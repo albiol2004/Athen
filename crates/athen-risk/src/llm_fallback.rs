@@ -28,13 +28,36 @@ impl LlmRiskEvaluator {
     }
 
     /// Evaluate the risk of an action description using an LLM.
+    ///
+    /// Uses a 10-second timeout. If the LLM call fails or times out,
+    /// falls back to a conservative score (WritePersist + PersonalInfo + 0.3 confidence)
+    /// which lands in the HumanConfirm range.
     pub async fn evaluate(
         &self,
         action: &str,
         context: &RiskContext,
     ) -> athen_core::error::Result<RiskScore> {
         let request = self.build_request(action);
-        let response = self.router.route(&request).await?;
+
+        // Timeout the LLM risk call — risk evaluation should be fast.
+        // On timeout or error, use conservative defaults that require approval.
+        let response = match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            self.router.route(&request),
+        )
+        .await
+        {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => {
+                tracing::warn!("LLM risk evaluation failed: {e}, using conservative defaults");
+                return Ok(self.conservative_fallback(context));
+            }
+            Err(_) => {
+                tracing::warn!("LLM risk evaluation timed out after 10s, using conservative defaults");
+                return Ok(self.conservative_fallback(context));
+            }
+        };
+
         let (impact, sensitivity, confidence) = self.parse_response(&response);
 
         let effective_context = RiskContext {
@@ -51,21 +74,41 @@ impl LlmRiskEvaluator {
         Ok(self.scorer.compute(impact, &effective_context, EvaluationMethod::LlmAssisted))
     }
 
+    /// Return a conservative risk score that lands in HumanConfirm range.
+    fn conservative_fallback(&self, context: &RiskContext) -> RiskScore {
+        let ctx = RiskContext {
+            trust_level: context.trust_level,
+            data_sensitivity: DataSensitivity::PersonalInfo,
+            llm_confidence: Some(0.3),
+            accumulated_risk: context.accumulated_risk,
+        };
+        self.scorer
+            .compute(BaseImpact::WritePersist, &ctx, EvaluationMethod::LlmAssisted)
+    }
+
     /// Build the LLM request for risk evaluation.
     pub fn build_request(&self, action: &str) -> LlmRequest {
         let system_prompt = concat!(
             "You are a risk evaluation engine for an AI agent system. ",
             "Your job is to classify the risk of a proposed action.\n\n",
+            "The action is a USER REQUEST that will be executed by an AI agent with shell access, ",
+            "file read/write capabilities, and internet access. Consider what the agent would ",
+            "ACTUALLY DO to fulfill this request, not just the literal text.\n\n",
             "Respond ONLY with a JSON object (no markdown, no explanation) with these fields:\n",
             "- \"impact\": one of \"read\", \"write_temp\", \"write_persist\", \"system\"\n",
             "- \"sensitivity\": one of \"plain\", \"personal_info\", \"secrets\"\n",
             "- \"confidence\": a float between 0.0 and 1.0 indicating your confidence\n",
             "- \"reasoning\": a brief explanation\n\n",
             "Impact levels:\n",
-            "- read: Read-only, no side effects\n",
-            "- write_temp: Creates temporary/reversible changes\n",
-            "- write_persist: Creates permanent/irreversible changes\n",
-            "- system: Modifies system configuration, installs software, or executes privileged commands\n\n",
+            "- read: Read-only, no side effects (listing files, reading, searching)\n",
+            "- write_temp: Creates temporary/reversible changes (writing to /tmp)\n",
+            "- write_persist: Creates permanent/irreversible changes (writing, modifying files)\n",
+            "- system: DESTRUCTIVE or DANGEROUS actions — deleting files/folders, modifying system config, ",
+            "installing/removing software, killing processes, formatting disks, sending data externally, ",
+            "ANY action that could cause data loss or security issues\n\n",
+            "IMPORTANT: If the user asks to delete, remove, wipe, destroy, or erase files/data, ",
+            "ALWAYS classify as \"system\" impact regardless of the language used. ",
+            "Be conservative — when in doubt, choose a higher impact level.\n\n",
             "Sensitivity levels:\n",
             "- plain: No sensitive data involved\n",
             "- personal_info: Contains PII (names, emails, phone numbers, addresses)\n",

@@ -12,10 +12,10 @@ use std::collections::HashMap;
 
 use athen_contacts::trust::TrustManager;
 use athen_core::contact::{ContactId, IdentifierKind, TrustLevel};
-use athen_core::error::Result;
+use athen_core::error::{AthenError, Result};
 use athen_core::event::{EventSource, SenseEvent, SenderInfo};
 use athen_core::risk::{DataSensitivity, RiskContext, RiskDecision};
-use athen_core::task::{AgentId, TaskId, TaskStatus};
+use athen_core::task::{AgentId, Task, TaskId, TaskStatus};
 use athen_core::traits::coordinator::{EventRouter, RiskEvaluator, TaskQueue};
 use athen_core::traits::persistence::{PersistentStore, TaskFilter};
 use tokio::sync::Mutex;
@@ -51,6 +51,8 @@ pub struct Coordinator {
     trust_manager: Option<TrustManager>,
     /// Maps task IDs to resolved contact IDs for trust feedback on completion.
     task_contacts: Mutex<HashMap<TaskId, ContactId>>,
+    /// Tasks awaiting human approval (risk score in HumanConfirm range).
+    awaiting_approval: Mutex<HashMap<TaskId, Task>>,
 }
 
 impl Coordinator {
@@ -63,6 +65,7 @@ impl Coordinator {
             store: None,
             trust_manager: None,
             task_contacts: Mutex::new(HashMap::new()),
+            awaiting_approval: Mutex::new(HashMap::new()),
         }
     }
 
@@ -170,9 +173,14 @@ impl Coordinator {
                 self.task_contacts.lock().await.insert(task.id, cid);
             }
 
-            // Only enqueue tasks that can proceed
+            // Only enqueue tasks that can proceed; hold risky ones for approval.
             if task.status == TaskStatus::Pending {
                 self.queue.enqueue(task.clone()).await?;
+            } else if task.status == TaskStatus::AwaitingApproval {
+                self.awaiting_approval
+                    .lock()
+                    .await
+                    .insert(task.id, task.clone());
             }
 
             // Persist the task if a store is available.
@@ -285,6 +293,52 @@ impl Coordinator {
 
         tracing::info!(count = recovered, "Recovered tasks from persistent store");
         Ok(recovered)
+    }
+
+    /// Get a task that is awaiting human approval.
+    ///
+    /// Returns the first task found in the awaiting-approval map, or `None`
+    /// if there are no tasks pending approval.
+    pub async fn get_awaiting_approval(&self) -> Option<Task> {
+        let map = self.awaiting_approval.lock().await;
+        map.values().next().cloned()
+    }
+
+    /// Approve a task that was waiting for human confirmation.
+    ///
+    /// Changes its status to `Pending` and enqueues it for dispatch.
+    /// Returns `Err` if the task is not found in the awaiting-approval map.
+    pub async fn approve_task(&self, task_id: TaskId) -> Result<Task> {
+        let mut map = self.awaiting_approval.lock().await;
+        let mut task = map
+            .remove(&task_id)
+            .ok_or_else(|| AthenError::TaskNotFound(task_id.to_string()))?;
+        task.status = TaskStatus::Pending;
+        task.updated_at = chrono::Utc::now();
+        self.queue.enqueue(task.clone()).await?;
+        Ok(task)
+    }
+
+    /// Deny a task that was waiting for human confirmation.
+    ///
+    /// Changes its status to `Cancelled` and removes it from the
+    /// awaiting-approval map.
+    pub async fn deny_task(&self, task_id: TaskId) -> Result<Task> {
+        let mut map = self.awaiting_approval.lock().await;
+        let mut task = map
+            .remove(&task_id)
+            .ok_or_else(|| AthenError::TaskNotFound(task_id.to_string()))?;
+        task.status = TaskStatus::Cancelled;
+        task.updated_at = chrono::Utc::now();
+
+        // Persist the cancelled status if a store is available.
+        if let Some(ref store) = self.store {
+            if let Err(e) = store.save_task(&task).await {
+                tracing::warn!(task_id = %task_id, error = %e, "Failed to persist denied task");
+            }
+        }
+
+        Ok(task)
     }
 
     /// Access the dispatcher for agent registration.

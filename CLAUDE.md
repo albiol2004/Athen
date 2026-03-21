@@ -430,6 +430,19 @@ SQLite stores: tasks, task steps, checkpoints, pending messages, contacts, confi
 
 ## Security Model
 
+### 3-Layer Defense Architecture
+
+Risk is evaluated at three independent layers — any layer can block a dangerous action:
+
+**Layer 1: User Message Risk (Coordinator)**
+Rule engine evaluates the user's natural language input before any LLM call. Catches both literal shell patterns (`rm -rf`, `sudo`) and natural language destructive intent ("delete all files", "wipe the database"). Intent-based matches add an uncertainty penalty pushing scores into HumanConfirm range. If rules are inconclusive, falls back to LLM risk evaluation (10-second timeout, conservative defaults on failure).
+
+**Layer 2: Tool Execution Risk (Agent)**
+`ShellToolRegistry.do_shell_execute()` runs `RuleEngine.evaluate()` on every actual shell command before execution. This catches dangerous commands regardless of what language the user spoke — the LLM may translate "borra todo" into `rm -rf /` and this layer catches it. Commands classified as Danger or Critical are blocked with an error returned to the LLM.
+
+**Layer 3: OS-Native Sandbox (Shell)**
+When bwrap is available, shell commands execute inside an OS-native sandbox with `SandboxProfile::RestrictedWrite`. Writable paths: `/tmp`, `$HOME`, current working directory. Everything else is read-only. Graceful fallback to unsandboxed execution if bwrap is not installed.
+
 ### Operation Modes
 - **Bunker**: Everything L2+ requires approval. Maximum caution.
 - **Assistant**: Standard risk evaluation. Normal operation.
@@ -445,6 +458,7 @@ SQLite stores: tasks, task steps, checkpoints, pending messages, contacts, confi
 - Max steps per task (default: 50)
 - Max time per task (default: 5 min)
 - Repetition detection: 3 identical actions without progress → pause
+- Graceful max-steps handling: when the executor hits the limit, it makes one final LLM call (with tools disabled) asking for a summary of work done so far, instead of returning raw JSON
 
 ### Kill Switch
 - Graceful: Ctrl+Shift+K — stops tasks cleanly, saves state
@@ -575,11 +589,18 @@ When the agent needs to contact the user:
 - `codec.rs`: `encode()` serializes `IpcMessage` to length-prefixed JSON bytes. `decode()` deserializes. `read_length_prefix()` extracts u32 from 4 bytes.
 - `server.rs`: `IpcServer` binds `UnixListener`, accepts connections, spawns per-connection reader tasks, identifies processes by first message's `source` field. Methods: `send_to()`, `broadcast()`, `broadcast_to_type()`, `route()`, `connected_count()`, `shutdown()`. `IpcClient` connects to coordinator, auto-sends Registration message.
 
-### athen-risk (55 tests)
-**Status**: Complete — full risk evaluation engine.
+### athen-risk (55 unit + 6 integration = 61 tests)
+**Status**: Complete — full risk evaluation engine with natural language intent detection.
 - `scorer.rs`: `RiskScorer` implementing the formula `(Ibase × Morigen × Mdatos) + Pincertidumbre`. Confidence penalty: `(1.0 - confidence)^2 × 100`. Maps total to RiskLevel and RiskDecision. Implements `RiskEvaluator` trait.
-- `rules.rs`: `RuleEngine` with compiled regex patterns. Detects: dangerous shell commands (rm -rf, sudo, dd, mkfs, chmod 777, pipe to sh), secrets (OpenAI keys sk-..., AWS keys AKIA..., private key headers, passwords in URLs), PII (emails, phone numbers), financial keywords (payment, transfer, purchase, buy), external URLs. Returns `Option<RiskScore>` — `Some` if confident, `None` for LLM fallback.
-- `llm_fallback.rs`: `LlmRiskEvaluator` takes `Box<dyn LlmRouter>`. Constructs structured prompt asking LLM to return JSON with impact/sensitivity/confidence/reasoning. Parses response, falls back to conservative defaults on parse failure.
+- `rules.rs`: `RuleEngine` with compiled regex patterns using `LazyLock`. Returns `RuleMatch` with `base_impact`, `data_sensitivity`, `matched_patterns`, and `intent_based` flag. Detects:
+  - **Dangerous shell commands**: rm -rf, sudo, dd, mkfs, chmod 777, redirect to /dev/, pipe to sh/bash/zsh
+  - **Natural language destructive intent** (`DESTRUCTIVE_INTENT` patterns): delete/remove/erase/wipe/destroy/nuke + file/folder/dir/everything/all (both orderings), format/reset/clear/empty/purge + disk/drive/partition/database/system, kill/terminate + all/every + process/service, modify/change/edit/overwrite + system/config/password/credentials, send/post/upload + data/file/secret/key/token. Intent-based matches set `intent_based = true` and receive `confidence = 0.6` (adds 16-point uncertainty penalty), pushing scores into HumanConfirm range.
+  - **Secrets**: OpenAI keys (sk-...), AWS keys (AKIA...), private key headers, passwords in URLs
+  - **PII**: email addresses, phone numbers
+  - **Financial keywords**: payment, transfer, purchase, buy, invoice, billing, credit card
+  - **External URLs**: http/https URLs
+  Returns `Option<RiskScore>` — `Some` if confident, `None` for LLM fallback.
+- `llm_fallback.rs`: `LlmRiskEvaluator` takes `Box<dyn LlmRouter>`. 10-second timeout on LLM calls. Constructs structured prompt that considers what the agent would ACTUALLY DO (not just literal text) — asks LLM to classify impact as system for any delete/remove/wipe/destroy actions. Conservative fallback on failure/timeout: `WritePersist + PersonalInfo + 0.3 confidence` (lands in HumanConfirm range, score ~89).
 - `lib.rs`: `CombinedRiskEvaluator` implementing `RiskEvaluator` — tries rules first, falls back to LLM if rules return `None`.
 
 ### athen-sandbox (32 tests)
@@ -592,17 +613,18 @@ When the agent needs to contact the user:
 - `windows.rs`: Stub returning "not yet implemented". Platform-gated.
 - `lib.rs`: `UnifiedSandbox` facade — auto-detects capabilities, selects best sandbox per level (bwrap > landlock > macos > windows for OsNative; podman > docker for Container).
 
-### athen-coordinador (37 unit + 4 integration tests)
-**Status**: Complete — full coordinator orchestration with persistence and trust integration.
+### athen-coordinador (37 unit + 4 integration = 41 tests)
+**Status**: Complete — full coordinator orchestration with persistence, trust, and approval management.
 - `router.rs`: `DefaultRouter` implementing `EventRouter`. Maps EventSource→DomainType (Email/Messaging→Communication, Calendar→Agenda, UserInput/System→Base). Priority: UserInput/Calendar=High, Messaging/Email=Normal, System=Low.
 - `queue.rs`: `PriorityTaskQueue` implementing `TaskQueue`. Uses `BinaryHeap<PrioritizedTask>` — higher priority first, FIFO within same priority (oldest first).
 - `dispatcher.rs`: `Dispatcher` manages agent availability. `register_agent()`, `unregister_agent()`, `assign_task()`, `release_agent()`, `assigned_agent()`.
 - `risk.rs`: `CoordinatorRiskEvaluator` wrapping `Box<dyn RiskEvaluator>`. `evaluate_and_decide()` returns `RiskDecision`.
-- `lib.rs`: `Coordinator` wiring all components with optional persistence and trust management:
+- `lib.rs`: `Coordinator` wiring all components with optional persistence, trust management, and human approval flow:
   - `.with_persistence(Box<dyn PersistentStore>)` — attaches SQLite store for task durability. `process_event()` saves tasks after creation, `complete_task()` updates status in DB. Persistence errors are logged but never crash the system.
   - `.with_trust_manager(TrustManager)` — enables contact-aware risk evaluation. `process_event()` resolves sender trust via `TrustManager` and factors it into risk scoring (AuthUser for UserInput, resolved trust for external senders, Neutral fallback). `complete_task()` records approval for implicit trust evolution.
   - `recover_tasks()` — loads non-terminal tasks from persistent store and re-enqueues them on startup. Terminal statuses (Completed, Failed, Cancelled) are skipped.
-  - `process_event()` routes→resolves sender trust→evaluates risk→sets status→persists→enqueues. `dispatch_next()` dequeues and assigns to agent. `complete_task()` releases agent→updates DB→records trust approval.
+  - `process_event()` routes→resolves sender trust→evaluates risk→sets status→persists→enqueues. Tasks with `HumanConfirm` risk go to `awaiting_approval` map instead of queue. `dispatch_next()` dequeues and assigns to agent. `complete_task()` releases agent→updates DB→records trust approval.
+  - **Approval management**: `awaiting_approval: Mutex<HashMap<TaskId, Task>>` holds tasks pending human decision. `get_awaiting_approval()` returns the first pending task. `approve_task(id)` moves task to Pending and enqueues. `deny_task(id)` sets status to Cancelled and persists.
   - `infer_identifier_kind()` helper — infers `IdentifierKind` (Email/Phone/Other) from sender identifier strings.
   - `task_contacts: Mutex<HashMap<TaskId, ContactId>>` — maps task IDs to resolved contact IDs for trust feedback on completion.
 
@@ -634,17 +656,17 @@ When the agent needs to contact the user:
 - `checkpoint.rs`: `CheckpointManager` — atomic file-based backup (write temp → fsync → rename). Integrity verification with SHA-256 checksums.
 - Schema: `tasks`, `task_steps`, `checkpoints`, `pending_messages` tables.
 
-### athen-agent (30 unit + 3 integration tests)
-**Status**: Complete — LLM-driven task execution with real tool calling, sandbox integration, and session memory.
-- `executor.rs`: `DefaultExecutor` implementing `AgentExecutor`. Accepts optional `context_messages: Vec<ChatMessage>` prepended to conversation for session-level memory. Loop: check timeout → check max_steps → build LlmRequest with conversation history + tools → call LlmRouter → execute tool calls via ToolRegistry → record steps via StepAuditor → repeat until LLM says done. Tool call results fed back as `Role::Tool` messages with `tool_call_id` for OpenAI-compatible APIs. System prompt explicitly lists available tools by name and description so the LLM knows what it can do.
+### athen-agent (30 unit + 3 integration = 33 tests)
+**Status**: Complete — LLM-driven task execution with real tool calling, tool-level risk checking, sandbox integration, session memory, and graceful max-steps handling.
+- `executor.rs`: `DefaultExecutor` implementing `AgentExecutor`. Accepts optional `context_messages: Vec<ChatMessage>` prepended to conversation for session-level memory. System prompt is conversation-aware: when context messages are present, it tells the LLM "You are in an ongoing conversation" instead of treating it as a fresh task. Loop: check timeout → check max_steps → build LlmRequest with conversation history + tools → call LlmRouter → execute tool calls via ToolRegistry → record steps via StepAuditor → repeat until LLM says done. Tool call results fed back as `Role::Tool` messages with `tool_call_id` for OpenAI-compatible APIs. **Graceful max-steps**: when the executor hits the step limit, it makes one final LLM call with `tools: None` asking for a summary of work accomplished, instead of returning raw JSON.
 - `tools.rs`: `ShellToolRegistry` implementing `ToolRegistry` with 6 built-in tools:
-  - `shell_execute` — runs shell commands, routed through bwrap sandbox when available (graceful fallback to unsandboxed if bwrap not installed)
+  - `shell_execute` — runs shell commands with **2-layer safety**: (1) pre-execution risk check via `RuleEngine.evaluate()` on the actual command string — blocks Danger/Critical commands with a descriptive error returned to the LLM, (2) sandboxed execution via bwrap with `SandboxProfile::RestrictedWrite` (writable: `/tmp`, `$HOME`, cwd; read-only: everything else). Graceful fallback to unsandboxed if bwrap not installed.
   - `read_file` — reads file contents via `tokio::fs`
   - `write_file` — writes content to a file via `tokio::fs`
   - `list_directory` — lists directory entries as JSON array
   - `memory_store` — stores key-value pairs in in-session `HashMap<String, String>` memory
   - `memory_recall` — retrieves value by key or lists all stored keys
-  Each tool has proper JSON Schema parameter definitions for LLM tool calling. `ShellToolRegistry` holds an optional `UnifiedSandbox` (from `athen-sandbox`) — auto-detected on construction. Shell commands execute inside an OS-native sandbox with `SandboxProfile::ReadOnly` when available.
+  Each tool has proper JSON Schema parameter definitions for LLM tool calling. `ShellToolRegistry` holds an optional `UnifiedSandbox` (from `athen-sandbox`) and a `RuleEngine` (from `athen-risk`) — both auto-initialized on construction.
 - `auditor.rs`: `InMemoryAuditor` implementing `StepAuditor` with `tokio::sync::Mutex<HashMap<TaskId, Vec<TaskStep>>>`.
 - `timeout.rs`: `DefaultTimeoutGuard` — sets deadline at Instant::now() + duration.
 - `resource.rs`: `DefaultResourceMonitor` — reads `/proc/self/statm` on Linux for resident memory. `AtomicBool` cache for within-limits state.
@@ -674,29 +696,45 @@ When the agent needs to contact the user:
 ### athen-cli (0 tests)
 **Status**: Complete — working agentic CLI with tool execution.
 - `main.rs`: REPL loop wiring all components end-to-end. Reads `DEEPSEEK_API_KEY` from env or config. Uses `config_loader` to discover config from `~/.athen/` or `./config/`. Creates `DeepSeekProvider` → `DefaultLlmRouter` (mapped to all profiles) → `CombinedRiskEvaluator` (real rule engine + LLM fallback) → `Coordinator` (real router, queue, dispatcher). Synchronous stdin with clean EOF/Ctrl+D handling. Risk-gated: low-risk auto-approved, high-risk prompts for confirmation, hard-block rejected. Commands: `/quit`, `/exit`.
-- Uses full `AgentBuilder` + `DefaultExecutor` with `ShellToolRegistry` — the agent can execute shell commands, read/write files, list directories, and use in-session memory autonomously via LLM tool calls.
+- Uses full `AgentBuilder` + `DefaultExecutor` with `ShellToolRegistry` — the agent can execute shell commands (sandboxed when bwrap available), read/write files, list directories, and use in-session memory (store/recall) autonomously via LLM tool calls.
 - `SharedRouter`: Wrapper around `Arc<DefaultLlmRouter>` implementing `LlmRouter` trait for sharing between risk evaluator and agent.
 - **Verified working**: Full agentic pipeline — user input → coordinator → risk → dispatch → agent executor → LLM → tool calls → execution → result.
 
 ### athen-app (0 tests)
-**Status**: Complete — Tauri 2 desktop app with full agentic tool execution and conversation history. Verified working.
-- `src/lib.rs`: Tauri composition root. Builds app, registers `AppState`, wires command handlers (`send_message`, `get_status`). Registers agent in `setup()` hook using `tauri::async_runtime::block_on()`.
+**Status**: Complete — Tauri 2 desktop app with full agentic tool execution, conversation history, real-time progress events, approval UI, config loading, and persistence. Verified working.
+- `src/lib.rs`: Tauri composition root. Builds app, registers `AppState`, wires command handlers (`send_message`, `get_status`, `approve_task`). Registers agent in `setup()` hook using `tauri::async_runtime::block_on()`.
 - `src/main.rs`: Entry point with `windows_subsystem = "windows"` for release builds.
-- `src/state.rs`: `AppState` — builds `Coordinator` + `DefaultLlmRouter` (DeepSeek) + `CombinedRiskEvaluator`. `SharedRouter` wrapper for `Arc`-based sharing. Reads `DEEPSEEK_API_KEY` from env. Contains `history: Mutex<Vec<ChatMessage>>` for session-level conversation memory persisted across messages within a session.
-- `src/commands.rs`: Tauri IPC commands — `send_message` snapshots conversation history, builds a full `AgentExecutor` with `ShellToolRegistry` per request (same pattern as `athen-cli`), passes history as `context_messages` to `AgentBuilder`, executes through coordinator pipeline, then appends user+assistant messages to session history. Returns `ChatResponse` with content, risk level, domain, and tool call info. `get_status` returns connection/model info. Multi-step agentic interactions (tool call → result → next tool call → final answer) are fully supported.
+- `src/state.rs`: `AppState` — composition root that loads TOML configuration via `find_config_dir()` (same discovery order as CLI: `~/.athen/` → `./config/` → defaults), resolves API key from env var + config, builds `Coordinator` + `DefaultLlmRouter` (DeepSeek) + `CombinedRiskEvaluator`, and opens SQLite database at `~/.athen/athen.db` via `build_coordinator_with_persistence()`. Contains:
+  - `history: Mutex<Vec<ChatMessage>>` — session-level conversation memory persisted across messages
+  - `pending_message: Mutex<Option<String>>` — stashes the user's original message for replay after approval
+  - `model_name: String` — resolved from config or default, returned by `get_status`
+  - `_database: Option<Database>` — keeps the connection alive
+  - `SharedRouter` wrapper for `Arc`-based sharing between risk evaluator and agent
+- `src/commands.rs`: Tauri IPC commands:
+  - `send_message` — emits `agent-progress` event for risk evaluation phase, processes through coordinator pipeline, checks for awaiting approval (returns `PendingApproval` with task_id/description/risk_score/risk_level), snapshots conversation history, builds full `AgentExecutor` with `ShellToolRegistry` per request, passes history as `context_messages`, executes with 25 max_steps and 90s timeout. On failure: shows friendly message ("ran out of steps, try simpler request"). Appends user+assistant messages to session history. Returns `ChatResponse` with content, risk level, domain, tool calls, and optional `pending_approval`.
+  - `approve_task` — approves or denies a task flagged by risk system. On approve: retrieves stashed message, builds executor, dispatches and executes. On deny: cancels task, clears stashed message.
+  - `get_status` — returns actual model name from config and connection status.
+  - `TauriAuditor` — wraps `InMemoryAuditor`, emits `agent-progress` Tauri events on each step with step index, tool name, and status. Frontend status bar shows "Step N: tool_name (status)" in real time.
 - `tauri.conf.json`: Window 900x700, `frontendDist` points to `../../frontend`. **`"withGlobalTauri": true`** required in `app` section to inject `window.__TAURI__` into the webview.
 - `frontend/index.html`: Chat UI shell with header, message container, input form, status bar.
-- `frontend/styles.css`: Dark theme (Tokyo Night-inspired) — styled messages, risk badges (safe/caution/danger), tool call display, monospace code blocks, scrollbar.
-- `frontend/app.js`: Polls for `window.__TAURI__` availability, calls `invoke('send_message')`, renders responses with risk badges and tool call info, manages input state. Error display on failures.
+- `frontend/styles.css`: Dark theme (Tokyo Night-inspired) — chat bubbles with avatars (Y for user, A for Athen), timestamps, risk badges (safe/caution/danger), tool call display, monospace code blocks with language labels, approval dialog styling, auto-growing textarea, smooth scrollbar, XSS-safe rendering.
+- `frontend/app.js`: Full chat frontend with:
+  - **Markdown renderer** (inline, no dependencies): fenced code blocks with language labels, inline code, headers (h1-h3), ordered/unordered lists, bold, italic, links. Code blocks protected from inline transformations.
+  - **XSS protection**: user messages use `textContent` (never innerHTML), assistant messages go through markdown renderer with `escapeHtml()` on code blocks.
+  - **Real-time progress**: listens for `agent-progress` Tauri events, updates status bar with "Step N: tool_name (status)" and "Evaluating risk..." during risk phase.
+  - **Approval dialog**: `addApprovalDialog()` shows risk badge, score, description, approve/deny buttons. `handleApproval()` calls `approve_task` command, removes dialog, shows result.
+  - **Auto-growing textarea**: expands with content up to 150px. Enter sends, Shift+Enter for newline.
+  - **Smooth scroll**: `requestAnimationFrame` + `scrollTo({ behavior: 'smooth' })` on new messages.
+  - Polls for `window.__TAURI__` availability, calls `invoke('send_message')`, renders responses with risk badges, domain labels, and tool call info.
 - **Requires system libraries**: `webkit2gtk4.1-devel gtk3-devel libsoup3-devel libappindicator-gtk3-devel` (Fedora).
-- **Verified working**: Full multi-step agentic pipeline confirmed. Tested: (1) "What tools do you have?" → LLM correctly lists its 6 tools, (2) "Read https://alejandrogarcia.blog/ and write to HELLO.md" → LLM uses `shell_execute` (curl) to fetch website, then `write_file` to save formatted markdown. Multi-step tool chains work end-to-end: user input → coordinator → risk → dispatch → AgentExecutor → LLM → tool call → result fed back → next tool call → final response. Conversation history is maintained across messages within a session.
+- **Verified working**: Full multi-step agentic pipeline confirmed. Tested: (1) "What tools do you have?" → LLM correctly lists its 6 tools, (2) "Read https://alejandrogarcia.blog/ and write to HELLO.md" → LLM uses `shell_execute` (curl) to fetch website, then `write_file` to save formatted markdown. Multi-step tool chains work end-to-end: user input → coordinator → risk → dispatch → AgentExecutor → LLM → tool call → result fed back → next tool call → final response. Conversation history is maintained across messages within a session. Approval UI tested with high-risk requests.
 
 ### mcp-filesystem (0 tests)
 **Status**: Stub — entry point only. Standalone MCP server (no athen-core dependency).
 
 ---
 
-## Integration Tests (25 tests)
+## Integration Tests (28 tests)
 
 Integration tests wire real implementations together (no mocks except LLM).
 
@@ -746,10 +784,12 @@ Integration tests wire real implementations together (no mocks except LLM).
 
 TOML-based configuration with split files and sensible defaults.
 
-### Config discovery (CLI)
+### Config discovery (CLI and Tauri app)
 1. `~/.athen/config.toml` — user-level config (checked first)
 2. `./config/config.toml` — project-local config (fallback)
 3. Built-in defaults if no file found
+
+Both `athen-cli` and `athen-app` use the same discovery logic. The Tauri app also creates `~/.athen/` if it does not exist and opens SQLite at `~/.athen/athen.db`.
 
 ### Config files
 - `config/config.toml` — operation mode, security settings, persistence paths

@@ -8,12 +8,14 @@ use async_trait::async_trait;
 use serde_json::json;
 use tokio::sync::Mutex;
 
+use athen_core::contact::TrustLevel;
 use athen_core::error::{AthenError, Result};
-use athen_core::risk::BaseImpact;
+use athen_core::risk::{BaseImpact, DataSensitivity, RiskContext, RiskLevel};
 use athen_core::sandbox::{SandboxLevel, SandboxProfile};
 use athen_core::tool::{ToolBackend, ToolDefinition, ToolResult};
 use athen_core::traits::shell::ShellExecutor;
 use athen_core::traits::tool::ToolRegistry;
+use athen_risk::rules::RuleEngine;
 use athen_sandbox::UnifiedSandbox;
 use athen_shell::Shell;
 
@@ -24,6 +26,7 @@ pub struct ShellToolRegistry {
     shell: Shell,
     memory: Arc<Mutex<HashMap<String, String>>>,
     sandbox: Option<UnifiedSandbox>,
+    rule_engine: RuleEngine,
 }
 
 impl ShellToolRegistry {
@@ -54,6 +57,7 @@ impl ShellToolRegistry {
             shell: Shell::new().await,
             memory: Arc::new(Mutex::new(HashMap::new())),
             sandbox,
+            rule_engine: RuleEngine::new(),
         }
     }
 
@@ -131,12 +135,61 @@ impl ShellToolRegistry {
 
         tracing::info!(tool = "shell_execute", command, "Executing shell command");
 
+        // Pre-execution risk check: evaluate the ACTUAL command (not user's
+        // natural language) through the rule engine. This catches dangerous
+        // commands like `rm -rf` regardless of what language the user spoke.
+        let risk_ctx = RiskContext {
+            trust_level: TrustLevel::AuthUser,
+            data_sensitivity: DataSensitivity::Plain,
+            llm_confidence: Some(1.0),
+            accumulated_risk: 0,
+        };
+        if let Some(score) = self.rule_engine.evaluate(command, &risk_ctx) {
+            if score.level == RiskLevel::Danger || score.level == RiskLevel::Critical {
+                tracing::warn!(
+                    tool = "shell_execute",
+                    command,
+                    risk_score = score.total,
+                    risk_level = ?score.level,
+                    "Command blocked by risk evaluation"
+                );
+                return Ok(ToolResult {
+                    success: false,
+                    output: json!({
+                        "error": "Command blocked by safety system",
+                        "reason": format!(
+                            "This command was classified as {:?} risk (score: {:.0}). \
+                             It cannot be executed without explicit user approval.",
+                            score.level, score.total
+                        ),
+                        "command": command,
+                    }),
+                    error: Some(format!(
+                        "Blocked: {:?} risk command (score {:.0})",
+                        score.level, score.total
+                    )),
+                    execution_time_ms: 0,
+                });
+            }
+        }
+
         let start = Instant::now();
 
         // Try sandboxed execution first, fall back to unsandboxed shell.
         let (stdout, stderr, exit_code) = if let Some(ref sandbox) = self.sandbox {
+            // Allow writes to /tmp and the current working directory.
+            // System directories remain read-only.
+            let mut allowed = vec![std::path::PathBuf::from("/tmp")];
+            if let Ok(cwd) = std::env::current_dir() {
+                allowed.push(cwd);
+            }
+            if let Ok(home) = std::env::var("HOME") {
+                allowed.push(std::path::PathBuf::from(home));
+            }
             let level = SandboxLevel::OsNative {
-                profile: SandboxProfile::ReadOnly,
+                profile: SandboxProfile::RestrictedWrite {
+                    allowed_paths: allowed,
+                },
             };
             match sandbox
                 .execute_sandboxed("sh", &["-c", command], &level)

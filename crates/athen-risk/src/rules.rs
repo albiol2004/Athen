@@ -18,6 +18,10 @@ pub struct RuleMatch {
     pub base_impact: BaseImpact,
     pub data_sensitivity: DataSensitivity,
     pub matched_patterns: Vec<String>,
+    /// True when the match is based on natural language intent rather than
+    /// a literal command pattern. This adds an uncertainty penalty because
+    /// we're interpreting what the user *might* do, not what they typed.
+    pub intent_based: bool,
 }
 
 /// Fast, regex-based risk rule engine.
@@ -36,6 +40,20 @@ static DANGEROUS_SHELL: LazyLock<Vec<(&str, Regex)>> = LazyLock::new(|| {
         ("chmod 777", Regex::new(r"\bchmod\s+777\b").unwrap()),
         ("> /dev/", Regex::new(r">\s*/dev/").unwrap()),
         ("pipe to sh", Regex::new(r"\|\s*(sh|bash|zsh)\b").unwrap()),
+    ]
+});
+
+/// Natural language patterns that indicate destructive or dangerous intent.
+/// These catch user requests that would result in risky tool calls even when
+/// the message isn't a literal shell command.
+static DESTRUCTIVE_INTENT: LazyLock<Vec<(&str, Regex)>> = LazyLock::new(|| {
+    vec![
+        ("delete intent", Regex::new(r"(?i)\b(delete|remove|erase|wipe|destroy|nuke)\b.*\b(file|folder|dir|everything|all)\b").unwrap()),
+        ("delete intent (reversed)", Regex::new(r"(?i)\b(file|folder|dir|everything|all)\b.*\b(delete|remove|erase|wipe|destroy|nuke)\b").unwrap()),
+        ("format/reset intent", Regex::new(r"(?i)\b(format|reset|clear|empty|purge)\b.*\b(disk|drive|partition|database|system)\b").unwrap()),
+        ("kill process", Regex::new(r"(?i)\b(kill|terminate|stop)\b.*\b(all|every)\b.*\b(process|service)\b").unwrap()),
+        ("modify system", Regex::new(r"(?i)\b(modify|change|edit|overwrite)\b.*\b(system|config|password|credentials|hosts|sudoers|fstab)\b").unwrap()),
+        ("send/post external", Regex::new(r"(?i)\b(send|post|upload|share|email|forward)\b.*\b(data|file|info|secret|password|key|token)\b").unwrap()),
     ]
 });
 
@@ -90,10 +108,18 @@ impl RuleEngine {
             context.data_sensitivity
         };
 
+        // Intent-based matches (natural language) get a lower confidence to
+        // add uncertainty penalty, pushing the score into HumanConfirm range.
+        let confidence = if rule_match.intent_based {
+            Some(0.6) // (1-0.6)^2 * 100 = 16 penalty points
+        } else {
+            context.llm_confidence
+        };
+
         let effective_context = RiskContext {
             trust_level: context.trust_level,
             data_sensitivity: effective_sensitivity,
-            llm_confidence: context.llm_confidence,
+            llm_confidence: confidence,
             accumulated_risk: context.accumulated_risk,
         };
 
@@ -110,12 +136,24 @@ impl RuleEngine {
         let mut matched_patterns: Vec<String> = Vec::new();
         let mut base_impact = None;
         let mut data_sensitivity = DataSensitivity::Plain;
+        let mut intent_based = false;
 
         // Check dangerous shell patterns -> System impact
         for (name, re) in DANGEROUS_SHELL.iter() {
             if re.is_match(action) {
                 matched_patterns.push(name.to_string());
                 base_impact = Some(BaseImpact::System);
+            }
+        }
+
+        // Check natural language destructive intent -> System impact
+        for (name, re) in DESTRUCTIVE_INTENT.iter() {
+            if re.is_match(action) {
+                matched_patterns.push(name.to_string());
+                intent_based = true;
+                if base_impact.is_none() || base_impact == Some(BaseImpact::WritePersist) {
+                    base_impact = Some(BaseImpact::System);
+                }
             }
         }
 
@@ -174,6 +212,7 @@ impl RuleEngine {
             base_impact: base_impact.unwrap_or(BaseImpact::Read),
             data_sensitivity,
             matched_patterns,
+            intent_based,
         })
     }
 }

@@ -9,21 +9,37 @@
 <body>
     <div id="app">
         <header>
-            <h1>Athen</h1>
-            <span class="subtitle">Universal AI Agent</span>
+            <div class="header-left">
+                <div class="logo">A</div>
+                <div class="header-text">
+                    <h1>Athen</h1>
+                    <span class="subtitle">Universal AI Agent</span>
+                </div>
+            </div>
         </header>
 
         <main id="chat-container">
-            <div id="messages"></div>
+            <div id="messages">
+                <div class="welcome-message">
+                    <div class="welcome-icon">A</div>
+                    <p>Hello! I'm <strong>Athen</strong>, your universal AI agent. I can execute shell commands, read and write files, manage tasks, and more.</p>
+                    <p class="welcome-hint">Type a message below to get started.</p>
+                </div>
+            </div>
         </main>
 
         <footer>
             <form id="input-form">
-                <input type="text" id="message-input" placeholder="Type your message..." autofocus>
-                <button type="submit">Send</button>
+                <div class="input-wrapper">
+                    <textarea id="message-input" placeholder="Send a message..." rows="1" autofocus></textarea>
+                    <button type="submit" id="send-btn" title="Send message">
+                        <span class="send-icon">&#10148;</span>
+                    </button>
+                </div>
             </form>
             <div id="status-bar">
-                <span id="status">Ready</span>
+                <span id="status-dot" class="status-dot idle"></span>
+                <span id="status-text">Ready</span>
             </div>
         </footer>
     </div>
