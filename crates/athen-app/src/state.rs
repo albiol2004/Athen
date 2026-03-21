@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use tokio::sync::Mutex;
 
 use athen_core::config::ProfileConfig;
 use athen_core::error::Result;
@@ -36,6 +37,8 @@ impl LlmRouter for SharedRouter {
 pub struct AppState {
     pub coordinator: Coordinator,
     pub router: Arc<DefaultLlmRouter>,
+    /// In-memory conversation history for the current session.
+    pub history: Mutex<Vec<ChatMessage>>,
 }
 
 impl AppState {
@@ -52,6 +55,7 @@ impl AppState {
         Self {
             coordinator,
             router,
+            history: Mutex::new(Vec::new()),
         }
     }
 }

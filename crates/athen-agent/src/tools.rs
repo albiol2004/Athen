@@ -1,28 +1,59 @@
 //! Built-in tool registry backed by shell execution and filesystem operations.
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
 use serde_json::json;
+use tokio::sync::Mutex;
 
 use athen_core::error::{AthenError, Result};
 use athen_core::risk::BaseImpact;
+use athen_core::sandbox::{SandboxLevel, SandboxProfile};
 use athen_core::tool::{ToolBackend, ToolDefinition, ToolResult};
 use athen_core::traits::shell::ShellExecutor;
 use athen_core::traits::tool::ToolRegistry;
+use athen_sandbox::UnifiedSandbox;
 use athen_shell::Shell;
 
-/// A [`ToolRegistry`] that provides built-in tools for shell execution
-/// and filesystem operations, backed by [`athen_shell::Shell`].
+/// A [`ToolRegistry`] that provides built-in tools for shell execution,
+/// filesystem operations, and in-session key-value memory,
+/// backed by [`athen_shell::Shell`].
 pub struct ShellToolRegistry {
     shell: Shell,
+    memory: Arc<Mutex<HashMap<String, String>>>,
+    sandbox: Option<UnifiedSandbox>,
 }
 
 impl ShellToolRegistry {
-    /// Create a new registry, auto-detecting the available shell backend.
+    /// Create a new registry, auto-detecting the available shell backend
+    /// and sandbox capabilities.
     pub async fn new() -> Self {
+        let sandbox = match UnifiedSandbox::new().await {
+            Ok(sb) => {
+                let caps = sb.capabilities();
+                if caps.bubblewrap || caps.landlock || caps.macos_sandbox || caps.windows_sandbox {
+                    tracing::info!("Sandbox available for shell tool execution");
+                    Some(sb)
+                } else {
+                    tracing::info!(
+                        "No OS-native sandbox capabilities detected, \
+                         shell commands will run unsandboxed"
+                    );
+                    None
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to initialize sandbox, proceeding without: {e}");
+                None
+            }
+        };
+
         Self {
             shell: Shell::new().await,
+            memory: Arc::new(Mutex::new(HashMap::new())),
+            sandbox,
         }
     }
 
@@ -87,6 +118,11 @@ impl ShellToolRegistry {
     }
 
     /// Execute a shell command and return the result.
+    ///
+    /// When a sandbox is available, the command is executed inside an
+    /// OS-native sandbox with a read-only filesystem profile. If sandbox
+    /// execution fails, the method falls back to unsandboxed shell
+    /// execution so that functionality is never broken.
     async fn do_shell_execute(&self, args: &serde_json::Value) -> Result<ToolResult> {
         let command = args
             .get("command")
@@ -96,14 +132,45 @@ impl ShellToolRegistry {
         tracing::info!(tool = "shell_execute", command, "Executing shell command");
 
         let start = Instant::now();
-        let output = self.shell.execute(command).await?;
-        let elapsed_ms = start.elapsed().as_millis() as u64;
 
-        let success = output.exit_code == 0;
+        // Try sandboxed execution first, fall back to unsandboxed shell.
+        let (stdout, stderr, exit_code) = if let Some(ref sandbox) = self.sandbox {
+            let level = SandboxLevel::OsNative {
+                profile: SandboxProfile::ReadOnly,
+            };
+            match sandbox
+                .execute_sandboxed("sh", &["-c", command], &level)
+                .await
+            {
+                Ok(output) => {
+                    tracing::debug!(tool = "shell_execute", "Command executed inside sandbox");
+                    (output.stdout, output.stderr, output.exit_code)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        tool = "shell_execute",
+                        error = %e,
+                        "Sandbox execution failed, falling back to unsandboxed shell"
+                    );
+                    let output = self.shell.execute(command).await?;
+                    (output.stdout, output.stderr, output.exit_code)
+                }
+            }
+        } else {
+            tracing::trace!(
+                tool = "shell_execute",
+                "No sandbox available, executing unsandboxed"
+            );
+            let output = self.shell.execute(command).await?;
+            (output.stdout, output.stderr, output.exit_code)
+        };
+
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        let success = exit_code == 0;
         let result_output = json!({
-            "stdout": output.stdout,
-            "stderr": output.stderr,
-            "exit_code": output.exit_code,
+            "stdout": stdout,
+            "stderr": stderr,
+            "exit_code": exit_code,
         });
 
         Ok(ToolResult {
@@ -114,8 +181,8 @@ impl ShellToolRegistry {
             } else {
                 Some(format!(
                     "exit code {}: {}",
-                    output.exit_code,
-                    output.stderr.trim()
+                    exit_code,
+                    stderr.trim()
                 ))
             },
             execution_time_ms: elapsed_ms,
@@ -130,6 +197,7 @@ impl ShellToolRegistry {
             .ok_or_else(|| AthenError::Other("missing 'path' parameter".to_string()))?;
 
         tracing::info!(tool = "read_file", path, "Reading file");
+        tracing::trace!(tool = "read_file", "Filesystem tools use tokio::fs directly (unsandboxed)");
 
         let start = Instant::now();
         match tokio::fs::read_to_string(path).await {
@@ -167,6 +235,7 @@ impl ShellToolRegistry {
             .ok_or_else(|| AthenError::Other("missing 'content' parameter".to_string()))?;
 
         tracing::info!(tool = "write_file", path, "Writing file");
+        tracing::trace!(tool = "write_file", "Filesystem tools use tokio::fs directly (unsandboxed)");
 
         let start = Instant::now();
         match tokio::fs::write(path, content).await {
@@ -191,6 +260,96 @@ impl ShellToolRegistry {
         }
     }
 
+    /// Build the JSON Schema for the `memory_store` tool parameters.
+    fn memory_store_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "key": {
+                    "type": "string",
+                    "description": "The key to store the value under"
+                },
+                "value": {
+                    "type": "string",
+                    "description": "The value to store"
+                }
+            },
+            "required": ["key", "value"]
+        })
+    }
+
+    /// Build the JSON Schema for the `memory_recall` tool parameters.
+    fn memory_recall_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "key": {
+                    "type": "string",
+                    "description": "The key to recall. If omitted, returns all stored keys."
+                }
+            },
+            "required": []
+        })
+    }
+
+    /// Store a key-value pair in in-session memory.
+    async fn do_memory_store(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let key = args
+            .get("key")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AthenError::Other("missing 'key' parameter".to_string()))?;
+
+        let value = args
+            .get("value")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AthenError::Other("missing 'value' parameter".to_string()))?;
+
+        tracing::info!(tool = "memory_store", key, "Storing value in memory");
+
+        let start = Instant::now();
+        self.memory
+            .lock()
+            .await
+            .insert(key.to_string(), value.to_string());
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+
+        Ok(ToolResult {
+            success: true,
+            output: json!({ "stored": key }),
+            error: None,
+            execution_time_ms: elapsed_ms,
+        })
+    }
+
+    /// Recall a value by key, or list all keys if no key is provided.
+    async fn do_memory_recall(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let key = args.get("key").and_then(|v| v.as_str());
+
+        tracing::info!(tool = "memory_recall", ?key, "Recalling from memory");
+
+        let start = Instant::now();
+        let memory = self.memory.lock().await;
+
+        let output = match key {
+            Some(k) => match memory.get(k) {
+                Some(v) => json!({ "key": k, "value": v }),
+                None => json!({ "key": k, "found": false }),
+            },
+            None => {
+                let keys: Vec<&String> = memory.keys().collect();
+                json!({ "keys": keys })
+            }
+        };
+
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        Ok(ToolResult {
+            success: true,
+            output,
+            error: None,
+            execution_time_ms: elapsed_ms,
+        })
+    }
+
     /// List entries in a directory.
     async fn do_list_directory(&self, args: &serde_json::Value) -> Result<ToolResult> {
         let path = args
@@ -199,6 +358,7 @@ impl ShellToolRegistry {
             .ok_or_else(|| AthenError::Other("missing 'path' parameter".to_string()))?;
 
         tracing::info!(tool = "list_directory", path, "Listing directory");
+        tracing::trace!(tool = "list_directory", "Filesystem tools use tokio::fs directly (unsandboxed)");
 
         let start = Instant::now();
         match tokio::fs::read_dir(path).await {
@@ -288,6 +448,26 @@ impl ToolRegistry for ShellToolRegistry {
                 },
                 base_risk: BaseImpact::Read,
             },
+            ToolDefinition {
+                name: "memory_store".to_string(),
+                description: "Store a key-value pair in in-session memory for later recall".to_string(),
+                parameters: Self::memory_store_schema(),
+                backend: ToolBackend::Shell {
+                    command: String::new(),
+                    native: false,
+                },
+                base_risk: BaseImpact::Read,
+            },
+            ToolDefinition {
+                name: "memory_recall".to_string(),
+                description: "Recall a value by key from in-session memory, or list all stored keys if no key is given".to_string(),
+                parameters: Self::memory_recall_schema(),
+                backend: ToolBackend::Shell {
+                    command: String::new(),
+                    native: false,
+                },
+                base_risk: BaseImpact::Read,
+            },
         ])
     }
 
@@ -301,6 +481,8 @@ impl ToolRegistry for ShellToolRegistry {
             "read_file" => self.do_read_file(&args).await,
             "write_file" => self.do_write_file(&args).await,
             "list_directory" => self.do_list_directory(&args).await,
+            "memory_store" => self.do_memory_store(&args).await,
+            "memory_recall" => self.do_memory_recall(&args).await,
             _ => Err(AthenError::ToolNotFound(name.to_string())),
         }
     }
@@ -317,13 +499,15 @@ mod tests {
         let registry = ShellToolRegistry::new().await;
         let tools = registry.list_tools().await.unwrap();
 
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), 6);
 
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"shell_execute"));
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"write_file"));
         assert!(names.contains(&"list_directory"));
+        assert!(names.contains(&"memory_store"));
+        assert!(names.contains(&"memory_recall"));
 
         // Each tool should have a non-empty description and valid parameters schema.
         for tool in &tools {
@@ -456,5 +640,67 @@ mod tests {
         let registry = ShellToolRegistry::new().await;
         let result = registry.call_tool("shell_execute", json!({})).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_memory_store_and_recall() {
+        let registry = ShellToolRegistry::new().await;
+
+        let store_result = registry
+            .call_tool("memory_store", json!({"key": "color", "value": "blue"}))
+            .await
+            .unwrap();
+        assert!(store_result.success);
+        assert_eq!(store_result.output["stored"], "color");
+
+        let recall_result = registry
+            .call_tool("memory_recall", json!({"key": "color"}))
+            .await
+            .unwrap();
+        assert!(recall_result.success);
+        assert_eq!(recall_result.output["key"], "color");
+        assert_eq!(recall_result.output["value"], "blue");
+    }
+
+    #[tokio::test]
+    async fn test_memory_recall_missing_key() {
+        let registry = ShellToolRegistry::new().await;
+
+        let result = registry
+            .call_tool("memory_recall", json!({"key": "nonexistent"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert_eq!(result.output["key"], "nonexistent");
+        assert_eq!(result.output["found"], false);
+    }
+
+    #[tokio::test]
+    async fn test_memory_recall_all_keys() {
+        let registry = ShellToolRegistry::new().await;
+
+        // Store multiple values.
+        registry
+            .call_tool("memory_store", json!({"key": "a", "value": "1"}))
+            .await
+            .unwrap();
+        registry
+            .call_tool("memory_store", json!({"key": "b", "value": "2"}))
+            .await
+            .unwrap();
+
+        // Recall without a key to list all keys.
+        let result = registry
+            .call_tool("memory_recall", json!({}))
+            .await
+            .unwrap();
+        assert!(result.success);
+
+        let keys = result.output["keys"].as_array().unwrap();
+        assert_eq!(keys.len(), 2);
+
+        let key_strs: Vec<&str> = keys.iter().map(|k| k.as_str().unwrap()).collect();
+        assert!(key_strs.contains(&"a"));
+        assert!(key_strs.contains(&"b"));
     }
 }

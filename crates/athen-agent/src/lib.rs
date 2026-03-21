@@ -19,6 +19,7 @@ pub use tools::ShellToolRegistry;
 use std::time::Duration;
 
 use athen_core::error::{AthenError, Result};
+use athen_core::llm::ChatMessage;
 use athen_core::traits::agent::StepAuditor;
 use athen_core::traits::llm::LlmRouter;
 use athen_core::traits::tool::ToolRegistry;
@@ -30,6 +31,7 @@ pub struct AgentBuilder {
     auditor: Option<Box<dyn StepAuditor>>,
     max_steps: u32,
     timeout: Duration,
+    context_messages: Vec<ChatMessage>,
 }
 
 impl AgentBuilder {
@@ -46,6 +48,7 @@ impl AgentBuilder {
             auditor: None,
             max_steps: 50,
             timeout: Duration::from_secs(300),
+            context_messages: Vec::new(),
         }
     }
 
@@ -79,6 +82,16 @@ impl AgentBuilder {
         self
     }
 
+    /// Set context messages to prepend to the conversation.
+    ///
+    /// These messages represent prior conversation history and are inserted
+    /// before the current task's user message, giving the agent memory of
+    /// earlier exchanges within the session.
+    pub fn context_messages(mut self, messages: Vec<ChatMessage>) -> Self {
+        self.context_messages = messages;
+        self
+    }
+
     /// Build the [`DefaultExecutor`].
     ///
     /// Returns an error if `llm_router` or `tool_registry` are not set.
@@ -101,6 +114,7 @@ impl AgentBuilder {
             auditor,
             self.max_steps,
             self.timeout,
+            self.context_messages,
         ))
     }
 }

@@ -77,6 +77,7 @@ dependencies = [
  "async-trait",
  "athen-core",
  "athen-ipc",
+ "athen-sandbox",
  "athen-shell",
  "chrono",
  "serde",
@@ -152,6 +153,7 @@ name = "athen-coordinador"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "athen-contacts",
  "athen-core",
  "athen-ipc",
  "athen-risk",

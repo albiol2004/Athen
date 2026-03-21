@@ -8,12 +8,32 @@ pub mod queue;
 pub mod risk;
 pub mod router;
 
-use athen_core::contact::TrustLevel;
+use std::collections::HashMap;
+
+use athen_contacts::trust::TrustManager;
+use athen_core::contact::{ContactId, IdentifierKind, TrustLevel};
 use athen_core::error::Result;
-use athen_core::event::SenseEvent;
+use athen_core::event::{EventSource, SenseEvent, SenderInfo};
 use athen_core::risk::{DataSensitivity, RiskContext, RiskDecision};
 use athen_core::task::{AgentId, TaskId, TaskStatus};
 use athen_core::traits::coordinator::{EventRouter, RiskEvaluator, TaskQueue};
+use athen_core::traits::persistence::{PersistentStore, TaskFilter};
+use tokio::sync::Mutex;
+
+/// Infer the `IdentifierKind` from a sender identifier string.
+fn infer_identifier_kind(identifier: &str) -> IdentifierKind {
+    if identifier.contains('@') {
+        IdentifierKind::Email
+    } else if identifier.len() >= 7
+        && identifier
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '+' || c == '-' || c == ' ')
+    {
+        IdentifierKind::Phone
+    } else {
+        IdentifierKind::Other
+    }
+}
 
 use crate::dispatcher::Dispatcher;
 use crate::queue::PriorityTaskQueue;
@@ -27,6 +47,10 @@ pub struct Coordinator {
     queue: PriorityTaskQueue,
     dispatcher: Dispatcher,
     risk_evaluator: CoordinatorRiskEvaluator,
+    store: Option<Box<dyn PersistentStore>>,
+    trust_manager: Option<TrustManager>,
+    /// Maps task IDs to resolved contact IDs for trust feedback on completion.
+    task_contacts: Mutex<HashMap<TaskId, ContactId>>,
 }
 
 impl Coordinator {
@@ -36,25 +60,83 @@ impl Coordinator {
             queue: PriorityTaskQueue::new(),
             dispatcher: Dispatcher::new(),
             risk_evaluator: CoordinatorRiskEvaluator::new(risk_evaluator),
+            store: None,
+            trust_manager: None,
+            task_contacts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Attach a persistent store for task durability.
+    /// Without this, tasks only live in memory.
+    pub fn with_persistence(mut self, store: Box<dyn PersistentStore>) -> Self {
+        self.store = Some(store);
+        self
+    }
+
+    /// Add a `TrustManager` for contact-aware risk evaluation.
+    ///
+    /// When configured, the coordinator resolves sender trust levels from
+    /// the contact store and uses them in risk evaluation instead of the
+    /// default `TrustLevel::Neutral`. Completed tasks also record a
+    /// positive trust interaction for the originating contact.
+    pub fn with_trust_manager(mut self, tm: TrustManager) -> Self {
+        self.trust_manager = Some(tm);
+        self
+    }
+
+    /// Resolve a sender's trust level via the TrustManager.
+    ///
+    /// Returns the trust level and the resolved contact ID.
+    /// Falls back to `TrustLevel::Neutral` when no trust manager is configured.
+    async fn resolve_sender_trust(
+        &self,
+        sender: &SenderInfo,
+    ) -> (TrustLevel, Option<ContactId>) {
+        let Some(ref tm) = self.trust_manager else {
+            return (TrustLevel::Neutral, None);
+        };
+
+        let kind = infer_identifier_kind(&sender.identifier);
+
+        match tm.resolve_contact(&sender.identifier, kind).await {
+            Ok(contact) => {
+                let trust = if contact.blocked {
+                    TrustLevel::Unknown
+                } else {
+                    contact.trust_level
+                };
+                (trust, Some(contact.id))
+            }
+            Err(_) => (TrustLevel::Neutral, None),
         }
     }
 
     /// Process an incoming sense event end-to-end.
     ///
-    /// 1. Route event to tasks
-    /// 2. Evaluate risk for each task
-    /// 3. Set status based on risk decision
-    /// 4. Enqueue tasks that can proceed
-    /// 5. Return created task IDs
+    /// 1. Resolve sender trust level (if sender present)
+    /// 2. Route event to tasks
+    /// 3. Evaluate risk for each task (using resolved trust)
+    /// 4. Set status based on risk decision
+    /// 5. Enqueue tasks that can proceed
+    /// 6. Return created task IDs
     pub async fn process_event(&self, event: SenseEvent) -> Result<Vec<TaskId>> {
+        // Resolve trust level from the sender, if present and not a UserInput event.
+        let (trust_level, contact_id) = match (&event.sender, &event.source) {
+            (Some(sender), source) if *source != EventSource::UserInput => {
+                self.resolve_sender_trust(sender).await
+            }
+            // UserInput events come from the authenticated user.
+            (_, EventSource::UserInput) => (TrustLevel::AuthUser, None),
+            // No sender information available.
+            _ => (TrustLevel::Neutral, None),
+        };
+
         let mut tasks = self.router.route(event).await?;
         let mut task_ids = Vec::with_capacity(tasks.len());
 
         for task in &mut tasks {
-            // Build a default risk context. In a full implementation this would
-            // be derived from the sender's contact trust level and content analysis.
             let context = RiskContext {
-                trust_level: TrustLevel::Neutral,
+                trust_level,
                 data_sensitivity: DataSensitivity::Plain,
                 llm_confidence: None,
                 accumulated_risk: 0,
@@ -83,9 +165,22 @@ impl Coordinator {
 
             task_ids.push(task.id);
 
+            // Track contact for trust feedback on task completion.
+            if let Some(cid) = contact_id {
+                self.task_contacts.lock().await.insert(task.id, cid);
+            }
+
             // Only enqueue tasks that can proceed
             if task.status == TaskStatus::Pending {
                 self.queue.enqueue(task.clone()).await?;
+            }
+
+            // Persist the task if a store is available.
+            // Persistence errors are logged but do not fail the operation.
+            if let Some(ref store) = self.store {
+                if let Err(e) = store.save_task(task).await {
+                    tracing::warn!(task_id = %task.id, error = %e, "Failed to persist task");
+                }
             }
         }
 
@@ -109,9 +204,87 @@ impl Coordinator {
         }
     }
 
-    /// Handle task completion: release the assigned agent.
+    /// Handle task completion: release the assigned agent and record
+    /// a positive trust interaction for the originating contact.
     pub async fn complete_task(&self, task_id: TaskId) -> Result<()> {
-        self.dispatcher.release_agent(task_id).await
+        self.dispatcher.release_agent(task_id).await?;
+
+        // Update the task status in the persistent store if available.
+        if let Some(ref store) = self.store {
+            match store.load_task(task_id).await {
+                Ok(Some(mut task)) => {
+                    task.status = TaskStatus::Completed;
+                    task.updated_at = chrono::Utc::now();
+                    if let Err(e) = store.save_task(&task).await {
+                        tracing::warn!(task_id = %task_id, error = %e, "Failed to persist completed task");
+                    }
+                }
+                Ok(None) => {
+                    tracing::debug!(task_id = %task_id, "Task not found in store for completion update");
+                }
+                Err(e) => {
+                    tracing::warn!(task_id = %task_id, error = %e, "Failed to load task for completion update");
+                }
+            }
+        }
+
+        // Record approval for the contact associated with this task.
+        if let Some(ref tm) = self.trust_manager {
+            let contact_id = self.task_contacts.lock().await.remove(&task_id);
+            if let Some(cid) = contact_id {
+                // Best-effort: log but don't fail the completion if trust update fails.
+                if let Err(e) = tm.record_approval(cid).await {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        contact_id = %cid,
+                        error = %e,
+                        "Failed to record approval for contact trust evolution"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Recover non-terminal tasks from the persistent store and re-enqueue them.
+    ///
+    /// Call this at startup to resume work that was interrupted.
+    /// Terminal statuses (Completed, Failed, Cancelled) are skipped.
+    /// Returns the number of tasks recovered, or 0 if no store is configured.
+    pub async fn recover_tasks(&self) -> Result<usize> {
+        let store = match self.store {
+            Some(ref s) => s,
+            None => return Ok(0),
+        };
+
+        // Load all tasks without a status filter, then filter in-memory
+        // for non-terminal statuses.
+        let all_tasks = store.list_tasks(TaskFilter::default()).await?;
+
+        let mut recovered = 0;
+        for task in all_tasks {
+            match task.status {
+                TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled => {
+                    continue;
+                }
+                _ => {}
+            }
+
+            // Re-enqueue tasks that were pending or in progress.
+            // AwaitingApproval and Paused tasks are also recovered so they
+            // are not lost, but they keep their original status.
+            if task.status == TaskStatus::Pending || task.status == TaskStatus::InProgress {
+                if let Err(e) = self.queue.enqueue(task).await {
+                    tracing::warn!(error = %e, "Failed to re-enqueue recovered task");
+                    continue;
+                }
+            }
+            recovered += 1;
+        }
+
+        tracing::info!(count = recovered, "Recovered tasks from persistent store");
+        Ok(recovered)
     }
 
     /// Access the dispatcher for agent registration.
@@ -129,7 +302,8 @@ impl Coordinator {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use athen_core::event::{EventKind, EventSource, NormalizedContent};
+    use athen_contacts::InMemoryContactStore;
+    use athen_core::event::{EventKind, EventSource, NormalizedContent, SenderInfo};
     use athen_core::risk::{EvaluationMethod, RiskLevel, RiskScore};
     use athen_core::task::Task;
     use chrono::Utc;
@@ -188,6 +362,31 @@ mod tests {
             source_risk: RiskLevel::Safe,
             raw_id: None,
         }
+    }
+
+    fn make_event_with_sender(source: EventSource, sender_id: &str) -> SenseEvent {
+        SenseEvent {
+            id: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            source,
+            kind: EventKind::NewMessage,
+            sender: Some(SenderInfo {
+                identifier: sender_id.to_string(),
+                contact_id: None,
+                display_name: None,
+            }),
+            content: NormalizedContent {
+                summary: Some("Test event".to_string()),
+                body: serde_json::Value::Null,
+                attachments: Vec::new(),
+            },
+            source_risk: RiskLevel::Safe,
+            raw_id: None,
+        }
+    }
+
+    fn make_trust_manager() -> TrustManager {
+        TrustManager::new(Box::new(InMemoryContactStore::new()))
     }
 
     #[tokio::test]
@@ -296,5 +495,107 @@ mod tests {
         // Complete both
         coordinator.complete_task(tid1).await.unwrap();
         coordinator.complete_task(tid2).await.unwrap();
+    }
+
+    // --- Trust integration tests ---
+
+    #[tokio::test]
+    async fn test_process_event_without_trust_manager_uses_neutral() {
+        // Without a trust manager, events with senders still work (default Neutral).
+        let coordinator = Coordinator::new(Box::new(MockRiskEvaluator::new(5.0)));
+
+        let event = make_event_with_sender(EventSource::Email, "alice@example.com");
+        let task_ids = coordinator.process_event(event).await.unwrap();
+
+        assert_eq!(task_ids.len(), 1);
+        assert_eq!(coordinator.queue.pending_count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_process_event_with_trust_manager_resolves_sender() {
+        let tm = make_trust_manager();
+        let coordinator =
+            Coordinator::new(Box::new(MockRiskEvaluator::new(5.0))).with_trust_manager(tm);
+
+        let event = make_event_with_sender(EventSource::Email, "new@example.com");
+        let task_ids = coordinator.process_event(event).await.unwrap();
+
+        assert_eq!(task_ids.len(), 1);
+        // Task should be tracked for trust feedback.
+        let contacts = coordinator.task_contacts.lock().await;
+        assert!(contacts.contains_key(&task_ids[0]));
+    }
+
+    #[tokio::test]
+    async fn test_user_input_uses_auth_user_trust() {
+        // UserInput events should use AuthUser trust, not look up the sender.
+        let tm = make_trust_manager();
+        let coordinator =
+            Coordinator::new(Box::new(MockRiskEvaluator::new(5.0))).with_trust_manager(tm);
+
+        // Even with a sender, UserInput should skip trust lookup.
+        let event = make_event_with_sender(EventSource::UserInput, "user@local");
+        let task_ids = coordinator.process_event(event).await.unwrap();
+
+        assert_eq!(task_ids.len(), 1);
+        // No contact should be tracked for UserInput events.
+        let contacts = coordinator.task_contacts.lock().await;
+        assert!(!contacts.contains_key(&task_ids[0]));
+    }
+
+    #[tokio::test]
+    async fn test_complete_task_records_approval() {
+        let tm = make_trust_manager();
+        let coordinator =
+            Coordinator::new(Box::new(MockRiskEvaluator::new(5.0))).with_trust_manager(tm);
+        let agent_id = Uuid::new_v4();
+
+        coordinator.dispatcher.register_agent(agent_id).await;
+
+        let event = make_event_with_sender(EventSource::Email, "sender@example.com");
+        coordinator.process_event(event).await.unwrap();
+
+        let (task_id, _) = coordinator.dispatch_next().await.unwrap().unwrap();
+        coordinator.complete_task(task_id).await.unwrap();
+
+        // The contact mapping should be removed after completion.
+        let contacts = coordinator.task_contacts.lock().await;
+        assert!(!contacts.contains_key(&task_id));
+    }
+
+    #[tokio::test]
+    async fn test_complete_task_without_trust_manager_still_works() {
+        // Backward compat: complete_task works without trust manager.
+        let coordinator = Coordinator::new(Box::new(MockRiskEvaluator::new(5.0)));
+        let agent_id = Uuid::new_v4();
+
+        coordinator.dispatcher.register_agent(agent_id).await;
+
+        let event = make_event(EventSource::UserInput);
+        coordinator.process_event(event).await.unwrap();
+
+        let (task_id, _) = coordinator.dispatch_next().await.unwrap().unwrap();
+        coordinator.complete_task(task_id).await.unwrap();
+    }
+
+    #[test]
+    fn test_infer_identifier_kind_email() {
+        assert_eq!(
+            infer_identifier_kind("user@example.com"),
+            IdentifierKind::Email
+        );
+    }
+
+    #[test]
+    fn test_infer_identifier_kind_phone() {
+        assert_eq!(
+            infer_identifier_kind("+1-555-1234567"),
+            IdentifierKind::Phone
+        );
+    }
+
+    #[test]
+    fn test_infer_identifier_kind_other() {
+        assert_eq!(infer_identifier_kind("johndoe"), IdentifierKind::Other);
     }
 }

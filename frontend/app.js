@@ -4,6 +4,15 @@ let invoke;
 function initTauri() {
     if (window.__TAURI__ && window.__TAURI__.core) {
         invoke = window.__TAURI__.core.invoke;
+
+        // Listen for real-time agent progress events.
+        if (window.__TAURI__.event && window.__TAURI__.event.listen) {
+            window.__TAURI__.event.listen('agent-progress', (event) => {
+                const { step, tool_name, status } = event.payload;
+                setStatus(`Step ${step}: ${tool_name} (${status})`);
+            });
+        }
+
         setStatus('Ready');
     } else {
         setStatus('Waiting for Tauri...');

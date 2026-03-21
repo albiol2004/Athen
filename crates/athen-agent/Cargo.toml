@@ -7,6 +7,7 @@ edition = "2021"
 athen-core = { workspace = true }
 athen-ipc = { workspace = true }
 athen-shell = { workspace = true }
+athen-sandbox = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 athen-core = { workspace = true }
+athen-contacts = { workspace = true }
 athen-ipc = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -16,6 +17,7 @@ chrono = { workspace = true }
 
 [dev-dependencies]
 athen-core = { workspace = true }
+athen-contacts = { workspace = true }
 athen-sentidos = { workspace = true }
 athen-risk = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }

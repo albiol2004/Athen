@@ -23,6 +23,7 @@ pub struct DefaultExecutor {
     auditor: Box<dyn StepAuditor>,
     max_steps: u32,
     timeout: Duration,
+    context_messages: Vec<ChatMessage>,
 }
 
 impl DefaultExecutor {
@@ -33,6 +34,7 @@ impl DefaultExecutor {
         auditor: Box<dyn StepAuditor>,
         max_steps: u32,
         timeout: Duration,
+        context_messages: Vec<ChatMessage>,
     ) -> Self {
         Self {
             llm_router,
@@ -40,19 +42,25 @@ impl DefaultExecutor {
             auditor,
             max_steps,
             timeout,
+            context_messages,
         }
     }
 
     /// Build the system prompt for the agent, including available tool descriptions.
     fn build_system_prompt(
-        task_description: &str,
         tools: &[athen_core::tool::ToolDefinition],
+        has_context: bool,
     ) -> String {
-        let mut prompt = format!(
-            "You are Athen, an AI agent that can execute tasks using tools.\n\n\
-             Your current task:\n{}\n\n",
-            task_description
+        let mut prompt = String::from(
+            "You are Athen, a helpful AI assistant with tool execution capabilities.\n\n",
         );
+
+        if has_context {
+            prompt.push_str(
+                "You are in an ongoing conversation. The message history is provided. \
+                 Continue naturally from where the conversation left off.\n\n",
+            );
+        }
 
         if !tools.is_empty() {
             prompt.push_str("You have the following tools available:\n");
@@ -63,8 +71,8 @@ impl DefaultExecutor {
         }
 
         prompt.push_str(
-            "Use tools when needed to accomplish the task. \
-             When the task is complete, respond with your final answer without any tool calls.",
+            "Use tools when needed to accomplish tasks. \
+             When done, respond with your final answer without any tool calls.",
         );
 
         prompt
@@ -82,13 +90,18 @@ impl AgentExecutor for DefaultExecutor {
         // Gather available tools for the LLM
         let available_tools = self.tool_registry.list_tools().await?;
 
+        // Prepend context messages (prior conversation history) before the
+        // current task's user message so the agent has session memory.
+        conversation.extend(self.context_messages.iter().cloned());
+
         // Seed the conversation with the task description as a user message
         conversation.push(ChatMessage {
             role: Role::User,
             content: MessageContent::Text(task.description.clone()),
         });
 
-        let system_prompt = Self::build_system_prompt(&task.description, &available_tools);
+        let system_prompt =
+            Self::build_system_prompt(&available_tools, !self.context_messages.is_empty());
 
         tracing::info!(task_id = %task_id, "Starting task execution");
 
@@ -99,7 +112,7 @@ impl AgentExecutor for DefaultExecutor {
                 return Err(AthenError::Timeout(self.timeout));
             }
 
-            // Check step limit
+            // Check step limit — ask the LLM for a summary before giving up.
             if steps_completed >= self.max_steps {
                 tracing::warn!(
                     task_id = %task_id,
@@ -107,12 +120,35 @@ impl AgentExecutor for DefaultExecutor {
                     max = self.max_steps,
                     "Task reached max steps limit"
                 );
+
+                // Ask the LLM to summarise what it found so far.
+                conversation.push(ChatMessage {
+                    role: Role::User,
+                    content: MessageContent::Text(
+                        "You've run out of steps. Summarise what you found and accomplished so far."
+                            .to_string(),
+                    ),
+                });
+                let summary_request = LlmRequest {
+                    profile: ModelProfile::Fast,
+                    messages: conversation.clone(),
+                    max_tokens: Some(2048),
+                    temperature: Some(0.5),
+                    tools: None, // no tools — just summarise
+                    system_prompt: Some(system_prompt.clone()),
+                };
+                let summary = match self.llm_router.route(&summary_request).await {
+                    Ok(resp) => resp.content,
+                    Err(_) => "Task reached step limit before completion.".to_string(),
+                };
+
                 return Ok(TaskResult {
                     task_id,
                     success: false,
                     output: Some(serde_json::json!({
                         "reason": "max_steps_exceeded",
                         "steps_completed": steps_completed,
+                        "response": summary,
                     })),
                     steps_completed,
                     total_risk_used: 0,
@@ -405,6 +441,7 @@ mod tests {
             Box::new(InMemoryAuditor::new()),
             10,
             Duration::from_secs(60),
+            vec![],
         );
 
         let task = make_task("Say hello");
@@ -442,6 +479,7 @@ mod tests {
             Box::new(InMemoryAuditor::new()),
             10,
             Duration::from_secs(60),
+            vec![],
         );
 
         let task = make_task("Search for something");
@@ -471,6 +509,7 @@ mod tests {
             Box::new(InMemoryAuditor::new()),
             3, // max 3 steps
             Duration::from_secs(60),
+            vec![],
         );
 
         let task = make_task("Infinite loop task");
@@ -500,6 +539,7 @@ mod tests {
             Box::new(InMemoryAuditor::new()),
             100,
             Duration::ZERO, // instant timeout
+            vec![],
         );
 
         let task = make_task("Should timeout");
@@ -560,6 +600,7 @@ mod tests {
             Box::new(ArcAuditor(Arc::clone(&auditor))),
             10,
             Duration::from_secs(60),
+            vec![],
         );
 
         let result = executor.execute(task).await.unwrap();
