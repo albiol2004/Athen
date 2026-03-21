@@ -1,5 +1,7 @@
 //! LLM-driven task execution loop.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -26,6 +28,7 @@ pub struct DefaultExecutor {
     timeout: Duration,
     context_messages: Vec<ChatMessage>,
     stream_sender: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    cancel_flag: Option<Arc<AtomicBool>>,
 }
 
 impl DefaultExecutor {
@@ -46,6 +49,7 @@ impl DefaultExecutor {
             timeout,
             context_messages,
             stream_sender: None,
+            cancel_flag: None,
         }
     }
 
@@ -56,6 +60,13 @@ impl DefaultExecutor {
     /// each text delta through this sender.
     pub fn set_stream_sender(&mut self, sender: tokio::sync::mpsc::UnboundedSender<String>) {
         self.stream_sender = Some(sender);
+    }
+
+    /// Set a cancellation flag that the executor checks at the top of each
+    /// iteration and between tool calls. When the flag is set to `true`, the
+    /// executor returns immediately with a "cancelled" result.
+    pub fn set_cancel_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.cancel_flag = Some(flag);
     }
 
     /// Build the system prompt for the agent, including available tool descriptions.
@@ -166,6 +177,23 @@ impl AgentExecutor for DefaultExecutor {
         tracing::info!(task_id = %task_id, "Starting task execution");
 
         loop {
+            // Check cancellation flag
+            if let Some(ref flag) = self.cancel_flag {
+                if flag.load(Ordering::Relaxed) {
+                    tracing::info!(task_id = %task_id, "Task cancelled by user");
+                    return Ok(TaskResult {
+                        task_id,
+                        success: false,
+                        output: Some(serde_json::json!({
+                            "reason": "cancelled",
+                            "response": "Task cancelled by user.",
+                        })),
+                        steps_completed,
+                        total_risk_used: 0,
+                    });
+                }
+            }
+
             // Check timeout
             if timeout_guard.is_expired() {
                 tracing::warn!(task_id = %task_id, "Task execution timed out");
@@ -290,6 +318,36 @@ impl AgentExecutor for DefaultExecutor {
             }
 
             if response.tool_calls.is_empty() {
+                // If this is the FIRST response and tools are available,
+                // the LLM might be narrating instead of acting. Nudge it
+                // to use tools before accepting the response as final.
+                if steps_completed == 0 && !available_tools.is_empty() {
+                    // Check if the response looks like an announcement
+                    // rather than a final answer.
+                    let lower = response.content.to_lowercase();
+                    let is_lazy = lower.contains("let me")
+                        || lower.contains("i'll ")
+                        || lower.contains("i will ")
+                        || lower.contains("i can ")
+                        || lower.contains("i would ")
+                        || lower.contains("would you like me")
+                        || lower.contains("shall i")
+                        || lower.contains("do you want me");
+
+                    if is_lazy {
+                        tracing::info!(task_id = %task_id, "Nudging LLM to use tools instead of narrating");
+                        conversation.push(ChatMessage {
+                            role: Role::User,
+                            content: MessageContent::Text(
+                                "Don't tell me what you'll do — just do it. Use your tools now."
+                                    .to_string(),
+                            ),
+                        });
+                        steps_completed += 1;
+                        continue;
+                    }
+                }
+
                 // No tool calls means the LLM considers the task complete
                 let step = TaskStep {
                     id: Uuid::new_v4(),
@@ -322,6 +380,23 @@ impl AgentExecutor for DefaultExecutor {
 
             // Execute each tool call
             for tool_call in &response.tool_calls {
+                // Check cancellation between tool calls
+                if let Some(ref flag) = self.cancel_flag {
+                    if flag.load(Ordering::Relaxed) {
+                        tracing::info!(task_id = %task_id, "Task cancelled by user between tool calls");
+                        return Ok(TaskResult {
+                            task_id,
+                            success: false,
+                            output: Some(serde_json::json!({
+                                "reason": "cancelled",
+                                "response": "Task cancelled by user.",
+                            })),
+                            steps_completed,
+                            total_risk_used: 0,
+                        });
+                    }
+                }
+
                 let started_at = Utc::now();
 
                 tracing::debug!(
@@ -707,5 +782,93 @@ mod tests {
 
         let steps = auditor.get_steps(task_id).await.unwrap();
         assert_eq!(steps.len(), 2); // 1 tool call + 1 completion
+    }
+
+    #[tokio::test]
+    async fn test_executor_cancel_flag_stops_execution() {
+        // LLM always requests tool calls, so it would loop forever without cancellation.
+        let tool_call = ToolCall {
+            id: "call_loop".to_string(),
+            name: "noop".to_string(),
+            arguments: serde_json::json!({}),
+        };
+
+        let responses: Vec<LlmResponse> = (0..10)
+            .map(|_| MockLlmRouter::make_response("Calling tool again.", vec![tool_call.clone()]))
+            .collect();
+
+        let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(true)); // pre-cancelled
+
+        let mut executor = DefaultExecutor::new(
+            Box::new(MockLlmRouter::new(responses)),
+            Box::new(MockToolRegistry::empty()),
+            Box::new(InMemoryAuditor::new()),
+            100,
+            Duration::from_secs(60),
+            vec![],
+        );
+        executor.set_cancel_flag(Arc::clone(&cancel_flag));
+
+        let task = make_task("Should be cancelled");
+        let result = executor.execute(task).await.unwrap();
+
+        assert!(!result.success);
+        assert_eq!(result.steps_completed, 0);
+        let reason = result
+            .output
+            .as_ref()
+            .and_then(|o| o.get("reason"))
+            .and_then(|r| r.as_str())
+            .unwrap();
+        assert_eq!(reason, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn test_executor_cancel_flag_between_tool_calls() {
+        // First LLM call requests 2 tool calls. Cancel flag is set after construction
+        // but before execution starts. The executor should stop before executing any tools.
+        let tool_call_1 = ToolCall {
+            id: "call_1".to_string(),
+            name: "tool_a".to_string(),
+            arguments: serde_json::json!({}),
+        };
+        let tool_call_2 = ToolCall {
+            id: "call_2".to_string(),
+            name: "tool_b".to_string(),
+            arguments: serde_json::json!({}),
+        };
+
+        let responses = vec![MockLlmRouter::make_response(
+            "Calling two tools.",
+            vec![tool_call_1, tool_call_2],
+        )];
+
+        let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let mut executor = DefaultExecutor::new(
+            Box::new(MockLlmRouter::new(responses)),
+            Box::new(MockToolRegistry::empty()),
+            Box::new(InMemoryAuditor::new()),
+            100,
+            Duration::from_secs(60),
+            vec![],
+        );
+        executor.set_cancel_flag(Arc::clone(&cancel_flag));
+
+        // Set the flag right before execution -- this simulates cancellation
+        // happening between the LLM call and tool execution.
+        cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let task = make_task("Should cancel between tools");
+        let result = executor.execute(task).await.unwrap();
+
+        assert!(!result.success);
+        let reason = result
+            .output
+            .as_ref()
+            .and_then(|o| o.get("reason"))
+            .and_then(|r| r.as_str())
+            .unwrap();
+        assert_eq!(reason, "cancelled");
     }
 }

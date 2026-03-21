@@ -3,6 +3,7 @@
 //! Each `#[tauri::command]` function is callable from the frontend
 //! via `window.__TAURI__.core.invoke(...)`.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,6 +26,47 @@ use athen_agent::{AgentBuilder, InMemoryAuditor, ShellToolRegistry};
 use athen_persistence::chat::SessionMeta;
 
 use crate::state::{AppState, PendingApproval, SharedRouter};
+
+/// Convert a raw technical error string into a user-friendly message.
+///
+/// Technical details are intentionally stripped — they are already logged
+/// via `tracing` and available in console output for debugging.
+fn format_user_error(err: &str) -> String {
+    if err.contains("Timeout") {
+        "The request took too long. Try a simpler question or check your internet connection."
+            .into()
+    } else if err.contains("request failed") || err.contains("Connection") {
+        "Could not connect to the AI provider. Check your internet connection and API key in Settings."
+            .into()
+    } else if err.contains("auth") || err.contains("401") || err.contains("Unauthorized") {
+        "Authentication failed. Please check your API key in Settings.".into()
+    } else if err.contains("rate_limit") || err.contains("429") {
+        "Rate limit reached. Please wait a moment and try again.".into()
+    } else if err.contains("max_steps") {
+        "I ran out of steps before finishing. Try breaking the task into smaller parts.".into()
+    } else if err.contains("budget") || err.contains("Budget") {
+        "Budget limit reached. Check your spending limits in Settings.".into()
+    } else if err.contains("RiskThresholdExceeded") {
+        "This action was blocked because it exceeds the allowed risk level.".into()
+    } else {
+        format!("Something went wrong: {}", simplify_error(err))
+    }
+}
+
+/// Strip Rust-specific formatting from error strings for the fallback case.
+///
+/// Removes enum variant wrappers like `LlmProvider { provider: ..., message: ... }`
+/// and extracts just the meaningful message portion.
+fn simplify_error(err: &str) -> String {
+    // Try to extract the "message: ..." portion from LlmProvider errors.
+    if let Some(idx) = err.find("message: ") {
+        let msg = &err[idx + 9..];
+        // Strip trailing brace/whitespace.
+        return msg.trim_end_matches('}').trim().to_string();
+    }
+    // Return the raw string if no simplification applies.
+    err.to_string()
+}
 
 /// A simplified chat message suitable for returning to the frontend.
 #[derive(Serialize)]
@@ -247,7 +289,11 @@ pub async fn send_message(
         .coordinator
         .process_event(event)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            let raw = e.to_string();
+            tracing::error!("Coordinator process_event failed: {raw}");
+            format_user_error(&raw)
+        })?;
 
     if task_ids.is_empty() {
         return Ok(ChatResponse {
@@ -312,6 +358,10 @@ pub async fn send_message(
             // in real time via Tauri events.
             let stream_tx = spawn_stream_forwarder(&app_handle);
 
+            // Reset and wire the cancellation flag.
+            let cancel_flag = Arc::clone(&state.cancel_flag);
+            cancel_flag.store(false, Ordering::Relaxed);
+
             let executor = AgentBuilder::new()
                 .llm_router(exec_router)
                 .tool_registry(Box::new(registry))
@@ -320,8 +370,13 @@ pub async fn send_message(
                 .timeout(Duration::from_secs(90))
                 .context_messages(context)
                 .stream_sender(stream_tx)
+                .cancel_flag(cancel_flag)
                 .build()
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| {
+                    let raw = e.to_string();
+                    tracing::error!("AgentBuilder failed: {raw}");
+                    format_user_error(&raw)
+                })?;
 
             // Create a task for the executor with the user's message.
             let task = Task {
@@ -345,7 +400,9 @@ pub async fn send_message(
                 Ok(r) => r,
                 Err(e) => {
                     let _ = state.coordinator.complete_task(task_id).await;
-                    let msg = format!("Agent timed out: {e}");
+                    let raw = e.to_string();
+                    tracing::error!("Agent execution failed: {raw}");
+                    let msg = format_user_error(&raw);
                     let mut history = state.history.lock().await;
                     history.push(ChatMessage {
                         role: Role::User,
@@ -370,17 +427,20 @@ pub async fn send_message(
 
             // Extract response content from the executor output.
             let content = if !result.success {
-                // Handle max_steps_exceeded or other failures gracefully.
-                let _reason = result
+                let reason = result
                     .output
                     .as_ref()
                     .and_then(|o| o.get("reason"))
                     .and_then(|r| r.as_str())
                     .unwrap_or("unknown");
-                format!(
-                    "I ran out of steps ({} used) before finishing. Try a simpler request or break it into smaller tasks.",
-                    result.steps_completed
-                )
+                if reason == "cancelled" {
+                    "Task cancelled by user.".to_string()
+                } else {
+                    format!(
+                        "I ran out of steps ({} used) before finishing. Try a simpler request or break it into smaller tasks.",
+                        result.steps_completed
+                    )
+                }
             } else {
                 let text = result
                     .output
@@ -435,7 +495,11 @@ pub async fn send_message(
             tool_calls: vec![],
             pending_approval: None,
         }),
-        Err(e) => Err(e.to_string()),
+        Err(e) => {
+            let raw = e.to_string();
+            tracing::error!("Dispatch failed: {raw}");
+            Err(format_user_error(&raw))
+        }
     }
 }
 
@@ -458,7 +522,11 @@ pub async fn approve_task(
             .coordinator
             .deny_task(task_uuid)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| {
+                let raw = e.to_string();
+                tracing::error!("Deny task failed: {raw}");
+                format_user_error(&raw)
+            })?;
 
         // Clear the stashed message.
         *state.pending_message.lock().await = None;
@@ -477,7 +545,11 @@ pub async fn approve_task(
         .coordinator
         .approve_task(task_uuid)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            let raw = e.to_string();
+            tracing::error!("Approve task failed: {raw}");
+            format_user_error(&raw)
+        })?;
 
     // Retrieve the stashed user message for execution context.
     let message = state
@@ -500,6 +572,10 @@ pub async fn approve_task(
             // Set up streaming for the approved task execution.
             let stream_tx = spawn_stream_forwarder(&app_handle);
 
+            // Reset and wire the cancellation flag.
+            let cancel_flag = Arc::clone(&state.cancel_flag);
+            cancel_flag.store(false, Ordering::Relaxed);
+
             let executor = AgentBuilder::new()
                 .llm_router(exec_router)
                 .tool_registry(Box::new(registry))
@@ -508,8 +584,13 @@ pub async fn approve_task(
                 .timeout(Duration::from_secs(90))
                 .context_messages(context)
                 .stream_sender(stream_tx)
+                .cancel_flag(cancel_flag)
                 .build()
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| {
+                    let raw = e.to_string();
+                    tracing::error!("AgentBuilder failed (approval): {raw}");
+                    format_user_error(&raw)
+                })?;
 
             let task = Task {
                 id: Uuid::new_v4(),
@@ -532,7 +613,9 @@ pub async fn approve_task(
                 Ok(r) => r,
                 Err(e) => {
                     let _ = state.coordinator.complete_task(coord_task_id).await;
-                    let msg = format!("Agent error after approval: {e}");
+                    let raw = e.to_string();
+                    tracing::error!("Agent execution failed after approval: {raw}");
+                    let msg = format_user_error(&raw);
                     let mut history = state.history.lock().await;
                     history.push(ChatMessage {
                         role: Role::User,
@@ -556,10 +639,20 @@ pub async fn approve_task(
             };
 
             let content = if !result.success {
-                format!(
-                    "I ran out of steps ({} used) before finishing. Try a simpler request.",
-                    result.steps_completed
-                )
+                let reason = result
+                    .output
+                    .as_ref()
+                    .and_then(|o| o.get("reason"))
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("unknown");
+                if reason == "cancelled" {
+                    "Task cancelled by user.".to_string()
+                } else {
+                    format!(
+                        "I ran out of steps ({} used) before finishing. Try a simpler request.",
+                        result.steps_completed
+                    )
+                }
             } else {
                 let text = result
                     .output
@@ -612,8 +705,25 @@ pub async fn approve_task(
             tool_calls: vec![],
             pending_approval: None,
         }),
-        Err(e) => Err(e.to_string()),
+        Err(e) => {
+            let raw = e.to_string();
+            tracing::error!("Dispatch failed (approval): {raw}");
+            Err(format_user_error(&raw))
+        }
     }
+}
+
+/// Cancel the currently running agent task.
+///
+/// Sets the shared cancellation flag to `true`, which the executor checks
+/// at the top of each loop iteration and between tool calls. The executor
+/// will return a "cancelled" result on its next check.
+#[tauri::command]
+pub async fn cancel_task(
+    state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    state.cancel_flag.store(true, Ordering::Relaxed);
+    Ok(())
 }
 
 /// Return basic status information.

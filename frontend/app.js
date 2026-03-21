@@ -15,6 +15,8 @@ let streamingBubble = null;
 let streamingText = '';
 // Whether we received any streaming chunks for the current request.
 let didReceiveStreamChunks = false;
+// Whether a request is currently being processed by the agent.
+let isProcessing = false;
 
 // ─── Session State ───
 
@@ -23,6 +25,18 @@ let activeSessionId = null;
 // Whether the first user message in this session has been sent
 // (used to auto-name the session).
 let sessionHasMessages = false;
+
+// ─── Error Retry State ───
+
+// Stores the last user message so we can retry on transient errors.
+let lastMessage = null;
+
+function retryLastMessage() {
+    if (lastMessage) {
+        inputEl.value = lastMessage;
+        formEl.requestSubmit();
+    }
+}
 
 function initTauri() {
     if (window.__TAURI__ && window.__TAURI__.core) {
@@ -164,6 +178,7 @@ const formEl = document.getElementById('input-form');
 const statusDot = document.getElementById('status-dot');
 const statusText = document.getElementById('status-text');
 const sendBtn = document.getElementById('send-btn');
+const stopBtn = document.getElementById('stop-btn');
 const sessionListEl = document.getElementById('session-list');
 const sidebarEl = document.getElementById('sidebar');
 const sidebarOverlay = document.getElementById('sidebar-overlay');
@@ -618,7 +633,48 @@ function addMessage(role, content, meta) {
         bubble.textContent = content;
     } else if (meta && meta.isError) {
         bubble.className = 'message-bubble error-message';
-        bubble.textContent = content;
+
+        // Build structured error card with icon, message, and optional action.
+        const errorIcon = document.createElement('span');
+        errorIcon.className = 'error-icon';
+        errorIcon.innerHTML = '&#9888;'; // warning triangle
+
+        const errorText = document.createElement('span');
+        errorText.className = 'error-text';
+        errorText.textContent = content;
+
+        bubble.appendChild(errorIcon);
+        bubble.appendChild(errorText);
+
+        // Determine error category for actionable buttons.
+        const errorStr = content.toLowerCase();
+        const isRetryable = errorStr.includes('took too long')
+            || errorStr.includes('could not connect')
+            || errorStr.includes('rate limit')
+            || errorStr.includes('try again');
+        const isAuthError = errorStr.includes('api key')
+            || errorStr.includes('authentication');
+
+        if (isRetryable && lastMessage) {
+            const retryBtn = document.createElement('button');
+            retryBtn.className = 'error-retry-btn';
+            retryBtn.textContent = 'Retry';
+            retryBtn.addEventListener('click', () => {
+                retryLastMessage();
+            });
+            bubble.appendChild(retryBtn);
+        }
+
+        if (isAuthError) {
+            const settingsLink = document.createElement('button');
+            settingsLink.className = 'error-settings-link';
+            settingsLink.textContent = 'Open Settings';
+            settingsLink.addEventListener('click', () => {
+                const settingsBtn = document.getElementById('settings-btn');
+                if (settingsBtn) settingsBtn.click();
+            });
+            bubble.appendChild(settingsLink);
+        }
     } else {
         // Assistant messages: render markdown
         bubble.innerHTML = renderMarkdown(content);
@@ -696,7 +752,17 @@ function setStatus(state, text) {
 
 function setInputEnabled(enabled) {
     inputEl.disabled = !enabled;
-    sendBtn.disabled = !enabled;
+    isProcessing = !enabled;
+    if (enabled) {
+        // Show send button, hide stop button.
+        sendBtn.classList.remove('hidden');
+        sendBtn.disabled = false;
+        stopBtn.classList.add('hidden');
+    } else {
+        // Hide send button, show stop button.
+        sendBtn.classList.add('hidden');
+        stopBtn.classList.remove('hidden');
+    }
 }
 
 // ─── Textarea Auto-Resize ───
@@ -882,6 +948,9 @@ formEl.addEventListener('submit', async (e) => {
     // Auto-name the session from the first message.
     autoNameSession(message);
 
+    // Store for potential retry on transient errors.
+    lastMessage = message;
+
     // Show user message
     addMessage('user', message);
     inputEl.value = '';
@@ -966,6 +1035,25 @@ formEl.addEventListener('submit', async (e) => {
 
     // Refresh sidebar to update message counts.
     loadSessions();
+});
+
+// ─── Cancel / Stop Button ───
+
+stopBtn.addEventListener('click', () => {
+    if (!invoke || !isProcessing) return;
+    invoke('cancel_task').catch((err) => {
+        console.error('Failed to cancel task:', err);
+    });
+    setStatus('working', 'Cancelling...');
+});
+
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && isProcessing && invoke) {
+        invoke('cancel_task').catch((err) => {
+            console.error('Failed to cancel task:', err);
+        });
+        setStatus('working', 'Cancelling...');
+    }
 });
 
 // ─── History Restoration ───

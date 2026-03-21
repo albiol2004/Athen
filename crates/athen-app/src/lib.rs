@@ -17,6 +17,7 @@ pub fn run() {
             commands::send_message,
             commands::get_status,
             commands::approve_task,
+            commands::cancel_task,
             commands::new_session,
             commands::get_history,
             commands::list_sessions,

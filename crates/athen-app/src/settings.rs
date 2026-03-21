@@ -187,36 +187,24 @@ fn provider_config_to_info(
         .unwrap_or_else(|| default_base_url(id))
         .to_string();
 
+    // Config file key takes priority over env var.
     let (has_key, hint) = match &config.auth {
         AuthType::ApiKey(key) if !key.is_empty() && !key.starts_with("${") => {
             (true, mask_api_key(key))
         }
-        _ => (false, String::new()),
-    };
-
-    // Check env var override for deepseek.
-    let (has_key, hint) = if id == "deepseek" {
-        if let Ok(env_key) = std::env::var("DEEPSEEK_API_KEY") {
-            if !env_key.is_empty() {
-                return ProviderInfo {
-                    id: id.to_string(),
-                    name: display_name(id).to_string(),
-                    provider_type: provider_type(id).to_string(),
-                    base_url,
-                    model: if config.default_model.is_empty() {
-                        default_model(id).to_string()
-                    } else {
-                        config.default_model.clone()
-                    },
-                    has_api_key: true,
-                    api_key_hint: format!("{}  (env)", mask_api_key(&env_key)),
-                    is_active: id == active_id,
-                };
+        _ => {
+            // Fall back to env var (e.g. DEEPSEEK_API_KEY, OPENAI_API_KEY).
+            let env_var = format!("{}_API_KEY", id.to_uppercase());
+            if let Ok(env_key) = std::env::var(&env_var) {
+                if !env_key.is_empty() {
+                    (true, format!("{}  (env)", mask_api_key(&env_key)))
+                } else {
+                    (false, String::new())
+                }
+            } else {
+                (false, String::new())
             }
         }
-        (has_key, hint)
-    } else {
-        (has_key, hint)
     };
 
     ProviderInfo {
@@ -306,6 +294,7 @@ pub async fn save_provider(
     base_url: String,
     model: String,
     api_key: Option<String>,
+    state: State<'_, AppState>,
 ) -> std::result::Result<String, String> {
     let mut models = load_models_config();
 
@@ -318,14 +307,26 @@ pub async fn save_provider(
             .unwrap_or(AuthType::None),
     };
 
+    let resolved_base_url = if base_url.is_empty() {
+        default_base_url(&id).to_string()
+    } else {
+        base_url.clone()
+    };
+
     let endpoint = if base_url.is_empty() || base_url == default_base_url(&id) {
         None
     } else {
         Some(base_url)
     };
 
+    let resolved_model = if model.is_empty() {
+        default_model(&id).to_string()
+    } else {
+        model.clone()
+    };
+
     let provider = ProviderConfig {
-        auth,
+        auth: auth.clone(),
         default_model: model,
         endpoint,
     };
@@ -333,12 +334,51 @@ pub async fn save_provider(
     models.providers.insert(id.clone(), provider);
     save_models_config(&models)?;
 
-    Ok("Provider saved. Restart the app to apply changes.".to_string())
+    // Hot-reload if saving the currently active provider.
+    let active_id = state.active_provider_id.lock().await.clone();
+    if id == active_id {
+        // Resolve the API key: saved key takes priority over env var.
+        let router_api_key = match &auth {
+            AuthType::ApiKey(key) if !key.is_empty() && !key.starts_with("${") => {
+                Some(key.clone())
+            }
+            _ => {
+                let env_var = format!("{}_API_KEY", id.to_uppercase());
+                std::env::var(&env_var).ok().filter(|k| !k.is_empty())
+            }
+        };
+
+        let new_router = build_router_for_provider(
+            &id,
+            &resolved_base_url,
+            &resolved_model,
+            router_api_key.as_deref(),
+        );
+
+        {
+            let mut router_guard = state.router.write().await;
+            *router_guard = new_router;
+        }
+        *state.model_name.lock().await = resolved_model.clone();
+
+        let name = display_name(&id);
+        info!("Hot-reloaded active provider {} ({})", name, resolved_model);
+        Ok(format!("Provider saved and activated ({} / {}).", name, resolved_model))
+    } else {
+        Ok("Provider saved.".to_string())
+    }
 }
 
 /// Delete a provider configuration.
+///
+/// If the deleted provider is the currently active one, automatically
+/// switches to the first remaining provider (or "deepseek" as fallback)
+/// and hot-reloads the router.
 #[tauri::command]
-pub async fn delete_provider(id: String) -> std::result::Result<String, String> {
+pub async fn delete_provider(
+    id: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<String, String> {
     let mut models = load_models_config();
 
     if models.providers.remove(&id).is_none() {
@@ -346,7 +386,64 @@ pub async fn delete_provider(id: String) -> std::result::Result<String, String> 
     }
 
     save_models_config(&models)?;
-    Ok(format!("Provider '{}' deleted. Restart the app to apply changes.", id))
+
+    // If deleting the active provider, switch to a fallback.
+    let active_id = state.active_provider_id.lock().await.clone();
+    if id == active_id {
+        let fallback_id = models
+            .providers
+            .keys()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "deepseek".to_string());
+
+        let fallback_cfg = models.providers.get(&fallback_id);
+        let base_url = fallback_cfg
+            .and_then(|c| c.endpoint.as_deref())
+            .unwrap_or_else(|| default_base_url(&fallback_id))
+            .to_string();
+        let model = fallback_cfg
+            .map(|c| c.default_model.as_str())
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| default_model(&fallback_id))
+            .to_string();
+
+        let api_key = fallback_cfg
+            .and_then(|c| match &c.auth {
+                AuthType::ApiKey(key) if !key.is_empty() && !key.starts_with("${") => {
+                    Some(key.clone())
+                }
+                _ => None,
+            })
+            .or_else(|| {
+                let env_var = format!("{}_API_KEY", fallback_id.to_uppercase());
+                std::env::var(&env_var).ok().filter(|k| !k.is_empty())
+            });
+
+        let new_router =
+            build_router_for_provider(&fallback_id, &base_url, &model, api_key.as_deref());
+
+        {
+            let mut router_guard = state.router.write().await;
+            *router_guard = new_router;
+        }
+        *state.active_provider_id.lock().await = fallback_id.clone();
+        *state.model_name.lock().await = model;
+
+        if let Err(e) = persist_active_provider(&fallback_id) {
+            warn!("Failed to persist active provider after delete: {e}");
+        }
+
+        let fallback_name = display_name(&fallback_id);
+        info!("Deleted provider '{}', switched to {}", id, fallback_name);
+        Ok(format!(
+            "Provider '{}' deleted. Switched to {}.",
+            id, fallback_name
+        ))
+    } else {
+        info!("Deleted provider '{}'", id);
+        Ok(format!("Provider '{}' deleted.", id))
+    }
 }
 
 /// Test connectivity to an LLM provider by sending a simple request.
@@ -438,23 +535,23 @@ pub async fn set_active_provider(
         .unwrap_or_else(|| default_model(&id))
         .to_string();
 
-    // Resolve API key: env var first, then config.
-    let env_var = format!("{}_API_KEY", id.to_uppercase());
-    let api_key = std::env::var(&env_var)
-        .ok()
-        .filter(|k| !k.is_empty())
+    // Resolve API key: saved config takes priority over env var.
+    let api_key = provider_cfg
+        .and_then(|c| match &c.auth {
+            AuthType::ApiKey(key) if !key.is_empty() && !key.starts_with("${") => {
+                Some(key.clone())
+            }
+            _ => None,
+        })
         .or_else(|| {
-            provider_cfg.and_then(|c| match &c.auth {
-                AuthType::ApiKey(key) if !key.is_empty() && !key.starts_with("${") => {
-                    Some(key.clone())
-                }
-                _ => None,
-            })
+            let env_var = format!("{}_API_KEY", id.to_uppercase());
+            std::env::var(&env_var).ok().filter(|k| !k.is_empty())
         });
 
     // Cloud providers require an API key.
     let is_local = matches!(id.as_str(), "ollama" | "llamacpp");
     if !is_local && api_key.is_none() {
+        let env_var = format!("{}_API_KEY", id.to_uppercase());
         return Err(format!(
             "No API key found for '{}'. Set {} env var or configure a key in settings first.",
             id, env_var,

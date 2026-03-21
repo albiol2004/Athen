@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -85,6 +86,9 @@ pub struct AppState {
     pub chat_store: Option<ChatStore>,
     /// Keep the database alive so the connection is not dropped.
     _database: Option<Database>,
+    /// Cancellation flag for the currently running agent executor.
+    /// Set to `true` to cancel the in-progress task immediately.
+    pub cancel_flag: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -125,6 +129,7 @@ impl AppState {
             session_id: Mutex::new(session_id),
             chat_store,
             _database: database,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -266,7 +271,17 @@ fn resolve_api_key_for(
     provider_id: &str,
     provider_cfg: Option<&athen_core::config::ProviderConfig>,
 ) -> Option<String> {
-    // Check for provider-specific env var (e.g. DEEPSEEK_API_KEY, OPENAI_API_KEY).
+    // Config file takes priority — the user explicitly saved this key via Settings.
+    if let Some(key) = provider_cfg.and_then(|c| match &c.auth {
+        AuthType::ApiKey(key) if !key.is_empty() && !key.starts_with("${") => {
+            Some(key.clone())
+        }
+        _ => None,
+    }) {
+        return Some(key);
+    }
+
+    // Fall back to environment variable (e.g. DEEPSEEK_API_KEY, OPENAI_API_KEY).
     let env_var = format!("{}_API_KEY", provider_id.to_uppercase());
     if let Ok(key) = std::env::var(&env_var) {
         if !key.is_empty() {
@@ -274,13 +289,7 @@ fn resolve_api_key_for(
         }
     }
 
-    // Fall back to config.
-    provider_cfg.and_then(|c| match &c.auth {
-        AuthType::ApiKey(key) if !key.is_empty() && !key.starts_with("${") => {
-            Some(key.clone())
-        }
-        _ => None,
-    })
+    None
 }
 
 /// Build a `DefaultLlmRouter` for a specific provider.

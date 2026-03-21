@@ -684,8 +684,59 @@ header h1 {
 
 /* ─── Error Messages ─── */
 .message-bubble.error-message {
-    color: var(--danger);
+    background: rgba(247, 118, 142, 0.08);
+    border-left: 3px solid var(--danger);
     border-color: rgba(247, 118, 142, 0.3);
+    border-left-color: var(--danger);
+    color: var(--text-primary);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 14px 16px;
+}
+
+.error-icon {
+    color: var(--danger);
+    font-size: 1.1em;
+    margin-right: 8px;
+}
+
+.error-text {
+    color: var(--text-secondary);
+    line-height: 1.5;
+}
+
+.error-retry-btn {
+    align-self: flex-start;
+    background: rgba(247, 118, 142, 0.12);
+    border: 1px solid rgba(247, 118, 142, 0.3);
+    border-radius: 6px;
+    color: var(--danger);
+    cursor: pointer;
+    font-size: 0.85em;
+    padding: 6px 16px;
+    transition: background 0.15s, border-color 0.15s;
+}
+
+.error-retry-btn:hover {
+    background: rgba(247, 118, 142, 0.2);
+    border-color: var(--danger);
+}
+
+.error-settings-link {
+    align-self: flex-start;
+    background: none;
+    border: none;
+    color: var(--accent);
+    cursor: pointer;
+    font-size: 0.85em;
+    padding: 4px 0;
+    text-decoration: underline;
+    transition: opacity 0.15s;
+}
+
+.error-settings-link:hover {
+    opacity: 0.8;
 }
 
 /* ─── Approval Dialog ─── */
@@ -864,8 +915,44 @@ footer {
     transform: none;
 }
 
+#send-btn.hidden {
+    display: none;
+}
+
 .send-icon {
     font-size: 16px;
+    line-height: 1;
+}
+
+#stop-btn {
+    width: 36px;
+    height: 36px;
+    border-radius: 8px;
+    background: var(--danger);
+    color: var(--bg-primary);
+    border: none;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.2s, transform 0.1s;
+    flex-shrink: 0;
+}
+
+#stop-btn:hover {
+    background: #ff9aa3;
+}
+
+#stop-btn:active {
+    transform: scale(0.95);
+}
+
+#stop-btn.hidden {
+    display: none;
+}
+
+.stop-icon {
+    font-size: 14px;
     line-height: 1;
 }
 

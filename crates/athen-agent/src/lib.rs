@@ -16,6 +16,8 @@ pub use resource::DefaultResourceMonitor;
 pub use timeout::DefaultTimeoutGuard;
 pub use tools::ShellToolRegistry;
 
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::Duration;
 
 use athen_core::error::{AthenError, Result};
@@ -33,6 +35,7 @@ pub struct AgentBuilder {
     timeout: Duration,
     context_messages: Vec<ChatMessage>,
     stream_sender: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    cancel_flag: Option<Arc<AtomicBool>>,
 }
 
 impl AgentBuilder {
@@ -51,6 +54,7 @@ impl AgentBuilder {
             timeout: Duration::from_secs(300),
             context_messages: Vec::new(),
             stream_sender: None,
+            cancel_flag: None,
         }
     }
 
@@ -107,6 +111,14 @@ impl AgentBuilder {
         self
     }
 
+    /// Set a cancellation flag that the executor checks at the top of each
+    /// loop iteration and between tool calls. Setting the flag to `true`
+    /// causes the executor to return immediately with a "cancelled" result.
+    pub fn cancel_flag(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.cancel_flag = Some(flag);
+        self
+    }
+
     /// Build the [`DefaultExecutor`].
     ///
     /// Returns an error if `llm_router` or `tool_registry` are not set.
@@ -134,6 +146,10 @@ impl AgentBuilder {
 
         if let Some(sender) = self.stream_sender {
             executor.set_stream_sender(sender);
+        }
+
+        if let Some(flag) = self.cancel_flag {
+            executor.set_cancel_flag(flag);
         }
 
         Ok(executor)
