@@ -1,0 +1,58 @@
+# Athen Configuration
+
+workspace_path = ".athen"
+
+[operation]
+mode = "AlwaysOn"
+
+[models]
+[models.providers]
+[models.profiles]
+[models.assignments]
+
+[security]
+mode = "Assistant"
+auto_approve_below = 20
+max_steps_per_task = 50
+max_task_duration_minutes = 5
+
+[persistence]
+db_path = "data/athen.db"
+checkpoint_interval_secs = 30
+completed_retention_days = 7
+
+[domains.base]
+description = "Generic tasks"
+model_profile = "Fast"
+max_steps = 50
+timeout_minutes = 5
+
+[domains.communication]
+description = "Emails, messages, responses"
+model_profile = "Fast"
+max_steps = 20
+timeout_minutes = 3
+
+[domains.code]
+description = "Programming, debugging, refactoring"
+model_profile = "Powerful"
+max_steps = 100
+timeout_minutes = 15
+
+[domains.agenda]
+description = "Calendar, reminders, scheduling"
+model_profile = "Fast"
+max_steps = 15
+timeout_minutes = 2
+
+[domains.files]
+description = "Document management"
+model_profile = "Fast"
+max_steps = 30
+timeout_minutes = 5
+
+[domains.research]
+description = "Web search, synthesis"
+model_profile = "Powerful"
+max_steps = 50
+timeout_minutes = 10

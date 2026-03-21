@@ -1,0 +1,22 @@
+[package]
+name = "athen-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+athen-core = { workspace = true }
+athen-coordinador = { workspace = true }
+athen-agent = { workspace = true }
+athen-llm = { workspace = true }
+athen-risk = { workspace = true }
+athen-contacts = { workspace = true }
+athen-sentidos = { workspace = true }
+athen-persistence = { workspace = true }
+athen-shell = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = "0.3"
+uuid = { workspace = true }
+chrono = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }

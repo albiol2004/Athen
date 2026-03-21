@@ -1,0 +1,8 @@
+{
+    "identifier": "default",
+    "description": "Default capability for Athen",
+    "windows": ["*"],
+    "permissions": [
+        "core:default"
+    ]
+}

@@ -1,0 +1,20 @@
+[package]
+name = "athen-agent"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+athen-core = { workspace = true }
+athen-ipc = { workspace = true }
+athen-shell = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+tempfile = "3"

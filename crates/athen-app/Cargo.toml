@@ -1,0 +1,26 @@
+[package]
+name = "athen-app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+athen-core = { workspace = true }
+athen-ipc = { workspace = true }
+athen-coordinador = { workspace = true }
+athen-llm = { workspace = true }
+athen-risk = { workspace = true }
+athen-contacts = { workspace = true }
+athen-agent = { workspace = true }
+athen-sentidos = { workspace = true }
+athen-persistence = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+tauri = { version = "2", features = [] }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }

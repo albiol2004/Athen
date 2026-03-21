@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/athen-core",
+    "crates/athen-ipc",
+    "crates/athen-sentidos",
+    "crates/athen-coordinador",
+    "crates/athen-agent",
+    "crates/athen-llm",
+    "crates/athen-memory",
+    "crates/athen-risk",
+    "crates/athen-persistence",
+    "crates/athen-contacts",
+    "crates/athen-sandbox",
+    "crates/athen-shell",
+    "crates/athen-app",
+    "crates/mcps/mcp-filesystem",
+    "crates/athen-cli",
+]
+
+[workspace.dependencies]
+# Internal
+athen-core = { path = "crates/athen-core" }
+athen-ipc = { path = "crates/athen-ipc" }
+athen-persistence = { path = "crates/athen-persistence" }
+athen-risk = { path = "crates/athen-risk" }
+athen-contacts = { path = "crates/athen-contacts" }
+athen-sandbox = { path = "crates/athen-sandbox" }
+athen-shell = { path = "crates/athen-shell" }
+athen-llm = { path = "crates/athen-llm" }
+athen-memory = { path = "crates/athen-memory" }
+athen-sentidos = { path = "crates/athen-sentidos" }
+athen-coordinador = { path = "crates/athen-coordinador" }
+athen-agent = { path = "crates/athen-agent" }
+
+# External
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+tracing = "0.1"
+async-trait = "0.1"
+url = { version = "2", features = ["serde"] }
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+futures = "0.3"
+toml = "0.8"

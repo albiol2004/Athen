@@ -1,0 +1,33 @@
+# LLM Provider Configuration
+
+[providers.deepseek]
+auth = { ApiKey = "${DEEPSEEK_API_KEY}" }
+default_model = "deepseek-chat"
+
+[providers.anthropic]
+auth = { ApiKey = "${ANTHROPIC_API_KEY}" }
+default_model = "claude-sonnet-4"
+
+[profiles.powerful]
+description = "Complex reasoning tasks"
+priority = ["anthropic", "deepseek"]
+
+[profiles.fast]
+description = "Quick responses"
+priority = ["deepseek", "anthropic"]
+
+[profiles.code]
+description = "Programming tasks"
+priority = ["anthropic", "deepseek"]
+
+[profiles.cheap]
+description = "Cost-effective tasks"
+priority = ["deepseek"]
+
+[assignments]
+base = "fast"
+communication = "fast"
+code = "powerful"
+agenda = "fast"
+files = "fast"
+research = "powerful"

@@ -1,0 +1,37 @@
+# Domain Configuration
+
+[base]
+description = "Generic tasks"
+model_profile = "Fast"
+max_steps = 50
+timeout_minutes = 5
+
+[communication]
+description = "Emails, messages, responses"
+model_profile = "Fast"
+max_steps = 20
+timeout_minutes = 3
+
+[code]
+description = "Programming, debugging, refactoring"
+model_profile = "Powerful"
+max_steps = 100
+timeout_minutes = 15
+
+[agenda]
+description = "Calendar, reminders, scheduling"
+model_profile = "Fast"
+max_steps = 15
+timeout_minutes = 2
+
+[files]
+description = "Document management"
+model_profile = "Fast"
+max_steps = 30
+timeout_minutes = 5
+
+[research]
+description = "Web search, synthesis"
+model_profile = "Powerful"
+max_steps = 50
+timeout_minutes = 10

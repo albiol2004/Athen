@@ -1,0 +1,25 @@
+[package]
+name = "athen-coordinador"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+athen-core = { workspace = true }
+athen-ipc = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+athen-core = { workspace = true }
+athen-sentidos = { workspace = true }
+athen-risk = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util"] }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }

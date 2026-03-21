@@ -1,0 +1,28 @@
+{
+    "productName": "Athen",
+    "version": "0.1.0",
+    "identifier": "com.athen.app",
+    "build": {
+        "frontendDist": "../../frontend"
+    },
+    "app": {
+        "withGlobalTauri": true,
+        "windows": [
+            {
+                "title": "Athen",
+                "width": 900,
+                "height": 700,
+                "resizable": true,
+                "fullscreen": false
+            }
+        ],
+        "security": {
+            "csp": null
+        }
+    },
+    "bundle": {
+        "active": true,
+        "targets": "all",
+        "icon": []
+    }
+}
