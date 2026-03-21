@@ -17,12 +17,16 @@ use tracing::{info, warn};
 use athen_core::config::{AthenConfig, AuthType, ProfileConfig};
 use athen_core::config_loader;
 use athen_core::error::Result;
-use athen_core::llm::*;
+use athen_core::llm::{
+    BudgetStatus, ChatMessage, LlmRequest, LlmResponse, LlmStream, MessageContent, ModelProfile,
+    Role,
+};
 use athen_core::traits::llm::{LlmProvider, LlmRouter};
 use athen_coordinador::Coordinator;
 use athen_llm::budget::BudgetTracker;
 use athen_llm::providers::deepseek::DeepSeekProvider;
 use athen_llm::router::DefaultLlmRouter;
+use athen_persistence::chat::ChatStore;
 use athen_persistence::Database;
 use athen_risk::llm_fallback::LlmRiskEvaluator;
 use athen_risk::CombinedRiskEvaluator;
@@ -34,6 +38,9 @@ pub(crate) struct SharedRouter(pub Arc<DefaultLlmRouter>);
 impl LlmRouter for SharedRouter {
     async fn route(&self, request: &LlmRequest) -> Result<LlmResponse> {
         self.0.route(request).await
+    }
+    async fn route_streaming(&self, request: &LlmRequest) -> Result<LlmStream> {
+        self.0.route_streaming(request).await
     }
     async fn budget_remaining(&self) -> Result<BudgetStatus> {
         self.0.budget_remaining().await
@@ -60,6 +67,10 @@ pub struct AppState {
     pub pending_message: Mutex<Option<String>>,
     /// The model name reported to the frontend (from config or default).
     pub model_name: String,
+    /// Current session identifier (format: `session_YYYYMMDD_HHMMSS`).
+    pub session_id: Mutex<String>,
+    /// Persistent chat storage backed by SQLite.
+    pub chat_store: Option<ChatStore>,
     /// Keep the database alive so the connection is not dropped.
     _database: Option<Database>,
 }
@@ -85,12 +96,18 @@ impl AppState {
         let router = build_router(api_key);
         let (coordinator, database) = build_coordinator_with_persistence(&router).await;
 
+        // Build the chat store and try to restore history from the latest session.
+        let chat_store = database.as_ref().map(|db| db.chat_store());
+        let (session_id, history) = restore_or_create_session(&chat_store).await;
+
         Self {
             coordinator,
             router,
-            history: Mutex::new(Vec::new()),
+            history: Mutex::new(history),
             pending_message: Mutex::new(None),
             model_name,
+            session_id: Mutex::new(session_id),
+            chat_store,
             _database: database,
         }
     }
@@ -241,6 +258,64 @@ fn build_router(api_key: String) -> Arc<DefaultLlmRouter> {
         profiles,
         BudgetTracker::new(None),
     ))
+}
+
+/// Generate a human-readable session identifier: `session_YYYYMMDD_HHMMSS`.
+fn generate_session_id() -> String {
+    chrono::Utc::now().format("session_%Y%m%d_%H%M%S").to_string()
+}
+
+/// Try to restore the most recent session from persistent chat storage.
+/// If the store is unavailable or empty, create a new session with empty history.
+async fn restore_or_create_session(
+    chat_store: &Option<ChatStore>,
+) -> (String, Vec<ChatMessage>) {
+    if let Some(store) = chat_store {
+        match store.list_sessions().await {
+            Ok(sessions) if !sessions.is_empty() => {
+                let latest = &sessions[0];
+                match store.load_messages(latest).await {
+                    Ok(persisted) => {
+                        let history: Vec<ChatMessage> = persisted
+                            .into_iter()
+                            .map(|m| ChatMessage {
+                                role: match m.role.as_str() {
+                                    "user" => Role::User,
+                                    "assistant" => Role::Assistant,
+                                    "system" => Role::System,
+                                    "tool" => Role::Tool,
+                                    _ => Role::User,
+                                },
+                                content: if m.content_type == "structured" {
+                                    match serde_json::from_str(&m.content) {
+                                        Ok(v) => MessageContent::Structured(v),
+                                        Err(_) => MessageContent::Text(m.content),
+                                    }
+                                } else {
+                                    MessageContent::Text(m.content)
+                                },
+                            })
+                            .collect();
+                        info!(
+                            "Restored {} messages from session '{}'",
+                            history.len(),
+                            latest
+                        );
+                        return (latest.clone(), history);
+                    }
+                    Err(e) => {
+                        warn!("Failed to load messages for session '{}': {e}", latest);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to list sessions: {e}");
+            }
+            _ => {}
+        }
+    }
+
+    (generate_session_id(), Vec::new())
 }
 
 /// Build the coordinator with the combined (rules + LLM) risk evaluator

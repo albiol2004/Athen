@@ -32,6 +32,7 @@ pub struct AgentBuilder {
     max_steps: u32,
     timeout: Duration,
     context_messages: Vec<ChatMessage>,
+    stream_sender: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 impl AgentBuilder {
@@ -49,6 +50,7 @@ impl AgentBuilder {
             max_steps: 50,
             timeout: Duration::from_secs(300),
             context_messages: Vec::new(),
+            stream_sender: None,
         }
     }
 
@@ -92,6 +94,19 @@ impl AgentBuilder {
         self
     }
 
+    /// Set a channel sender for streaming text chunks from the final LLM response.
+    ///
+    /// When provided, the executor will use `LlmRouter::route_streaming()` and
+    /// forward each text delta through this sender, enabling progressive
+    /// rendering in the UI.
+    pub fn stream_sender(
+        mut self,
+        sender: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> Self {
+        self.stream_sender = Some(sender);
+        self
+    }
+
     /// Build the [`DefaultExecutor`].
     ///
     /// Returns an error if `llm_router` or `tool_registry` are not set.
@@ -108,14 +123,20 @@ impl AgentBuilder {
             .auditor
             .unwrap_or_else(|| Box::new(InMemoryAuditor::new()));
 
-        Ok(DefaultExecutor::new(
+        let mut executor = DefaultExecutor::new(
             llm_router,
             tool_registry,
             auditor,
             self.max_steps,
             self.timeout,
             self.context_messages,
-        ))
+        );
+
+        if let Some(sender) = self.stream_sender {
+            executor.set_stream_sender(sender);
+        }
+
+        Ok(executor)
     }
 }
 

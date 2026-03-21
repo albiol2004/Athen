@@ -2,6 +2,20 @@
 
 let invoke;
 
+// Container for tool execution cards during the current request.
+let currentToolContainer = null;
+
+// ─── Streaming State ───
+
+// Tracks the currently streaming assistant message bubble so that
+// incoming `agent-stream` deltas can be appended to it progressively.
+let streamingBubble = null;
+// Accumulates the full text received via streaming so the final
+// message can be rendered with full markdown once complete.
+let streamingText = '';
+// Whether we received any streaming chunks for the current request.
+let didReceiveStreamChunks = false;
+
 function initTauri() {
     if (window.__TAURI__ && window.__TAURI__.core) {
         invoke = window.__TAURI__.core.invoke;
@@ -9,12 +23,117 @@ function initTauri() {
         // Listen for real-time agent progress events.
         if (window.__TAURI__.event && window.__TAURI__.event.listen) {
             window.__TAURI__.event.listen('agent-progress', (event) => {
-                const { step, tool_name, status } = event.payload;
+                const { step, tool_name, status, detail } = event.payload;
+
+                // Update status bar as before.
                 setStatus('working', `Step ${step}: ${tool_name} (${status})`);
+
+                // Skip non-tool steps (e.g. "Evaluating risk...", "Task completed").
+                if (step === 0 || tool_name === 'Task completed') return;
+
+                // Create tool container if it does not exist yet.
+                if (!currentToolContainer) {
+                    currentToolContainer = document.createElement('div');
+                    currentToolContainer.className = 'tool-steps-container';
+                    messagesEl.appendChild(currentToolContainer);
+                }
+
+                // Build the tool execution card.
+                const card = document.createElement('div');
+                const statusClass = status === 'Completed' ? 'completed' :
+                                    status === 'Failed' ? 'failed' : 'in-progress';
+                card.className = `tool-execution-card ${statusClass}`;
+
+                const statusIcon = status === 'Completed' ? '&#10003;' :
+                                   status === 'Failed' ? '&#10007;' : '&#9679;';
+
+                let detailHtml = '';
+                if (detail) {
+                    const truncated = detail.length > 80 ? detail.substring(0, 80) + '...' : detail;
+                    detailHtml = `<span class="tool-detail">${escapeHtml(truncated)}</span>`;
+                }
+
+                card.innerHTML =
+                    `<span class="tool-status-icon">${statusIcon}</span>` +
+                    `<span class="tool-name">${escapeHtml(tool_name)}</span>` +
+                    detailHtml;
+
+                currentToolContainer.appendChild(card);
+
+                // Scroll to keep latest card visible.
+                requestAnimationFrame(() => {
+                    messagesEl.parentElement.scrollTo({
+                        top: messagesEl.parentElement.scrollHeight,
+                        behavior: 'smooth'
+                    });
+                });
+            });
+
+            // Listen for streaming text chunks from the agent executor.
+            // Each event carries { delta: String, is_final: bool }.
+            window.__TAURI__.event.listen('agent-stream', (event) => {
+                const { delta, is_final } = event.payload;
+
+                if (is_final) {
+                    // Stream complete -- re-render the full text with markdown
+                    // for proper formatting now that we have the complete content.
+                    if (streamingBubble && streamingText) {
+                        streamingBubble.innerHTML = renderMarkdown(streamingText);
+                    }
+                    // Do NOT reset streamingBubble here -- the form submission
+                    // handler will finalize the message with meta info.
+                    return;
+                }
+
+                if (!delta) return;
+
+                didReceiveStreamChunks = true;
+                streamingText += delta;
+
+                // Create the streaming bubble on the first chunk.
+                if (!streamingBubble) {
+                    // Remove welcome message if present.
+                    const welcome = messagesEl.querySelector('.welcome-message');
+                    if (welcome) welcome.remove();
+
+                    const row = document.createElement('div');
+                    row.className = 'message-row assistant';
+                    row.id = 'streaming-message';
+
+                    const avatar = document.createElement('div');
+                    avatar.className = 'message-avatar';
+                    avatar.textContent = 'A';
+
+                    const wrap = document.createElement('div');
+                    wrap.className = 'message-content-wrap';
+
+                    streamingBubble = document.createElement('div');
+                    streamingBubble.className = 'message-bubble streaming';
+
+                    wrap.appendChild(streamingBubble);
+                    row.appendChild(avatar);
+                    row.appendChild(wrap);
+                    messagesEl.appendChild(row);
+                }
+
+                // Append the delta as escaped text. Full markdown rendering
+                // happens when the stream is finalized (is_final=true).
+                // Using textContent here is safe against XSS and fast for
+                // frequent small updates.
+                streamingBubble.textContent = streamingText;
+
+                // Keep the view scrolled to the bottom during streaming.
+                requestAnimationFrame(() => {
+                    messagesEl.parentElement.scrollTo({
+                        top: messagesEl.parentElement.scrollHeight,
+                        behavior: 'auto'
+                    });
+                });
             });
         }
 
         setStatus('idle', 'Ready');
+        loadHistory();
     } else {
         setStatus('working', 'Waiting for Tauri...');
         setTimeout(initTauri, 100);
@@ -219,6 +338,41 @@ function addMessage(role, content, meta) {
     });
 }
 
+/// Finalize a streaming message bubble by adding meta information
+/// (time, risk badge, domain) and removing the streaming class.
+function finalizeStreamingMessage(meta) {
+    const streamRow = document.getElementById('streaming-message');
+    if (!streamRow) return;
+
+    // Remove the temporary id and streaming class.
+    streamRow.removeAttribute('id');
+    const bubble = streamRow.querySelector('.message-bubble');
+    if (bubble) {
+        bubble.classList.remove('streaming');
+        // Render the accumulated text with full markdown. This handles
+        // the case where finalize runs before or after the is_final event.
+        if (streamingText) {
+            bubble.innerHTML = renderMarkdown(streamingText);
+        }
+    }
+
+    // Add meta row to the content wrap.
+    const wrap = streamRow.querySelector('.message-content-wrap');
+    if (wrap) {
+        const metaRow = document.createElement('div');
+        metaRow.className = 'message-meta';
+        let metaHtml = `<span class="message-time">${formatTime(new Date())}</span>`;
+        if (meta && meta.riskHtml) {
+            metaHtml += meta.riskHtml;
+        }
+        if (meta && meta.domain) {
+            metaHtml += `<span class="domain-label">${escapeHtml(meta.domain)}</span>`;
+        }
+        metaRow.innerHTML = metaHtml;
+        wrap.appendChild(metaRow);
+    }
+}
+
 // ─── Status Management ───
 
 function setStatus(state, text) {
@@ -334,6 +488,12 @@ async function handleApproval(taskId, approved) {
     setInputEnabled(false);
     setStatus('working', approved ? 'Executing approved action...' : 'Cancelling...');
 
+    // Reset tool container and streaming state for approval execution.
+    currentToolContainer = null;
+    streamingBubble = null;
+    streamingText = '';
+    didReceiveStreamChunks = false;
+
     try {
         const response = await invoke('approve_task', {
             taskId: taskId,
@@ -361,21 +521,15 @@ async function handleApproval(taskId, approved) {
                 meta.domain = response.domain;
             }
 
-            if (response.tool_calls && response.tool_calls.length > 0) {
-                let toolsHtml = '';
-                for (const tc of response.tool_calls) {
-                    const name = escapeHtml(tc.name || '');
-                    const summary = escapeHtml(tc.summary || '');
-                    toolsHtml += `<div class="tool-call">
-                        <span class="tool-call-icon">&#128295;</span>
-                        <span class="tool-call-name">${name}</span>
-                        <span class="tool-call-summary">${summary}</span>
-                    </div>`;
-                }
-                meta.toolCallsHtml = toolsHtml;
+            if (didReceiveStreamChunks && streamingBubble) {
+                // The response was already streamed progressively.
+                // Finalize the streaming bubble with meta info.
+                finalizeStreamingMessage(meta);
+            } else {
+                // No streaming happened (e.g. non-streaming provider,
+                // or the response was a failure message). Show normally.
+                addMessage('assistant', response.content || '', meta);
             }
-
-            addMessage('assistant', response.content || '', meta);
         }
 
         setStatus('idle', 'Ready');
@@ -384,6 +538,12 @@ async function handleApproval(taskId, approved) {
         addMessage('assistant', `Error: ${err}`, { isError: true });
         setStatus('error', 'Error');
     }
+
+    // Reset streaming state.
+    streamingBubble = null;
+    streamingText = '';
+    didReceiveStreamChunks = false;
+    currentToolContainer = null;
 
     setInputEnabled(true);
     inputEl.focus();
@@ -411,8 +571,15 @@ formEl.addEventListener('submit', async (e) => {
     setInputEnabled(false);
     setStatus('working', 'Thinking...');
 
+    // Reset tool container and streaming state for this new request.
+    currentToolContainer = null;
+    streamingBubble = null;
+    streamingText = '';
+    didReceiveStreamChunks = false;
+
     try {
-        // Call Tauri backend
+        // Call Tauri backend. While this awaits, `agent-stream` events
+        // may arrive and progressively build the streaming bubble.
         const response = await invoke('send_message', { message });
 
         // If the response contains a pending approval, show the approval dialog.
@@ -451,17 +618,79 @@ formEl.addEventListener('submit', async (e) => {
             meta.toolCallsHtml = toolsHtml;
         }
 
-        addMessage('assistant', response.content || '', meta);
+        if (didReceiveStreamChunks && streamingBubble) {
+            // The response was already rendered progressively via streaming.
+            // Just finalize with meta info (risk badge, domain, time).
+            finalizeStreamingMessage(meta);
+        } else {
+            // No streaming happened -- render the full response at once.
+            addMessage('assistant', response.content || '', meta);
+        }
+
+        currentToolContainer = null;
         setStatus('idle', 'Ready');
     } catch (err) {
         console.error('Tauri invoke error:', err);
         addMessage('assistant', `Error: ${err}`, { isError: true });
+        currentToolContainer = null;
         setStatus('error', 'Error');
     }
+
+    // Reset streaming state for the next request.
+    streamingBubble = null;
+    streamingText = '';
+    didReceiveStreamChunks = false;
 
     setInputEnabled(true);
     inputEl.focus();
 });
+
+// ─── History Restoration ───
+
+async function loadHistory() {
+    if (!invoke) return;
+    try {
+        const messages = await invoke('get_history');
+        if (messages && messages.length > 0) {
+            // Remove the welcome message since we have history.
+            const welcome = messagesEl.querySelector('.welcome-message');
+            if (welcome) welcome.remove();
+
+            for (const msg of messages) {
+                addMessage(msg.role, msg.content);
+            }
+        }
+    } catch (err) {
+        console.error('Failed to load history:', err);
+    }
+}
+
+// ─── New Chat ───
+
+const newChatBtn = document.getElementById('new-chat-btn');
+if (newChatBtn) {
+    newChatBtn.addEventListener('click', async () => {
+        if (!invoke) return;
+        try {
+            await invoke('new_session');
+            // Clear the messages UI and restore the welcome message.
+            messagesEl.innerHTML = `
+                <div class="welcome-message">
+                    <div class="welcome-icon">A</div>
+                    <p>Hello! I'm <strong>Athen</strong>, your universal AI agent. I can execute shell commands, read and write files, manage tasks, and more.</p>
+                    <p class="welcome-hint">Type a message below to get started.</p>
+                </div>
+            `;
+            currentToolContainer = null;
+            streamingBubble = null;
+            streamingText = '';
+            didReceiveStreamChunks = false;
+            inputEl.focus();
+        } catch (err) {
+            console.error('Failed to start new session:', err);
+        }
+    });
+}
 
 // ─── Initialize ───
 

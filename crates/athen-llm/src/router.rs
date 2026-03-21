@@ -9,7 +9,7 @@ use tracing::{debug, warn};
 
 use athen_core::config::ProfileConfig;
 use athen_core::error::{AthenError, Result};
-use athen_core::llm::{BudgetStatus, LlmRequest, LlmResponse, ModelProfile};
+use athen_core::llm::{BudgetStatus, LlmRequest, LlmResponse, LlmStream, ModelProfile};
 use athen_core::traits::llm::{LlmProvider, LlmRouter};
 
 use crate::budget::BudgetTracker;
@@ -194,6 +194,79 @@ impl DefaultLlmRouter {
         self
     }
 
+    /// Try each provider in the priority list for the requested profile (streaming).
+    async fn route_streaming_with_failover(&self, request: &LlmRequest) -> Result<LlmStream> {
+        let profile_config = self.profiles.get(&request.profile).ok_or_else(|| {
+            AthenError::Config(format!(
+                "no profile configuration for {:?}",
+                request.profile
+            ))
+        })?;
+
+        let priority = &profile_config.priority;
+        let mut last_error: Option<AthenError> = None;
+
+        for provider_id in priority {
+            // Check circuit breaker
+            {
+                let mut breakers = self.circuit_breakers.lock().unwrap();
+                let breaker = breakers.entry(provider_id.clone()).or_default();
+                if !breaker.allows_request() {
+                    debug!(
+                        provider = %provider_id,
+                        "circuit breaker open, skipping provider for streaming"
+                    );
+                    continue;
+                }
+            }
+
+            let provider = match self.providers.get(provider_id) {
+                Some(p) => p,
+                None => {
+                    warn!(provider = %provider_id, "provider not registered, skipping");
+                    continue;
+                }
+            };
+
+            match provider.complete_streaming(request).await {
+                Ok(stream) => {
+                    // Record success — note: for streaming we record success
+                    // at connection time. Individual chunk errors are handled
+                    // by the consumer of the stream.
+                    {
+                        let mut breakers = self.circuit_breakers.lock().unwrap();
+                        if let Some(breaker) = breakers.get_mut(provider_id) {
+                            breaker.record_success();
+                        }
+                    }
+                    return Ok(stream);
+                }
+                Err(e) => {
+                    warn!(
+                        provider = %provider_id,
+                        error = %e,
+                        "streaming provider call failed, trying next"
+                    );
+                    {
+                        let mut breakers = self.circuit_breakers.lock().unwrap();
+                        if let Some(breaker) = breakers.get_mut(provider_id) {
+                            breaker.record_failure();
+                        }
+                    }
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| AthenError::LlmProvider {
+            provider: "router".into(),
+            message: format!(
+                "all providers exhausted for streaming profile {:?}",
+                request.profile
+            ),
+        }))
+    }
+
     /// Try each provider in the priority list for the requested profile.
     async fn route_with_failover(&self, request: &LlmRequest) -> Result<LlmResponse> {
         let profile_config = self.profiles.get(&request.profile).ok_or_else(|| {
@@ -283,6 +356,17 @@ impl LlmRouter for DefaultLlmRouter {
         }
 
         self.route_with_failover(request).await
+    }
+
+    async fn route_streaming(&self, request: &LlmRequest) -> Result<LlmStream> {
+        if !self.budget_tracker.can_afford(0.0) {
+            return Err(AthenError::LlmProvider {
+                provider: "router".into(),
+                message: "daily budget exhausted".into(),
+            });
+        }
+
+        self.route_streaming_with_failover(request).await
     }
 
     async fn budget_remaining(&self) -> Result<BudgetStatus> {

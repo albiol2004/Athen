@@ -81,10 +81,12 @@ dependencies = [
  "athen-sandbox",
  "athen-shell",
  "chrono",
+ "futures",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "tracing",
  "uuid",
 ]

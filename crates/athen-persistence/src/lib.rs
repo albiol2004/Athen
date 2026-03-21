@@ -1,7 +1,8 @@
 //! SQLite persistence for Athen.
 //!
-//! Tasks, checkpoints, pending messages, and operational state.
+//! Tasks, checkpoints, pending messages, chat history, and operational state.
 
+pub mod chat;
 pub mod checkpoint;
 pub mod store;
 
@@ -13,6 +14,7 @@ use tokio::sync::Mutex;
 
 use athen_core::error::{AthenError, Result};
 
+use crate::chat::ChatStore;
 use crate::store::SqliteStore;
 
 /// Owns the SQLite connection and provides access to the store.
@@ -53,12 +55,19 @@ impl Database {
     /// Run schema migrations via the store's init_schema method.
     async fn run_migrations(&self) -> Result<()> {
         let store = self.store();
-        store.init_schema().await
+        store.init_schema().await?;
+        let chat = self.chat_store();
+        chat.init_schema().await
     }
 
     /// Create a `SqliteStore` backed by this database's connection.
     pub fn store(&self) -> SqliteStore {
         SqliteStore::new(self.conn.clone())
+    }
+
+    /// Create a `ChatStore` backed by this database's connection.
+    pub fn chat_store(&self) -> ChatStore {
+        ChatStore::new(self.conn.clone())
     }
 }
 

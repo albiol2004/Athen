@@ -12,6 +12,8 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 use uuid::Uuid;
 
+use tracing::warn;
+
 use athen_core::error::Result as AthenResult;
 use athen_core::event::*;
 use athen_core::llm::{ChatMessage, MessageContent, Role};
@@ -22,6 +24,23 @@ use athen_core::traits::llm::LlmRouter;
 use athen_agent::{AgentBuilder, InMemoryAuditor, ShellToolRegistry};
 
 use crate::state::{AppState, PendingApproval, SharedRouter};
+
+/// A simplified chat message suitable for returning to the frontend.
+#[derive(Serialize)]
+pub struct HistoryMessage {
+    pub role: String,
+    pub content: String,
+}
+
+/// Persist a chat message to SQLite (fire-and-forget; errors are logged, not propagated).
+async fn persist_message(state: &AppState, role: &str, content: &str) {
+    if let Some(ref store) = state.chat_store {
+        let session_id = state.session_id.lock().await.clone();
+        if let Err(e) = store.save_message(&session_id, role, content, "text").await {
+            warn!("Failed to persist chat message: {e}");
+        }
+    }
+}
 
 /// Response payload returned to the frontend after processing a chat message.
 #[derive(Serialize)]
@@ -54,6 +73,8 @@ struct AgentProgress {
     step: u32,
     tool_name: String,
     status: String,
+    /// Tool arguments or result summary (truncated to ~200 chars).
+    detail: Option<String>,
 }
 
 /// Step auditor that emits Tauri events for real-time progress in the UI.
@@ -69,6 +90,18 @@ impl TauriAuditor {
             app_handle,
         }
     }
+
+    /// Truncate a detail string to `max_len` characters, appending "..." if truncated.
+    /// Replaces newlines with spaces for compact display.
+    fn truncate_detail(s: &str, max_len: usize) -> String {
+        let compacted = s.replace('\n', " ");
+        let trimmed = compacted.trim();
+        if trimmed.len() <= max_len {
+            trimmed.to_string()
+        } else {
+            format!("{}...", &trimmed[..max_len])
+        }
+    }
 }
 
 #[async_trait]
@@ -80,12 +113,52 @@ impl StepAuditor for TauriAuditor {
             .strip_prefix("Tool call: ")
             .unwrap_or(&step.description)
             .to_string();
+
+        // Extract a useful detail string from the step output.
+        let detail = step.output.as_ref().and_then(|output| {
+            // For tool calls, show the command/path/key from the arguments or result.
+            if let Some(tool) = output.get("tool").and_then(|t| t.as_str()) {
+                // Try to build a summary from the tool result.
+                if let Some(result) = output.get("result") {
+                    let summary = match tool {
+                        "shell_execute" => result
+                            .get("stdout")
+                            .and_then(|s| s.as_str())
+                            .map(|s| s.to_string()),
+                        "read_file" | "write_file" => result
+                            .get("path")
+                            .and_then(|s| s.as_str())
+                            .map(|s| s.to_string()),
+                        "list_directory" => result
+                            .get("path")
+                            .and_then(|s| s.as_str())
+                            .map(|s| s.to_string()),
+                        _ => Some(
+                            serde_json::to_string(result)
+                                .unwrap_or_default(),
+                        ),
+                    };
+                    return summary.map(|s| Self::truncate_detail(&s, 200));
+                }
+                // If there was an error, show it.
+                if let Some(err) = output.get("error").and_then(|e| e.as_str()) {
+                    return Some(Self::truncate_detail(err, 200));
+                }
+            }
+            // For completion steps, show a brief response preview.
+            if let Some(response) = output.get("response").and_then(|r| r.as_str()) {
+                return Some(Self::truncate_detail(response, 200));
+            }
+            None
+        });
+
         let _ = self.app_handle.emit(
             "agent-progress",
             AgentProgress {
                 step: step.index + 1,
                 tool_name,
                 status: format!("{:?}", step.status),
+                detail,
             },
         );
         self.inner.record_step(task_id, step).await
@@ -94,6 +167,33 @@ impl StepAuditor for TauriAuditor {
     async fn get_steps(&self, task_id: TaskId) -> AthenResult<Vec<TaskStep>> {
         self.inner.get_steps(task_id).await
     }
+}
+
+/// Spawn a background task that forwards streaming text deltas from the
+/// executor to the frontend via Tauri events.
+///
+/// Returns the sender half of the channel that should be passed to
+/// `AgentBuilder::stream_sender()`.
+fn spawn_stream_forwarder(
+    app_handle: &AppHandle,
+) -> tokio::sync::mpsc::UnboundedSender<String> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let handle = app_handle.clone();
+    tokio::spawn(async move {
+        while let Some(delta) = rx.recv().await {
+            let _ = handle.emit(
+                "agent-stream",
+                serde_json::json!({ "delta": delta, "is_final": false }),
+            );
+        }
+        // Channel closed -- emit a final marker so the frontend knows
+        // the stream is complete.
+        let _ = handle.emit(
+            "agent-stream",
+            serde_json::json!({ "delta": "", "is_final": true }),
+        );
+    });
+    tx
 }
 
 /// Process a user message through the coordinator and agent executor.
@@ -132,6 +232,7 @@ pub async fn send_message(
             step: 0,
             tool_name: "Evaluating risk...".to_string(),
             status: "InProgress".to_string(),
+            detail: None,
         },
     );
 
@@ -199,7 +300,11 @@ pub async fn send_message(
                 Box::new(SharedRouter(Arc::clone(&state.router)));
             let registry = ShellToolRegistry::new().await;
 
-            let auditor = TauriAuditor::new(app_handle);
+            let auditor = TauriAuditor::new(app_handle.clone());
+
+            // Set up streaming: forward LLM text chunks to the frontend
+            // in real time via Tauri events.
+            let stream_tx = spawn_stream_forwarder(&app_handle);
 
             let executor = AgentBuilder::new()
                 .llm_router(exec_router)
@@ -208,6 +313,7 @@ pub async fn send_message(
                 .max_steps(25)
                 .timeout(Duration::from_secs(90))
                 .context_messages(context)
+                .stream_sender(stream_tx)
                 .build()
                 .map_err(|e| e.to_string())?;
 
@@ -237,12 +343,15 @@ pub async fn send_message(
                     let mut history = state.history.lock().await;
                     history.push(ChatMessage {
                         role: Role::User,
-                        content: MessageContent::Text(message),
+                        content: MessageContent::Text(message.clone()),
                     });
                     history.push(ChatMessage {
                         role: Role::Assistant,
                         content: MessageContent::Text(msg.clone()),
                     });
+                    drop(history);
+                    persist_message(&state, "user", &message).await;
+                    persist_message(&state, "assistant", &msg).await;
                     return Ok(ChatResponse {
                         content: msg,
                         risk_level: Some("Caution".into()),
@@ -290,13 +399,15 @@ pub async fn send_message(
                 let mut history = state.history.lock().await;
                 history.push(ChatMessage {
                     role: Role::User,
-                    content: MessageContent::Text(message),
+                    content: MessageContent::Text(message.clone()),
                 });
                 history.push(ChatMessage {
                     role: Role::Assistant,
                     content: MessageContent::Text(content.clone()),
                 });
             }
+            persist_message(&state, "user", &message).await;
+            persist_message(&state, "assistant", &content).await;
 
             // Mark coordinator task as completed.
             let _ = state.coordinator.complete_task(task_id).await;
@@ -378,7 +489,10 @@ pub async fn approve_task(
             let exec_router: Box<dyn LlmRouter> =
                 Box::new(SharedRouter(Arc::clone(&state.router)));
             let registry = ShellToolRegistry::new().await;
-            let auditor = TauriAuditor::new(app_handle);
+            let auditor = TauriAuditor::new(app_handle.clone());
+
+            // Set up streaming for the approved task execution.
+            let stream_tx = spawn_stream_forwarder(&app_handle);
 
             let executor = AgentBuilder::new()
                 .llm_router(exec_router)
@@ -387,6 +501,7 @@ pub async fn approve_task(
                 .max_steps(25)
                 .timeout(Duration::from_secs(90))
                 .context_messages(context)
+                .stream_sender(stream_tx)
                 .build()
                 .map_err(|e| e.to_string())?;
 
@@ -415,12 +530,15 @@ pub async fn approve_task(
                     let mut history = state.history.lock().await;
                     history.push(ChatMessage {
                         role: Role::User,
-                        content: MessageContent::Text(message),
+                        content: MessageContent::Text(message.clone()),
                     });
                     history.push(ChatMessage {
                         role: Role::Assistant,
                         content: MessageContent::Text(msg.clone()),
                     });
+                    drop(history);
+                    persist_message(&state, "user", &message).await;
+                    persist_message(&state, "assistant", &msg).await;
                     return Ok(ChatResponse {
                         content: msg,
                         risk_level: Some("Caution".into()),
@@ -459,13 +577,15 @@ pub async fn approve_task(
                 let mut history = state.history.lock().await;
                 history.push(ChatMessage {
                     role: Role::User,
-                    content: MessageContent::Text(message),
+                    content: MessageContent::Text(message.clone()),
                 });
                 history.push(ChatMessage {
                     role: Role::Assistant,
                     content: MessageContent::Text(content.clone()),
                 });
             }
+            persist_message(&state, "user", &message).await;
+            persist_message(&state, "assistant", &content).await;
 
             let _ = state.coordinator.complete_task(coord_task_id).await;
 
@@ -499,4 +619,61 @@ pub async fn get_status(
         connected: true,
         model: state.model_name.clone(),
     })
+}
+
+/// Start a fresh conversation session.
+///
+/// Clears the in-memory history and generates a new session identifier.
+/// Previous sessions remain in SQLite and can be loaded later.
+#[tauri::command]
+pub async fn new_session(
+    state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    let new_id = chrono::Utc::now()
+        .format("session_%Y%m%d_%H%M%S")
+        .to_string();
+
+    let mut history = state.history.lock().await;
+    history.clear();
+    drop(history);
+
+    let mut session_id = state.session_id.lock().await;
+    *session_id = new_id;
+
+    Ok(())
+}
+
+/// Return the current session's conversation history for the frontend
+/// to render on startup.
+///
+/// Only User and Assistant messages are returned (tool messages are
+/// filtered out since they are not meaningful for display).
+#[tauri::command]
+pub async fn get_history(
+    state: State<'_, AppState>,
+) -> std::result::Result<Vec<HistoryMessage>, String> {
+    let history = state.history.lock().await;
+    let messages: Vec<HistoryMessage> = history
+        .iter()
+        .filter(|m| matches!(m.role, Role::User | Role::Assistant))
+        .map(|m| {
+            let role = match m.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+                Role::System => "system",
+                Role::Tool => "tool",
+            };
+            let content = match &m.content {
+                MessageContent::Text(t) => t.clone(),
+                MessageContent::Structured(v) => {
+                    serde_json::to_string_pretty(v).unwrap_or_default()
+                }
+            };
+            HistoryMessage {
+                role: role.to_string(),
+                content,
+            }
+        })
+        .collect();
+    Ok(messages)
 }

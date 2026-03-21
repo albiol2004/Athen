@@ -16,6 +16,8 @@ pub fn run() {
             commands::send_message,
             commands::get_status,
             commands::approve_task,
+            commands::new_session,
+            commands::get_history,
         ])
         .setup(|app| {
             use tauri::Manager;

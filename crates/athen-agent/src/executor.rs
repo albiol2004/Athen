@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use tokio_stream::StreamExt;
 use uuid::Uuid;
 
 use athen_core::error::{AthenError, Result};
@@ -24,6 +25,7 @@ pub struct DefaultExecutor {
     max_steps: u32,
     timeout: Duration,
     context_messages: Vec<ChatMessage>,
+    stream_sender: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 impl DefaultExecutor {
@@ -43,7 +45,17 @@ impl DefaultExecutor {
             max_steps,
             timeout,
             context_messages,
+            stream_sender: None,
         }
+    }
+
+    /// Set a channel sender for streaming text chunks from the final LLM response.
+    ///
+    /// When set, the executor uses `route_streaming` for the final LLM call
+    /// (the call that produces the answer, with no tool calls) and forwards
+    /// each text delta through this sender.
+    pub fn set_stream_sender(&mut self, sender: tokio::sync::mpsc::UnboundedSender<String>) {
+        self.stream_sender = Some(sender);
     }
 
     /// Build the system prompt for the agent, including available tool descriptions.
@@ -71,11 +83,52 @@ impl DefaultExecutor {
         }
 
         prompt.push_str(
-            "Use tools when needed to accomplish tasks. \
+            "IMPORTANT: When the user asks you to do something, DO IT IMMEDIATELY using your tools. \
+             Do NOT announce what you will do — just do it and report the results. \
+             Be proactive: use tools first, then explain what you found.\n\
              When done, respond with your final answer without any tool calls.",
         );
 
         prompt
+    }
+}
+
+impl DefaultExecutor {
+    /// Attempt a streaming LLM call. Collects text deltas and forwards them
+    /// through `self.stream_sender`.
+    ///
+    /// Returns `Ok(Some(content))` if the stream produced non-empty text
+    /// (indicating a final text response with no tool calls).
+    /// Returns `Ok(None)` if the collected text was empty (indicating a
+    /// tool-call response whose data is not available via streaming).
+    async fn try_streaming_call(&self, request: &LlmRequest) -> Result<Option<String>> {
+        let mut stream = self.llm_router.route_streaming(request).await?;
+        let sender = self.stream_sender.as_ref();
+        let mut collected = String::new();
+
+        while let Some(chunk_result) = stream.next().await {
+            match chunk_result {
+                Ok(chunk) => {
+                    if !chunk.delta.is_empty() {
+                        collected.push_str(&chunk.delta);
+                        if let Some(tx) = sender {
+                            // Best-effort: if the receiver is dropped, we still
+                            // finish collecting the response text.
+                            let _ = tx.send(chunk.delta);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "error in LLM stream chunk, ignoring");
+                }
+            }
+        }
+
+        if collected.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(collected))
+        }
     }
 }
 
@@ -169,8 +222,47 @@ impl AgentExecutor for DefaultExecutor {
                 system_prompt: Some(system_prompt.clone()),
             };
 
-            // Call the LLM
-            let response = self.llm_router.route(&request).await?;
+            // Call the LLM — use streaming when a stream sender is available.
+            // Streaming allows the final text response to be forwarded chunk
+            // by chunk for progressive rendering in the UI.
+            let response = if self.stream_sender.is_some() {
+                // Try streaming first. If we get text content, the chunks
+                // have already been forwarded via the sender. If the
+                // collected text is empty (tool call responses have no
+                // content in the stream), fall back to non-streaming to
+                // retrieve the tool call data.
+                match self.try_streaming_call(&request).await {
+                    Ok(Some(content)) => {
+                        // Successful streaming text response (no tool calls).
+                        // Build a synthetic LlmResponse for the rest of the loop.
+                        athen_core::llm::LlmResponse {
+                            content,
+                            model_used: String::new(),
+                            provider: String::new(),
+                            usage: athen_core::llm::TokenUsage {
+                                prompt_tokens: 0,
+                                completion_tokens: 0,
+                                total_tokens: 0,
+                                estimated_cost_usd: None,
+                            },
+                            tool_calls: vec![],
+                            finish_reason: athen_core::llm::FinishReason::Stop,
+                        }
+                    }
+                    Ok(None) => {
+                        // Empty content from stream — likely a tool call response.
+                        // Fall back to non-streaming to get the full response
+                        // with tool call data.
+                        self.llm_router.route(&request).await?
+                    }
+                    Err(_) => {
+                        // Streaming failed — fall back to non-streaming.
+                        self.llm_router.route(&request).await?
+                    }
+                }
+            } else {
+                self.llm_router.route(&request).await?
+            };
 
             // Add assistant response to conversation.
             // When the response includes tool calls, embed them in a Structured
