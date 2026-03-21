@@ -22,6 +22,7 @@ use athen_core::task::{DomainType, Task, TaskId, TaskPriority, TaskStatus, TaskS
 use athen_core::traits::agent::{AgentExecutor, StepAuditor};
 use athen_core::traits::llm::LlmRouter;
 use athen_agent::{AgentBuilder, InMemoryAuditor, ShellToolRegistry};
+use athen_persistence::chat::SessionMeta;
 
 use crate::state::{AppState, PendingApproval, SharedRouter};
 
@@ -33,11 +34,16 @@ pub struct HistoryMessage {
 }
 
 /// Persist a chat message to SQLite (fire-and-forget; errors are logged, not propagated).
+///
+/// Also updates the session's `updated_at` timestamp.
 async fn persist_message(state: &AppState, role: &str, content: &str) {
     if let Some(ref store) = state.chat_store {
         let session_id = state.session_id.lock().await.clone();
         if let Err(e) = store.save_message(&session_id, role, content, "text").await {
             warn!("Failed to persist chat message: {e}");
+        }
+        if let Err(e) = store.touch_session(&session_id).await {
+            warn!("Failed to touch session: {e}");
         }
     }
 }
@@ -617,7 +623,7 @@ pub async fn get_status(
 ) -> std::result::Result<StatusResponse, String> {
     Ok(StatusResponse {
         connected: true,
-        model: state.model_name.clone(),
+        model: state.model_name.lock().await.clone(),
     })
 }
 
@@ -625,22 +631,30 @@ pub async fn get_status(
 ///
 /// Clears the in-memory history and generates a new session identifier.
 /// Previous sessions remain in SQLite and can be loaded later.
+/// Returns the new session ID so the frontend can update the sidebar.
 #[tauri::command]
 pub async fn new_session(
     state: State<'_, AppState>,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<String, String> {
     let new_id = chrono::Utc::now()
         .format("session_%Y%m%d_%H%M%S")
         .to_string();
+
+    // Create session metadata entry.
+    if let Some(ref store) = state.chat_store {
+        if let Err(e) = store.create_session(&new_id, "New Chat").await {
+            warn!("Failed to create session metadata: {e}");
+        }
+    }
 
     let mut history = state.history.lock().await;
     history.clear();
     drop(history);
 
     let mut session_id = state.session_id.lock().await;
-    *session_id = new_id;
+    *session_id = new_id.clone();
 
-    Ok(())
+    Ok(new_id)
 }
 
 /// Return the current session's conversation history for the frontend
@@ -676,4 +690,189 @@ pub async fn get_history(
         })
         .collect();
     Ok(messages)
+}
+
+/// List all sessions with metadata for the sidebar.
+#[tauri::command]
+pub async fn list_sessions(
+    state: State<'_, AppState>,
+) -> std::result::Result<Vec<SessionMeta>, String> {
+    let store = state
+        .chat_store
+        .as_ref()
+        .ok_or_else(|| "Chat store not available".to_string())?;
+    store
+        .list_sessions_with_meta()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Switch to a different session, loading its messages into the in-memory history.
+///
+/// Returns the loaded messages so the frontend can render them immediately.
+#[tauri::command]
+pub async fn switch_session(
+    session_id: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<Vec<HistoryMessage>, String> {
+    let store = state
+        .chat_store
+        .as_ref()
+        .ok_or_else(|| "Chat store not available".to_string())?;
+
+    // Load the persisted messages for the target session.
+    let persisted = store
+        .load_messages(&session_id)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let chat_messages: Vec<ChatMessage> = persisted
+        .iter()
+        .map(|m| ChatMessage {
+            role: match m.role.as_str() {
+                "user" => Role::User,
+                "assistant" => Role::Assistant,
+                "system" => Role::System,
+                "tool" => Role::Tool,
+                _ => Role::User,
+            },
+            content: if m.content_type == "structured" {
+                match serde_json::from_str(&m.content) {
+                    Ok(v) => MessageContent::Structured(v),
+                    Err(_) => MessageContent::Text(m.content.clone()),
+                }
+            } else {
+                MessageContent::Text(m.content.clone())
+            },
+        })
+        .collect();
+
+    // Build the display messages (user + assistant only).
+    let display: Vec<HistoryMessage> = persisted
+        .iter()
+        .filter(|m| m.role == "user" || m.role == "assistant")
+        .map(|m| HistoryMessage {
+            role: m.role.clone(),
+            content: m.content.clone(),
+        })
+        .collect();
+
+    // Swap in-memory state.
+    let mut history = state.history.lock().await;
+    *history = chat_messages;
+    drop(history);
+
+    let mut current_session = state.session_id.lock().await;
+    *current_session = session_id;
+
+    Ok(display)
+}
+
+/// Rename a session.
+#[tauri::command]
+pub async fn rename_session(
+    session_id: String,
+    name: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    let store = state
+        .chat_store
+        .as_ref()
+        .ok_or_else(|| "Chat store not available".to_string())?;
+    store
+        .rename_session(&session_id, &name)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Delete a session and all its messages.
+///
+/// Returns the session ID of the session that should become active
+/// (the most recent remaining session, or a newly created one).
+#[tauri::command]
+pub async fn delete_session(
+    session_id: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<String, String> {
+    let store = state
+        .chat_store
+        .as_ref()
+        .ok_or_else(|| "Chat store not available".to_string())?;
+
+    store
+        .delete_session(&session_id)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let current = state.session_id.lock().await.clone();
+
+    // If we deleted the active session, switch to another.
+    if current == session_id {
+        let sessions = store
+            .list_sessions_with_meta()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if let Some(next) = sessions.first() {
+            // Load the next session's history.
+            let persisted = store
+                .load_messages(&next.session_id)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            let chat_messages: Vec<ChatMessage> = persisted
+                .iter()
+                .map(|m| ChatMessage {
+                    role: match m.role.as_str() {
+                        "user" => Role::User,
+                        "assistant" => Role::Assistant,
+                        "system" => Role::System,
+                        "tool" => Role::Tool,
+                        _ => Role::User,
+                    },
+                    content: if m.content_type == "structured" {
+                        match serde_json::from_str(&m.content) {
+                            Ok(v) => MessageContent::Structured(v),
+                            Err(_) => MessageContent::Text(m.content.clone()),
+                        }
+                    } else {
+                        MessageContent::Text(m.content.clone())
+                    },
+                })
+                .collect();
+
+            let mut history = state.history.lock().await;
+            *history = chat_messages;
+            drop(history);
+
+            let mut sid = state.session_id.lock().await;
+            *sid = next.session_id.clone();
+
+            return Ok(next.session_id.clone());
+        }
+
+        // No sessions left -- create a new one.
+        let new_id = chrono::Utc::now()
+            .format("session_%Y%m%d_%H%M%S")
+            .to_string();
+        if let Err(e) = store.create_session(&new_id, "New Chat").await {
+            warn!("Failed to create replacement session: {e}");
+        }
+        let mut history = state.history.lock().await;
+        history.clear();
+        drop(history);
+        let mut sid = state.session_id.lock().await;
+        *sid = new_id.clone();
+        return Ok(new_id);
+    }
+
+    Ok(current)
+}
+
+/// Return the current active session ID.
+#[tauri::command]
+pub async fn get_current_session(
+    state: State<'_, AppState>,
+) -> std::result::Result<String, String> {
+    Ok(state.session_id.lock().await.clone())
 }

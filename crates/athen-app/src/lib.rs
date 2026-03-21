@@ -5,6 +5,7 @@
 
 mod commands;
 pub(crate) mod process;
+mod settings;
 pub(crate) mod state;
 
 use state::AppState;
@@ -18,6 +19,17 @@ pub fn run() {
             commands::approve_task,
             commands::new_session,
             commands::get_history,
+            commands::list_sessions,
+            commands::switch_session,
+            commands::rename_session,
+            commands::delete_session,
+            commands::get_current_session,
+            settings::get_settings,
+            settings::save_provider,
+            settings::delete_provider,
+            settings::test_provider,
+            settings::save_settings,
+            settings::set_active_provider,
         ])
         .setup(|app| {
             use tauri::Manager;

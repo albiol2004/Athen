@@ -16,6 +16,14 @@ let streamingText = '';
 // Whether we received any streaming chunks for the current request.
 let didReceiveStreamChunks = false;
 
+// ─── Session State ───
+
+// The currently active session ID.
+let activeSessionId = null;
+// Whether the first user message in this session has been sent
+// (used to auto-name the session).
+let sessionHasMessages = false;
+
 function initTauri() {
     if (window.__TAURI__ && window.__TAURI__.core) {
         invoke = window.__TAURI__.core.invoke;
@@ -133,7 +141,15 @@ function initTauri() {
         }
 
         setStatus('idle', 'Ready');
-        loadHistory();
+
+        // Load the current session ID, then load sessions and history.
+        invoke('get_current_session').then((sid) => {
+            activeSessionId = sid;
+            loadSessions();
+            loadHistory();
+        }).catch(() => {
+            loadHistory();
+        });
     } else {
         setStatus('working', 'Waiting for Tauri...');
         setTimeout(initTauri, 100);
@@ -148,6 +164,304 @@ const formEl = document.getElementById('input-form');
 const statusDot = document.getElementById('status-dot');
 const statusText = document.getElementById('status-text');
 const sendBtn = document.getElementById('send-btn');
+const sessionListEl = document.getElementById('session-list');
+const sidebarEl = document.getElementById('sidebar');
+const sidebarOverlay = document.getElementById('sidebar-overlay');
+const sidebarToggle = document.getElementById('sidebar-toggle');
+
+// ─── Sidebar Logic ───
+
+async function loadSessions() {
+    if (!invoke) return;
+    try {
+        const sessions = await invoke('list_sessions');
+        renderSessionList(sessions);
+    } catch (err) {
+        console.error('Failed to load sessions:', err);
+    }
+}
+
+function renderSessionList(sessions) {
+    sessionListEl.innerHTML = '';
+
+    if (!sessions || sessions.length === 0) {
+        sessionListEl.innerHTML = '<div class="session-list-empty">No conversations yet</div>';
+        return;
+    }
+
+    for (const session of sessions) {
+        const item = document.createElement('div');
+        item.className = 'session-item';
+        if (session.session_id === activeSessionId) {
+            item.classList.add('active');
+        }
+        item.dataset.sessionId = session.session_id;
+
+        const content = document.createElement('div');
+        content.className = 'session-item-content';
+
+        const nameEl = document.createElement('div');
+        nameEl.className = 'session-item-name';
+        nameEl.textContent = session.name;
+        content.appendChild(nameEl);
+
+        const metaEl = document.createElement('div');
+        metaEl.className = 'session-item-meta';
+
+        const dateEl = document.createElement('span');
+        dateEl.className = 'session-item-date';
+        dateEl.textContent = formatSessionDate(session.updated_at);
+        metaEl.appendChild(dateEl);
+
+        if (session.message_count > 0) {
+            const countEl = document.createElement('span');
+            countEl.className = 'session-item-count';
+            countEl.textContent = session.message_count;
+            metaEl.appendChild(countEl);
+        }
+
+        content.appendChild(metaEl);
+        item.appendChild(content);
+
+        // Action buttons (rename + delete)
+        const actions = document.createElement('div');
+        actions.className = 'session-item-actions';
+
+        const renameBtn = document.createElement('button');
+        renameBtn.className = 'session-action-btn';
+        renameBtn.title = 'Rename';
+        renameBtn.innerHTML = '&#9998;'; // pencil
+        renameBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            startRenameSession(item, session.session_id, session.name);
+        });
+        actions.appendChild(renameBtn);
+
+        const deleteBtn = document.createElement('button');
+        deleteBtn.className = 'session-action-btn delete';
+        deleteBtn.title = 'Delete';
+        deleteBtn.innerHTML = '&#10005;'; // x mark
+        deleteBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            handleDeleteSession(session.session_id);
+        });
+        actions.appendChild(deleteBtn);
+
+        item.appendChild(actions);
+
+        // Click to switch session
+        item.addEventListener('click', () => {
+            handleSwitchSession(session.session_id);
+        });
+
+        // Double-click to rename
+        nameEl.addEventListener('dblclick', (e) => {
+            e.stopPropagation();
+            startRenameSession(item, session.session_id, session.name);
+        });
+
+        sessionListEl.appendChild(item);
+    }
+}
+
+function formatSessionDate(dateStr) {
+    try {
+        const date = new Date(dateStr);
+        const now = new Date();
+        const diffMs = now - date;
+        const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+
+        if (diffDays === 0) return 'Today';
+        if (diffDays === 1) return 'Yesterday';
+        if (diffDays < 7) return `${diffDays}d ago`;
+
+        return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
+    } catch {
+        return '';
+    }
+}
+
+function startRenameSession(itemEl, sessionId, currentName) {
+    const nameEl = itemEl.querySelector('.session-item-name');
+    if (!nameEl) return;
+
+    // Replace name text with an input.
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'session-rename-input';
+    input.value = currentName;
+    nameEl.textContent = '';
+    nameEl.appendChild(input);
+    input.focus();
+    input.select();
+
+    const finishRename = async (save) => {
+        const newName = input.value.trim();
+        if (save && newName && newName !== currentName) {
+            try {
+                await invoke('rename_session', { sessionId, name: newName });
+                nameEl.textContent = newName;
+            } catch (err) {
+                console.error('Rename failed:', err);
+                nameEl.textContent = currentName;
+            }
+        } else {
+            nameEl.textContent = currentName;
+        }
+    };
+
+    input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            finishRename(true);
+        } else if (e.key === 'Escape') {
+            finishRename(false);
+        }
+    });
+
+    input.addEventListener('blur', () => {
+        finishRename(true);
+    });
+}
+
+async function handleSwitchSession(sessionId) {
+    if (!invoke || sessionId === activeSessionId) return;
+
+    try {
+        const messages = await invoke('switch_session', { sessionId });
+        activeSessionId = sessionId;
+
+        // Check if the session has messages already (for auto-naming).
+        sessionHasMessages = messages && messages.length > 0;
+
+        // Clear the chat UI and render the loaded messages.
+        clearChatUI();
+        if (messages && messages.length > 0) {
+            for (const msg of messages) {
+                addMessage(msg.role, msg.content);
+            }
+        }
+
+        // Update active highlight in sidebar.
+        document.querySelectorAll('.session-item').forEach((el) => {
+            el.classList.toggle('active', el.dataset.sessionId === sessionId);
+        });
+
+        // Close sidebar on mobile.
+        closeSidebar();
+
+        inputEl.focus();
+    } catch (err) {
+        console.error('Switch session failed:', err);
+    }
+}
+
+async function handleDeleteSession(sessionId) {
+    if (!invoke) return;
+    if (!confirm('Delete this conversation? This cannot be undone.')) return;
+
+    try {
+        const newActiveId = await invoke('delete_session', { sessionId });
+
+        // If the deleted session was the active one, the backend switched us.
+        if (sessionId === activeSessionId) {
+            activeSessionId = newActiveId;
+            // Reload messages for the new active session.
+            try {
+                const messages = await invoke('get_history');
+                clearChatUI();
+                if (messages && messages.length > 0) {
+                    for (const msg of messages) {
+                        addMessage(msg.role, msg.content);
+                    }
+                    sessionHasMessages = true;
+                } else {
+                    sessionHasMessages = false;
+                }
+            } catch (err2) {
+                console.error('Failed to load history after delete:', err2);
+                clearChatUI();
+            }
+        }
+
+        // Refresh the sidebar list.
+        await loadSessions();
+    } catch (err) {
+        console.error('Delete session failed:', err);
+    }
+}
+
+function clearChatUI() {
+    messagesEl.innerHTML = `
+        <div class="welcome-message">
+            <div class="welcome-icon">A</div>
+            <p>Hello! I'm <strong>Athen</strong>, your universal AI agent. I can execute shell commands, read and write files, manage tasks, and more.</p>
+            <p class="welcome-hint">Type a message below to get started.</p>
+        </div>
+    `;
+    currentToolContainer = null;
+    streamingBubble = null;
+    streamingText = '';
+    didReceiveStreamChunks = false;
+}
+
+// ─── Sidebar Toggle (mobile) ───
+
+function openSidebar() {
+    sidebarEl.classList.add('open');
+    sidebarOverlay.classList.add('visible');
+}
+
+function closeSidebar() {
+    sidebarEl.classList.remove('open');
+    sidebarOverlay.classList.remove('visible');
+}
+
+if (sidebarToggle) {
+    sidebarToggle.addEventListener('click', () => {
+        if (sidebarEl.classList.contains('open')) {
+            closeSidebar();
+        } else {
+            openSidebar();
+        }
+    });
+}
+
+if (sidebarOverlay) {
+    sidebarOverlay.addEventListener('click', closeSidebar);
+}
+
+// ─── Auto-name session ───
+
+async function autoNameSession(message) {
+    if (!invoke || !activeSessionId || sessionHasMessages) return;
+    sessionHasMessages = true;
+
+    // Truncate the first message to ~30 characters for the session name.
+    let name = message.trim();
+    if (name.length > 30) {
+        // Cut at last word boundary within 30 chars.
+        name = name.substring(0, 30);
+        const lastSpace = name.lastIndexOf(' ');
+        if (lastSpace > 15) {
+            name = name.substring(0, lastSpace);
+        }
+        name += '...';
+    }
+
+    try {
+        await invoke('rename_session', { sessionId: activeSessionId, name });
+        // Update the sidebar item in place.
+        const item = sessionListEl.querySelector(
+            `.session-item[data-session-id="${activeSessionId}"] .session-item-name`
+        );
+        if (item) {
+            item.textContent = name;
+        }
+    } catch (err) {
+        console.error('Auto-name session failed:', err);
+    }
+}
 
 // ─── Markdown Renderer ───
 
@@ -547,6 +861,9 @@ async function handleApproval(taskId, approved) {
 
     setInputEnabled(true);
     inputEl.focus();
+
+    // Refresh sidebar to update message counts.
+    loadSessions();
 }
 
 // ─── Form Submission ───
@@ -561,6 +878,9 @@ formEl.addEventListener('submit', async (e) => {
         addMessage('assistant', 'Tauri backend not connected. Is the app running inside Tauri?', { isError: true });
         return;
     }
+
+    // Auto-name the session from the first message.
+    autoNameSession(message);
 
     // Show user message
     addMessage('user', message);
@@ -643,6 +963,9 @@ formEl.addEventListener('submit', async (e) => {
 
     setInputEnabled(true);
     inputEl.focus();
+
+    // Refresh sidebar to update message counts.
+    loadSessions();
 });
 
 // ─── History Restoration ───
@@ -659,37 +982,412 @@ async function loadHistory() {
             for (const msg of messages) {
                 addMessage(msg.role, msg.content);
             }
+            sessionHasMessages = true;
         }
     } catch (err) {
         console.error('Failed to load history:', err);
     }
 }
 
-// ─── New Chat ───
+// ─── New Chat (both sidebar button and header button) ───
+
+async function handleNewChat() {
+    if (!invoke) return;
+    try {
+        const newId = await invoke('new_session');
+        activeSessionId = newId;
+        sessionHasMessages = false;
+        clearChatUI();
+        closeSidebar();
+        await loadSessions();
+        inputEl.focus();
+    } catch (err) {
+        console.error('Failed to start new session:', err);
+    }
+}
 
 const newChatBtn = document.getElementById('new-chat-btn');
 if (newChatBtn) {
-    newChatBtn.addEventListener('click', async () => {
-        if (!invoke) return;
-        try {
-            await invoke('new_session');
-            // Clear the messages UI and restore the welcome message.
-            messagesEl.innerHTML = `
-                <div class="welcome-message">
-                    <div class="welcome-icon">A</div>
-                    <p>Hello! I'm <strong>Athen</strong>, your universal AI agent. I can execute shell commands, read and write files, manage tasks, and more.</p>
-                    <p class="welcome-hint">Type a message below to get started.</p>
-                </div>
-            `;
-            currentToolContainer = null;
-            streamingBubble = null;
-            streamingText = '';
-            didReceiveStreamChunks = false;
-            inputEl.focus();
-        } catch (err) {
-            console.error('Failed to start new session:', err);
-        }
+    newChatBtn.addEventListener('click', handleNewChat);
+}
+
+const sidebarNewChatBtn = document.getElementById('sidebar-new-chat-btn');
+if (sidebarNewChatBtn) {
+    sidebarNewChatBtn.addEventListener('click', handleNewChat);
+}
+
+// ─── Settings ───
+
+const settingsView = document.getElementById('settings-view');
+const settingsBtn = document.getElementById('settings-btn');
+const settingsBack = document.getElementById('settings-back');
+const appView = document.getElementById('app');
+const providerListEl = document.getElementById('provider-list');
+const addProviderBtn = document.getElementById('add-provider-btn');
+const providerTemplates = document.getElementById('provider-templates');
+const securityModeEl = document.getElementById('security-mode');
+const securityHintEl = document.getElementById('security-hint');
+const saveSecurityBtn = document.getElementById('save-security-btn');
+
+const PROVIDER_DEFAULTS = {
+    deepseek:  { name: 'DeepSeek',        base_url: 'https://api.deepseek.com',  model: 'deepseek-chat',           type: 'cloud' },
+    openai:    { name: 'OpenAI',           base_url: 'https://api.openai.com',    model: 'gpt-4o',                 type: 'cloud' },
+    anthropic: { name: 'Anthropic',        base_url: 'https://api.anthropic.com', model: 'claude-sonnet-4-20250514', type: 'cloud' },
+    ollama:    { name: 'Ollama',           base_url: 'http://localhost:11434',     model: 'llama3',                 type: 'local' },
+    llamacpp:  { name: 'llama.cpp',        base_url: 'http://localhost:8080',      model: 'default',                type: 'local' },
+    custom:    { name: 'Custom Provider',  base_url: '',                           model: '',                       type: 'cloud' },
+};
+
+const SECURITY_HINTS = {
+    assistant: 'Standard risk evaluation. The agent asks for approval on risky actions.',
+    bunker:    'Maximum caution. Everything above read-only requires your approval.',
+    yolo:      'Minimal friction. Only critical actions (financial, system config) need approval.',
+};
+
+function showSettings() {
+    appView.style.display = 'none';
+    settingsView.classList.remove('hidden');
+    closeSidebar();
+    loadSettings();
+}
+
+function showChat() {
+    settingsView.classList.add('hidden');
+    appView.style.display = 'flex';
+    inputEl.focus();
+}
+
+async function loadSettings() {
+    if (!invoke) return;
+    try {
+        const settings = await invoke('get_settings');
+        renderProviders(settings.providers);
+        securityModeEl.value = settings.security_mode;
+        securityHintEl.textContent = SECURITY_HINTS[settings.security_mode] || '';
+    } catch (err) {
+        console.error('Failed to load settings:', err);
+        showToast('Failed to load settings: ' + err, 'error');
+    }
+}
+
+function renderProviders(providers) {
+    providerListEl.innerHTML = '';
+    for (const p of providers) {
+        providerListEl.appendChild(createProviderCard(p));
+    }
+}
+
+function createProviderCard(provider) {
+    const card = document.createElement('div');
+    card.className = 'provider-card' + (provider.is_active ? ' active' : '');
+    card.dataset.providerId = provider.id;
+
+    const header = document.createElement('div');
+    header.className = 'provider-card-header';
+
+    const titleArea = document.createElement('div');
+    titleArea.className = 'provider-card-title';
+
+    const dot = document.createElement('span');
+    dot.className = 'provider-status-dot ' + (provider.has_api_key || provider.provider_type === 'local' ? 'active' : 'inactive');
+
+    const name = document.createElement('span');
+    name.className = 'provider-name';
+    name.textContent = provider.name;
+
+    const subtitle = document.createElement('span');
+    subtitle.className = 'provider-subtitle';
+    subtitle.textContent = provider.model + ' \u00B7 ' + provider.base_url.replace(/^https?:\/\//, '');
+
+    titleArea.appendChild(dot);
+    titleArea.appendChild(name);
+    titleArea.appendChild(subtitle);
+    header.appendChild(titleArea);
+
+    const rightSide = document.createElement('div');
+    rightSide.style.display = 'flex';
+    rightSide.style.alignItems = 'center';
+    rightSide.style.gap = '8px';
+
+    if (provider.is_active) {
+        const badge = document.createElement('span');
+        badge.className = 'provider-active-badge';
+        badge.textContent = 'Active';
+        rightSide.appendChild(badge);
+    } else {
+        const setActiveBtn = document.createElement('button');
+        setActiveBtn.className = 'btn-set-active';
+        setActiveBtn.textContent = 'Set Active';
+        setActiveBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            handleSetActiveProvider(provider.id, provider.name);
+        });
+        rightSide.appendChild(setActiveBtn);
+    }
+
+    const chevron = document.createElement('span');
+    chevron.className = 'provider-card-chevron';
+    chevron.innerHTML = '&#9654;';
+    rightSide.appendChild(chevron);
+    header.appendChild(rightSide);
+
+    // Toggle expand
+    header.addEventListener('click', () => {
+        card.classList.toggle('expanded');
     });
+
+    // Body
+    const body = document.createElement('div');
+    body.className = 'provider-card-body';
+
+    const isLocal = provider.provider_type === 'local';
+
+    body.innerHTML = `
+        <div class="provider-field">
+            <label>Base URL</label>
+            <input type="text" class="provider-url" value="${escapeHtml(provider.base_url)}" placeholder="https://api.example.com">
+        </div>
+        <div class="provider-field">
+            <label>Model</label>
+            <input type="text" class="provider-model" value="${escapeHtml(provider.model)}" placeholder="model-name">
+        </div>
+        ${!isLocal ? `
+        <div class="provider-field">
+            <label>API Key</label>
+            <div class="api-key-wrapper">
+                <input type="password" class="provider-api-key" placeholder="${provider.has_api_key ? 'Key is set (leave blank to keep)' : 'Enter API key'}" autocomplete="off">
+                <button class="api-key-toggle" title="Show/hide key">&#128065;</button>
+            </div>
+            ${provider.api_key_hint ? `<div class="api-key-hint">Current: ${escapeHtml(provider.api_key_hint)}</div>` : ''}
+        </div>
+        ` : ''}
+        <div class="provider-card-actions">
+            <button class="btn-secondary test-btn">Test Connection</button>
+            <button class="btn-primary save-btn">Save</button>
+            <button class="btn-danger delete-btn">Delete</button>
+            <span class="test-result"></span>
+        </div>
+    `;
+
+    card.appendChild(header);
+    card.appendChild(body);
+
+    // Wire up events after adding to DOM (we do it immediately since innerHTML is set).
+    const apiKeyInput = body.querySelector('.provider-api-key');
+    const toggleBtn = body.querySelector('.api-key-toggle');
+    if (toggleBtn && apiKeyInput) {
+        toggleBtn.addEventListener('click', () => {
+            apiKeyInput.type = apiKeyInput.type === 'password' ? 'text' : 'password';
+        });
+    }
+
+    body.querySelector('.test-btn').addEventListener('click', () => {
+        handleTestProvider(card, provider.id);
+    });
+
+    body.querySelector('.save-btn').addEventListener('click', () => {
+        handleSaveProvider(card, provider.id);
+    });
+
+    body.querySelector('.delete-btn').addEventListener('click', () => {
+        handleDeleteProvider(provider.id);
+    });
+
+    return card;
+}
+
+async function handleSaveProvider(card, id) {
+    if (!invoke) return;
+
+    const baseUrl = card.querySelector('.provider-url').value.trim();
+    const model = card.querySelector('.provider-model').value.trim();
+    const apiKeyInput = card.querySelector('.provider-api-key');
+    // null means "don't change", empty string means "remove"
+    let apiKey = null;
+    if (apiKeyInput) {
+        const val = apiKeyInput.value;
+        if (val !== '') {
+            apiKey = val;
+        }
+    }
+
+    const saveBtn = card.querySelector('.save-btn');
+    saveBtn.disabled = true;
+    saveBtn.textContent = 'Saving...';
+
+    try {
+        const msg = await invoke('save_provider', {
+            id: id,
+            baseUrl: baseUrl,
+            model: model,
+            apiKey: apiKey,
+        });
+        showToast(msg, 'success');
+        // Reload to reflect changes.
+        await loadSettings();
+    } catch (err) {
+        showToast('Failed to save: ' + err, 'error');
+    }
+
+    saveBtn.disabled = false;
+    saveBtn.textContent = 'Save';
+}
+
+async function handleDeleteProvider(id) {
+    if (!invoke) return;
+    if (!confirm('Delete provider "' + id + '"? You can re-add it later.')) return;
+
+    try {
+        const msg = await invoke('delete_provider', { id: id });
+        showToast(msg, 'success');
+        await loadSettings();
+    } catch (err) {
+        showToast('Failed to delete: ' + err, 'error');
+    }
+}
+
+async function handleSetActiveProvider(id, name) {
+    if (!invoke) return;
+
+    try {
+        const msg = await invoke('set_active_provider', { id: id });
+        showToast(msg, 'success');
+        // Refresh the settings page to update active badges.
+        await loadSettings();
+    } catch (err) {
+        showToast('Failed to switch provider: ' + err, 'error');
+    }
+}
+
+async function handleTestProvider(card, id) {
+    if (!invoke) return;
+
+    const baseUrl = card.querySelector('.provider-url').value.trim();
+    const model = card.querySelector('.provider-model').value.trim();
+    const apiKeyInput = card.querySelector('.provider-api-key');
+    let apiKey = null;
+    if (apiKeyInput && apiKeyInput.value !== '') {
+        apiKey = apiKeyInput.value;
+    }
+
+    const testBtn = card.querySelector('.test-btn');
+    const resultEl = card.querySelector('.test-result');
+    testBtn.disabled = true;
+    testBtn.textContent = 'Testing...';
+    resultEl.textContent = '';
+    resultEl.className = 'test-result';
+
+    try {
+        const result = await invoke('test_provider', {
+            id: id,
+            baseUrl: baseUrl,
+            model: model,
+            apiKey: apiKey,
+        });
+        resultEl.textContent = result.message;
+        resultEl.className = 'test-result ' + (result.success ? 'success' : 'error');
+    } catch (err) {
+        resultEl.textContent = 'Error: ' + err;
+        resultEl.className = 'test-result error';
+    }
+
+    testBtn.disabled = false;
+    testBtn.textContent = 'Test Connection';
+}
+
+// Add provider template buttons
+if (addProviderBtn) {
+    addProviderBtn.addEventListener('click', () => {
+        providerTemplates.classList.toggle('hidden');
+    });
+}
+
+document.querySelectorAll('.template-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+        const providerId = btn.dataset.provider;
+        const defaults = PROVIDER_DEFAULTS[providerId];
+        providerTemplates.classList.add('hidden');
+
+        // Check if this provider already exists in the list.
+        const existingCard = providerListEl.querySelector(
+            `.provider-card[data-provider-id="${providerId}"]`
+        );
+        if (existingCard) {
+            existingCard.classList.add('expanded');
+            existingCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            return;
+        }
+
+        // Create a new card with template defaults.
+        const newProvider = {
+            id: providerId,
+            name: defaults.name,
+            provider_type: defaults.type,
+            base_url: defaults.base_url,
+            model: defaults.model,
+            has_api_key: false,
+            api_key_hint: '',
+            is_active: false,
+        };
+
+        const card = createProviderCard(newProvider);
+        card.classList.add('expanded');
+        providerListEl.appendChild(card);
+        card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    });
+});
+
+// Security mode change hint
+if (securityModeEl) {
+    securityModeEl.addEventListener('change', () => {
+        securityHintEl.textContent = SECURITY_HINTS[securityModeEl.value] || '';
+    });
+}
+
+// Save security settings
+if (saveSecurityBtn) {
+    saveSecurityBtn.addEventListener('click', async () => {
+        if (!invoke) return;
+        saveSecurityBtn.disabled = true;
+        saveSecurityBtn.textContent = 'Saving...';
+
+        try {
+            const msg = await invoke('save_settings', {
+                securityMode: securityModeEl.value,
+            });
+            showToast(msg, 'success');
+        } catch (err) {
+            showToast('Failed to save: ' + err, 'error');
+        }
+
+        saveSecurityBtn.disabled = false;
+        saveSecurityBtn.textContent = 'Save Security Settings';
+    });
+}
+
+// Settings navigation
+if (settingsBtn) {
+    settingsBtn.addEventListener('click', showSettings);
+}
+if (settingsBack) {
+    settingsBack.addEventListener('click', showChat);
+}
+
+// ─── Toast Notification ───
+
+function showToast(message, type) {
+    // Remove existing toasts.
+    document.querySelectorAll('.toast').forEach(t => t.remove());
+
+    const toast = document.createElement('div');
+    toast.className = 'toast ' + (type || '');
+    toast.textContent = message;
+    document.body.appendChild(toast);
+
+    setTimeout(() => {
+        toast.style.opacity = '0';
+        setTimeout(() => toast.remove(), 300);
+    }, 4000);
 }
 
 // ─── Initialize ───

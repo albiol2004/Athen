@@ -106,11 +106,13 @@ dependencies = [
  "athen-risk",
  "athen-sentidos",
  "chrono",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
  "tokio",
+ "toml 0.8.23",
  "tracing",
  "uuid",
 ]

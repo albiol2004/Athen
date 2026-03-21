@@ -21,6 +21,8 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 async-trait = { workspace = true }
 tauri = { version = "2", features = [] }
+toml = { workspace = true }
+reqwest = { workspace = true }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

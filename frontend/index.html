@@ -7,43 +7,110 @@
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-    <div id="app">
-        <header>
-            <div class="header-left">
-                <div class="logo">A</div>
-                <div class="header-text">
-                    <h1>Athen</h1>
-                    <span class="subtitle">Universal AI Agent</span>
-                </div>
+    <div id="app-layout">
+        <aside id="sidebar" class="sidebar">
+            <div class="sidebar-header">
+                <h2>Chats</h2>
+                <button id="sidebar-new-chat-btn" title="New Chat">+</button>
             </div>
-            <button id="new-chat-btn" title="Start a new conversation">New Chat</button>
+            <div id="session-list" class="session-list"></div>
+            <div class="sidebar-footer">
+                <button id="settings-btn" class="sidebar-footer-btn" title="Settings">
+                    <span class="settings-icon">&#9881;</span>
+                    <span>Settings</span>
+                </button>
+            </div>
+        </aside>
+
+        <div id="app">
+            <header>
+                <div class="header-left">
+                    <button id="sidebar-toggle" class="sidebar-toggle" title="Toggle sidebar">
+                        <span class="hamburger-icon">&#9776;</span>
+                    </button>
+                    <div class="logo">A</div>
+                    <div class="header-text">
+                        <h1>Athen</h1>
+                        <span class="subtitle">Universal AI Agent</span>
+                    </div>
+                </div>
+                <button id="new-chat-btn" title="Start a new conversation">New Chat</button>
+            </header>
+
+            <main id="chat-container">
+                <div id="messages">
+                    <div class="welcome-message">
+                        <div class="welcome-icon">A</div>
+                        <p>Hello! I'm <strong>Athen</strong>, your universal AI agent. I can execute shell commands, read and write files, manage tasks, and more.</p>
+                        <p class="welcome-hint">Type a message below to get started.</p>
+                    </div>
+                </div>
+            </main>
+
+            <footer>
+                <form id="input-form">
+                    <div class="input-wrapper">
+                        <textarea id="message-input" placeholder="Send a message..." rows="1" autofocus></textarea>
+                        <button type="submit" id="send-btn" title="Send message">
+                            <span class="send-icon">&#10148;</span>
+                        </button>
+                    </div>
+                </form>
+                <div id="status-bar">
+                    <span id="status-dot" class="status-dot idle"></span>
+                    <span id="status-text">Ready</span>
+                </div>
+            </footer>
+        </div>
+
+        <div id="settings-view" class="settings-view hidden">
+        <header class="settings-header">
+            <div class="header-left">
+                <button id="settings-back" class="settings-back-btn" title="Back to Chat">
+                    <span>&#8592;</span> Back
+                </button>
+            </div>
+            <h1>Settings</h1>
         </header>
 
-        <main id="chat-container">
-            <div id="messages">
-                <div class="welcome-message">
-                    <div class="welcome-icon">A</div>
-                    <p>Hello! I'm <strong>Athen</strong>, your universal AI agent. I can execute shell commands, read and write files, manage tasks, and more.</p>
-                    <p class="welcome-hint">Type a message below to get started.</p>
+        <div class="settings-content">
+            <section class="settings-section">
+                <h2>LLM Providers</h2>
+                <p class="settings-description">Configure the AI models Athen uses. Changes take effect after restarting the app.</p>
+                <div id="provider-list"></div>
+                <div class="add-provider-area">
+                    <button id="add-provider-btn" class="add-provider-btn">+ Add Provider</button>
+                    <div id="provider-templates" class="provider-templates hidden">
+                        <button class="template-btn" data-provider="deepseek">DeepSeek</button>
+                        <button class="template-btn" data-provider="openai">OpenAI</button>
+                        <button class="template-btn" data-provider="anthropic">Anthropic</button>
+                        <button class="template-btn" data-provider="ollama">Ollama (local)</button>
+                        <button class="template-btn" data-provider="llamacpp">llama.cpp (local)</button>
+                        <button class="template-btn" data-provider="custom">Custom</button>
+                    </div>
                 </div>
-            </div>
-        </main>
+            </section>
 
-        <footer>
-            <form id="input-form">
-                <div class="input-wrapper">
-                    <textarea id="message-input" placeholder="Send a message..." rows="1" autofocus></textarea>
-                    <button type="submit" id="send-btn" title="Send message">
-                        <span class="send-icon">&#10148;</span>
-                    </button>
+            <section class="settings-section">
+                <h2>Security</h2>
+                <div class="setting-row">
+                    <label for="security-mode">Security Mode</label>
+                    <select id="security-mode" class="settings-select">
+                        <option value="assistant">Assistant (recommended)</option>
+                        <option value="bunker">Bunker (extra cautious)</option>
+                        <option value="yolo">YOLO (minimal prompts)</option>
+                    </select>
+                    <p class="setting-hint" id="security-hint">Standard risk evaluation. The agent asks for approval on risky actions.</p>
                 </div>
-            </form>
-            <div id="status-bar">
-                <span id="status-dot" class="status-dot idle"></span>
-                <span id="status-text">Ready</span>
-            </div>
-        </footer>
+                <div class="setting-actions">
+                    <button id="save-security-btn" class="btn-primary">Save Security Settings</button>
+                </div>
+            </section>
+        </div>
     </div>
+    </div>
+
+    <div id="sidebar-overlay" class="sidebar-overlay"></div>
     <script src="app.js"></script>
 </body>
 </html>

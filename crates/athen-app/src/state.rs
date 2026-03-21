@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Serialize;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
 use athen_core::config::{AthenConfig, AuthType, ProfileConfig};
@@ -25,25 +25,33 @@ use athen_core::traits::llm::{LlmProvider, LlmRouter};
 use athen_coordinador::Coordinator;
 use athen_llm::budget::BudgetTracker;
 use athen_llm::providers::deepseek::DeepSeekProvider;
+use athen_llm::providers::llamacpp::LlamaCppProvider;
+use athen_llm::providers::ollama::OllamaProvider;
+use athen_llm::providers::openai::OpenAiCompatibleProvider;
 use athen_llm::router::DefaultLlmRouter;
 use athen_persistence::chat::ChatStore;
 use athen_persistence::Database;
 use athen_risk::llm_fallback::LlmRiskEvaluator;
 use athen_risk::CombinedRiskEvaluator;
 
-/// Wrapper to share the router via `Arc` while satisfying the `LlmRouter` trait.
-pub(crate) struct SharedRouter(pub Arc<DefaultLlmRouter>);
+/// Wrapper to share the router via `Arc<RwLock<Arc<...>>>` while satisfying
+/// the `LlmRouter` trait.  The `RwLock` allows the inner router to be swapped
+/// at runtime (e.g. when the user switches active provider).
+pub(crate) struct SharedRouter(pub Arc<RwLock<Arc<DefaultLlmRouter>>>);
 
 #[async_trait]
 impl LlmRouter for SharedRouter {
     async fn route(&self, request: &LlmRequest) -> Result<LlmResponse> {
-        self.0.route(request).await
+        let router = self.0.read().await.clone();
+        router.route(request).await
     }
     async fn route_streaming(&self, request: &LlmRequest) -> Result<LlmStream> {
-        self.0.route_streaming(request).await
+        let router = self.0.read().await.clone();
+        router.route_streaming(request).await
     }
     async fn budget_remaining(&self) -> Result<BudgetStatus> {
-        self.0.budget_remaining().await
+        let router = self.0.read().await.clone();
+        router.budget_remaining().await
     }
 }
 
@@ -59,14 +67,18 @@ pub struct PendingApproval {
 /// Top-level application state managed by Tauri.
 pub struct AppState {
     pub coordinator: Coordinator,
-    pub router: Arc<DefaultLlmRouter>,
+    /// The LLM router, wrapped in `RwLock` so it can be swapped at runtime
+    /// when the user switches active provider.
+    pub router: Arc<RwLock<Arc<DefaultLlmRouter>>>,
+    /// The ID of the currently active LLM provider (e.g. "deepseek", "ollama").
+    pub active_provider_id: Mutex<String>,
     /// In-memory conversation history for the current session.
     pub history: Mutex<Vec<ChatMessage>>,
     /// The user's original message for a task pending approval, so it can
     /// be replayed through the executor once approved.
     pub pending_message: Mutex<Option<String>>,
     /// The model name reported to the frontend (from config or default).
-    pub model_name: String,
+    pub model_name: Mutex<String>,
     /// Current session identifier (format: `session_YYYYMMDD_HHMMSS`).
     pub session_id: Mutex<String>,
     /// Persistent chat storage backed by SQLite.
@@ -91,9 +103,12 @@ impl AppState {
     /// `DEEPSEEK_API_KEY` env var always takes precedence over config file values.
     pub async fn new() -> Self {
         let config = load_config();
-        let (api_key, model_name) = resolve_api_key_and_model(&config);
 
-        let router = build_router(api_key);
+        // Determine which provider to activate on startup.
+        let active_id = resolve_active_provider(&config);
+        let (router, model_name) = build_router_for_provider_from_config(&active_id, &config);
+
+        let router = Arc::new(RwLock::new(router));
         let (coordinator, database) = build_coordinator_with_persistence(&router).await;
 
         // Build the chat store and try to restore history from the latest session.
@@ -103,9 +118,10 @@ impl AppState {
         Self {
             coordinator,
             router,
+            active_provider_id: Mutex::new(active_id),
             history: Mutex::new(history),
             pending_message: Mutex::new(None),
-            model_name,
+            model_name: Mutex::new(model_name),
             session_id: Mutex::new(session_id),
             chat_store,
             _database: database,
@@ -160,60 +176,6 @@ fn load_config() -> AthenConfig {
     }
 }
 
-/// Resolve the DeepSeek API key and model name from env var + config.
-///
-/// Env var `DEEPSEEK_API_KEY` takes precedence over config file values.
-/// Placeholder values like `${DEEPSEEK_API_KEY}` in the config are treated
-/// as unresolved.
-fn resolve_api_key_and_model(config: &AthenConfig) -> (String, String) {
-    let mut model_name = "deepseek-chat".to_string();
-
-    // Try env var first.
-    let api_key = match std::env::var("DEEPSEEK_API_KEY") {
-        Ok(key) if !key.is_empty() => {
-            // Still pick up the model name from config if available.
-            if let Some(provider) = config.models.providers.get("deepseek") {
-                if !provider.default_model.is_empty() {
-                    model_name = provider.default_model.clone();
-                }
-            }
-            key
-        }
-        _ => {
-            // Try to get from config providers.
-            match config.models.providers.get("deepseek") {
-                Some(provider) => {
-                    if !provider.default_model.is_empty() {
-                        model_name = provider.default_model.clone();
-                    }
-                    match &provider.auth {
-                        AuthType::ApiKey(key)
-                            if !key.is_empty() && !key.starts_with("${") =>
-                        {
-                            key.clone()
-                        }
-                        _ => {
-                            warn!(
-                                "No DEEPSEEK_API_KEY env var and no valid API key in config. \
-                                 Chat will not work until an API key is provided."
-                            );
-                            String::new()
-                        }
-                    }
-                }
-                None => {
-                    warn!(
-                        "No DEEPSEEK_API_KEY env var and no deepseek provider in config. \
-                         Chat will not work until an API key is provided."
-                    );
-                    String::new()
-                }
-            }
-        }
-    };
-
-    (api_key, model_name)
-}
 
 // ---------------------------------------------------------------------------
 // System initialisation
@@ -234,16 +196,152 @@ fn ensure_data_dir() -> Option<PathBuf> {
     }
 }
 
-/// Build the LLM router with the DeepSeek provider and default profiles.
-fn build_router(api_key: String) -> Arc<DefaultLlmRouter> {
-    let provider = DeepSeekProvider::new(api_key);
+/// Determine the active provider ID from config, falling back to "deepseek".
+///
+/// Looks for `active_provider` in `config.models.assignments` (we reuse the
+/// existing assignments map with a special key), or defaults to "deepseek".
+fn resolve_active_provider(config: &AthenConfig) -> String {
+    config
+        .models
+        .assignments
+        .get("active_provider")
+        .filter(|s| !s.is_empty())
+        .cloned()
+        .unwrap_or_else(|| "deepseek".to_string())
+}
+
+/// Build a router for the given provider ID, reading configuration from the
+/// supplied `AthenConfig`.  Returns `(Arc<DefaultLlmRouter>, model_name)`.
+fn build_router_for_provider_from_config(
+    provider_id: &str,
+    config: &AthenConfig,
+) -> (Arc<DefaultLlmRouter>, String) {
+    let provider_cfg = config.models.providers.get(provider_id);
+
+    let base_url = provider_cfg
+        .and_then(|c| c.endpoint.as_deref())
+        .unwrap_or_else(|| default_base_url_for(provider_id))
+        .to_string();
+
+    let model = provider_cfg
+        .map(|c| c.default_model.as_str())
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| default_model_for(provider_id))
+        .to_string();
+
+    // Resolve API key: env var first, then config.
+    let api_key = resolve_api_key_for(provider_id, provider_cfg);
+
+    let router = build_router_for_provider(provider_id, &base_url, &model, api_key.as_deref());
+    (router, model)
+}
+
+/// Default base URL for known provider IDs.
+fn default_base_url_for(id: &str) -> &str {
+    match id {
+        "deepseek" => "https://api.deepseek.com",
+        "openai" => "https://api.openai.com",
+        "anthropic" => "https://api.anthropic.com",
+        "ollama" => "http://localhost:11434",
+        "llamacpp" => "http://localhost:8080",
+        _ => "http://localhost:8080",
+    }
+}
+
+/// Default model for known provider IDs.
+fn default_model_for(id: &str) -> &str {
+    match id {
+        "deepseek" => "deepseek-chat",
+        "openai" => "gpt-4o",
+        "anthropic" => "claude-sonnet-4-20250514",
+        "ollama" => "llama3",
+        "llamacpp" => "default",
+        _ => "default",
+    }
+}
+
+/// Resolve an API key for a provider, checking environment variables first,
+/// then the config file value.
+fn resolve_api_key_for(
+    provider_id: &str,
+    provider_cfg: Option<&athen_core::config::ProviderConfig>,
+) -> Option<String> {
+    // Check for provider-specific env var (e.g. DEEPSEEK_API_KEY, OPENAI_API_KEY).
+    let env_var = format!("{}_API_KEY", provider_id.to_uppercase());
+    if let Ok(key) = std::env::var(&env_var) {
+        if !key.is_empty() {
+            return Some(key);
+        }
+    }
+
+    // Fall back to config.
+    provider_cfg.and_then(|c| match &c.auth {
+        AuthType::ApiKey(key) if !key.is_empty() && !key.starts_with("${") => {
+            Some(key.clone())
+        }
+        _ => None,
+    })
+}
+
+/// Build a `DefaultLlmRouter` for a specific provider.
+///
+/// Uses the appropriate provider type based on the ID:
+/// - `"deepseek"` -> `DeepSeekProvider`
+/// - `"ollama"` -> `OllamaProvider`
+/// - `"llamacpp"` -> `LlamaCppProvider`
+/// - anything else -> `OpenAiCompatibleProvider`
+pub(crate) fn build_router_for_provider(
+    provider_id: &str,
+    base_url: &str,
+    model: &str,
+    api_key: Option<&str>,
+) -> Arc<DefaultLlmRouter> {
+    let provider: Box<dyn LlmProvider> = match provider_id {
+        "deepseek" => {
+            let key = api_key.unwrap_or_default().to_string();
+            let mut p = DeepSeekProvider::new(key);
+            if base_url != "https://api.deepseek.com" {
+                p = p.with_base_url(base_url.to_string());
+            }
+            if model != "deepseek-chat" {
+                p = p.with_model(model.to_string());
+            }
+            Box::new(p)
+        }
+        "ollama" => {
+            let mut p = OllamaProvider::new(model.to_string());
+            if base_url != "http://localhost:11434" {
+                p = p.with_base_url(base_url.to_string());
+            }
+            Box::new(p)
+        }
+        "llamacpp" => {
+            Box::new(LlamaCppProvider::new(base_url.to_string(), model.to_string()))
+        }
+        _ => {
+            // Generic OpenAI-compatible provider (openai, anthropic, custom).
+            let mut p = OpenAiCompatibleProvider::new(base_url.to_string())
+                .with_model(model.to_string())
+                .with_provider_id(provider_id.to_string());
+            if let Some(key) = api_key {
+                p = p.with_api_key(key.to_string());
+            }
+            // Local providers use zero-cost estimation.
+            if matches!(provider_id, "ollama" | "llamacpp") {
+                p = p.with_cost_estimator(Box::new(
+                    athen_llm::providers::openai::ZeroCostEstimator,
+                ));
+            }
+            Box::new(p)
+        }
+    };
 
     let mut providers: HashMap<String, Box<dyn LlmProvider>> = HashMap::new();
-    providers.insert("deepseek".into(), Box::new(provider));
+    providers.insert(provider_id.into(), provider);
 
     let profile = ProfileConfig {
-        description: "DeepSeek default".into(),
-        priority: vec!["deepseek".into()],
+        description: format!("{} default", provider_id),
+        priority: vec![provider_id.into()],
         fallback: None,
     };
 
@@ -315,13 +413,20 @@ async fn restore_or_create_session(
         }
     }
 
-    (generate_session_id(), Vec::new())
+    // Create a new session with metadata.
+    let new_id = generate_session_id();
+    if let Some(store) = chat_store {
+        if let Err(e) = store.create_session(&new_id, "New Chat").await {
+            warn!("Failed to create initial session metadata: {e}");
+        }
+    }
+    (new_id, Vec::new())
 }
 
 /// Build the coordinator with the combined (rules + LLM) risk evaluator
 /// and optional SQLite persistence at `~/.athen/athen.db`.
 async fn build_coordinator_with_persistence(
-    router: &Arc<DefaultLlmRouter>,
+    router: &Arc<RwLock<Arc<DefaultLlmRouter>>>,
 ) -> (Coordinator, Option<Database>) {
     let risk_router: Box<dyn LlmRouter> = Box::new(SharedRouter(Arc::clone(router)));
     let llm_evaluator = LlmRiskEvaluator::new(risk_router);
