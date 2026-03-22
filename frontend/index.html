@@ -109,6 +109,64 @@
                     <button id="save-security-btn" class="btn-primary">Save Security Settings</button>
                 </div>
             </section>
+
+            <section class="settings-section">
+                <h2>Email Monitor</h2>
+                <p class="settings-description">Connect your email to let Athen monitor and act on incoming messages.</p>
+
+                <div class="setting-row">
+                    <label class="toggle-label">
+                        <input type="checkbox" id="email-enabled">
+                        <span>Enable Email Monitoring</span>
+                    </label>
+                </div>
+
+                <div id="email-settings-fields">
+                    <div class="setting-row">
+                        <label for="email-imap-server">IMAP Server</label>
+                        <input type="text" id="email-imap-server" class="settings-input" placeholder="imap.gmail.com">
+                    </div>
+                    <div class="setting-row">
+                        <label for="email-imap-port">Port</label>
+                        <input type="number" id="email-imap-port" class="settings-input" value="993" min="1" max="65535">
+                    </div>
+                    <div class="setting-row">
+                        <label for="email-username">Email / Username</label>
+                        <input type="text" id="email-username" class="settings-input" placeholder="you@gmail.com">
+                    </div>
+                    <div class="setting-row">
+                        <label for="email-password">Password / App Password</label>
+                        <input type="password" id="email-password" class="settings-input" placeholder="Enter app password">
+                        <p class="setting-hint">For Gmail, use an <a href="https://myaccount.google.com/apppasswords" target="_blank">App Password</a>. Your regular password won't work with 2FA.</p>
+                    </div>
+                    <div class="setting-row">
+                        <label class="toggle-label">
+                            <input type="checkbox" id="email-use-tls" checked>
+                            <span>Use TLS (recommended)</span>
+                        </label>
+                    </div>
+                    <div class="setting-row">
+                        <label for="email-folders">Folders to Monitor</label>
+                        <input type="text" id="email-folders" class="settings-input" value="INBOX" placeholder="INBOX, Important">
+                        <p class="setting-hint">Comma-separated list of IMAP folders.</p>
+                    </div>
+                    <div class="setting-row">
+                        <label for="email-poll-interval">Poll Interval (seconds)</label>
+                        <input type="number" id="email-poll-interval" class="settings-input" value="60" min="10" max="3600">
+                    </div>
+                    <div class="setting-row">
+                        <label for="email-lookback">Lookback (hours)</label>
+                        <input type="number" id="email-lookback" class="settings-input" value="24" min="1" max="168">
+                        <p class="setting-hint">Only process emails newer than this.</p>
+                    </div>
+                </div>
+
+                <div class="setting-actions">
+                    <button id="test-email-btn" class="btn-secondary">Test Connection</button>
+                    <button id="save-email-btn" class="btn-primary">Save Email Settings</button>
+                </div>
+                <div id="email-test-result" class="test-result hidden"></div>
+            </section>
         </div>
     </div>
     </div>

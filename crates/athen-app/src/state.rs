@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Serialize;
+use tauri::Emitter;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
@@ -89,6 +90,8 @@ pub struct AppState {
     /// Cancellation flag for the currently running agent executor.
     /// Set to `true` to cancel the in-progress task immediately.
     pub cancel_flag: Arc<AtomicBool>,
+    /// Shutdown sender for the email monitor background task.
+    pub email_shutdown: Option<tokio::sync::broadcast::Sender<()>>,
 }
 
 impl AppState {
@@ -130,7 +133,118 @@ impl AppState {
             chat_store,
             _database: database,
             cancel_flag: Arc::new(AtomicBool::new(false)),
+            email_shutdown: None,
         }
+    }
+
+    /// Start the email monitor background polling task.
+    ///
+    /// This must be called after the `AppState` is constructed but before it
+    /// is handed to `app.manage()`, because we need the `AppHandle` to emit
+    /// Tauri events to the frontend.
+    pub fn start_email_monitor(&mut self, app_handle: tauri::AppHandle) {
+        use athen_core::traits::sense::SenseMonitor;
+        use athen_sentidos::email::EmailMonitor;
+
+        let config = load_config();
+        if !config.email.enabled {
+            info!("Email monitor disabled in config, skipping startup");
+            return;
+        }
+
+        if config.email.imap_server.is_empty() {
+            warn!("Email monitor enabled but no IMAP server configured");
+            return;
+        }
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+        self.email_shutdown = Some(shutdown_tx);
+
+        let mut monitor = EmailMonitor::new();
+        let email_config = config.clone();
+
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = monitor.init(&email_config).await {
+                tracing::error!("Failed to initialize email monitor: {e}");
+                return;
+            }
+
+            let poll_interval = monitor.poll_interval();
+            info!("Email monitor started, polling every {:?}", poll_interval);
+
+            let mut shutdown = shutdown_rx;
+            loop {
+                match monitor.poll().await {
+                    Ok(events) if !events.is_empty() => {
+                        info!("Email monitor received {} new event(s)", events.len());
+                        for event in &events {
+                            let subject = event
+                                .content
+                                .summary
+                                .as_deref()
+                                .unwrap_or("(no subject)");
+                            let from = event
+                                .sender
+                                .as_ref()
+                                .map(|s| {
+                                    s.display_name
+                                        .as_deref()
+                                        .unwrap_or(&s.identifier)
+                                })
+                                .unwrap_or("unknown");
+
+                            // Extract a body preview (first 500 chars of text).
+                            let body_preview = event
+                                .content
+                                .body
+                                .get("text")
+                                .and_then(|t| t.as_str())
+                                .map(|t| {
+                                    let trimmed = t.trim();
+                                    if trimmed.len() > 500 {
+                                        format!("{}...", &trimmed[..500])
+                                    } else {
+                                        trimmed.to_string()
+                                    }
+                                })
+                                .unwrap_or_default();
+
+                            info!("New email from '{}': '{}'", from, subject);
+
+                            let _ = app_handle.emit(
+                                "email-event",
+                                serde_json::json!({
+                                    "type": "new_email",
+                                    "from": from,
+                                    "subject": subject,
+                                    "body_preview": body_preview,
+                                    "event_id": event.id.to_string(),
+                                }),
+                            );
+                        }
+                    }
+                    Ok(_) => {
+                        tracing::debug!("Email poll: no new messages");
+                    }
+                    Err(e) => {
+                        warn!("Email poll error: {e}");
+                    }
+                }
+
+                tokio::select! {
+                    _ = tokio::time::sleep(poll_interval) => {}
+                    _ = shutdown.recv() => {
+                        info!("Email monitor shutdown signal received");
+                        break;
+                    }
+                }
+            }
+
+            if let Err(e) = monitor.shutdown().await {
+                warn!("Email monitor shutdown error: {e}");
+            }
+            info!("Email monitor stopped");
+        });
     }
 }
 

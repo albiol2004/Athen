@@ -1494,8 +1494,82 @@ footer {
     margin-top: 6px;
 }
 
+.setting-hint a {
+    color: var(--accent);
+    text-decoration: none;
+}
+
+.setting-hint a:hover {
+    text-decoration: underline;
+}
+
 .setting-actions {
+    display: flex;
+    gap: 0.75rem;
     margin-top: 16px;
+}
+
+/* ─── Toggle & Input Controls ─── */
+.toggle-label {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    cursor: pointer;
+}
+
+.toggle-label input[type="checkbox"] {
+    width: 1.1rem;
+    height: 1.1rem;
+    accent-color: var(--accent);
+}
+
+.settings-input {
+    width: 100%;
+    max-width: 400px;
+    padding: 8px 12px;
+    background: var(--bg-code);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text-primary);
+    font-size: 13px;
+    font-family: inherit;
+    margin-top: 4px;
+    outline: none;
+    transition: border-color 0.2s;
+}
+
+.settings-input:focus {
+    border-color: var(--accent);
+}
+
+.settings-input::placeholder {
+    color: var(--text-muted);
+}
+
+/* ─── Email Test Results ─── */
+.test-success {
+    background: rgba(158, 206, 106, 0.15);
+    color: var(--success);
+    border: 1px solid rgba(158, 206, 106, 0.3);
+    padding: 8px 12px;
+    border-radius: 6px;
+    font-size: 13px;
+    margin-top: 12px;
+}
+
+.test-error {
+    background: rgba(247, 118, 142, 0.15);
+    color: var(--danger);
+    border: 1px solid rgba(247, 118, 142, 0.3);
+    padding: 8px 12px;
+    border-radius: 6px;
+    font-size: 13px;
+    margin-top: 12px;
+}
+
+.btn-secondary:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
 }
 
 /* ─── Toast Notification ─── */
@@ -1535,6 +1609,155 @@ footer {
 .settings-content::-webkit-scrollbar-thumb {
     background: var(--border-subtle);
     border-radius: 3px;
+}
+
+/* ─── Email Notification Toast ─── */
+
+.email-notification {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.75rem 1rem;
+    margin: 0.5rem 1rem;
+    background: linear-gradient(135deg, #1a1b26 0%, #24283b 100%);
+    border: 1px solid #7aa2f7;
+    border-left: 3px solid #7aa2f7;
+    border-radius: 8px;
+    animation: emailSlideIn 0.3s ease-out;
+    transition: opacity 0.3s ease;
+}
+
+.email-notification-icon {
+    font-size: 1.5rem;
+    flex-shrink: 0;
+}
+
+.email-notification-content {
+    flex: 1;
+    min-width: 0;
+}
+
+.email-notification-from {
+    color: #7aa2f7;
+    font-weight: 600;
+    font-size: 0.85rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.email-notification-subject {
+    color: #a9b1d6;
+    font-size: 0.8rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-top: 0.15rem;
+}
+
+.email-notification-close {
+    background: none;
+    border: none;
+    color: #565f89;
+    font-size: 1.2rem;
+    cursor: pointer;
+    padding: 0 0.25rem;
+    flex-shrink: 0;
+}
+
+.email-notification-close:hover {
+    color: #c0caf5;
+}
+
+/* Email card in chat */
+.email-card {
+    background: linear-gradient(135deg, #1a1b26 0%, #24283b 100%);
+    border: 1px solid #3b3d57;
+    border-left: 3px solid #7aa2f7;
+    border-radius: 10px;
+    padding: 1rem;
+    margin: 0.5rem 1rem;
+    animation: emailSlideIn 0.3s ease-out;
+}
+
+.email-card-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.5rem;
+}
+
+.email-card-icon {
+    font-size: 1.2rem;
+}
+
+.email-card-label {
+    color: #7aa2f7;
+    font-weight: 600;
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.email-card-time {
+    margin-left: auto;
+    color: #565f89;
+    font-size: 0.75rem;
+}
+
+.email-card-from {
+    color: #c0caf5;
+    font-weight: 600;
+    font-size: 0.9rem;
+    margin-bottom: 0.25rem;
+}
+
+.email-card-subject {
+    color: #a9b1d6;
+    font-size: 0.85rem;
+    margin-bottom: 0.5rem;
+}
+
+.email-card-body {
+    color: #787c99;
+    font-size: 0.8rem;
+    line-height: 1.4;
+    max-height: 6rem;
+    overflow: hidden;
+    margin-bottom: 0.75rem;
+    white-space: pre-wrap;
+}
+
+.email-card-actions {
+    display: flex;
+    gap: 0.5rem;
+}
+
+.email-action-btn {
+    background: #3b3d57;
+    color: #c0caf5;
+    border: none;
+    padding: 0.35rem 0.75rem;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.8rem;
+    transition: background 0.15s;
+}
+
+.email-action-btn:hover {
+    background: #7aa2f7;
+    color: #1a1b26;
+}
+
+@keyframes emailSlideIn {
+    from {
+        transform: translateY(-10px);
+        opacity: 0;
+    }
+    to {
+        transform: translateY(0);
+        opacity: 1;
+    }
 }
 
 /* ─── Responsive ─── */

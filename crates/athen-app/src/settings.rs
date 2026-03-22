@@ -33,12 +33,27 @@ pub struct ProviderInfo {
     pub is_active: bool,
 }
 
+/// Email configuration info for the frontend.
+#[derive(Debug, Clone, Serialize)]
+pub struct EmailSettingsInfo {
+    pub enabled: bool,
+    pub imap_server: String,
+    pub imap_port: u16,
+    pub username: String,
+    pub has_password: bool,
+    pub use_tls: bool,
+    pub folders: String,
+    pub poll_interval_secs: u64,
+    pub lookback_hours: u32,
+}
+
 /// Full settings response for the frontend.
 #[derive(Debug, Clone, Serialize)]
 pub struct SettingsResponse {
     pub providers: Vec<ProviderInfo>,
     pub active_provider: String,
     pub security_mode: String,
+    pub email: EmailSettingsInfo,
 }
 
 /// Result of a provider connection test.
@@ -274,10 +289,23 @@ pub async fn get_settings(
 
     let security_mode = format!("{:?}", main_config.security.mode).to_lowercase();
 
+    let email = EmailSettingsInfo {
+        enabled: main_config.email.enabled,
+        imap_server: main_config.email.imap_server.clone(),
+        imap_port: main_config.email.imap_port,
+        username: main_config.email.username.clone(),
+        has_password: !main_config.email.password.is_empty(),
+        use_tls: main_config.email.use_tls,
+        folders: main_config.email.folders.join(", "),
+        poll_interval_secs: main_config.email.poll_interval_secs,
+        lookback_hours: main_config.email.lookback_hours,
+    };
+
     Ok(SettingsResponse {
         providers,
         active_provider: active,
         security_mode,
+        email,
     })
 }
 
@@ -605,6 +633,123 @@ pub async fn save_settings(
 
     save_main_config(&config)?;
     Ok("Settings saved. Restart the app to apply changes.".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Email settings commands
+// ---------------------------------------------------------------------------
+
+/// Save email monitor settings.
+#[tauri::command]
+pub async fn save_email_settings(
+    enabled: bool,
+    imap_server: String,
+    imap_port: u16,
+    username: String,
+    password: Option<String>,
+    use_tls: bool,
+    folders: String,
+    poll_interval_secs: u64,
+    lookback_hours: u32,
+) -> std::result::Result<String, String> {
+    let mut config = load_main_config();
+
+    config.email.enabled = enabled;
+    config.email.imap_server = imap_server;
+    config.email.imap_port = imap_port;
+    config.email.username = username;
+    if let Some(pw) = password {
+        if !pw.is_empty() {
+            config.email.password = pw;
+        }
+    }
+    config.email.use_tls = use_tls;
+    config.email.folders = folders
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    config.email.poll_interval_secs = poll_interval_secs;
+    config.email.lookback_hours = lookback_hours;
+
+    save_main_config(&config)?;
+    Ok("Email settings saved. Restart to apply.".to_string())
+}
+
+/// Test email connection with the provided IMAP settings.
+#[tauri::command]
+pub async fn test_email_connection(
+    imap_server: String,
+    imap_port: u16,
+    username: String,
+    password: String,
+    use_tls: bool,
+) -> std::result::Result<TestResult, String> {
+    // Run the blocking IMAP test in spawn_blocking
+    let result = tokio::task::spawn_blocking(move || {
+        test_imap_connection(&imap_server, imap_port, &username, &password, use_tls)
+    })
+    .await
+    .map_err(|e| format!("Test task failed: {e}"))?;
+
+    match result {
+        Ok(msg) => Ok(TestResult {
+            success: true,
+            message: msg,
+        }),
+        Err(msg) => Ok(TestResult {
+            success: false,
+            message: msg,
+        }),
+    }
+}
+
+fn test_imap_connection(
+    server: &str,
+    port: u16,
+    username: &str,
+    password: &str,
+    use_tls: bool,
+) -> Result<String, String> {
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let addr = (server, port);
+    let tcp = TcpStream::connect(addr)
+        .map_err(|e| format!("Connection failed: {e}"))?;
+    tcp.set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(|e| format!("Failed to set timeout: {e}"))?;
+    tcp.set_write_timeout(Some(Duration::from_secs(10)))
+        .map_err(|e| format!("Failed to set timeout: {e}"))?;
+
+    if use_tls {
+        let connector = rustls_connector::RustlsConnector::new_with_native_certs()
+            .map_err(|e| format!("TLS setup failed: {e}"))?;
+        let tls_stream = connector
+            .connect(server, tcp)
+            .map_err(|e| format!("TLS handshake failed: {e}"))?;
+        let client = imap::Client::new(tls_stream);
+        let mut session = client
+            .login(username, password)
+            .map_err(|(e, _)| format!("Login failed: {e}"))?;
+        let mailbox = session
+            .select("INBOX")
+            .map_err(|e| format!("Failed to select INBOX: {e}"))?;
+        let count = mailbox.exists;
+        session.logout().map_err(|e| format!("Logout failed: {e}"))?;
+        Ok(format!("Connected successfully. INBOX has {} messages.", count))
+    } else {
+        let client = imap::Client::new(tcp);
+        let mut session = client
+            .login(username, password)
+            .map_err(|(e, _)| format!("Login failed: {e}"))?;
+        let mailbox = session
+            .select("INBOX")
+            .map_err(|e| format!("Failed to select INBOX: {e}"))?;
+        let count = mailbox.exists;
+        session.logout().map_err(|e| format!("Logout failed: {e}"))?;
+        Ok(format!("Connected successfully. INBOX has {} messages.", count))
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -12,6 +12,9 @@ use state::AppState;
 
 /// Build and run the Tauri application.
 pub fn run() {
+    // Install the rustls crypto provider before anything else uses TLS.
+    // Both reqwest (for LLM calls) and rustls-connector (for IMAP) need this.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             commands::send_message,
@@ -31,18 +34,23 @@ pub fn run() {
             settings::test_provider,
             settings::save_settings,
             settings::set_active_provider,
+            settings::save_email_settings,
+            settings::test_email_connection,
         ])
         .setup(|app| {
             use tauri::Manager;
 
             // Build the application state asynchronously (loads config, opens database).
-            let state = tauri::async_runtime::block_on(AppState::new());
+            let mut state = tauri::async_runtime::block_on(AppState::new());
 
             // Register an agent so tasks can be dispatched.
             let agent_id = uuid::Uuid::new_v4();
             tauri::async_runtime::block_on(async {
                 state.coordinator.dispatcher().register_agent(agent_id).await;
             });
+
+            // Start the email monitor background task before managing state.
+            state.start_email_monitor(app.handle().clone());
 
             app.manage(state);
             Ok(())

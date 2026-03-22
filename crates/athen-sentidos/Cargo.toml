@@ -13,3 +13,6 @@ tracing = { workspace = true }
 async-trait = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+imap = { workspace = true }
+rustls-connector = { workspace = true }
+mailparse = { workspace = true }

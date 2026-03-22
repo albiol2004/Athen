@@ -13,6 +13,7 @@ pub struct AthenConfig {
     pub domains: HashMap<String, DomainConfig>,
     pub security: SecurityConfig,
     pub persistence: PersistenceConfig,
+    pub email: EmailConfig,
 }
 
 impl Default for AthenConfig {
@@ -24,6 +25,7 @@ impl Default for AthenConfig {
             domains: default_domains(),
             security: SecurityConfig::default(),
             persistence: PersistenceConfig::default(),
+            email: EmailConfig::default(),
         }
     }
 }
@@ -191,6 +193,38 @@ pub struct PersistenceConfig {
     pub db_path: PathBuf,
     pub checkpoint_interval_secs: u32,
     pub completed_retention_days: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EmailConfig {
+    pub enabled: bool,
+    pub imap_server: String,
+    pub imap_port: u16,
+    pub username: String,
+    /// Stored encrypted or as app password reference
+    pub password: String,
+    pub use_tls: bool,
+    pub folders: Vec<String>,
+    pub poll_interval_secs: u64,
+    /// Only process emails newer than this many hours
+    pub lookback_hours: u32,
+}
+
+impl Default for EmailConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            imap_server: String::new(),
+            imap_port: 993,
+            username: String::new(),
+            password: String::new(),
+            use_tls: true,
+            folders: vec!["INBOX".to_string()],
+            poll_interval_secs: 60,
+            lookback_hours: 24,
+        }
+    }
 }
 
 impl Default for PersistenceConfig {

@@ -152,6 +152,14 @@ function initTauri() {
                     });
                 });
             });
+
+            // Listen for email monitor events.
+            window.__TAURI__.event.listen('email-event', (event) => {
+                const { type: eventType, from, subject, body_preview } = event.payload;
+                if (eventType === 'new_email') {
+                    showEmailNotification(from, subject, body_preview);
+                }
+            });
         }
 
         setStatus('idle', 'Ready');
@@ -592,6 +600,70 @@ function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
+}
+
+// ─── Email Notifications ───
+
+function showEmailNotification(from, subject, bodyPreview) {
+    const container = document.getElementById('messages');
+    if (!container) return;
+
+    // Remove welcome message if present.
+    const welcome = container.querySelector('.welcome-message');
+    if (welcome) welcome.remove();
+
+    // Build email card in the chat area.
+    const card = document.createElement('div');
+    card.className = 'email-card';
+
+    const preview = bodyPreview
+        ? '<div class="email-card-body">' + escapeHtml(bodyPreview) + '</div>'
+        : '';
+
+    card.innerHTML =
+        '<div class="email-card-header">' +
+            '<span class="email-card-icon">&#x1f4e7;</span>' +
+            '<span class="email-card-label">New Email</span>' +
+            '<span class="email-card-time">' + formatTime(new Date()) + '</span>' +
+        '</div>' +
+        '<div class="email-card-from">' + escapeHtml(from) + '</div>' +
+        '<div class="email-card-subject">' + escapeHtml(subject) + '</div>' +
+        preview +
+        '<div class="email-card-actions">' +
+            '<button class="email-action-btn" onclick="askAboutEmail(this, \'summarize\')">Summarize</button>' +
+            '<button class="email-action-btn" onclick="askAboutEmail(this, \'reply\')">Draft Reply</button>' +
+        '</div>';
+
+    container.appendChild(card);
+
+    // Scroll to the new card.
+    requestAnimationFrame(() => {
+        container.parentElement.scrollTo({
+            top: container.parentElement.scrollHeight,
+            behavior: 'smooth'
+        });
+    });
+}
+
+// Handle email action buttons — sends a message to the agent about the email.
+function askAboutEmail(btn, action) {
+    const card = btn.closest('.email-card');
+    if (!card) return;
+    const from = card.querySelector('.email-card-from')?.textContent || '';
+    const subject = card.querySelector('.email-card-subject')?.textContent || '';
+    const body = card.querySelector('.email-card-body')?.textContent || '';
+
+    let prompt;
+    if (action === 'summarize') {
+        prompt = 'Summarize this email from ' + from + ' with subject "' + subject + '":\n\n' + body;
+    } else if (action === 'reply') {
+        prompt = 'Draft a reply to this email from ' + from + ' with subject "' + subject + '":\n\n' + body;
+    }
+
+    if (prompt && inputEl) {
+        inputEl.value = prompt;
+        formEl.requestSubmit();
+    }
 }
 
 // ─── Time Formatting ───
@@ -1152,6 +1224,24 @@ async function loadSettings() {
         renderProviders(settings.providers);
         securityModeEl.value = settings.security_mode;
         securityHintEl.textContent = SECURITY_HINTS[settings.security_mode] || '';
+
+        // Populate email settings
+        if (settings.email) {
+            document.getElementById('email-enabled').checked = settings.email.enabled;
+            document.getElementById('email-imap-server').value = settings.email.imap_server || '';
+            document.getElementById('email-imap-port').value = settings.email.imap_port || 993;
+            document.getElementById('email-username').value = settings.email.username || '';
+            document.getElementById('email-use-tls').checked = settings.email.use_tls !== false;
+            document.getElementById('email-folders').value = settings.email.folders || 'INBOX';
+            document.getElementById('email-poll-interval').value = settings.email.poll_interval_secs || 60;
+            document.getElementById('email-lookback').value = settings.email.lookback_hours || 24;
+            // Don't populate password - show placeholder if has_password
+            const pwField = document.getElementById('email-password');
+            if (settings.email.has_password) {
+                pwField.placeholder = '••••••••  (saved)';
+            }
+            toggleEmailFields(settings.email.enabled);
+        }
     } catch (err) {
         console.error('Failed to load settings:', err);
         showToast('Failed to load settings: ' + err, 'error');
@@ -1476,6 +1566,70 @@ function showToast(message, type) {
         toast.style.opacity = '0';
         setTimeout(() => toast.remove(), 300);
     }, 4000);
+}
+
+// ─── Email Settings ───
+
+function toggleEmailFields(enabled) {
+    const fields = document.getElementById('email-settings-fields');
+    if (fields) {
+        fields.style.opacity = enabled ? '1' : '0.5';
+        fields.style.pointerEvents = enabled ? 'auto' : 'none';
+    }
+}
+
+document.getElementById('email-enabled')?.addEventListener('change', function() {
+    toggleEmailFields(this.checked);
+});
+
+document.getElementById('save-email-btn')?.addEventListener('click', async function() {
+    const password = document.getElementById('email-password').value;
+    try {
+        const result = await window.__TAURI__.core.invoke('save_email_settings', {
+            enabled: document.getElementById('email-enabled').checked,
+            imapServer: document.getElementById('email-imap-server').value,
+            imapPort: parseInt(document.getElementById('email-imap-port').value) || 993,
+            username: document.getElementById('email-username').value,
+            password: password || null,
+            useTls: document.getElementById('email-use-tls').checked,
+            folders: document.getElementById('email-folders').value,
+            pollIntervalSecs: parseInt(document.getElementById('email-poll-interval').value) || 60,
+            lookbackHours: parseInt(document.getElementById('email-lookback').value) || 24,
+        });
+        showEmailTestResult(true, result);
+    } catch (e) {
+        showEmailTestResult(false, e.toString());
+    }
+});
+
+document.getElementById('test-email-btn')?.addEventListener('click', async function() {
+    const btn = this;
+    btn.disabled = true;
+    btn.textContent = 'Testing...';
+    try {
+        const result = await window.__TAURI__.core.invoke('test_email_connection', {
+            imapServer: document.getElementById('email-imap-server').value,
+            imapPort: parseInt(document.getElementById('email-imap-port').value) || 993,
+            username: document.getElementById('email-username').value,
+            password: document.getElementById('email-password').value,
+            useTls: document.getElementById('email-use-tls').checked,
+        });
+        showEmailTestResult(result.success, result.message);
+    } catch (e) {
+        showEmailTestResult(false, e.toString());
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Test Connection';
+    }
+});
+
+function showEmailTestResult(success, message) {
+    const el = document.getElementById('email-test-result');
+    if (!el) return;
+    el.className = 'test-result ' + (success ? 'test-success' : 'test-error');
+    el.textContent = message;
+    el.classList.remove('hidden');
+    setTimeout(() => el.classList.add('hidden'), 5000);
 }
 
 // ─── Initialize ───
