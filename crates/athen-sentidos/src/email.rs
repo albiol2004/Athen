@@ -311,7 +311,7 @@ fn fetch_folder<S: std::io::Read + std::io::Write>(
         .join(",");
 
     let fetches = session
-        .uid_fetch(&uid_set, "(UID ENVELOPE BODY[] FLAGS)")
+        .uid_fetch(&uid_set, "(UID ENVELOPE BODY.PEEK[] FLAGS)")
         .map_err(|e| AthenError::Other(format!("IMAP uid_fetch in '{folder}': {e}")))?;
 
     let mut events = Vec::new();

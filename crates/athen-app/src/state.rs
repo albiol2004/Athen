@@ -142,6 +142,11 @@ impl AppState {
     /// This must be called after the `AppState` is constructed but before it
     /// is handed to `app.manage()`, because we need the `AppHandle` to emit
     /// Tauri events to the frontend.
+    ///
+    /// The monitor polls IMAP for new emails, then sends each email to the
+    /// LLM for relevance triage.  Only emails classified as `medium` or
+    /// `high` relevance are forwarded to the frontend as actionable cards.
+    /// Spam and irrelevant messages are silently logged and discarded.
     pub fn start_email_monitor(&mut self, app_handle: tauri::AppHandle) {
         use athen_core::traits::sense::SenseMonitor;
         use athen_sentidos::email::EmailMonitor;
@@ -162,6 +167,7 @@ impl AppState {
 
         let mut monitor = EmailMonitor::new();
         let email_config = config.clone();
+        let router = Arc::clone(&self.router);
 
         tauri::async_runtime::spawn(async move {
             if let Err(e) = monitor.init(&email_config).await {
@@ -193,34 +199,65 @@ impl AppState {
                                 })
                                 .unwrap_or("unknown");
 
-                            // Extract a body preview (first 500 chars of text).
-                            let body_preview = event
+                            let body_text = event
                                 .content
                                 .body
                                 .get("text")
                                 .and_then(|t| t.as_str())
-                                .map(|t| {
-                                    let trimmed = t.trim();
-                                    if trimmed.len() > 500 {
-                                        format!("{}...", &trimmed[..500])
+                                .unwrap_or("");
+
+                            // Truncate body for the LLM triage prompt (save tokens).
+                            let body_for_triage: String = if body_text.len() > 1000 {
+                                format!("{}...", &body_text[..1000])
+                            } else {
+                                body_text.to_string()
+                            };
+
+                            // Ask the LLM to triage this email.
+                            let triage = triage_email(
+                                &router,
+                                from,
+                                subject,
+                                &body_for_triage,
+                            )
+                            .await;
+
+                            match &triage {
+                                EmailTriage { relevance, .. }
+                                    if relevance == "ignore" || relevance == "low" =>
+                                {
+                                    info!(
+                                        "Email from '{}' triaged as {} — skipping: {}",
+                                        from, relevance, triage.reason
+                                    );
+                                }
+                                triage => {
+                                    info!(
+                                        "Email from '{}' triaged as {} — notifying user",
+                                        from, triage.relevance
+                                    );
+
+                                    let body_preview: String = if body_text.len() > 500 {
+                                        format!("{}...", &body_text[..500])
                                     } else {
-                                        trimmed.to_string()
-                                    }
-                                })
-                                .unwrap_or_default();
+                                        body_text.trim().to_string()
+                                    };
 
-                            info!("New email from '{}': '{}'", from, subject);
-
-                            let _ = app_handle.emit(
-                                "email-event",
-                                serde_json::json!({
-                                    "type": "new_email",
-                                    "from": from,
-                                    "subject": subject,
-                                    "body_preview": body_preview,
-                                    "event_id": event.id.to_string(),
-                                }),
-                            );
+                                    let _ = app_handle.emit(
+                                        "email-event",
+                                        serde_json::json!({
+                                            "type": "new_email",
+                                            "from": from,
+                                            "subject": subject,
+                                            "body_preview": body_preview,
+                                            "relevance": triage.relevance,
+                                            "reason": triage.reason,
+                                            "suggested_action": triage.suggested_action,
+                                            "event_id": event.id.to_string(),
+                                        }),
+                                    );
+                                }
+                            }
                         }
                     }
                     Ok(_) => {
@@ -245,6 +282,147 @@ impl AppState {
             }
             info!("Email monitor stopped");
         });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Email triage via LLM
+// ---------------------------------------------------------------------------
+
+/// Result of LLM email triage.
+struct EmailTriage {
+    /// One of: "ignore", "low", "medium", "high"
+    relevance: String,
+    /// One-line explanation of why (e.g. "spam newsletter", "meeting request from boss")
+    reason: String,
+    /// Suggested action (e.g. "none", "read", "reply", "calendar")
+    suggested_action: String,
+}
+
+/// Ask the LLM to classify an email's relevance.
+///
+/// Uses a structured prompt that asks for JSON output. Falls back to
+/// "medium" relevance if the LLM call fails (better to show than to miss).
+async fn triage_email(
+    router: &Arc<RwLock<Arc<DefaultLlmRouter>>>,
+    from: &str,
+    subject: &str,
+    body: &str,
+) -> EmailTriage {
+    use athen_core::llm::{LlmRequest, ChatMessage as LlmChatMessage, Role as LlmRole, MessageContent as LlmContent};
+
+    let prompt = format!(
+        r#"You are an email triage assistant. Classify this email's relevance to the user.
+
+From: {from}
+Subject: {subject}
+Body:
+{body}
+
+Respond with ONLY a JSON object (no markdown, no explanation):
+{{
+  "relevance": "ignore|low|medium|high",
+  "reason": "one-line explanation",
+  "suggested_action": "none|read|reply|calendar|urgent"
+}}
+
+Classification rules:
+- "ignore": ONLY for obvious machine-generated spam, marketing newsletters with unsubscribe links, automated CI/CD notifications, or promotional bulk email
+- "low": mailing list digests, non-urgent automated updates, social media notifications
+- "medium": any email from a real person, work-related messages, personal messages, requests, questions, invitations
+- "high": urgent requests, deadlines, time-sensitive matters, security alerts, messages marked urgent/important
+
+IMPORTANT: Default to "medium" unless you are very confident the email is spam or automated. Real emails from real people should NEVER be classified as "ignore"."#
+    );
+
+    let request = LlmRequest {
+        messages: vec![LlmChatMessage {
+            role: LlmRole::User,
+            content: LlmContent::Text(prompt),
+        }],
+        profile: athen_core::llm::ModelProfile::Cheap,
+        max_tokens: Some(150),
+        temperature: Some(0.1),
+        tools: None,
+        system_prompt: None,
+    };
+
+    let llm_router = router.read().await.clone();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        llm_router.route(&request),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(response)) => {
+            let text = response.content.trim().to_string();
+            info!("Email triage LLM response: {}", text);
+            parse_triage_json(&text)
+        }
+        Ok(Err(e)) => {
+            warn!("Email triage LLM error: {e}");
+            EmailTriage {
+                relevance: "medium".into(),
+                reason: "Could not assess — showing to be safe".into(),
+                suggested_action: "read".into(),
+            }
+        }
+        Err(_) => {
+            warn!("Email triage LLM timed out");
+            EmailTriage {
+                relevance: "medium".into(),
+                reason: "Triage timed out — showing to be safe".into(),
+                suggested_action: "read".into(),
+            }
+        }
+    }
+}
+
+/// Parse the LLM's JSON response into an `EmailTriage`.
+fn parse_triage_json(text: &str) -> EmailTriage {
+    // Strip markdown code fences if present.
+    let cleaned = text
+        .trim()
+        .strip_prefix("```json")
+        .or_else(|| text.trim().strip_prefix("```"))
+        .unwrap_or(text)
+        .trim()
+        .strip_suffix("```")
+        .unwrap_or(text)
+        .trim();
+
+    match serde_json::from_str::<serde_json::Value>(cleaned) {
+        Ok(v) => {
+            let relevance = v
+                .get("relevance")
+                .and_then(|r| r.as_str())
+                .unwrap_or("medium")
+                .to_string();
+            let reason = v
+                .get("reason")
+                .and_then(|r| r.as_str())
+                .unwrap_or("No reason provided")
+                .to_string();
+            let suggested_action = v
+                .get("suggested_action")
+                .and_then(|r| r.as_str())
+                .unwrap_or("read")
+                .to_string();
+            EmailTriage {
+                relevance,
+                reason,
+                suggested_action,
+            }
+        }
+        Err(e) => {
+            warn!("Failed to parse triage JSON '{}': {e}", cleaned);
+            EmailTriage {
+                relevance: "medium".into(),
+                reason: "Could not parse triage — showing to be safe".into(),
+                suggested_action: "read".into(),
+            }
+        }
     }
 }
 

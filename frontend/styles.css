@@ -1728,6 +1728,37 @@ footer {
     white-space: pre-wrap;
 }
 
+.email-card.email-high {
+    border-left-color: #f7768e;
+    border-color: rgba(247, 118, 142, 0.3);
+}
+
+.email-badge {
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 0.15rem 0.5rem;
+    border-radius: 4px;
+}
+
+.email-badge-high {
+    background: rgba(247, 118, 142, 0.2);
+    color: #f7768e;
+}
+
+.email-badge-medium {
+    background: rgba(122, 162, 247, 0.2);
+    color: #7aa2f7;
+}
+
+.email-card-reason {
+    color: #9ece6a;
+    font-size: 0.8rem;
+    font-style: italic;
+    margin-bottom: 0.5rem;
+}
+
 .email-card-actions {
     display: flex;
     gap: 0.5rem;
@@ -1747,6 +1778,16 @@ footer {
 .email-action-btn:hover {
     background: #7aa2f7;
     color: #1a1b26;
+}
+
+.email-action-primary {
+    background: #7aa2f7;
+    color: #1a1b26;
+    font-weight: 600;
+}
+
+.email-action-primary:hover {
+    background: #89b4fa;
 }
 
 @keyframes emailSlideIn {

@@ -153,11 +153,13 @@ function initTauri() {
                 });
             });
 
-            // Listen for email monitor events.
+            // Listen for email monitor events (only relevant emails reach here).
             window.__TAURI__.event.listen('email-event', (event) => {
-                const { type: eventType, from, subject, body_preview } = event.payload;
+                const { type: eventType, from, subject, body_preview,
+                        relevance, reason, suggested_action } = event.payload;
                 if (eventType === 'new_email') {
-                    showEmailNotification(from, subject, body_preview);
+                    showEmailNotification(from, subject, body_preview,
+                                          relevance, reason, suggested_action);
                 }
             });
         }
@@ -604,7 +606,7 @@ function escapeHtml(text) {
 
 // ─── Email Notifications ───
 
-function showEmailNotification(from, subject, bodyPreview) {
+function showEmailNotification(from, subject, bodyPreview, relevance, reason, suggestedAction) {
     const container = document.getElementById('messages');
     if (!container) return;
 
@@ -614,25 +616,41 @@ function showEmailNotification(from, subject, bodyPreview) {
 
     // Build email card in the chat area.
     const card = document.createElement('div');
-    card.className = 'email-card';
+    const urgencyClass = relevance === 'high' ? 'email-high' : 'email-medium';
+    card.className = 'email-card ' + urgencyClass;
 
     const preview = bodyPreview
         ? '<div class="email-card-body">' + escapeHtml(bodyPreview) + '</div>'
         : '';
 
+    const relevanceBadge = relevance === 'high'
+        ? '<span class="email-badge email-badge-high">Urgent</span>'
+        : '<span class="email-badge email-badge-medium">Important</span>';
+
+    const reasonHtml = reason
+        ? '<div class="email-card-reason">' + escapeHtml(reason) + '</div>'
+        : '';
+
+    // Build action buttons based on suggested_action.
+    let actionsHtml = '<button class="email-action-btn" onclick="askAboutEmail(this, \'summarize\')">Summarize</button>';
+    if (suggestedAction === 'reply' || suggestedAction === 'urgent') {
+        actionsHtml += '<button class="email-action-btn email-action-primary" onclick="askAboutEmail(this, \'reply\')">Draft Reply</button>';
+    }
+    if (suggestedAction === 'calendar') {
+        actionsHtml += '<button class="email-action-btn" onclick="askAboutEmail(this, \'calendar\')">Add to Calendar</button>';
+    }
+
     card.innerHTML =
         '<div class="email-card-header">' +
             '<span class="email-card-icon">&#x1f4e7;</span>' +
-            '<span class="email-card-label">New Email</span>' +
+            relevanceBadge +
             '<span class="email-card-time">' + formatTime(new Date()) + '</span>' +
         '</div>' +
         '<div class="email-card-from">' + escapeHtml(from) + '</div>' +
         '<div class="email-card-subject">' + escapeHtml(subject) + '</div>' +
+        reasonHtml +
         preview +
-        '<div class="email-card-actions">' +
-            '<button class="email-action-btn" onclick="askAboutEmail(this, \'summarize\')">Summarize</button>' +
-            '<button class="email-action-btn" onclick="askAboutEmail(this, \'reply\')">Draft Reply</button>' +
-        '</div>';
+        '<div class="email-card-actions">' + actionsHtml + '</div>';
 
     container.appendChild(card);
 
@@ -657,7 +675,9 @@ function askAboutEmail(btn, action) {
     if (action === 'summarize') {
         prompt = 'Summarize this email from ' + from + ' with subject "' + subject + '":\n\n' + body;
     } else if (action === 'reply') {
-        prompt = 'Draft a reply to this email from ' + from + ' with subject "' + subject + '":\n\n' + body;
+        prompt = 'Draft a professional reply to this email from ' + from + ' with subject "' + subject + '":\n\n' + body;
+    } else if (action === 'calendar') {
+        prompt = 'Extract the event details from this email from ' + from + ' with subject "' + subject + '" and tell me what to add to my calendar:\n\n' + body;
     }
 
     if (prompt && inputEl) {
