@@ -40,6 +40,10 @@ pub fn run() {
             settings::set_active_provider,
             settings::save_email_settings,
             settings::test_email_connection,
+            commands::list_calendar_events,
+            commands::create_calendar_event,
+            commands::update_calendar_event,
+            commands::delete_calendar_event,
         ])
         .setup(|app| {
             use tauri::Manager;
@@ -53,8 +57,9 @@ pub fn run() {
                 state.coordinator.dispatcher().register_agent(agent_id).await;
             });
 
-            // Start the email monitor background task before managing state.
+            // Start background monitor tasks before managing state.
             state.start_email_monitor(app.handle().clone());
+            state.start_calendar_monitor(app.handle().clone());
 
             app.manage(state);
             Ok(())

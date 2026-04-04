@@ -56,17 +56,28 @@ pub async fn process_sense_event(
     let summary = event.content.summary.as_deref().unwrap_or("(no subject)");
     let sender = event.sender.as_ref()
         .map(|s| s.display_name.as_deref().unwrap_or(&s.identifier))
-        .unwrap_or("unknown");
+        .unwrap_or(match event.source {
+            EventSource::Calendar => "Calendar",
+            EventSource::System => "System",
+            _ => "unknown",
+        });
 
-    let body_text = event.content.body.get("text")
-        .and_then(|t| t.as_str())
-        .unwrap_or("");
+    // Extract body text — for emails it's in "text", for calendar events
+    // we build a readable summary from the structured fields.
+    let body_text = if event.source == EventSource::Calendar {
+        format_calendar_body(&event.content.body)
+    } else {
+        event.content.body.get("text")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
 
     // Truncate body for LLM triage (save tokens).
     let body_for_triage: String = if body_text.len() > 1000 {
         format!("{}...", &body_text[..1000])
     } else {
-        body_text.to_string()
+        body_text.clone()
     };
 
     // Step 0: Fetch recent active arcs for context matching.
@@ -118,9 +129,9 @@ pub async fn process_sense_event(
         }
     };
 
-    // Step 3: Persist as ArcEntry.
+    // Step 3: Persist as ArcEntry + context message.
     let entry_type = event_source_to_entry_type(&event.source);
-    let entry_content = format_entry_content(sender, summary, body_text);
+    let entry_content = format_entry_content(sender, summary, &body_text);
     let entry_metadata = serde_json::json!({
         "event_id": event.id.to_string(),
         "source": source_name,
@@ -132,11 +143,22 @@ pub async fn process_sense_event(
     });
 
     if let Some(store) = arc_store {
+        // Store the raw sense event entry.
         if let Err(e) = store.add_entry(
             &arc_id, entry_type, source_name, &entry_content, Some(entry_metadata.clone()),
         ).await {
             warn!("Failed to persist sense event entry: {e}");
         }
+
+        // Also add a system message so the agent has context when the user
+        // opens this Arc and starts chatting.
+        let context_msg = build_context_message(&event.source, sender, summary, &body_text, &triage);
+        if let Err(e) = store.add_entry(
+            &arc_id, EntryType::Message, "system", &context_msg, None,
+        ).await {
+            warn!("Failed to persist sense context message: {e}");
+        }
+
         if let Err(e) = store.touch_arc(&arc_id).await {
             warn!("Failed to touch arc: {e}");
         }
@@ -203,6 +225,88 @@ pub(crate) fn event_source_to_entry_type(source: &EventSource) -> EntryType {
 
 pub(crate) fn generate_arc_id() -> String {
     chrono::Utc::now().format("arc_%Y%m%d_%H%M%S").to_string()
+}
+
+/// Build a readable summary from a calendar event's JSON body.
+fn format_calendar_body(body: &serde_json::Value) -> String {
+    let mut parts = Vec::new();
+
+    if let Some(title) = body.get("title").and_then(|t| t.as_str()) {
+        parts.push(format!("Event: {title}"));
+    }
+    if let Some(start) = body.get("start_time").and_then(|t| t.as_str()) {
+        parts.push(format!("Starts: {start}"));
+    }
+    if let Some(end) = body.get("end_time").and_then(|t| t.as_str()).filter(|s| !s.is_empty()) {
+        parts.push(format!("Ends: {end}"));
+    }
+    if let Some(loc) = body.get("location").and_then(|t| t.as_str()).filter(|s| !s.is_empty()) {
+        parts.push(format!("Location: {loc}"));
+    }
+    if let Some(desc) = body.get("description").and_then(|t| t.as_str()).filter(|s| !s.is_empty()) {
+        parts.push(format!("Description: {desc}"));
+    }
+    if let Some(cat) = body.get("category").and_then(|t| t.as_str()).filter(|s| !s.is_empty()) {
+        parts.push(format!("Category: {cat}"));
+    }
+    if let Some(mins) = body.get("minutes_until").and_then(|t| t.as_i64()) {
+        if mins <= 0 {
+            parts.push("Status: Starting now!".to_string());
+        } else if mins < 60 {
+            parts.push(format!("Status: Starting in {mins} minutes"));
+        } else {
+            let hours = mins / 60;
+            let remaining = mins % 60;
+            if remaining == 0 {
+                parts.push(format!("Status: Starting in {hours} hour(s)"));
+            } else {
+                parts.push(format!("Status: Starting in {hours}h {remaining}m"));
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        "(calendar event)".to_string()
+    } else {
+        parts.join("\n")
+    }
+}
+
+/// Build a system context message that gives the agent full awareness of
+/// the sense event when the user opens this Arc.
+fn build_context_message(
+    source: &EventSource,
+    sender: &str,
+    subject: &str,
+    body_text: &str,
+    triage: &SenseTriage,
+) -> String {
+    let source_name = source_display_name(source);
+    let mut msg = format!(
+        "[{} notification — relevance: {}, suggested action: {}]\n\n",
+        source_name, triage.relevance, triage.suggested_action
+    );
+
+    match source {
+        EventSource::Calendar => {
+            msg.push_str(&format!("Calendar reminder: {subject}\n{body_text}"));
+            msg.push_str("\n\nThe user may ask you about this event, want to reschedule it, \
+                          or need help preparing for it.");
+        }
+        EventSource::Email => {
+            msg.push_str(&format!("Email from {sender}\nSubject: {subject}\n\n{body_text}"));
+            msg.push_str("\n\nThe user may ask you to summarize, reply, or take action on this email.");
+        }
+        _ => {
+            msg.push_str(&format!("From: {sender}\nSubject: {subject}\n\n{body_text}"));
+        }
+    }
+
+    if !triage.reason.is_empty() {
+        msg.push_str(&format!("\n\nTriage reason: {}", triage.reason));
+    }
+
+    msg
 }
 
 pub(crate) fn format_entry_content(sender: &str, subject: &str, body: &str) -> String {

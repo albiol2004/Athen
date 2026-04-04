@@ -24,6 +24,7 @@ use athen_core::traits::agent::{AgentExecutor, StepAuditor};
 use athen_core::traits::llm::LlmRouter;
 use athen_agent::{AgentBuilder, InMemoryAuditor, ShellToolRegistry};
 use athen_persistence::arcs;
+use athen_persistence::calendar::CalendarEvent;
 
 use crate::state::{AppState, PendingApproval, SharedRouter};
 
@@ -1059,4 +1060,66 @@ pub async fn merge_arcs(
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Calendar commands
+// ---------------------------------------------------------------------------
+
+/// List calendar events within a time range.
+///
+/// `start` and `end` are RFC 3339 timestamps. Returns events whose time range
+/// overlaps [start, end].
+#[tauri::command]
+pub async fn list_calendar_events(
+    start: String,
+    end: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<Vec<CalendarEvent>, String> {
+    if let Some(ref store) = state.calendar_store {
+        store.list_events(&start, &end).await.map_err(|e| e.to_string())
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+/// Create a new calendar event.
+///
+/// The frontend sends a full `CalendarEvent` object (with a pre-generated id).
+/// Returns the event back on success.
+#[tauri::command]
+pub async fn create_calendar_event(
+    event: CalendarEvent,
+    state: State<'_, AppState>,
+) -> std::result::Result<CalendarEvent, String> {
+    if let Some(ref store) = state.calendar_store {
+        store.create_event(&event).await.map_err(|e| e.to_string())?;
+    }
+    Ok(event)
+}
+
+/// Update an existing calendar event.
+#[tauri::command]
+pub async fn update_calendar_event(
+    event: CalendarEvent,
+    state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    if let Some(ref store) = state.calendar_store {
+        store.update_event(&event).await.map_err(|e| e.to_string())
+    } else {
+        Ok(())
+    }
+}
+
+/// Delete a calendar event by id.
+#[tauri::command]
+pub async fn delete_calendar_event(
+    id: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    if let Some(ref store) = state.calendar_store {
+        store.delete_event(&id).await.map_err(|e| e.to_string())
+    } else {
+        Ok(())
+    }
 }

@@ -31,6 +31,7 @@ use athen_llm::providers::ollama::OllamaProvider;
 use athen_llm::providers::openai::OpenAiCompatibleProvider;
 use athen_llm::router::DefaultLlmRouter;
 use athen_persistence::arcs::ArcStore;
+use athen_persistence::calendar::CalendarStore;
 use athen_persistence::Database;
 use athen_risk::llm_fallback::LlmRiskEvaluator;
 use athen_risk::CombinedRiskEvaluator;
@@ -84,6 +85,8 @@ pub struct AppState {
     pub active_arc_id: Mutex<String>,
     /// Persistent Arc storage backed by SQLite.
     pub arc_store: Option<ArcStore>,
+    /// Persistent calendar event storage backed by SQLite.
+    pub calendar_store: Option<CalendarStore>,
     /// Keep the database alive so the connection is not dropped.
     _database: Option<Database>,
     /// Cancellation flag for the currently running agent executor.
@@ -119,6 +122,7 @@ impl AppState {
 
         // Build the arc store and run migration from legacy chat tables.
         let arc_store = database.as_ref().map(|db| db.arc_store());
+        let calendar_store = database.as_ref().map(|db| db.calendar_store());
         if let Some(ref store) = arc_store {
             match store.migrate_from_chat_tables().await {
                 Ok(0) => {}
@@ -137,6 +141,7 @@ impl AppState {
             model_name: Mutex::new(model_name),
             active_arc_id: Mutex::new(active_arc_id),
             arc_store,
+            calendar_store,
             _database: database,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             email_shutdown: None,
@@ -220,6 +225,52 @@ impl AppState {
                 warn!("Email monitor shutdown error: {e}");
             }
             info!("Email monitor stopped");
+        });
+    }
+
+    /// Start the calendar monitor background task.
+    ///
+    /// Polls the local calendar database every 60 seconds for upcoming events
+    /// and fires reminder SenseEvents through the sense router.
+    pub fn start_calendar_monitor(&mut self, app_handle: tauri::AppHandle) {
+        use athen_core::traits::sense::SenseMonitor;
+        use athen_sentidos::calendar::CalendarMonitor;
+
+        let mut monitor = CalendarMonitor::new();
+        let config = load_config();
+        let router = Arc::clone(&self.router);
+        let arc_store_ref = self._database.as_ref().map(|db| db.arc_store());
+
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = monitor.init(&config).await {
+                tracing::error!("Failed to initialize calendar monitor: {e}");
+                return;
+            }
+
+            let poll_interval = monitor.poll_interval();
+            info!("Calendar monitor started, polling every {:?}", poll_interval);
+
+            loop {
+                match monitor.poll().await {
+                    Ok(events) if !events.is_empty() => {
+                        info!("Calendar monitor: {} reminder(s)", events.len());
+                        for event in events {
+                            crate::sense_router::process_sense_event(
+                                &event,
+                                &router,
+                                &arc_store_ref,
+                                &app_handle,
+                            ).await;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!("Calendar poll error: {e}");
+                    }
+                }
+
+                tokio::time::sleep(poll_interval).await;
+            }
         });
     }
 }

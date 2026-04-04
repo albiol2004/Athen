@@ -18,6 +18,10 @@
             </div>
             <div id="session-list" class="session-list"></div>
             <div class="sidebar-footer">
+                <button id="calendar-btn" class="sidebar-footer-btn" title="Calendar">
+                    <span class="calendar-icon">&#128197;</span>
+                    <span>Calendar</span>
+                </button>
                 <button id="settings-btn" class="sidebar-footer-btn" title="Settings">
                     <span class="settings-icon">&#9881;</span>
                     <span>Settings</span>
@@ -185,6 +189,125 @@
             </section>
         </div>
     </div>
+
+        <div id="calendar-view" class="calendar-view hidden">
+            <header class="calendar-header">
+                <div class="header-left">
+                    <button id="calendar-back" class="settings-back-btn" title="Back">
+                        <span>&#8592;</span> Back
+                    </button>
+                </div>
+                <div class="calendar-nav">
+                    <button id="cal-prev" class="cal-nav-btn" title="Previous">&lt;</button>
+                    <h1 id="cal-title">April 2026</h1>
+                    <button id="cal-next" class="cal-nav-btn" title="Next">&gt;</button>
+                </div>
+                <div class="calendar-header-actions">
+                    <button id="cal-today-btn" class="cal-today-btn">Today</button>
+                    <select id="cal-view-select" class="cal-view-select">
+                        <option value="month">Month</option>
+                        <option value="week">Week</option>
+                    </select>
+                </div>
+            </header>
+            <div id="calendar-grid" class="calendar-grid"></div>
+
+            <div id="cal-modal-overlay" class="cal-modal-overlay hidden">
+                <div class="cal-modal">
+                    <div class="cal-modal-header">
+                        <h2 id="cal-modal-title">New Event</h2>
+                        <button id="cal-modal-close" class="cal-modal-close-btn">&times;</button>
+                    </div>
+                    <div class="cal-modal-body">
+                        <input type="hidden" id="cal-event-id">
+                        <div class="cal-field">
+                            <label for="cal-event-title">Title</label>
+                            <input type="text" id="cal-event-title" placeholder="Event title">
+                        </div>
+                        <div class="cal-field">
+                            <label for="cal-event-date">Date</label>
+                            <input type="date" id="cal-event-date">
+                        </div>
+                        <div class="cal-field">
+                            <label class="toggle-label">
+                                <input type="checkbox" id="cal-event-allday">
+                                <span>All day</span>
+                            </label>
+                        </div>
+                        <div class="cal-time-fields" id="cal-time-fields">
+                            <div class="cal-field cal-field-half">
+                                <label for="cal-event-start">Start</label>
+                                <input type="time" id="cal-event-start" value="09:00">
+                            </div>
+                            <div class="cal-field cal-field-half">
+                                <label for="cal-event-end">End</label>
+                                <input type="time" id="cal-event-end" value="10:00">
+                            </div>
+                        </div>
+                        <div class="cal-field">
+                            <label for="cal-event-location">Location</label>
+                            <input type="text" id="cal-event-location" placeholder="Add location">
+                        </div>
+                        <div class="cal-field">
+                            <label for="cal-event-description">Description</label>
+                            <textarea id="cal-event-description" rows="3" placeholder="Add description"></textarea>
+                        </div>
+                        <div class="cal-field">
+                            <label for="cal-event-category">Category</label>
+                            <select id="cal-event-category">
+                                <option value="meeting">Meeting</option>
+                                <option value="personal">Personal</option>
+                                <option value="work">Work</option>
+                                <option value="deadline">Deadline</option>
+                                <option value="reminder">Reminder</option>
+                                <option value="birthday">Birthday</option>
+                                <option value="other">Other</option>
+                            </select>
+                        </div>
+                        <div class="cal-field">
+                            <label>Color</label>
+                            <div class="cal-color-options" id="cal-color-options">
+                                <span class="cal-color-dot selected" data-color="#7aa2f7" style="background:#7aa2f7" title="Blue"></span>
+                                <span class="cal-color-dot" data-color="#bb9af7" style="background:#bb9af7" title="Purple"></span>
+                                <span class="cal-color-dot" data-color="#9ece6a" style="background:#9ece6a" title="Green"></span>
+                                <span class="cal-color-dot" data-color="#e0af68" style="background:#e0af68" title="Amber"></span>
+                                <span class="cal-color-dot" data-color="#f7768e" style="background:#f7768e" title="Red"></span>
+                                <span class="cal-color-dot" data-color="#73daca" style="background:#73daca" title="Teal"></span>
+                                <span class="cal-color-dot" data-color="#ff9e64" style="background:#ff9e64" title="Orange"></span>
+                            </div>
+                        </div>
+                        <div class="cal-field">
+                            <label for="cal-event-reminder">Reminder</label>
+                            <select id="cal-event-reminder">
+                                <option value="none">None</option>
+                                <option value="5">5 minutes before</option>
+                                <option value="15" selected>15 minutes before</option>
+                                <option value="30">30 minutes before</option>
+                                <option value="60">1 hour before</option>
+                                <option value="1440">1 day before</option>
+                            </select>
+                        </div>
+                        <div class="cal-field">
+                            <label for="cal-event-recurrence">Recurrence</label>
+                            <select id="cal-event-recurrence">
+                                <option value="none">Does not repeat</option>
+                                <option value="Daily">Daily</option>
+                                <option value="Weekly">Weekly</option>
+                                <option value="Monthly">Monthly</option>
+                                <option value="Yearly">Yearly</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="cal-modal-actions">
+                        <button id="cal-modal-delete" class="btn-danger hidden">Delete</button>
+                        <div class="cal-modal-actions-right">
+                            <button id="cal-modal-cancel" class="btn-secondary">Cancel</button>
+                            <button id="cal-modal-save" class="btn-primary">Save</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
     </div>
 
     <div id="sidebar-overlay" class="sidebar-overlay"></div>

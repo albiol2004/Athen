@@ -683,15 +683,24 @@ function showSenseNotification(source, from, subject, bodyPreview,
         ? '<div class="email-card-reason">' + escapeHtml(reason) + '</div>'
         : '';
 
-    // Build action buttons based on suggested_action.
-    let actionsHtml = '<button class="email-action-btn" onclick="askAboutSenseEvent(this, \'summarize\')">Summarize</button>';
-    if (suggestedAction === 'reply' || suggestedAction === 'urgent') {
-        actionsHtml += '<button class="email-action-btn email-action-primary" onclick="askAboutSenseEvent(this, \'reply\')">Draft Reply</button>';
+    // Build action buttons based on source and suggested_action.
+    let actionsHtml = '';
+
+    if (source === 'calendar') {
+        // Calendar-specific actions
+        actionsHtml += '<button class="email-action-btn email-action-primary" onclick="askAboutSenseEvent(this, \'prepare\')">What should I prepare?</button>';
+    } else {
+        // Email / messaging actions
+        actionsHtml += '<button class="email-action-btn" onclick="askAboutSenseEvent(this, \'summarize\')">Summarize</button>';
+        if (suggestedAction === 'reply' || suggestedAction === 'urgent') {
+            actionsHtml += '<button class="email-action-btn email-action-primary" onclick="askAboutSenseEvent(this, \'reply\')">Draft Reply</button>';
+        }
+        if (suggestedAction === 'calendar') {
+            actionsHtml += '<button class="email-action-btn" onclick="askAboutSenseEvent(this, \'calendar\')">Add to Calendar</button>';
+        }
     }
-    if (suggestedAction === 'calendar') {
-        actionsHtml += '<button class="email-action-btn" onclick="askAboutSenseEvent(this, \'calendar\')">Add to Calendar</button>';
-    }
-    // Open Arc button
+
+    // Open Arc button — always present, switches context to the event's arc
     if (arcId) {
         actionsHtml += '<button class="email-action-btn" onclick="handleSwitchArc(\'' + escapeHtml(arcId) + '\')">Open Arc</button>';
     }
@@ -723,20 +732,32 @@ function showSenseNotification(source, from, subject, bodyPreview,
 }
 
 // Handle sense event action buttons — sends a message to the agent.
-function askAboutSenseEvent(btn, action) {
+async function askAboutSenseEvent(btn, action) {
     const card = btn.closest('.email-card');
     if (!card) return;
     const from = card.querySelector('.email-card-from')?.textContent || '';
     const subject = card.querySelector('.email-card-subject')?.textContent || '';
     const body = card.querySelector('.email-card-body')?.textContent || '';
 
+    // Find the arc_id from the Open Arc button in the same card.
+    const arcBtn = card.querySelector('.email-action-btn[onclick*="handleSwitchArc"]');
+    const arcIdMatch = arcBtn?.getAttribute('onclick')?.match(/handleSwitchArc\('([^']+)'\)/);
+    const arcId = arcIdMatch ? arcIdMatch[1] : null;
+
+    // Switch to the event's Arc first so the agent has full context.
+    if (arcId && arcId !== activeArcId) {
+        await handleSwitchArc(arcId);
+    }
+
     let prompt;
     if (action === 'summarize') {
-        prompt = 'Summarize this message from ' + from + ' with subject "' + subject + '":\n\n' + body;
+        prompt = 'Summarize this for me briefly.';
     } else if (action === 'reply') {
-        prompt = 'Draft a professional reply to this message from ' + from + ' with subject "' + subject + '":\n\n' + body;
+        prompt = 'Draft a professional reply to this.';
     } else if (action === 'calendar') {
-        prompt = 'Extract the event details from this message from ' + from + ' with subject "' + subject + '" and tell me what to add to my calendar:\n\n' + body;
+        prompt = 'Extract the event details and tell me what to add to my calendar.';
+    } else if (action === 'prepare') {
+        prompt = 'What should I prepare or know about for this upcoming event?';
     }
 
     if (prompt && inputEl) {
@@ -1326,6 +1347,7 @@ const SECURITY_HINTS = {
 function showSettings() {
     appView.style.display = 'none';
     timelineView?.classList.add('hidden');
+    calendarView?.classList.add('hidden');
     document.getElementById('sidebar').style.display = '';
     if (timelineRefreshInterval) { clearInterval(timelineRefreshInterval); timelineRefreshInterval = null; }
     settingsView.classList.remove('hidden');
@@ -1336,6 +1358,7 @@ function showSettings() {
 function showChat() {
     settingsView.classList.add('hidden');
     timelineView?.classList.add('hidden');
+    calendarView?.classList.add('hidden');
     document.getElementById('sidebar').style.display = '';
     if (timelineRefreshInterval) { clearInterval(timelineRefreshInterval); timelineRefreshInterval = null; }
     appView.style.display = 'flex';
@@ -1767,6 +1790,7 @@ const timelineBackBtn = document.getElementById('timeline-back');
 function showTimeline() {
     appView.style.display = 'none';
     settingsView.classList.add('hidden');
+    calendarView?.classList.add('hidden');
     document.getElementById('sidebar').style.display = 'none';
     timelineView.classList.remove('hidden');
     renderTimeline();
@@ -2013,6 +2037,637 @@ function getTlEntryIcon(type) {
         default: return '\u25cf';
     }
 }
+
+// ─── Calendar ───
+
+let calCurrentDate = new Date();
+let calViewMode = 'month';
+let calEvents = [];
+
+const calendarView = document.getElementById('calendar-view');
+const calendarBtn = document.getElementById('calendar-btn');
+const calendarBack = document.getElementById('calendar-back');
+const calTitle = document.getElementById('cal-title');
+const calGrid = document.getElementById('calendar-grid');
+const calViewSelect = document.getElementById('cal-view-select');
+const calModalOverlay = document.getElementById('cal-modal-overlay');
+
+const CATEGORY_COLORS = {
+    meeting: '#7aa2f7',
+    birthday: '#bb9af7',
+    deadline: '#f7768e',
+    reminder: '#e0af68',
+    personal: '#9ece6a',
+    work: '#73daca',
+    other: '#ff9e64',
+};
+
+const MONTH_NAMES = [
+    'January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December'
+];
+
+const DAY_NAMES = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
+function showCalendar() {
+    appView.style.display = 'none';
+    settingsView.classList.add('hidden');
+    timelineView?.classList.add('hidden');
+    document.getElementById('sidebar').style.display = '';
+    if (timelineRefreshInterval) { clearInterval(timelineRefreshInterval); timelineRefreshInterval = null; }
+    calendarView.classList.remove('hidden');
+    closeSidebar();
+    loadCalendarEvents();
+}
+
+function hideCalendar() {
+    calendarView.classList.add('hidden');
+    document.getElementById('sidebar').style.display = '';
+    appView.style.display = 'flex';
+    inputEl.focus();
+}
+
+function updateCalTitle() {
+    if (calViewMode === 'month') {
+        calTitle.textContent = MONTH_NAMES[calCurrentDate.getMonth()] + ' ' + calCurrentDate.getFullYear();
+    } else {
+        const start = getWeekStart(calCurrentDate);
+        const end = new Date(start);
+        end.setDate(end.getDate() + 6);
+        const fmt = (d) => d.getDate() + ' ' + MONTH_NAMES[d.getMonth()].substring(0, 3);
+        calTitle.textContent = fmt(start) + ' - ' + fmt(end) + ' ' + end.getFullYear();
+    }
+}
+
+function getWeekStart(date) {
+    const d = new Date(date);
+    const day = d.getDay();
+    const diff = (day === 0 ? -6 : 1) - day; // Monday start
+    d.setDate(d.getDate() + diff);
+    d.setHours(0, 0, 0, 0);
+    return d;
+}
+
+async function loadCalendarEvents() {
+    if (!invoke) {
+        renderCalendar();
+        return;
+    }
+
+    let start, end;
+    if (calViewMode === 'month') {
+        start = new Date(calCurrentDate.getFullYear(), calCurrentDate.getMonth(), 1);
+        start.setDate(start.getDate() - 7); // include prev month overlap
+        end = new Date(calCurrentDate.getFullYear(), calCurrentDate.getMonth() + 1, 0);
+        end.setDate(end.getDate() + 7); // include next month overlap
+    } else {
+        start = getWeekStart(calCurrentDate);
+        end = new Date(start);
+        end.setDate(end.getDate() + 7);
+    }
+
+    try {
+        calEvents = await invoke('list_calendar_events', {
+            start: start.toISOString(),
+            end: end.toISOString(),
+        });
+    } catch (err) {
+        console.error('Failed to load calendar events:', err);
+        calEvents = [];
+    }
+    renderCalendar();
+}
+
+function renderCalendar() {
+    updateCalTitle();
+    if (calViewMode === 'month') {
+        renderMonthView();
+    } else {
+        renderWeekView();
+    }
+}
+
+function getEventsForDate(year, month, day) {
+    return calEvents.filter(ev => {
+        const d = new Date(ev.start_time || ev.start || ev.date);
+        return d.getFullYear() === year && d.getMonth() === month && d.getDate() === day;
+    });
+}
+
+function getEventColor(ev) {
+    if (ev.color) return ev.color;
+    return CATEGORY_COLORS[ev.category] || CATEGORY_COLORS.other;
+}
+
+function formatDateStr(year, month, day) {
+    return year + '-' + String(month + 1).padStart(2, '0') + '-' + String(day).padStart(2, '0');
+}
+
+function renderMonthView() {
+    const year = calCurrentDate.getFullYear();
+    const month = calCurrentDate.getMonth();
+    const firstDay = new Date(year, month, 1);
+    const lastDay = new Date(year, month + 1, 0);
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    // Day of week for the 1st (0=Sun). Adjust for Monday start.
+    let startDow = firstDay.getDay();
+    startDow = startDow === 0 ? 6 : startDow - 1;
+
+    const totalDays = lastDay.getDate();
+
+    let html = '<div class="cal-month-grid">';
+
+    // Weekday headers
+    for (const name of DAY_NAMES) {
+        html += '<div class="cal-weekday-header">' + name + '</div>';
+    }
+
+    // Previous month fill
+    const prevMonthLast = new Date(year, month, 0).getDate();
+    for (let i = startDow - 1; i >= 0; i--) {
+        const d = prevMonthLast - i;
+        const pm = month === 0 ? 11 : month - 1;
+        const py = month === 0 ? year - 1 : year;
+        const events = getEventsForDate(py, pm, d);
+        html += buildDayCell(py, pm, d, events, true, false);
+    }
+
+    // Current month days
+    for (let d = 1; d <= totalDays; d++) {
+        const isToday = year === today.getFullYear() && month === today.getMonth() && d === today.getDate();
+        const events = getEventsForDate(year, month, d);
+        html += buildDayCell(year, month, d, events, false, isToday);
+    }
+
+    // Next month fill to complete grid
+    const cellsRendered = startDow + totalDays;
+    const remaining = (Math.ceil(cellsRendered / 7) * 7) - cellsRendered;
+    for (let d = 1; d <= remaining; d++) {
+        const nm = month === 11 ? 0 : month + 1;
+        const ny = month === 11 ? year + 1 : year;
+        const events = getEventsForDate(ny, nm, d);
+        html += buildDayCell(ny, nm, d, events, true, false);
+    }
+
+    html += '</div>';
+    calGrid.innerHTML = html;
+
+    // Attach click handlers
+    calGrid.querySelectorAll('.cal-day').forEach(cell => {
+        cell.addEventListener('click', (e) => {
+            if (e.target.closest('.cal-event-item') || e.target.closest('.cal-event-more')) return;
+            const dateStr = cell.dataset.date;
+            if (dateStr) showEventModal(null, dateStr);
+        });
+    });
+
+    calGrid.querySelectorAll('.cal-event-item').forEach(pill => {
+        pill.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const evId = pill.dataset.eventId;
+            const ev = calEvents.find(ev => ev.id === evId);
+            if (ev) showEventModal(ev);
+        });
+    });
+}
+
+function buildDayCell(year, month, day, events, isOther, isToday) {
+    const classes = ['cal-day'];
+    if (isOther) classes.push('other-month');
+    if (isToday) classes.push('today');
+    const dateStr = formatDateStr(year, month, day);
+
+    let html = '<div class="' + classes.join(' ') + '" data-date="' + dateStr + '">';
+    html += '<div class="cal-day-number">' + day + '</div>';
+    html += '<div class="cal-day-events">';
+
+    const maxShow = 3;
+    const shown = events.slice(0, maxShow);
+    for (const ev of shown) {
+        const color = getEventColor(ev);
+        const title = escapeHtml(ev.title || 'Untitled');
+        html += '<div class="cal-event-item" data-event-id="' + ev.id + '" style="background:' + color + '">' + title + '</div>';
+    }
+    if (events.length > maxShow) {
+        html += '<div class="cal-event-more">+' + (events.length - maxShow) + ' more</div>';
+    }
+    html += '</div></div>';
+    return html;
+}
+
+function renderWeekView() {
+    const weekStart = getWeekStart(calCurrentDate);
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    let html = '<div class="cal-week-grid">';
+
+    // Header row
+    html += '<div class="cal-week-header-cell"></div>'; // time column corner
+    for (let i = 0; i < 7; i++) {
+        const d = new Date(weekStart);
+        d.setDate(d.getDate() + i);
+        const isToday = d.getTime() === today.getTime();
+        html += '<div class="cal-week-header-cell' + (isToday ? ' today' : '') + '">';
+        html += '<span>' + DAY_NAMES[i] + '</span>';
+        html += '<span class="cal-week-day-num">' + d.getDate() + '</span>';
+        html += '</div>';
+    }
+
+    // All-day row
+    html += '<div class="cal-week-allday-label">all-day</div>';
+    for (let i = 0; i < 7; i++) {
+        const d = new Date(weekStart);
+        d.setDate(d.getDate() + i);
+        const dayEvents = getEventsForDate(d.getFullYear(), d.getMonth(), d.getDate())
+            .filter(ev => ev.all_day);
+        html += '<div class="cal-week-allday-cell">';
+        for (const ev of dayEvents) {
+            const color = getEventColor(ev);
+            html += '<div class="cal-event-item" data-event-id="' + ev.id + '" style="background:' + color + '">' + escapeHtml(ev.title || 'Untitled') + '</div>';
+        }
+        html += '</div>';
+    }
+
+    // Hour rows (0-23)
+    for (let h = 0; h < 24; h++) {
+        const label = String(h).padStart(2, '0') + ':00';
+        html += '<div class="cal-week-time-label">' + label + '</div>';
+        for (let i = 0; i < 7; i++) {
+            const d = new Date(weekStart);
+            d.setDate(d.getDate() + i);
+            const dateStr = formatDateStr(d.getFullYear(), d.getMonth(), d.getDate());
+            html += '<div class="cal-week-day-col" data-date="' + dateStr + '" data-hour="' + h + '"></div>';
+        }
+    }
+
+    html += '</div>';
+    calGrid.innerHTML = html;
+
+    // Place timed events as positioned blocks
+    const weekDays = [];
+    for (let i = 0; i < 7; i++) {
+        const d = new Date(weekStart);
+        d.setDate(d.getDate() + i);
+        weekDays.push(d);
+    }
+
+    // Get all day columns for positioning
+    const dayCols = calGrid.querySelectorAll('.cal-week-day-col');
+    // dayCols is a flat list: 24 rows * 7 columns = 168 elements
+    // Index formula: row * 7 + col
+
+    calEvents.forEach(ev => {
+        if (ev.all_day) return;
+        const evStart = new Date(ev.start_time || ev.start || ev.date);
+        const evEnd = (ev.end_time || ev.end) ? new Date(ev.end_time || ev.end) : new Date(evStart.getTime() + 3600000);
+
+        // Find which day column
+        const evDate = new Date(evStart);
+        evDate.setHours(0, 0, 0, 0);
+        const colIdx = weekDays.findIndex(d => d.getTime() === evDate.getTime());
+        if (colIdx < 0) return;
+
+        const startHour = evStart.getHours() + evStart.getMinutes() / 60;
+        const endHour = evEnd.getHours() + evEnd.getMinutes() / 60;
+        const duration = Math.max(endHour - startHour, 0.5);
+
+        const hourRow = Math.floor(startHour);
+        const cellIdx = hourRow * 7 + colIdx;
+        const targetCell = dayCols[cellIdx];
+        if (!targetCell) return;
+
+        const topOffset = (startHour - hourRow) * 48; // 48px per hour row
+        const height = duration * 48;
+
+        const color = getEventColor(ev);
+        const block = document.createElement('div');
+        block.className = 'cal-week-event';
+        block.style.background = color;
+        block.style.top = topOffset + 'px';
+        block.style.height = Math.max(height, 20) + 'px';
+        block.dataset.eventId = ev.id;
+        block.textContent = ev.title || 'Untitled';
+
+        block.addEventListener('click', (e) => {
+            e.stopPropagation();
+            showEventModal(ev);
+        });
+
+        targetCell.appendChild(block);
+    });
+
+    // Click on empty cell to create event
+    calGrid.querySelectorAll('.cal-week-day-col').forEach(cell => {
+        cell.addEventListener('click', (e) => {
+            if (e.target.closest('.cal-week-event')) return;
+            const dateStr = cell.dataset.date;
+            const hour = cell.dataset.hour;
+            showEventModal(null, dateStr, hour);
+        });
+    });
+
+    // Click on all-day event
+    calGrid.querySelectorAll('.cal-week-allday-cell .cal-event-item').forEach(pill => {
+        pill.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const evId = pill.dataset.eventId;
+            const ev = calEvents.find(ev => ev.id === evId);
+            if (ev) showEventModal(ev);
+        });
+    });
+}
+
+// ─── Event Modal ───
+
+function showEventModal(event, defaultDate, defaultHour) {
+    const modal = calModalOverlay;
+    const titleEl = document.getElementById('cal-modal-title');
+    const deleteBtn = document.getElementById('cal-modal-delete');
+
+    // Reset form
+    document.getElementById('cal-event-id').value = '';
+    document.getElementById('cal-event-title').value = '';
+    document.getElementById('cal-event-date').value = '';
+    document.getElementById('cal-event-start').value = '09:00';
+    document.getElementById('cal-event-end').value = '10:00';
+    document.getElementById('cal-event-allday').checked = false;
+    document.getElementById('cal-event-location').value = '';
+    document.getElementById('cal-event-description').value = '';
+    document.getElementById('cal-event-category').value = 'meeting';
+    document.getElementById('cal-event-reminder').value = '15';
+    document.getElementById('cal-event-recurrence').value = 'none';
+    document.getElementById('cal-time-fields').classList.remove('hidden');
+
+    // Reset color picker
+    calModalOverlay.querySelectorAll('.cal-color-dot').forEach(d => d.classList.remove('selected'));
+    const defaultColorDot = calModalOverlay.querySelector('.cal-color-dot[data-color="#7aa2f7"]');
+    if (defaultColorDot) defaultColorDot.classList.add('selected');
+
+    if (event) {
+        // Edit mode
+        titleEl.textContent = 'Edit Event';
+        deleteBtn.classList.remove('hidden');
+        document.getElementById('cal-event-id').value = event.id;
+        document.getElementById('cal-event-title').value = event.title || '';
+        document.getElementById('cal-event-location').value = event.location || '';
+        document.getElementById('cal-event-description').value = event.description || '';
+        document.getElementById('cal-event-category').value = event.category || 'other';
+        // reminder_minutes is an array like [15], pick first or 'none'
+        const reminderVal = (event.reminder_minutes && event.reminder_minutes.length > 0)
+            ? String(event.reminder_minutes[0]) : 'none';
+        document.getElementById('cal-event-reminder').value = reminderVal;
+        document.getElementById('cal-event-recurrence').value = event.recurrence || 'none';
+
+        const evStart = new Date(event.start_time || event.start || event.date);
+        document.getElementById('cal-event-date').value = formatDateStr(evStart.getFullYear(), evStart.getMonth(), evStart.getDate());
+
+        if (event.all_day) {
+            document.getElementById('cal-event-allday').checked = true;
+            document.getElementById('cal-time-fields').classList.add('hidden');
+        } else {
+            document.getElementById('cal-event-start').value = String(evStart.getHours()).padStart(2, '0') + ':' + String(evStart.getMinutes()).padStart(2, '0');
+            const endStr = event.end_time || event.end;
+            if (endStr) {
+                const evEnd = new Date(endStr);
+                document.getElementById('cal-event-end').value = String(evEnd.getHours()).padStart(2, '0') + ':' + String(evEnd.getMinutes()).padStart(2, '0');
+            }
+        }
+
+        // Set color
+        const color = getEventColor(event);
+        calModalOverlay.querySelectorAll('.cal-color-dot').forEach(d => d.classList.remove('selected'));
+        const matchDot = calModalOverlay.querySelector('.cal-color-dot[data-color="' + color + '"]');
+        if (matchDot) matchDot.classList.add('selected');
+
+        // Set category color as default if color matches
+        const catColor = CATEGORY_COLORS[event.category];
+        if (!event.color && catColor) {
+            const catDot = calModalOverlay.querySelector('.cal-color-dot[data-color="' + catColor + '"]');
+            if (catDot) {
+                calModalOverlay.querySelectorAll('.cal-color-dot').forEach(d => d.classList.remove('selected'));
+                catDot.classList.add('selected');
+            }
+        }
+    } else {
+        // Create mode
+        titleEl.textContent = 'New Event';
+        deleteBtn.classList.add('hidden');
+
+        if (defaultDate) {
+            document.getElementById('cal-event-date').value = defaultDate;
+        } else {
+            const now = new Date();
+            document.getElementById('cal-event-date').value = formatDateStr(now.getFullYear(), now.getMonth(), now.getDate());
+        }
+
+        if (defaultHour !== undefined) {
+            const h = parseInt(defaultHour, 10);
+            document.getElementById('cal-event-start').value = String(h).padStart(2, '0') + ':00';
+            document.getElementById('cal-event-end').value = String(h + 1).padStart(2, '0') + ':00';
+        }
+    }
+
+    modal.classList.remove('hidden');
+    document.getElementById('cal-event-title').focus();
+}
+
+function hideEventModal() {
+    calModalOverlay.classList.add('hidden');
+}
+
+function getSelectedColor() {
+    const sel = calModalOverlay.querySelector('.cal-color-dot.selected');
+    return sel ? sel.dataset.color : '#7aa2f7';
+}
+
+async function saveCalendarEvent() {
+    const id = document.getElementById('cal-event-id').value;
+    const title = document.getElementById('cal-event-title').value.trim();
+    if (!title) {
+        document.getElementById('cal-event-title').focus();
+        return;
+    }
+
+    const dateStr = document.getElementById('cal-event-date').value;
+    if (!dateStr) {
+        document.getElementById('cal-event-date').focus();
+        return;
+    }
+    const allDay = document.getElementById('cal-event-allday').checked;
+    const startTime = document.getElementById('cal-event-start').value || '09:00';
+    const endTime = document.getElementById('cal-event-end').value || '10:00';
+    const location = document.getElementById('cal-event-location').value.trim();
+    const description = document.getElementById('cal-event-description').value.trim();
+    const category = document.getElementById('cal-event-category').value;
+    const color = getSelectedColor();
+    const reminder = document.getElementById('cal-event-reminder').value;
+    const recurrence = document.getElementById('cal-event-recurrence').value;
+
+    let start, end;
+    if (allDay) {
+        start = dateStr + 'T00:00:00';
+        end = dateStr + 'T23:59:59';
+    } else {
+        start = dateStr + 'T' + startTime + ':00';
+        end = dateStr + 'T' + endTime + ':00';
+    }
+
+    // Convert local times to ISO (with timezone offset)
+    const startDate = new Date(start);
+    const endDate = new Date(end);
+
+    const now = new Date().toISOString();
+    const reminderMinutes = (reminder === 'none' || !reminder) ? [] : [parseInt(reminder, 10)];
+
+    const eventData = {
+        id: id || crypto.randomUUID(),
+        title,
+        description: description || null,
+        start_time: startDate.toISOString(),
+        end_time: endDate.toISOString(),
+        all_day: allDay,
+        location: location || null,
+        recurrence: recurrence === 'none' ? null : recurrence,
+        reminder_minutes: reminderMinutes,
+        color: color || null,
+        category: category || null,
+        created_by: 'User',
+        arc_id: null,
+        created_at: now,
+        updated_at: now,
+    };
+
+    if (!invoke) {
+        // Offline / demo mode: manage locally
+        if (id) {
+            calEvents = calEvents.map(ev => ev.id === id ? eventData : ev);
+        } else {
+            calEvents.push(eventData);
+        }
+        hideEventModal();
+        renderCalendar();
+        return;
+    }
+
+    try {
+        if (id) {
+            await invoke('update_calendar_event', { event: eventData });
+        } else {
+            await invoke('create_calendar_event', { event: eventData });
+        }
+        hideEventModal();
+        await loadCalendarEvents();
+        showToast('Event saved', 'success');
+    } catch (err) {
+        console.error('Failed to save event:', err);
+        showToast('Failed to save event: ' + err, 'error');
+    }
+}
+
+async function deleteCalendarEvent() {
+    const id = document.getElementById('cal-event-id').value;
+    if (!id) return;
+
+    if (!confirm('Delete this event?')) return;
+
+    if (!invoke) {
+        calEvents = calEvents.filter(ev => ev.id !== id);
+        hideEventModal();
+        renderCalendar();
+        return;
+    }
+
+    try {
+        await invoke('delete_calendar_event', { id });
+        hideEventModal();
+        await loadCalendarEvents();
+        showToast('Event deleted', 'success');
+    } catch (err) {
+        console.error('Failed to delete event:', err);
+        showToast('Failed to delete event: ' + err, 'error');
+    }
+}
+
+// Calendar event listeners
+if (calendarBtn) {
+    calendarBtn.addEventListener('click', showCalendar);
+}
+
+if (calendarBack) {
+    calendarBack.addEventListener('click', hideCalendar);
+}
+
+document.getElementById('cal-prev')?.addEventListener('click', () => {
+    if (calViewMode === 'month') {
+        calCurrentDate.setMonth(calCurrentDate.getMonth() - 1);
+    } else {
+        calCurrentDate.setDate(calCurrentDate.getDate() - 7);
+    }
+    loadCalendarEvents();
+});
+
+document.getElementById('cal-next')?.addEventListener('click', () => {
+    if (calViewMode === 'month') {
+        calCurrentDate.setMonth(calCurrentDate.getMonth() + 1);
+    } else {
+        calCurrentDate.setDate(calCurrentDate.getDate() + 7);
+    }
+    loadCalendarEvents();
+});
+
+document.getElementById('cal-today-btn')?.addEventListener('click', () => {
+    calCurrentDate = new Date();
+    loadCalendarEvents();
+});
+
+if (calViewSelect) {
+    calViewSelect.addEventListener('change', (e) => {
+        calViewMode = e.target.value;
+        loadCalendarEvents();
+    });
+}
+
+// Modal event listeners
+document.getElementById('cal-modal-close')?.addEventListener('click', hideEventModal);
+document.getElementById('cal-modal-cancel')?.addEventListener('click', hideEventModal);
+document.getElementById('cal-modal-save')?.addEventListener('click', saveCalendarEvent);
+document.getElementById('cal-modal-delete')?.addEventListener('click', deleteCalendarEvent);
+
+// Close modal on overlay click
+calModalOverlay?.addEventListener('click', (e) => {
+    if (e.target === calModalOverlay) hideEventModal();
+});
+
+// All-day toggle
+document.getElementById('cal-event-allday')?.addEventListener('change', (e) => {
+    const tf = document.getElementById('cal-time-fields');
+    if (e.target.checked) {
+        tf.classList.add('hidden');
+    } else {
+        tf.classList.remove('hidden');
+    }
+});
+
+// Color picker
+document.getElementById('cal-color-options')?.addEventListener('click', (e) => {
+    const dot = e.target.closest('.cal-color-dot');
+    if (!dot) return;
+    calModalOverlay.querySelectorAll('.cal-color-dot').forEach(d => d.classList.remove('selected'));
+    dot.classList.add('selected');
+});
+
+// Category change updates default color
+document.getElementById('cal-event-category')?.addEventListener('change', (e) => {
+    const catColor = CATEGORY_COLORS[e.target.value];
+    if (catColor) {
+        calModalOverlay.querySelectorAll('.cal-color-dot').forEach(d => d.classList.remove('selected'));
+        const dot = calModalOverlay.querySelector('.cal-color-dot[data-color="' + catColor + '"]');
+        if (dot) dot.classList.add('selected');
+    }
+});
 
 // ─── Initialize ───
 
