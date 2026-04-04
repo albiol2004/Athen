@@ -1326,6 +1326,8 @@ const SECURITY_HINTS = {
 function showSettings() {
     appView.style.display = 'none';
     timelineView?.classList.add('hidden');
+    document.getElementById('sidebar').style.display = '';
+    if (timelineRefreshInterval) { clearInterval(timelineRefreshInterval); timelineRefreshInterval = null; }
     settingsView.classList.remove('hidden');
     closeSidebar();
     loadSettings();
@@ -1334,6 +1336,8 @@ function showSettings() {
 function showChat() {
     settingsView.classList.add('hidden');
     timelineView?.classList.add('hidden');
+    document.getElementById('sidebar').style.display = '';
+    if (timelineRefreshInterval) { clearInterval(timelineRefreshInterval); timelineRefreshInterval = null; }
     appView.style.display = 'flex';
     inputEl.focus();
 }
@@ -1755,20 +1759,29 @@ function showEmailTestResult(success, message) {
 
 // ─── Arc Timeline ───
 
+let timelineRefreshInterval = null;
+
 const timelineToggleBtn = document.getElementById('timeline-toggle-btn');
 const timelineBackBtn = document.getElementById('timeline-back');
 
 function showTimeline() {
     appView.style.display = 'none';
     settingsView.classList.add('hidden');
+    document.getElementById('sidebar').style.display = 'none';
     timelineView.classList.remove('hidden');
-    closeSidebar();
     renderTimeline();
+    // Auto-refresh every 30s
+    timelineRefreshInterval = setInterval(renderTimeline, 30000);
 }
 
 function hideTimeline() {
     timelineView.classList.add('hidden');
+    document.getElementById('sidebar').style.display = '';
     appView.style.display = 'flex';
+    if (timelineRefreshInterval) {
+        clearInterval(timelineRefreshInterval);
+        timelineRefreshInterval = null;
+    }
     inputEl.focus();
 }
 
@@ -1780,126 +1793,196 @@ if (timelineBackBtn) {
     timelineBackBtn.addEventListener('click', hideTimeline);
 }
 
+document.getElementById('timeline-new-arc')?.addEventListener('click', async () => {
+    hideTimeline();
+    if (typeof newArc === 'function') await newArc();
+});
+
 async function renderTimeline() {
     const canvas = document.getElementById('timeline-canvas');
     if (!canvas || !invoke) return;
-    canvas.innerHTML = '<div class="timeline-loading">Loading timeline...</div>';
 
     try {
-        const arcs = await invoke('list_arcs');
-        if (!arcs || arcs.length === 0) {
-            canvas.innerHTML = '<div class="timeline-empty">No arcs yet. Start a conversation or connect a sense monitor.</div>';
+        const timelineArcs = await invoke('get_timeline_data');
+        if (!timelineArcs || timelineArcs.length === 0) {
+            canvas.innerHTML = '<div class="tl-empty">No arcs yet. Start a conversation to see the timeline.</div>';
             return;
         }
 
-        // Build a map for quick lookup
-        const arcMap = {};
-        arcs.forEach(a => { arcMap[a.id] = a; });
-
-        // Sort by created_at ascending (oldest first = bottom of timeline)
-        const sorted = [...arcs].sort((a, b) =>
-            new Date(a.created_at) - new Date(b.created_at)
+        // Sort arcs by most recently updated (rightmost = most recent)
+        const sorted = [...timelineArcs].sort((a, b) =>
+            new Date(a.updated_at) - new Date(b.updated_at)
         );
 
-        // Assign lanes (columns) — root arcs get their own lane,
-        // branches share parent's lane + 1
-        const lanes = {};
-        let nextLane = 0;
-        sorted.forEach(arc => {
-            if (arc.parent_arc_id && lanes[arc.parent_arc_id] !== undefined) {
-                lanes[arc.id] = lanes[arc.parent_arc_id] + 1;
-                if (lanes[arc.id] >= nextLane) nextLane = lanes[arc.id] + 1;
+        // Collect ALL entries across all arcs with their arc index
+        let allEntries = [];
+        sorted.forEach((arc, colIdx) => {
+            (arc.entries || []).forEach(entry => {
+                allEntries.push({ ...entry, arcIdx: colIdx, arcId: arc.id });
+            });
+        });
+
+        // Sort entries by created_at descending (newest first)
+        allEntries.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+
+        // Build time slots — group entries by time proximity (within 2 minutes = same row)
+        const timeSlots = [];
+        allEntries.forEach(entry => {
+            const entryTime = new Date(entry.created_at).getTime();
+            const existing = timeSlots.find(slot =>
+                Math.abs(slot.time - entryTime) < 120000 // 2 min window
+            );
+            if (existing) {
+                existing.entries.push(entry);
             } else {
-                lanes[arc.id] = nextLane;
-                nextLane++;
+                timeSlots.push({ time: entryTime, entries: [entry] });
             }
         });
 
-        // Render newest first (reverse for display)
-        const display = [...sorted].reverse();
+        // Sort time slots newest first
+        timeSlots.sort((a, b) => b.time - a.time);
 
-        let html = '<div class="timeline-graph">';
+        const numCols = sorted.length;
 
-        display.forEach((arc) => {
-            const lane = lanes[arc.id] || 0;
-            const sourceIcon = getTimelineSourceIcon(arc.source);
-            const statusClass = arc.status === 'Merged' ? 'merged' :
-                               arc.status === 'Archived' ? 'archived' : 'active';
-            const laneColor = getTimelineLaneColor(lane);
+        // Build HTML
+        let html = '<div class="tl-graph">';
 
-            // Check for relationships
-            const isBranch = !!arc.parent_arc_id;
-            const isMerged = arc.status === 'Merged';
-            const mergeTarget = arc.merged_into_arc_id;
-
-            // Time display
-            const timeStr = formatSessionDate(arc.created_at);
-
-            html += '<div class="timeline-row ' + statusClass + '" data-arc-id="' + arc.id + '">';
-
-            // Left: graph rail
-            html += '<div class="timeline-rail" style="padding-left: ' + (lane * 24 + 12) + 'px">';
-            html += '<div class="timeline-node" style="background: ' + laneColor + '">' + sourceIcon + '</div>';
-            if (isBranch && lanes[arc.parent_arc_id] !== undefined) {
-                const parentLane = lanes[arc.parent_arc_id];
-                const lineLeft = parentLane * 24 + 20;
-                const lineWidth = (lane - parentLane) * 24;
-                html += '<div class="timeline-branch-line" style="left: ' + lineLeft + 'px; width: ' + lineWidth + 'px; border-color: ' + laneColor + '"></div>';
-            }
-            html += '</div>';
-
-            // Right: info
-            html += '<div class="timeline-info">';
-            html += '<div class="timeline-name">' + escapeHtml(arc.name) + '</div>';
-            html += '<div class="timeline-meta">';
-            html += '<span class="timeline-time">' + timeStr + '</span>';
-            html += '<span class="timeline-entries">' + arc.entry_count + ' entries</span>';
-            if (isBranch) {
-                const parentName = arcMap[arc.parent_arc_id]?.name || arc.parent_arc_id;
-                html += '<span class="timeline-branch-tag">\u21b3 from ' + escapeHtml(parentName) + '</span>';
-            }
-            if (isMerged && mergeTarget) {
-                const targetName = arcMap[mergeTarget]?.name || mergeTarget;
-                html += '<span class="timeline-merge-tag">\u2192 merged into ' + escapeHtml(targetName) + '</span>';
-            }
-            html += '</div>';
-            html += '</div>';
-
-            // Actions
-            html += '<div class="timeline-actions">';
-            if (arc.status === 'Active') {
-                html += '<button class="timeline-action-btn" onclick="event.stopPropagation(); switchArcFromTimeline(\'' + arc.id + '\')" title="Open">Open</button>';
-            }
-            html += '</div>';
-
+        // Arc headers (column headers)
+        html += '<div class="tl-header-row">';
+        html += '<div class="tl-time-label"></div>'; // empty corner
+        sorted.forEach((arc, i) => {
+            const color = getTlColor(i);
+            const icon = getTlSourceIcon(arc.source);
+            const statusCls = arc.status === 'Merged' ? ' tl-merged' : arc.status === 'Archived' ? ' tl-archived' : '';
+            html += '<div class="tl-col-header' + statusCls + '" style="border-bottom-color: ' + color + '" data-arc-id="' + arc.id + '" title="Click to open">';
+            html += '<span class="tl-col-icon">' + icon + '</span>';
+            html += '<span class="tl-col-name">' + escapeHtml(arc.name) + '</span>';
+            html += '<span class="tl-col-count">' + arc.entry_count + '</span>';
             html += '</div>';
         });
+        html += '</div>';
+
+        // Time rows
+        timeSlots.forEach(slot => {
+            const timeStr = formatTimelineTime(slot.time);
+            html += '<div class="tl-row">';
+            html += '<div class="tl-time-label">' + timeStr + '</div>';
+
+            // One cell per arc column
+            for (let col = 0; col < numCols; col++) {
+                const entriesInCol = slot.entries.filter(e => e.arcIdx === col);
+                const color = getTlColor(col);
+
+                html += '<div class="tl-cell">';
+                if (entriesInCol.length > 0) {
+                    entriesInCol.forEach(entry => {
+                        const nodeColor = getTlEntryColor(entry.entry_type);
+                        const typeIcon = getTlEntryIcon(entry.entry_type);
+                        const preview = entry.content.length > 120
+                            ? entry.content.substring(0, 120) + '...'
+                            : entry.content;
+                        const tooltipTime = new Date(entry.created_at).toLocaleString();
+
+                        html += '<div class="tl-node" style="background: ' + nodeColor + '" ';
+                        html += 'data-tooltip="' + escapeAttr(typeIcon + ' ' + entry.source + '\n' + preview + '\n' + tooltipTime) + '">';
+                        html += '</div>';
+                    });
+                }
+                // Vertical rail line (always present for active arcs)
+                html += '<div class="tl-rail" style="background: ' + color + '"></div>';
+                html += '</div>';
+            }
+            html += '</div>';
+        });
+
+        // If no entries at all but arcs exist, show just headers
+        if (timeSlots.length === 0) {
+            html += '<div class="tl-row"><div class="tl-time-label">-</div>';
+            for (let col = 0; col < numCols; col++) {
+                html += '<div class="tl-cell"><div class="tl-rail" style="background: ' + getTlColor(col) + '"></div></div>';
+            }
+            html += '</div>';
+        }
 
         html += '</div>';
         canvas.innerHTML = html;
 
-        // Click on row to open arc
-        canvas.querySelectorAll('.timeline-row.active').forEach(row => {
-            row.addEventListener('click', () => {
-                const arcId = row.dataset.arcId;
-                switchArcFromTimeline(arcId);
+        // Event listeners
+        canvas.querySelectorAll('.tl-col-header').forEach(header => {
+            header.addEventListener('click', () => {
+                const arcId = header.dataset.arcId;
+                hideTimeline();
+                if (typeof handleSwitchArc === 'function') handleSwitchArc(arcId);
             });
         });
 
+        // Tooltip handling via mouseover
+        canvas.querySelectorAll('.tl-node').forEach(node => {
+            node.addEventListener('mouseenter', (e) => showTlTooltip(e, node.dataset.tooltip));
+            node.addEventListener('mouseleave', hideTlTooltip);
+        });
+
     } catch (e) {
-        canvas.innerHTML = '<div class="timeline-empty">Failed to load timeline: ' + escapeHtml(e.toString()) + '</div>';
+        canvas.innerHTML = '<div class="tl-empty">Failed to load timeline: ' + escapeHtml(e.toString()) + '</div>';
     }
 }
 
-function switchArcFromTimeline(arcId) {
-    hideTimeline();
-    handleSwitchArc(arcId);
+function showTlTooltip(event, text) {
+    let tooltip = document.getElementById('tl-tooltip');
+    if (!tooltip) {
+        tooltip = document.createElement('div');
+        tooltip.id = 'tl-tooltip';
+        tooltip.className = 'tl-tooltip';
+        document.body.appendChild(tooltip);
+    }
+    tooltip.textContent = text;
+    tooltip.style.display = 'block';
+
+    // Position near the node
+    const rect = event.target.getBoundingClientRect();
+    tooltip.style.left = (rect.right + 8) + 'px';
+    tooltip.style.top = (rect.top - 10) + 'px';
+
+    // Keep on screen
+    const tooltipRect = tooltip.getBoundingClientRect();
+    if (tooltipRect.right > window.innerWidth - 10) {
+        tooltip.style.left = (rect.left - tooltipRect.width - 8) + 'px';
+    }
+    if (tooltipRect.bottom > window.innerHeight - 10) {
+        tooltip.style.top = (window.innerHeight - tooltipRect.height - 10) + 'px';
+    }
 }
 
-// Make it globally accessible for inline onclick handlers
-window.switchArcFromTimeline = switchArcFromTimeline;
+function hideTlTooltip() {
+    const tooltip = document.getElementById('tl-tooltip');
+    if (tooltip) tooltip.style.display = 'none';
+}
 
-function getTimelineSourceIcon(source) {
+function escapeAttr(s) {
+    return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function formatTimelineTime(timestamp) {
+    const now = Date.now();
+    const diff = now - timestamp;
+    const secs = Math.floor(diff / 1000);
+    if (secs < 60) return 'Now';
+    const mins = Math.floor(secs / 60);
+    if (mins < 60) return mins + 'm ago';
+    const hours = Math.floor(mins / 60);
+    if (hours < 24) return hours + 'h ago';
+    const days = Math.floor(hours / 24);
+    if (days === 1) return 'Yesterday';
+    if (days < 7) return days + 'd ago';
+    return new Date(timestamp).toLocaleDateString();
+}
+
+function getTlColor(idx) {
+    const colors = ['#7aa2f7', '#9ece6a', '#e0af68', '#f7768e', '#bb9af7', '#7dcfff', '#ff9e64', '#c0caf5'];
+    return colors[idx % colors.length];
+}
+
+function getTlSourceIcon(source) {
     switch (source) {
         case 'Email': return '\u{1f4e7}';
         case 'Calendar': return '\u{1f4c5}';
@@ -1909,9 +1992,26 @@ function getTimelineSourceIcon(source) {
     }
 }
 
-function getTimelineLaneColor(lane) {
-    const colors = ['#7aa2f7', '#9ece6a', '#e0af68', '#f7768e', '#bb9af7', '#7dcfff', '#ff9e64', '#c0caf5'];
-    return colors[lane % colors.length];
+function getTlEntryColor(type) {
+    switch (type) {
+        case 'message': return '#7aa2f7';
+        case 'tool_call': return '#e0af68';
+        case 'email_event': return '#bb9af7';
+        case 'calendar_event': return '#9ece6a';
+        case 'system_event': return '#565f89';
+        default: return '#7aa2f7';
+    }
+}
+
+function getTlEntryIcon(type) {
+    switch (type) {
+        case 'message': return '\u{1f4ac}';
+        case 'tool_call': return '\u{1f527}';
+        case 'email_event': return '\u{1f4e7}';
+        case 'calendar_event': return '\u{1f4c5}';
+        case 'system_event': return '\u2699\ufe0f';
+        default: return '\u25cf';
+    }
 }
 
 // ─── Initialize ───

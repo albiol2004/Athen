@@ -839,6 +839,45 @@ pub async fn list_arcs(
     }
 }
 
+/// Timeline data: all arcs with their entries for the full graph view.
+#[derive(Serialize)]
+pub struct TimelineArc {
+    #[serde(flatten)]
+    pub meta: arcs::ArcMeta,
+    pub entries: Vec<ArcEntryResponse>,
+}
+
+/// Return all arcs with their entries for the timeline view.
+#[tauri::command]
+pub async fn get_timeline_data(
+    state: State<'_, AppState>,
+) -> std::result::Result<Vec<TimelineArc>, String> {
+    if let Some(ref store) = state.arc_store {
+        let arc_list = store.list_arcs().await.map_err(|e| e.to_string())?;
+        let mut result = Vec::new();
+        for meta in arc_list {
+            let entries = store
+                .load_entries(&meta.id)
+                .await
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(|e| ArcEntryResponse {
+                    id: e.id,
+                    entry_type: e.entry_type.as_str().to_string(),
+                    source: e.source,
+                    content: e.content,
+                    metadata: e.metadata,
+                    created_at: e.created_at,
+                })
+                .collect();
+            result.push(TimelineArc { meta, entries });
+        }
+        Ok(result)
+    } else {
+        Ok(Vec::new())
+    }
+}
+
 /// Switch to a different arc, loading its entries into the in-memory history.
 ///
 /// Returns the loaded entries so the frontend can render them immediately.

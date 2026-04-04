@@ -31,6 +31,7 @@ pub fn run() {
             commands::get_current_arc,
             commands::branch_arc,
             commands::merge_arcs,
+            commands::get_timeline_data,
             settings::get_settings,
             settings::save_provider,
             settings::delete_provider,
