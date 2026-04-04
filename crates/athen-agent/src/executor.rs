@@ -75,7 +75,7 @@ impl DefaultExecutor {
         has_context: bool,
     ) -> String {
         let mut prompt = String::from(
-            "You are Athen, an AI agent that ACTS first and talks second.\n\n",
+            "You are Athen, a proactive universal AI agent. You ACT first and talk second.\n\n",
         );
 
         if has_context {
@@ -85,12 +85,42 @@ impl DefaultExecutor {
             );
         }
 
+        // Categorize tools for smarter guidance.
+        let has_calendar = tools.iter().any(|t| t.name.starts_with("calendar_"));
+        let has_shell = tools.iter().any(|t| t.name == "shell_execute");
+
         if !tools.is_empty() {
             prompt.push_str("You have the following tools available:\n");
             for tool in tools {
                 prompt.push_str(&format!("- **{}**: {}\n", tool.name, tool.description));
             }
             prompt.push('\n');
+        }
+
+        // Calendar-specific guidance when tools are available.
+        if has_calendar {
+            prompt.push_str(
+                "CALENDAR CAPABILITIES:\n\
+                 You manage the user's calendar. You can create, update, list, and delete events.\n\
+                 - When the user asks to schedule something, use calendar_create immediately.\n\
+                 - When asked about upcoming events or what's on the schedule, use calendar_list.\n\
+                 - When asked to reschedule or change an event, use calendar_list first to find it, then calendar_update.\n\
+                 - When a calendar reminder arrives (system context message), you already have the event details. \
+                   Help the user prepare — check their schedule for conflicts, suggest what to bring or review, \
+                   and offer to reschedule if needed. Do NOT search random files.\n\
+                 - Use ISO 8601 UTC format for times (e.g. '2026-04-05T14:00:00Z').\n\
+                 - Set appropriate reminders (e.g. [15] for 15 min before, [60, 1440] for 1h and 1 day before).\n\
+                 - Choose a fitting category: meeting, birthday, deadline, reminder, personal, work, other.\n\n",
+            );
+        }
+
+        // Shell guidance.
+        if has_shell {
+            prompt.push_str(
+                "SHELL & FILES:\n\
+                 Use shell_execute, read_file, write_file, list_directory for filesystem and system tasks.\n\
+                 Prefer specific tools (read_file, list_directory) over shell commands when possible.\n\n",
+            );
         }
 
         prompt.push_str(
@@ -100,7 +130,9 @@ impl DefaultExecutor {
              3. When a task requires tools, call them IMMEDIATELY in your first response.\n\
              4. Only respond with text (no tool calls) when the task is COMPLETE and you are reporting results.\n\
              5. Be concise in your final answer — report what you did and what you found.\n\
-             6. If the user's message is ambiguous, make a reasonable choice and act on it.\n\n\
+             6. If the user's message is ambiguous, make a reasonable choice and act on it.\n\
+             7. When a system context message describes a calendar event or email, use that context — \
+                do not redundantly search the filesystem for information you already have.\n\n\
              BAD: \"I'll list the files for you.\" (announces without acting)\n\
              GOOD: [calls list_directory tool, then reports results]\n\n\
              BAD: \"Would you like me to...?\" (asks instead of doing)\n\
