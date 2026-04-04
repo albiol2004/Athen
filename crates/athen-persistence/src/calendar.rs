@@ -100,6 +100,7 @@ CREATE TABLE IF NOT EXISTS fired_reminders (
 ";
 
 /// SQLite-backed calendar event storage.
+#[derive(Clone)]
 pub struct CalendarStore {
     conn: Arc<Mutex<Connection>>,
 }

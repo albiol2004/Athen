@@ -3,6 +3,7 @@
 //! This crate wires all Athen components together and exposes them
 //! to the frontend through Tauri IPC commands.
 
+pub(crate) mod app_tools;
 mod commands;
 pub(crate) mod process;
 pub(crate) mod sense_router;

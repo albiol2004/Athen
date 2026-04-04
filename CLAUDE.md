@@ -67,9 +67,9 @@ Multi-process architecture. Each major component runs as its own process, commun
 athen/
 ├── Cargo.toml                    # Workspace root
 ├── frontend/                     # Shared web frontend (HTML/CSS/JS)
-│   ├── index.html                # App layout: sidebar + chat + settings
-│   ├── styles.css                # Dark theme, streaming, tool cards, settings
-│   └── app.js                    # Chat logic, streaming, arcs, settings
+│   ├── index.html                # App layout: sidebar + chat + settings + calendar
+│   ├── styles.css                # Dark theme, streaming, tool cards, settings, calendar
+│   └── app.js                    # Chat logic, streaming, arcs, settings, calendar
 ├── crates/
 │   ├── athen-core/               # Shared types + trait contracts (THE CONTRACTS)
 │   ├── athen-ipc/                # IPC transport layer
@@ -79,7 +79,7 @@ athen/
 │   ├── athen-llm/                # LLM provider adapters + router + failover
 │   ├── athen-memory/             # Vector index + knowledge graph + SQLite
 │   ├── athen-risk/               # Risk scorer + regex rules + LLM fallback
-│   ├── athen-persistence/        # SQLite persistence, checkpoints, arcs
+│   ├── athen-persistence/        # SQLite persistence, checkpoints, arcs, calendar
 │   ├── athen-contacts/           # Contact trust model + risk multipliers
 │   ├── athen-sandbox/            # OS-native + container sandboxing
 │   ├── athen-shell/              # Nushell embedding + native shell fallback
@@ -427,7 +427,7 @@ Per-error-type behavior:
 
 ## Persistence & Recovery
 
-SQLite stores: tasks, task steps, checkpoints, pending messages, arcs, arc entries, contacts, configuration. (Legacy chat_messages/chat_sessions tables still exist for backward compatibility but are no longer used — auto-migrated to arcs on first startup.)
+SQLite stores: tasks, task steps, checkpoints, pending messages, arcs, arc entries, calendar events, fired reminders, contacts, configuration. (Legacy chat_messages/chat_sessions tables still exist for backward compatibility but are no longer used — auto-migrated to arcs on first startup.)
 
 **Checkpoint frequency**: After every completed step, every 30s during long steps, before any risky action, before LLM calls.
 
@@ -528,14 +528,18 @@ The agent can use tools through 4 backends, choosing the best for each situation
 3. **Script**: Python execution for data processing, ML tasks, etc.
 4. **HttpApi**: Direct HTTP calls to external services.
 
-### Built-in Tools (ShellToolRegistry)
-The agent has 6 built-in tools available via `ShellToolRegistry`:
+### Built-in Tools (AppToolRegistry)
+The agent has 10 built-in tools available via `AppToolRegistry` (wraps `ShellToolRegistry` + calendar tools):
 1. `shell_execute` — runs shell commands (sandboxed when bwrap available, with pre-execution risk check)
 2. `read_file` — reads file contents via `tokio::fs`
 3. `write_file` — writes content to files via `tokio::fs`
 4. `list_directory` — lists directory entries as JSON
 5. `memory_store` — stores key-value pairs in in-session memory (HashMap)
 6. `memory_recall` — retrieves by key or lists all stored keys
+7. `calendar_list` — query calendar events by date range
+8. `calendar_create` — create calendar events (title, time, location, category, reminders, recurrence). Sets `created_by: Agent`.
+9. `calendar_update` — partial update of calendar events (loads existing, merges only provided fields)
+10. `calendar_delete` — delete calendar event by ID
 
 ### Sandbox Tiers
 - **L1 actions**: No sandbox (read-only operations)
@@ -659,11 +663,17 @@ When the agent needs to contact the user:
 - `sqlite.rs`: `SqliteVectorIndex` and `SqliteGraph` — SQLite-backed persistent versions. Embeddings stored as little-endian f32 blobs. Uses `std::sync::Mutex` (not tokio) since rusqlite is synchronous and locks are never held across `.await`.
 - `lib.rs`: `Memory` facade implementing `MemoryStore`. `remember()` stores in vector + extracts entities to graph. `recall()` searches vector index. `forget()` removes from vector.
 
-### athen-sentidos (42 tests)
-**Status**: Complete — user input monitor, full email monitor, stubs, polling runner.
+### athen-sentidos (59 tests)
+**Status**: Complete — user input monitor, full email monitor, full calendar monitor, messaging stub, polling runner.
 - `user_input.rs`: `UserInputMonitor` using `tokio::sync::Mutex<mpsc::Receiver<String>>` for interior mutability. Converts strings to `SenseEvent` with EventSource::UserInput, EventKind::Command, RiskLevel::Safe. Exposes `sender()` for UI to push messages.
 - `email.rs`: Full `EmailMonitor` — real IMAP polling via `imap` v2.4 (sync, wrapped in `spawn_blocking`) + `rustls-connector` for TLS (no OpenSSL). `mailparse` for MIME body parsing (text, HTML, attachments). Tracks `last_seen_uid` for incremental polling. Uses `BODY.PEEK[]` to avoid marking emails as read. `extract_email_body()` recursively walks MIME parts. Configurable via `EmailConfig` (server, port, TLS, folders, poll interval, lookback). 15 tests.
-- `calendar.rs`: Stub `CalendarMonitor` — 300s poll interval.
+- `calendar.rs`: Full `CalendarMonitor` — polls SQLite every 60s, queries events within 7 days using `datetime()` for timezone-safe comparison. 21 tests.
+  - `generate_reminder_events()` — fires reminders when `minutes_until <= reminder_minutes` for each event
+  - "Starting now" notification when event within 1 minute, even without explicit reminders
+  - Session-level deduplication via `Mutex<HashSet<(event_id, reminder_minutes)>>`
+  - Opens fresh rusqlite connection per poll (safe at 60s interval)
+  - Graceful: returns empty if DB or table doesn't exist
+  - Added `rusqlite` and `tempfile` (dev) dependencies to athen-sentidos
 - `messaging.rs`: Stub `MessagingMonitor` — 30s poll interval.
 - `lib.rs`: Generic `SenseRunner<M: SenseMonitor>` — polling loop with `tokio::select!` for shutdown signal. Sends events through mpsc channel.
 
@@ -673,9 +683,9 @@ When the agent needs to contact the user:
 - `nushell.rs`: `NushellShell` — auto-detects `nu` binary. If available: `nu -c "command"`. If not: falls back to NativeShell with info log.
 - `lib.rs`: `Shell` unified facade. `execute()` prefers nushell, `execute_native()` always native. Convenience: `run()` returns stdout, `run_ok()` returns bool, `has_program()` checks existence.
 
-### athen-persistence (50 unit + 5 integration = 55 tests)
-**Status**: Complete — SQLite persistence with atomic checkpoints, arcs, and legacy chat history.
-- `lib.rs`: `Database` struct with `new(path)` and `in_memory()`. Auto-creates tables on init (including arc and legacy chat tables). Provides `store()` → `SqliteStore`, `chat_store()` → `ChatStore`, and `arc_store()` → `ArcStore` accessors.
+### athen-persistence (69 unit + 5 integration = 74 tests)
+**Status**: Complete — SQLite persistence with atomic checkpoints, arcs, calendar, and legacy chat history.
+- `lib.rs`: `Database` struct with `new(path)` and `in_memory()`. Auto-creates tables on init (including arc, calendar, and legacy chat tables). Provides `store()` → `SqliteStore`, `chat_store()` → `ChatStore`, `arc_store()` → `ArcStore`, and `calendar_store()` → `CalendarStore` accessors.
 - `store.rs`: `SqliteStore` implementing `PersistentStore`. Full CRUD for tasks (with steps serialized as JSON), checkpoints with SHA-256 integrity verification, pending messages with atomic pop (transaction-based select+update).
 - `checkpoint.rs`: `CheckpointManager` — atomic file-based backup (write temp → fsync → rename). Integrity verification with SHA-256 checksums.
 - `arcs.rs`: `ArcStore` — git-branch-like workflow containers replacing sessions. Types:
@@ -693,9 +703,15 @@ When the agent needs to contact the user:
   - `load_entries(arc_id)` — returns all entries ordered by creation time
   - `migrate_from_chat_tables()` — auto-migrates legacy chat_sessions/chat_messages to arcs on first startup
   Schema: `arcs` (id PK, name, source, status, parent_arc_id, merged_into_arc_id, created_at, updated_at) + `arc_entries` (id PK, arc_id FK, entry_type, source, content, metadata, created_at). 10 tests.
+- `calendar.rs`: `CalendarStore` (Clone) — Athen's native internal calendar system. 19 tests. Types:
+  - `CalendarEvent`: 15 fields (id, title, description, start_time, end_time, all_day, location, recurrence, reminder_minutes, color, category, created_by, arc_id, created_at, updated_at)
+  - `EventCreator` (User/Agent), `Recurrence` (Daily/Weekly/Monthly/Yearly), `FiredReminder`
+  Methods: full CRUD — `create_event`, `update_event`, `delete_event`, `get_event`, `list_events` (overlap range query using `datetime()` for proper timezone handling), `list_all_events`, `get_upcoming_events`, `get_events_by_category`.
+  Reminder tracking: `record_fired_reminder`, `is_reminder_fired`, `clear_old_fired_reminders`.
+  Schema: `calendar_events` table + `fired_reminders` table (composite PK).
 - `chat.rs`: `ChatStore` — legacy SQLite-backed chat history. Still exists for backward compatibility but no longer used by the app. Auto-migrated to arcs on first startup.
   Schema: `chat_messages` (id, session_id, role, content, content_type, created_at) + `chat_sessions` (session_id PK, name, created_at, updated_at).
-- Schema: `tasks`, `task_steps`, `checkpoints`, `pending_messages`, `arcs`, `arc_entries`, `chat_messages` (legacy), `chat_sessions` (legacy) tables.
+- Schema: `tasks`, `task_steps`, `checkpoints`, `pending_messages`, `arcs`, `arc_entries`, `calendar_events`, `fired_reminders`, `chat_messages` (legacy), `chat_sessions` (legacy) tables.
 
 ### athen-agent (32 unit + 3 integration = 35 tests)
 **Status**: Complete — LLM-driven task execution with real tool calling, streaming responses, cancellation, tool-level risk checking, sandbox integration, session memory, anti-lazy nudge, and graceful max-steps handling.
@@ -704,7 +720,7 @@ When the agent needs to contact the user:
   - **Cancellation**: `cancel_flag` is checked at loop start and between each tool call. When set to `true`, returns immediately with `{ reason: "cancelled", response: "Task cancelled by user." }`.
   - **Anti-lazy nudge**: on the first response (steps_completed == 0) when tools are available, detects lazy phrases ("let me", "i'll ", "i will ", "i can ", "i would ", "would you like me", "shall i", "do you want me") and re-prompts: "Don't tell me what you'll do -- just do it. Use your tools now."
   - **Graceful max-steps**: when the executor hits the step limit, it makes one final LLM call with `tools: None` asking for a summary of work accomplished, instead of returning raw JSON.
-- `tools.rs`: `ShellToolRegistry` implementing `ToolRegistry` with 6 built-in tools:
+- `tools.rs`: `ShellToolRegistry` implementing `ToolRegistry` with 6 built-in tools (extended to 10 by `AppToolRegistry` in athen-app):
   - `shell_execute` — runs shell commands with **2-layer safety**: (1) pre-execution risk check via `RuleEngine.evaluate()` on the actual command string — blocks Danger/Critical commands with a descriptive error returned to the LLM, (2) sandboxed execution via bwrap with `SandboxProfile::RestrictedWrite` (writable: `/tmp`, `$HOME`, cwd; read-only: everything else). Graceful fallback to unsandboxed if bwrap not installed.
   - `read_file` — reads file contents via `tokio::fs`
   - `write_file` — writes content to a file via `tokio::fs`
@@ -752,9 +768,9 @@ When the agent needs to contact the user:
 - `SharedRouter`: Wrapper around `Arc<DefaultLlmRouter>` implementing `LlmRouter` trait for sharing between risk evaluator and agent.
 - **Verified working**: Full agentic pipeline — user input → coordinator → risk → dispatch → agent executor → LLM → tool calls → execution → result.
 
-### athen-app (15 tests)
-**Status**: Complete — Tauri 2 desktop app with full agentic tool execution, streaming responses, arc-based workflow management, sense router for email/calendar/messaging triage, settings UI with provider and email management, provider hot-swap, kill switch, real-time progress events, approval UI, config loading, and persistence. Verified working.
-- `src/lib.rs`: Tauri composition root. Registers 22 command handlers: `send_message`, `get_status`, `approve_task`, `cancel_task`, `new_arc`, `get_arc_history`, `list_arcs`, `switch_arc`, `rename_arc`, `delete_arc`, `get_current_arc`, `branch_arc`, `merge_arcs`, `get_timeline_data`, `get_settings`, `save_provider`, `delete_provider`, `test_provider`, `save_settings`, `set_active_provider`, `save_email_settings`, `test_email_connection`. Registers agent in `setup()` hook. Installs `rustls::crypto::aws_lc_rs::default_provider()` at startup.
+### athen-app (30 tests)
+**Status**: Complete — Tauri 2 desktop app with full agentic tool execution (10 tools including calendar), streaming responses, arc-based workflow management, native calendar system, sense router for email/calendar/messaging triage, settings UI with provider and email management, provider hot-swap, kill switch, real-time progress events, approval UI, config loading, and persistence. Verified working.
+- `src/lib.rs`: Tauri composition root. Modules include `pub(crate) mod app_tools`. Registers 26 command handlers: `send_message`, `get_status`, `approve_task`, `cancel_task`, `new_arc`, `get_arc_history`, `list_arcs`, `switch_arc`, `rename_arc`, `delete_arc`, `get_current_arc`, `branch_arc`, `merge_arcs`, `get_timeline_data`, `get_settings`, `save_provider`, `delete_provider`, `test_provider`, `save_settings`, `set_active_provider`, `save_email_settings`, `test_email_connection`, `list_calendar_events`, `create_calendar_event`, `update_calendar_event`, `delete_calendar_event`. Registers agent in `setup()` hook. Installs `rustls::crypto::aws_lc_rs::default_provider()` at startup. Calls `state.start_calendar_monitor(app.handle().clone())` in setup.
 - `src/main.rs`: Entry point with `windows_subsystem = "windows"` for release builds.
 - `src/state.rs`: `AppState` — composition root that loads TOML configuration via `find_config_dir()` (same discovery order as CLI: `~/.athen/` → `./config/` → defaults), resolves active provider from config, builds router and coordinator. Contains:
   - `router: Arc<RwLock<Arc<DefaultLlmRouter>>>` — double-wrapped for runtime hot-swap: inner `Arc` is the router, `RwLock` allows atomic replacement when the user switches providers
@@ -762,15 +778,17 @@ When the agent needs to contact the user:
   - `history: Mutex<Vec<ChatMessage>>` — arc-level conversation memory
   - `arc_id: Mutex<String>` — current arc identifier
   - `arc_store: Option<ArcStore>` — persistent arc storage backed by SQLite
+  - `calendar_store: Option<CalendarStore>` — calendar event storage backed by SQLite
   - `pending_message: Mutex<Option<String>>` — stashes user's message for replay after approval
   - `model_name: Mutex<String>` — resolved from config, returned by `get_status`
   - `cancel_flag: Arc<AtomicBool>` — shared cancellation flag for in-progress tasks
   - `SharedRouter` wrapper implementing `LlmRouter` via `Arc<RwLock<Arc<DefaultLlmRouter>>>` — delegates `route()`, `route_streaming()`, and `budget_remaining()` through the double-Arc indirection
   - `build_router_for_provider(id, base_url, model, api_key)` — factory function that creates the appropriate provider type based on ID: "deepseek" → `DeepSeekProvider`, "ollama" → `OllamaProvider`, "llamacpp" → `LlamaCppProvider`, anything else → `OpenAiCompatibleProvider`
   - `restore_or_create_arc()` — on startup, tries to restore the most recent arc's entries from SQLite; creates a new arc if none exist. Auto-migrates legacy chat sessions to arcs on first startup.
+  - `start_calendar_monitor(app_handle)` — spawns background task that polls `CalendarStore` every 60s, fires SenseEvents through sense router for reminder notifications and arc creation. Always starts (no enable flag — just checks local DB).
   - **API key resolution**: config file key takes priority over env var (e.g. saved key via Settings > `DEEPSEEK_API_KEY` env var). Env var format: `{PROVIDER_ID}_API_KEY` (e.g. `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`). Config values like `${DEEPSEEK_API_KEY}` are treated as unresolved placeholders.
 - `src/commands.rs`: Tauri IPC commands:
-  - `send_message` — emits `agent-progress` event for risk evaluation phase, processes through coordinator pipeline, checks for awaiting approval (returns `PendingApproval` with task_id/description/risk_score/risk_level), snapshots conversation history, builds full `AgentExecutor` with `ShellToolRegistry` per request, passes history as `context_messages`, wires streaming sender and cancel flag, executes with 25 max_steps and 90s timeout. On failure: friendly error messages via `format_user_error()`. On cancellation: returns "Task cancelled by user." On max-steps: returns "I ran out of steps (N used) before finishing." Appends user+assistant messages to arc history. Persists entries to SQLite via `ArcStore`.
+  - `send_message` — emits `agent-progress` event for risk evaluation phase, processes through coordinator pipeline, checks for awaiting approval (returns `PendingApproval` with task_id/description/risk_score/risk_level), snapshots conversation history, builds full `AgentExecutor` with `AppToolRegistry` (10 tools: 6 shell + 4 calendar) per request, passes history as `context_messages`, wires streaming sender and cancel flag, executes with 25 max_steps and 90s timeout. On failure: friendly error messages via `format_user_error()`. On cancellation: returns "Task cancelled by user." On max-steps: returns "I ran out of steps (N used) before finishing." Appends user+assistant messages to arc history. Persists entries to SQLite via `ArcStore`.
   - `approve_task` — approves or denies a task flagged by risk system. On approve: retrieves stashed message, builds executor with streaming + cancel flag, dispatches and executes. On deny: cancels task, clears stashed message.
   - `cancel_task` — sets `cancel_flag` to `true`; executor checks at loop start and between tool calls.
   - `get_status` — returns actual model name and connection status.
@@ -783,14 +801,21 @@ When the agent needs to contact the user:
   - `list_arcs` — returns `Vec<ArcMeta>` for sidebar rendering.
   - `branch_arc(parent_id, name)` — creates a child arc branched from parent.
   - `merge_arcs(source_id, target_id)` — merges source arc entries into target, marks source as Merged.
+  - `list_calendar_events(start, end)` — range query for calendar events.
+  - `create_calendar_event(event)` — insert calendar event and return it.
+  - `update_calendar_event(event)` — update calendar event by id.
+  - `delete_calendar_event(id)` — delete calendar event by id.
   - `format_user_error(err)` — converts technical error strings to friendly messages (Timeout, Connection, Auth/401, rate_limit/429, max_steps, Budget, RiskThresholdExceeded). `simplify_error()` strips Rust enum formatting for the fallback case.
   - `AgentProgress` struct with `detail: Option<String>` field — carries tool arguments/result summaries (truncated to 200 chars).
   - `TauriAuditor` — wraps `InMemoryAuditor`, emits `agent-progress` Tauri events on each step. Extracts meaningful `detail` from step output: shell_execute → stdout, read_file/write_file → path, list_directory → path, errors → error text, completion → response preview. `truncate_detail()` compacts newlines and truncates.
   - `spawn_stream_forwarder(app_handle)` — spawns a background task that reads from `mpsc::UnboundedReceiver<String>` and emits `agent-stream` Tauri events with `{ delta, is_final }` payload. Emits `is_final: true` when the channel closes.
+- `src/app_tools.rs`: `AppToolRegistry` — wraps `ShellToolRegistry` + adds 4 calendar tools backed by `CalendarStore`. Implements `ToolRegistry` trait. Agent now has 10 tools (6 shell + 4 calendar): `calendar_list` (query by date range), `calendar_create` (create with all fields, sets `created_by: Agent`), `calendar_update` (partial update — loads existing, merges only provided fields), `calendar_delete` (delete by ID). Respects hexagonal architecture: no new deps on athen-agent, calendar tools injected via composition root. 15 integration tests covering full CRUD, partial updates, range filtering, error cases.
 - `src/sense_router.rs`: Generic sense-to-arc router that processes any `SenseEvent` through:
   - **LLM triage**: classifies event relevance as ignore/low/medium/high. Only medium+ reach the user. Spam/low-priority events are silently logged.
   - **Arc creation**: LLM generates descriptive arc names (e.g. "Meeting with John", "Server alert") based on event content.
   - **ArcEntry persistence**: stores event as `ArcEntry` with source-specific `EntryType` and metadata JSON.
+  - **Context messages**: `build_context_message()` adds a system message to the Arc so the agent has full context when user opens it. Calendar events get "The user may ask you about this event, want to reschedule it, or need help preparing for it."
+  - **Calendar formatting**: `format_calendar_body()` builds readable text from calendar event JSON fields (title, times, location, status like "Starting in 3h 6m"). Calendar events default sender to "Calendar". Body extraction handles calendar's structured JSON.
   - **Frontend emission**: emits `sense-event` Tauri event for real-time UI updates.
   - **Fallback**: if LLM fails or times out, defaults to "medium" relevance (better to show than miss).
   - Works for email, calendar, messaging, or any future sense source. Replaces sense-specific triage code.
@@ -806,19 +831,22 @@ When the agent needs to contact the user:
   - Helper types: `ProviderInfo` (id, name, type, base_url, model, has_api_key, api_key_hint, is_active), `SettingsResponse`, `TestResult`. `mask_api_key()` shows first 3 + last 4 chars.
 - `src/process.rs`: Child process lifecycle management (stub).
 - **Email monitor wiring**: On app launch, if `email.enabled = true` in config, starts `EmailMonitor` in background. Polls IMAP at configured interval, feeds `SenseEvent`s through the sense router for LLM triage and arc creation.
+- **Calendar monitor wiring**: Always starts on app launch (no enable flag — it just checks the local DB). `start_calendar_monitor()` background task polls every 60s, fires `SenseEvent`s through the sense router for reminder notifications and arc creation.
 - `tauri.conf.json`: Window 900x700, `frontendDist` points to `../../frontend`. **`"withGlobalTauri": true`** required in `app` section to inject `window.__TAURI__` into the webview.
-- `frontend/index.html`: Full app layout with sidebar, chat area, and settings page:
-  - **Sidebar**: arc list with `+ New Arc` button, Settings button at bottom, hamburger toggle for mobile. Arc list populated dynamically from `list_arcs`. Arcs show source icons (message/email/calendar/system) and branch indicators for child arcs.
+- `frontend/index.html`: Full app layout with sidebar, chat area, settings page, and calendar view:
+  - **Sidebar**: arc list with `+ New Arc` button, Settings and Calendar buttons at bottom, hamburger toggle for mobile. Arc list populated dynamically from `list_arcs`. Arcs show source icons (message/email/calendar/system) and branch indicators for child arcs.
   - **Chat area**: header with logo + "New Arc" button, message container, input form with send/stop buttons, status bar.
   - **Stop button**: red square (&#9632;), initially hidden, shown during processing. Calls `cancel_task`.
   - **Settings page**: provider cards area, "Add Provider" button with template dropdown (DeepSeek, OpenAI, Anthropic, Ollama, llama.cpp, Custom), security mode selector (Assistant/Bunker/YOLO), email settings section (IMAP config, test connection, app password hints), back button.
-- `frontend/styles.css`: Dark theme (Tokyo Night-inspired) — sidebar with arc items (source icons, branch indicators, rename/delete on hover), tool execution cards with status icons (check/cross/spinner) and fade-in animation, streaming message bubbles, chat bubbles with avatars, risk badges, code blocks with language labels, approval dialog, sense event cards with relevance badges, settings page with provider cards (expand/collapse) and email settings section, auto-growing textarea, stop button (red), mobile responsive.
+  - **Calendar view**: full `#calendar-view` container with header (prev/next/today/view-select), calendar grid, event modal with all fields (title, date, time, all-day, location, description, category dropdown, color picker, reminder dropdown, recurrence dropdown).
+- `frontend/styles.css`: Dark theme (Tokyo Night-inspired) — sidebar with arc items (source icons, branch indicators, rename/delete on hover), tool execution cards with status icons (check/cross/spinner) and fade-in animation, streaming message bubbles, chat bubbles with avatars, risk badges, code blocks with language labels, approval dialog, sense event cards with relevance badges, settings page with provider cards (expand/collapse) and email settings section, calendar view (month grid, week grid, event pills, day cells, modal, color picker dots — ~350 lines), auto-growing textarea, stop button (red), mobile responsive.
 - `frontend/app.js`: Full chat frontend with:
   - **Streaming**: listens for `agent-stream` Tauri events. Creates streaming bubble on first chunk, appends text progressively via `textContent` (safe, fast). On `is_final`, re-renders full text with markdown for proper formatting. Tracks `streamingBubble`, `streamingText`, `didReceiveStreamChunks` state.
   - **Tool execution cards**: listens for `agent-progress` events. Creates `tool-steps-container` div, appends `tool-execution-card` elements with status class (completed/failed/in-progress), status icon (checkmark/cross/dot), tool name, and truncated detail text. Cards have fade-in CSS animation.
   - **Arc sidebar**: `loadArcs()` fetches arc list, `renderArcList()` builds sidebar items with name, source icon (message/email/calendar/system), relative date, entry count badge, and branch indicator for child arcs. Double-click or pencil icon to rename (inline contenteditable). Delete button with confirmation. Branch button creates child arc. Merged arcs hidden from sidebar. Auto-names new arcs from first user message (~30 chars). Active arc highlighted. Timeline toggle button (⎇) in sidebar header.
-  - **Arc timeline view**: Full-screen time-aligned multi-lane graph, toggled via ⎇ button in sidebar. Each arc is a vertical column (most recently active = rightmost). Each entry is a colored node (blue=message, amber=tool, purple=email, green=calendar, gray=system) positioned by timestamp. Vertical rail lines connect nodes within each arc. Sticky column headers show source icon, arc name, entry count — click to open. Time axis on left margin with relative labels ("Now", "5m ago", "Yesterday"). Hover nodes for content preview tooltips. Entries within 2 minutes are grouped into the same row. Merged arcs dimmed (40% opacity), archived at 60%. "Back" and "+ New Arc" buttons in header. Auto-refreshes every 30 seconds. Backend: `get_timeline_data` command returns all arcs with their entries in a single call. Full-screen overlay (`position: fixed; z-index: 100`). Three-view toggle: chat ↔ settings ↔ timeline.
-  - **Sense event cards**: listens for `sense-event` Tauri events. Renders source-specific icons, LLM relevance badges (Important/Urgent), agent's reasoning text, and context-aware action buttons (Summarize/Draft Reply/Add to Calendar/Open Arc).
+  - **Arc timeline view**: Full-screen time-aligned multi-lane graph, toggled via ⎇ button in sidebar. Each arc is a vertical column (most recently active = rightmost). Each entry is a colored node (blue=message, amber=tool, purple=email, green=calendar, gray=system) positioned by timestamp. Vertical rail lines connect nodes within each arc. Sticky column headers show source icon, arc name, entry count — click to open. Time axis on left margin with relative labels ("Now", "5m ago", "Yesterday"). Hover nodes for content preview tooltips. Entries within 2 minutes are grouped into the same row. Merged arcs dimmed (40% opacity), archived at 60%. "Back" and "+ New Arc" buttons in header. Auto-refreshes every 30 seconds. Backend: `get_timeline_data` command returns all arcs with their entries in a single call. Full-screen overlay (`position: fixed; z-index: 100`). Four-view toggle: chat ↔ settings ↔ timeline ↔ calendar.
+  - **Sense event cards**: listens for `sense-event` Tauri events. Renders source-specific icons, LLM relevance badges (Important/Urgent), agent's reasoning text, and context-aware action buttons (Summarize/Draft Reply/Add to Calendar/Open Arc). Calendar events get "What should I prepare?" button instead of "Summarize"; action buttons switch to event's Arc first before sending prompt; prompts are short (agent has context from system message).
+  - **Calendar view**: `showCalendar()` / `hideCalendar()` view switching. Month view (7-column grid) and week view (time grid with positioned events). Event modal for create/edit/delete. Category-to-color mapping.
   - **Kill switch**: stop button (red &#9632;) replaces send button during processing. Calls `cancel_task` command. Escape key also cancels. `isProcessing` flag controls button visibility.
   - **Error handling**: `format_user_error()` produces friendly messages. Retry button for transient errors (stores `lastMessage`, `retryLastMessage()` re-submits). "Open Settings" link for auth errors.
   - **Markdown renderer** (inline, no dependencies): fenced code blocks with language labels, inline code, headers (h1-h3), ordered/unordered lists, bold, italic, links. Code blocks protected from inline transformations.
@@ -829,14 +857,14 @@ When the agent needs to contact the user:
   - **Auto-growing textarea**: expands with content up to 150px. Enter sends, Shift+Enter for newline.
   - **Smooth scroll**: `requestAnimationFrame` + `scrollTo` on new messages and tool cards.
 - **Requires system libraries**: `webkit2gtk4.1-devel gtk3-devel libsoup3-devel libappindicator-gtk3-devel` (Fedora).
-- **Verified working**: Full multi-step agentic pipeline with streaming confirmed. Tested: (1) "What tools do you have?" → LLM correctly lists its 6 tools, (2) "Read https://alejandrogarcia.blog/ and write to HELLO.md" → LLM uses `shell_execute` (curl) to fetch website, then `write_file` to save formatted markdown. Streaming renders progressively with markdown finalization. Tool execution cards show in real time with status icons. Arc persistence across app restarts. Provider hot-swap works without restart. Settings UI tested for add/edit/delete/test/activate providers. Email monitor tested with real IMAP server.
+- **Verified working**: Full multi-step agentic pipeline with streaming confirmed. Tested: (1) "What tools do you have?" → LLM correctly lists its 10 tools (6 shell + 4 calendar), (2) "Read https://alejandrogarcia.blog/ and write to HELLO.md" → LLM uses `shell_execute` (curl) to fetch website, then `write_file` to save formatted markdown. Streaming renders progressively with markdown finalization. Tool execution cards show in real time with status icons. Arc persistence across app restarts. Provider hot-swap works without restart. Settings UI tested for add/edit/delete/test/activate providers. Email monitor tested with real IMAP server. Calendar monitor fires reminders for upcoming events.
 
 ### mcp-filesystem (0 tests)
 **Status**: Stub — entry point only. Standalone MCP server (no athen-core dependency).
 
 ---
 
-## Integration Tests (28 integration tests)
+## Integration Tests (28 integration tests + 15 app_tools tests)
 
 Integration tests wire real implementations together (no mocks except LLM).
 
@@ -930,7 +958,7 @@ save_default_config(path) -> Result<()>         // Write defaults to file
 | `reqwest` | 0.12 (rustls-tls) | athen-llm, athen-app | HTTP client (pure Rust TLS) |
 | `futures` | 0.3 | athen-llm | Stream utilities |
 | `regex` | 1.x | athen-risk | Pattern matching for rules engine |
-| `rusqlite` | 0.32 (bundled) | athen-persistence, athen-memory | Embedded SQLite |
+| `rusqlite` | 0.32 (bundled) | athen-persistence, athen-memory, athen-sentidos | Embedded SQLite |
 | `sha2` | 0.10 | athen-persistence | Checkpoint integrity checksums |
 | `tempfile` | 3.x | athen-ipc (dev) | Test socket paths |
 | `tracing-subscriber` | 0.3 | athen-cli | Structured log output |
@@ -958,3 +986,16 @@ DEEPSEEK_API_KEY=sk-... ./target/release/athen-cli
 ```
 
 The CLI reads from stdin, processes through the full pipeline (coordinator → risk → dispatch → LLM), and prints responses. Exit with Ctrl+D, `/quit`, or `/exit`.
+
+---
+
+## CI/CD
+
+- `.github/workflows/ci.yml` — runs on push to main + PRs: clippy + tests on Linux.
+- `.github/workflows/release.yml` — manual trigger or tag push: cross-platform Tauri builds (Linux/macOS/Windows), uploads artifacts.
+
+---
+
+## Test Summary
+
+**Total: 468 tests**, 0 clippy warnings (except pre-existing `too_many_arguments` on `save_email_settings`).

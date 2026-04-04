@@ -26,6 +26,8 @@ use athen_agent::{AgentBuilder, InMemoryAuditor, ShellToolRegistry};
 use athen_persistence::arcs;
 use athen_persistence::calendar::CalendarEvent;
 
+use crate::app_tools::AppToolRegistry;
+
 use crate::state::{AppState, PendingApproval, SharedRouter};
 
 /// Convert a raw technical error string into a user-friendly message.
@@ -362,7 +364,8 @@ pub async fn send_message(
             // Build executor with real tool execution (same as athen-cli).
             let exec_router: Box<dyn LlmRouter> =
                 Box::new(SharedRouter(Arc::clone(&state.router)));
-            let registry = ShellToolRegistry::new().await;
+            let shell_registry = ShellToolRegistry::new().await;
+            let registry = AppToolRegistry::new(shell_registry, state.calendar_store.clone());
 
             let auditor = TauriAuditor::new(app_handle.clone());
 
@@ -578,7 +581,8 @@ pub async fn approve_task(
 
             let exec_router: Box<dyn LlmRouter> =
                 Box::new(SharedRouter(Arc::clone(&state.router)));
-            let registry = ShellToolRegistry::new().await;
+            let shell_registry = ShellToolRegistry::new().await;
+            let registry = AppToolRegistry::new(shell_registry, state.calendar_store.clone());
             let auditor = TauriAuditor::new(app_handle.clone());
 
             // Set up streaming for the approved task execution.
