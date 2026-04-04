@@ -196,8 +196,25 @@ impl ShellToolRegistry {
                 .await
             {
                 Ok(output) => {
-                    tracing::debug!(tool = "shell_execute", "Command executed inside sandbox");
-                    (output.stdout, output.stderr, output.exit_code)
+                    // Detect sandbox infrastructure failures (e.g. bwrap can't
+                    // create namespaces on restricted CI runners). If stderr
+                    // contains sandbox-specific errors, fall back to unsandboxed.
+                    let is_sandbox_failure = output.exit_code != 0
+                        && (output.stderr.contains("bwrap:")
+                            || output.stderr.contains("sandbox-exec:")
+                            || output.stderr.contains("creating new namespace"));
+                    if is_sandbox_failure {
+                        tracing::warn!(
+                            tool = "shell_execute",
+                            stderr = %output.stderr.trim(),
+                            "Sandbox infrastructure failed, falling back to unsandboxed shell"
+                        );
+                        let output = self.shell.execute(command).await?;
+                        (output.stdout, output.stderr, output.exit_code)
+                    } else {
+                        tracing::debug!(tool = "shell_execute", "Command executed inside sandbox");
+                        (output.stdout, output.stderr, output.exit_code)
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(
