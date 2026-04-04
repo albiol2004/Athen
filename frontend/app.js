@@ -18,13 +18,13 @@ let didReceiveStreamChunks = false;
 // Whether a request is currently being processed by the agent.
 let isProcessing = false;
 
-// ─── Session State ───
+// ─── Arc State ───
 
-// The currently active session ID.
-let activeSessionId = null;
-// Whether the first user message in this session has been sent
-// (used to auto-name the session).
-let sessionHasMessages = false;
+// The currently active arc ID.
+let activeArcId = null;
+// Whether the first user message in this arc has been sent
+// (used to auto-name the arc).
+let arcHasMessages = false;
 
 // ─── Error Retry State ───
 
@@ -153,23 +153,21 @@ function initTauri() {
                 });
             });
 
-            // Listen for email monitor events (only relevant emails reach here).
-            window.__TAURI__.event.listen('email-event', (event) => {
-                const { type: eventType, from, subject, body_preview,
-                        relevance, reason, suggested_action } = event.payload;
-                if (eventType === 'new_email') {
-                    showEmailNotification(from, subject, body_preview,
-                                          relevance, reason, suggested_action);
-                }
+            // Listen for sense events (email, calendar, messaging, etc.)
+            window.__TAURI__.event.listen('sense-event', (event) => {
+                const { source, from, subject, body_preview,
+                        relevance, reason, suggested_action, arc_id } = event.payload;
+                showSenseNotification(source, from, subject, body_preview,
+                                      relevance, reason, suggested_action, arc_id);
             });
         }
 
         setStatus('idle', 'Ready');
 
-        // Load the current session ID, then load sessions and history.
-        invoke('get_current_session').then((sid) => {
-            activeSessionId = sid;
-            loadSessions();
+        // Load the current arc ID, then load arcs and history.
+        invoke('get_current_arc').then((sid) => {
+            activeArcId = sid;
+            loadArcs();
             loadHistory();
         }).catch(() => {
             loadHistory();
@@ -196,59 +194,85 @@ const sidebarToggle = document.getElementById('sidebar-toggle');
 
 // ─── Sidebar Logic ───
 
-async function loadSessions() {
+async function loadArcs() {
     if (!invoke) return;
     try {
-        const sessions = await invoke('list_sessions');
-        renderSessionList(sessions);
+        const arcs = await invoke('list_arcs');
+        renderArcList(arcs || []);
     } catch (err) {
-        console.error('Failed to load sessions:', err);
+        console.error('Failed to load arcs:', err);
     }
 }
 
-function renderSessionList(sessions) {
+function getSourceIcon(source) {
+    switch (source) {
+        case 'Email': return '<span class="arc-source-icon" title="Email">&#x1f4e7;</span>';
+        case 'Calendar': return '<span class="arc-source-icon" title="Calendar">&#x1f4c5;</span>';
+        case 'Messaging': return '<span class="arc-source-icon" title="Message">&#x1f4ac;</span>';
+        case 'System': return '<span class="arc-source-icon" title="System">&#9881;</span>';
+        default: return '<span class="arc-source-icon" title="Chat">&#x1f4ac;</span>';
+    }
+}
+
+function renderArcList(arcs) {
     sessionListEl.innerHTML = '';
 
-    if (!sessions || sessions.length === 0) {
+    if (!arcs || arcs.length === 0) {
         sessionListEl.innerHTML = '<div class="session-list-empty">No conversations yet</div>';
         return;
     }
 
-    for (const session of sessions) {
+    for (const arc of arcs) {
+        // Skip merged arcs
+        if (arc.status === 'Merged') continue;
+
         const item = document.createElement('div');
         item.className = 'session-item';
-        if (session.session_id === activeSessionId) {
+        if (arc.id === activeArcId) {
             item.classList.add('active');
         }
-        item.dataset.sessionId = session.session_id;
+        item.dataset.arcId = arc.id;
 
         const content = document.createElement('div');
         content.className = 'session-item-content';
 
         const nameEl = document.createElement('div');
         nameEl.className = 'session-item-name';
-        nameEl.textContent = session.name;
+        nameEl.textContent = arc.name;
         content.appendChild(nameEl);
 
         const metaEl = document.createElement('div');
         metaEl.className = 'session-item-meta';
 
+        // Source icon
+        const sourceIconSpan = document.createElement('span');
+        sourceIconSpan.innerHTML = getSourceIcon(arc.source);
+        metaEl.appendChild(sourceIconSpan);
+
+        // Branch indicator
+        if (arc.parent_arc_id) {
+            const branchBadge = document.createElement('span');
+            branchBadge.className = 'arc-branch-badge';
+            branchBadge.textContent = '\u21b3';
+            metaEl.appendChild(branchBadge);
+        }
+
         const dateEl = document.createElement('span');
         dateEl.className = 'session-item-date';
-        dateEl.textContent = formatSessionDate(session.updated_at);
+        dateEl.textContent = formatSessionDate(arc.updated_at);
         metaEl.appendChild(dateEl);
 
-        if (session.message_count > 0) {
+        if (arc.entry_count > 0) {
             const countEl = document.createElement('span');
             countEl.className = 'session-item-count';
-            countEl.textContent = session.message_count;
+            countEl.textContent = arc.entry_count;
             metaEl.appendChild(countEl);
         }
 
         content.appendChild(metaEl);
         item.appendChild(content);
 
-        // Action buttons (rename + delete)
+        // Action buttons (rename + branch + delete)
         const actions = document.createElement('div');
         actions.className = 'session-item-actions';
 
@@ -258,9 +282,19 @@ function renderSessionList(sessions) {
         renameBtn.innerHTML = '&#9998;'; // pencil
         renameBtn.addEventListener('click', (e) => {
             e.stopPropagation();
-            startRenameSession(item, session.session_id, session.name);
+            startRenameArc(item, arc.id, arc.name);
         });
         actions.appendChild(renameBtn);
+
+        const branchBtn = document.createElement('button');
+        branchBtn.className = 'session-action-btn';
+        branchBtn.title = 'Branch';
+        branchBtn.textContent = '\u21b3';
+        branchBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            branchFromArc(arc.id, arc.name);
+        });
+        actions.appendChild(branchBtn);
 
         const deleteBtn = document.createElement('button');
         deleteBtn.className = 'session-action-btn delete';
@@ -268,21 +302,21 @@ function renderSessionList(sessions) {
         deleteBtn.innerHTML = '&#10005;'; // x mark
         deleteBtn.addEventListener('click', (e) => {
             e.stopPropagation();
-            handleDeleteSession(session.session_id);
+            handleDeleteArc(arc.id);
         });
         actions.appendChild(deleteBtn);
 
         item.appendChild(actions);
 
-        // Click to switch session
+        // Click to switch arc
         item.addEventListener('click', () => {
-            handleSwitchSession(session.session_id);
+            handleSwitchArc(arc.id);
         });
 
         // Double-click to rename
         nameEl.addEventListener('dblclick', (e) => {
             e.stopPropagation();
-            startRenameSession(item, session.session_id, session.name);
+            startRenameArc(item, arc.id, arc.name);
         });
 
         sessionListEl.appendChild(item);
@@ -306,7 +340,7 @@ function formatSessionDate(dateStr) {
     }
 }
 
-function startRenameSession(itemEl, sessionId, currentName) {
+function startRenameArc(itemEl, arcId, currentName) {
     const nameEl = itemEl.querySelector('.session-item-name');
     if (!nameEl) return;
 
@@ -324,7 +358,7 @@ function startRenameSession(itemEl, sessionId, currentName) {
         const newName = input.value.trim();
         if (save && newName && newName !== currentName) {
             try {
-                await invoke('rename_session', { sessionId, name: newName });
+                await invoke('rename_arc', { arcId, name: newName });
                 nameEl.textContent = newName;
             } catch (err) {
                 console.error('Rename failed:', err);
@@ -349,27 +383,34 @@ function startRenameSession(itemEl, sessionId, currentName) {
     });
 }
 
-async function handleSwitchSession(sessionId) {
-    if (!invoke || sessionId === activeSessionId) return;
+async function handleSwitchArc(arcId) {
+    if (!invoke || arcId === activeArcId) return;
 
     try {
-        const messages = await invoke('switch_session', { sessionId });
-        activeSessionId = sessionId;
+        const entries = await invoke('switch_arc', { arcId });
+        activeArcId = arcId;
 
-        // Check if the session has messages already (for auto-naming).
-        sessionHasMessages = messages && messages.length > 0;
+        // Check if the arc has entries already (for auto-naming).
+        arcHasMessages = entries && entries.length > 0;
 
-        // Clear the chat UI and render the loaded messages.
+        // Clear the chat UI and render the loaded entries.
         clearChatUI();
-        if (messages && messages.length > 0) {
-            for (const msg of messages) {
-                addMessage(msg.role, msg.content);
+        if (entries && entries.length > 0) {
+            for (const entry of entries) {
+                if (entry.entry_type === 'message') {
+                    addMessage(entry.source, entry.content);
+                } else if (entry.entry_type === 'email_event') {
+                    const meta = entry.metadata ? (typeof entry.metadata === 'string' ? JSON.parse(entry.metadata) : entry.metadata) : {};
+                    addEmailEntry(entry.content, meta);
+                } else if (entry.entry_type === 'tool_call') {
+                    addSystemEntry(entry.content, 'tool');
+                }
             }
         }
 
         // Update active highlight in sidebar.
         document.querySelectorAll('.session-item').forEach((el) => {
-            el.classList.toggle('active', el.dataset.sessionId === sessionId);
+            el.classList.toggle('active', el.dataset.arcId === arcId);
         });
 
         // Close sidebar on mobile.
@@ -377,31 +418,38 @@ async function handleSwitchSession(sessionId) {
 
         inputEl.focus();
     } catch (err) {
-        console.error('Switch session failed:', err);
+        console.error('Switch arc failed:', err);
     }
 }
 
-async function handleDeleteSession(sessionId) {
+async function handleDeleteArc(arcId) {
     if (!invoke) return;
-    if (!confirm('Delete this conversation? This cannot be undone.')) return;
+    if (!confirm('Delete this Arc and all its entries?')) return;
 
     try {
-        const newActiveId = await invoke('delete_session', { sessionId });
+        const newActiveId = await invoke('delete_arc', { arcId });
 
-        // If the deleted session was the active one, the backend switched us.
-        if (sessionId === activeSessionId) {
-            activeSessionId = newActiveId;
-            // Reload messages for the new active session.
+        // If the deleted arc was the active one, the backend switched us.
+        if (arcId === activeArcId) {
+            activeArcId = newActiveId;
+            // Reload entries for the new active arc.
             try {
-                const messages = await invoke('get_history');
+                const entries = await invoke('get_arc_history');
                 clearChatUI();
-                if (messages && messages.length > 0) {
-                    for (const msg of messages) {
-                        addMessage(msg.role, msg.content);
+                if (entries && entries.length > 0) {
+                    for (const entry of entries) {
+                        if (entry.entry_type === 'message') {
+                            addMessage(entry.source, entry.content);
+                        } else if (entry.entry_type === 'email_event') {
+                            const meta = entry.metadata ? (typeof entry.metadata === 'string' ? JSON.parse(entry.metadata) : entry.metadata) : {};
+                            addEmailEntry(entry.content, meta);
+                        } else if (entry.entry_type === 'tool_call') {
+                            addSystemEntry(entry.content, 'tool');
+                        }
                     }
-                    sessionHasMessages = true;
+                    arcHasMessages = true;
                 } else {
-                    sessionHasMessages = false;
+                    arcHasMessages = false;
                 }
             } catch (err2) {
                 console.error('Failed to load history after delete:', err2);
@@ -410,9 +458,9 @@ async function handleDeleteSession(sessionId) {
         }
 
         // Refresh the sidebar list.
-        await loadSessions();
+        await loadArcs();
     } catch (err) {
-        console.error('Delete session failed:', err);
+        console.error('Delete arc failed:', err);
     }
 }
 
@@ -456,13 +504,13 @@ if (sidebarOverlay) {
     sidebarOverlay.addEventListener('click', closeSidebar);
 }
 
-// ─── Auto-name session ───
+// ─── Auto-name arc ───
 
-async function autoNameSession(message) {
-    if (!invoke || !activeSessionId || sessionHasMessages) return;
-    sessionHasMessages = true;
+async function autoNameArc(message) {
+    if (!invoke || !activeArcId || arcHasMessages) return;
+    arcHasMessages = true;
 
-    // Truncate the first message to ~30 characters for the session name.
+    // Truncate the first message to ~30 characters for the arc name.
     let name = message.trim();
     if (name.length > 30) {
         // Cut at last word boundary within 30 chars.
@@ -475,16 +523,16 @@ async function autoNameSession(message) {
     }
 
     try {
-        await invoke('rename_session', { sessionId: activeSessionId, name });
+        await invoke('rename_arc', { arcId: activeArcId, name });
         // Update the sidebar item in place.
         const item = sessionListEl.querySelector(
-            `.session-item[data-session-id="${activeSessionId}"] .session-item-name`
+            `.session-item[data-arc-id="${activeArcId}"] .session-item-name`
         );
         if (item) {
             item.textContent = name;
         }
     } catch (err) {
-        console.error('Auto-name session failed:', err);
+        console.error('Auto-name arc failed:', err);
     }
 }
 
@@ -604,17 +652,16 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
-// ─── Email Notifications ───
+// ─── Sense Notifications ───
 
-function showEmailNotification(from, subject, bodyPreview, relevance, reason, suggestedAction) {
+function showSenseNotification(source, from, subject, bodyPreview,
+                                relevance, reason, suggestedAction, arcId) {
     const container = document.getElementById('messages');
     if (!container) return;
 
-    // Remove welcome message if present.
     const welcome = container.querySelector('.welcome-message');
     if (welcome) welcome.remove();
 
-    // Build email card in the chat area.
     const card = document.createElement('div');
     const urgencyClass = relevance === 'high' ? 'email-high' : 'email-medium';
     card.className = 'email-card ' + urgencyClass;
@@ -627,23 +674,33 @@ function showEmailNotification(from, subject, bodyPreview, relevance, reason, su
         ? '<span class="email-badge email-badge-high">Urgent</span>'
         : '<span class="email-badge email-badge-medium">Important</span>';
 
+    const sourceIcon = source === 'email' ? '\u{1f4e7}' :
+                       source === 'calendar' ? '\u{1f4c5}' :
+                       source === 'message' ? '\u{1f4ac}' : '\u{2699}\u{fe0f}';
+    const sourceLabel = source.charAt(0).toUpperCase() + source.slice(1);
+
     const reasonHtml = reason
         ? '<div class="email-card-reason">' + escapeHtml(reason) + '</div>'
         : '';
 
     // Build action buttons based on suggested_action.
-    let actionsHtml = '<button class="email-action-btn" onclick="askAboutEmail(this, \'summarize\')">Summarize</button>';
+    let actionsHtml = '<button class="email-action-btn" onclick="askAboutSenseEvent(this, \'summarize\')">Summarize</button>';
     if (suggestedAction === 'reply' || suggestedAction === 'urgent') {
-        actionsHtml += '<button class="email-action-btn email-action-primary" onclick="askAboutEmail(this, \'reply\')">Draft Reply</button>';
+        actionsHtml += '<button class="email-action-btn email-action-primary" onclick="askAboutSenseEvent(this, \'reply\')">Draft Reply</button>';
     }
     if (suggestedAction === 'calendar') {
-        actionsHtml += '<button class="email-action-btn" onclick="askAboutEmail(this, \'calendar\')">Add to Calendar</button>';
+        actionsHtml += '<button class="email-action-btn" onclick="askAboutSenseEvent(this, \'calendar\')">Add to Calendar</button>';
+    }
+    // Open Arc button
+    if (arcId) {
+        actionsHtml += '<button class="email-action-btn" onclick="handleSwitchArc(\'' + escapeHtml(arcId) + '\')">Open Arc</button>';
     }
 
     card.innerHTML =
         '<div class="email-card-header">' +
-            '<span class="email-card-icon">&#x1f4e7;</span>' +
+            '<span class="email-card-icon">' + sourceIcon + '</span>' +
             relevanceBadge +
+            '<span class="email-card-label">' + sourceLabel + '</span>' +
             '<span class="email-card-time">' + formatTime(new Date()) + '</span>' +
         '</div>' +
         '<div class="email-card-from">' + escapeHtml(from) + '</div>' +
@@ -654,17 +711,19 @@ function showEmailNotification(from, subject, bodyPreview, relevance, reason, su
 
     container.appendChild(card);
 
-    // Scroll to the new card.
     requestAnimationFrame(() => {
         container.parentElement.scrollTo({
             top: container.parentElement.scrollHeight,
             behavior: 'smooth'
         });
     });
+
+    // Refresh the arc list since a new arc may have been created.
+    loadArcs();
 }
 
-// Handle email action buttons — sends a message to the agent about the email.
-function askAboutEmail(btn, action) {
+// Handle sense event action buttons — sends a message to the agent.
+function askAboutSenseEvent(btn, action) {
     const card = btn.closest('.email-card');
     if (!card) return;
     const from = card.querySelector('.email-card-from')?.textContent || '';
@@ -673,11 +732,11 @@ function askAboutEmail(btn, action) {
 
     let prompt;
     if (action === 'summarize') {
-        prompt = 'Summarize this email from ' + from + ' with subject "' + subject + '":\n\n' + body;
+        prompt = 'Summarize this message from ' + from + ' with subject "' + subject + '":\n\n' + body;
     } else if (action === 'reply') {
-        prompt = 'Draft a professional reply to this email from ' + from + ' with subject "' + subject + '":\n\n' + body;
+        prompt = 'Draft a professional reply to this message from ' + from + ' with subject "' + subject + '":\n\n' + body;
     } else if (action === 'calendar') {
-        prompt = 'Extract the event details from this email from ' + from + ' with subject "' + subject + '" and tell me what to add to my calendar:\n\n' + body;
+        prompt = 'Extract the event details from this message from ' + from + ' with subject "' + subject + '" and tell me what to add to my calendar:\n\n' + body;
     }
 
     if (prompt && inputEl) {
@@ -1021,7 +1080,7 @@ async function handleApproval(taskId, approved) {
     inputEl.focus();
 
     // Refresh sidebar to update message counts.
-    loadSessions();
+    loadArcs();
 }
 
 // ─── Form Submission ───
@@ -1037,8 +1096,8 @@ formEl.addEventListener('submit', async (e) => {
         return;
     }
 
-    // Auto-name the session from the first message.
-    autoNameSession(message);
+    // Auto-name the arc from the first message.
+    autoNameArc(message);
 
     // Store for potential retry on transient errors.
     lastMessage = message;
@@ -1126,7 +1185,7 @@ formEl.addEventListener('submit', async (e) => {
     inputEl.focus();
 
     // Refresh sidebar to update message counts.
-    loadSessions();
+    loadArcs();
 });
 
 // ─── Cancel / Stop Button ───
@@ -1153,47 +1212,86 @@ document.addEventListener('keydown', (e) => {
 async function loadHistory() {
     if (!invoke) return;
     try {
-        const messages = await invoke('get_history');
-        if (messages && messages.length > 0) {
+        const entries = await invoke('get_arc_history');
+        if (entries && entries.length > 0) {
+            arcHasMessages = true;
             // Remove the welcome message since we have history.
             const welcome = messagesEl.querySelector('.welcome-message');
             if (welcome) welcome.remove();
 
-            for (const msg of messages) {
-                addMessage(msg.role, msg.content);
+            for (const entry of entries) {
+                if (entry.entry_type === 'message') {
+                    addMessage(entry.source, entry.content);
+                } else if (entry.entry_type === 'email_event') {
+                    const meta = entry.metadata ? (typeof entry.metadata === 'string' ? JSON.parse(entry.metadata) : entry.metadata) : {};
+                    addEmailEntry(entry.content, meta);
+                } else if (entry.entry_type === 'tool_call') {
+                    addSystemEntry(entry.content, 'tool');
+                }
             }
-            sessionHasMessages = true;
         }
     } catch (err) {
         console.error('Failed to load history:', err);
     }
 }
 
-// ─── New Chat (both sidebar button and header button) ───
+function addEmailEntry(content, meta) {
+    const row = document.createElement('div');
+    row.className = 'message-row system';
+    row.innerHTML = '<div class="email-inline-entry">&#x1f4e7; ' + escapeHtml(content) + '</div>';
+    messagesEl.appendChild(row);
+}
 
-async function handleNewChat() {
+function addSystemEntry(content, type) {
+    const row = document.createElement('div');
+    row.className = 'message-row system';
+    const icon = type === 'tool' ? '&#128295;' : '&#9881;';
+    row.innerHTML = '<div class="system-inline-entry">' + icon + ' ' + escapeHtml(content) + '</div>';
+    messagesEl.appendChild(row);
+}
+
+// ─── New Arc (both sidebar button and header button) ───
+
+async function newArc() {
     if (!invoke) return;
     try {
-        const newId = await invoke('new_session');
-        activeSessionId = newId;
-        sessionHasMessages = false;
+        const newId = await invoke('new_arc');
+        activeArcId = newId;
+        arcHasMessages = false;
         clearChatUI();
         closeSidebar();
-        await loadSessions();
+        await loadArcs();
         inputEl.focus();
     } catch (err) {
-        console.error('Failed to start new session:', err);
+        console.error('Failed to create arc:', err);
+    }
+}
+
+async function branchFromArc(parentArcId, parentName) {
+    if (!invoke) return;
+    const branchName = prompt('Name for the new branch:', parentName + ' (branch)');
+    if (!branchName) return;
+    try {
+        const newId = await invoke('branch_arc', { parentArcId, name: branchName });
+        activeArcId = newId;
+        arcHasMessages = false;
+        clearChatUI();
+        closeSidebar();
+        await loadArcs();
+        inputEl.focus();
+    } catch (err) {
+        console.error('Failed to branch arc:', err);
     }
 }
 
 const newChatBtn = document.getElementById('new-chat-btn');
 if (newChatBtn) {
-    newChatBtn.addEventListener('click', handleNewChat);
+    newChatBtn.addEventListener('click', newArc);
 }
 
 const sidebarNewChatBtn = document.getElementById('sidebar-new-chat-btn');
 if (sidebarNewChatBtn) {
-    sidebarNewChatBtn.addEventListener('click', handleNewChat);
+    sidebarNewChatBtn.addEventListener('click', newArc);
 }
 
 // ─── Settings ───

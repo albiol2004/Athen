@@ -12,7 +12,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Serialize;
-use tauri::Emitter;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
@@ -31,7 +30,7 @@ use athen_llm::providers::llamacpp::LlamaCppProvider;
 use athen_llm::providers::ollama::OllamaProvider;
 use athen_llm::providers::openai::OpenAiCompatibleProvider;
 use athen_llm::router::DefaultLlmRouter;
-use athen_persistence::chat::ChatStore;
+use athen_persistence::arcs::ArcStore;
 use athen_persistence::Database;
 use athen_risk::llm_fallback::LlmRiskEvaluator;
 use athen_risk::CombinedRiskEvaluator;
@@ -81,10 +80,10 @@ pub struct AppState {
     pub pending_message: Mutex<Option<String>>,
     /// The model name reported to the frontend (from config or default).
     pub model_name: Mutex<String>,
-    /// Current session identifier (format: `session_YYYYMMDD_HHMMSS`).
-    pub session_id: Mutex<String>,
-    /// Persistent chat storage backed by SQLite.
-    pub chat_store: Option<ChatStore>,
+    /// Current active Arc identifier (format: `arc_YYYYMMDD_HHMMSS`).
+    pub active_arc_id: Mutex<String>,
+    /// Persistent Arc storage backed by SQLite.
+    pub arc_store: Option<ArcStore>,
     /// Keep the database alive so the connection is not dropped.
     _database: Option<Database>,
     /// Cancellation flag for the currently running agent executor.
@@ -118,9 +117,16 @@ impl AppState {
         let router = Arc::new(RwLock::new(router));
         let (coordinator, database) = build_coordinator_with_persistence(&router).await;
 
-        // Build the chat store and try to restore history from the latest session.
-        let chat_store = database.as_ref().map(|db| db.chat_store());
-        let (session_id, history) = restore_or_create_session(&chat_store).await;
+        // Build the arc store and run migration from legacy chat tables.
+        let arc_store = database.as_ref().map(|db| db.arc_store());
+        if let Some(ref store) = arc_store {
+            match store.migrate_from_chat_tables().await {
+                Ok(0) => {}
+                Ok(n) => info!("Migrated {n} legacy sessions to arcs"),
+                Err(e) => warn!("Arc migration from chat tables failed: {e}"),
+            }
+        }
+        let (active_arc_id, history) = restore_or_create_arc(&arc_store).await;
 
         Self {
             coordinator,
@@ -129,8 +135,8 @@ impl AppState {
             history: Mutex::new(history),
             pending_message: Mutex::new(None),
             model_name: Mutex::new(model_name),
-            session_id: Mutex::new(session_id),
-            chat_store,
+            active_arc_id: Mutex::new(active_arc_id),
+            arc_store,
             _database: database,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             email_shutdown: None,
@@ -168,6 +174,7 @@ impl AppState {
         let mut monitor = EmailMonitor::new();
         let email_config = config.clone();
         let router = Arc::clone(&self.router);
+        let arc_store_ref = self._database.as_ref().map(|db| db.arc_store());
 
         tauri::async_runtime::spawn(async move {
             if let Err(e) = monitor.init(&email_config).await {
@@ -183,81 +190,13 @@ impl AppState {
                 match monitor.poll().await {
                     Ok(events) if !events.is_empty() => {
                         info!("Email monitor received {} new event(s)", events.len());
-                        for event in &events {
-                            let subject = event
-                                .content
-                                .summary
-                                .as_deref()
-                                .unwrap_or("(no subject)");
-                            let from = event
-                                .sender
-                                .as_ref()
-                                .map(|s| {
-                                    s.display_name
-                                        .as_deref()
-                                        .unwrap_or(&s.identifier)
-                                })
-                                .unwrap_or("unknown");
-
-                            let body_text = event
-                                .content
-                                .body
-                                .get("text")
-                                .and_then(|t| t.as_str())
-                                .unwrap_or("");
-
-                            // Truncate body for the LLM triage prompt (save tokens).
-                            let body_for_triage: String = if body_text.len() > 1000 {
-                                format!("{}...", &body_text[..1000])
-                            } else {
-                                body_text.to_string()
-                            };
-
-                            // Ask the LLM to triage this email.
-                            let triage = triage_email(
+                        for event in events {
+                            crate::sense_router::process_sense_event(
+                                &event,
                                 &router,
-                                from,
-                                subject,
-                                &body_for_triage,
-                            )
-                            .await;
-
-                            match &triage {
-                                EmailTriage { relevance, .. }
-                                    if relevance == "ignore" || relevance == "low" =>
-                                {
-                                    info!(
-                                        "Email from '{}' triaged as {} — skipping: {}",
-                                        from, relevance, triage.reason
-                                    );
-                                }
-                                triage => {
-                                    info!(
-                                        "Email from '{}' triaged as {} — notifying user",
-                                        from, triage.relevance
-                                    );
-
-                                    let body_preview: String = if body_text.len() > 500 {
-                                        format!("{}...", &body_text[..500])
-                                    } else {
-                                        body_text.trim().to_string()
-                                    };
-
-                                    let _ = app_handle.emit(
-                                        "email-event",
-                                        serde_json::json!({
-                                            "type": "new_email",
-                                            "from": from,
-                                            "subject": subject,
-                                            "body_preview": body_preview,
-                                            "relevance": triage.relevance,
-                                            "reason": triage.reason,
-                                            "suggested_action": triage.suggested_action,
-                                            "event_id": event.id.to_string(),
-                                        }),
-                                    );
-                                }
-                            }
+                                &arc_store_ref,
+                                &app_handle,
+                            ).await;
                         }
                     }
                     Ok(_) => {
@@ -282,147 +221,6 @@ impl AppState {
             }
             info!("Email monitor stopped");
         });
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Email triage via LLM
-// ---------------------------------------------------------------------------
-
-/// Result of LLM email triage.
-struct EmailTriage {
-    /// One of: "ignore", "low", "medium", "high"
-    relevance: String,
-    /// One-line explanation of why (e.g. "spam newsletter", "meeting request from boss")
-    reason: String,
-    /// Suggested action (e.g. "none", "read", "reply", "calendar")
-    suggested_action: String,
-}
-
-/// Ask the LLM to classify an email's relevance.
-///
-/// Uses a structured prompt that asks for JSON output. Falls back to
-/// "medium" relevance if the LLM call fails (better to show than to miss).
-async fn triage_email(
-    router: &Arc<RwLock<Arc<DefaultLlmRouter>>>,
-    from: &str,
-    subject: &str,
-    body: &str,
-) -> EmailTriage {
-    use athen_core::llm::{LlmRequest, ChatMessage as LlmChatMessage, Role as LlmRole, MessageContent as LlmContent};
-
-    let prompt = format!(
-        r#"You are an email triage assistant. Classify this email's relevance to the user.
-
-From: {from}
-Subject: {subject}
-Body:
-{body}
-
-Respond with ONLY a JSON object (no markdown, no explanation):
-{{
-  "relevance": "ignore|low|medium|high",
-  "reason": "one-line explanation",
-  "suggested_action": "none|read|reply|calendar|urgent"
-}}
-
-Classification rules:
-- "ignore": ONLY for obvious machine-generated spam, marketing newsletters with unsubscribe links, automated CI/CD notifications, or promotional bulk email
-- "low": mailing list digests, non-urgent automated updates, social media notifications
-- "medium": any email from a real person, work-related messages, personal messages, requests, questions, invitations
-- "high": urgent requests, deadlines, time-sensitive matters, security alerts, messages marked urgent/important
-
-IMPORTANT: Default to "medium" unless you are very confident the email is spam or automated. Real emails from real people should NEVER be classified as "ignore"."#
-    );
-
-    let request = LlmRequest {
-        messages: vec![LlmChatMessage {
-            role: LlmRole::User,
-            content: LlmContent::Text(prompt),
-        }],
-        profile: athen_core::llm::ModelProfile::Cheap,
-        max_tokens: Some(150),
-        temperature: Some(0.1),
-        tools: None,
-        system_prompt: None,
-    };
-
-    let llm_router = router.read().await.clone();
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        llm_router.route(&request),
-    )
-    .await;
-
-    match result {
-        Ok(Ok(response)) => {
-            let text = response.content.trim().to_string();
-            info!("Email triage LLM response: {}", text);
-            parse_triage_json(&text)
-        }
-        Ok(Err(e)) => {
-            warn!("Email triage LLM error: {e}");
-            EmailTriage {
-                relevance: "medium".into(),
-                reason: "Could not assess — showing to be safe".into(),
-                suggested_action: "read".into(),
-            }
-        }
-        Err(_) => {
-            warn!("Email triage LLM timed out");
-            EmailTriage {
-                relevance: "medium".into(),
-                reason: "Triage timed out — showing to be safe".into(),
-                suggested_action: "read".into(),
-            }
-        }
-    }
-}
-
-/// Parse the LLM's JSON response into an `EmailTriage`.
-fn parse_triage_json(text: &str) -> EmailTriage {
-    // Strip markdown code fences if present.
-    let cleaned = text
-        .trim()
-        .strip_prefix("```json")
-        .or_else(|| text.trim().strip_prefix("```"))
-        .unwrap_or(text)
-        .trim()
-        .strip_suffix("```")
-        .unwrap_or(text)
-        .trim();
-
-    match serde_json::from_str::<serde_json::Value>(cleaned) {
-        Ok(v) => {
-            let relevance = v
-                .get("relevance")
-                .and_then(|r| r.as_str())
-                .unwrap_or("medium")
-                .to_string();
-            let reason = v
-                .get("reason")
-                .and_then(|r| r.as_str())
-                .unwrap_or("No reason provided")
-                .to_string();
-            let suggested_action = v
-                .get("suggested_action")
-                .and_then(|r| r.as_str())
-                .unwrap_or("read")
-                .to_string();
-            EmailTriage {
-                relevance,
-                reason,
-                suggested_action,
-            }
-        }
-        Err(e) => {
-            warn!("Failed to parse triage JSON '{}': {e}", cleaned);
-            EmailTriage {
-                relevance: "medium".into(),
-                reason: "Could not parse triage — showing to be safe".into(),
-                suggested_action: "read".into(),
-            }
-        }
     }
 }
 
@@ -659,66 +457,72 @@ pub(crate) fn build_router_for_provider(
     ))
 }
 
-/// Generate a human-readable session identifier: `session_YYYYMMDD_HHMMSS`.
-fn generate_session_id() -> String {
-    chrono::Utc::now().format("session_%Y%m%d_%H%M%S").to_string()
+/// Generate a human-readable Arc identifier: `arc_YYYYMMDD_HHMMSS`.
+fn generate_arc_id() -> String {
+    chrono::Utc::now().format("arc_%Y%m%d_%H%M%S").to_string()
 }
 
-/// Try to restore the most recent session from persistent chat storage.
-/// If the store is unavailable or empty, create a new session with empty history.
-async fn restore_or_create_session(
-    chat_store: &Option<ChatStore>,
+/// Try to restore the most recent active Arc from persistent storage.
+/// If the store is unavailable or empty, create a new Arc with empty history.
+async fn restore_or_create_arc(
+    arc_store: &Option<ArcStore>,
 ) -> (String, Vec<ChatMessage>) {
-    if let Some(store) = chat_store {
-        match store.list_sessions().await {
-            Ok(sessions) if !sessions.is_empty() => {
-                let latest = &sessions[0];
-                match store.load_messages(latest).await {
-                    Ok(persisted) => {
-                        let history: Vec<ChatMessage> = persisted
-                            .into_iter()
-                            .map(|m| ChatMessage {
-                                role: match m.role.as_str() {
-                                    "user" => Role::User,
-                                    "assistant" => Role::Assistant,
-                                    "system" => Role::System,
-                                    "tool" => Role::Tool,
-                                    _ => Role::User,
-                                },
-                                content: if m.content_type == "structured" {
-                                    match serde_json::from_str(&m.content) {
-                                        Ok(v) => MessageContent::Structured(v),
-                                        Err(_) => MessageContent::Text(m.content),
-                                    }
-                                } else {
-                                    MessageContent::Text(m.content)
-                                },
-                            })
-                            .collect();
-                        info!(
-                            "Restored {} messages from session '{}'",
-                            history.len(),
-                            latest
-                        );
-                        return (latest.clone(), history);
-                    }
-                    Err(e) => {
-                        warn!("Failed to load messages for session '{}': {e}", latest);
+    if let Some(store) = arc_store {
+        match store.list_arcs().await {
+            Ok(arcs) if !arcs.is_empty() => {
+                // Find the most recent active arc.
+                let active = arcs
+                    .iter()
+                    .find(|a| a.status == athen_persistence::arcs::ArcStatus::Active);
+                if let Some(arc) = active {
+                    match store.load_entries(&arc.id).await {
+                        Ok(entries) => {
+                            let history: Vec<ChatMessage> = entries
+                                .into_iter()
+                                .filter(|e| {
+                                    e.entry_type
+                                        == athen_persistence::arcs::EntryType::Message
+                                })
+                                .map(|e| ChatMessage {
+                                    role: match e.source.as_str() {
+                                        "user" => Role::User,
+                                        "assistant" => Role::Assistant,
+                                        "system" => Role::System,
+                                        "tool" => Role::Tool,
+                                        _ => Role::User,
+                                    },
+                                    content: MessageContent::Text(e.content),
+                                })
+                                .collect();
+                            info!(
+                                "Restored {} messages from arc '{}'",
+                                history.len(),
+                                arc.id
+                            );
+                            return (arc.id.clone(), history);
+                        }
+                        Err(e) => {
+                            warn!("Failed to load entries for arc '{}': {e}", arc.id);
+                        }
                     }
                 }
             }
-            Err(e) => {
-                warn!("Failed to list sessions: {e}");
-            }
+            Err(e) => warn!("Failed to list arcs: {e}"),
             _ => {}
         }
     }
 
-    // Create a new session with metadata.
-    let new_id = generate_session_id();
-    if let Some(store) = chat_store {
-        if let Err(e) = store.create_session(&new_id, "New Chat").await {
-            warn!("Failed to create initial session metadata: {e}");
+    let new_id = generate_arc_id();
+    if let Some(store) = arc_store {
+        if let Err(e) = store
+            .create_arc(
+                &new_id,
+                "New Arc",
+                athen_persistence::arcs::ArcSource::UserInput,
+            )
+            .await
+        {
+            warn!("Failed to create initial arc: {e}");
         }
     }
     (new_id, Vec::new())

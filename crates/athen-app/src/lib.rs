@@ -5,6 +5,7 @@
 
 mod commands;
 pub(crate) mod process;
+pub(crate) mod sense_router;
 mod settings;
 pub(crate) mod state;
 
@@ -21,13 +22,15 @@ pub fn run() {
             commands::get_status,
             commands::approve_task,
             commands::cancel_task,
-            commands::new_session,
-            commands::get_history,
-            commands::list_sessions,
-            commands::switch_session,
-            commands::rename_session,
-            commands::delete_session,
-            commands::get_current_session,
+            commands::new_arc,
+            commands::get_arc_history,
+            commands::list_arcs,
+            commands::switch_arc,
+            commands::rename_arc,
+            commands::delete_arc,
+            commands::get_current_arc,
+            commands::branch_arc,
+            commands::merge_arcs,
             settings::get_settings,
             settings::save_provider,
             settings::delete_provider,

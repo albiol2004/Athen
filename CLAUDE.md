@@ -30,6 +30,13 @@ Multi-process architecture. Each major component runs as its own process, commun
                       │ IPC (normalized SenseEvents)
                       ▼
 ┌─────────────────────────────────────────────────────────────┐
+│                    SENSE ROUTER (Tauri app)                   │
+│  LLM triage (relevance) → Arc creation → ArcEntry storage  │
+│  Generic: works for email, calendar, messaging, any sense   │
+└─────────────────────┬───────────────────────────────────────┘
+                      │ SenseEvents (medium+ relevance)
+                      ▼
+┌─────────────────────────────────────────────────────────────┐
 │                    COORDINADOR (Coordinator)                  │
 │  Singleton process. Receives events, evaluates risk,         │
 │  prioritizes, dispatches to agent workers.                   │
@@ -62,7 +69,7 @@ athen/
 ├── frontend/                     # Shared web frontend (HTML/CSS/JS)
 │   ├── index.html                # App layout: sidebar + chat + settings
 │   ├── styles.css                # Dark theme, streaming, tool cards, settings
-│   └── app.js                    # Chat logic, streaming, sessions, settings
+│   └── app.js                    # Chat logic, streaming, arcs, settings
 ├── crates/
 │   ├── athen-core/               # Shared types + trait contracts (THE CONTRACTS)
 │   ├── athen-ipc/                # IPC transport layer
@@ -72,7 +79,7 @@ athen/
 │   ├── athen-llm/                # LLM provider adapters + router + failover
 │   ├── athen-memory/             # Vector index + knowledge graph + SQLite
 │   ├── athen-risk/               # Risk scorer + regex rules + LLM fallback
-│   ├── athen-persistence/        # SQLite persistence, checkpoints, chat history
+│   ├── athen-persistence/        # SQLite persistence, checkpoints, arcs
 │   ├── athen-contacts/           # Contact trust model + risk multipliers
 │   ├── athen-sandbox/            # OS-native + container sandboxing
 │   ├── athen-shell/              # Nushell embedding + native shell fallback
@@ -203,6 +210,7 @@ TOML-based configuration:
 - `SecurityMode`: Bunker (everything L2+ needs approval), Assistant (standard), Yolo (only L4)
 - `ModelsConfig`: Providers, profiles (Powerful/Fast/Code/Cheap/Local), domain assignments
 - `DomainConfig`: Per-domain model profile, max steps, timeout, custom options
+- `EmailConfig`: enabled, imap_server, imap_port, username, password, use_tls, folders, poll_interval_secs, lookback_hours
 
 ---
 
@@ -419,7 +427,7 @@ Per-error-type behavior:
 
 ## Persistence & Recovery
 
-SQLite stores: tasks, task steps, checkpoints, pending messages, chat messages, chat sessions, contacts, configuration.
+SQLite stores: tasks, task steps, checkpoints, pending messages, arcs, arc entries, contacts, configuration. (Legacy chat_messages/chat_sessions tables still exist for backward compatibility but are no longer used — auto-migrated to arcs on first startup.)
 
 **Checkpoint frequency**: After every completed step, every 30s during long steps, before any risky action, before LLM calls.
 
@@ -595,7 +603,7 @@ When the agent needs to contact the user:
 - `tool.rs`: `ToolDefinition`, `ToolBackend` (NativeMcp/Shell/Script/HttpApi), `ToolResult`, `AuthConfig`, `ScriptRuntime`, `HttpMethod`
 - `sandbox.rs`: `SandboxLevel` (None/OsNative/Container), `SandboxProfile`, `SandboxCapabilities`, `Mount`
 - `ipc.rs`: `IpcMessage`, `IpcPayload` (14 variants), `ProcessId`, `ProcessType`, `ProcessTarget`, `TaskProgressReport`, `TaskControlCommand`, `ControlAction`, `ProcessRegistration`, `ProcessHealthStatus`, `ApprovalRequest`, `ApprovalResponse`
-- `config.rs`: `AthenConfig`, `OperationMode`, `OperationConfig`, `ModelsConfig`, `ProviderConfig`, `AuthType`, `ProfileConfig`, `DomainConfig`, `SecurityConfig`, `SecurityMode`, `PersistenceConfig`
+- `config.rs`: `AthenConfig`, `OperationMode`, `OperationConfig`, `ModelsConfig`, `ProviderConfig`, `AuthType`, `ProfileConfig`, `DomainConfig`, `SecurityConfig`, `SecurityMode`, `PersistenceConfig`, `EmailConfig` (enabled, imap_server, imap_port, username, password, use_tls, folders, poll_interval_secs, lookback_hours — defaults: disabled, port 993, TLS on, INBOX, 60s poll, 24h lookback)
 - `config_loader.rs`: `load_config(path)`, `load_config_dir(dir)`, `save_default_config(path)`. Loads TOML files with serde defaults for missing fields. Supports split config: `config.toml` (main) + optional `models.toml` override.
 - `traits/`: 9 trait files defining all inter-module contracts
 
@@ -651,10 +659,10 @@ When the agent needs to contact the user:
 - `sqlite.rs`: `SqliteVectorIndex` and `SqliteGraph` — SQLite-backed persistent versions. Embeddings stored as little-endian f32 blobs. Uses `std::sync::Mutex` (not tokio) since rusqlite is synchronous and locks are never held across `.await`.
 - `lib.rs`: `Memory` facade implementing `MemoryStore`. `remember()` stores in vector + extracts entities to graph. `recall()` searches vector index. `forget()` removes from vector.
 
-### athen-sentidos (23 tests)
-**Status**: Complete — user input monitor + stubs + polling runner.
+### athen-sentidos (32 tests)
+**Status**: Complete — user input monitor, full email monitor, stubs, polling runner.
 - `user_input.rs`: `UserInputMonitor` using `tokio::sync::Mutex<mpsc::Receiver<String>>` for interior mutability. Converts strings to `SenseEvent` with EventSource::UserInput, EventKind::Command, RiskLevel::Safe. Exposes `sender()` for UI to push messages.
-- `email.rs`: Stub `EmailMonitor` — 60s poll interval, source_risk Caution.
+- `email.rs`: Full `EmailMonitor` — real IMAP polling via `imap` v2.4 (sync, wrapped in `spawn_blocking`) + `rustls-connector` for TLS (no OpenSSL). `mailparse` for MIME body parsing (text, HTML, attachments). Tracks `last_seen_uid` for incremental polling. Uses `BODY.PEEK[]` to avoid marking emails as read. `extract_email_body()` recursively walks MIME parts. Configurable via `EmailConfig` (server, port, TLS, folders, poll interval, lookback). 15 tests.
 - `calendar.rs`: Stub `CalendarMonitor` — 300s poll interval.
 - `messaging.rs`: Stub `MessagingMonitor` — 30s poll interval.
 - `lib.rs`: Generic `SenseRunner<M: SenseMonitor>` — polling loop with `tokio::select!` for shutdown signal. Sends events through mpsc channel.
@@ -665,23 +673,29 @@ When the agent needs to contact the user:
 - `nushell.rs`: `NushellShell` — auto-detects `nu` binary. If available: `nu -c "command"`. If not: falls back to NativeShell with info log.
 - `lib.rs`: `Shell` unified facade. `execute()` prefers nushell, `execute_native()` always native. Convenience: `run()` returns stdout, `run_ok()` returns bool, `has_program()` checks existence.
 
-### athen-persistence (30 unit + 5 integration = 35 tests)
-**Status**: Complete — SQLite persistence with atomic checkpoints and chat history.
-- `lib.rs`: `Database` struct with `new(path)` and `in_memory()`. Auto-creates tables on init (including chat tables). Provides `store()` → `SqliteStore` and `chat_store()` → `ChatStore` accessors.
+### athen-persistence (40 unit + 5 integration = 45 tests)
+**Status**: Complete — SQLite persistence with atomic checkpoints, arcs, and legacy chat history.
+- `lib.rs`: `Database` struct with `new(path)` and `in_memory()`. Auto-creates tables on init (including arc and legacy chat tables). Provides `store()` → `SqliteStore`, `chat_store()` → `ChatStore`, and `arc_store()` → `ArcStore` accessors.
 - `store.rs`: `SqliteStore` implementing `PersistentStore`. Full CRUD for tasks (with steps serialized as JSON), checkpoints with SHA-256 integrity verification, pending messages with atomic pop (transaction-based select+update).
 - `checkpoint.rs`: `CheckpointManager` — atomic file-based backup (write temp → fsync → rename). Integrity verification with SHA-256 checksums.
-- `chat.rs`: `ChatStore` — SQLite-backed persistent chat history with multi-session support. Types: `PersistedChatMessage` (id, session_id, role, content, content_type, created_at), `SessionMeta` (session_id, name, created_at, updated_at, message_count). Methods:
-  - `save_message(session_id, role, content, content_type)` — inserts a message
-  - `load_messages(session_id)` — returns all messages ordered by creation time
-  - `list_sessions()` — returns distinct session IDs ordered by most recent message
-  - `clear_session(session_id)` — deletes all messages for a session
-  - `create_session(session_id, name)` — creates session metadata entry
-  - `rename_session(session_id, name)` — updates session name
-  - `delete_session(session_id)` — deletes session metadata and all messages
-  - `touch_session(session_id)` — updates `updated_at` timestamp
-  - `list_sessions_with_meta()` — returns `Vec<SessionMeta>` with message counts, ordered by `updated_at` DESC. Auto-migrates legacy sessions (messages without metadata entries).
-  Schema: `chat_messages` (id, session_id, role, content, content_type, created_at) + `chat_sessions` (session_id PK, name, created_at, updated_at). Session IDs use format `session_YYYYMMDD_HHMMSS`.
-- Schema: `tasks`, `task_steps`, `checkpoints`, `pending_messages`, `chat_messages`, `chat_sessions` tables.
+- `arcs.rs`: `ArcStore` — git-branch-like workflow containers replacing sessions. Types:
+  - `ArcMeta`: id, name, source (`ArcSource`: UserInput/Email/Calendar/Messaging/System), status (`ArcStatus`: Active/Archived/Merged), parent_arc_id, merged_into_arc_id, created_at, updated_at
+  - `ArcEntry`: id, arc_id, entry_type (`EntryType`: Message/ToolCall/EmailEvent/CalendarEvent/SystemEvent), source, content, metadata (JSON), created_at
+  Methods:
+  - `create_arc(name, source)` — creates a new arc
+  - `create_arc_with_parent(name, source, parent_id)` — creates a branched child arc
+  - `list_arcs()` — returns all non-merged arcs ordered by `updated_at` DESC
+  - `rename_arc(id, name)` — renames an arc
+  - `delete_arc(id)` — deletes arc and all its entries
+  - `archive_arc(id)` — sets status to Archived
+  - `merge_arc(source_id, target_id)` — moves all entries from source to target arc, marks source as Merged with `merged_into_arc_id`
+  - `add_entry(arc_id, entry_type, source, content, metadata)` — adds an interaction entry
+  - `load_entries(arc_id)` — returns all entries ordered by creation time
+  - `migrate_from_chat_tables()` — auto-migrates legacy chat_sessions/chat_messages to arcs on first startup
+  Schema: `arcs` (id PK, name, source, status, parent_arc_id, merged_into_arc_id, created_at, updated_at) + `arc_entries` (id PK, arc_id FK, entry_type, source, content, metadata, created_at). 10 tests.
+- `chat.rs`: `ChatStore` — legacy SQLite-backed chat history. Still exists for backward compatibility but no longer used by the app. Auto-migrated to arcs on first startup.
+  Schema: `chat_messages` (id, session_id, role, content, content_type, created_at) + `chat_sessions` (session_id PK, name, created_at, updated_at).
+- Schema: `tasks`, `task_steps`, `checkpoints`, `pending_messages`, `arcs`, `arc_entries`, `chat_messages` (legacy), `chat_sessions` (legacy) tables.
 
 ### athen-agent (32 unit + 3 integration = 35 tests)
 **Status**: Complete — LLM-driven task execution with real tool calling, streaming responses, cancellation, tool-level risk checking, sandbox integration, session memory, anti-lazy nudge, and graceful max-steps handling.
@@ -739,38 +753,47 @@ When the agent needs to contact the user:
 - **Verified working**: Full agentic pipeline — user input → coordinator → risk → dispatch → agent executor → LLM → tool calls → execution → result.
 
 ### athen-app (0 tests)
-**Status**: Complete — Tauri 2 desktop app with full agentic tool execution, streaming responses, persistent chat history with multi-session support, settings UI with provider management, provider hot-swap, kill switch, real-time progress events, approval UI, config loading, and persistence. Verified working.
-- `src/lib.rs`: Tauri composition root. Registers 17 command handlers: `send_message`, `get_status`, `approve_task`, `cancel_task`, `new_session`, `get_history`, `list_sessions`, `switch_session`, `rename_session`, `delete_session`, `get_current_session`, `get_settings`, `save_provider`, `delete_provider`, `test_provider`, `save_settings`, `set_active_provider`. Registers agent in `setup()` hook.
+**Status**: Complete — Tauri 2 desktop app with full agentic tool execution, streaming responses, arc-based workflow management, sense router for email/calendar/messaging triage, settings UI with provider and email management, provider hot-swap, kill switch, real-time progress events, approval UI, config loading, and persistence. Verified working.
+- `src/lib.rs`: Tauri composition root. Registers 19 command handlers: `send_message`, `get_status`, `approve_task`, `cancel_task`, `new_arc`, `get_arc_history`, `list_arcs`, `switch_arc`, `rename_arc`, `delete_arc`, `get_current_arc`, `branch_arc`, `merge_arcs`, `get_settings`, `save_provider`, `delete_provider`, `test_provider`, `save_settings`, `set_active_provider`, `save_email_settings`, `test_email_connection`. Registers agent in `setup()` hook. Installs `rustls::crypto::aws_lc_rs::default_provider()` at startup.
 - `src/main.rs`: Entry point with `windows_subsystem = "windows"` for release builds.
 - `src/state.rs`: `AppState` — composition root that loads TOML configuration via `find_config_dir()` (same discovery order as CLI: `~/.athen/` → `./config/` → defaults), resolves active provider from config, builds router and coordinator. Contains:
   - `router: Arc<RwLock<Arc<DefaultLlmRouter>>>` — double-wrapped for runtime hot-swap: inner `Arc` is the router, `RwLock` allows atomic replacement when the user switches providers
   - `active_provider_id: Mutex<String>` — ID of the currently active LLM provider (e.g. "deepseek", "ollama")
-  - `history: Mutex<Vec<ChatMessage>>` — session-level conversation memory
-  - `session_id: Mutex<String>` — current session identifier (`session_YYYYMMDD_HHMMSS` format)
-  - `chat_store: Option<ChatStore>` — persistent chat storage backed by SQLite
+  - `history: Mutex<Vec<ChatMessage>>` — arc-level conversation memory
+  - `arc_id: Mutex<String>` — current arc identifier
+  - `arc_store: Option<ArcStore>` — persistent arc storage backed by SQLite
   - `pending_message: Mutex<Option<String>>` — stashes user's message for replay after approval
   - `model_name: Mutex<String>` — resolved from config, returned by `get_status`
   - `cancel_flag: Arc<AtomicBool>` — shared cancellation flag for in-progress tasks
   - `SharedRouter` wrapper implementing `LlmRouter` via `Arc<RwLock<Arc<DefaultLlmRouter>>>` — delegates `route()`, `route_streaming()`, and `budget_remaining()` through the double-Arc indirection
   - `build_router_for_provider(id, base_url, model, api_key)` — factory function that creates the appropriate provider type based on ID: "deepseek" → `DeepSeekProvider`, "ollama" → `OllamaProvider`, "llamacpp" → `LlamaCppProvider`, anything else → `OpenAiCompatibleProvider`
-  - `restore_or_create_session()` — on startup, tries to restore the most recent session's messages from SQLite; creates a new session if none exist
+  - `restore_or_create_arc()` — on startup, tries to restore the most recent arc's entries from SQLite; creates a new arc if none exist. Auto-migrates legacy chat sessions to arcs on first startup.
   - **API key resolution**: config file key takes priority over env var (e.g. saved key via Settings > `DEEPSEEK_API_KEY` env var). Env var format: `{PROVIDER_ID}_API_KEY` (e.g. `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`). Config values like `${DEEPSEEK_API_KEY}` are treated as unresolved placeholders.
 - `src/commands.rs`: Tauri IPC commands:
-  - `send_message` — emits `agent-progress` event for risk evaluation phase, processes through coordinator pipeline, checks for awaiting approval (returns `PendingApproval` with task_id/description/risk_score/risk_level), snapshots conversation history, builds full `AgentExecutor` with `ShellToolRegistry` per request, passes history as `context_messages`, wires streaming sender and cancel flag, executes with 25 max_steps and 90s timeout. On failure: friendly error messages via `format_user_error()`. On cancellation: returns "Task cancelled by user." On max-steps: returns "I ran out of steps (N used) before finishing." Appends user+assistant messages to session history. Persists messages to SQLite via `persist_message()`.
+  - `send_message` — emits `agent-progress` event for risk evaluation phase, processes through coordinator pipeline, checks for awaiting approval (returns `PendingApproval` with task_id/description/risk_score/risk_level), snapshots conversation history, builds full `AgentExecutor` with `ShellToolRegistry` per request, passes history as `context_messages`, wires streaming sender and cancel flag, executes with 25 max_steps and 90s timeout. On failure: friendly error messages via `format_user_error()`. On cancellation: returns "Task cancelled by user." On max-steps: returns "I ran out of steps (N used) before finishing." Appends user+assistant messages to arc history. Persists entries to SQLite via `ArcStore`.
   - `approve_task` — approves or denies a task flagged by risk system. On approve: retrieves stashed message, builds executor with streaming + cancel flag, dispatches and executes. On deny: cancels task, clears stashed message.
   - `cancel_task` — sets `cancel_flag` to `true`; executor checks at loop start and between tool calls.
   - `get_status` — returns actual model name and connection status.
-  - `get_history` — returns current session's User/Assistant messages for frontend rendering on startup.
-  - `new_session` — clears in-memory history, generates new session ID, creates session metadata entry.
-  - `get_current_session` — returns current session ID.
-  - `switch_session(session_id)` — loads target session's messages from SQLite into memory, returns display messages.
-  - `rename_session(session_id, name)` — renames a session.
-  - `delete_session(session_id)` — deletes session and messages. If deleting the active session, switches to next most recent or creates new one.
-  - `list_sessions` — returns `Vec<SessionMeta>` for sidebar rendering.
+  - `get_arc_history` — returns current arc's entries for frontend rendering on startup.
+  - `new_arc` — clears in-memory history, creates new arc with ArcSource::UserInput.
+  - `get_current_arc` — returns current arc ID.
+  - `switch_arc(arc_id)` — loads target arc's entries from SQLite into memory, returns display messages.
+  - `rename_arc(arc_id, name)` — renames an arc.
+  - `delete_arc(arc_id)` — deletes arc and entries. If deleting the active arc, switches to next most recent or creates new one.
+  - `list_arcs` — returns `Vec<ArcMeta>` for sidebar rendering.
+  - `branch_arc(parent_id, name)` — creates a child arc branched from parent.
+  - `merge_arcs(source_id, target_id)` — merges source arc entries into target, marks source as Merged.
   - `format_user_error(err)` — converts technical error strings to friendly messages (Timeout, Connection, Auth/401, rate_limit/429, max_steps, Budget, RiskThresholdExceeded). `simplify_error()` strips Rust enum formatting for the fallback case.
   - `AgentProgress` struct with `detail: Option<String>` field — carries tool arguments/result summaries (truncated to 200 chars).
   - `TauriAuditor` — wraps `InMemoryAuditor`, emits `agent-progress` Tauri events on each step. Extracts meaningful `detail` from step output: shell_execute → stdout, read_file/write_file → path, list_directory → path, errors → error text, completion → response preview. `truncate_detail()` compacts newlines and truncates.
   - `spawn_stream_forwarder(app_handle)` — spawns a background task that reads from `mpsc::UnboundedReceiver<String>` and emits `agent-stream` Tauri events with `{ delta, is_final }` payload. Emits `is_final: true` when the channel closes.
+- `src/sense_router.rs`: Generic sense-to-arc router that processes any `SenseEvent` through:
+  - **LLM triage**: classifies event relevance as ignore/low/medium/high. Only medium+ reach the user. Spam/low-priority events are silently logged.
+  - **Arc creation**: LLM generates descriptive arc names (e.g. "Meeting with John", "Server alert") based on event content.
+  - **ArcEntry persistence**: stores event as `ArcEntry` with source-specific `EntryType` and metadata JSON.
+  - **Frontend emission**: emits `sense-event` Tauri event for real-time UI updates.
+  - **Fallback**: if LLM fails or times out, defaults to "medium" relevance (better to show than miss).
+  - Works for email, calendar, messaging, or any future sense source. Replaces sense-specific triage code.
 - `src/settings.rs`: Settings management commands:
   - `get_settings` — loads `~/.athen/models.toml`, returns `SettingsResponse` with provider list (sorted: active first), active provider ID, security mode. Shows env var keys with `(env)` hint.
   - `save_provider(id, base_url, model, api_key)` — saves/updates provider to `~/.athen/models.toml`. API key handling: `None` preserves existing, `Some("")` removes, `Some("sk-...")` updates. **Hot-reloads** when saving the active provider: builds new router and swaps via `RwLock`.
@@ -778,37 +801,41 @@ When the agent needs to contact the user:
   - `test_provider(id, base_url, model, api_key)` — tests connectivity. Provider-specific: Ollama → `GET /api/tags`, llama.cpp → `GET /health`, Anthropic → `POST /v1/messages`, others → `POST /v1/chat/completions`. 15-second timeout.
   - `set_active_provider(id)` — switches active provider at runtime. Builds new router, swaps via `RwLock`, persists choice to `~/.athen/models.toml` under `assignments.active_provider`. Cloud providers require API key (checks config then env var).
   - `save_settings(security_mode)` — saves security mode (bunker/assistant/yolo) to `~/.athen/config.toml`.
+  - `save_email_settings(server, port, username, password, use_tls, folders, poll_interval, lookback_hours)` — saves email/IMAP config to `~/.athen/config.toml`. Restarts email monitor if enabled.
+  - `test_email_connection(server, port, username, password, use_tls)` — tests IMAP connectivity with provided credentials.
   - Helper types: `ProviderInfo` (id, name, type, base_url, model, has_api_key, api_key_hint, is_active), `SettingsResponse`, `TestResult`. `mask_api_key()` shows first 3 + last 4 chars.
 - `src/process.rs`: Child process lifecycle management (stub).
+- **Email monitor wiring**: On app launch, if `email.enabled = true` in config, starts `EmailMonitor` in background. Polls IMAP at configured interval, feeds `SenseEvent`s through the sense router for LLM triage and arc creation.
 - `tauri.conf.json`: Window 900x700, `frontendDist` points to `../../frontend`. **`"withGlobalTauri": true`** required in `app` section to inject `window.__TAURI__` into the webview.
 - `frontend/index.html`: Full app layout with sidebar, chat area, and settings page:
-  - **Sidebar**: session list with `+ New Chat` button, Settings button at bottom, hamburger toggle for mobile. Session list populated dynamically from `list_sessions`.
-  - **Chat area**: header with logo + "New Chat" button, message container, input form with send/stop buttons, status bar.
+  - **Sidebar**: arc list with `+ New Arc` button, Settings button at bottom, hamburger toggle for mobile. Arc list populated dynamically from `list_arcs`. Arcs show source icons (message/email/calendar/system) and branch indicators for child arcs.
+  - **Chat area**: header with logo + "New Arc" button, message container, input form with send/stop buttons, status bar.
   - **Stop button**: red square (&#9632;), initially hidden, shown during processing. Calls `cancel_task`.
-  - **Settings page**: provider cards area, "Add Provider" button with template dropdown (DeepSeek, OpenAI, Anthropic, Ollama, llama.cpp, Custom), security mode selector (Assistant/Bunker/YOLO), back button.
-- `frontend/styles.css`: Dark theme (Tokyo Night-inspired) — sidebar with session items (rename/delete on hover), tool execution cards with status icons (check/cross/spinner) and fade-in animation, streaming message bubbles, chat bubbles with avatars, risk badges, code blocks with language labels, approval dialog, settings page with provider cards (expand/collapse), auto-growing textarea, stop button (red), mobile responsive.
+  - **Settings page**: provider cards area, "Add Provider" button with template dropdown (DeepSeek, OpenAI, Anthropic, Ollama, llama.cpp, Custom), security mode selector (Assistant/Bunker/YOLO), email settings section (IMAP config, test connection, app password hints), back button.
+- `frontend/styles.css`: Dark theme (Tokyo Night-inspired) — sidebar with arc items (source icons, branch indicators, rename/delete on hover), tool execution cards with status icons (check/cross/spinner) and fade-in animation, streaming message bubbles, chat bubbles with avatars, risk badges, code blocks with language labels, approval dialog, sense event cards with relevance badges, settings page with provider cards (expand/collapse) and email settings section, auto-growing textarea, stop button (red), mobile responsive.
 - `frontend/app.js`: Full chat frontend with:
   - **Streaming**: listens for `agent-stream` Tauri events. Creates streaming bubble on first chunk, appends text progressively via `textContent` (safe, fast). On `is_final`, re-renders full text with markdown for proper formatting. Tracks `streamingBubble`, `streamingText`, `didReceiveStreamChunks` state.
   - **Tool execution cards**: listens for `agent-progress` events. Creates `tool-steps-container` div, appends `tool-execution-card` elements with status class (completed/failed/in-progress), status icon (checkmark/cross/dot), tool name, and truncated detail text. Cards have fade-in CSS animation.
-  - **Session sidebar**: `loadSessions()` fetches session list, `renderSessionList()` builds sidebar items with name, relative date, message count badge. Double-click or pencil icon to rename (inline contenteditable). Delete button with confirmation. Auto-names new sessions from first user message (~30 chars). Active session highlighted.
+  - **Arc sidebar**: `loadArcs()` fetches arc list, `renderArcList()` builds sidebar items with name, source icon (message/email/calendar/system), relative date, entry count badge, and branch indicator for child arcs. Double-click or pencil icon to rename (inline contenteditable). Delete button with confirmation. Branch button creates child arc. Merged arcs hidden from sidebar. Auto-names new arcs from first user message (~30 chars). Active arc highlighted.
+  - **Sense event cards**: listens for `sense-event` Tauri events. Renders source-specific icons, LLM relevance badges (Important/Urgent), agent's reasoning text, and context-aware action buttons (Summarize/Draft Reply/Add to Calendar/Open Arc).
   - **Kill switch**: stop button (red &#9632;) replaces send button during processing. Calls `cancel_task` command. Escape key also cancels. `isProcessing` flag controls button visibility.
   - **Error handling**: `format_user_error()` produces friendly messages. Retry button for transient errors (stores `lastMessage`, `retryLastMessage()` re-submits). "Open Settings" link for auth errors.
   - **Markdown renderer** (inline, no dependencies): fenced code blocks with language labels, inline code, headers (h1-h3), ordered/unordered lists, bold, italic, links. Code blocks protected from inline transformations.
   - **XSS protection**: user messages use `textContent` (never innerHTML), assistant messages go through markdown renderer with `escapeHtml()` on code blocks.
   - **Real-time progress**: status bar shows "Step N: tool_name (status)" and "Evaluating risk..." during risk phase.
   - **Approval dialog**: shows risk badge, score, description, approve/deny buttons.
-  - **Settings page**: loads providers via `get_settings`, renders provider cards with expand/collapse. Edit fields for base URL, model, API key (masked display, show/hide toggle). "Test Connection" and "Save" buttons per provider. "Set Active" button to switch provider. "Delete" with confirmation. Add provider via template selection. Security mode dropdown with contextual hints.
+  - **Settings page**: loads providers via `get_settings`, renders provider cards with expand/collapse. Edit fields for base URL, model, API key (masked display, show/hide toggle). "Test Connection" and "Save" buttons per provider. "Set Active" button to switch provider. "Delete" with confirmation. Add provider via template selection. Security mode dropdown with contextual hints. Email settings section with IMAP server/port/username/password fields, TLS toggle, test connection button, and app password hints for Gmail/Outlook.
   - **Auto-growing textarea**: expands with content up to 150px. Enter sends, Shift+Enter for newline.
   - **Smooth scroll**: `requestAnimationFrame` + `scrollTo` on new messages and tool cards.
 - **Requires system libraries**: `webkit2gtk4.1-devel gtk3-devel libsoup3-devel libappindicator-gtk3-devel` (Fedora).
-- **Verified working**: Full multi-step agentic pipeline with streaming confirmed. Tested: (1) "What tools do you have?" → LLM correctly lists its 6 tools, (2) "Read https://alejandrogarcia.blog/ and write to HELLO.md" → LLM uses `shell_execute` (curl) to fetch website, then `write_file` to save formatted markdown. Streaming renders progressively with markdown finalization. Tool execution cards show in real time with status icons. Session persistence across app restarts. Provider hot-swap works without restart. Settings UI tested for add/edit/delete/test/activate providers.
+- **Verified working**: Full multi-step agentic pipeline with streaming confirmed. Tested: (1) "What tools do you have?" → LLM correctly lists its 6 tools, (2) "Read https://alejandrogarcia.blog/ and write to HELLO.md" → LLM uses `shell_execute` (curl) to fetch website, then `write_file` to save formatted markdown. Streaming renders progressively with markdown finalization. Tool execution cards show in real time with status icons. Arc persistence across app restarts. Provider hot-swap works without restart. Settings UI tested for add/edit/delete/test/activate providers. Email monitor tested with real IMAP server.
 
 ### mcp-filesystem (0 tests)
 **Status**: Stub — entry point only. Standalone MCP server (no athen-core dependency).
 
 ---
 
-## Integration Tests (28 tests)
+## Integration Tests (28 integration tests)
 
 Integration tests wire real implementations together (no mocks except LLM).
 
@@ -866,7 +893,7 @@ TOML-based configuration with split files and sensible defaults.
 Both `athen-cli` and `athen-app` use the same discovery logic. The Tauri app also creates `~/.athen/` if it does not exist and opens SQLite at `~/.athen/athen.db`.
 
 ### Config files
-- `config/config.toml` — operation mode, security settings, persistence paths
+- `config/config.toml` — operation mode, security settings, persistence paths, email settings
 - `config/models.toml` — LLM providers (API keys, models), profiles (powerful/fast/code/cheap), domain-to-profile assignments
 - `config/domains.toml` — per-domain settings (model profile, max steps, timeout)
 
@@ -909,6 +936,10 @@ save_default_config(path) -> Result<()>         // Write defaults to file
 | `toml` | 0.8 | athen-core, athen-app | TOML config parsing (core: loading, app: settings save/load) |
 | `tauri` | 2.x | athen-app | Desktop app framework |
 | `tauri-build` | 2.x | athen-app (build) | Tauri build system |
+| `imap` | 2.4 (default-features = false) | athen-sentidos | IMAP client for email monitoring |
+| `rustls-connector` | 0.22 | athen-sentidos | Sync TLS via rustls for IMAP (no OpenSSL) |
+| `mailparse` | 0.16 | athen-sentidos | MIME email body parsing |
+| `rustls` | 0.23 (aws_lc_rs) | athen-app | Crypto provider installation |
 
 All HTTP uses `rustls-tls` (pure Rust) — no OpenSSL system dependency needed.
 

@@ -23,7 +23,7 @@ use athen_core::task::{DomainType, Task, TaskId, TaskPriority, TaskStatus, TaskS
 use athen_core::traits::agent::{AgentExecutor, StepAuditor};
 use athen_core::traits::llm::LlmRouter;
 use athen_agent::{AgentBuilder, InMemoryAuditor, ShellToolRegistry};
-use athen_persistence::chat::SessionMeta;
+use athen_persistence::arcs;
 
 use crate::state::{AppState, PendingApproval, SharedRouter};
 
@@ -68,26 +68,37 @@ fn simplify_error(err: &str) -> String {
     err.to_string()
 }
 
-/// A simplified chat message suitable for returning to the frontend.
-#[derive(Serialize)]
-pub struct HistoryMessage {
-    pub role: String,
-    pub content: String,
-}
-
-/// Persist a chat message to SQLite (fire-and-forget; errors are logged, not propagated).
+/// Persist an entry to the active Arc in SQLite (fire-and-forget; errors are logged, not propagated).
 ///
-/// Also updates the session's `updated_at` timestamp.
-async fn persist_message(state: &AppState, role: &str, content: &str) {
-    if let Some(ref store) = state.chat_store {
-        let session_id = state.session_id.lock().await.clone();
-        if let Err(e) = store.save_message(&session_id, role, content, "text").await {
-            warn!("Failed to persist chat message: {e}");
+/// Also updates the arc's `updated_at` timestamp.
+async fn persist_entry(
+    state: &AppState,
+    source: &str,
+    content: &str,
+    entry_type: &str,
+    metadata: Option<serde_json::Value>,
+) {
+    if let Some(ref store) = state.arc_store {
+        let arc_id = state.active_arc_id.lock().await.clone();
+        let et = arcs::EntryType::from_str(entry_type);
+        if let Err(e) = store.add_entry(&arc_id, et, source, content, metadata).await {
+            warn!("Failed to persist arc entry: {e}");
         }
-        if let Err(e) = store.touch_session(&session_id).await {
-            warn!("Failed to touch session: {e}");
+        if let Err(e) = store.touch_arc(&arc_id).await {
+            warn!("Failed to touch arc: {e}");
         }
     }
+}
+
+/// Response type for arc entries returned to the frontend.
+#[derive(Serialize)]
+pub struct ArcEntryResponse {
+    pub id: i64,
+    pub entry_type: String,
+    pub source: String,
+    pub content: String,
+    pub metadata: Option<serde_json::Value>,
+    pub created_at: String,
 }
 
 /// Response payload returned to the frontend after processing a chat message.
@@ -413,8 +424,8 @@ pub async fn send_message(
                         content: MessageContent::Text(msg.clone()),
                     });
                     drop(history);
-                    persist_message(&state, "user", &message).await;
-                    persist_message(&state, "assistant", &msg).await;
+                    persist_entry(&state, "user", &message, "message", None).await;
+                    persist_entry(&state, "assistant", &msg, "message", None).await;
                     return Ok(ChatResponse {
                         content: msg,
                         risk_level: Some("Caution".into()),
@@ -472,8 +483,8 @@ pub async fn send_message(
                     content: MessageContent::Text(content.clone()),
                 });
             }
-            persist_message(&state, "user", &message).await;
-            persist_message(&state, "assistant", &content).await;
+            persist_entry(&state, "user", &message, "message", None).await;
+            persist_entry(&state, "assistant", &content, "message", None).await;
 
             // Mark coordinator task as completed.
             let _ = state.coordinator.complete_task(task_id).await;
@@ -626,8 +637,8 @@ pub async fn approve_task(
                         content: MessageContent::Text(msg.clone()),
                     });
                     drop(history);
-                    persist_message(&state, "user", &message).await;
-                    persist_message(&state, "assistant", &msg).await;
+                    persist_entry(&state, "user", &message, "message", None).await;
+                    persist_entry(&state, "assistant", &msg, "message", None).await;
                     return Ok(ChatResponse {
                         content: msg,
                         risk_level: Some("Caution".into()),
@@ -683,8 +694,8 @@ pub async fn approve_task(
                     content: MessageContent::Text(content.clone()),
                 });
             }
-            persist_message(&state, "user", &message).await;
-            persist_message(&state, "assistant", &content).await;
+            persist_entry(&state, "user", &message, "message", None).await;
+            persist_entry(&state, "assistant", &content, "message", None).await;
 
             let _ = state.coordinator.complete_task(coord_task_id).await;
 
@@ -737,252 +748,276 @@ pub async fn get_status(
     })
 }
 
-/// Start a fresh conversation session.
+/// Start a fresh Arc.
 ///
-/// Clears the in-memory history and generates a new session identifier.
-/// Previous sessions remain in SQLite and can be loaded later.
-/// Returns the new session ID so the frontend can update the sidebar.
+/// Clears the in-memory history and generates a new Arc identifier.
+/// Previous arcs remain in SQLite and can be loaded later.
+/// Returns the new Arc ID so the frontend can update the sidebar.
 #[tauri::command]
-pub async fn new_session(
+pub async fn new_arc(
     state: State<'_, AppState>,
 ) -> std::result::Result<String, String> {
+    *state.history.lock().await = Vec::new();
     let new_id = chrono::Utc::now()
-        .format("session_%Y%m%d_%H%M%S")
+        .format("arc_%Y%m%d_%H%M%S")
         .to_string();
+    *state.active_arc_id.lock().await = new_id.clone();
 
-    // Create session metadata entry.
-    if let Some(ref store) = state.chat_store {
-        if let Err(e) = store.create_session(&new_id, "New Chat").await {
-            warn!("Failed to create session metadata: {e}");
+    if let Some(ref store) = state.arc_store {
+        if let Err(e) = store
+            .create_arc(
+                &new_id,
+                "New Arc",
+                arcs::ArcSource::UserInput,
+            )
+            .await
+        {
+            warn!("Failed to create arc: {e}");
         }
     }
-
-    let mut history = state.history.lock().await;
-    history.clear();
-    drop(history);
-
-    let mut session_id = state.session_id.lock().await;
-    *session_id = new_id.clone();
 
     Ok(new_id)
 }
 
-/// Return the current session's conversation history for the frontend
-/// to render on startup.
+/// Return the current arc's entries for the frontend to render on startup.
 ///
-/// Only User and Assistant messages are returned (tool messages are
-/// filtered out since they are not meaningful for display).
+/// Falls back to in-memory history if the arc store is unavailable.
 #[tauri::command]
-pub async fn get_history(
+pub async fn get_arc_history(
     state: State<'_, AppState>,
-) -> std::result::Result<Vec<HistoryMessage>, String> {
+) -> std::result::Result<Vec<ArcEntryResponse>, String> {
+    if let Some(ref store) = state.arc_store {
+        let arc_id = state.active_arc_id.lock().await.clone();
+        let entries = store
+            .load_entries(&arc_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        return Ok(entries
+            .into_iter()
+            .map(|e| ArcEntryResponse {
+                id: e.id,
+                entry_type: e.entry_type.as_str().to_string(),
+                source: e.source,
+                content: e.content,
+                metadata: e.metadata,
+                created_at: e.created_at,
+            })
+            .collect());
+    }
+
+    // Fallback to in-memory history.
     let history = state.history.lock().await;
-    let messages: Vec<HistoryMessage> = history
+    Ok(history
         .iter()
-        .filter(|m| matches!(m.role, Role::User | Role::Assistant))
-        .map(|m| {
-            let role = match m.role {
-                Role::User => "user",
-                Role::Assistant => "assistant",
-                Role::System => "system",
-                Role::Tool => "tool",
+        .filter_map(|m| {
+            let (role, content) = match (&m.role, &m.content) {
+                (Role::User, MessageContent::Text(t)) => ("user", t.clone()),
+                (Role::Assistant, MessageContent::Text(t)) => ("assistant", t.clone()),
+                _ => return None,
             };
-            let content = match &m.content {
-                MessageContent::Text(t) => t.clone(),
-                MessageContent::Structured(v) => {
-                    serde_json::to_string_pretty(v).unwrap_or_default()
-                }
-            };
-            HistoryMessage {
-                role: role.to_string(),
+            Some(ArcEntryResponse {
+                id: 0,
+                entry_type: "message".to_string(),
+                source: role.to_string(),
                 content,
-            }
+                metadata: None,
+                created_at: String::new(),
+            })
         })
-        .collect();
-    Ok(messages)
+        .collect())
 }
 
-/// List all sessions with metadata for the sidebar.
+/// List all arcs with metadata for the sidebar.
 #[tauri::command]
-pub async fn list_sessions(
+pub async fn list_arcs(
     state: State<'_, AppState>,
-) -> std::result::Result<Vec<SessionMeta>, String> {
-    let store = state
-        .chat_store
-        .as_ref()
-        .ok_or_else(|| "Chat store not available".to_string())?;
-    store
-        .list_sessions_with_meta()
-        .await
-        .map_err(|e| e.to_string())
+) -> std::result::Result<Vec<arcs::ArcMeta>, String> {
+    if let Some(ref store) = state.arc_store {
+        store.list_arcs().await.map_err(|e| e.to_string())
+    } else {
+        Ok(Vec::new())
+    }
 }
 
-/// Switch to a different session, loading its messages into the in-memory history.
+/// Switch to a different arc, loading its entries into the in-memory history.
 ///
-/// Returns the loaded messages so the frontend can render them immediately.
+/// Returns the loaded entries so the frontend can render them immediately.
 #[tauri::command]
-pub async fn switch_session(
-    session_id: String,
+pub async fn switch_arc(
+    arc_id: String,
     state: State<'_, AppState>,
-) -> std::result::Result<Vec<HistoryMessage>, String> {
-    let store = state
-        .chat_store
-        .as_ref()
-        .ok_or_else(|| "Chat store not available".to_string())?;
-
-    // Load the persisted messages for the target session.
-    let persisted = store
-        .load_messages(&session_id)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let chat_messages: Vec<ChatMessage> = persisted
-        .iter()
-        .map(|m| ChatMessage {
-            role: match m.role.as_str() {
-                "user" => Role::User,
-                "assistant" => Role::Assistant,
-                "system" => Role::System,
-                "tool" => Role::Tool,
-                _ => Role::User,
-            },
-            content: if m.content_type == "structured" {
-                match serde_json::from_str(&m.content) {
-                    Ok(v) => MessageContent::Structured(v),
-                    Err(_) => MessageContent::Text(m.content.clone()),
-                }
-            } else {
-                MessageContent::Text(m.content.clone())
-            },
-        })
-        .collect();
-
-    // Build the display messages (user + assistant only).
-    let display: Vec<HistoryMessage> = persisted
-        .iter()
-        .filter(|m| m.role == "user" || m.role == "assistant")
-        .map(|m| HistoryMessage {
-            role: m.role.clone(),
-            content: m.content.clone(),
-        })
-        .collect();
-
-    // Swap in-memory state.
-    let mut history = state.history.lock().await;
-    *history = chat_messages;
-    drop(history);
-
-    let mut current_session = state.session_id.lock().await;
-    *current_session = session_id;
-
-    Ok(display)
-}
-
-/// Rename a session.
-#[tauri::command]
-pub async fn rename_session(
-    session_id: String,
-    name: String,
-    state: State<'_, AppState>,
-) -> std::result::Result<(), String> {
-    let store = state
-        .chat_store
-        .as_ref()
-        .ok_or_else(|| "Chat store not available".to_string())?;
-    store
-        .rename_session(&session_id, &name)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-/// Delete a session and all its messages.
-///
-/// Returns the session ID of the session that should become active
-/// (the most recent remaining session, or a newly created one).
-#[tauri::command]
-pub async fn delete_session(
-    session_id: String,
-    state: State<'_, AppState>,
-) -> std::result::Result<String, String> {
-    let store = state
-        .chat_store
-        .as_ref()
-        .ok_or_else(|| "Chat store not available".to_string())?;
-
-    store
-        .delete_session(&session_id)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let current = state.session_id.lock().await.clone();
-
-    // If we deleted the active session, switch to another.
-    if current == session_id {
-        let sessions = store
-            .list_sessions_with_meta()
+) -> std::result::Result<Vec<ArcEntryResponse>, String> {
+    if let Some(ref store) = state.arc_store {
+        let entries = store
+            .load_entries(&arc_id)
             .await
             .map_err(|e| e.to_string())?;
 
-        if let Some(next) = sessions.first() {
-            // Load the next session's history.
-            let persisted = store
-                .load_messages(&next.session_id)
-                .await
-                .map_err(|e| e.to_string())?;
+        // Rebuild in-memory history from message entries.
+        let history: Vec<ChatMessage> = entries
+            .iter()
+            .filter(|e| e.entry_type == arcs::EntryType::Message)
+            .map(|e| ChatMessage {
+                role: match e.source.as_str() {
+                    "user" => Role::User,
+                    "assistant" => Role::Assistant,
+                    "system" => Role::System,
+                    "tool" => Role::Tool,
+                    _ => Role::User,
+                },
+                content: MessageContent::Text(e.content.clone()),
+            })
+            .collect();
 
-            let chat_messages: Vec<ChatMessage> = persisted
-                .iter()
-                .map(|m| ChatMessage {
-                    role: match m.role.as_str() {
-                        "user" => Role::User,
-                        "assistant" => Role::Assistant,
-                        "system" => Role::System,
-                        "tool" => Role::Tool,
-                        _ => Role::User,
-                    },
-                    content: if m.content_type == "structured" {
-                        match serde_json::from_str(&m.content) {
-                            Ok(v) => MessageContent::Structured(v),
-                            Err(_) => MessageContent::Text(m.content.clone()),
-                        }
-                    } else {
-                        MessageContent::Text(m.content.clone())
-                    },
-                })
-                .collect();
+        *state.history.lock().await = history;
+        *state.active_arc_id.lock().await = arc_id;
 
-            let mut history = state.history.lock().await;
-            *history = chat_messages;
-            drop(history);
+        return Ok(entries
+            .into_iter()
+            .map(|e| ArcEntryResponse {
+                id: e.id,
+                entry_type: e.entry_type.as_str().to_string(),
+                source: e.source,
+                content: e.content,
+                metadata: e.metadata,
+                created_at: e.created_at,
+            })
+            .collect());
+    }
+    Ok(Vec::new())
+}
 
-            let mut sid = state.session_id.lock().await;
-            *sid = next.session_id.clone();
+/// Rename an arc.
+#[tauri::command]
+pub async fn rename_arc(
+    arc_id: String,
+    name: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    if let Some(ref store) = state.arc_store {
+        store
+            .rename_arc(&arc_id, &name)
+            .await
+            .map_err(|e| e.to_string())
+    } else {
+        Ok(())
+    }
+}
 
-            return Ok(next.session_id.clone());
-        }
-
-        // No sessions left -- create a new one.
-        let new_id = chrono::Utc::now()
-            .format("session_%Y%m%d_%H%M%S")
-            .to_string();
-        if let Err(e) = store.create_session(&new_id, "New Chat").await {
-            warn!("Failed to create replacement session: {e}");
-        }
-        let mut history = state.history.lock().await;
-        history.clear();
-        drop(history);
-        let mut sid = state.session_id.lock().await;
-        *sid = new_id.clone();
-        return Ok(new_id);
+/// Delete an arc and all its entries.
+///
+/// Returns the arc ID of the arc that should become active
+/// (the most recent remaining active arc, or a newly created one).
+#[tauri::command]
+pub async fn delete_arc(
+    arc_id: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<String, String> {
+    if let Some(ref store) = state.arc_store {
+        store
+            .delete_arc(&arc_id)
+            .await
+            .map_err(|e| e.to_string())?;
     }
 
+    // If deleting the active arc, switch to next or create new.
+    let current = state.active_arc_id.lock().await.clone();
+    if arc_id == current {
+        if let Some(ref store) = state.arc_store {
+            let all_arcs = store.list_arcs().await.map_err(|e| e.to_string())?;
+            let next = all_arcs
+                .into_iter()
+                .find(|a| a.status == arcs::ArcStatus::Active)
+                .map(|a| a.id);
+            if let Some(next_id) = next {
+                *state.active_arc_id.lock().await = next_id.clone();
+                *state.history.lock().await = Vec::new();
+                return Ok(next_id);
+            }
+        }
+        // No arcs left, create new.
+        let new_id = chrono::Utc::now()
+            .format("arc_%Y%m%d_%H%M%S")
+            .to_string();
+        if let Some(ref store) = state.arc_store {
+            let _ = store
+                .create_arc(
+                    &new_id,
+                    "New Arc",
+                    arcs::ArcSource::UserInput,
+                )
+                .await;
+        }
+        *state.active_arc_id.lock().await = new_id.clone();
+        *state.history.lock().await = Vec::new();
+        return Ok(new_id);
+    }
     Ok(current)
 }
 
-/// Return the current active session ID.
+/// Return the current active arc ID.
 #[tauri::command]
-pub async fn get_current_session(
+pub async fn get_current_arc(
     state: State<'_, AppState>,
 ) -> std::result::Result<String, String> {
-    Ok(state.session_id.lock().await.clone())
+    Ok(state.active_arc_id.lock().await.clone())
+}
+
+/// Create a new arc branched from an existing parent arc.
+///
+/// The new arc starts empty but records the parent relationship.
+/// Switches the active arc to the new branch.
+#[tauri::command]
+pub async fn branch_arc(
+    parent_arc_id: String,
+    name: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<String, String> {
+    let new_id = chrono::Utc::now()
+        .format("arc_%Y%m%d_%H%M%S")
+        .to_string();
+    if let Some(ref store) = state.arc_store {
+        store
+            .create_arc_with_parent(
+                &new_id,
+                &name,
+                arcs::ArcSource::UserInput,
+                &parent_arc_id,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    // Switch to the new branch.
+    *state.active_arc_id.lock().await = new_id.clone();
+    *state.history.lock().await = Vec::new();
+
+    Ok(new_id)
+}
+
+/// Merge all entries from a source arc into a target arc.
+///
+/// The source arc is marked as Merged. If it was the active arc,
+/// switches to the target.
+#[tauri::command]
+pub async fn merge_arcs(
+    source_arc_id: String,
+    target_arc_id: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    if let Some(ref store) = state.arc_store {
+        store
+            .merge_arc(&source_arc_id, &target_arc_id)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    // If the merged (source) arc was active, switch to target.
+    let current = state.active_arc_id.lock().await.clone();
+    if current == source_arc_id {
+        *state.active_arc_id.lock().await = target_arc_id;
+        *state.history.lock().await = Vec::new();
+    }
+
+    Ok(())
 }

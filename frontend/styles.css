@@ -1801,6 +1801,30 @@ footer {
     }
 }
 
+/* ─── Arc Source & Branch Indicators ─── */
+.arc-source-icon {
+    font-size: 0.75rem;
+    margin-right: 0.25rem;
+}
+
+.arc-branch-badge {
+    color: #7aa2f7;
+    font-size: 0.75rem;
+    font-weight: 600;
+    margin-right: 0.25rem;
+}
+
+/* ─── Inline Entry Cards (email, tool, system) ─── */
+.email-inline-entry,
+.system-inline-entry {
+    padding: 0.5rem 1rem;
+    margin: 0.25rem 1rem;
+    font-size: 0.8rem;
+    color: #787c99;
+    border-left: 2px solid #3b3d57;
+    border-radius: 4px;
+}
+
 /* ─── Responsive ─── */
 
 /* Desktop: sidebar always visible, toggle hidden */
