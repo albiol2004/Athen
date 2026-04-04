@@ -640,6 +640,7 @@ pub async fn save_settings(
 // ---------------------------------------------------------------------------
 
 /// Save email monitor settings.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn save_email_settings(
     enabled: bool,

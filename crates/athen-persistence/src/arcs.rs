@@ -33,6 +33,7 @@ impl ArcSource {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s {
             "email" => Self::Email,
@@ -72,6 +73,7 @@ impl ArcStatus {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s {
             "archived" => Self::Archived,
@@ -116,6 +118,7 @@ impl EntryType {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s {
             "tool_call" => Self::ToolCall,

@@ -513,7 +513,7 @@ mod tests {
         };
 
         // First call should generate a reminder.
-        let first = generate_reminder_events(&[event.clone()], now, &fired);
+        let first = generate_reminder_events(std::slice::from_ref(&event), now, &fired);
         assert_eq!(first.len(), 1);
 
         // Second call with same event should be deduped.
