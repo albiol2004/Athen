@@ -1825,6 +1825,204 @@ footer {
     border-radius: 4px;
 }
 
+/* ─── Arc Timeline View ─── */
+
+.timeline-view {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-primary);
+    overflow: hidden;
+}
+
+.timeline-header {
+    display: flex;
+    align-items: center;
+    padding: 1rem 1.5rem;
+    border-bottom: 1px solid var(--border-subtle);
+    gap: 1rem;
+}
+
+.timeline-header h1 {
+    font-size: 1.2rem;
+    color: var(--text-primary);
+    margin: 0;
+}
+
+.timeline-canvas {
+    flex: 1;
+    overflow-y: auto;
+    padding: 1rem;
+}
+
+.timeline-canvas::-webkit-scrollbar { width: 4px; }
+.timeline-canvas::-webkit-scrollbar-track { background: transparent; }
+.timeline-canvas::-webkit-scrollbar-thumb {
+    background: var(--border-subtle);
+    border-radius: 2px;
+}
+
+.timeline-loading,
+.timeline-empty {
+    text-align: center;
+    color: var(--text-secondary);
+    padding: 3rem 1rem;
+    font-size: 0.9rem;
+}
+
+.timeline-graph {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.timeline-row {
+    display: flex;
+    align-items: center;
+    padding: 0.75rem 1rem;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: background 0.15s;
+    position: relative;
+}
+
+.timeline-row.active:hover {
+    background: var(--bg-surface);
+}
+
+.timeline-row.merged {
+    opacity: 0.5;
+}
+
+.timeline-row.archived {
+    opacity: 0.6;
+}
+
+.timeline-rail {
+    position: relative;
+    flex-shrink: 0;
+    width: 200px;
+    min-width: 60px;
+    display: flex;
+    align-items: center;
+}
+
+.timeline-node {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.75rem;
+    flex-shrink: 0;
+    z-index: 1;
+    position: relative;
+}
+
+.timeline-branch-line {
+    position: absolute;
+    top: 50%;
+    height: 0;
+    border-top: 2px dashed;
+    opacity: 0.5;
+}
+
+.timeline-info {
+    flex: 1;
+    min-width: 0;
+    padding-left: 0.75rem;
+}
+
+.timeline-name {
+    color: var(--text-primary);
+    font-weight: 600;
+    font-size: 0.9rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.timeline-meta {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-top: 0.2rem;
+    flex-wrap: wrap;
+}
+
+.timeline-time {
+    color: var(--text-secondary);
+    font-size: 0.75rem;
+}
+
+.timeline-entries {
+    color: var(--text-secondary);
+    font-size: 0.75rem;
+}
+
+.timeline-branch-tag {
+    color: var(--accent-blue);
+    font-size: 0.7rem;
+    font-weight: 500;
+}
+
+.timeline-merge-tag {
+    color: var(--warning);
+    font-size: 0.7rem;
+    font-weight: 500;
+    font-style: italic;
+}
+
+.timeline-actions {
+    flex-shrink: 0;
+    padding-left: 0.5rem;
+}
+
+.timeline-action-btn {
+    background: var(--bg-input);
+    color: var(--text-primary);
+    border: none;
+    padding: 0.3rem 0.75rem;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.8rem;
+    transition: background 0.15s;
+}
+
+.timeline-action-btn:hover {
+    background: var(--accent-blue);
+    color: var(--bg-primary);
+}
+
+/* Timeline toggle button in sidebar */
+.sidebar-header-buttons {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+}
+
+#timeline-toggle-btn {
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.9rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.15s;
+}
+
+#timeline-toggle-btn:hover {
+    background: var(--bg-input);
+    color: var(--text-primary);
+    border-color: var(--accent-dim);
+}
+
 /* ─── Responsive ─── */
 
 /* Desktop: sidebar always visible, toggle hidden */

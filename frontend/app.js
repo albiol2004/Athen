@@ -1300,6 +1300,7 @@ const settingsView = document.getElementById('settings-view');
 const settingsBtn = document.getElementById('settings-btn');
 const settingsBack = document.getElementById('settings-back');
 const appView = document.getElementById('app');
+const timelineView = document.getElementById('timeline-view');
 const providerListEl = document.getElementById('provider-list');
 const addProviderBtn = document.getElementById('add-provider-btn');
 const providerTemplates = document.getElementById('provider-templates');
@@ -1324,6 +1325,7 @@ const SECURITY_HINTS = {
 
 function showSettings() {
     appView.style.display = 'none';
+    timelineView?.classList.add('hidden');
     settingsView.classList.remove('hidden');
     closeSidebar();
     loadSettings();
@@ -1331,6 +1333,7 @@ function showSettings() {
 
 function showChat() {
     settingsView.classList.add('hidden');
+    timelineView?.classList.add('hidden');
     appView.style.display = 'flex';
     inputEl.focus();
 }
@@ -1748,6 +1751,167 @@ function showEmailTestResult(success, message) {
     el.textContent = message;
     el.classList.remove('hidden');
     setTimeout(() => el.classList.add('hidden'), 5000);
+}
+
+// ─── Arc Timeline ───
+
+const timelineToggleBtn = document.getElementById('timeline-toggle-btn');
+const timelineBackBtn = document.getElementById('timeline-back');
+
+function showTimeline() {
+    appView.style.display = 'none';
+    settingsView.classList.add('hidden');
+    timelineView.classList.remove('hidden');
+    closeSidebar();
+    renderTimeline();
+}
+
+function hideTimeline() {
+    timelineView.classList.add('hidden');
+    appView.style.display = 'flex';
+    inputEl.focus();
+}
+
+if (timelineToggleBtn) {
+    timelineToggleBtn.addEventListener('click', showTimeline);
+}
+
+if (timelineBackBtn) {
+    timelineBackBtn.addEventListener('click', hideTimeline);
+}
+
+async function renderTimeline() {
+    const canvas = document.getElementById('timeline-canvas');
+    if (!canvas || !invoke) return;
+    canvas.innerHTML = '<div class="timeline-loading">Loading timeline...</div>';
+
+    try {
+        const arcs = await invoke('list_arcs');
+        if (!arcs || arcs.length === 0) {
+            canvas.innerHTML = '<div class="timeline-empty">No arcs yet. Start a conversation or connect a sense monitor.</div>';
+            return;
+        }
+
+        // Build a map for quick lookup
+        const arcMap = {};
+        arcs.forEach(a => { arcMap[a.id] = a; });
+
+        // Sort by created_at ascending (oldest first = bottom of timeline)
+        const sorted = [...arcs].sort((a, b) =>
+            new Date(a.created_at) - new Date(b.created_at)
+        );
+
+        // Assign lanes (columns) — root arcs get their own lane,
+        // branches share parent's lane + 1
+        const lanes = {};
+        let nextLane = 0;
+        sorted.forEach(arc => {
+            if (arc.parent_arc_id && lanes[arc.parent_arc_id] !== undefined) {
+                lanes[arc.id] = lanes[arc.parent_arc_id] + 1;
+                if (lanes[arc.id] >= nextLane) nextLane = lanes[arc.id] + 1;
+            } else {
+                lanes[arc.id] = nextLane;
+                nextLane++;
+            }
+        });
+
+        // Render newest first (reverse for display)
+        const display = [...sorted].reverse();
+
+        let html = '<div class="timeline-graph">';
+
+        display.forEach((arc) => {
+            const lane = lanes[arc.id] || 0;
+            const sourceIcon = getTimelineSourceIcon(arc.source);
+            const statusClass = arc.status === 'Merged' ? 'merged' :
+                               arc.status === 'Archived' ? 'archived' : 'active';
+            const laneColor = getTimelineLaneColor(lane);
+
+            // Check for relationships
+            const isBranch = !!arc.parent_arc_id;
+            const isMerged = arc.status === 'Merged';
+            const mergeTarget = arc.merged_into_arc_id;
+
+            // Time display
+            const timeStr = formatSessionDate(arc.created_at);
+
+            html += '<div class="timeline-row ' + statusClass + '" data-arc-id="' + arc.id + '">';
+
+            // Left: graph rail
+            html += '<div class="timeline-rail" style="padding-left: ' + (lane * 24 + 12) + 'px">';
+            html += '<div class="timeline-node" style="background: ' + laneColor + '">' + sourceIcon + '</div>';
+            if (isBranch && lanes[arc.parent_arc_id] !== undefined) {
+                const parentLane = lanes[arc.parent_arc_id];
+                const lineLeft = parentLane * 24 + 20;
+                const lineWidth = (lane - parentLane) * 24;
+                html += '<div class="timeline-branch-line" style="left: ' + lineLeft + 'px; width: ' + lineWidth + 'px; border-color: ' + laneColor + '"></div>';
+            }
+            html += '</div>';
+
+            // Right: info
+            html += '<div class="timeline-info">';
+            html += '<div class="timeline-name">' + escapeHtml(arc.name) + '</div>';
+            html += '<div class="timeline-meta">';
+            html += '<span class="timeline-time">' + timeStr + '</span>';
+            html += '<span class="timeline-entries">' + arc.entry_count + ' entries</span>';
+            if (isBranch) {
+                const parentName = arcMap[arc.parent_arc_id]?.name || arc.parent_arc_id;
+                html += '<span class="timeline-branch-tag">\u21b3 from ' + escapeHtml(parentName) + '</span>';
+            }
+            if (isMerged && mergeTarget) {
+                const targetName = arcMap[mergeTarget]?.name || mergeTarget;
+                html += '<span class="timeline-merge-tag">\u2192 merged into ' + escapeHtml(targetName) + '</span>';
+            }
+            html += '</div>';
+            html += '</div>';
+
+            // Actions
+            html += '<div class="timeline-actions">';
+            if (arc.status === 'Active') {
+                html += '<button class="timeline-action-btn" onclick="event.stopPropagation(); switchArcFromTimeline(\'' + arc.id + '\')" title="Open">Open</button>';
+            }
+            html += '</div>';
+
+            html += '</div>';
+        });
+
+        html += '</div>';
+        canvas.innerHTML = html;
+
+        // Click on row to open arc
+        canvas.querySelectorAll('.timeline-row.active').forEach(row => {
+            row.addEventListener('click', () => {
+                const arcId = row.dataset.arcId;
+                switchArcFromTimeline(arcId);
+            });
+        });
+
+    } catch (e) {
+        canvas.innerHTML = '<div class="timeline-empty">Failed to load timeline: ' + escapeHtml(e.toString()) + '</div>';
+    }
+}
+
+function switchArcFromTimeline(arcId) {
+    hideTimeline();
+    handleSwitchArc(arcId);
+}
+
+// Make it globally accessible for inline onclick handlers
+window.switchArcFromTimeline = switchArcFromTimeline;
+
+function getTimelineSourceIcon(source) {
+    switch (source) {
+        case 'Email': return '\u{1f4e7}';
+        case 'Calendar': return '\u{1f4c5}';
+        case 'Messaging': return '\u{1f4ac}';
+        case 'System': return '\u2699\ufe0f';
+        default: return '\u{1f4ac}';
+    }
+}
+
+function getTimelineLaneColor(lane) {
+    const colors = ['#7aa2f7', '#9ece6a', '#e0af68', '#f7768e', '#bb9af7', '#7dcfff', '#ff9e64', '#c0caf5'];
+    return colors[lane % colors.length];
 }
 
 // ─── Initialize ───

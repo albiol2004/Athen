@@ -11,7 +11,10 @@
         <aside id="sidebar" class="sidebar">
             <div class="sidebar-header">
                 <h2>Arcs</h2>
-                <button id="sidebar-new-chat-btn" title="New Arc">+</button>
+                <div class="sidebar-header-buttons">
+                    <button id="timeline-toggle-btn" title="Timeline View">&#x2387;</button>
+                    <button id="sidebar-new-chat-btn" title="New Arc">+</button>
+                </div>
             </div>
             <div id="session-list" class="session-list"></div>
             <div class="sidebar-footer">
@@ -64,6 +67,18 @@
                     <span id="status-text">Ready</span>
                 </div>
             </footer>
+        </div>
+
+        <div id="timeline-view" class="timeline-view hidden">
+            <header class="timeline-header">
+                <div class="header-left">
+                    <button id="timeline-back" class="settings-back-btn" title="Back">
+                        <span>&#8592;</span> Back
+                    </button>
+                </div>
+                <h1>Arc Timeline</h1>
+            </header>
+            <div id="timeline-canvas" class="timeline-canvas"></div>
         </div>
 
         <div id="settings-view" class="settings-view hidden">

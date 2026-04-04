@@ -659,7 +659,7 @@ When the agent needs to contact the user:
 - `sqlite.rs`: `SqliteVectorIndex` and `SqliteGraph` — SQLite-backed persistent versions. Embeddings stored as little-endian f32 blobs. Uses `std::sync::Mutex` (not tokio) since rusqlite is synchronous and locks are never held across `.await`.
 - `lib.rs`: `Memory` facade implementing `MemoryStore`. `remember()` stores in vector + extracts entities to graph. `recall()` searches vector index. `forget()` removes from vector.
 
-### athen-sentidos (32 tests)
+### athen-sentidos (42 tests)
 **Status**: Complete — user input monitor, full email monitor, stubs, polling runner.
 - `user_input.rs`: `UserInputMonitor` using `tokio::sync::Mutex<mpsc::Receiver<String>>` for interior mutability. Converts strings to `SenseEvent` with EventSource::UserInput, EventKind::Command, RiskLevel::Safe. Exposes `sender()` for UI to push messages.
 - `email.rs`: Full `EmailMonitor` — real IMAP polling via `imap` v2.4 (sync, wrapped in `spawn_blocking`) + `rustls-connector` for TLS (no OpenSSL). `mailparse` for MIME body parsing (text, HTML, attachments). Tracks `last_seen_uid` for incremental polling. Uses `BODY.PEEK[]` to avoid marking emails as read. `extract_email_body()` recursively walks MIME parts. Configurable via `EmailConfig` (server, port, TLS, folders, poll interval, lookback). 15 tests.
@@ -673,7 +673,7 @@ When the agent needs to contact the user:
 - `nushell.rs`: `NushellShell` — auto-detects `nu` binary. If available: `nu -c "command"`. If not: falls back to NativeShell with info log.
 - `lib.rs`: `Shell` unified facade. `execute()` prefers nushell, `execute_native()` always native. Convenience: `run()` returns stdout, `run_ok()` returns bool, `has_program()` checks existence.
 
-### athen-persistence (40 unit + 5 integration = 45 tests)
+### athen-persistence (50 unit + 5 integration = 55 tests)
 **Status**: Complete — SQLite persistence with atomic checkpoints, arcs, and legacy chat history.
 - `lib.rs`: `Database` struct with `new(path)` and `in_memory()`. Auto-creates tables on init (including arc and legacy chat tables). Provides `store()` → `SqliteStore`, `chat_store()` → `ChatStore`, and `arc_store()` → `ArcStore` accessors.
 - `store.rs`: `SqliteStore` implementing `PersistentStore`. Full CRUD for tasks (with steps serialized as JSON), checkpoints with SHA-256 integrity verification, pending messages with atomic pop (transaction-based select+update).
@@ -752,7 +752,7 @@ When the agent needs to contact the user:
 - `SharedRouter`: Wrapper around `Arc<DefaultLlmRouter>` implementing `LlmRouter` trait for sharing between risk evaluator and agent.
 - **Verified working**: Full agentic pipeline — user input → coordinator → risk → dispatch → agent executor → LLM → tool calls → execution → result.
 
-### athen-app (0 tests)
+### athen-app (15 tests)
 **Status**: Complete — Tauri 2 desktop app with full agentic tool execution, streaming responses, arc-based workflow management, sense router for email/calendar/messaging triage, settings UI with provider and email management, provider hot-swap, kill switch, real-time progress events, approval UI, config loading, and persistence. Verified working.
 - `src/lib.rs`: Tauri composition root. Registers 19 command handlers: `send_message`, `get_status`, `approve_task`, `cancel_task`, `new_arc`, `get_arc_history`, `list_arcs`, `switch_arc`, `rename_arc`, `delete_arc`, `get_current_arc`, `branch_arc`, `merge_arcs`, `get_settings`, `save_provider`, `delete_provider`, `test_provider`, `save_settings`, `set_active_provider`, `save_email_settings`, `test_email_connection`. Registers agent in `setup()` hook. Installs `rustls::crypto::aws_lc_rs::default_provider()` at startup.
 - `src/main.rs`: Entry point with `windows_subsystem = "windows"` for release builds.
@@ -816,7 +816,8 @@ When the agent needs to contact the user:
 - `frontend/app.js`: Full chat frontend with:
   - **Streaming**: listens for `agent-stream` Tauri events. Creates streaming bubble on first chunk, appends text progressively via `textContent` (safe, fast). On `is_final`, re-renders full text with markdown for proper formatting. Tracks `streamingBubble`, `streamingText`, `didReceiveStreamChunks` state.
   - **Tool execution cards**: listens for `agent-progress` events. Creates `tool-steps-container` div, appends `tool-execution-card` elements with status class (completed/failed/in-progress), status icon (checkmark/cross/dot), tool name, and truncated detail text. Cards have fade-in CSS animation.
-  - **Arc sidebar**: `loadArcs()` fetches arc list, `renderArcList()` builds sidebar items with name, source icon (message/email/calendar/system), relative date, entry count badge, and branch indicator for child arcs. Double-click or pencil icon to rename (inline contenteditable). Delete button with confirmation. Branch button creates child arc. Merged arcs hidden from sidebar. Auto-names new arcs from first user message (~30 chars). Active arc highlighted.
+  - **Arc sidebar**: `loadArcs()` fetches arc list, `renderArcList()` builds sidebar items with name, source icon (message/email/calendar/system), relative date, entry count badge, and branch indicator for child arcs. Double-click or pencil icon to rename (inline contenteditable). Delete button with confirmation. Branch button creates child arc. Merged arcs hidden from sidebar. Auto-names new arcs from first user message (~30 chars). Active arc highlighted. Timeline toggle button (⎇) in sidebar header.
+  - **Arc timeline view**: Visual git-graph-like visualization toggled via ⎇ button. Vertical graph with arcs as rows (newest at top), colored lane nodes with source icons, branch connections (dashed lines from parent to child), merge indicators (dimmed rows with "→ merged into" tags). Lane colors differentiate parallel arcs (blue, green, amber, red, purple, cyan, orange). Click any active row or "Open" button to switch to that arc. Three-view toggle: chat ↔ settings ↔ timeline.
   - **Sense event cards**: listens for `sense-event` Tauri events. Renders source-specific icons, LLM relevance badges (Important/Urgent), agent's reasoning text, and context-aware action buttons (Summarize/Draft Reply/Add to Calendar/Open Arc).
   - **Kill switch**: stop button (red &#9632;) replaces send button during processing. Calls `cancel_task` command. Escape key also cancels. `isProcessing` flag controls button visibility.
   - **Error handling**: `format_user_error()` produces friendly messages. Retry button for transient errors (stores `lastMessage`, `retryLastMessage()` re-submits). "Open Settings" link for auth errors.
