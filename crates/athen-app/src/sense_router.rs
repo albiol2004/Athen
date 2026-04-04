@@ -17,7 +17,7 @@ use athen_core::llm::{
 };
 use athen_core::traits::llm::LlmRouter;
 use athen_llm::router::DefaultLlmRouter;
-use athen_persistence::arcs::{ArcSource, ArcStore, EntryType};
+use athen_persistence::arcs::{ArcMeta, ArcSource, ArcStatus, ArcStore, EntryType};
 
 /// Result of LLM triage for any sense event.
 pub struct SenseTriage {
@@ -32,7 +32,6 @@ pub struct SenseTriage {
 }
 
 /// Where to route the sense event.
-#[allow(dead_code)]
 pub enum TriageTarget {
     /// Create a new Arc for this event.
     NewArc { name: String },
@@ -70,9 +69,21 @@ pub async fn process_sense_event(
         body_text.to_string()
     };
 
-    // Step 1: Triage via LLM.
+    // Step 0: Fetch recent active arcs for context matching.
+    let recent_arcs = if let Some(store) = arc_store {
+        store.list_arcs().await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|a| a.status == ArcStatus::Active)
+            .take(10)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
+    // Step 1: Triage via LLM (with arc context for matching).
     let triage = triage_event(
-        router, &event.source, sender, summary, &body_for_triage,
+        router, &event.source, sender, summary, &body_for_triage, &recent_arcs,
     ).await;
 
     if triage.relevance == "ignore" || triage.relevance == "low" {
@@ -98,9 +109,13 @@ pub async fn process_sense_event(
                     warn!("Failed to create arc for sense event: {e}");
                 }
             }
+            info!("Created new arc '{}' for {} from '{}'", id, source_name, sender);
             id
         }
-        TriageTarget::ExistingArc { arc_id } => arc_id.clone(),
+        TriageTarget::ExistingArc { arc_id } => {
+            info!("Appending {} from '{}' to existing arc '{}'", source_name, sender, arc_id);
+            arc_id.clone()
+        }
     };
 
     // Step 3: Persist as ArcEntry.
@@ -156,7 +171,7 @@ pub async fn process_sense_event(
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn source_display_name(source: &EventSource) -> &'static str {
+pub(crate) fn source_display_name(source: &EventSource) -> &'static str {
     match source {
         EventSource::Email => "email",
         EventSource::Calendar => "calendar",
@@ -166,7 +181,7 @@ fn source_display_name(source: &EventSource) -> &'static str {
     }
 }
 
-fn event_source_to_arc_source(source: &EventSource) -> ArcSource {
+pub(crate) fn event_source_to_arc_source(source: &EventSource) -> ArcSource {
     match source {
         EventSource::Email => ArcSource::Email,
         EventSource::Calendar => ArcSource::Calendar,
@@ -176,7 +191,7 @@ fn event_source_to_arc_source(source: &EventSource) -> ArcSource {
     }
 }
 
-fn event_source_to_entry_type(source: &EventSource) -> EntryType {
+pub(crate) fn event_source_to_entry_type(source: &EventSource) -> EntryType {
     match source {
         EventSource::Email => EntryType::EmailEvent,
         EventSource::Calendar => EntryType::CalendarEvent,
@@ -186,11 +201,11 @@ fn event_source_to_entry_type(source: &EventSource) -> EntryType {
     }
 }
 
-fn generate_arc_id() -> String {
+pub(crate) fn generate_arc_id() -> String {
     chrono::Utc::now().format("arc_%Y%m%d_%H%M%S").to_string()
 }
 
-fn format_entry_content(sender: &str, subject: &str, body: &str) -> String {
+pub(crate) fn format_entry_content(sender: &str, subject: &str, body: &str) -> String {
     let preview = if body.len() > 500 {
         format!("{}...", &body[..500])
     } else {
@@ -204,14 +219,44 @@ fn format_entry_content(sender: &str, subject: &str, body: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Triage a sense event via LLM. Returns relevance + suggested action + target arc.
+///
+/// When `recent_arcs` is non-empty, the LLM is also asked whether the event
+/// belongs to an existing arc (by ID) or requires a new one.
 async fn triage_event(
     router: &Arc<RwLock<Arc<DefaultLlmRouter>>>,
     source: &EventSource,
     sender: &str,
     subject: &str,
     body: &str,
+    recent_arcs: &[ArcMeta],
 ) -> SenseTriage {
     let source_name = source_display_name(source);
+
+    // Build the existing arcs context for the prompt.
+    let arcs_context = if recent_arcs.is_empty() {
+        String::new()
+    } else {
+        let mut ctx = String::from("\n\nExisting active Arcs (conversations/threads):\n");
+        for arc in recent_arcs {
+            let source_label = arc.source.as_str();
+            ctx.push_str(&format!(
+                "- ID: \"{}\" | Name: \"{}\" | Source: {} | Entries: {}\n",
+                arc.id, arc.name, source_label, arc.entry_count,
+            ));
+        }
+        ctx
+    };
+
+    let arc_matching_instruction = if recent_arcs.is_empty() {
+        r#"For "arc_name": give a short, descriptive name summarizing the topic (max 40 chars, e.g. "Meeting with John", "Server alert")."#.to_string()
+    } else {
+        r#"IMPORTANT — Arc matching:
+Look at the existing Arcs listed above. If this message is CLEARLY related to one of them (same topic, same person, same thread, a reply to an ongoing conversation), set "existing_arc_id" to that arc's ID.
+Only create a new arc ("arc_name") if the message is about a genuinely new topic not covered by any existing arc.
+When in doubt, prefer creating a new arc over merging into the wrong one.
+
+Set EITHER "existing_arc_id" OR "arc_name", never both."#.to_string()
+    };
 
     let prompt = format!(
         r#"You are a personal assistant triaging an incoming {source_name}.
@@ -219,14 +264,14 @@ async fn triage_event(
 From: {sender}
 Subject: {subject}
 Body:
-{body}
-
+{body}{arcs_context}
 Respond with ONLY a JSON object (no markdown, no explanation):
 {{
   "relevance": "ignore|low|medium|high",
   "reason": "one-line explanation",
   "suggested_action": "none|read|reply|calendar|urgent",
-  "arc_name": "short descriptive name for this thread (max 40 chars)"
+  "arc_name": "short descriptive name for this thread (max 40 chars)",
+  "existing_arc_id": null
 }}
 
 Classification rules:
@@ -237,7 +282,7 @@ Classification rules:
 
 IMPORTANT: Default to "medium" unless you are very confident it is spam or automated. Real messages from real people should NEVER be classified as "ignore".
 
-For "arc_name": give a short, descriptive name summarizing the topic (e.g. "Meeting with John", "Server alert", "Project proposal from Alice")."#
+{arc_matching_instruction}"#
     );
 
     let request = LlmRequest {
@@ -291,7 +336,7 @@ For "arc_name": give a short, descriptive name summarizing the topic (e.g. "Meet
 }
 
 /// Parse the LLM's JSON triage response.
-fn parse_triage_response(text: &str) -> SenseTriage {
+pub(crate) fn parse_triage_response(text: &str) -> SenseTriage {
     let cleaned = text
         .trim()
         .strip_prefix("```json")
@@ -316,16 +361,27 @@ fn parse_triage_response(text: &str) -> SenseTriage {
                 .and_then(|r| r.as_str())
                 .unwrap_or("read")
                 .to_string();
-            let arc_name = v.get("arc_name")
+
+            // Check if LLM matched to an existing arc.
+            let target_arc = if let Some(arc_id) = v.get("existing_arc_id")
                 .and_then(|r| r.as_str())
-                .unwrap_or("Incoming event")
-                .to_string();
+                .filter(|s| !s.is_empty())
+            {
+                info!("LLM matched sense event to existing arc: {}", arc_id);
+                TriageTarget::ExistingArc { arc_id: arc_id.to_string() }
+            } else {
+                let arc_name = v.get("arc_name")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("Incoming event")
+                    .to_string();
+                TriageTarget::NewArc { name: arc_name }
+            };
 
             SenseTriage {
                 relevance,
                 reason,
                 suggested_action,
-                target_arc: TriageTarget::NewArc { name: arc_name },
+                target_arc,
             }
         }
         Err(e) => {
@@ -339,5 +395,156 @@ fn parse_triage_response(text: &str) -> SenseTriage {
                 },
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_new_arc_response() {
+        let json = r#"{"relevance":"medium","reason":"Work email","suggested_action":"read","arc_name":"Project update from Bob"}"#;
+        let triage = parse_triage_response(json);
+        assert_eq!(triage.relevance, "medium");
+        assert_eq!(triage.reason, "Work email");
+        assert_eq!(triage.suggested_action, "read");
+        match &triage.target_arc {
+            TriageTarget::NewArc { name } => assert_eq!(name, "Project update from Bob"),
+            TriageTarget::ExistingArc { .. } => panic!("Expected NewArc"),
+        }
+    }
+
+    #[test]
+    fn parse_existing_arc_response() {
+        let json = r#"{"relevance":"high","reason":"Reply to ongoing thread","suggested_action":"reply","existing_arc_id":"arc_20260404_120000","arc_name":null}"#;
+        let triage = parse_triage_response(json);
+        assert_eq!(triage.relevance, "high");
+        assert_eq!(triage.suggested_action, "reply");
+        match &triage.target_arc {
+            TriageTarget::ExistingArc { arc_id } => assert_eq!(arc_id, "arc_20260404_120000"),
+            TriageTarget::NewArc { .. } => panic!("Expected ExistingArc"),
+        }
+    }
+
+    #[test]
+    fn parse_existing_arc_null_falls_back_to_new() {
+        let json = r#"{"relevance":"medium","reason":"New topic","suggested_action":"read","existing_arc_id":null,"arc_name":"Server monitoring alert"}"#;
+        let triage = parse_triage_response(json);
+        match &triage.target_arc {
+            TriageTarget::NewArc { name } => assert_eq!(name, "Server monitoring alert"),
+            TriageTarget::ExistingArc { .. } => panic!("Expected NewArc when existing_arc_id is null"),
+        }
+    }
+
+    #[test]
+    fn parse_existing_arc_empty_string_falls_back_to_new() {
+        let json = r#"{"relevance":"medium","reason":"test","suggested_action":"read","existing_arc_id":"","arc_name":"Something new"}"#;
+        let triage = parse_triage_response(json);
+        match &triage.target_arc {
+            TriageTarget::NewArc { name } => assert_eq!(name, "Something new"),
+            TriageTarget::ExistingArc { .. } => panic!("Expected NewArc when existing_arc_id is empty"),
+        }
+    }
+
+    #[test]
+    fn parse_with_markdown_code_fences() {
+        let json = "```json\n{\"relevance\":\"high\",\"reason\":\"Urgent\",\"suggested_action\":\"urgent\",\"arc_name\":\"Critical alert\"}\n```";
+        let triage = parse_triage_response(json);
+        assert_eq!(triage.relevance, "high");
+        assert_eq!(triage.reason, "Urgent");
+        match &triage.target_arc {
+            TriageTarget::NewArc { name } => assert_eq!(name, "Critical alert"),
+            _ => panic!("Expected NewArc"),
+        }
+    }
+
+    #[test]
+    fn parse_with_bare_code_fences() {
+        let json = "```\n{\"relevance\":\"low\",\"reason\":\"Newsletter\",\"suggested_action\":\"none\",\"arc_name\":\"test\"}\n```";
+        let triage = parse_triage_response(json);
+        assert_eq!(triage.relevance, "low");
+    }
+
+    #[test]
+    fn parse_invalid_json_falls_back_to_medium() {
+        let triage = parse_triage_response("this is not json at all");
+        assert_eq!(triage.relevance, "medium");
+        assert!(triage.reason.contains("Could not parse"));
+        match &triage.target_arc {
+            TriageTarget::NewArc { .. } => {},
+            _ => panic!("Expected NewArc fallback"),
+        }
+    }
+
+    #[test]
+    fn parse_missing_fields_uses_defaults() {
+        let json = r#"{"relevance":"high"}"#;
+        let triage = parse_triage_response(json);
+        assert_eq!(triage.relevance, "high");
+        assert_eq!(triage.reason, "No reason provided");
+        assert_eq!(triage.suggested_action, "read");
+        match &triage.target_arc {
+            TriageTarget::NewArc { name } => assert_eq!(name, "Incoming event"),
+            _ => panic!("Expected NewArc with default name"),
+        }
+    }
+
+    #[test]
+    fn parse_ignore_relevance() {
+        let json = r#"{"relevance":"ignore","reason":"Spam newsletter","suggested_action":"none","arc_name":"spam"}"#;
+        let triage = parse_triage_response(json);
+        assert_eq!(triage.relevance, "ignore");
+        assert_eq!(triage.suggested_action, "none");
+    }
+
+    #[test]
+    fn source_display_names_correct() {
+        assert_eq!(source_display_name(&EventSource::Email), "email");
+        assert_eq!(source_display_name(&EventSource::Calendar), "calendar");
+        assert_eq!(source_display_name(&EventSource::Messaging), "message");
+        assert_eq!(source_display_name(&EventSource::UserInput), "user_input");
+        assert_eq!(source_display_name(&EventSource::System), "system");
+    }
+
+    #[test]
+    fn event_source_maps_to_arc_source() {
+        assert_eq!(event_source_to_arc_source(&EventSource::Email), ArcSource::Email);
+        assert_eq!(event_source_to_arc_source(&EventSource::Calendar), ArcSource::Calendar);
+        assert_eq!(event_source_to_arc_source(&EventSource::UserInput), ArcSource::UserInput);
+    }
+
+    #[test]
+    fn event_source_maps_to_entry_type() {
+        assert_eq!(event_source_to_entry_type(&EventSource::Email), EntryType::EmailEvent);
+        assert_eq!(event_source_to_entry_type(&EventSource::Calendar), EntryType::CalendarEvent);
+        assert_eq!(event_source_to_entry_type(&EventSource::Messaging), EntryType::Message);
+        assert_eq!(event_source_to_entry_type(&EventSource::System), EntryType::SystemEvent);
+    }
+
+    #[test]
+    fn format_entry_content_truncates_long_body() {
+        let long_body = "x".repeat(1000);
+        let content = format_entry_content("alice@test.com", "Hello", &long_body);
+        assert!(content.contains("From: alice@test.com"));
+        assert!(content.contains("Subject: Hello"));
+        assert!(content.len() < 1000); // should be truncated
+        assert!(content.ends_with("..."));
+    }
+
+    #[test]
+    fn format_entry_content_short_body() {
+        let content = format_entry_content("bob@test.com", "Hi", "Short body");
+        assert!(content.contains("From: bob@test.com"));
+        assert!(content.contains("Subject: Hi"));
+        assert!(content.contains("Short body"));
+        assert!(!content.contains("..."));
+    }
+
+    #[test]
+    fn generate_arc_id_has_correct_format() {
+        let id = generate_arc_id();
+        assert!(id.starts_with("arc_"));
+        assert!(id.len() > 10);
     }
 }

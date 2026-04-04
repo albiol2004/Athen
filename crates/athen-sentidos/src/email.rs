@@ -641,4 +641,172 @@ This is the body.";
         assert!(body["text"].as_str().unwrap().contains("This is the body"));
         assert!(body["html"].is_null());
     }
+
+    #[test]
+    fn extract_sender_with_quoted_name_and_angle_brackets() {
+        let raw = b"From: \"John O'Brien\" <john.obrien@example.com>\r\n\
+Subject: Test\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+Body";
+        let parsed = mailparse::parse_mail(raw).unwrap();
+        let sender = extract_sender(&parsed).unwrap();
+        assert_eq!(sender.identifier, "john.obrien@example.com");
+        assert_eq!(sender.display_name.as_deref(), Some("John O'Brien"));
+    }
+
+    #[test]
+    fn extract_sender_no_from_header() {
+        let raw = b"Subject: No From\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+Body";
+        let parsed = mailparse::parse_mail(raw).unwrap();
+        let sender = extract_sender(&parsed);
+        assert!(sender.is_none());
+    }
+
+    #[test]
+    fn extract_subject_missing() {
+        let raw = b"From: x@y.com\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+Body";
+        let parsed = mailparse::parse_mail(raw).unwrap();
+        let subject = extract_subject(&parsed);
+        assert!(subject.is_none());
+    }
+
+    #[test]
+    fn extract_subject_empty() {
+        let raw = b"From: x@y.com\r\n\
+Subject: \r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+Body";
+        let parsed = mailparse::parse_mail(raw).unwrap();
+        let subject = extract_subject(&parsed);
+        // Empty subject should return None
+        assert!(subject.is_none());
+    }
+
+    #[test]
+    fn parse_nested_multipart() {
+        let raw = b"From: nested@example.com\r\n\
+Subject: Nested\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"outer\"\r\n\
+\r\n\
+--outer\r\n\
+Content-Type: multipart/alternative; boundary=\"inner\"\r\n\
+\r\n\
+--inner\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+Plain text\r\n\
+--inner\r\n\
+Content-Type: text/html\r\n\
+\r\n\
+<p>HTML</p>\r\n\
+--inner--\r\n\
+--outer\r\n\
+Content-Type: image/png; name=\"photo.png\"\r\n\
+Content-Disposition: attachment; filename=\"photo.png\"\r\n\
+Content-Transfer-Encoding: base64\r\n\
+\r\n\
+iVBOR\r\n\
+--outer--\r\n";
+
+        let (text, html, attachments) = extract_email_body(raw);
+        assert!(text.contains("Plain text"));
+        assert!(html.is_some());
+        assert!(html.unwrap().contains("<p>HTML</p>"));
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].name, "photo.png");
+    }
+
+    #[test]
+    fn parse_email_with_non_utf8_tolerant() {
+        // Email with Latin-1 content that's valid ASCII subset
+        let raw = b"From: latin@example.com\r\n\
+Subject: Latin chars\r\n\
+Content-Type: text/plain; charset=iso-8859-1\r\n\
+\r\n\
+Hello world";
+        let (text, _, _) = extract_email_body(raw);
+        assert!(text.contains("Hello world"));
+    }
+
+    #[test]
+    fn message_to_event_no_subject() {
+        let raw = b"From: nosub@example.com\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+Just a body, no subject";
+
+        let event = message_to_event(99, raw).unwrap();
+        assert!(event.content.summary.is_none());
+        assert_eq!(event.raw_id.as_deref(), Some("99"));
+        assert!(event.content.body["text"].as_str().unwrap().contains("Just a body"));
+    }
+
+    #[test]
+    fn message_to_event_no_sender() {
+        let raw = b"Subject: No From\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+Body without sender";
+
+        let event = message_to_event(100, raw).unwrap();
+        assert!(event.sender.is_none());
+        assert_eq!(event.content.summary.as_deref(), Some("No From"));
+    }
+
+    #[test]
+    fn multiple_text_parts_concatenated() {
+        let raw = b"From: multi@example.com\r\n\
+Subject: Multi text\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"bound\"\r\n\
+\r\n\
+--bound\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+Part one\r\n\
+--bound\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+Part two\r\n\
+--bound--\r\n";
+
+        let (text, _, _) = extract_email_body(raw);
+        assert!(text.contains("Part one"));
+        assert!(text.contains("Part two"));
+    }
+
+    #[test]
+    fn inline_image_treated_as_attachment() {
+        let raw = b"From: inline@example.com\r\n\
+Subject: Inline\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"bound\"\r\n\
+\r\n\
+--bound\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+See image below\r\n\
+--bound\r\n\
+Content-Type: image/jpeg; name=\"photo.jpg\"\r\n\
+Content-Disposition: inline\r\n\
+Content-Transfer-Encoding: base64\r\n\
+\r\n\
+/9j/4AAQ\r\n\
+--bound--\r\n";
+
+        let (text, _, attachments) = extract_email_body(raw);
+        assert!(text.contains("See image below"));
+        // Inline non-text parts should be treated as attachments
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].mime_type, "image/jpeg");
+    }
 }

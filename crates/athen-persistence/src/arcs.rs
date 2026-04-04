@@ -1033,4 +1033,175 @@ mod tests {
         let count2 = store.migrate_from_chat_tables().await.unwrap();
         assert_eq!(count2, 0);
     }
+
+    #[tokio::test]
+    async fn test_merge_moves_all_entries() {
+        let store = setup_arc_store().await;
+        store.create_arc("src", "Source", ArcSource::Email).await.unwrap();
+        store.create_arc("tgt", "Target", ArcSource::UserInput).await.unwrap();
+
+        // Add entries to source
+        store.add_entry("src", EntryType::EmailEvent, "email", "Email 1", None).await.unwrap();
+        store.add_entry("src", EntryType::EmailEvent, "email", "Email 2", None).await.unwrap();
+        store.add_entry("tgt", EntryType::Message, "user", "Hello", None).await.unwrap();
+
+        // Merge source into target
+        store.merge_arc("src", "tgt").await.unwrap();
+
+        // Target should have all 3 entries
+        let target_entries = store.load_entries("tgt").await.unwrap();
+        assert_eq!(target_entries.len(), 3);
+
+        // Source should have 0 entries
+        let source_entries = store.load_entries("src").await.unwrap();
+        assert_eq!(source_entries.len(), 0);
+
+        // Source arc should be Merged
+        let src_arc = store.get_arc("src").await.unwrap().unwrap();
+        assert_eq!(src_arc.status, ArcStatus::Merged);
+        assert_eq!(src_arc.merged_into_arc_id.as_deref(), Some("tgt"));
+    }
+
+    #[tokio::test]
+    async fn test_merged_arcs_not_in_active_list() {
+        let store = setup_arc_store().await;
+        store.create_arc("a1", "Active", ArcSource::UserInput).await.unwrap();
+        store.create_arc("a2", "Will Merge", ArcSource::Email).await.unwrap();
+        store.merge_arc("a2", "a1").await.unwrap();
+
+        let arcs = store.list_arcs().await.unwrap();
+        // Both are still listed (filtering by status is done at the app layer)
+        let merged = arcs.iter().find(|a| a.id == "a2").unwrap();
+        assert_eq!(merged.status, ArcStatus::Merged);
+    }
+
+    #[tokio::test]
+    async fn test_entry_types_preserved() {
+        let store = setup_arc_store().await;
+        store.create_arc("a1", "Multi-type", ArcSource::UserInput).await.unwrap();
+
+        store.add_entry("a1", EntryType::Message, "user", "Hello", None).await.unwrap();
+        store.add_entry("a1", EntryType::ToolCall, "assistant", "shell_execute echo hi", None).await.unwrap();
+        store.add_entry("a1", EntryType::EmailEvent, "email", "From: bob", None).await.unwrap();
+        store.add_entry("a1", EntryType::SystemEvent, "system", "Monitor started", None).await.unwrap();
+        store.add_entry("a1", EntryType::CalendarEvent, "calendar", "Meeting at 3pm", None).await.unwrap();
+
+        let entries = store.load_entries("a1").await.unwrap();
+        assert_eq!(entries.len(), 5);
+        assert_eq!(entries[0].entry_type, EntryType::Message);
+        assert_eq!(entries[1].entry_type, EntryType::ToolCall);
+        assert_eq!(entries[2].entry_type, EntryType::EmailEvent);
+        assert_eq!(entries[3].entry_type, EntryType::SystemEvent);
+        assert_eq!(entries[4].entry_type, EntryType::CalendarEvent);
+    }
+
+    #[tokio::test]
+    async fn test_entry_metadata_json() {
+        let store = setup_arc_store().await;
+        store.create_arc("a1", "Meta test", ArcSource::Email).await.unwrap();
+
+        let meta = serde_json::json!({
+            "event_id": "uuid-123",
+            "sender": "alice@test.com",
+            "relevance": "high",
+            "nested": {"key": "value"}
+        });
+
+        store.add_entry("a1", EntryType::EmailEvent, "email", "Content", Some(meta.clone())).await.unwrap();
+
+        let entries = store.load_entries("a1").await.unwrap();
+        assert_eq!(entries.len(), 1);
+        let loaded_meta = entries[0].metadata.as_ref().unwrap();
+        assert_eq!(loaded_meta["sender"], "alice@test.com");
+        assert_eq!(loaded_meta["relevance"], "high");
+        assert_eq!(loaded_meta["nested"]["key"], "value");
+    }
+
+    #[tokio::test]
+    async fn test_branch_preserves_parent_reference() {
+        let store = setup_arc_store().await;
+        store.create_arc("parent", "Parent Arc", ArcSource::UserInput).await.unwrap();
+        store.add_entry("parent", EntryType::Message, "user", "Original message", None).await.unwrap();
+
+        store.create_arc_with_parent("child", "Branch", ArcSource::UserInput, "parent").await.unwrap();
+        store.add_entry("child", EntryType::Message, "user", "Branch message", None).await.unwrap();
+
+        let child = store.get_arc("child").await.unwrap().unwrap();
+        assert_eq!(child.parent_arc_id.as_deref(), Some("parent"));
+        assert_eq!(child.status, ArcStatus::Active);
+
+        // Parent should be unaffected
+        let parent = store.get_arc("parent").await.unwrap().unwrap();
+        assert_eq!(parent.status, ArcStatus::Active);
+        let parent_entries = store.load_entries("parent").await.unwrap();
+        assert_eq!(parent_entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_delete_arc_cascades_entries() {
+        let store = setup_arc_store().await;
+        store.create_arc("a1", "To Delete", ArcSource::UserInput).await.unwrap();
+        store.add_entry("a1", EntryType::Message, "user", "Msg 1", None).await.unwrap();
+        store.add_entry("a1", EntryType::Message, "assistant", "Msg 2", None).await.unwrap();
+        store.add_entry("a1", EntryType::ToolCall, "assistant", "Tool call", None).await.unwrap();
+
+        store.delete_arc("a1").await.unwrap();
+
+        assert!(store.get_arc("a1").await.unwrap().is_none());
+        assert!(store.load_entries("a1").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_archive_arc_status_change() {
+        let store = setup_arc_store().await;
+        store.create_arc("a1", "To Archive", ArcSource::UserInput).await.unwrap();
+        store.archive_arc("a1").await.unwrap();
+
+        let arc = store.get_arc("a1").await.unwrap().unwrap();
+        assert_eq!(arc.status, ArcStatus::Archived);
+    }
+
+    #[tokio::test]
+    async fn test_multiple_arcs_different_sources() {
+        let store = setup_arc_store().await;
+        store.create_arc("chat1", "Chat", ArcSource::UserInput).await.unwrap();
+        store.create_arc("email1", "Email thread", ArcSource::Email).await.unwrap();
+        store.create_arc("cal1", "Meeting", ArcSource::Calendar).await.unwrap();
+        store.create_arc("msg1", "WhatsApp", ArcSource::Messaging).await.unwrap();
+
+        let arcs = store.list_arcs().await.unwrap();
+        assert_eq!(arcs.len(), 4);
+
+        let sources: Vec<&ArcSource> = arcs.iter().map(|a| &a.source).collect();
+        assert!(sources.contains(&&ArcSource::UserInput));
+        assert!(sources.contains(&&ArcSource::Email));
+        assert!(sources.contains(&&ArcSource::Calendar));
+        assert!(sources.contains(&&ArcSource::Messaging));
+    }
+
+    #[tokio::test]
+    async fn test_add_entry_returns_id() {
+        let store = setup_arc_store().await;
+        store.create_arc("a1", "Test", ArcSource::UserInput).await.unwrap();
+
+        let id1 = store.add_entry("a1", EntryType::Message, "user", "First", None).await.unwrap();
+        let id2 = store.add_entry("a1", EntryType::Message, "user", "Second", None).await.unwrap();
+
+        assert!(id2 > id1);
+    }
+
+    #[tokio::test]
+    async fn test_arc_entry_count_updates() {
+        let store = setup_arc_store().await;
+        store.create_arc("a1", "Count test", ArcSource::UserInput).await.unwrap();
+
+        let arcs = store.list_arcs().await.unwrap();
+        assert_eq!(arcs[0].entry_count, 0);
+
+        store.add_entry("a1", EntryType::Message, "user", "One", None).await.unwrap();
+        store.add_entry("a1", EntryType::Message, "user", "Two", None).await.unwrap();
+
+        let arcs = store.list_arcs().await.unwrap();
+        assert_eq!(arcs[0].entry_count, 2);
+    }
 }
