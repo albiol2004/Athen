@@ -14,6 +14,7 @@ pub struct AthenConfig {
     pub security: SecurityConfig,
     pub persistence: PersistenceConfig,
     pub email: EmailConfig,
+    pub telegram: TelegramConfig,
 }
 
 impl Default for AthenConfig {
@@ -26,6 +27,7 @@ impl Default for AthenConfig {
             security: SecurityConfig::default(),
             persistence: PersistenceConfig::default(),
             email: EmailConfig::default(),
+            telegram: TelegramConfig::default(),
         }
     }
 }
@@ -223,6 +225,36 @@ impl Default for EmailConfig {
             folders: vec!["INBOX".to_string()],
             poll_interval_secs: 60,
             lookback_hours: 24,
+        }
+    }
+}
+
+fn default_telegram_poll_interval() -> u64 {
+    5
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TelegramConfig {
+    pub enabled: bool,
+    pub bot_token: String,
+    /// Telegram user ID of the owner (messages from this ID get AuthUser trust)
+    pub owner_user_id: Option<i64>,
+    /// Only process messages from these chat IDs (empty = all)
+    pub allowed_chat_ids: Vec<i64>,
+    /// Poll interval in seconds
+    #[serde(default = "default_telegram_poll_interval")]
+    pub poll_interval_secs: u64,
+}
+
+impl Default for TelegramConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bot_token: String::new(),
+            owner_user_id: None,
+            allowed_chat_ids: Vec::new(),
+            poll_interval_secs: default_telegram_poll_interval(),
         }
     }
 }

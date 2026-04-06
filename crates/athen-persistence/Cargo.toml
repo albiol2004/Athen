@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 athen-core = { workspace = true }
+athen-contacts = { path = "../athen-contacts" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

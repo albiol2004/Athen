@@ -18,6 +18,10 @@
             </div>
             <div id="session-list" class="session-list"></div>
             <div class="sidebar-footer">
+                <button id="contacts-btn" class="sidebar-footer-btn" title="Contacts">
+                    <span class="contacts-icon">&#128100;</span>
+                    <span>Contacts</span>
+                </button>
                 <button id="calendar-btn" class="sidebar-footer-btn" title="Calendar">
                     <span class="calendar-icon">&#128197;</span>
                     <span>Calendar</span>
@@ -187,8 +191,70 @@
                 </div>
                 <div id="email-test-result" class="test-result hidden"></div>
             </section>
+
+            <section class="settings-section">
+                <h2>Telegram Bot</h2>
+                <p class="settings-description">Create a bot via <a href="https://t.me/BotFather" target="_blank">@BotFather</a> on Telegram, then paste the token here.</p>
+
+                <div class="setting-row">
+                    <label class="toggle-label">
+                        <input type="checkbox" id="telegram-enabled">
+                        <span>Enable Telegram Monitoring</span>
+                    </label>
+                </div>
+
+                <div id="telegram-settings-fields">
+                    <div class="setting-row">
+                        <label for="telegram-bot-token">Bot Token</label>
+                        <div class="api-key-wrapper">
+                            <input type="password" id="telegram-bot-token" class="settings-input" placeholder="123456:ABC-DEF..." autocomplete="off">
+                            <button class="api-key-toggle" id="telegram-token-toggle" title="Show/hide token">&#128065;</button>
+                        </div>
+                        <p class="setting-hint" id="telegram-token-hint"></p>
+                    </div>
+                    <div class="setting-row">
+                        <label for="telegram-owner-id">Your Telegram User ID</label>
+                        <input type="number" id="telegram-owner-id" class="settings-input" placeholder="Optional">
+                        <p class="setting-hint">Messages from this ID get lowest risk. Send /start to <a href="https://t.me/userinfobot" target="_blank">@userinfobot</a> to find yours.</p>
+                    </div>
+                    <div class="setting-row">
+                        <label for="telegram-chat-ids">Allowed Chat IDs</label>
+                        <input type="text" id="telegram-chat-ids" class="settings-input" placeholder="Comma-separated, empty = all">
+                        <p class="setting-hint">Only process messages from these chats. Leave empty to accept all.</p>
+                    </div>
+                    <div class="setting-row">
+                        <label for="telegram-poll-interval">Poll Interval (seconds)</label>
+                        <input type="number" id="telegram-poll-interval" class="settings-input" value="5" min="1" max="300">
+                    </div>
+                </div>
+
+                <div class="setting-actions">
+                    <button id="test-telegram-btn" class="btn-secondary">Test Connection</button>
+                    <button id="save-telegram-btn" class="btn-primary">Save Telegram Settings</button>
+                </div>
+                <div id="telegram-test-result" class="test-result hidden"></div>
+            </section>
         </div>
     </div>
+
+        <div id="contacts-view" class="contacts-view hidden">
+            <header class="contacts-header">
+                <div class="header-left">
+                    <button id="contacts-back" class="settings-back-btn" title="Back">
+                        <span>&#8592;</span> Back
+                    </button>
+                </div>
+                <h1 id="contacts-title">Contacts</h1>
+            </header>
+            <div class="contacts-content">
+                <div id="contacts-list"></div>
+                <div id="contacts-empty" class="contacts-empty hidden">
+                    <div class="contacts-empty-icon">&#128100;</div>
+                    <p>No contacts yet.</p>
+                    <p class="contacts-empty-hint">Contacts are automatically created when Athen receives messages from new senders.</p>
+                </div>
+            </div>
+        </div>
 
         <div id="calendar-view" class="calendar-view hidden">
             <header class="calendar-header">

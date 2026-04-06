@@ -1348,6 +1348,7 @@ function showSettings() {
     appView.style.display = 'none';
     timelineView?.classList.add('hidden');
     calendarView?.classList.add('hidden');
+    contactsView?.classList.add('hidden');
     document.getElementById('sidebar').style.display = '';
     if (timelineRefreshInterval) { clearInterval(timelineRefreshInterval); timelineRefreshInterval = null; }
     settingsView.classList.remove('hidden');
@@ -1359,6 +1360,7 @@ function showChat() {
     settingsView.classList.add('hidden');
     timelineView?.classList.add('hidden');
     calendarView?.classList.add('hidden');
+    contactsView?.classList.add('hidden');
     document.getElementById('sidebar').style.display = '';
     if (timelineRefreshInterval) { clearInterval(timelineRefreshInterval); timelineRefreshInterval = null; }
     appView.style.display = 'flex';
@@ -1389,6 +1391,29 @@ async function loadSettings() {
                 pwField.placeholder = '••••••••  (saved)';
             }
             toggleEmailFields(settings.email.enabled);
+        }
+
+        // Populate telegram settings
+        if (settings.telegram) {
+            document.getElementById('telegram-enabled').checked = settings.telegram.enabled;
+            const ownerIdEl = document.getElementById('telegram-owner-id');
+            if (settings.telegram.owner_user_id) {
+                ownerIdEl.value = settings.telegram.owner_user_id;
+            } else {
+                ownerIdEl.value = '';
+            }
+            const chatIdsEl = document.getElementById('telegram-chat-ids');
+            chatIdsEl.value = settings.telegram.allowed_chat_ids.length > 0
+                ? settings.telegram.allowed_chat_ids.join(', ')
+                : '';
+            document.getElementById('telegram-poll-interval').value = settings.telegram.poll_interval_secs || 5;
+
+            // Populate token field so the user can test connection again
+            const tokenField = document.getElementById('telegram-bot-token');
+            if (settings.telegram.bot_token) {
+                tokenField.value = settings.telegram.bot_token;
+            }
+            toggleTelegramFields(settings.telegram.enabled);
         }
     } catch (err) {
         console.error('Failed to load settings:', err);
@@ -1780,6 +1805,77 @@ function showEmailTestResult(success, message) {
     setTimeout(() => el.classList.add('hidden'), 5000);
 }
 
+// ─── Telegram Settings ───
+
+function toggleTelegramFields(enabled) {
+    const fields = document.getElementById('telegram-settings-fields');
+    if (fields) {
+        fields.style.opacity = enabled ? '1' : '0.5';
+        fields.style.pointerEvents = enabled ? 'auto' : 'none';
+    }
+}
+
+document.getElementById('telegram-enabled')?.addEventListener('change', function() {
+    toggleTelegramFields(this.checked);
+});
+
+document.getElementById('telegram-token-toggle')?.addEventListener('click', function() {
+    const input = document.getElementById('telegram-bot-token');
+    if (input) {
+        input.type = input.type === 'password' ? 'text' : 'password';
+    }
+});
+
+document.getElementById('save-telegram-btn')?.addEventListener('click', async function() {
+    const token = document.getElementById('telegram-bot-token').value;
+    const ownerIdStr = document.getElementById('telegram-owner-id').value;
+    const chatIdsStr = document.getElementById('telegram-chat-ids').value;
+    const pollInterval = parseInt(document.getElementById('telegram-poll-interval').value);
+
+    const allowedChatIds = chatIdsStr
+        ? chatIdsStr.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n))
+        : [];
+
+    try {
+        const result = await window.__TAURI__.core.invoke('save_telegram_settings', {
+            enabled: document.getElementById('telegram-enabled').checked,
+            botToken: token || null,
+            ownerUserId: ownerIdStr ? parseInt(ownerIdStr) : null,
+            allowedChatIds: allowedChatIds,
+            pollIntervalSecs: !isNaN(pollInterval) ? pollInterval : null,
+        });
+        showTelegramTestResult(true, result);
+    } catch (e) {
+        showTelegramTestResult(false, e.toString());
+    }
+});
+
+document.getElementById('test-telegram-btn')?.addEventListener('click', async function() {
+    const btn = this;
+    btn.disabled = true;
+    btn.textContent = 'Testing...';
+    try {
+        const result = await window.__TAURI__.core.invoke('test_telegram_connection', {
+            botToken: document.getElementById('telegram-bot-token').value,
+        });
+        showTelegramTestResult(result.success, result.message);
+    } catch (e) {
+        showTelegramTestResult(false, e.toString());
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Test Connection';
+    }
+});
+
+function showTelegramTestResult(success, message) {
+    const el = document.getElementById('telegram-test-result');
+    if (!el) return;
+    el.className = 'test-result ' + (success ? 'test-success' : 'test-error');
+    el.textContent = message;
+    el.classList.remove('hidden');
+    setTimeout(() => el.classList.add('hidden'), 5000);
+}
+
 // ─── Arc Timeline ───
 
 let timelineRefreshInterval = null;
@@ -1791,6 +1887,7 @@ function showTimeline() {
     appView.style.display = 'none';
     settingsView.classList.add('hidden');
     calendarView?.classList.add('hidden');
+    contactsView?.classList.add('hidden');
     document.getElementById('sidebar').style.display = 'none';
     timelineView.classList.remove('hidden');
     renderTimeline();
@@ -2073,6 +2170,7 @@ function showCalendar() {
     appView.style.display = 'none';
     settingsView.classList.add('hidden');
     timelineView?.classList.add('hidden');
+    contactsView?.classList.add('hidden');
     document.getElementById('sidebar').style.display = '';
     if (timelineRefreshInterval) { clearInterval(timelineRefreshInterval); timelineRefreshInterval = null; }
     calendarView.classList.remove('hidden');
@@ -2668,6 +2766,231 @@ document.getElementById('cal-event-category')?.addEventListener('change', (e) =>
         if (dot) dot.classList.add('selected');
     }
 });
+
+// ─── Contacts ───
+
+const contactsView = document.getElementById('contacts-view');
+const contactsBtn = document.getElementById('contacts-btn');
+const contactsBack = document.getElementById('contacts-back');
+const contactsListEl = document.getElementById('contacts-list');
+const contactsEmptyEl = document.getElementById('contacts-empty');
+const contactsTitle = document.getElementById('contacts-title');
+
+function showContacts() {
+    appView.style.display = 'none';
+    settingsView.classList.add('hidden');
+    timelineView?.classList.add('hidden');
+    calendarView?.classList.add('hidden');
+    document.getElementById('sidebar').style.display = '';
+    if (timelineRefreshInterval) { clearInterval(timelineRefreshInterval); timelineRefreshInterval = null; }
+    contactsView.classList.remove('hidden');
+    closeSidebar();
+    loadContacts();
+}
+
+function hideContacts() {
+    contactsView.classList.add('hidden');
+    document.getElementById('sidebar').style.display = '';
+    appView.style.display = 'flex';
+    inputEl.focus();
+}
+
+async function loadContacts() {
+    if (!invoke) return;
+    try {
+        const contacts = await invoke('list_contacts');
+        renderContactList(contacts);
+    } catch (err) {
+        console.error('Failed to load contacts:', err);
+        showToast('Failed to load contacts: ' + err, 'error');
+    }
+}
+
+function renderContactList(contacts) {
+    if (!contacts || contacts.length === 0) {
+        contactsListEl.innerHTML = '';
+        contactsEmptyEl.classList.remove('hidden');
+        contactsTitle.textContent = 'Contacts';
+        return;
+    }
+
+    contactsEmptyEl.classList.add('hidden');
+    contactsTitle.textContent = 'Contacts (' + contacts.length + ')';
+    contactsListEl.innerHTML = '';
+
+    // Sort: blocked last, then by name
+    contacts.sort((a, b) => {
+        if (a.blocked !== b.blocked) return a.blocked ? 1 : -1;
+        return a.name.localeCompare(b.name);
+    });
+
+    contacts.forEach(contact => {
+        const card = document.createElement('div');
+        card.className = 'contact-card' + (contact.blocked ? ' blocked' : '');
+        card.dataset.contactId = contact.id;
+
+        const trustClass = 'trust-' + contact.trust_level.toLowerCase();
+        const blockedBadge = contact.blocked ? '<span class="contact-badge blocked-badge">Blocked</span>' : '';
+
+        // Interactions text
+        const interactionsText = contact.interaction_count > 0
+            ? contact.interaction_count + ' interaction' + (contact.interaction_count !== 1 ? 's' : '')
+            : 'No interactions';
+
+        // Header (clickable to expand)
+        const headerEl = document.createElement('div');
+        headerEl.className = 'contact-card-header';
+        headerEl.innerHTML =
+            '<span class="contact-name">' + escapeHtml(contact.name) + '</span>' +
+            blockedBadge +
+            '<span class="contact-badge ' + trustClass + '">' + escapeHtml(contact.trust_level) + '</span>' +
+            '<span class="contact-interactions">' + interactionsText + '</span>';
+
+        headerEl.addEventListener('click', () => {
+            card.classList.toggle('expanded');
+        });
+
+        // Details (shown when expanded)
+        const detailsEl = document.createElement('div');
+        detailsEl.className = 'contact-details';
+
+        // Identifiers
+        let identifiersHtml = '';
+        if (contact.identifiers && contact.identifiers.length > 0) {
+            identifiersHtml = '<div class="contact-identifiers">';
+            contact.identifiers.forEach(ident => {
+                identifiersHtml +=
+                    '<div class="contact-identifier">' +
+                    '<span class="contact-identifier-kind">' + escapeHtml(ident.kind) + '</span>' +
+                    '<span>' + escapeHtml(ident.value) + '</span>' +
+                    '</div>';
+            });
+            identifiersHtml += '</div>';
+        }
+
+        // Meta info
+        let metaHtml = '<div class="contact-meta">';
+        if (contact.last_interaction) {
+            const lastDate = new Date(contact.last_interaction);
+            metaHtml += 'Last interaction: ' + lastDate.toLocaleDateString() + ' ' + lastDate.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+        } else {
+            metaHtml += 'No interactions yet';
+        }
+        if (contact.trust_manual_override) {
+            metaHtml += ' &middot; <em>Trust manually set</em>';
+        }
+        metaHtml += '</div>';
+
+        // Actions
+        let actionsHtml = '<div class="contact-actions">';
+
+        // Trust level dropdown (don't show AuthUser)
+        actionsHtml += '<select class="contact-trust-select" data-contact-id="' + contact.id + '">';
+        ['Unknown', 'Neutral', 'Known', 'Trusted'].forEach(level => {
+            const selected = contact.trust_level === level ? ' selected' : '';
+            actionsHtml += '<option value="' + level + '"' + selected + '>' + level + '</option>';
+        });
+        actionsHtml += '</select>';
+
+        // Block/Unblock button
+        if (contact.blocked) {
+            actionsHtml += '<button class="contact-action-btn btn-unblock" data-action="unblock" data-contact-id="' + contact.id + '">Unblock</button>';
+        } else {
+            actionsHtml += '<button class="contact-action-btn btn-block" data-action="block" data-contact-id="' + contact.id + '">Block</button>';
+        }
+
+        // Delete button
+        actionsHtml += '<button class="contact-action-btn btn-delete" data-action="delete" data-contact-id="' + contact.id + '">Delete</button>';
+
+        if (contact.trust_manual_override) {
+            actionsHtml += '<span class="contact-override-hint">Manual override active</span>';
+        }
+
+        actionsHtml += '</div>';
+
+        detailsEl.innerHTML = identifiersHtml + metaHtml + actionsHtml;
+
+        card.appendChild(headerEl);
+        card.appendChild(detailsEl);
+        contactsListEl.appendChild(card);
+    });
+
+    // Attach event listeners for actions within cards
+    contactsListEl.querySelectorAll('.contact-trust-select').forEach(select => {
+        select.addEventListener('change', async (e) => {
+            const contactId = e.target.dataset.contactId;
+            const level = e.target.value;
+            await setContactTrust(contactId, level);
+        });
+    });
+
+    contactsListEl.querySelectorAll('.contact-action-btn').forEach(btn => {
+        btn.addEventListener('click', async (e) => {
+            const contactId = e.target.dataset.contactId;
+            const action = e.target.dataset.action;
+            if (action === 'block') {
+                await toggleBlockContact(contactId, true);
+            } else if (action === 'unblock') {
+                await toggleBlockContact(contactId, false);
+            } else if (action === 'delete') {
+                await deleteContact(contactId);
+            }
+        });
+    });
+}
+
+async function setContactTrust(id, level) {
+    if (!invoke) return;
+    try {
+        await invoke('set_contact_trust', { id, trustLevel: level });
+        showToast('Trust level updated', 'success');
+        await loadContacts();
+    } catch (err) {
+        console.error('Failed to set trust level:', err);
+        showToast('Failed to set trust level: ' + err, 'error');
+    }
+}
+
+async function toggleBlockContact(id, block) {
+    if (!invoke) return;
+    try {
+        if (block) {
+            await invoke('block_contact', { id });
+            showToast('Contact blocked', 'success');
+        } else {
+            await invoke('unblock_contact', { id });
+            showToast('Contact unblocked', 'success');
+        }
+        await loadContacts();
+    } catch (err) {
+        console.error('Failed to ' + (block ? 'block' : 'unblock') + ' contact:', err);
+        showToast(err, 'error');
+    }
+}
+
+async function deleteContact(id) {
+    if (!confirm('Are you sure you want to delete this contact? This cannot be undone.')) {
+        return;
+    }
+    if (!invoke) return;
+    try {
+        await invoke('delete_contact', { id });
+        showToast('Contact deleted', 'success');
+        await loadContacts();
+    } catch (err) {
+        console.error('Failed to delete contact:', err);
+        showToast(err, 'error');
+    }
+}
+
+// Contacts event listeners
+if (contactsBtn) {
+    contactsBtn.addEventListener('click', showContacts);
+}
+
+if (contactsBack) {
+    contactsBack.addEventListener('click', hideContacts);
+}
 
 // ─── Initialize ───
 

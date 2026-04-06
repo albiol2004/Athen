@@ -6,6 +6,7 @@ pub mod arcs;
 pub mod calendar;
 pub mod chat;
 pub mod checkpoint;
+pub mod contacts;
 pub mod store;
 
 use std::path::Path;
@@ -19,6 +20,7 @@ use athen_core::error::{AthenError, Result};
 use crate::arcs::ArcStore;
 use crate::calendar::CalendarStore;
 use crate::chat::ChatStore;
+use crate::contacts::SqliteContactStore;
 use crate::store::SqliteStore;
 
 /// Owns the SQLite connection and provides access to the store.
@@ -65,7 +67,9 @@ impl Database {
         let arcs = self.arc_store();
         arcs.init_schema().await?;
         let calendar = self.calendar_store();
-        calendar.init_schema().await
+        calendar.init_schema().await?;
+        let contacts = self.contact_store();
+        contacts.init_schema().await
     }
 
     /// Create a `SqliteStore` backed by this database's connection.
@@ -86,6 +90,11 @@ impl Database {
     /// Create a `CalendarStore` backed by this database's connection.
     pub fn calendar_store(&self) -> CalendarStore {
         CalendarStore::new(self.conn.clone())
+    }
+
+    /// Create a `SqliteContactStore` backed by this database's connection.
+    pub fn contact_store(&self) -> SqliteContactStore {
+        SqliteContactStore::new(self.conn.clone())
     }
 }
 

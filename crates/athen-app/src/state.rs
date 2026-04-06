@@ -15,6 +15,8 @@ use serde::Serialize;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
+use athen_contacts::trust::TrustManager;
+use athen_persistence::contacts::SqliteContactStore;
 use athen_core::config::{AthenConfig, AuthType, ProfileConfig};
 use athen_core::config_loader;
 use athen_core::error::Result;
@@ -87,6 +89,11 @@ pub struct AppState {
     pub arc_store: Option<ArcStore>,
     /// Persistent calendar event storage backed by SQLite.
     pub calendar_store: Option<CalendarStore>,
+    /// Trust manager for contact-aware risk evaluation and contact management.
+    pub trust_manager: Option<TrustManager>,
+    /// Direct access to the shared contact store for operations that
+    /// TrustManager doesn't expose (unblock, delete).
+    pub contact_store: Option<SqliteContactStore>,
     /// Keep the database alive so the connection is not dropped.
     _database: Option<Database>,
     /// Cancellation flag for the currently running agent executor.
@@ -94,6 +101,8 @@ pub struct AppState {
     pub cancel_flag: Arc<AtomicBool>,
     /// Shutdown sender for the email monitor background task.
     pub email_shutdown: Option<tokio::sync::broadcast::Sender<()>>,
+    /// Shutdown sender for the Telegram monitor background task.
+    pub telegram_shutdown: Option<tokio::sync::broadcast::Sender<()>>,
 }
 
 impl AppState {
@@ -118,7 +127,8 @@ impl AppState {
         let (router, model_name) = build_router_for_provider_from_config(&active_id, &config);
 
         let router = Arc::new(RwLock::new(router));
-        let (coordinator, database) = build_coordinator_with_persistence(&router).await;
+
+        let (coordinator, database, contact_store) = build_coordinator_with_persistence(&router).await;
 
         // Build the arc store and run migration from legacy chat tables.
         let arc_store = database.as_ref().map(|db| db.arc_store());
@@ -142,9 +152,14 @@ impl AppState {
             active_arc_id: Mutex::new(active_arc_id),
             arc_store,
             calendar_store,
+            trust_manager: contact_store.as_ref().map(|cs| {
+                TrustManager::new(Box::new(cs.clone()))
+            }),
+            contact_store,
             _database: database,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             email_shutdown: None,
+            telegram_shutdown: None,
         }
     }
 
@@ -271,6 +286,80 @@ impl AppState {
 
                 tokio::time::sleep(poll_interval).await;
             }
+        });
+    }
+
+    /// Start the Telegram bot monitor background polling task.
+    ///
+    /// Polls the Telegram Bot API via `getUpdates` for new messages and routes
+    /// each through the sense router for LLM triage and arc creation.
+    pub fn start_telegram_monitor(&mut self, app_handle: tauri::AppHandle) {
+        use athen_core::traits::sense::SenseMonitor;
+        use athen_sentidos::telegram::TelegramMonitor;
+
+        let config = load_config();
+        if !config.telegram.enabled {
+            info!("Telegram monitor disabled in config, skipping startup");
+            return;
+        }
+
+        if config.telegram.bot_token.is_empty() {
+            warn!("Telegram monitor enabled but no bot token configured");
+            return;
+        }
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+        self.telegram_shutdown = Some(shutdown_tx);
+
+        let mut monitor = TelegramMonitor::new(config.telegram.clone());
+        let telegram_config = config.clone();
+        let router = Arc::clone(&self.router);
+        let arc_store_ref = self._database.as_ref().map(|db| db.arc_store());
+
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = monitor.init(&telegram_config).await {
+                tracing::error!("Failed to initialize Telegram monitor: {e}");
+                return;
+            }
+
+            let poll_interval = monitor.poll_interval();
+            info!("Telegram monitor started, polling every {:?}", poll_interval);
+
+            let mut shutdown = shutdown_rx;
+            loop {
+                match monitor.poll().await {
+                    Ok(events) if !events.is_empty() => {
+                        info!("Telegram monitor received {} new event(s)", events.len());
+                        for event in events {
+                            crate::sense_router::process_sense_event(
+                                &event,
+                                &router,
+                                &arc_store_ref,
+                                &app_handle,
+                            ).await;
+                        }
+                    }
+                    Ok(_) => {
+                        tracing::debug!("Telegram poll: no new messages");
+                    }
+                    Err(e) => {
+                        warn!("Telegram poll error: {e}");
+                    }
+                }
+
+                tokio::select! {
+                    _ = tokio::time::sleep(poll_interval) => {}
+                    _ = shutdown.recv() => {
+                        info!("Telegram monitor shutdown signal received");
+                        break;
+                    }
+                }
+            }
+
+            if let Err(e) = monitor.shutdown().await {
+                warn!("Telegram monitor shutdown error: {e}");
+            }
+            info!("Telegram monitor stopped");
         });
     }
 }
@@ -579,15 +668,15 @@ async fn restore_or_create_arc(
     (new_id, Vec::new())
 }
 
-/// Build the coordinator with the combined (rules + LLM) risk evaluator
-/// and optional SQLite persistence at `~/.athen/athen.db`.
+/// Build the coordinator with the combined (rules + LLM) risk evaluator,
+/// trust manager, and optional SQLite persistence at `~/.athen/athen.db`.
 async fn build_coordinator_with_persistence(
     router: &Arc<RwLock<Arc<DefaultLlmRouter>>>,
-) -> (Coordinator, Option<Database>) {
+) -> (Coordinator, Option<Database>, Option<SqliteContactStore>) {
     let risk_router: Box<dyn LlmRouter> = Box::new(SharedRouter(Arc::clone(router)));
     let llm_evaluator = LlmRiskEvaluator::new(risk_router);
     let combined = CombinedRiskEvaluator::new(llm_evaluator);
-    let coordinator = Coordinator::new(Box::new(combined));
+    let mut coordinator = Coordinator::new(Box::new(combined));
 
     // Try to open the database for persistence.
     if let Some(data_dir) = ensure_data_dir() {
@@ -595,9 +684,16 @@ async fn build_coordinator_with_persistence(
         match Database::new(&db_path).await {
             Ok(db) => {
                 let store = db.store();
+                let contact_store = db.contact_store();
                 info!("Database opened at {}", db_path.display());
-                let coordinator = coordinator.with_persistence(Box::new(store));
-                return (coordinator, Some(db));
+
+                // Wire trust manager with SQLite-backed contact store.
+                let trust_manager = TrustManager::new(Box::new(contact_store.clone()));
+                coordinator = coordinator
+                    .with_persistence(Box::new(store))
+                    .with_trust_manager(trust_manager);
+
+                return (coordinator, Some(db), Some(contact_store));
             }
             Err(e) => {
                 warn!(
@@ -608,5 +704,5 @@ async fn build_coordinator_with_persistence(
         }
     }
 
-    (coordinator, None)
+    (coordinator, None, None)
 }

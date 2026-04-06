@@ -7,6 +7,7 @@
 pub mod calendar;
 pub mod email;
 pub mod messaging;
+pub mod telegram;
 pub mod user_input;
 
 use athen_core::error::{AthenError, Result};

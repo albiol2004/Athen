@@ -5,6 +5,7 @@
 
 pub(crate) mod app_tools;
 mod commands;
+mod contacts;
 pub(crate) mod process;
 pub(crate) mod sense_router;
 mod settings;
@@ -41,10 +42,18 @@ pub fn run() {
             settings::set_active_provider,
             settings::save_email_settings,
             settings::test_email_connection,
+            settings::save_telegram_settings,
+            settings::test_telegram_connection,
             commands::list_calendar_events,
             commands::create_calendar_event,
             commands::update_calendar_event,
             commands::delete_calendar_event,
+            contacts::list_contacts,
+            contacts::get_contact,
+            contacts::set_contact_trust,
+            contacts::block_contact,
+            contacts::unblock_contact,
+            contacts::delete_contact,
         ])
         .setup(|app| {
             use tauri::Manager;
@@ -61,6 +70,7 @@ pub fn run() {
             // Start background monitor tasks before managing state.
             state.start_email_monitor(app.handle().clone());
             state.start_calendar_monitor(app.handle().clone());
+            state.start_telegram_monitor(app.handle().clone());
 
             app.manage(state);
             Ok(())

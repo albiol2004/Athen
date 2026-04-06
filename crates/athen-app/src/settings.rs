@@ -47,6 +47,19 @@ pub struct EmailSettingsInfo {
     pub lookback_hours: u32,
 }
 
+/// Telegram bot configuration info for the frontend.
+#[derive(Debug, Clone, Serialize)]
+pub struct TelegramSettingsInfo {
+    pub enabled: bool,
+    pub has_bot_token: bool,
+    pub bot_token_hint: String,
+    /// The actual bot token so the frontend can re-populate the field.
+    pub bot_token: String,
+    pub owner_user_id: Option<i64>,
+    pub allowed_chat_ids: Vec<i64>,
+    pub poll_interval_secs: u64,
+}
+
 /// Full settings response for the frontend.
 #[derive(Debug, Clone, Serialize)]
 pub struct SettingsResponse {
@@ -54,6 +67,7 @@ pub struct SettingsResponse {
     pub active_provider: String,
     pub security_mode: String,
     pub email: EmailSettingsInfo,
+    pub telegram: TelegramSettingsInfo,
 }
 
 /// Result of a provider connection test.
@@ -301,11 +315,26 @@ pub async fn get_settings(
         lookback_hours: main_config.email.lookback_hours,
     };
 
+    let telegram = TelegramSettingsInfo {
+        enabled: main_config.telegram.enabled,
+        has_bot_token: !main_config.telegram.bot_token.is_empty(),
+        bot_token_hint: if main_config.telegram.bot_token.is_empty() {
+            String::new()
+        } else {
+            mask_api_key(&main_config.telegram.bot_token)
+        },
+        bot_token: main_config.telegram.bot_token.clone(),
+        owner_user_id: main_config.telegram.owner_user_id,
+        allowed_chat_ids: main_config.telegram.allowed_chat_ids.clone(),
+        poll_interval_secs: main_config.telegram.poll_interval_secs,
+    };
+
     Ok(SettingsResponse {
         providers,
         active_provider: active,
         security_mode,
         email,
+        telegram,
     })
 }
 
@@ -750,6 +779,101 @@ fn test_imap_connection(
         let count = mailbox.exists;
         session.logout().map_err(|e| format!("Logout failed: {e}"))?;
         Ok(format!("Connected successfully. INBOX has {} messages.", count))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Telegram settings commands
+// ---------------------------------------------------------------------------
+
+/// Save Telegram bot monitor settings.
+#[tauri::command]
+pub async fn save_telegram_settings(
+    enabled: bool,
+    bot_token: Option<String>,
+    owner_user_id: Option<i64>,
+    allowed_chat_ids: Vec<i64>,
+    poll_interval_secs: Option<u64>,
+) -> std::result::Result<String, String> {
+    let mut config = load_main_config();
+
+    config.telegram.enabled = enabled;
+    if let Some(token) = bot_token {
+        if !token.is_empty() {
+            config.telegram.bot_token = token;
+        }
+    }
+    config.telegram.owner_user_id = owner_user_id;
+    config.telegram.allowed_chat_ids = allowed_chat_ids;
+    if let Some(interval) = poll_interval_secs {
+        config.telegram.poll_interval_secs = interval;
+    }
+
+    save_main_config(&config)?;
+    Ok("Telegram settings saved. Restart to apply.".to_string())
+}
+
+/// Test Telegram bot connectivity by calling the `getMe` API endpoint.
+#[tauri::command]
+pub async fn test_telegram_connection(
+    bot_token: String,
+) -> std::result::Result<TestResult, String> {
+    if bot_token.is_empty() {
+        return Ok(TestResult {
+            success: false,
+            message: "Bot token is required.".to_string(),
+        });
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+
+    let url = format!("https://api.telegram.org/bot{}/getMe", bot_token);
+
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Connection failed: {e}"));
+
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            let body: serde_json::Value = r
+                .json()
+                .await
+                .map_err(|e| format!("Invalid response: {e}"))?;
+            let username = body
+                .get("result")
+                .and_then(|r| r.get("username"))
+                .and_then(|u| u.as_str())
+                .unwrap_or("unknown");
+            Ok(TestResult {
+                success: true,
+                message: format!("Connected! Bot: @{}", username),
+            })
+        }
+        Ok(r) => {
+            let status = r.status();
+            let text = r.text().await.unwrap_or_default();
+            let detail = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|v| {
+                    v.get("description")
+                        .and_then(|d| d.as_str())
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_else(|| text.chars().take(200).collect());
+            Ok(TestResult {
+                success: false,
+                message: format!("HTTP {}: {}", status, detail),
+            })
+        }
+        Err(msg) => Ok(TestResult {
+            success: false,
+            message: msg,
+        }),
     }
 }
 
