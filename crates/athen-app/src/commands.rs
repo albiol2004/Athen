@@ -357,7 +357,17 @@ pub async fn send_message(
     }
 
     // Try to dispatch the next pending task to an available agent.
-    match state.coordinator.dispatch_next().await {
+    // If no agent is available (stale assignment from a previous task),
+    // force-release all and retry once.
+    let dispatch_result = match state.coordinator.dispatch_next().await {
+        Ok(None) => {
+            tracing::warn!("No agent available, force-releasing stale assignments");
+            state.coordinator.dispatcher().force_release_all().await;
+            state.coordinator.dispatch_next().await
+        }
+        other => other,
+    };
+    match dispatch_result {
         Ok(Some((task_id, _))) => {
             // Snapshot the current conversation history for context.
             let context = state.history.lock().await.clone();

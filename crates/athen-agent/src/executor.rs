@@ -74,8 +74,14 @@ impl DefaultExecutor {
         tools: &[athen_core::tool::ToolDefinition],
         has_context: bool,
     ) -> String {
-        let mut prompt = String::from(
-            "You are Athen, a proactive universal AI agent. You ACT first and talk second.\n\n",
+        let now = chrono::Local::now();
+        let tz_offset = now.format("%:z"); // e.g. "+02:00"
+        let mut prompt = format!(
+            "You are Athen, a proactive universal AI agent. You ACT first and talk second.\n\
+             Current date and time: {} ({}, UTC{})\n\n",
+            now.format("%A, %B %-d, %Y at %H:%M"),
+            now.format("%Z"),
+            tz_offset,
         );
 
         if has_context {
@@ -99,7 +105,7 @@ impl DefaultExecutor {
 
         // Calendar-specific guidance when tools are available.
         if has_calendar {
-            prompt.push_str(
+            prompt.push_str(&format!(
                 "CALENDAR CAPABILITIES:\n\
                  You manage the user's calendar. You can create, update, list, and delete events.\n\
                  - When the user asks to schedule something, use calendar_create immediately.\n\
@@ -108,10 +114,12 @@ impl DefaultExecutor {
                  - When a calendar reminder arrives (system context message), you already have the event details. \
                    Help the user prepare — check their schedule for conflicts, suggest what to bring or review, \
                    and offer to reschedule if needed. Do NOT search random files.\n\
-                 - Use ISO 8601 UTC format for times (e.g. '2026-04-05T14:00:00Z').\n\
+                 - IMPORTANT: The user's local timezone is UTC{tz_offset}. When the user says a time like '12:15', \
+                   they mean LOCAL time. Use ISO 8601 with their offset: e.g. '2026-04-06T12:15:00{tz_offset}'. \
+                   NEVER use 'Z' (UTC) unless the user explicitly says UTC.\n\
                  - Set appropriate reminders (e.g. [15] for 15 min before, [60, 1440] for 1h and 1 day before).\n\
                  - Choose a fitting category: meeting, birthday, deadline, reminder, personal, work, other.\n\n",
-            );
+            ));
         }
 
         // Shell guidance.
@@ -133,9 +141,9 @@ impl DefaultExecutor {
              6. If the user's message is ambiguous, make a reasonable choice and act on it.\n\
              7. When a system context message describes a calendar event or email, use that context — \
                 do not redundantly search the filesystem for information you already have.\n\n\
-             BAD: \"I'll list the files for you.\" (announces without acting)\n\
+             BAD: \"I'll list the files for you.\" / \"Voy a listar los archivos.\" (announces without acting)\n\
              GOOD: [calls list_directory tool, then reports results]\n\n\
-             BAD: \"Would you like me to...?\" (asks instead of doing)\n\
+             BAD: \"Would you like me to...?\" / \"¿Quieres que...?\" (asks instead of doing)\n\
              GOOD: [does the thing, reports what happened]",
         );
 
@@ -144,6 +152,75 @@ impl DefaultExecutor {
 }
 
 impl DefaultExecutor {
+    /// Ask a cheap LLM whether the agent actually completed the user's task.
+    ///
+    /// Returns `true` if the agent should CONTINUE (task is NOT done),
+    /// `false` if the task is genuinely complete.
+    async fn judge_completion(
+        &self,
+        user_request: &str,
+        agent_response: &str,
+        tools_called: &[String],
+    ) -> bool {
+        let tools_str = if tools_called.is_empty() {
+            "NONE".to_string()
+        } else {
+            tools_called.join(", ")
+        };
+
+        let prompt = format!(
+            "You are a strict task completion judge. Determine if the AI agent ACTUALLY \
+             completed the user's request by using tools, or if it just talked about it.\n\n\
+             User's request: \"{user_request}\"\n\
+             Agent's response: \"{agent_response}\"\n\
+             Tools actually called: [{tools_str}]\n\n\
+             Rules:\n\
+             - If the user asked for an ACTION (create, update, delete, modify, move, write, \
+               execute) and the agent did NOT call the appropriate write tool \
+               (calendar_update, calendar_create, calendar_delete, write_file, shell_execute), \
+               answer CONTINUE.\n\
+             - If the agent only used read tools (calendar_list, read_file, list_directory, \
+               memory_recall) but the user wanted a write action, answer CONTINUE.\n\
+             - If the agent just narrated what it would do without calling tools, answer CONTINUE.\n\
+             - If the user asked a question or for information and the agent answered it \
+               (with or without tools), answer DONE.\n\
+             - If the agent genuinely completed the action using the right tools, answer DONE.\n\
+             - If the user is just chatting (greeting, joke, conversation), answer DONE.\n\n\
+             Reply with ONLY one word: DONE or CONTINUE"
+        );
+
+        let request = LlmRequest {
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: MessageContent::Text(prompt),
+            }],
+            profile: ModelProfile::Cheap,
+            max_tokens: Some(5),
+            temperature: Some(0.0),
+            tools: None,
+            system_prompt: None,
+        };
+
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.llm_router.route(&request),
+        ).await {
+            Ok(Ok(resp)) => {
+                let answer = resp.content.trim().to_uppercase();
+                tracing::debug!("Completion judge verdict: {}", answer);
+                answer.contains("CONTINUE")
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("Completion judge LLM error: {e}, defaulting to DONE");
+                false // Don't block on judge failure
+            }
+            Err(_) => {
+                tracing::warn!("Completion judge timed out, defaulting to DONE");
+                false
+            }
+        }
+    }
+
     /// Attempt a streaming LLM call. Collects text deltas and forwards them
     /// through `self.stream_sender`.
     ///
@@ -188,6 +265,8 @@ impl AgentExecutor for DefaultExecutor {
         let timeout_guard = DefaultTimeoutGuard::new(self.timeout);
         let task_id = task.id;
         let mut steps_completed: u32 = 0;
+        let mut has_been_judged = false;
+        let mut tools_called: Vec<String> = Vec::new();
         let mut conversation: Vec<ChatMessage> = Vec::new();
 
         // Gather available tools for the LLM
@@ -350,28 +429,29 @@ impl AgentExecutor for DefaultExecutor {
             }
 
             if response.tool_calls.is_empty() {
-                // If this is the FIRST response and tools are available,
-                // the LLM might be narrating instead of acting. Nudge it
-                // to use tools before accepting the response as final.
-                if steps_completed == 0 && !available_tools.is_empty() {
-                    // Check if the response looks like an announcement
-                    // rather than a final answer.
-                    let lower = response.content.to_lowercase();
-                    let is_lazy = lower.contains("let me")
-                        || lower.contains("i'll ")
-                        || lower.contains("i will ")
-                        || lower.contains("i can ")
-                        || lower.contains("i would ")
-                        || lower.contains("would you like me")
-                        || lower.contains("shall i")
-                        || lower.contains("do you want me");
+                // Completion judge: before accepting a text-only response as
+                // "done", ask a cheap LLM whether the task was actually
+                // completed.  This catches narration, false claims, and
+                // incomplete tool use — in any language.
+                if !available_tools.is_empty() && !has_been_judged {
+                    let should_continue = self.judge_completion(
+                        &task.description,
+                        &response.content,
+                        &tools_called,
+                    ).await;
 
-                    if is_lazy {
-                        tracing::info!(task_id = %task_id, "Nudging LLM to use tools instead of narrating");
+                    if should_continue {
+                        tracing::info!(
+                            task_id = %task_id,
+                            "Completion judge: task NOT done, nudging agent"
+                        );
+                        has_been_judged = true;
                         conversation.push(ChatMessage {
                             role: Role::User,
                             content: MessageContent::Text(
-                                "Don't tell me what you'll do — just do it. Use your tools now."
+                                "You have NOT completed the task. You MUST call the appropriate \
+                                 tools to actually perform the action. Do it NOW — no narration, \
+                                 no announcements, just tool calls."
                                     .to_string(),
                             ),
                         });
@@ -412,6 +492,7 @@ impl AgentExecutor for DefaultExecutor {
 
             // Execute each tool call
             for tool_call in &response.tool_calls {
+                tools_called.push(tool_call.name.clone());
                 // Check cancellation between tool calls
                 if let Some(ref flag) = self.cancel_flag {
                     if flag.load(Ordering::Relaxed) {

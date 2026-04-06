@@ -10,7 +10,27 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+use chrono::DateTime;
+
 use athen_core::error::{AthenError, Result};
+
+/// Normalize a timestamp string to UTC ISO 8601 format.
+///
+/// Handles inputs like `2026-04-06T12:15:00+02:00`, `2026-04-06T10:15:00Z`,
+/// or bare `2026-04-06T12:15:00` (treated as UTC).  Returns the original
+/// string unchanged if parsing fails.
+fn normalize_to_utc(ts: &str) -> String {
+    // Try parsing with timezone offset first.
+    if let Ok(dt) = DateTime::parse_from_rfc3339(ts) {
+        return dt.with_timezone(&Utc).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    }
+    // Try parsing bare datetime (no offset) — treat as UTC.
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S") {
+        return dt.and_utc().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    }
+    // Return as-is if we can't parse.
+    ts.to_string()
+}
 
 /// Who created the event.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -128,7 +148,10 @@ impl CalendarStore {
     /// Insert a new calendar event.
     pub async fn create_event(&self, event: &CalendarEvent) -> Result<()> {
         let conn = self.conn.clone();
-        let event = event.clone();
+        let mut event = event.clone();
+        // Normalize timestamps to UTC for consistent storage and querying.
+        event.start_time = normalize_to_utc(&event.start_time);
+        event.end_time = normalize_to_utc(&event.end_time);
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             let reminders_json = serde_json::to_string(&event.reminder_minutes)
@@ -171,7 +194,10 @@ impl CalendarStore {
     /// Update an existing calendar event by id, also setting updated_at.
     pub async fn update_event(&self, event: &CalendarEvent) -> Result<()> {
         let conn = self.conn.clone();
-        let event = event.clone();
+        let mut event = event.clone();
+        // Normalize timestamps to UTC for consistent storage and querying.
+        event.start_time = normalize_to_utc(&event.start_time);
+        event.end_time = normalize_to_utc(&event.end_time);
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             let reminders_json = serde_json::to_string(&event.reminder_minutes)

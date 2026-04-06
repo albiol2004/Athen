@@ -74,6 +74,24 @@ impl Dispatcher {
         let assigned = self.assigned.lock().await;
         assigned.get(&task_id).copied()
     }
+
+    /// Force-release all assigned agents back to the available pool.
+    ///
+    /// Used in single-user desktop apps where stale assignments can block
+    /// new tasks (e.g. after a previous task's `complete_task` was missed).
+    pub async fn force_release_all(&self) {
+        let mut assigned = self.assigned.lock().await;
+        let agent_ids: Vec<AgentId> = assigned.values().copied().collect();
+        assigned.clear();
+        drop(assigned);
+
+        let mut agents = self.available_agents.lock().await;
+        for id in agent_ids {
+            if !agents.contains(&id) {
+                agents.push(id);
+            }
+        }
+    }
 }
 
 impl Default for Dispatcher {
