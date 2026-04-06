@@ -25,6 +25,8 @@ let activeArcId = null;
 // Whether the first user message in this arc has been sent
 // (used to auto-name the arc).
 let arcHasMessages = false;
+// Arcs with unread background activity (e.g. Telegram responses).
+const arcsWithNotifications = new Set();
 
 // ─── Error Retry State ───
 
@@ -92,25 +94,35 @@ function initTauri() {
             });
 
             // Listen for streaming text chunks from the agent executor.
-            // Each event carries { delta: String, is_final: bool }.
+            // Each event carries { delta, is_final, arc_id }.
+            // If the stream belongs to a different arc, show a notification
+            // dot on that arc in the sidebar instead of rendering a bubble.
             window.__TAURI__.event.listen('agent-stream', (event) => {
-                const { delta, is_final } = event.payload;
+                const { delta, is_final, arc_id } = event.payload;
+
+                // Check if this stream belongs to the currently visible arc.
+                const isActiveArc = !arc_id || arc_id === activeArcId;
 
                 if (is_final) {
-                    // Stream complete -- re-render the full text with markdown
-                    // for proper formatting now that we have the complete content.
-                    if (streamingBubble && streamingText) {
+                    if (isActiveArc && streamingBubble && streamingText) {
                         streamingBubble.innerHTML = renderMarkdown(streamingText);
                         streamingBubble.classList.remove('streaming');
                     }
-                    // Reset so the next stream (e.g. another Telegram message)
-                    // creates a fresh bubble instead of appending.
+                    // If it was a background arc, show a notification dot
+                    // and refresh the sidebar.
+                    if (!isActiveArc && arc_id) {
+                        markArcWithNotification(arc_id);
+                        loadArcs();
+                    }
                     streamingBubble = null;
                     streamingText = '';
                     return;
                 }
 
                 if (!delta) return;
+
+                // For background arcs, silently accumulate but don't render.
+                if (!isActiveArc) return;
 
                 didReceiveStreamChunks = true;
                 streamingText += delta;
@@ -141,13 +153,8 @@ function initTauri() {
                     messagesEl.appendChild(row);
                 }
 
-                // Append the delta as escaped text. Full markdown rendering
-                // happens when the stream is finalized (is_final=true).
-                // Using textContent here is safe against XSS and fast for
-                // frequent small updates.
                 streamingBubble.textContent = streamingText;
 
-                // Keep the view scrolled to the bottom during streaming.
                 requestAnimationFrame(() => {
                     messagesEl.parentElement.scrollTo({
                         top: messagesEl.parentElement.scrollHeight,
@@ -244,6 +251,13 @@ function renderArcList(arcs) {
         const content = document.createElement('div');
         content.className = 'session-item-content';
 
+        // Notification dot for arcs with unread background activity.
+        if (arcsWithNotifications.has(arc.id)) {
+            const dot = document.createElement('span');
+            dot.className = 'arc-notification-dot';
+            content.appendChild(dot);
+        }
+
         const nameEl = document.createElement('div');
         nameEl.className = 'session-item-name';
         nameEl.textContent = arc.name;
@@ -331,6 +345,18 @@ function renderArcList(arcs) {
     }
 }
 
+/// Mark an arc as having unread background activity.
+function markArcWithNotification(arcId) {
+    arcsWithNotifications.add(arcId);
+    // Try to update the existing sidebar item immediately.
+    const item = sessionListEl.querySelector(`[data-arc-id="${arcId}"]`);
+    if (item && !item.querySelector('.arc-notification-dot')) {
+        const dot = document.createElement('span');
+        dot.className = 'arc-notification-dot';
+        item.querySelector('.session-item-content')?.prepend(dot);
+    }
+}
+
 function formatSessionDate(dateStr) {
     try {
         const date = new Date(dateStr);
@@ -397,6 +423,9 @@ async function handleSwitchArc(arcId) {
     try {
         const entries = await invoke('switch_arc', { arcId });
         activeArcId = arcId;
+
+        // Clear notification dot for this arc.
+        arcsWithNotifications.delete(arcId);
 
         // Check if the arc has entries already (for auto-naming).
         arcHasMessages = entries && entries.length > 0;

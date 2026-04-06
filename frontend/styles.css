@@ -170,6 +170,22 @@ body {
     line-height: 16px;
 }
 
+.arc-notification-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #7aa2f7;
+    flex-shrink: 0;
+    margin-right: 4px;
+    animation: pulse-dot 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse-dot {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+}
+
 .session-item-actions {
     display: flex;
     gap: 2px;

@@ -528,7 +528,7 @@ async fn execute_owner_telegram_message(
     let shell_registry = ShellToolRegistry::new().await;
     let registry = AppToolRegistry::new(shell_registry, calendar_store.clone());
     let auditor = TauriAuditor::new(app_handle.clone());
-    let stream_tx = spawn_stream_forwarder(app_handle);
+    let stream_tx = spawn_stream_forwarder(app_handle, target_arc_id.clone());
     let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let executor = match AgentBuilder::new()

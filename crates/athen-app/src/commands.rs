@@ -238,6 +238,7 @@ impl StepAuditor for TauriAuditor {
 /// `AgentBuilder::stream_sender()`.
 pub(crate) fn spawn_stream_forwarder(
     app_handle: &AppHandle,
+    arc_id: Option<String>,
 ) -> tokio::sync::mpsc::UnboundedSender<String> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let handle = app_handle.clone();
@@ -245,14 +246,14 @@ pub(crate) fn spawn_stream_forwarder(
         while let Some(delta) = rx.recv().await {
             let _ = handle.emit(
                 "agent-stream",
-                serde_json::json!({ "delta": delta, "is_final": false }),
+                serde_json::json!({ "delta": delta, "is_final": false, "arc_id": arc_id }),
             );
         }
         // Channel closed -- emit a final marker so the frontend knows
         // the stream is complete.
         let _ = handle.emit(
             "agent-stream",
-            serde_json::json!({ "delta": "", "is_final": true }),
+            serde_json::json!({ "delta": "", "is_final": true, "arc_id": arc_id }),
         );
     });
     tx
@@ -370,8 +371,9 @@ pub async fn send_message(
             let auditor = TauriAuditor::new(app_handle.clone());
 
             // Set up streaming: forward LLM text chunks to the frontend
-            // in real time via Tauri events.
-            let stream_tx = spawn_stream_forwarder(&app_handle);
+            // in real time via Tauri events, tagged with the active arc.
+            let current_arc = state.active_arc_id.lock().await.clone();
+            let stream_tx = spawn_stream_forwarder(&app_handle, Some(current_arc));
 
             // Reset and wire the cancellation flag.
             let cancel_flag = Arc::clone(&state.cancel_flag);
@@ -586,7 +588,8 @@ pub async fn approve_task(
             let auditor = TauriAuditor::new(app_handle.clone());
 
             // Set up streaming for the approved task execution.
-            let stream_tx = spawn_stream_forwarder(&app_handle);
+            let current_arc = state.active_arc_id.lock().await.clone();
+            let stream_tx = spawn_stream_forwarder(&app_handle, Some(current_arc));
 
             // Reset and wire the cancellation flag.
             let cancel_flag = Arc::clone(&state.cancel_flag);
