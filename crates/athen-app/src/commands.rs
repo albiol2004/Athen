@@ -131,22 +131,22 @@ pub struct StatusResponse {
 
 /// Progress event emitted to the frontend during agent execution.
 #[derive(Clone, Serialize)]
-struct AgentProgress {
-    step: u32,
-    tool_name: String,
-    status: String,
+pub(crate) struct AgentProgress {
+    pub step: u32,
+    pub tool_name: String,
+    pub status: String,
     /// Tool arguments or result summary (truncated to ~200 chars).
-    detail: Option<String>,
+    pub detail: Option<String>,
 }
 
 /// Step auditor that emits Tauri events for real-time progress in the UI.
-struct TauriAuditor {
+pub(crate) struct TauriAuditor {
     inner: InMemoryAuditor,
     app_handle: AppHandle,
 }
 
 impl TauriAuditor {
-    fn new(app_handle: AppHandle) -> Self {
+    pub(crate) fn new(app_handle: AppHandle) -> Self {
         Self {
             inner: InMemoryAuditor::new(),
             app_handle,
@@ -236,7 +236,7 @@ impl StepAuditor for TauriAuditor {
 ///
 /// Returns the sender half of the channel that should be passed to
 /// `AgentBuilder::stream_sender()`.
-fn spawn_stream_forwarder(
+pub(crate) fn spawn_stream_forwarder(
     app_handle: &AppHandle,
 ) -> tokio::sync::mpsc::UnboundedSender<String> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();

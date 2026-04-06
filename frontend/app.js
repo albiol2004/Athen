@@ -101,9 +101,12 @@ function initTauri() {
                     // for proper formatting now that we have the complete content.
                     if (streamingBubble && streamingText) {
                         streamingBubble.innerHTML = renderMarkdown(streamingText);
+                        streamingBubble.classList.remove('streaming');
                     }
-                    // Do NOT reset streamingBubble here -- the form submission
-                    // handler will finalize the message with meta info.
+                    // Reset so the next stream (e.g. another Telegram message)
+                    // creates a fresh bubble instead of appending.
+                    streamingBubble = null;
+                    streamingText = '';
                     return;
                 }
 
@@ -151,6 +154,11 @@ function initTauri() {
                         behavior: 'auto'
                     });
                 });
+            });
+
+            // Listen for arc updates (e.g. Telegram auto-execution).
+            window.__TAURI__.event.listen('arc-updated', () => {
+                loadArcs();
             });
 
             // Listen for sense events (email, calendar, messaging, etc.)
@@ -891,8 +899,8 @@ function finalizeStreamingMessage(meta) {
     const bubble = streamRow.querySelector('.message-bubble');
     if (bubble) {
         bubble.classList.remove('streaming');
-        // Render the accumulated text with full markdown. This handles
-        // the case where finalize runs before or after the is_final event.
+        // If the is_final handler already rendered markdown, the bubble has
+        // innerHTML set.  If not (race condition), render from streamingText.
         if (streamingText) {
             bubble.innerHTML = renderMarkdown(streamingText);
         }
@@ -1179,9 +1187,13 @@ formEl.addEventListener('submit', async (e) => {
             meta.toolCallsHtml = toolsHtml;
         }
 
-        if (didReceiveStreamChunks && streamingBubble) {
-            // The response was already rendered progressively via streaming.
-            // Just finalize with meta info (risk badge, domain, time).
+        // Check if streaming already rendered the response. The bubble
+        // reference may have been cleared by `is_final`, but the DOM element
+        // (`#streaming-message`) still exists.
+        const streamedRow = messagesEl.querySelector('#streaming-message');
+        if (didReceiveStreamChunks && streamedRow) {
+            // Re-acquire the bubble reference for finalization.
+            streamingBubble = streamedRow.querySelector('.message-bubble');
             finalizeStreamingMessage(meta);
         } else {
             // No streaming happened -- render the full response at once.

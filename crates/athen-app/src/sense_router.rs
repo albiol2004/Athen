@@ -111,17 +111,31 @@ pub async fn process_sense_event(
     );
 
     // Step 2: Find or create an Arc.
+    // Time-window grouping: if the LLM wants a new arc but there's a recent
+    // arc from the same source updated within the last 5 minutes, merge into
+    // it instead.  This prevents rapid-fire messages from the same sender
+    // spawning separate arcs.
     let arc_source = event_source_to_arc_source(&event.source);
     let arc_id = match &triage.target_arc {
         TriageTarget::NewArc { name } => {
-            let id = generate_arc_id();
-            if let Some(store) = arc_store {
-                if let Err(e) = store.create_arc(&id, name, arc_source).await {
-                    warn!("Failed to create arc for sense event: {e}");
+            // Check for a recent arc from the same source within the time window.
+            let recent_match = find_recent_arc_from_source(&recent_arcs, &arc_source, 300);
+            if let Some(existing_id) = recent_match {
+                info!(
+                    "Merging {} from '{}' into recent arc '{}' (time-window grouping)",
+                    source_name, sender, existing_id
+                );
+                existing_id
+            } else {
+                let id = generate_arc_id();
+                if let Some(store) = arc_store {
+                    if let Err(e) = store.create_arc(&id, name, arc_source).await {
+                        warn!("Failed to create arc for sense event: {e}");
+                    }
                 }
+                info!("Created new arc '{}' for {} from '{}'", id, source_name, sender);
+                id
             }
-            info!("Created new arc '{}' for {} from '{}'", id, source_name, sender);
-            id
         }
         TriageTarget::ExistingArc { arc_id } => {
             info!("Appending {} from '{}' to existing arc '{}'", source_name, sender, arc_id);
@@ -307,6 +321,29 @@ fn build_context_message(
     }
 
     msg
+}
+
+/// Find a recent active arc from the same source updated within `window_secs` seconds.
+///
+/// Used for time-window grouping: rapid messages from the same source (e.g.
+/// Telegram, Email) get merged into the same arc instead of creating new ones.
+fn find_recent_arc_from_source(
+    arcs: &[ArcMeta],
+    source: &ArcSource,
+    window_secs: i64,
+) -> Option<String> {
+    let now = chrono::Utc::now();
+    arcs.iter()
+        .filter(|a| a.source == *source && a.status == ArcStatus::Active)
+        .find(|a| {
+            if let Ok(updated) = chrono::DateTime::parse_from_rfc3339(&a.updated_at) {
+                let age = now.signed_duration_since(updated);
+                age.num_seconds() < window_secs
+            } else {
+                false
+            }
+        })
+        .map(|a| a.id.clone())
 }
 
 pub(crate) fn format_entry_content(sender: &str, subject: &str, body: &str) -> String {
@@ -650,5 +687,49 @@ mod tests {
         let id = generate_arc_id();
         assert!(id.starts_with("arc_"));
         assert!(id.len() > 10);
+    }
+
+    #[test]
+    fn time_window_groups_recent_arcs() {
+        let now = chrono::Utc::now();
+        let recent = (now - chrono::Duration::seconds(60)).to_rfc3339();
+        let old = (now - chrono::Duration::seconds(600)).to_rfc3339();
+
+        let arcs = vec![
+            ArcMeta {
+                id: "arc_old".into(),
+                name: "Old".into(),
+                source: ArcSource::Messaging,
+                status: ArcStatus::Active,
+                parent_arc_id: None,
+                merged_into_arc_id: None,
+                created_at: old.clone(),
+                updated_at: old,
+                entry_count: 3,
+            },
+            ArcMeta {
+                id: "arc_recent".into(),
+                name: "Recent".into(),
+                source: ArcSource::Messaging,
+                status: ArcStatus::Active,
+                parent_arc_id: None,
+                merged_into_arc_id: None,
+                created_at: recent.clone(),
+                updated_at: recent,
+                entry_count: 1,
+            },
+        ];
+
+        // Within 5 min window → finds recent messaging arc.
+        let result = find_recent_arc_from_source(&arcs, &ArcSource::Messaging, 300);
+        assert_eq!(result, Some("arc_recent".into()));
+
+        // Different source → no match.
+        let result = find_recent_arc_from_source(&arcs, &ArcSource::Email, 300);
+        assert_eq!(result, None);
+
+        // Very short window → no match (60s old, 10s window).
+        let result = find_recent_arc_from_source(&arcs, &ArcSource::Messaging, 10);
+        assert_eq!(result, None);
     }
 }

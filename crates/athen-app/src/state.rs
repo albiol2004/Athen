@@ -293,6 +293,14 @@ impl AppState {
     ///
     /// Polls the Telegram Bot API via `getUpdates` for new messages and routes
     /// each through the sense router for LLM triage and arc creation.
+    ///
+    /// **Owner auto-execution**: messages from the owner (identified by
+    /// `owner_user_id` in the Telegram config) have `source_risk == Safe`
+    /// set by `TelegramMonitor`.  After normal sense routing (arc creation,
+    /// triage, frontend notification), these messages are additionally
+    /// executed through the agent — exactly as if the user typed them in
+    /// the chat UI.  Non-owner messages continue through the standard
+    /// sense router triage only.
     pub fn start_telegram_monitor(&mut self, app_handle: tauri::AppHandle) {
         use athen_core::traits::sense::SenseMonitor;
         use athen_sentidos::telegram::TelegramMonitor;
@@ -312,9 +320,11 @@ impl AppState {
         self.telegram_shutdown = Some(shutdown_tx);
 
         let mut monitor = TelegramMonitor::new(config.telegram.clone());
+        let bot_token = config.telegram.bot_token.clone();
         let telegram_config = config.clone();
         let router = Arc::clone(&self.router);
         let arc_store_ref = self._database.as_ref().map(|db| db.arc_store());
+        let calendar_store_ref = self.calendar_store.clone();
 
         tauri::async_runtime::spawn(async move {
             if let Err(e) = monitor.init(&telegram_config).await {
@@ -330,13 +340,56 @@ impl AppState {
                 match monitor.poll().await {
                     Ok(events) if !events.is_empty() => {
                         info!("Telegram monitor received {} new event(s)", events.len());
-                        for event in events {
-                            crate::sense_router::process_sense_event(
-                                &event,
-                                &router,
-                                &arc_store_ref,
-                                &app_handle,
-                            ).await;
+                        for event in &events {
+                            let is_owner =
+                                event.source_risk == athen_core::risk::RiskLevel::Safe;
+
+                            if is_owner {
+                                // Owner messages skip triage/notification and go
+                                // straight to agent execution (like typing in the
+                                // chat).  Arc creation is handled inside.
+                                let text = event
+                                    .content
+                                    .body
+                                    .get("text")
+                                    .and_then(|v| v.as_str())
+                                    .filter(|s| !s.is_empty())
+                                    .or_else(|| {
+                                        event.content.summary.as_deref()
+                                            .filter(|s| !s.is_empty())
+                                    })
+                                    .unwrap_or("");
+
+                                let chat_id = event
+                                    .content
+                                    .body
+                                    .get("chat_id")
+                                    .and_then(|v| v.as_i64())
+                                    .unwrap_or(0);
+
+                                if !text.is_empty() && chat_id != 0 {
+                                    execute_owner_telegram_message(
+                                        text,
+                                        chat_id,
+                                        &bot_token,
+                                        &router,
+                                        &arc_store_ref,
+                                        &calendar_store_ref,
+                                        &app_handle,
+                                    )
+                                    .await;
+                                }
+                            } else {
+                                // Non-owner messages go through the full sense
+                                // router: LLM triage, arc creation, notification.
+                                crate::sense_router::process_sense_event(
+                                    event,
+                                    &router,
+                                    &arc_store_ref,
+                                    &app_handle,
+                                )
+                                .await;
+                            }
                         }
                     }
                     Ok(_) => {
@@ -362,6 +415,298 @@ impl AppState {
             info!("Telegram monitor stopped");
         });
     }
+}
+
+// ---------------------------------------------------------------------------
+// Owner Telegram auto-execution
+// ---------------------------------------------------------------------------
+
+/// Execute a Telegram message from the owner through the agent, just like
+/// `send_message` does for direct UI input.
+///
+/// This skips risk evaluation (owner messages are trusted) and goes straight
+/// to agent execution.  The response is persisted to the most recent arc
+/// (created by the sense router moments before) and streamed to the frontend.
+async fn execute_owner_telegram_message(
+    text: &str,
+    chat_id: i64,
+    bot_token: &str,
+    router: &Arc<RwLock<Arc<DefaultLlmRouter>>>,
+    arc_store: &Option<ArcStore>,
+    calendar_store: &Option<CalendarStore>,
+    app_handle: &tauri::AppHandle,
+) {
+    use std::time::Duration;
+
+    use athen_agent::{AgentBuilder, ShellToolRegistry};
+    use athen_core::task::{DomainType, Task, TaskPriority, TaskStatus};
+    use athen_core::traits::agent::AgentExecutor;
+    use crate::app_tools::AppToolRegistry;
+    use crate::commands::{spawn_stream_forwarder, AgentProgress, TauriAuditor};
+    use tauri::Emitter;
+
+    info!("Executing owner Telegram message through agent: {}", text);
+
+    // Find or create an arc for this Telegram conversation.
+    // Use a 5-minute time window: if there's a recent Messaging arc, reuse it.
+    let target_arc_id = if let Some(store) = arc_store {
+        match store.list_arcs().await {
+            Ok(arcs) => {
+                let now = chrono::Utc::now();
+                // Look for a recent active Messaging arc within 5 minutes.
+                let recent = arcs.iter()
+                    .filter(|a| {
+                        a.source == athen_persistence::arcs::ArcSource::Messaging
+                            && a.status == athen_persistence::arcs::ArcStatus::Active
+                    })
+                    .find(|a| {
+                        chrono::DateTime::parse_from_rfc3339(&a.updated_at)
+                            .map(|t| now.signed_duration_since(t).num_seconds() < 300)
+                            .unwrap_or(false)
+                    })
+                    .map(|a| a.id.clone());
+
+                if let Some(id) = recent {
+                    info!("Reusing recent Telegram arc: {}", id);
+                    Some(id)
+                } else {
+                    // Create a new arc.
+                    let arc_id = crate::sense_router::generate_arc_id();
+                    let name = if text.len() > 30 {
+                        format!("{}...", &text[..27])
+                    } else {
+                        text.to_string()
+                    };
+                    if let Err(e) = store.create_arc(
+                        &arc_id,
+                        &name,
+                        athen_persistence::arcs::ArcSource::Messaging,
+                    ).await {
+                        warn!("Failed to create arc for Telegram message: {e}");
+                    }
+                    info!("Created new Telegram arc: {}", arc_id);
+                    Some(arc_id)
+                }
+            }
+            Err(e) => {
+                warn!("Failed to list arcs for owner message: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Load conversation history from the arc for context continuity.
+    let context = if let (Some(store), Some(ref arc_id)) = (arc_store, &target_arc_id) {
+        match store.load_entries(arc_id).await {
+            Ok(entries) => entries
+                .into_iter()
+                .filter(|e| e.entry_type == athen_persistence::arcs::EntryType::Message)
+                .filter_map(|e| {
+                    let role = match e.source.as_str() {
+                        "user" => athen_core::llm::Role::User,
+                        "assistant" => athen_core::llm::Role::Assistant,
+                        "system" => athen_core::llm::Role::System,
+                        _ => return None,
+                    };
+                    Some(athen_core::llm::ChatMessage {
+                        role,
+                        content: athen_core::llm::MessageContent::Text(e.content),
+                    })
+                })
+                .collect::<Vec<_>>(),
+            Err(_) => vec![],
+        }
+    } else {
+        vec![]
+    };
+
+    // Build the executor (mirrors send_message logic but without risk/coordinator).
+    let exec_router: Box<dyn athen_core::traits::llm::LlmRouter> =
+        Box::new(SharedRouter(Arc::clone(router)));
+    let shell_registry = ShellToolRegistry::new().await;
+    let registry = AppToolRegistry::new(shell_registry, calendar_store.clone());
+    let auditor = TauriAuditor::new(app_handle.clone());
+    let stream_tx = spawn_stream_forwarder(app_handle);
+    let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let executor = match AgentBuilder::new()
+        .llm_router(exec_router)
+        .tool_registry(Box::new(registry))
+        .auditor(Box::new(auditor))
+        .max_steps(25)
+        .timeout(Duration::from_secs(90))
+        .context_messages(context)
+        .stream_sender(stream_tx)
+        .cancel_flag(cancel_flag)
+        .build()
+    {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::error!("Failed to build agent for owner Telegram message: {e}");
+            return;
+        }
+    };
+
+    let task = Task {
+        id: uuid::Uuid::new_v4(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        source_event: None,
+        domain: DomainType::Base,
+        description: text.to_string(),
+        priority: TaskPriority::Normal,
+        status: TaskStatus::InProgress,
+        risk_score: None,
+        risk_budget: None,
+        risk_used: 0,
+        assigned_agent: None,
+        steps: vec![],
+        deadline: None,
+    };
+
+    // Emit a progress event so the frontend knows execution started.
+    let _ = app_handle.emit(
+        "agent-progress",
+        AgentProgress {
+            step: 0,
+            tool_name: "Processing Telegram message...".to_string(),
+            status: "InProgress".to_string(),
+            detail: Some(text.chars().take(200).collect()),
+        },
+    );
+
+    let result = match executor.execute(task).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("Agent execution failed for owner Telegram message: {e}");
+            return;
+        }
+    };
+
+    // Extract the response text (same logic as send_message).
+    let content = if !result.success {
+        let reason = result
+            .output
+            .as_ref()
+            .and_then(|o| o.get("reason"))
+            .and_then(|r| r.as_str())
+            .unwrap_or("unknown");
+        if reason == "cancelled" {
+            "Task cancelled.".to_string()
+        } else {
+            format!(
+                "Ran out of steps ({} used) before finishing.",
+                result.steps_completed
+            )
+        }
+    } else {
+        let response_text = result
+            .output
+            .as_ref()
+            .and_then(|o| o.get("response"))
+            .and_then(|r| r.as_str())
+            .unwrap_or("")
+            .to_string();
+        if response_text.is_empty() {
+            result
+                .output
+                .as_ref()
+                .map(|o| serde_json::to_string_pretty(o).unwrap_or_default())
+                .unwrap_or_else(|| "Task completed.".to_string())
+        } else {
+            response_text
+        }
+    };
+
+    // Persist the user message and assistant response to the arc.
+    if let (Some(store), Some(ref arc_id)) = (arc_store, &target_arc_id) {
+        // Persist user entry.
+        if let Err(e) = store
+            .add_entry(
+                arc_id,
+                athen_persistence::arcs::EntryType::Message,
+                "user",
+                text,
+                None,
+            )
+            .await
+        {
+            warn!("Failed to persist owner Telegram user entry: {e}");
+        }
+        // Persist assistant response.
+        if let Err(e) = store
+            .add_entry(
+                arc_id,
+                athen_persistence::arcs::EntryType::Message,
+                "assistant",
+                &content,
+                None,
+            )
+            .await
+        {
+            warn!("Failed to persist owner Telegram assistant entry: {e}");
+        }
+        if let Err(e) = store.touch_arc(arc_id).await {
+            warn!("Failed to touch arc: {e}");
+        }
+    }
+
+    // Notify the frontend so the sidebar refreshes.
+    if let Some(ref arc_id) = target_arc_id {
+        let _ = app_handle.emit("arc-updated", serde_json::json!({ "arc_id": arc_id }));
+    }
+
+    // Send the response back to Telegram.
+    if let Err(e) = send_telegram_reply(bot_token, chat_id, &content).await {
+        warn!("Failed to send Telegram reply: {e}");
+    }
+
+    info!(
+        "Owner Telegram message executed, response length: {} chars",
+        content.len()
+    );
+}
+
+/// Send a text message to a Telegram chat via the Bot API.
+async fn send_telegram_reply(bot_token: &str, chat_id: i64, text: &str) -> std::result::Result<(), String> {
+    let url = format!("https://api.telegram.org/bot{}/sendMessage", bot_token);
+    let client = reqwest::Client::new();
+
+    // Telegram has a 4096 character limit per message.  Split if needed.
+    let chunks: Vec<&str> = if text.len() <= 4096 {
+        vec![text]
+    } else {
+        text.as_bytes()
+            .chunks(4096)
+            .map(|c| std::str::from_utf8(c).unwrap_or(""))
+            .collect()
+    };
+
+    for chunk in chunks {
+        if chunk.is_empty() {
+            continue;
+        }
+        let resp = client
+            .post(&url)
+            .json(&serde_json::json!({
+                "chat_id": chat_id,
+                "text": chunk,
+            }))
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|e| format!("HTTP error: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("Telegram API error {status}: {body}"));
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
