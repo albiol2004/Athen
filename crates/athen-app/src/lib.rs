@@ -61,6 +61,8 @@ pub fn run() {
             commands::list_notifications,
             commands::mark_notification_read,
             commands::mark_all_notifications_read,
+            commands::delete_notification,
+            commands::delete_read_notifications,
             settings::get_notification_settings,
             settings::save_notification_settings,
         ])

@@ -1223,3 +1223,29 @@ pub async fn mark_all_notifications_read(
     }
     Ok(())
 }
+
+/// Delete a single notification.
+#[tauri::command]
+pub async fn delete_notification(
+    state: State<'_, AppState>,
+    id: String,
+) -> std::result::Result<(), String> {
+    let uuid =
+        Uuid::parse_str(&id).map_err(|e| format!("Invalid notification ID: {e}"))?;
+    if let Some(ref notifier) = state.notifier {
+        notifier.delete_notification(uuid).await;
+    }
+    Ok(())
+}
+
+/// Delete all read notifications. Returns the count of deleted notifications.
+#[tauri::command]
+pub async fn delete_read_notifications(
+    state: State<'_, AppState>,
+) -> std::result::Result<usize, String> {
+    if let Some(ref notifier) = state.notifier {
+        Ok(notifier.delete_read_notifications().await)
+    } else {
+        Ok(0)
+    }
+}

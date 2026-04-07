@@ -3127,6 +3127,16 @@ function renderNotificationList(notifications) {
             actions.appendChild(readBtn);
         }
 
+        const deleteBtn = document.createElement('button');
+        deleteBtn.className = 'notif-action-btn notif-delete-btn';
+        deleteBtn.textContent = 'Delete';
+        deleteBtn.addEventListener('click', async () => {
+            await invoke('delete_notification', { id: notif.id });
+            item.remove();
+            updateNotifBadge();
+        });
+        actions.appendChild(deleteBtn);
+
         item.appendChild(actions);
         container.appendChild(item);
     }
@@ -3155,6 +3165,16 @@ async function markAllNotificationsRead() {
         updateNotifBadge();
     } catch (e) {
         console.error('Failed to mark all as read:', e);
+    }
+}
+
+async function deleteReadNotifications() {
+    try {
+        await invoke('delete_read_notifications');
+        loadNotifications();
+        updateNotifBadge();
+    } catch (e) {
+        console.error('Failed to delete read notifications:', e);
     }
 }
 

@@ -211,10 +211,21 @@ impl AppState {
         let llm_router: Box<dyn athen_core::traits::llm::LlmRouter> =
             Box::new(SharedRouter(Arc::clone(&self.router)));
 
-        self.notifier = Some(Arc::new(
+        let mut orchestrator =
             NotificationOrchestrator::new(config.notifications.clone(), channels)
-                .with_llm_router(llm_router),
-        ));
+                .with_llm_router(llm_router);
+
+        // Attach the notification store for persistence.
+        if let Some(ref db) = self._database {
+            orchestrator = orchestrator.with_store(db.notification_store());
+        }
+
+        let notifier = Arc::new(orchestrator);
+
+        // Load persisted notifications from a previous session.
+        tauri::async_runtime::block_on(notifier.load_persisted());
+
+        self.notifier = Some(notifier);
     }
 
     /// Start the email monitor background polling task.

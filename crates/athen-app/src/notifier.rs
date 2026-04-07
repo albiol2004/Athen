@@ -22,6 +22,7 @@ use athen_core::notification::{
 };
 use athen_core::traits::llm::LlmRouter;
 use athen_core::traits::notification::NotificationChannel;
+use athen_persistence::notifications::NotificationStore;
 
 /// A notification with its read status, serializable for the frontend.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -139,6 +140,7 @@ pub struct NotificationOrchestrator {
     pending: RwLock<HashMap<Uuid, PendingNotification>>,
     cancellation_tokens: RwLock<HashMap<Uuid, CancellationToken>>,
     llm_router: Option<Box<dyn LlmRouter>>,
+    store: Option<NotificationStore>,
 }
 
 impl NotificationOrchestrator {
@@ -153,11 +155,17 @@ impl NotificationOrchestrator {
             pending: RwLock::new(HashMap::new()),
             cancellation_tokens: RwLock::new(HashMap::new()),
             llm_router: None,
+            store: None,
         }
     }
 
     pub fn with_llm_router(mut self, router: Box<dyn LlmRouter>) -> Self {
         self.llm_router = Some(router);
+        self
+    }
+
+    pub fn with_store(mut self, store: NotificationStore) -> Self {
+        self.store = Some(store);
         self
     }
 
@@ -186,11 +194,18 @@ impl NotificationOrchestrator {
             pending.insert(
                 notification.id,
                 PendingNotification {
-                    notification,
+                    notification: notification.clone(),
                     status: DeliveryStatus::Pending,
                     channel_index: 0,
                 },
             );
+
+            // Persist queued notification.
+            if let Some(ref store) = self.store {
+                if let Err(e) = store.save(&notification, false).await {
+                    tracing::warn!(error = %e, "Failed to persist queued notification");
+                }
+            }
             return;
         }
 
@@ -214,10 +229,45 @@ impl NotificationOrchestrator {
         if let Some(pending) = self.pending.write().await.get_mut(&notification_id) {
             pending.status = DeliveryStatus::Seen;
         }
+
+        // Persist read status.
+        if let Some(ref store) = self.store {
+            if let Err(e) = store.mark_read(notification_id).await {
+                tracing::warn!(error = %e, "Failed to persist notification read status");
+            }
+        }
     }
 
     /// Return all notifications, newest first.
+    ///
+    /// Prefers the SQLite store as source of truth when available,
+    /// falling back to the in-memory map otherwise.
     pub async fn list_notifications(&self) -> Vec<NotificationInfo> {
+        // Prefer DB as source of truth.
+        if let Some(ref store) = self.store {
+            match store.list_all().await {
+                Ok(notifications) => {
+                    return notifications
+                        .iter()
+                        .map(|(n, is_read)| NotificationInfo {
+                            id: n.id.to_string(),
+                            urgency: n.urgency.clone(),
+                            title: n.title.clone(),
+                            body: n.body.clone(),
+                            origin: n.origin.clone(),
+                            arc_id: n.arc_id.clone(),
+                            created_at: n.created_at.to_rfc3339(),
+                            is_read: *is_read,
+                        })
+                        .collect();
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to load notifications from DB, using in-memory");
+                }
+            }
+        }
+
+        // Fallback to in-memory.
         let pending = self.pending.read().await;
         let mut notifs: Vec<NotificationInfo> = pending
             .values()
@@ -254,6 +304,14 @@ impl NotificationOrchestrator {
         for pn in pending.values_mut() {
             pn.status = DeliveryStatus::Seen;
         }
+        drop(pending);
+
+        // Persist mark-all-read.
+        if let Some(ref store) = self.store {
+            if let Err(e) = store.mark_all_read().await {
+                tracing::warn!(error = %e, "Failed to persist mark-all-read");
+            }
+        }
     }
 
     /// Mark all notifications related to a specific arc as read.
@@ -278,6 +336,14 @@ impl NotificationOrchestrator {
 
     /// Count of unread notifications.
     pub async fn unread_count(&self) -> usize {
+        if let Some(ref store) = self.store {
+            match store.unread_count().await {
+                Ok(count) => return count,
+                Err(e) => tracing::warn!(error = %e, "Failed to get unread count from DB"),
+            }
+        }
+
+        // Fallback to in-memory.
         let pending = self.pending.read().await;
         pending
             .values()
@@ -312,6 +378,84 @@ impl NotificationOrchestrator {
             let channel_index = self.select_first_channel();
             self.deliver(notification, channel_index).await;
         }
+    }
+
+    /// Load persisted notifications from SQLite into the in-memory map.
+    ///
+    /// Call once at startup, after attaching the store.
+    pub async fn load_persisted(&self) {
+        let store = match &self.store {
+            Some(s) => s,
+            None => return,
+        };
+
+        match store.list_all().await {
+            Ok(notifications) => {
+                let mut pending = self.pending.write().await;
+                for (notif, is_read) in notifications {
+                    let status = if is_read {
+                        DeliveryStatus::Seen
+                    } else {
+                        DeliveryStatus::Pending
+                    };
+                    pending.insert(
+                        notif.id,
+                        PendingNotification {
+                            notification: notif,
+                            status,
+                            channel_index: 0,
+                        },
+                    );
+                }
+                tracing::info!(count = pending.len(), "Loaded persisted notifications");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to load persisted notifications");
+            }
+        }
+    }
+
+    /// Delete a single notification.
+    pub async fn delete_notification(&self, notification_id: Uuid) {
+        // Remove from in-memory.
+        self.pending.write().await.remove(&notification_id);
+
+        // Cancel escalation if any.
+        if let Some(token) = self
+            .cancellation_tokens
+            .write()
+            .await
+            .remove(&notification_id)
+        {
+            token.cancel();
+        }
+
+        // Remove from DB.
+        if let Some(ref store) = self.store {
+            if let Err(e) = store.delete(notification_id).await {
+                tracing::warn!(error = %e, "Failed to delete notification from DB");
+            }
+        }
+    }
+
+    /// Delete all read notifications. Returns count deleted.
+    pub async fn delete_read_notifications(&self) -> usize {
+        // Remove read from in-memory.
+        let mut pending = self.pending.write().await;
+        let before = pending.len();
+        pending.retain(|_, pn| !matches!(pn.status, DeliveryStatus::Seen));
+        let in_memory_deleted = before - pending.len();
+        drop(pending);
+
+        // Remove from DB.
+        if let Some(ref store) = self.store {
+            match store.delete_read().await {
+                Ok(count) => return count as usize,
+                Err(e) => tracing::warn!(error = %e, "Failed to delete read notifications from DB"),
+            }
+        }
+
+        in_memory_deleted
     }
 
     // --- Private helpers ---
@@ -430,10 +574,17 @@ impl NotificationOrchestrator {
                 .entry(notif_id)
                 .and_modify(|pn| pn.status = DeliveryStatus::Expired)
                 .or_insert(PendingNotification {
-                    notification,
+                    notification: notification.clone(),
                     status: DeliveryStatus::Expired,
                     channel_index: 0,
                 });
+
+            // Persist expired notification.
+            if let Some(ref store) = self.store {
+                if let Err(e) = store.save(&notification, false).await {
+                    tracing::warn!(error = %e, "Failed to persist expired notification");
+                }
+            }
             return;
         }
 
@@ -453,6 +604,13 @@ impl NotificationOrchestrator {
                         channel_index,
                     },
                 );
+
+                // Persist to SQLite.
+                if let Some(ref store) = self.store {
+                    if let Err(e) = store.save(&notification, false).await {
+                        tracing::warn!(error = %e, "Failed to persist notification");
+                    }
+                }
 
                 // Spawn escalation for high/critical notifications that need a response.
                 if requires_response
@@ -1043,5 +1201,159 @@ mod tests {
 
         orch.mark_read(n1_id).await;
         assert_eq!(orch.unread_count().await, 2);
+    }
+
+    // --- Persistence tests ---
+
+    /// Build an orchestrator backed by an in-memory SQLite database.
+    async fn make_orchestrator_with_store(
+        config: NotificationConfig,
+    ) -> (Arc<NotificationOrchestrator>, Arc<AtomicUsize>) {
+        let db = athen_persistence::Database::in_memory()
+            .await
+            .expect("in-memory DB");
+        let store = db.notification_store();
+
+        let inapp = MockChannel::new(NotificationChannelKind::InApp);
+        let counter = inapp.counter();
+
+        let orch = Arc::new(
+            NotificationOrchestrator::new(config, vec![Box::new(inapp)]).with_store(store),
+        );
+
+        (orch, counter)
+    }
+
+    #[tokio::test]
+    async fn test_notify_persists_to_db() {
+        let (orch, _counter) = make_orchestrator_with_store(make_config()).await;
+        orch.set_user_present(true);
+
+        let notif = make_notification(NotificationUrgency::Medium, false);
+        let notif_id = notif.id;
+        orch.notify(notif).await;
+
+        // Verify it's in the DB via list_notifications (which reads from DB).
+        let list = orch.list_notifications().await;
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, notif_id.to_string());
+        assert!(!list[0].is_read);
+    }
+
+    #[tokio::test]
+    async fn test_mark_read_persists_to_db() {
+        let (orch, _counter) = make_orchestrator_with_store(make_config()).await;
+        orch.set_user_present(true);
+
+        let notif = make_notification(NotificationUrgency::Medium, false);
+        let notif_id = notif.id;
+        orch.notify(notif).await;
+
+        orch.mark_read(notif_id).await;
+
+        let list = orch.list_notifications().await;
+        assert_eq!(list.len(), 1);
+        assert!(list[0].is_read);
+    }
+
+    #[tokio::test]
+    async fn test_delete_notification() {
+        let (orch, _counter) = make_orchestrator_with_store(make_config()).await;
+        orch.set_user_present(true);
+
+        let n1 = make_notification(NotificationUrgency::Low, false);
+        let n2 = make_notification(NotificationUrgency::High, false);
+        let n1_id = n1.id;
+        orch.notify(n1).await;
+        orch.notify(n2).await;
+
+        assert_eq!(orch.list_notifications().await.len(), 2);
+
+        orch.delete_notification(n1_id).await;
+
+        let list = orch.list_notifications().await;
+        assert_eq!(list.len(), 1);
+        assert_ne!(list[0].id, n1_id.to_string());
+    }
+
+    #[tokio::test]
+    async fn test_delete_read_notifications() {
+        let (orch, _counter) = make_orchestrator_with_store(make_config()).await;
+        orch.set_user_present(true);
+
+        let n1 = make_notification(NotificationUrgency::Low, false);
+        let n2 = make_notification(NotificationUrgency::Medium, false);
+        let n3 = make_notification(NotificationUrgency::High, false);
+        let n1_id = n1.id;
+        let n2_id = n2.id;
+        orch.notify(n1).await;
+        orch.notify(n2).await;
+        orch.notify(n3).await;
+
+        // Mark two as read.
+        orch.mark_read(n1_id).await;
+        orch.mark_read(n2_id).await;
+
+        let deleted = orch.delete_read_notifications().await;
+        assert_eq!(deleted, 2);
+
+        let list = orch.list_notifications().await;
+        assert_eq!(list.len(), 1);
+        assert!(!list[0].is_read);
+    }
+
+    #[tokio::test]
+    async fn test_load_persisted_restores_notifications() {
+        // Use a shared DB so two orchestrators see the same data.
+        let db = athen_persistence::Database::in_memory()
+            .await
+            .expect("in-memory DB");
+        let store = db.notification_store();
+
+        // First orchestrator: send notifications.
+        let inapp1 = MockChannel::new(NotificationChannelKind::InApp);
+        let orch1 = Arc::new(
+            NotificationOrchestrator::new(make_config(), vec![Box::new(inapp1)])
+                .with_store(store.clone()),
+        );
+        orch1.set_user_present(true);
+
+        let n1 = make_notification(NotificationUrgency::Low, false);
+        let n2 = make_notification(NotificationUrgency::High, false);
+        let n1_id = n1.id;
+        orch1.notify(n1).await;
+        orch1.notify(n2).await;
+        orch1.mark_read(n1_id).await;
+
+        // Second orchestrator (simulating restart): load from same DB.
+        let inapp2 = MockChannel::new(NotificationChannelKind::InApp);
+        let orch2 = Arc::new(
+            NotificationOrchestrator::new(make_config(), vec![Box::new(inapp2)])
+                .with_store(store),
+        );
+        orch2.load_persisted().await;
+
+        let list = orch2.list_notifications().await;
+        assert_eq!(list.len(), 2);
+
+        let read_count = list.iter().filter(|n| n.is_read).count();
+        let unread_count = list.iter().filter(|n| !n.is_read).count();
+        assert_eq!(read_count, 1);
+        assert_eq!(unread_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_mark_all_read_persists_to_db() {
+        let (orch, _counter) = make_orchestrator_with_store(make_config()).await;
+        orch.set_user_present(true);
+
+        orch.notify(make_notification(NotificationUrgency::Low, false)).await;
+        orch.notify(make_notification(NotificationUrgency::Medium, false)).await;
+
+        orch.mark_all_read().await;
+
+        let list = orch.list_notifications().await;
+        assert!(list.iter().all(|n| n.is_read));
+        assert_eq!(orch.unread_count().await, 0);
     }
 }

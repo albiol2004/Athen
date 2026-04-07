@@ -7,6 +7,7 @@ pub mod calendar;
 pub mod chat;
 pub mod checkpoint;
 pub mod contacts;
+pub mod notifications;
 pub mod store;
 
 use std::path::Path;
@@ -21,6 +22,7 @@ use crate::arcs::ArcStore;
 use crate::calendar::CalendarStore;
 use crate::chat::ChatStore;
 use crate::contacts::SqliteContactStore;
+use crate::notifications::NotificationStore;
 use crate::store::SqliteStore;
 
 /// Owns the SQLite connection and provides access to the store.
@@ -69,7 +71,9 @@ impl Database {
         let calendar = self.calendar_store();
         calendar.init_schema().await?;
         let contacts = self.contact_store();
-        contacts.init_schema().await
+        contacts.init_schema().await?;
+        let notifications = self.notification_store();
+        notifications.init_schema().await
     }
 
     /// Create a `SqliteStore` backed by this database's connection.
@@ -95,6 +99,11 @@ impl Database {
     /// Create a `SqliteContactStore` backed by this database's connection.
     pub fn contact_store(&self) -> SqliteContactStore {
         SqliteContactStore::new(self.conn.clone())
+    }
+
+    /// Create a `NotificationStore` backed by this database's connection.
+    pub fn notification_store(&self) -> NotificationStore {
+        NotificationStore::new(self.conn.clone())
     }
 }
 
