@@ -10,8 +10,8 @@ use tauri::State;
 use tracing::{info, warn};
 
 use athen_core::config::{
-    AthenConfig, AuthType, ModelsConfig, NotificationChannelKind, NotificationConfig,
-    ProviderConfig, QuietHours, SecurityMode,
+    AthenConfig, AuthType, EmbeddingMode, ModelsConfig,
+    NotificationChannelKind, NotificationConfig, ProviderConfig, QuietHours, SecurityMode,
 };
 use athen_core::config_loader;
 
@@ -74,6 +74,17 @@ pub struct NotificationSettingsInfo {
     pub quiet_allow_critical: bool,
 }
 
+/// Embedding provider configuration info for the frontend.
+#[derive(Debug, Clone, Serialize)]
+pub struct EmbeddingSettingsInfo {
+    pub mode: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub base_url: Option<String>,
+    pub has_api_key: bool,
+    pub api_key_hint: Option<String>,
+}
+
 /// Full settings response for the frontend.
 #[derive(Debug, Clone, Serialize)]
 pub struct SettingsResponse {
@@ -83,6 +94,7 @@ pub struct SettingsResponse {
     pub email: EmailSettingsInfo,
     pub telegram: TelegramSettingsInfo,
     pub notifications: NotificationSettingsInfo,
+    pub embeddings: EmbeddingSettingsInfo,
 }
 
 /// Result of a provider connection test.
@@ -375,6 +387,23 @@ pub async fn get_settings(
         }
     };
 
+    let embeddings = {
+        let ec = &main_config.embeddings;
+        let mode_str = format!("{:?}", ec.mode);
+        let (has_key, hint) = match &ec.api_key {
+            Some(key) if !key.is_empty() => (true, Some(mask_api_key(key))),
+            _ => (false, None),
+        };
+        EmbeddingSettingsInfo {
+            mode: mode_str,
+            provider: ec.provider.clone(),
+            model: ec.model.clone(),
+            base_url: ec.base_url.clone(),
+            has_api_key: has_key,
+            api_key_hint: hint,
+        }
+    };
+
     Ok(SettingsResponse {
         providers,
         active_provider: active,
@@ -382,6 +411,7 @@ pub async fn get_settings(
         email,
         telegram,
         notifications,
+        embeddings,
     })
 }
 
@@ -1113,6 +1143,184 @@ pub async fn save_notification_settings(
 
     save_main_config(&config)?;
     Ok("Notification settings saved. Restart to apply.".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Embedding settings commands
+// ---------------------------------------------------------------------------
+
+/// Save embedding / memory provider settings.
+#[tauri::command]
+pub async fn save_embedding_settings(
+    _state: State<'_, AppState>,
+    mode: String,
+    provider: Option<String>,
+    model: Option<String>,
+    base_url: Option<String>,
+    api_key: Option<String>,
+) -> std::result::Result<String, String> {
+    let mut config = load_main_config();
+
+    config.embeddings.mode = match mode.as_str() {
+        "Cloud" => EmbeddingMode::Cloud,
+        "LocalOnly" => EmbeddingMode::LocalOnly,
+        "Specific" => EmbeddingMode::Specific,
+        "Off" => EmbeddingMode::Off,
+        _ => EmbeddingMode::Automatic,
+    };
+
+    config.embeddings.provider = provider.filter(|s| !s.is_empty());
+    config.embeddings.model = model.filter(|s| !s.is_empty());
+    config.embeddings.base_url = base_url.filter(|s| !s.is_empty());
+
+    // API key handling: None preserves existing, Some("") removes, Some("sk-...") updates.
+    match api_key {
+        Some(key) if key.is_empty() => {
+            config.embeddings.api_key = None;
+        }
+        Some(key) => {
+            config.embeddings.api_key = Some(key);
+        }
+        None => {
+            // Preserve existing key.
+        }
+    }
+
+    save_main_config(&config)?;
+    Ok("Embedding settings saved. Restart to apply.".to_string())
+}
+
+/// Test connectivity to an embedding provider.
+#[tauri::command]
+pub async fn test_embedding_provider(
+    _state: State<'_, AppState>,
+    provider: String,
+    model: Option<String>,
+    base_url: Option<String>,
+    api_key: Option<String>,
+) -> std::result::Result<TestResult, String> {
+    // Keyword provider always works — no connectivity needed.
+    if provider == "keyword" {
+        return Ok(TestResult {
+            success: true,
+            message: "Keyword fallback is always available.".to_string(),
+        });
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+
+    let result = match provider.as_str() {
+        "ollama" => {
+            let url = base_url
+                .as_deref()
+                .unwrap_or("http://localhost:11434");
+            let model_name = model.as_deref().unwrap_or("nomic-embed-text");
+            test_ollama_embedding(&client, url, model_name).await
+        }
+        _ => {
+            // OpenAI-compatible embedding endpoint.
+            let url = base_url
+                .as_deref()
+                .unwrap_or("https://api.openai.com");
+            let model_name = model
+                .as_deref()
+                .unwrap_or("text-embedding-3-small");
+            let key = api_key
+                .or_else(|| {
+                    // Fall back to saved config key.
+                    let cfg = load_main_config();
+                    cfg.embeddings.api_key.clone()
+                })
+                .unwrap_or_default();
+            test_openai_embedding(&client, url, model_name, &key).await
+        }
+    };
+
+    match result {
+        Ok(msg) => Ok(TestResult {
+            success: true,
+            message: msg,
+        }),
+        Err(msg) => Ok(TestResult {
+            success: false,
+            message: msg,
+        }),
+    }
+}
+
+async fn test_ollama_embedding(
+    client: &reqwest::Client,
+    base_url: &str,
+    model: &str,
+) -> Result<String, String> {
+    let url = format!("{}/api/embed", base_url.trim_end_matches('/'));
+
+    let body = serde_json::json!({
+        "model": model,
+        "input": "test embedding connection",
+    });
+
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Connection failed: {e}"))?;
+
+    if resp.status().is_success() {
+        Ok(format!("Connected. Model '{}' is available for embeddings.", model))
+    } else {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        Err(format!("HTTP {}: {}", status, text.chars().take(200).collect::<String>()))
+    }
+}
+
+async fn test_openai_embedding(
+    client: &reqwest::Client,
+    base_url: &str,
+    model: &str,
+    api_key: &str,
+) -> Result<String, String> {
+    if api_key.is_empty() {
+        return Err("API key is required for cloud embedding providers.".to_string());
+    }
+
+    let url = format!("{}/v1/embeddings", base_url.trim_end_matches('/'));
+
+    let body = serde_json::json!({
+        "model": model,
+        "input": "test embedding connection",
+    });
+
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Connection failed: {e}"))?;
+
+    if resp.status().is_success() {
+        Ok(format!("Connected. Model '{}' returned embeddings successfully.", model))
+    } else {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        let detail = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| {
+                v.get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| text.chars().take(200).collect());
+        Err(format!("HTTP {}: {}", status, detail))
+    }
 }
 
 // ---------------------------------------------------------------------------

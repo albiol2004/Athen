@@ -1487,6 +1487,39 @@ async function loadSettings() {
             }
             renderChannelOrder(settings.notifications.preferred_channels || []);
         }
+
+        // Populate embedding settings
+        if (settings.embeddings) {
+            const modeEl = document.getElementById('embedding-mode');
+            if (modeEl) modeEl.value = settings.embeddings.mode || 'Automatic';
+            const providerEl = document.getElementById('embedding-provider');
+            if (providerEl && settings.embeddings.provider) providerEl.value = settings.embeddings.provider;
+            const modelEl = document.getElementById('embedding-model');
+            if (modelEl && settings.embeddings.model) modelEl.value = settings.embeddings.model;
+            const urlEl = document.getElementById('embedding-base-url');
+            if (urlEl && settings.embeddings.base_url) urlEl.value = settings.embeddings.base_url;
+            const keyEl = document.getElementById('embedding-api-key');
+            if (keyEl && settings.embeddings.api_key_hint) {
+                keyEl.placeholder = settings.embeddings.api_key_hint + '  (saved)';
+            }
+            const hintEl = document.getElementById('embedding-mode-hint');
+            if (hintEl) {
+                const hints = {
+                    'Automatic': 'Auto-detects the best available provider for generating embeddings.',
+                    'Cloud': 'Uses a cloud provider (requires API key) for highest quality embeddings.',
+                    'LocalOnly': 'Forces local-only embedding generation. No data leaves your machine.',
+                    'Off': 'Disables memory and embeddings entirely.',
+                };
+                hintEl.textContent = hints[settings.embeddings.mode] || '';
+            }
+            // If mode is Specific, auto-expand advanced
+            if (settings.embeddings.mode === 'Specific') {
+                const adv = document.getElementById('embedding-advanced');
+                const arrow = document.querySelector('#embedding-advanced-toggle .advanced-arrow');
+                if (adv) adv.style.display = 'block';
+                if (arrow) arrow.textContent = '\u25BC';
+            }
+        }
     } catch (err) {
         console.error('Failed to load settings:', err);
         showToast('Failed to load settings: ' + err, 'error');
@@ -2117,6 +2150,103 @@ document.getElementById('save-notif-btn')?.addEventListener('click', async funct
         showToast('Failed to save notification settings: ' + e, 'error');
     }
 });
+
+// ─── Embedding Settings ───
+
+const EMBEDDING_MODE_HINTS = {
+    'Automatic': 'Auto-detects the best available provider for generating embeddings.',
+    'Cloud': 'Uses a cloud provider (requires API key) for highest quality embeddings.',
+    'LocalOnly': 'Forces local-only embedding generation. No data leaves your machine.',
+    'Off': 'Disables memory and embeddings entirely.',
+};
+
+document.getElementById('embedding-mode')?.addEventListener('change', function() {
+    const hint = document.getElementById('embedding-mode-hint');
+    if (hint) hint.textContent = EMBEDDING_MODE_HINTS[this.value] || '';
+});
+
+document.getElementById('embedding-advanced-toggle')?.addEventListener('click', function() {
+    const adv = document.getElementById('embedding-advanced');
+    const arrow = this.querySelector('.advanced-arrow');
+    if (!adv) return;
+    if (adv.style.display === 'none') {
+        adv.style.display = 'block';
+        if (arrow) arrow.textContent = '\u25BC';
+    } else {
+        adv.style.display = 'none';
+        if (arrow) arrow.textContent = '\u25B6';
+    }
+});
+
+document.getElementById('embedding-key-toggle')?.addEventListener('click', function() {
+    const input = document.getElementById('embedding-api-key');
+    if (input) {
+        input.type = input.type === 'password' ? 'text' : 'password';
+    }
+});
+
+document.getElementById('save-embedding-btn')?.addEventListener('click', async function() {
+    const btn = this;
+    btn.disabled = true;
+    btn.textContent = 'Saving...';
+
+    const advVisible = document.getElementById('embedding-advanced')?.style.display !== 'none';
+    const provider = document.getElementById('embedding-provider')?.value || null;
+    const model = document.getElementById('embedding-model')?.value || null;
+    const baseUrl = document.getElementById('embedding-base-url')?.value || null;
+    const apiKey = document.getElementById('embedding-api-key')?.value || null;
+
+    // If advanced is expanded and a specific provider is chosen, use Specific mode.
+    let mode = document.getElementById('embedding-mode')?.value || 'Automatic';
+    if (advVisible && provider) {
+        mode = 'Specific';
+    }
+
+    try {
+        const result = await window.__TAURI__.core.invoke('save_embedding_settings', {
+            mode: mode,
+            provider: provider || null,
+            model: model || null,
+            baseUrl: baseUrl || null,
+            apiKey: apiKey || null,
+        });
+        showToast(result, 'success');
+    } catch (e) {
+        showToast('Failed to save embedding settings: ' + e, 'error');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Save Embedding Settings';
+    }
+});
+
+document.getElementById('test-embedding-btn')?.addEventListener('click', async function() {
+    const btn = this;
+    btn.disabled = true;
+    btn.textContent = 'Testing...';
+    try {
+        const result = await window.__TAURI__.core.invoke('test_embedding_provider', {
+            provider: document.getElementById('embedding-provider')?.value || 'ollama',
+            model: document.getElementById('embedding-model')?.value || null,
+            baseUrl: document.getElementById('embedding-base-url')?.value || null,
+            apiKey: document.getElementById('embedding-api-key')?.value || null,
+        });
+        showEmbeddingTestResult(result.success, result.message);
+    } catch (e) {
+        showEmbeddingTestResult(false, e.toString());
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Test Connection';
+    }
+});
+
+function showEmbeddingTestResult(success, message) {
+    const el = document.getElementById('embedding-test-result');
+    if (!el) return;
+    el.className = 'test-result ' + (success ? 'test-success' : 'test-error');
+    el.textContent = message;
+    el.classList.remove('hidden');
+    setTimeout(() => el.classList.add('hidden'), 5000);
+}
 
 // ─── Arc Timeline ───
 

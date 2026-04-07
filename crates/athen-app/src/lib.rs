@@ -65,6 +65,8 @@ pub fn run() {
             commands::delete_read_notifications,
             settings::get_notification_settings,
             settings::save_notification_settings,
+            settings::save_embedding_settings,
+            settings::test_embedding_provider,
         ])
         .setup(|app| {
             use tauri::Manager;

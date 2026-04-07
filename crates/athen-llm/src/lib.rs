@@ -4,5 +4,6 @@
 //! failover chains, and budget management.
 
 pub mod budget;
+pub mod embeddings;
 pub mod providers;
 pub mod router;

@@ -294,6 +294,69 @@
                     <button id="save-notif-btn" class="btn-primary">Save Notification Settings</button>
                 </div>
             </section>
+
+            <section class="settings-section">
+                <h2>Memory &amp; Embeddings</h2>
+                <p class="settings-description">Configure how Athen processes and remembers information.</p>
+
+                <div class="setting-row">
+                    <label for="embedding-mode">Memory Quality</label>
+                    <select id="embedding-mode" class="settings-select">
+                        <option value="Automatic">Automatic (recommended)</option>
+                        <option value="Cloud">Cloud (highest quality)</option>
+                        <option value="LocalOnly">Local only (private)</option>
+                        <option value="Off">Off</option>
+                    </select>
+                    <p class="setting-hint" id="embedding-mode-hint">Auto-detects the best available provider for generating embeddings.</p>
+                </div>
+
+                <div class="setting-row">
+                    <label class="toggle-label advanced-toggle" id="embedding-advanced-toggle">
+                        <span class="advanced-arrow">&#9654;</span>
+                        <span>Advanced options</span>
+                    </label>
+                </div>
+
+                <div id="embedding-advanced" style="display: none;">
+                    <div class="setting-row">
+                        <label for="embedding-provider">Provider</label>
+                        <select id="embedding-provider" class="settings-select">
+                            <option value="">Auto-detect</option>
+                            <option value="ollama">Ollama (local)</option>
+                            <option value="openai">OpenAI</option>
+                            <option value="openai-compatible">OpenAI Compatible</option>
+                            <option value="keyword">Keyword fallback</option>
+                        </select>
+                    </div>
+
+                    <div class="setting-row">
+                        <label for="embedding-model">Model</label>
+                        <input type="text" id="embedding-model" class="settings-input" placeholder="e.g. nomic-embed-text, text-embedding-3-small">
+                    </div>
+
+                    <div class="setting-row">
+                        <label for="embedding-base-url">Base URL</label>
+                        <input type="text" id="embedding-base-url" class="settings-input" placeholder="e.g. http://localhost:11434">
+                    </div>
+
+                    <div class="setting-row">
+                        <label for="embedding-api-key">API Key</label>
+                        <div class="api-key-wrapper">
+                            <input type="password" id="embedding-api-key" class="settings-input" placeholder="Only needed for cloud providers" autocomplete="off">
+                            <button class="api-key-toggle" id="embedding-key-toggle" title="Show/hide key">&#128065;</button>
+                        </div>
+                    </div>
+
+                    <div class="setting-actions">
+                        <button id="test-embedding-btn" class="btn-secondary">Test Connection</button>
+                    </div>
+                    <div id="embedding-test-result" class="test-result hidden"></div>
+                </div>
+
+                <div class="setting-actions">
+                    <button id="save-embedding-btn" class="btn-primary">Save Embedding Settings</button>
+                </div>
+            </section>
         </div>
     </div>
 

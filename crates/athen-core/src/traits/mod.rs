@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod coordinator;
+pub mod embedding;
 pub mod llm;
 pub mod memory;
 pub mod notification;

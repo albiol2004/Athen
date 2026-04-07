@@ -17,6 +17,8 @@ pub struct AthenConfig {
     pub telegram: TelegramConfig,
     #[serde(default)]
     pub notifications: NotificationConfig,
+    #[serde(default)]
+    pub embeddings: EmbeddingConfig,
 }
 
 impl Default for AthenConfig {
@@ -31,6 +33,7 @@ impl Default for AthenConfig {
             email: EmailConfig::default(),
             telegram: TelegramConfig::default(),
             notifications: NotificationConfig::default(),
+            embeddings: EmbeddingConfig::default(),
         }
     }
 }
@@ -302,6 +305,49 @@ impl Default for PersistenceConfig {
             db_path: PathBuf::from("data/athen.db"),
             checkpoint_interval_secs: 30,
             completed_retention_days: 7,
+        }
+    }
+}
+
+/// Embedding provider configuration for the memory/RAG system.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EmbeddingConfig {
+    /// Provider selection mode.
+    pub mode: EmbeddingMode,
+    /// Specific provider ID when mode is `Specific` (e.g. "ollama", "openai").
+    pub provider: Option<String>,
+    /// Model name (e.g. "nomic-embed-text", "text-embedding-3-small").
+    pub model: Option<String>,
+    /// Base URL for OpenAI-compatible endpoints.
+    pub base_url: Option<String>,
+    /// API key for cloud providers.
+    pub api_key: Option<String>,
+}
+
+/// How the embedding provider is selected.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum EmbeddingMode {
+    /// Auto-detect best available provider (NPU > GPU > Ollama > CPU > keyword).
+    Automatic,
+    /// Use a cloud provider (requires API key).
+    Cloud,
+    /// Force local-only (no network calls for embeddings).
+    LocalOnly,
+    /// Use a specific provider by ID.
+    Specific,
+    /// Disable memory/embeddings entirely.
+    Off,
+}
+
+impl Default for EmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            mode: EmbeddingMode::Automatic,
+            provider: None,
+            model: None,
+            base_url: None,
+            api_key: None,
         }
     }
 }

@@ -1539,6 +1539,22 @@ footer {
     accent-color: var(--accent);
 }
 
+.advanced-toggle {
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+    user-select: none;
+}
+
+.advanced-toggle:hover {
+    color: var(--text-primary);
+}
+
+.advanced-arrow {
+    display: inline-block;
+    font-size: 0.7rem;
+    transition: transform 0.15s ease;
+}
+
 .settings-input {
     width: 100%;
     max-width: 400px;
