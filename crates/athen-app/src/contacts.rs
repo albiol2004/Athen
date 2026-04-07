@@ -3,10 +3,10 @@
 //! Provides Tauri IPC commands for viewing and managing contacts
 //! and their trust levels through the UI.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::State;
 
-use athen_core::contact::TrustLevel;
+use athen_core::contact::{Contact, ContactIdentifier, IdentifierKind, TrustLevel};
 
 use crate::state::AppState;
 
@@ -54,6 +54,30 @@ fn parse_trust_level(s: &str) -> Result<TrustLevel, String> {
         "trusted" => Ok(TrustLevel::Trusted),
         "authuser" => Ok(TrustLevel::AuthUser),
         _ => Err(format!("Invalid trust level: '{}'", s)),
+    }
+}
+
+/// Input type for contact identifiers from the frontend.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IdentifierInput {
+    pub value: String,
+    pub kind: String,
+}
+
+/// Parse an identifier kind string into the enum.
+fn parse_identifier_kind(s: &str) -> IdentifierKind {
+    match s {
+        "Email" => IdentifierKind::Email,
+        "Phone" => IdentifierKind::Phone,
+        "Telegram" => IdentifierKind::Telegram,
+        "WhatsApp" => IdentifierKind::WhatsApp,
+        "IMessage" => IdentifierKind::IMessage,
+        "Signal" => IdentifierKind::Signal,
+        "Discord" => IdentifierKind::Discord,
+        "Slack" => IdentifierKind::Slack,
+        "Twitter" => IdentifierKind::Twitter,
+        "Username" => IdentifierKind::Username,
+        _ => IdentifierKind::Other,
     }
 }
 
@@ -237,4 +261,122 @@ pub async fn delete_contact(
         .map_err(|e| format!("Failed to delete contact: {e}"))?;
 
     Ok(())
+}
+
+/// Create a new contact with a name and optional identifiers.
+#[tauri::command]
+pub async fn create_contact(
+    state: State<'_, AppState>,
+    name: String,
+    identifiers: Vec<IdentifierInput>,
+) -> Result<ContactInfo, String> {
+    use athen_contacts::ContactStore as _;
+
+    let store = state
+        .contact_store
+        .as_ref()
+        .ok_or_else(|| "Contact store not available".to_string())?;
+
+    let id = uuid::Uuid::new_v4();
+    let contact = Contact {
+        id,
+        name: name.clone(),
+        trust_level: TrustLevel::Neutral,
+        trust_manual_override: false,
+        identifiers: identifiers
+            .iter()
+            .map(|i| ContactIdentifier {
+                value: i.value.clone(),
+                kind: parse_identifier_kind(&i.kind),
+            })
+            .collect(),
+        interaction_count: 0,
+        last_interaction: None,
+        notes: None,
+        blocked: false,
+    };
+
+    store
+        .save(&contact)
+        .await
+        .map_err(|e| format!("Failed to create contact: {e}"))?;
+
+    Ok(ContactInfo {
+        id: id.to_string(),
+        name,
+        trust_level: trust_level_str(TrustLevel::Neutral).to_string(),
+        trust_manual_override: false,
+        identifiers: identifiers
+            .iter()
+            .map(|i| IdentifierInfo {
+                value: i.value.clone(),
+                kind: i.kind.clone(),
+            })
+            .collect(),
+        interaction_count: 0,
+        last_interaction: None,
+        blocked: false,
+    })
+}
+
+/// Update an existing contact. Only provided fields are changed.
+#[tauri::command]
+pub async fn update_contact(
+    state: State<'_, AppState>,
+    id: String,
+    name: Option<String>,
+    identifiers: Option<Vec<IdentifierInput>>,
+) -> Result<ContactInfo, String> {
+    use athen_contacts::ContactStore as _;
+
+    let store = state
+        .contact_store
+        .as_ref()
+        .ok_or_else(|| "Contact store not available".to_string())?;
+
+    let uuid = uuid::Uuid::parse_str(&id)
+        .map_err(|e| format!("Invalid contact ID: {e}"))?;
+
+    let mut contact = store
+        .load(uuid)
+        .await
+        .map_err(|e| format!("Failed to load contact: {e}"))?
+        .ok_or_else(|| format!("Contact not found: {id}"))?;
+
+    if let Some(new_name) = name {
+        contact.name = new_name;
+    }
+
+    if let Some(new_identifiers) = identifiers {
+        contact.identifiers = new_identifiers
+            .iter()
+            .map(|i| ContactIdentifier {
+                value: i.value.clone(),
+                kind: parse_identifier_kind(&i.kind),
+            })
+            .collect();
+    }
+
+    store
+        .save(&contact)
+        .await
+        .map_err(|e| format!("Failed to update contact: {e}"))?;
+
+    Ok(ContactInfo {
+        id: contact.id.to_string(),
+        name: contact.name.clone(),
+        trust_level: trust_level_str(contact.trust_level).to_string(),
+        trust_manual_override: contact.trust_manual_override,
+        identifiers: contact
+            .identifiers
+            .iter()
+            .map(|i| IdentifierInfo {
+                value: i.value.clone(),
+                kind: format!("{:?}", i.kind),
+            })
+            .collect(),
+        interaction_count: contact.interaction_count,
+        last_interaction: contact.last_interaction.map(|t| t.to_rfc3339()),
+        blocked: contact.blocked,
+    })
 }

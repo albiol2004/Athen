@@ -376,7 +376,7 @@ pub async fn send_message(
             let exec_router: Box<dyn LlmRouter> =
                 Box::new(SharedRouter(Arc::clone(&state.router)));
             let shell_registry = ShellToolRegistry::new().await;
-            let registry = AppToolRegistry::new(shell_registry, state.calendar_store.clone());
+            let registry = AppToolRegistry::new(shell_registry, state.calendar_store.clone(), state.contact_store.clone());
 
             let auditor = TauriAuditor::new(app_handle.clone());
 
@@ -594,7 +594,7 @@ pub async fn approve_task(
             let exec_router: Box<dyn LlmRouter> =
                 Box::new(SharedRouter(Arc::clone(&state.router)));
             let shell_registry = ShellToolRegistry::new().await;
-            let registry = AppToolRegistry::new(shell_registry, state.calendar_store.clone());
+            let registry = AppToolRegistry::new(shell_registry, state.calendar_store.clone(), state.contact_store.clone());
             let auditor = TauriAuditor::new(app_handle.clone());
 
             // Set up streaming for the approved task execution.

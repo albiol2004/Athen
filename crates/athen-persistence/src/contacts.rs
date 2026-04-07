@@ -92,6 +92,13 @@ fn identifier_kind_to_str(kind: IdentifierKind) -> &'static str {
     match kind {
         IdentifierKind::Email => "Email",
         IdentifierKind::Phone => "Phone",
+        IdentifierKind::Telegram => "Telegram",
+        IdentifierKind::WhatsApp => "WhatsApp",
+        IdentifierKind::IMessage => "IMessage",
+        IdentifierKind::Signal => "Signal",
+        IdentifierKind::Discord => "Discord",
+        IdentifierKind::Slack => "Slack",
+        IdentifierKind::Twitter => "Twitter",
         IdentifierKind::Username => "Username",
         IdentifierKind::Other => "Other",
     }
@@ -101,6 +108,13 @@ fn identifier_kind_from_str(s: &str) -> IdentifierKind {
     match s {
         "Email" => IdentifierKind::Email,
         "Phone" => IdentifierKind::Phone,
+        "Telegram" => IdentifierKind::Telegram,
+        "WhatsApp" => IdentifierKind::WhatsApp,
+        "IMessage" => IdentifierKind::IMessage,
+        "Signal" => IdentifierKind::Signal,
+        "Discord" => IdentifierKind::Discord,
+        "Slack" => IdentifierKind::Slack,
+        "Twitter" => IdentifierKind::Twitter,
         "Username" => IdentifierKind::Username,
         _ => IdentifierKind::Other,
     }

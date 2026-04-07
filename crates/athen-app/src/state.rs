@@ -325,6 +325,7 @@ impl AppState {
         let router = Arc::clone(&self.router);
         let arc_store_ref = self._database.as_ref().map(|db| db.arc_store());
         let calendar_store_ref = self.calendar_store.clone();
+        let contact_store_ref = self.contact_store.clone();
 
         tauri::async_runtime::spawn(async move {
             if let Err(e) = monitor.init(&telegram_config).await {
@@ -375,6 +376,7 @@ impl AppState {
                                         &router,
                                         &arc_store_ref,
                                         &calendar_store_ref,
+                                        &contact_store_ref,
                                         &app_handle,
                                     )
                                     .await;
@@ -427,6 +429,7 @@ impl AppState {
 /// This skips risk evaluation (owner messages are trusted) and goes straight
 /// to agent execution.  The response is persisted to the most recent arc
 /// (created by the sense router moments before) and streamed to the frontend.
+#[allow(clippy::too_many_arguments)]
 async fn execute_owner_telegram_message(
     text: &str,
     chat_id: i64,
@@ -434,6 +437,7 @@ async fn execute_owner_telegram_message(
     router: &Arc<RwLock<Arc<DefaultLlmRouter>>>,
     arc_store: &Option<ArcStore>,
     calendar_store: &Option<CalendarStore>,
+    contact_store: &Option<SqliteContactStore>,
     app_handle: &tauri::AppHandle,
 ) {
     use std::time::Duration;
@@ -526,7 +530,7 @@ async fn execute_owner_telegram_message(
     let exec_router: Box<dyn athen_core::traits::llm::LlmRouter> =
         Box::new(SharedRouter(Arc::clone(router)));
     let shell_registry = ShellToolRegistry::new().await;
-    let registry = AppToolRegistry::new(shell_registry, calendar_store.clone());
+    let registry = AppToolRegistry::new(shell_registry, calendar_store.clone(), contact_store.clone());
     let auditor = TauriAuditor::new(app_handle.clone());
     let stream_tx = spawn_stream_forwarder(app_handle, target_arc_id.clone());
     let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));

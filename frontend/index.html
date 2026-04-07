@@ -245,6 +245,7 @@
                     </button>
                 </div>
                 <h1 id="contacts-title">Contacts</h1>
+                <button class="btn-primary" id="new-contact-btn" onclick="showNewContactModal()">+ New Contact</button>
             </header>
             <div class="contacts-content">
                 <div id="contacts-list"></div>
@@ -252,6 +253,44 @@
                     <div class="contacts-empty-icon">&#128100;</div>
                     <p>No contacts yet.</p>
                     <p class="contacts-empty-hint">Contacts are automatically created when Athen receives messages from new senders.</p>
+                </div>
+            </div>
+
+            <div id="contact-modal-overlay" class="cal-modal-overlay" style="display:none">
+                <div class="cal-modal contact-modal">
+                    <div class="cal-modal-header">
+                        <h2 id="contact-modal-title">New Contact</h2>
+                        <button class="cal-modal-close-btn" onclick="hideContactModal()">&times;</button>
+                    </div>
+                    <div class="cal-modal-body">
+                        <input type="hidden" id="contact-edit-id">
+                        <div class="cal-field">
+                            <label>Name</label>
+                            <input type="text" id="contact-name" placeholder="John Doe">
+                        </div>
+                        <div class="cal-field">
+                            <label>Trust Level</label>
+                            <select id="contact-trust-modal-select">
+                                <option value="Unknown">Unknown</option>
+                                <option value="Neutral" selected>Neutral</option>
+                                <option value="Known">Known</option>
+                                <option value="Trusted">Trusted</option>
+                            </select>
+                        </div>
+                        <div id="contact-identifiers-section">
+                            <label>Identifiers</label>
+                            <div id="contact-identifiers-list">
+                            </div>
+                            <button class="btn-secondary" id="add-identifier-btn" onclick="addIdentifierRow()">+ Add Identifier</button>
+                        </div>
+                    </div>
+                    <div class="cal-modal-actions">
+                        <div></div>
+                        <div class="cal-modal-actions-right">
+                            <button class="btn-secondary" onclick="hideContactModal()">Cancel</button>
+                            <button class="btn-primary" id="save-contact-btn" onclick="saveContact()">Save</button>
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>

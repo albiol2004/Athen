@@ -2885,7 +2885,13 @@ function renderContactList(contacts) {
             '<span class="contact-name">' + escapeHtml(contact.name) + '</span>' +
             blockedBadge +
             '<span class="contact-badge ' + trustClass + '">' + escapeHtml(contact.trust_level) + '</span>' +
-            '<span class="contact-interactions">' + interactionsText + '</span>';
+            '<span class="contact-interactions">' + interactionsText + '</span>' +
+            '<button class="contact-edit-btn" title="Edit contact">&#9998;</button>';
+
+        headerEl.querySelector('.contact-edit-btn').addEventListener('click', (e) => {
+            e.stopPropagation();
+            showEditContactModal(contact);
+        });
 
         headerEl.addEventListener('click', () => {
             card.classList.toggle('expanded');
@@ -3024,6 +3030,136 @@ async function deleteContact(id) {
     }
 }
 
+// ─── Contact Modal ───
+
+function getIdentifierPlaceholder(kind) {
+    switch(kind) {
+        case 'Email': return 'user@example.com';
+        case 'Phone': return '+1 234 567 8900';
+        case 'Telegram': return '@username or user ID';
+        case 'WhatsApp': return '+1 234 567 8900';
+        case 'IMessage': return 'email or phone';
+        case 'Signal': return '+1 234 567 8900';
+        case 'Discord': return 'username#1234';
+        case 'Slack': return '@username';
+        case 'Twitter': return '@handle';
+        case 'Username': return 'username';
+        default: return 'identifier';
+    }
+}
+
+const identifierKinds = ['Email', 'Phone', 'Telegram', 'WhatsApp', 'IMessage', 'Signal', 'Discord', 'Slack', 'Twitter', 'Username', 'Other'];
+
+function addIdentifierRow(kind, value) {
+    const list = document.getElementById('contact-identifiers-list');
+    const row = document.createElement('div');
+    row.className = 'identifier-row';
+
+    const select = document.createElement('select');
+    identifierKinds.forEach(k => {
+        const opt = document.createElement('option');
+        opt.value = k;
+        opt.textContent = k;
+        if (kind && k === kind) opt.selected = true;
+        select.appendChild(opt);
+    });
+
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.placeholder = getIdentifierPlaceholder(kind || 'Email');
+    if (value) input.value = value;
+
+    select.addEventListener('change', () => {
+        input.placeholder = getIdentifierPlaceholder(select.value);
+    });
+
+    const removeBtn = document.createElement('button');
+    removeBtn.className = 'remove-identifier-btn';
+    removeBtn.textContent = '\u00d7';
+    removeBtn.title = 'Remove';
+    removeBtn.addEventListener('click', () => row.remove());
+
+    row.appendChild(select);
+    row.appendChild(input);
+    row.appendChild(removeBtn);
+    list.appendChild(row);
+}
+
+function showNewContactModal() {
+    document.getElementById('contact-edit-id').value = '';
+    document.getElementById('contact-name').value = '';
+    document.getElementById('contact-trust-modal-select').value = 'Neutral';
+    document.getElementById('contact-identifiers-list').innerHTML = '';
+    document.getElementById('contact-modal-title').textContent = 'New Contact';
+    addIdentifierRow();
+    document.getElementById('contact-modal-overlay').style.display = '';
+}
+
+function showEditContactModal(contact) {
+    document.getElementById('contact-edit-id').value = contact.id;
+    document.getElementById('contact-name').value = contact.name || '';
+    document.getElementById('contact-trust-modal-select').value = contact.trust_level || 'Neutral';
+    document.getElementById('contact-identifiers-list').innerHTML = '';
+    document.getElementById('contact-modal-title').textContent = 'Edit Contact';
+
+    if (contact.identifiers && contact.identifiers.length > 0) {
+        contact.identifiers.forEach(ident => {
+            addIdentifierRow(ident.kind, ident.value);
+        });
+    } else {
+        addIdentifierRow();
+    }
+
+    document.getElementById('contact-modal-overlay').style.display = '';
+}
+
+function hideContactModal() {
+    document.getElementById('contact-modal-overlay').style.display = 'none';
+}
+
+async function saveContact() {
+    const id = document.getElementById('contact-edit-id').value;
+    const name = document.getElementById('contact-name').value.trim();
+    const trustLevel = document.getElementById('contact-trust-modal-select').value;
+
+    if (!name) {
+        showToast('Name is required', 'error');
+        return;
+    }
+
+    const rows = document.querySelectorAll('#contact-identifiers-list .identifier-row');
+    const identifiers = [];
+    rows.forEach(row => {
+        const kind = row.querySelector('select').value;
+        const value = row.querySelector('input').value.trim();
+        if (value) {
+            identifiers.push({ kind, value });
+        }
+    });
+
+    if (identifiers.length === 0) {
+        showToast('At least one identifier is required', 'error');
+        return;
+    }
+
+    if (!invoke) return;
+
+    try {
+        if (id) {
+            await invoke('update_contact', { id, name, trustLevel, identifiers });
+            showToast('Contact updated', 'success');
+        } else {
+            await invoke('create_contact', { name, trustLevel, identifiers });
+            showToast('Contact created', 'success');
+        }
+        hideContactModal();
+        await loadContacts();
+    } catch (err) {
+        console.error('Failed to save contact:', err);
+        showToast('Failed to save contact: ' + err, 'error');
+    }
+}
+
 // Contacts event listeners
 if (contactsBtn) {
     contactsBtn.addEventListener('click', showContacts);
@@ -3032,6 +3168,11 @@ if (contactsBtn) {
 if (contactsBack) {
     contactsBack.addEventListener('click', hideContacts);
 }
+
+// Close contact modal on overlay click
+document.getElementById('contact-modal-overlay')?.addEventListener('click', function(e) {
+    if (e.target === this) hideContactModal();
+});
 
 // ─── Initialize ───
 

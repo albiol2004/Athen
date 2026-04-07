@@ -2947,3 +2947,93 @@ footer {
     font-style: italic;
     margin-left: auto;
 }
+
+/* Contact modal */
+
+.contact-modal {
+    max-width: 500px;
+}
+
+#new-contact-btn {
+    margin-left: auto;
+    flex-shrink: 0;
+}
+
+.contact-edit-btn {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 14px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    transition: color 0.12s, background 0.12s;
+    flex-shrink: 0;
+}
+
+.contact-edit-btn:hover {
+    color: var(--text-primary);
+    background: rgba(255, 255, 255, 0.05);
+}
+
+.identifier-row {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 8px;
+    align-items: center;
+}
+
+.identifier-row select {
+    width: 140px;
+    flex-shrink: 0;
+    font-size: 13px;
+    padding: 6px 8px;
+    background: var(--bg-input, var(--bg-primary));
+    color: var(--text-primary);
+    border: 1px solid var(--border-subtle);
+    border-radius: 6px;
+}
+
+.identifier-row input {
+    flex: 1;
+}
+
+.identifier-row .remove-identifier-btn {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 16px;
+    padding: 4px 8px;
+}
+
+.identifier-row .remove-identifier-btn:hover {
+    color: #f7768e;
+}
+
+#contact-identifiers-section {
+    margin-top: 12px;
+}
+
+#contact-identifiers-section > label {
+    display: block;
+    margin-bottom: 8px;
+    color: var(--text-secondary);
+    font-size: 13px;
+}
+
+#contact-identifiers-section .btn-secondary {
+    font-size: 12px;
+    padding: 4px 12px;
+    margin-top: 4px;
+}
+
+#contact-trust-modal-select {
+    width: 100%;
+    font-size: 13px;
+    padding: 7px 10px;
+    background: var(--bg-input, var(--bg-primary));
+    color: var(--text-primary);
+    border: 1px solid var(--border-subtle);
+    border-radius: 6px;
+}

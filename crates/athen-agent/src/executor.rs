@@ -94,6 +94,7 @@ impl DefaultExecutor {
         // Categorize tools for smarter guidance.
         let has_calendar = tools.iter().any(|t| t.name.starts_with("calendar_"));
         let has_shell = tools.iter().any(|t| t.name == "shell_execute");
+        let has_contacts = tools.iter().any(|t| t.name.starts_with("contacts_"));
 
         if !tools.is_empty() {
             prompt.push_str("You have the following tools available:\n");
@@ -128,6 +129,18 @@ impl DefaultExecutor {
                 "SHELL & FILES:\n\
                  Use shell_execute, read_file, write_file, list_directory for filesystem and system tasks.\n\
                  Prefer specific tools (read_file, list_directory) over shell commands when possible.\n\n",
+            );
+        }
+
+        // Contacts guidance.
+        if has_contacts {
+            prompt.push_str(
+                "CONTACTS CAPABILITIES:\n\
+                 You manage the user's contacts. You can create, search, update, and delete contacts.\n\
+                 - Each contact has a name and multiple identifiers (email, phone, Telegram, WhatsApp, etc.)\n\
+                 - When you learn about a person (from emails, messages, conversations), create or update their contact.\n\
+                 - Use contacts_search to find contacts by name or identifier before creating duplicates.\n\
+                 - Trust levels: Unknown (new), Neutral, Known (interacted), Trusted (explicitly marked).\n\n",
             );
         }
 

@@ -54,6 +54,8 @@ pub fn run() {
             contacts::block_contact,
             contacts::unblock_contact,
             contacts::delete_contact,
+            contacts::create_contact,
+            contacts::update_contact,
         ])
         .setup(|app| {
             use tauri::Manager;

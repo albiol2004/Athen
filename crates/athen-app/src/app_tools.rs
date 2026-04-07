@@ -1,31 +1,40 @@
 //! Composite tool registry that extends ShellToolRegistry with app-level tools.
 //!
-//! Calendar CRUD tools are added here since athen-agent doesn't depend on
-//! athen-persistence. The composition root (athen-app) wires the CalendarStore
-//! into the registry before handing it to the agent.
+//! Calendar CRUD tools and contact management tools are added here since
+//! athen-agent doesn't depend on athen-persistence or athen-contacts.
+//! The composition root (athen-app) wires the stores into the registry
+//! before handing it to the agent.
 
 use std::time::Instant;
 
 use async_trait::async_trait;
 use serde_json::json;
 
+use athen_contacts::ContactStore;
+use athen_core::contact::{Contact, ContactIdentifier, IdentifierKind, TrustLevel};
 use athen_core::error::{AthenError, Result};
 use athen_core::risk::BaseImpact;
 use athen_core::tool::{ToolBackend, ToolDefinition, ToolResult};
 use athen_core::traits::tool::ToolRegistry;
 use athen_agent::ShellToolRegistry;
 use athen_persistence::calendar::{CalendarEvent, CalendarStore, EventCreator};
+use athen_persistence::contacts::SqliteContactStore;
 
-/// Wraps [`ShellToolRegistry`] and adds calendar tools backed by [`CalendarStore`].
+/// Wraps [`ShellToolRegistry`] and adds calendar and contact tools.
 pub struct AppToolRegistry {
     inner: ShellToolRegistry,
     calendar: Option<CalendarStore>,
+    contacts: Option<SqliteContactStore>,
 }
 
 impl AppToolRegistry {
     /// Create a new composite registry.
-    pub fn new(inner: ShellToolRegistry, calendar: Option<CalendarStore>) -> Self {
-        Self { inner, calendar }
+    pub fn new(
+        inner: ShellToolRegistry,
+        calendar: Option<CalendarStore>,
+        contacts: Option<SqliteContactStore>,
+    ) -> Self {
+        Self { inner, calendar, contacts }
     }
 
     // ── Schema helpers ───────────────────────────────────────────────
@@ -356,6 +365,335 @@ impl AppToolRegistry {
             execution_time_ms: elapsed,
         })
     }
+
+    // ── Contact schema helpers ──────────────────────────────────────
+
+    fn contacts_list_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {},
+            "required": []
+        })
+    }
+
+    fn contacts_search_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query to match against contact names and identifier values (case-insensitive)"
+                }
+            },
+            "required": ["query"]
+        })
+    }
+
+    fn contacts_create_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "The contact's display name"
+                },
+                "identifiers": {
+                    "type": "array",
+                    "description": "List of identifiers for this contact (optional)",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "value": {
+                                "type": "string",
+                                "description": "The identifier value (e.g. email address, phone number, username)"
+                            },
+                            "kind": {
+                                "type": "string",
+                                "description": "Identifier type: Email, Phone, Telegram, WhatsApp, IMessage, Signal, Discord, Slack, Twitter, Username, Other"
+                            }
+                        },
+                        "required": ["value", "kind"]
+                    }
+                },
+                "trust_level": {
+                    "type": "string",
+                    "description": "Initial trust level: Unknown, Neutral, Known, Trusted (default: Neutral)"
+                }
+            },
+            "required": ["name"]
+        })
+    }
+
+    fn contacts_update_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description": "The contact ID to update"
+                },
+                "name": {
+                    "type": "string",
+                    "description": "New name (optional, keeps existing if omitted)"
+                },
+                "identifiers": {
+                    "type": "array",
+                    "description": "New identifiers list (optional, REPLACES all existing identifiers if provided)",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "value": { "type": "string" },
+                            "kind": { "type": "string" }
+                        },
+                        "required": ["value", "kind"]
+                    }
+                },
+                "trust_level": {
+                    "type": "string",
+                    "description": "New trust level (optional)"
+                }
+            },
+            "required": ["id"]
+        })
+    }
+
+    fn contacts_delete_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description": "The contact ID to delete"
+                }
+            },
+            "required": ["id"]
+        })
+    }
+
+    // ── Contact tool implementations ────────────────────────────────
+
+    fn contact_store(&self) -> Result<&SqliteContactStore> {
+        self.contacts.as_ref()
+            .ok_or_else(|| AthenError::Other("Contact store not available".into()))
+    }
+
+    fn parse_identifier_kind(s: &str) -> IdentifierKind {
+        match s {
+            "Email" => IdentifierKind::Email,
+            "Phone" => IdentifierKind::Phone,
+            "Telegram" => IdentifierKind::Telegram,
+            "WhatsApp" => IdentifierKind::WhatsApp,
+            "IMessage" => IdentifierKind::IMessage,
+            "Signal" => IdentifierKind::Signal,
+            "Discord" => IdentifierKind::Discord,
+            "Slack" => IdentifierKind::Slack,
+            "Twitter" => IdentifierKind::Twitter,
+            "Username" => IdentifierKind::Username,
+            _ => IdentifierKind::Other,
+        }
+    }
+
+    fn parse_trust_level(s: &str) -> TrustLevel {
+        match s.to_lowercase().as_str() {
+            "unknown" => TrustLevel::Unknown,
+            "neutral" => TrustLevel::Neutral,
+            "known" => TrustLevel::Known,
+            "trusted" => TrustLevel::Trusted,
+            "authuser" => TrustLevel::AuthUser,
+            _ => TrustLevel::Neutral,
+        }
+    }
+
+    fn contact_to_json(c: &Contact) -> serde_json::Value {
+        json!({
+            "id": c.id.to_string(),
+            "name": c.name,
+            "trust_level": format!("{:?}", c.trust_level),
+            "trust_manual_override": c.trust_manual_override,
+            "identifiers": c.identifiers.iter().map(|i| json!({
+                "value": i.value,
+                "kind": format!("{:?}", i.kind),
+            })).collect::<Vec<_>>(),
+            "interaction_count": c.interaction_count,
+            "last_interaction": c.last_interaction.map(|t| t.to_rfc3339()),
+            "blocked": c.blocked,
+        })
+    }
+
+    async fn do_contacts_list(&self, _args: &serde_json::Value) -> Result<ToolResult> {
+        let store = self.contact_store()?;
+
+        tracing::info!(tool = "contacts_list", "Listing all contacts");
+
+        let t = Instant::now();
+        let contacts = store.list_all().await?;
+        let elapsed = t.elapsed().as_millis() as u64;
+
+        let contacts_json: Vec<serde_json::Value> = contacts.iter()
+            .map(Self::contact_to_json)
+            .collect();
+
+        Ok(ToolResult {
+            success: true,
+            output: json!({ "contacts": contacts_json, "count": contacts_json.len() }),
+            error: None,
+            execution_time_ms: elapsed,
+        })
+    }
+
+    async fn do_contacts_search(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let store = self.contact_store()?;
+
+        let query = args.get("query").and_then(|v| v.as_str())
+            .ok_or_else(|| AthenError::Other("missing 'query' parameter".into()))?;
+
+        tracing::info!(tool = "contacts_search", query, "Searching contacts");
+
+        let t = Instant::now();
+        let contacts = store.list_all().await?;
+        let query_lower = query.to_lowercase();
+        let matches: Vec<serde_json::Value> = contacts.iter()
+            .filter(|c| {
+                c.name.to_lowercase().contains(&query_lower)
+                    || c.identifiers.iter().any(|i| i.value.to_lowercase().contains(&query_lower))
+            })
+            .map(Self::contact_to_json)
+            .collect();
+        let elapsed = t.elapsed().as_millis() as u64;
+
+        Ok(ToolResult {
+            success: true,
+            output: json!({ "contacts": matches, "count": matches.len() }),
+            error: None,
+            execution_time_ms: elapsed,
+        })
+    }
+
+    async fn do_contacts_create(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let store = self.contact_store()?;
+
+        let name = args.get("name").and_then(|v| v.as_str())
+            .ok_or_else(|| AthenError::Other("missing 'name' parameter".into()))?;
+
+        let identifiers: Vec<ContactIdentifier> = args.get("identifiers")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|item| {
+                let value = item.get("value")?.as_str()?;
+                let kind = item.get("kind")?.as_str()?;
+                Some(ContactIdentifier {
+                    value: value.to_string(),
+                    kind: Self::parse_identifier_kind(kind),
+                })
+            }).collect())
+            .unwrap_or_default();
+
+        let trust_level = args.get("trust_level")
+            .and_then(|v| v.as_str())
+            .map(Self::parse_trust_level)
+            .unwrap_or(TrustLevel::Neutral);
+
+        let id = uuid::Uuid::new_v4();
+        let contact = Contact {
+            id,
+            name: name.to_string(),
+            trust_level,
+            trust_manual_override: false,
+            identifiers,
+            interaction_count: 0,
+            last_interaction: None,
+            notes: None,
+            blocked: false,
+        };
+
+        tracing::info!(tool = "contacts_create", name, "Creating contact");
+
+        let t = Instant::now();
+        store.save(&contact).await?;
+        let elapsed = t.elapsed().as_millis() as u64;
+
+        Ok(ToolResult {
+            success: true,
+            output: json!({
+                "id": id.to_string(),
+                "name": name,
+                "message": format!("Contact '{}' created successfully", name),
+            }),
+            error: None,
+            execution_time_ms: elapsed,
+        })
+    }
+
+    async fn do_contacts_update(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let store = self.contact_store()?;
+
+        let id_str = args.get("id").and_then(|v| v.as_str())
+            .ok_or_else(|| AthenError::Other("missing 'id' parameter".into()))?;
+
+        let id = uuid::Uuid::parse_str(id_str)
+            .map_err(|e| AthenError::Other(format!("Invalid contact ID: {e}")))?;
+
+        tracing::info!(tool = "contacts_update", id = id_str, "Updating contact");
+
+        let mut contact = store.load(id).await?
+            .ok_or_else(|| AthenError::Other(format!("Contact '{id_str}' not found")))?;
+
+        if let Some(name) = args.get("name").and_then(|v| v.as_str()) {
+            contact.name = name.to_string();
+        }
+
+        if let Some(arr) = args.get("identifiers").and_then(|v| v.as_array()) {
+            contact.identifiers = arr.iter().filter_map(|item| {
+                let value = item.get("value")?.as_str()?;
+                let kind = item.get("kind")?.as_str()?;
+                Some(ContactIdentifier {
+                    value: value.to_string(),
+                    kind: Self::parse_identifier_kind(kind),
+                })
+            }).collect();
+        }
+
+        if let Some(level_str) = args.get("trust_level").and_then(|v| v.as_str()) {
+            contact.trust_level = Self::parse_trust_level(level_str);
+        }
+
+        let t = Instant::now();
+        store.save(&contact).await?;
+        let elapsed = t.elapsed().as_millis() as u64;
+
+        Ok(ToolResult {
+            success: true,
+            output: json!({
+                "id": id_str,
+                "name": contact.name,
+                "message": format!("Contact '{}' updated successfully", contact.name),
+            }),
+            error: None,
+            execution_time_ms: elapsed,
+        })
+    }
+
+    async fn do_contacts_delete(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let store = self.contact_store()?;
+
+        let id_str = args.get("id").and_then(|v| v.as_str())
+            .ok_or_else(|| AthenError::Other("missing 'id' parameter".into()))?;
+
+        let id = uuid::Uuid::parse_str(id_str)
+            .map_err(|e| AthenError::Other(format!("Invalid contact ID: {e}")))?;
+
+        tracing::info!(tool = "contacts_delete", id = id_str, "Deleting contact");
+
+        let t = Instant::now();
+        store.delete(id).await?;
+        let elapsed = t.elapsed().as_millis() as u64;
+
+        Ok(ToolResult {
+            success: true,
+            output: json!({ "id": id_str, "message": "Contact deleted successfully" }),
+            error: None,
+            execution_time_ms: elapsed,
+        })
+    }
 }
 
 #[async_trait]
@@ -394,6 +732,44 @@ impl ToolRegistry for AppToolRegistry {
             });
         }
 
+        if self.contacts.is_some() {
+            tools.push(ToolDefinition {
+                name: "contacts_list".to_string(),
+                description: "List all contacts with their names, identifiers, and trust levels.".to_string(),
+                parameters: Self::contacts_list_schema(),
+                backend: ToolBackend::Shell { command: String::new(), native: false },
+                base_risk: BaseImpact::Read,
+            });
+            tools.push(ToolDefinition {
+                name: "contacts_search".to_string(),
+                description: "Search contacts by name or identifier value (case-insensitive). Returns matching contacts.".to_string(),
+                parameters: Self::contacts_search_schema(),
+                backend: ToolBackend::Shell { command: String::new(), native: false },
+                base_risk: BaseImpact::Read,
+            });
+            tools.push(ToolDefinition {
+                name: "contacts_create".to_string(),
+                description: "Create a new contact with a name, optional identifiers (email, phone, Telegram, etc.), and optional trust level.".to_string(),
+                parameters: Self::contacts_create_schema(),
+                backend: ToolBackend::Shell { command: String::new(), native: false },
+                base_risk: BaseImpact::WritePersist,
+            });
+            tools.push(ToolDefinition {
+                name: "contacts_update".to_string(),
+                description: "Update an existing contact. Only provided fields are changed. If identifiers are provided, they REPLACE all existing identifiers. Requires the contact ID.".to_string(),
+                parameters: Self::contacts_update_schema(),
+                backend: ToolBackend::Shell { command: String::new(), native: false },
+                base_risk: BaseImpact::WritePersist,
+            });
+            tools.push(ToolDefinition {
+                name: "contacts_delete".to_string(),
+                description: "Delete a contact by ID.".to_string(),
+                parameters: Self::contacts_delete_schema(),
+                backend: ToolBackend::Shell { command: String::new(), native: false },
+                base_risk: BaseImpact::WritePersist,
+            });
+        }
+
         Ok(tools)
     }
 
@@ -403,6 +779,11 @@ impl ToolRegistry for AppToolRegistry {
             "calendar_create" => self.do_calendar_create(&args).await,
             "calendar_update" => self.do_calendar_update(&args).await,
             "calendar_delete" => self.do_calendar_delete(&args).await,
+            "contacts_list" => self.do_contacts_list(&args).await,
+            "contacts_search" => self.do_contacts_search(&args).await,
+            "contacts_create" => self.do_contacts_create(&args).await,
+            "contacts_update" => self.do_contacts_update(&args).await,
+            "contacts_delete" => self.do_contacts_delete(&args).await,
             _ => self.inner.call_tool(name, args).await,
         }
     }
@@ -421,14 +802,33 @@ mod tests {
         let db = Database::in_memory().await.unwrap();
         let calendar_store = db.calendar_store();
         let shell = ShellToolRegistry::new().await;
-        let registry = AppToolRegistry::new(shell, Some(calendar_store));
+        let registry = AppToolRegistry::new(shell, Some(calendar_store), None);
         (db, registry)
     }
 
     /// Helper: create an AppToolRegistry without a calendar store.
     async fn setup_without_calendar() -> AppToolRegistry {
         let shell = ShellToolRegistry::new().await;
-        AppToolRegistry::new(shell, None)
+        AppToolRegistry::new(shell, None, None)
+    }
+
+    /// Helper: create an in-memory DB + ContactStore + AppToolRegistry.
+    async fn setup_with_contacts() -> (Database, AppToolRegistry) {
+        let db = Database::in_memory().await.unwrap();
+        let contact_store = db.contact_store();
+        let shell = ShellToolRegistry::new().await;
+        let registry = AppToolRegistry::new(shell, None, Some(contact_store));
+        (db, registry)
+    }
+
+    /// Helper: create an in-memory DB + both CalendarStore and ContactStore.
+    async fn setup_with_all() -> (Database, AppToolRegistry) {
+        let db = Database::in_memory().await.unwrap();
+        let calendar_store = db.calendar_store();
+        let contact_store = db.contact_store();
+        let shell = ShellToolRegistry::new().await;
+        let registry = AppToolRegistry::new(shell, Some(calendar_store), Some(contact_store));
+        (db, registry)
     }
 
     /// Helper: extract the event ID from a calendar_create result.
@@ -837,5 +1237,238 @@ mod tests {
             err_msg.to_lowercase().contains("not found") || err_msg.to_lowercase().contains("unknown"),
             "Error should indicate tool not found: {err_msg}"
         );
+    }
+
+    // ── Contact tool tests ──────────────────────────────────────────
+
+    // 16. list_tools_includes_contact_tools
+    #[tokio::test]
+    async fn list_tools_includes_contact_tools() {
+        let (_db, registry) = setup_with_contacts().await;
+        let tools = registry.list_tools().await.unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"contacts_list"));
+        assert!(names.contains(&"contacts_search"));
+        assert!(names.contains(&"contacts_create"));
+        assert!(names.contains(&"contacts_update"));
+        assert!(names.contains(&"contacts_delete"));
+        // 6 shell + 5 contact = 11
+        assert_eq!(tools.len(), 11);
+    }
+
+    // 17. list_tools_with_all_stores
+    #[tokio::test]
+    async fn list_tools_with_all_stores() {
+        let (_db, registry) = setup_with_all().await;
+        let tools = registry.list_tools().await.unwrap();
+        // 6 shell + 4 calendar + 5 contact = 15
+        assert_eq!(tools.len(), 15);
+    }
+
+    // 18. contacts_create_basic
+    #[tokio::test]
+    async fn contacts_create_basic() {
+        let (_db, registry) = setup_with_contacts().await;
+        let result = registry
+            .call_tool(
+                "contacts_create",
+                json!({
+                    "name": "Alice",
+                    "identifiers": [
+                        { "value": "alice@example.com", "kind": "Email" }
+                    ]
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output["id"].as_str().is_some());
+        assert_eq!(result.output["name"].as_str().unwrap(), "Alice");
+    }
+
+    // 19. contacts_list_after_create
+    #[tokio::test]
+    async fn contacts_list_after_create() {
+        let (_db, registry) = setup_with_contacts().await;
+
+        // Create two contacts
+        registry
+            .call_tool("contacts_create", json!({ "name": "Alice" }))
+            .await
+            .unwrap();
+        registry
+            .call_tool("contacts_create", json!({ "name": "Bob" }))
+            .await
+            .unwrap();
+
+        let result = registry
+            .call_tool("contacts_list", json!({}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert_eq!(result.output["count"].as_u64().unwrap(), 2);
+    }
+
+    // 20. contacts_search_by_name
+    #[tokio::test]
+    async fn contacts_search_by_name() {
+        let (_db, registry) = setup_with_contacts().await;
+
+        registry
+            .call_tool("contacts_create", json!({ "name": "Alice Smith" }))
+            .await
+            .unwrap();
+        registry
+            .call_tool("contacts_create", json!({ "name": "Bob Jones" }))
+            .await
+            .unwrap();
+
+        let result = registry
+            .call_tool("contacts_search", json!({ "query": "alice" }))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert_eq!(result.output["count"].as_u64().unwrap(), 1);
+        assert_eq!(
+            result.output["contacts"][0]["name"].as_str().unwrap(),
+            "Alice Smith"
+        );
+    }
+
+    // 21. contacts_search_by_identifier
+    #[tokio::test]
+    async fn contacts_search_by_identifier() {
+        let (_db, registry) = setup_with_contacts().await;
+
+        registry
+            .call_tool(
+                "contacts_create",
+                json!({
+                    "name": "Alice",
+                    "identifiers": [{ "value": "alice@test.com", "kind": "Email" }]
+                }),
+            )
+            .await
+            .unwrap();
+
+        let result = registry
+            .call_tool("contacts_search", json!({ "query": "alice@test" }))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert_eq!(result.output["count"].as_u64().unwrap(), 1);
+    }
+
+    // 22. contacts_update_name
+    #[tokio::test]
+    async fn contacts_update_name() {
+        let (_db, registry) = setup_with_contacts().await;
+
+        let create_result = registry
+            .call_tool(
+                "contacts_create",
+                json!({
+                    "name": "Alice",
+                    "identifiers": [{ "value": "alice@test.com", "kind": "Email" }]
+                }),
+            )
+            .await
+            .unwrap();
+        let id = create_result.output["id"].as_str().unwrap().to_string();
+
+        let update_result = registry
+            .call_tool(
+                "contacts_update",
+                json!({ "id": id, "name": "Alice Updated" }),
+            )
+            .await
+            .unwrap();
+        assert!(update_result.success);
+        assert_eq!(update_result.output["name"].as_str().unwrap(), "Alice Updated");
+
+        // Verify identifier was preserved
+        let list_result = registry
+            .call_tool("contacts_search", json!({ "query": "alice@test" }))
+            .await
+            .unwrap();
+        assert_eq!(list_result.output["count"].as_u64().unwrap(), 1);
+        assert_eq!(
+            list_result.output["contacts"][0]["name"].as_str().unwrap(),
+            "Alice Updated"
+        );
+    }
+
+    // 23. contacts_delete_basic
+    #[tokio::test]
+    async fn contacts_delete_basic() {
+        let (_db, registry) = setup_with_contacts().await;
+
+        let create_result = registry
+            .call_tool("contacts_create", json!({ "name": "Ephemeral" }))
+            .await
+            .unwrap();
+        let id = create_result.output["id"].as_str().unwrap().to_string();
+
+        let delete_result = registry
+            .call_tool("contacts_delete", json!({ "id": id }))
+            .await
+            .unwrap();
+        assert!(delete_result.success);
+
+        // Verify empty
+        let list_result = registry
+            .call_tool("contacts_list", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(list_result.output["count"].as_u64().unwrap(), 0);
+    }
+
+    // 24. contacts_update_nonexistent
+    #[tokio::test]
+    async fn contacts_update_nonexistent() {
+        let (_db, registry) = setup_with_contacts().await;
+        let result = registry
+            .call_tool(
+                "contacts_update",
+                json!({ "id": "00000000-0000-0000-0000-000000000000", "name": "Ghost" }),
+            )
+            .await;
+        assert!(result.is_err());
+    }
+
+    // 25. contacts_no_store_returns_error
+    #[tokio::test]
+    async fn contacts_no_store_returns_error() {
+        let registry = setup_without_calendar().await;
+        let result = registry
+            .call_tool("contacts_list", json!({}))
+            .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("not available"));
+    }
+
+    // 26. contacts_create_with_trust_level
+    #[tokio::test]
+    async fn contacts_create_with_trust_level() {
+        let (db, registry) = setup_with_contacts().await;
+        let contact_store = db.contact_store();
+
+        let result = registry
+            .call_tool(
+                "contacts_create",
+                json!({
+                    "name": "Trusted Alice",
+                    "trust_level": "Trusted"
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(result.success);
+
+        let id_str = result.output["id"].as_str().unwrap();
+        let id = uuid::Uuid::parse_str(id_str).unwrap();
+        let loaded = contact_store.load(id).await.unwrap().unwrap();
+        assert_eq!(loaded.trust_level, TrustLevel::Trusted);
     }
 }

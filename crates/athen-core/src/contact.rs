@@ -27,6 +27,13 @@ pub struct ContactIdentifier {
 pub enum IdentifierKind {
     Email,
     Phone,
+    Telegram,
+    WhatsApp,
+    IMessage,
+    Signal,
+    Discord,
+    Slack,
+    Twitter,
     Username,
     Other,
 }
