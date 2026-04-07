@@ -168,6 +168,9 @@ impl TelegramMonitor {
                 "chat_id": message.chat.id,
                 "chat_type": message.chat.chat_type,
                 "message_id": message.message_id,
+                "sender_user_id": message.from.as_ref().map(|u| u.id),
+                "sender_username": message.from.as_ref().and_then(|u| u.username.as_deref()),
+                "sender_first_name": message.from.as_ref().map(|u| u.first_name.as_str()),
             });
 
             events.push(SenseEvent {

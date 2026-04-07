@@ -166,7 +166,7 @@ pub async fn process_sense_event(
 
         // Also add a system message so the agent has context when the user
         // opens this Arc and starts chatting.
-        let context_msg = build_context_message(&event.source, sender, summary, &body_text, &triage);
+        let context_msg = build_context_message(&event.source, sender, summary, &body_text, &event.content.body, &triage);
         if let Err(e) = store.add_entry(
             &arc_id, EntryType::Message, "system", &context_msg, None,
         ).await {
@@ -293,6 +293,7 @@ fn build_context_message(
     sender: &str,
     subject: &str,
     body_text: &str,
+    body_json: &serde_json::Value,
     triage: &SenseTriage,
 ) -> String {
     let source_name = source_display_name(source);
@@ -309,7 +310,37 @@ fn build_context_message(
         }
         EventSource::Email => {
             msg.push_str(&format!("Email from {sender}\nSubject: {subject}\n\n{body_text}"));
-            msg.push_str("\n\nThe user may ask you to summarize, reply, or take action on this email.");
+            msg.push_str(&format!(
+                "\n\nSender identifier: {sender} (type: Email)\n\
+                 The user may ask you to summarize, reply, or take action on this email.\n\
+                 If you have contacts tools, check if this sender exists in contacts — \
+                 if not, consider creating a contact or asking the user if they match an existing one."
+            ));
+        }
+        EventSource::Messaging => {
+            msg.push_str(&format!("Message from {sender}\n\n{body_text}"));
+            // Extract Telegram-specific sender details from the body JSON.
+            let tg_user_id = body_json.get("sender_user_id")
+                .and_then(|v| v.as_i64());
+            let tg_username = body_json.get("sender_username")
+                .and_then(|v| v.as_str());
+            let tg_name = body_json.get("sender_first_name")
+                .and_then(|v| v.as_str());
+            let mut sender_details = format!("\n\nSender: {sender}");
+            if let Some(uid) = tg_user_id {
+                sender_details.push_str(&format!(" | Telegram user ID: {uid}"));
+            }
+            if let Some(uname) = tg_username {
+                sender_details.push_str(&format!(" | Telegram username: @{uname}"));
+            }
+            if let Some(name) = tg_name {
+                sender_details.push_str(&format!(" | Name: {name}"));
+            }
+            msg.push_str(&sender_details);
+            msg.push_str(
+                "\n\nIf you have contacts tools, check if this sender exists in contacts — \
+                 if not, consider creating a contact or asking the user if they match an existing one."
+            );
         }
         _ => {
             msg.push_str(&format!("From: {sender}\nSubject: {subject}\n\n{body_text}"));

@@ -140,7 +140,17 @@ impl DefaultExecutor {
                  - Each contact has a name and multiple identifiers (email, phone, Telegram, WhatsApp, etc.)\n\
                  - When you learn about a person (from emails, messages, conversations), create or update their contact.\n\
                  - Use contacts_search to find contacts by name or identifier before creating duplicates.\n\
-                 - Trust levels: Unknown (new), Neutral, Known (interacted), Trusted (explicitly marked).\n\n",
+                 - Trust levels: Unknown (new), Neutral, Known (interacted), Trusted (explicitly marked).\n\n\
+                 CONTACT MATCHING (important):\n\
+                 When you receive a message from an external sender (email, Telegram, etc.), check if they \
+                 match an existing contact:\n\
+                 1. Use contacts_search with the sender's name or identifier.\n\
+                 2. If you find a plausible match (same name, or related identifiers), ASK the user: \
+                    \"I received a message from [sender]. Is this the same person as your contact [name] \
+                    ([existing identifiers])? If so, I'll add their [new identifier type] to the contact.\"\n\
+                 3. If the user confirms, use contacts_update to add the new identifier.\n\
+                 4. If no match or user denies, use contacts_create with the new sender's info.\n\
+                 5. NEVER auto-merge contacts without asking — always confirm with the user first.\n\n",
             );
         }
 
