@@ -1824,10 +1824,6 @@ function showNotificationToast(data) {
     iconSpan.className = 'toast-icon';
     iconSpan.textContent = icon;
 
-    const titleSpan = document.createElement('span');
-    titleSpan.className = 'toast-title';
-    titleSpan.textContent = data.title || 'Notification';
-
     const closeBtn = document.createElement('button');
     closeBtn.className = 'toast-close';
     closeBtn.textContent = '\u00D7';
@@ -1836,16 +1832,32 @@ function showNotificationToast(data) {
         toast.remove();
     });
 
-    headerDiv.appendChild(iconSpan);
-    headerDiv.appendChild(titleSpan);
-    headerDiv.appendChild(closeBtn);
+    if (data.title) {
+        // Structured: title + body
+        const titleSpan = document.createElement('span');
+        titleSpan.className = 'toast-title';
+        titleSpan.textContent = data.title;
+        headerDiv.appendChild(iconSpan);
+        headerDiv.appendChild(titleSpan);
+        headerDiv.appendChild(closeBtn);
+        toast.appendChild(headerDiv);
 
-    const bodyDiv = document.createElement('div');
-    bodyDiv.className = 'toast-body';
-    bodyDiv.textContent = data.body || '';
-
-    toast.appendChild(headerDiv);
-    toast.appendChild(bodyDiv);
+        if (data.body) {
+            const bodyDiv = document.createElement('div');
+            bodyDiv.className = 'toast-body';
+            bodyDiv.textContent = data.body;
+            toast.appendChild(bodyDiv);
+        }
+    } else {
+        // Humanized: body only, shown as the main content
+        headerDiv.appendChild(iconSpan);
+        const msgSpan = document.createElement('span');
+        msgSpan.className = 'toast-title';
+        msgSpan.textContent = data.body || 'Notification';
+        headerDiv.appendChild(msgSpan);
+        headerDiv.appendChild(closeBtn);
+        toast.appendChild(headerDiv);
+    }
 
     // Click to open the related arc
     if (data.arc_id) {

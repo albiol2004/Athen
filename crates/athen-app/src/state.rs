@@ -208,10 +208,13 @@ impl AppState {
             });
         }
 
-        self.notifier = Some(Arc::new(NotificationOrchestrator::new(
-            config.notifications.clone(),
-            channels,
-        )));
+        let llm_router: Box<dyn athen_core::traits::llm::LlmRouter> =
+            Box::new(SharedRouter(Arc::clone(&self.router)));
+
+        self.notifier = Some(Arc::new(
+            NotificationOrchestrator::new(config.notifications.clone(), channels)
+                .with_llm_router(llm_router),
+        ));
     }
 
     /// Start the email monitor background polling task.

@@ -16,7 +16,9 @@ use uuid::Uuid;
 
 use athen_core::config::{NotificationChannelKind, NotificationConfig};
 use athen_core::error::Result;
+use athen_core::llm::{ChatMessage, LlmRequest, MessageContent, ModelProfile, Role};
 use athen_core::notification::{DeliveryResult, DeliveryStatus, Notification, NotificationUrgency};
+use athen_core::traits::llm::LlmRouter;
 use athen_core::traits::notification::NotificationChannel;
 
 // ---------------------------------------------------------------------------
@@ -83,17 +85,12 @@ impl NotificationChannel for TelegramChannel {
     }
 
     async fn send(&self, notification: &Notification) -> Result<DeliveryResult> {
-        let urgency_icon = match notification.urgency {
-            NotificationUrgency::Low => "i]",
-            NotificationUrgency::Medium => "[]",
-            NotificationUrgency::High => "/!\\",
-            NotificationUrgency::Critical => "(!)",
+        let text = if notification.title.is_empty() {
+            // Already humanized — send body as-is.
+            notification.body.clone()
+        } else {
+            format!("{}\n\n{}", notification.title, notification.body)
         };
-
-        let text = format!(
-            "{} {}\n\n{}",
-            urgency_icon, notification.title, notification.body
-        );
 
         match athen_sentidos::telegram::send_message(&self.bot_token, self.owner_chat_id, &text)
             .await
@@ -126,6 +123,7 @@ pub struct NotificationOrchestrator {
     user_present: AtomicBool,
     pending: RwLock<HashMap<Uuid, PendingNotification>>,
     cancellation_tokens: RwLock<HashMap<Uuid, CancellationToken>>,
+    llm_router: Option<Box<dyn LlmRouter>>,
 }
 
 impl NotificationOrchestrator {
@@ -139,7 +137,13 @@ impl NotificationOrchestrator {
             user_present: AtomicBool::new(true), // assume present at startup
             pending: RwLock::new(HashMap::new()),
             cancellation_tokens: RwLock::new(HashMap::new()),
+            llm_router: None,
         }
+    }
+
+    pub fn with_llm_router(mut self, router: Box<dyn LlmRouter>) -> Self {
+        self.llm_router = Some(router);
+        self
     }
 
     pub fn set_user_present(&self, present: bool) {
@@ -151,7 +155,12 @@ impl NotificationOrchestrator {
     }
 
     /// Main entry point: deliver a notification through the best available channel.
+    ///
+    /// If an LLM router is configured, the title and body are rephrased into
+    /// natural, human-like language before delivery.
     pub async fn notify(self: &Arc<Self>, notification: Notification) {
+        let notification = self.humanize(notification).await;
+
         // Check quiet hours -- critical notifications always go through.
         if self.is_quiet_hours() && notification.urgency != NotificationUrgency::Critical {
             tracing::info!(
@@ -222,6 +231,60 @@ impl NotificationOrchestrator {
     }
 
     // --- Private helpers ---
+
+    /// Rephrase a notification's title and body into natural, human-like
+    /// language using a fast LLM call.  Falls back to the original text on
+    /// failure or when no router is configured.
+    async fn humanize(&self, mut notification: Notification) -> Notification {
+        let router = match &self.llm_router {
+            Some(r) => r,
+            None => return notification,
+        };
+
+        let prompt = format!(
+            "You are a personal assistant notifying your user about something.\n\
+             Rewrite the notification below into a short, friendly, natural message \
+             as if you were a human assistant talking to them casually.\n\
+             - Be concise (1-2 sentences max).\n\
+             - Don't use emojis.\n\
+             - Keep all important details (names, times, numbers).\n\
+             - Don't add information that isn't there.\n\
+             - Answer with ONLY the rewritten message, nothing else.\n\n\
+             Title: {}\n\
+             Body: {}",
+            notification.title, notification.body
+        );
+
+        let request = LlmRequest {
+            profile: ModelProfile::Cheap,
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: MessageContent::Text(prompt),
+            }],
+            max_tokens: Some(100),
+            temperature: Some(0.7),
+            tools: None,
+            system_prompt: None,
+        };
+
+        match tokio::time::timeout(Duration::from_secs(5), router.route(&request)).await {
+            Ok(Ok(response)) => {
+                let text = response.content.trim().to_string();
+                if !text.is_empty() {
+                    notification.title = String::new();
+                    notification.body = text;
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, "LLM humanization failed, using original text");
+            }
+            Err(_) => {
+                tracing::debug!("LLM humanization timed out, using original text");
+            }
+        }
+
+        notification
+    }
 
     fn is_quiet_hours(&self) -> bool {
         let qh = match &self.config.quiet_hours {
