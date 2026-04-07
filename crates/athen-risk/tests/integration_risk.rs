@@ -81,6 +81,7 @@ impl LlmRouter for MockRouter {
     async fn route(&self, _request: &LlmRequest) -> athen_core::error::Result<LlmResponse> {
         Ok(LlmResponse {
             content: self.response_content.clone(),
+            reasoning_content: None,
             model_used: "mock".to_string(),
             provider: "mock".to_string(),
             usage: TokenUsage {
@@ -449,15 +450,18 @@ async fn test_combined_evaluator_chooses_rules_or_llm() {
     );
 
     // 2. "help me organize my files" — no rules match => falls through to LLM.
+    //    Use a non-AuthUser trust level so the evaluator does not short-circuit
+    //    to a safe score (AuthUser + no rule match = safe, by design).
+    let ctx_known = ctx(TrustLevel::Known, DataSensitivity::Plain, Some(1.0));
     let task_ambiguous = make_task("help me organize my files");
     let score_ambiguous = evaluator
-        .evaluate(&task_ambiguous, &ctx_auth)
+        .evaluate(&task_ambiguous, &ctx_known)
         .await
         .unwrap();
     assert_eq!(
         score_ambiguous.evaluation_method,
         EvaluationMethod::LlmAssisted,
-        "Ambiguous action should fall through to LLM"
+        "Ambiguous action from non-AuthUser should fall through to LLM"
     );
 
     // Verify that the rule-based result carries expected risk values.
@@ -468,10 +472,10 @@ async fn test_combined_evaluator_chooses_rules_or_llm() {
         score_sudo.total
     );
 
-    // The LLM mock returns read/plain/1.0 => Read(1) * AuthUser(0.5) * Plain(1) = 0.5
+    // The LLM mock returns read/plain/1.0 => Read(1) * Known(1.5) * Plain(1) = 1.5
     assert!(
-        (score_ambiguous.total - 0.5).abs() < f64::EPSILON,
-        "LLM-evaluated score should be 0.5, got {}",
+        (score_ambiguous.total - 1.5).abs() < f64::EPSILON,
+        "LLM-evaluated score should be 1.5, got {}",
         score_ambiguous.total
     );
 }

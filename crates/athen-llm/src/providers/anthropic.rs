@@ -178,6 +178,7 @@ impl LlmProvider for AnthropicProvider {
 
         Ok(LlmResponse {
             content,
+            reasoning_content: None,
             model_used: api_response.model,
             provider: "anthropic".into(),
             usage,
@@ -249,6 +250,8 @@ fn parse_sse_chunks(text: &str) -> Vec<Result<LlmChunk>> {
                 chunks.push(Ok(LlmChunk {
                     delta: String::new(),
                     is_final: true,
+                    is_thinking: false,
+                    tool_calls: vec![],
                 }));
                 continue;
             }
@@ -269,6 +272,8 @@ fn parse_sse_chunks(text: &str) -> Vec<Result<LlmChunk>> {
                                 chunks.push(Ok(LlmChunk {
                                     delta: delta.to_string(),
                                     is_final: false,
+                                    is_thinking: false,
+                                    tool_calls: vec![],
                                 }));
                             }
                         }
@@ -276,6 +281,8 @@ fn parse_sse_chunks(text: &str) -> Vec<Result<LlmChunk>> {
                             chunks.push(Ok(LlmChunk {
                                 delta: String::new(),
                                 is_final: true,
+                                is_thinking: false,
+                                tool_calls: vec![],
                             }));
                         }
                         _ => {

@@ -10,6 +10,7 @@ pub mod vector;
 use async_trait::async_trait;
 
 use athen_core::error::Result;
+use athen_core::traits::embedding::EmbeddingProvider;
 use athen_core::traits::memory::{
     Entity, EntityType, KnowledgeGraph, MemoryItem, MemoryStore, SearchResult, VectorIndex,
 };
@@ -18,22 +19,46 @@ use athen_core::traits::memory::{
 pub struct Memory {
     vector: Box<dyn VectorIndex>,
     graph: Box<dyn KnowledgeGraph>,
+    embedder: Option<Box<dyn EmbeddingProvider>>,
 }
 
 impl Memory {
     pub fn new(vector: Box<dyn VectorIndex>, graph: Box<dyn KnowledgeGraph>) -> Self {
-        Self { vector, graph }
+        Self {
+            vector,
+            graph,
+            embedder: None,
+        }
+    }
+
+    /// Attach an embedding provider for real semantic search.
+    pub fn with_embedder(mut self, embedder: Box<dyn EmbeddingProvider>) -> Self {
+        self.embedder = Some(embedder);
+        self
     }
 }
 
 #[async_trait]
 impl MemoryStore for Memory {
     async fn remember(&self, item: MemoryItem) -> Result<()> {
-        // Store in vector index with empty embedding placeholder.
-        // In production, an embedding model would generate the vector from item.content.
-        let embedding = vec![0.0f32; 0];
+        // Generate embedding from content if an embedder is available.
+        let embedding = if let Some(ref embedder) = self.embedder {
+            embedder.embed(&item.content).await?
+        } else {
+            vec![0.0f32; 0]
+        };
+
+        // Store content inside metadata so we can reconstruct it on recall.
+        let mut metadata = item.metadata.clone();
+        if let serde_json::Value::Object(ref mut map) = metadata {
+            map.insert(
+                "_content".to_string(),
+                serde_json::Value::String(item.content.clone()),
+            );
+        }
+
         self.vector
-            .upsert(&item.id, embedding, item.metadata.clone())
+            .upsert(&item.id, embedding, metadata)
             .await?;
 
         // If metadata contains entity information, add to graph.
@@ -70,19 +95,31 @@ impl MemoryStore for Memory {
     }
 
     async fn recall(&self, query: &str, limit: usize) -> Result<Vec<MemoryItem>> {
-        // Search vector index. Since we store empty embeddings for now,
-        // we use a zero-vector query. In production, the query string
-        // would be converted to an embedding first.
-        let query_embedding = vec![0.0f32; 0];
+        // Embed the query if an embedder is available.
+        let query_embedding = if let Some(ref embedder) = self.embedder {
+            embedder.embed(query).await?
+        } else {
+            vec![0.0f32; 0]
+        };
+
         let results: Vec<SearchResult> =
             self.vector.search(query_embedding, limit).await?;
 
         let items = results
             .into_iter()
-            .map(|r| MemoryItem {
-                id: r.id,
-                content: query.to_string(),
-                metadata: r.metadata,
+            .map(|r| {
+                // Extract original content from metadata if stored.
+                let content = r
+                    .metadata
+                    .get("_content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(query)
+                    .to_string();
+                MemoryItem {
+                    id: r.id,
+                    content,
+                    metadata: r.metadata,
+                }
             })
             .collect();
 
@@ -102,12 +139,14 @@ mod tests {
     use super::*;
     use crate::graph::InMemoryGraph;
     use crate::vector::InMemoryVectorIndex;
+    use athen_llm::embeddings::keyword::KeywordEmbedding;
 
     fn make_memory() -> Memory {
         Memory::new(
             Box::new(InMemoryVectorIndex::new()),
             Box::new(InMemoryGraph::new()),
         )
+        .with_embedder(Box::new(KeywordEmbedding::new()))
     }
 
     #[tokio::test]
@@ -171,17 +210,29 @@ mod tests {
     async fn test_remember_multiple_and_recall() {
         let mem = make_memory();
 
-        for i in 0..5 {
+        let items = [
+            ("item-0", "Rust programming language tutorial"),
+            ("item-1", "Python data science overview"),
+            ("item-2", "JavaScript web development guide"),
+            ("item-3", "Database design patterns"),
+            ("item-4", "Cloud infrastructure management"),
+        ];
+
+        for (id, content) in &items {
             let item = MemoryItem {
-                id: format!("item-{}", i),
-                content: format!("Content {}", i),
-                metadata: serde_json::json!({"index": i}),
+                id: id.to_string(),
+                content: content.to_string(),
+                metadata: serde_json::json!({}),
             };
             mem.remember(item).await.unwrap();
         }
 
-        let results = mem.recall("query", 3).await.unwrap();
+        // Recall with limit 3 — should return 3 results
+        let results = mem.recall("Rust programming", 3).await.unwrap();
         assert_eq!(results.len(), 3);
+
+        // The Rust item should rank highest
+        assert_eq!(results[0].id, "item-0");
     }
 
     #[tokio::test]
@@ -189,5 +240,48 @@ mod tests {
         let mem = make_memory();
         // Forgetting something that doesn't exist should not error
         mem.forget("does-not-exist").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_semantic_similarity_ranking() {
+        let mem = make_memory();
+
+        mem.remember(MemoryItem {
+            id: "rust".to_string(),
+            content: "Rust programming tutorial".to_string(),
+            metadata: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+
+        mem.remember(MemoryItem {
+            id: "python".to_string(),
+            content: "Python machine learning".to_string(),
+            metadata: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+
+        mem.remember(MemoryItem {
+            id: "javascript".to_string(),
+            content: "JavaScript web development".to_string(),
+            metadata: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+
+        // Query for Rust — the Rust item should rank first
+        let results = mem.recall("programming in Rust", 3).await.unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(
+            results[0].id, "rust",
+            "Rust item should rank first for 'programming in Rust' query"
+        );
+
+        // Verify content was reconstructed from metadata
+        assert!(
+            results[0].content.contains("Rust"),
+            "Content should be the original stored content"
+        );
     }
 }

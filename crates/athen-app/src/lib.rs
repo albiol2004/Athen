@@ -16,6 +16,14 @@ use state::AppState;
 
 /// Build and run the Tauri application.
 pub fn run() {
+    // Initialize tracing with RUST_LOG env filter (defaults to info).
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
     // Install the rustls crypto provider before anything else uses TLS.
     // Both reqwest (for LLM calls) and rustls-connector (for IMAP) need this.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();

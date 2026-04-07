@@ -48,6 +48,7 @@ pub enum MessageContent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmResponse {
     pub content: String,
+    pub reasoning_content: Option<String>,
     pub model_used: String,
     pub provider: String,
     pub usage: TokenUsage,
@@ -82,6 +83,10 @@ pub enum FinishReason {
 pub struct LlmChunk {
     pub delta: String,
     pub is_final: bool,
+    pub is_thinking: bool,
+    /// Tool calls extracted from streaming SSE chunks.
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCall>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

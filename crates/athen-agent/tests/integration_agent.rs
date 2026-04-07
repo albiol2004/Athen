@@ -41,6 +41,7 @@ impl MockLlmRouter {
         };
         LlmResponse {
             content: content.to_string(),
+            reasoning_content: None,
             model_used: "mock-model".to_string(),
             provider: "mock".to_string(),
             usage: TokenUsage {

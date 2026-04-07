@@ -698,6 +698,38 @@ header h1 {
     margin-bottom: 0;
 }
 
+/* ─── Thinking Block (reasoning models) ─── */
+.thinking-block {
+    margin-bottom: 8px;
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    font-size: 0.85em;
+    overflow: hidden;
+}
+
+.thinking-block summary {
+    padding: 8px 12px;
+    cursor: pointer;
+    color: rgba(255, 255, 255, 0.4);
+    font-style: italic;
+    user-select: none;
+}
+
+.thinking-block summary:hover {
+    color: rgba(255, 255, 255, 0.6);
+}
+
+.thinking-block .thinking-content {
+    padding: 8px 12px;
+    color: rgba(255, 255, 255, 0.35);
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 300px;
+    overflow-y: auto;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
 /* ─── Error Messages ─── */
 .message-bubble.error-message {
     background: rgba(247, 118, 142, 0.08);

@@ -196,6 +196,7 @@ mod tests {
         fn response(&self) -> LlmResponse {
             LlmResponse {
                 content: self.response_content.clone(),
+                reasoning_content: None,
                 model_used: "mock-model".to_string(),
                 provider: "mock".to_string(),
                 usage: TokenUsage {

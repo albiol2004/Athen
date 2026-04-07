@@ -427,6 +427,7 @@ mod tests {
             } else {
                 Ok(LlmResponse {
                     content: format!("response from {}", self.id),
+                    reasoning_content: None,
                     model_used: "mock-model".into(),
                     provider: self.id.clone(),
                     usage: TokenUsage {

@@ -17,6 +17,10 @@ let streamingText = '';
 let didReceiveStreamChunks = false;
 // Whether a request is currently being processed by the agent.
 let isProcessing = false;
+// Tracks the thinking/reasoning block for thinking models.
+let thinkingBlock = null;
+let thinkingContent = null;
+let thinkingText = '';
 
 // ─── Arc State ───
 
@@ -98,7 +102,7 @@ function initTauri() {
             // If the stream belongs to a different arc, show a notification
             // dot on that arc in the sidebar instead of rendering a bubble.
             window.__TAURI__.event.listen('agent-stream', (event) => {
-                const { delta, is_final, arc_id } = event.payload;
+                const { delta, is_final, arc_id, is_thinking } = event.payload;
 
                 // Check if this stream belongs to the currently visible arc.
                 const isActiveArc = !arc_id || arc_id === activeArcId;
@@ -108,6 +112,12 @@ function initTauri() {
                         streamingBubble.innerHTML = renderMarkdown(streamingText);
                         streamingBubble.classList.remove('streaming');
                     }
+                    // Close the thinking block so it's collapsed by default
+                    // but still expandable by the user.
+                    if (isActiveArc && thinkingBlock && thinkingText) {
+                        thinkingContent.textContent = thinkingText;
+                        thinkingBlock.open = false;
+                    }
                     // If it was a background arc, show a notification dot
                     // and refresh the sidebar.
                     if (!isActiveArc && arc_id) {
@@ -116,6 +126,9 @@ function initTauri() {
                     }
                     streamingBubble = null;
                     streamingText = '';
+                    thinkingBlock = null;
+                    thinkingContent = null;
+                    thinkingText = '';
                     return;
                 }
 
@@ -125,35 +138,90 @@ function initTauri() {
                 if (!isActiveArc) return;
 
                 didReceiveStreamChunks = true;
-                streamingText += delta;
 
-                // Create the streaming bubble on the first chunk.
-                if (!streamingBubble) {
-                    // Remove welcome message if present.
-                    const welcome = messagesEl.querySelector('.welcome-message');
-                    if (welcome) welcome.remove();
+                if (is_thinking) {
+                    thinkingText += delta;
 
-                    const row = document.createElement('div');
-                    row.className = 'message-row assistant';
-                    row.id = 'streaming-message';
+                    // Create the thinking block on the first thinking chunk.
+                    if (!thinkingBlock) {
+                        // Remove welcome message if present.
+                        const welcome = messagesEl.querySelector('.welcome-message');
+                        if (welcome) welcome.remove();
 
-                    const avatar = document.createElement('div');
-                    avatar.className = 'message-avatar';
-                    avatar.textContent = 'A';
+                        // Ensure we have a message row to attach the thinking block to.
+                        let row = messagesEl.querySelector('#streaming-message');
+                        if (!row) {
+                            row = document.createElement('div');
+                            row.className = 'message-row assistant';
+                            row.id = 'streaming-message';
 
-                    const wrap = document.createElement('div');
-                    wrap.className = 'message-content-wrap';
+                            const avatar = document.createElement('div');
+                            avatar.className = 'message-avatar';
+                            avatar.textContent = 'A';
 
-                    streamingBubble = document.createElement('div');
-                    streamingBubble.className = 'message-bubble streaming';
+                            const wrap = document.createElement('div');
+                            wrap.className = 'message-content-wrap';
 
-                    wrap.appendChild(streamingBubble);
-                    row.appendChild(avatar);
-                    row.appendChild(wrap);
-                    messagesEl.appendChild(row);
+                            row.appendChild(avatar);
+                            row.appendChild(wrap);
+                            messagesEl.appendChild(row);
+                        }
+
+                        const wrap = row.querySelector('.message-content-wrap');
+
+                        thinkingBlock = document.createElement('details');
+                        thinkingBlock.className = 'thinking-block';
+                        thinkingBlock.open = true;
+
+                        const summary = document.createElement('summary');
+                        summary.textContent = 'Thinking...';
+                        thinkingBlock.appendChild(summary);
+
+                        thinkingContent = document.createElement('div');
+                        thinkingContent.className = 'thinking-content';
+                        thinkingBlock.appendChild(thinkingContent);
+
+                        wrap.appendChild(thinkingBlock);
+                    }
+
+                    thinkingContent.textContent = thinkingText;
+                } else {
+                    streamingText += delta;
+
+                    // Create the streaming bubble on the first content chunk.
+                    if (!streamingBubble) {
+                        // Remove welcome message if present.
+                        const welcome = messagesEl.querySelector('.welcome-message');
+                        if (welcome) welcome.remove();
+
+                        let row = messagesEl.querySelector('#streaming-message');
+                        if (!row) {
+                            row = document.createElement('div');
+                            row.className = 'message-row assistant';
+                            row.id = 'streaming-message';
+
+                            const avatar = document.createElement('div');
+                            avatar.className = 'message-avatar';
+                            avatar.textContent = 'A';
+
+                            const wrap = document.createElement('div');
+                            wrap.className = 'message-content-wrap';
+
+                            row.appendChild(avatar);
+                            row.appendChild(wrap);
+                            messagesEl.appendChild(row);
+                        }
+
+                        const wrap = row.querySelector('.message-content-wrap');
+
+                        streamingBubble = document.createElement('div');
+                        streamingBubble.className = 'message-bubble streaming';
+
+                        wrap.appendChild(streamingBubble);
+                    }
+
+                    streamingBubble.textContent = streamingText;
                 }
-
-                streamingBubble.textContent = streamingText;
 
                 requestAnimationFrame(() => {
                     messagesEl.parentElement.scrollTo({
@@ -1186,6 +1254,9 @@ formEl.addEventListener('submit', async (e) => {
     streamingBubble = null;
     streamingText = '';
     didReceiveStreamChunks = false;
+    thinkingBlock = null;
+    thinkingContent = null;
+    thinkingText = '';
 
     try {
         // Call Tauri backend. While this awaits, `agent-stream` events

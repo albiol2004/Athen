@@ -11,6 +11,7 @@ use rusqlite::Connection;
 use athen_core::traits::memory::{
     Entity, EntityType, ExploreParams, KnowledgeGraph, MemoryItem, MemoryStore, VectorIndex,
 };
+use athen_llm::embeddings::keyword::KeywordEmbedding;
 use athen_memory::sqlite::{SqliteGraph, SqliteVectorIndex};
 use athen_memory::Memory;
 
@@ -268,7 +269,8 @@ async fn test_memory_facade_remember_and_recall() {
     let vector = SqliteVectorIndex::new(Arc::clone(&conn)).unwrap();
     let graph = SqliteGraph::new(conn).unwrap();
 
-    let mem = Memory::new(Box::new(vector), Box::new(graph));
+    let mem = Memory::new(Box::new(vector), Box::new(graph))
+        .with_embedder(Box::new(KeywordEmbedding::new()));
 
     // Remember three items
     mem.remember(MemoryItem {
@@ -308,25 +310,26 @@ async fn test_memory_facade_remember_and_recall() {
     .await
     .unwrap();
 
-    // Recall with limit 5 — the facade stores items with empty embeddings,
-    // so recall returns all items up to limit (cosine similarity is 0.0 for
-    // empty vectors, all tied). We verify the items were stored and can be
-    // retrieved.
+    // With real keyword embeddings, "Juan" should rank the meeting item highest
+    // (it contains "Juan" in its content).
     let results = mem.recall("Juan", 5).await.unwrap();
-    assert_eq!(results.len(), 3, "All 3 items should be recalled (empty embeddings = tied scores)");
+    assert_eq!(results.len(), 3, "All 3 items should be recalled");
+    assert_eq!(
+        results[0].id, "item-meeting",
+        "Meeting item (mentions Juan) should rank first for 'Juan' query"
+    );
 
-    // Verify all item IDs are present
-    let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
-    assert!(ids.contains(&"item-meeting"));
-    assert!(ids.contains(&"item-email"));
-    assert!(ids.contains(&"item-code"));
-
-    // Recall with limit 5 for "budget"
+    // Recall for "budget" — the email item should rank first.
     let budget_results = mem.recall("budget", 5).await.unwrap();
-    let budget_ids: Vec<&str> = budget_results.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(
+        budget_results[0].id, "item-email",
+        "Email item (about budget) should rank first for 'budget' query"
+    );
+
+    // Verify content was reconstructed from stored metadata.
     assert!(
-        budget_ids.contains(&"item-email"),
-        "Email item should be in recall results"
+        budget_results[0].content.contains("budget"),
+        "Content should be the original stored content"
     );
 
     // Forget the meeting item

@@ -233,6 +233,7 @@ impl OpenAiCompatibleProvider {
             temperature: request.temperature.unwrap_or(0.7),
             tools,
             stream: false,
+            extra: None,
         }
     }
 
@@ -317,6 +318,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
             })?;
 
         let content = choice.message.content.clone().unwrap_or_default();
+        let reasoning_content = choice.message.reasoning_content.clone();
 
         // Extract tool calls if present.
         let tool_calls: Vec<ToolCall> = choice
@@ -367,6 +369,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
 
         Ok(LlmResponse {
             content,
+            reasoning_content,
             model_used: api_response.model,
             provider: self.provider_id.clone(),
             usage,
@@ -437,27 +440,80 @@ pub fn parse_sse_chunks(text: &str, provider_id: &str) -> Vec<Result<LlmChunk>> 
     for line in text.lines() {
         let line = line.trim();
         if let Some(data) = line.strip_prefix("data: ") {
+            debug!(provider = provider_id, raw_sse = data, "SSE chunk received");
             if data == "[DONE]" {
                 chunks.push(Ok(LlmChunk {
                     delta: String::new(),
                     is_final: true,
+                    is_thinking: false,
+                    tool_calls: vec![],
                 }));
                 continue;
             }
             match serde_json::from_str::<serde_json::Value>(data) {
                 Ok(event) => {
-                    // OpenAI streaming format: choices[0].delta.content
-                    if let Some(delta_content) = event
+                    let delta_obj = event
                         .get("choices")
                         .and_then(|c| c.get(0))
-                        .and_then(|c| c.get("delta"))
+                        .and_then(|c| c.get("delta"));
+
+                    // Check for reasoning_content (thinking models like Qwen 3.5, DeepSeek R1).
+                    if let Some(reasoning) = delta_obj
+                        .and_then(|d| d.get("reasoning_content"))
+                        .and_then(|c| c.as_str())
+                    {
+                        if !reasoning.is_empty() {
+                            chunks.push(Ok(LlmChunk {
+                                delta: reasoning.to_string(),
+                                is_final: false,
+                                is_thinking: true,
+                                tool_calls: vec![],
+                            }));
+                        }
+                    }
+
+                    // OpenAI streaming format: choices[0].delta.content
+                    if let Some(delta_content) = delta_obj
                         .and_then(|d| d.get("content"))
                         .and_then(|c| c.as_str())
                     {
                         chunks.push(Ok(LlmChunk {
                             delta: delta_content.to_string(),
                             is_final: false,
+                            is_thinking: false,
+                            tool_calls: vec![],
                         }));
+                    }
+
+                    // Check for tool_calls in the delta.
+                    if let Some(tool_calls_arr) = delta_obj
+                        .and_then(|d| d.get("tool_calls"))
+                        .and_then(|tc| tc.as_array())
+                    {
+                        let mut extracted_calls = Vec::new();
+                        for tc_val in tool_calls_arr {
+                            if let (Some(id), Some(name), Some(args_str)) = (
+                                tc_val.get("id").and_then(|v| v.as_str()),
+                                tc_val.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()),
+                                tc_val.get("function").and_then(|f| f.get("arguments")).and_then(|a| a.as_str()),
+                            ) {
+                                let arguments = serde_json::from_str(args_str)
+                                    .unwrap_or(serde_json::Value::String(args_str.to_string()));
+                                extracted_calls.push(ToolCall {
+                                    id: id.to_string(),
+                                    name: name.to_string(),
+                                    arguments,
+                                });
+                            }
+                        }
+                        if !extracted_calls.is_empty() {
+                            chunks.push(Ok(LlmChunk {
+                                delta: String::new(),
+                                is_final: false,
+                                is_thinking: false,
+                                tool_calls: extracted_calls,
+                            }));
+                        }
                     }
 
                     // Check for finish_reason to detect the final chunk.
@@ -471,6 +527,8 @@ pub fn parse_sse_chunks(text: &str, provider_id: &str) -> Vec<Result<LlmChunk>> 
                             chunks.push(Ok(LlmChunk {
                                 delta: String::new(),
                                 is_final: true,
+                                is_thinking: false,
+                                tool_calls: vec![],
                             }));
                         }
                     }
@@ -570,6 +628,10 @@ struct OpenAiRequestOut {
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<OpenAiTool>>,
     stream: bool,
+    /// Extra fields merged into the top-level request body.
+    /// Used for provider-specific parameters like Qwen's `enable_thinking`.
+    #[serde(flatten)]
+    extra: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -631,6 +693,7 @@ pub(crate) struct OpenAiChoice {
 #[derive(Debug, Deserialize)]
 pub(crate) struct OpenAiResponseMessage {
     pub content: Option<String>,
+    pub reasoning_content: Option<String>,
     pub tool_calls: Option<Vec<OpenAiToolCallIn>>,
 }
 

@@ -18,6 +18,49 @@ use athen_core::traits::tool::ToolRegistry;
 
 use crate::timeout::DefaultTimeoutGuard;
 
+/// Check if a text response is an empty JSON blob (e.g. `{"response": ""}`).
+///
+/// Clean up model responses that are wrapped in JSON or empty.
+///
+/// Small/local models sometimes output JSON like `{"response": "text"}` or
+/// `{"response": ""}` instead of plain natural language. This function:
+/// 1. Tries to parse as JSON object — extracts the first non-empty string value
+/// 2. If all values are empty or the string is empty, returns a default message
+/// 3. If not JSON, returns the original text as-is
+fn clean_model_response(text: &str) -> String {
+    let trimmed = text.trim();
+
+    // Not JSON → return as-is.
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        // Still handle completely empty text.
+        if trimmed.is_empty() {
+            return "I don't have enough information to answer that.".to_string();
+        }
+        return trimmed.to_string();
+    };
+
+    match value {
+        serde_json::Value::Object(map) => {
+            // Try to extract a meaningful text value from the JSON.
+            for v in map.values() {
+                if let serde_json::Value::String(s) = v {
+                    if !s.trim().is_empty() {
+                        return s.clone();
+                    }
+                }
+            }
+            // All values empty or no string values → model had nothing to say.
+            "I don't have enough information to answer that.".to_string()
+        }
+        serde_json::Value::String(s) if s.trim().is_empty() => {
+            "I don't have enough information to answer that.".to_string()
+        }
+        serde_json::Value::String(s) => s,
+        // Other JSON types (array, number, etc.) — just stringify.
+        other => other.to_string(),
+    }
+}
+
 /// LLM-driven executor that runs a task through iterative LLM calls,
 /// invoking tools as requested by the model until the task is complete.
 pub struct DefaultExecutor {
@@ -163,15 +206,28 @@ impl DefaultExecutor {
              5. Be concise in your final answer — report what you did and what you found.\n\
              6. If the user's message is ambiguous, make a reasonable choice and act on it.\n\
              7. When a system context message describes a calendar event or email, use that context — \
-                do not redundantly search the filesystem for information you already have.\n\n\
+                do not redundantly search the filesystem for information you already have.\n\
+             8. ALWAYS respond in natural language. NEVER output raw JSON. \
+                If you don't know the answer, say so naturally in the user's language.\n\n\
              BAD: \"I'll list the files for you.\" / \"Voy a listar los archivos.\" (announces without acting)\n\
              GOOD: [calls list_directory tool, then reports results]\n\n\
              BAD: \"Would you like me to...?\" / \"¿Quieres que...?\" (asks instead of doing)\n\
-             GOOD: [does the thing, reports what happened]",
+             GOOD: [does the thing, reports what happened]\n\n\
+             BAD: {\"response\": \"\"} (raw JSON output)\n\
+             GOOD: \"I don't have that information.\" / \"No tengo esa información.\"",
         );
 
         prompt
     }
+}
+
+/// Result from a streaming LLM call, containing collected text, thinking
+/// content, and any tool calls extracted from SSE chunks.
+struct StreamResult {
+    content: String,
+    #[allow(dead_code)]
+    thinking: String,
+    tool_calls: Vec<athen_core::llm::ToolCall>,
 }
 
 impl DefaultExecutor {
@@ -245,27 +301,40 @@ impl DefaultExecutor {
     }
 
     /// Attempt a streaming LLM call. Collects text deltas and forwards them
-    /// through `self.stream_sender`.
+    /// through `self.stream_sender`. Also collects tool calls from SSE chunks.
     ///
-    /// Returns `Ok(Some(content))` if the stream produced non-empty text
-    /// (indicating a final text response with no tool calls).
-    /// Returns `Ok(None)` if the collected text was empty (indicating a
-    /// tool-call response whose data is not available via streaming).
-    async fn try_streaming_call(&self, request: &LlmRequest) -> Result<Option<String>> {
+    /// Returns a `StreamResult` with the collected content, thinking text, and
+    /// tool calls. The caller decides how to proceed based on whether content
+    /// and/or tool calls are present.
+    async fn try_streaming_call(&self, request: &LlmRequest) -> Result<StreamResult> {
         let mut stream = self.llm_router.route_streaming(request).await?;
         let sender = self.stream_sender.as_ref();
         let mut collected = String::new();
+        let mut thinking = String::new();
+        let mut tool_calls_collected: Vec<athen_core::llm::ToolCall> = Vec::new();
 
         while let Some(chunk_result) = stream.next().await {
             match chunk_result {
                 Ok(chunk) => {
                     if !chunk.delta.is_empty() {
-                        collected.push_str(&chunk.delta);
-                        if let Some(tx) = sender {
-                            // Best-effort: if the receiver is dropped, we still
-                            // finish collecting the response text.
-                            let _ = tx.send(chunk.delta);
+                        if chunk.is_thinking {
+                            // Prefix with STX to mark as thinking content for the
+                            // stream forwarder.
+                            if let Some(tx) = sender {
+                                let _ = tx.send(format!("\x02{}", chunk.delta));
+                            }
+                            thinking.push_str(&chunk.delta);
+                        } else {
+                            collected.push_str(&chunk.delta);
+                            if let Some(tx) = sender {
+                                // Best-effort: if the receiver is dropped, we still
+                                // finish collecting the response text.
+                                let _ = tx.send(chunk.delta);
+                            }
                         }
+                    }
+                    if !chunk.tool_calls.is_empty() {
+                        tool_calls_collected.extend(chunk.tool_calls);
                     }
                 }
                 Err(e) => {
@@ -274,11 +343,18 @@ impl DefaultExecutor {
             }
         }
 
-        if collected.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(collected))
+        if !thinking.is_empty() {
+            tracing::debug!(
+                thinking_len = thinking.len(),
+                "collected reasoning/thinking content from stream"
+            );
         }
+
+        Ok(StreamResult {
+            content: collected,
+            thinking,
+            tool_calls: tool_calls_collected,
+        })
     }
 }
 
@@ -289,6 +365,7 @@ impl AgentExecutor for DefaultExecutor {
         let task_id = task.id;
         let mut steps_completed: u32 = 0;
         let mut has_been_judged = false;
+
         let mut tools_called: Vec<String> = Vec::new();
         let mut conversation: Vec<ChatMessage> = Vec::new();
 
@@ -401,11 +478,21 @@ impl AgentExecutor for DefaultExecutor {
                 // content in the stream), fall back to non-streaming to
                 // retrieve the tool call data.
                 match self.try_streaming_call(&request).await {
-                    Ok(Some(content)) => {
-                        // Successful streaming text response (no tool calls).
+                    Ok(result) if !result.content.is_empty() || !result.tool_calls.is_empty() => {
+                        // Got content and/or tool calls from streaming.
                         // Build a synthetic LlmResponse for the rest of the loop.
+                        let finish_reason = if result.tool_calls.is_empty() {
+                            athen_core::llm::FinishReason::Stop
+                        } else {
+                            athen_core::llm::FinishReason::ToolUse
+                        };
                         athen_core::llm::LlmResponse {
-                            content,
+                            content: result.content,
+                            reasoning_content: if result.thinking.is_empty() {
+                                None
+                            } else {
+                                Some(result.thinking)
+                            },
                             model_used: String::new(),
                             provider: String::new(),
                             usage: athen_core::llm::TokenUsage {
@@ -414,18 +501,45 @@ impl AgentExecutor for DefaultExecutor {
                                 total_tokens: 0,
                                 estimated_cost_usd: None,
                             },
-                            tool_calls: vec![],
-                            finish_reason: athen_core::llm::FinishReason::Stop,
+                            tool_calls: result.tool_calls,
+                            finish_reason,
                         }
                     }
-                    Ok(None) => {
-                        // Empty content from stream — likely a tool call response.
-                        // Fall back to non-streaming to get the full response
-                        // with tool call data.
-                        self.llm_router.route(&request).await?
+                    Ok(_) => {
+                        // No content AND no tool calls from stream — fall back to
+                        // non-streaming to get the full response.
+                        match self.llm_router.route(&request).await {
+                            Ok(resp) => resp,
+                            Err(e) => {
+                                tracing::warn!(
+                                    task_id = %task_id,
+                                    error = %e,
+                                    "non-streaming fallback failed after successful stream, using empty response"
+                                );
+                                athen_core::llm::LlmResponse {
+                                    content: String::new(),
+                                    reasoning_content: None,
+                                    model_used: String::new(),
+                                    provider: String::new(),
+                                    usage: athen_core::llm::TokenUsage {
+                                        prompt_tokens: 0,
+                                        completion_tokens: 0,
+                                        total_tokens: 0,
+                                        estimated_cost_usd: None,
+                                    },
+                                    tool_calls: vec![],
+                                    finish_reason: athen_core::llm::FinishReason::Stop,
+                                }
+                            }
+                        }
                     }
-                    Err(_) => {
-                        // Streaming failed — fall back to non-streaming.
+                    Err(e) => {
+                        tracing::warn!(
+                            task_id = %task_id,
+                            error = %e,
+                            "streaming call failed, falling back to non-streaming"
+                        );
+                        // Streaming failed entirely — fall back to non-streaming.
                         self.llm_router.route(&request).await?
                     }
                 }
@@ -452,6 +566,29 @@ impl AgentExecutor for DefaultExecutor {
             }
 
             if response.tool_calls.is_empty() {
+                // Clean up the response content: small models sometimes wrap
+                // their answer in JSON like {"response": "text"} or return
+                // empty JSON/empty strings. Fix it before proceeding.
+                let cleaned_content = clean_model_response(&response.content);
+
+                // Update the conversation with the cleaned content.
+                if cleaned_content != response.content {
+                    tracing::info!(
+                        task_id = %task_id,
+                        original = %response.content,
+                        cleaned = %cleaned_content,
+                        "cleaned up model response"
+                    );
+                    conversation.pop();
+                    conversation.push(ChatMessage {
+                        role: Role::Assistant,
+                        content: MessageContent::Text(cleaned_content.clone()),
+                    });
+                }
+
+                // Use the cleaned content from here on.
+                let response_content = cleaned_content;
+
                 // Completion judge: before accepting a text-only response as
                 // "done", ask a cheap LLM whether the task was actually
                 // completed.  This catches narration, false claims, and
@@ -459,7 +596,7 @@ impl AgentExecutor for DefaultExecutor {
                 if !available_tools.is_empty() && !has_been_judged {
                     let should_continue = self.judge_completion(
                         &task.description,
-                        &response.content,
+                        &response_content,
                         &tools_called,
                     ).await;
 
@@ -491,7 +628,7 @@ impl AgentExecutor for DefaultExecutor {
                     status: StepStatus::Completed,
                     started_at: Some(Utc::now()),
                     completed_at: Some(Utc::now()),
-                    output: Some(serde_json::json!({ "response": response.content })),
+                    output: Some(serde_json::json!({ "response": response_content })),
                     checkpoint: None,
                 };
 
@@ -507,7 +644,7 @@ impl AgentExecutor for DefaultExecutor {
                 return Ok(TaskResult {
                     task_id,
                     success: true,
-                    output: Some(serde_json::json!({ "response": response.content })),
+                    output: Some(serde_json::json!({ "response": response_content })),
                     steps_completed,
                     total_risk_used: 0,
                 });
@@ -634,6 +771,7 @@ mod tests {
             };
             LlmResponse {
                 content: content.to_string(),
+                reasoning_content: None,
                 model_used: "mock-model".to_string(),
                 provider: "mock".to_string(),
                 usage: TokenUsage {
@@ -1006,5 +1144,81 @@ mod tests {
             .and_then(|r| r.as_str())
             .unwrap();
         assert_eq!(reason, "cancelled");
+    }
+
+    #[test]
+    fn test_clean_model_response() {
+        // JSON with empty response → default message
+        assert_eq!(
+            clean_model_response(r#"{"response": ""}"#),
+            "I don't have enough information to answer that."
+        );
+        assert_eq!(
+            clean_model_response(r#"{}"#),
+            "I don't have enough information to answer that."
+        );
+        assert_eq!(
+            clean_model_response(r#"  {"response": ""}  "#),
+            "I don't have enough information to answer that."
+        );
+
+        // JSON with actual text → extract it
+        assert_eq!(
+            clean_model_response(r#"{"response": "hello world"}"#),
+            "hello world"
+        );
+        assert_eq!(
+            clean_model_response(r#"{"a": "", "b": "real answer"}"#),
+            "real answer"
+        );
+
+        // Plain text → pass through
+        assert_eq!(clean_model_response("just text"), "just text");
+        assert_eq!(clean_model_response("  spaced  "), "spaced");
+
+        // Empty string → default message
+        assert_eq!(
+            clean_model_response(""),
+            "I don't have enough information to answer that."
+        );
+        assert_eq!(
+            clean_model_response("   "),
+            "I don't have enough information to answer that."
+        );
+
+        // JSON string value
+        assert_eq!(clean_model_response(r#""hello""#), "hello");
+
+        // JSON array/number → stringify
+        assert_eq!(clean_model_response("[1,2,3]"), "[1,2,3]");
+    }
+
+    #[tokio::test]
+    async fn test_executor_cleans_json_response() {
+        // Model returns JSON blob — executor should extract the text.
+        let responses = vec![
+            MockLlmRouter::make_response(r#"{"response": ""}"#, vec![]),
+        ];
+
+        let executor = DefaultExecutor::new(
+            Box::new(MockLlmRouter::new(responses)),
+            Box::new(MockToolRegistry::empty()),
+            Box::new(InMemoryAuditor::new()),
+            10,
+            Duration::from_secs(60),
+            vec![],
+        );
+
+        let task = make_task("Tell me something");
+        let result = executor.execute(task).await.unwrap();
+
+        assert!(result.success);
+        let response = result
+            .output
+            .as_ref()
+            .and_then(|o| o.get("response"))
+            .and_then(|r| r.as_str())
+            .unwrap();
+        assert_eq!(response, "I don't have enough information to answer that.");
     }
 }

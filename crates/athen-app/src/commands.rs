@@ -245,16 +245,22 @@ pub(crate) fn spawn_stream_forwarder(
     let handle = app_handle.clone();
     tokio::spawn(async move {
         while let Some(delta) = rx.recv().await {
+            // Check for STX prefix (\x02) which marks thinking/reasoning content.
+            let (actual_delta, is_thinking) = if delta.starts_with('\x02') {
+                (delta['\x02'.len_utf8()..].to_string(), true)
+            } else {
+                (delta, false)
+            };
             let _ = handle.emit(
                 "agent-stream",
-                serde_json::json!({ "delta": delta, "is_final": false, "arc_id": arc_id }),
+                serde_json::json!({ "delta": actual_delta, "is_final": false, "arc_id": arc_id, "is_thinking": is_thinking }),
             );
         }
         // Channel closed -- emit a final marker so the frontend knows
         // the stream is complete.
         let _ = handle.emit(
             "agent-stream",
-            serde_json::json!({ "delta": "", "is_final": true, "arc_id": arc_id }),
+            serde_json::json!({ "delta": "", "is_final": true, "arc_id": arc_id, "is_thinking": false }),
         );
     });
     tx

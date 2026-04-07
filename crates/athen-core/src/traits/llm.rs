@@ -38,6 +38,8 @@ pub trait LlmRouter: Send + Sync {
         let chunk = LlmChunk {
             delta: response.content,
             is_final: true,
+            is_thinking: false,
+            tool_calls: vec![],
         };
         Ok(Box::pin(tokio_stream::once(Ok(chunk))))
     }

@@ -13,8 +13,12 @@ use athen_core::risk::{RiskContext, RiskDecision, RiskScore};
 use athen_core::task::Task;
 use athen_core::traits::coordinator::RiskEvaluator;
 
+use athen_core::contact::TrustLevel;
+use athen_core::risk::{BaseImpact, DataSensitivity, EvaluationMethod};
+
 use crate::llm_fallback::LlmRiskEvaluator;
 use crate::rules::RuleEngine;
+use crate::scorer::RiskScorer;
 
 /// Combined risk evaluator: tries fast regex rules first,
 /// falls back to LLM for ambiguous cases.
@@ -46,7 +50,27 @@ impl RiskEvaluator for CombinedRiskEvaluator {
             return Ok(score);
         }
 
-        // Step 2: Fall back to LLM for ambiguous cases.
+        // Step 2: If the user is the authenticated owner and rules found nothing
+        // dangerous, skip the LLM fallback entirely. The LLM risk check was
+        // designed for ambiguous external messages — direct user input from an
+        // authenticated user should never be flagged just because a small local
+        // model returns invalid JSON.
+        if context.trust_level == TrustLevel::AuthUser {
+            tracing::debug!(
+                task_id = %task.id,
+                "Rules inconclusive but sender is AuthUser, returning safe score"
+            );
+            let scorer = RiskScorer::new();
+            let safe_ctx = RiskContext {
+                trust_level: TrustLevel::AuthUser,
+                data_sensitivity: DataSensitivity::Plain,
+                llm_confidence: Some(1.0),
+                accumulated_risk: context.accumulated_risk,
+            };
+            return Ok(scorer.compute(BaseImpact::Read, &safe_ctx, EvaluationMethod::RuleBased));
+        }
+
+        // Step 3: Fall back to LLM for ambiguous cases from external sources.
         tracing::debug!(
             task_id = %task.id,
             "Rules inconclusive, falling back to LLM risk evaluation"
@@ -73,11 +97,10 @@ impl RiskEvaluator for CombinedRiskEvaluator {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use athen_core::contact::TrustLevel;
     use athen_core::llm::{
         BudgetStatus, FinishReason, LlmRequest, LlmResponse, TokenUsage,
     };
-    use athen_core::risk::{DataSensitivity, EvaluationMethod, RiskLevel};
+    use athen_core::risk::RiskLevel;
     use athen_core::task::{DomainType, Task, TaskPriority, TaskStatus};
     use athen_core::traits::llm::LlmRouter;
     use chrono::Utc;
@@ -100,6 +123,7 @@ mod tests {
         async fn route(&self, _request: &LlmRequest) -> Result<LlmResponse> {
             Ok(LlmResponse {
                 content: self.response_content.clone(),
+                reasoning_content: None,
                 model_used: "mock".to_string(),
                 provider: "mock".to_string(),
                 usage: TokenUsage {
@@ -174,7 +198,13 @@ mod tests {
         let evaluator = CombinedRiskEvaluator::new(LlmRiskEvaluator::new(Box::new(router)));
 
         let task = make_task("organize my photos into folders");
-        let ctx = default_ctx();
+        // Use a non-AuthUser trust level so the evaluator falls through to LLM
+        let ctx = RiskContext {
+            trust_level: TrustLevel::Known,
+            data_sensitivity: DataSensitivity::Plain,
+            llm_confidence: Some(1.0),
+            accumulated_risk: 0,
+        };
         let score = evaluator.evaluate(&task, &ctx).await.unwrap();
 
         assert_eq!(score.evaluation_method, EvaluationMethod::LlmAssisted);
@@ -198,6 +228,31 @@ mod tests {
 
         // System(90) * Unknown(5.0) * Plain(1) + 0 = 450 -> HardBlock
         assert!(evaluator.requires_approval(&score));
+    }
+
+    #[tokio::test]
+    async fn auth_user_benign_input_skips_llm() {
+        // The mock LLM returns invalid JSON — if the evaluator called it,
+        // the conservative fallback would produce a high score (HumanConfirm).
+        // But since the sender is AuthUser, the evaluator should skip the LLM
+        // and return a safe score directly.
+        let router = MockRouter::new("this is not valid json at all");
+        let evaluator = CombinedRiskEvaluator::new(LlmRiskEvaluator::new(Box::new(router)));
+
+        let task = make_task("Quien es mi novia?");
+        let ctx = RiskContext {
+            trust_level: TrustLevel::AuthUser,
+            data_sensitivity: DataSensitivity::Plain,
+            llm_confidence: Some(1.0),
+            accumulated_risk: 0,
+        };
+        let score = evaluator.evaluate(&task, &ctx).await.unwrap();
+
+        assert_eq!(score.level, RiskLevel::Safe);
+        assert_eq!(score.evaluation_method, EvaluationMethod::RuleBased);
+        assert!(!evaluator.requires_approval(&score));
+        // Read(1) * AuthUser(0.5) * Plain(1) + 0 = 0.5
+        assert!(score.total < 1.0, "Score should be ~0.5, got {}", score.total);
     }
 
     #[tokio::test]

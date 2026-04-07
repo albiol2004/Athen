@@ -27,6 +27,7 @@ imap = { workspace = true }
 rustls-connector = { workspace = true }
 rustls = { version = "0.23", features = ["aws_lc_rs"] }
 tokio-util = "0.7"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

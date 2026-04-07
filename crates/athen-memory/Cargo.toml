@@ -16,6 +16,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
 athen-core = { workspace = true }
+athen-llm = { path = "../athen-llm" }
 tokio = { workspace = true, features = ["full", "test-util"] }
 uuid = { workspace = true }
 chrono = { workspace = true }

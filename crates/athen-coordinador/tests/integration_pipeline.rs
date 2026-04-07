@@ -35,6 +35,7 @@ impl LlmRouter for MockLlmRouter {
     async fn route(&self, _request: &LlmRequest) -> Result<LlmResponse> {
         Ok(LlmResponse {
             content: r#"{"impact":"read","sensitivity":"plain","confidence":0.95}"#.to_string(),
+            reasoning_content: None,
             model_used: "mock-model".to_string(),
             provider: "mock-provider".to_string(),
             usage: TokenUsage {
