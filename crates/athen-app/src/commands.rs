@@ -28,7 +28,7 @@ use athen_persistence::arcs;
 use athen_persistence::calendar::CalendarEvent;
 
 use crate::app_tools::AppToolRegistry;
-
+use crate::notifier::NotificationInfo;
 use crate::state::{AppState, PendingApproval, SharedRouter};
 
 /// Convert a raw technical error string into a user-friendly message.
@@ -949,7 +949,12 @@ pub async fn switch_arc(
             .collect();
 
         *state.history.lock().await = history;
-        *state.active_arc_id.lock().await = arc_id;
+        *state.active_arc_id.lock().await = arc_id.clone();
+
+        // Mark any pending notifications for this arc as read.
+        if let Some(ref notifier) = state.notifier {
+            notifier.mark_arc_read(&arc_id).await;
+        }
 
         return Ok(entries
             .into_iter()
@@ -1178,6 +1183,43 @@ pub async fn mark_notification_seen(
 
     if let Some(ref notifier) = state.notifier {
         notifier.mark_seen(uuid).await;
+    }
+    Ok(())
+}
+
+/// Return all notifications, newest first.
+#[tauri::command]
+pub async fn list_notifications(
+    state: State<'_, AppState>,
+) -> std::result::Result<Vec<NotificationInfo>, String> {
+    if let Some(ref notifier) = state.notifier {
+        Ok(notifier.list_notifications().await)
+    } else {
+        Ok(vec![])
+    }
+}
+
+/// Mark a single notification as read (alias for mark_seen with a clearer name).
+#[tauri::command]
+pub async fn mark_notification_read(
+    state: State<'_, AppState>,
+    id: String,
+) -> std::result::Result<(), String> {
+    let uuid = Uuid::parse_str(&id)
+        .map_err(|e| format!("Invalid notification ID: {e}"))?;
+    if let Some(ref notifier) = state.notifier {
+        notifier.mark_read(uuid).await;
+    }
+    Ok(())
+}
+
+/// Mark all notifications as read.
+#[tauri::command]
+pub async fn mark_all_notifications_read(
+    state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    if let Some(ref notifier) = state.notifier {
+        notifier.mark_all_read().await;
     }
     Ok(())
 }

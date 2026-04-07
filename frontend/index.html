@@ -18,6 +18,11 @@
             </div>
             <div id="session-list" class="session-list"></div>
             <div class="sidebar-footer">
+                <button id="notifications-btn" class="sidebar-footer-btn" title="Notifications">
+                    <span class="sidebar-icon">&#128276;</span>
+                    <span>Notifications</span>
+                    <span id="notif-badge" class="notif-badge" style="display: none;">0</span>
+                </button>
                 <button id="contacts-btn" class="sidebar-footer-btn" title="Contacts">
                     <span class="contacts-icon">&#128100;</span>
                     <span>Contacts</span>
@@ -347,6 +352,21 @@
                         </div>
                     </div>
                 </div>
+            </div>
+        </div>
+
+        <div id="notifications-view" class="notifications-view hidden">
+            <header class="notifications-header">
+                <div class="header-left">
+                    <button id="notifications-back" class="settings-back-btn" title="Back">
+                        <span>&#8592;</span> Back
+                    </button>
+                </div>
+                <h2>Notifications</h2>
+                <button class="mark-all-btn" onclick="markAllNotificationsRead()">Mark all read</button>
+            </header>
+            <div id="notifications-list" class="notifications-list">
+                <p class="empty-state">No notifications yet</p>
             </div>
         </div>
 

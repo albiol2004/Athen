@@ -17,9 +17,24 @@ use uuid::Uuid;
 use athen_core::config::{NotificationChannelKind, NotificationConfig};
 use athen_core::error::Result;
 use athen_core::llm::{ChatMessage, LlmRequest, MessageContent, ModelProfile, Role};
-use athen_core::notification::{DeliveryResult, DeliveryStatus, Notification, NotificationUrgency};
+use athen_core::notification::{
+    DeliveryResult, DeliveryStatus, Notification, NotificationOrigin, NotificationUrgency,
+};
 use athen_core::traits::llm::LlmRouter;
 use athen_core::traits::notification::NotificationChannel;
+
+/// A notification with its read status, serializable for the frontend.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NotificationInfo {
+    pub id: String,
+    pub urgency: NotificationUrgency,
+    pub title: String,
+    pub body: String,
+    pub origin: NotificationOrigin,
+    pub arc_id: Option<String>,
+    pub created_at: String,
+    pub is_read: bool,
+}
 
 // ---------------------------------------------------------------------------
 // InAppChannel
@@ -199,6 +214,75 @@ impl NotificationOrchestrator {
         if let Some(pending) = self.pending.write().await.get_mut(&notification_id) {
             pending.status = DeliveryStatus::Seen;
         }
+    }
+
+    /// Return all notifications, newest first.
+    pub async fn list_notifications(&self) -> Vec<NotificationInfo> {
+        let pending = self.pending.read().await;
+        let mut notifs: Vec<NotificationInfo> = pending
+            .values()
+            .map(|pn| NotificationInfo {
+                id: pn.notification.id.to_string(),
+                urgency: pn.notification.urgency.clone(),
+                title: pn.notification.title.clone(),
+                body: pn.notification.body.clone(),
+                origin: pn.notification.origin.clone(),
+                arc_id: pn.notification.arc_id.clone(),
+                created_at: pn.notification.created_at.to_rfc3339(),
+                is_read: matches!(pn.status, DeliveryStatus::Seen),
+            })
+            .collect();
+        notifs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        notifs
+    }
+
+    /// Mark a single notification as read.
+    pub async fn mark_read(&self, notification_id: Uuid) {
+        self.mark_seen(notification_id).await;
+    }
+
+    /// Mark all notifications as read.
+    pub async fn mark_all_read(&self) {
+        // Cancel all escalation tokens.
+        let mut tokens = self.cancellation_tokens.write().await;
+        for (_, token) in tokens.drain() {
+            token.cancel();
+        }
+
+        // Mark all as Seen.
+        let mut pending = self.pending.write().await;
+        for pn in pending.values_mut() {
+            pn.status = DeliveryStatus::Seen;
+        }
+    }
+
+    /// Mark all notifications related to a specific arc as read.
+    ///
+    /// Called when the user switches to an arc or actively engages with it
+    /// (e.g. via Telegram owner message).
+    pub async fn mark_arc_read(&self, arc_id: &str) {
+        let ids_to_mark: Vec<Uuid> = {
+            let pending = self.pending.read().await;
+            pending
+                .values()
+                .filter(|pn| pn.notification.arc_id.as_deref() == Some(arc_id))
+                .filter(|pn| !matches!(pn.status, DeliveryStatus::Seen))
+                .map(|pn| pn.notification.id)
+                .collect()
+        };
+
+        for id in ids_to_mark {
+            self.mark_seen(id).await;
+        }
+    }
+
+    /// Count of unread notifications.
+    pub async fn unread_count(&self) -> usize {
+        let pending = self.pending.read().await;
+        pending
+            .values()
+            .filter(|pn| !matches!(pn.status, DeliveryStatus::Seen))
+            .count()
     }
 
     /// Flush any notifications queued during quiet hours.
@@ -862,5 +946,102 @@ mod tests {
         };
         let orch = NotificationOrchestrator::new(config, vec![]);
         assert!(!orch.is_quiet_hours());
+    }
+
+    fn make_notification_with_arc(
+        urgency: NotificationUrgency,
+        arc_id: Option<&str>,
+    ) -> Notification {
+        Notification {
+            id: Uuid::new_v4(),
+            urgency,
+            title: "Test".to_string(),
+            body: "Test body".to_string(),
+            origin: NotificationOrigin::System,
+            arc_id: arc_id.map(|s| s.to_string()),
+            task_id: None,
+            created_at: Utc::now(),
+            requires_response: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_notifications() {
+        let (orch, _inapp, _tg) = make_orchestrator(make_config());
+        orch.set_user_present(true);
+
+        let n1 = make_notification(NotificationUrgency::Low, false);
+        let n2 = make_notification(NotificationUrgency::High, false);
+        orch.notify(n1).await;
+
+        // Small sleep to ensure different timestamps.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        orch.notify(n2).await;
+
+        let list = orch.list_notifications().await;
+        assert_eq!(list.len(), 2);
+        // Newest first.
+        assert!(list[0].created_at >= list[1].created_at);
+    }
+
+    #[tokio::test]
+    async fn test_mark_arc_read() {
+        let (orch, _inapp, _tg) = make_orchestrator(make_config());
+        orch.set_user_present(true);
+
+        let n1 = make_notification_with_arc(NotificationUrgency::Medium, Some("arc1"));
+        let n2 = make_notification_with_arc(NotificationUrgency::Medium, Some("arc2"));
+        let n1_id = n1.id.to_string();
+        let n2_id = n2.id.to_string();
+
+        orch.notify(n1).await;
+        orch.notify(n2).await;
+
+        // Mark arc1 as read.
+        orch.mark_arc_read("arc1").await;
+
+        let list = orch.list_notifications().await;
+        let arc1_notif = list.iter().find(|n| n.id == n1_id).unwrap();
+        let arc2_notif = list.iter().find(|n| n.id == n2_id).unwrap();
+        assert!(arc1_notif.is_read);
+        assert!(!arc2_notif.is_read);
+    }
+
+    #[tokio::test]
+    async fn test_mark_all_read() {
+        let (orch, _inapp, _tg) = make_orchestrator(make_config());
+        orch.set_user_present(true);
+
+        orch.notify(make_notification(NotificationUrgency::Low, false))
+            .await;
+        orch.notify(make_notification(NotificationUrgency::Medium, false))
+            .await;
+        orch.notify(make_notification(NotificationUrgency::High, false))
+            .await;
+
+        orch.mark_all_read().await;
+
+        let list = orch.list_notifications().await;
+        assert_eq!(list.len(), 3);
+        assert!(list.iter().all(|n| n.is_read));
+    }
+
+    #[tokio::test]
+    async fn test_unread_count() {
+        let (orch, _inapp, _tg) = make_orchestrator(make_config());
+        orch.set_user_present(true);
+
+        let n1 = make_notification(NotificationUrgency::Low, false);
+        let n1_id = n1.id;
+        orch.notify(n1).await;
+        orch.notify(make_notification(NotificationUrgency::Medium, false))
+            .await;
+        orch.notify(make_notification(NotificationUrgency::High, false))
+            .await;
+
+        assert_eq!(orch.unread_count().await, 3);
+
+        orch.mark_read(n1_id).await;
+        assert_eq!(orch.unread_count().await, 2);
     }
 }

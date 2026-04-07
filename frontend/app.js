@@ -172,6 +172,11 @@ function initTauri() {
             window.__TAURI__.event.listen('notification', (event) => {
                 const data = event.payload;
                 showNotificationToast(data);
+                updateNotifBadge();
+                // If the user is viewing the notifications tab, refresh the list
+                if (notificationsView && !notificationsView.classList.contains('hidden')) {
+                    loadNotifications();
+                }
             });
 
             // Listen for sense events (email, calendar, messaging, etc.)
@@ -190,6 +195,7 @@ function initTauri() {
             activeArcId = sid;
             loadArcs();
             loadHistory();
+            updateNotifBadge();
         }).catch(() => {
             loadHistory();
         });
@@ -1396,6 +1402,7 @@ function showSettings() {
     timelineView?.classList.add('hidden');
     calendarView?.classList.add('hidden');
     contactsView?.classList.add('hidden');
+    notificationsView?.classList.add('hidden');
     document.getElementById('sidebar').style.display = '';
     if (timelineRefreshInterval) { clearInterval(timelineRefreshInterval); timelineRefreshInterval = null; }
     settingsView.classList.remove('hidden');
@@ -1408,6 +1415,7 @@ function showChat() {
     timelineView?.classList.add('hidden');
     calendarView?.classList.add('hidden');
     contactsView?.classList.add('hidden');
+    notificationsView?.classList.add('hidden');
     document.getElementById('sidebar').style.display = '';
     if (timelineRefreshInterval) { clearInterval(timelineRefreshInterval); timelineRefreshInterval = null; }
     appView.style.display = 'flex';
@@ -1867,7 +1875,7 @@ function showNotificationToast(data) {
                 handleSwitchArc(data.arc_id);
                 toast.remove();
                 if (data.id && invoke) {
-                    invoke('mark_notification_seen', { id: data.id }).catch(() => {});
+                    invoke('mark_notification_seen', { id: data.id }).then(() => updateNotifBadge()).catch(() => {});
                 }
             }
         });
@@ -2122,6 +2130,7 @@ function showTimeline() {
     settingsView.classList.add('hidden');
     calendarView?.classList.add('hidden');
     contactsView?.classList.add('hidden');
+    notificationsView?.classList.add('hidden');
     document.getElementById('sidebar').style.display = 'none';
     timelineView.classList.remove('hidden');
     renderTimeline();
@@ -2405,6 +2414,7 @@ function showCalendar() {
     settingsView.classList.add('hidden');
     timelineView?.classList.add('hidden');
     contactsView?.classList.add('hidden');
+    notificationsView?.classList.add('hidden');
     document.getElementById('sidebar').style.display = '';
     if (timelineRefreshInterval) { clearInterval(timelineRefreshInterval); timelineRefreshInterval = null; }
     calendarView.classList.remove('hidden');
@@ -3001,6 +3011,162 @@ document.getElementById('cal-event-category')?.addEventListener('change', (e) =>
     }
 });
 
+// ─── Notifications ───
+
+const notificationsView = document.getElementById('notifications-view');
+const notificationsBtn = document.getElementById('notifications-btn');
+const notificationsBack = document.getElementById('notifications-back');
+
+function showNotifications() {
+    appView.style.display = 'none';
+    settingsView.classList.add('hidden');
+    timelineView?.classList.add('hidden');
+    calendarView?.classList.add('hidden');
+    contactsView?.classList.add('hidden');
+    document.getElementById('sidebar').style.display = '';
+    if (timelineRefreshInterval) { clearInterval(timelineRefreshInterval); timelineRefreshInterval = null; }
+    notificationsView.classList.remove('hidden');
+    closeSidebar();
+    loadNotifications();
+}
+
+function hideNotifications() {
+    notificationsView.classList.add('hidden');
+    document.getElementById('sidebar').style.display = '';
+    appView.style.display = 'flex';
+    inputEl.focus();
+}
+
+async function loadNotifications() {
+    if (!invoke) return;
+    try {
+        const notifications = await invoke('list_notifications');
+        renderNotificationList(notifications);
+    } catch (e) {
+        console.error('Failed to load notifications:', e);
+    }
+}
+
+function renderNotificationList(notifications) {
+    const container = document.getElementById('notifications-list');
+
+    if (!notifications || notifications.length === 0) {
+        container.innerHTML = '<p class="empty-state">No notifications yet</p>';
+        return;
+    }
+
+    container.innerHTML = '';
+
+    for (const notif of notifications) {
+        const item = document.createElement('div');
+        item.className = 'notification-item' + (notif.is_read ? ' read' : ' unread');
+
+        const urgencyIcons = { Low: '\u2139\uFE0F', Medium: '\uD83D\uDCEC', High: '\u26A0\uFE0F', Critical: '\uD83D\uDEA8' };
+        const icon = urgencyIcons[notif.urgency] || '\uD83D\uDCEC';
+
+        const timeAgo = formatTimelineTime(new Date(notif.created_at).getTime());
+
+        // Build the item
+        const header = document.createElement('div');
+        header.className = 'notification-item-header';
+
+        const iconSpan = document.createElement('span');
+        iconSpan.className = 'notif-icon';
+        iconSpan.textContent = icon;
+
+        const textDiv = document.createElement('div');
+        textDiv.className = 'notif-text';
+
+        if (notif.title) {
+            const titleEl = document.createElement('div');
+            titleEl.className = 'notif-title';
+            titleEl.textContent = notif.title;
+            textDiv.appendChild(titleEl);
+        }
+
+        const bodyEl = document.createElement('div');
+        bodyEl.className = 'notif-body';
+        bodyEl.textContent = notif.body;
+        textDiv.appendChild(bodyEl);
+
+        const timeEl = document.createElement('span');
+        timeEl.className = 'notif-time';
+        timeEl.textContent = timeAgo;
+
+        header.appendChild(iconSpan);
+        header.appendChild(textDiv);
+        header.appendChild(timeEl);
+        item.appendChild(header);
+
+        // Actions row
+        const actions = document.createElement('div');
+        actions.className = 'notif-actions';
+
+        if (notif.arc_id) {
+            const openBtn = document.createElement('button');
+            openBtn.className = 'notif-action-btn';
+            openBtn.textContent = 'Open';
+            openBtn.addEventListener('click', () => {
+                handleSwitchArc(notif.arc_id);
+                hideNotifications();
+            });
+            actions.appendChild(openBtn);
+        }
+
+        if (!notif.is_read) {
+            const readBtn = document.createElement('button');
+            readBtn.className = 'notif-action-btn';
+            readBtn.textContent = 'Mark read';
+            readBtn.addEventListener('click', async () => {
+                await invoke('mark_notification_read', { id: notif.id });
+                item.classList.remove('unread');
+                item.classList.add('read');
+                readBtn.remove();
+                updateNotifBadge();
+            });
+            actions.appendChild(readBtn);
+        }
+
+        item.appendChild(actions);
+        container.appendChild(item);
+    }
+}
+
+async function updateNotifBadge() {
+    try {
+        const notifications = await invoke('list_notifications');
+        const unreadCount = notifications.filter(n => !n.is_read).length;
+        const badge = document.getElementById('notif-badge');
+        if (unreadCount > 0) {
+            badge.textContent = unreadCount;
+            badge.style.display = 'inline-flex';
+        } else {
+            badge.style.display = 'none';
+        }
+    } catch (e) {
+        // Ignore errors during badge updates
+    }
+}
+
+async function markAllNotificationsRead() {
+    try {
+        await invoke('mark_all_notifications_read');
+        loadNotifications();
+        updateNotifBadge();
+    } catch (e) {
+        console.error('Failed to mark all as read:', e);
+    }
+}
+
+// Notifications event listeners
+if (notificationsBtn) {
+    notificationsBtn.addEventListener('click', showNotifications);
+}
+
+if (notificationsBack) {
+    notificationsBack.addEventListener('click', hideNotifications);
+}
+
 // ─── Contacts ───
 
 const contactsView = document.getElementById('contacts-view');
@@ -3015,6 +3181,7 @@ function showContacts() {
     settingsView.classList.add('hidden');
     timelineView?.classList.add('hidden');
     calendarView?.classList.add('hidden');
+    notificationsView?.classList.add('hidden');
     document.getElementById('sidebar').style.display = '';
     if (timelineRefreshInterval) { clearInterval(timelineRefreshInterval); timelineRefreshInterval = null; }
     contactsView.classList.remove('hidden');

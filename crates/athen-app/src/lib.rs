@@ -58,6 +58,9 @@ pub fn run() {
             contacts::create_contact,
             contacts::update_contact,
             commands::mark_notification_seen,
+            commands::list_notifications,
+            commands::mark_notification_read,
+            commands::mark_all_notifications_read,
             settings::get_notification_settings,
             settings::save_notification_settings,
         ])

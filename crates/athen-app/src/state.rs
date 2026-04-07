@@ -437,6 +437,7 @@ impl AppState {
                                         &calendar_store_ref,
                                         &contact_store_ref,
                                         &app_handle,
+                                        notifier.as_ref(),
                                     )
                                     .await;
                                 }
@@ -499,6 +500,7 @@ async fn execute_owner_telegram_message(
     calendar_store: &Option<CalendarStore>,
     contact_store: &Option<SqliteContactStore>,
     app_handle: &tauri::AppHandle,
+    notifier: Option<&Arc<NotificationOrchestrator>>,
 ) {
     use std::time::Duration;
 
@@ -560,6 +562,12 @@ async fn execute_owner_telegram_message(
     } else {
         None
     };
+
+    // Mark any pending notifications for this arc as read — the owner is
+    // actively engaging via Telegram, so in-app notifications are redundant.
+    if let (Some(notifier), Some(ref arc_id)) = (notifier, &target_arc_id) {
+        notifier.mark_arc_read(arc_id).await;
+    }
 
     // Load conversation history from the arc for context continuity.
     let context = if let (Some(store), Some(ref arc_id)) = (arc_store, &target_arc_id) {
