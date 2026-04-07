@@ -20,6 +20,41 @@ use crate::timeout::DefaultTimeoutGuard;
 
 /// Check if a text response is an empty JSON blob (e.g. `{"response": ""}`).
 ///
+/// Extract `<think>...</think>` blocks from model output.
+///
+/// Some servers (llama.cpp, Ollama) embed chain-of-thought in the content
+/// field wrapped in `<think>` tags instead of using a separate
+/// `reasoning_content` field. This function splits the text into
+/// (content_without_think, thinking_text).
+fn extract_think_tags(text: &str) -> (String, String) {
+    let mut thinking = String::new();
+    let mut content = text.to_string();
+
+    // Extract all <think>...</think> blocks (greedy within each block).
+    while let Some(start) = content.find("<think>") {
+        if let Some(end) = content.find("</think>") {
+            let think_end = end + "</think>".len();
+            let think_content = &content[start + "<think>".len()..end];
+            if !thinking.is_empty() {
+                thinking.push('\n');
+            }
+            thinking.push_str(think_content.trim());
+            content = format!("{}{}", &content[..start], &content[think_end..]);
+        } else {
+            // Unclosed <think> tag — treat the rest as thinking.
+            let think_content = &content[start + "<think>".len()..];
+            if !thinking.is_empty() {
+                thinking.push('\n');
+            }
+            thinking.push_str(think_content.trim());
+            content = content[..start].to_string();
+            break;
+        }
+    }
+
+    (content.trim().to_string(), thinking)
+}
+
 /// Clean up model responses that are wrapped in JSON or empty.
 ///
 /// Small/local models sometimes output JSON like `{"response": "text"}` or
@@ -343,6 +378,17 @@ impl DefaultExecutor {
             }
         }
 
+        // Some servers embed thinking in content with <think>...</think> tags
+        // instead of using the separate reasoning_content field. Extract it.
+        let (final_content, inline_thinking) = extract_think_tags(&collected);
+        if !inline_thinking.is_empty() {
+            // Re-send the thinking through the stream forwarder so the UI shows it.
+            if let Some(tx) = sender {
+                let _ = tx.send(format!("\x02{}", inline_thinking));
+            }
+            thinking.push_str(&inline_thinking);
+        }
+
         if !thinking.is_empty() {
             tracing::debug!(
                 thinking_len = thinking.len(),
@@ -351,7 +397,7 @@ impl DefaultExecutor {
         }
 
         Ok(StreamResult {
-            content: collected,
+            content: final_content,
             thinking,
             tool_calls: tool_calls_collected,
         })
@@ -547,19 +593,30 @@ impl AgentExecutor for DefaultExecutor {
                 self.llm_router.route(&request).await?
             };
 
+            // Extract <think> tags from content (servers that embed thinking inline).
+            let (stripped_content, inline_think) = extract_think_tags(&response.content);
+            if !inline_think.is_empty() {
+                tracing::debug!(thinking_len = inline_think.len(), "extracted inline <think> tags");
+                // Forward thinking to UI via stream sender.
+                if let Some(ref tx) = self.stream_sender {
+                    let _ = tx.send(format!("\x02{}", inline_think));
+                }
+            }
+            let response_content_clean = stripped_content;
+
             // Add assistant response to conversation.
             // When the response includes tool calls, embed them in a Structured
             // message so downstream providers can reconstruct the API format.
             if response.tool_calls.is_empty() {
                 conversation.push(ChatMessage {
                     role: Role::Assistant,
-                    content: MessageContent::Text(response.content.clone()),
+                    content: MessageContent::Text(response_content_clean.clone()),
                 });
             } else {
                 conversation.push(ChatMessage {
                     role: Role::Assistant,
                     content: MessageContent::Structured(serde_json::json!({
-                        "text": response.content,
+                        "text": response_content_clean,
                         "tool_calls": response.tool_calls,
                     })),
                 });
@@ -569,10 +626,10 @@ impl AgentExecutor for DefaultExecutor {
                 // Clean up the response content: small models sometimes wrap
                 // their answer in JSON like {"response": "text"} or return
                 // empty JSON/empty strings. Fix it before proceeding.
-                let cleaned_content = clean_model_response(&response.content);
+                let cleaned_content = clean_model_response(&response_content_clean);
 
                 // Update the conversation with the cleaned content.
-                if cleaned_content != response.content {
+                if cleaned_content != response_content_clean {
                     tracing::info!(
                         task_id = %task_id,
                         original = %response.content,
@@ -1191,6 +1248,43 @@ mod tests {
 
         // JSON array/number → stringify
         assert_eq!(clean_model_response("[1,2,3]"), "[1,2,3]");
+    }
+
+    #[test]
+    fn test_extract_think_tags() {
+        // Basic think block
+        let (content, thinking) = extract_think_tags("<think>I need to consider this</think>Hello!");
+        assert_eq!(content, "Hello!");
+        assert_eq!(thinking, "I need to consider this");
+
+        // No think tags → pass through
+        let (content, thinking) = extract_think_tags("Just normal text");
+        assert_eq!(content, "Just normal text");
+        assert!(thinking.is_empty());
+
+        // Think with JSON response after
+        let (content, thinking) = extract_think_tags(
+            "<think>The user asks about X</think>{\"response\": \"\"}"
+        );
+        assert_eq!(content, "{\"response\": \"\"}");
+        assert_eq!(thinking, "The user asks about X");
+
+        // Only thinking, no content
+        let (content, thinking) = extract_think_tags("<think>Just thinking here</think>");
+        assert!(content.is_empty());
+        assert_eq!(thinking, "Just thinking here");
+
+        // Unclosed think tag
+        let (content, thinking) = extract_think_tags("<think>Still thinking...");
+        assert!(content.is_empty());
+        assert_eq!(thinking, "Still thinking...");
+
+        // Multiple think blocks
+        let (content, thinking) = extract_think_tags(
+            "<think>First thought</think>Middle<think>Second thought</think>End"
+        );
+        assert_eq!(content, "MiddleEnd");
+        assert_eq!(thinking, "First thought\nSecond thought");
     }
 
     #[tokio::test]
