@@ -168,6 +168,12 @@ function initTauri() {
                 loadArcs();
             });
 
+            // Listen for notifications from the agent
+            window.__TAURI__.event.listen('notification', (event) => {
+                const data = event.payload;
+                showNotificationToast(data);
+            });
+
             // Listen for sense events (email, calendar, messaging, etc.)
             window.__TAURI__.event.listen('sense-event', (event) => {
                 const { source, from, subject, body_preview,
@@ -1456,6 +1462,23 @@ async function loadSettings() {
             }
             toggleTelegramFields(settings.telegram.enabled);
         }
+
+        // Populate notification settings
+        if (settings.notifications) {
+            document.getElementById('notif-escalation-timeout').value = settings.notifications.escalation_timeout_secs || 300;
+            document.getElementById('notif-quiet-hours-enabled').checked = settings.notifications.quiet_hours_enabled;
+            if (settings.notifications.quiet_hours_enabled) {
+                document.getElementById('notif-quiet-start-hour').value = settings.notifications.quiet_start_hour;
+                document.getElementById('notif-quiet-start-minute').value = settings.notifications.quiet_start_minute;
+                document.getElementById('notif-quiet-end-hour').value = settings.notifications.quiet_end_hour;
+                document.getElementById('notif-quiet-end-minute').value = settings.notifications.quiet_end_minute;
+                document.getElementById('notif-quiet-allow-critical').checked = settings.notifications.quiet_allow_critical;
+                document.getElementById('quiet-hours-fields').style.display = 'block';
+            } else {
+                document.getElementById('quiet-hours-fields').style.display = 'none';
+            }
+            renderChannelOrder(settings.notifications.preferred_channels || []);
+        }
     } catch (err) {
         console.error('Failed to load settings:', err);
         showToast('Failed to load settings: ' + err, 'error');
@@ -1782,6 +1805,78 @@ function showToast(message, type) {
     }, 4000);
 }
 
+// ─── Notification Toasts ───
+
+function showNotificationToast(data) {
+    const toast = document.createElement('div');
+    toast.className = 'notification-toast';
+
+    const urgencyClass = 'urgency-' + (data.urgency || 'Medium').toLowerCase();
+    toast.classList.add(urgencyClass);
+
+    const icons = { Low: '\u2139\uFE0F', Medium: '\uD83D\uDCEC', High: '\u26A0\uFE0F', Critical: '\uD83D\uDEA8' };
+    const icon = icons[data.urgency] || '\uD83D\uDCEC';
+
+    const headerDiv = document.createElement('div');
+    headerDiv.className = 'toast-header';
+
+    const iconSpan = document.createElement('span');
+    iconSpan.className = 'toast-icon';
+    iconSpan.textContent = icon;
+
+    const titleSpan = document.createElement('span');
+    titleSpan.className = 'toast-title';
+    titleSpan.textContent = data.title || 'Notification';
+
+    const closeBtn = document.createElement('button');
+    closeBtn.className = 'toast-close';
+    closeBtn.textContent = '\u00D7';
+    closeBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        toast.remove();
+    });
+
+    headerDiv.appendChild(iconSpan);
+    headerDiv.appendChild(titleSpan);
+    headerDiv.appendChild(closeBtn);
+
+    const bodyDiv = document.createElement('div');
+    bodyDiv.className = 'toast-body';
+    bodyDiv.textContent = data.body || '';
+
+    toast.appendChild(headerDiv);
+    toast.appendChild(bodyDiv);
+
+    // Click to open the related arc
+    if (data.arc_id) {
+        toast.style.cursor = 'pointer';
+        toast.addEventListener('click', (e) => {
+            if (!e.target.classList.contains('toast-close')) {
+                handleSwitchArc(data.arc_id);
+                toast.remove();
+                if (data.id && invoke) {
+                    invoke('mark_notification_seen', { id: data.id }).catch(() => {});
+                }
+            }
+        });
+    }
+
+    // Auto-dismiss after 10s for Low/Medium, stay for High/Critical
+    const autoDismiss = !data.urgency || data.urgency === 'Low' || data.urgency === 'Medium';
+    if (autoDismiss) {
+        setTimeout(() => toast.remove(), 10000);
+    }
+
+    // Add to toast container
+    let container = document.getElementById('toast-container');
+    if (!container) {
+        container = document.createElement('div');
+        container.id = 'toast-container';
+        document.body.appendChild(container);
+    }
+    container.appendChild(toast);
+}
+
 // ─── Email Settings ───
 
 function toggleEmailFields(enabled) {
@@ -1916,6 +2011,92 @@ function showTelegramTestResult(success, message) {
     el.classList.remove('hidden');
     setTimeout(() => el.classList.add('hidden'), 5000);
 }
+
+// ─── Notification Settings ───
+
+function renderChannelOrder(channels) {
+    const container = document.getElementById('notif-channel-order');
+    if (!container) return;
+    container.innerHTML = '';
+    const allChannels = ['InApp', 'Telegram'];
+    const ordered = channels.length > 0 ? channels : allChannels;
+
+    ordered.forEach((ch, i) => {
+        const item = document.createElement('div');
+        item.className = 'channel-order-item';
+
+        const nameSpan = document.createElement('span');
+        nameSpan.className = 'channel-name';
+        nameSpan.textContent = ch === 'InApp' ? '\uD83D\uDDA5\uFE0F In-App' : '\uD83D\uDCF1 Telegram';
+
+        const buttonsDiv = document.createElement('div');
+        buttonsDiv.className = 'channel-order-buttons';
+
+        const upBtn = document.createElement('button');
+        upBtn.textContent = '\u25B2';
+        upBtn.disabled = i === 0;
+        upBtn.addEventListener('click', () => moveChannel(i, -1));
+
+        const downBtn = document.createElement('button');
+        downBtn.textContent = '\u25BC';
+        downBtn.disabled = i === ordered.length - 1;
+        downBtn.addEventListener('click', () => moveChannel(i, 1));
+
+        buttonsDiv.appendChild(upBtn);
+        buttonsDiv.appendChild(downBtn);
+        item.appendChild(nameSpan);
+        item.appendChild(buttonsDiv);
+        container.appendChild(item);
+    });
+
+    // Store the current order on the container for retrieval
+    container.dataset.order = JSON.stringify(ordered);
+}
+
+function moveChannel(index, direction) {
+    const container = document.getElementById('notif-channel-order');
+    if (!container) return;
+    const order = JSON.parse(container.dataset.order || '["InApp","Telegram"]');
+    const newIndex = index + direction;
+    if (newIndex < 0 || newIndex >= order.length) return;
+    const temp = order[index];
+    order[index] = order[newIndex];
+    order[newIndex] = temp;
+    renderChannelOrder(order);
+}
+
+function getChannelOrder() {
+    const container = document.getElementById('notif-channel-order');
+    if (!container || !container.dataset.order) return ['InApp', 'Telegram'];
+    return JSON.parse(container.dataset.order);
+}
+
+document.getElementById('notif-quiet-hours-enabled')?.addEventListener('change', function() {
+    document.getElementById('quiet-hours-fields').style.display = this.checked ? 'block' : 'none';
+});
+
+document.getElementById('save-notif-btn')?.addEventListener('click', async function() {
+    try {
+        const channels = getChannelOrder();
+        const quietEnabled = document.getElementById('notif-quiet-hours-enabled').checked;
+
+        await window.__TAURI__.core.invoke('save_notification_settings', {
+            preferredChannels: channels,
+            escalationTimeoutSecs: parseInt(document.getElementById('notif-escalation-timeout').value) || 300,
+            quietHoursEnabled: quietEnabled,
+            quietStartHour: quietEnabled ? parseInt(document.getElementById('notif-quiet-start-hour').value) || 22 : null,
+            quietStartMinute: quietEnabled ? parseInt(document.getElementById('notif-quiet-start-minute').value) || 0 : null,
+            quietEndHour: quietEnabled ? parseInt(document.getElementById('notif-quiet-end-hour').value) || 8 : null,
+            quietEndMinute: quietEnabled ? parseInt(document.getElementById('notif-quiet-end-minute').value) || 0 : null,
+            quietAllowCritical: quietEnabled ? document.getElementById('notif-quiet-allow-critical').checked : null,
+        });
+
+        showToast('Notification settings saved', 'success');
+    } catch (e) {
+        console.error('Failed to save notification settings:', e);
+        showToast('Failed to save notification settings: ' + e, 'error');
+    }
+});
 
 // ─── Arc Timeline ───
 

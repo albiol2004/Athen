@@ -10,7 +10,8 @@ use tauri::State;
 use tracing::{info, warn};
 
 use athen_core::config::{
-    AthenConfig, AuthType, ModelsConfig, ProviderConfig, SecurityMode,
+    AthenConfig, AuthType, ModelsConfig, NotificationChannelKind, NotificationConfig,
+    ProviderConfig, QuietHours, SecurityMode,
 };
 use athen_core::config_loader;
 
@@ -60,6 +61,19 @@ pub struct TelegramSettingsInfo {
     pub poll_interval_secs: u64,
 }
 
+/// Notification delivery configuration info for the frontend.
+#[derive(Debug, Clone, Serialize)]
+pub struct NotificationSettingsInfo {
+    pub preferred_channels: Vec<String>,
+    pub escalation_timeout_secs: u64,
+    pub quiet_hours_enabled: bool,
+    pub quiet_start_hour: u32,
+    pub quiet_start_minute: u32,
+    pub quiet_end_hour: u32,
+    pub quiet_end_minute: u32,
+    pub quiet_allow_critical: bool,
+}
+
 /// Full settings response for the frontend.
 #[derive(Debug, Clone, Serialize)]
 pub struct SettingsResponse {
@@ -68,6 +82,7 @@ pub struct SettingsResponse {
     pub security_mode: String,
     pub email: EmailSettingsInfo,
     pub telegram: TelegramSettingsInfo,
+    pub notifications: NotificationSettingsInfo,
 }
 
 /// Result of a provider connection test.
@@ -329,12 +344,44 @@ pub async fn get_settings(
         poll_interval_secs: main_config.telegram.poll_interval_secs,
     };
 
+    let notifications = {
+        let nc = &main_config.notifications;
+        let (qh_enabled, qh_start_h, qh_start_m, qh_end_h, qh_end_m, qh_critical) =
+            match &nc.quiet_hours {
+                Some(qh) => (
+                    true,
+                    qh.start_hour,
+                    qh.start_minute,
+                    qh.end_hour,
+                    qh.end_minute,
+                    qh.allow_critical,
+                ),
+                None => (false, 22, 0, 8, 0, true),
+            };
+
+        NotificationSettingsInfo {
+            preferred_channels: nc
+                .preferred_channels
+                .iter()
+                .map(|k| format!("{k:?}"))
+                .collect(),
+            escalation_timeout_secs: nc.escalation_timeout_secs,
+            quiet_hours_enabled: qh_enabled,
+            quiet_start_hour: qh_start_h,
+            quiet_start_minute: qh_start_m,
+            quiet_end_hour: qh_end_h,
+            quiet_end_minute: qh_end_m,
+            quiet_allow_critical: qh_critical,
+        }
+    };
+
     Ok(SettingsResponse {
         providers,
         active_provider: active,
         security_mode,
         email,
         telegram,
+        notifications,
     })
 }
 
@@ -974,6 +1021,103 @@ async fn test_openai_compatible(
         Err(format!("HTTP {}: {}", status, detail))
     }
 }
+
+// ---------------------------------------------------------------------------
+// Notification settings commands
+// ---------------------------------------------------------------------------
+
+/// Return the current notification settings.
+#[tauri::command]
+pub async fn get_notification_settings(
+    _state: State<'_, AppState>,
+) -> std::result::Result<NotificationSettingsInfo, String> {
+    let main_config = load_main_config();
+    let nc = &main_config.notifications;
+
+    let (qh_enabled, qh_start_h, qh_start_m, qh_end_h, qh_end_m, qh_critical) =
+        match &nc.quiet_hours {
+            Some(qh) => (
+                true,
+                qh.start_hour,
+                qh.start_minute,
+                qh.end_hour,
+                qh.end_minute,
+                qh.allow_critical,
+            ),
+            None => (false, 22, 0, 8, 0, true),
+        };
+
+    Ok(NotificationSettingsInfo {
+        preferred_channels: nc
+            .preferred_channels
+            .iter()
+            .map(|k| format!("{k:?}"))
+            .collect(),
+        escalation_timeout_secs: nc.escalation_timeout_secs,
+        quiet_hours_enabled: qh_enabled,
+        quiet_start_hour: qh_start_h,
+        quiet_start_minute: qh_start_m,
+        quiet_end_hour: qh_end_h,
+        quiet_end_minute: qh_end_m,
+        quiet_allow_critical: qh_critical,
+    })
+}
+
+/// Save notification delivery settings.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn save_notification_settings(
+    _state: State<'_, AppState>,
+    preferred_channels: Vec<String>,
+    escalation_timeout_secs: u64,
+    quiet_hours_enabled: bool,
+    quiet_start_hour: Option<u32>,
+    quiet_start_minute: Option<u32>,
+    quiet_end_hour: Option<u32>,
+    quiet_end_minute: Option<u32>,
+    quiet_allow_critical: Option<bool>,
+) -> std::result::Result<String, String> {
+    let mut config = load_main_config();
+
+    let channels: Vec<NotificationChannelKind> = preferred_channels
+        .iter()
+        .filter_map(|s| match s.to_lowercase().as_str() {
+            "inapp" | "in_app" => Some(NotificationChannelKind::InApp),
+            "telegram" => Some(NotificationChannelKind::Telegram),
+            _ => None,
+        })
+        .collect();
+
+    config.notifications = NotificationConfig {
+        preferred_channels: if channels.is_empty() {
+            vec![
+                NotificationChannelKind::InApp,
+                NotificationChannelKind::Telegram,
+            ]
+        } else {
+            channels
+        },
+        escalation_timeout_secs,
+        quiet_hours: if quiet_hours_enabled {
+            Some(QuietHours {
+                start_hour: quiet_start_hour.unwrap_or(22),
+                start_minute: quiet_start_minute.unwrap_or(0),
+                end_hour: quiet_end_hour.unwrap_or(8),
+                end_minute: quiet_end_minute.unwrap_or(0),
+                allow_critical: quiet_allow_critical.unwrap_or(true),
+            })
+        } else {
+            None
+        },
+    };
+
+    save_main_config(&config)?;
+    Ok("Notification settings saved. Restart to apply.".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Provider-specific test functions (continued)
+// ---------------------------------------------------------------------------
 
 async fn test_anthropic(
     client: &reqwest::Client,

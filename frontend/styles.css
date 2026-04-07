@@ -3037,3 +3037,149 @@ footer {
     border: 1px solid var(--border-subtle);
     border-radius: 6px;
 }
+
+/* ─── Notification Toasts ─── */
+#toast-container {
+    position: fixed;
+    top: 16px;
+    right: 16px;
+    z-index: 200;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-width: 380px;
+}
+
+.notification-toast {
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+    animation: toast-slide-in 0.3s ease;
+}
+
+.notification-toast.urgency-low {
+    border-color: var(--text-muted);
+}
+
+.notification-toast.urgency-medium {
+    border-color: var(--accent-blue);
+}
+
+.notification-toast.urgency-high {
+    border-color: var(--warning);
+}
+
+.notification-toast.urgency-critical {
+    border-color: var(--danger);
+    background: rgba(26, 27, 38, 0.95);
+}
+
+.toast-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 6px;
+}
+
+.toast-icon {
+    font-size: 16px;
+}
+
+.toast-title {
+    flex: 1;
+    font-weight: 600;
+    color: var(--text-primary);
+    font-size: 13px;
+}
+
+.toast-close {
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 18px;
+    padding: 0 4px;
+}
+
+.toast-close:hover {
+    color: var(--text-primary);
+}
+
+.toast-body {
+    color: var(--text-secondary);
+    font-size: 12px;
+    line-height: 1.4;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+}
+
+@keyframes toast-slide-in {
+    from { transform: translateX(100%); opacity: 0; }
+    to { transform: translateX(0); opacity: 1; }
+}
+
+/* ─── Notification Settings: Channel Order ─── */
+.channel-order-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 12px;
+    background: var(--bg-input);
+    border-radius: 6px;
+    margin-bottom: 4px;
+}
+
+.channel-name {
+    color: var(--text-primary);
+    font-size: 13px;
+}
+
+.channel-order-buttons {
+    display: flex;
+    gap: 4px;
+}
+
+.channel-order-buttons button {
+    background: var(--bg-primary);
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    border-radius: 4px;
+    padding: 2px 8px;
+    cursor: pointer;
+    font-size: 11px;
+}
+
+.channel-order-buttons button:hover:not(:disabled) {
+    background: var(--bg-surface);
+}
+
+.channel-order-buttons button:disabled {
+    opacity: 0.3;
+    cursor: default;
+}
+
+/* ─── Notification Settings: Time Input ─── */
+.settings-field-row {
+    display: flex;
+    gap: 16px;
+}
+
+.time-input {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.time-input input {
+    text-align: center;
+}
+
+.time-input span {
+    color: var(--text-secondary);
+    font-weight: bold;
+}

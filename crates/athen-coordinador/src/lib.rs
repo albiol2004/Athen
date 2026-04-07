@@ -121,8 +121,8 @@ impl Coordinator {
     /// 3. Evaluate risk for each task (using resolved trust)
     /// 4. Set status based on risk decision
     /// 5. Enqueue tasks that can proceed
-    /// 6. Return created task IDs
-    pub async fn process_event(&self, event: SenseEvent) -> Result<Vec<TaskId>> {
+    /// 6. Return created task IDs with their risk decisions
+    pub async fn process_event(&self, event: SenseEvent) -> Result<Vec<(TaskId, RiskDecision)>> {
         // Resolve trust level from the sender, if present and not a UserInput event.
         let (trust_level, contact_id) = match (&event.sender, &event.source) {
             (Some(sender), source) if *source != EventSource::UserInput => {
@@ -135,7 +135,7 @@ impl Coordinator {
         };
 
         let mut tasks = self.router.route(event).await?;
-        let mut task_ids = Vec::with_capacity(tasks.len());
+        let mut task_ids: Vec<(TaskId, RiskDecision)> = Vec::with_capacity(tasks.len());
 
         for task in &mut tasks {
             let context = RiskContext {
@@ -166,7 +166,7 @@ impl Coordinator {
                 }
             }
 
-            task_ids.push(task.id);
+            task_ids.push((task.id, decision));
 
             // Track contact for trust feedback on task completion.
             if let Some(cid) = contact_id {
@@ -448,9 +448,10 @@ mod tests {
         let coordinator = Coordinator::new(Box::new(MockRiskEvaluator::new(5.0)));
 
         let event = make_event(EventSource::UserInput);
-        let task_ids = coordinator.process_event(event).await.unwrap();
+        let results = coordinator.process_event(event).await.unwrap();
 
-        assert_eq!(task_ids.len(), 1);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1, RiskDecision::SilentApprove);
         // Task should be enqueued (low risk = Pending)
         assert_eq!(coordinator.queue.pending_count().await.unwrap(), 1);
     }
@@ -460,9 +461,10 @@ mod tests {
         let coordinator = Coordinator::new(Box::new(MockRiskEvaluator::new(60.0)));
 
         let event = make_event(EventSource::Email);
-        let task_ids = coordinator.process_event(event).await.unwrap();
+        let results = coordinator.process_event(event).await.unwrap();
 
-        assert_eq!(task_ids.len(), 1);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1, RiskDecision::HumanConfirm);
         // High risk task should NOT be enqueued (AwaitingApproval)
         assert_eq!(coordinator.queue.pending_count().await.unwrap(), 0);
     }
@@ -472,9 +474,10 @@ mod tests {
         let coordinator = Coordinator::new(Box::new(MockRiskEvaluator::new(95.0)));
 
         let event = make_event(EventSource::System);
-        let task_ids = coordinator.process_event(event).await.unwrap();
+        let results = coordinator.process_event(event).await.unwrap();
 
-        assert_eq!(task_ids.len(), 1);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1, RiskDecision::HardBlock);
         // Hard-blocked task should NOT be enqueued
         assert_eq!(coordinator.queue.pending_count().await.unwrap(), 0);
     }
@@ -559,9 +562,9 @@ mod tests {
         let coordinator = Coordinator::new(Box::new(MockRiskEvaluator::new(5.0)));
 
         let event = make_event_with_sender(EventSource::Email, "alice@example.com");
-        let task_ids = coordinator.process_event(event).await.unwrap();
+        let results = coordinator.process_event(event).await.unwrap();
 
-        assert_eq!(task_ids.len(), 1);
+        assert_eq!(results.len(), 1);
         assert_eq!(coordinator.queue.pending_count().await.unwrap(), 1);
     }
 
@@ -572,12 +575,12 @@ mod tests {
             Coordinator::new(Box::new(MockRiskEvaluator::new(5.0))).with_trust_manager(tm);
 
         let event = make_event_with_sender(EventSource::Email, "new@example.com");
-        let task_ids = coordinator.process_event(event).await.unwrap();
+        let results = coordinator.process_event(event).await.unwrap();
 
-        assert_eq!(task_ids.len(), 1);
+        assert_eq!(results.len(), 1);
         // Task should be tracked for trust feedback.
         let contacts = coordinator.task_contacts.lock().await;
-        assert!(contacts.contains_key(&task_ids[0]));
+        assert!(contacts.contains_key(&results[0].0));
     }
 
     #[tokio::test]
@@ -589,12 +592,12 @@ mod tests {
 
         // Even with a sender, UserInput should skip trust lookup.
         let event = make_event_with_sender(EventSource::UserInput, "user@local");
-        let task_ids = coordinator.process_event(event).await.unwrap();
+        let results = coordinator.process_event(event).await.unwrap();
 
-        assert_eq!(task_ids.len(), 1);
+        assert_eq!(results.len(), 1);
         // No contact should be tracked for UserInput events.
         let contacts = coordinator.task_contacts.lock().await;
-        assert!(!contacts.contains_key(&task_ids[0]));
+        assert!(!contacts.contains_key(&results[0].0));
     }
 
     #[tokio::test]

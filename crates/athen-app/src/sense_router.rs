@@ -6,18 +6,23 @@
 
 use std::sync::Arc;
 
+use chrono::Utc;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use athen_core::event::{EventSource, SenseEvent};
 use athen_core::llm::{
     ChatMessage as LlmChatMessage, LlmRequest, MessageContent as LlmContent,
     ModelProfile, Role as LlmRole,
 };
+use athen_core::notification::{Notification, NotificationOrigin, NotificationUrgency};
 use athen_core::traits::llm::LlmRouter;
 use athen_llm::router::DefaultLlmRouter;
 use athen_persistence::arcs::{ArcMeta, ArcSource, ArcStatus, ArcStore, EntryType};
+
+use crate::notifier::NotificationOrchestrator;
 
 /// Result of LLM triage for any sense event.
 pub struct SenseTriage {
@@ -51,6 +56,7 @@ pub async fn process_sense_event(
     router: &Arc<RwLock<Arc<DefaultLlmRouter>>>,
     arc_store: &Option<ArcStore>,
     app_handle: &AppHandle,
+    notifier: Option<&Arc<NotificationOrchestrator>>,
 ) -> bool {
     let source_name = source_display_name(&event.source);
     let summary = event.content.summary.as_deref().unwrap_or("(no subject)");
@@ -199,6 +205,36 @@ pub async fn process_sense_event(
             "event_id": event.id.to_string(),
         }),
     );
+
+    // Step 5: Notify through orchestrator channels.
+    if let Some(notifier) = notifier {
+        let urgency = match triage.relevance.as_str() {
+            "high" => NotificationUrgency::High,
+            "medium" => NotificationUrgency::Medium,
+            _ => NotificationUrgency::Low,
+        };
+
+        let title = format!("{}: {}", source_name, summary);
+        let body_notif = if body_preview.len() > 200 {
+            format!("{}...", &body_preview[..200])
+        } else {
+            body_preview.clone()
+        };
+
+        let notification = Notification {
+            id: Uuid::new_v4(),
+            urgency,
+            title,
+            body: body_notif,
+            origin: NotificationOrigin::SenseRouter,
+            arc_id: Some(arc_id.clone()),
+            task_id: None,
+            created_at: Utc::now(),
+            requires_response: false,
+        };
+
+        notifier.notify(notification).await;
+    }
 
     true
 }

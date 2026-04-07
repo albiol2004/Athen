@@ -6,6 +6,7 @@
 pub(crate) mod app_tools;
 mod commands;
 mod contacts;
+pub(crate) mod notifier;
 pub(crate) mod process;
 pub(crate) mod sense_router;
 mod settings;
@@ -56,6 +57,9 @@ pub fn run() {
             contacts::delete_contact,
             contacts::create_contact,
             contacts::update_contact,
+            commands::mark_notification_seen,
+            settings::get_notification_settings,
+            settings::save_notification_settings,
         ])
         .setup(|app| {
             use tauri::Manager;
@@ -69,12 +73,31 @@ pub fn run() {
                 state.coordinator.dispatcher().register_agent(agent_id).await;
             });
 
+            // Initialize the notification orchestrator (needs AppHandle for InApp channel).
+            state.init_notifier(app.handle().clone());
+
             // Start background monitor tasks before managing state.
             state.start_email_monitor(app.handle().clone());
             state.start_calendar_monitor(app.handle().clone());
             state.start_telegram_monitor(app.handle().clone());
 
             app.manage(state);
+
+            // Track window focus state for the notification orchestrator.
+            // When the window loses focus, the orchestrator routes notifications
+            // to external channels (Telegram) instead of in-app.
+            let state_ref = app.state::<AppState>();
+            let notifier_for_focus = state_ref.notifier.clone();
+            if let Some(window) = app.get_webview_window("main") {
+                window.on_window_event(move |event| {
+                    if let Some(ref notifier) = notifier_for_focus {
+                        if let tauri::WindowEvent::Focused(focused) = event {
+                            notifier.set_user_present(*focused);
+                        }
+                    }
+                });
+            }
+
             Ok(())
         })
         .run(tauri::generate_context!())

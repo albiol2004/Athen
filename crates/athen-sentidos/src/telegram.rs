@@ -314,6 +314,52 @@ impl SenseMonitor for TelegramMonitor {
 }
 
 // ---------------------------------------------------------------------------
+// Public utility: send a message via the Telegram Bot API
+// ---------------------------------------------------------------------------
+
+/// Send a text message to a Telegram chat via the Bot API.
+///
+/// Handles the 4096-character limit by splitting into multiple messages.
+pub async fn send_message(bot_token: &str, chat_id: i64, text: &str) -> std::result::Result<(), String> {
+    let client = reqwest::Client::new();
+    let url = format!("https://api.telegram.org/bot{}/sendMessage", bot_token);
+
+    // Telegram has a 4096 character limit per message.  Split if needed.
+    let chunks: Vec<&str> = if text.len() <= 4096 {
+        vec![text]
+    } else {
+        text.as_bytes()
+            .chunks(4096)
+            .map(|c| std::str::from_utf8(c).unwrap_or(""))
+            .collect()
+    };
+
+    for chunk in chunks {
+        if chunk.is_empty() {
+            continue;
+        }
+        let resp = client
+            .post(&url)
+            .json(&serde_json::json!({
+                "chat_id": chat_id,
+                "text": chunk,
+            }))
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|e| format!("Failed to send Telegram message: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("Telegram API error {status}: {body}"));
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

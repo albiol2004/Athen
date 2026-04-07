@@ -243,7 +243,7 @@ async fn main() {
 
         // Process through coordinator pipeline.
         let event = make_event(line);
-        let task_ids = match coordinator.process_event(event).await {
+        let task_results = match coordinator.process_event(event).await {
             Ok(ids) => ids,
             Err(e) => {
                 eprintln!("  Error: {e}");
@@ -251,7 +251,7 @@ async fn main() {
             }
         };
 
-        if task_ids.is_empty() {
+        if task_results.is_empty() {
             eprintln!("  No tasks created.");
             continue;
         }

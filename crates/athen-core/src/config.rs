@@ -15,6 +15,8 @@ pub struct AthenConfig {
     pub persistence: PersistenceConfig,
     pub email: EmailConfig,
     pub telegram: TelegramConfig,
+    #[serde(default)]
+    pub notifications: NotificationConfig,
 }
 
 impl Default for AthenConfig {
@@ -28,6 +30,7 @@ impl Default for AthenConfig {
             persistence: PersistenceConfig::default(),
             email: EmailConfig::default(),
             telegram: TelegramConfig::default(),
+            notifications: NotificationConfig::default(),
         }
     }
 }
@@ -255,6 +258,40 @@ impl Default for TelegramConfig {
             owner_user_id: None,
             allowed_chat_ids: Vec::new(),
             poll_interval_secs: default_telegram_poll_interval(),
+        }
+    }
+}
+
+/// Notification delivery configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotificationConfig {
+    pub preferred_channels: Vec<NotificationChannelKind>,
+    pub escalation_timeout_secs: u64,
+    pub quiet_hours: Option<QuietHours>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuietHours {
+    pub start_hour: u32,
+    pub start_minute: u32,
+    pub end_hour: u32,
+    pub end_minute: u32,
+    pub allow_critical: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum NotificationChannelKind {
+    InApp,
+    Telegram,
+}
+
+impl Default for NotificationConfig {
+    fn default() -> Self {
+        Self {
+            preferred_channels: vec![NotificationChannelKind::InApp, NotificationChannelKind::Telegram],
+            escalation_timeout_secs: 300,
+            quiet_hours: None,
         }
     }
 }

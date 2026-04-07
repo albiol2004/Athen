@@ -18,7 +18,8 @@ use tracing::warn;
 use athen_core::error::Result as AthenResult;
 use athen_core::event::*;
 use athen_core::llm::{ChatMessage, MessageContent, Role};
-use athen_core::risk::RiskLevel;
+use athen_core::notification::{Notification, NotificationOrigin, NotificationUrgency};
+use athen_core::risk::{RiskDecision, RiskLevel};
 use athen_core::task::{DomainType, Task, TaskId, TaskPriority, TaskStatus, TaskStep};
 use athen_core::traits::agent::{AgentExecutor, StepAuditor};
 use athen_core::traits::llm::LlmRouter;
@@ -300,7 +301,7 @@ pub async fn send_message(
     );
 
     // Route the event through the coordinator (risk + queue).
-    let task_ids = state
+    let task_results = state
         .coordinator
         .process_event(event)
         .await
@@ -310,7 +311,7 @@ pub async fn send_message(
             format_user_error(&raw)
         })?;
 
-    if task_ids.is_empty() {
+    if task_results.is_empty() {
         return Ok(ChatResponse {
             content: "No tasks created.".into(),
             risk_level: None,
@@ -318,6 +319,27 @@ pub async fn send_message(
             tool_calls: vec![],
             pending_approval: None,
         });
+    }
+
+    // Notify on NotifyAndProceed decisions (medium-risk auto-executed tasks).
+    let current_arc_for_notif = state.active_arc_id.lock().await.clone();
+    for (task_id, decision) in &task_results {
+        if matches!(decision, RiskDecision::NotifyAndProceed) {
+            if let Some(ref notifier) = state.notifier {
+                let notification = Notification {
+                    id: Uuid::new_v4(),
+                    urgency: NotificationUrgency::Medium,
+                    title: "Task auto-executed".to_string(),
+                    body: "A medium-risk task was automatically executed.".to_string(),
+                    origin: NotificationOrigin::RiskSystem,
+                    arc_id: Some(current_arc_for_notif.clone()),
+                    task_id: Some(*task_id),
+                    created_at: chrono::Utc::now(),
+                    requires_response: false,
+                };
+                notifier.notify(notification).await;
+            }
+        }
     }
 
     // Check if the task was flagged for human approval.
@@ -1139,4 +1161,23 @@ pub async fn delete_calendar_event(
     } else {
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Notification commands
+// ---------------------------------------------------------------------------
+
+/// Mark a notification as seen, cancelling any pending escalation.
+#[tauri::command]
+pub async fn mark_notification_seen(
+    state: State<'_, AppState>,
+    id: String,
+) -> std::result::Result<(), String> {
+    let uuid = Uuid::parse_str(&id)
+        .map_err(|e| format!("Invalid notification ID: {e}"))?;
+
+    if let Some(ref notifier) = state.notifier {
+        notifier.mark_seen(uuid).await;
+    }
+    Ok(())
 }

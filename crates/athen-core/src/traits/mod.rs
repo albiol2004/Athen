@@ -2,6 +2,7 @@ pub mod agent;
 pub mod coordinator;
 pub mod llm;
 pub mod memory;
+pub mod notification;
 pub mod persistence;
 pub mod sandbox;
 pub mod sense;

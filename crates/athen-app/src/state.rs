@@ -19,6 +19,9 @@ use athen_contacts::trust::TrustManager;
 use athen_persistence::contacts::SqliteContactStore;
 use athen_core::config::{AthenConfig, AuthType, ProfileConfig};
 use athen_core::config_loader;
+use athen_core::traits::notification::NotificationChannel;
+
+use crate::notifier::{InAppChannel, NotificationOrchestrator, TelegramChannel};
 use athen_core::error::Result;
 use athen_core::llm::{
     BudgetStatus, ChatMessage, LlmRequest, LlmResponse, LlmStream, MessageContent, ModelProfile,
@@ -103,6 +106,10 @@ pub struct AppState {
     pub email_shutdown: Option<tokio::sync::broadcast::Sender<()>>,
     /// Shutdown sender for the Telegram monitor background task.
     pub telegram_shutdown: Option<tokio::sync::broadcast::Sender<()>>,
+    /// Notification orchestrator for delivering notifications through the
+    /// best available channel (in-app, Telegram, etc.) with quiet-hours
+    /// support and escalation.  Initialized after setup via `init_notifier`.
+    pub notifier: Option<Arc<NotificationOrchestrator>>,
 }
 
 impl AppState {
@@ -160,7 +167,51 @@ impl AppState {
             cancel_flag: Arc::new(AtomicBool::new(false)),
             email_shutdown: None,
             telegram_shutdown: None,
+            notifier: None,
         }
+    }
+
+    /// Initialize the notification orchestrator.
+    ///
+    /// Must be called after `AppState::new()` but before `app.manage()`,
+    /// because it needs the Tauri `AppHandle` to create the `InAppChannel`.
+    /// Channels are built from the current config: InApp is always added,
+    /// Telegram is added only if the bot is configured with an owner.
+    pub fn init_notifier(&mut self, app_handle: tauri::AppHandle) {
+        let config = load_config();
+        let mut channels: Vec<Box<dyn NotificationChannel>> = Vec::new();
+
+        // InApp is always available.
+        channels.push(Box::new(InAppChannel::new(app_handle)));
+
+        // Add Telegram channel if the bot is configured and has an owner.
+        if config.telegram.enabled {
+            let token = &config.telegram.bot_token;
+            if let Some(owner_id) = config.telegram.owner_user_id {
+                if !token.is_empty() {
+                    channels.push(Box::new(TelegramChannel::new(
+                        token.clone(),
+                        owner_id,
+                    )));
+                }
+            }
+        }
+
+        // Re-order channels to match preferred order from config.
+        let preferred = &config.notifications.preferred_channels;
+        if !preferred.is_empty() {
+            channels.sort_by_key(|ch| {
+                preferred
+                    .iter()
+                    .position(|k| *k == ch.channel_kind())
+                    .unwrap_or(usize::MAX)
+            });
+        }
+
+        self.notifier = Some(Arc::new(NotificationOrchestrator::new(
+            config.notifications.clone(),
+            channels,
+        )));
     }
 
     /// Start the email monitor background polling task.
@@ -195,6 +246,7 @@ impl AppState {
         let email_config = config.clone();
         let router = Arc::clone(&self.router);
         let arc_store_ref = self._database.as_ref().map(|db| db.arc_store());
+        let notifier = self.notifier.clone();
 
         tauri::async_runtime::spawn(async move {
             if let Err(e) = monitor.init(&email_config).await {
@@ -216,6 +268,7 @@ impl AppState {
                                 &router,
                                 &arc_store_ref,
                                 &app_handle,
+                                notifier.as_ref(),
                             ).await;
                         }
                     }
@@ -255,6 +308,7 @@ impl AppState {
         let config = load_config();
         let router = Arc::clone(&self.router);
         let arc_store_ref = self._database.as_ref().map(|db| db.arc_store());
+        let notifier = self.notifier.clone();
 
         tauri::async_runtime::spawn(async move {
             if let Err(e) = monitor.init(&config).await {
@@ -275,6 +329,7 @@ impl AppState {
                                 &router,
                                 &arc_store_ref,
                                 &app_handle,
+                                notifier.as_ref(),
                             ).await;
                         }
                     }
@@ -326,6 +381,7 @@ impl AppState {
         let arc_store_ref = self._database.as_ref().map(|db| db.arc_store());
         let calendar_store_ref = self.calendar_store.clone();
         let contact_store_ref = self.contact_store.clone();
+        let notifier = self.notifier.clone();
 
         tauri::async_runtime::spawn(async move {
             if let Err(e) = monitor.init(&telegram_config).await {
@@ -389,6 +445,7 @@ impl AppState {
                                     &router,
                                     &arc_store_ref,
                                     &app_handle,
+                                    notifier.as_ref(),
                                 )
                                 .await;
                             }
@@ -674,43 +731,10 @@ async fn execute_owner_telegram_message(
 }
 
 /// Send a text message to a Telegram chat via the Bot API.
+///
+/// Delegates to [`athen_sentidos::telegram::send_message`].
 async fn send_telegram_reply(bot_token: &str, chat_id: i64, text: &str) -> std::result::Result<(), String> {
-    let url = format!("https://api.telegram.org/bot{}/sendMessage", bot_token);
-    let client = reqwest::Client::new();
-
-    // Telegram has a 4096 character limit per message.  Split if needed.
-    let chunks: Vec<&str> = if text.len() <= 4096 {
-        vec![text]
-    } else {
-        text.as_bytes()
-            .chunks(4096)
-            .map(|c| std::str::from_utf8(c).unwrap_or(""))
-            .collect()
-    };
-
-    for chunk in chunks {
-        if chunk.is_empty() {
-            continue;
-        }
-        let resp = client
-            .post(&url)
-            .json(&serde_json::json!({
-                "chat_id": chat_id,
-                "text": chunk,
-            }))
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
-            .map_err(|e| format!("HTTP error: {e}"))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("Telegram API error {status}: {body}"));
-        }
-    }
-
-    Ok(())
+    athen_sentidos::telegram::send_message(bot_token, chat_id, text).await
 }
 
 // ---------------------------------------------------------------------------

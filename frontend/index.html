@@ -234,6 +234,61 @@
                 </div>
                 <div id="telegram-test-result" class="test-result hidden"></div>
             </section>
+
+            <section class="settings-section">
+                <h2>Notifications</h2>
+                <p class="settings-description">Configure how Athen contacts you for important events and approvals.</p>
+
+                <div class="setting-row">
+                    <label>Channel Priority</label>
+                    <p class="setting-hint">Order in which channels are tried. First channel is preferred.</p>
+                    <div id="notif-channel-order"></div>
+                </div>
+
+                <div class="setting-row">
+                    <label for="notif-escalation-timeout">Escalation Timeout (seconds)</label>
+                    <input type="number" id="notif-escalation-timeout" class="settings-input" value="300" min="60" max="3600">
+                    <p class="setting-hint">Wait this long before trying the next channel when no response.</p>
+                </div>
+
+                <div class="setting-row">
+                    <label class="toggle-label">
+                        <input type="checkbox" id="notif-quiet-hours-enabled">
+                        <span>Enable Quiet Hours</span>
+                    </label>
+                </div>
+
+                <div id="quiet-hours-fields" style="display: none;">
+                    <div class="settings-field-row">
+                        <div class="setting-row">
+                            <label>Start</label>
+                            <div class="time-input">
+                                <input type="number" id="notif-quiet-start-hour" class="settings-input" value="22" min="0" max="23" style="width: 60px">
+                                <span>:</span>
+                                <input type="number" id="notif-quiet-start-minute" class="settings-input" value="0" min="0" max="59" style="width: 60px">
+                            </div>
+                        </div>
+                        <div class="setting-row">
+                            <label>End</label>
+                            <div class="time-input">
+                                <input type="number" id="notif-quiet-end-hour" class="settings-input" value="8" min="0" max="23" style="width: 60px">
+                                <span>:</span>
+                                <input type="number" id="notif-quiet-end-minute" class="settings-input" value="0" min="0" max="59" style="width: 60px">
+                            </div>
+                        </div>
+                    </div>
+                    <div class="setting-row">
+                        <label class="toggle-label">
+                            <input type="checkbox" id="notif-quiet-allow-critical" checked>
+                            <span>Allow critical notifications during quiet hours</span>
+                        </label>
+                    </div>
+                </div>
+
+                <div class="setting-actions">
+                    <button id="save-notif-btn" class="btn-primary">Save Notification Settings</button>
+                </div>
+            </section>
         </div>
     </div>
 

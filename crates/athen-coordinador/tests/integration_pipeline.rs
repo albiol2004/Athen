@@ -116,8 +116,8 @@ async fn test_user_input_flows_to_coordinator() {
     assert_eq!(event.source, EventSource::UserInput);
 
     // 5. Process the event through the coordinator.
-    let task_ids = coordinator.process_event(event).await.unwrap();
-    assert_eq!(task_ids.len(), 1, "expected exactly one task created");
+    let results = coordinator.process_event(event).await.unwrap();
+    assert_eq!(results.len(), 1, "expected exactly one task created");
 
     // 6. The task should be enqueued as Pending (benign input, low risk).
     //    Dequeue it to inspect its fields.
@@ -154,8 +154,8 @@ async fn test_dangerous_command_gets_blocked() {
         "sudo rm -rf /",
     );
 
-    let task_ids = coordinator.process_event(event).await.unwrap();
-    assert_eq!(task_ids.len(), 1);
+    let results = coordinator.process_event(event).await.unwrap();
+    assert_eq!(results.len(), 1);
 
     // The task should NOT be in the queue (it was blocked or held for approval).
     let pending = coordinator.queue().pending_count().await.unwrap();
@@ -240,8 +240,8 @@ async fn test_priority_ordering() {
         EventKind::NewMessage,
         "Meeting notes from today",
     );
-    let email_task_ids = coordinator.process_event(email_event).await.unwrap();
-    assert_eq!(email_task_ids.len(), 1);
+    let email_results = coordinator.process_event(email_event).await.unwrap();
+    assert_eq!(email_results.len(), 1);
 
     // Process a user input event second (High priority).
     let user_event = make_event(
@@ -249,8 +249,8 @@ async fn test_priority_ordering() {
         EventKind::Command,
         "summarize my day",
     );
-    let user_task_ids = coordinator.process_event(user_event).await.unwrap();
-    assert_eq!(user_task_ids.len(), 1);
+    let user_results = coordinator.process_event(user_event).await.unwrap();
+    assert_eq!(user_results.len(), 1);
 
     // Both tasks should be in the queue.
     assert_eq!(coordinator.queue().pending_count().await.unwrap(), 2);
@@ -258,7 +258,7 @@ async fn test_priority_ordering() {
     // First dispatch should return the High priority task (UserInput).
     let (first_task_id, _) = coordinator.dispatch_next().await.unwrap().unwrap();
     assert_eq!(
-        first_task_id, user_task_ids[0],
+        first_task_id, user_results[0].0,
         "High priority user input task should be dispatched first"
     );
 
@@ -268,7 +268,7 @@ async fn test_priority_ordering() {
     // Second dispatch should return the Normal priority task (Email).
     let (second_task_id, _) = coordinator.dispatch_next().await.unwrap().unwrap();
     assert_eq!(
-        second_task_id, email_task_ids[0],
+        second_task_id, email_results[0].0,
         "Normal priority email task should be dispatched second"
     );
 
