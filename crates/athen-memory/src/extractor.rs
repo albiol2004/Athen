@@ -124,7 +124,17 @@ fn parse_extraction_json(val: &serde_json::Value) -> ExtractionResult {
         .map(|arr| {
             arr.iter()
                 .filter_map(|e| {
-                    let name = e.get("name")?.as_str()?.to_string();
+                    let name = e.get("name")?.as_str()?.trim().to_string();
+                    // Filter out garbage: too short, tool names, generic words.
+                    if name.len() < 2
+                        || name.contains('_')
+                        || name.contains('(')
+                        || name.eq_ignore_ascii_case("user")
+                        || name.eq_ignore_ascii_case("assistant")
+                        || name.eq_ignore_ascii_case("system")
+                    {
+                        return None;
+                    }
                     let entity_type = parse_entity_type(
                         e.get("type").and_then(|v| v.as_str()).unwrap_or("Concept"),
                     );

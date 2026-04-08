@@ -106,6 +106,18 @@ impl VectorIndex for InMemoryVectorIndex {
         entries.retain(|e| e.id != id);
         Ok(())
     }
+
+    async fn list_all(&self) -> Result<Vec<SearchResult>> {
+        let entries = self.entries.read().await;
+        Ok(entries
+            .iter()
+            .map(|e| SearchResult {
+                id: e.id.clone(),
+                score: 1.0,
+                metadata: e.metadata.clone(),
+            })
+            .collect())
+    }
 }
 
 #[cfg(test)]

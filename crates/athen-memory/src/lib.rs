@@ -312,6 +312,77 @@ impl MemoryStore for Memory {
 }
 
 impl Memory {
+    /// List all stored memories for UI display.
+    pub async fn list_all(&self) -> Result<Vec<MemoryItem>> {
+        let results = self.vector.list_all().await?;
+        Ok(results
+            .into_iter()
+            .map(|r| {
+                let content = r
+                    .metadata
+                    .get("_content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                MemoryItem {
+                    id: r.id,
+                    content,
+                    metadata: r.metadata,
+                }
+            })
+            .collect())
+    }
+
+    /// Update a memory item's content (re-embeds automatically).
+    pub async fn update(&self, id: &str, new_content: &str) -> Result<()> {
+        let embedding = if let Some(ref embedder) = self.embedder {
+            embedder.embed(new_content).await?
+        } else {
+            vec![]
+        };
+        let metadata = serde_json::json!({
+            "_content": new_content,
+        });
+        self.vector.upsert(id, embedding, metadata).await
+    }
+
+    /// List all entities in the knowledge graph.
+    pub async fn list_entities(&self) -> Result<Vec<Entity>> {
+        self.graph.list_entities().await
+    }
+
+    /// List all relations in the knowledge graph.
+    pub async fn list_relations(
+        &self,
+    ) -> Result<Vec<(EntityId, String, String, EntityId, String)>> {
+        self.graph.list_relations().await
+    }
+
+    /// Update an entity's name and/or type.
+    pub async fn update_entity(
+        &self,
+        id: EntityId,
+        name: Option<String>,
+        entity_type: Option<EntityType>,
+    ) -> Result<()> {
+        self.graph.update_entity(id, name, entity_type).await
+    }
+
+    /// Delete an entity and all its relations.
+    pub async fn delete_entity(&self, id: EntityId) -> Result<()> {
+        self.graph.delete_entity(id).await
+    }
+
+    /// Delete a specific relation between two entities.
+    pub async fn delete_relation(
+        &self,
+        from: EntityId,
+        to: EntityId,
+        relation: &str,
+    ) -> Result<()> {
+        self.graph.delete_relation(from, to, relation).await
+    }
+
     /// Extract entities from manual metadata (Phase 1 fallback).
     async fn extract_entities_from_metadata(
         &self,

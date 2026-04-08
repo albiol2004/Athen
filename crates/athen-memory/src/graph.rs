@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use athen_core::error::Result;
 use athen_core::traits::memory::{
-    Entity, EntityId, ExploreParams, GraphEdge, GraphNode, KnowledgeGraph,
+    Entity, EntityId, EntityType, ExploreParams, GraphEdge, GraphNode, KnowledgeGraph,
 };
 
 pub(crate) struct Edge {
@@ -142,6 +142,66 @@ impl KnowledgeGraph for InMemoryGraph {
 
         Ok(result)
     }
+
+    async fn list_entities(&self) -> Result<Vec<Entity>> {
+        let entities = self.entities.read().await;
+        Ok(entities.values().cloned().collect())
+    }
+
+    async fn list_relations(&self) -> Result<Vec<(EntityId, String, String, EntityId, String)>> {
+        let entities = self.entities.read().await;
+        let edges = self.edges.read().await;
+        let mut result = Vec::new();
+        for edge in edges.iter() {
+            let from_name = entities
+                .get(&edge.from)
+                .map(|e| e.name.clone())
+                .unwrap_or_default();
+            let to_name = entities
+                .get(&edge.to)
+                .map(|e| e.name.clone())
+                .unwrap_or_default();
+            result.push((edge.from, from_name, edge.relation.clone(), edge.to, to_name));
+        }
+        Ok(result)
+    }
+
+    async fn update_entity(
+        &self,
+        id: EntityId,
+        name: Option<String>,
+        entity_type: Option<EntityType>,
+    ) -> Result<()> {
+        let mut entities = self.entities.write().await;
+        if let Some(entity) = entities.get_mut(&id) {
+            if let Some(new_name) = name {
+                entity.name = new_name;
+            }
+            if let Some(new_type) = entity_type {
+                entity.entity_type = new_type;
+            }
+        }
+        Ok(())
+    }
+
+    async fn delete_entity(&self, id: EntityId) -> Result<()> {
+        self.edges.write().await.retain(|e| e.from != id && e.to != id);
+        self.entities.write().await.remove(&id);
+        Ok(())
+    }
+
+    async fn delete_relation(
+        &self,
+        from: EntityId,
+        to: EntityId,
+        relation: &str,
+    ) -> Result<()> {
+        self.edges
+            .write()
+            .await
+            .retain(|e| !(e.from == from && e.to == to && e.relation == relation));
+        Ok(())
+    }
 }
 
 /// A shared wrapper around `InMemoryGraph` that allows inspecting internal state
@@ -187,6 +247,36 @@ impl KnowledgeGraph for SharedInMemoryGraph {
 
     async fn explore(&self, entry: EntityId, params: ExploreParams) -> Result<Vec<GraphNode>> {
         self.inner.explore(entry, params).await
+    }
+
+    async fn list_entities(&self) -> Result<Vec<Entity>> {
+        self.inner.list_entities().await
+    }
+
+    async fn list_relations(&self) -> Result<Vec<(EntityId, String, String, EntityId, String)>> {
+        self.inner.list_relations().await
+    }
+
+    async fn update_entity(
+        &self,
+        id: EntityId,
+        name: Option<String>,
+        entity_type: Option<EntityType>,
+    ) -> Result<()> {
+        self.inner.update_entity(id, name, entity_type).await
+    }
+
+    async fn delete_entity(&self, id: EntityId) -> Result<()> {
+        self.inner.delete_entity(id).await
+    }
+
+    async fn delete_relation(
+        &self,
+        from: EntityId,
+        to: EntityId,
+        relation: &str,
+    ) -> Result<()> {
+        self.inner.delete_relation(from, to, relation).await
     }
 }
 

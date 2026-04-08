@@ -21,6 +21,12 @@ pub trait VectorIndex: Send + Sync {
         top_k: usize,
     ) -> Result<Vec<SearchResult>>;
     async fn delete(&self, id: &str) -> Result<()>;
+
+    /// List all stored entries.
+    /// Default implementation returns empty (not all backends support this).
+    async fn list_all(&self) -> Result<Vec<SearchResult>> {
+        Ok(vec![])
+    }
 }
 
 /// Structured knowledge graph for entity relationships.
@@ -38,6 +44,43 @@ pub trait KnowledgeGraph: Send + Sync {
         entry: EntityId,
         params: ExploreParams,
     ) -> Result<Vec<GraphNode>>;
+
+    /// List all entities in the graph.
+    /// Default implementation returns empty (not all backends support this).
+    async fn list_entities(&self) -> Result<Vec<Entity>> {
+        Ok(vec![])
+    }
+
+    /// List all relations as (from_id, from_name, relation, to_id, to_name).
+    /// Default implementation returns empty.
+    async fn list_relations(&self) -> Result<Vec<(EntityId, String, String, EntityId, String)>> {
+        Ok(vec![])
+    }
+
+    /// Update an entity's name and/or type.
+    async fn update_entity(
+        &self,
+        _id: EntityId,
+        _name: Option<String>,
+        _entity_type: Option<EntityType>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Delete an entity and all its relations.
+    async fn delete_entity(&self, _id: EntityId) -> Result<()> {
+        Ok(())
+    }
+
+    /// Delete a specific relation between two entities.
+    async fn delete_relation(
+        &self,
+        _from: EntityId,
+        _to: EntityId,
+        _relation: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Unified memory facade.

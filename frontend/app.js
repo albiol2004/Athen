@@ -1474,6 +1474,7 @@ function showSettings() {
     calendarView?.classList.add('hidden');
     contactsView?.classList.add('hidden');
     notificationsView?.classList.add('hidden');
+    document.getElementById('memory-view')?.classList.add('hidden');
     document.getElementById('sidebar').style.display = '';
     if (timelineRefreshInterval) { clearInterval(timelineRefreshInterval); timelineRefreshInterval = null; }
     settingsView.classList.remove('hidden');
@@ -1487,6 +1488,7 @@ function showChat() {
     calendarView?.classList.add('hidden');
     contactsView?.classList.add('hidden');
     notificationsView?.classList.add('hidden');
+    document.getElementById('memory-view')?.classList.add('hidden');
     document.getElementById('sidebar').style.display = '';
     if (timelineRefreshInterval) { clearInterval(timelineRefreshInterval); timelineRefreshInterval = null; }
     appView.style.display = 'flex';
@@ -2332,6 +2334,7 @@ function showTimeline() {
     calendarView?.classList.add('hidden');
     contactsView?.classList.add('hidden');
     notificationsView?.classList.add('hidden');
+    document.getElementById('memory-view')?.classList.add('hidden');
     document.getElementById('sidebar').style.display = 'none';
     timelineView.classList.remove('hidden');
     renderTimeline();
@@ -2616,6 +2619,7 @@ function showCalendar() {
     timelineView?.classList.add('hidden');
     contactsView?.classList.add('hidden');
     notificationsView?.classList.add('hidden');
+    document.getElementById('memory-view')?.classList.add('hidden');
     document.getElementById('sidebar').style.display = '';
     if (timelineRefreshInterval) { clearInterval(timelineRefreshInterval); timelineRefreshInterval = null; }
     calendarView.classList.remove('hidden');
@@ -3224,6 +3228,7 @@ function showNotifications() {
     timelineView?.classList.add('hidden');
     calendarView?.classList.add('hidden');
     contactsView?.classList.add('hidden');
+    document.getElementById('memory-view')?.classList.add('hidden');
     document.getElementById('sidebar').style.display = '';
     if (timelineRefreshInterval) { clearInterval(timelineRefreshInterval); timelineRefreshInterval = null; }
     notificationsView.classList.remove('hidden');
@@ -3403,6 +3408,7 @@ function showContacts() {
     timelineView?.classList.add('hidden');
     calendarView?.classList.add('hidden');
     notificationsView?.classList.add('hidden');
+    document.getElementById('memory-view')?.classList.add('hidden');
     document.getElementById('sidebar').style.display = '';
     if (timelineRefreshInterval) { clearInterval(timelineRefreshInterval); timelineRefreshInterval = null; }
     contactsView.classList.remove('hidden');
@@ -3754,6 +3760,216 @@ if (contactsBack) {
 document.getElementById('contact-modal-overlay')?.addEventListener('click', function(e) {
     if (e.target === this) hideContactModal();
 });
+
+// ─── Memory ───
+
+const memoryView = document.getElementById('memory-view');
+const memoryBtn = document.getElementById('memory-btn');
+const memoryBack = document.getElementById('memory-back');
+
+function showMemory() {
+    appView.style.display = 'none';
+    settingsView.classList.add('hidden');
+    timelineView?.classList.add('hidden');
+    calendarView?.classList.add('hidden');
+    notificationsView?.classList.add('hidden');
+    contactsView?.classList.add('hidden');
+    document.getElementById('sidebar').style.display = '';
+    if (timelineRefreshInterval) { clearInterval(timelineRefreshInterval); timelineRefreshInterval = null; }
+    memoryView.classList.remove('hidden');
+    closeSidebar();
+    loadMemories();
+    loadEntities();
+}
+
+function hideMemory() {
+    memoryView.classList.add('hidden');
+    document.getElementById('sidebar').style.display = '';
+    appView.style.display = 'flex';
+    inputEl.focus();
+}
+
+async function loadMemories() {
+    if (!invoke) return;
+    try {
+        const items = await invoke('list_memories');
+        renderMemories(items);
+    } catch (e) {
+        console.error('Failed to load memories:', e);
+    }
+}
+
+function renderMemories(items) {
+    const container = document.getElementById('memories-list');
+    if (!items || items.length === 0) {
+        container.innerHTML = '<div class="empty-state">No memories stored yet. The agent will remember important information from your conversations.</div>';
+        return;
+    }
+
+    container.innerHTML = items.map(item => {
+        const timeAgo = formatTimelineTime(new Date(item.timestamp).getTime());
+        return '<div class="memory-card" data-id="' + escapeHtml(item.id) + '">' +
+            '<div class="memory-card-header">' +
+                '<span class="memory-type-badge ' + escapeHtml(item.memory_type) + '">' + escapeHtml(item.memory_type) + '</span>' +
+                '<span class="memory-source">' + escapeHtml(item.source) + '</span>' +
+                '<span class="memory-time">' + timeAgo + '</span>' +
+            '</div>' +
+            '<div class="memory-content">' + escapeHtml(item.content) + '</div>' +
+            '<div class="memory-actions">' +
+                '<button class="memory-edit-btn" onclick="editMemory(\'' + escapeHtml(item.id) + '\', this)">Edit</button>' +
+                '<button class="memory-delete-btn" onclick="deleteMemory(\'' + escapeHtml(item.id) + '\')">Delete</button>' +
+            '</div>' +
+        '</div>';
+    }).join('');
+}
+
+async function editMemory(id, btn) {
+    const card = btn.closest('.memory-card');
+    const contentEl = card.querySelector('.memory-content');
+
+    if (contentEl.contentEditable === 'true') {
+        // Save mode
+        const newContent = contentEl.textContent;
+        try {
+            await invoke('update_memory', { id: id, content: newContent });
+            btn.textContent = 'Edit';
+            contentEl.contentEditable = 'false';
+            contentEl.classList.remove('editing');
+        } catch (e) {
+            console.error('Failed to update memory:', e);
+            showToast('Failed to update memory: ' + e, 'error');
+        }
+    } else {
+        // Edit mode
+        contentEl.contentEditable = 'true';
+        contentEl.classList.add('editing');
+        contentEl.focus();
+        btn.textContent = 'Save';
+    }
+}
+
+async function deleteMemory(id) {
+    if (!confirm('Delete this memory?')) return;
+    try {
+        await invoke('delete_memory', { id: id });
+        loadMemories();
+    } catch (e) {
+        console.error('Failed to delete memory:', e);
+        showToast('Failed to delete memory: ' + e, 'error');
+    }
+}
+
+async function loadEntities() {
+    if (!invoke) return;
+    try {
+        const entities = await invoke('list_entities');
+        renderEntities(entities);
+    } catch (e) {
+        console.error('Failed to load entities:', e);
+    }
+}
+
+function renderEntities(entities) {
+    const container = document.getElementById('entities-list');
+    if (!entities || entities.length === 0) {
+        container.innerHTML = '<div class="empty-state">No entities discovered yet. The agent extracts people, organizations, and concepts from your conversations.</div>';
+        return;
+    }
+
+    container.innerHTML = entities.map(e => {
+        const typeClass = escapeHtml(e.entity_type.toLowerCase());
+        let inner = '';
+
+        // Entity ID
+        inner += '<div class="entity-id-row"><span class="entity-section-label">ID</span> <span class="entity-id-value">' + escapeHtml(e.id) + '</span></div>';
+
+        // Relations
+        if (e.relations && e.relations.length > 0) {
+            inner += '<div class="entity-relations">';
+            inner += '<div class="entity-section-label">Relations</div>';
+            e.relations.forEach(r => {
+                const arrow = r.direction === 'out' ? '→' : '←';
+                inner += '<div class="entity-relation-row">' +
+                    '<span class="relation-arrow">' + arrow + '</span>' +
+                    '<span class="relation-label">' + escapeHtml(r.relation) + '</span>' +
+                    '<span class="relation-target">' + escapeHtml(r.target_name) + '</span>' +
+                '</div>';
+            });
+            inner += '</div>';
+        } else {
+            inner += '<div class="entity-no-relations">No relations yet</div>';
+        }
+
+        // Metadata (skip empty objects)
+        if (e.metadata && Object.keys(e.metadata).length > 0) {
+            inner += '<div class="entity-metadata">';
+            inner += '<div class="entity-section-label">Metadata</div>';
+            inner += '<pre class="entity-meta-json">' + escapeHtml(JSON.stringify(e.metadata, null, 2)) + '</pre>';
+            inner += '</div>';
+        }
+
+        const detailsHtml = '<div class="entity-details">' + inner + '</div>';
+
+        return '<details class="entity-card" data-id="' + escapeHtml(e.id) + '">' +
+            '<summary class="entity-summary">' +
+                '<span class="entity-type-badge ' + typeClass + '">' + escapeHtml(e.entity_type) + '</span>' +
+                '<span class="entity-name">' + escapeHtml(e.name) + '</span>' +
+                (e.relations && e.relations.length > 0
+                    ? '<span class="entity-rel-count">' + e.relations.length + ' rel</span>'
+                    : '') +
+                '<button class="entity-delete-btn" onclick="event.preventDefault(); deleteEntity(\'' + escapeHtml(e.id) + '\')">×</button>' +
+            '</summary>' +
+            detailsHtml +
+        '</details>';
+    }).join('');
+}
+
+async function deleteEntity(id) {
+    if (!confirm('Delete this entity and its relations?')) return;
+    try {
+        await invoke('delete_entity', { id });
+        loadEntities();
+    } catch (e) {
+        console.error('Failed to delete entity:', e);
+        showToast({ urgency: 'high', title: 'Error', body: 'Failed to delete entity' });
+    }
+}
+
+function filterMemories(query) {
+    const cards = document.querySelectorAll('#memories-list .memory-card');
+    const lowerQuery = query.toLowerCase();
+    cards.forEach(card => {
+        const content = card.querySelector('.memory-content').textContent.toLowerCase();
+        const source = card.querySelector('.memory-source')?.textContent.toLowerCase() || '';
+        const matches = !lowerQuery || content.includes(lowerQuery) || source.includes(lowerQuery);
+        card.style.display = matches ? '' : 'none';
+    });
+}
+
+// Memory tab switching
+document.querySelectorAll('.memory-tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+        document.querySelectorAll('.memory-tab').forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+        const target = tab.dataset.tab;
+        document.getElementById('memories-panel').style.display = target === 'memories' ? '' : 'none';
+        document.getElementById('entities-panel').style.display = target === 'entities' ? '' : 'none';
+    });
+});
+
+// Memory search
+document.getElementById('memory-search-input')?.addEventListener('input', (e) => {
+    filterMemories(e.target.value);
+});
+
+// Memory event listeners
+if (memoryBtn) {
+    memoryBtn.addEventListener('click', showMemory);
+}
+
+if (memoryBack) {
+    memoryBack.addEventListener('click', hideMemory);
+}
 
 // ─── Initialize ───
 

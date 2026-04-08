@@ -75,6 +75,14 @@ pub fn run() {
             settings::save_notification_settings,
             settings::save_embedding_settings,
             settings::test_embedding_provider,
+            commands::list_memories,
+            commands::update_memory,
+            commands::delete_memory,
+            commands::list_entities,
+            commands::list_relations,
+            commands::update_entity,
+            commands::delete_entity,
+            commands::delete_relation,
         ])
         .setup(|app| {
             use tauri::Manager;

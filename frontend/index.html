@@ -31,6 +31,10 @@
                     <span class="calendar-icon">&#128197;</span>
                     <span>Calendar</span>
                 </button>
+                <button id="memory-btn" class="sidebar-footer-btn" title="Memory">
+                    <span class="memory-icon">&#129504;</span>
+                    <span>Memory</span>
+                </button>
                 <button id="settings-btn" class="sidebar-footer-btn" title="Settings">
                     <span class="settings-icon">&#9881;</span>
                     <span>Settings</span>
@@ -549,6 +553,35 @@
                             <button id="cal-modal-save" class="btn-primary">Save</button>
                         </div>
                     </div>
+                </div>
+            </div>
+        </div>
+
+        <div id="memory-view" class="memory-view hidden">
+            <header class="memory-header">
+                <div class="header-left">
+                    <button id="memory-back" class="settings-back-btn" title="Back">
+                        <span>&#8592;</span> Back
+                    </button>
+                </div>
+                <h2>Memory</h2>
+            </header>
+
+            <div class="memory-tabs">
+                <button class="memory-tab active" data-tab="memories">Memories</button>
+                <button class="memory-tab" data-tab="entities">Knowledge Graph</button>
+            </div>
+
+            <div id="memories-panel" class="memory-panel">
+                <div class="memory-search">
+                    <input type="text" id="memory-search-input" placeholder="Search memories..." />
+                </div>
+                <div id="memories-list" class="memories-list">
+                </div>
+            </div>
+
+            <div id="entities-panel" class="memory-panel" style="display: none;">
+                <div id="entities-list" class="entities-list">
                 </div>
             </div>
         </div>

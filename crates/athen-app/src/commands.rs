@@ -1425,3 +1425,225 @@ pub async fn delete_read_notifications(
         Ok(0)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Memory management commands
+// ---------------------------------------------------------------------------
+
+/// Serializable memory item for frontend display.
+#[derive(Serialize)]
+pub struct MemoryInfo {
+    pub id: String,
+    pub content: String,
+    pub source: String,
+    pub timestamp: String,
+    pub memory_type: String,
+}
+
+/// Serializable entity for frontend display.
+#[derive(Serialize)]
+pub struct EntityInfo {
+    pub id: String,
+    pub name: String,
+    pub entity_type: String,
+    pub metadata: serde_json::Value,
+    pub relations: Vec<EntityRelation>,
+}
+
+/// A relation shown inline on an entity card.
+#[derive(Serialize)]
+pub struct EntityRelation {
+    pub relation: String,
+    pub target_name: String,
+    pub direction: String, // "out" or "in"
+}
+
+/// Serializable relation for frontend display.
+#[derive(Serialize)]
+pub struct RelationInfo {
+    pub from_id: String,
+    pub from_name: String,
+    pub relation: String,
+    pub to_id: String,
+    pub to_name: String,
+}
+
+/// List all stored memories.
+#[tauri::command]
+pub async fn list_memories(
+    state: State<'_, AppState>,
+) -> std::result::Result<Vec<MemoryInfo>, String> {
+    let memory = state.memory.as_ref().ok_or("Memory not initialized")?;
+    let items = memory.list_all().await.map_err(|e| e.to_string())?;
+    Ok(items
+        .into_iter()
+        .map(|item| MemoryInfo {
+            id: item.id,
+            content: item.content,
+            source: item
+                .metadata
+                .get("source")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string(),
+            timestamp: item
+                .metadata
+                .get("timestamp")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            memory_type: if item.metadata.get("key").is_some() {
+                "keyword".to_string()
+            } else {
+                "semantic".to_string()
+            },
+        })
+        .collect())
+}
+
+/// Update a memory item's content.
+#[tauri::command]
+pub async fn update_memory(
+    state: State<'_, AppState>,
+    id: String,
+    content: String,
+) -> std::result::Result<(), String> {
+    let memory = state.memory.as_ref().ok_or("Memory not initialized")?;
+    memory.update(&id, &content).await.map_err(|e| e.to_string())
+}
+
+/// Delete a memory item.
+#[tauri::command]
+pub async fn delete_memory(
+    state: State<'_, AppState>,
+    id: String,
+) -> std::result::Result<(), String> {
+    let memory = state.memory.as_ref().ok_or("Memory not initialized")?;
+    memory.forget(&id).await.map_err(|e| e.to_string())
+}
+
+/// List all entities in the knowledge graph.
+#[tauri::command]
+pub async fn list_entities(
+    state: State<'_, AppState>,
+) -> std::result::Result<Vec<EntityInfo>, String> {
+    let memory = state.memory.as_ref().ok_or("Memory not initialized")?;
+    let entities = memory.list_entities().await.map_err(|e| e.to_string())?;
+    let all_relations = memory.list_relations().await.unwrap_or_default();
+
+    Ok(entities
+        .into_iter()
+        .map(|e| {
+            let eid = e.id.map(|id| id.to_string()).unwrap_or_default();
+            // Collect relations where this entity is involved.
+            let relations: Vec<EntityRelation> = all_relations
+                .iter()
+                .filter_map(|(from_id, from_name, relation, to_id, to_name)| {
+                    let fid = from_id.to_string();
+                    let tid = to_id.to_string();
+                    if fid == eid {
+                        Some(EntityRelation {
+                            relation: relation.clone(),
+                            target_name: to_name.clone(),
+                            direction: "out".to_string(),
+                        })
+                    } else if tid == eid {
+                        Some(EntityRelation {
+                            relation: relation.clone(),
+                            target_name: from_name.clone(),
+                            direction: "in".to_string(),
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            EntityInfo {
+                id: eid,
+                name: e.name,
+                entity_type: format!("{:?}", e.entity_type),
+                metadata: e.metadata,
+                relations,
+            }
+        })
+        .collect())
+}
+
+/// List all relations in the knowledge graph.
+#[tauri::command]
+pub async fn list_relations(
+    state: State<'_, AppState>,
+) -> std::result::Result<Vec<RelationInfo>, String> {
+    let memory = state.memory.as_ref().ok_or("Memory not initialized")?;
+    let relations = memory.list_relations().await.map_err(|e| e.to_string())?;
+    Ok(relations
+        .into_iter()
+        .map(|(from_id, from_name, relation, to_id, to_name)| RelationInfo {
+            from_id: from_id.to_string(),
+            from_name,
+            relation,
+            to_id: to_id.to_string(),
+            to_name,
+        })
+        .collect())
+}
+
+/// Update an entity's name and/or type.
+#[tauri::command]
+pub async fn update_entity(
+    state: State<'_, AppState>,
+    id: String,
+    name: Option<String>,
+    entity_type: Option<String>,
+) -> std::result::Result<(), String> {
+    let memory = state.memory.as_ref().ok_or("Memory not initialized")?;
+    let entity_id =
+        Uuid::parse_str(&id).map_err(|e| format!("Invalid entity ID: {e}"))?;
+    let parsed_type = entity_type.map(|t| match t.as_str() {
+        "Person" => athen_core::traits::memory::EntityType::Person,
+        "Organization" => athen_core::traits::memory::EntityType::Organization,
+        "Project" => athen_core::traits::memory::EntityType::Project,
+        "Event" => athen_core::traits::memory::EntityType::Event,
+        "Document" => athen_core::traits::memory::EntityType::Document,
+        _ => athen_core::traits::memory::EntityType::Concept,
+    });
+    memory
+        .update_entity(entity_id, name, parsed_type)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Delete an entity and all its relations.
+#[tauri::command]
+pub async fn delete_entity(
+    state: State<'_, AppState>,
+    id: String,
+) -> std::result::Result<(), String> {
+    let memory = state.memory.as_ref().ok_or("Memory not initialized")?;
+    let entity_id =
+        Uuid::parse_str(&id).map_err(|e| format!("Invalid entity ID: {e}"))?;
+    memory
+        .delete_entity(entity_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Delete a specific relation between two entities.
+#[tauri::command]
+pub async fn delete_relation(
+    state: State<'_, AppState>,
+    from_id: String,
+    to_id: String,
+    relation: String,
+) -> std::result::Result<(), String> {
+    let memory = state.memory.as_ref().ok_or("Memory not initialized")?;
+    let from =
+        Uuid::parse_str(&from_id).map_err(|e| format!("Invalid from entity ID: {e}"))?;
+    let to =
+        Uuid::parse_str(&to_id).map_err(|e| format!("Invalid to entity ID: {e}"))?;
+    memory
+        .delete_relation(from, to, &relation)
+        .await
+        .map_err(|e| e.to_string())
+}

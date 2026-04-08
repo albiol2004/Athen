@@ -136,6 +136,34 @@ impl VectorIndex for SqliteVectorIndex {
             .map_err(|e| AthenError::Other(e.to_string()))?;
         Ok(())
     }
+
+    async fn list_all(&self) -> Result<Vec<SearchResult>> {
+        let conn = self.conn.lock().map_err(|e| AthenError::Other(e.to_string()))?;
+        let mut stmt = conn
+            .prepare("SELECT id, metadata_json FROM vectors ORDER BY rowid DESC")
+            .map_err(|e| AthenError::Other(e.to_string()))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let meta_str: String = row.get(1)?;
+                Ok((id, meta_str))
+            })
+            .map_err(|e| AthenError::Other(e.to_string()))?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            let (id, meta_str) = row.map_err(|e| AthenError::Other(e.to_string()))?;
+            let metadata: serde_json::Value =
+                serde_json::from_str(&meta_str).unwrap_or(serde_json::Value::Null);
+            results.push(SearchResult {
+                id,
+                score: 1.0,
+                metadata,
+            });
+        }
+        Ok(results)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -219,10 +247,26 @@ fn edge_score(edge: &SqliteEdge, params: &ExploreParams) -> f32 {
 #[async_trait]
 impl KnowledgeGraph for SqliteGraph {
     async fn add_entity(&self, mut entity: Entity) -> Result<EntityId> {
+        let conn = self.conn.lock().map_err(|e| AthenError::Other(e.to_string()))?;
+
+        // Deduplicate by name: if an entity with the same name exists, return its ID.
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT id FROM entities WHERE name = ?1 COLLATE NOCASE LIMIT 1",
+                params![entity.name],
+                |row| row.get(0),
+            )
+            .ok();
+
+        if let Some(existing_id) = existing {
+            if let Ok(uuid) = Uuid::parse_str(&existing_id) {
+                return Ok(uuid);
+            }
+        }
+
         let id = entity.id.unwrap_or_else(Uuid::new_v4);
         entity.id = Some(id);
 
-        let conn = self.conn.lock().map_err(|e| AthenError::Other(e.to_string()))?;
         let type_str = entity_type_to_str(&entity.entity_type);
         let meta_json = serde_json::to_string(&entity.metadata)?;
 
@@ -380,6 +424,127 @@ impl KnowledgeGraph for SqliteGraph {
         }
 
         Ok(result)
+    }
+
+    async fn list_entities(&self) -> Result<Vec<Entity>> {
+        let conn = self.conn.lock().map_err(|e| AthenError::Other(e.to_string()))?;
+        let mut stmt = conn
+            .prepare("SELECT id, entity_type, name, metadata_json FROM entities")
+            .map_err(|e| AthenError::Other(e.to_string()))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let id_str: String = row.get(0)?;
+                let type_str: String = row.get(1)?;
+                let name: String = row.get(2)?;
+                let meta_str: String = row.get(3)?;
+                Ok((id_str, type_str, name, meta_str))
+            })
+            .map_err(|e| AthenError::Other(e.to_string()))?;
+
+        let mut entities = Vec::new();
+        for row in rows {
+            let (id_str, type_str, name, meta_str) =
+                row.map_err(|e| AthenError::Other(e.to_string()))?;
+            let id = Uuid::parse_str(&id_str)
+                .map_err(|e| AthenError::Other(e.to_string()))?;
+            let metadata: serde_json::Value =
+                serde_json::from_str(&meta_str).unwrap_or(serde_json::Value::Null);
+            entities.push(Entity {
+                id: Some(id),
+                entity_type: str_to_entity_type(&type_str),
+                name,
+                metadata,
+            });
+        }
+        Ok(entities)
+    }
+
+    async fn list_relations(&self) -> Result<Vec<(EntityId, String, String, EntityId, String)>> {
+        let conn = self.conn.lock().map_err(|e| AthenError::Other(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT e.from_entity, ef.name, e.relation, e.to_entity, et.name
+                 FROM edges e
+                 JOIN entities ef ON ef.id = e.from_entity
+                 JOIN entities et ON et.id = e.to_entity",
+            )
+            .map_err(|e| AthenError::Other(e.to_string()))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let from_str: String = row.get(0)?;
+                let from_name: String = row.get(1)?;
+                let relation: String = row.get(2)?;
+                let to_str: String = row.get(3)?;
+                let to_name: String = row.get(4)?;
+                Ok((from_str, from_name, relation, to_str, to_name))
+            })
+            .map_err(|e| AthenError::Other(e.to_string()))?;
+
+        let mut relations = Vec::new();
+        for row in rows {
+            let (from_str, from_name, relation, to_str, to_name) =
+                row.map_err(|e| AthenError::Other(e.to_string()))?;
+            let from_id = Uuid::parse_str(&from_str)
+                .map_err(|e| AthenError::Other(e.to_string()))?;
+            let to_id = Uuid::parse_str(&to_str)
+                .map_err(|e| AthenError::Other(e.to_string()))?;
+            relations.push((from_id, from_name, relation, to_id, to_name));
+        }
+        Ok(relations)
+    }
+
+    async fn update_entity(
+        &self,
+        id: EntityId,
+        name: Option<String>,
+        entity_type: Option<EntityType>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| AthenError::Other(e.to_string()))?;
+        if let Some(new_name) = &name {
+            conn.execute(
+                "UPDATE entities SET name = ?1 WHERE id = ?2",
+                params![new_name, id.to_string()],
+            )
+            .map_err(|e| AthenError::Other(e.to_string()))?;
+        }
+        if let Some(new_type) = &entity_type {
+            conn.execute(
+                "UPDATE entities SET entity_type = ?1 WHERE id = ?2",
+                params![entity_type_to_str(new_type), id.to_string()],
+            )
+            .map_err(|e| AthenError::Other(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    async fn delete_entity(&self, id: EntityId) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| AthenError::Other(e.to_string()))?;
+        let id_str = id.to_string();
+        conn.execute(
+            "DELETE FROM edges WHERE from_entity = ?1 OR to_entity = ?1",
+            params![id_str],
+        )
+        .map_err(|e| AthenError::Other(e.to_string()))?;
+        conn.execute("DELETE FROM entities WHERE id = ?1", params![id_str])
+            .map_err(|e| AthenError::Other(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn delete_relation(
+        &self,
+        from: EntityId,
+        to: EntityId,
+        relation: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| AthenError::Other(e.to_string()))?;
+        conn.execute(
+            "DELETE FROM edges WHERE from_entity = ?1 AND to_entity = ?2 AND relation = ?3",
+            params![from.to_string(), to.to_string(), relation],
+        )
+        .map_err(|e| AthenError::Other(e.to_string()))?;
+        Ok(())
     }
 }
 
