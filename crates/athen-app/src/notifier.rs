@@ -335,6 +335,7 @@ impl NotificationOrchestrator {
     }
 
     /// Count of unread notifications.
+    #[allow(dead_code)] // Will be used by periodic quiet-hours flushing
     pub async fn unread_count(&self) -> usize {
         if let Some(ref store) = self.store {
             match store.unread_count().await {
@@ -353,6 +354,7 @@ impl NotificationOrchestrator {
 
     /// Flush any notifications queued during quiet hours.
     /// Call this periodically or when quiet hours end.
+    #[allow(dead_code)] // Will be used by periodic quiet-hours flushing
     pub async fn flush_pending(self: &Arc<Self>) {
         if self.is_quiet_hours() {
             return;
@@ -747,6 +749,7 @@ mod tests {
             }
         }
 
+        #[allow(dead_code)]
         fn send_count(&self) -> usize {
             self.send_count.load(Ordering::Relaxed)
         }
