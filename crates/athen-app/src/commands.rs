@@ -23,6 +23,7 @@ use athen_core::risk::{RiskDecision, RiskLevel};
 use athen_core::task::{DomainType, Task, TaskId, TaskPriority, TaskStatus, TaskStep};
 use athen_core::traits::agent::{AgentExecutor, StepAuditor};
 use athen_core::traits::llm::LlmRouter;
+use athen_core::traits::memory::MemoryStore;
 use athen_agent::{AgentBuilder, InMemoryAuditor, ShellToolRegistry};
 use athen_persistence::arcs;
 use athen_persistence::calendar::CalendarEvent;
@@ -159,10 +160,15 @@ impl TauriAuditor {
     fn truncate_detail(s: &str, max_len: usize) -> String {
         let compacted = s.replace('\n', " ");
         let trimmed = compacted.trim();
-        if trimmed.len() <= max_len {
+        if trimmed.chars().count() <= max_len {
             trimmed.to_string()
         } else {
-            format!("{}...", &trimmed[..max_len])
+            let end: usize = trimmed
+                .char_indices()
+                .nth(max_len)
+                .map(|(i, _)| i)
+                .unwrap_or(trimmed.len());
+            format!("{}...", &trimmed[..end])
         }
     }
 }
@@ -398,13 +404,42 @@ pub async fn send_message(
     match dispatch_result {
         Ok(Some((task_id, _))) => {
             // Snapshot the current conversation history for context.
-            let context = state.history.lock().await.clone();
+            let mut context = state.history.lock().await.clone();
+
+            // Auto-inject relevant memories into context.
+            if let Some(ref memory) = state.memory {
+                match memory.recall(&message, 5).await {
+                    Ok(items) if !items.is_empty() => {
+                        tracing::info!(
+                            count = items.len(),
+                            "Injecting relevant memories into context"
+                        );
+                        let memory_text = items
+                            .iter()
+                            .map(|m| format!("- {}", m.content))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        context.insert(0, ChatMessage {
+                            role: Role::System,
+                            content: MessageContent::Text(format!(
+                                "Relevant information from your memory:\n{memory_text}"
+                            )),
+                        });
+                    }
+                    Ok(_) => {
+                        tracing::debug!("No relevant memories found for query");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Memory recall failed");
+                    }
+                }
+            }
 
             // Build executor with real tool execution (same as athen-cli).
             let exec_router: Box<dyn LlmRouter> =
                 Box::new(SharedRouter(Arc::clone(&state.router)));
             let shell_registry = ShellToolRegistry::new().await;
-            let registry = AppToolRegistry::new(shell_registry, state.calendar_store.clone(), state.contact_store.clone());
+            let registry = AppToolRegistry::new(shell_registry, state.calendar_store.clone(), state.contact_store.clone(), state.memory.clone());
 
             let auditor = TauriAuditor::new(app_handle.clone());
 
@@ -530,6 +565,23 @@ pub async fn send_message(
             persist_entry(&state, "user", &message, "message", None).await;
             persist_entry(&state, "assistant", &content, "message", None).await;
 
+            // Auto-remember the interaction in persistent memory.
+            if let Some(ref memory) = state.memory {
+                let memory_content = format!("User: {}\nAssistant: {}", message, content);
+                let item = athen_core::traits::memory::MemoryItem {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    content: memory_content,
+                    metadata: serde_json::json!({
+                        "source": "conversation",
+                        "arc_id": *state.active_arc_id.lock().await,
+                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                    }),
+                };
+                if let Err(e) = memory.remember(item).await {
+                    tracing::warn!("Failed to remember interaction: {e}");
+                }
+            }
+
             // Mark coordinator task as completed.
             let _ = state.coordinator.complete_task(task_id).await;
 
@@ -617,12 +669,41 @@ pub async fn approve_task(
     // Dispatch the now-enqueued task.
     match state.coordinator.dispatch_next().await {
         Ok(Some((coord_task_id, _))) => {
-            let context = state.history.lock().await.clone();
+            let mut context = state.history.lock().await.clone();
+
+            // Auto-inject relevant memories into context.
+            if let Some(ref memory) = state.memory {
+                match memory.recall(&message, 5).await {
+                    Ok(items) if !items.is_empty() => {
+                        tracing::info!(
+                            count = items.len(),
+                            "Injecting relevant memories into approved task context"
+                        );
+                        let memory_text = items
+                            .iter()
+                            .map(|m| format!("- {}", m.content))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        context.insert(0, ChatMessage {
+                            role: Role::System,
+                            content: MessageContent::Text(format!(
+                                "Relevant information from your memory:\n{memory_text}"
+                            )),
+                        });
+                    }
+                    Ok(_) => {
+                        tracing::debug!("No relevant memories found for approved task");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Memory recall failed for approved task");
+                    }
+                }
+            }
 
             let exec_router: Box<dyn LlmRouter> =
                 Box::new(SharedRouter(Arc::clone(&state.router)));
             let shell_registry = ShellToolRegistry::new().await;
-            let registry = AppToolRegistry::new(shell_registry, state.calendar_store.clone(), state.contact_store.clone());
+            let registry = AppToolRegistry::new(shell_registry, state.calendar_store.clone(), state.contact_store.clone(), state.memory.clone());
             let auditor = TauriAuditor::new(app_handle.clone());
 
             // Set up streaming for the approved task execution.
@@ -742,6 +823,23 @@ pub async fn approve_task(
             }
             persist_entry(&state, "user", &message, "message", None).await;
             persist_entry(&state, "assistant", &content, "message", None).await;
+
+            // Auto-remember the interaction in persistent memory.
+            if let Some(ref memory) = state.memory {
+                let memory_content = format!("User: {}\nAssistant: {}", message, content);
+                let item = athen_core::traits::memory::MemoryItem {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    content: memory_content,
+                    metadata: serde_json::json!({
+                        "source": "conversation",
+                        "arc_id": *state.active_arc_id.lock().await,
+                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                    }),
+                };
+                if let Err(e) = memory.remember(item).await {
+                    tracing::warn!("Failed to remember interaction: {e}");
+                }
+            }
 
             let _ = state.coordinator.complete_task(coord_task_id).await;
 

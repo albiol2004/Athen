@@ -13,6 +13,7 @@ athen-contacts = { workspace = true }
 athen-agent = { workspace = true }
 athen-sentidos = { workspace = true }
 athen-persistence = { workspace = true }
+athen-memory = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -26,6 +27,7 @@ reqwest = { workspace = true }
 imap = { workspace = true }
 rustls-connector = { workspace = true }
 rustls = { version = "0.23", features = ["aws_lc_rs"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 tokio-util = "0.7"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

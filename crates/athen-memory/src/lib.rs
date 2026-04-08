@@ -26,6 +26,9 @@ pub struct Memory {
     graph: Box<dyn KnowledgeGraph>,
     embedder: Option<Box<dyn EmbeddingProvider>>,
     extractor: Option<Box<dyn EntityExtractor>>,
+    /// Minimum relevance score for `recall()` results. Items below this
+    /// threshold are filtered out before the `limit` is applied.
+    min_relevance_score: f32,
 }
 
 impl Memory {
@@ -35,6 +38,7 @@ impl Memory {
             graph,
             embedder: None,
             extractor: None,
+            min_relevance_score: 0.3,
         }
     }
 
@@ -47,6 +51,13 @@ impl Memory {
     /// Attach an entity extractor for automatic knowledge graph population.
     pub fn with_extractor(mut self, extractor: Box<dyn EntityExtractor>) -> Self {
         self.extractor = Some(extractor);
+        self
+    }
+
+    /// Set the minimum relevance score for `recall()`. Results below this
+    /// threshold are discarded before the `limit` is applied. Default: 0.3.
+    pub fn with_min_score(mut self, score: f32) -> Self {
+        self.min_relevance_score = score;
         self
     }
 }
@@ -270,9 +281,10 @@ impl MemoryStore for Memory {
             .collect();
         sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Take top `limit` and convert to MemoryItems.
+        // Filter by minimum relevance score, then take top `limit`.
         let items = sorted
             .into_iter()
+            .filter(|(_, score, _)| *score >= self.min_relevance_score)
             .take(limit)
             .map(|(id, _score, metadata)| {
                 let content = metadata
@@ -414,7 +426,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_remember_multiple_and_recall() {
-        let mem = make_memory();
+        let mem = make_memory().with_min_score(0.0);
 
         let items = [
             ("item-0", "Rust programming language tutorial"),
@@ -450,7 +462,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_semantic_similarity_ranking() {
-        let mem = make_memory();
+        let mem = make_memory().with_min_score(0.0);
 
         mem.remember(MemoryItem {
             id: "rust".to_string(),

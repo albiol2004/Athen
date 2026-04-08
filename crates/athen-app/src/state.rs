@@ -35,6 +35,7 @@ use athen_llm::providers::llamacpp::LlamaCppProvider;
 use athen_llm::providers::ollama::OllamaProvider;
 use athen_llm::providers::openai::OpenAiCompatibleProvider;
 use athen_llm::router::DefaultLlmRouter;
+use athen_memory::Memory;
 use athen_persistence::arcs::ArcStore;
 use athen_persistence::calendar::CalendarStore;
 use athen_persistence::Database;
@@ -110,6 +111,10 @@ pub struct AppState {
     /// best available channel (in-app, Telegram, etc.) with quiet-hours
     /// support and escalation.  Initialized after setup via `init_notifier`.
     pub notifier: Option<Arc<NotificationOrchestrator>>,
+    /// Persistent semantic memory (vector search + knowledge graph).
+    /// Used for auto-injecting relevant context before LLM calls and
+    /// auto-remembering important interactions after task completion.
+    pub memory: Option<Arc<Memory>>,
 }
 
 impl AppState {
@@ -149,6 +154,9 @@ impl AppState {
         }
         let (active_arc_id, history) = restore_or_create_arc(&arc_store).await;
 
+        // Build persistent memory (vector search + knowledge graph).
+        let memory = build_memory(&router).await;
+
         Self {
             coordinator,
             router,
@@ -168,6 +176,7 @@ impl AppState {
             email_shutdown: None,
             telegram_shutdown: None,
             notifier: None,
+            memory,
         }
     }
 
@@ -395,6 +404,7 @@ impl AppState {
         let arc_store_ref = self._database.as_ref().map(|db| db.arc_store());
         let calendar_store_ref = self.calendar_store.clone();
         let contact_store_ref = self.contact_store.clone();
+        let memory_ref = self.memory.clone();
         let notifier = self.notifier.clone();
 
         tauri::async_runtime::spawn(async move {
@@ -447,6 +457,7 @@ impl AppState {
                                         &arc_store_ref,
                                         &calendar_store_ref,
                                         &contact_store_ref,
+                                        &memory_ref,
                                         &app_handle,
                                         notifier.as_ref(),
                                     )
@@ -510,6 +521,7 @@ async fn execute_owner_telegram_message(
     arc_store: &Option<ArcStore>,
     calendar_store: &Option<CalendarStore>,
     contact_store: &Option<SqliteContactStore>,
+    memory: &Option<Arc<Memory>>,
     app_handle: &tauri::AppHandle,
     notifier: Option<&Arc<NotificationOrchestrator>>,
 ) {
@@ -609,7 +621,7 @@ async fn execute_owner_telegram_message(
     let exec_router: Box<dyn athen_core::traits::llm::LlmRouter> =
         Box::new(SharedRouter(Arc::clone(router)));
     let shell_registry = ShellToolRegistry::new().await;
-    let registry = AppToolRegistry::new(shell_registry, calendar_store.clone(), contact_store.clone());
+    let registry = AppToolRegistry::new(shell_registry, calendar_store.clone(), contact_store.clone(), memory.clone());
     let auditor = TauriAuditor::new(app_handle.clone());
     let stream_tx = spawn_stream_forwarder(app_handle, target_arc_id.clone());
     let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1100,4 +1112,68 @@ async fn build_coordinator_with_persistence(
     }
 
     (coordinator, None, None)
+}
+
+/// Build the persistent memory system (vector search + knowledge graph)
+/// backed by a separate SQLite connection to `~/.athen/athen.db`.
+///
+/// Uses keyword embeddings as fallback (always available, near-instant)
+/// and an LLM entity extractor for automatic knowledge graph population.
+/// Returns `None` if the data directory or database cannot be opened.
+async fn build_memory(
+    router: &Arc<RwLock<Arc<DefaultLlmRouter>>>,
+) -> Option<Arc<Memory>> {
+    use athen_llm::embeddings::router::EmbeddingRouter;
+    use athen_memory::extractor::LlmEntityExtractor;
+    use athen_memory::sqlite::{SqliteGraph, SqliteVectorIndex};
+
+    let data_dir = ensure_data_dir()?;
+    let db_path = data_dir.join("athen.db");
+
+    // Open a separate rusqlite connection for the memory subsystem.
+    // Memory uses std::sync::Mutex while Database uses tokio::sync::Mutex,
+    // so they cannot share a connection. SQLite handles concurrent access
+    // from multiple connections to the same file safely.
+    let conn = match rusqlite::Connection::open(&db_path) {
+        Ok(c) => {
+            // Enable WAL mode for better concurrent access.
+            let _ = c.execute_batch("PRAGMA journal_mode=WAL;");
+            c
+        }
+        Err(e) => {
+            warn!("Failed to open memory database at {}: {e}", db_path.display());
+            return None;
+        }
+    };
+
+    let conn = std::sync::Arc::new(std::sync::Mutex::new(conn));
+
+    let vector = match SqliteVectorIndex::new(conn.clone()) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("Failed to create vector index: {e}");
+            return None;
+        }
+    };
+    let graph = match SqliteGraph::new(conn) {
+        Ok(g) => g,
+        Err(e) => {
+            warn!("Failed to create knowledge graph: {e}");
+            return None;
+        }
+    };
+
+    // Use keyword embeddings as the default fallback (always available).
+    let embedding_router = EmbeddingRouter::new(vec![]);
+    // LLM entity extractor for automatic knowledge graph population.
+    let extractor_router: Box<dyn LlmRouter> =
+        Box::new(SharedRouter(Arc::clone(router)));
+    let extractor = LlmEntityExtractor::new(extractor_router);
+
+    let memory = Memory::new(Box::new(vector), Box::new(graph))
+        .with_embedder(Box::new(embedding_router))
+        .with_extractor(Box::new(extractor));
+
+    info!("Memory system initialized with SQLite persistence");
+    Some(Arc::new(memory))
 }

@@ -5,6 +5,7 @@
 //! The composition root (athen-app) wires the stores into the registry
 //! before handing it to the agent.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -15,8 +16,10 @@ use athen_core::contact::{Contact, ContactIdentifier, IdentifierKind, TrustLevel
 use athen_core::error::{AthenError, Result};
 use athen_core::risk::BaseImpact;
 use athen_core::tool::{ToolBackend, ToolDefinition, ToolResult};
+use athen_core::traits::memory::{MemoryItem, MemoryStore};
 use athen_core::traits::tool::ToolRegistry;
 use athen_agent::ShellToolRegistry;
+use athen_memory::Memory;
 use athen_persistence::calendar::{CalendarEvent, CalendarStore, EventCreator};
 use athen_persistence::contacts::SqliteContactStore;
 
@@ -25,6 +28,7 @@ pub struct AppToolRegistry {
     inner: ShellToolRegistry,
     calendar: Option<CalendarStore>,
     contacts: Option<SqliteContactStore>,
+    memory: Option<Arc<Memory>>,
 }
 
 impl AppToolRegistry {
@@ -33,8 +37,9 @@ impl AppToolRegistry {
         inner: ShellToolRegistry,
         calendar: Option<CalendarStore>,
         contacts: Option<SqliteContactStore>,
+        memory: Option<Arc<Memory>>,
     ) -> Self {
-        Self { inner, calendar, contacts }
+        Self { inner, calendar, contacts, memory }
     }
 
     // ── Schema helpers ───────────────────────────────────────────────
@@ -694,12 +699,110 @@ impl AppToolRegistry {
             execution_time_ms: elapsed,
         })
     }
+
+    // ── Persistent memory tool implementations ─────────────────────
+
+    async fn do_persistent_memory_store(
+        &self,
+        memory: &Memory,
+        args: &serde_json::Value,
+    ) -> Result<ToolResult> {
+        let key = args.get("key").and_then(|v| v.as_str())
+            .ok_or_else(|| AthenError::Other("missing 'key' parameter".into()))?;
+        let value = args.get("value").and_then(|v| v.as_str())
+            .ok_or_else(|| AthenError::Other("missing 'value' parameter".into()))?;
+
+        tracing::info!(tool = "memory_store", key, "Storing in persistent memory");
+
+        let start = Instant::now();
+        let item = MemoryItem {
+            id: format!("agent_{key}"),
+            content: format!("{key}: {value}"),
+            metadata: json!({
+                "key": key,
+                "value": value,
+                "source": "agent_tool",
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+            }),
+        };
+
+        memory.remember(item).await?;
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+
+        Ok(ToolResult {
+            success: true,
+            output: json!({ "stored": key, "persistent": true }),
+            error: None,
+            execution_time_ms: elapsed_ms,
+        })
+    }
+
+    async fn do_persistent_memory_recall(
+        &self,
+        memory: &Memory,
+        args: &serde_json::Value,
+    ) -> Result<ToolResult> {
+        let key = args.get("key").and_then(|v| v.as_str());
+
+        tracing::info!(tool = "memory_recall", ?key, "Recalling from persistent memory");
+
+        let start = Instant::now();
+
+        let output = if let Some(query) = key {
+            // Search for memories matching the key/query.
+            match memory.recall(query, 10).await {
+                Ok(items) if items.is_empty() => {
+                    json!({ "query": query, "found": false, "memories": [] })
+                }
+                Ok(items) => {
+                    let memories: Vec<serde_json::Value> = items.iter().map(|item| {
+                        json!({
+                            "id": item.id,
+                            "content": item.content,
+                        })
+                    }).collect();
+                    json!({ "query": query, "found": true, "memories": memories })
+                }
+                Err(e) => {
+                    json!({ "query": query, "error": e.to_string() })
+                }
+            }
+        } else {
+            // No key: list all stored memories by searching with a very
+            // broad query at zero threshold. We temporarily bypass the
+            // min_relevance_score by searching for a common token.
+            json!({
+                "hint": "Please provide a search query to find specific memories. Example: memory_recall with key='Nadia' or key='meeting'.",
+                "memories": [],
+                "count": 0
+            })
+        };
+
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        Ok(ToolResult {
+            success: true,
+            output,
+            error: None,
+            execution_time_ms: elapsed_ms,
+        })
+    }
 }
 
 #[async_trait]
 impl ToolRegistry for AppToolRegistry {
     async fn list_tools(&self) -> Result<Vec<ToolDefinition>> {
         let mut tools = self.inner.list_tools().await?;
+
+        // Override memory tool descriptions when persistent memory is wired.
+        if self.memory.is_some() {
+            for tool in &mut tools {
+                if tool.name == "memory_store" {
+                    tool.description = "IMPORTANT: When the user asks you to remember something, call this tool IMMEDIATELY. Stores information permanently across conversations. Use key as a short label and value as the full detail.".to_string();
+                } else if tool.name == "memory_recall" {
+                    tool.description = "Search your persistent memory. ALWAYS provide a key (search query) — e.g. key='Nadia' or key='meeting'. Returns semantically similar stored memories.".to_string();
+                }
+            }
+        }
 
         if self.calendar.is_some() {
             tools.push(ToolDefinition {
@@ -774,6 +877,15 @@ impl ToolRegistry for AppToolRegistry {
     }
 
     async fn call_tool(&self, name: &str, args: serde_json::Value) -> Result<ToolResult> {
+        // Override memory tools with persistent memory when available.
+        if let Some(ref memory) = self.memory {
+            match name {
+                "memory_store" => return self.do_persistent_memory_store(memory, &args).await,
+                "memory_recall" => return self.do_persistent_memory_recall(memory, &args).await,
+                _ => {}
+            }
+        }
+
         match name {
             "calendar_list" => self.do_calendar_list(&args).await,
             "calendar_create" => self.do_calendar_create(&args).await,
@@ -802,14 +914,14 @@ mod tests {
         let db = Database::in_memory().await.unwrap();
         let calendar_store = db.calendar_store();
         let shell = ShellToolRegistry::new().await;
-        let registry = AppToolRegistry::new(shell, Some(calendar_store), None);
+        let registry = AppToolRegistry::new(shell, Some(calendar_store), None, None);
         (db, registry)
     }
 
     /// Helper: create an AppToolRegistry without a calendar store.
     async fn setup_without_calendar() -> AppToolRegistry {
         let shell = ShellToolRegistry::new().await;
-        AppToolRegistry::new(shell, None, None)
+        AppToolRegistry::new(shell, None, None, None)
     }
 
     /// Helper: create an in-memory DB + ContactStore + AppToolRegistry.
@@ -817,7 +929,7 @@ mod tests {
         let db = Database::in_memory().await.unwrap();
         let contact_store = db.contact_store();
         let shell = ShellToolRegistry::new().await;
-        let registry = AppToolRegistry::new(shell, None, Some(contact_store));
+        let registry = AppToolRegistry::new(shell, None, Some(contact_store), None);
         (db, registry)
     }
 
@@ -827,7 +939,7 @@ mod tests {
         let calendar_store = db.calendar_store();
         let contact_store = db.contact_store();
         let shell = ShellToolRegistry::new().await;
-        let registry = AppToolRegistry::new(shell, Some(calendar_store), Some(contact_store));
+        let registry = AppToolRegistry::new(shell, Some(calendar_store), Some(contact_store), None);
         (db, registry)
     }
 

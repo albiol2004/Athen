@@ -1,6 +1,6 @@
 # Implementation Status
 
-**Total: ~600 tests**, 0 clippy warnings.
+**Total: ~604 tests**, 0 clippy warnings.
 
 ---
 
@@ -21,6 +21,7 @@
 - `traits/`: 11 trait files defining all inter-module contracts
   - `traits/notification.rs`: `NotificationChannel` trait with `channel_kind()` and `send()`
   - `traits/embedding.rs`: `EmbeddingProvider` trait with `provider_id()`, `dimensions()`, `embed()`, `embed_batch()`, `is_available()`
+  - `traits/memory.rs`: `EntityExtractor` trait with `extract()` method + `ExtractionResult` struct (entities: Vec<Entity>, relations: Vec<(String, String, String)>)
 
 ### athen-ipc (13 unit + 5 integration = 18 tests)
 **Status**: Complete -- full IPC transport layer.
@@ -40,7 +41,7 @@
   - **External URLs**: http/https URLs
   Returns `Option<RiskScore>` -- `Some` if confident, `None` for LLM fallback.
 - `llm_fallback.rs`: `LlmRiskEvaluator` takes `Box<dyn LlmRouter>`. 10-second timeout on LLM calls. Constructs structured prompt that considers what the agent would ACTUALLY DO (not just literal text) -- asks LLM to classify impact as system for any delete/remove/wipe/destroy actions. Conservative fallback on failure/timeout: `WritePersist + PersonalInfo + 0.3 confidence` (lands in HumanConfirm range, score ~89).
-- `lib.rs`: `CombinedRiskEvaluator` implementing `RiskEvaluator` -- tries rules first, falls back to LLM if rules return `None`. **AuthUser bypass**: skips LLM risk evaluation for benign user input (no dangerous patterns matched by rules).
+- `lib.rs`: `CombinedRiskEvaluator` implementing `RiskEvaluator` -- tries rules first, falls back to LLM if rules return `None`. **AuthUser bypass**: when rules return `None` (no dangerous patterns) and trust is `AuthUser`, returns a safe score (0.5) directly -- skips LLM risk fallback entirely for benign user input, reducing latency.
 
 ### athen-sandbox (32 tests)
 **Status**: Complete -- tiered sandboxing with auto-detection.
@@ -67,12 +68,17 @@
   - `infer_identifier_kind()` helper -- infers `IdentifierKind` (Email/Phone/Other) from sender identifier strings.
   - `task_contacts: Mutex<HashMap<TaskId, ContactId>>` -- maps task IDs to resolved contact IDs for trust feedback on completion.
 
-### athen-memory (28 unit + 5 integration = 33 tests)
-**Status**: Complete -- vector search + knowledge graph with SQLite persistence + Phase 1 embeddings.
+### athen-memory (38 unit + 5 integration = 43 tests)
+**Status**: Complete -- vector search + knowledge graph with SQLite persistence + real embeddings + LLM entity extraction + hybrid retrieval.
 - `vector.rs`: `InMemoryVectorIndex` -- brute-force cosine similarity search. `tokio::sync::RwLock` for concurrent reads.
 - `graph.rs`: `InMemoryGraph` -- BFS exploration from entry node. Scoring combines recency (exponential decay, 7-day half-life), frequency, and importance weighted by `ExploreParams`.
 - `sqlite.rs`: `SqliteVectorIndex` and `SqliteGraph` -- SQLite-backed persistent versions. Embeddings stored as little-endian f32 blobs. Uses `std::sync::Mutex` (not tokio) since rusqlite is synchronous and locks are never held across `.await`.
-- `lib.rs`: `Memory` facade implementing `MemoryStore`. `remember()` stores in vector + extracts entities to graph. `recall()` searches vector index. `forget()` removes from vector. **Phase 1 embeddings wired**: `EmbeddingProvider` integrated into the Memory facade for real vector embeddings.
+- `extractor.rs`: `LlmEntityExtractor` implementing `EntityExtractor` -- extracts entities and relations from text via LLM calls (Cheap profile, 5s timeout). Parses structured JSON output into `ExtractionResult`.
+- `lib.rs`: `Memory` facade implementing `MemoryStore`. Three-phase intelligence:
+  - **Phase 1 (Embeddings)**: `embedder: Option<Box<dyn EmbeddingProvider>>` with `with_embedder()` builder. `remember()` generates real embeddings via provider, stores content in `metadata._content`. `recall()` embeds query for semantic vector search.
+  - **Phase 2 (Entity Extraction)**: `extractor: Option<Box<dyn EntityExtractor>>` with `with_extractor()` builder. `remember()` auto-extracts entities and relations from content via LLM, adds them to the knowledge graph automatically.
+  - **Phase 3 (Hybrid Retrieval)**: `recall()` performs hybrid vector search + graph exploration. Graph-connected results receive a score boost, results are deduplicated and merged for richer context.
+  - `forget()` removes from vector index.
 
 ### athen-sentidos (81 tests)
 **Status**: Complete -- user input monitor, full email monitor, full calendar monitor, full telegram monitor, messaging stub, polling runner.
@@ -130,11 +136,11 @@
 
 ### athen-agent (32 unit + 3 integration = 35 tests)
 **Status**: Complete -- LLM-driven task execution with real tool calling, streaming responses (including thinking content forwarding), cancellation, tool-level risk checking, sandbox integration, session memory, LLM completion judge, graceful max-steps handling, and streaming tool call support.
-- `executor.rs`: `DefaultExecutor` implementing `AgentExecutor`. Fields include optional `stream_sender: Option<mpsc::UnboundedSender<String>>` for progressive streaming and `cancel_flag: Option<Arc<AtomicBool>>` for user-initiated cancellation. Accepts optional `context_messages: Vec<ChatMessage>` prepended to conversation for session-level memory. System prompt ("You are Athen, an AI agent that ACTS first and talks second") is conversation-aware: when context messages are present, it tells the LLM "You are in an ongoing conversation". **System prompt includes current date/time and timezone** (e.g. "Current date and time: Monday, April 6, 2026 at 11:46 (CEST, UTC+02:00)") via `chrono::Local::now()`. **Calendar guidance**: tells the agent to use the local timezone offset (e.g. `2026-04-06T12:15:00+02:00`) instead of UTC `Z`, with the detected offset included dynamically. Includes numbered rules: (1) never say "I'll do X" -- just do it, (2) never ask what to do -- take initiative, (3) call tools immediately, (4) only text when task is complete, (5) be concise, (6) make reasonable choices. BAD/GOOD examples included (English + Spanish variants). Loop: check cancel_flag -> check timeout -> check max_steps -> build LlmRequest -> call LlmRouter (streaming or non-streaming) -> execute tool calls via ToolRegistry -> check cancel_flag between tool calls -> record steps via StepAuditor -> repeat until LLM says done. Tool call results fed back as `Role::Tool` messages with `tool_call_id` for OpenAI-compatible APIs. **Tool tracking**: `tools_called: Vec<String>` tracks which specific tools were called during execution.
-  - **Streaming**: when `stream_sender` is set, uses `try_streaming_call()` which calls `LlmRouter::route_streaming()`, collects text deltas, and forwards each chunk through the sender. If streaming returns empty content (tool call response), falls back to non-streaming `route()` to get tool call data. **Streaming tool calls**: supports `tool_calls` arriving via streaming chunks. **Thinking content**: forwards `is_thinking` chunks and `<think>` tag content to the stream sender for frontend display.
+- `executor.rs`: `DefaultExecutor` implementing `AgentExecutor`. Fields include optional `stream_sender: Option<mpsc::UnboundedSender<String>>` for progressive streaming and `cancel_flag: Option<Arc<AtomicBool>>` for user-initiated cancellation. Accepts optional `context_messages: Vec<ChatMessage>` prepended to conversation for session-level memory. System prompt ("You are Athen, an AI agent that ACTS first and talks second") is conversation-aware: when context messages are present, it tells the LLM "You are in an ongoing conversation". **System prompt includes current date/time and timezone** (e.g. "Current date and time: Monday, April 6, 2026 at 11:46 (CEST, UTC+02:00)") via `chrono::Local::now()`. **Calendar guidance**: tells the agent to use the local timezone offset (e.g. `2026-04-06T12:15:00+02:00`) instead of UTC `Z`, with the detected offset included dynamically. Includes numbered rules: (1) never say "I'll do X" -- just do it, (2) never ask what to do -- take initiative, (3) call tools immediately, (4) only text when task is complete, (5) be concise, (6) make reasonable choices, (8) ALWAYS respond in natural language, NEVER output raw JSON (with BAD/GOOD examples). BAD/GOOD examples included (English + Spanish variants). Loop: check cancel_flag -> check timeout -> check max_steps -> build LlmRequest -> call LlmRouter (streaming or non-streaming) -> execute tool calls via ToolRegistry -> check cancel_flag between tool calls -> record steps via StepAuditor -> repeat until LLM says done. Tool call results fed back as `Role::Tool` messages with `tool_call_id` for OpenAI-compatible APIs. **Tool tracking**: `tools_called: Vec<String>` tracks which specific tools were called during execution.
+  - **Streaming**: when `stream_sender` is set, uses `try_streaming_call()` which calls `LlmRouter::route_streaming()`, collects text deltas, and forwards each chunk through the sender. If streaming returns empty content (tool call response), falls back to non-streaming `route()` to get tool call data. **Streaming tool calls**: supports `tool_calls` arriving via streaming chunks. **Thinking content**: forwards `is_thinking` chunks and `<think>` tag content to the stream sender for frontend display. **Graceful fallback**: when streaming succeeds but non-streaming fallback errors, returns empty response instead of propagating the error.
   - **`StreamResult` struct**: returned from `try_streaming_call()`, contains collected content, tool calls, and reasoning content.
   - **`extract_think_tags()`**: parses `<think>...</think>` blocks from model responses (e.g. DeepSeek R1).
-  - **`clean_model_response()`**: strips thinking tags from final displayed response.
+  - **`clean_model_response()`**: strips thinking tags from final displayed response, extracts text from JSON wrappers like `{"response": "text"}`, replaces empty responses with default message.
   - **Cancellation**: `cancel_flag` is checked at loop start and between each tool call. When set to `true`, returns immediately with `{ reason: "cancelled", response: "Task cancelled by user." }`.
   - **LLM Completion Judge**: replaces the regex-based anti-lazy nudge system. `judge_completion()` is a lightweight LLM call (Cheap profile, 5 tokens, 5s timeout) that evaluates whether the agent actually completed the user's request. Checks the user's request, agent's response, and list of tools called. Returns DONE or CONTINUE. Language-agnostic (works for English, Spanish, any language). Fires at most once per execution. Defaults to DONE on failure/timeout.
   - **Graceful max-steps**: when the executor hits the step limit, it makes one final LLM call with `tools: None` asking for a summary of work accomplished, instead of returning raw JSON.
@@ -170,7 +176,9 @@
 - `providers/openai.rs`: `OpenAiCompatibleProvider` -- fully generic adapter for any OpenAI-compatible API endpoint. Builder pattern: `new(base_url)`, `with_api_key()`, `with_model()`, `with_provider_id()`, `with_client()`, `with_cost_estimator()`. Convenience constructor: `openai(api_key)` for OpenAI proper. Features:
   - API key is optional -- `Authorization: Bearer` header only sent when key is present (supports local servers without auth)
   - Full tool calling support with proper wire format conversion (assistant messages with tool_calls, tool result messages with tool_call_id)
-  - SSE streaming via `complete_streaming()` -- parses `data:` lines, handles `[DONE]`, extracts content deltas, finish_reason, **`reasoning_content`**, and **`tool_calls`** from streaming chunks
+  - SSE streaming via `complete_streaming()` -- parses `data:` lines, handles `[DONE]`, extracts content deltas, finish_reason, **`reasoning_content`** (thinking models), and **`tool_calls`** from streaming chunks
+  - Non-streaming `complete()` extracts `message.reasoning_content` into `LlmResponse.reasoning_content`
+  - `OpenAiRequestOut` has `extra: Option<Value>` field with `#[serde(flatten)]` for provider-specific parameters
   - `CostEstimator` trait for pluggable pricing: `OpenAiCostEstimator` (gpt-4o, gpt-4o-mini, o3, etc.), `ZeroCostEstimator` (for local providers)
   - `parse_sse_chunks()` public function for reuse by wrapper providers
 - `providers/deepseek.rs`: Full `DeepSeekProvider` -- OpenAI-compatible API at `api.deepseek.com/v1/chat/completions`. Bearer auth, request/response mapping, SSE streaming, tool call support. Cost estimation: deepseek-chat ($0.14/M input, $0.28/M output), deepseek-reasoner ($0.55/$2.19). Builder pattern: `new(api_key)`, `with_model()`, `with_base_url()`.

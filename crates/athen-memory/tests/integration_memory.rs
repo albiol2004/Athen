@@ -270,7 +270,8 @@ async fn test_memory_facade_remember_and_recall() {
     let graph = SqliteGraph::new(conn).unwrap();
 
     let mem = Memory::new(Box::new(vector), Box::new(graph))
-        .with_embedder(Box::new(KeywordEmbedding::new()));
+        .with_embedder(Box::new(KeywordEmbedding::new()))
+        .with_min_score(0.0);
 
     // Remember three items
     mem.remember(MemoryItem {
