@@ -73,6 +73,41 @@ fn simplify_error(err: &str) -> String {
     err.to_string()
 }
 
+/// Extract key terms from a user message for broader memory search.
+///
+/// Filters out common stop words (Spanish + English) and short words,
+/// returning meaningful terms that might match stored memories.
+fn extract_key_terms(message: &str) -> Vec<String> {
+    const STOP_WORDS: &[&str] = &[
+        // Spanish
+        "el", "la", "los", "las", "un", "una", "unos", "unas", "de", "del", "al",
+        "en", "con", "por", "para", "que", "es", "son", "fue", "ser", "estar",
+        "haz", "hay", "tiene", "tengo", "como", "pero", "más", "muy", "sin",
+        "sobre", "entre", "este", "esta", "ese", "esa", "aqui", "ahi", "aquí",
+        "ahí", "donde", "cuando", "quien", "cual", "todo", "toda", "todos",
+        "mi", "tu", "su", "nos", "les", "me", "te", "se", "lo", "le",
+        "quiero", "puedes", "puede", "hacer", "dime", "dame", "escribe",
+        "escribeme", "aqui", "chat", "algo",
+        // English
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+        "have", "has", "had", "do", "does", "did", "will", "would", "could",
+        "should", "may", "might", "can", "shall", "to", "of", "in", "for",
+        "on", "with", "at", "by", "from", "and", "or", "but", "not", "no",
+        "my", "your", "his", "her", "its", "our", "their", "this", "that",
+        "what", "which", "who", "how", "when", "where", "why", "all", "each",
+        "me", "you", "him", "it", "us", "them", "some", "any",
+    ];
+
+    message
+        .split(|c: char| !c.is_alphanumeric() && c != 'á' && c != 'é' && c != 'í' && c != 'ó' && c != 'ú' && c != 'ñ' && c != 'ü')
+        .filter(|w| {
+            let lower = w.to_lowercase();
+            lower.len() > 2 && !STOP_WORDS.contains(&lower.as_str())
+        })
+        .map(|w| w.to_string())
+        .collect()
+}
+
 /// Persist an entry to the active Arc in SQLite (fire-and-forget; errors are logged, not propagated).
 ///
 /// Also updates the arc's `updated_at` timestamp.
@@ -407,31 +442,54 @@ pub async fn send_message(
             let mut context = state.history.lock().await.clone();
 
             // Auto-inject relevant memories into context.
+            // Search with the full message AND with individual key terms
+            // to catch indirect references (e.g., "mi novia" → finds "Nadia es mi novia").
             if let Some(ref memory) = state.memory {
-                match memory.recall(&message, 5).await {
-                    Ok(items) if !items.is_empty() => {
-                        tracing::info!(
-                            count = items.len(),
-                            "Injecting relevant memories into context"
-                        );
-                        let memory_text = items
-                            .iter()
-                            .map(|m| format!("- {}", m.content))
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        context.insert(0, ChatMessage {
-                            role: Role::System,
-                            content: MessageContent::Text(format!(
-                                "Relevant information from your memory:\n{memory_text}"
-                            )),
-                        });
+                let mut all_items = Vec::new();
+                let mut seen_ids = std::collections::HashSet::new();
+
+                // 1. Full message search.
+                if let Ok(items) = memory.recall(&message, 5).await {
+                    for item in items {
+                        if seen_ids.insert(item.id.clone()) {
+                            all_items.push(item);
+                        }
                     }
-                    Ok(_) => {
-                        tracing::debug!("No relevant memories found for query");
+                }
+
+                // 2. Extract key terms and search each one for broader coverage.
+                let key_terms = extract_key_terms(&message);
+                for term in &key_terms {
+                    if let Ok(items) = memory.recall(term, 3).await {
+                        for item in items {
+                            if seen_ids.insert(item.id.clone()) {
+                                all_items.push(item);
+                            }
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Memory recall failed");
-                    }
+                }
+
+                // Limit to top 5 total.
+                all_items.truncate(5);
+
+                if !all_items.is_empty() {
+                    tracing::info!(
+                        count = all_items.len(),
+                        "Injecting relevant memories into context"
+                    );
+                    let memory_text = all_items
+                        .iter()
+                        .map(|m| format!("- {}", m.content))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    context.insert(0, ChatMessage {
+                        role: Role::System,
+                        content: MessageContent::Text(format!(
+                            "Relevant information from your memory:\n{memory_text}"
+                        )),
+                    });
+                } else {
+                    tracing::debug!("No relevant memories found for query");
                 }
             }
 
@@ -673,30 +731,44 @@ pub async fn approve_task(
 
             // Auto-inject relevant memories into context.
             if let Some(ref memory) = state.memory {
-                match memory.recall(&message, 5).await {
-                    Ok(items) if !items.is_empty() => {
-                        tracing::info!(
-                            count = items.len(),
-                            "Injecting relevant memories into approved task context"
-                        );
-                        let memory_text = items
-                            .iter()
-                            .map(|m| format!("- {}", m.content))
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        context.insert(0, ChatMessage {
-                            role: Role::System,
-                            content: MessageContent::Text(format!(
-                                "Relevant information from your memory:\n{memory_text}"
-                            )),
-                        });
+                let mut all_items = Vec::new();
+                let mut seen_ids = std::collections::HashSet::new();
+
+                if let Ok(items) = memory.recall(&message, 5).await {
+                    for item in items {
+                        if seen_ids.insert(item.id.clone()) {
+                            all_items.push(item);
+                        }
                     }
-                    Ok(_) => {
-                        tracing::debug!("No relevant memories found for approved task");
+                }
+                let key_terms = extract_key_terms(&message);
+                for term in &key_terms {
+                    if let Ok(items) = memory.recall(term, 3).await {
+                        for item in items {
+                            if seen_ids.insert(item.id.clone()) {
+                                all_items.push(item);
+                            }
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Memory recall failed for approved task");
-                    }
+                }
+                all_items.truncate(5);
+
+                if !all_items.is_empty() {
+                    tracing::info!(
+                        count = all_items.len(),
+                        "Injecting relevant memories into approved task context"
+                    );
+                    let memory_text = all_items
+                        .iter()
+                        .map(|m| format!("- {}", m.content))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    context.insert(0, ChatMessage {
+                        role: Role::System,
+                        content: MessageContent::Text(format!(
+                            "Relevant information from your memory:\n{memory_text}"
+                        )),
+                    });
                 }
             }
 

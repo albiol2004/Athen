@@ -40,9 +40,9 @@ impl EntityExtractor for LlmEntityExtractor {
             system_prompt: None,
         };
 
-        // 5-second timeout on the LLM call.
+        // 30-second timeout — local models can be slow.
         let response = match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(30),
             self.router.route(&request),
         )
         .await

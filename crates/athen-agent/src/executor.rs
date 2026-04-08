@@ -173,6 +173,7 @@ impl DefaultExecutor {
         let has_calendar = tools.iter().any(|t| t.name.starts_with("calendar_"));
         let has_shell = tools.iter().any(|t| t.name == "shell_execute");
         let has_contacts = tools.iter().any(|t| t.name.starts_with("contacts_"));
+        let has_memory = tools.iter().any(|t| t.name == "memory_store");
 
         if !tools.is_empty() {
             prompt.push_str("You have the following tools available:\n");
@@ -229,6 +230,19 @@ impl DefaultExecutor {
                  3. If the user confirms, use contacts_update to add the new identifier.\n\
                  4. If no match or user denies, use contacts_create with the new sender's info.\n\
                  5. NEVER auto-merge contacts without asking — always confirm with the user first.\n\n",
+            );
+        }
+
+        // Memory guidance.
+        if has_memory {
+            prompt.push_str(
+                "MEMORY & KNOWLEDGE:\n\
+                 You have persistent memory that survives across conversations.\n\
+                 - When the user asks you to remember something, use memory_store IMMEDIATELY.\n\
+                 - When the user mentions a person (\"mi novia\", \"my boss\", a name), check memory_recall \
+                   AND contacts_list to find what you know about them BEFORE responding.\n\
+                 - When writing something for/about a person, ALWAYS look up their name and details first.\n\
+                 - Relevant memories from past conversations may be provided as system context — use them.\n\n",
             );
         }
 
