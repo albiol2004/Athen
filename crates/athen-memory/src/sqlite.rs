@@ -720,4 +720,49 @@ mod tests {
         let nodes = graph.explore(a, params).await.unwrap();
         assert_eq!(nodes.len(), 2); // A and B only
     }
+
+    #[tokio::test]
+    async fn test_sqlite_graph_entity_deduplication_by_name() {
+        let conn = in_memory_conn();
+        let graph = SqliteGraph::new(conn).unwrap();
+
+        // Adding "Nadia" twice should return the same EntityId.
+        let id1 = graph.add_entity(person("Nadia")).await.unwrap();
+        let id2 = graph.add_entity(person("Nadia")).await.unwrap();
+        assert_eq!(id1, id2, "Same name should deduplicate to same ID");
+
+        // Case-insensitive: "nadia" should also match.
+        let id3 = graph.add_entity(person("nadia")).await.unwrap();
+        assert_eq!(id1, id3, "Case-insensitive name should deduplicate");
+
+        // A different name should get a different ID.
+        let id4 = graph.add_entity(person("Bob")).await.unwrap();
+        assert_ne!(id1, id4, "Different name should get different ID");
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_vector_list_all_newest_first() {
+        let conn = in_memory_conn();
+        let index = SqliteVectorIndex::new(conn).unwrap();
+
+        index
+            .upsert("a", vec![1.0, 0.0], serde_json::json!({"label": "A"}))
+            .await
+            .unwrap();
+        index
+            .upsert("b", vec![0.0, 1.0], serde_json::json!({"label": "B"}))
+            .await
+            .unwrap();
+        index
+            .upsert("c", vec![0.5, 0.5], serde_json::json!({"label": "C"}))
+            .await
+            .unwrap();
+
+        let results = index.list_all().await.unwrap();
+        assert_eq!(results.len(), 3);
+        // ORDER BY rowid DESC → newest first: C, B, A
+        assert_eq!(results[0].id, "c");
+        assert_eq!(results[1].id, "b");
+        assert_eq!(results[2].id, "a");
+    }
 }

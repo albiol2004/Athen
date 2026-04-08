@@ -233,4 +233,69 @@ mod tests {
         assert_eq!(result.entities.len(), 1);
         assert_eq!(result.entities[0].entity_type, EntityType::Concept); // default
     }
+
+    #[test]
+    fn test_filters_entities_with_underscores() {
+        let val = serde_json::json!({
+            "entities": [
+                {"name": "memory_recall", "type": "Concept"},
+                {"name": "shell_execute", "type": "Concept"}
+            ]
+        });
+        let result = parse_extraction_json(&val);
+        assert!(result.entities.is_empty(), "Tool-like names with underscores should be filtered");
+    }
+
+    #[test]
+    fn test_filters_entities_with_parentheses() {
+        let val = serde_json::json!({
+            "entities": [
+                {"name": "foo(bar)", "type": "Concept"}
+            ]
+        });
+        let result = parse_extraction_json(&val);
+        assert!(result.entities.is_empty(), "Names with parentheses should be filtered");
+    }
+
+    #[test]
+    fn test_filters_short_entity_names() {
+        let val = serde_json::json!({
+            "entities": [
+                {"name": "X", "type": "Person"},
+                {"name": "", "type": "Person"}
+            ]
+        });
+        let result = parse_extraction_json(&val);
+        assert!(result.entities.is_empty(), "Names shorter than 2 chars should be filtered");
+    }
+
+    #[test]
+    fn test_filters_generic_role_names() {
+        let val = serde_json::json!({
+            "entities": [
+                {"name": "user", "type": "Person"},
+                {"name": "Assistant", "type": "Person"},
+                {"name": "SYSTEM", "type": "Concept"}
+            ]
+        });
+        let result = parse_extraction_json(&val);
+        assert!(result.entities.is_empty(), "Generic role names should be filtered");
+    }
+
+    #[test]
+    fn test_keeps_valid_entities() {
+        let val = serde_json::json!({
+            "entities": [
+                {"name": "Nadia", "type": "Person"},
+                {"name": "Acme Corp", "type": "Organization"},
+                {"name": "memory_recall", "type": "Concept"},
+                {"name": "user", "type": "Person"},
+                {"name": "A", "type": "Person"}
+            ]
+        });
+        let result = parse_extraction_json(&val);
+        assert_eq!(result.entities.len(), 2);
+        assert_eq!(result.entities[0].name, "Nadia");
+        assert_eq!(result.entities[1].name, "Acme Corp");
+    }
 }

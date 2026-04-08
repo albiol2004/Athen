@@ -790,4 +790,55 @@ mod tests {
             }
         }
     }
+
+    #[tokio::test]
+    async fn test_min_relevance_score_filtering() {
+        let mem = make_memory().with_min_score(0.0);
+
+        let items = [
+            ("item-a", "Rust programming language"),
+            ("item-b", "Python data science"),
+            ("item-c", "JavaScript web development"),
+        ];
+
+        for (id, content) in &items {
+            mem.remember(MemoryItem {
+                id: id.to_string(),
+                content: content.to_string(),
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        }
+
+        // With min_score 0.0, all items should be returned.
+        let results_all = mem.recall("programming", 10).await.unwrap();
+        assert!(
+            !results_all.is_empty(),
+            "With min_score 0.0, should return results"
+        );
+
+        // With a very high threshold, fewer or no results should be returned.
+        let mem_strict = make_memory().with_min_score(0.99);
+
+        for (id, content) in &items {
+            mem_strict
+                .remember(MemoryItem {
+                    id: id.to_string(),
+                    content: content.to_string(),
+                    metadata: serde_json::json!({}),
+                })
+                .await
+                .unwrap();
+        }
+
+        let results_strict = mem_strict.recall("programming", 10).await.unwrap();
+        assert!(
+            results_strict.len() < results_all.len(),
+            "High min_score ({}) should return fewer results than min_score 0.0 ({} vs {})",
+            0.99,
+            results_strict.len(),
+            results_all.len()
+        );
+    }
 }

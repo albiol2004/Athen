@@ -1758,3 +1758,62 @@ pub async fn delete_relation(
         .await
         .map_err(|e| e.to_string())
 }
+
+#[cfg(test)]
+mod key_term_tests {
+    use super::extract_key_terms;
+
+    #[test]
+    fn basic_extraction() {
+        let terms = extract_key_terms("Nadia likes Rust programming");
+        assert!(terms.contains(&"Nadia".to_string()));
+        assert!(terms.contains(&"likes".to_string()));
+        assert!(terms.contains(&"Rust".to_string()));
+        assert!(terms.contains(&"programming".to_string()));
+    }
+
+    #[test]
+    fn stop_words_filtered_spanish_and_english() {
+        // Spanish stop words
+        let terms = extract_key_terms("el gato está en la casa");
+        assert!(!terms.iter().any(|t| t.eq_ignore_ascii_case("el")));
+        assert!(!terms.iter().any(|t| t.eq_ignore_ascii_case("la")));
+        assert!(!terms.iter().any(|t| t.eq_ignore_ascii_case("en")));
+        assert!(terms.contains(&"gato".to_string()));
+        assert!(terms.contains(&"casa".to_string()));
+
+        // English stop words
+        let terms = extract_key_terms("the cat is on the table");
+        assert!(!terms.iter().any(|t| t.eq_ignore_ascii_case("the")));
+        assert!(!terms.iter().any(|t| t.eq_ignore_ascii_case("is")));
+        assert!(!terms.iter().any(|t| t.eq_ignore_ascii_case("on")));
+        assert!(terms.contains(&"cat".to_string()));
+        assert!(terms.contains(&"table".to_string()));
+    }
+
+    #[test]
+    fn short_words_filtered() {
+        let terms = extract_key_terms("go do it ox");
+        // All words are <= 2 chars → should all be filtered
+        assert!(terms.is_empty());
+    }
+
+    #[test]
+    fn accented_characters_preserved() {
+        let terms = extract_key_terms("información está aquí código");
+        assert!(terms.contains(&"información".to_string()));
+        assert!(terms.contains(&"código".to_string()));
+    }
+
+    #[test]
+    fn empty_string_returns_empty() {
+        let terms = extract_key_terms("");
+        assert!(terms.is_empty());
+    }
+
+    #[test]
+    fn all_stop_words_returns_empty() {
+        let terms = extract_key_terms("the and or but not for with");
+        assert!(terms.is_empty());
+    }
+}
