@@ -110,6 +110,21 @@ impl Default for ExploreParams {
     }
 }
 
+/// Extracts entities and relationships from text content.
+#[async_trait]
+pub trait EntityExtractor: Send + Sync {
+    /// Extract entities and their relationships from text.
+    /// Returns a list of entities and a list of (from_name, relation, to_name) tuples.
+    async fn extract(&self, text: &str) -> Result<ExtractionResult>;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractionResult {
+    pub entities: Vec<Entity>,
+    /// (from_name, relation, to_name) tuples.
+    pub relations: Vec<(String, String, String)>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryItem {
     pub id: String,

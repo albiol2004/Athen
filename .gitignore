@@ -3,3 +3,19 @@
 .env
 *.db
 *.db-journal
+
+# Private keys
+*.pem
+*.key
+*.p12
+*.pfx
+
+# SQLite variants
+*.sqlite
+*.sqlite-journal
+
+# Logs
+*.log
+
+# User config (if copied into repo)
+.athen/

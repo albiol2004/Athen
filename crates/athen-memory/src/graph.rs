@@ -12,18 +12,18 @@ use athen_core::traits::memory::{
     Entity, EntityId, ExploreParams, GraphEdge, GraphNode, KnowledgeGraph,
 };
 
-struct Edge {
-    from: EntityId,
-    relation: String,
-    to: EntityId,
-    weight: f32,
-    created_at: DateTime<Utc>,
+pub(crate) struct Edge {
+    pub(crate) from: EntityId,
+    pub(crate) relation: String,
+    pub(crate) to: EntityId,
+    pub(crate) weight: f32,
+    pub(crate) created_at: DateTime<Utc>,
 }
 
 /// In-memory knowledge graph with BFS exploration.
 pub struct InMemoryGraph {
-    entities: RwLock<HashMap<EntityId, Entity>>,
-    edges: RwLock<Vec<Edge>>,
+    pub(crate) entities: RwLock<HashMap<EntityId, Entity>>,
+    pub(crate) edges: RwLock<Vec<Edge>>,
 }
 
 impl InMemoryGraph {
@@ -141,6 +141,52 @@ impl KnowledgeGraph for InMemoryGraph {
         }
 
         Ok(result)
+    }
+}
+
+/// A shared wrapper around `InMemoryGraph` that allows inspecting internal state
+/// while also being usable as a `Box<dyn KnowledgeGraph>`.
+pub struct SharedInMemoryGraph {
+    inner: std::sync::Arc<InMemoryGraph>,
+}
+
+impl Default for SharedInMemoryGraph {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SharedInMemoryGraph {
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Arc::new(InMemoryGraph::new()),
+        }
+    }
+
+    /// Access the internal entities for inspection (e.g. in tests).
+    pub async fn entities(&self) -> tokio::sync::RwLockReadGuard<'_, HashMap<EntityId, Entity>> {
+        self.inner.entities.read().await
+    }
+
+    /// Access the internal edges for inspection (e.g. in tests).
+    #[allow(dead_code)]
+    pub(crate) async fn edges(&self) -> tokio::sync::RwLockReadGuard<'_, Vec<Edge>> {
+        self.inner.edges.read().await
+    }
+}
+
+#[async_trait]
+impl KnowledgeGraph for SharedInMemoryGraph {
+    async fn add_entity(&self, entity: Entity) -> Result<EntityId> {
+        self.inner.add_entity(entity).await
+    }
+
+    async fn add_relation(&self, from: EntityId, relation: &str, to: EntityId) -> Result<()> {
+        self.inner.add_relation(from, relation, to).await
+    }
+
+    async fn explore(&self, entry: EntityId, params: ExploreParams) -> Result<Vec<GraphNode>> {
+        self.inner.explore(entry, params).await
     }
 }
 

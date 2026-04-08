@@ -81,6 +81,7 @@ Every crate can be tested in isolation by mocking trait dependencies.
 - Tests: mock trait dependencies, not real services
 - `cargo clippy --workspace` must produce zero warnings
 - All config via UI, never config files -- Athen is for non-technical users
+- NEVER commit or push to git unless explicitly asked by the user
 
 ## Key Commands
 
