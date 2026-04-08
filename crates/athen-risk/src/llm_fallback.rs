@@ -42,7 +42,7 @@ impl LlmRiskEvaluator {
         // Timeout the LLM risk call — risk evaluation should be fast.
         // On timeout or error, use conservative defaults that require approval.
         let response = match tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(30),
             self.router.route(&request),
         )
         .await

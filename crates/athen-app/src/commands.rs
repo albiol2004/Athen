@@ -108,6 +108,85 @@ fn extract_key_terms(message: &str) -> Vec<String> {
         .collect()
 }
 
+/// Judge whether a conversation exchange is worth storing in persistent memory.
+///
+/// Returns `Some(summary)` with a distilled summary if worth remembering,
+/// or `None` if the interaction is trivial (greetings, small talk, repeated info).
+/// Uses a cheap LLM call with a 15-second timeout. On failure, returns `None`
+/// (better to skip than to store garbage).
+async fn judge_worth_remembering(
+    router: &dyn LlmRouter,
+    user_msg: &str,
+    assistant_msg: &str,
+) -> Option<String> {
+    use athen_core::llm::{LlmRequest, ModelProfile, ChatMessage as LlmChatMessage, MessageContent as LlmContent, Role as LlmRole};
+
+    let prompt = format!(
+        "Analyze this conversation exchange and decide if it contains information worth remembering for future conversations.\n\n\
+         User: {user_msg}\n\
+         Assistant: {assistant_msg}\n\n\
+         Worth remembering: facts about people, preferences, relationships, decisions, plans, \
+         important events, personal details the user shared, or things the user explicitly asked to remember.\n\
+         NOT worth remembering: greetings, small talk, questions about capabilities, \
+         generic requests (write a poem, translate), or information the assistant already has from tools.\n\n\
+         If worth remembering, respond with ONLY a concise summary of the key facts (1-2 sentences, no fluff).\n\
+         If NOT worth remembering, respond with exactly: SKIP"
+    );
+
+    let request = LlmRequest {
+        profile: ModelProfile::Cheap,
+        messages: vec![LlmChatMessage {
+            role: LlmRole::User,
+            content: LlmContent::Text(prompt),
+        }],
+        max_tokens: Some(100),
+        temperature: Some(0.0),
+        tools: None,
+        system_prompt: None,
+    };
+
+    let response = match tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        router.route(&request),
+    ).await {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(e)) => {
+            tracing::debug!("Memory judge LLM failed: {e}");
+            return None;
+        }
+        Err(_) => {
+            tracing::debug!("Memory judge timed out");
+            return None;
+        }
+    };
+
+    let text = response.content.trim().to_string();
+
+    // Check if the model said SKIP (or any variation).
+    if text.is_empty()
+        || text.eq_ignore_ascii_case("SKIP")
+        || text.to_uppercase().starts_with("SKIP")
+        || text.starts_with("NOT ")
+        || text.starts_with("No ")
+    {
+        return None;
+    }
+
+    // Strip any "REMEMBER:" or "Summary:" prefix the model might add.
+    let cleaned = text
+        .strip_prefix("REMEMBER:")
+        .or_else(|| text.strip_prefix("Summary:"))
+        .unwrap_or(&text)
+        .trim()
+        .to_string();
+
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
 /// Persist an entry to the active Arc in SQLite (fire-and-forget; errors are logged, not propagated).
 ///
 /// Also updates the arc's `updated_at` timestamp.
@@ -623,21 +702,38 @@ pub async fn send_message(
             persist_entry(&state, "user", &message, "message", None).await;
             persist_entry(&state, "assistant", &content, "message", None).await;
 
-            // Auto-remember the interaction in persistent memory.
+            // Auto-remember: judge whether this interaction is worth storing,
+            // then remember only a distilled summary (not greetings, small talk, etc.).
             if let Some(ref memory) = state.memory {
-                let memory_content = format!("User: {}\nAssistant: {}", message, content);
-                let item = athen_core::traits::memory::MemoryItem {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    content: memory_content,
-                    metadata: serde_json::json!({
-                        "source": "conversation",
-                        "arc_id": *state.active_arc_id.lock().await,
-                        "timestamp": chrono::Utc::now().to_rfc3339(),
-                    }),
-                };
-                if let Err(e) = memory.remember(item).await {
-                    tracing::warn!("Failed to remember interaction: {e}");
-                }
+                let router = SharedRouter(Arc::clone(&state.router));
+                let arc_id = state.active_arc_id.lock().await.clone();
+                let msg_clone = message.clone();
+                let content_clone = content.clone();
+                let memory_clone = Arc::clone(memory);
+
+                // Fire-and-forget in background so it doesn't block the response.
+                tokio::spawn(async move {
+                    match judge_worth_remembering(&router, &msg_clone, &content_clone).await {
+                        Some(summary) => {
+                            tracing::info!("Memory judge: worth remembering");
+                            let item = athen_core::traits::memory::MemoryItem {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                content: summary,
+                                metadata: serde_json::json!({
+                                    "source": "conversation",
+                                    "arc_id": arc_id,
+                                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                                }),
+                            };
+                            if let Err(e) = memory_clone.remember(item).await {
+                                tracing::warn!("Failed to remember interaction: {e}");
+                            }
+                        }
+                        None => {
+                            tracing::debug!("Memory judge: not worth remembering, skipping");
+                        }
+                    }
+                });
             }
 
             // Mark coordinator task as completed.
@@ -896,21 +992,36 @@ pub async fn approve_task(
             persist_entry(&state, "user", &message, "message", None).await;
             persist_entry(&state, "assistant", &content, "message", None).await;
 
-            // Auto-remember the interaction in persistent memory.
+            // Auto-remember with LLM judge (same as send_message).
             if let Some(ref memory) = state.memory {
-                let memory_content = format!("User: {}\nAssistant: {}", message, content);
-                let item = athen_core::traits::memory::MemoryItem {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    content: memory_content,
-                    metadata: serde_json::json!({
-                        "source": "conversation",
-                        "arc_id": *state.active_arc_id.lock().await,
-                        "timestamp": chrono::Utc::now().to_rfc3339(),
-                    }),
-                };
-                if let Err(e) = memory.remember(item).await {
-                    tracing::warn!("Failed to remember interaction: {e}");
-                }
+                let router = SharedRouter(Arc::clone(&state.router));
+                let arc_id = state.active_arc_id.lock().await.clone();
+                let msg_clone = message.clone();
+                let content_clone = content.clone();
+                let memory_clone = Arc::clone(memory);
+
+                tokio::spawn(async move {
+                    match judge_worth_remembering(&router, &msg_clone, &content_clone).await {
+                        Some(summary) => {
+                            tracing::info!("Memory judge: worth remembering (approved task)");
+                            let item = athen_core::traits::memory::MemoryItem {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                content: summary,
+                                metadata: serde_json::json!({
+                                    "source": "conversation",
+                                    "arc_id": arc_id,
+                                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                                }),
+                            };
+                            if let Err(e) = memory_clone.remember(item).await {
+                                tracing::warn!("Failed to remember interaction: {e}");
+                            }
+                        }
+                        None => {
+                            tracing::debug!("Memory judge: not worth remembering (approved task)");
+                        }
+                    }
+                });
             }
 
             let _ = state.coordinator.complete_task(coord_task_id).await;

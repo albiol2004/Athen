@@ -497,7 +497,7 @@ impl NotificationOrchestrator {
             system_prompt: None,
         };
 
-        match tokio::time::timeout(Duration::from_secs(5), router.route(&request)).await {
+        match tokio::time::timeout(Duration::from_secs(30), router.route(&request)).await {
             Ok(Ok(response)) => {
                 let text = response.content.trim().to_string();
                 if !text.is_empty() {

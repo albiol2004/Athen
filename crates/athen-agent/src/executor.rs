@@ -330,7 +330,7 @@ impl DefaultExecutor {
         };
 
         match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(30),
             self.llm_router.route(&request),
         ).await {
             Ok(Ok(resp)) => {
