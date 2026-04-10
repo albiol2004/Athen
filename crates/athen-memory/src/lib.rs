@@ -140,11 +140,13 @@ impl MemoryStore for Memory {
                         .map(|(name, id)| (name.as_str(), *id))
                         .collect();
 
-                    for (from_name, relation, to_name) in &result.relations {
+                    for (from_name, relation, to_name, importance) in &result.relations {
                         if let (Some(&from_id), Some(&to_id)) =
                             (name_to_id.get(from_name.as_str()), name_to_id.get(to_name.as_str()))
                         {
-                            self.graph.add_relation(from_id, relation, to_id).await?;
+                            self.graph
+                                .add_relation_weighted(from_id, relation, to_id, *importance)
+                                .await?;
                         } else {
                             debug!(
                                 "Skipping relation {from_name} -[{relation}]-> {to_name}: entity not found"
@@ -381,6 +383,24 @@ impl Memory {
         relation: &str,
     ) -> Result<()> {
         self.graph.delete_relation(from, to, relation).await
+    }
+
+    /// Reinforce edges connected to the given entity.
+    pub async fn reinforce_entity(&self, entity_id: EntityId, amount: f32) -> Result<()> {
+        self.graph.reinforce_entity(entity_id, amount).await
+    }
+
+    /// Reinforce entities by name (convenience method for keyword matching).
+    pub async fn reinforce_by_name(&self, entity_name: &str, amount: f32) -> Result<()> {
+        let entities = self.graph.list_entities().await?;
+        for e in entities {
+            if e.name.eq_ignore_ascii_case(entity_name) {
+                if let Some(id) = e.id {
+                    self.graph.reinforce_entity(id, amount).await?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Extract entities from manual metadata (Phase 1 fallback).
@@ -655,6 +675,7 @@ mod tests {
                 "Alice".to_string(),
                 "works_at".to_string(),
                 "Acme Corp".to_string(),
+                0.8,
             )],
         })));
 
@@ -840,5 +861,93 @@ mod tests {
             results_strict.len(),
             results_all.len()
         );
+    }
+
+    #[tokio::test]
+    async fn test_reinforce_by_name() {
+        use crate::graph::SharedInMemoryGraph;
+
+        let graph = std::sync::Arc::new(SharedInMemoryGraph::new());
+        let graph_for_mem = graph.clone();
+
+        struct ArcGraphAdapter(std::sync::Arc<SharedInMemoryGraph>);
+
+        #[async_trait]
+        impl KnowledgeGraph for ArcGraphAdapter {
+            async fn add_entity(
+                &self,
+                entity: Entity,
+            ) -> Result<EntityId> {
+                self.0.add_entity(entity).await
+            }
+            async fn add_relation(
+                &self,
+                from: EntityId,
+                relation: &str,
+                to: EntityId,
+            ) -> Result<()> {
+                self.0.add_relation(from, relation, to).await
+            }
+            async fn explore(
+                &self,
+                entry: EntityId,
+                params: ExploreParams,
+            ) -> Result<Vec<athen_core::traits::memory::GraphNode>> {
+                self.0.explore(entry, params).await
+            }
+            async fn list_entities(&self) -> Result<Vec<Entity>> {
+                self.0.list_entities().await
+            }
+            async fn reinforce_entity(
+                &self,
+                entity_id: EntityId,
+                amount: f32,
+            ) -> Result<()> {
+                self.0.reinforce_entity(entity_id, amount).await
+            }
+        }
+
+        let mem = Memory::new(
+            Box::new(InMemoryVectorIndex::new()),
+            Box::new(ArcGraphAdapter(graph_for_mem)),
+        )
+        .with_embedder(Box::new(KeywordEmbedding::new()));
+
+        // Manually add entities and a relation.
+        let alice_entity = Entity {
+            id: None,
+            entity_type: EntityType::Person,
+            name: "Alice".to_string(),
+            metadata: serde_json::json!({}),
+        };
+        let bob_entity = Entity {
+            id: None,
+            entity_type: EntityType::Person,
+            name: "Bob".to_string(),
+            metadata: serde_json::json!({}),
+        };
+
+        let alice_id = graph.add_entity(alice_entity).await.unwrap();
+        let bob_id = graph.add_entity(bob_entity).await.unwrap();
+        graph.add_relation(alice_id, "knows", bob_id).await.unwrap();
+
+        // Verify initial strength.
+        {
+            let edges = graph.edges().await;
+            assert!((edges[0].strength - 0.5).abs() < 0.001, "Initial strength should be 0.5");
+        }
+
+        // Reinforce by name.
+        mem.reinforce_by_name("Alice", 0.2).await.unwrap();
+
+        // Verify strength increased.
+        {
+            let edges = graph.edges().await;
+            assert!(
+                (edges[0].strength - 0.7).abs() < 0.001,
+                "Strength should be 0.7 after reinforcement, got {}",
+                edges[0].strength
+            );
+        }
     }
 }

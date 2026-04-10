@@ -18,6 +18,12 @@ pub(crate) struct Edge {
     pub(crate) to: EntityId,
     pub(crate) weight: f32,
     pub(crate) created_at: DateTime<Utc>,
+    /// Dynamic usefulness signal, reinforced on use, decays over time.
+    pub(crate) strength: f32,
+    /// Intrinsic weight set at creation (rarely changes).
+    pub(crate) importance: f32,
+    /// ISO 8601 timestamp for decay calculation.
+    pub(crate) last_used: DateTime<Utc>,
 }
 
 /// In-memory knowledge graph with BFS exploration.
@@ -41,18 +47,29 @@ impl Default for InMemoryGraph {
     }
 }
 
+/// Calculate effective strength with time-based decay.
+/// Half-life: 30 days. Strength never drops below 0.01.
+fn decay_strength(base_strength: f32, last_used: &DateTime<Utc>) -> f32 {
+    let age_secs = (Utc::now() - *last_used).num_seconds().max(0) as f64;
+    let half_life_secs = 30.0 * 24.0 * 3600.0; // 30 days
+    let decay = (-age_secs * 2.0f64.ln() / half_life_secs).exp() as f32;
+    (base_strength * decay).max(0.01)
+}
+
 /// Compute a combined score for an edge based on explore params.
 fn edge_score(edge: &Edge, params: &ExploreParams) -> f32 {
+    let effective_strength = decay_strength(edge.strength, &edge.last_used);
+
     // Recency: exponential decay, half-life of 7 days
     let age_secs = (Utc::now() - edge.created_at).num_seconds().max(0) as f64;
     let half_life_secs = 7.0 * 24.0 * 3600.0;
     let recency = (-age_secs * (2.0f64.ln()) / half_life_secs).exp() as f32;
 
-    // Frequency: use weight as a proxy (higher weight = more frequent interaction)
-    let frequency = edge.weight.min(1.0);
+    // Frequency: use effective strength as a proxy
+    let frequency = effective_strength;
 
-    // Importance: also based on weight
-    let importance = edge.weight.min(1.0);
+    // Importance: from edge importance field
+    let importance = edge.importance.min(1.0);
 
     params.recency_weight * recency
         + params.frequency_weight * frequency
@@ -69,13 +86,50 @@ impl KnowledgeGraph for InMemoryGraph {
     }
 
     async fn add_relation(&self, from: EntityId, relation: &str, to: EntityId) -> Result<()> {
+        let now = Utc::now();
         self.edges.write().await.push(Edge {
             from,
             relation: relation.to_string(),
             to,
             weight: 1.0,
-            created_at: Utc::now(),
+            created_at: now,
+            strength: 0.5,
+            importance: 0.5,
+            last_used: now,
         });
+        Ok(())
+    }
+
+    async fn add_relation_weighted(
+        &self,
+        from: EntityId,
+        relation: &str,
+        to: EntityId,
+        importance: f32,
+    ) -> Result<()> {
+        let now = Utc::now();
+        self.edges.write().await.push(Edge {
+            from,
+            relation: relation.to_string(),
+            to,
+            weight: 1.0,
+            created_at: now,
+            strength: 0.5,
+            importance: importance.clamp(0.0, 1.0),
+            last_used: now,
+        });
+        Ok(())
+    }
+
+    async fn reinforce_entity(&self, entity_id: EntityId, amount: f32) -> Result<()> {
+        let now = Utc::now();
+        let mut edges = self.edges.write().await;
+        for edge in edges.iter_mut() {
+            if edge.from == entity_id || edge.to == entity_id {
+                edge.strength = (edge.strength + amount).min(1.0);
+                edge.last_used = now;
+            }
+        }
         Ok(())
     }
 
@@ -277,6 +331,22 @@ impl KnowledgeGraph for SharedInMemoryGraph {
         relation: &str,
     ) -> Result<()> {
         self.inner.delete_relation(from, to, relation).await
+    }
+
+    async fn add_relation_weighted(
+        &self,
+        from: EntityId,
+        relation: &str,
+        to: EntityId,
+        importance: f32,
+    ) -> Result<()> {
+        self.inner
+            .add_relation_weighted(from, relation, to, importance)
+            .await
+    }
+
+    async fn reinforce_entity(&self, entity_id: EntityId, amount: f32) -> Result<()> {
+        self.inner.reinforce_entity(entity_id, amount).await
     }
 }
 

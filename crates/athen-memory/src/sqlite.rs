@@ -192,10 +192,20 @@ impl SqliteGraph {
                     relation TEXT NOT NULL,
                     to_entity TEXT NOT NULL REFERENCES entities(id),
                     weight REAL NOT NULL DEFAULT 1.0,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    strength REAL NOT NULL DEFAULT 0.5,
+                    importance REAL NOT NULL DEFAULT 0.5,
+                    last_used TEXT NOT NULL DEFAULT ''
                 );",
             )
             .map_err(|e| AthenError::Other(e.to_string()))?;
+
+            // Migration: add columns for existing databases.
+            // SQLite doesn't support IF NOT EXISTS for ALTER TABLE ADD COLUMN,
+            // so we ignore errors (column already exists).
+            let _ = c.execute_batch("ALTER TABLE edges ADD COLUMN strength REAL NOT NULL DEFAULT 0.5;");
+            let _ = c.execute_batch("ALTER TABLE edges ADD COLUMN importance REAL NOT NULL DEFAULT 0.5;");
+            let _ = c.execute_batch("ALTER TABLE edges ADD COLUMN last_used TEXT NOT NULL DEFAULT '';");
         }
         Ok(Self { conn })
     }
@@ -230,14 +240,28 @@ struct SqliteEdge {
     to: EntityId,
     weight: f32,
     created_at: DateTime<Utc>,
+    strength: f32,
+    importance: f32,
+    last_used: DateTime<Utc>,
+}
+
+/// Calculate effective strength with time-based decay.
+/// Half-life: 30 days. Strength never drops below 0.01.
+fn decay_strength(base_strength: f32, last_used: &DateTime<Utc>) -> f32 {
+    let age_secs = (Utc::now() - *last_used).num_seconds().max(0) as f64;
+    let half_life_secs = 30.0 * 24.0 * 3600.0; // 30 days
+    let decay = (-age_secs * 2.0f64.ln() / half_life_secs).exp() as f32;
+    (base_strength * decay).max(0.01)
 }
 
 fn edge_score(edge: &SqliteEdge, params: &ExploreParams) -> f32 {
+    let effective_strength = decay_strength(edge.strength, &edge.last_used);
+
     let age_secs = (Utc::now() - edge.created_at).num_seconds().max(0) as f64;
     let half_life_secs = 7.0 * 24.0 * 3600.0;
     let recency = (-age_secs * (2.0f64.ln()) / half_life_secs).exp() as f32;
-    let frequency = edge.weight.min(1.0);
-    let importance = edge.weight.min(1.0);
+    let frequency = effective_strength;
+    let importance = edge.importance.min(1.0);
 
     params.recency_weight * recency
         + params.frequency_weight * frequency
@@ -285,8 +309,42 @@ impl KnowledgeGraph for SqliteGraph {
         let now = Utc::now().to_rfc3339();
 
         conn.execute(
-            "INSERT INTO edges (from_entity, relation, to_entity, weight, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![from.to_string(), relation, to.to_string(), 1.0f64, now],
+            "INSERT INTO edges (from_entity, relation, to_entity, weight, created_at, strength, importance, last_used) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![from.to_string(), relation, to.to_string(), 1.0f64, now, 0.5f64, 0.5f64, now],
+        )
+        .map_err(|e| AthenError::Other(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn add_relation_weighted(
+        &self,
+        from: EntityId,
+        relation: &str,
+        to: EntityId,
+        importance: f32,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| AthenError::Other(e.to_string()))?;
+        let now = Utc::now().to_rfc3339();
+        let importance_clamped = importance.clamp(0.0, 1.0) as f64;
+
+        conn.execute(
+            "INSERT INTO edges (from_entity, relation, to_entity, weight, created_at, strength, importance, last_used) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![from.to_string(), relation, to.to_string(), 1.0f64, now, 0.5f64, importance_clamped, now],
+        )
+        .map_err(|e| AthenError::Other(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn reinforce_entity(&self, entity_id: EntityId, amount: f32) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| AthenError::Other(e.to_string()))?;
+        let now = Utc::now().to_rfc3339();
+        let id_str = entity_id.to_string();
+
+        conn.execute(
+            "UPDATE edges SET strength = MIN(strength + ?1, 1.0), last_used = ?2 WHERE from_entity = ?3 OR to_entity = ?3",
+            params![amount as f64, now, id_str],
         )
         .map_err(|e| AthenError::Other(e.to_string()))?;
 
@@ -339,7 +397,7 @@ impl KnowledgeGraph for SqliteGraph {
         let mut all_edges: Vec<SqliteEdge> = Vec::new();
         {
             let mut stmt = conn
-                .prepare("SELECT from_entity, relation, to_entity, weight, created_at FROM edges")
+                .prepare("SELECT from_entity, relation, to_entity, weight, created_at, strength, importance, last_used FROM edges")
                 .map_err(|e| AthenError::Other(e.to_string()))?;
             let rows = stmt
                 .query_map([], |row| {
@@ -348,12 +406,15 @@ impl KnowledgeGraph for SqliteGraph {
                     let to_str: String = row.get(2)?;
                     let weight: f64 = row.get(3)?;
                     let created_str: String = row.get(4)?;
-                    Ok((from_str, relation, to_str, weight, created_str))
+                    let strength: f64 = row.get(5)?;
+                    let importance: f64 = row.get(6)?;
+                    let last_used_str: String = row.get(7)?;
+                    Ok((from_str, relation, to_str, weight, created_str, strength, importance, last_used_str))
                 })
                 .map_err(|e| AthenError::Other(e.to_string()))?;
 
             for row in rows {
-                let (from_str, relation, to_str, weight, created_str) =
+                let (from_str, relation, to_str, weight, created_str, strength, importance, last_used_str) =
                     row.map_err(|e| AthenError::Other(e.to_string()))?;
                 let from = Uuid::parse_str(&from_str)
                     .map_err(|e| AthenError::Other(e.to_string()))?;
@@ -362,6 +423,9 @@ impl KnowledgeGraph for SqliteGraph {
                 let created_at = DateTime::parse_from_rfc3339(&created_str)
                     .map(|dt| dt.with_timezone(&Utc))
                     .unwrap_or_else(|_| Utc::now());
+                let last_used = DateTime::parse_from_rfc3339(&last_used_str)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or(created_at);
 
                 all_edges.push(SqliteEdge {
                     from,
@@ -369,6 +433,9 @@ impl KnowledgeGraph for SqliteGraph {
                     to,
                     weight: weight as f32,
                     created_at,
+                    strength: strength as f32,
+                    importance: importance as f32,
+                    last_used,
                 });
             }
         }
@@ -764,5 +831,113 @@ mod tests {
         assert_eq!(results[0].id, "c");
         assert_eq!(results[1].id, "b");
         assert_eq!(results[2].id, "a");
+    }
+
+    // -- Decay + Reinforcement tests --
+
+    #[test]
+    fn test_decay_strength() {
+        // A fresh edge should have approximately base_strength.
+        let now = Utc::now();
+        let result = decay_strength(0.5, &now);
+        assert!(
+            (result - 0.5).abs() < 0.01,
+            "Fresh edge should be ~0.5, got {result}"
+        );
+
+        // A 30-day-old edge should be approximately half of base_strength.
+        let thirty_days_ago = now - chrono::Duration::days(30);
+        let result = decay_strength(0.5, &thirty_days_ago);
+        assert!(
+            (result - 0.25).abs() < 0.02,
+            "30-day-old edge should be ~0.25 (half of 0.5), got {result}"
+        );
+
+        // A very old edge should not drop below 0.01.
+        let ancient = now - chrono::Duration::days(365);
+        let result = decay_strength(0.5, &ancient);
+        assert!(
+            (result - 0.01).abs() < 0.001,
+            "Very old edge should be ~0.01, got {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reinforce_entity() {
+        let conn = in_memory_conn();
+        let graph = SqliteGraph::new(conn).unwrap();
+
+        let alice = graph.add_entity(person("Alice")).await.unwrap();
+        let bob = graph.add_entity(person("Bob")).await.unwrap();
+        graph.add_relation(alice, "knows", bob).await.unwrap();
+
+        // Default strength is 0.5. Reinforce by 0.2 -> should become 0.7.
+        graph.reinforce_entity(alice, 0.2).await.unwrap();
+
+        // Verify by reading the edge strength from the database.
+        let c = graph.conn.lock().unwrap();
+        let strength: f64 = c
+            .query_row(
+                "SELECT strength FROM edges WHERE from_entity = ?1",
+                params![alice.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            (strength - 0.7).abs() < 0.001,
+            "Strength should be 0.7, got {strength}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_strength_clamped_to_one() {
+        let conn = in_memory_conn();
+        let graph = SqliteGraph::new(conn).unwrap();
+
+        let alice = graph.add_entity(person("Alice")).await.unwrap();
+        let bob = graph.add_entity(person("Bob")).await.unwrap();
+        graph.add_relation(alice, "knows", bob).await.unwrap();
+
+        // Reinforce by 0.9 (0.5 + 0.9 = 1.4, should clamp to 1.0).
+        graph.reinforce_entity(alice, 0.9).await.unwrap();
+
+        let c = graph.conn.lock().unwrap();
+        let strength: f64 = c
+            .query_row(
+                "SELECT strength FROM edges WHERE from_entity = ?1",
+                params![alice.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            (strength - 1.0).abs() < 0.001,
+            "Strength should be clamped to 1.0, got {strength}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_relation_weighted() {
+        let conn = in_memory_conn();
+        let graph = SqliteGraph::new(conn).unwrap();
+
+        let alice = graph.add_entity(person("Alice")).await.unwrap();
+        let bob = graph.add_entity(person("Bob")).await.unwrap();
+        graph
+            .add_relation_weighted(alice, "married_to", bob, 0.9)
+            .await
+            .unwrap();
+
+        let c = graph.conn.lock().unwrap();
+        let importance: f64 = c
+            .query_row(
+                "SELECT importance FROM edges WHERE from_entity = ?1",
+                params![alice.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            (importance - 0.9).abs() < 0.001,
+            "Importance should be 0.9, got {importance}"
+        );
     }
 }

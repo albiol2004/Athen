@@ -108,6 +108,55 @@ fn extract_key_terms(message: &str) -> Vec<String> {
         .collect()
 }
 
+/// Reinforce graph edges for memories that were actually used in the response.
+/// Uses keyword overlap to detect usage -- zero LLM cost.
+async fn reinforce_used_memories(
+    memory: &athen_memory::Memory,
+    context: &[ChatMessage],
+    response: &str,
+) {
+    let response_terms: std::collections::HashSet<String> = extract_key_terms(response)
+        .into_iter()
+        .map(|t| t.to_lowercase())
+        .collect();
+
+    if response_terms.is_empty() {
+        return;
+    }
+
+    // Find the injected memory system message.
+    let memory_msg = context.iter().find(|m| {
+        matches!(m.role, Role::System)
+            && matches!(&m.content, MessageContent::Text(t) if t.starts_with("Relevant information"))
+    });
+
+    let Some(ChatMessage {
+        content: MessageContent::Text(memory_text),
+        ..
+    }) = memory_msg
+    else {
+        return;
+    };
+
+    for line in memory_text.lines() {
+        let line = line.strip_prefix("- ").unwrap_or(line);
+        let memory_terms: std::collections::HashSet<String> = extract_key_terms(line)
+            .into_iter()
+            .map(|t| t.to_lowercase())
+            .collect();
+
+        // If 2+ key terms overlap, this memory was used.
+        let overlap = response_terms.intersection(&memory_terms).count();
+        if overlap >= 2 {
+            for term in &memory_terms {
+                if let Err(e) = memory.reinforce_by_name(term, 0.1).await {
+                    tracing::debug!("reinforce failed for {term}: {e}");
+                }
+            }
+        }
+    }
+}
+
 /// Judge whether a conversation exchange is worth storing in persistent memory.
 ///
 /// Returns `Some(summary)` with a distilled summary if worth remembering,
@@ -589,6 +638,9 @@ pub async fn send_message(
             let cancel_flag = Arc::clone(&state.cancel_flag);
             cancel_flag.store(false, Ordering::Relaxed);
 
+            // Snapshot context for post-response reinforcement.
+            let context_snapshot = context.clone();
+
             let executor = AgentBuilder::new()
                 .llm_router(exec_router)
                 .tool_registry(Box::new(registry))
@@ -701,6 +753,11 @@ pub async fn send_message(
             }
             persist_entry(&state, "user", &message, "message", None).await;
             persist_entry(&state, "assistant", &content, "message", None).await;
+
+            // Reinforce memories that were actually used in the response.
+            if let Some(ref memory) = state.memory {
+                reinforce_used_memories(memory, &context_snapshot, &content).await;
+            }
 
             // Auto-remember: judge whether this interaction is worth storing,
             // then remember only a distilled summary (not greetings, small talk, etc.).
@@ -882,6 +939,9 @@ pub async fn approve_task(
             let cancel_flag = Arc::clone(&state.cancel_flag);
             cancel_flag.store(false, Ordering::Relaxed);
 
+            // Snapshot context for post-response reinforcement.
+            let context_snapshot = context.clone();
+
             let executor = AgentBuilder::new()
                 .llm_router(exec_router)
                 .tool_registry(Box::new(registry))
@@ -991,6 +1051,11 @@ pub async fn approve_task(
             }
             persist_entry(&state, "user", &message, "message", None).await;
             persist_entry(&state, "assistant", &content, "message", None).await;
+
+            // Reinforce memories that were actually used in the response.
+            if let Some(ref memory) = state.memory {
+                reinforce_used_memories(memory, &context_snapshot, &content).await;
+            }
 
             // Auto-remember with LLM judge (same as send_message).
             if let Some(ref memory) = state.memory {

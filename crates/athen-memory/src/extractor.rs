@@ -20,7 +20,8 @@ impl LlmEntityExtractor {
 }
 
 const EXTRACTION_PROMPT: &str = r#"Extract entities and relationships from this text. Return JSON only, no other text:
-{"entities": [{"name": "...", "type": "Person|Organization|Project|Event|Document|Concept"}], "relations": [{"from": "entity_name", "relation": "verb/relationship", "to": "entity_name"}]}
+{"entities": [{"name": "...", "type": "Person|Organization|Project|Event|Document|Concept"}], "relations": [{"from": "entity_name", "relation": "verb/relationship", "to": "entity_name", "importance": 0.0-1.0}]}
+importance: 0.9 = critical relationship (family, partner), 0.5 = notable, 0.2 = minor detail.
 Only include clearly stated entities. Be concise."#;
 
 #[async_trait]
@@ -158,7 +159,11 @@ fn parse_extraction_json(val: &serde_json::Value) -> ExtractionResult {
                     let from = r.get("from")?.as_str()?.to_string();
                     let relation = r.get("relation")?.as_str()?.to_string();
                     let to = r.get("to")?.as_str()?.to_string();
-                    Some((from, relation, to))
+                    let importance = r
+                        .get("importance")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.5) as f32;
+                    Some((from, relation, to, importance.clamp(0.0, 1.0)))
                 })
                 .collect()
         })
@@ -211,7 +216,10 @@ mod tests {
         assert_eq!(result.entities[1].name, "Acme");
         assert_eq!(result.entities[1].entity_type, EntityType::Organization);
         assert_eq!(result.relations.len(), 1);
-        assert_eq!(result.relations[0], ("Alice".into(), "works_at".into(), "Acme".into()));
+        assert_eq!(result.relations[0].0, "Alice");
+        assert_eq!(result.relations[0].1, "works_at");
+        assert_eq!(result.relations[0].2, "Acme");
+        assert!((result.relations[0].3 - 0.5).abs() < f32::EPSILON); // default importance
     }
 
     #[test]

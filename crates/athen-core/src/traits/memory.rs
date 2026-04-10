@@ -81,6 +81,24 @@ pub trait KnowledgeGraph: Send + Sync {
     ) -> Result<()> {
         Ok(())
     }
+
+    /// Add a relation with an explicit importance weight.
+    /// Default delegates to `add_relation` (ignoring importance).
+    async fn add_relation_weighted(
+        &self,
+        from: EntityId,
+        relation: &str,
+        to: EntityId,
+        _importance: f32,
+    ) -> Result<()> {
+        self.add_relation(from, relation, to).await
+    }
+
+    /// Reinforce edges connected to the given entity.
+    /// Increases strength by `amount` (clamped to 1.0) and updates last_used.
+    async fn reinforce_entity(&self, _entity_id: EntityId, _amount: f32) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Unified memory facade.
@@ -164,8 +182,9 @@ pub trait EntityExtractor: Send + Sync {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractionResult {
     pub entities: Vec<Entity>,
-    /// (from_name, relation, to_name) tuples.
-    pub relations: Vec<(String, String, String)>,
+    /// (from_name, relation, to_name, importance) tuples.
+    /// importance: 0.0–1.0, where 0.9 = critical, 0.5 = notable, 0.2 = minor.
+    pub relations: Vec<(String, String, String, f32)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
