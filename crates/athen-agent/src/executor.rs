@@ -194,12 +194,14 @@ impl DefaultExecutor {
                  otherwise call `get_tool_details(name=\"<tool_name>\")` first to load it.\n",
             );
             for group in summarize_groups(tools) {
+                let count = group.tool_count();
                 prompt.push_str(&format!(
-                    "- **{}** ({} tool{}): {}\n",
+                    "- **{}** ({} tool{}): {}\n  Tools: {}\n",
                     group.display_name,
-                    group.tool_count,
-                    if group.tool_count == 1 { "" } else { "s" },
+                    count,
+                    if count == 1 { "" } else { "s" },
                     group.one_liner,
+                    group.tool_names.join(", "),
                 ));
             }
             prompt.push('\n');
@@ -836,28 +838,54 @@ impl AgentExecutor for DefaultExecutor {
                                 .get("name")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("")
+                                .trim()
                                 .to_string();
-                            match available_ref.iter().find(|t| t.name == requested) {
-                                Some(def) => Ok(athen_core::tool::ToolResult {
+                            if requested.is_empty() {
+                                // No name passed — return the full list so the
+                                // model can pick a real one and try again.
+                                let all_names: Vec<String> = available_ref
+                                    .iter()
+                                    .map(|t| t.name.clone())
+                                    .collect();
+                                Ok(athen_core::tool::ToolResult {
                                     success: true,
                                     output: serde_json::json!({
-                                        "name": def.name,
-                                        "description": def.description,
-                                        "parameters": def.parameters,
-                                        "note": "Tool details revealed. You can now call this tool directly."
+                                        "available_tools": all_names,
+                                        "hint": "Pass one of these exact names as the 'name' argument: get_tool_details(name=\"<tool_name>\")."
                                     }),
                                     error: None,
                                     execution_time_ms: 0,
-                                }),
-                                None => Ok(athen_core::tool::ToolResult {
-                                    success: false,
-                                    output: serde_json::json!({
-                                        "error": format!("Unknown tool: {requested}"),
-                                        "hint": "Tool names are case-sensitive; check the AVAILABLE TOOL GROUPS section.",
+                                })
+                            } else {
+                                match available_ref.iter().find(|t| t.name == requested) {
+                                    Some(def) => Ok(athen_core::tool::ToolResult {
+                                        success: true,
+                                        output: serde_json::json!({
+                                            "name": def.name,
+                                            "description": def.description,
+                                            "parameters": def.parameters,
+                                            "note": "Tool details revealed. You can now call this tool directly."
+                                        }),
+                                        error: None,
+                                        execution_time_ms: 0,
                                     }),
-                                    error: Some(format!("Unknown tool: {requested}")),
-                                    execution_time_ms: 0,
-                                }),
+                                    None => {
+                                        let all_names: Vec<String> = available_ref
+                                            .iter()
+                                            .map(|t| t.name.clone())
+                                            .collect();
+                                        Ok(athen_core::tool::ToolResult {
+                                            success: false,
+                                            output: serde_json::json!({
+                                                "error": format!("Unknown tool: {requested}"),
+                                                "available_tools": all_names,
+                                                "hint": "Tool names are case-sensitive. Pick one from 'available_tools'."
+                                            }),
+                                            error: Some(format!("Unknown tool: {requested}")),
+                                            execution_time_ms: 0,
+                                        })
+                                    }
+                                }
                             }
                         } else {
                             registry.call_tool(&name, args).await
@@ -1490,14 +1518,21 @@ mod tests {
         assert!(prompt.contains("memory_store"));
         assert!(prompt.contains("memory_recall"));
         assert!(prompt.contains(crate::tool_grouping::META_TOOL_NAME));
-        // Calendar / Files were NOT revealed → their full descriptions should
-        // not appear under "DETAILED TOOLS".
-        let detailed_section = prompt
-            .split("DETAILED TOOLS")
-            .nth(1)
-            .unwrap_or("");
-        assert!(!detailed_section.contains("calendar_create"));
-        assert!(!detailed_section.contains("files__write_file"));
+        // The non-revealed tools' user-facing descriptions should NOT
+        // appear in the prompt at all (their names do, in the group index,
+        // so the model knows what to ask for).
+        assert!(
+            !prompt.contains("create a calendar event"),
+            "non-revealed tool description leaked into prompt"
+        );
+        assert!(
+            !prompt.contains("write a file"),
+            "non-revealed tool description leaked into prompt"
+        );
+        // But the names should be visible in the group index so the model
+        // knows what to ask for via get_tool_details.
+        assert!(prompt.contains("calendar_create"));
+        assert!(prompt.contains("files__write_file"));
     }
 
     #[tokio::test]
@@ -1659,6 +1694,69 @@ mod tests {
         assert!(result.success);
         // 1 dispatch + 1 completion = 2 steps (no get_tool_details round-trip).
         assert_eq!(result.steps_completed, 2);
+    }
+
+    #[tokio::test]
+    async fn meta_tool_with_no_name_returns_available_list() {
+        let discover = ToolCall {
+            id: "c1".to_string(),
+            name: crate::tool_grouping::META_TOOL_NAME.to_string(),
+            arguments: serde_json::json!({}), // no "name" arg
+        };
+        let responses = vec![
+            MockLlmRouter::make_response("Looking up.", vec![discover]),
+            MockLlmRouter::make_response("Done.", vec![]),
+        ];
+
+        let auditor = Arc::new(InMemoryAuditor::new());
+        struct ArcAuditor(Arc<InMemoryAuditor>);
+        #[async_trait]
+        impl StepAuditor for ArcAuditor {
+            async fn record_step(
+                &self,
+                task_id: athen_core::task::TaskId,
+                step: &TaskStep,
+            ) -> Result<()> {
+                self.0.record_step(task_id, step).await
+            }
+            async fn get_steps(
+                &self,
+                task_id: athen_core::task::TaskId,
+            ) -> Result<Vec<TaskStep>> {
+                self.0.get_steps(task_id).await
+            }
+        }
+
+        let task = make_task("Find tools");
+        let task_id = task.id;
+        let executor = DefaultExecutor::new(
+            Box::new(MockLlmRouter::new(responses)),
+            Box::new(MockToolRegistry::new(
+                vec![tool_def("calendar_create", ""), tool_def("files__write_file", "")],
+                vec![],
+            )),
+            Box::new(ArcAuditor(Arc::clone(&auditor))),
+            10,
+            Duration::from_secs(60),
+            vec![],
+        );
+
+        let result = executor.execute(task).await.unwrap();
+        assert!(result.success);
+
+        // Find the meta-tool step and check its output included the tool list.
+        let steps = auditor.get_steps(task_id).await.unwrap();
+        let meta_step = steps
+            .iter()
+            .find(|s| s.description.contains(crate::tool_grouping::META_TOOL_NAME))
+            .expect("meta-tool step recorded");
+        let output = meta_step.output.as_ref().unwrap();
+        let names = output["result"]["available_tools"]
+            .as_array()
+            .expect("available_tools array");
+        let name_strs: Vec<&str> = names.iter().filter_map(|v| v.as_str()).collect();
+        assert!(name_strs.contains(&"calendar_create"));
+        assert!(name_strs.contains(&"files__write_file"));
     }
 
     #[tokio::test]

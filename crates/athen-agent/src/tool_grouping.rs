@@ -42,7 +42,13 @@ pub struct ToolGroupSummary {
     pub id: String,
     pub display_name: String,
     pub one_liner: String,
-    pub tool_count: usize,
+    pub tool_names: Vec<String>,
+}
+
+impl ToolGroupSummary {
+    pub fn tool_count(&self) -> usize {
+        self.tool_names.len()
+    }
 }
 
 /// Build a list of group summaries, sorted by id for stable prompts.
@@ -56,11 +62,16 @@ pub fn summarize_groups(tools: &[ToolDefinition]) -> Vec<ToolGroupSummary> {
     }
     by_group
         .into_iter()
-        .map(|(id, ts)| ToolGroupSummary {
-            display_name: pretty_group_name(&id),
-            one_liner: group_one_liner(&id, &ts),
-            tool_count: ts.len(),
-            id,
+        .map(|(id, ts)| {
+            let mut tool_names: Vec<String> =
+                ts.iter().map(|t| t.name.clone()).collect();
+            tool_names.sort();
+            ToolGroupSummary {
+                display_name: pretty_group_name(&id),
+                one_liner: group_one_liner(&id, &ts),
+                tool_names,
+                id,
+            }
         })
         .collect()
 }
@@ -188,10 +199,14 @@ mod tests {
         ];
         let summary = summarize_groups(&tools);
         let by_id: std::collections::HashMap<_, _> =
-            summary.iter().map(|g| (g.id.as_str(), g.tool_count)).collect();
+            summary.iter().map(|g| (g.id.as_str(), g.tool_count())).collect();
         assert_eq!(by_id.get("memory"), Some(&2));
         assert_eq!(by_id.get("calendar"), Some(&2));
         assert_eq!(by_id.get("files"), Some(&3));
+        // Names are exposed for the model to pass to get_tool_details.
+        let files = summary.iter().find(|g| g.id == "files").unwrap();
+        assert!(files.tool_names.contains(&"files__read_file".to_string()));
+        assert!(files.tool_names.contains(&"files__write_file".to_string()));
     }
 
     #[test]
