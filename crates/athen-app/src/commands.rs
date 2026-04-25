@@ -651,8 +651,8 @@ pub async fn send_message(
                 .context_messages(context)
                 .stream_sender(stream_tx)
                 .cancel_flag(cancel_flag);
-            if let Some(p) = state.tool_doc_path.clone() {
-                builder = builder.tool_doc_path(p);
+            if let Some(p) = state.tool_doc_dir.clone() {
+                builder = builder.tool_doc_dir(p);
             }
             let executor = builder
                 .build()
@@ -957,8 +957,8 @@ pub async fn approve_task(
                 .context_messages(context)
                 .stream_sender(stream_tx)
                 .cancel_flag(cancel_flag);
-            if let Some(p) = state.tool_doc_path.clone() {
-                builder = builder.tool_doc_path(p);
+            if let Some(p) = state.tool_doc_dir.clone() {
+                builder = builder.tool_doc_dir(p);
             }
             let executor = builder
                 .build()

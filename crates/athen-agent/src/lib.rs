@@ -124,11 +124,12 @@ impl AgentBuilder {
         self
     }
 
-    /// Path to a markdown reference of every available tool. When set, the
-    /// system prompt instructs the agent to `read_file` this path for full
-    /// schemas of any tool whose arguments it doesn't already know.
-    pub fn tool_doc_path(mut self, path: PathBuf) -> Self {
-        self.tool_doc_path = Some(path);
+    /// Directory containing per-group markdown references (e.g. `calendar.md`,
+    /// `files.md`). When set, the system prompt instructs the agent to
+    /// `read_file` the relevant group file for full schemas of any tool whose
+    /// arguments it doesn't already know.
+    pub fn tool_doc_dir(mut self, dir: PathBuf) -> Self {
+        self.tool_doc_path = Some(dir);
         self
     }
 
@@ -166,7 +167,7 @@ impl AgentBuilder {
         }
 
         if let Some(path) = self.tool_doc_path {
-            executor.set_tool_doc_path(path);
+            executor.set_tool_doc_dir(path);
         }
 
         Ok(executor)

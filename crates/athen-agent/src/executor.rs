@@ -110,10 +110,10 @@ pub struct DefaultExecutor {
     context_messages: Vec<ChatMessage>,
     stream_sender: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     cancel_flag: Option<Arc<AtomicBool>>,
-    /// Path to the markdown tool reference (typically `~/.athen/TOOLS.md`).
-    /// When set, the system prompt instructs the agent to read this file
-    /// for full schemas of tools it doesn't already know.
-    tool_doc_path: Option<PathBuf>,
+    /// Directory of per-group markdown references (typically
+    /// `~/.athen/tools/`). When set, the system prompt instructs the agent
+    /// to read the relevant `<group>.md` file for full schemas.
+    tool_doc_dir: Option<PathBuf>,
 }
 
 impl DefaultExecutor {
@@ -135,15 +135,15 @@ impl DefaultExecutor {
             context_messages,
             stream_sender: None,
             cancel_flag: None,
-            tool_doc_path: None,
+            tool_doc_dir: None,
         }
     }
 
-    /// Tell the executor where the markdown tool reference lives. The agent
-    /// will be told to `read_file` this path for any tool whose schema it
-    /// doesn't already remember.
-    pub fn set_tool_doc_path(&mut self, path: PathBuf) {
-        self.tool_doc_path = Some(path);
+    /// Tell the executor where the per-group markdown reference files live.
+    /// The agent will be told to `read_file` `<dir>/<group>.md` for any tool
+    /// whose schema it doesn't already remember.
+    pub fn set_tool_doc_dir(&mut self, dir: PathBuf) {
+        self.tool_doc_dir = Some(dir);
     }
 
     /// Set a channel sender for streaming text chunks from the final LLM response.
@@ -167,13 +167,14 @@ impl DefaultExecutor {
     /// `tools` is the *complete* set of tools the agent can ever access this
     /// session. `revealed` is the subset whose full descriptions and schemas
     /// are surfaced inline — memory tools plus any tool the agent has already
-    /// dispatched at least once this session. `tool_doc_path` (when set)
-    /// points at a markdown reference the agent can read for full schemas.
+    /// dispatched at least once this session. `tool_doc_dir` (when set)
+    /// points at a directory of per-group markdown files the agent can read
+    /// for full schemas of one group at a time.
     fn build_system_prompt(
         tools: &[athen_core::tool::ToolDefinition],
         revealed: &HashSet<String>,
         has_context: bool,
-        tool_doc_path: Option<&std::path::Path>,
+        tool_doc_dir: Option<&std::path::Path>,
     ) -> String {
         let now = chrono::Local::now();
         let tz_offset = now.format("%:z"); // e.g. "+02:00"
@@ -207,19 +208,22 @@ impl DefaultExecutor {
                  you have two options:\n\
                  - Just try calling it; the response will tell you if anything is wrong.\n",
             );
-            if let Some(path) = tool_doc_path {
+            if let Some(dir) = tool_doc_dir {
                 prompt.push_str(&format!(
-                    "- Or use `read_file(path=\"{}\")` to fetch the full reference \
-                     (every tool's name, description, and JSON schema).\n",
-                    path.display(),
+                    "- Or read the schema file for the group you need: \
+                     `read_file(path=\"{}/<group>.md\")` where `<group>` is one of \
+                     the group ids below (e.g. `calendar`, `files`). Each file \
+                     contains ONLY that group's schemas, so reads stay small.\n",
+                    dir.display(),
                 ));
             }
             prompt.push('\n');
             for group in summarize_groups(tools) {
                 let count = group.tool_count();
                 prompt.push_str(&format!(
-                    "- **{}** ({} tool{}): {}\n  Tools: {}\n",
+                    "- **{}** [id: `{}`] ({} tool{}): {}\n  Tools: {}\n",
                     group.display_name,
+                    group.id,
                     count,
                     if count == 1 { "" } else { "s" },
                     group.one_liner,
@@ -529,7 +533,7 @@ impl AgentExecutor for DefaultExecutor {
                 &available_tools,
                 &revealed_tools,
                 has_context,
-                self.tool_doc_path.as_deref(),
+                self.tool_doc_dir.as_deref(),
             );
 
             // Tools sent to the LLM API: only the revealed subset carries
@@ -1552,14 +1556,18 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_includes_tool_doc_path_when_set() {
+    fn system_prompt_includes_tool_doc_dir_when_set() {
         let tools = vec![tool_def("calendar_create", "create event")];
         let revealed = HashSet::new();
-        let path = std::path::PathBuf::from("/tmp/athen-test/TOOLS.md");
+        let dir = std::path::PathBuf::from("/tmp/athen-test/tools");
         let prompt =
-            DefaultExecutor::build_system_prompt(&tools, &revealed, false, Some(&path));
-        assert!(prompt.contains("/tmp/athen-test/TOOLS.md"));
+            DefaultExecutor::build_system_prompt(&tools, &revealed, false, Some(&dir));
+        // Pattern reference uses the directory + <group>.md placeholder.
+        assert!(prompt.contains("/tmp/athen-test/tools"));
+        assert!(prompt.contains("<group>.md"));
         assert!(prompt.contains("read_file"));
+        // Group id is shown in the index so the model knows the filename.
+        assert!(prompt.contains("[id: `calendar`]"));
     }
 
     #[test]
@@ -1568,7 +1576,7 @@ mod tests {
         let revealed = HashSet::new();
         let prompt =
             DefaultExecutor::build_system_prompt(&tools, &revealed, false, None);
-        assert!(!prompt.contains("TOOLS.md"));
+        assert!(!prompt.contains("read_file"));
     }
 
     /// Tool registry that records dispatch *order* and sleeps in each call so

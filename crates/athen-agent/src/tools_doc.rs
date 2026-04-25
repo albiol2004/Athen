@@ -1,69 +1,42 @@
-//! Generates a markdown reference of the agent's currently available tools.
+//! Generates per-group markdown references of the agent's currently
+//! available tools.
 //!
-//! The doc is written to disk (typically `~/.athen/TOOLS.md`) so the agent
-//! can read it on demand with the same `read_file` tool it uses for any other
-//! file. This replaces the synthetic `get_tool_details` meta-tool: instead
-//! of teaching the model a new discovery interface it doesn't reliably use,
-//! we lean on a capability it already has.
+//! Layout under the configured directory (typically `~/.athen/tools/`):
+//! - `calendar.md`, `contacts.md`, `files.md`, ... — one file per group,
+//!   each containing the full schema for every tool in that group.
+//!
+//! The agent reads only the group it needs via `read_file`, so loading the
+//! schema for one group doesn't pull every other group into context. This
+//! replaces both the synthetic `get_tool_details` meta-tool (which models
+//! didn't use reliably) and a single monolithic TOOLS.md (which would load
+//! every schema on each read).
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use athen_core::tool::ToolDefinition;
 use serde_json::Value;
 
 use crate::tool_grouping::{group_for, summarize_groups};
 
-/// Build the full markdown reference for the given tool list.
-///
-/// Output structure:
-/// 1. Top-level header + brief usage note.
-/// 2. One section per tool group, with each tool's name, description, and
-///    JSON Schema rendered as a fenced code block.
-pub fn generate(tools: &[ToolDefinition]) -> String {
+/// Render the markdown for a single group.
+pub fn generate_group(display_name: &str, tools: &[&ToolDefinition]) -> String {
     let mut out = String::new();
-    out.push_str("# Athen Tool Reference\n\n");
+    out.push_str(&format!("# {display_name} tools\n\n"));
     out.push_str(
-        "This file lists every tool currently available to the agent. \
-         Each entry includes the name, a short description, and the JSON \
-         schema for its arguments. Read the section for any tool whose \
-         schema you don't already know before calling it.\n\n",
+        "Schemas for every tool in this group. Pass arguments as a JSON \
+         object matching the schema below.\n\n",
     );
-
-    // Quick index — mirrors the system-prompt summary so the agent can
-    // jump to the right section quickly.
-    out.push_str("## Index\n\n");
-    let groups = summarize_groups(tools);
-    for g in &groups {
-        out.push_str(&format!(
-            "- **{}** ({}): {}\n",
-            g.display_name,
-            g.tool_count(),
-            g.one_liner,
-        ));
+    let mut sorted: Vec<&&ToolDefinition> = tools.iter().collect();
+    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+    for tool in sorted {
+        out.push_str(&format!("## `{}`\n\n", tool.name));
+        out.push_str(&format!("{}\n\n", tool.description.trim()));
+        out.push_str("**Arguments:**\n\n");
+        out.push_str("```json\n");
+        out.push_str(&pretty_schema(&tool.parameters));
+        out.push_str("\n```\n\n");
     }
-    out.push('\n');
-
-    // Group → tools, ordered the same way summarize_groups returned them.
-    let mut by_group: BTreeMap<&str, Vec<&ToolDefinition>> = BTreeMap::new();
-    for t in tools {
-        by_group.entry(group_for(&t.name)).or_default().push(t);
-    }
-
-    for g in &groups {
-        out.push_str(&format!("## {}\n\n", g.display_name));
-        let Some(group_tools) = by_group.get(g.id.as_str()) else { continue };
-        let mut sorted = group_tools.clone();
-        sorted.sort_by(|a, b| a.name.cmp(&b.name));
-        for tool in sorted {
-            out.push_str(&format!("### `{}`\n\n", tool.name));
-            out.push_str(&format!("{}\n\n", tool.description.trim()));
-            out.push_str("**Arguments:**\n\n");
-            out.push_str("```json\n");
-            out.push_str(&pretty_schema(&tool.parameters));
-            out.push_str("\n```\n\n");
-        }
-    }
-
     out
 }
 
@@ -71,13 +44,50 @@ fn pretty_schema(schema: &Value) -> String {
     serde_json::to_string_pretty(schema).unwrap_or_else(|_| schema.to_string())
 }
 
-/// Write `generate(tools)` to `path`, creating parent directories. Returns
-/// any I/O error so callers can decide whether to log or surface it.
-pub fn write_to(path: &std::path::Path, tools: &[ToolDefinition]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+/// Write one markdown file per tool group into `dir`, creating the directory
+/// if needed. Returns the list of (group_id, absolute_path) pairs that were
+/// written so the system prompt can point the agent at them.
+///
+/// Existing `*.md` files in `dir` for groups that no longer exist are
+/// removed so stale entries don't confuse the agent after MCPs are toggled
+/// off.
+pub fn write_per_group(
+    dir: &Path,
+    tools: &[ToolDefinition],
+) -> std::io::Result<Vec<(String, PathBuf)>> {
+    std::fs::create_dir_all(dir)?;
+
+    let mut by_group: BTreeMap<&str, Vec<&ToolDefinition>> = BTreeMap::new();
+    for t in tools {
+        by_group.entry(group_for(&t.name)).or_default().push(t);
     }
-    std::fs::write(path, generate(tools))
+    let groups = summarize_groups(tools);
+
+    // Track which files we wrote this run so we can clean up stale ones.
+    let mut written: Vec<(String, PathBuf)> = Vec::new();
+    for g in &groups {
+        let Some(group_tools) = by_group.get(g.id.as_str()) else { continue };
+        let path = dir.join(format!("{}.md", g.id));
+        let body = generate_group(&g.display_name, group_tools);
+        std::fs::write(&path, body)?;
+        written.push((g.id.clone(), path));
+    }
+
+    // Remove .md files in the dir that don't correspond to a current group.
+    let current_files: std::collections::HashSet<PathBuf> =
+        written.iter().map(|(_, p)| p.clone()).collect();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|s| s.to_str()) == Some("md")
+                && !current_files.contains(&p)
+            {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+
+    Ok(written)
 }
 
 #[cfg(test)]
@@ -101,68 +111,87 @@ mod tests {
     }
 
     #[test]
-    fn includes_every_tool() {
+    fn writes_one_file_per_group() {
+        let tmp = tempfile::tempdir().unwrap();
         let tools = vec![
-            def("calendar_create", "Create an event", json!({"type": "object"})),
+            def("calendar_create", "Create event", json!({"type": "object"})),
             def("calendar_list", "List events", json!({"type": "object"})),
             def(
                 "files__write_file",
-                "Write to a file",
+                "Write file",
                 json!({"type": "object", "required": ["path"]}),
             ),
         ];
-        let md = generate(&tools);
-        assert!(md.contains("`calendar_create`"));
-        assert!(md.contains("`calendar_list`"));
-        assert!(md.contains("`files__write_file`"));
+        let written = write_per_group(tmp.path(), &tools).unwrap();
+        let groups: std::collections::HashSet<&str> =
+            written.iter().map(|(g, _)| g.as_str()).collect();
+        assert!(groups.contains("calendar"));
+        assert!(groups.contains("files"));
+
+        let cal = std::fs::read_to_string(tmp.path().join("calendar.md")).unwrap();
+        assert!(cal.contains("calendar_create"));
+        assert!(cal.contains("calendar_list"));
+        // Calendar file should NOT contain files schemas.
+        assert!(!cal.contains("files__write_file"));
+
+        let files = std::fs::read_to_string(tmp.path().join("files.md")).unwrap();
+        assert!(files.contains("files__write_file"));
+        assert!(!files.contains("calendar_create"));
     }
 
     #[test]
-    fn groups_tools_by_prefix() {
-        let tools = vec![
-            def("calendar_create", "x", json!({})),
-            def("calendar_list", "x", json!({})),
-            def("contacts_list", "x", json!({})),
-        ];
-        let md = generate(&tools);
-        // Each group's heading shows up exactly once.
-        assert_eq!(md.matches("## Calendar\n").count(), 1);
-        assert_eq!(md.matches("## Contacts\n").count(), 1);
-    }
-
-    #[test]
-    fn renders_schema_as_json_block() {
+    fn schema_appears_as_json_block() {
+        let tmp = tempfile::tempdir().unwrap();
         let tools = vec![def(
             "calendar_create",
             "Create an event",
             json!({
                 "type": "object",
-                "properties": {
-                    "title": {"type": "string"}
-                },
+                "properties": { "title": {"type": "string"} },
                 "required": ["title"]
             }),
         )];
-        let md = generate(&tools);
-        assert!(md.contains("```json"));
-        assert!(md.contains("\"title\""));
-        assert!(md.contains("\"required\""));
+        write_per_group(tmp.path(), &tools).unwrap();
+        let cal = std::fs::read_to_string(tmp.path().join("calendar.md")).unwrap();
+        assert!(cal.contains("```json"));
+        assert!(cal.contains("\"title\""));
+        assert!(cal.contains("\"required\""));
     }
 
     #[test]
-    fn write_to_creates_file_and_directory() {
+    fn creates_directory_if_missing() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("nested").join("TOOLS.md");
+        let dir = tmp.path().join("nested").join("tools");
         let tools = vec![def("calendar_list", "List events", json!({}))];
-        write_to(&path, &tools).unwrap();
-        let contents = std::fs::read_to_string(&path).unwrap();
-        assert!(contents.contains("calendar_list"));
+        write_per_group(&dir, &tools).unwrap();
+        assert!(dir.join("calendar.md").exists());
     }
 
     #[test]
-    fn empty_tools_still_writes_header() {
-        let md = generate(&[]);
-        assert!(md.starts_with("# Athen Tool Reference"));
-        assert!(md.contains("## Index"));
+    fn empty_tool_list_writes_no_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let written = write_per_group(tmp.path(), &[]).unwrap();
+        assert!(written.is_empty());
+    }
+
+    #[test]
+    fn stale_group_files_are_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        // First write: calendar + files.
+        let initial = vec![
+            def("calendar_list", "x", json!({})),
+            def("files__read_file", "x", json!({})),
+        ];
+        write_per_group(tmp.path(), &initial).unwrap();
+        assert!(tmp.path().join("files.md").exists());
+
+        // Second write: only calendar (user disabled the Files MCP).
+        let after = vec![def("calendar_list", "x", json!({}))];
+        write_per_group(tmp.path(), &after).unwrap();
+        assert!(tmp.path().join("calendar.md").exists());
+        assert!(
+            !tmp.path().join("files.md").exists(),
+            "stale group file should be removed when its group disappears"
+        );
     }
 }
