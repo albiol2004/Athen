@@ -17,10 +17,9 @@ use athen_core::traits::llm::LlmRouter;
 use athen_core::traits::tool::ToolRegistry;
 
 use crate::timeout::DefaultTimeoutGuard;
-use crate::tool_grouping::{
-    is_always_revealed, meta_tool_definition, summarize_groups, META_TOOL_NAME,
-};
+use crate::tool_grouping::{is_always_revealed, summarize_groups};
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 /// Check if a text response is an empty JSON blob (e.g. `{"response": ""}`).
 ///
@@ -111,6 +110,10 @@ pub struct DefaultExecutor {
     context_messages: Vec<ChatMessage>,
     stream_sender: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     cancel_flag: Option<Arc<AtomicBool>>,
+    /// Path to the markdown tool reference (typically `~/.athen/TOOLS.md`).
+    /// When set, the system prompt instructs the agent to read this file
+    /// for full schemas of tools it doesn't already know.
+    tool_doc_path: Option<PathBuf>,
 }
 
 impl DefaultExecutor {
@@ -132,7 +135,15 @@ impl DefaultExecutor {
             context_messages,
             stream_sender: None,
             cancel_flag: None,
+            tool_doc_path: None,
         }
+    }
+
+    /// Tell the executor where the markdown tool reference lives. The agent
+    /// will be told to `read_file` this path for any tool whose schema it
+    /// doesn't already remember.
+    pub fn set_tool_doc_path(&mut self, path: PathBuf) {
+        self.tool_doc_path = Some(path);
     }
 
     /// Set a channel sender for streaming text chunks from the final LLM response.
@@ -155,12 +166,14 @@ impl DefaultExecutor {
     ///
     /// `tools` is the *complete* set of tools the agent can ever access this
     /// session. `revealed` is the subset whose full descriptions and schemas
-    /// are surfaced inline — typically memory + the discovery meta-tool +
-    /// any tool the agent has already asked about via `get_tool_details`.
+    /// are surfaced inline — memory tools plus any tool the agent has already
+    /// dispatched at least once this session. `tool_doc_path` (when set)
+    /// points at a markdown reference the agent can read for full schemas.
     fn build_system_prompt(
         tools: &[athen_core::tool::ToolDefinition],
         revealed: &HashSet<String>,
         has_context: bool,
+        tool_doc_path: Option<&std::path::Path>,
     ) -> String {
         let now = chrono::Local::now();
         let tz_offset = now.format("%:z"); // e.g. "+02:00"
@@ -189,10 +202,19 @@ impl DefaultExecutor {
         if !tools.is_empty() {
             prompt.push_str(
                 "AVAILABLE TOOL GROUPS — every tool listed below exists and is callable. \
-                 The ones in \"DETAILED TOOLS\" already have their full schemas loaded. \
-                 For any other tool: if you remember its schema, call it directly; \
-                 otherwise call `get_tool_details(name=\"<tool_name>\")` first to load it.\n",
+                 If you already know a tool's arguments, call it directly. If you're \
+                 unsure of the arguments for a tool that isn't in DETAILED TOOLS, \
+                 you have two options:\n\
+                 - Just try calling it; the response will tell you if anything is wrong.\n",
             );
+            if let Some(path) = tool_doc_path {
+                prompt.push_str(&format!(
+                    "- Or use `read_file(path=\"{}\")` to fetch the full reference \
+                     (every tool's name, description, and JSON schema).\n",
+                    path.display(),
+                ));
+            }
+            prompt.push('\n');
             for group in summarize_groups(tools) {
                 let count = group.tool_count();
                 prompt.push_str(&format!(
@@ -212,7 +234,7 @@ impl DefaultExecutor {
                 .filter(|t| revealed.contains(&t.name))
                 .collect();
             if !revealed_tools.is_empty() {
-                prompt.push_str("DETAILED TOOLS (callable directly right now):\n");
+                prompt.push_str("DETAILED TOOLS (schemas already loaded — call directly):\n");
                 for tool in revealed_tools {
                     prompt.push_str(&format!("- **{}**: {}\n", tool.name, tool.description));
                 }
@@ -473,14 +495,12 @@ impl AgentExecutor for DefaultExecutor {
             std::collections::HashMap::new();
         const SIGNATURE_REPEAT_LIMIT: u32 = 3;
 
-        // Gather available tools for the LLM. Append the synthetic discovery
-        // meta-tool so the agent can lazily reveal others on demand.
-        let mut available_tools = self.tool_registry.list_tools().await?;
-        available_tools.push(meta_tool_definition());
+        // Gather available tools for the LLM.
+        let available_tools = self.tool_registry.list_tools().await?;
 
         // Two-tier surfacing: only the "revealed" subset has its full schema
-        // sent to the LLM each turn. Memory + the meta-tool are revealed by
-        // default; other tools enter the set when the agent asks about them.
+        // sent to the LLM each turn. Memory tools are revealed by default;
+        // others enter the set on first dispatch (tolerant dispatch).
         let mut revealed_tools: HashSet<String> = available_tools
             .iter()
             .map(|t| t.name.clone())
@@ -505,12 +525,16 @@ impl AgentExecutor for DefaultExecutor {
             // Rebuild the system prompt each iteration so newly-revealed
             // tools' full schemas appear inline. The prompt itself is small;
             // rebuilding is cheap.
-            let system_prompt =
-                Self::build_system_prompt(&available_tools, &revealed_tools, has_context);
+            let system_prompt = Self::build_system_prompt(
+                &available_tools,
+                &revealed_tools,
+                has_context,
+                self.tool_doc_path.as_deref(),
+            );
 
             // Tools sent to the LLM API: only the revealed subset carries
-            // schemas. The model sees the others in the system-prompt index
-            // and uses `get_tool_details` to surface them.
+            // schemas. The model sees others in the system-prompt index;
+            // tolerant dispatch reveals them on first call.
             let revealed_tool_defs: Vec<athen_core::tool::ToolDefinition> = available_tools
                 .iter()
                 .filter(|t| revealed_tools.contains(&t.name))
@@ -792,23 +816,9 @@ impl AgentExecutor for DefaultExecutor {
             // ── Pre-scan: track tool names + reveals (synchronous) ──
             // Doing this up front means we can launch the actual dispatches
             // in parallel without each future racing on `revealed_tools`.
-            // Snapshot which tools were already revealed BEFORE this batch so
-            // the meta-tool can tell the model when it asked about something
-            // it already had in its DETAILED TOOLS section.
-            let revealed_before_batch: HashSet<String> = revealed_tools.clone();
             for tool_call in &response.tool_calls {
                 tools_called.push(tool_call.name.clone());
-                if tool_call.name == META_TOOL_NAME {
-                    if let Some(requested) = tool_call
-                        .arguments
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                    {
-                        if available_tools.iter().any(|t| t.name == requested) {
-                            revealed_tools.insert(requested.to_string());
-                        }
-                    }
-                } else if !revealed_tools.contains(&tool_call.name)
+                if !revealed_tools.contains(&tool_call.name)
                     && available_tools.iter().any(|t| t.name == tool_call.name)
                 {
                     revealed_tools.insert(tool_call.name.clone());
@@ -833,14 +843,11 @@ impl AgentExecutor for DefaultExecutor {
             }
 
             // ── Dispatch all tool calls in parallel ──
-            // Independent tool calls run concurrently; the meta-tool is
-            // resolved synchronously inside its async block. Results come
-            // back in input order. Identical calls within the batch share a
-            // single result, and any signature called more than
+            // Independent tool calls run concurrently. Results come back in
+            // input order. Identical calls within the batch share a single
+            // result, and any signature called more than
             // SIGNATURE_REPEAT_LIMIT times is short-circuited as a loop.
             let registry: &dyn ToolRegistry = &*self.tool_registry;
-            let available_ref = &available_tools;
-            let already_revealed = &revealed_before_batch;
 
             // Update signature counts and decide which calls to actually run.
             // For duplicates within the batch (same name+args), only the first
@@ -901,82 +908,7 @@ impl AgentExecutor for DefaultExecutor {
                             }),
                         );
                     }
-                    let result: Result<athen_core::tool::ToolResult> =
-                        if name == META_TOOL_NAME {
-                            let requested = args
-                                .get("name")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .trim()
-                                .to_string();
-                            if requested.is_empty() {
-                                // Hard error — calling with no name is a bug
-                                // in the model's tool use. A friendly response
-                                // here causes parallel-spam loops.
-                                Ok(athen_core::tool::ToolResult {
-                                    success: false,
-                                    output: serde_json::json!({
-                                        "error": "Missing required parameter 'name'. You MUST pass the exact tool name as a string, e.g. get_tool_details(name=\"calendar_create\"). Pick one name from the 'Tools:' line of any group in your AVAILABLE TOOL GROUPS section."
-                                    }),
-                                    error: Some("missing required parameter 'name'".to_string()),
-                                    execution_time_ms: 0,
-                                })
-                            } else if already_revealed.contains(&requested) {
-                                // The model asked about a tool that was already
-                                // in its DETAILED TOOLS section. Don't re-dump
-                                // the schema; just remind the model.
-                                Ok(athen_core::tool::ToolResult {
-                                    success: true,
-                                    output: serde_json::json!({
-                                        "status": "already_known",
-                                        "name": requested,
-                                        "message": format!(
-                                            "The full schema for '{requested}' is already in your system prompt under DETAILED TOOLS. Call it directly — no need to look it up."
-                                        ),
-                                    }),
-                                    error: None,
-                                    execution_time_ms: 0,
-                                })
-                            } else {
-                                match available_ref.iter().find(|t| t.name == requested) {
-                                    Some(def) => Ok(athen_core::tool::ToolResult {
-                                        success: true,
-                                        // Schema is the FIRST field so the model
-                                        // sees it before any wrapper text.
-                                        output: serde_json::json!({
-                                            "tool_name": def.name,
-                                            "input_schema": def.parameters,
-                                            "description": def.description,
-                                            "ready_to_call": true,
-                                            "next_step": format!(
-                                                "Call '{}' directly now — its schema above is loaded.",
-                                                def.name
-                                            ),
-                                        }),
-                                        error: None,
-                                        execution_time_ms: 0,
-                                    }),
-                                    None => {
-                                        let all_names: Vec<String> = available_ref
-                                            .iter()
-                                            .map(|t| t.name.clone())
-                                            .collect();
-                                        Ok(athen_core::tool::ToolResult {
-                                            success: false,
-                                            output: serde_json::json!({
-                                                "error": format!("Unknown tool: {requested}"),
-                                                "available_tools": all_names,
-                                                "hint": "Tool names are case-sensitive. Pick one from 'available_tools'."
-                                            }),
-                                            error: Some(format!("Unknown tool: {requested}")),
-                                            execution_time_ms: 0,
-                                        })
-                                    }
-                                }
-                            }
-                        } else {
-                            registry.call_tool(&name, args).await
-                        };
+                    let result = registry.call_tool(&name, args).await;
                     (started_at, result)
                 }
             });
@@ -1584,30 +1516,27 @@ mod tests {
             tool_def("memory_recall", "recall a memory"),
             tool_def("calendar_create", "create a calendar event"),
             tool_def("files__write_file", "write a file"),
-            crate::tool_grouping::meta_tool_definition(),
         ];
         let mut revealed = HashSet::new();
         revealed.insert("memory_store".to_string());
         revealed.insert("memory_recall".to_string());
-        revealed.insert(crate::tool_grouping::META_TOOL_NAME.to_string());
 
-        let prompt = DefaultExecutor::build_system_prompt(&tools, &revealed, false);
+        let prompt =
+            DefaultExecutor::build_system_prompt(&tools, &revealed, false, None);
 
         // Group index lists every group with counts.
         assert!(prompt.contains("AVAILABLE TOOL GROUPS"));
         assert!(prompt.contains("**Memory**"));
         assert!(prompt.contains("**Calendar**"));
         assert!(prompt.contains("**Files**"));
-        assert!(prompt.contains("**Tool discovery**"));
 
         // Detailed section only includes the revealed ones.
         assert!(prompt.contains("DETAILED TOOLS"));
         assert!(prompt.contains("memory_store"));
         assert!(prompt.contains("memory_recall"));
-        assert!(prompt.contains(crate::tool_grouping::META_TOOL_NAME));
         // The non-revealed tools' user-facing descriptions should NOT
         // appear in the prompt at all (their names do, in the group index,
-        // so the model knows what to ask for).
+        // so the model knows they exist).
         assert!(
             !prompt.contains("create a calendar event"),
             "non-revealed tool description leaked into prompt"
@@ -1617,59 +1546,29 @@ mod tests {
             "non-revealed tool description leaked into prompt"
         );
         // But the names should be visible in the group index so the model
-        // knows what to ask for via get_tool_details.
+        // knows what to call (via tolerant dispatch).
         assert!(prompt.contains("calendar_create"));
         assert!(prompt.contains("files__write_file"));
     }
 
-    #[tokio::test]
-    async fn meta_tool_reveals_target_for_subsequent_call() {
-        // Iter 1: agent calls get_tool_details(name="files__write_file")
-        // Iter 2: agent calls files__write_file directly (now revealed)
-        // Iter 3: agent reports done
-        let discover = ToolCall {
-            id: "c1".to_string(),
-            name: crate::tool_grouping::META_TOOL_NAME.to_string(),
-            arguments: serde_json::json!({"name": "files__write_file"}),
-        };
-        let real_call = ToolCall {
-            id: "c2".to_string(),
-            name: "files__write_file".to_string(),
-            arguments: serde_json::json!({"path": "x", "contents": "y"}),
-        };
-        let responses = vec![
-            MockLlmRouter::make_response("Looking up the tool.", vec![discover]),
-            MockLlmRouter::make_response("Writing the file.", vec![real_call]),
-            MockLlmRouter::make_response("Done.", vec![]),
-        ];
+    #[test]
+    fn system_prompt_includes_tool_doc_path_when_set() {
+        let tools = vec![tool_def("calendar_create", "create event")];
+        let revealed = HashSet::new();
+        let path = std::path::PathBuf::from("/tmp/athen-test/TOOLS.md");
+        let prompt =
+            DefaultExecutor::build_system_prompt(&tools, &revealed, false, Some(&path));
+        assert!(prompt.contains("/tmp/athen-test/TOOLS.md"));
+        assert!(prompt.contains("read_file"));
+    }
 
-        // Tool registry only knows about files__write_file (the meta tool is
-        // synthesized inside the executor, not registered).
-        let write_result = CoreToolResult {
-            success: true,
-            output: serde_json::json!({"text": "ok"}),
-            error: None,
-            execution_time_ms: 1,
-        };
-        let registry = MockToolRegistry::new(
-            vec![tool_def("files__write_file", "write a file")],
-            vec![write_result],
-        );
-
-        let executor = DefaultExecutor::new(
-            Box::new(MockLlmRouter::new(responses)),
-            Box::new(registry),
-            Box::new(InMemoryAuditor::new()),
-            10,
-            Duration::from_secs(60),
-            vec![],
-        );
-
-        let task = make_task("Write a file");
-        let result = executor.execute(task).await.unwrap();
-        assert!(result.success);
-        // 1 discover step + 1 actual tool call + 1 completion = 3 steps
-        assert_eq!(result.steps_completed, 3);
+    #[test]
+    fn system_prompt_omits_doc_pointer_when_unset() {
+        let tools = vec![tool_def("calendar_create", "create event")];
+        let revealed = HashSet::new();
+        let prompt =
+            DefaultExecutor::build_system_prompt(&tools, &revealed, false, None);
+        assert!(!prompt.contains("TOOLS.md"));
     }
 
     /// Tool registry that records dispatch *order* and sleeps in each call so
@@ -1784,75 +1683,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn meta_tool_with_no_name_returns_hard_error() {
-        // Empty name MUST be an error so the model sees `success: false` and
-        // doesn't enter a friendly-loop. Soft "here's the list" responses
-        // caused 30+ call loops in production.
-        let discover = ToolCall {
-            id: "c1".to_string(),
-            name: crate::tool_grouping::META_TOOL_NAME.to_string(),
-            arguments: serde_json::json!({}),
-        };
-        let responses = vec![
-            MockLlmRouter::make_response("Looking up.", vec![discover]),
-            MockLlmRouter::make_response("OK I see, I need a name.", vec![]),
-        ];
-
-        let auditor = Arc::new(InMemoryAuditor::new());
-        struct ArcAuditor(Arc<InMemoryAuditor>);
-        #[async_trait]
-        impl StepAuditor for ArcAuditor {
-            async fn record_step(
-                &self,
-                task_id: athen_core::task::TaskId,
-                step: &TaskStep,
-            ) -> Result<()> {
-                self.0.record_step(task_id, step).await
-            }
-            async fn get_steps(
-                &self,
-                task_id: athen_core::task::TaskId,
-            ) -> Result<Vec<TaskStep>> {
-                self.0.get_steps(task_id).await
-            }
-        }
-
-        let task = make_task("Find tools");
-        let task_id = task.id;
-        let executor = DefaultExecutor::new(
-            Box::new(MockLlmRouter::new(responses)),
-            Box::new(MockToolRegistry::new(
-                vec![tool_def("calendar_create", ""), tool_def("files__write_file", "")],
-                vec![],
-            )),
-            Box::new(ArcAuditor(Arc::clone(&auditor))),
-            10,
-            Duration::from_secs(60),
-            vec![],
-        );
-
-        executor.execute(task).await.unwrap();
-
-        let steps = auditor.get_steps(task_id).await.unwrap();
-        let meta_step = steps
-            .iter()
-            .find(|s| s.description.contains(crate::tool_grouping::META_TOOL_NAME))
-            .expect("meta-tool step recorded");
-        assert_eq!(meta_step.status, StepStatus::Failed);
-        let err = meta_step.output.as_ref().unwrap()["result"]["error"]
-            .as_str()
-            .expect("error field");
-        assert!(err.contains("Missing required parameter"));
-    }
-
-    #[tokio::test]
     async fn loop_guard_short_circuits_repeated_calls() {
-        // Five consecutive identical empty-name discoveries — the 4th and 5th
-        // should hit the loop guard rather than reaching the meta-tool logic.
+        // Five consecutive identical calls — the 4th and 5th should hit the
+        // loop guard rather than reaching the registry.
         let make_call = || ToolCall {
             id: "x".to_string(),
-            name: crate::tool_grouping::META_TOOL_NAME.to_string(),
-            arguments: serde_json::json!({}),
+            name: "calendar_list".to_string(),
+            arguments: serde_json::json!({"start": "a", "end": "b"}),
         };
         let responses = vec![
             MockLlmRouter::make_response("1", vec![make_call()]),
@@ -1884,9 +1721,19 @@ mod tests {
 
         let task = make_task("loop test");
         let task_id = task.id;
+        // Registry returns the same result every time the model calls.
+        let make_result = || CoreToolResult {
+            success: true,
+            output: serde_json::json!({"events": []}),
+            error: None,
+            execution_time_ms: 0,
+        };
         let executor = DefaultExecutor::new(
             Box::new(MockLlmRouter::new(responses)),
-            Box::new(MockToolRegistry::new(vec![tool_def("x", "")], vec![])),
+            Box::new(MockToolRegistry::new(
+                vec![tool_def("calendar_list", "list events")],
+                vec![make_result(), make_result(), make_result()],
+            )),
             Box::new(ArcAuditor(Arc::clone(&auditor))),
             20,
             Duration::from_secs(60),
@@ -1911,16 +1758,16 @@ mod tests {
     async fn duplicate_calls_in_one_batch_are_deduped() {
         let one = ToolCall {
             id: "a".to_string(),
-            name: crate::tool_grouping::META_TOOL_NAME.to_string(),
-            arguments: serde_json::json!({"name": "calendar_create"}),
+            name: "calendar_list".to_string(),
+            arguments: serde_json::json!({"start": "a", "end": "b"}),
         };
         let two = ToolCall {
             id: "b".to_string(),
-            name: crate::tool_grouping::META_TOOL_NAME.to_string(),
-            arguments: serde_json::json!({"name": "calendar_create"}),
+            name: "calendar_list".to_string(),
+            arguments: serde_json::json!({"start": "a", "end": "b"}),
         };
         let responses = vec![
-            MockLlmRouter::make_response("looking up twice", vec![one, two]),
+            MockLlmRouter::make_response("listing twice", vec![one, two]),
             MockLlmRouter::make_response("done", vec![]),
         ];
 
@@ -1948,8 +1795,13 @@ mod tests {
         let executor = DefaultExecutor::new(
             Box::new(MockLlmRouter::new(responses)),
             Box::new(MockToolRegistry::new(
-                vec![tool_def("calendar_create", "create event")],
-                vec![],
+                vec![tool_def("calendar_list", "list events")],
+                vec![CoreToolResult {
+                    success: true,
+                    output: serde_json::json!({"events": []}),
+                    error: None,
+                    execution_time_ms: 0,
+                }],
             )),
             Box::new(ArcAuditor(Arc::clone(&auditor))),
             10,
@@ -1960,13 +1812,13 @@ mod tests {
         executor.execute(task).await.unwrap();
 
         let steps = auditor.get_steps(task_id).await.unwrap();
-        let meta_steps: Vec<&TaskStep> = steps
+        let cal_steps: Vec<&TaskStep> = steps
             .iter()
-            .filter(|s| s.description.contains(crate::tool_grouping::META_TOOL_NAME))
+            .filter(|s| s.description.contains("calendar_list"))
             .collect();
-        assert_eq!(meta_steps.len(), 2);
+        assert_eq!(cal_steps.len(), 2);
         // The second call should be deduped (failed with duplicate_in_batch).
-        let dup_count = meta_steps
+        let dup_count = cal_steps
             .iter()
             .filter(|s| {
                 s.output
@@ -1977,95 +1829,5 @@ mod tests {
             })
             .count();
         assert_eq!(dup_count, 1, "exactly one of the two should be deduped");
-    }
-
-    #[tokio::test]
-    async fn meta_tool_for_already_revealed_returns_short_message() {
-        // Model wastes a call asking for memory_store, which is already in
-        // DETAILED TOOLS. The meta-tool should short-circuit with a reminder
-        // instead of re-dumping the schema.
-        let discover = ToolCall {
-            id: "c1".to_string(),
-            name: crate::tool_grouping::META_TOOL_NAME.to_string(),
-            arguments: serde_json::json!({"name": "memory_store"}),
-        };
-        let responses = vec![
-            MockLlmRouter::make_response("Looking up.", vec![discover]),
-            MockLlmRouter::make_response("Done.", vec![]),
-        ];
-
-        let auditor = Arc::new(InMemoryAuditor::new());
-        struct ArcAuditor(Arc<InMemoryAuditor>);
-        #[async_trait]
-        impl StepAuditor for ArcAuditor {
-            async fn record_step(
-                &self,
-                task_id: athen_core::task::TaskId,
-                step: &TaskStep,
-            ) -> Result<()> {
-                self.0.record_step(task_id, step).await
-            }
-            async fn get_steps(
-                &self,
-                task_id: athen_core::task::TaskId,
-            ) -> Result<Vec<TaskStep>> {
-                self.0.get_steps(task_id).await
-            }
-        }
-
-        let task = make_task("Test already-revealed");
-        let task_id = task.id;
-        let executor = DefaultExecutor::new(
-            Box::new(MockLlmRouter::new(responses)),
-            Box::new(MockToolRegistry::new(
-                vec![tool_def("memory_store", "store something")],
-                vec![],
-            )),
-            Box::new(ArcAuditor(Arc::clone(&auditor))),
-            10,
-            Duration::from_secs(60),
-            vec![],
-        );
-
-        let result = executor.execute(task).await.unwrap();
-        assert!(result.success);
-
-        let steps = auditor.get_steps(task_id).await.unwrap();
-        let meta_step = steps
-            .iter()
-            .find(|s| s.description.contains(crate::tool_grouping::META_TOOL_NAME))
-            .expect("meta-tool step recorded");
-        let output = meta_step.output.as_ref().unwrap();
-        assert_eq!(output["result"]["status"].as_str(), Some("already_known"));
-        // No giant schema dump — keeps token usage low.
-        assert!(output["result"].get("input_schema").is_none());
-    }
-
-    #[tokio::test]
-    async fn meta_tool_unknown_name_returns_error_without_revealing() {
-        let discover = ToolCall {
-            id: "c1".to_string(),
-            name: crate::tool_grouping::META_TOOL_NAME.to_string(),
-            arguments: serde_json::json!({"name": "nonexistent_tool"}),
-        };
-        let responses = vec![
-            MockLlmRouter::make_response("Looking up.", vec![discover]),
-            MockLlmRouter::make_response("Done.", vec![]),
-        ];
-
-        let executor = DefaultExecutor::new(
-            Box::new(MockLlmRouter::new(responses)),
-            Box::new(MockToolRegistry::new(vec![tool_def("real_tool", "")], vec![])),
-            Box::new(InMemoryAuditor::new()),
-            10,
-            Duration::from_secs(60),
-            vec![],
-        );
-
-        let task = make_task("Discover something missing");
-        let result = executor.execute(task).await.unwrap();
-        // Even though the lookup failed, the executor continues — the agent
-        // sees the error and decides to stop.
-        assert!(result.success);
     }
 }

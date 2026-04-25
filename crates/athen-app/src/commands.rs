@@ -642,7 +642,7 @@ pub async fn send_message(
             // Snapshot context for post-response reinforcement.
             let context_snapshot = context.clone();
 
-            let executor = AgentBuilder::new()
+            let mut builder = AgentBuilder::new()
                 .llm_router(exec_router)
                 .tool_registry(Box::new(registry))
                 .auditor(Box::new(auditor))
@@ -650,7 +650,11 @@ pub async fn send_message(
                 .timeout(Duration::from_secs(90))
                 .context_messages(context)
                 .stream_sender(stream_tx)
-                .cancel_flag(cancel_flag)
+                .cancel_flag(cancel_flag);
+            if let Some(p) = state.tool_doc_path.clone() {
+                builder = builder.tool_doc_path(p);
+            }
+            let executor = builder
                 .build()
                 .map_err(|e| {
                     let raw = e.to_string();
@@ -944,7 +948,7 @@ pub async fn approve_task(
             // Snapshot context for post-response reinforcement.
             let context_snapshot = context.clone();
 
-            let executor = AgentBuilder::new()
+            let mut builder = AgentBuilder::new()
                 .llm_router(exec_router)
                 .tool_registry(Box::new(registry))
                 .auditor(Box::new(auditor))
@@ -952,7 +956,11 @@ pub async fn approve_task(
                 .timeout(Duration::from_secs(90))
                 .context_messages(context)
                 .stream_sender(stream_tx)
-                .cancel_flag(cancel_flag)
+                .cancel_flag(cancel_flag);
+            if let Some(p) = state.tool_doc_path.clone() {
+                builder = builder.tool_doc_path(p);
+            }
+            let executor = builder
                 .build()
                 .map_err(|e| {
                     let raw = e.to_string();
@@ -1889,6 +1897,9 @@ pub async fn enable_mcp(
             .await
             .map_err(|e| e.to_string())?;
     }
+    if let Err(e) = state.refresh_tools_doc().await {
+        tracing::warn!("Failed to refresh TOOLS.md after enable_mcp: {e}");
+    }
     Ok(())
 }
 
@@ -1900,6 +1911,9 @@ pub async fn disable_mcp(
     state.mcp.disable(&mcp_id).await;
     if let Some(store) = &state.mcp_store {
         store.disable(&mcp_id).await.map_err(|e| e.to_string())?;
+    }
+    if let Err(e) = state.refresh_tools_doc().await {
+        tracing::warn!("Failed to refresh TOOLS.md after disable_mcp: {e}");
     }
     Ok(())
 }

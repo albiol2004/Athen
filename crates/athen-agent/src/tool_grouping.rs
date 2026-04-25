@@ -2,27 +2,18 @@
 //!
 //! Goal: keep the agent's prompt small without hiding capabilities. Tools are
 //! grouped by prefix; only a one-line summary per group is always in the
-//! system prompt. The full schemas of "always-on" tools (memory + the
-//! discovery meta-tool) are in every request so the agent can use them
-//! directly. To use any other tool, the agent first calls `get_tool_details`
-//! to learn the schema; the executor adds that tool to the "revealed" set,
-//! and from then on its full schema is sent on every request.
+//! system prompt. Memory tools have their full schemas inlined every request
+//! ("always-revealed"). Other tools are listed by name only; the agent calls
+//! them directly via tolerant dispatch (the executor reveals their schema on
+//! first call) or reads `~/.athen/TOOLS.md` for full details.
 
-use serde_json::json;
 use std::collections::BTreeMap;
 
-use athen_core::risk::BaseImpact;
-use athen_core::tool::{ToolBackend, ToolDefinition};
-
-/// Name of the synthesized meta-tool the agent uses to discover schemas.
-pub const META_TOOL_NAME: &str = "get_tool_details";
+use athen_core::tool::ToolDefinition;
 
 /// Return the canonical group id for a tool name. The id is the prefix the
 /// system prompt groups by — "memory", "calendar", "files", and so on.
 pub fn group_for(name: &str) -> &str {
-    if name == META_TOOL_NAME {
-        return "discovery";
-    }
     // MCP tools are namespaced as "<mcp_id>__<tool>"; the mcp_id is the group.
     if let Some((prefix, _)) = name.split_once("__") {
         return prefix;
@@ -83,7 +74,6 @@ fn pretty_group_name(id: &str) -> String {
         "contacts" => "Contacts".to_string(),
         "shell" => "Shell".to_string(),
         "files" => "Files".to_string(),
-        "discovery" => "Tool discovery".to_string(),
         // Capitalize first letter for unknown groups (MCPs etc.)
         other => {
             let mut chars = other.chars();
@@ -103,50 +93,23 @@ fn group_one_liner(id: &str, tools: &[&ToolDefinition]) -> String {
         "contacts" => "manage contacts and their identifiers".to_string(),
         "shell" => "execute shell commands and basic file ops".to_string(),
         "files" => "read, write, list and organize files in a sandboxed folder".to_string(),
-        "discovery" => "fetch the schema of any tool you need".to_string(),
         // Fallback: show the bare tool names so the agent can recognise them.
         _ => format!("tools: {}", names.join(", ")),
     }
 }
 
-/// Build the synthetic `ToolDefinition` for the discovery meta-tool. The
-/// executor intercepts calls to it before the registry sees them.
-pub fn meta_tool_definition() -> ToolDefinition {
-    ToolDefinition {
-        name: META_TOOL_NAME.to_string(),
-        description: "Load the input schema of a tool listed in AVAILABLE TOOL GROUPS \
-                      but not in DETAILED TOOLS. Pass `name` = the exact tool name from \
-                      the 'Tools:' line of a group (e.g. \"calendar_create\"). \
-                      DO NOT call this for tools already shown in DETAILED TOOLS — \
-                      call those directly. The response contains `input_schema` with \
-                      the JSON Schema you need to construct the next call."
-            .to_string(),
-        parameters: json!({
-            "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "description": "Exact tool name (e.g. \"calendar_create\", \"files__write_file\")."
-                }
-            },
-            "required": ["name"]
-        }),
-        backend: ToolBackend::Shell {
-            command: String::new(),
-            native: false,
-        },
-        base_risk: BaseImpact::Read,
-    }
-}
-
 /// True if the tool should always be revealed (full schema in every request).
+/// Memory is always revealed because the agent must use it on every turn.
 pub fn is_always_revealed(name: &str) -> bool {
-    name == META_TOOL_NAME || group_for(name) == "memory"
+    group_for(name) == "memory"
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use athen_core::risk::BaseImpact;
+    use athen_core::tool::ToolBackend;
+    use serde_json::json;
 
     fn def(name: &str) -> ToolDefinition {
         ToolDefinition {
@@ -176,15 +139,9 @@ mod tests {
     }
 
     #[test]
-    fn group_for_meta_tool() {
-        assert_eq!(group_for(META_TOOL_NAME), "discovery");
-    }
-
-    #[test]
-    fn always_revealed_covers_memory_and_meta() {
+    fn always_revealed_covers_memory_only() {
         assert!(is_always_revealed("memory_store"));
         assert!(is_always_revealed("memory_recall"));
-        assert!(is_always_revealed(META_TOOL_NAME));
         assert!(!is_always_revealed("calendar_create"));
         assert!(!is_always_revealed("files__write_file"));
     }
@@ -206,18 +163,8 @@ mod tests {
         assert_eq!(by_id.get("memory"), Some(&2));
         assert_eq!(by_id.get("calendar"), Some(&2));
         assert_eq!(by_id.get("files"), Some(&3));
-        // Names are exposed for the model to pass to get_tool_details.
         let files = summary.iter().find(|g| g.id == "files").unwrap();
         assert!(files.tool_names.contains(&"files__read_file".to_string()));
         assert!(files.tool_names.contains(&"files__write_file".to_string()));
-    }
-
-    #[test]
-    fn meta_tool_has_required_name_param() {
-        let def = meta_tool_definition();
-        assert_eq!(def.name, META_TOOL_NAME);
-        let required = def.parameters.get("required").and_then(|v| v.as_array());
-        assert!(required.is_some());
-        assert!(required.unwrap().iter().any(|v| v.as_str() == Some("name")));
     }
 }

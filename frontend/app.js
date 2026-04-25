@@ -1593,9 +1593,224 @@ async function loadSettings() {
                 if (arrow) arrow.textContent = '\u25BC';
             }
         }
+        await loadMcpCatalog();
     } catch (err) {
         console.error('Failed to load settings:', err);
         showToast('Failed to load settings: ' + err, 'error');
+    }
+}
+
+// ─── MCP catalog ──────────────────────────────────────────────────────
+
+async function loadMcpCatalog() {
+    const listEl = document.getElementById('mcp-list');
+    if (!listEl) return;
+    try {
+        const entries = await invoke('list_mcp_catalog');
+        renderMcpCatalog(entries);
+    } catch (err) {
+        console.error('Failed to load MCP catalog:', err);
+        listEl.innerHTML = '<p class="setting-hint">Failed to load tools.</p>';
+    }
+}
+
+function renderMcpCatalog(entries) {
+    const listEl = document.getElementById('mcp-list');
+    listEl.innerHTML = '';
+    if (!entries || entries.length === 0) {
+        listEl.innerHTML = '<p class="setting-hint">No tools available.</p>';
+        return;
+    }
+    for (const entry of entries) {
+        listEl.appendChild(createMcpCard(entry));
+    }
+}
+
+function createMcpCard(entry) {
+    const card = document.createElement('div');
+    card.className = 'mcp-card' + (entry.enabled ? ' enabled' : '');
+    card.dataset.mcpId = entry.id;
+
+    const header = document.createElement('div');
+    header.className = 'mcp-card-header';
+
+    const titleWrap = document.createElement('div');
+    titleWrap.className = 'mcp-card-title';
+    if (entry.icon) {
+        const icon = document.createElement('span');
+        icon.className = 'mcp-card-icon';
+        icon.textContent = entry.icon;
+        titleWrap.appendChild(icon);
+    }
+    const nameWrap = document.createElement('div');
+    nameWrap.className = 'mcp-card-name-wrap';
+    const name = document.createElement('div');
+    name.className = 'mcp-card-name';
+    name.textContent = entry.display_name;
+    const desc = document.createElement('div');
+    desc.className = 'mcp-card-desc';
+    desc.textContent = entry.description;
+    nameWrap.appendChild(name);
+    nameWrap.appendChild(desc);
+    titleWrap.appendChild(nameWrap);
+
+    const toggle = document.createElement('label');
+    toggle.className = 'mcp-toggle';
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.checked = entry.enabled;
+    const slider = document.createElement('span');
+    slider.className = 'mcp-toggle-slider';
+    toggle.appendChild(checkbox);
+    toggle.appendChild(slider);
+
+    header.appendChild(titleWrap);
+    header.appendChild(toggle);
+    card.appendChild(header);
+
+    const body = document.createElement('div');
+    body.className = 'mcp-card-body';
+    body.style.display = entry.enabled ? 'block' : 'none';
+
+    const fields = renderJsonSchemaFields(entry.config_schema, entry.config || {});
+    if (fields) {
+        body.appendChild(fields);
+
+        const actions = document.createElement('div');
+        actions.className = 'setting-actions';
+        const saveBtn = document.createElement('button');
+        saveBtn.className = 'btn-primary';
+        saveBtn.textContent = 'Save Configuration';
+        saveBtn.addEventListener('click', () => handleSaveMcpConfig(card, entry));
+        actions.appendChild(saveBtn);
+        body.appendChild(actions);
+    }
+    card.appendChild(body);
+
+    checkbox.addEventListener('change', async (e) => {
+        const willEnable = e.target.checked;
+        try {
+            if (willEnable) {
+                const config = readMcpConfigFromCard(card, entry.config_schema);
+                await invoke('enable_mcp', { mcpId: entry.id, config });
+                card.classList.add('enabled');
+                body.style.display = 'block';
+                showToast(`${entry.display_name} enabled`, 'success');
+            } else {
+                await invoke('disable_mcp', { mcpId: entry.id });
+                card.classList.remove('enabled');
+                body.style.display = 'none';
+                showToast(`${entry.display_name} disabled`, 'success');
+            }
+        } catch (err) {
+            console.error('Failed to toggle MCP:', err);
+            e.target.checked = !willEnable;
+            showToast('Failed: ' + err, 'error');
+        }
+    });
+
+    return card;
+}
+
+function renderJsonSchemaFields(schema, currentValues) {
+    if (!schema || schema.type !== 'object' || !schema.properties) return null;
+    const props = schema.properties;
+    const required = new Set(schema.required || []);
+    const keys = Object.keys(props);
+    if (keys.length === 0) return null;
+
+    const container = document.createElement('div');
+    container.className = 'mcp-config-fields';
+
+    for (const key of keys) {
+        const prop = props[key];
+        const row = document.createElement('div');
+        row.className = 'setting-row';
+
+        const label = document.createElement('label');
+        label.textContent = prop.title || key + (required.has(key) ? ' *' : '');
+        label.htmlFor = `mcp-field-${key}`;
+        row.appendChild(label);
+
+        const input = document.createElement(
+            prop.type === 'boolean' ? 'input' :
+            (prop.enum ? 'select' : 'input')
+        );
+        input.id = `mcp-field-${key}`;
+        input.dataset.fieldKey = key;
+        input.dataset.fieldType = prop.type || 'string';
+        input.className = 'settings-input';
+
+        const currentValue = currentValues[key] !== undefined ? currentValues[key] : prop.default;
+
+        if (prop.type === 'boolean') {
+            input.type = 'checkbox';
+            input.checked = !!currentValue;
+        } else if (prop.enum) {
+            for (const opt of prop.enum) {
+                const o = document.createElement('option');
+                o.value = opt;
+                o.textContent = opt;
+                if (opt === currentValue) o.selected = true;
+                input.appendChild(o);
+            }
+        } else if (prop.type === 'integer' || prop.type === 'number') {
+            input.type = 'number';
+            if (currentValue !== undefined && currentValue !== null) input.value = currentValue;
+            if (prop.minimum !== undefined) input.min = prop.minimum;
+            if (prop.maximum !== undefined) input.max = prop.maximum;
+        } else {
+            input.type = 'text';
+            if (currentValue !== undefined && currentValue !== null) input.value = currentValue;
+            if (prop.description) input.placeholder = prop.description;
+        }
+
+        row.appendChild(input);
+
+        if (prop.description) {
+            const hint = document.createElement('p');
+            hint.className = 'setting-hint';
+            hint.textContent = prop.description;
+            row.appendChild(hint);
+        }
+
+        container.appendChild(row);
+    }
+
+    return container;
+}
+
+function readMcpConfigFromCard(card, schema) {
+    const config = {};
+    if (!schema || !schema.properties) return config;
+    const inputs = card.querySelectorAll('[data-field-key]');
+    for (const input of inputs) {
+        const key = input.dataset.fieldKey;
+        const type = input.dataset.fieldType;
+        if (type === 'boolean') {
+            config[key] = input.checked;
+        } else if (type === 'integer') {
+            const v = input.value.trim();
+            if (v !== '') config[key] = parseInt(v, 10);
+        } else if (type === 'number') {
+            const v = input.value.trim();
+            if (v !== '') config[key] = parseFloat(v);
+        } else {
+            const v = input.value.trim();
+            if (v !== '') config[key] = v;
+        }
+    }
+    return config;
+}
+
+async function handleSaveMcpConfig(card, entry) {
+    try {
+        const config = readMcpConfigFromCard(card, entry.config_schema);
+        await invoke('enable_mcp', { mcpId: entry.id, config });
+        showToast(`${entry.display_name} configuration saved`, 'success');
+    } catch (err) {
+        console.error('Failed to save MCP config:', err);
+        showToast('Failed: ' + err, 'error');
     }
 }
 

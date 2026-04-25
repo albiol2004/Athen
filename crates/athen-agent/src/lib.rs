@@ -10,6 +10,7 @@ pub mod resource;
 pub mod timeout;
 pub mod tool_grouping;
 pub mod tools;
+pub mod tools_doc;
 
 pub use auditor::InMemoryAuditor;
 pub use executor::DefaultExecutor;
@@ -17,6 +18,7 @@ pub use resource::DefaultResourceMonitor;
 pub use timeout::DefaultTimeoutGuard;
 pub use tools::ShellToolRegistry;
 
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,6 +39,7 @@ pub struct AgentBuilder {
     context_messages: Vec<ChatMessage>,
     stream_sender: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     cancel_flag: Option<Arc<AtomicBool>>,
+    tool_doc_path: Option<PathBuf>,
 }
 
 impl AgentBuilder {
@@ -56,6 +59,7 @@ impl AgentBuilder {
             context_messages: Vec::new(),
             stream_sender: None,
             cancel_flag: None,
+            tool_doc_path: None,
         }
     }
 
@@ -120,6 +124,14 @@ impl AgentBuilder {
         self
     }
 
+    /// Path to a markdown reference of every available tool. When set, the
+    /// system prompt instructs the agent to `read_file` this path for full
+    /// schemas of any tool whose arguments it doesn't already know.
+    pub fn tool_doc_path(mut self, path: PathBuf) -> Self {
+        self.tool_doc_path = Some(path);
+        self
+    }
+
     /// Build the [`DefaultExecutor`].
     ///
     /// Returns an error if `llm_router` or `tool_registry` are not set.
@@ -151,6 +163,10 @@ impl AgentBuilder {
 
         if let Some(flag) = self.cancel_flag {
             executor.set_cancel_flag(flag);
+        }
+
+        if let Some(path) = self.tool_doc_path {
+            executor.set_tool_doc_path(path);
         }
 
         Ok(executor)

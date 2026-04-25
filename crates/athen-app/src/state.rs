@@ -122,6 +122,11 @@ pub struct AppState {
     pub mcp: Arc<McpRegistry>,
     /// SQLite-backed persistence for which MCPs the user has enabled.
     pub mcp_store: Option<McpStore>,
+    /// Path to the markdown reference of all available tools (typically
+    /// `~/.athen/TOOLS.md`). The agent reads this on demand instead of
+    /// inflating every system prompt with full schemas. Refreshed at
+    /// startup and after every MCP enable/disable.
+    pub tool_doc_path: Option<std::path::PathBuf>,
 }
 
 impl AppState {
@@ -173,7 +178,9 @@ impl AppState {
             }
         }
 
-        Self {
+        let tool_doc_path = ensure_data_dir().map(|d| d.join("TOOLS.md"));
+
+        let state = Self {
             coordinator,
             router,
             active_provider_id: Mutex::new(active_id),
@@ -195,7 +202,43 @@ impl AppState {
             memory,
             mcp,
             mcp_store,
+            tool_doc_path,
+        };
+
+        if let Err(e) = state.refresh_tools_doc().await {
+            warn!("Failed to write initial TOOLS.md: {e}");
         }
+
+        state
+    }
+
+    /// Generate the markdown tool reference and write it to `tool_doc_path`.
+    /// Called at startup and whenever the available tool set changes (i.e.
+    /// after a user enables or disables an MCP). Silently no-ops when no
+    /// path is configured (no data dir).
+    pub async fn refresh_tools_doc(&self) -> athen_core::error::Result<()> {
+        let Some(path) = self.tool_doc_path.clone() else {
+            return Ok(());
+        };
+        // Build the same registry the executor sees so the doc reflects
+        // exactly what the agent has access to.
+        let shell_registry = athen_agent::ShellToolRegistry::new().await;
+        let registry = crate::app_tools::AppToolRegistry::new(
+            shell_registry,
+            self.calendar_store.clone(),
+            self.contact_store.clone(),
+            self.memory.clone(),
+        )
+        .with_mcp(self.mcp.clone() as Arc<dyn athen_core::traits::mcp::McpClient>);
+        let tools = athen_core::traits::tool::ToolRegistry::list_tools(&registry).await?;
+        athen_agent::tools_doc::write_to(&path, &tools).map_err(|e| {
+            athen_core::error::AthenError::Other(format!(
+                "write TOOLS.md ({}): {e}",
+                path.display()
+            ))
+        })?;
+        info!("Wrote tool reference to {} ({} tools)", path.display(), tools.len());
+        Ok(())
     }
 
     /// Initialize the notification orchestrator.
@@ -424,6 +467,7 @@ impl AppState {
         let contact_store_ref = self.contact_store.clone();
         let memory_ref = self.memory.clone();
         let mcp_ref = self.mcp.clone();
+        let tool_doc_path_ref = self.tool_doc_path.clone();
         let notifier = self.notifier.clone();
 
         tauri::async_runtime::spawn(async move {
@@ -478,6 +522,7 @@ impl AppState {
                                         &contact_store_ref,
                                         &memory_ref,
                                         &mcp_ref,
+                                        tool_doc_path_ref.as_deref(),
                                         &app_handle,
                                         notifier.as_ref(),
                                     )
@@ -543,6 +588,7 @@ async fn execute_owner_telegram_message(
     contact_store: &Option<SqliteContactStore>,
     memory: &Option<Arc<Memory>>,
     mcp: &Arc<McpRegistry>,
+    tool_doc_path: Option<&std::path::Path>,
     app_handle: &tauri::AppHandle,
     notifier: Option<&Arc<NotificationOrchestrator>>,
 ) {
@@ -648,7 +694,7 @@ async fn execute_owner_telegram_message(
     let stream_tx = spawn_stream_forwarder(app_handle, target_arc_id.clone());
     let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    let executor = match AgentBuilder::new()
+    let mut builder = AgentBuilder::new()
         .llm_router(exec_router)
         .tool_registry(Box::new(registry))
         .auditor(Box::new(auditor))
@@ -656,8 +702,11 @@ async fn execute_owner_telegram_message(
         .timeout(Duration::from_secs(90))
         .context_messages(context)
         .stream_sender(stream_tx)
-        .cancel_flag(cancel_flag)
-        .build()
+        .cancel_flag(cancel_flag);
+    if let Some(p) = tool_doc_path {
+        builder = builder.tool_doc_path(p.to_path_buf());
+    }
+    let executor = match builder.build()
     {
         Ok(e) => e,
         Err(e) => {

@@ -94,15 +94,25 @@ impl McpRegistry {
     /// Enable a single mcp by catalog id with the supplied configuration.
     /// If it was already enabled, the configuration is replaced and any live
     /// connection is dropped so the next call re-spawns with the new config.
+    /// Eagerly spawns the child process and runs the rmcp handshake so any
+    /// configuration error surfaces to the caller (and the UI) immediately
+    /// instead of silently failing the next time the agent calls list_tools.
     pub async fn enable(&self, mcp_id: &str, config: serde_json::Value) -> Result<()> {
         let entry = catalog::lookup(mcp_id)
             .ok_or_else(|| AthenError::Other(format!("unknown MCP id: {mcp_id}")))?;
+        let enabled_entry = EnabledEntry { entry, config };
+        // Verify by spawning before we commit to the enabled set. If this
+        // fails we leave state untouched so the UI toggle can revert.
+        let live = spawn_client(&enabled_entry).await?;
         self.enabled
             .lock()
             .await
-            .insert(mcp_id.to_string(), EnabledEntry { entry, config });
-        // Drop any pre-existing client so the next call uses the new config.
-        self.clients.lock().await.remove(mcp_id);
+            .insert(mcp_id.to_string(), enabled_entry);
+        // Replace any pre-existing client with the freshly spawned one.
+        self.clients
+            .lock()
+            .await
+            .insert(mcp_id.to_string(), Arc::new(live));
         Ok(())
     }
 
@@ -166,19 +176,34 @@ async fn spawn_client(enabled: &EnabledEntry) -> Result<LiveClient> {
     // Per-entry argument shaping. For now only "files" needs a sandbox root.
     let mut cmd = Command::new(&path);
     if enabled.entry.id == "files" {
-        let root = enabled
+        let configured = enabled
             .config
             .get("sandbox_root")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| AthenError::Other("Files: missing 'sandbox_root' in config".into()))?;
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        let root = match configured {
+            Some(r) => r,
+            None => {
+                // Documented default: ~/.athen/files. We materialise it here
+                // so the user can flip Files on without configuring anything.
+                let home = std::env::var("HOME").map_err(|_| {
+                    AthenError::Other(
+                        "Files: HOME env var not set; cannot derive default sandbox_root".into(),
+                    )
+                })?;
+                format!("{home}/.athen/files")
+            }
+        };
         // Make sure the directory exists before handing it to the binary —
         // mcp-filesystem will refuse to start if the path isn't there.
-        if let Err(e) = std::fs::create_dir_all(root) {
+        if let Err(e) = std::fs::create_dir_all(&root) {
             return Err(AthenError::Other(format!(
                 "Files: cannot create sandbox root {root}: {e}"
             )));
         }
-        cmd.arg(root);
+        cmd.arg(&root);
     }
 
     tracing::info!(
@@ -281,15 +306,48 @@ impl McpClient for McpRegistry {
 mod tests {
     use super::*;
 
+    /// All tests that need the filesystem binary serialise on this mutex
+    /// because they share one symlink path under `current_exe` parent.
+    /// Tokio mutex (not std) so the await across the lock is safe.
+    static BINARY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Make `mcp-filesystem` resolvable from `current_exe` parent (where
+    /// `resolve_bundled_binary` looks first). Returns the symlink path so
+    /// callers can clean it up. Returns `None` if the binary isn't built
+    /// yet, so tests can skip gracefully.
+    fn link_filesystem_binary() -> Option<std::path::PathBuf> {
+        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let bin = ["target/debug/mcp-filesystem", "target/release/mcp-filesystem"]
+            .iter()
+            .map(|c| workspace_root.join(c))
+            .find(|p| p.exists())?;
+        let exe_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+        let link = exe_dir.join("mcp-filesystem");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&bin, &link).ok()?;
+        Some(link)
+    }
+
     #[tokio::test]
     async fn enable_disable_tracks_state() {
+        let _guard = BINARY_LOCK.lock().await;
+        let Some(link) = link_filesystem_binary() else {
+            eprintln!("skipping: mcp-filesystem binary not built");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
         let reg = McpRegistry::new();
-        reg.enable("files", serde_json::json!({"sandbox_root": "/tmp/athen-test"}))
+        reg.enable("files", serde_json::json!({"sandbox_root": tmp.path()}))
             .await
             .unwrap();
         assert_eq!(reg.enabled_ids().await, vec!["files"]);
         reg.disable("files").await;
         assert!(reg.enabled_ids().await.is_empty());
+        let _ = std::fs::remove_file(&link);
     }
 
     #[tokio::test]
@@ -310,35 +368,13 @@ mod tests {
     /// silently when the binary isn't on disk.
     #[tokio::test]
     async fn end_to_end_with_real_binary() {
-        let candidates = ["target/debug/mcp-filesystem", "target/release/mcp-filesystem"];
-        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap();
-        let bin = candidates
-            .iter()
-            .map(|c| workspace_root.join(c))
-            .find(|p| p.exists());
-        let Some(bin_path) = bin else {
+        let _guard = BINARY_LOCK.lock().await;
+        let Some(link) = link_filesystem_binary() else {
             eprintln!("skipping: mcp-filesystem binary not built");
             return;
         };
-        // Override resolution by symlinking into the current_exe parent.
-        // Simpler: spawn directly using a custom enabled entry whose
-        // catalog source path resolves to our binary by name + cwd.
         let tmp = tempfile::tempdir().unwrap();
         let reg = McpRegistry::new();
-        // Force absolute path by stuffing it as binary_name; the resolver
-        // returns the path unchanged when it doesn't exist next to current_exe.
-        // We work around that by symlinking next to the test exe's dir.
-        let exe_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
-        let link = exe_dir.join("mcp-filesystem");
-        let _ = std::fs::remove_file(&link);
-        if std::os::unix::fs::symlink(&bin_path, &link).is_err() {
-            eprintln!("skipping: could not create symlink for binary");
-            return;
-        }
         reg.enable("files", serde_json::json!({"sandbox_root": tmp.path()}))
             .await
             .unwrap();
