@@ -264,7 +264,7 @@ async fn main() {
             let executor = AgentBuilder::new()
                 .llm_router(exec_router)
                 .tool_registry(Box::new(registry))
-                .max_steps(20)
+                .max_steps(50)
                 .timeout(Duration::from_secs(120))
                 .build()?;
 

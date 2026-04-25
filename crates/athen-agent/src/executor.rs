@@ -466,6 +466,13 @@ impl AgentExecutor for DefaultExecutor {
         let mut tools_called: Vec<String> = Vec::new();
         let mut conversation: Vec<ChatMessage> = Vec::new();
 
+        // Loop guard: count how many times each `(name, args)` has been
+        // dispatched in this run. If a model gets stuck calling the same
+        // thing repeatedly we short-circuit to break the cycle.
+        let mut call_signature_counts: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
+        const SIGNATURE_REPEAT_LIMIT: u32 = 3;
+
         // Gather available tools for the LLM. Append the synthetic discovery
         // meta-tool so the agent can lazily reveal others on demand.
         let mut available_tools = self.tool_registry.list_tools().await?;
@@ -785,6 +792,10 @@ impl AgentExecutor for DefaultExecutor {
             // ── Pre-scan: track tool names + reveals (synchronous) ──
             // Doing this up front means we can launch the actual dispatches
             // in parallel without each future racing on `revealed_tools`.
+            // Snapshot which tools were already revealed BEFORE this batch so
+            // the meta-tool can tell the model when it asked about something
+            // it already had in its DETAILED TOOLS section.
+            let revealed_before_batch: HashSet<String> = revealed_tools.clone();
             for tool_call in &response.tool_calls {
                 tools_called.push(tool_call.name.clone());
                 if tool_call.name == META_TOOL_NAME {
@@ -824,14 +835,72 @@ impl AgentExecutor for DefaultExecutor {
             // ── Dispatch all tool calls in parallel ──
             // Independent tool calls run concurrently; the meta-tool is
             // resolved synchronously inside its async block. Results come
-            // back in input order.
+            // back in input order. Identical calls within the batch share a
+            // single result, and any signature called more than
+            // SIGNATURE_REPEAT_LIMIT times is short-circuited as a loop.
             let registry: &dyn ToolRegistry = &*self.tool_registry;
             let available_ref = &available_tools;
-            let dispatches = response.tool_calls.iter().map(|tc| {
+            let already_revealed = &revealed_before_batch;
+
+            // Update signature counts and decide which calls to actually run.
+            // For duplicates within the batch (same name+args), only the first
+            // is dispatched; the others reuse its result.
+            let mut first_index_by_signature: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            let mut should_loop_guard = vec![false; response.tool_calls.len()];
+            let mut dedup_target = vec![None::<usize>; response.tool_calls.len()];
+            for (idx, tc) in response.tool_calls.iter().enumerate() {
+                let sig = format!("{}|{}", tc.name, tc.arguments);
+                *call_signature_counts.entry(sig.clone()).or_insert(0) += 1;
+                if call_signature_counts[&sig] > SIGNATURE_REPEAT_LIMIT {
+                    should_loop_guard[idx] = true;
+                    continue;
+                }
+                if let Some(&first) = first_index_by_signature.get(&sig) {
+                    dedup_target[idx] = Some(first);
+                } else {
+                    first_index_by_signature.insert(sig, idx);
+                }
+            }
+
+            let dispatches = response.tool_calls.iter().enumerate().map(|(idx, tc)| {
                 let name = tc.name.clone();
                 let args = tc.arguments.clone();
                 let started_at = Utc::now();
+                let loop_guarded = should_loop_guard[idx];
+                let dedup_of = dedup_target[idx];
                 async move {
+                    if loop_guarded {
+                        return (
+                            started_at,
+                            Ok(athen_core::tool::ToolResult {
+                                success: false,
+                                output: serde_json::json!({
+                                    "error": format!(
+                                        "Loop guard: '{name}' has been called more than {SIGNATURE_REPEAT_LIMIT} times with the same arguments. Stop repeating this call. If a tool isn't working, try a different approach or report the failure to the user."
+                                    ),
+                                }),
+                                error: Some("loop_guard".to_string()),
+                                execution_time_ms: 0,
+                            }),
+                        );
+                    }
+                    if dedup_of.is_some() {
+                        // Duplicate within the same batch — return a stub
+                        // pointing at the first call's result. The model
+                        // should batch unique calls, not repeats.
+                        return (
+                            started_at,
+                            Ok(athen_core::tool::ToolResult {
+                                success: false,
+                                output: serde_json::json!({
+                                    "error": "Duplicate call in batch. Each parallel tool_call must be unique — see the result of the earlier identical call."
+                                }),
+                                error: Some("duplicate_in_batch".to_string()),
+                                execution_time_ms: 0,
+                            }),
+                        );
+                    }
                     let result: Result<athen_core::tool::ToolResult> =
                         if name == META_TOOL_NAME {
                             let requested = args
@@ -841,17 +910,29 @@ impl AgentExecutor for DefaultExecutor {
                                 .trim()
                                 .to_string();
                             if requested.is_empty() {
-                                // No name passed — return the full list so the
-                                // model can pick a real one and try again.
-                                let all_names: Vec<String> = available_ref
-                                    .iter()
-                                    .map(|t| t.name.clone())
-                                    .collect();
+                                // Hard error — calling with no name is a bug
+                                // in the model's tool use. A friendly response
+                                // here causes parallel-spam loops.
+                                Ok(athen_core::tool::ToolResult {
+                                    success: false,
+                                    output: serde_json::json!({
+                                        "error": "Missing required parameter 'name'. You MUST pass the exact tool name as a string, e.g. get_tool_details(name=\"calendar_create\"). Pick one name from the 'Tools:' line of any group in your AVAILABLE TOOL GROUPS section."
+                                    }),
+                                    error: Some("missing required parameter 'name'".to_string()),
+                                    execution_time_ms: 0,
+                                })
+                            } else if already_revealed.contains(&requested) {
+                                // The model asked about a tool that was already
+                                // in its DETAILED TOOLS section. Don't re-dump
+                                // the schema; just remind the model.
                                 Ok(athen_core::tool::ToolResult {
                                     success: true,
                                     output: serde_json::json!({
-                                        "available_tools": all_names,
-                                        "hint": "Pass one of these exact names as the 'name' argument: get_tool_details(name=\"<tool_name>\")."
+                                        "status": "already_known",
+                                        "name": requested,
+                                        "message": format!(
+                                            "The full schema for '{requested}' is already in your system prompt under DETAILED TOOLS. Call it directly — no need to look it up."
+                                        ),
                                     }),
                                     error: None,
                                     execution_time_ms: 0,
@@ -860,11 +941,17 @@ impl AgentExecutor for DefaultExecutor {
                                 match available_ref.iter().find(|t| t.name == requested) {
                                     Some(def) => Ok(athen_core::tool::ToolResult {
                                         success: true,
+                                        // Schema is the FIRST field so the model
+                                        // sees it before any wrapper text.
                                         output: serde_json::json!({
-                                            "name": def.name,
+                                            "tool_name": def.name,
+                                            "input_schema": def.parameters,
                                             "description": def.description,
-                                            "parameters": def.parameters,
-                                            "note": "Tool details revealed. You can now call this tool directly."
+                                            "ready_to_call": true,
+                                            "next_step": format!(
+                                                "Call '{}' directly now — its schema above is loaded.",
+                                                def.name
+                                            ),
                                         }),
                                         error: None,
                                         execution_time_ms: 0,
@@ -1697,15 +1784,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn meta_tool_with_no_name_returns_available_list() {
+    async fn meta_tool_with_no_name_returns_hard_error() {
+        // Empty name MUST be an error so the model sees `success: false` and
+        // doesn't enter a friendly-loop. Soft "here's the list" responses
+        // caused 30+ call loops in production.
         let discover = ToolCall {
             id: "c1".to_string(),
             name: crate::tool_grouping::META_TOOL_NAME.to_string(),
-            arguments: serde_json::json!({}), // no "name" arg
+            arguments: serde_json::json!({}),
         };
         let responses = vec![
             MockLlmRouter::make_response("Looking up.", vec![discover]),
-            MockLlmRouter::make_response("Done.", vec![]),
+            MockLlmRouter::make_response("OK I see, I need a name.", vec![]),
         ];
 
         let auditor = Arc::new(InMemoryAuditor::new());
@@ -1741,22 +1831,214 @@ mod tests {
             vec![],
         );
 
+        executor.execute(task).await.unwrap();
+
+        let steps = auditor.get_steps(task_id).await.unwrap();
+        let meta_step = steps
+            .iter()
+            .find(|s| s.description.contains(crate::tool_grouping::META_TOOL_NAME))
+            .expect("meta-tool step recorded");
+        assert_eq!(meta_step.status, StepStatus::Failed);
+        let err = meta_step.output.as_ref().unwrap()["result"]["error"]
+            .as_str()
+            .expect("error field");
+        assert!(err.contains("Missing required parameter"));
+    }
+
+    #[tokio::test]
+    async fn loop_guard_short_circuits_repeated_calls() {
+        // Five consecutive identical empty-name discoveries — the 4th and 5th
+        // should hit the loop guard rather than reaching the meta-tool logic.
+        let make_call = || ToolCall {
+            id: "x".to_string(),
+            name: crate::tool_grouping::META_TOOL_NAME.to_string(),
+            arguments: serde_json::json!({}),
+        };
+        let responses = vec![
+            MockLlmRouter::make_response("1", vec![make_call()]),
+            MockLlmRouter::make_response("2", vec![make_call()]),
+            MockLlmRouter::make_response("3", vec![make_call()]),
+            MockLlmRouter::make_response("4", vec![make_call()]),
+            MockLlmRouter::make_response("5", vec![make_call()]),
+            MockLlmRouter::make_response("done", vec![]),
+        ];
+
+        let auditor = Arc::new(InMemoryAuditor::new());
+        struct ArcAuditor(Arc<InMemoryAuditor>);
+        #[async_trait]
+        impl StepAuditor for ArcAuditor {
+            async fn record_step(
+                &self,
+                task_id: athen_core::task::TaskId,
+                step: &TaskStep,
+            ) -> Result<()> {
+                self.0.record_step(task_id, step).await
+            }
+            async fn get_steps(
+                &self,
+                task_id: athen_core::task::TaskId,
+            ) -> Result<Vec<TaskStep>> {
+                self.0.get_steps(task_id).await
+            }
+        }
+
+        let task = make_task("loop test");
+        let task_id = task.id;
+        let executor = DefaultExecutor::new(
+            Box::new(MockLlmRouter::new(responses)),
+            Box::new(MockToolRegistry::new(vec![tool_def("x", "")], vec![])),
+            Box::new(ArcAuditor(Arc::clone(&auditor))),
+            20,
+            Duration::from_secs(60),
+            vec![],
+        );
+
+        executor.execute(task).await.unwrap();
+
+        let steps = auditor.get_steps(task_id).await.unwrap();
+        // Find a step whose output mentions the loop guard.
+        let guarded = steps.iter().any(|s| {
+            s.output
+                .as_ref()
+                .and_then(|o| o["result"]["error"].as_str())
+                .map(|e| e.contains("Loop guard"))
+                .unwrap_or(false)
+        });
+        assert!(guarded, "expected at least one loop-guarded step");
+    }
+
+    #[tokio::test]
+    async fn duplicate_calls_in_one_batch_are_deduped() {
+        let one = ToolCall {
+            id: "a".to_string(),
+            name: crate::tool_grouping::META_TOOL_NAME.to_string(),
+            arguments: serde_json::json!({"name": "calendar_create"}),
+        };
+        let two = ToolCall {
+            id: "b".to_string(),
+            name: crate::tool_grouping::META_TOOL_NAME.to_string(),
+            arguments: serde_json::json!({"name": "calendar_create"}),
+        };
+        let responses = vec![
+            MockLlmRouter::make_response("looking up twice", vec![one, two]),
+            MockLlmRouter::make_response("done", vec![]),
+        ];
+
+        let auditor = Arc::new(InMemoryAuditor::new());
+        struct ArcAuditor(Arc<InMemoryAuditor>);
+        #[async_trait]
+        impl StepAuditor for ArcAuditor {
+            async fn record_step(
+                &self,
+                task_id: athen_core::task::TaskId,
+                step: &TaskStep,
+            ) -> Result<()> {
+                self.0.record_step(task_id, step).await
+            }
+            async fn get_steps(
+                &self,
+                task_id: athen_core::task::TaskId,
+            ) -> Result<Vec<TaskStep>> {
+                self.0.get_steps(task_id).await
+            }
+        }
+
+        let task = make_task("dedup test");
+        let task_id = task.id;
+        let executor = DefaultExecutor::new(
+            Box::new(MockLlmRouter::new(responses)),
+            Box::new(MockToolRegistry::new(
+                vec![tool_def("calendar_create", "create event")],
+                vec![],
+            )),
+            Box::new(ArcAuditor(Arc::clone(&auditor))),
+            10,
+            Duration::from_secs(60),
+            vec![],
+        );
+
+        executor.execute(task).await.unwrap();
+
+        let steps = auditor.get_steps(task_id).await.unwrap();
+        let meta_steps: Vec<&TaskStep> = steps
+            .iter()
+            .filter(|s| s.description.contains(crate::tool_grouping::META_TOOL_NAME))
+            .collect();
+        assert_eq!(meta_steps.len(), 2);
+        // The second call should be deduped (failed with duplicate_in_batch).
+        let dup_count = meta_steps
+            .iter()
+            .filter(|s| {
+                s.output
+                    .as_ref()
+                    .and_then(|o| o["result"]["error"].as_str())
+                    .map(|e| e.contains("Duplicate call in batch"))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(dup_count, 1, "exactly one of the two should be deduped");
+    }
+
+    #[tokio::test]
+    async fn meta_tool_for_already_revealed_returns_short_message() {
+        // Model wastes a call asking for memory_store, which is already in
+        // DETAILED TOOLS. The meta-tool should short-circuit with a reminder
+        // instead of re-dumping the schema.
+        let discover = ToolCall {
+            id: "c1".to_string(),
+            name: crate::tool_grouping::META_TOOL_NAME.to_string(),
+            arguments: serde_json::json!({"name": "memory_store"}),
+        };
+        let responses = vec![
+            MockLlmRouter::make_response("Looking up.", vec![discover]),
+            MockLlmRouter::make_response("Done.", vec![]),
+        ];
+
+        let auditor = Arc::new(InMemoryAuditor::new());
+        struct ArcAuditor(Arc<InMemoryAuditor>);
+        #[async_trait]
+        impl StepAuditor for ArcAuditor {
+            async fn record_step(
+                &self,
+                task_id: athen_core::task::TaskId,
+                step: &TaskStep,
+            ) -> Result<()> {
+                self.0.record_step(task_id, step).await
+            }
+            async fn get_steps(
+                &self,
+                task_id: athen_core::task::TaskId,
+            ) -> Result<Vec<TaskStep>> {
+                self.0.get_steps(task_id).await
+            }
+        }
+
+        let task = make_task("Test already-revealed");
+        let task_id = task.id;
+        let executor = DefaultExecutor::new(
+            Box::new(MockLlmRouter::new(responses)),
+            Box::new(MockToolRegistry::new(
+                vec![tool_def("memory_store", "store something")],
+                vec![],
+            )),
+            Box::new(ArcAuditor(Arc::clone(&auditor))),
+            10,
+            Duration::from_secs(60),
+            vec![],
+        );
+
         let result = executor.execute(task).await.unwrap();
         assert!(result.success);
 
-        // Find the meta-tool step and check its output included the tool list.
         let steps = auditor.get_steps(task_id).await.unwrap();
         let meta_step = steps
             .iter()
             .find(|s| s.description.contains(crate::tool_grouping::META_TOOL_NAME))
             .expect("meta-tool step recorded");
         let output = meta_step.output.as_ref().unwrap();
-        let names = output["result"]["available_tools"]
-            .as_array()
-            .expect("available_tools array");
-        let name_strs: Vec<&str> = names.iter().filter_map(|v| v.as_str()).collect();
-        assert!(name_strs.contains(&"calendar_create"));
-        assert!(name_strs.contains(&"files__write_file"));
+        assert_eq!(output["result"]["status"].as_str(), Some("already_known"));
+        // No giant schema dump — keeps token usage low.
+        assert!(output["result"].get("input_schema").is_none());
     }
 
     #[tokio::test]

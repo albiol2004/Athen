@@ -114,9 +114,12 @@ fn group_one_liner(id: &str, tools: &[&ToolDefinition]) -> String {
 pub fn meta_tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: META_TOOL_NAME.to_string(),
-        description: "Look up the full input schema for a tool you have not used yet \
-                      this session. Pass the tool's exact name. Call this BEFORE invoking \
-                      a tool whose details are not already in this prompt."
+        description: "Load the input schema of a tool listed in AVAILABLE TOOL GROUPS \
+                      but not in DETAILED TOOLS. Pass `name` = the exact tool name from \
+                      the 'Tools:' line of a group (e.g. \"calendar_create\"). \
+                      DO NOT call this for tools already shown in DETAILED TOOLS — \
+                      call those directly. The response contains `input_schema` with \
+                      the JSON Schema you need to construct the next call."
             .to_string(),
         parameters: json!({
             "type": "object",
