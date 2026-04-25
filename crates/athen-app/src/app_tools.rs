@@ -16,6 +16,7 @@ use athen_core::contact::{Contact, ContactIdentifier, IdentifierKind, TrustLevel
 use athen_core::error::{AthenError, Result};
 use athen_core::risk::BaseImpact;
 use athen_core::tool::{ToolBackend, ToolDefinition, ToolResult};
+use athen_core::traits::mcp::McpClient;
 use athen_core::traits::memory::{MemoryItem, MemoryStore};
 use athen_core::traits::tool::ToolRegistry;
 use athen_agent::ShellToolRegistry;
@@ -23,12 +24,17 @@ use athen_memory::Memory;
 use athen_persistence::calendar::{CalendarEvent, CalendarStore, EventCreator};
 use athen_persistence::contacts::SqliteContactStore;
 
-/// Wraps [`ShellToolRegistry`] and adds calendar and contact tools.
+/// Prefix MCP-routed tools use to avoid name collisions with built-in tools.
+/// `files__read_file` resolves to mcp_id="files", tool="read_file".
+const MCP_TOOL_SEPARATOR: &str = "__";
+
+/// Wraps [`ShellToolRegistry`] and adds calendar, contact, memory, and MCP tools.
 pub struct AppToolRegistry {
     inner: ShellToolRegistry,
     calendar: Option<CalendarStore>,
     contacts: Option<SqliteContactStore>,
     memory: Option<Arc<Memory>>,
+    mcp: Option<Arc<dyn McpClient>>,
 }
 
 impl AppToolRegistry {
@@ -39,7 +45,14 @@ impl AppToolRegistry {
         contacts: Option<SqliteContactStore>,
         memory: Option<Arc<Memory>>,
     ) -> Self {
-        Self { inner, calendar, contacts, memory }
+        Self { inner, calendar, contacts, memory, mcp: None }
+    }
+
+    /// Attach an MCP client. Tools exposed by enabled MCP servers will appear
+    /// alongside the built-in tools, prefixed with `<mcp_id>__`.
+    pub fn with_mcp(mut self, mcp: Arc<dyn McpClient>) -> Self {
+        self.mcp = Some(mcp);
+        self
     }
 
     // ── Schema helpers ───────────────────────────────────────────────
@@ -835,6 +848,33 @@ impl ToolRegistry for AppToolRegistry {
             });
         }
 
+        if let Some(mcp) = &self.mcp {
+            match mcp.list_tools().await {
+                Ok(mcp_tools) => {
+                    for t in mcp_tools {
+                        let prefixed_name =
+                            format!("{}{MCP_TOOL_SEPARATOR}{}", t.mcp_id, t.name);
+                        tools.push(ToolDefinition {
+                            name: prefixed_name,
+                            description: t
+                                .description
+                                .unwrap_or_else(|| format!("MCP tool from {}", t.mcp_id)),
+                            parameters: t.input_schema,
+                            // Generic backend; the dispatch in call_tool routes to MCP.
+                            backend: ToolBackend::Shell {
+                                command: String::new(),
+                                native: false,
+                            },
+                            base_risk: BaseImpact::WritePersist,
+                        });
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to list MCP tools: {e}");
+                }
+            }
+        }
+
         if self.contacts.is_some() {
             tools.push(ToolDefinition {
                 name: "contacts_list".to_string(),
@@ -877,6 +917,24 @@ impl ToolRegistry for AppToolRegistry {
     }
 
     async fn call_tool(&self, name: &str, args: serde_json::Value) -> Result<ToolResult> {
+        // Route MCP-prefixed tool names (e.g. "files__read_file") to the registry.
+        if let Some(mcp) = &self.mcp {
+            if let Some((mcp_id, tool)) = name.split_once(MCP_TOOL_SEPARATOR) {
+                let started = Instant::now();
+                let outcome = mcp.call_tool(mcp_id, tool, args).await?;
+                let elapsed = started.elapsed().as_millis() as u64;
+                return Ok(ToolResult {
+                    success: outcome.success,
+                    output: serde_json::json!({
+                        "text": outcome.text,
+                        "content": outcome.raw,
+                    }),
+                    error: if outcome.success { None } else { Some(outcome.text.clone()) },
+                    execution_time_ms: elapsed,
+                });
+            }
+        }
+
         // Override memory tools with persistent memory when available.
         if let Some(ref memory) = self.memory {
             match name {

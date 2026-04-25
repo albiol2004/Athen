@@ -35,9 +35,11 @@ use athen_llm::providers::llamacpp::LlamaCppProvider;
 use athen_llm::providers::ollama::OllamaProvider;
 use athen_llm::providers::openai::OpenAiCompatibleProvider;
 use athen_llm::router::DefaultLlmRouter;
+use athen_mcp::McpRegistry;
 use athen_memory::Memory;
 use athen_persistence::arcs::ArcStore;
 use athen_persistence::calendar::CalendarStore;
+use athen_persistence::mcp::McpStore;
 use athen_persistence::Database;
 use athen_risk::llm_fallback::LlmRiskEvaluator;
 use athen_risk::CombinedRiskEvaluator;
@@ -115,6 +117,11 @@ pub struct AppState {
     /// Used for auto-injecting relevant context before LLM calls and
     /// auto-remembering important interactions after task completion.
     pub memory: Option<Arc<Memory>>,
+    /// MCP runtime registry. Holds enabled-state and lazy-spawned client
+    /// connections for branded MCP servers (Files, etc.).
+    pub mcp: Arc<McpRegistry>,
+    /// SQLite-backed persistence for which MCPs the user has enabled.
+    pub mcp_store: Option<McpStore>,
 }
 
 impl AppState {
@@ -157,6 +164,15 @@ impl AppState {
         // Build persistent memory (vector search + knowledge graph).
         let memory = build_memory(&router).await;
 
+        // Build the MCP registry and load persisted enabled state.
+        let mcp = Arc::new(McpRegistry::new());
+        let mcp_store = database.as_ref().map(|db| db.mcp_store());
+        if let Some(ref store) = mcp_store {
+            if let Err(e) = restore_enabled_mcps(&mcp, store).await {
+                warn!("Failed to restore enabled MCPs: {e}");
+            }
+        }
+
         Self {
             coordinator,
             router,
@@ -177,6 +193,8 @@ impl AppState {
             telegram_shutdown: None,
             notifier: None,
             memory,
+            mcp,
+            mcp_store,
         }
     }
 
@@ -405,6 +423,7 @@ impl AppState {
         let calendar_store_ref = self.calendar_store.clone();
         let contact_store_ref = self.contact_store.clone();
         let memory_ref = self.memory.clone();
+        let mcp_ref = self.mcp.clone();
         let notifier = self.notifier.clone();
 
         tauri::async_runtime::spawn(async move {
@@ -458,6 +477,7 @@ impl AppState {
                                         &calendar_store_ref,
                                         &contact_store_ref,
                                         &memory_ref,
+                                        &mcp_ref,
                                         &app_handle,
                                         notifier.as_ref(),
                                     )
@@ -522,6 +542,7 @@ async fn execute_owner_telegram_message(
     calendar_store: &Option<CalendarStore>,
     contact_store: &Option<SqliteContactStore>,
     memory: &Option<Arc<Memory>>,
+    mcp: &Arc<McpRegistry>,
     app_handle: &tauri::AppHandle,
     notifier: Option<&Arc<NotificationOrchestrator>>,
 ) {
@@ -621,7 +642,8 @@ async fn execute_owner_telegram_message(
     let exec_router: Box<dyn athen_core::traits::llm::LlmRouter> =
         Box::new(SharedRouter(Arc::clone(router)));
     let shell_registry = ShellToolRegistry::new().await;
-    let registry = AppToolRegistry::new(shell_registry, calendar_store.clone(), contact_store.clone(), memory.clone());
+    let registry = AppToolRegistry::new(shell_registry, calendar_store.clone(), contact_store.clone(), memory.clone())
+        .with_mcp(mcp.clone() as Arc<dyn athen_core::traits::mcp::McpClient>);
     let auditor = TauriAuditor::new(app_handle.clone());
     let stream_tx = spawn_stream_forwarder(app_handle, target_arc_id.clone());
     let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1112,6 +1134,32 @@ async fn build_coordinator_with_persistence(
     }
 
     (coordinator, None, None)
+}
+
+/// Restore the set of enabled MCPs from the SQLite store into the registry.
+async fn restore_enabled_mcps(
+    registry: &Arc<McpRegistry>,
+    store: &McpStore,
+) -> Result<()> {
+    let rows = store.list_enabled().await?;
+    let mut entries = Vec::new();
+    for row in rows {
+        match athen_mcp::lookup(&row.mcp_id) {
+            Some(entry) => {
+                entries.push(athen_mcp::EnabledEntry {
+                    entry,
+                    config: row.config,
+                });
+            }
+            None => {
+                warn!("Persisted MCP id '{}' not found in catalog; skipping", row.mcp_id);
+            }
+        }
+    }
+    let count = entries.len();
+    registry.set_enabled(entries).await;
+    info!("Restored {count} enabled MCP(s)");
+    Ok(())
 }
 
 /// Build the persistent memory system (vector search + knowledge graph)

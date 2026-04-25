@@ -2,6 +2,7 @@ pub mod agent;
 pub mod coordinator;
 pub mod embedding;
 pub mod llm;
+pub mod mcp;
 pub mod memory;
 pub mod notification;
 pub mod persistence;

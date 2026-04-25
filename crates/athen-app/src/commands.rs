@@ -625,7 +625,8 @@ pub async fn send_message(
             let exec_router: Box<dyn LlmRouter> =
                 Box::new(SharedRouter(Arc::clone(&state.router)));
             let shell_registry = ShellToolRegistry::new().await;
-            let registry = AppToolRegistry::new(shell_registry, state.calendar_store.clone(), state.contact_store.clone(), state.memory.clone());
+            let registry = AppToolRegistry::new(shell_registry, state.calendar_store.clone(), state.contact_store.clone(), state.memory.clone())
+                .with_mcp(state.mcp.clone() as Arc<dyn athen_core::traits::mcp::McpClient>);
 
             let auditor = TauriAuditor::new(app_handle.clone());
 
@@ -928,7 +929,8 @@ pub async fn approve_task(
             let exec_router: Box<dyn LlmRouter> =
                 Box::new(SharedRouter(Arc::clone(&state.router)));
             let shell_registry = ShellToolRegistry::new().await;
-            let registry = AppToolRegistry::new(shell_registry, state.calendar_store.clone(), state.contact_store.clone(), state.memory.clone());
+            let registry = AppToolRegistry::new(shell_registry, state.calendar_store.clone(), state.contact_store.clone(), state.memory.clone())
+                .with_mcp(state.mcp.clone() as Arc<dyn athen_core::traits::mcp::McpClient>);
             let auditor = TauriAuditor::new(app_handle.clone());
 
             // Set up streaming for the approved task execution.
@@ -1822,6 +1824,84 @@ pub async fn delete_relation(
         .delete_relation(from, to, &relation)
         .await
         .map_err(|e| e.to_string())
+}
+
+// ─── MCP management ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CatalogEntryView {
+    pub id: String,
+    pub display_name: String,
+    pub description: String,
+    pub icon: Option<String>,
+    pub config_schema: serde_json::Value,
+    pub enabled: bool,
+    pub config: serde_json::Value,
+}
+
+#[tauri::command]
+pub async fn list_mcp_catalog(
+    state: State<'_, AppState>,
+) -> std::result::Result<Vec<CatalogEntryView>, String> {
+    let enabled_ids: std::collections::HashSet<String> =
+        state.mcp.enabled_ids().await.into_iter().collect();
+    let enabled_configs: std::collections::HashMap<String, serde_json::Value> = state
+        .mcp
+        .enabled_entries()
+        .await
+        .into_iter()
+        .map(|e| (e.entry.id, e.config))
+        .collect();
+    Ok(athen_mcp::builtin_catalog()
+        .into_iter()
+        .map(|e| {
+            let id = e.id.clone();
+            CatalogEntryView {
+                enabled: enabled_ids.contains(&id),
+                config: enabled_configs
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({})),
+                id,
+                display_name: e.display_name,
+                description: e.description,
+                icon: e.icon,
+                config_schema: e.config_schema,
+            }
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub async fn enable_mcp(
+    state: State<'_, AppState>,
+    mcp_id: String,
+    config: serde_json::Value,
+) -> std::result::Result<(), String> {
+    state
+        .mcp
+        .enable(&mcp_id, config.clone())
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Some(store) = &state.mcp_store {
+        store
+            .enable(&mcp_id, &config)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn disable_mcp(
+    state: State<'_, AppState>,
+    mcp_id: String,
+) -> std::result::Result<(), String> {
+    state.mcp.disable(&mcp_id).await;
+    if let Some(store) = &state.mcp_store {
+        store.disable(&mcp_id).await.map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

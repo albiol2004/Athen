@@ -14,6 +14,7 @@ members = [
     "crates/athen-sandbox",
     "crates/athen-shell",
     "crates/athen-app",
+    "crates/athen-mcp",
     "crates/mcps/mcp-filesystem",
     "crates/athen-cli",
 ]
@@ -32,6 +33,7 @@ athen-memory = { path = "crates/athen-memory" }
 athen-sentidos = { path = "crates/athen-sentidos" }
 athen-coordinador = { path = "crates/athen-coordinador" }
 athen-agent = { path = "crates/athen-agent" }
+athen-mcp = { path = "crates/athen-mcp" }
 
 # External
 tokio = { version = "1", features = ["full"] }
@@ -51,3 +53,7 @@ toml = "0.8"
 imap = { version = "2.4", default-features = false }
 rustls-connector = { version = "0.22", default-features = true }
 mailparse = "0.16"
+rmcp = { version = "1.5", default-features = false }
+schemars = "1.0"
+anyhow = "1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

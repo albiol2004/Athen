@@ -83,6 +83,9 @@ pub fn run() {
             commands::update_entity,
             commands::delete_entity,
             commands::delete_relation,
+            commands::list_mcp_catalog,
+            commands::enable_mcp,
+            commands::disable_mcp,
         ])
         .setup(|app| {
             use tauri::Manager;

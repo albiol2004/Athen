@@ -14,6 +14,7 @@ athen-agent = { workspace = true }
 athen-sentidos = { workspace = true }
 athen-persistence = { workspace = true }
 athen-memory = { workspace = true }
+athen-mcp = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
