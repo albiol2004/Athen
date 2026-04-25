@@ -188,9 +188,10 @@ impl DefaultExecutor {
         // ── Tier 1: capability index (always shown, one line per group) ──
         if !tools.is_empty() {
             prompt.push_str(
-                "AVAILABLE TOOL GROUPS (you know these exist, but only the ones in \
-                 \"DETAILED TOOLS\" below are immediately callable; for any other tool, \
-                 first call `get_tool_details(name=\"<tool_name>\")` to load its schema):\n",
+                "AVAILABLE TOOL GROUPS — every tool listed below exists and is callable. \
+                 The ones in \"DETAILED TOOLS\" already have their full schemas loaded. \
+                 For any other tool: if you remember its schema, call it directly; \
+                 otherwise call `get_tool_details(name=\"<tool_name>\")` first to load it.\n",
             );
             for group in summarize_groups(tools) {
                 prompt.push_str(&format!(
@@ -779,77 +780,97 @@ impl AgentExecutor for DefaultExecutor {
                 });
             }
 
-            // Execute each tool call
+            // ── Pre-scan: track tool names + reveals (synchronous) ──
+            // Doing this up front means we can launch the actual dispatches
+            // in parallel without each future racing on `revealed_tools`.
             for tool_call in &response.tool_calls {
                 tools_called.push(tool_call.name.clone());
-                // Check cancellation between tool calls
-                if let Some(ref flag) = self.cancel_flag {
-                    if flag.load(Ordering::Relaxed) {
-                        tracing::info!(task_id = %task_id, "Task cancelled by user between tool calls");
-                        return Ok(TaskResult {
-                            task_id,
-                            success: false,
-                            output: Some(serde_json::json!({
-                                "reason": "cancelled",
-                                "response": "Task cancelled by user.",
-                            })),
-                            steps_completed,
-                            total_risk_used: 0,
-                        });
-                    }
-                }
-
-                let started_at = Utc::now();
-
-                tracing::debug!(
-                    task_id = %task_id,
-                    tool = %tool_call.name,
-                    "Executing tool call"
-                );
-
-                // Intercept the discovery meta-tool: don't dispatch to the
-                // registry, just look up the schema and add it to the
-                // revealed set so the next request includes it.
-                let tool_result = if tool_call.name == META_TOOL_NAME {
-                    let requested = tool_call
+                if tool_call.name == META_TOOL_NAME {
+                    if let Some(requested) = tool_call
                         .arguments
                         .get("name")
                         .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let lookup = available_tools
-                        .iter()
-                        .find(|t| t.name == requested);
-                    match lookup {
-                        Some(def) => {
-                            revealed_tools.insert(def.name.clone());
-                            Ok(athen_core::tool::ToolResult {
-                                success: true,
-                                output: serde_json::json!({
-                                    "name": def.name,
-                                    "description": def.description,
-                                    "parameters": def.parameters,
-                                    "note": "Tool details revealed. You can now call this tool directly on the next step."
-                                }),
-                                error: None,
-                                execution_time_ms: 0,
-                            })
+                    {
+                        if available_tools.iter().any(|t| t.name == requested) {
+                            revealed_tools.insert(requested.to_string());
                         }
-                        None => Ok(athen_core::tool::ToolResult {
-                            success: false,
-                            output: serde_json::json!({
-                                "error": format!("Unknown tool: {requested}"),
-                                "hint": "Tool names are case-sensitive; check the AVAILABLE TOOL GROUPS section.",
-                            }),
-                            error: Some(format!("Unknown tool: {requested}")),
-                            execution_time_ms: 0,
-                        }),
                     }
-                } else {
-                    self.tool_registry
-                        .call_tool(&tool_call.name, tool_call.arguments.clone())
-                        .await
-                };
+                } else if !revealed_tools.contains(&tool_call.name)
+                    && available_tools.iter().any(|t| t.name == tool_call.name)
+                {
+                    revealed_tools.insert(tool_call.name.clone());
+                }
+            }
 
+            // Cancellation check before launching the batch.
+            if let Some(ref flag) = self.cancel_flag {
+                if flag.load(Ordering::Relaxed) {
+                    tracing::info!(task_id = %task_id, "Task cancelled by user before tool batch");
+                    return Ok(TaskResult {
+                        task_id,
+                        success: false,
+                        output: Some(serde_json::json!({
+                            "reason": "cancelled",
+                            "response": "Task cancelled by user.",
+                        })),
+                        steps_completed,
+                        total_risk_used: 0,
+                    });
+                }
+            }
+
+            // ── Dispatch all tool calls in parallel ──
+            // Independent tool calls run concurrently; the meta-tool is
+            // resolved synchronously inside its async block. Results come
+            // back in input order.
+            let registry: &dyn ToolRegistry = &*self.tool_registry;
+            let available_ref = &available_tools;
+            let dispatches = response.tool_calls.iter().map(|tc| {
+                let name = tc.name.clone();
+                let args = tc.arguments.clone();
+                let started_at = Utc::now();
+                async move {
+                    let result: Result<athen_core::tool::ToolResult> =
+                        if name == META_TOOL_NAME {
+                            let requested = args
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            match available_ref.iter().find(|t| t.name == requested) {
+                                Some(def) => Ok(athen_core::tool::ToolResult {
+                                    success: true,
+                                    output: serde_json::json!({
+                                        "name": def.name,
+                                        "description": def.description,
+                                        "parameters": def.parameters,
+                                        "note": "Tool details revealed. You can now call this tool directly."
+                                    }),
+                                    error: None,
+                                    execution_time_ms: 0,
+                                }),
+                                None => Ok(athen_core::tool::ToolResult {
+                                    success: false,
+                                    output: serde_json::json!({
+                                        "error": format!("Unknown tool: {requested}"),
+                                        "hint": "Tool names are case-sensitive; check the AVAILABLE TOOL GROUPS section.",
+                                    }),
+                                    error: Some(format!("Unknown tool: {requested}")),
+                                    execution_time_ms: 0,
+                                }),
+                            }
+                        } else {
+                            registry.call_tool(&name, args).await
+                        };
+                    (started_at, result)
+                }
+            });
+            let outcomes = futures::future::join_all(dispatches).await;
+
+            // ── Process results in order: audit + thread into conversation ──
+            for (tool_call, (started_at, tool_result)) in
+                response.tool_calls.iter().zip(outcomes.into_iter())
+            {
                 let (step_status, output) = match &tool_result {
                     Ok(result) => (
                         if result.success {
@@ -1527,6 +1548,117 @@ mod tests {
         assert!(result.success);
         // 1 discover step + 1 actual tool call + 1 completion = 3 steps
         assert_eq!(result.steps_completed, 3);
+    }
+
+    /// Tool registry that records dispatch *order* and sleeps in each call so
+    /// we can prove the executor runs concurrent tool calls in parallel.
+    struct OrderedSleepyRegistry {
+        order: Arc<std::sync::Mutex<Vec<String>>>,
+        sleep: Duration,
+    }
+
+    #[async_trait]
+    impl ToolRegistry for OrderedSleepyRegistry {
+        async fn list_tools(&self) -> Result<Vec<ToolDefinition>> {
+            Ok(vec![tool_def("a", ""), tool_def("b", ""), tool_def("c", "")])
+        }
+        async fn call_tool(
+            &self,
+            name: &str,
+            _args: serde_json::Value,
+        ) -> Result<CoreToolResult> {
+            self.order.lock().unwrap().push(name.to_string());
+            tokio::time::sleep(self.sleep).await;
+            Ok(CoreToolResult {
+                success: true,
+                output: serde_json::json!({"name": name}),
+                error: None,
+                execution_time_ms: 0,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn batched_tool_calls_run_in_parallel() {
+        // Three slow tool calls in one response. If sequential, total ≥ 3 × sleep.
+        // If parallel, total ≈ 1 × sleep. Use 200ms sleep, assert <500ms total.
+        let calls = vec![
+            ToolCall { id: "1".into(), name: "a".into(), arguments: serde_json::json!({}) },
+            ToolCall { id: "2".into(), name: "b".into(), arguments: serde_json::json!({}) },
+            ToolCall { id: "3".into(), name: "c".into(), arguments: serde_json::json!({}) },
+        ];
+        let responses = vec![
+            MockLlmRouter::make_response("Calling all three.", calls),
+            MockLlmRouter::make_response("Done.", vec![]),
+        ];
+
+        let order = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let registry = OrderedSleepyRegistry {
+            order: Arc::clone(&order),
+            sleep: Duration::from_millis(200),
+        };
+
+        let executor = DefaultExecutor::new(
+            Box::new(MockLlmRouter::new(responses)),
+            Box::new(registry),
+            Box::new(InMemoryAuditor::new()),
+            10,
+            Duration::from_secs(60),
+            vec![],
+        );
+
+        let started = std::time::Instant::now();
+        let result = executor.execute(make_task("Run three things")).await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(result.success);
+        // 3 tool calls + 1 completion step.
+        assert_eq!(result.steps_completed, 4);
+        // Three 200ms sleeps run in parallel should finish well under 500ms.
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "expected parallel execution (<500ms), got {elapsed:?}"
+        );
+        // All three calls landed on the registry.
+        assert_eq!(order.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn tolerant_dispatch_reveals_unrequested_known_tool() {
+        // Model directly calls "calendar_create" without first calling
+        // get_tool_details. The registry knows the tool — it should dispatch
+        // and add it to revealed for future requests.
+        let calls = vec![ToolCall {
+            id: "1".into(),
+            name: "calendar_create".into(),
+            arguments: serde_json::json!({}),
+        }];
+        let responses = vec![
+            MockLlmRouter::make_response("Creating event.", calls),
+            MockLlmRouter::make_response("Done.", vec![]),
+        ];
+
+        let executor = DefaultExecutor::new(
+            Box::new(MockLlmRouter::new(responses)),
+            Box::new(MockToolRegistry::new(
+                vec![tool_def("calendar_create", "create event")],
+                vec![CoreToolResult {
+                    success: true,
+                    output: serde_json::json!({"ok": true}),
+                    error: None,
+                    execution_time_ms: 1,
+                }],
+            )),
+            Box::new(InMemoryAuditor::new()),
+            5,
+            Duration::from_secs(60),
+            vec![],
+        );
+
+        let result = executor.execute(make_task("Create an event")).await.unwrap();
+        assert!(result.success);
+        // 1 dispatch + 1 completion = 2 steps (no get_tool_details round-trip).
+        assert_eq!(result.steps_completed, 2);
     }
 
     #[tokio::test]
