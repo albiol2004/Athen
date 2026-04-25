@@ -1,0 +1,205 @@
+//! Helpers for the two-tier tool surfacing system.
+//!
+//! Goal: keep the agent's prompt small without hiding capabilities. Tools are
+//! grouped by prefix; only a one-line summary per group is always in the
+//! system prompt. The full schemas of "always-on" tools (memory + the
+//! discovery meta-tool) are in every request so the agent can use them
+//! directly. To use any other tool, the agent first calls `get_tool_details`
+//! to learn the schema; the executor adds that tool to the "revealed" set,
+//! and from then on its full schema is sent on every request.
+
+use serde_json::json;
+use std::collections::BTreeMap;
+
+use athen_core::risk::BaseImpact;
+use athen_core::tool::{ToolBackend, ToolDefinition};
+
+/// Name of the synthesized meta-tool the agent uses to discover schemas.
+pub const META_TOOL_NAME: &str = "get_tool_details";
+
+/// Return the canonical group id for a tool name. The id is the prefix the
+/// system prompt groups by — "memory", "calendar", "files", and so on.
+pub fn group_for(name: &str) -> &str {
+    if name == META_TOOL_NAME {
+        return "discovery";
+    }
+    // MCP tools are namespaced as "<mcp_id>__<tool>"; the mcp_id is the group.
+    if let Some((prefix, _)) = name.split_once("__") {
+        return prefix;
+    }
+    // Built-in tools follow a "<group>_<verb>" convention. Single-word tools
+    // (e.g. "shell_execute" → "shell", "read_file" → "read") fall back to
+    // the part before the first underscore.
+    if let Some((prefix, _)) = name.split_once('_') {
+        return prefix;
+    }
+    name
+}
+
+/// One group's worth of summary information for the system prompt.
+#[derive(Debug, Clone)]
+pub struct ToolGroupSummary {
+    pub id: String,
+    pub display_name: String,
+    pub one_liner: String,
+    pub tool_count: usize,
+}
+
+/// Build a list of group summaries, sorted by id for stable prompts.
+pub fn summarize_groups(tools: &[ToolDefinition]) -> Vec<ToolGroupSummary> {
+    let mut by_group: BTreeMap<String, Vec<&ToolDefinition>> = BTreeMap::new();
+    for t in tools {
+        by_group
+            .entry(group_for(&t.name).to_string())
+            .or_default()
+            .push(t);
+    }
+    by_group
+        .into_iter()
+        .map(|(id, ts)| ToolGroupSummary {
+            display_name: pretty_group_name(&id),
+            one_liner: group_one_liner(&id, &ts),
+            tool_count: ts.len(),
+            id,
+        })
+        .collect()
+}
+
+fn pretty_group_name(id: &str) -> String {
+    match id {
+        "memory" => "Memory".to_string(),
+        "calendar" => "Calendar".to_string(),
+        "contacts" => "Contacts".to_string(),
+        "shell" => "Shell".to_string(),
+        "files" => "Files".to_string(),
+        "discovery" => "Tool discovery".to_string(),
+        // Capitalize first letter for unknown groups (MCPs etc.)
+        other => {
+            let mut chars = other.chars();
+            chars
+                .next()
+                .map(|c| c.to_uppercase().to_string() + chars.as_str())
+                .unwrap_or_default()
+        }
+    }
+}
+
+fn group_one_liner(id: &str, tools: &[&ToolDefinition]) -> String {
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+    match id {
+        "memory" => "persistent memory across conversations".to_string(),
+        "calendar" => "create, list, update, delete calendar events".to_string(),
+        "contacts" => "manage contacts and their identifiers".to_string(),
+        "shell" => "execute shell commands and basic file ops".to_string(),
+        "files" => "read, write, list and organize files in a sandboxed folder".to_string(),
+        "discovery" => "fetch the schema of any tool you need".to_string(),
+        // Fallback: show the bare tool names so the agent can recognise them.
+        _ => format!("tools: {}", names.join(", ")),
+    }
+}
+
+/// Build the synthetic `ToolDefinition` for the discovery meta-tool. The
+/// executor intercepts calls to it before the registry sees them.
+pub fn meta_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: META_TOOL_NAME.to_string(),
+        description: "Look up the full input schema for a tool you have not used yet \
+                      this session. Pass the tool's exact name. Call this BEFORE invoking \
+                      a tool whose details are not already in this prompt."
+            .to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Exact tool name (e.g. \"calendar_create\", \"files__write_file\")."
+                }
+            },
+            "required": ["name"]
+        }),
+        backend: ToolBackend::Shell {
+            command: String::new(),
+            native: false,
+        },
+        base_risk: BaseImpact::Read,
+    }
+}
+
+/// True if the tool should always be revealed (full schema in every request).
+pub fn is_always_revealed(name: &str) -> bool {
+    name == META_TOOL_NAME || group_for(name) == "memory"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn def(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_string(),
+            description: format!("desc for {name}"),
+            parameters: json!({}),
+            backend: ToolBackend::Shell {
+                command: String::new(),
+                native: false,
+            },
+            base_risk: BaseImpact::Read,
+        }
+    }
+
+    #[test]
+    fn group_for_builtin() {
+        assert_eq!(group_for("memory_store"), "memory");
+        assert_eq!(group_for("calendar_create"), "calendar");
+        assert_eq!(group_for("contacts_search"), "contacts");
+        assert_eq!(group_for("shell_execute"), "shell");
+    }
+
+    #[test]
+    fn group_for_mcp_uses_double_underscore() {
+        assert_eq!(group_for("files__read_file"), "files");
+        assert_eq!(group_for("calendar__list_events"), "calendar");
+    }
+
+    #[test]
+    fn group_for_meta_tool() {
+        assert_eq!(group_for(META_TOOL_NAME), "discovery");
+    }
+
+    #[test]
+    fn always_revealed_covers_memory_and_meta() {
+        assert!(is_always_revealed("memory_store"));
+        assert!(is_always_revealed("memory_recall"));
+        assert!(is_always_revealed(META_TOOL_NAME));
+        assert!(!is_always_revealed("calendar_create"));
+        assert!(!is_always_revealed("files__write_file"));
+    }
+
+    #[test]
+    fn summarize_groups_collapses_by_prefix() {
+        let tools = vec![
+            def("memory_store"),
+            def("memory_recall"),
+            def("calendar_create"),
+            def("calendar_list"),
+            def("files__read_file"),
+            def("files__write_file"),
+            def("files__list_dir"),
+        ];
+        let summary = summarize_groups(&tools);
+        let by_id: std::collections::HashMap<_, _> =
+            summary.iter().map(|g| (g.id.as_str(), g.tool_count)).collect();
+        assert_eq!(by_id.get("memory"), Some(&2));
+        assert_eq!(by_id.get("calendar"), Some(&2));
+        assert_eq!(by_id.get("files"), Some(&3));
+    }
+
+    #[test]
+    fn meta_tool_has_required_name_param() {
+        let def = meta_tool_definition();
+        assert_eq!(def.name, META_TOOL_NAME);
+        let required = def.parameters.get("required").and_then(|v| v.as_array());
+        assert!(required.is_some());
+        assert!(required.unwrap().iter().any(|v| v.as_str() == Some("name")));
+    }
+}

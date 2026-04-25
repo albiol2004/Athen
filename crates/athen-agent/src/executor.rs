@@ -17,6 +17,10 @@ use athen_core::traits::llm::LlmRouter;
 use athen_core::traits::tool::ToolRegistry;
 
 use crate::timeout::DefaultTimeoutGuard;
+use crate::tool_grouping::{
+    is_always_revealed, meta_tool_definition, summarize_groups, META_TOOL_NAME,
+};
+use std::collections::HashSet;
 
 /// Check if a text response is an empty JSON blob (e.g. `{"response": ""}`).
 ///
@@ -147,9 +151,15 @@ impl DefaultExecutor {
         self.cancel_flag = Some(flag);
     }
 
-    /// Build the system prompt for the agent, including available tool descriptions.
+    /// Build the system prompt for the agent.
+    ///
+    /// `tools` is the *complete* set of tools the agent can ever access this
+    /// session. `revealed` is the subset whose full descriptions and schemas
+    /// are surfaced inline — typically memory + the discovery meta-tool +
+    /// any tool the agent has already asked about via `get_tool_details`.
     fn build_system_prompt(
         tools: &[athen_core::tool::ToolDefinition],
+        revealed: &HashSet<String>,
         has_context: bool,
     ) -> String {
         let now = chrono::Local::now();
@@ -175,12 +185,36 @@ impl DefaultExecutor {
         let has_contacts = tools.iter().any(|t| t.name.starts_with("contacts_"));
         let has_memory = tools.iter().any(|t| t.name == "memory_store");
 
+        // ── Tier 1: capability index (always shown, one line per group) ──
         if !tools.is_empty() {
-            prompt.push_str("You have the following tools available:\n");
-            for tool in tools {
-                prompt.push_str(&format!("- **{}**: {}\n", tool.name, tool.description));
+            prompt.push_str(
+                "AVAILABLE TOOL GROUPS (you know these exist, but only the ones in \
+                 \"DETAILED TOOLS\" below are immediately callable; for any other tool, \
+                 first call `get_tool_details(name=\"<tool_name>\")` to load its schema):\n",
+            );
+            for group in summarize_groups(tools) {
+                prompt.push_str(&format!(
+                    "- **{}** ({} tool{}): {}\n",
+                    group.display_name,
+                    group.tool_count,
+                    if group.tool_count == 1 { "" } else { "s" },
+                    group.one_liner,
+                ));
             }
             prompt.push('\n');
+
+            // ── Tier 2: full schemas for revealed tools ──
+            let revealed_tools: Vec<&athen_core::tool::ToolDefinition> = tools
+                .iter()
+                .filter(|t| revealed.contains(&t.name))
+                .collect();
+            if !revealed_tools.is_empty() {
+                prompt.push_str("DETAILED TOOLS (callable directly right now):\n");
+                for tool in revealed_tools {
+                    prompt.push_str(&format!("- **{}**: {}\n", tool.name, tool.description));
+                }
+                prompt.push('\n');
+            }
         }
 
         // Calendar-specific guidance when tools are available.
@@ -429,8 +463,19 @@ impl AgentExecutor for DefaultExecutor {
         let mut tools_called: Vec<String> = Vec::new();
         let mut conversation: Vec<ChatMessage> = Vec::new();
 
-        // Gather available tools for the LLM
-        let available_tools = self.tool_registry.list_tools().await?;
+        // Gather available tools for the LLM. Append the synthetic discovery
+        // meta-tool so the agent can lazily reveal others on demand.
+        let mut available_tools = self.tool_registry.list_tools().await?;
+        available_tools.push(meta_tool_definition());
+
+        // Two-tier surfacing: only the "revealed" subset has its full schema
+        // sent to the LLM each turn. Memory + the meta-tool are revealed by
+        // default; other tools enter the set when the agent asks about them.
+        let mut revealed_tools: HashSet<String> = available_tools
+            .iter()
+            .map(|t| t.name.clone())
+            .filter(|name| is_always_revealed(name))
+            .collect();
 
         // Prepend context messages (prior conversation history) before the
         // current task's user message so the agent has session memory.
@@ -442,12 +487,25 @@ impl AgentExecutor for DefaultExecutor {
             content: MessageContent::Text(task.description.clone()),
         });
 
-        let system_prompt =
-            Self::build_system_prompt(&available_tools, !self.context_messages.is_empty());
-
         tracing::info!(task_id = %task_id, "Starting task execution");
 
+        let has_context = !self.context_messages.is_empty();
+
         loop {
+            // Rebuild the system prompt each iteration so newly-revealed
+            // tools' full schemas appear inline. The prompt itself is small;
+            // rebuilding is cheap.
+            let system_prompt =
+                Self::build_system_prompt(&available_tools, &revealed_tools, has_context);
+
+            // Tools sent to the LLM API: only the revealed subset carries
+            // schemas. The model sees the others in the system-prompt index
+            // and uses `get_tool_details` to surface them.
+            let revealed_tool_defs: Vec<athen_core::tool::ToolDefinition> = available_tools
+                .iter()
+                .filter(|t| revealed_tools.contains(&t.name))
+                .cloned()
+                .collect();
             // Check cancellation flag
             if let Some(ref flag) = self.cancel_flag {
                 if flag.load(Ordering::Relaxed) {
@@ -494,7 +552,7 @@ impl AgentExecutor for DefaultExecutor {
                     max_tokens: Some(2048),
                     temperature: Some(0.5),
                     tools: None, // no tools — just summarise
-                    system_prompt: Some(system_prompt.clone()),
+                    system_prompt: Some(system_prompt),
                 };
                 let summary = match self.llm_router.route(&summary_request).await {
                     Ok(resp) => resp.content,
@@ -514,18 +572,18 @@ impl AgentExecutor for DefaultExecutor {
                 });
             }
 
-            // Build LLM request
+            // Build LLM request — only the revealed tool subset is sent.
             let request = LlmRequest {
                 profile: ModelProfile::Fast,
                 messages: conversation.clone(),
                 max_tokens: Some(4096),
                 temperature: Some(0.7),
-                tools: if available_tools.is_empty() {
+                tools: if revealed_tool_defs.is_empty() {
                     None
                 } else {
-                    Some(available_tools.clone())
+                    Some(revealed_tool_defs.clone())
                 },
-                system_prompt: Some(system_prompt.clone()),
+                system_prompt: Some(system_prompt),
             };
 
             // Call the LLM — use streaming when a stream sender is available.
@@ -749,10 +807,48 @@ impl AgentExecutor for DefaultExecutor {
                     "Executing tool call"
                 );
 
-                let tool_result = self
-                    .tool_registry
-                    .call_tool(&tool_call.name, tool_call.arguments.clone())
-                    .await;
+                // Intercept the discovery meta-tool: don't dispatch to the
+                // registry, just look up the schema and add it to the
+                // revealed set so the next request includes it.
+                let tool_result = if tool_call.name == META_TOOL_NAME {
+                    let requested = tool_call
+                        .arguments
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let lookup = available_tools
+                        .iter()
+                        .find(|t| t.name == requested);
+                    match lookup {
+                        Some(def) => {
+                            revealed_tools.insert(def.name.clone());
+                            Ok(athen_core::tool::ToolResult {
+                                success: true,
+                                output: serde_json::json!({
+                                    "name": def.name,
+                                    "description": def.description,
+                                    "parameters": def.parameters,
+                                    "note": "Tool details revealed. You can now call this tool directly on the next step."
+                                }),
+                                error: None,
+                                execution_time_ms: 0,
+                            })
+                        }
+                        None => Ok(athen_core::tool::ToolResult {
+                            success: false,
+                            output: serde_json::json!({
+                                "error": format!("Unknown tool: {requested}"),
+                                "hint": "Tool names are case-sensitive; check the AVAILABLE TOOL GROUPS section.",
+                            }),
+                            error: Some(format!("Unknown tool: {requested}")),
+                            execution_time_ms: 0,
+                        }),
+                    }
+                } else {
+                    self.tool_registry
+                        .call_tool(&tool_call.name, tool_call.arguments.clone())
+                        .await
+                };
 
                 let (step_status, output) = match &tool_result {
                     Ok(result) => (
@@ -1328,5 +1424,136 @@ mod tests {
             .and_then(|r| r.as_str())
             .unwrap();
         assert_eq!(response, "I don't have enough information to answer that.");
+    }
+
+    // ── Two-tier tool surfacing ─────────────────────────────────────────
+
+    fn tool_def(name: &str, desc: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_string(),
+            description: desc.to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+            backend: athen_core::tool::ToolBackend::Shell {
+                command: String::new(),
+                native: false,
+            },
+            base_risk: athen_core::risk::BaseImpact::Read,
+        }
+    }
+
+    #[test]
+    fn system_prompt_lists_groups_and_only_revealed_details() {
+        let tools = vec![
+            tool_def("memory_store", "store a memory"),
+            tool_def("memory_recall", "recall a memory"),
+            tool_def("calendar_create", "create a calendar event"),
+            tool_def("files__write_file", "write a file"),
+            crate::tool_grouping::meta_tool_definition(),
+        ];
+        let mut revealed = HashSet::new();
+        revealed.insert("memory_store".to_string());
+        revealed.insert("memory_recall".to_string());
+        revealed.insert(crate::tool_grouping::META_TOOL_NAME.to_string());
+
+        let prompt = DefaultExecutor::build_system_prompt(&tools, &revealed, false);
+
+        // Group index lists every group with counts.
+        assert!(prompt.contains("AVAILABLE TOOL GROUPS"));
+        assert!(prompt.contains("**Memory**"));
+        assert!(prompt.contains("**Calendar**"));
+        assert!(prompt.contains("**Files**"));
+        assert!(prompt.contains("**Tool discovery**"));
+
+        // Detailed section only includes the revealed ones.
+        assert!(prompt.contains("DETAILED TOOLS"));
+        assert!(prompt.contains("memory_store"));
+        assert!(prompt.contains("memory_recall"));
+        assert!(prompt.contains(crate::tool_grouping::META_TOOL_NAME));
+        // Calendar / Files were NOT revealed → their full descriptions should
+        // not appear under "DETAILED TOOLS".
+        let detailed_section = prompt
+            .split("DETAILED TOOLS")
+            .nth(1)
+            .unwrap_or("");
+        assert!(!detailed_section.contains("calendar_create"));
+        assert!(!detailed_section.contains("files__write_file"));
+    }
+
+    #[tokio::test]
+    async fn meta_tool_reveals_target_for_subsequent_call() {
+        // Iter 1: agent calls get_tool_details(name="files__write_file")
+        // Iter 2: agent calls files__write_file directly (now revealed)
+        // Iter 3: agent reports done
+        let discover = ToolCall {
+            id: "c1".to_string(),
+            name: crate::tool_grouping::META_TOOL_NAME.to_string(),
+            arguments: serde_json::json!({"name": "files__write_file"}),
+        };
+        let real_call = ToolCall {
+            id: "c2".to_string(),
+            name: "files__write_file".to_string(),
+            arguments: serde_json::json!({"path": "x", "contents": "y"}),
+        };
+        let responses = vec![
+            MockLlmRouter::make_response("Looking up the tool.", vec![discover]),
+            MockLlmRouter::make_response("Writing the file.", vec![real_call]),
+            MockLlmRouter::make_response("Done.", vec![]),
+        ];
+
+        // Tool registry only knows about files__write_file (the meta tool is
+        // synthesized inside the executor, not registered).
+        let write_result = CoreToolResult {
+            success: true,
+            output: serde_json::json!({"text": "ok"}),
+            error: None,
+            execution_time_ms: 1,
+        };
+        let registry = MockToolRegistry::new(
+            vec![tool_def("files__write_file", "write a file")],
+            vec![write_result],
+        );
+
+        let executor = DefaultExecutor::new(
+            Box::new(MockLlmRouter::new(responses)),
+            Box::new(registry),
+            Box::new(InMemoryAuditor::new()),
+            10,
+            Duration::from_secs(60),
+            vec![],
+        );
+
+        let task = make_task("Write a file");
+        let result = executor.execute(task).await.unwrap();
+        assert!(result.success);
+        // 1 discover step + 1 actual tool call + 1 completion = 3 steps
+        assert_eq!(result.steps_completed, 3);
+    }
+
+    #[tokio::test]
+    async fn meta_tool_unknown_name_returns_error_without_revealing() {
+        let discover = ToolCall {
+            id: "c1".to_string(),
+            name: crate::tool_grouping::META_TOOL_NAME.to_string(),
+            arguments: serde_json::json!({"name": "nonexistent_tool"}),
+        };
+        let responses = vec![
+            MockLlmRouter::make_response("Looking up.", vec![discover]),
+            MockLlmRouter::make_response("Done.", vec![]),
+        ];
+
+        let executor = DefaultExecutor::new(
+            Box::new(MockLlmRouter::new(responses)),
+            Box::new(MockToolRegistry::new(vec![tool_def("real_tool", "")], vec![])),
+            Box::new(InMemoryAuditor::new()),
+            10,
+            Duration::from_secs(60),
+            vec![],
+        );
+
+        let task = make_task("Discover something missing");
+        let result = executor.execute(task).await.unwrap();
+        // Even though the lookup failed, the executor continues — the agent
+        // sees the error and decides to stop.
+        assert!(result.success);
     }
 }

@@ -8,6 +8,7 @@ pub mod auditor;
 pub mod executor;
 pub mod resource;
 pub mod timeout;
+pub mod tool_grouping;
 pub mod tools;
 
 pub use auditor::InMemoryAuditor;
