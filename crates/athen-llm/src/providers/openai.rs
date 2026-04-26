@@ -4,6 +4,8 @@
 //! OpenAI itself, Ollama, llama.cpp, LM Studio, vLLM, text-generation-webui,
 //! and any other compatible endpoint.
 
+use std::collections::BTreeMap;
+
 use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::Client;
@@ -407,19 +409,75 @@ impl LlmProvider for OpenAiCompatibleProvider {
         let byte_stream = http_response.bytes_stream();
         let provider_id = self.provider_id.clone();
 
-        // Parse SSE events from the byte stream.
-        let chunk_stream = byte_stream
-            .map(move |result| match result {
-                Ok(bytes) => {
-                    let text = String::from_utf8_lossy(&bytes).to_string();
-                    parse_sse_chunks(&text, &provider_id)
+        // Stateful SSE parser: a `ToolCallAccumulator` is threaded across
+        // every byte chunk so fragmented tool-call deltas (id+name in one
+        // event, arguments dribbled across many later events) are merged
+        // into a single emitted ToolCall when finish_reason / [DONE] arrives.
+        //
+        // `pending_bytes` buffers raw bytes (NOT decoded text) across chunks
+        // so SSE event lines split across HTTP byte chunks reassemble
+        // correctly, AND multi-byte UTF-8 codepoints split at chunk seams
+        // are not corrupted by `from_utf8_lossy`.
+        let chunk_stream = futures::stream::unfold(
+            StreamState {
+                byte_stream,
+                acc: ToolCallAccumulator::default(),
+                pending_bytes: Vec::new(),
+                provider_id,
+                done: false,
+            },
+            |mut state| async move {
+                if state.done {
+                    return None;
                 }
-                Err(e) => vec![Err(AthenError::LlmProvider {
-                    provider: provider_id.clone(),
-                    message: format!("stream error: {}", e),
-                })],
-            })
-            .flat_map(futures::stream::iter);
+                let parsed = match state.byte_stream.next().await {
+                    Some(Ok(bytes)) => {
+                        state.pending_bytes.extend_from_slice(&bytes);
+                        let complete = take_complete_lines(&mut state.pending_bytes);
+                        if complete.is_empty() {
+                            Vec::new()
+                        } else {
+                            let text = String::from_utf8_lossy(&complete);
+                            parse_sse_chunks(&text, &state.provider_id, &mut state.acc)
+                        }
+                    }
+                    Some(Err(e)) => vec![Err(AthenError::LlmProvider {
+                        provider: state.provider_id.clone(),
+                        message: format!("stream error: {}", e),
+                    })],
+                    None => {
+                        // End of byte stream. Flush any final partial line
+                        // and drain the accumulator so callers still receive
+                        // tool calls if the server omitted [DONE].
+                        state.done = true;
+                        let mut out = Vec::new();
+                        if !state.pending_bytes.is_empty() {
+                            let tail = std::mem::take(&mut state.pending_bytes);
+                            let text = String::from_utf8_lossy(&tail);
+                            out.extend(parse_sse_chunks(
+                                &text,
+                                &state.provider_id,
+                                &mut state.acc,
+                            ));
+                        }
+                        if !state.acc.is_empty() {
+                            let tool_calls = state.acc.drain();
+                            if !tool_calls.is_empty() {
+                                out.push(Ok(LlmChunk {
+                                    delta: String::new(),
+                                    is_final: true,
+                                    is_thinking: false,
+                                    tool_calls,
+                                }));
+                            }
+                        }
+                        out
+                    }
+                };
+                Some((futures::stream::iter(parsed), state))
+            },
+        )
+        .flatten();
 
         Ok(Box::pin(chunk_stream))
     }
@@ -431,118 +489,233 @@ impl LlmProvider for OpenAiCompatibleProvider {
     }
 }
 
+/// Per-stream state for the SSE `unfold` loop.
+///
+/// Generic over the byte-stream type so both this provider and DeepSeek
+/// (which reuses the same buffering logic) can share it without naming
+/// `reqwest`'s private `Bytes` stream type explicitly.
+struct StreamState<S> {
+    byte_stream: S,
+    acc: ToolCallAccumulator,
+    pending_bytes: Vec<u8>,
+    provider_id: String,
+    done: bool,
+}
+
+/// Split off the longest prefix of `buf` that ends in `\n`, returning it.
+///
+/// The trailing partial line (everything after the last `\n`) stays in
+/// `buf` for the next iteration. Operates on raw bytes so multi-byte
+/// UTF-8 codepoints split across HTTP byte chunks are never decoded
+/// into U+FFFD replacement characters.
+pub(crate) fn take_complete_lines(buf: &mut Vec<u8>) -> Vec<u8> {
+    match buf.iter().rposition(|&b| b == b'\n') {
+        Some(idx) => {
+            let rest = buf.split_off(idx + 1);
+            std::mem::replace(buf, rest)
+        }
+        None => Vec::new(),
+    }
+}
+
+/// Per-tool-call buffer used while assembling fragmented streaming deltas.
+#[derive(Debug, Default, Clone)]
+struct PartialToolCall {
+    id: Option<String>,
+    name: Option<String>,
+    arguments_buf: String,
+}
+
+/// Stateful accumulator for OpenAI-compatible streaming tool calls.
+///
+/// In OpenAI's SSE format, a single tool call is split across many delta
+/// events keyed by `index`: the first event typically carries the `id` and
+/// `name` (with empty arguments); subsequent events carry only `arguments`
+/// fragments that must be concatenated. The accumulator collects these
+/// fragments per-index and finalizes them into [`ToolCall`]s on demand.
+#[derive(Debug, Default)]
+pub struct ToolCallAccumulator {
+    parts: BTreeMap<u32, PartialToolCall>,
+}
+
+impl ToolCallAccumulator {
+    /// Ingest a single `tool_calls[i]` JSON value from a streaming delta.
+    fn ingest(&mut self, tc_val: &serde_json::Value) {
+        let index = tc_val
+            .get("index")
+            .and_then(|v| v.as_u64())
+            .map(|i| i as u32)
+            .unwrap_or(0);
+        let entry = self.parts.entry(index).or_default();
+
+        if let Some(id) = tc_val.get("id").and_then(|v| v.as_str()) {
+            if entry.id.is_none() && !id.is_empty() {
+                entry.id = Some(id.to_string());
+            }
+        }
+        if let Some(name) = tc_val
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|n| n.as_str())
+        {
+            if entry.name.is_none() && !name.is_empty() {
+                entry.name = Some(name.to_string());
+            }
+        }
+        if let Some(args_frag) = tc_val
+            .get("function")
+            .and_then(|f| f.get("arguments"))
+            .and_then(|a| a.as_str())
+        {
+            entry.arguments_buf.push_str(args_frag);
+        }
+    }
+
+    /// Drain all accumulated entries into finalized [`ToolCall`]s.
+    ///
+    /// Entries lacking a `name` are discarded (incomplete). Missing `id`s
+    /// are synthesized from the index. Empty argument buffers become an
+    /// empty JSON object (some tools take no arguments).
+    pub(crate) fn drain(&mut self) -> Vec<ToolCall> {
+        let parts = std::mem::take(&mut self.parts);
+        parts
+            .into_iter()
+            .filter_map(|(index, p)| {
+                let name = p.name?;
+                let id = p.id.unwrap_or_else(|| format!("call_{}", index));
+                let arguments = if p.arguments_buf.is_empty() {
+                    serde_json::Value::Object(serde_json::Map::new())
+                } else {
+                    serde_json::from_str(&p.arguments_buf)
+                        .unwrap_or(serde_json::Value::String(p.arguments_buf))
+                };
+                Some(ToolCall {
+                    id,
+                    name,
+                    arguments,
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.parts.is_empty()
+    }
+}
+
 /// Parse SSE text into `LlmChunk` results (OpenAI streaming format).
 ///
-/// This is public so wrapper providers can reuse it if needed.
-pub fn parse_sse_chunks(text: &str, provider_id: &str) -> Vec<Result<LlmChunk>> {
+/// `acc` must persist across byte-stream chunks so that tool-call deltas
+/// fragmented across multiple SSE events are merged correctly.
+///
+/// This is public so wrapper providers (e.g. DeepSeek) can reuse it.
+pub fn parse_sse_chunks(
+    text: &str,
+    provider_id: &str,
+    acc: &mut ToolCallAccumulator,
+) -> Vec<Result<LlmChunk>> {
     let mut chunks = Vec::new();
 
     for line in text.lines() {
         let line = line.trim();
-        if let Some(data) = line.strip_prefix("data: ") {
-            debug!(provider = provider_id, raw_sse = data, "SSE chunk received");
-            if data == "[DONE]" {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        debug!(provider = provider_id, raw_sse = data, "SSE chunk received");
+
+        if data == "[DONE]" {
+            let tool_calls = acc.drain();
+            chunks.push(Ok(LlmChunk {
+                delta: String::new(),
+                is_final: true,
+                is_thinking: false,
+                tool_calls,
+            }));
+            continue;
+        }
+
+        let event = match serde_json::from_str::<serde_json::Value>(data) {
+            Ok(v) => v,
+            Err(_) => {
+                warn!(
+                    provider = provider_id,
+                    data = data,
+                    "failed to parse SSE event data"
+                );
+                continue;
+            }
+        };
+
+        let delta_obj = event
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("delta"));
+
+        // Reasoning / thinking content (Qwen 3.5, DeepSeek R1, ...).
+        if let Some(reasoning) = delta_obj
+            .and_then(|d| d.get("reasoning_content"))
+            .and_then(|c| c.as_str())
+        {
+            if !reasoning.is_empty() {
+                chunks.push(Ok(LlmChunk {
+                    delta: reasoning.to_string(),
+                    is_final: false,
+                    is_thinking: true,
+                    tool_calls: vec![],
+                }));
+            }
+        }
+
+        // Plain text content delta.
+        if let Some(delta_content) = delta_obj
+            .and_then(|d| d.get("content"))
+            .and_then(|c| c.as_str())
+        {
+            chunks.push(Ok(LlmChunk {
+                delta: delta_content.to_string(),
+                is_final: false,
+                is_thinking: false,
+                tool_calls: vec![],
+            }));
+        }
+
+        // Tool-call fragments — accumulate, do not emit yet.
+        if let Some(tool_calls_arr) = delta_obj
+            .and_then(|d| d.get("tool_calls"))
+            .and_then(|tc| tc.as_array())
+        {
+            for tc_val in tool_calls_arr {
+                acc.ingest(tc_val);
+            }
+        }
+
+        // finish_reason marks the end of the message: drain accumulator
+        // and emit a single final chunk that carries all assembled tool calls.
+        if let Some(finish) = event
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("finish_reason"))
+            .and_then(|f| f.as_str())
+        {
+            if finish == "stop" || finish == "length" || finish == "tool_calls" {
+                let tool_calls = acc.drain();
                 chunks.push(Ok(LlmChunk {
                     delta: String::new(),
                     is_final: true,
                     is_thinking: false,
-                    tool_calls: vec![],
+                    tool_calls,
                 }));
-                continue;
-            }
-            match serde_json::from_str::<serde_json::Value>(data) {
-                Ok(event) => {
-                    let delta_obj = event
-                        .get("choices")
-                        .and_then(|c| c.get(0))
-                        .and_then(|c| c.get("delta"));
-
-                    // Check for reasoning_content (thinking models like Qwen 3.5, DeepSeek R1).
-                    if let Some(reasoning) = delta_obj
-                        .and_then(|d| d.get("reasoning_content"))
-                        .and_then(|c| c.as_str())
-                    {
-                        if !reasoning.is_empty() {
-                            chunks.push(Ok(LlmChunk {
-                                delta: reasoning.to_string(),
-                                is_final: false,
-                                is_thinking: true,
-                                tool_calls: vec![],
-                            }));
-                        }
-                    }
-
-                    // OpenAI streaming format: choices[0].delta.content
-                    if let Some(delta_content) = delta_obj
-                        .and_then(|d| d.get("content"))
-                        .and_then(|c| c.as_str())
-                    {
-                        chunks.push(Ok(LlmChunk {
-                            delta: delta_content.to_string(),
-                            is_final: false,
-                            is_thinking: false,
-                            tool_calls: vec![],
-                        }));
-                    }
-
-                    // Check for tool_calls in the delta.
-                    if let Some(tool_calls_arr) = delta_obj
-                        .and_then(|d| d.get("tool_calls"))
-                        .and_then(|tc| tc.as_array())
-                    {
-                        let mut extracted_calls = Vec::new();
-                        for tc_val in tool_calls_arr {
-                            if let (Some(id), Some(name), Some(args_str)) = (
-                                tc_val.get("id").and_then(|v| v.as_str()),
-                                tc_val.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()),
-                                tc_val.get("function").and_then(|f| f.get("arguments")).and_then(|a| a.as_str()),
-                            ) {
-                                let arguments = serde_json::from_str(args_str)
-                                    .unwrap_or(serde_json::Value::String(args_str.to_string()));
-                                extracted_calls.push(ToolCall {
-                                    id: id.to_string(),
-                                    name: name.to_string(),
-                                    arguments,
-                                });
-                            }
-                        }
-                        if !extracted_calls.is_empty() {
-                            chunks.push(Ok(LlmChunk {
-                                delta: String::new(),
-                                is_final: false,
-                                is_thinking: false,
-                                tool_calls: extracted_calls,
-                            }));
-                        }
-                    }
-
-                    // Check for finish_reason to detect the final chunk.
-                    if let Some(finish) = event
-                        .get("choices")
-                        .and_then(|c| c.get(0))
-                        .and_then(|c| c.get("finish_reason"))
-                        .and_then(|f| f.as_str())
-                    {
-                        if finish == "stop" || finish == "length" || finish == "tool_calls" {
-                            chunks.push(Ok(LlmChunk {
-                                delta: String::new(),
-                                is_final: true,
-                                is_thinking: false,
-                                tool_calls: vec![],
-                            }));
-                        }
-                    }
-                }
-                Err(_) => {
-                    warn!(
-                        provider = provider_id,
-                        data = data,
-                        "failed to parse SSE event data"
-                    );
-                }
             }
         }
     }
+
+    // If the upstream stream ends without a finish_reason or [DONE]
+    // (rare, but seen with some compatibility servers), the caller should
+    // still get the accumulated tool calls. We don't flush here because
+    // we're called per byte chunk, not at end-of-stream — a later chunk
+    // may extend the buffer. Anything left in `acc` will be flushed when
+    // the next finish_reason / [DONE] arrives, or dropped on stream end.
+    let _ = acc.is_empty();
 
     chunks
 }
@@ -905,7 +1078,8 @@ data: {"choices":[{"delta":{"content":" world"},"index":0}]}
 
 data: [DONE]
 "#;
-        let chunks = parse_sse_chunks(sse, "test");
+        let mut acc = ToolCallAccumulator::default();
+        let chunks = parse_sse_chunks(sse, "test", &mut acc);
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[0].as_ref().unwrap().delta, "Hello");
         assert!(!chunks[0].as_ref().unwrap().is_final);
@@ -917,7 +1091,8 @@ data: [DONE]
     fn test_parse_sse_chunks_finish_reason() {
         let sse =
             r#"data: {"choices":[{"delta":{},"index":0,"finish_reason":"stop"}]}"#;
-        let chunks = parse_sse_chunks(sse, "test");
+        let mut acc = ToolCallAccumulator::default();
+        let chunks = parse_sse_chunks(sse, "test", &mut acc);
         assert_eq!(chunks.len(), 1);
         assert!(chunks[0].as_ref().unwrap().is_final);
     }
@@ -925,9 +1100,123 @@ data: [DONE]
     #[test]
     fn test_parse_sse_ignores_non_data_lines() {
         let sse = ": this is a comment\nsome random line\ndata: [DONE]\n";
-        let chunks = parse_sse_chunks(sse, "test");
+        let mut acc = ToolCallAccumulator::default();
+        let chunks = parse_sse_chunks(sse, "test", &mut acc);
         assert_eq!(chunks.len(), 1);
         assert!(chunks[0].as_ref().unwrap().is_final);
+    }
+
+    #[test]
+    fn test_parse_sse_chunks_fragmented_tool_call() {
+        let sse = "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_abc\",\"type\":\"function\",\"function\":{\"name\":\"files__list_dir\",\"arguments\":\"\"}}]}}]}\n\n\
+                   data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"pa\"}}]}}]}\n\n\
+                   data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"th\\\":\\\"/h\"}}]}}]}\n\n\
+                   data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"ome\\\"}\"}}]}}]}\n\n\
+                   data: {\"choices\":[{\"index\":0,\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n\n";
+
+        let mut acc = ToolCallAccumulator::default();
+        let chunks = parse_sse_chunks(sse, "test", &mut acc);
+
+        let final_chunks: Vec<&LlmChunk> = chunks
+            .iter()
+            .filter_map(|c| c.as_ref().ok())
+            .filter(|c| c.is_final)
+            .collect();
+        assert_eq!(final_chunks.len(), 1);
+        assert_eq!(final_chunks[0].tool_calls.len(), 1);
+
+        let tc = &final_chunks[0].tool_calls[0];
+        assert_eq!(tc.id, "call_abc");
+        assert_eq!(tc.name, "files__list_dir");
+        assert_eq!(tc.arguments, serde_json::json!({"path": "/home"}));
+
+        let mid_tool_chunks: Vec<&LlmChunk> = chunks
+            .iter()
+            .filter_map(|c| c.as_ref().ok())
+            .filter(|c| !c.is_final && !c.tool_calls.is_empty())
+            .collect();
+        assert!(
+            mid_tool_chunks.is_empty(),
+            "fragments must not be emitted before finish_reason"
+        );
+    }
+
+    #[test]
+    fn test_parse_sse_chunks_multiple_parallel_tool_calls() {
+        let sse = "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"foo\",\"arguments\":\"\"}}]}}]}\n\n\
+                   data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_b\",\"type\":\"function\",\"function\":{\"name\":\"bar\",\"arguments\":\"\"}}]}}]}\n\n\
+                   data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"x\\\":1}\"}}]}}]}\n\n\
+                   data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"arguments\":\"{\\\"y\\\":2}\"}}]}}]}\n\n\
+                   data: {\"choices\":[{\"index\":0,\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n\n";
+
+        let mut acc = ToolCallAccumulator::default();
+        let chunks = parse_sse_chunks(sse, "test", &mut acc);
+
+        let final_chunk = chunks
+            .iter()
+            .filter_map(|c| c.as_ref().ok())
+            .find(|c| c.is_final)
+            .expect("final chunk");
+        assert_eq!(final_chunk.tool_calls.len(), 2);
+
+        let foo = final_chunk
+            .tool_calls
+            .iter()
+            .find(|t| t.name == "foo")
+            .expect("foo tool call");
+        assert_eq!(foo.id, "call_a");
+        assert_eq!(foo.arguments, serde_json::json!({"x": 1}));
+
+        let bar = final_chunk
+            .tool_calls
+            .iter()
+            .find(|t| t.name == "bar")
+            .expect("bar tool call");
+        assert_eq!(bar.id, "call_b");
+        assert_eq!(bar.arguments, serde_json::json!({"y": 2}));
+    }
+
+    #[test]
+    fn test_parse_sse_chunks_tool_call_no_args() {
+        let sse = "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"now\",\"arguments\":\"\"}}]}}]}\n\n\
+                   data: {\"choices\":[{\"index\":0,\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n\n";
+
+        let mut acc = ToolCallAccumulator::default();
+        let chunks = parse_sse_chunks(sse, "test", &mut acc);
+
+        let final_chunk = chunks
+            .iter()
+            .filter_map(|c| c.as_ref().ok())
+            .find(|c| c.is_final)
+            .expect("final chunk");
+        assert_eq!(final_chunk.tool_calls.len(), 1);
+        let tc = &final_chunk.tool_calls[0];
+        assert_eq!(tc.name, "now");
+        assert_eq!(tc.arguments, serde_json::json!({}));
+    }
+
+    #[test]
+    fn test_parse_sse_chunks_state_persists_across_calls() {
+        let mut acc = ToolCallAccumulator::default();
+
+        let part1 = "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_x\",\"type\":\"function\",\"function\":{\"name\":\"f\",\"arguments\":\"{\\\"a\\\":\"}}]}}]}\n\n";
+        let part2 = "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"42}\"}}]}}]}\n\n\
+                     data: {\"choices\":[{\"index\":0,\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n\n";
+
+        let chunks1 = parse_sse_chunks(part1, "test", &mut acc);
+        assert!(chunks1.iter().filter_map(|c| c.as_ref().ok()).all(|c| !c.is_final));
+
+        let chunks2 = parse_sse_chunks(part2, "test", &mut acc);
+        let final_chunk = chunks2
+            .iter()
+            .filter_map(|c| c.as_ref().ok())
+            .find(|c| c.is_final)
+            .expect("final chunk");
+        assert_eq!(final_chunk.tool_calls.len(), 1);
+        assert_eq!(
+            final_chunk.tool_calls[0].arguments,
+            serde_json::json!({"a": 42})
+        );
     }
 
     #[test]
@@ -1021,6 +1310,119 @@ data: [DONE]
         assert_eq!(resp.choices[0].message.content.as_deref(), Some("Hello!"));
         assert_eq!(resp.choices[0].finish_reason.as_deref(), Some("stop"));
         assert_eq!(resp.usage.as_ref().unwrap().prompt_tokens, 10);
+    }
+
+    #[test]
+    fn test_take_complete_lines_no_newline() {
+        let mut buf = b"data: {\"partial\":".to_vec();
+        let complete = take_complete_lines(&mut buf);
+        assert!(complete.is_empty());
+        assert_eq!(buf, b"data: {\"partial\":");
+    }
+
+    #[test]
+    fn test_take_complete_lines_splits_at_last_newline() {
+        let mut buf = b"data: a\ndata: b\ndata: par".to_vec();
+        let complete = take_complete_lines(&mut buf);
+        assert_eq!(complete, b"data: a\ndata: b\n");
+        assert_eq!(buf, b"data: par");
+    }
+
+    #[test]
+    fn test_take_complete_lines_all_complete() {
+        let mut buf = b"data: a\ndata: b\n".to_vec();
+        let complete = take_complete_lines(&mut buf);
+        assert_eq!(complete, b"data: a\ndata: b\n");
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_buffer_holds_partial_utf8() {
+        // The emoji 📄 is 0xF0 0x9F 0x93 0x84 in UTF-8.
+        // Simulate two byte chunks: the first ends mid-codepoint with no
+        // newline so nothing is decoded yet; the second supplies the rest
+        // plus a newline.
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"data: \"\xF0\x9F"); // first 2 emoji bytes
+        let complete1 = take_complete_lines(&mut buf);
+        assert!(
+            complete1.is_empty(),
+            "no newline yet -> no decode, no replacement chars introduced"
+        );
+
+        buf.extend_from_slice(b"\x93\x84\"\n"); // remaining 2 bytes + close quote + \n
+        let complete2 = take_complete_lines(&mut buf);
+        let text = String::from_utf8_lossy(&complete2);
+        assert!(text.contains('\u{1F4C4}'), "got: {:?}", text);
+        assert!(!text.contains('\u{FFFD}'), "no replacement char");
+    }
+
+    #[test]
+    fn test_streaming_handles_split_sse_event() {
+        // Simulate two byte chunks: chunk 1 ends mid-JSON; chunk 2 completes it.
+        let chunk1 = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel";
+        let chunk2 = b"lo\"}}]}\n\ndata: [DONE]\n";
+
+        let mut buf: Vec<u8> = Vec::new();
+        let mut acc = ToolCallAccumulator::default();
+        let mut all_chunks: Vec<Result<LlmChunk>> = Vec::new();
+
+        buf.extend_from_slice(chunk1);
+        let complete = take_complete_lines(&mut buf);
+        // First chunk has no newline -> nothing complete yet.
+        assert!(complete.is_empty());
+
+        buf.extend_from_slice(chunk2);
+        let complete = take_complete_lines(&mut buf);
+        let text = String::from_utf8_lossy(&complete);
+        all_chunks.extend(parse_sse_chunks(&text, "test", &mut acc));
+
+        let content: String = all_chunks
+            .iter()
+            .filter_map(|c| c.as_ref().ok())
+            .filter(|c| !c.is_final)
+            .map(|c| c.delta.clone())
+            .collect();
+        assert_eq!(content, "Hello");
+
+        assert!(all_chunks
+            .iter()
+            .filter_map(|c| c.as_ref().ok())
+            .any(|c| c.is_final));
+    }
+
+    #[test]
+    fn test_streaming_split_utf8_codepoint() {
+        // Full SSE event: data: {"choices":[{"delta":{"content":"📄"}}]}\n\ndata: [DONE]\n
+        // The emoji is 4 bytes: F0 9F 93 84. Split between bytes 2 and 3.
+        let full = b"data: {\"choices\":[{\"delta\":{\"content\":\"\xF0\x9F\x93\x84\"}}]}\n\ndata: [DONE]\n";
+        let split_at = full.iter().position(|&b| b == 0xF0).unwrap() + 2;
+        let chunk1 = &full[..split_at];
+        let chunk2 = &full[split_at..];
+
+        let mut buf: Vec<u8> = Vec::new();
+        let mut acc = ToolCallAccumulator::default();
+        let mut all_chunks: Vec<Result<LlmChunk>> = Vec::new();
+
+        buf.extend_from_slice(chunk1);
+        let complete = take_complete_lines(&mut buf);
+        // No newline in chunk1 -> nothing decoded yet (this is what saves us
+        // from from_utf8_lossy producing a replacement character at the seam).
+        assert!(complete.is_empty());
+
+        buf.extend_from_slice(chunk2);
+        let complete = take_complete_lines(&mut buf);
+        let text = String::from_utf8_lossy(&complete);
+        all_chunks.extend(parse_sse_chunks(&text, "test", &mut acc));
+
+        let content: String = all_chunks
+            .iter()
+            .filter_map(|c| c.as_ref().ok())
+            .filter(|c| !c.is_final)
+            .map(|c| c.delta.clone())
+            .collect();
+        assert_eq!(content, "\u{1F4C4}");
+        assert!(!content.contains('\u{FFFD}'));
     }
 
     #[test]

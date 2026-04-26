@@ -17,13 +17,17 @@ use rmcp::{ErrorData as McpError, ServerHandler, schemars, tool, tool_handler, t
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct PathArg {
-    /// Path relative to the sandbox root.
+    /// Path relative to the sandbox root. Use "." for the root itself, or
+    /// relative paths like "notes/foo.txt". Absolute paths are rejected —
+    /// use shell_execute for files outside the sandbox.
     pub path: String,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct WriteArg {
-    /// Path relative to the sandbox root.
+    /// Path relative to the sandbox root. Use "." for the root itself, or
+    /// relative paths like "notes/foo.txt". Absolute paths are rejected —
+    /// use shell_execute for files outside the sandbox.
     pub path: String,
     /// File contents to write (UTF-8).
     pub contents: String,
@@ -31,9 +35,13 @@ pub struct WriteArg {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct MoveArg {
-    /// Source path relative to the sandbox root.
+    /// Source path relative to the sandbox root. Use relative paths like
+    /// "notes/foo.txt". Absolute paths are rejected — use shell_execute
+    /// for files outside the sandbox.
     pub from: String,
-    /// Destination path relative to the sandbox root.
+    /// Destination path relative to the sandbox root. Use relative paths
+    /// like "notes/foo.txt". Absolute paths are rejected — use
+    /// shell_execute for files outside the sandbox.
     pub to: String,
 }
 
@@ -63,9 +71,14 @@ impl Filesystem {
     /// absolute paths and any traversal that would escape the root.
     fn resolve(&self, path: &str) -> Result<PathBuf, McpError> {
         let candidate = Path::new(path);
+        let root = self.root.display();
         if candidate.is_absolute() {
             return Err(McpError::invalid_params(
-                "path must be relative to the sandbox root",
+                format!(
+                    "path '{path}' is absolute, but this MCP is sandboxed to '{root}'. \
+                     Use a path relative to that root (e.g. '.', 'notes/foo.txt'). \
+                     For files outside the sandbox, use shell_execute instead."
+                ),
                 None,
             ));
         }
@@ -77,14 +90,22 @@ impl Filesystem {
                 Component::ParentDir => {
                     if !joined.pop() || !joined.starts_with(self.root.as_ref()) {
                         return Err(McpError::invalid_params(
-                            "path escapes the sandbox root",
+                            format!(
+                                "path '{path}' escapes the sandbox root '{root}'. \
+                                 Use a relative path that stays inside the root, or \
+                                 shell_execute for paths outside it."
+                            ),
                             None,
                         ));
                     }
                 }
                 Component::Prefix(_) | Component::RootDir => {
                     return Err(McpError::invalid_params(
-                        "path must be relative to the sandbox root",
+                        format!(
+                            "path '{path}' is absolute, but this MCP is sandboxed to '{root}'. \
+                             Use a path relative to that root (e.g. '.', 'notes/foo.txt'). \
+                             For files outside the sandbox, use shell_execute instead."
+                        ),
                         None,
                     ));
                 }
@@ -92,14 +113,18 @@ impl Filesystem {
         }
         if !joined.starts_with(self.root.as_ref()) {
             return Err(McpError::invalid_params(
-                "path escapes the sandbox root",
+                format!(
+                    "path '{path}' escapes the sandbox root '{root}'. \
+                     Use a relative path that stays inside the root, or \
+                     shell_execute for paths outside it."
+                ),
                 None,
             ));
         }
         Ok(joined)
     }
 
-    #[tool(description = "Read a UTF-8 text file. Path is relative to the sandbox root.")]
+    #[tool(description = "Read a UTF-8 text file from the sandbox. For files outside the sandbox, use shell_execute.")]
     async fn read_file(
         &self,
         Parameters(PathArg { path }): Parameters<PathArg>,
@@ -111,7 +136,7 @@ impl Filesystem {
         }
     }
 
-    #[tool(description = "Write (overwrite) a UTF-8 text file. Creates parent dirs as needed.")]
+    #[tool(description = "Write (overwrite) a UTF-8 text file in the sandbox. Creates parent dirs as needed. For files outside the sandbox, use shell_execute.")]
     async fn write_file(
         &self,
         Parameters(WriteArg { path, contents }): Parameters<WriteArg>,
@@ -128,7 +153,7 @@ impl Filesystem {
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
-    #[tool(description = "Append text to a file. Creates the file if missing.")]
+    #[tool(description = "Append text to a file in the sandbox. Creates the file if missing. For files outside the sandbox, use shell_execute.")]
     async fn append_file(
         &self,
         Parameters(WriteArg { path, contents }): Parameters<WriteArg>,
@@ -152,7 +177,7 @@ impl Filesystem {
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
-    #[tool(description = "List entries in a directory. Returns one entry per line as 'TYPE\\tNAME'.")]
+    #[tool(description = "List entries in a sandbox directory. Returns one entry per line as 'TYPE\\tNAME'. Use '.' to list the sandbox root. For directories outside the sandbox, use shell_execute.")]
     async fn list_dir(
         &self,
         Parameters(PathArg { path }): Parameters<PathArg>,
@@ -187,7 +212,7 @@ impl Filesystem {
         Ok(CallToolResult::success(vec![Content::text(out)]))
     }
 
-    #[tool(description = "Create a directory (and parents) at the given path.")]
+    #[tool(description = "Create a directory (and parents) at the given sandbox path. For paths outside the sandbox, use shell_execute.")]
     async fn create_dir(
         &self,
         Parameters(PathArg { path }): Parameters<PathArg>,
@@ -199,7 +224,7 @@ impl Filesystem {
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
-    #[tool(description = "Delete a file or empty directory. Recursive for directories.")]
+    #[tool(description = "Delete a file or directory in the sandbox. Recursive for directories. For paths outside the sandbox, use shell_execute.")]
     async fn delete_path(
         &self,
         Parameters(PathArg { path }): Parameters<PathArg>,
@@ -226,7 +251,7 @@ impl Filesystem {
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
-    #[tool(description = "Move or rename a file/directory within the sandbox.")]
+    #[tool(description = "Move or rename a file/directory within the sandbox. Both paths must stay inside the sandbox; for paths outside it, use shell_execute.")]
     async fn move_path(
         &self,
         Parameters(MoveArg { from, to }): Parameters<MoveArg>,
@@ -244,7 +269,7 @@ impl Filesystem {
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
-    #[tool(description = "Check whether a path exists. Returns 'true' or 'false'.")]
+    #[tool(description = "Check whether a sandbox path exists. Returns 'true' or 'false'. For paths outside the sandbox, use shell_execute.")]
     async fn exists(
         &self,
         Parameters(PathArg { path }): Parameters<PathArg>,
@@ -256,7 +281,7 @@ impl Filesystem {
         )]))
     }
 
-    #[tool(description = "Get metadata for a path. Returns 'TYPE\\tSIZE_BYTES'.")]
+    #[tool(description = "Get metadata for a sandbox path. Returns 'TYPE\\tSIZE_BYTES'. For paths outside the sandbox, use shell_execute.")]
     async fn stat(
         &self,
         Parameters(PathArg { path }): Parameters<PathArg>,
@@ -289,8 +314,10 @@ impl ServerHandler for Filesystem {
         .with_protocol_version(ProtocolVersion::V_2024_11_05)
         .with_instructions(
             "Sandboxed filesystem access. All paths are relative to a fixed root directory; \
-             absolute paths and traversal outside the root are rejected. Tools: read_file, \
-             write_file, append_file, list_dir, create_dir, delete_path, move_path, exists, stat."
+             absolute paths and traversal outside the root are rejected. \
+             For files outside this sandbox, prefer shell_execute. \
+             Tools: read_file, write_file, append_file, list_dir, create_dir, delete_path, \
+             move_path, exists, stat."
                 .to_string(),
         )
     }

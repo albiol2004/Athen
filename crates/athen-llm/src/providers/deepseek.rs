@@ -8,11 +8,13 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use athen_core::error::{AthenError, Result};
 use athen_core::llm::*;
 use athen_core::traits::llm::LlmProvider;
+
+use crate::providers::openai::{parse_sse_chunks, take_complete_lines, ToolCallAccumulator};
 
 const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
 const DEFAULT_MODEL: &str = "deepseek-chat";
@@ -333,19 +335,62 @@ impl LlmProvider for DeepSeekProvider {
 
         let byte_stream = http_response.bytes_stream();
 
-        // Parse SSE events from the byte stream.
-        let chunk_stream = byte_stream
-            .map(|result| match result {
-                Ok(bytes) => {
-                    let text = String::from_utf8_lossy(&bytes).to_string();
-                    parse_sse_chunks(&text)
+        // DeepSeek is OpenAI-compatible — reuse the stateful SSE parser so
+        // fragmented tool-call deltas are correctly assembled across chunks,
+        // and buffer raw bytes across HTTP chunks so SSE lines and multi-byte
+        // UTF-8 codepoints split at chunk boundaries reassemble correctly.
+        let chunk_stream = futures::stream::unfold(
+            (
+                byte_stream,
+                ToolCallAccumulator::default(),
+                Vec::<u8>::new(),
+                false,
+            ),
+            |(mut byte_stream, mut acc, mut pending, mut done)| async move {
+                if done {
+                    return None;
                 }
-                Err(e) => vec![Err(AthenError::LlmProvider {
-                    provider: "deepseek".into(),
-                    message: format!("stream error: {}", e),
-                })],
-            })
-            .flat_map(futures::stream::iter);
+                let parsed = match byte_stream.next().await {
+                    Some(Ok(bytes)) => {
+                        pending.extend_from_slice(&bytes);
+                        let complete = take_complete_lines(&mut pending);
+                        if complete.is_empty() {
+                            Vec::new()
+                        } else {
+                            let text = String::from_utf8_lossy(&complete);
+                            parse_sse_chunks(&text, "deepseek", &mut acc)
+                        }
+                    }
+                    Some(Err(e)) => vec![Err(AthenError::LlmProvider {
+                        provider: "deepseek".into(),
+                        message: format!("stream error: {}", e),
+                    })],
+                    None => {
+                        done = true;
+                        let mut out = Vec::new();
+                        if !pending.is_empty() {
+                            let tail = std::mem::take(&mut pending);
+                            let text = String::from_utf8_lossy(&tail);
+                            out.extend(parse_sse_chunks(&text, "deepseek", &mut acc));
+                        }
+                        if !acc.is_empty() {
+                            let tool_calls = acc.drain();
+                            if !tool_calls.is_empty() {
+                                out.push(Ok(LlmChunk {
+                                    delta: String::new(),
+                                    is_final: true,
+                                    is_thinking: false,
+                                    tool_calls,
+                                }));
+                            }
+                        }
+                        out
+                    }
+                };
+                Some((futures::stream::iter(parsed), (byte_stream, acc, pending, done)))
+            },
+        )
+        .flatten();
 
         Ok(Box::pin(chunk_stream))
     }
@@ -353,115 +398,6 @@ impl LlmProvider for DeepSeekProvider {
     async fn is_available(&self) -> bool {
         true
     }
-}
-
-/// Parse SSE text into `LlmChunk` results (OpenAI streaming format).
-fn parse_sse_chunks(text: &str) -> Vec<Result<LlmChunk>> {
-    let mut chunks = Vec::new();
-
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(data) = line.strip_prefix("data: ") {
-            if data == "[DONE]" {
-                chunks.push(Ok(LlmChunk {
-                    delta: String::new(),
-                    is_final: true,
-                    is_thinking: false,
-                    tool_calls: vec![],
-                }));
-                continue;
-            }
-            match serde_json::from_str::<serde_json::Value>(data) {
-                Ok(event) => {
-                    let delta_obj = event
-                        .get("choices")
-                        .and_then(|c| c.get(0))
-                        .and_then(|c| c.get("delta"));
-
-                    // Check for reasoning_content (DeepSeek R1 thinking output).
-                    if let Some(reasoning) = delta_obj
-                        .and_then(|d| d.get("reasoning_content"))
-                        .and_then(|c| c.as_str())
-                    {
-                        if !reasoning.is_empty() {
-                            chunks.push(Ok(LlmChunk {
-                                delta: reasoning.to_string(),
-                                is_final: false,
-                                is_thinking: true,
-                                tool_calls: vec![],
-                            }));
-                        }
-                    }
-
-                    // OpenAI streaming format: choices[0].delta.content
-                    if let Some(delta_content) = delta_obj
-                        .and_then(|d| d.get("content"))
-                        .and_then(|c| c.as_str())
-                    {
-                        chunks.push(Ok(LlmChunk {
-                            delta: delta_content.to_string(),
-                            is_final: false,
-                            is_thinking: false,
-                            tool_calls: vec![],
-                        }));
-                    }
-
-                    // Check for tool_calls in the delta.
-                    if let Some(tool_calls_arr) = delta_obj
-                        .and_then(|d| d.get("tool_calls"))
-                        .and_then(|tc| tc.as_array())
-                    {
-                        let mut extracted_calls = Vec::new();
-                        for tc_val in tool_calls_arr {
-                            if let (Some(id), Some(name), Some(args_str)) = (
-                                tc_val.get("id").and_then(|v| v.as_str()),
-                                tc_val.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()),
-                                tc_val.get("function").and_then(|f| f.get("arguments")).and_then(|a| a.as_str()),
-                            ) {
-                                let arguments = serde_json::from_str(args_str)
-                                    .unwrap_or(serde_json::Value::String(args_str.to_string()));
-                                extracted_calls.push(ToolCall {
-                                    id: id.to_string(),
-                                    name: name.to_string(),
-                                    arguments,
-                                });
-                            }
-                        }
-                        if !extracted_calls.is_empty() {
-                            chunks.push(Ok(LlmChunk {
-                                delta: String::new(),
-                                is_final: false,
-                                is_thinking: false,
-                                tool_calls: extracted_calls,
-                            }));
-                        }
-                    }
-
-                    // Check for finish_reason to detect the final chunk.
-                    if let Some(finish) = event
-                        .get("choices")
-                        .and_then(|c| c.get(0))
-                        .and_then(|c| c.get("finish_reason"))
-                        .and_then(|f| f.as_str())
-                    {
-                        if finish == "stop" || finish == "length" || finish == "tool_calls" {
-                            chunks.push(Ok(LlmChunk {
-                                delta: String::new(),
-                                is_final: true,
-                                is_thinking: false,
-                                tool_calls: vec![],
-                            }));
-                        }
-                    }
-                }
-                Err(_) => {
-                    warn!(data = data, "failed to parse DeepSeek SSE event data");
-                }
-            }
-        }
-    }
-
-    chunks
 }
 
 /// Cost estimation for DeepSeek models.

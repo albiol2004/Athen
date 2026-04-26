@@ -57,9 +57,11 @@ athen/
 ## Design Principles (CRITICAL)
 
 ### 1. Hexagonal Architecture (Ports & Adapters)
+
 `athen-core` defines ALL traits (ports). Every other crate implements adapters. No crate depends on a sibling -- only on `athen-core`. `athen-app` is the composition root that wires implementations together.
 
 ### 2. Dependency Rules
+
 - `athen-core` depends on NOTHING internal (only serde, chrono, uuid, thiserror, async-trait, url, tokio-stream)
 - All other crates depend on `athen-core` for trait definitions
 - MCPs (`crates/mcps/*`) do NOT depend on `athen-core` -- standalone JSON-RPC servers
@@ -67,6 +69,7 @@ athen/
 - `athen-app` is the ONLY crate that depends on multiple siblings
 
 ### 3. Independent Testability
+
 Every crate can be tested in isolation by mocking trait dependencies.
 
 ## Coding Guidelines
