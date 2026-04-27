@@ -17,9 +17,36 @@ Defined in `crates/athen-agent/src/tools.rs`. Six built-in tools:
 
 `shell_execute` passes the command through `RuleEngine` before dispatch; `Danger` or `Critical` risk score returns an error without executing (`tools.rs:167-199`).
 
-Calendar tools (`calendar_list/create/update/delete`) are added by `AppToolRegistry` in `crates/athen-app/src/app_tools.rs`, which wraps `ShellToolRegistry`.
+### Composition (`AppToolRegistry`)
 
-MCP tools are registered at the same layer via `McpRegistry::list_tools` and namespaced as `<mcp_id>__<tool_name>` (e.g. `files__read_file`).
+`crates/athen-app/src/app_tools.rs:34` composes the production tool surface from optional adapters:
+
+```rust
+struct AppToolRegistry {
+    inner: ShellToolRegistry,
+    calendar: Option<CalendarStore>,
+    contacts: Option<SqliteContactStore>,
+    memory:   Option<Arc<Memory>>,
+    mcp:      Option<Arc<dyn McpClient>>,
+    file_gate: Option<Arc<FileGate>>,
+}
+```
+
+Constructed eagerly with the first four; `mcp` and `file_gate` are attached via builders (`with_mcp`, `with_file_gate`) so the same struct works in tests without those subsystems.
+
+**Tools added on top of the inner six:**
+- 4 calendar tools when `calendar.is_some()` — `calendar_list/create/update/delete` (`Read`, `WritePersist`, `WritePersist`, `WritePersist`).
+- 5 contacts tools when `contacts.is_some()` — `contacts_list/search/create/update/delete` (`Read`, `Read`, `WritePersist`, `WritePersist`, `WritePersist`).
+- N MCP tools when `mcp.is_some()` — each tool returned by `McpClient::list_tools` is namespaced `<mcp_id>__<tool_name>` (e.g. `files__read_file`) using `MCP_TOOL_SEPARATOR`.
+
+**Description override:** when `memory.is_some()`, the inner `memory_store` / `memory_recall` descriptions are rewritten to point at persistent semantic memory rather than the in-session `HashMap` (`app_tools.rs:820-829`).
+
+**`call_tool` dispatch order** (`app_tools.rs:930-1024`):
+1. **`FileGate` interception** — if a `file_gate` is set and `FileGate::is_file_tool(name)` matches, the call is routed through `gate.handle()` which evaluates the path against `PathRiskEvaluator` + grants. The gate either runs the op directly (paths outside the sandbox), or hands back to a `dispatch_inside_sandbox` closure (paths the MCP can serve).
+2. **MCP routing** — names containing `MCP_TOOL_SEPARATOR` are split and forwarded to `McpClient::call_tool(mcp_id, tool, args)`.
+3. **Persistent memory override** — `memory_store` / `memory_recall` are intercepted to call `Memory::remember` / `Memory::recall` instead of the inner `HashMap`.
+4. **Built-in match** — calendar and contacts tools dispatch to `do_calendar_*` / `do_contacts_*` async methods.
+5. **Fallback** — anything else delegates to `inner.call_tool(name, args)` (the original `ShellToolRegistry`).
 
 ### Two-Tier Tool Discovery
 
@@ -97,9 +124,9 @@ All monitors implement `SenseMonitor` from `athen-core`. `SenseRunner<M>` drives
 ### Source priority (highest → lowest)
 
 1. **UserInput** — `RiskLevel::Safe`. UI layer pushes strings to `UserInputMonitor::sender()`, drained as `EventKind::Command` events. No network, no latency.
-2. **Calendar** — agent-managed deadlines; events carry reminder data.
+2. **Calendar** — `RiskLevel::Safe`. Polls `~/.athen/athen.db` every 60 s via `tokio::task::spawn_blocking` to keep SQLite off the async runtime (`calendar.rs:324-358`). `query_upcoming_events` returns events whose `start_time` is within the maximum lead time of any reminder, plus a small look-ahead. `generate_reminder_events` (`calendar.rs:271-305`) emits one `EventKind::Reminder` per `(event_id, reminder_minutes)` tuple as the start time approaches that lead time, plus an extra "starting now" reminder when `0 ≤ minutes_until ≤ 1`. A per-monitor `Mutex<HashSet<(String, i64)>>` (`fired_reminders`) deduplicates within the session; cross-restart dedup is the persistence layer's responsibility (`fired_reminders` table in athen-persistence).
 3. **Telegram** — `RiskLevel::Caution`. Polls `getUpdates` via long-polling HTTP. Tracks `last_update_id` to avoid reprocessing. Owner chat messages are elevated to `L1` trust at the coordinator layer; all other senders are triaged normally. (`telegram.rs:73-76`)
-4. **Messaging** — iMessage/WhatsApp stub (`messaging.rs`).
+4. **Messaging** — iMessage/WhatsApp **stub** (`messaging.rs`). 30 s default poll interval; `poll()` always returns an empty vec. Wired into the runner like the others so swapping in a real implementation is a one-file change.
 5. **Email** — `RiskLevel::Caution`. IMAP poll every 60 s (configurable). Tracks `last_seen_uid` to fetch only new unseen messages. Attachments parsed via `mailparse`. (`email.rs:27-55`)
 
 Each monitor normalizes its input into `SenseEvent` (uuid, timestamp, `EventSource`, `EventKind`, `SenderInfo`, `NormalizedContent`, `source_risk`, `raw_id`) before the coordinator sees it.
