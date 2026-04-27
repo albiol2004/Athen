@@ -733,17 +733,15 @@ async function autoNameArc(message) {
 // ─── Markdown Renderer ───
 
 function renderMarkdown(text) {
-    // WORKAROUND: code blocks trigger a WebKit/KWin Wayland freeze on AMD
-    // hardware. Strip fenced ``` markers and render the raw code as plain
-    // text inside the paragraph flow. Ugly but reliable.
     const codeBlocks = [];
-    let processed = text.replace(/```(\w*)\n([\s\S]*?)```/g, (_match, _lang, code) => {
+    let processed = text.replace(/```(\w*)\n([\s\S]*?)```/g, (_match, lang, code) => {
         const idx = codeBlocks.length;
-        codeBlocks.push(escapeHtml(code.replace(/\n$/, '')));
+        const langLabel = lang ? `<div class="code-lang">${escapeHtml(lang)}</div>` : '';
+        const body = escapeHtml(code.replace(/\n$/, ''));
+        codeBlocks.push(`<div class="code-block">${langLabel}<span class="code-body">${body}</span></div>`);
         return `\x00CODEBLOCK_${idx}\x00`;
     });
 
-    // Inline code -> just plain text wrapped in styled span (no <code>).
     const inlineCodes = [];
     processed = processed.replace(/`([^`\n]+)`/g, (_match, code) => {
         const idx = inlineCodes.length;
@@ -797,6 +795,13 @@ function renderMarkdown(text) {
             continue;
         }
 
+        // Standalone code-block placeholder — emit as block, do not wrap in <p>
+        if (/^\x00CODEBLOCK_\d+\x00$/.test(line)) {
+            result.push(line);
+            i++;
+            continue;
+        }
+
         // Regular text — collect consecutive lines into a paragraph
         const paraLines = [];
         while (i < lines.length && lines[i].trim() !== '' &&
@@ -815,13 +820,10 @@ function renderMarkdown(text) {
 
     let html = result.filter(l => l !== '').join('\n');
 
-    // Restore code blocks as plain text replacing newlines with <br>
     codeBlocks.forEach((block, idx) => {
-        const safe = block.replace(/\n/g, '<br>');
-        html = html.replaceAll(`\x00CODEBLOCK_${idx}\x00`, safe);
+        html = html.replaceAll(`\x00CODEBLOCK_${idx}\x00`, block);
     });
 
-    // Restore inline codes
     inlineCodes.forEach((code, idx) => {
         html = html.replaceAll(`\x00INLINE_${idx}\x00`, code);
     });
