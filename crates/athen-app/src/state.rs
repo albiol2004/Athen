@@ -39,10 +39,13 @@ use athen_mcp::McpRegistry;
 use athen_memory::Memory;
 use athen_persistence::arcs::ArcStore;
 use athen_persistence::calendar::CalendarStore;
+use athen_persistence::grants::GrantStore;
 use athen_persistence::mcp::McpStore;
 use athen_persistence::Database;
 use athen_risk::llm_fallback::LlmRiskEvaluator;
 use athen_risk::CombinedRiskEvaluator;
+
+use crate::file_gate::PendingGrants;
 
 /// Wrapper to share the router via `Arc<RwLock<Arc<...>>>` while satisfying
 /// the `LlmRouter` trait.  The `RwLock` allows the inner router to be swapped
@@ -127,6 +130,13 @@ pub struct AppState {
     /// any tool whose schema isn't already revealed. Refreshed at startup
     /// and after every MCP enable/disable.
     pub tool_doc_dir: Option<std::path::PathBuf>,
+    /// Per-arc and global directory grants. Backs the path-permission gate
+    /// and the settings UI for managing grants. Always wired against the
+    /// same SQLite connection as `_database`.
+    pub grant_store: Option<Arc<GrantStore>>,
+    /// Outstanding grant requests parked waiting for the user. Each entry
+    /// holds a oneshot sender that resolves with the user's choice.
+    pub pending_grants: PendingGrants,
 }
 
 impl AppState {
@@ -180,6 +190,10 @@ impl AppState {
 
         let tool_doc_dir = ensure_data_dir().map(|d| d.join("tools"));
 
+        let grant_store = database.as_ref().map(|db| Arc::new(db.grant_store()));
+        let pending_grants =
+            Arc::new(Mutex::new(std::collections::HashMap::new()));
+
         let state = Self {
             coordinator,
             router,
@@ -203,6 +217,8 @@ impl AppState {
             mcp,
             mcp_store,
             tool_doc_dir,
+            grant_store,
+            pending_grants,
         };
 
         if let Err(e) = state.refresh_tools_doc().await {
@@ -221,7 +237,8 @@ impl AppState {
             return Ok(());
         };
         // Build the same registry the executor sees so the docs reflect
-        // exactly what the agent has access to.
+        // exactly what the agent has access to. The file gate is not
+        // attached here — listing tools never invokes them.
         let shell_registry = athen_agent::ShellToolRegistry::new().await;
         let registry = crate::app_tools::AppToolRegistry::new(
             shell_registry,
@@ -244,6 +261,42 @@ impl AppState {
             dir.display()
         );
         Ok(())
+    }
+
+    /// Build a per-arc tool registry wired with the file-permission gate
+    /// and the shell sandbox grant provider. Called from every code path
+    /// that constructs an executor so the agent always sees the same
+    /// permission picture.
+    pub async fn build_tool_registry(
+        &self,
+        arc_id: &str,
+        app_handle: Option<tauri::AppHandle>,
+    ) -> crate::app_tools::AppToolRegistry {
+        let mut shell = athen_agent::ShellToolRegistry::new().await;
+        if let Some(store) = self.grant_store.clone() {
+            let provider = Arc::new(crate::file_gate::ArcWritableProvider {
+                arc_id: crate::file_gate::arc_uuid(arc_id),
+                store,
+            });
+            shell = shell.with_extra_writable(provider);
+        }
+        let mut registry = crate::app_tools::AppToolRegistry::new(
+            shell,
+            self.calendar_store.clone(),
+            self.contact_store.clone(),
+            self.memory.clone(),
+        )
+        .with_mcp(self.mcp.clone() as Arc<dyn athen_core::traits::mcp::McpClient>);
+        if let Some(grants) = self.grant_store.clone() {
+            let gate = Arc::new(crate::file_gate::FileGate::new(
+                arc_id.to_string(),
+                grants,
+                self.pending_grants.clone(),
+                app_handle,
+            ));
+            registry = registry.with_file_gate(gate);
+        }
+        registry
     }
 
     /// Initialize the notification orchestrator.
@@ -474,6 +527,8 @@ impl AppState {
         let mcp_ref = self.mcp.clone();
         let tool_doc_dir_ref = self.tool_doc_dir.clone();
         let notifier = self.notifier.clone();
+        let grant_store_ref = self.grant_store.clone();
+        let pending_grants_ref = self.pending_grants.clone();
 
         tauri::async_runtime::spawn(async move {
             if let Err(e) = monitor.init(&telegram_config).await {
@@ -530,6 +585,8 @@ impl AppState {
                                         tool_doc_dir_ref.as_deref(),
                                         &app_handle,
                                         notifier.as_ref(),
+                                        grant_store_ref.as_ref(),
+                                        &pending_grants_ref,
                                     )
                                     .await;
                                 }
@@ -596,6 +653,8 @@ async fn execute_owner_telegram_message(
     tool_doc_dir: Option<&std::path::Path>,
     app_handle: &tauri::AppHandle,
     notifier: Option<&Arc<NotificationOrchestrator>>,
+    grant_store: Option<&Arc<GrantStore>>,
+    pending_grants: &PendingGrants,
 ) {
     use std::time::Duration;
 
@@ -692,9 +751,25 @@ async fn execute_owner_telegram_message(
     // Build the executor (mirrors send_message logic but without risk/coordinator).
     let exec_router: Box<dyn athen_core::traits::llm::LlmRouter> =
         Box::new(SharedRouter(Arc::clone(router)));
-    let shell_registry = ShellToolRegistry::new().await;
-    let registry = AppToolRegistry::new(shell_registry, calendar_store.clone(), contact_store.clone(), memory.clone())
+    let mut shell_registry = ShellToolRegistry::new().await;
+    if let (Some(store), Some(arc_id_str)) = (grant_store, target_arc_id.as_ref()) {
+        let provider = Arc::new(crate::file_gate::ArcWritableProvider {
+            arc_id: crate::file_gate::arc_uuid(arc_id_str),
+            store: store.clone(),
+        });
+        shell_registry = shell_registry.with_extra_writable(provider);
+    }
+    let mut registry = AppToolRegistry::new(shell_registry, calendar_store.clone(), contact_store.clone(), memory.clone())
         .with_mcp(mcp.clone() as Arc<dyn athen_core::traits::mcp::McpClient>);
+    if let (Some(store), Some(arc_id_str)) = (grant_store, target_arc_id.as_ref()) {
+        let gate = Arc::new(crate::file_gate::FileGate::new(
+            arc_id_str.clone(),
+            store.clone(),
+            pending_grants.clone(),
+            Some(app_handle.clone()),
+        ));
+        registry = registry.with_file_gate(gate);
+    }
     let auditor = TauriAuditor::new(app_handle.clone());
     let stream_tx = spawn_stream_forwarder(app_handle, target_arc_id.clone());
     let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));

@@ -24,6 +24,8 @@ use athen_memory::Memory;
 use athen_persistence::calendar::{CalendarEvent, CalendarStore, EventCreator};
 use athen_persistence::contacts::SqliteContactStore;
 
+use crate::file_gate::FileGate;
+
 /// Prefix MCP-routed tools use to avoid name collisions with built-in tools.
 /// `files__read_file` resolves to mcp_id="files", tool="read_file".
 const MCP_TOOL_SEPARATOR: &str = "__";
@@ -35,6 +37,7 @@ pub struct AppToolRegistry {
     contacts: Option<SqliteContactStore>,
     memory: Option<Arc<Memory>>,
     mcp: Option<Arc<dyn McpClient>>,
+    file_gate: Option<Arc<FileGate>>,
 }
 
 impl AppToolRegistry {
@@ -45,13 +48,21 @@ impl AppToolRegistry {
         contacts: Option<SqliteContactStore>,
         memory: Option<Arc<Memory>>,
     ) -> Self {
-        Self { inner, calendar, contacts, memory, mcp: None }
+        Self { inner, calendar, contacts, memory, mcp: None, file_gate: None }
     }
 
     /// Attach an MCP client. Tools exposed by enabled MCP servers will appear
     /// alongside the built-in tools, prefixed with `<mcp_id>__`.
     pub fn with_mcp(mut self, mcp: Arc<dyn McpClient>) -> Self {
         self.mcp = Some(mcp);
+        self
+    }
+
+    /// Attach the path-permission gate. When set, every file-touching tool
+    /// call is routed through `FileGate::handle` before reaching the
+    /// underlying registry or MCP client.
+    pub fn with_file_gate(mut self, gate: Arc<FileGate>) -> Self {
+        self.file_gate = Some(gate);
         self
     }
 
@@ -917,6 +928,60 @@ impl ToolRegistry for AppToolRegistry {
     }
 
     async fn call_tool(&self, name: &str, args: serde_json::Value) -> Result<ToolResult> {
+        // Path permission gate: any file-touching tool is intercepted here.
+        // The gate may run the operation directly (for absolute paths
+        // outside the sandbox) or hand back control via the closure
+        // for paths inside the sandbox / built-in tools.
+        if let Some(gate) = self.file_gate.clone() {
+            if FileGate::is_file_tool(name) {
+                let name_owned = name.to_string();
+                let mcp = self.mcp.clone();
+                // The `dispatch_inside_sandbox` closure: chooses either
+                // the MCP path (for `files__*`) or returns an error for
+                // built-ins, since the gate handles those directly.
+                let inner_clone_name = name_owned.clone();
+                let dispatch = move |rewritten: serde_json::Value| {
+                    let name = inner_clone_name.clone();
+                    let mcp_opt = mcp.clone();
+                    Box::pin(async move {
+                        if let Some((mcp_id, tool)) = name.split_once(MCP_TOOL_SEPARATOR) {
+                            if let Some(mcp_client) = mcp_opt {
+                                let started = Instant::now();
+                                let outcome =
+                                    mcp_client.call_tool(mcp_id, tool, rewritten).await?;
+                                let elapsed = started.elapsed().as_millis() as u64;
+                                return Ok(ToolResult {
+                                    success: outcome.success,
+                                    output: serde_json::json!({
+                                        "text": outcome.text,
+                                        "content": outcome.raw,
+                                    }),
+                                    error: if outcome.success {
+                                        None
+                                    } else {
+                                        Some(outcome.text.clone())
+                                    },
+                                    execution_time_ms: elapsed,
+                                });
+                            }
+                            return Err(AthenError::Other(
+                                "MCP client not available".into(),
+                            ));
+                        }
+                        // Built-in path goes back through FileGate's
+                        // direct executor; the gate only invokes this
+                        // closure for sandbox-inside paths, but for
+                        // built-in tools the sandbox-inside concept is
+                        // moot — there's no separate sandbox for them.
+                        Err(AthenError::Other(format!(
+                            "Built-in file tool {name} should be dispatched directly"
+                        )))
+                    }) as futures::future::BoxFuture<'static, Result<ToolResult>>
+                };
+                return gate.handle(name, args, dispatch).await;
+            }
+        }
+
         // Route MCP-prefixed tool names (e.g. "files__read_file") to the registry.
         if let Some(mcp) = &self.mcp {
             if let Some((mcp_id, tool)) = name.split_once(MCP_TOOL_SEPARATOR) {

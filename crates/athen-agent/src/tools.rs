@@ -1,6 +1,7 @@
 //! Built-in tool registry backed by shell execution and filesystem operations.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -10,6 +11,7 @@ use tokio::sync::Mutex;
 
 use athen_core::contact::TrustLevel;
 use athen_core::error::{AthenError, Result};
+use athen_core::paths;
 use athen_core::risk::{BaseImpact, DataSensitivity, RiskContext, RiskLevel};
 use athen_core::sandbox::{SandboxLevel, SandboxProfile};
 use athen_core::tool::{ToolBackend, ToolDefinition, ToolResult};
@@ -19,6 +21,18 @@ use athen_risk::rules::RuleEngine;
 use athen_sandbox::UnifiedSandbox;
 use athen_shell::Shell;
 
+/// Provider used by the shell tool to discover the per-arc set of writable
+/// directories that should be exposed to the sandbox in addition to the
+/// hardcoded default writable set (`/tmp` plus the data dir).
+///
+/// The `app_tools` layer wires this against the `GrantStore`. When no
+/// provider is set the shell still works — the agent just won't be able to
+/// write outside the default safe locations.
+#[async_trait]
+pub trait ShellExtraWritableProvider: Send + Sync {
+    async fn extra_writable_paths(&self) -> Vec<PathBuf>;
+}
+
 /// A [`ToolRegistry`] that provides built-in tools for shell execution,
 /// filesystem operations, and in-session key-value memory,
 /// backed by [`athen_shell::Shell`].
@@ -27,6 +41,7 @@ pub struct ShellToolRegistry {
     memory: Arc<Mutex<HashMap<String, String>>>,
     sandbox: Option<UnifiedSandbox>,
     rule_engine: RuleEngine,
+    extra_writable: Option<Arc<dyn ShellExtraWritableProvider>>,
 }
 
 impl ShellToolRegistry {
@@ -58,7 +73,18 @@ impl ShellToolRegistry {
             memory: Arc::new(Mutex::new(HashMap::new())),
             sandbox,
             rule_engine: RuleEngine::new(),
+            extra_writable: None,
         }
+    }
+
+    /// Inject a provider that supplies additional writable paths for the
+    /// shell sandbox, typically derived from the active arc's grants.
+    pub fn with_extra_writable(
+        mut self,
+        provider: Arc<dyn ShellExtraWritableProvider>,
+    ) -> Self {
+        self.extra_writable = Some(provider);
+        self
     }
 
     /// Build the JSON Schema for the `shell_execute` tool parameters.
@@ -177,14 +203,22 @@ impl ShellToolRegistry {
 
         // Try sandboxed execution first, fall back to unsandboxed shell.
         let (stdout, stderr, exit_code) = if let Some(ref sandbox) = self.sandbox {
-            // Allow writes to /tmp and the current working directory.
-            // System directories remain read-only.
-            let mut allowed = vec![std::path::PathBuf::from("/tmp")];
+            // Default writable set: /tmp, the Athen data dir, and cwd.
+            // $HOME is intentionally NOT included by default — explicit
+            // grants via the GrantStore push entries through `extra_writable`.
+            let mut allowed: Vec<PathBuf> = vec![PathBuf::from("/tmp")];
+            if let Some(data) = paths::athen_data_dir() {
+                allowed.push(data);
+            }
             if let Ok(cwd) = std::env::current_dir() {
                 allowed.push(cwd);
             }
-            if let Ok(home) = std::env::var("HOME") {
-                allowed.push(std::path::PathBuf::from(home));
+            if let Some(provider) = self.extra_writable.as_ref() {
+                for p in provider.extra_writable_paths().await {
+                    if !paths::is_system_path(&p) {
+                        allowed.push(p);
+                    }
+                }
             }
             let level = SandboxLevel::OsNative {
                 profile: SandboxProfile::RestrictedWrite {

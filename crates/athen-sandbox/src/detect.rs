@@ -68,20 +68,26 @@ impl SandboxDetector {
 
     /// Check if `sandbox-exec` is available (macOS only).
     fn has_macos_sandbox() -> bool {
-        if !cfg!(target_os = "macos") {
-            return false;
+        #[cfg(target_os = "macos")]
+        {
+            crate::macos::macos_capability()
         }
-        // On macOS, sandbox-exec is at /usr/bin/sandbox-exec
-        std::path::Path::new("/usr/bin/sandbox-exec").exists()
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
     }
 
-    /// Check if Windows Sandbox feature is enabled (Windows only).
+    /// Check if a Windows sandbox primitive is available (Windows only).
     fn has_windows_sandbox() -> bool {
-        if !cfg!(target_os = "windows") {
-            return false;
+        #[cfg(target_os = "windows")]
+        {
+            crate::windows::windows_capability()
         }
-        // Would check for Windows Sandbox feature via registry or Get-WindowsOptionalFeature
-        false
+        #[cfg(not(target_os = "windows"))]
+        {
+            false
+        }
     }
 
     /// Check if Podman is installed and runnable.

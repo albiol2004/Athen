@@ -24,11 +24,11 @@ use athen_core::task::{DomainType, Task, TaskId, TaskPriority, TaskStatus, TaskS
 use athen_core::traits::agent::{AgentExecutor, StepAuditor};
 use athen_core::traits::llm::LlmRouter;
 use athen_core::traits::memory::MemoryStore;
-use athen_agent::{AgentBuilder, InMemoryAuditor, ShellToolRegistry};
+use athen_agent::{AgentBuilder, InMemoryAuditor};
 use athen_persistence::arcs;
 use athen_persistence::calendar::CalendarEvent;
 
-use crate::app_tools::AppToolRegistry;
+use crate::file_gate::{GrantDecision, PendingGrantSummary};
 use crate::notifier::NotificationInfo;
 use crate::state::{AppState, PendingApproval, SharedRouter};
 
@@ -624,9 +624,10 @@ pub async fn send_message(
             // Build executor with real tool execution (same as athen-cli).
             let exec_router: Box<dyn LlmRouter> =
                 Box::new(SharedRouter(Arc::clone(&state.router)));
-            let shell_registry = ShellToolRegistry::new().await;
-            let registry = AppToolRegistry::new(shell_registry, state.calendar_store.clone(), state.contact_store.clone(), state.memory.clone())
-                .with_mcp(state.mcp.clone() as Arc<dyn athen_core::traits::mcp::McpClient>);
+            let arc_for_registry = state.active_arc_id.lock().await.clone();
+            let registry = state
+                .build_tool_registry(&arc_for_registry, Some(app_handle.clone()))
+                .await;
 
             let auditor = TauriAuditor::new(app_handle.clone());
 
@@ -932,9 +933,10 @@ pub async fn approve_task(
 
             let exec_router: Box<dyn LlmRouter> =
                 Box::new(SharedRouter(Arc::clone(&state.router)));
-            let shell_registry = ShellToolRegistry::new().await;
-            let registry = AppToolRegistry::new(shell_registry, state.calendar_store.clone(), state.contact_store.clone(), state.memory.clone())
-                .with_mcp(state.mcp.clone() as Arc<dyn athen_core::traits::mcp::McpClient>);
+            let arc_for_registry = state.active_arc_id.lock().await.clone();
+            let registry = state
+                .build_tool_registry(&arc_for_registry, Some(app_handle.clone()))
+                .await;
             let auditor = TauriAuditor::new(app_handle.clone());
 
             // Set up streaming for the approved task execution.
@@ -1916,6 +1918,139 @@ pub async fn disable_mcp(
         tracing::warn!("Failed to refresh TOOLS.md after disable_mcp: {e}");
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Path-grant approval flow + grant management
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+pub struct DirectoryGrantSummary {
+    pub id: i64,
+    pub scope: String,
+    pub arc_id: Option<String>,
+    pub path: String,
+    pub access: String,
+}
+
+fn grant_to_summary(g: athen_persistence::grants::DirectoryGrant) -> DirectoryGrantSummary {
+    let (scope, arc_id) = match g.scope {
+        athen_persistence::grants::GrantScope::Arc(id) => ("arc".to_string(), Some(id.to_string())),
+        athen_persistence::grants::GrantScope::Global => ("global".to_string(), None),
+    };
+    DirectoryGrantSummary {
+        id: g.id,
+        scope,
+        arc_id,
+        path: g.path.display().to_string(),
+        access: match g.access {
+            athen_persistence::grants::Access::Read => "read".to_string(),
+            athen_persistence::grants::Access::Write => "write".to_string(),
+        },
+    }
+}
+
+#[tauri::command]
+pub async fn list_pending_grants(
+    state: State<'_, AppState>,
+) -> std::result::Result<Vec<PendingGrantSummary>, String> {
+    let map = state.pending_grants.lock().await;
+    Ok(map.iter().map(|(id, req)| req.summary(*id)).collect())
+}
+
+#[tauri::command]
+pub async fn resolve_pending_grant(
+    state: State<'_, AppState>,
+    id: String,
+    decision: GrantDecision,
+) -> std::result::Result<(), String> {
+    let id: Uuid = id.parse().map_err(|e| format!("Invalid id: {e}"))?;
+    let req = {
+        let mut map = state.pending_grants.lock().await;
+        map.remove(&id)
+            .ok_or_else(|| "No such pending grant".to_string())?
+    };
+    req.responder
+        .send(decision)
+        .map_err(|_| "Pending grant already resolved".to_string())
+}
+
+#[tauri::command]
+pub async fn list_arc_grants(
+    state: State<'_, AppState>,
+    arc_id: String,
+) -> std::result::Result<Vec<DirectoryGrantSummary>, String> {
+    let store = state
+        .grant_store
+        .as_ref()
+        .ok_or_else(|| "Grant store unavailable".to_string())?;
+    let arc_uuid = crate::file_gate::arc_uuid(&arc_id);
+    let grants = store
+        .list_arc(arc_uuid)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(grants.into_iter().map(grant_to_summary).collect())
+}
+
+#[tauri::command]
+pub async fn list_global_grants(
+    state: State<'_, AppState>,
+) -> std::result::Result<Vec<DirectoryGrantSummary>, String> {
+    let store = state
+        .grant_store
+        .as_ref()
+        .ok_or_else(|| "Grant store unavailable".to_string())?;
+    let grants = store
+        .list_global()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(grants.into_iter().map(grant_to_summary).collect())
+}
+
+#[tauri::command]
+pub async fn add_global_grant(
+    state: State<'_, AppState>,
+    path: String,
+    access: String,
+) -> std::result::Result<(), String> {
+    let store = state
+        .grant_store
+        .as_ref()
+        .ok_or_else(|| "Grant store unavailable".to_string())?;
+    let access = match access.to_lowercase().as_str() {
+        "read" => athen_persistence::grants::Access::Read,
+        "write" => athen_persistence::grants::Access::Write,
+        other => return Err(format!("Invalid access: {other}")),
+    };
+    store
+        .grant_global(std::path::Path::new(&path), access)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn revoke_arc_grant(
+    state: State<'_, AppState>,
+    id: i64,
+) -> std::result::Result<(), String> {
+    let store = state
+        .grant_store
+        .as_ref()
+        .ok_or_else(|| "Grant store unavailable".to_string())?;
+    store.revoke_arc_by_id(id).await.map(|_| ()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn revoke_global_grant(
+    state: State<'_, AppState>,
+    id: i64,
+) -> std::result::Result<(), String> {
+    let store = state
+        .grant_store
+        .as_ref()
+        .ok_or_else(|| "Grant store unavailable".to_string())?;
+    store.revoke_global_by_id(id).await.map(|_| ()).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

@@ -7,6 +7,7 @@ pub mod calendar;
 pub mod chat;
 pub mod checkpoint;
 pub mod contacts;
+pub mod grants;
 pub mod mcp;
 pub mod notifications;
 pub mod store;
@@ -23,6 +24,7 @@ use crate::arcs::ArcStore;
 use crate::calendar::CalendarStore;
 use crate::chat::ChatStore;
 use crate::contacts::SqliteContactStore;
+use crate::grants::GrantStore;
 use crate::mcp::McpStore;
 use crate::notifications::NotificationStore;
 use crate::store::SqliteStore;
@@ -77,7 +79,9 @@ impl Database {
         let notifications = self.notification_store();
         notifications.init_schema().await?;
         let mcp = self.mcp_store();
-        mcp.init_schema().await
+        mcp.init_schema().await?;
+        let grants = self.grant_store();
+        grants.init_schema().await
     }
 
     /// Create a `SqliteStore` backed by this database's connection.
@@ -113,6 +117,11 @@ impl Database {
     /// Create a `McpStore` backed by this database's connection.
     pub fn mcp_store(&self) -> McpStore {
         McpStore::new(self.conn.clone())
+    }
+
+    /// Create a `GrantStore` backed by this database's connection.
+    pub fn grant_store(&self) -> GrantStore {
+        GrantStore::new(self.conn.clone())
     }
 }
 

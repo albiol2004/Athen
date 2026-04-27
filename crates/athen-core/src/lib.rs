@@ -6,6 +6,7 @@ pub mod event;
 pub mod ipc;
 pub mod llm;
 pub mod notification;
+pub mod paths;
 pub mod risk;
 pub mod sandbox;
 pub mod task;

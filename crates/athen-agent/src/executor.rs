@@ -186,6 +186,20 @@ impl DefaultExecutor {
             tz_offset,
         );
 
+        // Working directory + permission model. Helps the agent reason
+        // about relative paths and understand the approval flow it'll see
+        // the first time it touches an unprotected directory.
+        let cwd = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "<unknown>".to_string());
+        prompt.push_str(&format!(
+            "Current working directory: {cwd}\n\
+             You may pass absolute paths to file tools. The first time you touch a \
+             directory outside the agent's sandbox (~/.athen/files), the user will be \
+             asked to approve. Approvals can be made permanent for the current arc — \
+             after that, future operations on the same directory are silent.\n\n",
+        ));
+
         if has_context {
             prompt.push_str(
                 "You are in an ongoing conversation. The message history is provided. \

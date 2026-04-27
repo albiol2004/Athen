@@ -1,30 +1,37 @@
-//! macOS: sandbox-exec / App Sandbox.
+//! macOS sandbox backend stub.
 //!
-//! Uses the macOS `sandbox-exec` command with dynamically generated
-//! Seatbelt profiles to restrict process capabilities.
+//! TODO: Implement using `sandbox-exec` with a Seatbelt profile of the form
+//! `(version 1) (deny default) (allow file-read*) (allow file-write* (subpath "..."))`
+//! generated per `SandboxProfile` (one `subpath` per writable path). The
+//! `generate_seatbelt_profile` helper below is a starting point.
 
-#[cfg(target_os = "macos")]
+#![cfg(target_os = "macos")]
+
 use async_trait::async_trait;
-#[cfg(target_os = "macos")]
 use athen_core::error::{AthenError, Result};
-#[cfg(target_os = "macos")]
 use athen_core::sandbox::{SandboxCapabilities, SandboxLevel, SandboxProfile};
-#[cfg(target_os = "macos")]
 use athen_core::traits::sandbox::{SandboxExecutor, SandboxOutput};
-#[cfg(target_os = "macos")]
-use std::time::Instant;
-#[cfg(target_os = "macos")]
-use tokio::process::Command;
-#[cfg(target_os = "macos")]
-use tracing::debug;
+use std::path::Path;
 
-/// macOS sandbox executor using sandbox-exec with Seatbelt profiles.
-#[cfg(target_os = "macos")]
+const SANDBOX_EXEC_PATH: &str = "/usr/bin/sandbox-exec";
+
+/// Returns true when the macOS `sandbox-exec` binary is present.
+/// Used by `SandboxDetector` to populate `SandboxCapabilities::macos_sandbox`.
+pub fn macos_capability() -> bool {
+    Path::new(SANDBOX_EXEC_PATH).exists()
+}
+
+/// macOS sandbox executor.
+///
+/// Currently a stub: even when `sandbox-exec` is present we refuse to execute
+/// rather than run unsandboxed, so the agent layer is forced to fall back to
+/// container isolation or a refusal — same fallback shape the Linux backend
+/// uses when bwrap is unavailable.
 pub struct MacOsSandbox;
 
-#[cfg(target_os = "macos")]
 impl MacOsSandbox {
     /// Generate a Seatbelt profile string for the given sandbox profile.
+    /// Kept as scaffolding for the eventual real implementation.
     pub fn generate_seatbelt_profile(profile: &SandboxProfile) -> String {
         match profile {
             SandboxProfile::ReadOnly => {
@@ -50,7 +57,6 @@ impl MacOsSandbox {
     }
 }
 
-#[cfg(target_os = "macos")]
 #[async_trait]
 impl SandboxExecutor for MacOsSandbox {
     async fn detect_capabilities(&self) -> Result<SandboxCapabilities> {
@@ -60,39 +66,33 @@ impl SandboxExecutor for MacOsSandbox {
 
     async fn execute(
         &self,
-        command: &str,
-        args: &[&str],
-        sandbox: &SandboxLevel,
+        _command: &str,
+        _args: &[&str],
+        _sandbox: &SandboxLevel,
     ) -> Result<SandboxOutput> {
-        let profile = match sandbox {
-            SandboxLevel::OsNative { profile } => profile,
-            _ => {
-                return Err(AthenError::Sandbox(
-                    "MacOsSandbox requires SandboxLevel::OsNative".into(),
-                ))
-            }
-        };
+        Err(AthenError::Sandbox(
+            "macOS sandbox-exec backend is not yet implemented; refusing to run unsandboxed for safety".into(),
+        ))
+    }
+}
 
-        let seatbelt = Self::generate_seatbelt_profile(profile);
-        debug!(%seatbelt, "Generated Seatbelt profile");
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        let start = Instant::now();
-        let output = Command::new("sandbox-exec")
-            .arg("-p")
-            .arg(&seatbelt)
-            .arg(command)
-            .args(args)
-            .output()
-            .await
-            .map_err(|e| AthenError::Sandbox(format!("sandbox-exec failed: {e}")))?;
+    #[test]
+    fn capability_matches_filesystem() {
+        assert_eq!(macos_capability(), Path::new(SANDBOX_EXEC_PATH).exists());
+    }
 
-        let elapsed = start.elapsed();
-
-        Ok(SandboxOutput {
-            exit_code: output.status.code().unwrap_or(-1),
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-            execution_time_ms: elapsed.as_millis() as u64,
-        })
+    #[tokio::test]
+    async fn execute_returns_unimplemented_error() {
+        let result = MacOsSandbox
+            .execute("/bin/echo", &["hi"], &SandboxLevel::OsNative {
+                profile: SandboxProfile::ReadOnly,
+            })
+            .await;
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("not yet implemented"));
     }
 }

@@ -134,6 +134,30 @@
             </section>
 
             <section class="settings-section">
+                <h2>Permissions</h2>
+                <p class="settings-description">Directories Athen can access without asking. Global grants apply to every conversation; arc grants only apply to the current arc.</p>
+
+                <h3 class="permissions-subhead">Global grants</h3>
+                <div id="global-grants-list" class="grants-list">
+                    <p class="grants-empty">No global grants yet.</p>
+                </div>
+
+                <div class="add-grant-form">
+                    <input type="text" id="new-grant-path" class="settings-input" placeholder="/absolute/path/to/directory">
+                    <select id="new-grant-access" class="settings-select grants-access-select">
+                        <option value="read">Read</option>
+                        <option value="write">Write</option>
+                    </select>
+                    <button id="add-grant-btn" class="btn-primary">Add</button>
+                </div>
+
+                <h3 class="permissions-subhead">Arc grants <span class="permissions-subnote">(current conversation)</span></h3>
+                <div id="arc-grants-list" class="grants-list">
+                    <p class="grants-empty">No grants for this arc.</p>
+                </div>
+            </section>
+
+            <section class="settings-section">
                 <h2>Security</h2>
                 <div class="setting-row">
                     <label for="security-mode">Security Mode</label>
@@ -594,6 +618,38 @@
     </div>
 
     <div id="sidebar-overlay" class="sidebar-overlay"></div>
+
+    <div id="grant-modal-overlay" class="grant-modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="grant-modal-title">
+        <div class="grant-modal">
+            <div class="grant-modal-header">
+                <span class="grant-access-badge" id="grant-modal-badge">Read</span>
+                <h2 id="grant-modal-title">Allow access?</h2>
+            </div>
+            <div class="grant-modal-body">
+                <div class="grant-modal-question" id="grant-modal-question"></div>
+                <div class="grant-modal-paths" id="grant-modal-paths"></div>
+                <div class="grant-modal-meta">
+                    <div class="grant-modal-meta-row">
+                        <span class="grant-modal-meta-label">Tool</span>
+                        <span class="grant-modal-meta-value" id="grant-modal-tool"></span>
+                    </div>
+                    <div class="grant-modal-meta-row">
+                        <span class="grant-modal-meta-label">Scope</span>
+                        <span class="grant-modal-meta-value">For this conversation</span>
+                    </div>
+                </div>
+                <div class="grant-modal-queue hidden" id="grant-modal-queue"></div>
+            </div>
+            <div class="grant-modal-actions">
+                <button class="btn-deny" id="grant-deny-btn">Deny</button>
+                <div class="grant-modal-actions-right">
+                    <button class="btn-secondary" id="grant-allow-btn">Allow once</button>
+                    <button class="btn-primary" id="grant-allow-always-btn">Allow always</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script src="app.js"></script>
 </body>
 </html>

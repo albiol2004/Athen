@@ -6,6 +6,7 @@
 pub(crate) mod app_tools;
 mod commands;
 mod contacts;
+pub(crate) mod file_gate;
 pub(crate) mod notifier;
 pub(crate) mod process;
 pub(crate) mod sense_router;
@@ -86,6 +87,13 @@ pub fn run() {
             commands::list_mcp_catalog,
             commands::enable_mcp,
             commands::disable_mcp,
+            commands::list_pending_grants,
+            commands::resolve_pending_grant,
+            commands::list_arc_grants,
+            commands::list_global_grants,
+            commands::add_global_grant,
+            commands::revoke_arc_grant,
+            commands::revoke_global_grant,
         ])
         .setup(|app| {
             use tauri::Manager;

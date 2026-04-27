@@ -44,233 +44,283 @@ function retryLastMessage() {
     }
 }
 
+// Schedule a non-critical callback for an idle slice, with a setTimeout
+// fallback for environments lacking requestIdleCallback (older WebKitGTK).
+function scheduleIdle(fn) {
+    if (typeof requestIdleCallback === 'function') {
+        requestIdleCallback(fn, { timeout: 2000 });
+    } else {
+        setTimeout(fn, 100);
+    }
+}
+
+function registerTauriEventListeners() {
+    if (!(window.__TAURI__.event && window.__TAURI__.event.listen)) return;
+
+    window.__TAURI__.event.listen('agent-progress', (event) => {
+        const { step, tool_name, status, detail } = event.payload;
+
+        // Update status bar as before.
+        setStatus('working', `Step ${step}: ${tool_name} (${status})`);
+
+        // Skip non-tool steps (e.g. "Evaluating risk...", "Task completed").
+        if (step === 0 || tool_name === 'Task completed') return;
+
+        // Create tool container if it does not exist yet.
+        if (!currentToolContainer) {
+            currentToolContainer = document.createElement('div');
+            currentToolContainer.className = 'tool-steps-container';
+            messagesEl.appendChild(currentToolContainer);
+        }
+
+        // Build the tool execution card.
+        const card = document.createElement('div');
+        const statusClass = status === 'Completed' ? 'completed' :
+                            status === 'Failed' ? 'failed' : 'in-progress';
+        card.className = `tool-execution-card ${statusClass}`;
+
+        const statusIcon = status === 'Completed' ? '&#10003;' :
+                           status === 'Failed' ? '&#10007;' : '&#9679;';
+
+        let detailHtml = '';
+        if (detail) {
+            const truncated = detail.length > 80 ? detail.substring(0, 80) + '...' : detail;
+            detailHtml = `<span class="tool-detail">${escapeHtml(truncated)}</span>`;
+        }
+
+        card.innerHTML =
+            `<span class="tool-status-icon">${statusIcon}</span>` +
+            `<span class="tool-name">${escapeHtml(tool_name)}</span>` +
+            detailHtml;
+
+        currentToolContainer.appendChild(card);
+
+        // Scroll to keep latest card visible.
+        requestAnimationFrame(() => {
+            messagesEl.parentElement.scrollTo({
+                top: messagesEl.parentElement.scrollHeight,
+                behavior: 'smooth'
+            });
+        });
+    });
+
+    // Listen for streaming text chunks from the agent executor.
+    // Each event carries { delta, is_final, arc_id }.
+    // If the stream belongs to a different arc, show a notification
+    // dot on that arc in the sidebar instead of rendering a bubble.
+    window.__TAURI__.event.listen('agent-stream', (event) => {
+        const { delta, is_final, arc_id, is_thinking } = event.payload;
+
+        // Check if this stream belongs to the currently visible arc.
+        const isActiveArc = !arc_id || arc_id === activeArcId;
+
+        if (is_final) {
+            if (isActiveArc && streamingBubble && streamingText) {
+                streamingBubble.innerHTML = renderMarkdown(streamingText);
+                streamingBubble.classList.remove('streaming');
+            }
+            // Close the thinking block so it's collapsed by default
+            // but still expandable by the user.
+            if (isActiveArc && thinkingBlock && thinkingText) {
+                thinkingContent.textContent = thinkingText;
+                thinkingBlock.open = false;
+            }
+            // If it was a background arc, show a notification dot
+            // and refresh the sidebar.
+            if (!isActiveArc && arc_id) {
+                markArcWithNotification(arc_id);
+                loadArcs();
+            }
+            streamingBubble = null;
+            streamingText = '';
+            thinkingBlock = null;
+            thinkingContent = null;
+            thinkingText = '';
+            return;
+        }
+
+        if (!delta) return;
+
+        // For background arcs, silently accumulate but don't render.
+        if (!isActiveArc) return;
+
+        didReceiveStreamChunks = true;
+
+        if (is_thinking) {
+            thinkingText += delta;
+
+            // Create the thinking block on the first thinking chunk.
+            if (!thinkingBlock) {
+                // Remove welcome message if present.
+                const welcome = messagesEl.querySelector('.welcome-message');
+                if (welcome) welcome.remove();
+
+                // Ensure we have a message row to attach the thinking block to.
+                let row = messagesEl.querySelector('#streaming-message');
+                if (!row) {
+                    row = document.createElement('div');
+                    row.className = 'message-row assistant';
+                    row.id = 'streaming-message';
+
+                    const avatar = document.createElement('div');
+                    avatar.className = 'message-avatar';
+                    avatar.textContent = 'A';
+
+                    const wrap = document.createElement('div');
+                    wrap.className = 'message-content-wrap';
+
+                    row.appendChild(avatar);
+                    row.appendChild(wrap);
+                    messagesEl.appendChild(row);
+                }
+
+                const wrap = row.querySelector('.message-content-wrap');
+
+                thinkingBlock = document.createElement('details');
+                thinkingBlock.className = 'thinking-block';
+                thinkingBlock.open = true;
+
+                const summary = document.createElement('summary');
+                summary.textContent = 'Thinking...';
+                thinkingBlock.appendChild(summary);
+
+                thinkingContent = document.createElement('div');
+                thinkingContent.className = 'thinking-content';
+                thinkingBlock.appendChild(thinkingContent);
+
+                wrap.appendChild(thinkingBlock);
+            }
+
+            thinkingContent.textContent = thinkingText;
+        } else {
+            streamingText += delta;
+
+            // Create the streaming bubble on the first content chunk.
+            if (!streamingBubble) {
+                // Remove welcome message if present.
+                const welcome = messagesEl.querySelector('.welcome-message');
+                if (welcome) welcome.remove();
+
+                let row = messagesEl.querySelector('#streaming-message');
+                if (!row) {
+                    row = document.createElement('div');
+                    row.className = 'message-row assistant';
+                    row.id = 'streaming-message';
+
+                    const avatar = document.createElement('div');
+                    avatar.className = 'message-avatar';
+                    avatar.textContent = 'A';
+
+                    const wrap = document.createElement('div');
+                    wrap.className = 'message-content-wrap';
+
+                    row.appendChild(avatar);
+                    row.appendChild(wrap);
+                    messagesEl.appendChild(row);
+                }
+
+                const wrap = row.querySelector('.message-content-wrap');
+
+                streamingBubble = document.createElement('div');
+                streamingBubble.className = 'message-bubble streaming';
+
+                wrap.appendChild(streamingBubble);
+            }
+
+            streamingBubble.textContent = streamingText;
+        }
+
+        requestAnimationFrame(() => {
+            messagesEl.parentElement.scrollTo({
+                top: messagesEl.parentElement.scrollHeight,
+                behavior: 'auto'
+            });
+        });
+    });
+
+    // Listen for arc updates (e.g. Telegram auto-execution).
+    window.__TAURI__.event.listen('arc-updated', () => {
+        loadArcs();
+    });
+
+    // Listen for notifications from the agent
+    window.__TAURI__.event.listen('notification', (event) => {
+        const data = event.payload;
+        showNotificationToast(data);
+        updateNotifBadge();
+        // If the user is viewing the notifications tab, refresh the list
+        if (notificationsView && !notificationsView.classList.contains('hidden')) {
+            loadNotifications();
+        }
+    });
+
+    // Listen for path-grant requests from the file gate.
+    window.__TAURI__.event.listen('grant-requested', (event) => {
+        enqueueGrantRequest(event.payload);
+    });
+
+    // Listen for sense events (email, calendar, messaging, etc.)
+    window.__TAURI__.event.listen('sense-event', (event) => {
+        const { source, from, subject, body_preview,
+                relevance, reason, suggested_action, arc_id } = event.payload;
+        showSenseNotification(source, from, subject, body_preview,
+                              relevance, reason, suggested_action, arc_id);
+    });
+}
+
 function initTauri() {
+    performance.mark('athen-init-start');
     if (window.__TAURI__ && window.__TAURI__.core) {
         invoke = window.__TAURI__.core.invoke;
 
-        // Listen for real-time agent progress events.
-        if (window.__TAURI__.event && window.__TAURI__.event.listen) {
-            window.__TAURI__.event.listen('agent-progress', (event) => {
-                const { step, tool_name, status, detail } = event.payload;
-
-                // Update status bar as before.
-                setStatus('working', `Step ${step}: ${tool_name} (${status})`);
-
-                // Skip non-tool steps (e.g. "Evaluating risk...", "Task completed").
-                if (step === 0 || tool_name === 'Task completed') return;
-
-                // Create tool container if it does not exist yet.
-                if (!currentToolContainer) {
-                    currentToolContainer = document.createElement('div');
-                    currentToolContainer.className = 'tool-steps-container';
-                    messagesEl.appendChild(currentToolContainer);
-                }
-
-                // Build the tool execution card.
-                const card = document.createElement('div');
-                const statusClass = status === 'Completed' ? 'completed' :
-                                    status === 'Failed' ? 'failed' : 'in-progress';
-                card.className = `tool-execution-card ${statusClass}`;
-
-                const statusIcon = status === 'Completed' ? '&#10003;' :
-                                   status === 'Failed' ? '&#10007;' : '&#9679;';
-
-                let detailHtml = '';
-                if (detail) {
-                    const truncated = detail.length > 80 ? detail.substring(0, 80) + '...' : detail;
-                    detailHtml = `<span class="tool-detail">${escapeHtml(truncated)}</span>`;
-                }
-
-                card.innerHTML =
-                    `<span class="tool-status-icon">${statusIcon}</span>` +
-                    `<span class="tool-name">${escapeHtml(tool_name)}</span>` +
-                    detailHtml;
-
-                currentToolContainer.appendChild(card);
-
-                // Scroll to keep latest card visible.
-                requestAnimationFrame(() => {
-                    messagesEl.parentElement.scrollTo({
-                        top: messagesEl.parentElement.scrollHeight,
-                        behavior: 'smooth'
-                    });
-                });
-            });
-
-            // Listen for streaming text chunks from the agent executor.
-            // Each event carries { delta, is_final, arc_id }.
-            // If the stream belongs to a different arc, show a notification
-            // dot on that arc in the sidebar instead of rendering a bubble.
-            window.__TAURI__.event.listen('agent-stream', (event) => {
-                const { delta, is_final, arc_id, is_thinking } = event.payload;
-
-                // Check if this stream belongs to the currently visible arc.
-                const isActiveArc = !arc_id || arc_id === activeArcId;
-
-                if (is_final) {
-                    if (isActiveArc && streamingBubble && streamingText) {
-                        streamingBubble.innerHTML = renderMarkdown(streamingText);
-                        streamingBubble.classList.remove('streaming');
-                    }
-                    // Close the thinking block so it's collapsed by default
-                    // but still expandable by the user.
-                    if (isActiveArc && thinkingBlock && thinkingText) {
-                        thinkingContent.textContent = thinkingText;
-                        thinkingBlock.open = false;
-                    }
-                    // If it was a background arc, show a notification dot
-                    // and refresh the sidebar.
-                    if (!isActiveArc && arc_id) {
-                        markArcWithNotification(arc_id);
-                        loadArcs();
-                    }
-                    streamingBubble = null;
-                    streamingText = '';
-                    thinkingBlock = null;
-                    thinkingContent = null;
-                    thinkingText = '';
-                    return;
-                }
-
-                if (!delta) return;
-
-                // For background arcs, silently accumulate but don't render.
-                if (!isActiveArc) return;
-
-                didReceiveStreamChunks = true;
-
-                if (is_thinking) {
-                    thinkingText += delta;
-
-                    // Create the thinking block on the first thinking chunk.
-                    if (!thinkingBlock) {
-                        // Remove welcome message if present.
-                        const welcome = messagesEl.querySelector('.welcome-message');
-                        if (welcome) welcome.remove();
-
-                        // Ensure we have a message row to attach the thinking block to.
-                        let row = messagesEl.querySelector('#streaming-message');
-                        if (!row) {
-                            row = document.createElement('div');
-                            row.className = 'message-row assistant';
-                            row.id = 'streaming-message';
-
-                            const avatar = document.createElement('div');
-                            avatar.className = 'message-avatar';
-                            avatar.textContent = 'A';
-
-                            const wrap = document.createElement('div');
-                            wrap.className = 'message-content-wrap';
-
-                            row.appendChild(avatar);
-                            row.appendChild(wrap);
-                            messagesEl.appendChild(row);
-                        }
-
-                        const wrap = row.querySelector('.message-content-wrap');
-
-                        thinkingBlock = document.createElement('details');
-                        thinkingBlock.className = 'thinking-block';
-                        thinkingBlock.open = true;
-
-                        const summary = document.createElement('summary');
-                        summary.textContent = 'Thinking...';
-                        thinkingBlock.appendChild(summary);
-
-                        thinkingContent = document.createElement('div');
-                        thinkingContent.className = 'thinking-content';
-                        thinkingBlock.appendChild(thinkingContent);
-
-                        wrap.appendChild(thinkingBlock);
-                    }
-
-                    thinkingContent.textContent = thinkingText;
-                } else {
-                    streamingText += delta;
-
-                    // Create the streaming bubble on the first content chunk.
-                    if (!streamingBubble) {
-                        // Remove welcome message if present.
-                        const welcome = messagesEl.querySelector('.welcome-message');
-                        if (welcome) welcome.remove();
-
-                        let row = messagesEl.querySelector('#streaming-message');
-                        if (!row) {
-                            row = document.createElement('div');
-                            row.className = 'message-row assistant';
-                            row.id = 'streaming-message';
-
-                            const avatar = document.createElement('div');
-                            avatar.className = 'message-avatar';
-                            avatar.textContent = 'A';
-
-                            const wrap = document.createElement('div');
-                            wrap.className = 'message-content-wrap';
-
-                            row.appendChild(avatar);
-                            row.appendChild(wrap);
-                            messagesEl.appendChild(row);
-                        }
-
-                        const wrap = row.querySelector('.message-content-wrap');
-
-                        streamingBubble = document.createElement('div');
-                        streamingBubble.className = 'message-bubble streaming';
-
-                        wrap.appendChild(streamingBubble);
-                    }
-
-                    streamingBubble.textContent = streamingText;
-                }
-
-                requestAnimationFrame(() => {
-                    messagesEl.parentElement.scrollTo({
-                        top: messagesEl.parentElement.scrollHeight,
-                        behavior: 'auto'
-                    });
-                });
-            });
-
-            // Listen for arc updates (e.g. Telegram auto-execution).
-            window.__TAURI__.event.listen('arc-updated', () => {
-                loadArcs();
-            });
-
-            // Listen for notifications from the agent
-            window.__TAURI__.event.listen('notification', (event) => {
-                const data = event.payload;
-                showNotificationToast(data);
-                updateNotifBadge();
-                // If the user is viewing the notifications tab, refresh the list
-                if (notificationsView && !notificationsView.classList.contains('hidden')) {
-                    loadNotifications();
-                }
-            });
-
-            // Listen for sense events (email, calendar, messaging, etc.)
-            window.__TAURI__.event.listen('sense-event', (event) => {
-                const { source, from, subject, body_preview,
-                        relevance, reason, suggested_action, arc_id } = event.payload;
-                showSenseNotification(source, from, subject, body_preview,
-                                      relevance, reason, suggested_action, arc_id);
-            });
-        }
+        // Synchronous, lightweight: just registers .listen() handlers.
+        // Must run before any task could fire (e.g. agent-stream).
+        registerTauriEventListeners();
 
         setStatus('idle', 'Ready');
 
-        // Load the current arc ID, then load arcs and history.
-        invoke('get_current_arc').then((sid) => {
-            activeArcId = sid;
-            loadArcs();
-            loadHistory();
-            updateNotifBadge();
-        }).catch(() => {
-            loadHistory();
-        });
+        // Yield to the renderer for first paint before kicking off any
+        // IPC. WebKitGTK 2.52's WebProcess watchdog crashes if a sync
+        // IPC isn't answered within 10s of document load -- spreading
+        // startup work across frames keeps the main thread responsive.
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+            startInitialDataLoads();
+        }));
     } else {
         setStatus('working', 'Waiting for Tauri...');
         setTimeout(initTauri, 100);
     }
+}
+
+function startInitialDataLoads() {
+    performance.mark('athen-init-data-load');
+
+    // Critical path: arc + history needed for first usable view.
+    invoke('get_current_arc').then((sid) => {
+        activeArcId = sid;
+        loadArcs();
+        loadHistory();
+    }).catch(() => {
+        loadHistory();
+    }).finally(() => {
+        performance.mark('athen-init-done');
+        try {
+            const t0 = performance.getEntriesByName('athen-init-start')[0];
+            const t1 = performance.getEntriesByName('athen-init-data-load')[0];
+            const t2 = performance.getEntriesByName('athen-init-done')[0];
+            if (t0 && t1 && t2) {
+                console.log(
+                    `[athen] init: paint-yield=${(t1.startTime - t0.startTime).toFixed(1)}ms, ` +
+                    `critical-load=${(t2.startTime - t1.startTime).toFixed(1)}ms, ` +
+                    `total=${(t2.startTime - t0.startTime).toFixed(1)}ms`
+                );
+            }
+        } catch (_) { /* ignore */ }
+    });
+
+    // Non-critical: defer to idle slices so they can't contend with first paint.
+    scheduleIdle(() => updateNotifBadge());
+    scheduleIdle(() => recoverPendingGrants());
 }
 
 // ─── DOM References ───
@@ -309,19 +359,10 @@ function getSourceIcon(source) {
     }
 }
 
-function renderArcList(arcs) {
-    sessionListEl.innerHTML = '';
-
-    if (!arcs || arcs.length === 0) {
-        sessionListEl.innerHTML = '<div class="session-list-empty">No conversations yet</div>';
-        return;
-    }
-
-    for (const arc of arcs) {
-        // Skip merged arcs
-        if (arc.status === 'Merged') continue;
-
-        const item = document.createElement('div');
+// Build a single arc DOM item. Extracted so renderArcList can stream
+// items across frames without duplicating the construction logic.
+function buildArcItem(arc) {
+    const item = document.createElement('div');
         item.className = 'session-item';
         if (arc.id === activeArcId) {
             item.classList.add('active');
@@ -421,8 +462,44 @@ function renderArcList(arcs) {
             startRenameArc(item, arc.id, arc.name);
         });
 
-        sessionListEl.appendChild(item);
+    return item;
+}
+
+// Render the arc sidebar. The first ARC_EAGER_COUNT visible arcs are
+// rendered synchronously (they're above the fold). Any remaining arcs
+// are appended on idle slices so initial paint isn't blocked when the
+// user has hundreds of conversations.
+const ARC_EAGER_COUNT = 10;
+function renderArcList(arcs) {
+    sessionListEl.innerHTML = '';
+
+    if (!arcs || arcs.length === 0) {
+        sessionListEl.innerHTML = '<div class="session-list-empty">No conversations yet</div>';
+        return;
     }
+
+    // Filter out merged arcs once so the chunking math below is honest.
+    const visible = arcs.filter((a) => a.status !== 'Merged');
+
+    const eager = visible.slice(0, ARC_EAGER_COUNT);
+    const rest = visible.slice(ARC_EAGER_COUNT);
+
+    for (const arc of eager) {
+        sessionListEl.appendChild(buildArcItem(arc));
+    }
+
+    if (rest.length === 0) return;
+
+    let idx = 0;
+    function appendChunk() {
+        // Two arcs per idle slice keeps frame budget under ~4ms.
+        const end = Math.min(idx + 2, rest.length);
+        for (; idx < end; idx++) {
+            sessionListEl.appendChild(buildArcItem(rest[idx]));
+        }
+        if (idx < rest.length) scheduleIdle(appendChunk);
+    }
+    scheduleIdle(appendChunk);
 }
 
 /// Mark an arc as having unread background activity.
@@ -656,21 +733,21 @@ async function autoNameArc(message) {
 // ─── Markdown Renderer ───
 
 function renderMarkdown(text) {
-    // Collect code blocks first to protect them from other transformations
+    // WORKAROUND: code blocks trigger a WebKit/KWin Wayland freeze on AMD
+    // hardware. Strip fenced ``` markers and render the raw code as plain
+    // text inside the paragraph flow. Ugly but reliable.
     const codeBlocks = [];
-    let processed = text.replace(/```(\w*)\n([\s\S]*?)```/g, (_match, lang, code) => {
+    let processed = text.replace(/```(\w*)\n([\s\S]*?)```/g, (_match, _lang, code) => {
         const idx = codeBlocks.length;
-        const escapedCode = escapeHtml(code.replace(/\n$/, ''));
-        const langLabel = lang ? `<span class="code-lang">${escapeHtml(lang)}</span>` : '';
-        codeBlocks.push(`<pre>${langLabel}<code>${escapedCode}</code></pre>`);
+        codeBlocks.push(escapeHtml(code.replace(/\n$/, '')));
         return `\x00CODEBLOCK_${idx}\x00`;
     });
 
-    // Inline code (protect from further processing)
+    // Inline code -> just plain text wrapped in styled span (no <code>).
     const inlineCodes = [];
     processed = processed.replace(/`([^`\n]+)`/g, (_match, code) => {
         const idx = inlineCodes.length;
-        inlineCodes.push(`<code>${escapeHtml(code)}</code>`);
+        inlineCodes.push(`<span class="inline-code">${escapeHtml(code)}</span>`);
         return `\x00INLINE_${idx}\x00`;
     });
 
@@ -738,11 +815,10 @@ function renderMarkdown(text) {
 
     let html = result.filter(l => l !== '').join('\n');
 
-    // Restore code blocks
+    // Restore code blocks as plain text replacing newlines with <br>
     codeBlocks.forEach((block, idx) => {
-        html = html.replace(`\x00CODEBLOCK_${idx}\x00`, block);
-        // Also handle if wrapped in <p>
-        html = html.replace(`<p>${block}</p>`, block);
+        const safe = block.replace(/\n/g, '<br>');
+        html = html.replaceAll(`\x00CODEBLOCK_${idx}\x00`, safe);
     });
 
     // Restore inline codes
@@ -1354,6 +1430,21 @@ document.addEventListener('keydown', (e) => {
 
 // ─── History Restoration ───
 
+// Render a single history entry. Pulled out so loadHistory can stream
+// entries across idle slices instead of rendering all of them in one go.
+function renderHistoryEntry(entry) {
+    if (entry.entry_type === 'message') {
+        addMessage(entry.source, entry.content);
+    } else if (entry.entry_type === 'email_event') {
+        const meta = entry.metadata
+            ? (typeof entry.metadata === 'string' ? JSON.parse(entry.metadata) : entry.metadata)
+            : {};
+        addEmailEntry(entry.content, meta);
+    } else if (entry.entry_type === 'tool_call') {
+        addSystemEntry(entry.content, 'tool');
+    }
+}
+
 async function loadHistory() {
     if (!invoke) return;
     try {
@@ -1364,15 +1455,25 @@ async function loadHistory() {
             const welcome = messagesEl.querySelector('.welcome-message');
             if (welcome) welcome.remove();
 
-            for (const entry of entries) {
-                if (entry.entry_type === 'message') {
-                    addMessage(entry.source, entry.content);
-                } else if (entry.entry_type === 'email_event') {
-                    const meta = entry.metadata ? (typeof entry.metadata === 'string' ? JSON.parse(entry.metadata) : entry.metadata) : {};
-                    addEmailEntry(entry.content, meta);
-                } else if (entry.entry_type === 'tool_call') {
-                    addSystemEntry(entry.content, 'tool');
-                }
+            // Render the first 2 entries (above the fold) eagerly,
+            // then stream the rest across idle slices to avoid stalling
+            // the WebKit main thread on long conversations.
+            const eagerCount = Math.min(2, entries.length);
+            for (let i = 0; i < eagerCount; i++) {
+                renderHistoryEntry(entries[i]);
+            }
+
+            if (entries.length > eagerCount) {
+                let idx = eagerCount;
+                const appendChunk = () => {
+                    // Two entries per slice -- markdown render dominates cost.
+                    const end = Math.min(idx + 2, entries.length);
+                    for (; idx < end; idx++) {
+                        renderHistoryEntry(entries[idx]);
+                    }
+                    if (idx < entries.length) scheduleIdle(appendChunk);
+                };
+                scheduleIdle(appendChunk);
             }
         }
     } catch (err) {
@@ -1594,6 +1695,7 @@ async function loadSettings() {
             }
         }
         await loadMcpCatalog();
+        await loadGrants();
     } catch (err) {
         console.error('Failed to load settings:', err);
         showToast('Failed to load settings: ' + err, 'error');
@@ -4185,6 +4287,260 @@ if (memoryBtn) {
 if (memoryBack) {
     memoryBack.addEventListener('click', hideMemory);
 }
+
+// ─── Path-Grant Modal & Permissions Settings ───
+
+const SYSTEM_PATH_PREFIXES = ['/etc', '/usr', '/bin', '/sbin', '/boot', '/sys', '/proc', '/var/run', '/var/lib'];
+
+const grantQueue = [];
+let grantInFlight = null;
+
+function isSystemPath(p) {
+    if (!p) return false;
+    return SYSTEM_PATH_PREFIXES.some((pref) => p === pref || p.startsWith(pref + '/'));
+}
+
+function ellipsizePath(p, maxLen = 60) {
+    if (!p || p.length <= maxLen) return p;
+    const head = Math.ceil((maxLen - 3) * 0.55);
+    const tail = (maxLen - 3) - head;
+    return p.slice(0, head) + '...' + p.slice(p.length - tail);
+}
+
+function escapeHtml(s) {
+    return String(s ?? '')
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function enqueueGrantRequest(payload) {
+    if (!payload || !payload.id) return;
+    // Deduplicate by id (same request might fire on init + via event).
+    if (grantInFlight && grantInFlight.id === payload.id) return;
+    if (grantQueue.some((q) => q.id === payload.id)) return;
+    grantQueue.push(payload);
+    if (!grantInFlight) showNextGrantRequest();
+    else updateGrantQueueIndicator();
+}
+
+async function recoverPendingGrants() {
+    if (!invoke) return;
+    try {
+        const list = await invoke('list_pending_grants');
+        (list || []).forEach(enqueueGrantRequest);
+    } catch (err) {
+        console.error('Failed to recover pending grants:', err);
+    }
+}
+
+function showNextGrantRequest() {
+    const overlay = document.getElementById('grant-modal-overlay');
+    if (!overlay) return;
+    if (grantQueue.length === 0) {
+        grantInFlight = null;
+        overlay.classList.add('hidden');
+        return;
+    }
+    grantInFlight = grantQueue.shift();
+    renderGrantModal(grantInFlight);
+    overlay.classList.remove('hidden');
+}
+
+function renderGrantModal(req) {
+    const titleEl = document.getElementById('grant-modal-title');
+    const badgeEl = document.getElementById('grant-modal-badge');
+    const questionEl = document.getElementById('grant-modal-question');
+    const pathsEl = document.getElementById('grant-modal-paths');
+    const toolEl = document.getElementById('grant-modal-tool');
+    const allowAlwaysBtn = document.getElementById('grant-allow-always-btn');
+
+    const access = (req.access || 'read').toLowerCase();
+    const accessLabel = access === 'write' ? 'Write' : 'Read';
+    const verb = access === 'write' ? 'write to' : 'read';
+
+    badgeEl.textContent = accessLabel;
+    badgeEl.className = 'grant-access-badge ' + (access === 'write' ? 'badge-write' : 'badge-read');
+
+    const paths = Array.isArray(req.paths) ? req.paths : [];
+    const isMove = paths.length > 1;
+    if (isMove) {
+        titleEl.textContent = 'Allow file move?';
+        questionEl.textContent = `A tool wants to move a file:`;
+    } else {
+        titleEl.textContent = `Allow ${access} access?`;
+        questionEl.textContent = `A tool wants to ${verb}:`;
+    }
+
+    pathsEl.innerHTML = '';
+    paths.forEach((p, idx) => {
+        const row = document.createElement('div');
+        row.className = 'grant-modal-path';
+        const prefix = isMove ? (idx === 0 ? 'From: ' : 'To: ') : '';
+        row.innerHTML = `<span class="grant-modal-path-prefix">${escapeHtml(prefix)}</span><code title="${escapeHtml(p)}">${escapeHtml(ellipsizePath(p))}</code>`;
+        pathsEl.appendChild(row);
+    });
+
+    toolEl.textContent = req.tool || req.requesting_tool || 'unknown';
+
+    // Defensive: grey out Allow Always if any path looks like a system path.
+    const anySystem = paths.some(isSystemPath);
+    if (anySystem) {
+        allowAlwaysBtn.disabled = true;
+        allowAlwaysBtn.title = 'System paths cannot be granted permanently';
+    } else {
+        allowAlwaysBtn.disabled = false;
+        allowAlwaysBtn.title = '';
+    }
+
+    updateGrantQueueIndicator();
+}
+
+function updateGrantQueueIndicator() {
+    const queueEl = document.getElementById('grant-modal-queue');
+    if (!queueEl) return;
+    if (grantQueue.length > 0) {
+        queueEl.classList.remove('hidden');
+        queueEl.textContent = `${grantQueue.length} more request${grantQueue.length === 1 ? '' : 's'} waiting`;
+    } else {
+        queueEl.classList.add('hidden');
+    }
+}
+
+async function resolveCurrentGrant(decision) {
+    if (!grantInFlight || !invoke) return;
+    const req = grantInFlight;
+    grantInFlight = null;
+    try {
+        await invoke('resolve_pending_grant', { id: req.id, decision });
+        if (decision === 'AllowAlways') {
+            // Refresh arc grants list if settings is open.
+            if (document.getElementById('settings-view') &&
+                !document.getElementById('settings-view').classList.contains('hidden')) {
+                loadArcGrants();
+            }
+        }
+    } catch (err) {
+        console.error('Failed to resolve grant:', err);
+        showToast('Failed to resolve grant: ' + err, 'error');
+    }
+    showNextGrantRequest();
+}
+
+document.getElementById('grant-allow-btn')?.addEventListener('click', () => resolveCurrentGrant('Allow'));
+document.getElementById('grant-allow-always-btn')?.addEventListener('click', () => resolveCurrentGrant('AllowAlways'));
+document.getElementById('grant-deny-btn')?.addEventListener('click', () => resolveCurrentGrant('Deny'));
+
+// ESC closes the modal as Deny (only when modal is visible).
+document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    const overlay = document.getElementById('grant-modal-overlay');
+    if (!overlay || overlay.classList.contains('hidden')) return;
+    if (!grantInFlight) return;
+    e.stopPropagation();
+    resolveCurrentGrant('Deny');
+});
+
+// Click backdrop = no-op (don't accidentally Deny). Modal is dismissed only by buttons or ESC.
+
+// ─── Permissions settings: grant lists ──────────────────────────────
+
+async function loadGrants() {
+    await Promise.all([loadGlobalGrants(), loadArcGrants()]);
+}
+
+async function loadGlobalGrants() {
+    if (!invoke) return;
+    try {
+        const grants = await invoke('list_global_grants');
+        renderGrantsList('global-grants-list', grants || [], 'global');
+    } catch (err) {
+        console.error('Failed to load global grants:', err);
+    }
+}
+
+async function loadArcGrants() {
+    if (!invoke) return;
+    if (!activeArcId) {
+        // No active arc -- leave the empty state visible.
+        renderGrantsList('arc-grants-list', [], 'arc');
+        return;
+    }
+    try {
+        const grants = await invoke('list_arc_grants', { arcId: activeArcId });
+        renderGrantsList('arc-grants-list', grants || [], 'arc');
+    } catch (err) {
+        console.error('Failed to load arc grants:', err);
+    }
+}
+
+function renderGrantsList(containerId, grants, scope) {
+    const el = document.getElementById(containerId);
+    if (!el) return;
+    if (!grants || grants.length === 0) {
+        el.innerHTML = `<p class="grants-empty">${scope === 'global' ? 'No global grants yet.' : 'No grants for this arc.'}</p>`;
+        return;
+    }
+    el.innerHTML = '';
+    grants.forEach((g) => {
+        const card = document.createElement('div');
+        card.className = 'grant-card';
+        const access = (g.access || 'read').toLowerCase();
+        const badgeClass = access === 'write' ? 'badge-write' : 'badge-read';
+        const accessLabel = access === 'write' ? 'Write' : 'Read';
+        card.innerHTML = `
+            <div class="grant-card-main">
+                <span class="grant-access-badge ${badgeClass}">${accessLabel}</span>
+                <code class="grant-card-path" title="${escapeHtml(g.path)}">${escapeHtml(ellipsizePath(g.path, 70))}</code>
+            </div>
+            <button class="btn-secondary grant-revoke-btn" data-grant-id="${g.id}" data-scope="${scope}">Revoke</button>
+        `;
+        el.appendChild(card);
+    });
+    el.querySelectorAll('.grant-revoke-btn').forEach((btn) => {
+        btn.addEventListener('click', () => {
+            const id = parseInt(btn.dataset.grantId, 10);
+            const sc = btn.dataset.scope;
+            revokeGrant(id, sc);
+        });
+    });
+}
+
+async function revokeGrant(id, scope) {
+    if (!invoke) return;
+    try {
+        const cmd = scope === 'global' ? 'revoke_global_grant' : 'revoke_arc_grant';
+        await invoke(cmd, { id });
+        showToast('Grant revoked', 'success');
+        if (scope === 'global') loadGlobalGrants();
+        else loadArcGrants();
+    } catch (err) {
+        showToast('Failed to revoke: ' + err, 'error');
+    }
+}
+
+document.getElementById('add-grant-btn')?.addEventListener('click', async () => {
+    if (!invoke) return;
+    const pathEl = document.getElementById('new-grant-path');
+    const accessEl = document.getElementById('new-grant-access');
+    const path = (pathEl?.value || '').trim();
+    const access = accessEl?.value || 'read';
+    if (!path) {
+        showToast('Enter a directory path', 'error');
+        return;
+    }
+    if (!path.startsWith('/')) {
+        showToast('Path must be absolute (start with /)', 'error');
+        return;
+    }
+    try {
+        await invoke('add_global_grant', { path, access });
+        showToast('Grant added', 'success');
+        pathEl.value = '';
+        loadGlobalGrants();
+    } catch (err) {
+        showToast('Failed to add grant: ' + err, 'error');
+    }
+});
 
 // ─── Initialize ───
 

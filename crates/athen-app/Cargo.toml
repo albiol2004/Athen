@@ -31,6 +31,7 @@ rustls = { version = "0.23", features = ["aws_lc_rs"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 tokio-util = "0.7"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures = { workspace = true }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

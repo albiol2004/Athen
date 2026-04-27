@@ -637,8 +637,8 @@ header h1 {
     text-decoration: underline;
 }
 
-.message-bubble code {
-    font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+.message-bubble .inline-code {
+    font-family: monospace;
     background: var(--bg-code);
     padding: 2px 6px;
     border-radius: 4px;
@@ -646,33 +646,32 @@ header h1 {
     color: var(--info);
 }
 
-.message-bubble pre {
+.message-bubble .code-block {
     background: var(--bg-code);
     border: 1px solid var(--border-subtle);
     border-radius: 8px;
     padding: 12px 16px;
     margin: 8px 0;
-    overflow-x: auto;
-    position: relative;
-}
-
-.message-bubble pre code {
-    background: none;
-    padding: 0;
-    border-radius: 0;
+    font-family: monospace;
     font-size: 13px;
     color: var(--text-primary);
     line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-all;
+    overflow-wrap: anywhere;
+}
+
+.message-bubble .code-block .code-body {
+    display: block;
 }
 
 .code-lang {
-    position: absolute;
-    top: 6px;
-    right: 10px;
+    display: inline-block;
+    margin-bottom: 4px;
     font-size: 10px;
     color: var(--text-muted);
     text-transform: uppercase;
-    font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+    font-family: monospace;
     letter-spacing: 0.5px;
 }
 
@@ -3835,3 +3834,266 @@ footer {
     transform: translateX(18px);
 }
 
+/* ─── Path-Grant Modal ─── */
+
+.grant-modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.7);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 600;
+    animation: calModalFadeIn 0.15s ease-out;
+}
+
+.grant-modal-overlay.hidden {
+    display: none;
+}
+
+.grant-modal {
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    width: 480px;
+    max-width: 95vw;
+    max-height: 85vh;
+    overflow-y: auto;
+    box-shadow: 0 12px 48px rgba(0, 0, 0, 0.6);
+    animation: calModalSlideIn 0.18s ease-out;
+}
+
+.grant-modal-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 18px 22px 12px;
+    border-bottom: 1px solid var(--border-subtle);
+}
+
+.grant-modal-header h2 {
+    font-size: 16px;
+    font-weight: 600;
+    margin: 0;
+    color: var(--text-primary);
+}
+
+.grant-modal-body {
+    padding: 16px 22px 8px;
+}
+
+.grant-modal-question {
+    font-size: 13px;
+    color: var(--text-secondary);
+    margin-bottom: 10px;
+}
+
+.grant-modal-paths {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 14px;
+}
+
+.grant-modal-path {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    background: var(--bg-base, rgba(255, 255, 255, 0.03));
+    border: 1px solid var(--border-subtle);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 13px;
+    overflow: hidden;
+}
+
+.grant-modal-path-prefix {
+    font-size: 11px;
+    color: var(--text-muted);
+    flex-shrink: 0;
+    font-weight: 500;
+}
+
+.grant-modal-path code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color: var(--text-primary);
+    font-size: 12px;
+    word-break: break-all;
+    background: transparent;
+}
+
+.grant-modal-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-bottom: 12px;
+    padding: 10px 12px;
+    background: var(--bg-base, rgba(255, 255, 255, 0.02));
+    border-radius: 6px;
+}
+
+.grant-modal-meta-row {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+}
+
+.grant-modal-meta-label {
+    color: var(--text-muted);
+}
+
+.grant-modal-meta-value {
+    color: var(--text-secondary);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.grant-modal-queue {
+    font-size: 11px;
+    color: var(--text-muted);
+    padding: 6px 10px;
+    background: rgba(122, 162, 247, 0.08);
+    border-left: 2px solid var(--text-muted);
+    border-radius: 4px;
+    margin-top: 6px;
+}
+
+.grant-modal-queue.hidden { display: none; }
+
+.grant-modal-actions {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 22px 18px;
+    border-top: 1px solid var(--border-subtle);
+    gap: 10px;
+}
+
+.grant-modal-actions-right {
+    display: flex;
+    gap: 8px;
+}
+
+.btn-deny {
+    background: transparent;
+    color: var(--text-secondary);
+    border: 1px solid var(--border-subtle);
+    border-radius: 6px;
+    padding: 8px 14px;
+    font-size: 13px;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+}
+
+.btn-deny:hover {
+    background: rgba(247, 118, 142, 0.12);
+    color: #f7768e;
+    border-color: rgba(247, 118, 142, 0.4);
+}
+
+/* Access badge (shared by modal + grant cards) */
+.grant-access-badge {
+    display: inline-flex;
+    align-items: center;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 3px 8px;
+    border-radius: 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    flex-shrink: 0;
+}
+
+.grant-access-badge.badge-read {
+    background: rgba(122, 162, 247, 0.18);
+    color: #7aa2f7;
+}
+
+.grant-access-badge.badge-write {
+    background: rgba(224, 175, 104, 0.18);
+    color: #e0af68;
+}
+
+/* ─── Permissions settings section ─── */
+
+.permissions-subhead {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    margin: 16px 0 8px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.permissions-subnote {
+    font-weight: 400;
+    text-transform: none;
+    letter-spacing: 0;
+    color: var(--text-muted);
+    font-size: 12px;
+    margin-left: 6px;
+}
+
+.grants-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.grants-empty {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin: 4px 0 8px;
+    font-style: italic;
+}
+
+.grant-card {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    border-radius: 6px;
+    padding: 10px 12px;
+}
+
+.grant-card-main {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+    flex: 1;
+}
+
+.grant-card-path {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    background: transparent;
+}
+
+.grant-revoke-btn {
+    font-size: 12px;
+    padding: 5px 10px;
+    flex-shrink: 0;
+}
+
+.add-grant-form {
+    display: flex;
+    gap: 8px;
+    margin: 12px 0 4px;
+    align-items: stretch;
+}
+
+.add-grant-form .settings-input {
+    flex: 1;
+    min-width: 0;
+}
+
+.grants-access-select {
+    width: 110px;
+    flex-shrink: 0;
+}
