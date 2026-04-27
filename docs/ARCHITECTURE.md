@@ -315,6 +315,58 @@ trait ShellExecutor: Send + Sync {
 }
 ```
 
+### Memory System (VectorIndex, KnowledgeGraph, MemoryStore)
+Three complementary traits working together:
+
+**VectorIndex** (`traits/memory.rs:VectorIndex`) — Semantic search over stored knowledge:
+```rust
+async fn upsert(&self, id: &str, embedding: Vec<f32>, metadata: Value) -> Result<()>;
+async fn search(&self, query_embedding: Vec<f32>, top_k: usize) -> Result<Vec<SearchResult>>;
+async fn delete(&self, id: &str) -> Result<()>;
+```
+Implemented in `athen-memory/src/vector.rs` with in-memory brute-force cosine similarity.
+
+**KnowledgeGraph** (`traits/memory.rs:KnowledgeGraph`) — Structured entity relationships:
+```rust
+async fn add_entity(&self, entity: Entity) -> Result<EntityId>;
+async fn add_relation(&self, from: EntityId, relation: &str, to: EntityId) -> Result<()>;
+async fn explore(&self, entry: EntityId, params: ExploreParams) -> Result<Vec<GraphNode>>;
+```
+Entities (Person, Organization, Project, Event, Document, Concept) connected by typed relations. BFS exploration respects `ExploreParams`:
+- `max_depth: u8` — Stops graph traversal at this depth (default: 3)
+- `max_nodes: u16` — Caps result set (default: 50)
+- `recency_weight, frequency_weight, importance_weight` — Edge scoring combines recency (7-day half-life), frequency (via strength), and explicit importance (0.0–1.0)
+
+**Decay & Strength** — Edges track `strength` (0.0–1.0, starts at 0.5, reinforced on use) and `last_used` timestamp. Effective strength decays with half-life 30 days: `strength * exp(-t * ln(2) / 30d)`, never dropping below 0.01. Reinforcement (used in agent context-switching) adds up to 1.0 and updates `last_used` to now.
+
+**MemoryStore** (`traits/memory.rs:MemoryStore`) — Unified facade:
+```rust
+async fn remember(&self, item: MemoryItem) -> Result<()>;  // Embed + extract entities + graph population
+async fn recall(&self, query: &str, limit: usize) -> Result<Vec<MemoryItem>>;  // Hybrid retrieval
+async fn forget(&self, id: &str) -> Result<()>;
+```
+Implemented in `athen-memory/src/lib.rs:Memory` as a composition of vector + graph + embedder + extractor.
+
+**Remember Flow** (3 phases):
+1. Embed content and store in vector index
+2. Extract entities via `EntityExtractor` (LLM-based: `LlmEntityExtractor`, or fallback to manual metadata parsing)
+3. Populate knowledge graph: add entities, create relations with importance weights, store extracted entity names in vector metadata
+
+**Entity Extraction** (`athen-memory/src/extractor.rs:LlmEntityExtractor`) — LLM gate deciding "is this worth remembering?":
+- Uses `ModelProfile::Cheap` with 30-second timeout (conservative: empty result on timeout)
+- Extracts entities + relations with importance scores (0.9=critical, 0.5=notable, 0.2=minor)
+- Graceful fallback: if extraction fails/times out, proceeds with manual metadata parsing
+
+**Recall Flow** (hybrid retrieval):
+1. Vector search: fetch `limit * 3` results (cosine similarity)
+2. Extract entity names from results → search for related entities
+3. Graph-connected results get boosted score: `score * 0.5 + 0.5`
+4. Merge, deduplicate, filter by `min_relevance_score` (default 0.3), rank by composite score, return top `limit`
+
+**Edit & Deduplication** — `Memory.update(id, new_content)` re-embeds and upserts. Forget removes from vector index but leaves graph entities intact (no reference counting). Deduplication happens at recall time via ID deduplication in merged result set.
+
+Implementations: `InMemoryVectorIndex` (simple brute-force) and `InMemoryGraph` (BFS with decay). SQLite backends available in `sqlite.rs` for persistence.
+
 ### PersistentStore (`traits/persistence.rs`)
 ```rust
 trait PersistentStore: Send + Sync {

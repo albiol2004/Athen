@@ -67,6 +67,68 @@ Optional daily USD limit with warning threshold. Per-provider rate limits. Token
 
 ---
 
+## Embedding Configuration
+
+Embeddings are configured separately from LLM providers and controlled entirely via the Tauri UI. No config files.
+
+### Embedding Modes (`EmbeddingConfig`)
+- **Automatic** (default): Auto-detect best available provider (NPU > GPU > Ollama > CPU > keyword fallback)
+- **Cloud**: Use a cloud provider (OpenAI-compatible endpoint; requires API key)
+- **LocalOnly**: Force local-only embeddings (no network calls; Ollama or keyword)
+- **Specific**: Use a specific provider by ID (ollama, openai, etc.)
+- **Off**: Disable memory/embeddings entirely
+
+### Tauri Commands for Embedding Settings
+- `save_embedding_settings(mode, provider?, model?, base_url?, api_key?)` — Save mode and optional provider details. API key `None` preserves existing; `Some("")` removes; `Some("sk-...")` updates.
+- `test_embedding_provider(provider, model?, base_url?, api_key?)` — Test connectivity (Ollama `/api/embed`, cloud `/v1/embeddings`, keyword always succeeds)
+
+### Supported Providers
+- **Ollama** (local): `POST {base_url}/api/embed` with `model` and `input`
+- **OpenAI-compatible** (cloud): `POST {base_url}/v1/embeddings` with auth header and `model`
+- **Keyword** (fallback): TF-IDF-based hashing; no external calls needed
+
+See: `athen-core/config.rs:EmbeddingConfig` (lines 315–353), `athen-app/src/settings.rs:save_embedding_settings` (1154–1191) and `test_embedding_provider` (1195–1252).
+
+---
+
+## MCP (Model Context Protocol) Configuration
+
+MCPs provide tool integrations (filesystem access, web search, shell execution, etc.). Fully managed through the Tauri UI.
+
+### Tauri Commands for MCP Management
+- `list_mcp_catalog()` — Return all available MCPs with enable/disable state, current config, display name, description, and JSON schema for config validation.
+- `enable_mcp(mcp_id, config)` — Enable an MCP with optional configuration and persist to database.
+- `disable_mcp(mcp_id)` — Disable an MCP and persist the change.
+
+MCPs are stored in the database (athen-mcp-store) and automatically loaded on startup. The `tools.md` document is refreshed after enable/disable.
+
+See: `athen-app/src/commands.rs:list_mcp_catalog` (1853–1883), `enable_mcp` (1886–1906), `disable_mcp` (1909–1921); `athen-mcp` crate for builtin catalog.
+
+---
+
+## Directory Grants for MCPs
+
+MCPs requesting filesystem access are mediated by a permission model with two scopes:
+
+### Permission Scopes
+- **Arc-scoped**: Grant applies only to a specific conversation/Arc. Requires one-time human approval via pending queue.
+- **Global**: Grant applies to all future tasks. Persisted and reusable.
+
+### Tauri Commands for Grant Management
+- `list_pending_grants()` — Return pending filesystem access requests awaiting human approval (shows path, access type, requesting MCP).
+- `resolve_pending_grant(id, decision)` — Approve or deny a pending grant (GrantDecision::Allow | Deny).
+- `list_arc_grants(arc_id)` — List all grants for a specific Arc.
+- `list_global_grants()` — List all global grants.
+- `add_global_grant(path, access)` — Manually grant global filesystem access (read/write).
+- `revoke_arc_grant(id)` — Revoke an Arc-scoped grant.
+- `revoke_global_grant(id)` — Revoke a global grant.
+
+Grants are persisted in SQLite and enforced by the FileGate before MCPs access the filesystem.
+
+See: `athen-app/src/commands.rs:list_pending_grants` (1954–1959), `resolve_pending_grant` (1962–1976), `list_arc_grants` (1979–1993), `list_global_grants` (1996–2008), `add_global_grant` (2011–2030), `revoke_arc_grant` (2033–2042), `revoke_global_grant` (2045+); `athen-app/src/file_gate.rs` for FileGate implementation.
+
+---
+
 ## Operation Modes
 
 1. **Always-On**: PC stays awake 24/7. Immediate reactivity. ~15-30W idle.

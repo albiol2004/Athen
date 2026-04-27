@@ -42,6 +42,7 @@ athen/
 │   ├── athen-coordinador/        # Coordinator (router, risk eval, queue, dispatch)
 │   ├── athen-agent/              # Agent worker (LLM executor, auditor, timeout)
 │   ├── athen-llm/                # LLM provider adapters + router + failover + embeddings
+│   ├── athen-mcp/                # MCP runtime catalog + registry (enable/config/spawn MCPs)
 │   ├── athen-memory/             # Vector index + knowledge graph + SQLite
 │   ├── athen-risk/               # Risk scorer + regex rules + LLM fallback
 │   ├── athen-persistence/        # SQLite persistence, checkpoints, arcs, calendar, contacts
