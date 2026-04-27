@@ -32,7 +32,7 @@ const MCP_TOOL_SEPARATOR: &str = "__";
 
 /// Wraps [`ShellToolRegistry`] and adds calendar, contact, memory, and MCP tools.
 pub struct AppToolRegistry {
-    inner: ShellToolRegistry,
+    inner: Arc<ShellToolRegistry>,
     calendar: Option<CalendarStore>,
     contacts: Option<SqliteContactStore>,
     memory: Option<Arc<Memory>>,
@@ -48,7 +48,7 @@ impl AppToolRegistry {
         contacts: Option<SqliteContactStore>,
         memory: Option<Arc<Memory>>,
     ) -> Self {
-        Self { inner, calendar, contacts, memory, mcp: None, file_gate: None }
+        Self { inner: Arc::new(inner), calendar, contacts, memory, mcp: None, file_gate: None }
     }
 
     /// Attach an MCP client. Tools exposed by enabled MCP servers will appear
@@ -936,14 +936,38 @@ impl ToolRegistry for AppToolRegistry {
             if FileGate::is_file_tool(name) {
                 let name_owned = name.to_string();
                 let mcp = self.mcp.clone();
-                // The `dispatch_inside_sandbox` closure: chooses either
-                // the MCP path (for `files__*`) or returns an error for
-                // built-ins, since the gate handles those directly.
+                // The `dispatch_inside_sandbox` closure: routes either
+                // to the MCP server (for `files__*` inside sandbox) or
+                // to the inner ShellToolRegistry (for the new built-in
+                // file tools `read`/`edit`/`write`/`grep`, which carry
+                // stateful read-state).
+                //
+                // The gate calls this closure only when it can't (or
+                // shouldn't) execute the op directly with `tokio::fs`.
                 let inner_clone_name = name_owned.clone();
+                // We need the inner registry to dispatch built-in calls.
+                // ShellToolRegistry is held inside `self`, but we can't
+                // move `&self` into a 'static closure. The gate's
+                // `dispatch` is invoked synchronously inside `handle()`,
+                // so a raw pointer borrow would be unsound. Instead,
+                // since the inner registry is `Send + Sync`, we rebuild
+                // the dispatch by running the gate first with a closure
+                // that delegates to a *channel*. That's overkill for our
+                // needs — a simpler workaround is to capture an Arc.
+                //
+                // ShellToolRegistry isn't behind an Arc here; rather
+                // than restructure the field, we route built-in calls
+                // by re-invoking `self.inner.call_tool` after the gate
+                // handle returns its own result. To do that cleanly, we
+                // package the args and recurse via a helper.
+                let mcp_opt_for_closure = mcp.clone();
+                let inner_for_closure = self.inner.clone();
                 let dispatch = move |rewritten: serde_json::Value| {
                     let name = inner_clone_name.clone();
-                    let mcp_opt = mcp.clone();
+                    let mcp_opt = mcp_opt_for_closure.clone();
+                    let inner_for_closure = inner_for_closure.clone();
                     Box::pin(async move {
+                        // MCP path.
                         if let Some((mcp_id, tool)) = name.split_once(MCP_TOOL_SEPARATOR) {
                             if let Some(mcp_client) = mcp_opt {
                                 let started = Instant::now();
@@ -968,14 +992,11 @@ impl ToolRegistry for AppToolRegistry {
                                 "MCP client not available".into(),
                             ));
                         }
-                        // Built-in path goes back through FileGate's
-                        // direct executor; the gate only invokes this
-                        // closure for sandbox-inside paths, but for
-                        // built-in tools the sandbox-inside concept is
-                        // moot — there's no separate sandbox for them.
-                        Err(AthenError::Other(format!(
-                            "Built-in file tool {name} should be dispatched directly"
-                        )))
+                        // Built-in file tool path: delegate to the inner
+                        // ShellToolRegistry so stateful behaviors (e.g.
+                        // the read-state hash for `edit`/`write`) are
+                        // preserved.
+                        inner_for_closure.call_tool(&name, rewritten).await
                     }) as futures::future::BoxFuture<'static, Result<ToolResult>>
                 };
                 return gate.handle(name, args, dispatch).await;
@@ -1076,7 +1097,7 @@ mod tests {
     async fn list_tools_includes_calendar_tools() {
         let (_db, registry) = setup_with_calendar().await;
         let tools = registry.list_tools().await.unwrap();
-        assert_eq!(tools.len(), 10, "Expected 6 shell + 4 calendar tools");
+        assert_eq!(tools.len(), 12, "Expected 8 shell + 4 calendar tools");
 
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"calendar_list"));
@@ -1085,12 +1106,12 @@ mod tests {
         assert!(names.contains(&"calendar_delete"));
     }
 
-    // 2. list_tools_without_calendar_has_6
+    // 2. list_tools_without_calendar_has_8
     #[tokio::test]
-    async fn list_tools_without_calendar_has_6() {
+    async fn list_tools_without_calendar_has_8() {
         let registry = setup_without_calendar().await;
         let tools = registry.list_tools().await.unwrap();
-        assert_eq!(tools.len(), 6, "Expected only 6 shell tools when calendar is None");
+        assert_eq!(tools.len(), 8, "Expected only 8 shell tools when calendar is None");
 
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(!names.contains(&"calendar_list"));
@@ -1487,8 +1508,8 @@ mod tests {
         assert!(names.contains(&"contacts_create"));
         assert!(names.contains(&"contacts_update"));
         assert!(names.contains(&"contacts_delete"));
-        // 6 shell + 5 contact = 11
-        assert_eq!(tools.len(), 11);
+        // 8 shell + 5 contact = 13
+        assert_eq!(tools.len(), 13);
     }
 
     // 17. list_tools_with_all_stores
@@ -1496,8 +1517,8 @@ mod tests {
     async fn list_tools_with_all_stores() {
         let (_db, registry) = setup_with_all().await;
         let tools = registry.list_tools().await.unwrap();
-        // 6 shell + 4 calendar + 5 contact = 15
-        assert_eq!(tools.len(), 15);
+        // 8 shell + 4 calendar + 5 contact = 17
+        assert_eq!(tools.len(), 17);
     }
 
     // 18. contacts_create_basic

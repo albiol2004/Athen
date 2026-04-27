@@ -126,7 +126,7 @@ impl AgentBuilder {
 
     /// Directory containing per-group markdown references (e.g. `calendar.md`,
     /// `files.md`). When set, the system prompt instructs the agent to
-    /// `read_file` the relevant group file for full schemas of any tool whose
+    /// `read` the relevant group file for full schemas of any tool whose
     /// arguments it doesn't already know.
     pub fn tool_doc_dir(mut self, dir: PathBuf) -> Self {
         self.tool_doc_path = Some(dir);

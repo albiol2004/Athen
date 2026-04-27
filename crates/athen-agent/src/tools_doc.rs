@@ -5,7 +5,7 @@
 //! - `calendar.md`, `contacts.md`, `files.md`, ... — one file per group,
 //!   each containing the full schema for every tool in that group.
 //!
-//! The agent reads only the group it needs via `read_file`, so loading the
+//! The agent reads only the group it needs via `read`, so loading the
 //! schema for one group doesn't pull every other group into context. This
 //! replaces both the synthetic `get_tool_details` meta-tool (which models
 //! didn't use reliably) and a single monolithic TOOLS.md (which would load

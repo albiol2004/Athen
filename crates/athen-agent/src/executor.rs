@@ -225,7 +225,7 @@ impl DefaultExecutor {
             if let Some(dir) = tool_doc_dir {
                 prompt.push_str(&format!(
                     "- Or read the schema file for the group you need: \
-                     `read_file(path=\"{}/<group>.md\")` where `<group>` is one of \
+                     `read(path=\"{}/<group>.md\")` where `<group>` is one of \
                      the group ids below (e.g. `calendar`, `files`). Each file \
                      contains ONLY that group's schemas, so reads stay small.\n",
                     dir.display(),
@@ -283,8 +283,11 @@ impl DefaultExecutor {
         if has_shell {
             prompt.push_str(
                 "SHELL & FILES:\n\
-                 Use shell_execute, read_file, write_file, list_directory for filesystem and system tasks.\n\
-                 Prefer specific tools (read_file, list_directory) over shell commands when possible.\n\n",
+                 Use shell_execute for system commands. For files use the dedicated tools: \
+                 read (offset/limit, prefer over cat/head/tail), edit (exact-string replace, \
+                 prefer over sed/awk), write (full overwrite — read first), grep (ripgrep \
+                 search, prefer over grep/find), list_directory.\n\
+                 Edit and write require a prior read of the same file (except for new files).\n\n",
             );
         }
 
@@ -382,9 +385,9 @@ impl DefaultExecutor {
              Rules:\n\
              - If the user asked for an ACTION (create, update, delete, modify, move, write, \
                execute) and the agent did NOT call the appropriate write tool \
-               (calendar_update, calendar_create, calendar_delete, write_file, shell_execute), \
+               (calendar_update, calendar_create, calendar_delete, write, edit, shell_execute), \
                answer CONTINUE.\n\
-             - If the agent only used read tools (calendar_list, read_file, list_directory, \
+             - If the agent only used read tools (calendar_list, read, grep, list_directory, \
                memory_recall) but the user wanted a write action, answer CONTINUE.\n\
              - If the agent just narrated what it would do without calling tools, answer CONTINUE.\n\
              - If the user asked a question or for information and the agent answered it \
@@ -1579,7 +1582,7 @@ mod tests {
         // Pattern reference uses the directory + <group>.md placeholder.
         assert!(prompt.contains("/tmp/athen-test/tools"));
         assert!(prompt.contains("<group>.md"));
-        assert!(prompt.contains("read_file"));
+        assert!(prompt.contains("read("));
         // Group id is shown in the index so the model knows the filename.
         assert!(prompt.contains("[id: `calendar`]"));
     }
@@ -1590,7 +1593,7 @@ mod tests {
         let revealed = HashSet::new();
         let prompt =
             DefaultExecutor::build_system_prompt(&tools, &revealed, false, None);
-        assert!(!prompt.contains("read_file"));
+        assert!(!prompt.contains("read("));
     }
 
     /// Tool registry that records dispatch *order* and sleeps in each call so

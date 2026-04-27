@@ -357,7 +357,7 @@ impl StepAuditor for TauriAuditor {
                             .get("stdout")
                             .and_then(|s| s.as_str())
                             .map(|s| s.to_string()),
-                        "read_file" | "write_file" => result
+                        "read" | "write" | "edit" => result
                             .get("path")
                             .and_then(|s| s.as_str())
                             .map(|s| s.to_string()),

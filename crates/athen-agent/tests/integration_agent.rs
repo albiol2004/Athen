@@ -136,7 +136,7 @@ async fn test_agent_executes_shell_tool_and_completes() {
     assert!(response.contains("hello_from_agent"));
 }
 
-/// The agent should handle read_file tool calls with real filesystem access.
+/// The agent should handle `read` tool calls with real filesystem access.
 #[tokio::test]
 async fn test_agent_reads_file_via_tool() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -145,7 +145,7 @@ async fn test_agent_reads_file_via_tool() {
 
     let tool_call = ToolCall {
         id: "call_read".to_string(),
-        name: "read_file".to_string(),
+        name: "read".to_string(),
         arguments: json!({"path": file_path.to_str().unwrap()}),
     };
 
@@ -185,7 +185,7 @@ async fn test_agent_multi_step_tool_usage() {
 
     let read_call = ToolCall {
         id: "call_read".to_string(),
-        name: "read_file".to_string(),
+        name: "read".to_string(),
         arguments: json!({"path": dir.path().join("readme.md").to_str().unwrap()}),
     };
 

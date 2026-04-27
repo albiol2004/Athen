@@ -170,8 +170,10 @@ impl FileGate {
     pub fn is_file_tool(name: &str) -> bool {
         matches!(
             name,
-            "read_file"
-                | "write_file"
+            "read"
+                | "edit"
+                | "write"
+                | "grep"
                 | "list_directory"
                 | "files__read_file"
                 | "files__write_file"
@@ -188,7 +190,8 @@ impl FileGate {
     /// Map a tool name to the access kind it needs, for risk classification.
     fn access_for(name: &str) -> PathAccess {
         match name {
-            "read_file"
+            "read"
+            | "grep"
             | "list_directory"
             | "files__read_file"
             | "files__list_dir"
@@ -199,7 +202,9 @@ impl FileGate {
     }
 
     /// Pull the path argument(s) from the JSON payload. `move_path`
-    /// carries two; everything else carries one.
+    /// carries two; `grep` defaults to the current working directory
+    /// when `path` is omitted; everything else carries a single
+    /// required `path`.
     fn paths_from_args(name: &str, args: &Value) -> Result<Vec<PathBuf>> {
         let extract = |key: &str| -> Result<PathBuf> {
             let s = args
@@ -210,6 +215,16 @@ impl FileGate {
         };
         match name {
             "files__move_path" => Ok(vec![extract("from")?, extract("to")?]),
+            "grep" => {
+                let p = args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| {
+                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+                    });
+                Ok(vec![p])
+            }
             _ => Ok(vec![extract("path")?]),
         }
     }
@@ -338,10 +353,11 @@ impl FileGate {
 
         // Dispatch. The MCP `files__*` tools accept only relative paths
         // anchored to the sandbox root; when the user pointed at a path
-        // inside the sandbox we rewrite + delegate, otherwise we run
-        // directly against the absolute path with `tokio::fs`. Built-in
-        // tools (`read_file`, `write_file`, `list_directory`) always run
-        // directly — they are not sandbox-scoped to begin with.
+        // inside the sandbox we rewrite + delegate. The new built-in
+        // file tools (`read`, `edit`, `write`, `grep`) carry stateful
+        // read-state in the inner registry, so we always route them
+        // through the dispatch closure rather than reimplementing here.
+        // `list_directory` is stateless and runs directly via tokio::fs.
         let is_mcp = name.starts_with("files__");
         if is_mcp {
             let sandbox_root = paths::athen_files_sandbox();
@@ -354,6 +370,10 @@ impl FileGate {
                 let rewritten = rewrite_args_relative(name, &args, &root)?;
                 return dispatch_inside_sandbox(rewritten).await;
             }
+        }
+
+        if matches!(name, "read" | "edit" | "write" | "grep") {
+            return dispatch_inside_sandbox(args).await;
         }
 
         execute_direct(name, &abs_paths, &args).await
@@ -430,21 +450,10 @@ async fn execute_direct(name: &str, abs: &[PathBuf], args: &Value) -> Result<Too
     let start = std::time::Instant::now();
     let path = &abs[0];
     let res: std::result::Result<Value, String> = match name {
-        "read_file" | "files__read_file" => match tokio::fs::read_to_string(path).await {
+        "files__read_file" => match tokio::fs::read_to_string(path).await {
             Ok(c) => Ok(json!({ "content": c })),
             Err(e) => Err(e.to_string()),
         },
-        "write_file" => {
-            let content = args
-                .get("content")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| AthenError::Other("missing 'content' parameter".to_string()))?;
-            ensure_parent_dir(path).await;
-            match tokio::fs::write(path, content).await {
-                Ok(()) => Ok(json!({ "path": path.display().to_string(), "bytes_written": content.len() })),
-                Err(e) => Err(e.to_string()),
-            }
-        }
         "files__write_file" => {
             let contents = args
                 .get("contents")
@@ -605,31 +614,46 @@ mod tests {
     #[test]
     fn paths_from_args_single_path() {
         let args = json!({ "path": "/tmp/x" });
-        let v = FileGate::paths_from_args("read_file", &args).unwrap();
+        let v = FileGate::paths_from_args("read", &args).unwrap();
         assert_eq!(v, vec![PathBuf::from("/tmp/x")]);
     }
 
     #[test]
     fn missing_path_errors() {
-        let r = FileGate::paths_from_args("read_file", &json!({}));
+        let r = FileGate::paths_from_args("read", &json!({}));
         assert!(r.is_err());
     }
 
     #[test]
+    fn grep_path_defaults_to_cwd() {
+        let r = FileGate::paths_from_args("grep", &json!({ "pattern": "x" })).unwrap();
+        assert_eq!(r.len(), 1);
+        // Should produce *some* path (cwd or ".") rather than erroring.
+        assert!(!r[0].as_os_str().is_empty());
+    }
+
+    #[test]
     fn classifies_read_vs_write() {
-        assert_eq!(FileGate::access_for("read_file"), PathAccess::Read);
+        assert_eq!(FileGate::access_for("read"), PathAccess::Read);
+        assert_eq!(FileGate::access_for("grep"), PathAccess::Read);
         assert_eq!(FileGate::access_for("files__exists"), PathAccess::Read);
-        assert_eq!(FileGate::access_for("write_file"), PathAccess::Write);
+        assert_eq!(FileGate::access_for("write"), PathAccess::Write);
+        assert_eq!(FileGate::access_for("edit"), PathAccess::Write);
         assert_eq!(FileGate::access_for("files__delete_path"), PathAccess::Write);
         assert_eq!(FileGate::access_for("files__move_path"), PathAccess::Write);
     }
 
     #[test]
     fn detects_file_tools() {
-        assert!(FileGate::is_file_tool("read_file"));
+        assert!(FileGate::is_file_tool("read"));
+        assert!(FileGate::is_file_tool("edit"));
+        assert!(FileGate::is_file_tool("write"));
+        assert!(FileGate::is_file_tool("grep"));
         assert!(FileGate::is_file_tool("files__write_file"));
         assert!(!FileGate::is_file_tool("shell_execute"));
         assert!(!FileGate::is_file_tool("calendar_create"));
+        assert!(!FileGate::is_file_tool("read_file"));
+        assert!(!FileGate::is_file_tool("write_file"));
     }
 
     #[test]
@@ -745,7 +769,7 @@ mod tests {
         // Spawn a task that races against the resolver.
         let p_clone = pending.clone();
         let join = tokio::spawn(async move {
-            gate.ask_user(vec![target.clone()], Access::Write, "write_file")
+            gate.ask_user(vec![target.clone()], Access::Write, "write")
                 .await
         });
 
@@ -788,7 +812,7 @@ mod tests {
         let target_clone = target.clone();
         let join = tokio::spawn(async move {
             let dec = gate
-                .ask_user(vec![target_clone.clone()], Access::Write, "write_file")
+                .ask_user(vec![target_clone.clone()], Access::Write, "write")
                 .await
                 .unwrap();
             if dec == GrantDecision::AllowAlways {

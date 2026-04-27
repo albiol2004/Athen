@@ -1,7 +1,7 @@
 //! Built-in tool registry backed by shell execution and filesystem operations.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -42,6 +42,10 @@ pub struct ShellToolRegistry {
     sandbox: Option<UnifiedSandbox>,
     rule_engine: RuleEngine,
     extra_writable: Option<Arc<dyn ShellExtraWritableProvider>>,
+    /// Per-path blake3 hash of the file contents the agent has most recently
+    /// `read`. Used by `edit` and `write` to enforce read-before-modify and
+    /// detect external changes between reads and writes.
+    read_state: Arc<Mutex<HashMap<PathBuf, blake3::Hash>>>,
 }
 
 impl ShellToolRegistry {
@@ -74,6 +78,7 @@ impl ShellToolRegistry {
             sandbox,
             rule_engine: RuleEngine::new(),
             extra_writable: None,
+            read_state: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -101,35 +106,115 @@ impl ShellToolRegistry {
         })
     }
 
-    /// Build the JSON Schema for the `read_file` tool parameters.
-    fn read_file_schema() -> serde_json::Value {
+    /// Build the JSON Schema for the `read` tool parameters.
+    fn read_schema() -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Absolute path to the file to read"
+                    "description": "Absolute path to the file"
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "1-based starting line (default 1)"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of lines to return (default 2000)"
                 }
             },
             "required": ["path"]
         })
     }
 
-    /// Build the JSON Schema for the `write_file` tool parameters.
-    fn write_file_schema() -> serde_json::Value {
+    /// Build the JSON Schema for the `edit` tool parameters.
+    fn edit_schema() -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Absolute path to the file to write"
+                    "description": "Absolute path to the file"
+                },
+                "old_string": {
+                    "type": "string",
+                    "description": "Exact text to replace (must be unique unless replace_all=true)"
+                },
+                "new_string": {
+                    "type": "string",
+                    "description": "Replacement text"
+                },
+                "replace_all": {
+                    "type": "boolean",
+                    "description": "Replace every occurrence (default false)"
+                }
+            },
+            "required": ["path", "old_string", "new_string"]
+        })
+    }
+
+    /// Build the JSON Schema for the `write` tool parameters.
+    fn write_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Absolute path to the file"
                 },
                 "content": {
                     "type": "string",
-                    "description": "Content to write to the file"
+                    "description": "Full file contents"
                 }
             },
             "required": ["path", "content"]
+        })
+    }
+
+    /// Build the JSON Schema for the `grep` tool parameters.
+    fn grep_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Regex pattern to search for"
+                },
+                "path": {
+                    "type": "string",
+                    "description": "File or directory to search (default '.')"
+                },
+                "glob": {
+                    "type": "string",
+                    "description": "Glob filter, e.g. '*.rs'"
+                },
+                "case_insensitive": {
+                    "type": "boolean",
+                    "description": "Case-insensitive match"
+                },
+                "line_numbers": {
+                    "type": "boolean",
+                    "description": "Include line numbers in content mode (default true)"
+                },
+                "context_before": {
+                    "type": "integer",
+                    "description": "Lines of context before each match"
+                },
+                "context_after": {
+                    "type": "integer",
+                    "description": "Lines of context after each match"
+                },
+                "output_mode": {
+                    "type": "string",
+                    "description": "'files_with_matches' (default), 'content', or 'count'"
+                },
+                "max_count": {
+                    "type": "integer",
+                    "description": "Cap on number of results (default 100)"
+                }
+            },
+            "required": ["pattern"]
         })
     }
 
@@ -293,75 +378,379 @@ impl ShellToolRegistry {
         })
     }
 
-    /// Read a file and return its contents.
-    async fn do_read_file(&self, args: &serde_json::Value) -> Result<ToolResult> {
-        let path = args
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| AthenError::Other("missing 'path' parameter".to_string()))?;
+    /// Canonicalize a path for read-state map keys. Falls back to a
+    /// lexically absolute path when the file doesn't yet exist.
+    fn canonical_key(p: &Path) -> PathBuf {
+        if let Ok(c) = std::fs::canonicalize(p) {
+            return c;
+        }
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("/"))
+                .join(p)
+        }
+    }
 
-        tracing::info!(tool = "read_file", path, "Reading file");
-        tracing::trace!(tool = "read_file", "Filesystem tools use tokio::fs directly (unsandboxed)");
+    /// Record the blake3 hash of `content` for `path`. Always hashes the
+    /// whole file regardless of which slice the caller used.
+    pub async fn record_hash(&self, path: &Path, content: &[u8]) {
+        let key = Self::canonical_key(path);
+        let hash = blake3::hash(content);
+        self.read_state.lock().await.insert(key, hash);
+    }
 
-        let start = Instant::now();
-        match tokio::fs::read_to_string(path).await {
-            Ok(content) => {
-                let elapsed_ms = start.elapsed().as_millis() as u64;
-                Ok(ToolResult {
-                    success: true,
-                    output: json!({ "content": content }),
-                    error: None,
-                    execution_time_ms: elapsed_ms,
-                })
-            }
-            Err(e) => {
-                let elapsed_ms = start.elapsed().as_millis() as u64;
-                Ok(ToolResult {
-                    success: false,
-                    output: json!({ "error": e.to_string() }),
-                    error: Some(e.to_string()),
-                    execution_time_ms: elapsed_ms,
-                })
+    /// Verify that `current` matches the stored hash for `path`. Returns
+    /// a clear error when the file was never read or has been modified
+    /// externally since the last read.
+    pub async fn check_hash(&self, path: &Path, current: &[u8]) -> Result<()> {
+        let key = Self::canonical_key(path);
+        let map = self.read_state.lock().await;
+        match map.get(&key) {
+            None => Err(AthenError::Other(format!(
+                "must Read this file first before editing or overwriting: {}",
+                path.display()
+            ))),
+            Some(stored) => {
+                let now = blake3::hash(current);
+                if *stored == now {
+                    Ok(())
+                } else {
+                    Err(AthenError::Other(format!(
+                        "file changed on disk since last read: {} — re-read it before editing",
+                        path.display()
+                    )))
+                }
             }
         }
     }
 
-    /// Write content to a file.
-    async fn do_write_file(&self, args: &serde_json::Value) -> Result<ToolResult> {
+    /// Read a file (or a slice of it) and return numbered lines.
+    async fn do_read(&self, args: &serde_json::Value) -> Result<ToolResult> {
         let path = args
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AthenError::Other("missing 'path' parameter".to_string()))?;
+        let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(1);
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(2000);
+        let offset = offset.max(1) as usize;
+        let limit = limit.max(1) as usize;
 
+        tracing::info!(tool = "read", path, offset, limit, "Reading file");
+        let start = Instant::now();
+        let p = Path::new(path);
+
+        // Reject directories early with a clear message.
+        match tokio::fs::metadata(p).await {
+            Ok(m) if m.is_dir() => {
+                let msg = format!("'{path}' is a directory, not a file");
+                return Ok(ToolResult {
+                    success: false,
+                    output: json!({ "error": msg }),
+                    error: Some(msg),
+                    execution_time_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+            Ok(_) => {}
+            Err(e) => {
+                let msg = format!("cannot read '{path}': {e}");
+                return Ok(ToolResult {
+                    success: false,
+                    output: json!({ "error": msg }),
+                    error: Some(msg),
+                    execution_time_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+        }
+
+        let bytes = match tokio::fs::read(p).await {
+            Ok(b) => b,
+            Err(e) => {
+                let msg = e.to_string();
+                return Ok(ToolResult {
+                    success: false,
+                    output: json!({ "error": msg }),
+                    error: Some(msg),
+                    execution_time_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+        };
+
+        // Binary-file detection: any NUL byte and we bail. Cheap and
+        // matches what most editors and tools do.
+        if bytes.contains(&0u8) {
+            let msg = format!("'{path}' appears to be a binary file (contains NUL bytes)");
+            return Ok(ToolResult {
+                success: false,
+                output: json!({ "error": msg }),
+                error: Some(msg),
+                execution_time_ms: start.elapsed().as_millis() as u64,
+            });
+        }
+
+        let content = String::from_utf8_lossy(&bytes).to_string();
+
+        // Slice the requested line range, then number lines `cat -n` style.
+        let total_lines = content.lines().count();
+        let mut out = String::new();
+        let mut returned = 0usize;
+        for (i, line) in content.lines().enumerate() {
+            let line_no = i + 1;
+            if line_no < offset {
+                continue;
+            }
+            if returned >= limit {
+                break;
+            }
+            out.push_str(&format!("{line_no}\t{line}\n"));
+            returned += 1;
+        }
+
+        // Always hash the *whole* file content so a partial read still
+        // protects subsequent edits.
+        self.record_hash(p, &bytes).await;
+
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        Ok(ToolResult {
+            success: true,
+            output: json!({
+                "content": out,
+                "lines_returned": returned,
+                "total_lines": total_lines,
+                "offset": offset,
+            }),
+            error: None,
+            execution_time_ms: elapsed_ms,
+        })
+    }
+
+    /// Edit a file by exact-string replacement.
+    async fn do_edit(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let path = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AthenError::Other("missing 'path' parameter".to_string()))?;
+        let old_string = args
+            .get("old_string")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AthenError::Other("missing 'old_string' parameter".to_string()))?;
+        let new_string = args
+            .get("new_string")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AthenError::Other("missing 'new_string' parameter".to_string()))?;
+        let replace_all = args
+            .get("replace_all")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if old_string == new_string {
+            return Err(AthenError::Other(
+                "old_string and new_string are identical (no-op)".to_string(),
+            ));
+        }
+
+        tracing::info!(tool = "edit", path, replace_all, "Editing file");
+        let start = Instant::now();
+        let p = Path::new(path);
+
+        let current = tokio::fs::read(p)
+            .await
+            .map_err(|e| AthenError::Other(format!("cannot read '{path}': {e}")))?;
+
+        // Read-before-write guard. Returns its own clear error message.
+        self.check_hash(p, &current).await?;
+
+        let text = String::from_utf8_lossy(&current).to_string();
+        let count = text.matches(old_string).count();
+        if count == 0 {
+            return Err(AthenError::Other(format!(
+                "old_string not found in '{path}'"
+            )));
+        }
+        let new_text = if replace_all {
+            text.replace(old_string, new_string)
+        } else {
+            if count > 1 {
+                return Err(AthenError::Other(format!(
+                    "old_string matches {count} times in '{path}'; \
+                     add surrounding context to make it unique, or pass replace_all=true"
+                )));
+            }
+            text.replacen(old_string, new_string, 1)
+        };
+
+        atomic_write(p, new_text.as_bytes()).await?;
+        self.record_hash(p, new_text.as_bytes()).await;
+
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        Ok(ToolResult {
+            success: true,
+            output: json!({
+                "path": path,
+                "replacements": if replace_all { count } else { 1 },
+                "bytes_written": new_text.len(),
+            }),
+            error: None,
+            execution_time_ms: elapsed_ms,
+        })
+    }
+
+    /// Write the full contents of a file. New paths skip the read-required
+    /// check; existing paths must have been Read first.
+    async fn do_write(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let path = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AthenError::Other("missing 'path' parameter".to_string()))?;
         let content = args
             .get("content")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AthenError::Other("missing 'content' parameter".to_string()))?;
 
-        tracing::info!(tool = "write_file", path, "Writing file");
-        tracing::trace!(tool = "write_file", "Filesystem tools use tokio::fs directly (unsandboxed)");
-
+        tracing::info!(tool = "write", path, "Writing file");
         let start = Instant::now();
-        match tokio::fs::write(path, content).await {
-            Ok(()) => {
-                let elapsed_ms = start.elapsed().as_millis() as u64;
-                Ok(ToolResult {
-                    success: true,
-                    output: json!({ "path": path, "bytes_written": content.len() }),
-                    error: None,
-                    execution_time_ms: elapsed_ms,
-                })
+        let p = Path::new(path);
+
+        if let Ok(existing) = tokio::fs::read(p).await {
+            self.check_hash(p, &existing).await?;
+        }
+        // (else: new file — allowed without prior read.)
+
+        atomic_write(p, content.as_bytes()).await?;
+        self.record_hash(p, content.as_bytes()).await;
+
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        Ok(ToolResult {
+            success: true,
+            output: json!({
+                "path": path,
+                "bytes_written": content.len(),
+            }),
+            error: None,
+            execution_time_ms: elapsed_ms,
+        })
+    }
+
+    /// Search files using ripgrep.
+    async fn do_grep(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let pattern = args
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AthenError::Other("missing 'pattern' parameter".to_string()))?;
+        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+        let glob = args.get("glob").and_then(|v| v.as_str());
+        let case_insensitive = args
+            .get("case_insensitive")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let line_numbers = args
+            .get("line_numbers")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let context_before = args.get("context_before").and_then(|v| v.as_u64());
+        let context_after = args.get("context_after").and_then(|v| v.as_u64());
+        let output_mode = args
+            .get("output_mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("files_with_matches");
+        let max_count = args
+            .get("max_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(100);
+
+        tracing::info!(tool = "grep", pattern, path, output_mode, "ripgrep search");
+        let start = Instant::now();
+
+        let mut cmd = tokio::process::Command::new("rg");
+        cmd.arg("--color=never");
+        if case_insensitive {
+            cmd.arg("-i");
+        }
+        match output_mode {
+            "files_with_matches" => {
+                cmd.arg("-l");
             }
-            Err(e) => {
-                let elapsed_ms = start.elapsed().as_millis() as u64;
-                Ok(ToolResult {
-                    success: false,
-                    output: json!({ "error": e.to_string() }),
-                    error: Some(e.to_string()),
-                    execution_time_ms: elapsed_ms,
-                })
+            "count" => {
+                cmd.arg("-c");
+            }
+            "content" => {
+                if line_numbers {
+                    cmd.arg("-n");
+                }
+                if let Some(b) = context_before {
+                    cmd.arg("-B").arg(b.to_string());
+                }
+                if let Some(a) = context_after {
+                    cmd.arg("-A").arg(a.to_string());
+                }
+                // Per-file cap on individual matches is friendlier than a
+                // hard global cap when scanning many files.
+                cmd.arg("-m").arg(max_count.to_string());
+            }
+            other => {
+                return Err(AthenError::Other(format!(
+                    "invalid output_mode '{other}': use files_with_matches, content, or count"
+                )));
             }
         }
+        if let Some(g) = glob {
+            cmd.arg("--glob").arg(g);
+        }
+        cmd.arg("--").arg(pattern).arg(path);
+
+        let output = match cmd.output().await {
+            Ok(o) => o,
+            Err(e) => {
+                let msg = if e.kind() == std::io::ErrorKind::NotFound {
+                    "ripgrep ('rg') not found on PATH — install it from \
+                     https://github.com/BurntSushi/ripgrep#installation"
+                        .to_string()
+                } else {
+                    format!("failed to invoke rg: {e}")
+                };
+                return Ok(ToolResult {
+                    success: false,
+                    output: json!({ "error": msg }),
+                    error: Some(msg),
+                    execution_time_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        // rg exits 1 when there are no matches — that's not a failure.
+        let exit = output.status.code().unwrap_or(-1);
+        let success = exit == 0 || exit == 1;
+
+        // Post-truncate the output to `max_count` lines so non-content
+        // modes also respect the cap.
+        let truncated: String = stdout
+            .lines()
+            .take(max_count as usize)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let display = if truncated.trim().is_empty() {
+            "No matches".to_string()
+        } else {
+            truncated
+        };
+
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        Ok(ToolResult {
+            success,
+            output: json!({
+                "matches": display,
+                "exit_code": exit,
+            }),
+            error: if success {
+                None
+            } else {
+                Some(format!("rg failed (exit {exit}): {}", stderr.trim()))
+            },
+            execution_time_ms: elapsed_ms,
+        })
     }
 
     /// Build the JSON Schema for the `memory_store` tool parameters.
@@ -523,9 +912,9 @@ impl ToolRegistry for ShellToolRegistry {
                 base_risk: BaseImpact::WritePersist,
             },
             ToolDefinition {
-                name: "read_file".to_string(),
-                description: "Read the contents of a file at the given path".to_string(),
-                parameters: Self::read_file_schema(),
+                name: "read".to_string(),
+                description: "Read a file with optional offset/limit. Returns lines numbered cat -n style. ALWAYS use this instead of cat/head/tail.".to_string(),
+                parameters: Self::read_schema(),
                 backend: ToolBackend::Shell {
                     command: String::new(),
                     native: false,
@@ -533,14 +922,34 @@ impl ToolRegistry for ShellToolRegistry {
                 base_risk: BaseImpact::Read,
             },
             ToolDefinition {
-                name: "write_file".to_string(),
-                description: "Write content to a file at the given path, creating or overwriting it".to_string(),
-                parameters: Self::write_file_schema(),
+                name: "edit".to_string(),
+                description: "Replace exact text in a file. Requires a prior read. Prefer this over sed/awk.".to_string(),
+                parameters: Self::edit_schema(),
                 backend: ToolBackend::Shell {
                     command: String::new(),
                     native: false,
                 },
                 base_risk: BaseImpact::WritePersist,
+            },
+            ToolDefinition {
+                name: "write".to_string(),
+                description: "Overwrite or create a file. For partial changes prefer edit. Existing files require a prior read.".to_string(),
+                parameters: Self::write_schema(),
+                backend: ToolBackend::Shell {
+                    command: String::new(),
+                    native: false,
+                },
+                base_risk: BaseImpact::WritePersist,
+            },
+            ToolDefinition {
+                name: "grep".to_string(),
+                description: "Search files with ripgrep. Use this instead of grep/find for code search.".to_string(),
+                parameters: Self::grep_schema(),
+                backend: ToolBackend::Shell {
+                    command: String::new(),
+                    native: false,
+                },
+                base_risk: BaseImpact::Read,
             },
             ToolDefinition {
                 name: "list_directory".to_string(),
@@ -582,14 +991,56 @@ impl ToolRegistry for ShellToolRegistry {
     ) -> Result<ToolResult> {
         match name {
             "shell_execute" => self.do_shell_execute(&args).await,
-            "read_file" => self.do_read_file(&args).await,
-            "write_file" => self.do_write_file(&args).await,
+            "read" => self.do_read(&args).await,
+            "edit" => self.do_edit(&args).await,
+            "write" => self.do_write(&args).await,
+            "grep" => self.do_grep(&args).await,
             "list_directory" => self.do_list_directory(&args).await,
             "memory_store" => self.do_memory_store(&args).await,
             "memory_recall" => self.do_memory_recall(&args).await,
             _ => Err(AthenError::ToolNotFound(name.to_string())),
         }
     }
+}
+
+/// Write `bytes` to `path` atomically: write to a sibling tmp file then
+/// rename. Falls back to a direct write when the rename can't happen
+/// (e.g. tmp dir on a different filesystem). Used by `edit` and `write`.
+async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = match path.file_name() {
+        Some(name) => {
+            let mut tmp_name = std::ffi::OsString::from(".athen-tmp-");
+            tmp_name.push(name);
+            tmp_name.push(format!(".{}", std::process::id()));
+            path.with_file_name(tmp_name)
+        }
+        None => {
+            return Err(AthenError::Other(format!(
+                "invalid file path '{}'",
+                path.display()
+            )))
+        }
+    };
+
+    if let Err(e) = tokio::fs::write(&tmp, bytes).await {
+        // If the directory doesn't exist, surface that directly.
+        return Err(AthenError::Other(format!(
+            "failed to write tmp file '{}': {}",
+            tmp.display(),
+            e
+        )));
+    }
+    if let Err(e) = tokio::fs::rename(&tmp, path).await {
+        // Best-effort cleanup, then fall back to a direct write so
+        // callers on quirky filesystems aren't dead in the water.
+        let _ = tokio::fs::remove_file(&tmp).await;
+        tokio::fs::write(path, bytes)
+            .await
+            .map_err(|e2| AthenError::Other(format!(
+                "atomic rename failed ({e}); fallback write also failed: {e2}"
+            )))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -603,12 +1054,15 @@ mod tests {
         let registry = ShellToolRegistry::new().await;
         let tools = registry.list_tools().await.unwrap();
 
-        assert_eq!(tools.len(), 6);
+        // shell_execute, read, edit, write, grep, list_directory, memory_store, memory_recall
+        assert_eq!(tools.len(), 8);
 
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"shell_execute"));
-        assert!(names.contains(&"read_file"));
-        assert!(names.contains(&"write_file"));
+        assert!(names.contains(&"read"));
+        assert!(names.contains(&"edit"));
+        assert!(names.contains(&"write"));
+        assert!(names.contains(&"grep"));
         assert!(names.contains(&"list_directory"));
         assert!(names.contains(&"memory_store"));
         assert!(names.contains(&"memory_recall"));
@@ -648,55 +1102,379 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_file() {
+    async fn test_read_basic_numbers_lines() {
         let mut tmp = NamedTempFile::new().unwrap();
-        write!(tmp, "hello from test").unwrap();
+        writeln!(tmp, "alpha").unwrap();
+        writeln!(tmp, "beta").unwrap();
+        writeln!(tmp, "gamma").unwrap();
         let path = tmp.path().to_str().unwrap().to_string();
 
         let registry = ShellToolRegistry::new().await;
         let result = registry
-            .call_tool("read_file", json!({"path": path}))
+            .call_tool("read", json!({"path": path}))
             .await
             .unwrap();
 
         assert!(result.success);
         let content = result.output["content"].as_str().unwrap();
-        assert_eq!(content, "hello from test");
+        assert!(content.contains("1\talpha"));
+        assert!(content.contains("2\tbeta"));
+        assert!(content.contains("3\tgamma"));
+        assert_eq!(result.output["lines_returned"], 3);
+        assert_eq!(result.output["total_lines"], 3);
     }
 
     #[tokio::test]
-    async fn test_read_file_not_found() {
+    async fn test_read_with_offset_and_limit() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        for i in 1..=10 {
+            writeln!(tmp, "line{i}").unwrap();
+        }
+        let path = tmp.path().to_str().unwrap().to_string();
+
         let registry = ShellToolRegistry::new().await;
         let result = registry
-            .call_tool("read_file", json!({"path": "/tmp/__athen_nonexistent_file__"}))
+            .call_tool("read", json!({"path": path, "offset": 4, "limit": 2}))
             .await
             .unwrap();
 
+        assert!(result.success);
+        let content = result.output["content"].as_str().unwrap();
+        assert!(content.contains("4\tline4"));
+        assert!(content.contains("5\tline5"));
+        assert!(!content.contains("3\tline3"));
+        assert!(!content.contains("6\tline6"));
+        assert_eq!(result.output["lines_returned"], 2);
+    }
+
+    #[tokio::test]
+    async fn test_read_rejects_directory() {
+        let dir = TempDir::new().unwrap();
+        let registry = ShellToolRegistry::new().await;
+        let result = registry
+            .call_tool("read", json!({"path": dir.path().to_str().unwrap()}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let err = result.error.unwrap();
+        assert!(err.contains("directory"));
+    }
+
+    #[tokio::test]
+    async fn test_read_rejects_binary_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("binary.bin");
+        std::fs::write(&path, [0x48, 0x00, 0x49]).unwrap();
+
+        let registry = ShellToolRegistry::new().await;
+        let result = registry
+            .call_tool("read", json!({"path": path.to_str().unwrap()}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let err = result.error.unwrap();
+        assert!(err.contains("binary"));
+    }
+
+    #[tokio::test]
+    async fn test_read_not_found() {
+        let registry = ShellToolRegistry::new().await;
+        let result = registry
+            .call_tool("read", json!({"path": "/tmp/__athen_nonexistent_file__"}))
+            .await
+            .unwrap();
         assert!(!result.success);
         assert!(result.error.is_some());
     }
 
     #[tokio::test]
-    async fn test_write_file() {
+    async fn test_edit_rejects_without_prior_read() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("test_write.txt");
-        let path_str = path.to_str().unwrap().to_string();
+        let path = dir.path().join("e.txt");
+        std::fs::write(&path, "hello world").unwrap();
 
         let registry = ShellToolRegistry::new().await;
         let result = registry
             .call_tool(
-                "write_file",
-                json!({"path": path_str, "content": "written by test"}),
+                "edit",
+                json!({
+                    "path": path.to_str().unwrap(),
+                    "old_string": "hello",
+                    "new_string": "goodbye",
+                }),
             )
+            .await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.to_lowercase().contains("read this file first"));
+    }
+
+    #[tokio::test]
+    async fn test_edit_rejects_on_external_change() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("e.txt");
+        std::fs::write(&path, "version1").unwrap();
+
+        let registry = ShellToolRegistry::new().await;
+        // Read first to record the hash.
+        registry
+            .call_tool("read", json!({"path": path.to_str().unwrap()}))
             .await
             .unwrap();
 
-        assert!(result.success);
-        assert_eq!(result.output["bytes_written"], 15);
+        // External modification.
+        std::fs::write(&path, "version2").unwrap();
 
-        // Verify the file was actually written.
+        let result = registry
+            .call_tool(
+                "edit",
+                json!({
+                    "path": path.to_str().unwrap(),
+                    "old_string": "version2",
+                    "new_string": "version3",
+                }),
+            )
+            .await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("changed on disk"));
+    }
+
+    #[tokio::test]
+    async fn test_edit_rejects_ambiguous_old_string() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("e.txt");
+        std::fs::write(&path, "foo bar foo bar foo").unwrap();
+
+        let registry = ShellToolRegistry::new().await;
+        registry
+            .call_tool("read", json!({"path": path.to_str().unwrap()}))
+            .await
+            .unwrap();
+
+        let result = registry
+            .call_tool(
+                "edit",
+                json!({
+                    "path": path.to_str().unwrap(),
+                    "old_string": "foo",
+                    "new_string": "qux",
+                }),
+            )
+            .await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("matches 3 times"));
+    }
+
+    #[tokio::test]
+    async fn test_edit_replace_all() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("e.txt");
+        std::fs::write(&path, "foo bar foo bar foo").unwrap();
+
+        let registry = ShellToolRegistry::new().await;
+        registry
+            .call_tool("read", json!({"path": path.to_str().unwrap()}))
+            .await
+            .unwrap();
+
+        let result = registry
+            .call_tool(
+                "edit",
+                json!({
+                    "path": path.to_str().unwrap(),
+                    "old_string": "foo",
+                    "new_string": "qux",
+                    "replace_all": true,
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert_eq!(result.output["replacements"], 3);
+
         let content = tokio::fs::read_to_string(&path).await.unwrap();
-        assert_eq!(content, "written by test");
+        assert_eq!(content, "qux bar qux bar qux");
+    }
+
+    #[tokio::test]
+    async fn test_edit_unique_replace() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("e.txt");
+        std::fs::write(&path, "alpha beta gamma").unwrap();
+
+        let registry = ShellToolRegistry::new().await;
+        registry
+            .call_tool("read", json!({"path": path.to_str().unwrap()}))
+            .await
+            .unwrap();
+
+        let result = registry
+            .call_tool(
+                "edit",
+                json!({
+                    "path": path.to_str().unwrap(),
+                    "old_string": "beta",
+                    "new_string": "BETA",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(result.success);
+
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(content, "alpha BETA gamma");
+    }
+
+    #[tokio::test]
+    async fn test_edit_then_edit_uses_updated_hash() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("e.txt");
+        std::fs::write(&path, "v1").unwrap();
+
+        let registry = ShellToolRegistry::new().await;
+        registry
+            .call_tool("read", json!({"path": path.to_str().unwrap()}))
+            .await
+            .unwrap();
+        registry
+            .call_tool(
+                "edit",
+                json!({
+                    "path": path.to_str().unwrap(),
+                    "old_string": "v1",
+                    "new_string": "v2",
+                }),
+            )
+            .await
+            .unwrap();
+        // Second edit without re-reading — should still succeed because
+        // the first edit updated the recorded hash.
+        let result = registry
+            .call_tool(
+                "edit",
+                json!({
+                    "path": path.to_str().unwrap(),
+                    "old_string": "v2",
+                    "new_string": "v3",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(result.success);
+    }
+
+    #[tokio::test]
+    async fn test_write_new_file_no_read_required() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("brand_new.txt");
+
+        let registry = ShellToolRegistry::new().await;
+        let result = registry
+            .call_tool(
+                "write",
+                json!({"path": path.to_str().unwrap(), "content": "hi"}),
+            )
+            .await
+            .unwrap();
+        assert!(result.success);
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(content, "hi");
+    }
+
+    #[tokio::test]
+    async fn test_write_existing_file_requires_read() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("existing.txt");
+        std::fs::write(&path, "original").unwrap();
+
+        let registry = ShellToolRegistry::new().await;
+        let result = registry
+            .call_tool(
+                "write",
+                json!({"path": path.to_str().unwrap(), "content": "overwritten"}),
+            )
+            .await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.to_lowercase().contains("read this file first"));
+    }
+
+    #[tokio::test]
+    async fn test_write_existing_file_after_read_succeeds() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("existing.txt");
+        std::fs::write(&path, "original").unwrap();
+
+        let registry = ShellToolRegistry::new().await;
+        registry
+            .call_tool("read", json!({"path": path.to_str().unwrap()}))
+            .await
+            .unwrap();
+        let result = registry
+            .call_tool(
+                "write",
+                json!({"path": path.to_str().unwrap(), "content": "overwritten"}),
+            )
+            .await
+            .unwrap();
+        assert!(result.success);
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(content, "overwritten");
+    }
+
+    #[tokio::test]
+    async fn test_grep_basic_match() {
+        if which::which("rg").is_err() {
+            // Skip if ripgrep isn't installed in this environment.
+            eprintln!("skipping: rg not on PATH");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "needle in a haystack\nother line\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "no match here\n").unwrap();
+
+        let registry = ShellToolRegistry::new().await;
+        let result = registry
+            .call_tool(
+                "grep",
+                json!({
+                    "pattern": "needle",
+                    "path": dir.path().to_str().unwrap(),
+                    "output_mode": "files_with_matches",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(result.success);
+        let matches = result.output["matches"].as_str().unwrap();
+        assert!(matches.contains("a.txt"));
+        assert!(!matches.contains("b.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_grep_no_matches_returns_text() {
+        if which::which("rg").is_err() {
+            eprintln!("skipping: rg not on PATH");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
+
+        let registry = ShellToolRegistry::new().await;
+        let result = registry
+            .call_tool(
+                "grep",
+                json!({
+                    "pattern": "zzznotthere",
+                    "path": dir.path().to_str().unwrap(),
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert_eq!(result.output["matches"].as_str().unwrap(), "No matches");
     }
 
     #[tokio::test]
