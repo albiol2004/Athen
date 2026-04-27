@@ -149,6 +149,7 @@ impl BwrapSandbox {
         let start = Instant::now();
         let output = Command::new("bwrap")
             .args(&bwrap_args)
+            .kill_on_drop(true)
             .output()
             .await
             .map_err(|e| AthenError::Sandbox(format!("bwrap execution failed: {e}")))?;

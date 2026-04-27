@@ -33,6 +33,7 @@ impl NativeShell {
         let start = Instant::now();
 
         let mut cmd = self.build_command(command);
+        cmd.kill_on_drop(true);
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),

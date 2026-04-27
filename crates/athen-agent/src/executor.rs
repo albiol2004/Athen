@@ -287,7 +287,18 @@ impl DefaultExecutor {
                  read (offset/limit, prefer over cat/head/tail), edit (exact-string replace, \
                  prefer over sed/awk), write (full overwrite — read first), grep (ripgrep \
                  search, prefer over grep/find), list_directory.\n\
-                 Edit and write require a prior read of the same file (except for new files).\n\n",
+                 Edit and write require a prior read of the same file (except for new files).\n\
+                 \n\
+                 LONG-RUNNING COMMANDS (servers, daemons, watch processes):\n\
+                 shell_execute waits for the command to fully exit and EOF its stdio. A bare \
+                 trailing `&` is NOT enough — the child inherits stdio pipes and keeps the call \
+                 hanging. Use one of these patterns:\n\
+                 - Detached daemon: `nohup CMD >/tmp/cmd.log 2>&1 &` then read the log later.\n\
+                 - Time-bounded: `timeout 30 CMD` to cap runtime at 30s.\n\
+                 - Multi-line input: HEREDOC, e.g. `python3 <<'EOF' ... EOF`.\n\
+                 The default tool timeout is 120s; pass `timeout_ms` up to 600000 for longer \
+                 commands. On timeout the process is killed and you'll get a clear error — \
+                 fix the command pattern, don't just bump the timeout.\n\n",
             );
         }
 

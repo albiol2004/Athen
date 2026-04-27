@@ -99,7 +99,15 @@ impl ShellToolRegistry {
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "The shell command to execute"
+                    "description": "The shell command to execute. For long-running or backgrounded \
+                                    processes (servers, daemons), redirect stdio: \
+                                    `nohup CMD >/tmp/log 2>&1 &`. Otherwise the inherited pipes \
+                                    keep this call hanging until timeout."
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "description": "Hard timeout in milliseconds (default 120000, max 600000). \
+                                    On timeout the process is killed."
                 }
             },
             "required": ["command"]
@@ -244,7 +252,13 @@ impl ShellToolRegistry {
             .and_then(|v| v.as_str())
             .ok_or_else(|| AthenError::Other("missing 'command' parameter".to_string()))?;
 
-        tracing::info!(tool = "shell_execute", command, "Executing shell command");
+        let timeout_ms = args
+            .get("timeout_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(120_000)
+            .min(600_000);
+
+        tracing::info!(tool = "shell_execute", command, timeout_ms, "Executing shell command");
 
         // Pre-execution risk check: evaluate the ACTUAL command (not user's
         // natural language) through the rule engine. This catches dangerous
@@ -287,6 +301,10 @@ impl ShellToolRegistry {
         let start = Instant::now();
 
         // Try sandboxed execution first, fall back to unsandboxed shell.
+        // The whole exec is wrapped below in `tokio::time::timeout`; bwrap
+        // and NativeShell both set `kill_on_drop`, so dropping the future
+        // SIGKILLs the spawned process group.
+        let exec_future = async {
         let (stdout, stderr, exit_code) = if let Some(ref sandbox) = self.sandbox {
             // Default writable set: /tmp, the Athen data dir, and cwd.
             // $HOME is intentionally NOT included by default — explicit
@@ -352,6 +370,38 @@ impl ShellToolRegistry {
             );
             let output = self.shell.execute(command).await?;
             (output.stdout, output.stderr, output.exit_code)
+        };
+            Ok::<_, AthenError>((stdout, stderr, exit_code))
+        };
+
+        let (stdout, stderr, exit_code) = match tokio::time::timeout(
+            std::time::Duration::from_millis(timeout_ms),
+            exec_future,
+        )
+        .await
+        {
+            Ok(inner) => inner?,
+            Err(_) => {
+                tracing::warn!(
+                    tool = "shell_execute",
+                    command,
+                    timeout_ms,
+                    "Command timed out — process killed"
+                );
+                let msg = format!(
+                    "command timed out after {}ms and was killed. \
+                     For long-running processes use: \
+                     `nohup CMD >/tmp/log 2>&1 &` so the process detaches from this call's pipes. \
+                     For commands that legitimately need longer, pass `timeout_ms` (max 600000).",
+                    timeout_ms
+                );
+                return Ok(ToolResult {
+                    success: false,
+                    output: json!({ "error": &msg, "timed_out": true }),
+                    error: Some(msg),
+                    execution_time_ms: start.elapsed().as_millis() as u64,
+                });
+            }
         };
 
         let elapsed_ms = start.elapsed().as_millis() as u64;
