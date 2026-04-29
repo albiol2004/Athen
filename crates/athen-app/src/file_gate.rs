@@ -190,13 +190,8 @@ impl FileGate {
     /// Map a tool name to the access kind it needs, for risk classification.
     fn access_for(name: &str) -> PathAccess {
         match name {
-            "read"
-            | "grep"
-            | "list_directory"
-            | "files__read_file"
-            | "files__list_dir"
-            | "files__exists"
-            | "files__stat" => PathAccess::Read,
+            "read" | "grep" | "list_directory" | "files__read_file" | "files__list_dir"
+            | "files__exists" | "files__stat" => PathAccess::Read,
             _ => PathAccess::Write,
         }
     }
@@ -251,11 +246,7 @@ impl FileGate {
 
     /// Evaluate every path; returns the strictest decision so callers
     /// react once per call (e.g. `move_path` evaluates both endpoints).
-    async fn evaluate_all(
-        &self,
-        paths_in: &[PathBuf],
-        access: PathAccess,
-    ) -> Result<RiskDecision> {
+    async fn evaluate_all(&self, paths_in: &[PathBuf], access: PathAccess) -> Result<RiskDecision> {
         let ctx = Self::risk_ctx();
         let mut worst = RiskDecision::SilentApprove;
         for p in paths_in {
@@ -304,7 +295,10 @@ impl FileGate {
         &self,
         name: &str,
         args: Value,
-        dispatch_inside_sandbox: impl FnOnce(Value) -> futures::future::BoxFuture<'static, Result<ToolResult>>,
+        dispatch_inside_sandbox: impl FnOnce(
+            Value,
+        )
+            -> futures::future::BoxFuture<'static, Result<ToolResult>>,
     ) -> Result<ToolResult> {
         let raw_paths = Self::paths_from_args(name, &args)?;
         let abs_paths: Vec<PathBuf> = raw_paths.iter().map(|p| Self::absolutize(p)).collect();
@@ -321,9 +315,7 @@ impl FileGate {
         match decision {
             RiskDecision::SilentApprove | RiskDecision::NotifyAndProceed => {}
             RiskDecision::HumanConfirm => {
-                let user = self
-                    .ask_user(abs_paths.clone(), access_kind, name)
-                    .await?;
+                let user = self.ask_user(abs_paths.clone(), access_kind, name).await?;
                 match user {
                     GrantDecision::Deny => {
                         return Err(AthenError::Other(format!(
@@ -334,9 +326,7 @@ impl FileGate {
                     }
                     GrantDecision::AllowAlways => {
                         for p in &abs_paths {
-                            self.grants
-                                .grant_arc(self.arc_uuid, p, access_kind)
-                                .await?;
+                            self.grants.grant_arc(self.arc_uuid, p, access_kind).await?;
                         }
                     }
                     GrantDecision::Allow => {}
@@ -461,7 +451,9 @@ async fn execute_direct(name: &str, abs: &[PathBuf], args: &Value) -> Result<Too
                 .ok_or_else(|| AthenError::Other("missing 'contents' parameter".to_string()))?;
             ensure_parent_dir(path).await;
             match tokio::fs::write(path, contents).await {
-                Ok(()) => Ok(json!({ "path": path.display().to_string(), "bytes_written": contents.len() })),
+                Ok(()) => Ok(
+                    json!({ "path": path.display().to_string(), "bytes_written": contents.len() }),
+                ),
                 Err(e) => Err(e.to_string()),
             }
         }
@@ -479,7 +471,9 @@ async fn execute_direct(name: &str, abs: &[PathBuf], args: &Value) -> Result<Too
                 .await
             {
                 Ok(mut f) => match f.write_all(contents.as_bytes()).await {
-                    Ok(()) => Ok(json!({ "path": path.display().to_string(), "bytes_appended": contents.len() })),
+                    Ok(()) => Ok(
+                        json!({ "path": path.display().to_string(), "bytes_appended": contents.len() }),
+                    ),
                     Err(e) => Err(e.to_string()),
                 },
                 Err(e) => Err(e.to_string()),
@@ -529,7 +523,9 @@ async fn execute_direct(name: &str, abs: &[PathBuf], args: &Value) -> Result<Too
             let to = &abs[1];
             ensure_parent_dir(to).await;
             match tokio::fs::rename(path, to).await {
-                Ok(()) => Ok(json!({ "from": path.display().to_string(), "to": to.display().to_string() })),
+                Ok(()) => Ok(
+                    json!({ "from": path.display().to_string(), "to": to.display().to_string() }),
+                ),
                 Err(e) => Err(e.to_string()),
             }
         }
@@ -653,7 +649,10 @@ mod tests {
         assert_eq!(FileGate::access_for("files__exists"), PathAccess::Read);
         assert_eq!(FileGate::access_for("write"), PathAccess::Write);
         assert_eq!(FileGate::access_for("edit"), PathAccess::Write);
-        assert_eq!(FileGate::access_for("files__delete_path"), PathAccess::Write);
+        assert_eq!(
+            FileGate::access_for("files__delete_path"),
+            PathAccess::Write
+        );
         assert_eq!(FileGate::access_for("files__move_path"), PathAccess::Write);
     }
 
@@ -735,10 +734,7 @@ mod tests {
         let pending = pending();
         let arc_str = "arc_test_grantflow";
         let arc_id = arc_uuid(arc_str);
-        let dir = std::env::temp_dir().join(format!(
-            "athen_phaseB_grant_{}",
-            Uuid::new_v4()
-        ));
+        let dir = std::env::temp_dir().join(format!("athen_phaseB_grant_{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         grants.grant_arc(arc_id, &dir, Access::Write).await.unwrap();
 
@@ -772,12 +768,7 @@ mod tests {
         let grants = fresh_grants().await;
         let pending = pending();
         let arc_str = "arc_test_park";
-        let gate = FileGate::new(
-            arc_str.into(),
-            grants.clone(),
-            pending.clone(),
-            None,
-        );
+        let gate = FileGate::new(arc_str.into(), grants.clone(), pending.clone(), None);
         let target = paths::home_dir().unwrap().join("phaseB_ask.txt");
 
         // Spawn a task that races against the resolver.
@@ -850,10 +841,7 @@ mod tests {
         req.responder.send(GrantDecision::AllowAlways).unwrap();
         join.await.unwrap();
 
-        let scope = grants
-            .check(arc_id, &target, Access::Write)
-            .await
-            .unwrap();
+        let scope = grants.check(arc_id, &target, Access::Write).await.unwrap();
         assert!(scope.is_some());
         let _ = std::fs::remove_dir_all(&target);
     }

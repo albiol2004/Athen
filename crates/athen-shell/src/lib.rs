@@ -150,10 +150,7 @@ mod tests {
     #[tokio::test]
     async fn test_shell_which() {
         let shell = Shell::new().await;
-        let result = shell
-            .which("nonexistent_program_xyz_12345")
-            .await
-            .unwrap();
+        let result = shell.which("nonexistent_program_xyz_12345").await.unwrap();
         assert!(result.is_none());
     }
 }

@@ -129,10 +129,13 @@ impl EmbeddingProvider for OllamaEmbedding {
 
     async fn embed(&self, text: &str) -> Result<Vec<f32>> {
         let results = self.call_embed(vec![text.to_string()]).await?;
-        results.into_iter().next().ok_or_else(|| AthenError::LlmProvider {
-            provider: "ollama-embed".to_string(),
-            message: "embed response contained no embeddings".to_string(),
-        })
+        results
+            .into_iter()
+            .next()
+            .ok_or_else(|| AthenError::LlmProvider {
+                provider: "ollama-embed".to_string(),
+                message: "embed response contained no embeddings".to_string(),
+            })
     }
 
     async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
@@ -210,8 +213,8 @@ mod tests {
 
     #[test]
     fn test_custom_base_url() {
-        let provider = OllamaEmbedding::new("nomic-embed-text")
-            .with_base_url("http://gpu-box:11434");
+        let provider =
+            OllamaEmbedding::new("nomic-embed-text").with_base_url("http://gpu-box:11434");
         assert_eq!(provider.base_url, "http://gpu-box:11434");
     }
 
@@ -223,8 +226,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_is_available_when_not_running() {
-        let provider = OllamaEmbedding::new("nomic-embed-text")
-            .with_base_url("http://127.0.0.1:19999");
+        let provider =
+            OllamaEmbedding::new("nomic-embed-text").with_base_url("http://127.0.0.1:19999");
         assert!(!provider.is_available().await);
     }
 
@@ -259,8 +262,8 @@ mod tests {
     #[tokio::test]
     async fn test_embed_batch_empty() {
         // With an unreachable server, empty batch should return Ok(empty).
-        let provider = OllamaEmbedding::new("nomic-embed-text")
-            .with_base_url("http://127.0.0.1:19999");
+        let provider =
+            OllamaEmbedding::new("nomic-embed-text").with_base_url("http://127.0.0.1:19999");
         let result = provider.embed_batch(&[]).await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());

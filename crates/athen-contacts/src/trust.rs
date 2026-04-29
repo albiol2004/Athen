@@ -1,8 +1,6 @@
 //! Trust level business logic and risk multiplier calculations.
 
-use athen_core::contact::{
-    Contact, ContactId, ContactIdentifier, IdentifierKind, TrustLevel,
-};
+use athen_core::contact::{Contact, ContactId, ContactIdentifier, IdentifierKind, TrustLevel};
 use athen_core::error::{AthenError, Result};
 use chrono::Utc;
 use uuid::Uuid;
@@ -28,11 +26,7 @@ impl TrustManager {
 
     /// Resolve a sender identifier to a contact, creating a new T0 contact
     /// if none exists.
-    pub async fn resolve_contact(
-        &self,
-        identifier: &str,
-        kind: IdentifierKind,
-    ) -> Result<Contact> {
+    pub async fn resolve_contact(&self, identifier: &str, kind: IdentifierKind) -> Result<Contact> {
         if let Some(contact) = self.store.find_by_identifier(identifier).await? {
             return Ok(contact);
         }
@@ -134,11 +128,7 @@ impl TrustManager {
     ///
     /// After a manual override the trust level is pinned and will not be
     /// changed by implicit learning (approvals/rejections).
-    pub async fn set_trust_level(
-        &self,
-        contact_id: ContactId,
-        level: TrustLevel,
-    ) -> Result<()> {
+    pub async fn set_trust_level(&self, contact_id: ContactId, level: TrustLevel) -> Result<()> {
         let mut contact = self
             .store
             .load(contact_id)
@@ -279,26 +269,42 @@ mod tests {
         for _ in 0..4 {
             manager.record_approval(id).await.unwrap();
         }
-        let c = manager.find_by_identifier("sender@test.com").await.unwrap().unwrap();
+        let c = manager
+            .find_by_identifier("sender@test.com")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(c.trust_level, TrustLevel::Unknown);
 
         // 5th approval: upgrade T0 -> T1.
         manager.record_approval(id).await.unwrap();
-        let c = manager.find_by_identifier("sender@test.com").await.unwrap().unwrap();
+        let c = manager
+            .find_by_identifier("sender@test.com")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(c.trust_level, TrustLevel::Neutral);
 
         // 5 more approvals: upgrade T1 -> T2.
         for _ in 0..5 {
             manager.record_approval(id).await.unwrap();
         }
-        let c = manager.find_by_identifier("sender@test.com").await.unwrap().unwrap();
+        let c = manager
+            .find_by_identifier("sender@test.com")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(c.trust_level, TrustLevel::Known);
 
         // 5 more approvals: should NOT upgrade past T2.
         for _ in 0..5 {
             manager.record_approval(id).await.unwrap();
         }
-        let c = manager.find_by_identifier("sender@test.com").await.unwrap().unwrap();
+        let c = manager
+            .find_by_identifier("sender@test.com")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(c.trust_level, TrustLevel::Known);
     }
 
@@ -314,7 +320,10 @@ mod tests {
         let id = contact.id;
 
         // Manually set to Known so we can observe downgrades.
-        manager.set_trust_level(id, TrustLevel::Known).await.unwrap();
+        manager
+            .set_trust_level(id, TrustLevel::Known)
+            .await
+            .unwrap();
         // Clear the manual override flag so implicit learning works.
         {
             let mut c = manager.store.load(id).await.unwrap().unwrap();

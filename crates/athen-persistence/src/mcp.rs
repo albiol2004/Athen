@@ -80,11 +80,8 @@ impl McpStore {
 
     pub async fn disable(&self, mcp_id: &str) -> Result<()> {
         let conn = self.conn.lock().await;
-        conn.execute(
-            "DELETE FROM mcp_enabled WHERE mcp_id = ?1",
-            params![mcp_id],
-        )
-        .map_err(|e| AthenError::Other(format!("delete mcp_enabled: {e}")))?;
+        conn.execute("DELETE FROM mcp_enabled WHERE mcp_id = ?1", params![mcp_id])
+            .map_err(|e| AthenError::Other(format!("delete mcp_enabled: {e}")))?;
         Ok(())
     }
 

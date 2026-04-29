@@ -127,10 +127,13 @@ impl LlmProvider for AnthropicProvider {
         }
 
         let api_response: AnthropicResponse =
-            http_response.json().await.map_err(|e| AthenError::LlmProvider {
-                provider: "anthropic".into(),
-                message: format!("failed to parse response: {}", e),
-            })?;
+            http_response
+                .json()
+                .await
+                .map_err(|e| AthenError::LlmProvider {
+                    provider: "anthropic".into(),
+                    message: format!("failed to parse response: {}", e),
+                })?;
 
         // Extract text content from response blocks.
         let content = api_response
@@ -257,10 +260,7 @@ fn parse_sse_chunks(text: &str) -> Vec<Result<LlmChunk>> {
             }
             match serde_json::from_str::<serde_json::Value>(data) {
                 Ok(event) => {
-                    let event_type = event
-                        .get("type")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
                     match event_type {
                         "content_block_delta" => {

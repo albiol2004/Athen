@@ -149,11 +149,7 @@ async fn test_dangerous_command_gets_blocked() {
     // sudo -> System(90), rm -rf -> also System(90). The rule engine picks
     // the highest impact. With Neutral trust (2.0x) and Plain data (1.0x):
     //   total = 90 * 2.0 * 1.0 + 0 = 180 -> HardBlock (>= 90)
-    let event = make_event(
-        EventSource::System,
-        EventKind::Command,
-        "sudo rm -rf /",
-    );
+    let event = make_event(EventSource::System, EventKind::Command, "sudo rm -rf /");
 
     let results = coordinator.process_event(event).await.unwrap();
     assert_eq!(results.len(), 1);
@@ -182,16 +178,15 @@ async fn test_dispatch_assigns_to_agent() {
     coordinator.dispatcher().register_agent(agent_id).await;
 
     // 2. Process a benign user input event.
-    let event = make_event(
-        EventSource::UserInput,
-        EventKind::Command,
-        "list my files",
-    );
+    let event = make_event(EventSource::UserInput, EventKind::Command, "list my files");
     coordinator.process_event(event).await.unwrap();
 
     // 3. Dispatch the next task.
     let result = coordinator.dispatch_next().await.unwrap();
-    assert!(result.is_some(), "dispatch should succeed with an available agent");
+    assert!(
+        result.is_some(),
+        "dispatch should succeed with an available agent"
+    );
 
     let (task_id, dispatched_agent) = result.unwrap();
 
@@ -207,18 +202,20 @@ async fn test_dispatch_assigns_to_agent() {
 
     // 6. Agent should be available again (no longer assigned).
     let assigned_after = coordinator.dispatcher().assigned_agent(task_id).await;
-    assert_eq!(assigned_after, None, "agent should be released after task completion");
+    assert_eq!(
+        assigned_after, None,
+        "agent should be released after task completion"
+    );
 
     // Verify the agent can be assigned a new task.
-    let event2 = make_event(
-        EventSource::UserInput,
-        EventKind::Command,
-        "check my email",
-    );
+    let event2 = make_event(EventSource::UserInput, EventKind::Command, "check my email");
     coordinator.process_event(event2).await.unwrap();
 
     let result2 = coordinator.dispatch_next().await.unwrap();
-    assert!(result2.is_some(), "agent should be available for a new task");
+    assert!(
+        result2.is_some(),
+        "agent should be available for a new task"
+    );
     let (_, agent2) = result2.unwrap();
     assert_eq!(agent2, agent_id);
 }

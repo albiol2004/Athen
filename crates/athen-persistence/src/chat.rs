@@ -114,9 +114,7 @@ impl ChatStore {
 
             let mut messages = Vec::new();
             for row in rows {
-                messages.push(
-                    row.map_err(|e| AthenError::Other(format!("Message row: {e}")))?,
-                );
+                messages.push(row.map_err(|e| AthenError::Other(format!("Message row: {e}")))?);
             }
             Ok(messages)
         })
@@ -142,8 +140,7 @@ impl ChatStore {
 
             let mut sessions = Vec::new();
             for row in rows {
-                sessions
-                    .push(row.map_err(|e| AthenError::Other(format!("Session row: {e}")))?);
+                sessions.push(row.map_err(|e| AthenError::Other(format!("Session row: {e}")))?);
             }
             Ok(sessions)
         })
@@ -294,9 +291,8 @@ impl ChatStore {
 
             let mut sessions = Vec::new();
             for row in rows {
-                sessions.push(
-                    row.map_err(|e| AthenError::Other(format!("Session meta row: {e}")))?,
-                );
+                sessions
+                    .push(row.map_err(|e| AthenError::Other(format!("Session meta row: {e}")))?);
             }
             Ok(sessions)
         })
@@ -440,14 +436,8 @@ mod tests {
     async fn test_create_and_list_sessions_with_meta() {
         let store = setup_chat_store().await;
 
-        store
-            .create_session("s1", "First Chat")
-            .await
-            .unwrap();
-        store
-            .create_session("s2", "Second Chat")
-            .await
-            .unwrap();
+        store.create_session("s1", "First Chat").await.unwrap();
+        store.create_session("s2", "Second Chat").await.unwrap();
 
         store
             .save_message("s1", "user", "Hello", "text")

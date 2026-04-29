@@ -36,7 +36,10 @@ impl EmbeddingRouter {
     async fn resolve(&self) -> &dyn EmbeddingProvider {
         for provider in &self.providers {
             if provider.is_available().await {
-                debug!(provider = provider.provider_id(), "using embedding provider");
+                debug!(
+                    provider = provider.provider_id(),
+                    "using embedding provider"
+                );
                 return provider.as_ref();
             }
         }

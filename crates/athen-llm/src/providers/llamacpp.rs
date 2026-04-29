@@ -112,8 +112,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_is_available_when_not_running() {
-        let provider =
-            LlamaCppProvider::new("http://127.0.0.1:19998".into(), "model".into());
+        let provider = LlamaCppProvider::new("http://127.0.0.1:19998".into(), "model".into());
         assert!(!provider.is_available().await);
     }
 }

@@ -58,10 +58,7 @@ fn clamp_shell_timeout(
     }
 
     if let Some(obj) = args.as_object_mut() {
-        obj.insert(
-            "timeout_ms".to_string(),
-            serde_json::Value::from(clamped),
-        );
+        obj.insert("timeout_ms".to_string(), serde_json::Value::from(clamped));
     }
     None
 }
@@ -264,7 +261,9 @@ impl DefaultExecutor {
         let has_shell = tools.iter().any(|t| t.name == "shell_execute");
         let has_contacts = tools.iter().any(|t| t.name.starts_with("contacts_"));
         let has_memory = tools.iter().any(|t| t.name == "memory_store");
-        let has_web = tools.iter().any(|t| t.name == "web_search" || t.name == "web_fetch");
+        let has_web = tools
+            .iter()
+            .any(|t| t.name == "web_search" || t.name == "web_fetch");
 
         // ── Tier 1: capability index (always shown, one line per group) ──
         if !tools.is_empty() {
@@ -536,7 +535,9 @@ impl DefaultExecutor {
         match tokio::time::timeout(
             std::time::Duration::from_secs(30),
             self.llm_router.route(&request),
-        ).await {
+        )
+        .await
+        {
             Ok(Ok(resp)) => {
                 let answer = resp.content.trim().to_uppercase();
                 tracing::debug!("Completion judge verdict: {}", answer);
@@ -847,7 +848,10 @@ impl AgentExecutor for DefaultExecutor {
             // Extract <think> tags from content (servers that embed thinking inline).
             let (stripped_content, inline_think) = extract_think_tags(&response.content);
             if !inline_think.is_empty() {
-                tracing::debug!(thinking_len = inline_think.len(), "extracted inline <think> tags");
+                tracing::debug!(
+                    thinking_len = inline_think.len(),
+                    "extracted inline <think> tags"
+                );
                 // Forward thinking to UI via stream sender.
                 if let Some(ref tx) = self.stream_sender {
                     let _ = tx.send(format!("\x02{}", inline_think));
@@ -902,11 +906,9 @@ impl AgentExecutor for DefaultExecutor {
                 // completed.  This catches narration, false claims, and
                 // incomplete tool use — in any language.
                 if !available_tools.is_empty() && !has_been_judged {
-                    let should_continue = self.judge_completion(
-                        &task.description,
-                        &response_content,
-                        &tools_called,
-                    ).await;
+                    let should_continue = self
+                        .judge_completion(&task.description, &response_content, &tools_called)
+                        .await;
 
                     if should_continue {
                         tracing::info!(
@@ -1083,7 +1085,7 @@ impl AgentExecutor for DefaultExecutor {
 
             // ── Process results in order: audit + thread into conversation ──
             for (tool_call, (started_at, tool_result)) in
-                response.tool_calls.iter().zip(outcomes.into_iter())
+                response.tool_calls.iter().zip(outcomes)
             {
                 let (step_status, output) = match &tool_result {
                     Ok(result) => (
@@ -1124,8 +1126,9 @@ impl AgentExecutor for DefaultExecutor {
                 // Include the tool_call_id so the provider can match results
                 // to their originating tool calls (required by OpenAI-compatible APIs).
                 let tool_response_content = match &tool_result {
-                    Ok(result) => serde_json::to_string(&result.output)
-                        .unwrap_or_else(|_| "{}".to_string()),
+                    Ok(result) => {
+                        serde_json::to_string(&result.output).unwrap_or_else(|_| "{}".to_string())
+                    }
                     Err(e) => format!("Error: {}", e),
                 };
 
@@ -1238,11 +1241,7 @@ mod tests {
             Ok(self.tools.clone())
         }
 
-        async fn call_tool(
-            &self,
-            _name: &str,
-            _args: serde_json::Value,
-        ) -> Result<CoreToolResult> {
+        async fn call_tool(&self, _name: &str, _args: serde_json::Value) -> Result<CoreToolResult> {
             let idx = self.call_index.fetch_add(1, Ordering::SeqCst);
             let results = self.results.lock().unwrap();
             if idx < results.len() {
@@ -1280,10 +1279,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_executor_completes_simple_task() {
-        let router = MockLlmRouter::new(vec![MockLlmRouter::make_response(
-            "Task is done.",
-            vec![],
-        )]);
+        let router =
+            MockLlmRouter::new(vec![MockLlmRouter::make_response("Task is done.", vec![])]);
 
         let executor = DefaultExecutor::new(
             Box::new(router),
@@ -1433,10 +1430,7 @@ mod tests {
             ) -> Result<()> {
                 self.0.record_step(task_id, step).await
             }
-            async fn get_steps(
-                &self,
-                task_id: athen_core::task::TaskId,
-            ) -> Result<Vec<TaskStep>> {
+            async fn get_steps(&self, task_id: athen_core::task::TaskId) -> Result<Vec<TaskStep>> {
                 self.0.get_steps(task_id).await
             }
         }
@@ -1598,7 +1592,8 @@ mod tests {
     #[test]
     fn test_extract_think_tags() {
         // Basic think block
-        let (content, thinking) = extract_think_tags("<think>I need to consider this</think>Hello!");
+        let (content, thinking) =
+            extract_think_tags("<think>I need to consider this</think>Hello!");
         assert_eq!(content, "Hello!");
         assert_eq!(thinking, "I need to consider this");
 
@@ -1608,9 +1603,8 @@ mod tests {
         assert!(thinking.is_empty());
 
         // Think with JSON response after
-        let (content, thinking) = extract_think_tags(
-            "<think>The user asks about X</think>{\"response\": \"\"}"
-        );
+        let (content, thinking) =
+            extract_think_tags("<think>The user asks about X</think>{\"response\": \"\"}");
         assert_eq!(content, "{\"response\": \"\"}");
         assert_eq!(thinking, "The user asks about X");
 
@@ -1626,7 +1620,7 @@ mod tests {
 
         // Multiple think blocks
         let (content, thinking) = extract_think_tags(
-            "<think>First thought</think>Middle<think>Second thought</think>End"
+            "<think>First thought</think>Middle<think>Second thought</think>End",
         );
         assert_eq!(content, "MiddleEnd");
         assert_eq!(thinking, "First thought\nSecond thought");
@@ -1635,9 +1629,7 @@ mod tests {
     #[tokio::test]
     async fn test_executor_cleans_json_response() {
         // Model returns JSON blob — executor should extract the text.
-        let responses = vec![
-            MockLlmRouter::make_response(r#"{"response": ""}"#, vec![]),
-        ];
+        let responses = vec![MockLlmRouter::make_response(r#"{"response": ""}"#, vec![])];
 
         let executor = DefaultExecutor::new(
             Box::new(MockLlmRouter::new(responses)),
@@ -1688,8 +1680,7 @@ mod tests {
         revealed.insert("memory_store".to_string());
         revealed.insert("memory_recall".to_string());
 
-        let prompt =
-            DefaultExecutor::build_system_prompt(&tools, &revealed, false, None);
+        let prompt = DefaultExecutor::build_system_prompt(&tools, &revealed, false, None);
 
         // Group index lists every group with counts.
         assert!(prompt.contains("AVAILABLE TOOL GROUPS"));
@@ -1723,8 +1714,7 @@ mod tests {
         let tools = vec![tool_def("calendar_create", "create event")];
         let revealed = HashSet::new();
         let dir = std::path::PathBuf::from("/tmp/athen-test/tools");
-        let prompt =
-            DefaultExecutor::build_system_prompt(&tools, &revealed, false, Some(&dir));
+        let prompt = DefaultExecutor::build_system_prompt(&tools, &revealed, false, Some(&dir));
         // Pattern reference uses the directory + <group>.md placeholder.
         assert!(prompt.contains("/tmp/athen-test/tools"));
         assert!(prompt.contains("<group>.md"));
@@ -1737,8 +1727,7 @@ mod tests {
     fn system_prompt_omits_doc_pointer_when_unset() {
         let tools = vec![tool_def("calendar_create", "create event")];
         let revealed = HashSet::new();
-        let prompt =
-            DefaultExecutor::build_system_prompt(&tools, &revealed, false, None);
+        let prompt = DefaultExecutor::build_system_prompt(&tools, &revealed, false, None);
         assert!(!prompt.contains("read("));
     }
 
@@ -1752,13 +1741,13 @@ mod tests {
     #[async_trait]
     impl ToolRegistry for OrderedSleepyRegistry {
         async fn list_tools(&self) -> Result<Vec<ToolDefinition>> {
-            Ok(vec![tool_def("a", ""), tool_def("b", ""), tool_def("c", "")])
+            Ok(vec![
+                tool_def("a", ""),
+                tool_def("b", ""),
+                tool_def("c", ""),
+            ])
         }
-        async fn call_tool(
-            &self,
-            name: &str,
-            _args: serde_json::Value,
-        ) -> Result<CoreToolResult> {
+        async fn call_tool(&self, name: &str, _args: serde_json::Value) -> Result<CoreToolResult> {
             self.order.lock().unwrap().push(name.to_string());
             tokio::time::sleep(self.sleep).await;
             Ok(CoreToolResult {
@@ -1775,9 +1764,21 @@ mod tests {
         // Three slow tool calls in one response. If sequential, total ≥ 3 × sleep.
         // If parallel, total ≈ 1 × sleep. Use 200ms sleep, assert <500ms total.
         let calls = vec![
-            ToolCall { id: "1".into(), name: "a".into(), arguments: serde_json::json!({}) },
-            ToolCall { id: "2".into(), name: "b".into(), arguments: serde_json::json!({}) },
-            ToolCall { id: "3".into(), name: "c".into(), arguments: serde_json::json!({}) },
+            ToolCall {
+                id: "1".into(),
+                name: "a".into(),
+                arguments: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "2".into(),
+                name: "b".into(),
+                arguments: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "3".into(),
+                name: "c".into(),
+                arguments: serde_json::json!({}),
+            },
         ];
         let responses = vec![
             MockLlmRouter::make_response("Calling all three.", calls),
@@ -1800,7 +1801,10 @@ mod tests {
         );
 
         let started = std::time::Instant::now();
-        let result = executor.execute(make_task("Run three things")).await.unwrap();
+        let result = executor
+            .execute(make_task("Run three things"))
+            .await
+            .unwrap();
         let elapsed = started.elapsed();
 
         assert!(result.success);
@@ -1847,7 +1851,10 @@ mod tests {
             vec![],
         );
 
-        let result = executor.execute(make_task("Create an event")).await.unwrap();
+        let result = executor
+            .execute(make_task("Create an event"))
+            .await
+            .unwrap();
         assert!(result.success);
         // 1 dispatch + 1 completion = 2 steps (no get_tool_details round-trip).
         assert_eq!(result.steps_completed, 2);
@@ -1882,10 +1889,7 @@ mod tests {
             ) -> Result<()> {
                 self.0.record_step(task_id, step).await
             }
-            async fn get_steps(
-                &self,
-                task_id: athen_core::task::TaskId,
-            ) -> Result<Vec<TaskStep>> {
+            async fn get_steps(&self, task_id: athen_core::task::TaskId) -> Result<Vec<TaskStep>> {
                 self.0.get_steps(task_id).await
             }
         }
@@ -1952,10 +1956,7 @@ mod tests {
             ) -> Result<()> {
                 self.0.record_step(task_id, step).await
             }
-            async fn get_steps(
-                &self,
-                task_id: athen_core::task::TaskId,
-            ) -> Result<Vec<TaskStep>> {
+            async fn get_steps(&self, task_id: athen_core::task::TaskId) -> Result<Vec<TaskStep>> {
                 self.0.get_steps(task_id).await
             }
         }

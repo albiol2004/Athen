@@ -83,10 +83,7 @@ impl DeepSeekProvider {
                 (Role::Assistant, MessageContent::Structured(v))
                     if v.get("tool_calls").is_some() =>
                 {
-                    let text = v
-                        .get("text")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or_default();
+                    let text = v.get("text").and_then(|t| t.as_str()).unwrap_or_default();
                     let content = if text.is_empty() {
                         None
                     } else {
@@ -106,13 +103,9 @@ impl DeepSeekProvider {
                                     function: OpenAiToolCallFunctionOut {
                                         name: tc.name,
                                         arguments: if tc.arguments.is_string() {
-                                            tc.arguments
-                                                .as_str()
-                                                .unwrap_or_default()
-                                                .to_string()
+                                            tc.arguments.as_str().unwrap_or_default().to_string()
                                         } else {
-                                            serde_json::to_string(&tc.arguments)
-                                                .unwrap_or_default()
+                                            serde_json::to_string(&tc.arguments).unwrap_or_default()
                                         },
                                     },
                                 })
@@ -127,18 +120,13 @@ impl DeepSeekProvider {
                     });
                 }
                 // Tool result messages with tool_call_id.
-                (Role::Tool, MessageContent::Structured(v))
-                    if v.get("tool_call_id").is_some() =>
-                {
+                (Role::Tool, MessageContent::Structured(v)) if v.get("tool_call_id").is_some() => {
                     let tool_call_id = v
                         .get("tool_call_id")
                         .and_then(|id| id.as_str())
                         .unwrap_or_default()
                         .to_string();
-                    let content_str = v
-                        .get("content")
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("{}");
+                    let content_str = v.get("content").and_then(|c| c.as_str()).unwrap_or("{}");
 
                     messages.push(OpenAiMessageOut {
                         role: role.to_string(),
@@ -238,15 +226,21 @@ impl LlmProvider for DeepSeekProvider {
         }
 
         let api_response: OpenAiResponse =
-            http_response.json().await.map_err(|e| AthenError::LlmProvider {
-                provider: "deepseek".into(),
-                message: format!("failed to parse response: {}", e),
-            })?;
+            http_response
+                .json()
+                .await
+                .map_err(|e| AthenError::LlmProvider {
+                    provider: "deepseek".into(),
+                    message: format!("failed to parse response: {}", e),
+                })?;
 
-        let choice = api_response.choices.first().ok_or_else(|| AthenError::LlmProvider {
-            provider: "deepseek".into(),
-            message: "response contained no choices".into(),
-        })?;
+        let choice = api_response
+            .choices
+            .first()
+            .ok_or_else(|| AthenError::LlmProvider {
+                provider: "deepseek".into(),
+                message: "response contained no choices".into(),
+            })?;
 
         let content = choice.message.content.clone().unwrap_or_default();
         let reasoning_content = choice.message.reasoning_content.clone();
@@ -387,7 +381,10 @@ impl LlmProvider for DeepSeekProvider {
                         out
                     }
                 };
-                Some((futures::stream::iter(parsed), (byte_stream, acc, pending, done)))
+                Some((
+                    futures::stream::iter(parsed),
+                    (byte_stream, acc, pending, done),
+                ))
             },
         )
         .flatten();

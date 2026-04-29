@@ -186,10 +186,7 @@ impl DefaultLlmRouter {
     }
 
     /// Build a router with custom circuit breaker settings per provider.
-    pub fn with_circuit_breakers(
-        self,
-        breakers: HashMap<String, CircuitBreaker>,
-    ) -> Self {
+    pub fn with_circuit_breakers(self, breakers: HashMap<String, CircuitBreaker>) -> Self {
         *self.circuit_breakers.lock().unwrap() = breakers;
         self
     }
@@ -283,9 +280,7 @@ impl DefaultLlmRouter {
             // Check circuit breaker
             {
                 let mut breakers = self.circuit_breakers.lock().unwrap();
-                let breaker = breakers
-                    .entry(provider_id.clone())
-                    .or_default();
+                let breaker = breakers.entry(provider_id.clone()).or_default();
                 if !breaker.allows_request() {
                     debug!(
                         provider = %provider_id,
@@ -336,10 +331,7 @@ impl DefaultLlmRouter {
 
         Err(last_error.unwrap_or_else(|| AthenError::LlmProvider {
             provider: "router".into(),
-            message: format!(
-                "all providers exhausted for profile {:?}",
-                request.profile
-            ),
+            message: format!("all providers exhausted for profile {:?}", request.profile),
         }))
     }
 }
@@ -442,10 +434,7 @@ mod tests {
             }
         }
 
-        async fn complete_streaming(
-            &self,
-            _request: &LlmRequest,
-        ) -> Result<LlmStream> {
+        async fn complete_streaming(&self, _request: &LlmRequest) -> Result<LlmStream> {
             Err(AthenError::LlmProvider {
                 provider: self.id.clone(),
                 message: "streaming not supported in mock".into(),
@@ -531,11 +520,7 @@ mod tests {
 
     #[test]
     fn test_circuit_breaker_state_transitions() {
-        let mut cb = CircuitBreaker::with_thresholds(
-            3,
-            2,
-            Duration::from_millis(50),
-        );
+        let mut cb = CircuitBreaker::with_thresholds(3, 2, Duration::from_millis(50));
 
         // Starts closed
         assert_eq!(cb.state(), CircuitState::Closed);
@@ -580,11 +565,7 @@ mod tests {
 
     #[test]
     fn test_circuit_breaker_half_open_failure_reopens() {
-        let mut cb = CircuitBreaker::with_thresholds(
-            2,
-            2,
-            Duration::from_millis(1),
-        );
+        let mut cb = CircuitBreaker::with_thresholds(2, 2, Duration::from_millis(1));
 
         cb.record_failure();
         cb.record_failure();
@@ -637,12 +618,8 @@ mod tests {
         breakers.insert("provider_a".into(), cb);
         breakers.insert("provider_b".into(), CircuitBreaker::new());
 
-        let router = DefaultLlmRouter::new(
-            providers,
-            profiles,
-            BudgetTracker::new(None),
-        )
-        .with_circuit_breakers(breakers);
+        let router = DefaultLlmRouter::new(providers, profiles, BudgetTracker::new(None))
+            .with_circuit_breakers(breakers);
 
         let response = router.route(&make_request()).await.unwrap();
         assert_eq!(response.provider, "provider_b");
@@ -662,10 +639,7 @@ mod tests {
         );
 
         let mut profiles = HashMap::new();
-        profiles.insert(
-            ModelProfile::Powerful,
-            make_profile(vec!["provider_a"]),
-        );
+        profiles.insert(ModelProfile::Powerful, make_profile(vec!["provider_a"]));
 
         let tracker = BudgetTracker::new(Some(0.0)); // zero budget
 
@@ -685,10 +659,7 @@ mod tests {
         );
 
         let mut profiles = HashMap::new();
-        profiles.insert(
-            ModelProfile::Powerful,
-            make_profile(vec!["provider_a"]),
-        );
+        profiles.insert(ModelProfile::Powerful, make_profile(vec!["provider_a"]));
 
         let tracker = BudgetTracker::new(Some(1.0));
         let router = DefaultLlmRouter::new(providers, profiles, tracker);

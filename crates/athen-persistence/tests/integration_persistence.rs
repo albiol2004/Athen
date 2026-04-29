@@ -43,7 +43,13 @@ fn make_step(index: u32, description: &str, status: StepStatus) -> TaskStep {
 
 fn make_task_with_steps(description: &str, num_steps: u32) -> Task {
     let steps: Vec<TaskStep> = (0..num_steps)
-        .map(|i| make_step(i, &format!("Step {i}: process stage {i}"), StepStatus::Pending))
+        .map(|i| {
+            make_step(
+                i,
+                &format!("Step {i}: process stage {i}"),
+                StepStatus::Pending,
+            )
+        })
         .collect();
 
     Task {
@@ -304,7 +310,10 @@ async fn test_pending_messages_queue_ordering() {
 
     // Pop again -- should get empty vec
     let popped_empty = store.pop_pending_messages(3).await.unwrap();
-    assert!(popped_empty.is_empty(), "Should get empty vec when no messages remain");
+    assert!(
+        popped_empty.is_empty(),
+        "Should get empty vec when no messages remain"
+    );
 
     // Verify the popped messages can't be popped again (they're marked processed)
     let popped_again = store.pop_pending_messages(100).await.unwrap();
@@ -362,10 +371,7 @@ async fn test_concurrent_task_operations() {
     }
 
     // List all tasks -- should have exactly 10
-    let all_tasks = store
-        .list_tasks(TaskFilter::default())
-        .await
-        .unwrap();
+    let all_tasks = store.list_tasks(TaskFilter::default()).await.unwrap();
     assert_eq!(all_tasks.len(), 10, "Should have exactly 10 tasks");
 
     // Each task should have unique data
@@ -401,8 +407,7 @@ async fn test_checkpoint_manager_file_atomicity() {
     let store = db.store();
 
     // Create a CheckpointManager with a temp directory
-    let manager =
-        CheckpointManager::with_file_backup(store, &checkpoint_dir).unwrap();
+    let manager = CheckpointManager::with_file_backup(store, &checkpoint_dir).unwrap();
 
     let task_id = Uuid::new_v4();
 
@@ -437,7 +442,10 @@ async fn test_checkpoint_manager_file_atomicity() {
     // Load again -- should get the new data, not the old
     let loaded_v2 = manager.load(task_id).await.unwrap().unwrap();
     assert_eq!(loaded_v2, data_v2);
-    assert_ne!(loaded_v2, data_v1, "Should not return old data after overwrite");
+    assert_ne!(
+        loaded_v2, data_v1,
+        "Should not return old data after overwrite"
+    );
 
     // Verify the file on disk was updated (not duplicated)
     assert!(checkpoint_file.exists());

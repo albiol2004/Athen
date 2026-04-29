@@ -58,9 +58,13 @@ mod tests {
     async fn test_landlock_returns_not_implemented() {
         let sandbox = LandlockSandbox;
         let result = sandbox
-            .execute("ls", &[], &SandboxLevel::OsNative {
-                profile: athen_core::sandbox::SandboxProfile::ReadOnly,
-            })
+            .execute(
+                "ls",
+                &[],
+                &SandboxLevel::OsNative {
+                    profile: athen_core::sandbox::SandboxProfile::ReadOnly,
+                },
+            )
             .await;
 
         assert!(result.is_err());

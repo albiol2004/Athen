@@ -30,12 +30,10 @@ pub fn load_config_dir(dir: &Path) -> Result<AthenConfig> {
 
     // Override models if models.toml exists
     if dir.join("models.toml").exists() {
-        let content = std::fs::read_to_string(dir.join("models.toml")).map_err(|e| {
-            AthenError::Config(format!("Failed to read models.toml: {e}"))
-        })?;
-        config.models = toml::from_str(&content).map_err(|e| {
-            AthenError::Config(format!("Failed to parse models.toml: {e}"))
-        })?;
+        let content = std::fs::read_to_string(dir.join("models.toml"))
+            .map_err(|e| AthenError::Config(format!("Failed to read models.toml: {e}")))?;
+        config.models = toml::from_str(&content)
+            .map_err(|e| AthenError::Config(format!("Failed to parse models.toml: {e}")))?;
     }
 
     Ok(config)
@@ -65,9 +63,7 @@ pub fn save_default_config(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{
-        AuthType, OperationMode, ProfileConfig, ProviderConfig, SecurityMode,
-    };
+    use crate::config::{AuthType, OperationMode, ProfileConfig, ProviderConfig, SecurityMode};
     use tempfile::TempDir;
 
     #[test]

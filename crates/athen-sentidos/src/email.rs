@@ -110,10 +110,7 @@ fn collect_parts(
             .cloned()
             .unwrap_or_else(|| "unnamed".to_string());
 
-        let size = mail
-            .get_body_raw()
-            .map(|b| b.len() as u64)
-            .unwrap_or(0);
+        let size = mail.get_body_raw().map(|b| b.len() as u64).unwrap_or(0);
 
         attachments.push(Attachment {
             name: filename,
@@ -155,10 +152,7 @@ fn collect_parts(
             .cloned()
             .unwrap_or_else(|| "unnamed".to_string());
 
-        let size = mail
-            .get_body_raw()
-            .map(|b| b.len() as u64)
-            .unwrap_or(0);
+        let size = mail.get_body_raw().map(|b| b.len() as u64).unwrap_or(0);
 
         attachments.push(Attachment {
             name: filename,
@@ -184,10 +178,7 @@ fn extract_sender(parsed: &mailparse::ParsedMail<'_>) -> Option<SenderInfo> {
     // Try to split "Display Name <email@example.com>" format.
     let (display_name, identifier) = if let Some(start) = from.find('<') {
         let name = from[..start].trim().trim_matches('"').to_string();
-        let email = from[start + 1..]
-            .trim_end_matches('>')
-            .trim()
-            .to_string();
+        let email = from[start + 1..].trim_end_matches('>').trim().to_string();
         let display = if name.is_empty() { None } else { Some(name) };
         (display, email)
     } else {
@@ -367,7 +358,7 @@ impl SenseMonitor for EmailMonitor {
             match guard.as_ref() {
                 Some(c) if c.enabled => c.clone(),
                 Some(_) => return Ok(Vec::new()), // disabled
-                None => return Ok(Vec::new()),     // not initialized
+                None => return Ok(Vec::new()),    // not initialized
             }
         };
 
@@ -384,14 +375,12 @@ impl SenseMonitor for EmailMonitor {
                     AthenError::Other(format!("TCP connect to {server}:{port}: {e}"))
                 })?;
 
-                let connector =
-                    rustls_connector::RustlsConnector::new_with_native_certs().map_err(|e| {
-                        AthenError::Other(format!("TLS connector setup: {e}"))
-                    })?;
+                let connector = rustls_connector::RustlsConnector::new_with_native_certs()
+                    .map_err(|e| AthenError::Other(format!("TLS connector setup: {e}")))?;
 
-                let tls_stream = connector.connect(server, tcp).map_err(|e| {
-                    AthenError::Other(format!("TLS handshake with {server}: {e}"))
-                })?;
+                let tls_stream = connector
+                    .connect(server, tcp)
+                    .map_err(|e| AthenError::Other(format!("TLS handshake with {server}: {e}")))?;
 
                 let client = imap::Client::new(tls_stream);
                 let mut session = client
@@ -747,7 +736,10 @@ Just a body, no subject";
         let event = message_to_event(99, raw).unwrap();
         assert!(event.content.summary.is_none());
         assert_eq!(event.raw_id.as_deref(), Some("99"));
-        assert!(event.content.body["text"].as_str().unwrap().contains("Just a body"));
+        assert!(event.content.body["text"]
+            .as_str()
+            .unwrap()
+            .contains("Just a body"));
     }
 
     #[test]

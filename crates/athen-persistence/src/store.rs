@@ -116,8 +116,7 @@ fn save_task_sync(conn: &Connection, task: &Task) -> Result<()> {
         .unchecked_transaction()
         .map_err(|e| AthenError::Other(format!("Transaction start: {e}")))?;
 
-    let domain_json =
-        serde_json::to_string(&task.domain).map_err(AthenError::Serialization)?;
+    let domain_json = serde_json::to_string(&task.domain).map_err(AthenError::Serialization)?;
     let risk_score_json = task
         .risk_score
         .as_ref()
@@ -179,8 +178,7 @@ fn save_task_sync(conn: &Connection, task: &Task) -> Result<()> {
                 task.id.to_string(),
                 step.index as i64,
                 step.description,
-                serde_json::to_string(&step.status)
-                    .map_err(AthenError::Serialization)?,
+                serde_json::to_string(&step.status).map_err(AthenError::Serialization)?,
                 step.started_at.map(|t| t.to_rfc3339()),
                 step.completed_at.map(|t| t.to_rfc3339()),
                 output_json,
@@ -472,8 +470,7 @@ impl PersistentStore for SqliteStore {
 
             let mut tasks = Vec::new();
             for row_result in rows {
-                let row =
-                    row_result.map_err(|e| AthenError::Other(format!("Row: {e}")))?;
+                let row = row_result.map_err(|e| AthenError::Other(format!("Row: {e}")))?;
                 let task_id_str = row.id.clone();
                 let steps = load_steps_sync(&conn, &task_id_str)?;
                 tasks.push(row_to_task(row, steps)?);
@@ -488,8 +485,7 @@ impl PersistentStore for SqliteStore {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            let data_json =
-                serde_json::to_string(&data).map_err(AthenError::Serialization)?;
+            let data_json = serde_json::to_string(&data).map_err(AthenError::Serialization)?;
 
             use sha2::{Digest, Sha256};
             let checksum = format!("{:x}", Sha256::digest(data_json.as_bytes()));
@@ -529,16 +525,15 @@ impl PersistentStore for SqliteStore {
                 Some((data_json, stored_checksum)) => {
                     // Verify integrity
                     use sha2::{Digest, Sha256};
-                    let computed =
-                        format!("{:x}", Sha256::digest(data_json.as_bytes()));
+                    let computed = format!("{:x}", Sha256::digest(data_json.as_bytes()));
                     if computed != stored_checksum {
                         return Err(AthenError::Other(format!(
                             "Checkpoint integrity check failed for task {task_id}: \
                              expected {stored_checksum}, got {computed}"
                         )));
                     }
-                    let value: Value = serde_json::from_str(&data_json)
-                        .map_err(AthenError::Serialization)?;
+                    let value: Value =
+                        serde_json::from_str(&data_json).map_err(AthenError::Serialization)?;
                     Ok(Some(value))
                 }
             }
@@ -552,16 +547,11 @@ impl PersistentStore for SqliteStore {
         let msg = msg.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            let message_json =
-                serde_json::to_string(&msg).map_err(AthenError::Serialization)?;
+            let message_json = serde_json::to_string(&msg).map_err(AthenError::Serialization)?;
             conn.execute(
                 "INSERT INTO pending_messages (id, message_json, received_at, processed) \
                  VALUES (?1, ?2, ?3, 0)",
-                params![
-                    msg.id.to_string(),
-                    message_json,
-                    Utc::now().to_rfc3339(),
-                ],
+                params![msg.id.to_string(), message_json, Utc::now().to_rfc3339(),],
             )
             .map_err(|e| AthenError::Other(format!("Save pending: {e}")))?;
             Ok(())
@@ -588,10 +578,11 @@ impl PersistentStore for SqliteStore {
                     )
                     .map_err(|e| AthenError::Other(format!("Prepare pop: {e}")))?;
 
-                let mapped = stmt.query_map(params![limit as i64], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })
-                .map_err(|e| AthenError::Other(format!("Query pop: {e}")))?;
+                let mapped = stmt
+                    .query_map(params![limit as i64], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .map_err(|e| AthenError::Other(format!("Query pop: {e}")))?;
                 let collected = mapped
                     .collect::<std::result::Result<Vec<_>, _>>()
                     .map_err(|e| AthenError::Other(format!("Collect pop: {e}")))?;
@@ -757,10 +748,7 @@ mod tests {
         store.save_task(&t1).await.unwrap();
         store.save_task(&t2).await.unwrap();
 
-        let all = store
-            .list_tasks(TaskFilter::default())
-            .await
-            .unwrap();
+        let all = store.list_tasks(TaskFilter::default()).await.unwrap();
         assert_eq!(all.len(), 2);
     }
 

@@ -88,9 +88,13 @@ mod tests {
     #[tokio::test]
     async fn execute_returns_unimplemented_error() {
         let result = MacOsSandbox
-            .execute("/bin/echo", &["hi"], &SandboxLevel::OsNative {
-                profile: SandboxProfile::ReadOnly,
-            })
+            .execute(
+                "/bin/echo",
+                &["hi"],
+                &SandboxLevel::OsNative {
+                    profile: SandboxProfile::ReadOnly,
+                },
+            )
             .await;
         let err = result.unwrap_err().to_string();
         assert!(err.contains("not yet implemented"));

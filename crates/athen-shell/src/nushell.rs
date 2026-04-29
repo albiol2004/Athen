@@ -197,10 +197,7 @@ mod tests {
     async fn test_which_fallback() {
         let shell = NushellShell::new().await;
         // Nonexistent program should return None regardless of nushell availability.
-        let result = shell
-            .which("nonexistent_program_xyz_12345")
-            .await
-            .unwrap();
+        let result = shell.which("nonexistent_program_xyz_12345").await.unwrap();
         assert!(result.is_none());
     }
 

@@ -65,7 +65,10 @@ impl PageReader for CloudflareReader {
 
         // Standard Cloudflare API envelope: { success, errors, result }.
         // The /markdown endpoint puts the markdown string in `result`.
-        let success = body.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+        let success = body
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         if !success {
             return Err(AthenError::Other(format!(
                 "cloudflare reader reported failure: {body}"

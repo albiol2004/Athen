@@ -8,20 +8,18 @@ use async_trait::async_trait;
 use chrono::Utc;
 use uuid::Uuid;
 
+use athen_agent::{AgentBuilder, ShellToolRegistry};
+use athen_coordinador::Coordinator;
 use athen_core::config::{AuthType, ProfileConfig};
 use athen_core::config_loader;
 use athen_core::error::Result;
 use athen_core::event::{EventKind, EventSource, NormalizedContent, SenseEvent};
-use athen_core::llm::{
-    BudgetStatus, LlmRequest, LlmResponse, ModelProfile,
-};
+use athen_core::llm::{BudgetStatus, LlmRequest, LlmResponse, ModelProfile};
 use athen_core::risk::RiskLevel;
 use athen_core::task::{DomainType, Task, TaskPriority, TaskStatus};
 use athen_core::traits::agent::AgentExecutor;
 use athen_core::traits::coordinator::TaskQueue;
 use athen_core::traits::llm::LlmRouter;
-use athen_agent::{AgentBuilder, ShellToolRegistry};
-use athen_coordinador::Coordinator;
 use athen_llm::budget::BudgetTracker;
 use athen_llm::providers::deepseek::DeepSeekProvider;
 use athen_llm::router::DefaultLlmRouter;
@@ -183,24 +181,18 @@ async fn main() {
             // Try to get from config providers
             match config.models.providers.get("deepseek") {
                 Some(provider) => match &provider.auth {
-                    AuthType::ApiKey(key)
-                        if !key.is_empty() && !key.starts_with("${") =>
-                    {
+                    AuthType::ApiKey(key) if !key.is_empty() && !key.starts_with("${") => {
                         key.clone()
                     }
                     _ => {
                         eprintln!("Error: DEEPSEEK_API_KEY environment variable not set.");
-                        eprintln!(
-                            "Export it before running:  export DEEPSEEK_API_KEY=\"sk-...\""
-                        );
+                        eprintln!("Export it before running:  export DEEPSEEK_API_KEY=\"sk-...\"");
                         std::process::exit(1);
                     }
                 },
                 None => {
                     eprintln!("Error: DEEPSEEK_API_KEY environment variable not set.");
-                    eprintln!(
-                        "Export it before running:  export DEEPSEEK_API_KEY=\"sk-...\""
-                    );
+                    eprintln!("Export it before running:  export DEEPSEEK_API_KEY=\"sk-...\"");
                     std::process::exit(1);
                 }
             }
@@ -302,7 +294,10 @@ async fn main() {
                             {
                                 println!("{response}");
                             } else {
-                                println!("{}", serde_json::to_string_pretty(output).unwrap_or_default());
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(output).unwrap_or_default()
+                                );
                             }
                         }
                         if !result.success {

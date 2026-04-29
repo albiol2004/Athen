@@ -98,7 +98,9 @@ fn dirs_path() -> Option<std::path::PathBuf> {
 fn home_dir() -> Option<std::path::PathBuf> {
     #[cfg(target_os = "windows")]
     {
-        std::env::var("USERPROFILE").ok().map(std::path::PathBuf::from)
+        std::env::var("USERPROFILE")
+            .ok()
+            .map(std::path::PathBuf::from)
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -113,10 +115,7 @@ fn home_dir() -> Option<std::path::PathBuf> {
 /// 7 days and let `generate_reminder_events` decide which reminders to fire
 /// based on each event's `reminder_minutes`. This correctly handles long-lead
 /// reminders like "1 day before".
-fn query_upcoming_events(
-    db_path: &str,
-    now: DateTime<Utc>,
-) -> Result<Vec<UpcomingEvent>> {
+fn query_upcoming_events(db_path: &str, now: DateTime<Utc>) -> Result<Vec<UpcomingEvent>> {
     let conn = rusqlite::Connection::open(db_path)
         .map_err(|e| AthenError::Other(format!("Calendar DB open failed: {e}")))?;
 

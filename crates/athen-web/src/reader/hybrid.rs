@@ -155,9 +155,8 @@ impl PageReader for HybridReader {
 
         // Nothing worked. Surface the primary's outcome — even if it was
         // thin content, that's still our best signal of what's there.
-        primary_result.map_err(|_| {
-            AthenError::Other(format!("hybrid reader: all tiers failed for {url}"))
-        })
+        primary_result
+            .map_err(|_| AthenError::Other(format!("hybrid reader: all tiers failed for {url}")))
     }
 }
 

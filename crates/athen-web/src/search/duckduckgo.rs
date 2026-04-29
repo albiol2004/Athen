@@ -24,7 +24,9 @@ pub struct DuckDuckGoSearch {
 
 impl DuckDuckGoSearch {
     pub fn new() -> Self {
-        Self { client: crate::default_http_client() }
+        Self {
+            client: crate::default_http_client(),
+        }
     }
 
     pub fn with_client(client: reqwest::Client) -> Self {
@@ -88,11 +90,10 @@ impl WebSearchProvider for DuckDuckGoSearch {
 /// query.
 fn parse_serp(html: &str, max_results: usize) -> Vec<SearchResult> {
     let doc = Html::parse_document(html);
-    let result_sel =
-        Selector::parse(result_selector()).expect("static selector should parse");
+    let result_sel = Selector::parse(result_selector()).expect("static selector should parse");
     let title_sel = Selector::parse("a.result__a").expect("static selector should parse");
-    let snippet_sel =
-        Selector::parse("a.result__snippet, .result__snippet").expect("static selector should parse");
+    let snippet_sel = Selector::parse("a.result__snippet, .result__snippet")
+        .expect("static selector should parse");
 
     let mut out = Vec::with_capacity(max_results.min(20));
     for el in doc.select(&result_sel) {
@@ -121,7 +122,11 @@ fn parse_serp(html: &str, max_results: usize) -> Vec<SearchResult> {
         if title.is_empty() && url.is_empty() {
             continue;
         }
-        out.push(SearchResult { title, url, snippet });
+        out.push(SearchResult {
+            title,
+            url,
+            snippet,
+        });
     }
     out
 }

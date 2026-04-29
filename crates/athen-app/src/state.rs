@@ -16,19 +16,19 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
 use athen_contacts::trust::TrustManager;
-use athen_persistence::contacts::SqliteContactStore;
 use athen_core::config::{AthenConfig, AuthType, ProfileConfig};
 use athen_core::config_loader;
 use athen_core::traits::notification::NotificationChannel;
+use athen_persistence::contacts::SqliteContactStore;
 
 use crate::notifier::{InAppChannel, NotificationOrchestrator, TelegramChannel};
+use athen_coordinador::Coordinator;
 use athen_core::error::Result;
 use athen_core::llm::{
     BudgetStatus, ChatMessage, LlmRequest, LlmResponse, LlmStream, MessageContent, ModelProfile,
     Role,
 };
 use athen_core::traits::llm::{LlmProvider, LlmRouter};
-use athen_coordinador::Coordinator;
 use athen_llm::budget::BudgetTracker;
 use athen_llm::providers::deepseek::DeepSeekProvider;
 use athen_llm::providers::llamacpp::LlamaCppProvider;
@@ -173,7 +173,8 @@ impl AppState {
 
         let router = Arc::new(RwLock::new(router));
 
-        let (coordinator, database, contact_store) = build_coordinator_with_persistence(&router).await;
+        let (coordinator, database, contact_store) =
+            build_coordinator_with_persistence(&router).await;
 
         // Build the arc store and run migration from legacy chat tables.
         let arc_store = database.as_ref().map(|db| db.arc_store());
@@ -202,8 +203,7 @@ impl AppState {
         let tool_doc_dir = ensure_data_dir().map(|d| d.join("tools"));
 
         let grant_store = database.as_ref().map(|db| Arc::new(db.grant_store()));
-        let pending_grants =
-            Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let pending_grants = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let spawned_processes: athen_agent::SpawnedProcessMap =
             Arc::new(Mutex::new(HashMap::new()));
 
@@ -217,9 +217,9 @@ impl AppState {
             active_arc_id: Mutex::new(active_arc_id),
             arc_store,
             calendar_store,
-            trust_manager: contact_store.as_ref().map(|cs| {
-                TrustManager::new(Box::new(cs.clone()))
-            }),
+            trust_manager: contact_store
+                .as_ref()
+                .map(|cs| TrustManager::new(Box::new(cs.clone()))),
             contact_store,
             _database: database,
             cancel_flag: Arc::new(AtomicBool::new(false)),
@@ -264,13 +264,12 @@ impl AppState {
         )
         .with_mcp(self.mcp.clone() as Arc<dyn athen_core::traits::mcp::McpClient>);
         let tools = athen_core::traits::tool::ToolRegistry::list_tools(&registry).await?;
-        let written =
-            athen_agent::tools_doc::write_per_group(&dir, &tools).map_err(|e| {
-                athen_core::error::AthenError::Other(format!(
-                    "write tool docs into {}: {e}",
-                    dir.display()
-                ))
-            })?;
+        let written = athen_agent::tools_doc::write_per_group(&dir, &tools).map_err(|e| {
+            athen_core::error::AthenError::Other(format!(
+                "write tool docs into {}: {e}",
+                dir.display()
+            ))
+        })?;
         info!(
             "Wrote {} group(s) of tool schemas under {}",
             written.len(),
@@ -335,10 +334,7 @@ impl AppState {
             let token = &config.telegram.bot_token;
             if let Some(owner_id) = config.telegram.owner_user_id {
                 if !token.is_empty() {
-                    channels.push(Box::new(TelegramChannel::new(
-                        token.clone(),
-                        owner_id,
-                    )));
+                    channels.push(Box::new(TelegramChannel::new(token.clone(), owner_id)));
                 }
             }
         }
@@ -429,7 +425,8 @@ impl AppState {
                                 &arc_store_ref,
                                 &app_handle,
                                 notifier.as_ref(),
-                            ).await;
+                            )
+                            .await;
                         }
                     }
                     Ok(_) => {
@@ -477,7 +474,10 @@ impl AppState {
             }
 
             let poll_interval = monitor.poll_interval();
-            info!("Calendar monitor started, polling every {:?}", poll_interval);
+            info!(
+                "Calendar monitor started, polling every {:?}",
+                poll_interval
+            );
 
             loop {
                 match monitor.poll().await {
@@ -490,7 +490,8 @@ impl AppState {
                                 &arc_store_ref,
                                 &app_handle,
                                 notifier.as_ref(),
-                            ).await;
+                            )
+                            .await;
                         }
                     }
                     Ok(_) => {}
@@ -556,7 +557,10 @@ impl AppState {
             }
 
             let poll_interval = monitor.poll_interval();
-            info!("Telegram monitor started, polling every {:?}", poll_interval);
+            info!(
+                "Telegram monitor started, polling every {:?}",
+                poll_interval
+            );
 
             let mut shutdown = shutdown_rx;
             loop {
@@ -564,8 +568,7 @@ impl AppState {
                     Ok(events) if !events.is_empty() => {
                         info!("Telegram monitor received {} new event(s)", events.len());
                         for event in &events {
-                            let is_owner =
-                                event.source_risk == athen_core::risk::RiskLevel::Safe;
+                            let is_owner = event.source_risk == athen_core::risk::RiskLevel::Safe;
 
                             if is_owner {
                                 // Owner messages skip triage/notification and go
@@ -578,8 +581,7 @@ impl AppState {
                                     .and_then(|v| v.as_str())
                                     .filter(|s| !s.is_empty())
                                     .or_else(|| {
-                                        event.content.summary.as_deref()
-                                            .filter(|s| !s.is_empty())
+                                        event.content.summary.as_deref().filter(|s| !s.is_empty())
                                     })
                                     .unwrap_or("");
 
@@ -679,11 +681,11 @@ async fn execute_owner_telegram_message(
 ) {
     use std::time::Duration;
 
+    use crate::app_tools::AppToolRegistry;
+    use crate::commands::{spawn_stream_forwarder, AgentProgress, TauriAuditor};
     use athen_agent::{AgentBuilder, ShellToolRegistry};
     use athen_core::task::{DomainType, Task, TaskPriority, TaskStatus};
     use athen_core::traits::agent::AgentExecutor;
-    use crate::app_tools::AppToolRegistry;
-    use crate::commands::{spawn_stream_forwarder, AgentProgress, TauriAuditor};
     use tauri::Emitter;
 
     info!("Executing owner Telegram message through agent: {}", text);
@@ -695,7 +697,8 @@ async fn execute_owner_telegram_message(
             Ok(arcs) => {
                 let now = chrono::Utc::now();
                 // Look for a recent active Messaging arc within 5 minutes.
-                let recent = arcs.iter()
+                let recent = arcs
+                    .iter()
                     .filter(|a| {
                         a.source == athen_persistence::arcs::ArcSource::Messaging
                             && a.status == athen_persistence::arcs::ArcStatus::Active
@@ -718,11 +721,14 @@ async fn execute_owner_telegram_message(
                     } else {
                         text.to_string()
                     };
-                    if let Err(e) = store.create_arc(
-                        &arc_id,
-                        &name,
-                        athen_persistence::arcs::ArcSource::Messaging,
-                    ).await {
+                    if let Err(e) = store
+                        .create_arc(
+                            &arc_id,
+                            &name,
+                            athen_persistence::arcs::ArcSource::Messaging,
+                        )
+                        .await
+                    {
                         warn!("Failed to create arc for Telegram message: {e}");
                     }
                     info!("Created new Telegram arc: {}", arc_id);
@@ -782,8 +788,13 @@ async fn execute_owner_telegram_message(
         });
         shell_registry = shell_registry.with_extra_writable(provider);
     }
-    let mut registry = AppToolRegistry::new(shell_registry, calendar_store.clone(), contact_store.clone(), memory.clone())
-        .with_mcp(mcp.clone() as Arc<dyn athen_core::traits::mcp::McpClient>);
+    let mut registry = AppToolRegistry::new(
+        shell_registry,
+        calendar_store.clone(),
+        contact_store.clone(),
+        memory.clone(),
+    )
+    .with_mcp(mcp.clone() as Arc<dyn athen_core::traits::mcp::McpClient>);
     if let (Some(store), Some(arc_id_str)) = (grant_store, target_arc_id.as_ref()) {
         let gate = Arc::new(crate::file_gate::FileGate::new(
             arc_id_str.clone(),
@@ -809,8 +820,7 @@ async fn execute_owner_telegram_message(
     if let Some(p) = tool_doc_dir {
         builder = builder.tool_doc_dir(p.to_path_buf());
     }
-    let executor = match builder.build()
-    {
+    let executor = match builder.build() {
         Ok(e) => e,
         Err(e) => {
             tracing::error!("Failed to build agent for owner Telegram message: {e}");
@@ -941,7 +951,11 @@ async fn execute_owner_telegram_message(
 /// Send a text message to a Telegram chat via the Bot API.
 ///
 /// Delegates to [`athen_sentidos::telegram::send_message`].
-async fn send_telegram_reply(bot_token: &str, chat_id: i64, text: &str) -> std::result::Result<(), String> {
+async fn send_telegram_reply(
+    bot_token: &str,
+    chat_id: i64,
+    text: &str,
+) -> std::result::Result<(), String> {
     athen_sentidos::telegram::send_message(bot_token, chat_id, text).await
 }
 
@@ -992,7 +1006,6 @@ fn load_config() -> AthenConfig {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // System initialisation
 // ---------------------------------------------------------------------------
@@ -1002,7 +1015,10 @@ fn ensure_data_dir() -> Option<PathBuf> {
     if let Some(home) = std::env::var_os("HOME") {
         let data_dir = PathBuf::from(home).join(".athen");
         if let Err(e) = std::fs::create_dir_all(&data_dir) {
-            warn!("Failed to create data directory {}: {e}", data_dir.display());
+            warn!(
+                "Failed to create data directory {}: {e}",
+                data_dir.display()
+            );
             return None;
         }
         Some(data_dir)
@@ -1084,9 +1100,7 @@ fn resolve_api_key_for(
 ) -> Option<String> {
     // Config file takes priority — the user explicitly saved this key via Settings.
     if let Some(key) = provider_cfg.and_then(|c| match &c.auth {
-        AuthType::ApiKey(key) if !key.is_empty() && !key.starts_with("${") => {
-            Some(key.clone())
-        }
+        AuthType::ApiKey(key) if !key.is_empty() && !key.starts_with("${") => Some(key.clone()),
         _ => None,
     }) {
         return Some(key);
@@ -1135,9 +1149,10 @@ pub(crate) fn build_router_for_provider(
             }
             Box::new(p)
         }
-        "llamacpp" => {
-            Box::new(LlamaCppProvider::new(base_url.to_string(), model.to_string()))
-        }
+        "llamacpp" => Box::new(LlamaCppProvider::new(
+            base_url.to_string(),
+            model.to_string(),
+        )),
         _ => {
             // Generic OpenAI-compatible provider (openai, anthropic, custom).
             let mut p = OpenAiCompatibleProvider::new(base_url.to_string())
@@ -1148,9 +1163,8 @@ pub(crate) fn build_router_for_provider(
             }
             // Local providers use zero-cost estimation.
             if matches!(provider_id, "ollama" | "llamacpp") {
-                p = p.with_cost_estimator(Box::new(
-                    athen_llm::providers::openai::ZeroCostEstimator,
-                ));
+                p = p
+                    .with_cost_estimator(Box::new(athen_llm::providers::openai::ZeroCostEstimator));
             }
             Box::new(p)
         }
@@ -1185,9 +1199,7 @@ fn generate_arc_id() -> String {
 
 /// Try to restore the most recent active Arc from persistent storage.
 /// If the store is unavailable or empty, create a new Arc with empty history.
-async fn restore_or_create_arc(
-    arc_store: &Option<ArcStore>,
-) -> (String, Vec<ChatMessage>) {
+async fn restore_or_create_arc(arc_store: &Option<ArcStore>) -> (String, Vec<ChatMessage>) {
     if let Some(store) = arc_store {
         match store.list_arcs().await {
             Ok(arcs) if !arcs.is_empty() => {
@@ -1201,8 +1213,7 @@ async fn restore_or_create_arc(
                             let history: Vec<ChatMessage> = entries
                                 .into_iter()
                                 .filter(|e| {
-                                    e.entry_type
-                                        == athen_persistence::arcs::EntryType::Message
+                                    e.entry_type == athen_persistence::arcs::EntryType::Message
                                 })
                                 .map(|e| ChatMessage {
                                     role: match e.source.as_str() {
@@ -1215,11 +1226,7 @@ async fn restore_or_create_arc(
                                     content: MessageContent::Text(e.content),
                                 })
                                 .collect();
-                            info!(
-                                "Restored {} messages from arc '{}'",
-                                history.len(),
-                                arc.id
-                            );
+                            info!("Restored {} messages from arc '{}'", history.len(), arc.id);
                             return (arc.id.clone(), history);
                         }
                         Err(e) => {
@@ -1289,10 +1296,7 @@ async fn build_coordinator_with_persistence(
 }
 
 /// Restore the set of enabled MCPs from the SQLite store into the registry.
-async fn restore_enabled_mcps(
-    registry: &Arc<McpRegistry>,
-    store: &McpStore,
-) -> Result<()> {
+async fn restore_enabled_mcps(registry: &Arc<McpRegistry>, store: &McpStore) -> Result<()> {
     let rows = store.list_enabled().await?;
     let mut entries = Vec::new();
     for row in rows {
@@ -1304,7 +1308,10 @@ async fn restore_enabled_mcps(
                 });
             }
             None => {
-                warn!("Persisted MCP id '{}' not found in catalog; skipping", row.mcp_id);
+                warn!(
+                    "Persisted MCP id '{}' not found in catalog; skipping",
+                    row.mcp_id
+                );
             }
         }
     }
@@ -1320,9 +1327,7 @@ async fn restore_enabled_mcps(
 /// Uses keyword embeddings as fallback (always available, near-instant)
 /// and an LLM entity extractor for automatic knowledge graph population.
 /// Returns `None` if the data directory or database cannot be opened.
-async fn build_memory(
-    router: &Arc<RwLock<Arc<DefaultLlmRouter>>>,
-) -> Option<Arc<Memory>> {
+async fn build_memory(router: &Arc<RwLock<Arc<DefaultLlmRouter>>>) -> Option<Arc<Memory>> {
     use athen_llm::embeddings::router::EmbeddingRouter;
     use athen_memory::extractor::LlmEntityExtractor;
     use athen_memory::sqlite::{SqliteGraph, SqliteVectorIndex};
@@ -1341,7 +1346,10 @@ async fn build_memory(
             c
         }
         Err(e) => {
-            warn!("Failed to open memory database at {}: {e}", db_path.display());
+            warn!(
+                "Failed to open memory database at {}: {e}",
+                db_path.display()
+            );
             return None;
         }
     };
@@ -1366,8 +1374,7 @@ async fn build_memory(
     // Use keyword embeddings as the default fallback (always available).
     let embedding_router = EmbeddingRouter::new(vec![]);
     // LLM entity extractor for automatic knowledge graph population.
-    let extractor_router: Box<dyn LlmRouter> =
-        Box::new(SharedRouter(Arc::clone(router)));
+    let extractor_router: Box<dyn LlmRouter> = Box::new(SharedRouter(Arc::clone(router)));
     let extractor = LlmEntityExtractor::new(extractor_router);
 
     let memory = Memory::new(Box::new(vector), Box::new(graph))

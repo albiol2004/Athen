@@ -3,12 +3,8 @@
 //! When the fast regex rules cannot confidently classify an action,
 //! we ask an LLM to evaluate its risk.
 
-use athen_core::llm::{
-    ChatMessage, LlmRequest, LlmResponse, MessageContent, ModelProfile, Role,
-};
-use athen_core::risk::{
-    BaseImpact, DataSensitivity, EvaluationMethod, RiskContext, RiskScore,
-};
+use athen_core::llm::{ChatMessage, LlmRequest, LlmResponse, MessageContent, ModelProfile, Role};
+use athen_core::risk::{BaseImpact, DataSensitivity, EvaluationMethod, RiskContext, RiskScore};
 use athen_core::traits::llm::LlmRouter;
 
 use crate::scorer::RiskScorer;
@@ -53,7 +49,9 @@ impl LlmRiskEvaluator {
                 return Ok(self.conservative_fallback(context));
             }
             Err(_) => {
-                tracing::warn!("LLM risk evaluation timed out after 10s, using conservative defaults");
+                tracing::warn!(
+                    "LLM risk evaluation timed out after 10s, using conservative defaults"
+                );
                 return Ok(self.conservative_fallback(context));
             }
         };
@@ -71,7 +69,9 @@ impl LlmRiskEvaluator {
             accumulated_risk: context.accumulated_risk,
         };
 
-        Ok(self.scorer.compute(impact, &effective_context, EvaluationMethod::LlmAssisted))
+        Ok(self
+            .scorer
+            .compute(impact, &effective_context, EvaluationMethod::LlmAssisted))
     }
 
     /// Return a conservative risk score that lands in HumanConfirm range.
@@ -82,8 +82,11 @@ impl LlmRiskEvaluator {
             llm_confidence: Some(0.3),
             accumulated_risk: context.accumulated_risk,
         };
-        self.scorer
-            .compute(BaseImpact::WritePersist, &ctx, EvaluationMethod::LlmAssisted)
+        self.scorer.compute(
+            BaseImpact::WritePersist,
+            &ctx,
+            EvaluationMethod::LlmAssisted,
+        )
     }
 
     /// Build the LLM request for risk evaluation.
@@ -176,9 +179,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use athen_core::contact::TrustLevel;
-    use athen_core::llm::{
-        BudgetStatus, FinishReason, LlmResponse, TokenUsage,
-    };
+    use athen_core::llm::{BudgetStatus, FinishReason, LlmResponse, TokenUsage};
     use athen_core::risk::RiskLevel;
 
     /// Mock LLM router that returns a fixed response.
@@ -261,7 +262,10 @@ mod tests {
         let router = MockRouter::new(json);
         let evaluator = LlmRiskEvaluator::new(Box::new(router));
         let ctx = default_ctx();
-        let score = evaluator.evaluate("do something dangerous", &ctx).await.unwrap();
+        let score = evaluator
+            .evaluate("do something dangerous", &ctx)
+            .await
+            .unwrap();
         // System(90) * AuthUser(0.5) * Secrets(5) + (1-0.95)^2*100 = 225 + 0.25 = 225.25
         assert!((score.total - 225.25).abs() < 0.01);
         assert_eq!(score.evaluation_method, EvaluationMethod::LlmAssisted);
@@ -269,7 +273,8 @@ mod tests {
 
     #[tokio::test]
     async fn parses_read_plain_high_confidence() {
-        let json = r#"{"impact":"read","sensitivity":"plain","confidence":1.0,"reasoning":"safe read"}"#;
+        let json =
+            r#"{"impact":"read","sensitivity":"plain","confidence":1.0,"reasoning":"safe read"}"#;
         let router = MockRouter::new(json);
         let evaluator = LlmRiskEvaluator::new(Box::new(router));
         let ctx = default_ctx();

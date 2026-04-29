@@ -10,8 +10,8 @@ use uuid::Uuid;
 
 use athen_core::error::{AthenError, Result};
 use athen_core::traits::memory::{
-    Entity, EntityId, EntityType, ExploreParams, GraphEdge, GraphNode,
-    KnowledgeGraph, SearchResult, VectorIndex,
+    Entity, EntityId, EntityType, ExploreParams, GraphEdge, GraphNode, KnowledgeGraph,
+    SearchResult, VectorIndex,
 };
 
 // ---------------------------------------------------------------------------
@@ -78,8 +78,16 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 
 #[async_trait]
 impl VectorIndex for SqliteVectorIndex {
-    async fn upsert(&self, id: &str, embedding: Vec<f32>, metadata: serde_json::Value) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| AthenError::Other(e.to_string()))?;
+    async fn upsert(
+        &self,
+        id: &str,
+        embedding: Vec<f32>,
+        metadata: serde_json::Value,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| AthenError::Other(e.to_string()))?;
         let blob = embedding_to_bytes(&embedding);
         let json = serde_json::to_string(&metadata)?;
         conn.execute(
@@ -91,12 +99,11 @@ impl VectorIndex for SqliteVectorIndex {
         Ok(())
     }
 
-    async fn search(
-        &self,
-        query_embedding: Vec<f32>,
-        top_k: usize,
-    ) -> Result<Vec<SearchResult>> {
-        let conn = self.conn.lock().map_err(|e| AthenError::Other(e.to_string()))?;
+    async fn search(&self, query_embedding: Vec<f32>, top_k: usize) -> Result<Vec<SearchResult>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| AthenError::Other(e.to_string()))?;
         let mut stmt = conn
             .prepare("SELECT id, embedding, metadata_json FROM vectors")
             .map_err(|e| AthenError::Other(e.to_string()))?;
@@ -126,19 +133,29 @@ impl VectorIndex for SqliteVectorIndex {
         Ok(scored
             .into_iter()
             .take(top_k)
-            .map(|(score, id, metadata)| SearchResult { id, score, metadata })
+            .map(|(score, id, metadata)| SearchResult {
+                id,
+                score,
+                metadata,
+            })
             .collect())
     }
 
     async fn delete(&self, id: &str) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| AthenError::Other(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| AthenError::Other(e.to_string()))?;
         conn.execute("DELETE FROM vectors WHERE id = ?1", params![id])
             .map_err(|e| AthenError::Other(e.to_string()))?;
         Ok(())
     }
 
     async fn list_all(&self) -> Result<Vec<SearchResult>> {
-        let conn = self.conn.lock().map_err(|e| AthenError::Other(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| AthenError::Other(e.to_string()))?;
         let mut stmt = conn
             .prepare("SELECT id, metadata_json FROM vectors ORDER BY rowid DESC")
             .map_err(|e| AthenError::Other(e.to_string()))?;
@@ -203,9 +220,13 @@ impl SqliteGraph {
             // Migration: add columns for existing databases.
             // SQLite doesn't support IF NOT EXISTS for ALTER TABLE ADD COLUMN,
             // so we ignore errors (column already exists).
-            let _ = c.execute_batch("ALTER TABLE edges ADD COLUMN strength REAL NOT NULL DEFAULT 0.5;");
-            let _ = c.execute_batch("ALTER TABLE edges ADD COLUMN importance REAL NOT NULL DEFAULT 0.5;");
-            let _ = c.execute_batch("ALTER TABLE edges ADD COLUMN last_used TEXT NOT NULL DEFAULT '';");
+            let _ =
+                c.execute_batch("ALTER TABLE edges ADD COLUMN strength REAL NOT NULL DEFAULT 0.5;");
+            let _ = c.execute_batch(
+                "ALTER TABLE edges ADD COLUMN importance REAL NOT NULL DEFAULT 0.5;",
+            );
+            let _ =
+                c.execute_batch("ALTER TABLE edges ADD COLUMN last_used TEXT NOT NULL DEFAULT '';");
         }
         Ok(Self { conn })
     }
@@ -271,7 +292,10 @@ fn edge_score(edge: &SqliteEdge, params: &ExploreParams) -> f32 {
 #[async_trait]
 impl KnowledgeGraph for SqliteGraph {
     async fn add_entity(&self, mut entity: Entity) -> Result<EntityId> {
-        let conn = self.conn.lock().map_err(|e| AthenError::Other(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| AthenError::Other(e.to_string()))?;
 
         // Deduplicate by name: if an entity with the same name exists, return its ID.
         let existing: Option<String> = conn
@@ -305,7 +329,10 @@ impl KnowledgeGraph for SqliteGraph {
     }
 
     async fn add_relation(&self, from: EntityId, relation: &str, to: EntityId) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| AthenError::Other(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| AthenError::Other(e.to_string()))?;
         let now = Utc::now().to_rfc3339();
 
         conn.execute(
@@ -324,7 +351,10 @@ impl KnowledgeGraph for SqliteGraph {
         to: EntityId,
         importance: f32,
     ) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| AthenError::Other(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| AthenError::Other(e.to_string()))?;
         let now = Utc::now().to_rfc3339();
         let importance_clamped = importance.clamp(0.0, 1.0) as f64;
 
@@ -338,7 +368,10 @@ impl KnowledgeGraph for SqliteGraph {
     }
 
     async fn reinforce_entity(&self, entity_id: EntityId, amount: f32) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| AthenError::Other(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| AthenError::Other(e.to_string()))?;
         let now = Utc::now().to_rfc3339();
         let id_str = entity_id.to_string();
 
@@ -351,12 +384,11 @@ impl KnowledgeGraph for SqliteGraph {
         Ok(())
     }
 
-    async fn explore(
-        &self,
-        entry: EntityId,
-        params: ExploreParams,
-    ) -> Result<Vec<GraphNode>> {
-        let conn = self.conn.lock().map_err(|e| AthenError::Other(e.to_string()))?;
+    async fn explore(&self, entry: EntityId, params: ExploreParams) -> Result<Vec<GraphNode>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| AthenError::Other(e.to_string()))?;
 
         // Load all entities into memory for exploration
         let mut entities: HashMap<EntityId, Entity> = HashMap::new();
@@ -377,8 +409,7 @@ impl KnowledgeGraph for SqliteGraph {
             for row in rows {
                 let (id_str, type_str, name, meta_str) =
                     row.map_err(|e| AthenError::Other(e.to_string()))?;
-                let id = Uuid::parse_str(&id_str)
-                    .map_err(|e| AthenError::Other(e.to_string()))?;
+                let id = Uuid::parse_str(&id_str).map_err(|e| AthenError::Other(e.to_string()))?;
                 let metadata: serde_json::Value =
                     serde_json::from_str(&meta_str).unwrap_or(serde_json::Value::Null);
                 entities.insert(
@@ -409,17 +440,33 @@ impl KnowledgeGraph for SqliteGraph {
                     let strength: f64 = row.get(5)?;
                     let importance: f64 = row.get(6)?;
                     let last_used_str: String = row.get(7)?;
-                    Ok((from_str, relation, to_str, weight, created_str, strength, importance, last_used_str))
+                    Ok((
+                        from_str,
+                        relation,
+                        to_str,
+                        weight,
+                        created_str,
+                        strength,
+                        importance,
+                        last_used_str,
+                    ))
                 })
                 .map_err(|e| AthenError::Other(e.to_string()))?;
 
             for row in rows {
-                let (from_str, relation, to_str, weight, created_str, strength, importance, last_used_str) =
-                    row.map_err(|e| AthenError::Other(e.to_string()))?;
-                let from = Uuid::parse_str(&from_str)
-                    .map_err(|e| AthenError::Other(e.to_string()))?;
-                let to = Uuid::parse_str(&to_str)
-                    .map_err(|e| AthenError::Other(e.to_string()))?;
+                let (
+                    from_str,
+                    relation,
+                    to_str,
+                    weight,
+                    created_str,
+                    strength,
+                    importance,
+                    last_used_str,
+                ) = row.map_err(|e| AthenError::Other(e.to_string()))?;
+                let from =
+                    Uuid::parse_str(&from_str).map_err(|e| AthenError::Other(e.to_string()))?;
+                let to = Uuid::parse_str(&to_str).map_err(|e| AthenError::Other(e.to_string()))?;
                 let created_at = DateTime::parse_from_rfc3339(&created_str)
                     .map(|dt| dt.with_timezone(&Utc))
                     .unwrap_or_else(|_| Utc::now());
@@ -474,11 +521,13 @@ impl KnowledgeGraph for SqliteGraph {
                             weight: edge.weight,
                         });
 
-                        if depth < params.max_depth && !visited.contains(&edge.to)
-                            && edge.weight >= params.relevance_threshold {
-                                visited.insert(edge.to);
-                                queue.push_back((edge.to, depth + 1));
-                            }
+                        if depth < params.max_depth
+                            && !visited.contains(&edge.to)
+                            && edge.weight >= params.relevance_threshold
+                        {
+                            visited.insert(edge.to);
+                            queue.push_back((edge.to, depth + 1));
+                        }
                     }
                 }
             }
@@ -494,7 +543,10 @@ impl KnowledgeGraph for SqliteGraph {
     }
 
     async fn list_entities(&self) -> Result<Vec<Entity>> {
-        let conn = self.conn.lock().map_err(|e| AthenError::Other(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| AthenError::Other(e.to_string()))?;
         let mut stmt = conn
             .prepare("SELECT id, entity_type, name, metadata_json FROM entities")
             .map_err(|e| AthenError::Other(e.to_string()))?;
@@ -513,8 +565,7 @@ impl KnowledgeGraph for SqliteGraph {
         for row in rows {
             let (id_str, type_str, name, meta_str) =
                 row.map_err(|e| AthenError::Other(e.to_string()))?;
-            let id = Uuid::parse_str(&id_str)
-                .map_err(|e| AthenError::Other(e.to_string()))?;
+            let id = Uuid::parse_str(&id_str).map_err(|e| AthenError::Other(e.to_string()))?;
             let metadata: serde_json::Value =
                 serde_json::from_str(&meta_str).unwrap_or(serde_json::Value::Null);
             entities.push(Entity {
@@ -528,7 +579,10 @@ impl KnowledgeGraph for SqliteGraph {
     }
 
     async fn list_relations(&self) -> Result<Vec<(EntityId, String, String, EntityId, String)>> {
-        let conn = self.conn.lock().map_err(|e| AthenError::Other(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| AthenError::Other(e.to_string()))?;
         let mut stmt = conn
             .prepare(
                 "SELECT e.from_entity, ef.name, e.relation, e.to_entity, et.name
@@ -553,10 +607,9 @@ impl KnowledgeGraph for SqliteGraph {
         for row in rows {
             let (from_str, from_name, relation, to_str, to_name) =
                 row.map_err(|e| AthenError::Other(e.to_string()))?;
-            let from_id = Uuid::parse_str(&from_str)
-                .map_err(|e| AthenError::Other(e.to_string()))?;
-            let to_id = Uuid::parse_str(&to_str)
-                .map_err(|e| AthenError::Other(e.to_string()))?;
+            let from_id =
+                Uuid::parse_str(&from_str).map_err(|e| AthenError::Other(e.to_string()))?;
+            let to_id = Uuid::parse_str(&to_str).map_err(|e| AthenError::Other(e.to_string()))?;
             relations.push((from_id, from_name, relation, to_id, to_name));
         }
         Ok(relations)
@@ -568,7 +621,10 @@ impl KnowledgeGraph for SqliteGraph {
         name: Option<String>,
         entity_type: Option<EntityType>,
     ) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| AthenError::Other(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| AthenError::Other(e.to_string()))?;
         if let Some(new_name) = &name {
             conn.execute(
                 "UPDATE entities SET name = ?1 WHERE id = ?2",
@@ -587,7 +643,10 @@ impl KnowledgeGraph for SqliteGraph {
     }
 
     async fn delete_entity(&self, id: EntityId) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| AthenError::Other(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| AthenError::Other(e.to_string()))?;
         let id_str = id.to_string();
         conn.execute(
             "DELETE FROM edges WHERE from_entity = ?1 OR to_entity = ?1",
@@ -599,13 +658,11 @@ impl KnowledgeGraph for SqliteGraph {
         Ok(())
     }
 
-    async fn delete_relation(
-        &self,
-        from: EntityId,
-        to: EntityId,
-        relation: &str,
-    ) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| AthenError::Other(e.to_string()))?;
+    async fn delete_relation(&self, from: EntityId, to: EntityId, relation: &str) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| AthenError::Other(e.to_string()))?;
         conn.execute(
             "DELETE FROM edges WHERE from_entity = ?1 AND to_entity = ?2 AND relation = ?3",
             params![from.to_string(), to.to_string(), relation],
@@ -695,7 +752,11 @@ mod tests {
         let index = SqliteVectorIndex::new(Arc::clone(&conn)).unwrap();
 
         index
-            .upsert("persist", vec![0.5, 0.5, 0.5], serde_json::json!({"key": "val"}))
+            .upsert(
+                "persist",
+                vec![0.5, 0.5, 0.5],
+                serde_json::json!({"key": "val"}),
+            )
             .await
             .unwrap();
 

@@ -167,8 +167,14 @@ mod tests {
     #[tokio::test]
     async fn test_embed_similar_texts() {
         let provider = KeywordEmbedding::new();
-        let a = provider.embed("the quick brown fox jumps over the lazy dog").await.unwrap();
-        let b = provider.embed("the fast brown fox leaps over the lazy dog").await.unwrap();
+        let a = provider
+            .embed("the quick brown fox jumps over the lazy dog")
+            .await
+            .unwrap();
+        let b = provider
+            .embed("the fast brown fox leaps over the lazy dog")
+            .await
+            .unwrap();
         let sim = cosine_similarity(&a, &b);
         // Similar texts should have high similarity.
         assert!(sim > 0.5, "similarity was {}, expected > 0.5", sim);
@@ -177,11 +183,20 @@ mod tests {
     #[tokio::test]
     async fn test_embed_different_texts() {
         let provider = KeywordEmbedding::new();
-        let a = provider.embed("quantum physics nuclear reactor energy").await.unwrap();
-        let b = provider.embed("chocolate cake recipe baking dessert").await.unwrap();
+        let a = provider
+            .embed("quantum physics nuclear reactor energy")
+            .await
+            .unwrap();
+        let b = provider
+            .embed("chocolate cake recipe baking dessert")
+            .await
+            .unwrap();
         let sim = cosine_similarity(&a, &b);
         // Dissimilar texts should have lower similarity than similar ones.
-        let c = provider.embed("quantum mechanics nuclear fusion energy").await.unwrap();
+        let c = provider
+            .embed("quantum mechanics nuclear fusion energy")
+            .await
+            .unwrap();
         let sim_same = cosine_similarity(&a, &c);
         assert!(
             sim_same > sim,
@@ -194,7 +209,10 @@ mod tests {
     #[tokio::test]
     async fn test_embed_is_normalized() {
         let provider = KeywordEmbedding::new();
-        let embedding = provider.embed("testing vector normalization here").await.unwrap();
+        let embedding = provider
+            .embed("testing vector normalization here")
+            .await
+            .unwrap();
         let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
         // Should be approximately 1.0 (L2 normalized).
         assert!(

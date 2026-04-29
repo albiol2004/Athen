@@ -24,11 +24,7 @@ pub struct BwrapSandbox;
 impl BwrapSandbox {
     /// Build the bwrap argument list for a given sandbox profile.
     /// Public for testability.
-    pub fn build_bwrap_args(
-        command: &str,
-        args: &[&str],
-        profile: &SandboxProfile,
-    ) -> Vec<String> {
+    pub fn build_bwrap_args(command: &str, args: &[&str], profile: &SandboxProfile) -> Vec<String> {
         let mut bwrap_args: Vec<String> = Vec::new();
 
         // Always use these safety flags
@@ -226,7 +222,11 @@ mod tests {
 
     #[test]
     fn test_build_args_no_network() {
-        let args = BwrapSandbox::build_bwrap_args("curl", &["https://example.com"], &SandboxProfile::NoNetwork);
+        let args = BwrapSandbox::build_bwrap_args(
+            "curl",
+            &["https://example.com"],
+            &SandboxProfile::NoNetwork,
+        );
 
         assert!(args.contains(&"--unshare-net".to_string()));
         assert!(args.contains(&"--ro-bind".to_string()));

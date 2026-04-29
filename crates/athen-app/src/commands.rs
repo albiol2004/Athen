@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use tracing::warn;
 
+use athen_agent::{AgentBuilder, InMemoryAuditor};
 use athen_core::error::Result as AthenResult;
 use athen_core::event::*;
 use athen_core::llm::{ChatMessage, MessageContent, Role};
@@ -24,7 +25,6 @@ use athen_core::task::{DomainType, Task, TaskId, TaskPriority, TaskStatus, TaskS
 use athen_core::traits::agent::{AgentExecutor, StepAuditor};
 use athen_core::traits::llm::LlmRouter;
 use athen_core::traits::memory::MemoryStore;
-use athen_agent::{AgentBuilder, InMemoryAuditor};
 use athen_persistence::arcs;
 use athen_persistence::calendar::CalendarEvent;
 
@@ -80,26 +80,152 @@ fn simplify_error(err: &str) -> String {
 fn extract_key_terms(message: &str) -> Vec<String> {
     const STOP_WORDS: &[&str] = &[
         // Spanish
-        "el", "la", "los", "las", "un", "una", "unos", "unas", "de", "del", "al",
-        "en", "con", "por", "para", "que", "es", "son", "fue", "ser", "estar",
-        "haz", "hay", "tiene", "tengo", "como", "pero", "más", "muy", "sin",
-        "sobre", "entre", "este", "esta", "ese", "esa", "aqui", "ahi", "aquí",
-        "ahí", "donde", "cuando", "quien", "cual", "todo", "toda", "todos",
-        "mi", "tu", "su", "nos", "les", "me", "te", "se", "lo", "le",
-        "quiero", "puedes", "puede", "hacer", "dime", "dame", "escribe",
-        "escribeme", "aqui", "chat", "algo",
+        "el",
+        "la",
+        "los",
+        "las",
+        "un",
+        "una",
+        "unos",
+        "unas",
+        "de",
+        "del",
+        "al",
+        "en",
+        "con",
+        "por",
+        "para",
+        "que",
+        "es",
+        "son",
+        "fue",
+        "ser",
+        "estar",
+        "haz",
+        "hay",
+        "tiene",
+        "tengo",
+        "como",
+        "pero",
+        "más",
+        "muy",
+        "sin",
+        "sobre",
+        "entre",
+        "este",
+        "esta",
+        "ese",
+        "esa",
+        "aqui",
+        "ahi",
+        "aquí",
+        "ahí",
+        "donde",
+        "cuando",
+        "quien",
+        "cual",
+        "todo",
+        "toda",
+        "todos",
+        "mi",
+        "tu",
+        "su",
+        "nos",
+        "les",
+        "me",
+        "te",
+        "se",
+        "lo",
+        "le",
+        "quiero",
+        "puedes",
+        "puede",
+        "hacer",
+        "dime",
+        "dame",
+        "escribe",
+        "escribeme",
+        "aqui",
+        "chat",
+        "algo",
         // English
-        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
-        "have", "has", "had", "do", "does", "did", "will", "would", "could",
-        "should", "may", "might", "can", "shall", "to", "of", "in", "for",
-        "on", "with", "at", "by", "from", "and", "or", "but", "not", "no",
-        "my", "your", "his", "her", "its", "our", "their", "this", "that",
-        "what", "which", "who", "how", "when", "where", "why", "all", "each",
-        "me", "you", "him", "it", "us", "them", "some", "any",
+        "the",
+        "a",
+        "an",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "have",
+        "has",
+        "had",
+        "do",
+        "does",
+        "did",
+        "will",
+        "would",
+        "could",
+        "should",
+        "may",
+        "might",
+        "can",
+        "shall",
+        "to",
+        "of",
+        "in",
+        "for",
+        "on",
+        "with",
+        "at",
+        "by",
+        "from",
+        "and",
+        "or",
+        "but",
+        "not",
+        "no",
+        "my",
+        "your",
+        "his",
+        "her",
+        "its",
+        "our",
+        "their",
+        "this",
+        "that",
+        "what",
+        "which",
+        "who",
+        "how",
+        "when",
+        "where",
+        "why",
+        "all",
+        "each",
+        "me",
+        "you",
+        "him",
+        "it",
+        "us",
+        "them",
+        "some",
+        "any",
     ];
 
     message
-        .split(|c: char| !c.is_alphanumeric() && c != 'á' && c != 'é' && c != 'í' && c != 'ó' && c != 'ú' && c != 'ñ' && c != 'ü')
+        .split(|c: char| {
+            !c.is_alphanumeric()
+                && c != 'á'
+                && c != 'é'
+                && c != 'í'
+                && c != 'ó'
+                && c != 'ú'
+                && c != 'ñ'
+                && c != 'ü'
+        })
         .filter(|w| {
             let lower = w.to_lowercase();
             lower.len() > 2 && !STOP_WORDS.contains(&lower.as_str())
@@ -168,7 +294,10 @@ async fn judge_worth_remembering(
     user_msg: &str,
     assistant_msg: &str,
 ) -> Option<String> {
-    use athen_core::llm::{LlmRequest, ModelProfile, ChatMessage as LlmChatMessage, MessageContent as LlmContent, Role as LlmRole};
+    use athen_core::llm::{
+        ChatMessage as LlmChatMessage, LlmRequest, MessageContent as LlmContent, ModelProfile,
+        Role as LlmRole,
+    };
 
     let prompt = format!(
         "Analyze this conversation exchange and decide if it contains information worth remembering for future conversations.\n\n\
@@ -197,7 +326,9 @@ async fn judge_worth_remembering(
     let response = match tokio::time::timeout(
         std::time::Duration::from_secs(60),
         router.route(&request),
-    ).await {
+    )
+    .await
+    {
         Ok(Ok(resp)) => resp,
         Ok(Err(e)) => {
             tracing::debug!("Memory judge LLM failed: {e}");
@@ -249,7 +380,10 @@ async fn persist_entry(
     if let Some(ref store) = state.arc_store {
         let arc_id = state.active_arc_id.lock().await.clone();
         let et = arcs::EntryType::from_str(entry_type);
-        if let Err(e) = store.add_entry(&arc_id, et, source, content, metadata).await {
+        if let Err(e) = store
+            .add_entry(&arc_id, et, source, content, metadata)
+            .await
+        {
             warn!("Failed to persist arc entry: {e}");
         }
         if let Err(e) = store.touch_arc(&arc_id).await {
@@ -365,10 +499,7 @@ impl StepAuditor for TauriAuditor {
                             .get("path")
                             .and_then(|s| s.as_str())
                             .map(|s| s.to_string()),
-                        _ => Some(
-                            serde_json::to_string(result)
-                                .unwrap_or_default(),
-                        ),
+                        _ => Some(serde_json::to_string(result).unwrap_or_default()),
                     };
                     return summary.map(|s| Self::truncate_detail(&s, 200));
                 }
@@ -476,15 +607,11 @@ pub async fn send_message(
     );
 
     // Route the event through the coordinator (risk + queue).
-    let task_results = state
-        .coordinator
-        .process_event(event)
-        .await
-        .map_err(|e| {
-            let raw = e.to_string();
-            tracing::error!("Coordinator process_event failed: {raw}");
-            format_user_error(&raw)
-        })?;
+    let task_results = state.coordinator.process_event(event).await.map_err(|e| {
+        let raw = e.to_string();
+        tracing::error!("Coordinator process_event failed: {raw}");
+        format_user_error(&raw)
+    })?;
 
     if task_results.is_empty() {
         return Ok(ChatResponse {
@@ -610,20 +737,22 @@ pub async fn send_message(
                         .map(|m| format!("- {}", m.content))
                         .collect::<Vec<_>>()
                         .join("\n");
-                    context.insert(0, ChatMessage {
-                        role: Role::System,
-                        content: MessageContent::Text(format!(
-                            "Relevant information from your memory:\n{memory_text}"
-                        )),
-                    });
+                    context.insert(
+                        0,
+                        ChatMessage {
+                            role: Role::System,
+                            content: MessageContent::Text(format!(
+                                "Relevant information from your memory:\n{memory_text}"
+                            )),
+                        },
+                    );
                 } else {
                     tracing::debug!("No relevant memories found for query");
                 }
             }
 
             // Build executor with real tool execution (same as athen-cli).
-            let exec_router: Box<dyn LlmRouter> =
-                Box::new(SharedRouter(Arc::clone(&state.router)));
+            let exec_router: Box<dyn LlmRouter> = Box::new(SharedRouter(Arc::clone(&state.router)));
             let arc_for_registry = state.active_arc_id.lock().await.clone();
             let registry = state
                 .build_tool_registry(&arc_for_registry, Some(app_handle.clone()))
@@ -655,13 +784,11 @@ pub async fn send_message(
             if let Some(p) = state.tool_doc_dir.clone() {
                 builder = builder.tool_doc_dir(p);
             }
-            let executor = builder
-                .build()
-                .map_err(|e| {
-                    let raw = e.to_string();
-                    tracing::error!("AgentBuilder failed: {raw}");
-                    format_user_error(&raw)
-                })?;
+            let executor = builder.build().map_err(|e| {
+                let raw = e.to_string();
+                tracing::error!("AgentBuilder failed: {raw}");
+                format_user_error(&raw)
+            })?;
 
             // Create a task for the executor with the user's message.
             let task = Task {
@@ -804,9 +931,7 @@ pub async fn send_message(
 
             Ok(ChatResponse {
                 content,
-                risk_level: Some(
-                    if result.success { "Safe" } else { "Caution" }.into(),
-                ),
+                risk_level: Some(if result.success { "Safe" } else { "Caution" }.into()),
                 domain: Some("base".into()),
                 tool_calls: vec![],
                 pending_approval: None,
@@ -838,19 +963,17 @@ pub async fn approve_task(
     state: State<'_, AppState>,
     app_handle: AppHandle,
 ) -> std::result::Result<ChatResponse, String> {
-    let task_uuid: Uuid = task_id.parse().map_err(|e| format!("Invalid task ID: {e}"))?;
+    let task_uuid: Uuid = task_id
+        .parse()
+        .map_err(|e| format!("Invalid task ID: {e}"))?;
 
     if !approved {
         // Deny the task.
-        state
-            .coordinator
-            .deny_task(task_uuid)
-            .await
-            .map_err(|e| {
-                let raw = e.to_string();
-                tracing::error!("Deny task failed: {raw}");
-                format_user_error(&raw)
-            })?;
+        state.coordinator.deny_task(task_uuid).await.map_err(|e| {
+            let raw = e.to_string();
+            tracing::error!("Deny task failed: {raw}");
+            format_user_error(&raw)
+        })?;
 
         // Clear the stashed message.
         *state.pending_message.lock().await = None;
@@ -922,17 +1045,19 @@ pub async fn approve_task(
                         .map(|m| format!("- {}", m.content))
                         .collect::<Vec<_>>()
                         .join("\n");
-                    context.insert(0, ChatMessage {
-                        role: Role::System,
-                        content: MessageContent::Text(format!(
-                            "Relevant information from your memory:\n{memory_text}"
-                        )),
-                    });
+                    context.insert(
+                        0,
+                        ChatMessage {
+                            role: Role::System,
+                            content: MessageContent::Text(format!(
+                                "Relevant information from your memory:\n{memory_text}"
+                            )),
+                        },
+                    );
                 }
             }
 
-            let exec_router: Box<dyn LlmRouter> =
-                Box::new(SharedRouter(Arc::clone(&state.router)));
+            let exec_router: Box<dyn LlmRouter> = Box::new(SharedRouter(Arc::clone(&state.router)));
             let arc_for_registry = state.active_arc_id.lock().await.clone();
             let registry = state
                 .build_tool_registry(&arc_for_registry, Some(app_handle.clone()))
@@ -962,13 +1087,11 @@ pub async fn approve_task(
             if let Some(p) = state.tool_doc_dir.clone() {
                 builder = builder.tool_doc_dir(p);
             }
-            let executor = builder
-                .build()
-                .map_err(|e| {
-                    let raw = e.to_string();
-                    tracing::error!("AgentBuilder failed (approval): {raw}");
-                    format_user_error(&raw)
-                })?;
+            let executor = builder.build().map_err(|e| {
+                let raw = e.to_string();
+                tracing::error!("AgentBuilder failed (approval): {raw}");
+                format_user_error(&raw)
+            })?;
 
             let task = Task {
                 id: Uuid::new_v4(),
@@ -1105,9 +1228,7 @@ pub async fn approve_task(
 
             Ok(ChatResponse {
                 content,
-                risk_level: Some(
-                    if result.success { "Safe" } else { "Caution" }.into(),
-                ),
+                risk_level: Some(if result.success { "Safe" } else { "Caution" }.into()),
                 domain: Some(format!("{:?}", approved_task.domain)),
                 tool_calls: vec![],
                 pending_approval: None,
@@ -1134,18 +1255,14 @@ pub async fn approve_task(
 /// at the top of each loop iteration and between tool calls. The executor
 /// will return a "cancelled" result on its next check.
 #[tauri::command]
-pub async fn cancel_task(
-    state: State<'_, AppState>,
-) -> std::result::Result<(), String> {
+pub async fn cancel_task(state: State<'_, AppState>) -> std::result::Result<(), String> {
     state.cancel_flag.store(true, Ordering::Relaxed);
     Ok(())
 }
 
 /// Return basic status information.
 #[tauri::command]
-pub async fn get_status(
-    state: State<'_, AppState>,
-) -> std::result::Result<StatusResponse, String> {
+pub async fn get_status(state: State<'_, AppState>) -> std::result::Result<StatusResponse, String> {
     Ok(StatusResponse {
         connected: true,
         model: state.model_name.lock().await.clone(),
@@ -1158,22 +1275,14 @@ pub async fn get_status(
 /// Previous arcs remain in SQLite and can be loaded later.
 /// Returns the new Arc ID so the frontend can update the sidebar.
 #[tauri::command]
-pub async fn new_arc(
-    state: State<'_, AppState>,
-) -> std::result::Result<String, String> {
+pub async fn new_arc(state: State<'_, AppState>) -> std::result::Result<String, String> {
     *state.history.lock().await = Vec::new();
-    let new_id = chrono::Utc::now()
-        .format("arc_%Y%m%d_%H%M%S")
-        .to_string();
+    let new_id = chrono::Utc::now().format("arc_%Y%m%d_%H%M%S").to_string();
     *state.active_arc_id.lock().await = new_id.clone();
 
     if let Some(ref store) = state.arc_store {
         if let Err(e) = store
-            .create_arc(
-                &new_id,
-                "New Arc",
-                arcs::ArcSource::UserInput,
-            )
+            .create_arc(&new_id, "New Arc", arcs::ArcSource::UserInput)
             .await
         {
             warn!("Failed to create arc: {e}");
@@ -1362,10 +1471,7 @@ pub async fn delete_arc(
     state: State<'_, AppState>,
 ) -> std::result::Result<String, String> {
     if let Some(ref store) = state.arc_store {
-        store
-            .delete_arc(&arc_id)
-            .await
-            .map_err(|e| e.to_string())?;
+        store.delete_arc(&arc_id).await.map_err(|e| e.to_string())?;
     }
 
     // If deleting the active arc, switch to next or create new.
@@ -1384,16 +1490,10 @@ pub async fn delete_arc(
             }
         }
         // No arcs left, create new.
-        let new_id = chrono::Utc::now()
-            .format("arc_%Y%m%d_%H%M%S")
-            .to_string();
+        let new_id = chrono::Utc::now().format("arc_%Y%m%d_%H%M%S").to_string();
         if let Some(ref store) = state.arc_store {
             let _ = store
-                .create_arc(
-                    &new_id,
-                    "New Arc",
-                    arcs::ArcSource::UserInput,
-                )
+                .create_arc(&new_id, "New Arc", arcs::ArcSource::UserInput)
                 .await;
         }
         *state.active_arc_id.lock().await = new_id.clone();
@@ -1405,9 +1505,7 @@ pub async fn delete_arc(
 
 /// Return the current active arc ID.
 #[tauri::command]
-pub async fn get_current_arc(
-    state: State<'_, AppState>,
-) -> std::result::Result<String, String> {
+pub async fn get_current_arc(state: State<'_, AppState>) -> std::result::Result<String, String> {
     Ok(state.active_arc_id.lock().await.clone())
 }
 
@@ -1421,17 +1519,10 @@ pub async fn branch_arc(
     name: String,
     state: State<'_, AppState>,
 ) -> std::result::Result<String, String> {
-    let new_id = chrono::Utc::now()
-        .format("arc_%Y%m%d_%H%M%S")
-        .to_string();
+    let new_id = chrono::Utc::now().format("arc_%Y%m%d_%H%M%S").to_string();
     if let Some(ref store) = state.arc_store {
         store
-            .create_arc_with_parent(
-                &new_id,
-                &name,
-                arcs::ArcSource::UserInput,
-                &parent_arc_id,
-            )
+            .create_arc_with_parent(&new_id, &name, arcs::ArcSource::UserInput, &parent_arc_id)
             .await
             .map_err(|e| e.to_string())?;
     }
@@ -1485,7 +1576,10 @@ pub async fn list_calendar_events(
     state: State<'_, AppState>,
 ) -> std::result::Result<Vec<CalendarEvent>, String> {
     if let Some(ref store) = state.calendar_store {
-        store.list_events(&start, &end).await.map_err(|e| e.to_string())
+        store
+            .list_events(&start, &end)
+            .await
+            .map_err(|e| e.to_string())
     } else {
         Ok(Vec::new())
     }
@@ -1501,7 +1595,10 @@ pub async fn create_calendar_event(
     state: State<'_, AppState>,
 ) -> std::result::Result<CalendarEvent, String> {
     if let Some(ref store) = state.calendar_store {
-        store.create_event(&event).await.map_err(|e| e.to_string())?;
+        store
+            .create_event(&event)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     Ok(event)
 }
@@ -1542,8 +1639,7 @@ pub async fn mark_notification_seen(
     state: State<'_, AppState>,
     id: String,
 ) -> std::result::Result<(), String> {
-    let uuid = Uuid::parse_str(&id)
-        .map_err(|e| format!("Invalid notification ID: {e}"))?;
+    let uuid = Uuid::parse_str(&id).map_err(|e| format!("Invalid notification ID: {e}"))?;
 
     if let Some(ref notifier) = state.notifier {
         notifier.mark_seen(uuid).await;
@@ -1569,8 +1665,7 @@ pub async fn mark_notification_read(
     state: State<'_, AppState>,
     id: String,
 ) -> std::result::Result<(), String> {
-    let uuid = Uuid::parse_str(&id)
-        .map_err(|e| format!("Invalid notification ID: {e}"))?;
+    let uuid = Uuid::parse_str(&id).map_err(|e| format!("Invalid notification ID: {e}"))?;
     if let Some(ref notifier) = state.notifier {
         notifier.mark_read(uuid).await;
     }
@@ -1594,8 +1689,7 @@ pub async fn delete_notification(
     state: State<'_, AppState>,
     id: String,
 ) -> std::result::Result<(), String> {
-    let uuid =
-        Uuid::parse_str(&id).map_err(|e| format!("Invalid notification ID: {e}"))?;
+    let uuid = Uuid::parse_str(&id).map_err(|e| format!("Invalid notification ID: {e}"))?;
     if let Some(ref notifier) = state.notifier {
         notifier.delete_notification(uuid).await;
     }
@@ -1697,7 +1791,10 @@ pub async fn update_memory(
     content: String,
 ) -> std::result::Result<(), String> {
     let memory = state.memory.as_ref().ok_or("Memory not initialized")?;
-    memory.update(&id, &content).await.map_err(|e| e.to_string())
+    memory
+        .update(&id, &content)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Delete a memory item.
@@ -1767,13 +1864,15 @@ pub async fn list_relations(
     let relations = memory.list_relations().await.map_err(|e| e.to_string())?;
     Ok(relations
         .into_iter()
-        .map(|(from_id, from_name, relation, to_id, to_name)| RelationInfo {
-            from_id: from_id.to_string(),
-            from_name,
-            relation,
-            to_id: to_id.to_string(),
-            to_name,
-        })
+        .map(
+            |(from_id, from_name, relation, to_id, to_name)| RelationInfo {
+                from_id: from_id.to_string(),
+                from_name,
+                relation,
+                to_id: to_id.to_string(),
+                to_name,
+            },
+        )
         .collect())
 }
 
@@ -1786,8 +1885,7 @@ pub async fn update_entity(
     entity_type: Option<String>,
 ) -> std::result::Result<(), String> {
     let memory = state.memory.as_ref().ok_or("Memory not initialized")?;
-    let entity_id =
-        Uuid::parse_str(&id).map_err(|e| format!("Invalid entity ID: {e}"))?;
+    let entity_id = Uuid::parse_str(&id).map_err(|e| format!("Invalid entity ID: {e}"))?;
     let parsed_type = entity_type.map(|t| match t.as_str() {
         "Person" => athen_core::traits::memory::EntityType::Person,
         "Organization" => athen_core::traits::memory::EntityType::Organization,
@@ -1809,8 +1907,7 @@ pub async fn delete_entity(
     id: String,
 ) -> std::result::Result<(), String> {
     let memory = state.memory.as_ref().ok_or("Memory not initialized")?;
-    let entity_id =
-        Uuid::parse_str(&id).map_err(|e| format!("Invalid entity ID: {e}"))?;
+    let entity_id = Uuid::parse_str(&id).map_err(|e| format!("Invalid entity ID: {e}"))?;
     memory
         .delete_entity(entity_id)
         .await
@@ -1826,10 +1923,8 @@ pub async fn delete_relation(
     relation: String,
 ) -> std::result::Result<(), String> {
     let memory = state.memory.as_ref().ok_or("Memory not initialized")?;
-    let from =
-        Uuid::parse_str(&from_id).map_err(|e| format!("Invalid from entity ID: {e}"))?;
-    let to =
-        Uuid::parse_str(&to_id).map_err(|e| format!("Invalid to entity ID: {e}"))?;
+    let from = Uuid::parse_str(&from_id).map_err(|e| format!("Invalid from entity ID: {e}"))?;
+    let to = Uuid::parse_str(&to_id).map_err(|e| format!("Invalid to entity ID: {e}"))?;
     memory
         .delete_relation(from, to, &relation)
         .await
@@ -1985,10 +2080,7 @@ pub async fn list_arc_grants(
         .as_ref()
         .ok_or_else(|| "Grant store unavailable".to_string())?;
     let arc_uuid = crate::file_gate::arc_uuid(&arc_id);
-    let grants = store
-        .list_arc(arc_uuid)
-        .await
-        .map_err(|e| e.to_string())?;
+    let grants = store.list_arc(arc_uuid).await.map_err(|e| e.to_string())?;
     Ok(grants.into_iter().map(grant_to_summary).collect())
 }
 
@@ -2000,10 +2092,7 @@ pub async fn list_global_grants(
         .grant_store
         .as_ref()
         .ok_or_else(|| "Grant store unavailable".to_string())?;
-    let grants = store
-        .list_global()
-        .await
-        .map_err(|e| e.to_string())?;
+    let grants = store.list_global().await.map_err(|e| e.to_string())?;
     Ok(grants.into_iter().map(grant_to_summary).collect())
 }
 
@@ -2038,7 +2127,11 @@ pub async fn revoke_arc_grant(
         .grant_store
         .as_ref()
         .ok_or_else(|| "Grant store unavailable".to_string())?;
-    store.revoke_arc_by_id(id).await.map(|_| ()).map_err(|e| e.to_string())
+    store
+        .revoke_arc_by_id(id)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -2050,7 +2143,11 @@ pub async fn revoke_global_grant(
         .grant_store
         .as_ref()
         .ok_or_else(|| "Grant store unavailable".to_string())?;
-    store.revoke_global_by_id(id).await.map(|_| ()).map_err(|e| e.to_string())
+    store
+        .revoke_global_by_id(id)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

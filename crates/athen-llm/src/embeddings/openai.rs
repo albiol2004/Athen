@@ -136,14 +136,14 @@ impl OpenAiEmbedding {
             "sending OpenAI embedding request"
         );
 
-        let response = self
-            .build_request(&url, &body)
-            .send()
-            .await
-            .map_err(|e| AthenError::LlmProvider {
-                provider: self.provider_id.clone(),
-                message: format!("embedding request failed: {}", e),
-            })?;
+        let response =
+            self.build_request(&url, &body)
+                .send()
+                .await
+                .map_err(|e| AthenError::LlmProvider {
+                    provider: self.provider_id.clone(),
+                    message: format!("embedding request failed: {}", e),
+                })?;
 
         let status = response.status();
         if !status.is_success() {
@@ -202,10 +202,13 @@ impl EmbeddingProvider for OpenAiEmbedding {
 
     async fn embed(&self, text: &str) -> Result<Vec<f32>> {
         let results = self.call_embed(vec![text.to_string()]).await?;
-        results.into_iter().next().ok_or_else(|| AthenError::LlmProvider {
-            provider: self.provider_id.clone(),
-            message: "embedding response contained no data".to_string(),
-        })
+        results
+            .into_iter()
+            .next()
+            .ok_or_else(|| AthenError::LlmProvider {
+                provider: self.provider_id.clone(),
+                message: "embedding response contained no data".to_string(),
+            })
     }
 
     async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
@@ -235,9 +238,7 @@ impl EmbeddingProvider for OpenAiEmbedding {
 fn known_dimensions(model: &str) -> usize {
     if model.contains("text-embedding-3-large") {
         3072
-    } else if model.contains("text-embedding-3-small")
-        || model.contains("text-embedding-ada-002")
-    {
+    } else if model.contains("text-embedding-3-small") || model.contains("text-embedding-ada-002") {
         1536
     } else {
         0
@@ -299,8 +300,8 @@ mod tests {
 
     #[test]
     fn test_custom_provider_id() {
-        let provider = OpenAiEmbedding::compatible("http://localhost:8080")
-            .with_provider_id("vllm");
+        let provider =
+            OpenAiEmbedding::compatible("http://localhost:8080").with_provider_id("vllm");
         assert_eq!(provider.provider_id(), "vllm");
     }
 
@@ -312,16 +313,13 @@ mod tests {
 
     #[test]
     fn test_dimensions_for_known_models() {
-        let p1 = OpenAiEmbedding::openai("sk-test")
-            .with_model("text-embedding-3-large");
+        let p1 = OpenAiEmbedding::openai("sk-test").with_model("text-embedding-3-large");
         assert_eq!(p1.dimensions(), 3072);
 
-        let p2 = OpenAiEmbedding::openai("sk-test")
-            .with_model("text-embedding-3-small");
+        let p2 = OpenAiEmbedding::openai("sk-test").with_model("text-embedding-3-small");
         assert_eq!(p2.dimensions(), 1536);
 
-        let p3 = OpenAiEmbedding::openai("sk-test")
-            .with_model("text-embedding-ada-002");
+        let p3 = OpenAiEmbedding::openai("sk-test").with_model("text-embedding-ada-002");
         assert_eq!(p3.dimensions(), 1536);
     }
 

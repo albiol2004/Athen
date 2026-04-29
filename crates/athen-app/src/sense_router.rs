@@ -14,8 +14,8 @@ use uuid::Uuid;
 
 use athen_core::event::{EventSource, SenseEvent};
 use athen_core::llm::{
-    ChatMessage as LlmChatMessage, LlmRequest, MessageContent as LlmContent,
-    ModelProfile, Role as LlmRole,
+    ChatMessage as LlmChatMessage, LlmRequest, MessageContent as LlmContent, ModelProfile,
+    Role as LlmRole,
 };
 use athen_core::notification::{Notification, NotificationOrigin, NotificationUrgency};
 use athen_core::traits::llm::LlmRouter;
@@ -60,7 +60,9 @@ pub async fn process_sense_event(
 ) -> bool {
     let source_name = source_display_name(&event.source);
     let summary = event.content.summary.as_deref().unwrap_or("(no subject)");
-    let sender = event.sender.as_ref()
+    let sender = event
+        .sender
+        .as_ref()
         .map(|s| s.display_name.as_deref().unwrap_or(&s.identifier))
         .unwrap_or(match event.source {
             EventSource::Calendar => "Calendar",
@@ -73,7 +75,10 @@ pub async fn process_sense_event(
     let body_text = if event.source == EventSource::Calendar {
         format_calendar_body(&event.content.body)
     } else {
-        event.content.body.get("text")
+        event
+            .content
+            .body
+            .get("text")
             .and_then(|t| t.as_str())
             .unwrap_or("")
             .to_string()
@@ -88,7 +93,9 @@ pub async fn process_sense_event(
 
     // Step 0: Fetch recent active arcs for context matching.
     let recent_arcs = if let Some(store) = arc_store {
-        store.list_arcs().await
+        store
+            .list_arcs()
+            .await
             .unwrap_or_default()
             .into_iter()
             .filter(|a| a.status == ArcStatus::Active)
@@ -100,8 +107,14 @@ pub async fn process_sense_event(
 
     // Step 1: Triage via LLM (with arc context for matching).
     let triage = triage_event(
-        router, &event.source, sender, summary, &body_for_triage, &recent_arcs,
-    ).await;
+        router,
+        &event.source,
+        sender,
+        summary,
+        &body_for_triage,
+        &recent_arcs,
+    )
+    .await;
 
     if triage.relevance == "ignore" || triage.relevance == "low" {
         info!(
@@ -139,12 +152,18 @@ pub async fn process_sense_event(
                         warn!("Failed to create arc for sense event: {e}");
                     }
                 }
-                info!("Created new arc '{}' for {} from '{}'", id, source_name, sender);
+                info!(
+                    "Created new arc '{}' for {} from '{}'",
+                    id, source_name, sender
+                );
                 id
             }
         }
         TriageTarget::ExistingArc { arc_id } => {
-            info!("Appending {} from '{}' to existing arc '{}'", source_name, sender, arc_id);
+            info!(
+                "Appending {} from '{}' to existing arc '{}'",
+                source_name, sender, arc_id
+            );
             arc_id.clone()
         }
     };
@@ -164,18 +183,33 @@ pub async fn process_sense_event(
 
     if let Some(store) = arc_store {
         // Store the raw sense event entry.
-        if let Err(e) = store.add_entry(
-            &arc_id, entry_type, source_name, &entry_content, Some(entry_metadata.clone()),
-        ).await {
+        if let Err(e) = store
+            .add_entry(
+                &arc_id,
+                entry_type,
+                source_name,
+                &entry_content,
+                Some(entry_metadata.clone()),
+            )
+            .await
+        {
             warn!("Failed to persist sense event entry: {e}");
         }
 
         // Also add a system message so the agent has context when the user
         // opens this Arc and starts chatting.
-        let context_msg = build_context_message(&event.source, sender, summary, &body_text, &event.content.body, &triage);
-        if let Err(e) = store.add_entry(
-            &arc_id, EntryType::Message, "system", &context_msg, None,
-        ).await {
+        let context_msg = build_context_message(
+            &event.source,
+            sender,
+            summary,
+            &body_text,
+            &event.content.body,
+            &triage,
+        );
+        if let Err(e) = store
+            .add_entry(&arc_id, EntryType::Message, "system", &context_msg, None)
+            .await
+        {
             warn!("Failed to persist sense context message: {e}");
         }
 
@@ -287,16 +321,32 @@ fn format_calendar_body(body: &serde_json::Value) -> String {
     if let Some(start) = body.get("start_time").and_then(|t| t.as_str()) {
         parts.push(format!("Starts: {start}"));
     }
-    if let Some(end) = body.get("end_time").and_then(|t| t.as_str()).filter(|s| !s.is_empty()) {
+    if let Some(end) = body
+        .get("end_time")
+        .and_then(|t| t.as_str())
+        .filter(|s| !s.is_empty())
+    {
         parts.push(format!("Ends: {end}"));
     }
-    if let Some(loc) = body.get("location").and_then(|t| t.as_str()).filter(|s| !s.is_empty()) {
+    if let Some(loc) = body
+        .get("location")
+        .and_then(|t| t.as_str())
+        .filter(|s| !s.is_empty())
+    {
         parts.push(format!("Location: {loc}"));
     }
-    if let Some(desc) = body.get("description").and_then(|t| t.as_str()).filter(|s| !s.is_empty()) {
+    if let Some(desc) = body
+        .get("description")
+        .and_then(|t| t.as_str())
+        .filter(|s| !s.is_empty())
+    {
         parts.push(format!("Description: {desc}"));
     }
-    if let Some(cat) = body.get("category").and_then(|t| t.as_str()).filter(|s| !s.is_empty()) {
+    if let Some(cat) = body
+        .get("category")
+        .and_then(|t| t.as_str())
+        .filter(|s| !s.is_empty())
+    {
         parts.push(format!("Category: {cat}"));
     }
     if let Some(mins) = body.get("minutes_until").and_then(|t| t.as_i64()) {
@@ -341,11 +391,15 @@ fn build_context_message(
     match source {
         EventSource::Calendar => {
             msg.push_str(&format!("Calendar reminder: {subject}\n{body_text}"));
-            msg.push_str("\n\nThe user may ask you about this event, want to reschedule it, \
-                          or need help preparing for it.");
+            msg.push_str(
+                "\n\nThe user may ask you about this event, want to reschedule it, \
+                          or need help preparing for it.",
+            );
         }
         EventSource::Email => {
-            msg.push_str(&format!("Email from {sender}\nSubject: {subject}\n\n{body_text}"));
+            msg.push_str(&format!(
+                "Email from {sender}\nSubject: {subject}\n\n{body_text}"
+            ));
             msg.push_str(&format!(
                 "\n\nSender identifier: {sender} (type: Email)\n\
                  The user may ask you to summarize, reply, or take action on this email.\n\
@@ -356,12 +410,9 @@ fn build_context_message(
         EventSource::Messaging => {
             msg.push_str(&format!("Message from {sender}\n\n{body_text}"));
             // Extract Telegram-specific sender details from the body JSON.
-            let tg_user_id = body_json.get("sender_user_id")
-                .and_then(|v| v.as_i64());
-            let tg_username = body_json.get("sender_username")
-                .and_then(|v| v.as_str());
-            let tg_name = body_json.get("sender_first_name")
-                .and_then(|v| v.as_str());
+            let tg_user_id = body_json.get("sender_user_id").and_then(|v| v.as_i64());
+            let tg_username = body_json.get("sender_username").and_then(|v| v.as_str());
+            let tg_name = body_json.get("sender_first_name").and_then(|v| v.as_str());
             let mut sender_details = format!("\n\nSender: {sender}");
             if let Some(uid) = tg_user_id {
                 sender_details.push_str(&format!(" | Telegram user ID: {uid}"));
@@ -379,7 +430,9 @@ fn build_context_message(
             );
         }
         _ => {
-            msg.push_str(&format!("From: {sender}\nSubject: {subject}\n\n{body_text}"));
+            msg.push_str(&format!(
+                "From: {sender}\nSubject: {subject}\n\n{body_text}"
+            ));
         }
     }
 
@@ -557,28 +610,35 @@ pub(crate) fn parse_triage_response(text: &str) -> SenseTriage {
 
     match serde_json::from_str::<serde_json::Value>(cleaned) {
         Ok(v) => {
-            let relevance = v.get("relevance")
+            let relevance = v
+                .get("relevance")
                 .and_then(|r| r.as_str())
                 .unwrap_or("medium")
                 .to_string();
-            let reason = v.get("reason")
+            let reason = v
+                .get("reason")
                 .and_then(|r| r.as_str())
                 .unwrap_or("No reason provided")
                 .to_string();
-            let suggested_action = v.get("suggested_action")
+            let suggested_action = v
+                .get("suggested_action")
                 .and_then(|r| r.as_str())
                 .unwrap_or("read")
                 .to_string();
 
             // Check if LLM matched to an existing arc.
-            let target_arc = if let Some(arc_id) = v.get("existing_arc_id")
+            let target_arc = if let Some(arc_id) = v
+                .get("existing_arc_id")
                 .and_then(|r| r.as_str())
                 .filter(|s| !s.is_empty())
             {
                 info!("LLM matched sense event to existing arc: {}", arc_id);
-                TriageTarget::ExistingArc { arc_id: arc_id.to_string() }
+                TriageTarget::ExistingArc {
+                    arc_id: arc_id.to_string(),
+                }
             } else {
-                let arc_name = v.get("arc_name")
+                let arc_name = v
+                    .get("arc_name")
                     .and_then(|r| r.as_str())
                     .unwrap_or("Incoming event")
                     .to_string();
@@ -641,7 +701,9 @@ mod tests {
         let triage = parse_triage_response(json);
         match &triage.target_arc {
             TriageTarget::NewArc { name } => assert_eq!(name, "Server monitoring alert"),
-            TriageTarget::ExistingArc { .. } => panic!("Expected NewArc when existing_arc_id is null"),
+            TriageTarget::ExistingArc { .. } => {
+                panic!("Expected NewArc when existing_arc_id is null")
+            }
         }
     }
 
@@ -651,7 +713,9 @@ mod tests {
         let triage = parse_triage_response(json);
         match &triage.target_arc {
             TriageTarget::NewArc { name } => assert_eq!(name, "Something new"),
-            TriageTarget::ExistingArc { .. } => panic!("Expected NewArc when existing_arc_id is empty"),
+            TriageTarget::ExistingArc { .. } => {
+                panic!("Expected NewArc when existing_arc_id is empty")
+            }
         }
     }
 
@@ -680,7 +744,7 @@ mod tests {
         assert_eq!(triage.relevance, "medium");
         assert!(triage.reason.contains("Could not parse"));
         match &triage.target_arc {
-            TriageTarget::NewArc { .. } => {},
+            TriageTarget::NewArc { .. } => {}
             _ => panic!("Expected NewArc fallback"),
         }
     }
@@ -717,17 +781,38 @@ mod tests {
 
     #[test]
     fn event_source_maps_to_arc_source() {
-        assert_eq!(event_source_to_arc_source(&EventSource::Email), ArcSource::Email);
-        assert_eq!(event_source_to_arc_source(&EventSource::Calendar), ArcSource::Calendar);
-        assert_eq!(event_source_to_arc_source(&EventSource::UserInput), ArcSource::UserInput);
+        assert_eq!(
+            event_source_to_arc_source(&EventSource::Email),
+            ArcSource::Email
+        );
+        assert_eq!(
+            event_source_to_arc_source(&EventSource::Calendar),
+            ArcSource::Calendar
+        );
+        assert_eq!(
+            event_source_to_arc_source(&EventSource::UserInput),
+            ArcSource::UserInput
+        );
     }
 
     #[test]
     fn event_source_maps_to_entry_type() {
-        assert_eq!(event_source_to_entry_type(&EventSource::Email), EntryType::EmailEvent);
-        assert_eq!(event_source_to_entry_type(&EventSource::Calendar), EntryType::CalendarEvent);
-        assert_eq!(event_source_to_entry_type(&EventSource::Messaging), EntryType::Message);
-        assert_eq!(event_source_to_entry_type(&EventSource::System), EntryType::SystemEvent);
+        assert_eq!(
+            event_source_to_entry_type(&EventSource::Email),
+            EntryType::EmailEvent
+        );
+        assert_eq!(
+            event_source_to_entry_type(&EventSource::Calendar),
+            EntryType::CalendarEvent
+        );
+        assert_eq!(
+            event_source_to_entry_type(&EventSource::Messaging),
+            EntryType::Message
+        );
+        assert_eq!(
+            event_source_to_entry_type(&EventSource::System),
+            EntryType::SystemEvent
+        );
     }
 
     #[test]

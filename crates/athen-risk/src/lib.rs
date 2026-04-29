@@ -98,9 +98,7 @@ impl RiskEvaluator for CombinedRiskEvaluator {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use athen_core::llm::{
-        BudgetStatus, FinishReason, LlmRequest, LlmResponse, TokenUsage,
-    };
+    use athen_core::llm::{BudgetStatus, FinishReason, LlmRequest, LlmResponse, TokenUsage};
     use athen_core::risk::RiskLevel;
     use athen_core::task::{DomainType, Task, TaskPriority, TaskStatus};
     use athen_core::traits::llm::LlmRouter;
@@ -194,7 +192,8 @@ mod tests {
 
     #[tokio::test]
     async fn falls_back_to_llm_for_ambiguous() {
-        let llm_json = r#"{"impact":"write_persist","sensitivity":"personal_info","confidence":0.8}"#;
+        let llm_json =
+            r#"{"impact":"write_persist","sensitivity":"personal_info","confidence":0.8}"#;
         let router = MockRouter::new(llm_json);
         let evaluator = CombinedRiskEvaluator::new(LlmRiskEvaluator::new(Box::new(router)));
 
@@ -253,7 +252,11 @@ mod tests {
         assert_eq!(score.evaluation_method, EvaluationMethod::RuleBased);
         assert!(!evaluator.requires_approval(&score));
         // Read(1) * AuthUser(0.5) * Plain(1) + 0 = 0.5
-        assert!(score.total < 1.0, "Score should be ~0.5, got {}", score.total);
+        assert!(
+            score.total < 1.0,
+            "Score should be ~0.5, got {}",
+            score.total
+        );
     }
 
     #[tokio::test]

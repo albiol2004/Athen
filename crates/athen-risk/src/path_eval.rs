@@ -12,9 +12,7 @@ use uuid::Uuid;
 use athen_core::contact::TrustLevel;
 use athen_core::error::Result;
 use athen_core::paths;
-use athen_core::risk::{
-    BaseImpact, DataSensitivity, EvaluationMethod, RiskContext, RiskScore,
-};
+use athen_core::risk::{BaseImpact, DataSensitivity, EvaluationMethod, RiskContext, RiskScore};
 
 use crate::scorer::RiskScorer;
 
@@ -61,11 +59,9 @@ impl<G: GrantLookup> PathRiskEvaluator<G> {
                 llm_confidence: Some(0.0),
                 accumulated_risk: context.accumulated_risk,
             };
-            return Ok(self.scorer.compute(
-                BaseImpact::System,
-                &ctx,
-                EvaluationMethod::RuleBased,
-            ));
+            return Ok(self
+                .scorer
+                .compute(BaseImpact::System, &ctx, EvaluationMethod::RuleBased));
         }
 
         // 2. Granted -> Safe.
@@ -76,7 +72,9 @@ impl<G: GrantLookup> PathRiskEvaluator<G> {
                 BaseImpact::Read
             };
             let ctx = safe_ctx(context);
-            return Ok(self.scorer.compute(impact, &ctx, EvaluationMethod::RuleBased));
+            return Ok(self
+                .scorer
+                .compute(impact, &ctx, EvaluationMethod::RuleBased));
         }
 
         // 3. Inside athen_data_dir -> Safe.
@@ -88,7 +86,9 @@ impl<G: GrantLookup> PathRiskEvaluator<G> {
                     BaseImpact::Read
                 };
                 let ctx = safe_ctx(context);
-                return Ok(self.scorer.compute(impact, &ctx, EvaluationMethod::RuleBased));
+                return Ok(self
+                    .scorer
+                    .compute(impact, &ctx, EvaluationMethod::RuleBased));
             }
         }
 
@@ -124,7 +124,9 @@ impl<G: GrantLookup> PathRiskEvaluator<G> {
             ));
         }
         let ctx = caution_ctx(context);
-        Ok(self.scorer.compute(BaseImpact::Read, &ctx, EvaluationMethod::RuleBased))
+        Ok(self
+            .scorer
+            .compute(BaseImpact::Read, &ctx, EvaluationMethod::RuleBased))
     }
 }
 
@@ -187,11 +189,8 @@ mod tests {
     impl GrantLookup for MockGrants {
         async fn check(&self, arc_id: Uuid, path: &Path, write: bool) -> Result<bool> {
             let g = self.granted.lock().unwrap();
-            Ok(g.iter().any(|(a, p, w)| {
-                *a == arc_id
-                    && paths::path_within(path, p)
-                    && (*w || !write)
-            }))
+            Ok(g.iter()
+                .any(|(a, p, w)| *a == arc_id && paths::path_within(path, p) && (*w || !write)))
         }
     }
 

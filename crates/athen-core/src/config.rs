@@ -292,7 +292,10 @@ pub enum NotificationChannelKind {
 impl Default for NotificationConfig {
     fn default() -> Self {
         Self {
-            preferred_channels: vec![NotificationChannelKind::InApp, NotificationChannelKind::Telegram],
+            preferred_channels: vec![
+                NotificationChannelKind::InApp,
+                NotificationChannelKind::Telegram,
+            ],
             escalation_timeout_secs: 300,
             quiet_hours: None,
         }

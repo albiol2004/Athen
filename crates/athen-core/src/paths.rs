@@ -50,8 +50,8 @@ pub fn resolve_in_workspace(p: &Path) -> PathBuf {
     if p.is_absolute() {
         return p.to_path_buf();
     }
-    let base = athen_workspace_dir()
-        .unwrap_or_else(|| std::env::temp_dir().join("athen-workspace"));
+    let base =
+        athen_workspace_dir().unwrap_or_else(|| std::env::temp_dir().join("athen-workspace"));
     base.join(p)
 }
 
@@ -147,15 +147,13 @@ fn normalize(p: &Path) -> PathBuf {
     for comp in p.components() {
         match comp {
             Component::CurDir => {}
-            Component::ParentDir => {
-                match stack.last() {
-                    Some(Component::Normal(_)) => {
-                        stack.pop();
-                    }
-                    Some(Component::ParentDir) | None => stack.push(Component::ParentDir),
-                    _ => {}
+            Component::ParentDir => match stack.last() {
+                Some(Component::Normal(_)) => {
+                    stack.pop();
                 }
-            }
+                Some(Component::ParentDir) | None => stack.push(Component::ParentDir),
+                _ => {}
+            },
             other => stack.push(other),
         }
     }
@@ -184,7 +182,7 @@ mod tests {
 
     #[test]
     fn home_paths_not_system() {
-        assert!(!is_system_path(Path::new("/home/alex/Documents")));
+        assert!(!is_system_path(Path::new("/home/user/Documents")));
         assert!(!is_system_path(Path::new("/tmp/foo")));
     }
 

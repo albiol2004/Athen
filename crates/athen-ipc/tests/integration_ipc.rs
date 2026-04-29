@@ -134,10 +134,7 @@ async fn test_monitor_sends_event_to_coordinator_via_ipc() {
         IpcPayload::SenseEvent(evt) => {
             assert_eq!(evt.id, event_id);
             assert_eq!(evt.source, EventSource::Email);
-            assert_eq!(
-                evt.content.summary.as_deref(),
-                Some("test email")
-            );
+            assert_eq!(evt.content.summary.as_deref(), Some("test email"));
         }
         other => panic!("expected SenseEvent, got {:?}", other),
     }
@@ -393,10 +390,7 @@ async fn test_client_reconnection_after_disconnect() {
         },
     };
     let pong_id = pong.id;
-    server
-        .send_to(client2.process_id(), &pong)
-        .await
-        .unwrap();
+    server.send_to(client2.process_id(), &pong).await.unwrap();
 
     let reply = timeout(TEST_TIMEOUT, client2.recv())
         .await
@@ -490,7 +484,10 @@ async fn test_concurrent_message_sending() {
         }
     }
 
-    assert_eq!(registration_count, 5, "should have received 5 registrations");
+    assert_eq!(
+        registration_count, 5,
+        "should have received 5 registrations"
+    );
     assert_eq!(
         received_ids, expected_ids,
         "all 5 HealthPing message IDs should be received"

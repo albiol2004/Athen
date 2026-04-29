@@ -108,10 +108,7 @@ impl AgentBuilder {
     /// When provided, the executor will use `LlmRouter::route_streaming()` and
     /// forward each text delta through this sender, enabling progressive
     /// rendering in the UI.
-    pub fn stream_sender(
-        mut self,
-        sender: tokio::sync::mpsc::UnboundedSender<String>,
-    ) -> Self {
+    pub fn stream_sender(mut self, sender: tokio::sync::mpsc::UnboundedSender<String>) -> Self {
         self.stream_sender = Some(sender);
         self
     }
@@ -206,11 +203,7 @@ mod tests {
         async fn list_tools(&self) -> Result<Vec<ToolDefinition>> {
             Ok(vec![])
         }
-        async fn call_tool(
-            &self,
-            _name: &str,
-            _args: serde_json::Value,
-        ) -> Result<CoreToolResult> {
+        async fn call_tool(&self, _name: &str, _args: serde_json::Value) -> Result<CoreToolResult> {
             unimplemented!()
         }
     }

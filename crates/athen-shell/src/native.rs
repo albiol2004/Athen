@@ -102,7 +102,13 @@ impl NativeShell {
     async fn find_program(&self, program: &str) -> Result<Option<PathBuf>> {
         let output = self.run_command(&format!("where {}", program)).await?;
         if output.exit_code == 0 {
-            let path = output.stdout.lines().next().unwrap_or("").trim().to_string();
+            let path = output
+                .stdout
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
             if path.is_empty() {
                 Ok(None)
             } else {
@@ -184,10 +190,7 @@ mod tests {
     #[tokio::test]
     async fn test_which_nonexistent_program() {
         let shell = NativeShell::new();
-        let result = shell
-            .which("nonexistent_program_xyz_12345")
-            .await
-            .unwrap();
+        let result = shell.which("nonexistent_program_xyz_12345").await.unwrap();
         assert!(result.is_none());
     }
 

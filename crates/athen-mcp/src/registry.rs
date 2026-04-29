@@ -282,12 +282,10 @@ impl McpClient for McpRegistry {
             params = params.with_arguments(a);
         }
 
-        let result = client
-            .service
-            .peer()
-            .call_tool(params)
-            .await
-            .map_err(|e| AthenError::Other(format!("MCP '{mcp_id}' call_tool '{tool}': {e}")))?;
+        let result =
+            client.service.peer().call_tool(params).await.map_err(|e| {
+                AthenError::Other(format!("MCP '{mcp_id}' call_tool '{tool}': {e}"))
+            })?;
 
         let raw = serde_json::to_value(&result.content).unwrap_or(serde_json::json!([]));
         let text = result
@@ -321,11 +319,18 @@ mod tests {
             .unwrap()
             .parent()
             .unwrap();
-        let bin = ["target/debug/mcp-filesystem", "target/release/mcp-filesystem"]
-            .iter()
-            .map(|c| workspace_root.join(c))
-            .find(|p| p.exists())?;
-        let exe_dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+        let bin = [
+            "target/debug/mcp-filesystem",
+            "target/release/mcp-filesystem",
+        ]
+        .iter()
+        .map(|c| workspace_root.join(c))
+        .find(|p| p.exists())?;
+        let exe_dir = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
         let link = exe_dir.join("mcp-filesystem");
         let _ = std::fs::remove_file(&link);
         std::os::unix::fs::symlink(&bin, &link).ok()?;
@@ -359,7 +364,9 @@ mod tests {
     #[tokio::test]
     async fn call_tool_when_disabled_errors() {
         let reg = McpRegistry::new();
-        let res = reg.call_tool("files", "read_file", serde_json::json!({})).await;
+        let res = reg
+            .call_tool("files", "read_file", serde_json::json!({}))
+            .await;
         assert!(res.is_err());
     }
 
@@ -395,7 +402,11 @@ mod tests {
             .await
             .unwrap();
         let read = reg
-            .call_tool("files", "read_file", serde_json::json!({"path": "hello.txt"}))
+            .call_tool(
+                "files",
+                "read_file",
+                serde_json::json!({"path": "hello.txt"}),
+            )
             .await
             .unwrap();
         assert!(read.success);

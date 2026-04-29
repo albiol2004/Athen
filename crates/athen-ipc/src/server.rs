@@ -364,10 +364,7 @@ mod tests {
             },
         };
         let pong_id = pong.id;
-        server
-            .send_to(client.process_id(), &pong)
-            .await
-            .unwrap();
+        server.send_to(client.process_id(), &pong).await.unwrap();
 
         let reply = client.recv().await.unwrap();
         assert_eq!(reply.id, pong_id);

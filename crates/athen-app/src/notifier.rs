@@ -144,10 +144,7 @@ pub struct NotificationOrchestrator {
 }
 
 impl NotificationOrchestrator {
-    pub fn new(
-        config: NotificationConfig,
-        channels: Vec<Box<dyn NotificationChannel>>,
-    ) -> Self {
+    pub fn new(config: NotificationConfig, channels: Vec<Box<dyn NotificationChannel>>) -> Self {
         Self {
             channels,
             config,
@@ -1331,8 +1328,7 @@ mod tests {
         // Second orchestrator (simulating restart): load from same DB.
         let inapp2 = MockChannel::new(NotificationChannelKind::InApp);
         let orch2 = Arc::new(
-            NotificationOrchestrator::new(make_config(), vec![Box::new(inapp2)])
-                .with_store(store),
+            NotificationOrchestrator::new(make_config(), vec![Box::new(inapp2)]).with_store(store),
         );
         orch2.load_persisted().await;
 
@@ -1350,8 +1346,10 @@ mod tests {
         let (orch, _counter) = make_orchestrator_with_store(make_config()).await;
         orch.set_user_present(true);
 
-        orch.notify(make_notification(NotificationUrgency::Low, false)).await;
-        orch.notify(make_notification(NotificationUrgency::Medium, false)).await;
+        orch.notify(make_notification(NotificationUrgency::Low, false))
+            .await;
+        orch.notify(make_notification(NotificationUrgency::Medium, false))
+            .await;
 
         orch.mark_all_read().await;
 

@@ -39,8 +39,7 @@ impl Database {
     pub async fn new(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let conn = tokio::task::spawn_blocking(move || {
-            Connection::open(&path)
-                .map_err(|e| AthenError::Other(format!("Open database: {e}")))
+            Connection::open(&path).map_err(|e| AthenError::Other(format!("Open database: {e}")))
         })
         .await
         .map_err(|e| AthenError::Other(format!("Spawn blocking: {e}")))??;

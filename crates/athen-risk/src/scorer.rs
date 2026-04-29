@@ -3,9 +3,7 @@
 use async_trait::async_trait;
 
 use athen_core::error::Result;
-use athen_core::risk::{
-    BaseImpact, EvaluationMethod, RiskContext, RiskLevel, RiskScore,
-};
+use athen_core::risk::{BaseImpact, EvaluationMethod, RiskContext, RiskLevel, RiskScore};
 use athen_core::task::Task;
 use athen_core::traits::coordinator::RiskEvaluator;
 
@@ -131,7 +129,11 @@ mod tests {
         let scorer = RiskScorer::new();
         let score = scorer.compute(
             BaseImpact::WritePersist,
-            &ctx(TrustLevel::Trusted, DataSensitivity::PersonalInfo, Some(0.5)),
+            &ctx(
+                TrustLevel::Trusted,
+                DataSensitivity::PersonalInfo,
+                Some(0.5),
+            ),
             EvaluationMethod::LlmAssisted,
         );
         // 40 * 1.0 * 2 + (0.5)^2 * 100 = 80 + 25 = 105

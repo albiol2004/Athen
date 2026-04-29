@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use athen_contacts::trust::TrustManager;
 use athen_core::contact::{ContactId, IdentifierKind, TrustLevel};
 use athen_core::error::{AthenError, Result};
-use athen_core::event::{EventSource, SenseEvent, SenderInfo};
+use athen_core::event::{EventSource, SenderInfo, SenseEvent};
 use athen_core::risk::{DataSensitivity, RiskContext, RiskDecision};
 use athen_core::task::{AgentId, Task, TaskId, TaskStatus};
 use athen_core::traits::coordinator::{EventRouter, RiskEvaluator, TaskQueue};
@@ -91,10 +91,7 @@ impl Coordinator {
     ///
     /// Returns the trust level and the resolved contact ID.
     /// Falls back to `TrustLevel::Neutral` when no trust manager is configured.
-    async fn resolve_sender_trust(
-        &self,
-        sender: &SenderInfo,
-    ) -> (TrustLevel, Option<ContactId>) {
+    async fn resolve_sender_trust(&self, sender: &SenderInfo) -> (TrustLevel, Option<ContactId>) {
         let Some(ref tm) = self.trust_manager else {
             return (TrustLevel::Neutral, None);
         };

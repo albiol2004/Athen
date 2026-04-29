@@ -68,14 +68,8 @@ async fn test_build_and_explore_contact_network() {
         .add_relation(maria, "trabaja_en", empresa_x)
         .await
         .unwrap();
-    graph
-        .add_relation(juan, "participó", alpha)
-        .await
-        .unwrap();
-    graph
-        .add_relation(maria, "participó", alpha)
-        .await
-        .unwrap();
+    graph.add_relation(juan, "participó", alpha).await.unwrap();
+    graph.add_relation(maria, "participó", alpha).await.unwrap();
 
     // Also add reverse relations so BFS can discover María through shared nodes
     graph
@@ -107,10 +101,7 @@ async fn test_build_and_explore_contact_network() {
     let nodes = graph.explore(juan, params_depth2).await.unwrap();
     let names: Vec<&str> = nodes.iter().map(|n| n.entity.name.as_str()).collect();
 
-    assert!(
-        names.contains(&"Juan"),
-        "Entry node Juan must be present"
-    );
+    assert!(names.contains(&"Juan"), "Entry node Juan must be present");
     assert!(
         names.contains(&"Empresa X"),
         "Direct neighbor Empresa X must be present"
@@ -128,10 +119,7 @@ async fn test_build_and_explore_contact_network() {
     let juan_node = nodes.iter().find(|n| n.entity.name == "Juan").unwrap();
     assert_eq!(juan_node.depth, 0, "Juan is the entry node at depth 0");
 
-    let empresa_node = nodes
-        .iter()
-        .find(|n| n.entity.name == "Empresa X")
-        .unwrap();
+    let empresa_node = nodes.iter().find(|n| n.entity.name == "Empresa X").unwrap();
     assert_eq!(empresa_node.depth, 1, "Empresa X is at depth 1");
 
     let alpha_node = nodes.iter().find(|n| n.entity.name == "Alpha").unwrap();
@@ -225,7 +213,10 @@ async fn test_vector_search_finds_semantically_similar() {
     assert_eq!(results.len(), 3, "Should return top 3 results");
 
     // "meeting notes" should be first (exact match, cosine similarity = 1.0)
-    assert_eq!(results[0].id, "meeting_notes", "Exact match should be first");
+    assert_eq!(
+        results[0].id, "meeting_notes",
+        "Exact match should be first"
+    );
     assert!(
         (results[0].score - 1.0).abs() < 1e-5,
         "Score for exact match should be ~1.0"
@@ -238,10 +229,7 @@ async fn test_vector_search_finds_semantically_similar() {
     );
 
     // "email draft" should be third (somewhat similar)
-    assert_eq!(
-        results[2].id, "email_draft",
-        "email_draft should be third"
-    );
+    assert_eq!(results[2].id, "email_draft", "email_draft should be third");
 
     // Verify that python_code and rust_code are NOT in the top 3
     let top3_ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
@@ -515,10 +503,7 @@ async fn test_graph_explore_respects_params() {
     let has_deep = nodes_shallow
         .iter()
         .any(|n| n.entity.name.starts_with("Deep"));
-    assert!(
-        !has_deep,
-        "Deep nodes should NOT appear with max_depth=1"
-    );
+    assert!(!has_deep, "Deep nodes should NOT appear with max_depth=1");
 
     // --- Test relevance_threshold=0.9 ---
     // With default weights (recency=0.4, frequency=0.2, importance=0.3) and

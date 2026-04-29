@@ -202,8 +202,14 @@ mod tests {
 
         assert_eq!(queue.pending_count().await.unwrap(), 0);
 
-        queue.enqueue(make_task(TaskPriority::Normal, now)).await.unwrap();
-        queue.enqueue(make_task(TaskPriority::High, now)).await.unwrap();
+        queue
+            .enqueue(make_task(TaskPriority::Normal, now))
+            .await
+            .unwrap();
+        queue
+            .enqueue(make_task(TaskPriority::High, now))
+            .await
+            .unwrap();
 
         assert_eq!(queue.pending_count().await.unwrap(), 2);
 

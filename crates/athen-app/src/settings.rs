@@ -10,12 +10,12 @@ use tauri::State;
 use tracing::{info, warn};
 
 use athen_core::config::{
-    AthenConfig, AuthType, EmbeddingMode, ModelsConfig,
-    NotificationChannelKind, NotificationConfig, ProviderConfig, QuietHours, SecurityMode,
+    AthenConfig, AuthType, EmbeddingMode, ModelsConfig, NotificationChannelKind,
+    NotificationConfig, ProviderConfig, QuietHours, SecurityMode,
 };
 use athen_core::config_loader;
 
-use crate::state::{AppState, build_router_for_provider};
+use crate::state::{build_router_for_provider, AppState};
 
 // ---------------------------------------------------------------------------
 // Response types
@@ -110,11 +110,10 @@ pub struct TestResult {
 
 /// Resolve the `~/.athen/` directory, creating it if needed.
 fn ensure_athen_dir() -> Result<PathBuf, String> {
-    let home = std::env::var_os("HOME")
-        .ok_or_else(|| "HOME environment variable not set".to_string())?;
+    let home =
+        std::env::var_os("HOME").ok_or_else(|| "HOME environment variable not set".to_string())?;
     let dir = PathBuf::from(home).join(".athen");
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("Failed to create ~/.athen/: {e}"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create ~/.athen/: {e}"))?;
     Ok(dir)
 }
 
@@ -142,8 +141,7 @@ fn save_models_config(config: &ModelsConfig) -> Result<(), String> {
     let path = dir.join("models.toml");
     let content = toml::to_string_pretty(config)
         .map_err(|e| format!("Failed to serialize models config: {e}"))?;
-    std::fs::write(&path, content)
-        .map_err(|e| format!("Failed to write models.toml: {e}"))?;
+    std::fs::write(&path, content).map_err(|e| format!("Failed to write models.toml: {e}"))?;
     info!("Saved models config to {}", path.display());
     Ok(())
 }
@@ -166,10 +164,9 @@ fn load_main_config() -> AthenConfig {
 fn save_main_config(config: &AthenConfig) -> Result<(), String> {
     let dir = ensure_athen_dir()?;
     let path = dir.join("config.toml");
-    let content = toml::to_string_pretty(config)
-        .map_err(|e| format!("Failed to serialize config: {e}"))?;
-    std::fs::write(&path, content)
-        .map_err(|e| format!("Failed to write config.toml: {e}"))?;
+    let content =
+        toml::to_string_pretty(config).map_err(|e| format!("Failed to serialize config: {e}"))?;
+    std::fs::write(&path, content).map_err(|e| format!("Failed to write config.toml: {e}"))?;
     info!("Saved config to {}", path.display());
     Ok(())
 }
@@ -232,11 +229,7 @@ fn mask_api_key(key: &str) -> String {
 }
 
 /// Convert a `ProviderConfig` entry into `ProviderInfo` for the frontend.
-fn provider_config_to_info(
-    id: &str,
-    config: &ProviderConfig,
-    active_id: &str,
-) -> ProviderInfo {
+fn provider_config_to_info(id: &str, config: &ProviderConfig, active_id: &str) -> ProviderInfo {
     let base_url = config
         .endpoint
         .as_deref()
@@ -436,9 +429,7 @@ pub async fn save_provider(
     let auth = match api_key {
         Some(key) if key.is_empty() => AuthType::None,
         Some(key) => AuthType::ApiKey(key),
-        None => existing
-            .map(|p| p.auth.clone())
-            .unwrap_or(AuthType::None),
+        None => existing.map(|p| p.auth.clone()).unwrap_or(AuthType::None),
     };
 
     let resolved_base_url = if base_url.is_empty() {
@@ -473,9 +464,7 @@ pub async fn save_provider(
     if id == active_id {
         // Resolve the API key: saved key takes priority over env var.
         let router_api_key = match &auth {
-            AuthType::ApiKey(key) if !key.is_empty() && !key.starts_with("${") => {
-                Some(key.clone())
-            }
+            AuthType::ApiKey(key) if !key.is_empty() && !key.starts_with("${") => Some(key.clone()),
             _ => {
                 let env_var = format!("{}_API_KEY", id.to_uppercase());
                 std::env::var(&env_var).ok().filter(|k| !k.is_empty())
@@ -497,7 +486,10 @@ pub async fn save_provider(
 
         let name = display_name(&id);
         info!("Hot-reloaded active provider {} ({})", name, resolved_model);
-        Ok(format!("Provider saved and activated ({} / {}).", name, resolved_model))
+        Ok(format!(
+            "Provider saved and activated ({} / {}).",
+            name, resolved_model
+        ))
     } else {
         Ok("Provider saved.".to_string())
     }
@@ -611,9 +603,7 @@ pub async fn test_provider(
                 .providers
                 .get(&id)
                 .and_then(|p| match &p.auth {
-                    AuthType::ApiKey(k) if !k.is_empty() && !k.starts_with("${") => {
-                        Some(k.clone())
-                    }
+                    AuthType::ApiKey(k) if !k.is_empty() && !k.starts_with("${") => Some(k.clone()),
                     _ => None,
                 })
                 .unwrap_or_default()
@@ -672,9 +662,7 @@ pub async fn set_active_provider(
     // Resolve API key: saved config takes priority over env var.
     let api_key = provider_cfg
         .and_then(|c| match &c.auth {
-            AuthType::ApiKey(key) if !key.is_empty() && !key.starts_with("${") => {
-                Some(key.clone())
-            }
+            AuthType::ApiKey(key) if !key.is_empty() && !key.starts_with("${") => Some(key.clone()),
             _ => None,
         })
         .or_else(|| {
@@ -726,9 +714,7 @@ fn persist_active_provider(provider_id: &str) -> Result<(), String> {
 
 /// Save general settings (security mode, etc.).
 #[tauri::command]
-pub async fn save_settings(
-    security_mode: String,
-) -> std::result::Result<String, String> {
+pub async fn save_settings(security_mode: String) -> std::result::Result<String, String> {
     let mut config = load_main_config();
 
     config.security.mode = match security_mode.to_lowercase().as_str() {
@@ -822,8 +808,7 @@ fn test_imap_connection(
     use std::time::Duration;
 
     let addr = (server, port);
-    let tcp = TcpStream::connect(addr)
-        .map_err(|e| format!("Connection failed: {e}"))?;
+    let tcp = TcpStream::connect(addr).map_err(|e| format!("Connection failed: {e}"))?;
     tcp.set_read_timeout(Some(Duration::from_secs(10)))
         .map_err(|e| format!("Failed to set timeout: {e}"))?;
     tcp.set_write_timeout(Some(Duration::from_secs(10)))
@@ -843,8 +828,13 @@ fn test_imap_connection(
             .select("INBOX")
             .map_err(|e| format!("Failed to select INBOX: {e}"))?;
         let count = mailbox.exists;
-        session.logout().map_err(|e| format!("Logout failed: {e}"))?;
-        Ok(format!("Connected successfully. INBOX has {} messages.", count))
+        session
+            .logout()
+            .map_err(|e| format!("Logout failed: {e}"))?;
+        Ok(format!(
+            "Connected successfully. INBOX has {} messages.",
+            count
+        ))
     } else {
         let client = imap::Client::new(tcp);
         let mut session = client
@@ -854,8 +844,13 @@ fn test_imap_connection(
             .select("INBOX")
             .map_err(|e| format!("Failed to select INBOX: {e}"))?;
         let count = mailbox.exists;
-        session.logout().map_err(|e| format!("Logout failed: {e}"))?;
-        Ok(format!("Connected successfully. INBOX has {} messages.", count))
+        session
+            .logout()
+            .map_err(|e| format!("Logout failed: {e}"))?;
+        Ok(format!(
+            "Connected successfully. INBOX has {} messages.",
+            count
+        ))
     }
 }
 
@@ -958,10 +953,7 @@ pub async fn test_telegram_connection(
 // Provider-specific test functions
 // ---------------------------------------------------------------------------
 
-async fn test_ollama(
-    client: &reqwest::Client,
-    base_url: &str,
-) -> Result<String, String> {
+async fn test_ollama(client: &reqwest::Client, base_url: &str) -> Result<String, String> {
     let url = format!("{}/api/tags", base_url.trim_end_matches('/'));
     let resp = client
         .get(&url)
@@ -985,10 +977,7 @@ async fn test_ollama(
     }
 }
 
-async fn test_llamacpp(
-    client: &reqwest::Client,
-    base_url: &str,
-) -> Result<String, String> {
+async fn test_llamacpp(client: &reqwest::Client, base_url: &str) -> Result<String, String> {
     let url = format!("{}/health", base_url.trim_end_matches('/'));
     let resp = client
         .get(&url)
@@ -1013,10 +1002,7 @@ async fn test_openai_compatible(
         return Err("API key is required.".to_string());
     }
 
-    let url = format!(
-        "{}/v1/chat/completions",
-        base_url.trim_end_matches('/')
-    );
+    let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
 
     let body = serde_json::json!({
         "model": model,
@@ -1214,20 +1200,14 @@ pub async fn test_embedding_provider(
 
     let result = match provider.as_str() {
         "ollama" => {
-            let url = base_url
-                .as_deref()
-                .unwrap_or("http://localhost:11434");
+            let url = base_url.as_deref().unwrap_or("http://localhost:11434");
             let model_name = model.as_deref().unwrap_or("nomic-embed-text");
             test_ollama_embedding(&client, url, model_name).await
         }
         _ => {
             // OpenAI-compatible embedding endpoint.
-            let url = base_url
-                .as_deref()
-                .unwrap_or("https://api.openai.com");
-            let model_name = model
-                .as_deref()
-                .unwrap_or("text-embedding-3-small");
+            let url = base_url.as_deref().unwrap_or("https://api.openai.com");
+            let model_name = model.as_deref().unwrap_or("text-embedding-3-small");
             let key = api_key
                 .or_else(|| {
                     // Fall back to saved config key.
@@ -1271,11 +1251,18 @@ async fn test_ollama_embedding(
         .map_err(|e| format!("Connection failed: {e}"))?;
 
     if resp.status().is_success() {
-        Ok(format!("Connected. Model '{}' is available for embeddings.", model))
+        Ok(format!(
+            "Connected. Model '{}' is available for embeddings.",
+            model
+        ))
     } else {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        Err(format!("HTTP {}: {}", status, text.chars().take(200).collect::<String>()))
+        Err(format!(
+            "HTTP {}: {}",
+            status,
+            text.chars().take(200).collect::<String>()
+        ))
     }
 }
 
@@ -1306,7 +1293,10 @@ async fn test_openai_embedding(
         .map_err(|e| format!("Connection failed: {e}"))?;
 
     if resp.status().is_success() {
-        Ok(format!("Connected. Model '{}' returned embeddings successfully.", model))
+        Ok(format!(
+            "Connected. Model '{}' returned embeddings successfully.",
+            model
+        ))
     } else {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -1337,10 +1327,7 @@ async fn test_anthropic(
         return Err("API key is required.".to_string());
     }
 
-    let url = format!(
-        "{}/v1/messages",
-        base_url.trim_end_matches('/')
-    );
+    let url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
 
     let body = serde_json::json!({
         "model": model,

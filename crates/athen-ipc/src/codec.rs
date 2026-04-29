@@ -41,7 +41,7 @@ pub fn read_length_prefix(data: &[u8]) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use athen_core::ipc::{ProcessId, ProcessTarget, ProcessType, IpcPayload};
+    use athen_core::ipc::{IpcPayload, ProcessId, ProcessTarget, ProcessType};
     use uuid::Uuid;
 
     fn make_test_message() -> IpcMessage {

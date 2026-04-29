@@ -104,10 +104,7 @@ impl BudgetTracker {
 /// Get the start of today (midnight UTC).
 fn today_start() -> DateTime<Utc> {
     let now = Utc::now();
-    now.date_naive()
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
-        .and_utc()
+    now.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc()
 }
 
 #[cfg(test)]

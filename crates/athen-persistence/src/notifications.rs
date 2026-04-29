@@ -45,8 +45,9 @@ impl NotificationStore {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            conn.execute_batch(NOTIFICATIONS_SCHEMA_SQL)
-                .map_err(|e| AthenError::Other(format!("Failed to init notifications schema: {e}")))?;
+            conn.execute_batch(NOTIFICATIONS_SCHEMA_SQL).map_err(|e| {
+                AthenError::Other(format!("Failed to init notifications schema: {e}"))
+            })?;
             Ok(())
         })
         .await
@@ -327,11 +328,7 @@ fn row_to_notification_with_read(
 ) -> rusqlite::Result<(Notification, bool)> {
     let id_str: String = row.get(0)?;
     let id = Uuid::parse_str(&id_str).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(
-            0,
-            rusqlite::types::Type::Text,
-            Box::new(e),
-        )
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
     })?;
     let urgency_str: String = row.get(1)?;
     let origin_str: String = row.get(4)?;

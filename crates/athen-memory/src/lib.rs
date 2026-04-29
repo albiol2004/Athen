@@ -141,9 +141,10 @@ impl MemoryStore for Memory {
                         .collect();
 
                     for (from_name, relation, to_name, importance) in &result.relations {
-                        if let (Some(&from_id), Some(&to_id)) =
-                            (name_to_id.get(from_name.as_str()), name_to_id.get(to_name.as_str()))
-                        {
+                        if let (Some(&from_id), Some(&to_id)) = (
+                            name_to_id.get(from_name.as_str()),
+                            name_to_id.get(to_name.as_str()),
+                        ) {
                             self.graph
                                 .add_relation_weighted(from_id, relation, to_id, *importance)
                                 .await?;
@@ -217,12 +218,9 @@ impl MemoryStore for Memory {
                 // Embed the entity name and search for memory items mentioning related entities.
                 if let Some(ref embedder) = self.embedder {
                     if let Ok(entity_embedding) = embedder.embed(name).await {
-                        if let Ok(entity_results) =
-                            self.vector.search(entity_embedding, 5).await
-                        {
+                        if let Ok(entity_results) = self.vector.search(entity_embedding, 5).await {
                             for er in &entity_results {
-                                let names =
-                                    extract_entity_names_from_metadata(&er.metadata);
+                                let names = extract_entity_names_from_metadata(&er.metadata);
                                 related_entity_names.extend(names);
                             }
                         }
@@ -640,13 +638,25 @@ mod tests {
 
         #[async_trait]
         impl KnowledgeGraph for ArcGraphAdapter {
-            async fn add_entity(&self, entity: Entity) -> Result<athen_core::traits::memory::EntityId> {
+            async fn add_entity(
+                &self,
+                entity: Entity,
+            ) -> Result<athen_core::traits::memory::EntityId> {
                 self.0.add_entity(entity).await
             }
-            async fn add_relation(&self, from: athen_core::traits::memory::EntityId, relation: &str, to: athen_core::traits::memory::EntityId) -> Result<()> {
+            async fn add_relation(
+                &self,
+                from: athen_core::traits::memory::EntityId,
+                relation: &str,
+                to: athen_core::traits::memory::EntityId,
+            ) -> Result<()> {
                 self.0.add_relation(from, relation, to).await
             }
-            async fn explore(&self, entry: athen_core::traits::memory::EntityId, params: athen_core::traits::memory::ExploreParams) -> Result<Vec<athen_core::traits::memory::GraphNode>> {
+            async fn explore(
+                &self,
+                entry: athen_core::traits::memory::EntityId,
+                params: athen_core::traits::memory::ExploreParams,
+            ) -> Result<Vec<athen_core::traits::memory::GraphNode>> {
                 self.0.explore(entry, params).await
             }
         }
@@ -733,7 +743,10 @@ mod tests {
             })
             .await;
 
-        assert!(result.is_ok(), "remember() should succeed despite extractor failure");
+        assert!(
+            result.is_ok(),
+            "remember() should succeed despite extractor failure"
+        );
 
         // Verify the item was still stored and can be recalled.
         let results = mem.recall("content", 5).await.unwrap();
@@ -874,10 +887,7 @@ mod tests {
 
         #[async_trait]
         impl KnowledgeGraph for ArcGraphAdapter {
-            async fn add_entity(
-                &self,
-                entity: Entity,
-            ) -> Result<EntityId> {
+            async fn add_entity(&self, entity: Entity) -> Result<EntityId> {
                 self.0.add_entity(entity).await
             }
             async fn add_relation(
@@ -898,11 +908,7 @@ mod tests {
             async fn list_entities(&self) -> Result<Vec<Entity>> {
                 self.0.list_entities().await
             }
-            async fn reinforce_entity(
-                &self,
-                entity_id: EntityId,
-                amount: f32,
-            ) -> Result<()> {
+            async fn reinforce_entity(&self, entity_id: EntityId, amount: f32) -> Result<()> {
                 self.0.reinforce_entity(entity_id, amount).await
             }
         }
@@ -934,7 +940,10 @@ mod tests {
         // Verify initial strength.
         {
             let edges = graph.edges().await;
-            assert!((edges[0].strength - 0.5).abs() < 0.001, "Initial strength should be 0.5");
+            assert!(
+                (edges[0].strength - 0.5).abs() < 0.001,
+                "Initial strength should be 0.5"
+            );
         }
 
         // Reinforce by name.

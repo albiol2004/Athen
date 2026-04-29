@@ -130,10 +130,7 @@ impl OpenAiCompatibleProvider {
                 (Role::Assistant, MessageContent::Structured(v))
                     if v.get("tool_calls").is_some() =>
                 {
-                    let text = v
-                        .get("text")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or_default();
+                    let text = v.get("text").and_then(|t| t.as_str()).unwrap_or_default();
                     let content = if text.is_empty() {
                         None
                     } else {
@@ -143,9 +140,7 @@ impl OpenAiCompatibleProvider {
                     // Convert our ToolCall structs into OpenAI wire format.
                     let tool_calls: Option<Vec<OpenAiToolCallOut>> = v
                         .get("tool_calls")
-                        .and_then(|tc| {
-                            serde_json::from_value::<Vec<ToolCallWire>>(tc.clone()).ok()
-                        })
+                        .and_then(|tc| serde_json::from_value::<Vec<ToolCallWire>>(tc.clone()).ok())
                         .map(|calls| {
                             calls
                                 .into_iter()
@@ -155,13 +150,9 @@ impl OpenAiCompatibleProvider {
                                     function: OpenAiToolCallFunctionOut {
                                         name: tc.name,
                                         arguments: if tc.arguments.is_string() {
-                                            tc.arguments
-                                                .as_str()
-                                                .unwrap_or_default()
-                                                .to_string()
+                                            tc.arguments.as_str().unwrap_or_default().to_string()
                                         } else {
-                                            serde_json::to_string(&tc.arguments)
-                                                .unwrap_or_default()
+                                            serde_json::to_string(&tc.arguments).unwrap_or_default()
                                         },
                                     },
                                 })
@@ -176,18 +167,13 @@ impl OpenAiCompatibleProvider {
                     });
                 }
                 // Tool result messages with tool_call_id.
-                (Role::Tool, MessageContent::Structured(v))
-                    if v.get("tool_call_id").is_some() =>
-                {
+                (Role::Tool, MessageContent::Structured(v)) if v.get("tool_call_id").is_some() => {
                     let tool_call_id = v
                         .get("tool_call_id")
                         .and_then(|id| id.as_str())
                         .unwrap_or_default()
                         .to_string();
-                    let content_str = v
-                        .get("content")
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("{}");
+                    let content_str = v.get("content").and_then(|c| c.as_str()).unwrap_or("{}");
 
                     messages.push(OpenAiMessageOut {
                         role: role.to_string(),
@@ -334,9 +320,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
                         id: tc.id.clone(),
                         name: tc.function.name.clone(),
                         arguments: serde_json::from_str(&tc.function.arguments)
-                            .unwrap_or(serde_json::Value::String(
-                                tc.function.arguments.clone(),
-                            )),
+                            .unwrap_or(serde_json::Value::String(tc.function.arguments.clone())),
                     })
                     .collect()
             })
@@ -454,11 +438,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
                         if !state.pending_bytes.is_empty() {
                             let tail = std::mem::take(&mut state.pending_bytes);
                             let text = String::from_utf8_lossy(&tail);
-                            out.extend(parse_sse_chunks(
-                                &text,
-                                &state.provider_id,
-                                &mut state.acc,
-                            ));
+                            out.extend(parse_sse_chunks(&text, &state.provider_id, &mut state.acc));
                         }
                         if !state.acc.is_empty() {
                             let tool_calls = state.acc.drain();
@@ -1022,10 +1002,7 @@ mod tests {
         let body = provider.build_request_body(&request);
 
         assert_eq!(body.messages[0].role, "tool");
-        assert_eq!(
-            body.messages[0].tool_call_id,
-            Some("call_123".to_string())
-        );
+        assert_eq!(body.messages[0].tool_call_id, Some("call_123".to_string()));
         assert_eq!(
             body.messages[0].content,
             Some(serde_json::Value::String("{\"result\": 42}".into()))
@@ -1089,8 +1066,7 @@ data: [DONE]
 
     #[test]
     fn test_parse_sse_chunks_finish_reason() {
-        let sse =
-            r#"data: {"choices":[{"delta":{},"index":0,"finish_reason":"stop"}]}"#;
+        let sse = r#"data: {"choices":[{"delta":{},"index":0,"finish_reason":"stop"}]}"#;
         let mut acc = ToolCallAccumulator::default();
         let chunks = parse_sse_chunks(sse, "test", &mut acc);
         assert_eq!(chunks.len(), 1);
@@ -1204,7 +1180,10 @@ data: [DONE]
                      data: {\"choices\":[{\"index\":0,\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n\n";
 
         let chunks1 = parse_sse_chunks(part1, "test", &mut acc);
-        assert!(chunks1.iter().filter_map(|c| c.as_ref().ok()).all(|c| !c.is_final));
+        assert!(chunks1
+            .iter()
+            .filter_map(|c| c.as_ref().ok())
+            .all(|c| !c.is_final));
 
         let chunks2 = parse_sse_chunks(part2, "test", &mut acc);
         let final_chunk = chunks2
@@ -1246,8 +1225,7 @@ data: [DONE]
 
     #[tokio::test]
     async fn test_is_available_without_key() {
-        let provider =
-            OpenAiCompatibleProvider::new("http://localhost:8080".into());
+        let provider = OpenAiCompatibleProvider::new("http://localhost:8080".into());
         assert!(!provider.is_available().await);
     }
 

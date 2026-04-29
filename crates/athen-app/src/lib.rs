@@ -104,7 +104,11 @@ pub fn run() {
             // Register an agent so tasks can be dispatched.
             let agent_id = uuid::Uuid::new_v4();
             tauri::async_runtime::block_on(async {
-                state.coordinator.dispatcher().register_agent(agent_id).await;
+                state
+                    .coordinator
+                    .dispatcher()
+                    .register_agent(agent_id)
+                    .await;
             });
 
             // Initialize the notification orchestrator (needs AppHandle for InApp channel).

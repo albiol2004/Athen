@@ -11,6 +11,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use serde_json::json;
 
+use athen_agent::ShellToolRegistry;
 use athen_contacts::ContactStore;
 use athen_core::contact::{Contact, ContactIdentifier, IdentifierKind, TrustLevel};
 use athen_core::error::{AthenError, Result};
@@ -19,7 +20,6 @@ use athen_core::tool::{ToolBackend, ToolDefinition, ToolResult};
 use athen_core::traits::mcp::McpClient;
 use athen_core::traits::memory::{MemoryItem, MemoryStore};
 use athen_core::traits::tool::ToolRegistry;
-use athen_agent::ShellToolRegistry;
 use athen_memory::Memory;
 use athen_persistence::calendar::{CalendarEvent, CalendarStore, EventCreator};
 use athen_persistence::contacts::SqliteContactStore;
@@ -48,7 +48,14 @@ impl AppToolRegistry {
         contacts: Option<SqliteContactStore>,
         memory: Option<Arc<Memory>>,
     ) -> Self {
-        Self { inner: Arc::new(inner), calendar, contacts, memory, mcp: None, file_gate: None }
+        Self {
+            inner: Arc::new(inner),
+            calendar,
+            contacts,
+            memory,
+            mcp: None,
+            file_gate: None,
+        }
     }
 
     /// Attach an MCP client. Tools exposed by enabled MCP servers will appear
@@ -205,35 +212,49 @@ impl AppToolRegistry {
     // ── Tool implementations ─────────────────────────────────────────
 
     async fn do_calendar_list(&self, args: &serde_json::Value) -> Result<ToolResult> {
-        let store = self.calendar.as_ref()
+        let store = self
+            .calendar
+            .as_ref()
             .ok_or_else(|| AthenError::Other("Calendar not available".into()))?;
 
-        let start = args.get("start").and_then(|v| v.as_str())
+        let start = args
+            .get("start")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| AthenError::Other("missing 'start' parameter".into()))?;
-        let end = args.get("end").and_then(|v| v.as_str())
+        let end = args
+            .get("end")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| AthenError::Other("missing 'end' parameter".into()))?;
 
-        tracing::info!(tool = "calendar_list", start, end, "Listing calendar events");
+        tracing::info!(
+            tool = "calendar_list",
+            start,
+            end,
+            "Listing calendar events"
+        );
 
         let t = Instant::now();
         let events = store.list_events(start, end).await?;
         let elapsed = t.elapsed().as_millis() as u64;
 
-        let events_json: Vec<serde_json::Value> = events.iter().map(|e| {
-            json!({
-                "id": e.id,
-                "title": e.title,
-                "start_time": e.start_time,
-                "end_time": e.end_time,
-                "all_day": e.all_day,
-                "location": e.location,
-                "description": e.description,
-                "category": e.category,
-                "color": e.color,
-                "recurrence": e.recurrence,
-                "reminder_minutes": e.reminder_minutes,
+        let events_json: Vec<serde_json::Value> = events
+            .iter()
+            .map(|e| {
+                json!({
+                    "id": e.id,
+                    "title": e.title,
+                    "start_time": e.start_time,
+                    "end_time": e.end_time,
+                    "all_day": e.all_day,
+                    "location": e.location,
+                    "description": e.description,
+                    "category": e.category,
+                    "color": e.color,
+                    "recurrence": e.recurrence,
+                    "reminder_minutes": e.reminder_minutes,
+                })
             })
-        }).collect();
+            .collect();
 
         Ok(ToolResult {
             success: true,
@@ -244,47 +265,74 @@ impl AppToolRegistry {
     }
 
     async fn do_calendar_create(&self, args: &serde_json::Value) -> Result<ToolResult> {
-        let store = self.calendar.as_ref()
+        let store = self
+            .calendar
+            .as_ref()
             .ok_or_else(|| AthenError::Other("Calendar not available".into()))?;
 
-        let title = args.get("title").and_then(|v| v.as_str())
+        let title = args
+            .get("title")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| AthenError::Other("missing 'title' parameter".into()))?;
-        let start_time = args.get("start_time").and_then(|v| v.as_str())
+        let start_time = args
+            .get("start_time")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| AthenError::Other("missing 'start_time' parameter".into()))?;
-        let end_time = args.get("end_time").and_then(|v| v.as_str())
+        let end_time = args
+            .get("end_time")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| AthenError::Other("missing 'end_time' parameter".into()))?;
 
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().to_rfc3339();
 
-        let reminder_minutes: Vec<i64> = args.get("reminder_minutes")
+        let reminder_minutes: Vec<i64> = args
+            .get("reminder_minutes")
             .and_then(|v| v.as_array())
             .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
             .unwrap_or_default();
 
-        let recurrence = args.get("recurrence")
+        let recurrence = args
+            .get("recurrence")
             .and_then(|v| v.as_str())
             .and_then(|s| serde_json::from_value(json!(s)).ok());
 
         let event = CalendarEvent {
             id: id.clone(),
             title: title.to_string(),
-            description: args.get("description").and_then(|v| v.as_str()).map(String::from),
+            description: args
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(String::from),
             start_time: start_time.to_string(),
             end_time: end_time.to_string(),
-            all_day: args.get("all_day").and_then(|v| v.as_bool()).unwrap_or(false),
-            location: args.get("location").and_then(|v| v.as_str()).map(String::from),
+            all_day: args
+                .get("all_day")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            location: args
+                .get("location")
+                .and_then(|v| v.as_str())
+                .map(String::from),
             recurrence,
             reminder_minutes,
             color: args.get("color").and_then(|v| v.as_str()).map(String::from),
-            category: args.get("category").and_then(|v| v.as_str()).map(String::from),
+            category: args
+                .get("category")
+                .and_then(|v| v.as_str())
+                .map(String::from),
             created_by: EventCreator::Agent,
             arc_id: None,
             created_at: now.clone(),
             updated_at: now,
         };
 
-        tracing::info!(tool = "calendar_create", title, start_time, "Creating calendar event");
+        tracing::info!(
+            tool = "calendar_create",
+            title,
+            start_time,
+            "Creating calendar event"
+        );
 
         let t = Instant::now();
         store.create_event(&event).await?;
@@ -305,21 +353,28 @@ impl AppToolRegistry {
     }
 
     async fn do_calendar_update(&self, args: &serde_json::Value) -> Result<ToolResult> {
-        let store = self.calendar.as_ref()
+        let store = self
+            .calendar
+            .as_ref()
             .ok_or_else(|| AthenError::Other("Calendar not available".into()))?;
 
-        let id = args.get("id").and_then(|v| v.as_str())
+        let id = args
+            .get("id")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| AthenError::Other("missing 'id' parameter".into()))?;
 
         tracing::info!(tool = "calendar_update", id, "Updating calendar event");
 
         // Load the existing event first.
-        let existing = store.get_event(id).await?
+        let existing = store
+            .get_event(id)
+            .await?
             .ok_or_else(|| AthenError::Other(format!("Event '{id}' not found")))?;
 
         let now = chrono::Utc::now().to_rfc3339();
 
-        let reminder_minutes: Vec<i64> = args.get("reminder_minutes")
+        let reminder_minutes: Vec<i64> = args
+            .get("reminder_minutes")
             .and_then(|v| v.as_array())
             .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
             .unwrap_or(existing.reminder_minutes);
@@ -334,24 +389,47 @@ impl AppToolRegistry {
 
         let updated = CalendarEvent {
             id: id.to_string(),
-            title: args.get("title").and_then(|v| v.as_str())
-                .unwrap_or(&existing.title).to_string(),
-            description: args.get("description").and_then(|v| v.as_str())
-                .map(String::from).or(existing.description),
-            start_time: args.get("start_time").and_then(|v| v.as_str())
-                .unwrap_or(&existing.start_time).to_string(),
-            end_time: args.get("end_time").and_then(|v| v.as_str())
-                .unwrap_or(&existing.end_time).to_string(),
-            all_day: args.get("all_day").and_then(|v| v.as_bool())
+            title: args
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&existing.title)
+                .to_string(),
+            description: args
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .or(existing.description),
+            start_time: args
+                .get("start_time")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&existing.start_time)
+                .to_string(),
+            end_time: args
+                .get("end_time")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&existing.end_time)
+                .to_string(),
+            all_day: args
+                .get("all_day")
+                .and_then(|v| v.as_bool())
                 .unwrap_or(existing.all_day),
-            location: args.get("location").and_then(|v| v.as_str())
-                .map(String::from).or(existing.location),
+            location: args
+                .get("location")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .or(existing.location),
             recurrence,
             reminder_minutes,
-            color: args.get("color").and_then(|v| v.as_str())
-                .map(String::from).or(existing.color),
-            category: args.get("category").and_then(|v| v.as_str())
-                .map(String::from).or(existing.category),
+            color: args
+                .get("color")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .or(existing.color),
+            category: args
+                .get("category")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .or(existing.category),
             created_by: existing.created_by,
             arc_id: existing.arc_id,
             created_at: existing.created_at,
@@ -375,10 +453,14 @@ impl AppToolRegistry {
     }
 
     async fn do_calendar_delete(&self, args: &serde_json::Value) -> Result<ToolResult> {
-        let store = self.calendar.as_ref()
+        let store = self
+            .calendar
+            .as_ref()
             .ok_or_else(|| AthenError::Other("Calendar not available".into()))?;
 
-        let id = args.get("id").and_then(|v| v.as_str())
+        let id = args
+            .get("id")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| AthenError::Other("missing 'id' parameter".into()))?;
 
         tracing::info!(tool = "calendar_delete", id, "Deleting calendar event");
@@ -502,7 +584,8 @@ impl AppToolRegistry {
     // ── Contact tool implementations ────────────────────────────────
 
     fn contact_store(&self) -> Result<&SqliteContactStore> {
-        self.contacts.as_ref()
+        self.contacts
+            .as_ref()
             .ok_or_else(|| AthenError::Other("Contact store not available".into()))
     }
 
@@ -558,9 +641,8 @@ impl AppToolRegistry {
         let contacts = store.list_all().await?;
         let elapsed = t.elapsed().as_millis() as u64;
 
-        let contacts_json: Vec<serde_json::Value> = contacts.iter()
-            .map(Self::contact_to_json)
-            .collect();
+        let contacts_json: Vec<serde_json::Value> =
+            contacts.iter().map(Self::contact_to_json).collect();
 
         Ok(ToolResult {
             success: true,
@@ -573,7 +655,9 @@ impl AppToolRegistry {
     async fn do_contacts_search(&self, args: &serde_json::Value) -> Result<ToolResult> {
         let store = self.contact_store()?;
 
-        let query = args.get("query").and_then(|v| v.as_str())
+        let query = args
+            .get("query")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| AthenError::Other("missing 'query' parameter".into()))?;
 
         tracing::info!(tool = "contacts_search", query, "Searching contacts");
@@ -581,10 +665,13 @@ impl AppToolRegistry {
         let t = Instant::now();
         let contacts = store.list_all().await?;
         let query_lower = query.to_lowercase();
-        let matches: Vec<serde_json::Value> = contacts.iter()
+        let matches: Vec<serde_json::Value> = contacts
+            .iter()
             .filter(|c| {
                 c.name.to_lowercase().contains(&query_lower)
-                    || c.identifiers.iter().any(|i| i.value.to_lowercase().contains(&query_lower))
+                    || c.identifiers
+                        .iter()
+                        .any(|i| i.value.to_lowercase().contains(&query_lower))
             })
             .map(Self::contact_to_json)
             .collect();
@@ -601,22 +688,30 @@ impl AppToolRegistry {
     async fn do_contacts_create(&self, args: &serde_json::Value) -> Result<ToolResult> {
         let store = self.contact_store()?;
 
-        let name = args.get("name").and_then(|v| v.as_str())
+        let name = args
+            .get("name")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| AthenError::Other("missing 'name' parameter".into()))?;
 
-        let identifiers: Vec<ContactIdentifier> = args.get("identifiers")
+        let identifiers: Vec<ContactIdentifier> = args
+            .get("identifiers")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|item| {
-                let value = item.get("value")?.as_str()?;
-                let kind = item.get("kind")?.as_str()?;
-                Some(ContactIdentifier {
-                    value: value.to_string(),
-                    kind: Self::parse_identifier_kind(kind),
-                })
-            }).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|item| {
+                        let value = item.get("value")?.as_str()?;
+                        let kind = item.get("kind")?.as_str()?;
+                        Some(ContactIdentifier {
+                            value: value.to_string(),
+                            kind: Self::parse_identifier_kind(kind),
+                        })
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
 
-        let trust_level = args.get("trust_level")
+        let trust_level = args
+            .get("trust_level")
             .and_then(|v| v.as_str())
             .map(Self::parse_trust_level)
             .unwrap_or(TrustLevel::Neutral);
@@ -655,7 +750,9 @@ impl AppToolRegistry {
     async fn do_contacts_update(&self, args: &serde_json::Value) -> Result<ToolResult> {
         let store = self.contact_store()?;
 
-        let id_str = args.get("id").and_then(|v| v.as_str())
+        let id_str = args
+            .get("id")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| AthenError::Other("missing 'id' parameter".into()))?;
 
         let id = uuid::Uuid::parse_str(id_str)
@@ -663,7 +760,9 @@ impl AppToolRegistry {
 
         tracing::info!(tool = "contacts_update", id = id_str, "Updating contact");
 
-        let mut contact = store.load(id).await?
+        let mut contact = store
+            .load(id)
+            .await?
             .ok_or_else(|| AthenError::Other(format!("Contact '{id_str}' not found")))?;
 
         if let Some(name) = args.get("name").and_then(|v| v.as_str()) {
@@ -671,14 +770,17 @@ impl AppToolRegistry {
         }
 
         if let Some(arr) = args.get("identifiers").and_then(|v| v.as_array()) {
-            contact.identifiers = arr.iter().filter_map(|item| {
-                let value = item.get("value")?.as_str()?;
-                let kind = item.get("kind")?.as_str()?;
-                Some(ContactIdentifier {
-                    value: value.to_string(),
-                    kind: Self::parse_identifier_kind(kind),
+            contact.identifiers = arr
+                .iter()
+                .filter_map(|item| {
+                    let value = item.get("value")?.as_str()?;
+                    let kind = item.get("kind")?.as_str()?;
+                    Some(ContactIdentifier {
+                        value: value.to_string(),
+                        kind: Self::parse_identifier_kind(kind),
+                    })
                 })
-            }).collect();
+                .collect();
         }
 
         if let Some(level_str) = args.get("trust_level").and_then(|v| v.as_str()) {
@@ -704,7 +806,9 @@ impl AppToolRegistry {
     async fn do_contacts_delete(&self, args: &serde_json::Value) -> Result<ToolResult> {
         let store = self.contact_store()?;
 
-        let id_str = args.get("id").and_then(|v| v.as_str())
+        let id_str = args
+            .get("id")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| AthenError::Other("missing 'id' parameter".into()))?;
 
         let id = uuid::Uuid::parse_str(id_str)
@@ -731,9 +835,13 @@ impl AppToolRegistry {
         memory: &Memory,
         args: &serde_json::Value,
     ) -> Result<ToolResult> {
-        let key = args.get("key").and_then(|v| v.as_str())
+        let key = args
+            .get("key")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| AthenError::Other("missing 'key' parameter".into()))?;
-        let value = args.get("value").and_then(|v| v.as_str())
+        let value = args
+            .get("value")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| AthenError::Other("missing 'value' parameter".into()))?;
 
         tracing::info!(tool = "memory_store", key, "Storing in persistent memory");
@@ -768,7 +876,11 @@ impl AppToolRegistry {
     ) -> Result<ToolResult> {
         let key = args.get("key").and_then(|v| v.as_str());
 
-        tracing::info!(tool = "memory_recall", ?key, "Recalling from persistent memory");
+        tracing::info!(
+            tool = "memory_recall",
+            ?key,
+            "Recalling from persistent memory"
+        );
 
         let start = Instant::now();
 
@@ -779,12 +891,15 @@ impl AppToolRegistry {
                     json!({ "query": query, "found": false, "memories": [] })
                 }
                 Ok(items) => {
-                    let memories: Vec<serde_json::Value> = items.iter().map(|item| {
-                        json!({
-                            "id": item.id,
-                            "content": item.content,
+                    let memories: Vec<serde_json::Value> = items
+                        .iter()
+                        .map(|item| {
+                            json!({
+                                "id": item.id,
+                                "content": item.content,
+                            })
                         })
-                    }).collect();
+                        .collect();
                     json!({ "query": query, "found": true, "memories": memories })
                 }
                 Err(e) => {
@@ -854,7 +969,10 @@ impl ToolRegistry for AppToolRegistry {
                 name: "calendar_delete".to_string(),
                 description: "Delete a calendar event by ID.".to_string(),
                 parameters: Self::calendar_delete_schema(),
-                backend: ToolBackend::Shell { command: String::new(), native: false },
+                backend: ToolBackend::Shell {
+                    command: String::new(),
+                    native: false,
+                },
                 base_risk: BaseImpact::WritePersist,
             });
         }
@@ -863,8 +981,7 @@ impl ToolRegistry for AppToolRegistry {
             match mcp.list_tools().await {
                 Ok(mcp_tools) => {
                     for t in mcp_tools {
-                        let prefixed_name =
-                            format!("{}{MCP_TOOL_SEPARATOR}{}", t.mcp_id, t.name);
+                        let prefixed_name = format!("{}{MCP_TOOL_SEPARATOR}{}", t.mcp_id, t.name);
                         tools.push(ToolDefinition {
                             name: prefixed_name,
                             description: t
@@ -889,9 +1006,13 @@ impl ToolRegistry for AppToolRegistry {
         if self.contacts.is_some() {
             tools.push(ToolDefinition {
                 name: "contacts_list".to_string(),
-                description: "List all contacts with their names, identifiers, and trust levels.".to_string(),
+                description: "List all contacts with their names, identifiers, and trust levels."
+                    .to_string(),
                 parameters: Self::contacts_list_schema(),
-                backend: ToolBackend::Shell { command: String::new(), native: false },
+                backend: ToolBackend::Shell {
+                    command: String::new(),
+                    native: false,
+                },
                 base_risk: BaseImpact::Read,
             });
             tools.push(ToolDefinition {
@@ -919,7 +1040,10 @@ impl ToolRegistry for AppToolRegistry {
                 name: "contacts_delete".to_string(),
                 description: "Delete a contact by ID.".to_string(),
                 parameters: Self::contacts_delete_schema(),
-                backend: ToolBackend::Shell { command: String::new(), native: false },
+                backend: ToolBackend::Shell {
+                    command: String::new(),
+                    native: false,
+                },
                 base_risk: BaseImpact::WritePersist,
             });
         }
@@ -971,8 +1095,7 @@ impl ToolRegistry for AppToolRegistry {
                         if let Some((mcp_id, tool)) = name.split_once(MCP_TOOL_SEPARATOR) {
                             if let Some(mcp_client) = mcp_opt {
                                 let started = Instant::now();
-                                let outcome =
-                                    mcp_client.call_tool(mcp_id, tool, rewritten).await?;
+                                let outcome = mcp_client.call_tool(mcp_id, tool, rewritten).await?;
                                 let elapsed = started.elapsed().as_millis() as u64;
                                 return Ok(ToolResult {
                                     success: outcome.success,
@@ -988,16 +1111,15 @@ impl ToolRegistry for AppToolRegistry {
                                     execution_time_ms: elapsed,
                                 });
                             }
-                            return Err(AthenError::Other(
-                                "MCP client not available".into(),
-                            ));
+                            return Err(AthenError::Other("MCP client not available".into()));
                         }
                         // Built-in file tool path: delegate to the inner
                         // ShellToolRegistry so stateful behaviors (e.g.
                         // the read-state hash for `edit`/`write`) are
                         // preserved.
                         inner_for_closure.call_tool(&name, rewritten).await
-                    }) as futures::future::BoxFuture<'static, Result<ToolResult>>
+                    })
+                        as futures::future::BoxFuture<'static, Result<ToolResult>>
                 };
                 return gate.handle(name, args, dispatch).await;
             }
@@ -1015,7 +1137,11 @@ impl ToolRegistry for AppToolRegistry {
                         "text": outcome.text,
                         "content": outcome.raw,
                     }),
-                    error: if outcome.success { None } else { Some(outcome.text.clone()) },
+                    error: if outcome.success {
+                        None
+                    } else {
+                        Some(outcome.text.clone())
+                    },
                     execution_time_ms: elapsed,
                 });
             }
@@ -1048,8 +1174,8 @@ impl ToolRegistry for AppToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use athen_persistence::Database;
     use athen_persistence::calendar::EventCreator;
+    use athen_persistence::Database;
     use serde_json::json;
 
     /// Helper: create an in-memory DB + CalendarStore + AppToolRegistry.
@@ -1111,7 +1237,11 @@ mod tests {
     async fn list_tools_without_calendar_has_8() {
         let registry = setup_without_calendar().await;
         let tools = registry.list_tools().await.unwrap();
-        assert_eq!(tools.len(), 8, "Expected only 8 shell tools when calendar is None");
+        assert_eq!(
+            tools.len(),
+            8,
+            "Expected only 8 shell tools when calendar is None"
+        );
 
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(!names.contains(&"calendar_list"));
@@ -1128,7 +1258,10 @@ mod tests {
             .unwrap();
         assert!(result.success);
         let output = result.output.to_string();
-        assert!(output.contains("hello"), "Expected 'hello' in output: {output}");
+        assert!(
+            output.contains("hello"),
+            "Expected 'hello' in output: {output}"
+        );
     }
 
     // 4. calendar_create_basic
@@ -1240,7 +1373,10 @@ mod tests {
         assert_eq!(event.category, Some("meeting".to_string()));
         assert_eq!(event.color, Some("#7aa2f7".to_string()));
         assert_eq!(event.reminder_minutes, vec![15, 60]);
-        assert_eq!(event.recurrence, Some(athen_persistence::calendar::Recurrence::Weekly));
+        assert_eq!(
+            event.recurrence,
+            Some(athen_persistence::calendar::Recurrence::Weekly)
+        );
     }
 
     // 8. calendar_update_partial
@@ -1276,7 +1412,10 @@ mod tests {
             .await
             .unwrap();
         assert!(update_result.success);
-        assert_eq!(update_result.output["title"].as_str().unwrap(), "Updated Title");
+        assert_eq!(
+            update_result.output["title"].as_str().unwrap(),
+            "Updated Title"
+        );
 
         // Verify location is still "Room A"
         let event = calendar_store.get_event(&id).await.unwrap().unwrap();
@@ -1297,7 +1436,10 @@ mod tests {
                 }),
             )
             .await;
-        assert!(result.is_err(), "Updating a nonexistent event should return an error");
+        assert!(
+            result.is_err(),
+            "Updating a nonexistent event should return an error"
+        );
     }
 
     // 10. calendar_delete_basic
@@ -1472,7 +1614,10 @@ mod tests {
                 }),
             )
             .await;
-        assert!(result.is_err(), "Calendar tool should fail when store is None");
+        assert!(
+            result.is_err(),
+            "Calendar tool should fail when store is None"
+        );
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("not available"),
@@ -1490,7 +1635,8 @@ mod tests {
         assert!(result.is_err(), "Unknown tool should return an error");
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.to_lowercase().contains("not found") || err_msg.to_lowercase().contains("unknown"),
+            err_msg.to_lowercase().contains("not found")
+                || err_msg.to_lowercase().contains("unknown"),
             "Error should indicate tool not found: {err_msg}"
         );
     }
@@ -1640,7 +1786,10 @@ mod tests {
             .await
             .unwrap();
         assert!(update_result.success);
-        assert_eq!(update_result.output["name"].as_str().unwrap(), "Alice Updated");
+        assert_eq!(
+            update_result.output["name"].as_str().unwrap(),
+            "Alice Updated"
+        );
 
         // Verify identifier was preserved
         let list_result = registry
@@ -1696,9 +1845,7 @@ mod tests {
     #[tokio::test]
     async fn contacts_no_store_returns_error() {
         let registry = setup_without_calendar().await;
-        let result = registry
-            .call_tool("contacts_list", json!({}))
-            .await;
+        let result = registry.call_tool("contacts_list", json!({})).await;
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("not available"));

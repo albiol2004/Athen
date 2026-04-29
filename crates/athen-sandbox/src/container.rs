@@ -234,7 +234,16 @@ mod tests {
     #[test]
     fn test_build_run_args_basic() {
         let executor = make_executor(ContainerRuntime::Podman);
-        let args = executor.build_run_args("echo", &["hello"], "alpine:latest", &[], true, None, None, None);
+        let args = executor.build_run_args(
+            "echo",
+            &["hello"],
+            "alpine:latest",
+            &[],
+            true,
+            None,
+            None,
+            None,
+        );
         assert_eq!(args, vec!["run", "--rm", "alpine:latest", "echo", "hello"]);
     }
 
@@ -260,7 +269,8 @@ mod tests {
                 read_only: false,
             },
         ];
-        let args = executor.build_run_args("ls", &[], "alpine:latest", &mounts, true, None, None, None);
+        let args =
+            executor.build_run_args("ls", &[], "alpine:latest", &mounts, true, None, None, None);
         assert!(args.contains(&"-v".to_string()));
         assert!(args.contains(&"/home/user/data:/data:ro".to_string()));
         assert!(args.contains(&"/tmp/work:/work".to_string()));
@@ -270,8 +280,14 @@ mod tests {
     fn test_build_run_args_resource_limits() {
         let executor = make_executor(ContainerRuntime::Podman);
         let args = executor.build_run_args(
-            "ls", &[], "alpine:latest", &[], true,
-            Some("512m"), Some(2.0), None,
+            "ls",
+            &[],
+            "alpine:latest",
+            &[],
+            true,
+            Some("512m"),
+            Some(2.0),
+            None,
         );
         assert!(args.contains(&"--memory".to_string()));
         assert!(args.contains(&"512m".to_string()));
@@ -282,10 +298,8 @@ mod tests {
     #[test]
     fn test_build_run_args_timeout_podman() {
         let executor = make_executor(ContainerRuntime::Podman);
-        let args = executor.build_run_args(
-            "ls", &[], "alpine:latest", &[], true,
-            None, None, Some(30),
-        );
+        let args =
+            executor.build_run_args("ls", &[], "alpine:latest", &[], true, None, None, Some(30));
         assert!(args.contains(&"--timeout".to_string()));
         assert!(args.contains(&"30".to_string()));
     }
@@ -293,10 +307,8 @@ mod tests {
     #[test]
     fn test_build_run_args_timeout_docker_ignored() {
         let executor = make_executor(ContainerRuntime::Docker);
-        let args = executor.build_run_args(
-            "ls", &[], "alpine:latest", &[], true,
-            None, None, Some(30),
-        );
+        let args =
+            executor.build_run_args("ls", &[], "alpine:latest", &[], true, None, None, Some(30));
         // Docker does not support --timeout natively
         assert!(!args.contains(&"--timeout".to_string()));
     }
@@ -305,8 +317,14 @@ mod tests {
     fn test_build_run_args_multiple_command_args() {
         let executor = make_executor(ContainerRuntime::Podman);
         let args = executor.build_run_args(
-            "bash", &["-c", "echo hello world"], "alpine:latest", &[], true,
-            None, None, None,
+            "bash",
+            &["-c", "echo hello world"],
+            "alpine:latest",
+            &[],
+            true,
+            None,
+            None,
+            None,
         );
         let last_three: Vec<&str> = args.iter().rev().take(3).map(|s| s.as_str()).collect();
         assert!(last_three.contains(&"bash"));

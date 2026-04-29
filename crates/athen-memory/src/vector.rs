@@ -73,11 +73,7 @@ impl VectorIndex for InMemoryVectorIndex {
         Ok(())
     }
 
-    async fn search(
-        &self,
-        query_embedding: Vec<f32>,
-        top_k: usize,
-    ) -> Result<Vec<SearchResult>> {
+    async fn search(&self, query_embedding: Vec<f32>, top_k: usize) -> Result<Vec<SearchResult>> {
         let entries = self.entries.read().await;
 
         let mut scored: Vec<(f32, &VectorEntry)> = entries

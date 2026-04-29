@@ -66,7 +66,9 @@ pub fn write_per_group(
     // Track which files we wrote this run so we can clean up stale ones.
     let mut written: Vec<(String, PathBuf)> = Vec::new();
     for g in &groups {
-        let Some(group_tools) = by_group.get(g.id.as_str()) else { continue };
+        let Some(group_tools) = by_group.get(g.id.as_str()) else {
+            continue;
+        };
         let path = dir.join(format!("{}.md", g.id));
         let body = generate_group(&g.display_name, group_tools);
         std::fs::write(&path, body)?;
@@ -79,9 +81,7 @@ pub fn write_per_group(
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let p = entry.path();
-            if p.extension().and_then(|s| s.to_str()) == Some("md")
-                && !current_files.contains(&p)
-            {
+            if p.extension().and_then(|s| s.to_str()) == Some("md") && !current_files.contains(&p) {
                 let _ = std::fs::remove_file(p);
             }
         }

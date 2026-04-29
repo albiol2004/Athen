@@ -6,7 +6,7 @@ use tracing::{debug, warn};
 use athen_core::error::Result;
 use athen_core::llm::{ChatMessage, LlmRequest, MessageContent, ModelProfile, Role};
 use athen_core::traits::llm::LlmRouter;
-use athen_core::traits::memory::{Entity, EntityType, ExtractionResult, EntityExtractor};
+use athen_core::traits::memory::{Entity, EntityExtractor, EntityType, ExtractionResult};
 
 /// Extracts entities and relationships from text using an LLM.
 pub struct LlmEntityExtractor {
@@ -31,9 +31,7 @@ impl EntityExtractor for LlmEntityExtractor {
             profile: ModelProfile::Cheap,
             messages: vec![ChatMessage {
                 role: Role::User,
-                content: MessageContent::Text(format!(
-                    "{EXTRACTION_PROMPT}\n\nText:\n{text}"
-                )),
+                content: MessageContent::Text(format!("{EXTRACTION_PROMPT}\n\nText:\n{text}")),
             }],
             max_tokens: Some(500),
             temperature: Some(0.0),
@@ -159,10 +157,8 @@ fn parse_extraction_json(val: &serde_json::Value) -> ExtractionResult {
                     let from = r.get("from")?.as_str()?.to_string();
                     let relation = r.get("relation")?.as_str()?.to_string();
                     let to = r.get("to")?.as_str()?.to_string();
-                    let importance = r
-                        .get("importance")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.5) as f32;
+                    let importance =
+                        r.get("importance").and_then(|v| v.as_f64()).unwrap_or(0.5) as f32;
                     Some((from, relation, to, importance.clamp(0.0, 1.0)))
                 })
                 .collect()
@@ -251,7 +247,10 @@ mod tests {
             ]
         });
         let result = parse_extraction_json(&val);
-        assert!(result.entities.is_empty(), "Tool-like names with underscores should be filtered");
+        assert!(
+            result.entities.is_empty(),
+            "Tool-like names with underscores should be filtered"
+        );
     }
 
     #[test]
@@ -262,7 +261,10 @@ mod tests {
             ]
         });
         let result = parse_extraction_json(&val);
-        assert!(result.entities.is_empty(), "Names with parentheses should be filtered");
+        assert!(
+            result.entities.is_empty(),
+            "Names with parentheses should be filtered"
+        );
     }
 
     #[test]
@@ -274,7 +276,10 @@ mod tests {
             ]
         });
         let result = parse_extraction_json(&val);
-        assert!(result.entities.is_empty(), "Names shorter than 2 chars should be filtered");
+        assert!(
+            result.entities.is_empty(),
+            "Names shorter than 2 chars should be filtered"
+        );
     }
 
     #[test]
@@ -287,7 +292,10 @@ mod tests {
             ]
         });
         let result = parse_extraction_json(&val);
-        assert!(result.entities.is_empty(), "Generic role names should be filtered");
+        assert!(
+            result.entities.is_empty(),
+            "Generic role names should be filtered"
+        );
     }
 
     #[test]

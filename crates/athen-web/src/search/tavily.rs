@@ -51,9 +51,7 @@ impl WebSearchProvider for TavilySearch {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            return Err(AthenError::Other(format!(
-                "tavily HTTP {status}: {text}"
-            )));
+            return Err(AthenError::Other(format!("tavily HTTP {status}: {text}")));
         }
 
         let parsed: serde_json::Value = resp
@@ -71,8 +69,16 @@ impl WebSearchProvider for TavilySearch {
             .into_iter()
             .take(max_results)
             .map(|r| SearchResult {
-                title: r.get("title").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-                url: r.get("url").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                title: r
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                url: r
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
                 snippet: r
                     .get("content")
                     .and_then(|v| v.as_str())

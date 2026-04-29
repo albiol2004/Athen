@@ -15,11 +15,7 @@ pub trait VectorIndex: Send + Sync {
         embedding: Vec<f32>,
         metadata: serde_json::Value,
     ) -> Result<()>;
-    async fn search(
-        &self,
-        query_embedding: Vec<f32>,
-        top_k: usize,
-    ) -> Result<Vec<SearchResult>>;
+    async fn search(&self, query_embedding: Vec<f32>, top_k: usize) -> Result<Vec<SearchResult>>;
     async fn delete(&self, id: &str) -> Result<()>;
 
     /// List all stored entries.
@@ -33,17 +29,8 @@ pub trait VectorIndex: Send + Sync {
 #[async_trait]
 pub trait KnowledgeGraph: Send + Sync {
     async fn add_entity(&self, entity: Entity) -> Result<EntityId>;
-    async fn add_relation(
-        &self,
-        from: EntityId,
-        relation: &str,
-        to: EntityId,
-    ) -> Result<()>;
-    async fn explore(
-        &self,
-        entry: EntityId,
-        params: ExploreParams,
-    ) -> Result<Vec<GraphNode>>;
+    async fn add_relation(&self, from: EntityId, relation: &str, to: EntityId) -> Result<()>;
+    async fn explore(&self, entry: EntityId, params: ExploreParams) -> Result<Vec<GraphNode>>;
 
     /// List all entities in the graph.
     /// Default implementation returns empty (not all backends support this).
@@ -73,12 +60,7 @@ pub trait KnowledgeGraph: Send + Sync {
     }
 
     /// Delete a specific relation between two entities.
-    async fn delete_relation(
-        &self,
-        _from: EntityId,
-        _to: EntityId,
-        _relation: &str,
-    ) -> Result<()> {
+    async fn delete_relation(&self, _from: EntityId, _to: EntityId, _relation: &str) -> Result<()> {
         Ok(())
     }
 

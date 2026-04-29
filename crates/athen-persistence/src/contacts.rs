@@ -12,9 +12,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use athen_contacts::ContactStore;
-use athen_core::contact::{
-    Contact, ContactId, ContactIdentifier, IdentifierKind, TrustLevel,
-};
+use athen_core::contact::{Contact, ContactId, ContactIdentifier, IdentifierKind, TrustLevel};
 use athen_core::error::{AthenError, Result};
 
 const CONTACTS_SCHEMA_SQL: &str = "\
@@ -125,9 +123,8 @@ fn load_identifiers(
     conn: &Connection,
     contact_id: &str,
 ) -> std::result::Result<Vec<ContactIdentifier>, rusqlite::Error> {
-    let mut stmt = conn.prepare(
-        "SELECT identifier, kind FROM contact_identifiers WHERE contact_id = ?1",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT identifier, kind FROM contact_identifiers WHERE contact_id = ?1")?;
     let rows = stmt.query_map(params![contact_id], |row| {
         let value: String = row.get(0)?;
         let kind_str: String = row.get(1)?;
@@ -146,8 +143,9 @@ fn load_identifiers(
 /// Map a rusqlite row to a Contact (without identifiers — those are loaded separately).
 fn row_to_contact(row: &rusqlite::Row<'_>) -> rusqlite::Result<Contact> {
     let id_str: String = row.get(0)?;
-    let id = Uuid::parse_str(&id_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let id = Uuid::parse_str(&id_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     let trust_str: String = row.get(2)?;
     let override_int: i32 = row.get(3)?;
     let interaction_count: u32 = row.get::<_, i64>(4)? as u32;
@@ -192,7 +190,8 @@ impl ContactStore for SqliteContactStore {
             let id_str = contact.id.to_string();
             let last_interaction_str = contact.last_interaction.map(|dt| dt.to_rfc3339());
 
-            let tx = conn.unchecked_transaction()
+            let tx = conn
+                .unchecked_transaction()
                 .map_err(|e| AthenError::Other(format!("Begin transaction: {e}")))?;
 
             // Upsert contact row.
@@ -236,11 +235,7 @@ impl ContactStore for SqliteContactStore {
                 tx.execute(
                     "INSERT INTO contact_identifiers (contact_id, identifier, kind) \
                      VALUES (?1, ?2, ?3)",
-                    params![
-                        id_str,
-                        ident.value,
-                        identifier_kind_to_str(ident.kind),
-                    ],
+                    params![id_str, ident.value, identifier_kind_to_str(ident.kind),],
                 )
                 .map_err(|e| AthenError::Other(format!("Insert identifier: {e}")))?;
             }
@@ -329,8 +324,8 @@ impl ContactStore for SqliteContactStore {
 
             let mut contacts = Vec::new();
             for row in rows {
-                let mut contact = row
-                    .map_err(|e| AthenError::Other(format!("Read contact row: {e}")))?;
+                let mut contact =
+                    row.map_err(|e| AthenError::Other(format!("Read contact row: {e}")))?;
                 let id_str = contact.id.to_string();
                 contact.identifiers = load_identifiers(&conn, &id_str)
                     .map_err(|e| AthenError::Other(format!("Load identifiers: {e}")))?;
@@ -514,7 +509,10 @@ mod tests {
     #[tokio::test]
     async fn test_find_unknown_identifier_returns_none() {
         let store = setup().await;
-        let found = store.find_by_identifier("nobody@nowhere.com").await.unwrap();
+        let found = store
+            .find_by_identifier("nobody@nowhere.com")
+            .await
+            .unwrap();
         assert!(found.is_none());
     }
 
@@ -614,10 +612,7 @@ mod tests {
             TrustLevel::AuthUser,
         ];
         for level in levels {
-            let mut contact = make_contact(
-                &format!("{level:?}"),
-                vec![],
-            );
+            let mut contact = make_contact(&format!("{level:?}"), vec![]);
             contact.trust_level = level;
             let id = contact.id;
             store.save(&contact).await.unwrap();

@@ -61,15 +61,13 @@ impl CheckpointManager {
         // If file backup is configured, perform atomic file write
         if let Some(ref dir) = self.checkpoint_dir {
             let dir = dir.clone();
-            tokio::task::spawn_blocking(move || {
-                atomic_file_save(&dir, task_id, &data)
-            })
-            .await
-            .map_err(|e| AthenError::Other(format!("Spawn blocking: {e}")))?
-            .map_err(|e| {
-                tracing::warn!("File checkpoint save failed (DB save succeeded): {e}");
-                e
-            })?;
+            tokio::task::spawn_blocking(move || atomic_file_save(&dir, task_id, &data))
+                .await
+                .map_err(|e| AthenError::Other(format!("Spawn blocking: {e}")))?
+                .map_err(|e| {
+                    tracing::warn!("File checkpoint save failed (DB save succeeded): {e}");
+                    e
+                })?;
         }
 
         Ok(())

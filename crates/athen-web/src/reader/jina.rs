@@ -127,7 +127,8 @@ mod tests {
 
     #[test]
     fn splits_jina_header() {
-        let body = "Title: Hello World\nURL Source: https://x\nMarkdown Content:\n# Hello\n\nbody text";
+        let body =
+            "Title: Hello World\nURL Source: https://x\nMarkdown Content:\n# Hello\n\nbody text";
         let (title, content) = split_jina_header(body);
         assert_eq!(title.as_deref(), Some("Hello World"));
         assert!(content.starts_with("# Hello"));

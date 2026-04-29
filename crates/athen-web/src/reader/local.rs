@@ -23,7 +23,9 @@ pub struct LocalReader {
 
 impl LocalReader {
     pub fn new() -> Self {
-        Self { client: crate::default_http_client() }
+        Self {
+            client: crate::default_http_client(),
+        }
     }
 
     pub fn with_client(client: reqwest::Client) -> Self {
@@ -49,7 +51,10 @@ impl PageReader for LocalReader {
             .get(url)
             // Cloudflare's edge content negotiation hands back markdown when
             // the origin opts in. Costs us one header on every fetch.
-            .header(reqwest::header::ACCEPT, "text/markdown, text/html;q=0.9, */*;q=0.5")
+            .header(
+                reqwest::header::ACCEPT,
+                "text/markdown, text/html;q=0.9, */*;q=0.5",
+            )
             .send()
             .await
             .map_err(|e| AthenError::Other(format!("fetch_url request failed: {e}")))?;
@@ -150,7 +155,11 @@ fn extract_title(html: &str) -> Option<String> {
     let after_open = html[start..].find('>')? + start + 1;
     let close = lower[after_open..].find("</title>")? + after_open;
     let title = html[after_open..close].trim();
-    if title.is_empty() { None } else { Some(title.to_string()) }
+    if title.is_empty() {
+        None
+    } else {
+        Some(title.to_string())
+    }
 }
 
 /// UTF-8 safe character truncation. Cuts at the char boundary closest to

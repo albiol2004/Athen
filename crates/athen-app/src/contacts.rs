@@ -87,9 +87,7 @@ fn parse_identifier_kind(s: &str) -> IdentifierKind {
 
 /// Return all contacts for the contacts list view.
 #[tauri::command]
-pub async fn list_contacts(
-    state: State<'_, AppState>,
-) -> Result<Vec<ContactInfo>, String> {
+pub async fn list_contacts(state: State<'_, AppState>) -> Result<Vec<ContactInfo>, String> {
     let tm = state
         .trust_manager
         .as_ref()
@@ -133,31 +131,33 @@ pub async fn get_contact(
         .as_ref()
         .ok_or_else(|| "Trust manager not available".to_string())?;
 
-    let uuid = uuid::Uuid::parse_str(&id)
-        .map_err(|e| format!("Invalid contact ID: {e}"))?;
+    let uuid = uuid::Uuid::parse_str(&id).map_err(|e| format!("Invalid contact ID: {e}"))?;
 
     let contacts = tm
         .list_contacts()
         .await
         .map_err(|e| format!("Failed to load contacts: {e}"))?;
 
-    Ok(contacts.into_iter().find(|c| c.id == uuid).map(|c| ContactInfo {
-        id: c.id.to_string(),
-        name: c.name.clone(),
-        trust_level: trust_level_str(c.trust_level).to_string(),
-        trust_manual_override: c.trust_manual_override,
-        identifiers: c
-            .identifiers
-            .iter()
-            .map(|i| IdentifierInfo {
-                value: i.value.clone(),
-                kind: format!("{:?}", i.kind),
-            })
-            .collect(),
-        interaction_count: c.interaction_count,
-        last_interaction: c.last_interaction.map(|t| t.to_rfc3339()),
-        blocked: c.blocked,
-    }))
+    Ok(contacts
+        .into_iter()
+        .find(|c| c.id == uuid)
+        .map(|c| ContactInfo {
+            id: c.id.to_string(),
+            name: c.name.clone(),
+            trust_level: trust_level_str(c.trust_level).to_string(),
+            trust_manual_override: c.trust_manual_override,
+            identifiers: c
+                .identifiers
+                .iter()
+                .map(|i| IdentifierInfo {
+                    value: i.value.clone(),
+                    kind: format!("{:?}", i.kind),
+                })
+                .collect(),
+            interaction_count: c.interaction_count,
+            last_interaction: c.last_interaction.map(|t| t.to_rfc3339()),
+            blocked: c.blocked,
+        }))
 }
 
 /// Set the trust level for a contact (manual override).
@@ -172,8 +172,7 @@ pub async fn set_contact_trust(
         .as_ref()
         .ok_or_else(|| "Trust manager not available".to_string())?;
 
-    let uuid = uuid::Uuid::parse_str(&id)
-        .map_err(|e| format!("Invalid contact ID: {e}"))?;
+    let uuid = uuid::Uuid::parse_str(&id).map_err(|e| format!("Invalid contact ID: {e}"))?;
     let level = parse_trust_level(&trust_level)?;
 
     tm.set_trust_level(uuid, level)
@@ -185,17 +184,13 @@ pub async fn set_contact_trust(
 
 /// Block a contact so all their actions receive maximum risk multiplier.
 #[tauri::command]
-pub async fn block_contact(
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<(), String> {
+pub async fn block_contact(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let tm = state
         .trust_manager
         .as_ref()
         .ok_or_else(|| "Trust manager not available".to_string())?;
 
-    let uuid = uuid::Uuid::parse_str(&id)
-        .map_err(|e| format!("Invalid contact ID: {e}"))?;
+    let uuid = uuid::Uuid::parse_str(&id).map_err(|e| format!("Invalid contact ID: {e}"))?;
 
     tm.block_contact(uuid)
         .await
@@ -209,10 +204,7 @@ pub async fn block_contact(
 /// TrustManager only exposes `block_contact` (one-way), so we use the
 /// shared contact store directly to load, mutate, and save the contact.
 #[tauri::command]
-pub async fn unblock_contact(
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<(), String> {
+pub async fn unblock_contact(state: State<'_, AppState>, id: String) -> Result<(), String> {
     use athen_contacts::ContactStore as _;
 
     let store = state
@@ -220,8 +212,7 @@ pub async fn unblock_contact(
         .as_ref()
         .ok_or_else(|| "Contact store not available".to_string())?;
 
-    let uuid = uuid::Uuid::parse_str(&id)
-        .map_err(|e| format!("Invalid contact ID: {e}"))?;
+    let uuid = uuid::Uuid::parse_str(&id).map_err(|e| format!("Invalid contact ID: {e}"))?;
 
     let mut contact = store
         .load(uuid)
@@ -241,10 +232,7 @@ pub async fn unblock_contact(
 
 /// Delete a contact from the store.
 #[tauri::command]
-pub async fn delete_contact(
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<(), String> {
+pub async fn delete_contact(state: State<'_, AppState>, id: String) -> Result<(), String> {
     use athen_contacts::ContactStore as _;
 
     let store = state
@@ -252,8 +240,7 @@ pub async fn delete_contact(
         .as_ref()
         .ok_or_else(|| "Contact store not available".to_string())?;
 
-    let uuid = uuid::Uuid::parse_str(&id)
-        .map_err(|e| format!("Invalid contact ID: {e}"))?;
+    let uuid = uuid::Uuid::parse_str(&id).map_err(|e| format!("Invalid contact ID: {e}"))?;
 
     store
         .delete(uuid)
@@ -334,8 +321,7 @@ pub async fn update_contact(
         .as_ref()
         .ok_or_else(|| "Contact store not available".to_string())?;
 
-    let uuid = uuid::Uuid::parse_str(&id)
-        .map_err(|e| format!("Invalid contact ID: {e}"))?;
+    let uuid = uuid::Uuid::parse_str(&id).map_err(|e| format!("Invalid contact ID: {e}"))?;
 
     let mut contact = store
         .load(uuid)

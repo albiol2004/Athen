@@ -20,7 +20,9 @@ pub struct WaybackReader {
 
 impl WaybackReader {
     pub fn new() -> Self {
-        Self { inner: LocalReader::new() }
+        Self {
+            inner: LocalReader::new(),
+        }
     }
 }
 
@@ -43,9 +45,11 @@ impl PageReader for WaybackReader {
         // non-success HTTP status — bubbled up as Err to the chain.
         let archive_url = format!("https://web.archive.org/web/2id_/{url}");
 
-        let mut result = self.inner.fetch(&archive_url).await.map_err(|e| {
-            AthenError::Other(format!("wayback fetch failed for {url}: {e}"))
-        })?;
+        let mut result = self
+            .inner
+            .fetch(&archive_url)
+            .await
+            .map_err(|e| AthenError::Other(format!("wayback fetch failed for {url}: {e}")))?;
 
         // Tell the caller this came from the archive — the local reader
         // doesn't know it was wrapped in a Wayback URL.

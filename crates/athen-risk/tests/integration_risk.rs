@@ -9,12 +9,8 @@ use async_trait::async_trait;
 use athen_contacts::trust::TrustManager;
 use athen_contacts::InMemoryContactStore;
 use athen_core::contact::{IdentifierKind, TrustLevel};
-use athen_core::llm::{
-    BudgetStatus, FinishReason, LlmRequest, LlmResponse, TokenUsage,
-};
-use athen_core::risk::{
-    BaseImpact, DataSensitivity, EvaluationMethod, RiskContext, RiskDecision,
-};
+use athen_core::llm::{BudgetStatus, FinishReason, LlmRequest, LlmResponse, TokenUsage};
+use athen_core::risk::{BaseImpact, DataSensitivity, EvaluationMethod, RiskContext, RiskDecision};
 use athen_core::task::{DomainType, Task, TaskPriority, TaskStatus};
 use athen_core::traits::llm::LlmRouter;
 use athen_risk::llm_fallback::LlmRiskEvaluator;
@@ -30,11 +26,7 @@ use uuid::Uuid;
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn ctx(
-    trust: TrustLevel,
-    data: DataSensitivity,
-    confidence: Option<f64>,
-) -> RiskContext {
+fn ctx(trust: TrustLevel, data: DataSensitivity, confidence: Option<f64>) -> RiskContext {
     RiskContext {
         trust_level: trust,
         data_sensitivity: data,
@@ -321,7 +313,11 @@ fn test_data_sensitivity_escalation() {
     // PersonalInfo (2x): 40 * 1.0 * 2 = 80
     let score_personal = scorer.compute(
         BaseImpact::WritePersist,
-        &ctx(TrustLevel::Trusted, DataSensitivity::PersonalInfo, Some(1.0)),
+        &ctx(
+            TrustLevel::Trusted,
+            DataSensitivity::PersonalInfo,
+            Some(1.0),
+        ),
         EvaluationMethod::RuleBased,
     );
     assert!(

@@ -15,9 +15,7 @@ use uuid::Uuid;
 
 use athen_core::config::{AthenConfig, TelegramConfig};
 use athen_core::error::{AthenError, Result};
-use athen_core::event::{
-    EventKind, EventSource, NormalizedContent, SenderInfo, SenseEvent,
-};
+use athen_core::event::{EventKind, EventSource, NormalizedContent, SenderInfo, SenseEvent};
 use athen_core::risk::RiskLevel;
 use athen_core::traits::sense::SenseMonitor;
 
@@ -136,10 +134,7 @@ impl TelegramMonitor {
                     user.first_name.clone()
                 };
                 SenderInfo {
-                    identifier: user
-                        .username
-                        .clone()
-                        .unwrap_or_else(|| user.id.to_string()),
+                    identifier: user.username.clone().unwrap_or_else(|| user.id.to_string()),
                     contact_id: None,
                     display_name: Some(display),
                 }
@@ -320,7 +315,11 @@ impl SenseMonitor for TelegramMonitor {
 /// Send a text message to a Telegram chat via the Bot API.
 ///
 /// Handles the 4096-character limit by splitting into multiple messages.
-pub async fn send_message(bot_token: &str, chat_id: i64, text: &str) -> std::result::Result<(), String> {
+pub async fn send_message(
+    bot_token: &str,
+    chat_id: i64,
+    text: &str,
+) -> std::result::Result<(), String> {
     let client = reqwest::Client::new();
     let url = format!("https://api.telegram.org/bot{}/sendMessage", bot_token);
 
@@ -521,7 +520,13 @@ mod tests {
     fn process_updates_converts_text_message() {
         let monitor = TelegramMonitor::new(test_config());
         let updates = vec![make_text_update(
-            100, 1, 99, "Bob", Some("bob123"), 99, "Hello!",
+            100,
+            1,
+            99,
+            "Bob",
+            Some("bob123"),
+            99,
+            "Hello!",
         )];
 
         let events = monitor.process_updates(updates);
@@ -537,10 +542,7 @@ mod tests {
 
         let sender = event.sender.as_ref().unwrap();
         assert_eq!(sender.identifier, "bob123");
-        assert_eq!(
-            sender.display_name.as_deref(),
-            Some("Bob (@bob123)")
-        );
+        assert_eq!(sender.display_name.as_deref(), Some("Bob (@bob123)"));
     }
 
     #[test]
@@ -579,7 +581,13 @@ mod tests {
         let monitor = TelegramMonitor::new(test_config());
         // owner_user_id is 42
         let updates = vec![make_text_update(
-            100, 1, 42, "Alex", Some("alexdev"), 42, "Owner message",
+            100,
+            1,
+            42,
+            "Alex",
+            Some("alexdev"),
+            42,
+            "Owner message",
         )];
 
         let events = monitor.process_updates(updates);

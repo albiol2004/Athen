@@ -133,11 +133,7 @@ impl KnowledgeGraph for InMemoryGraph {
         Ok(())
     }
 
-    async fn explore(
-        &self,
-        entry: EntityId,
-        params: ExploreParams,
-    ) -> Result<Vec<GraphNode>> {
+    async fn explore(&self, entry: EntityId, params: ExploreParams) -> Result<Vec<GraphNode>> {
         let entities = self.entities.read().await;
         let edges = self.edges.read().await;
 
@@ -178,11 +174,13 @@ impl KnowledgeGraph for InMemoryGraph {
                         });
 
                         // Enqueue neighbor if within depth limit and not visited
-                        if depth < params.max_depth && !visited.contains(&edge.to)
-                            && edge.weight >= params.relevance_threshold {
-                                visited.insert(edge.to);
-                                queue.push_back((edge.to, depth + 1));
-                            }
+                        if depth < params.max_depth
+                            && !visited.contains(&edge.to)
+                            && edge.weight >= params.relevance_threshold
+                        {
+                            visited.insert(edge.to);
+                            queue.push_back((edge.to, depth + 1));
+                        }
                     }
                 }
             }
@@ -215,7 +213,13 @@ impl KnowledgeGraph for InMemoryGraph {
                 .get(&edge.to)
                 .map(|e| e.name.clone())
                 .unwrap_or_default();
-            result.push((edge.from, from_name, edge.relation.clone(), edge.to, to_name));
+            result.push((
+                edge.from,
+                from_name,
+                edge.relation.clone(),
+                edge.to,
+                to_name,
+            ));
         }
         Ok(result)
     }
@@ -239,17 +243,15 @@ impl KnowledgeGraph for InMemoryGraph {
     }
 
     async fn delete_entity(&self, id: EntityId) -> Result<()> {
-        self.edges.write().await.retain(|e| e.from != id && e.to != id);
+        self.edges
+            .write()
+            .await
+            .retain(|e| e.from != id && e.to != id);
         self.entities.write().await.remove(&id);
         Ok(())
     }
 
-    async fn delete_relation(
-        &self,
-        from: EntityId,
-        to: EntityId,
-        relation: &str,
-    ) -> Result<()> {
+    async fn delete_relation(&self, from: EntityId, to: EntityId, relation: &str) -> Result<()> {
         self.edges
             .write()
             .await
@@ -324,12 +326,7 @@ impl KnowledgeGraph for SharedInMemoryGraph {
         self.inner.delete_entity(id).await
     }
 
-    async fn delete_relation(
-        &self,
-        from: EntityId,
-        to: EntityId,
-        relation: &str,
-    ) -> Result<()> {
+    async fn delete_relation(&self, from: EntityId, to: EntityId, relation: &str) -> Result<()> {
         self.inner.delete_relation(from, to, relation).await
     }
 
@@ -391,10 +388,7 @@ mod tests {
         let alice = graph.add_entity(person("Alice")).await.unwrap();
         let bob = graph.add_entity(person("Bob")).await.unwrap();
 
-        graph
-            .add_relation(alice, "knows", bob)
-            .await
-            .unwrap();
+        graph.add_relation(alice, "knows", bob).await.unwrap();
 
         let params = ExploreParams {
             max_depth: 1,

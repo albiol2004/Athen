@@ -20,8 +20,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let reader = HybridReader::new();
     let urls = [
         ("static (expect: local-html)", "https://example.com/"),
-        ("personal blog (expect: local-html)", "https://alejandrogarcia.blog/"),
-        ("JS-heavy SPA (expect: jina or wayback)", "https://x.com/elonmusk"),
+        (
+            "personal blog (expect: local-html)",
+            "https://alejandrogarcia.blog/",
+        ),
+        (
+            "JS-heavy SPA (expect: jina or wayback)",
+            "https://x.com/elonmusk",
+        ),
     ];
 
     for (label, url) in urls {

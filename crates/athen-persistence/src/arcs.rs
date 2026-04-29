@@ -253,8 +253,7 @@ impl ArcStore {
 
             match rows.next() {
                 Some(row) => {
-                    let meta =
-                        row.map_err(|e| AthenError::Other(format!("Get arc row: {e}")))?;
+                    let meta = row.map_err(|e| AthenError::Other(format!("Get arc row: {e}")))?;
                     Ok(Some(meta))
                 }
                 None => Ok(None),
@@ -301,9 +300,7 @@ impl ArcStore {
 
             let mut arcs = Vec::new();
             for row in rows {
-                arcs.push(
-                    row.map_err(|e| AthenError::Other(format!("List arcs row: {e}")))?,
-                );
+                arcs.push(row.map_err(|e| AthenError::Other(format!("List arcs row: {e}")))?);
             }
             Ok(arcs)
         })
@@ -336,11 +333,8 @@ impl ArcStore {
         let id = id.to_string();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            conn.execute(
-                "DELETE FROM arc_entries WHERE arc_id = ?1",
-                params![id],
-            )
-            .map_err(|e| AthenError::Other(format!("Delete arc entries: {e}")))?;
+            conn.execute("DELETE FROM arc_entries WHERE arc_id = ?1", params![id])
+                .map_err(|e| AthenError::Other(format!("Delete arc entries: {e}")))?;
             conn.execute("DELETE FROM arcs WHERE id = ?1", params![id])
                 .map_err(|e| AthenError::Other(format!("Delete arc: {e}")))?;
             Ok(())
@@ -472,8 +466,7 @@ impl ArcStore {
             let rows = stmt
                 .query_map(params![arc_id], |row| {
                     let metadata_str: Option<String> = row.get(5)?;
-                    let metadata = metadata_str
-                        .and_then(|s| serde_json::from_str(&s).ok());
+                    let metadata = metadata_str.and_then(|s| serde_json::from_str(&s).ok());
                     Ok(ArcEntry {
                         id: row.get(0)?,
                         arc_id: row.get(1)?,
@@ -488,9 +481,7 @@ impl ArcStore {
 
             let mut entries = Vec::new();
             for row in rows {
-                entries.push(
-                    row.map_err(|e| AthenError::Other(format!("Entry row: {e}")))?,
-                );
+                entries.push(row.map_err(|e| AthenError::Other(format!("Entry row: {e}")))?);
             }
             Ok(entries)
         })
@@ -571,9 +562,7 @@ impl ArcStore {
                 let mut v = Vec::new();
                 for row in rows {
                     v.push(
-                        row.map_err(|e| {
-                            AthenError::Other(format!("Migrate session row: {e}"))
-                        })?,
+                        row.map_err(|e| AthenError::Other(format!("Migrate session row: {e}")))?,
                     );
                 }
                 v
@@ -591,9 +580,7 @@ impl ArcStore {
                 let mut v = Vec::new();
                 for row in rows {
                     v.push(
-                        row.map_err(|e| {
-                            AthenError::Other(format!("Migrate session row: {e}"))
-                        })?,
+                        row.map_err(|e| AthenError::Other(format!("Migrate session row: {e}")))?,
                     );
                 }
                 v
@@ -604,7 +591,14 @@ impl ArcStore {
                 conn.execute(
                     "INSERT INTO arcs (id, name, source, status, created_at, updated_at) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![session_id, name, "user_input", "active", created_at, updated_at],
+                    params![
+                        session_id,
+                        name,
+                        "user_input",
+                        "active",
+                        created_at,
+                        updated_at
+                    ],
                 )
                 .map_err(|e| AthenError::Other(format!("Insert migrated arc: {e}")))?;
 
@@ -625,14 +619,14 @@ impl ArcStore {
                                 row.get::<_, String>(2)?,
                             ))
                         })
-                        .map_err(|e| {
-                            AthenError::Other(format!("Query migrate messages: {e}"))
-                        })?;
+                        .map_err(|e| AthenError::Other(format!("Query migrate messages: {e}")))?;
                     let mut v = Vec::new();
                     for row in rows {
-                        v.push(row.map_err(|e| {
-                            AthenError::Other(format!("Migrate message row: {e}"))
-                        })?);
+                        v.push(
+                            row.map_err(|e| {
+                                AthenError::Other(format!("Migrate message row: {e}"))
+                            })?,
+                        );
                     }
                     v
                 };
@@ -774,7 +768,13 @@ mod tests {
             .await
             .unwrap();
         store
-            .add_entry("arc_1", EntryType::ToolCall, "assistant", "Running ls", None)
+            .add_entry(
+                "arc_1",
+                EntryType::ToolCall,
+                "assistant",
+                "Running ls",
+                None,
+            )
             .await
             .unwrap();
         store
@@ -1040,13 +1040,28 @@ mod tests {
     #[tokio::test]
     async fn test_merge_moves_all_entries() {
         let store = setup_arc_store().await;
-        store.create_arc("src", "Source", ArcSource::Email).await.unwrap();
-        store.create_arc("tgt", "Target", ArcSource::UserInput).await.unwrap();
+        store
+            .create_arc("src", "Source", ArcSource::Email)
+            .await
+            .unwrap();
+        store
+            .create_arc("tgt", "Target", ArcSource::UserInput)
+            .await
+            .unwrap();
 
         // Add entries to source
-        store.add_entry("src", EntryType::EmailEvent, "email", "Email 1", None).await.unwrap();
-        store.add_entry("src", EntryType::EmailEvent, "email", "Email 2", None).await.unwrap();
-        store.add_entry("tgt", EntryType::Message, "user", "Hello", None).await.unwrap();
+        store
+            .add_entry("src", EntryType::EmailEvent, "email", "Email 1", None)
+            .await
+            .unwrap();
+        store
+            .add_entry("src", EntryType::EmailEvent, "email", "Email 2", None)
+            .await
+            .unwrap();
+        store
+            .add_entry("tgt", EntryType::Message, "user", "Hello", None)
+            .await
+            .unwrap();
 
         // Merge source into target
         store.merge_arc("src", "tgt").await.unwrap();
@@ -1068,8 +1083,14 @@ mod tests {
     #[tokio::test]
     async fn test_merged_arcs_not_in_active_list() {
         let store = setup_arc_store().await;
-        store.create_arc("a1", "Active", ArcSource::UserInput).await.unwrap();
-        store.create_arc("a2", "Will Merge", ArcSource::Email).await.unwrap();
+        store
+            .create_arc("a1", "Active", ArcSource::UserInput)
+            .await
+            .unwrap();
+        store
+            .create_arc("a2", "Will Merge", ArcSource::Email)
+            .await
+            .unwrap();
         store.merge_arc("a2", "a1").await.unwrap();
 
         let arcs = store.list_arcs().await.unwrap();
@@ -1081,13 +1102,49 @@ mod tests {
     #[tokio::test]
     async fn test_entry_types_preserved() {
         let store = setup_arc_store().await;
-        store.create_arc("a1", "Multi-type", ArcSource::UserInput).await.unwrap();
+        store
+            .create_arc("a1", "Multi-type", ArcSource::UserInput)
+            .await
+            .unwrap();
 
-        store.add_entry("a1", EntryType::Message, "user", "Hello", None).await.unwrap();
-        store.add_entry("a1", EntryType::ToolCall, "assistant", "shell_execute echo hi", None).await.unwrap();
-        store.add_entry("a1", EntryType::EmailEvent, "email", "From: bob", None).await.unwrap();
-        store.add_entry("a1", EntryType::SystemEvent, "system", "Monitor started", None).await.unwrap();
-        store.add_entry("a1", EntryType::CalendarEvent, "calendar", "Meeting at 3pm", None).await.unwrap();
+        store
+            .add_entry("a1", EntryType::Message, "user", "Hello", None)
+            .await
+            .unwrap();
+        store
+            .add_entry(
+                "a1",
+                EntryType::ToolCall,
+                "assistant",
+                "shell_execute echo hi",
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .add_entry("a1", EntryType::EmailEvent, "email", "From: bob", None)
+            .await
+            .unwrap();
+        store
+            .add_entry(
+                "a1",
+                EntryType::SystemEvent,
+                "system",
+                "Monitor started",
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .add_entry(
+                "a1",
+                EntryType::CalendarEvent,
+                "calendar",
+                "Meeting at 3pm",
+                None,
+            )
+            .await
+            .unwrap();
 
         let entries = store.load_entries("a1").await.unwrap();
         assert_eq!(entries.len(), 5);
@@ -1101,7 +1158,10 @@ mod tests {
     #[tokio::test]
     async fn test_entry_metadata_json() {
         let store = setup_arc_store().await;
-        store.create_arc("a1", "Meta test", ArcSource::Email).await.unwrap();
+        store
+            .create_arc("a1", "Meta test", ArcSource::Email)
+            .await
+            .unwrap();
 
         let meta = serde_json::json!({
             "event_id": "uuid-123",
@@ -1110,7 +1170,16 @@ mod tests {
             "nested": {"key": "value"}
         });
 
-        store.add_entry("a1", EntryType::EmailEvent, "email", "Content", Some(meta.clone())).await.unwrap();
+        store
+            .add_entry(
+                "a1",
+                EntryType::EmailEvent,
+                "email",
+                "Content",
+                Some(meta.clone()),
+            )
+            .await
+            .unwrap();
 
         let entries = store.load_entries("a1").await.unwrap();
         assert_eq!(entries.len(), 1);
@@ -1123,11 +1192,29 @@ mod tests {
     #[tokio::test]
     async fn test_branch_preserves_parent_reference() {
         let store = setup_arc_store().await;
-        store.create_arc("parent", "Parent Arc", ArcSource::UserInput).await.unwrap();
-        store.add_entry("parent", EntryType::Message, "user", "Original message", None).await.unwrap();
+        store
+            .create_arc("parent", "Parent Arc", ArcSource::UserInput)
+            .await
+            .unwrap();
+        store
+            .add_entry(
+                "parent",
+                EntryType::Message,
+                "user",
+                "Original message",
+                None,
+            )
+            .await
+            .unwrap();
 
-        store.create_arc_with_parent("child", "Branch", ArcSource::UserInput, "parent").await.unwrap();
-        store.add_entry("child", EntryType::Message, "user", "Branch message", None).await.unwrap();
+        store
+            .create_arc_with_parent("child", "Branch", ArcSource::UserInput, "parent")
+            .await
+            .unwrap();
+        store
+            .add_entry("child", EntryType::Message, "user", "Branch message", None)
+            .await
+            .unwrap();
 
         let child = store.get_arc("child").await.unwrap().unwrap();
         assert_eq!(child.parent_arc_id.as_deref(), Some("parent"));
@@ -1143,10 +1230,22 @@ mod tests {
     #[tokio::test]
     async fn test_delete_arc_cascades_entries() {
         let store = setup_arc_store().await;
-        store.create_arc("a1", "To Delete", ArcSource::UserInput).await.unwrap();
-        store.add_entry("a1", EntryType::Message, "user", "Msg 1", None).await.unwrap();
-        store.add_entry("a1", EntryType::Message, "assistant", "Msg 2", None).await.unwrap();
-        store.add_entry("a1", EntryType::ToolCall, "assistant", "Tool call", None).await.unwrap();
+        store
+            .create_arc("a1", "To Delete", ArcSource::UserInput)
+            .await
+            .unwrap();
+        store
+            .add_entry("a1", EntryType::Message, "user", "Msg 1", None)
+            .await
+            .unwrap();
+        store
+            .add_entry("a1", EntryType::Message, "assistant", "Msg 2", None)
+            .await
+            .unwrap();
+        store
+            .add_entry("a1", EntryType::ToolCall, "assistant", "Tool call", None)
+            .await
+            .unwrap();
 
         store.delete_arc("a1").await.unwrap();
 
@@ -1157,7 +1256,10 @@ mod tests {
     #[tokio::test]
     async fn test_archive_arc_status_change() {
         let store = setup_arc_store().await;
-        store.create_arc("a1", "To Archive", ArcSource::UserInput).await.unwrap();
+        store
+            .create_arc("a1", "To Archive", ArcSource::UserInput)
+            .await
+            .unwrap();
         store.archive_arc("a1").await.unwrap();
 
         let arc = store.get_arc("a1").await.unwrap().unwrap();
@@ -1167,10 +1269,22 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_arcs_different_sources() {
         let store = setup_arc_store().await;
-        store.create_arc("chat1", "Chat", ArcSource::UserInput).await.unwrap();
-        store.create_arc("email1", "Email thread", ArcSource::Email).await.unwrap();
-        store.create_arc("cal1", "Meeting", ArcSource::Calendar).await.unwrap();
-        store.create_arc("msg1", "WhatsApp", ArcSource::Messaging).await.unwrap();
+        store
+            .create_arc("chat1", "Chat", ArcSource::UserInput)
+            .await
+            .unwrap();
+        store
+            .create_arc("email1", "Email thread", ArcSource::Email)
+            .await
+            .unwrap();
+        store
+            .create_arc("cal1", "Meeting", ArcSource::Calendar)
+            .await
+            .unwrap();
+        store
+            .create_arc("msg1", "WhatsApp", ArcSource::Messaging)
+            .await
+            .unwrap();
 
         let arcs = store.list_arcs().await.unwrap();
         assert_eq!(arcs.len(), 4);
@@ -1185,10 +1299,19 @@ mod tests {
     #[tokio::test]
     async fn test_add_entry_returns_id() {
         let store = setup_arc_store().await;
-        store.create_arc("a1", "Test", ArcSource::UserInput).await.unwrap();
+        store
+            .create_arc("a1", "Test", ArcSource::UserInput)
+            .await
+            .unwrap();
 
-        let id1 = store.add_entry("a1", EntryType::Message, "user", "First", None).await.unwrap();
-        let id2 = store.add_entry("a1", EntryType::Message, "user", "Second", None).await.unwrap();
+        let id1 = store
+            .add_entry("a1", EntryType::Message, "user", "First", None)
+            .await
+            .unwrap();
+        let id2 = store
+            .add_entry("a1", EntryType::Message, "user", "Second", None)
+            .await
+            .unwrap();
 
         assert!(id2 > id1);
     }
@@ -1196,13 +1319,22 @@ mod tests {
     #[tokio::test]
     async fn test_arc_entry_count_updates() {
         let store = setup_arc_store().await;
-        store.create_arc("a1", "Count test", ArcSource::UserInput).await.unwrap();
+        store
+            .create_arc("a1", "Count test", ArcSource::UserInput)
+            .await
+            .unwrap();
 
         let arcs = store.list_arcs().await.unwrap();
         assert_eq!(arcs[0].entry_count, 0);
 
-        store.add_entry("a1", EntryType::Message, "user", "One", None).await.unwrap();
-        store.add_entry("a1", EntryType::Message, "user", "Two", None).await.unwrap();
+        store
+            .add_entry("a1", EntryType::Message, "user", "One", None)
+            .await
+            .unwrap();
+        store
+            .add_entry("a1", EntryType::Message, "user", "Two", None)
+            .await
+            .unwrap();
 
         let arcs = store.list_arcs().await.unwrap();
         assert_eq!(arcs[0].entry_count, 2);

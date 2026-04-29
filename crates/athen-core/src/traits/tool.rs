@@ -12,11 +12,7 @@ pub trait ToolRegistry: Send + Sync {
     async fn list_tools(&self) -> Result<Vec<ToolDefinition>>;
 
     /// Invoke a tool by name with the given arguments.
-    async fn call_tool(
-        &self,
-        name: &str,
-        args: serde_json::Value,
-    ) -> Result<ToolResult>;
+    async fn call_tool(&self, name: &str, args: serde_json::Value) -> Result<ToolResult>;
 }
 
 /// Lifecycle management for tool backend processes (MCPs, etc).

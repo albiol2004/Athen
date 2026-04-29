@@ -162,10 +162,7 @@ impl ShellToolRegistry {
 
     /// Inject a provider that supplies additional writable paths for the
     /// shell sandbox, typically derived from the active arc's grants.
-    pub fn with_extra_writable(
-        mut self,
-        provider: Arc<dyn ShellExtraWritableProvider>,
-    ) -> Self {
+    pub fn with_extra_writable(mut self, provider: Arc<dyn ShellExtraWritableProvider>) -> Self {
         self.extra_writable = Some(provider);
         self
     }
@@ -349,7 +346,12 @@ impl ShellToolRegistry {
         // only what actually runs.
         let wrapped_command = Self::workspace_wrap(command);
 
-        tracing::info!(tool = "shell_execute", command, timeout_ms, "Executing shell command");
+        tracing::info!(
+            tool = "shell_execute",
+            command,
+            timeout_ms,
+            "Executing shell command"
+        );
 
         // Pre-execution risk check: evaluate the ACTUAL command (not user's
         // natural language) through the rule engine. This catches dangerous
@@ -396,103 +398,104 @@ impl ShellToolRegistry {
         // and NativeShell both set `kill_on_drop`, so dropping the future
         // SIGKILLs the spawned process group.
         let exec_future = async {
-        let (stdout, stderr, exit_code) = if let Some(ref sandbox) = self.sandbox {
-            // Default writable set: /tmp, the Athen data dir, and cwd.
-            // $HOME is intentionally NOT included by default — explicit
-            // grants via the GrantStore push entries through `extra_writable`.
-            let mut allowed: Vec<PathBuf> = vec![PathBuf::from("/tmp")];
-            if let Some(data) = paths::athen_data_dir() {
-                allowed.push(data);
-            }
-            if let Ok(cwd) = std::env::current_dir() {
-                allowed.push(cwd);
-            }
-            if let Some(provider) = self.extra_writable.as_ref() {
-                for p in provider.extra_writable_paths().await {
-                    if !paths::is_system_path(&p) {
-                        allowed.push(p);
+            let (stdout, stderr, exit_code) = if let Some(ref sandbox) = self.sandbox {
+                // Default writable set: /tmp, the Athen data dir, and cwd.
+                // $HOME is intentionally NOT included by default — explicit
+                // grants via the GrantStore push entries through `extra_writable`.
+                let mut allowed: Vec<PathBuf> = vec![PathBuf::from("/tmp")];
+                if let Some(data) = paths::athen_data_dir() {
+                    allowed.push(data);
+                }
+                if let Ok(cwd) = std::env::current_dir() {
+                    allowed.push(cwd);
+                }
+                if let Some(provider) = self.extra_writable.as_ref() {
+                    for p in provider.extra_writable_paths().await {
+                        if !paths::is_system_path(&p) {
+                            allowed.push(p);
+                        }
                     }
                 }
-            }
-            let level = SandboxLevel::OsNative {
-                profile: SandboxProfile::RestrictedWrite {
-                    allowed_paths: allowed,
-                },
-            };
-            match sandbox
-                .execute_sandboxed("sh", &["-c", &wrapped_command], &level)
-                .await
-            {
-                Ok(output) => {
-                    // Detect sandbox infrastructure failures (e.g. bwrap can't
-                    // create namespaces on restricted CI runners). If stderr
-                    // contains sandbox-specific errors, fall back to unsandboxed.
-                    let is_sandbox_failure = output.exit_code != 0
-                        && (output.stderr.contains("bwrap:")
-                            || output.stderr.contains("sandbox-exec:")
-                            || output.stderr.contains("creating new namespace"));
-                    if is_sandbox_failure {
+                let level = SandboxLevel::OsNative {
+                    profile: SandboxProfile::RestrictedWrite {
+                        allowed_paths: allowed,
+                    },
+                };
+                match sandbox
+                    .execute_sandboxed("sh", &["-c", &wrapped_command], &level)
+                    .await
+                {
+                    Ok(output) => {
+                        // Detect sandbox infrastructure failures (e.g. bwrap can't
+                        // create namespaces on restricted CI runners). If stderr
+                        // contains sandbox-specific errors, fall back to unsandboxed.
+                        let is_sandbox_failure = output.exit_code != 0
+                            && (output.stderr.contains("bwrap:")
+                                || output.stderr.contains("sandbox-exec:")
+                                || output.stderr.contains("creating new namespace"));
+                        if is_sandbox_failure {
+                            tracing::warn!(
+                                tool = "shell_execute",
+                                stderr = %output.stderr.trim(),
+                                "Sandbox infrastructure failed, falling back to unsandboxed shell"
+                            );
+                            let output = self.shell.execute(&wrapped_command).await?;
+                            (output.stdout, output.stderr, output.exit_code)
+                        } else {
+                            tracing::debug!(
+                                tool = "shell_execute",
+                                "Command executed inside sandbox"
+                            );
+                            (output.stdout, output.stderr, output.exit_code)
+                        }
+                    }
+                    Err(e) => {
                         tracing::warn!(
                             tool = "shell_execute",
-                            stderr = %output.stderr.trim(),
-                            "Sandbox infrastructure failed, falling back to unsandboxed shell"
+                            error = %e,
+                            "Sandbox execution failed, falling back to unsandboxed shell"
                         );
                         let output = self.shell.execute(&wrapped_command).await?;
                         (output.stdout, output.stderr, output.exit_code)
-                    } else {
-                        tracing::debug!(tool = "shell_execute", "Command executed inside sandbox");
-                        (output.stdout, output.stderr, output.exit_code)
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        tool = "shell_execute",
-                        error = %e,
-                        "Sandbox execution failed, falling back to unsandboxed shell"
-                    );
-                    let output = self.shell.execute(&wrapped_command).await?;
-                    (output.stdout, output.stderr, output.exit_code)
-                }
-            }
-        } else {
-            tracing::trace!(
-                tool = "shell_execute",
-                "No sandbox available, executing unsandboxed"
-            );
-            let output = self.shell.execute(&wrapped_command).await?;
-            (output.stdout, output.stderr, output.exit_code)
-        };
+            } else {
+                tracing::trace!(
+                    tool = "shell_execute",
+                    "No sandbox available, executing unsandboxed"
+                );
+                let output = self.shell.execute(&wrapped_command).await?;
+                (output.stdout, output.stderr, output.exit_code)
+            };
             Ok::<_, AthenError>((stdout, stderr, exit_code))
         };
 
-        let (stdout, stderr, exit_code) = match tokio::time::timeout(
-            std::time::Duration::from_millis(timeout_ms),
-            exec_future,
-        )
-        .await
-        {
-            Ok(inner) => inner?,
-            Err(_) => {
-                tracing::warn!(
-                    tool = "shell_execute",
-                    command,
-                    timeout_ms,
-                    "Command timed out — process killed"
-                );
-                let msg = format!(
-                    "command timed out after {}ms and was killed. \
+        let (stdout, stderr, exit_code) =
+            match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), exec_future)
+                .await
+            {
+                Ok(inner) => inner?,
+                Err(_) => {
+                    tracing::warn!(
+                        tool = "shell_execute",
+                        command,
+                        timeout_ms,
+                        "Command timed out — process killed"
+                    );
+                    let msg = format!(
+                        "command timed out after {}ms and was killed. \
                      For long-lived servers/daemons use shell_spawn (returns a PID + log file). \
                      For commands that legitimately need longer, pass `timeout_ms` (max 600000).",
-                    timeout_ms
-                );
-                return Ok(ToolResult {
-                    success: false,
-                    output: json!({ "error": &msg, "timed_out": true }),
-                    error: Some(msg),
-                    execution_time_ms: start.elapsed().as_millis() as u64,
-                });
-            }
-        };
+                        timeout_ms
+                    );
+                    return Ok(ToolResult {
+                        success: false,
+                        output: json!({ "error": &msg, "timed_out": true }),
+                        error: Some(msg),
+                        execution_time_ms: start.elapsed().as_millis() as u64,
+                    });
+                }
+            };
 
         let elapsed_ms = start.elapsed().as_millis() as u64;
         let success = exit_code == 0;
@@ -508,11 +511,7 @@ impl ShellToolRegistry {
             error: if success {
                 None
             } else {
-                Some(format!(
-                    "exit code {}: {}",
-                    exit_code,
-                    stderr.trim()
-                ))
+                Some(format!("exit code {}: {}", exit_code, stderr.trim()))
             },
             execution_time_ms: elapsed_ms,
         })
@@ -1062,11 +1061,13 @@ impl ShellToolRegistry {
             Ok(results) => {
                 let json_results: Vec<serde_json::Value> = results
                     .iter()
-                    .map(|r| json!({
-                        "title": r.title,
-                        "url": r.url,
-                        "snippet": r.snippet,
-                    }))
+                    .map(|r| {
+                        json!({
+                            "title": r.title,
+                            "url": r.url,
+                            "snippet": r.snippet,
+                        })
+                    })
                     .collect();
                 Ok(ToolResult {
                     success: true,
@@ -1213,7 +1214,12 @@ impl ShellToolRegistry {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        tracing::info!(tool = "shell_spawn", command, ?label, "Spawning detached process");
+        tracing::info!(
+            tool = "shell_spawn",
+            command,
+            ?label,
+            "Spawning detached process"
+        );
         let start = Instant::now();
 
         // Same risk check as shell_execute — a long-lived daemon can do as
@@ -1271,13 +1277,17 @@ impl ShellToolRegistry {
         }
 
         let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S-%f").to_string();
-        let stem = label
-            .clone()
-            .unwrap_or_else(|| "spawn".to_string());
+        let stem = label.clone().unwrap_or_else(|| "spawn".to_string());
         // Sanitize label for filesystem use.
         let safe_stem: String = stem
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
             .collect();
         let log_path = log_dir.join(format!("{safe_stem}-{timestamp}.log"));
 
@@ -1296,13 +1306,13 @@ impl ShellToolRegistry {
                 });
             }
         };
-        let stderr_file = match std::fs::OpenOptions::new()
-            .append(true)
-            .open(&log_path)
-        {
+        let stderr_file = match std::fs::OpenOptions::new().append(true).open(&log_path) {
             Ok(f) => f,
             Err(e) => {
-                let msg = format!("failed to open log file for stderr '{}': {e}", log_path.display());
+                let msg = format!(
+                    "failed to open log file for stderr '{}': {e}",
+                    log_path.display()
+                );
                 return Ok(ToolResult {
                     success: false,
                     output: json!({ "error": msg }),
@@ -1401,9 +1411,8 @@ impl ShellToolRegistry {
         {
             let map = self.spawned.lock().await;
             if !map.contains_key(&pid) {
-                let msg =
-                    "PID not managed by shell_spawn; refusing to kill arbitrary processes"
-                        .to_string();
+                let msg = "PID not managed by shell_spawn; refusing to kill arbitrary processes"
+                    .to_string();
                 return Ok(ToolResult {
                     success: false,
                     output: json!({ "error": &msg, "pid": pid }),
@@ -1422,7 +1431,11 @@ impl ShellToolRegistry {
             let pgid = Pid::from_raw(-(pid as i32));
             let direct = Pid::from_raw(pid as i32);
 
-            let initial_sig = if force { Signal::SIGKILL } else { Signal::SIGTERM };
+            let initial_sig = if force {
+                Signal::SIGKILL
+            } else {
+                Signal::SIGTERM
+            };
             // Best-effort: try the group first, then the bare PID as a
             // fallback (group send fails if we're not the group leader).
             let _ = kill(pgid, initial_sig);
@@ -1547,7 +1560,10 @@ impl ShellToolRegistry {
             .ok_or_else(|| AthenError::Other("missing 'path' parameter".to_string()))?;
 
         tracing::info!(tool = "list_directory", path, "Listing directory");
-        tracing::trace!(tool = "list_directory", "Filesystem tools use tokio::fs directly (unsandboxed)");
+        tracing::trace!(
+            tool = "list_directory",
+            "Filesystem tools use tokio::fs directly (unsandboxed)"
+        );
 
         let start = Instant::now();
         match tokio::fs::read_dir(path).await {
@@ -1730,11 +1746,7 @@ impl ToolRegistry for ShellToolRegistry {
         ])
     }
 
-    async fn call_tool(
-        &self,
-        name: &str,
-        args: serde_json::Value,
-    ) -> Result<ToolResult> {
+    async fn call_tool(&self, name: &str, args: serde_json::Value) -> Result<ToolResult> {
         match name {
             "shell_execute" => self.do_shell_execute(&args).await,
             "shell_spawn" => self.do_shell_spawn(&args).await,
@@ -1810,11 +1822,11 @@ async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         // Best-effort cleanup, then fall back to a direct write so
         // callers on quirky filesystems aren't dead in the water.
         let _ = tokio::fs::remove_file(&tmp).await;
-        tokio::fs::write(path, bytes)
-            .await
-            .map_err(|e2| AthenError::Other(format!(
+        tokio::fs::write(path, bytes).await.map_err(|e2| {
+            AthenError::Other(format!(
                 "atomic rename failed ({e}); fallback write also failed: {e2}"
-            )))?;
+            ))
+        })?;
     }
     Ok(())
 }
@@ -2215,7 +2227,11 @@ mod tests {
             return;
         }
         let dir = TempDir::new().unwrap();
-        std::fs::write(dir.path().join("a.txt"), "needle in a haystack\nother line\n").unwrap();
+        std::fs::write(
+            dir.path().join("a.txt"),
+            "needle in a haystack\nother line\n",
+        )
+        .unwrap();
         std::fs::write(dir.path().join("b.txt"), "no match here\n").unwrap();
 
         let registry = ShellToolRegistry::new().await;
@@ -2282,7 +2298,10 @@ mod tests {
         assert_eq!(entries.len(), 3);
         assert_eq!(result.output["count"], 3);
 
-        let names: Vec<&str> = entries.iter().map(|e| e["name"].as_str().unwrap()).collect();
+        let names: Vec<&str> = entries
+            .iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
         assert!(names.contains(&"alpha.txt"));
         assert!(names.contains(&"beta.txt"));
         assert!(names.contains(&"subdir"));
@@ -2347,7 +2366,10 @@ mod tests {
         let desc = schema["properties"]["timeout_ms"]["description"]
             .as_str()
             .unwrap();
-        assert!(desc.contains("60000"), "schema desc should mention 60000ms default: {desc}");
+        assert!(
+            desc.contains("60000"),
+            "schema desc should mention 60000ms default: {desc}"
+        );
     }
 
     #[cfg(unix)]
@@ -2626,7 +2648,9 @@ mod tests {
                 },
             ],
         };
-        let registry = ShellToolRegistry::new().await.with_web_search(Arc::new(stub));
+        let registry = ShellToolRegistry::new()
+            .await
+            .with_web_search(Arc::new(stub));
 
         let result = registry
             .call_tool("web_search", json!({ "query": "rust", "max_results": 2 }))
@@ -2644,8 +2668,12 @@ mod tests {
 
     #[tokio::test]
     async fn web_search_clamps_max_results_to_safe_range() {
-        let stub = StubSearch { results: Vec::new() };
-        let registry = ShellToolRegistry::new().await.with_web_search(Arc::new(stub));
+        let stub = StubSearch {
+            results: Vec::new(),
+        };
+        let registry = ShellToolRegistry::new()
+            .await
+            .with_web_search(Arc::new(stub));
 
         // 0 must be raised to >=1, 999 must be clamped to <=20. The stub
         // returns empty either way; success is what we're checking — a
@@ -2673,7 +2701,9 @@ mod tests {
                 source: "stub-reader".into(),
             }),
         };
-        let registry = ShellToolRegistry::new().await.with_page_reader(Arc::new(stub));
+        let registry = ShellToolRegistry::new()
+            .await
+            .with_page_reader(Arc::new(stub));
 
         let result = registry
             .call_tool("web_fetch", json!({ "url": "https://example.com/" }))
@@ -2695,7 +2725,9 @@ mod tests {
         let stub = StubReader {
             outcome: Err("reader must not be called".into()),
         };
-        let registry = ShellToolRegistry::new().await.with_page_reader(Arc::new(stub));
+        let registry = ShellToolRegistry::new()
+            .await
+            .with_page_reader(Arc::new(stub));
 
         let result = registry
             .call_tool("web_fetch", json!({ "url": "ftp://nope/" }))
@@ -2704,7 +2736,10 @@ mod tests {
 
         assert!(!result.success);
         let err = result.error.as_deref().unwrap_or("");
-        assert!(err.contains("http(s)"), "expected scheme guard error, got: {err}");
+        assert!(
+            err.contains("http(s)"),
+            "expected scheme guard error, got: {err}"
+        );
     }
 
     #[tokio::test]
@@ -2712,7 +2747,9 @@ mod tests {
         let stub = StubReader {
             outcome: Err("simulated reader failure".into()),
         };
-        let registry = ShellToolRegistry::new().await.with_page_reader(Arc::new(stub));
+        let registry = ShellToolRegistry::new()
+            .await
+            .with_page_reader(Arc::new(stub));
 
         let result = registry
             .call_tool("web_fetch", json!({ "url": "https://example.com/" }))

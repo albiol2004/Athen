@@ -109,7 +109,10 @@ mod tests {
         let config = NotificationConfig::default();
         assert_eq!(
             config.preferred_channels,
-            vec![NotificationChannelKind::InApp, NotificationChannelKind::Telegram]
+            vec![
+                NotificationChannelKind::InApp,
+                NotificationChannelKind::Telegram
+            ]
         );
         assert_eq!(config.escalation_timeout_secs, 300);
         assert!(config.quiet_hours.is_none());

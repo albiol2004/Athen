@@ -13,7 +13,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResult, Content, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
 };
-use rmcp::{ErrorData as McpError, ServerHandler, schemars, tool, tool_handler, tool_router};
+use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct PathArg {
@@ -124,7 +124,9 @@ impl Filesystem {
         Ok(joined)
     }
 
-    #[tool(description = "Read a UTF-8 text file from the sandbox. For files outside the sandbox, use shell_execute.")]
+    #[tool(
+        description = "Read a UTF-8 text file from the sandbox. For files outside the sandbox, use shell_execute."
+    )]
     async fn read_file(
         &self,
         Parameters(PathArg { path }): Parameters<PathArg>,
@@ -136,7 +138,9 @@ impl Filesystem {
         }
     }
 
-    #[tool(description = "Write (overwrite) a UTF-8 text file in the sandbox. Creates parent dirs as needed. For files outside the sandbox, use shell_execute.")]
+    #[tool(
+        description = "Write (overwrite) a UTF-8 text file in the sandbox. Creates parent dirs as needed. For files outside the sandbox, use shell_execute."
+    )]
     async fn write_file(
         &self,
         Parameters(WriteArg { path, contents }): Parameters<WriteArg>,
@@ -153,7 +157,9 @@ impl Filesystem {
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
-    #[tool(description = "Append text to a file in the sandbox. Creates the file if missing. For files outside the sandbox, use shell_execute.")]
+    #[tool(
+        description = "Append text to a file in the sandbox. Creates the file if missing. For files outside the sandbox, use shell_execute."
+    )]
     async fn append_file(
         &self,
         Parameters(WriteArg { path, contents }): Parameters<WriteArg>,
@@ -177,7 +183,9 @@ impl Filesystem {
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
-    #[tool(description = "List entries in a sandbox directory. Returns one entry per line as 'TYPE\\tNAME'. Use '.' to list the sandbox root. For directories outside the sandbox, use shell_execute.")]
+    #[tool(
+        description = "List entries in a sandbox directory. Returns one entry per line as 'TYPE\\tNAME'. Use '.' to list the sandbox root. For directories outside the sandbox, use shell_execute."
+    )]
     async fn list_dir(
         &self,
         Parameters(PathArg { path }): Parameters<PathArg>,
@@ -212,7 +220,9 @@ impl Filesystem {
         Ok(CallToolResult::success(vec![Content::text(out)]))
     }
 
-    #[tool(description = "Create a directory (and parents) at the given sandbox path. For paths outside the sandbox, use shell_execute.")]
+    #[tool(
+        description = "Create a directory (and parents) at the given sandbox path. For paths outside the sandbox, use shell_execute."
+    )]
     async fn create_dir(
         &self,
         Parameters(PathArg { path }): Parameters<PathArg>,
@@ -224,7 +234,9 @@ impl Filesystem {
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
-    #[tool(description = "Delete a file or directory in the sandbox. Recursive for directories. For paths outside the sandbox, use shell_execute.")]
+    #[tool(
+        description = "Delete a file or directory in the sandbox. Recursive for directories. For paths outside the sandbox, use shell_execute."
+    )]
     async fn delete_path(
         &self,
         Parameters(PathArg { path }): Parameters<PathArg>,
@@ -251,7 +263,9 @@ impl Filesystem {
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
-    #[tool(description = "Move or rename a file/directory within the sandbox. Both paths must stay inside the sandbox; for paths outside it, use shell_execute.")]
+    #[tool(
+        description = "Move or rename a file/directory within the sandbox. Both paths must stay inside the sandbox; for paths outside it, use shell_execute."
+    )]
     async fn move_path(
         &self,
         Parameters(MoveArg { from, to }): Parameters<MoveArg>,
@@ -269,7 +283,9 @@ impl Filesystem {
         Ok(CallToolResult::success(vec![Content::text("ok")]))
     }
 
-    #[tool(description = "Check whether a sandbox path exists. Returns 'true' or 'false'. For paths outside the sandbox, use shell_execute.")]
+    #[tool(
+        description = "Check whether a sandbox path exists. Returns 'true' or 'false'. For paths outside the sandbox, use shell_execute."
+    )]
     async fn exists(
         &self,
         Parameters(PathArg { path }): Parameters<PathArg>,
@@ -281,7 +297,9 @@ impl Filesystem {
         )]))
     }
 
-    #[tool(description = "Get metadata for a sandbox path. Returns 'TYPE\\tSIZE_BYTES'. For paths outside the sandbox, use shell_execute.")]
+    #[tool(
+        description = "Get metadata for a sandbox path. Returns 'TYPE\\tSIZE_BYTES'. For paths outside the sandbox, use shell_execute."
+    )]
     async fn stat(
         &self,
         Parameters(PathArg { path }): Parameters<PathArg>,
@@ -307,27 +325,25 @@ impl Filesystem {
 #[tool_handler]
 impl ServerHandler for Filesystem {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
-            ServerCapabilities::builder().enable_tools().build(),
-        )
-        .with_server_info(Implementation::from_build_env())
-        .with_protocol_version(ProtocolVersion::V_2024_11_05)
-        .with_instructions(
-            "Sandboxed filesystem access. All paths are relative to a fixed root directory; \
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::from_build_env())
+            .with_protocol_version(ProtocolVersion::V_2024_11_05)
+            .with_instructions(
+                "Sandboxed filesystem access. All paths are relative to a fixed root directory; \
              absolute paths and traversal outside the root are rejected. \
              For files outside this sandbox, prefer shell_execute. \
              Tools: read_file, write_file, append_file, list_dir, create_dir, delete_path, \
              move_path, exists, stat."
-                .to_string(),
-        )
+                    .to_string(),
+            )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmcp::ServiceExt;
     use rmcp::model::CallToolRequestParams;
+    use rmcp::ServiceExt;
     use tempfile::tempdir;
 
     fn args(v: serde_json::Value) -> rmcp::model::JsonObject {
@@ -388,8 +404,9 @@ mod tests {
 
         let _ = client
             .call_tool(
-                CallToolRequestParams::new("write_file")
-                    .with_arguments(args(serde_json::json!({"path": "hello.txt", "contents": "hi"}))),
+                CallToolRequestParams::new("write_file").with_arguments(args(
+                    serde_json::json!({"path": "hello.txt", "contents": "hi"}),
+                )),
             )
             .await
             .unwrap();

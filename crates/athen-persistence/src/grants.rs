@@ -127,12 +127,7 @@ impl GrantStore {
         })
     }
 
-    pub async fn revoke_arc(
-        &self,
-        arc_id: Uuid,
-        path: &Path,
-        access: Access,
-    ) -> Result<bool> {
+    pub async fn revoke_arc(&self, arc_id: Uuid, path: &Path, access: Access) -> Result<bool> {
         let canonical = paths::canonicalize_loose(path);
         let conn = self.conn.clone();
         let arc_id_str = arc_id.to_string();
@@ -448,7 +443,9 @@ mod tests {
         let result = store.grant_arc(arc, Path::new("/etc"), Access::Write).await;
         assert!(result.is_err());
 
-        let result = store.grant_global(Path::new("/etc/passwd"), Access::Write).await;
+        let result = store
+            .grant_global(Path::new("/etc/passwd"), Access::Write)
+            .await;
         assert!(result.is_err());
     }
 

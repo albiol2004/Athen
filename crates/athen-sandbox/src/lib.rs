@@ -94,18 +94,17 @@ impl UnifiedSandbox {
         level: &SandboxLevel,
     ) -> Result<SandboxOutput> {
         let sandbox_name = self.select_sandbox_name(level)?;
-        debug!(sandbox = sandbox_name, command, "Executing sandboxed command");
+        debug!(
+            sandbox = sandbox_name,
+            command, "Executing sandboxed command"
+        );
 
         match level {
             SandboxLevel::None => Self::execute_direct(command, args).await,
 
-            SandboxLevel::OsNative { .. } => {
-                self.execute_os_native(command, args, level).await
-            }
+            SandboxLevel::OsNative { .. } => self.execute_os_native(command, args, level).await,
 
-            SandboxLevel::Container { .. } => {
-                self.execute_container(command, args, level).await
-            }
+            SandboxLevel::Container { .. } => self.execute_container(command, args, level).await,
         }
     }
 
@@ -166,9 +165,7 @@ impl UnifiedSandbox {
             }
         }
 
-        Err(AthenError::Sandbox(
-            "No OS-native sandbox available".into(),
-        ))
+        Err(AthenError::Sandbox("No OS-native sandbox available".into()))
     }
 
     /// Execute using container runtime.
@@ -183,9 +180,7 @@ impl UnifiedSandbox {
         } else if self.capabilities.docker {
             ContainerExecutor::with_runtime(container::ContainerRuntime::Docker)
         } else {
-            return Err(AthenError::Sandbox(
-                "No container runtime available".into(),
-            ));
+            return Err(AthenError::Sandbox("No container runtime available".into()));
         };
 
         executor.execute(command, args, level).await
