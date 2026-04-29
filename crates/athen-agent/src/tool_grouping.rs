@@ -99,9 +99,26 @@ fn group_one_liner(id: &str, tools: &[&ToolDefinition]) -> String {
 }
 
 /// True if the tool should always be revealed (full schema in every request).
-/// Memory is always revealed because the agent must use it on every turn.
+/// Always-revealed tools are the universally-used core: memory (referenced on
+/// every turn) plus the shell + file primitives (the bread-and-butter coding
+/// tools). Without their schemas, small models fall back to whatever IS
+/// schema-visible and loop. Domain-specific tools (calendar, contacts, MCP)
+/// stay tier-2 to keep the prompt small.
 pub fn is_always_revealed(name: &str) -> bool {
-    group_for(name) == "memory"
+    matches!(
+        name,
+        "memory_store"
+            | "memory_recall"
+            | "shell_execute"
+            | "shell_spawn"
+            | "shell_kill"
+            | "shell_logs"
+            | "read"
+            | "edit"
+            | "write"
+            | "grep"
+            | "list_directory"
+    )
 }
 
 #[cfg(test)]
@@ -139,9 +156,15 @@ mod tests {
     }
 
     #[test]
-    fn always_revealed_covers_memory_only() {
+    fn always_revealed_covers_core_tools() {
         assert!(is_always_revealed("memory_store"));
         assert!(is_always_revealed("memory_recall"));
+        assert!(is_always_revealed("shell_execute"));
+        assert!(is_always_revealed("shell_spawn"));
+        assert!(is_always_revealed("read"));
+        assert!(is_always_revealed("edit"));
+        assert!(is_always_revealed("write"));
+        assert!(is_always_revealed("grep"));
         assert!(!is_always_revealed("calendar_create"));
         assert!(!is_always_revealed("files__write_file"));
     }
