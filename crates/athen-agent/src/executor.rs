@@ -1084,9 +1084,7 @@ impl AgentExecutor for DefaultExecutor {
             let outcomes = futures::future::join_all(dispatches).await;
 
             // ── Process results in order: audit + thread into conversation ──
-            for (tool_call, (started_at, tool_result)) in
-                response.tool_calls.iter().zip(outcomes)
-            {
+            for (tool_call, (started_at, tool_result)) in response.tool_calls.iter().zip(outcomes) {
                 let (step_status, output) = match &tool_result {
                     Ok(result) => (
                         if result.success {
