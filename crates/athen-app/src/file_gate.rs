@@ -221,7 +221,9 @@ impl FileGate {
                     .and_then(|v| v.as_str())
                     .map(PathBuf::from)
                     .unwrap_or_else(|| {
-                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+                        // Default to the agent workspace dir so risk eval
+                        // matches what `do_grep` will actually search.
+                        paths::athen_workspace_dir().unwrap_or_else(|| PathBuf::from("."))
                     });
                 Ok(vec![p])
             }
@@ -229,15 +231,13 @@ impl FileGate {
         }
     }
 
-    /// Resolve a possibly-relative path against the current working
-    /// directory and lexically normalize.
+    /// Resolve a possibly-relative path against the agent's workspace dir
+    /// and lexically normalize. Must agree with how the built-in file tools
+    /// resolve paths internally — otherwise risk eval and the actual file
+    /// op would target different locations.
     fn absolutize(p: &Path) -> PathBuf {
-        if p.is_absolute() {
-            paths::canonicalize_loose(p)
-        } else {
-            let base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-            paths::canonicalize_loose(&base.join(p))
-        }
+        let resolved = paths::resolve_in_workspace(p);
+        paths::canonicalize_loose(&resolved)
     }
 
     fn risk_ctx() -> RiskContext {
@@ -625,11 +625,25 @@ mod tests {
     }
 
     #[test]
-    fn grep_path_defaults_to_cwd() {
+    fn grep_path_defaults_to_workspace() {
         let r = FileGate::paths_from_args("grep", &json!({ "pattern": "x" })).unwrap();
         assert_eq!(r.len(), 1);
-        // Should produce *some* path (cwd or ".") rather than erroring.
-        assert!(!r[0].as_os_str().is_empty());
+        let ws = paths::athen_workspace_dir().unwrap();
+        assert_eq!(r[0], ws);
+    }
+
+    #[test]
+    fn absolutize_relative_uses_workspace() {
+        let abs = FileGate::absolutize(Path::new("test.html"));
+        let ws = paths::athen_workspace_dir().unwrap();
+        // canonicalize_loose may resolve symlinks if the dir exists; check
+        // that the resolved path lives under the workspace either way.
+        assert!(
+            paths::path_within(&abs, &ws),
+            "expected {} to be under workspace {}",
+            abs.display(),
+            ws.display(),
+        );
     }
 
     #[test]

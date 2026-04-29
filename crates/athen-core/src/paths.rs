@@ -31,6 +31,30 @@ pub fn athen_files_sandbox() -> Option<PathBuf> {
     athen_data_dir().map(|d| d.join("files"))
 }
 
+/// Default workspace directory the agent works inside when the user hasn't
+/// pointed at a specific location. Relative paths in built-in file tools and
+/// shell commands resolve against this dir, NOT the process cwd — so a fresh
+/// `write { path: "test.html", ... }` lands here instead of the project the
+/// app was launched from.
+///
+/// - Unix: `~/.athen/workspace`
+/// - Windows: `%APPDATA%\Athen\workspace`
+pub fn athen_workspace_dir() -> Option<PathBuf> {
+    athen_data_dir().map(|d| d.join("workspace"))
+}
+
+/// Resolve `p` against the agent workspace dir. Absolute paths pass through
+/// unchanged; relative paths are joined with [`athen_workspace_dir`], or
+/// with a `<temp>/athen-workspace` fallback when home isn't resolvable.
+pub fn resolve_in_workspace(p: &Path) -> PathBuf {
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    let base = athen_workspace_dir()
+        .unwrap_or_else(|| std::env::temp_dir().join("athen-workspace"));
+    base.join(p)
+}
+
 /// OS-specific list of read-only system roots.
 pub fn system_readonly_paths() -> Vec<PathBuf> {
     #[cfg(target_os = "linux")]
@@ -193,5 +217,26 @@ mod tests {
         assert!(athen_data_dir().is_some());
         let files = athen_files_sandbox().unwrap();
         assert!(files.ends_with("files"));
+    }
+
+    #[test]
+    fn workspace_dir_under_data_dir() {
+        let ws = athen_workspace_dir().expect("workspace");
+        assert!(ws.ends_with("workspace"));
+        let data = athen_data_dir().expect("data");
+        assert!(ws.starts_with(&data));
+    }
+
+    #[test]
+    fn resolve_relative_uses_workspace() {
+        let resolved = resolve_in_workspace(Path::new("test.html"));
+        let ws = athen_workspace_dir().unwrap();
+        assert_eq!(resolved, ws.join("test.html"));
+    }
+
+    #[test]
+    fn resolve_absolute_unchanged() {
+        let abs = Path::new("/tmp/x");
+        assert_eq!(resolve_in_workspace(abs), PathBuf::from("/tmp/x"));
     }
 }

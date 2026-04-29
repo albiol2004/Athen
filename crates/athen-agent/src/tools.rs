@@ -69,9 +69,39 @@ pub struct ShellToolRegistry {
 }
 
 impl ShellToolRegistry {
+    /// Wrap a shell command so it runs in the agent workspace directory by
+    /// default. Returns the command unchanged if the workspace dir can't be
+    /// determined. The user's command runs inside `( ... )` so embedded
+    /// `;` doesn't escape the cd (e.g. `cd ws && echo a; echo b` would
+    /// otherwise leak `echo b` outside the workspace context).
+    fn workspace_wrap(command: &str) -> String {
+        let Some(ws) = paths::athen_workspace_dir() else {
+            return command.to_string();
+        };
+        let escaped = format!("'{}'", ws.to_string_lossy().replace('\'', "'\\''"));
+        format!("cd {escaped} && ( {command} )")
+    }
+
+    /// Best-effort: create the agent workspace dir so relative paths in
+    /// `read`/`edit`/`write`/`grep` and shell `cd <workspace>` wrapping have
+    /// a real directory to land in. Failure is logged but not fatal — we'll
+    /// surface a real error on first use if the path is genuinely unwritable.
+    async fn ensure_workspace_dir() {
+        if let Some(ws) = paths::athen_workspace_dir() {
+            if let Err(e) = tokio::fs::create_dir_all(&ws).await {
+                tracing::warn!(
+                    workspace = %ws.display(),
+                    error = %e,
+                    "Failed to create agent workspace dir"
+                );
+            }
+        }
+    }
+
     /// Create a new registry, auto-detecting the available shell backend
     /// and sandbox capabilities.
     pub async fn new() -> Self {
+        Self::ensure_workspace_dir().await;
         let sandbox = match UnifiedSandbox::new().await {
             Ok(sb) => {
                 let caps = sb.capabilities();
@@ -287,6 +317,11 @@ impl ShellToolRegistry {
             .unwrap_or(60_000)
             .min(600_000);
 
+        // Default-cwd to the agent workspace. Risk evaluation and the
+        // sandbox-allowed paths see the original command — the wrapper is
+        // only what actually runs.
+        let wrapped_command = Self::workspace_wrap(command);
+
         tracing::info!(tool = "shell_execute", command, timeout_ms, "Executing shell command");
 
         // Pre-execution risk check: evaluate the ACTUAL command (not user's
@@ -358,7 +393,7 @@ impl ShellToolRegistry {
                 },
             };
             match sandbox
-                .execute_sandboxed("sh", &["-c", command], &level)
+                .execute_sandboxed("sh", &["-c", &wrapped_command], &level)
                 .await
             {
                 Ok(output) => {
@@ -375,7 +410,7 @@ impl ShellToolRegistry {
                             stderr = %output.stderr.trim(),
                             "Sandbox infrastructure failed, falling back to unsandboxed shell"
                         );
-                        let output = self.shell.execute(command).await?;
+                        let output = self.shell.execute(&wrapped_command).await?;
                         (output.stdout, output.stderr, output.exit_code)
                     } else {
                         tracing::debug!(tool = "shell_execute", "Command executed inside sandbox");
@@ -388,7 +423,7 @@ impl ShellToolRegistry {
                         error = %e,
                         "Sandbox execution failed, falling back to unsandboxed shell"
                     );
-                    let output = self.shell.execute(command).await?;
+                    let output = self.shell.execute(&wrapped_command).await?;
                     (output.stdout, output.stderr, output.exit_code)
                 }
             }
@@ -397,7 +432,7 @@ impl ShellToolRegistry {
                 tool = "shell_execute",
                 "No sandbox available, executing unsandboxed"
             );
-            let output = self.shell.execute(command).await?;
+            let output = self.shell.execute(&wrapped_command).await?;
             (output.stdout, output.stderr, output.exit_code)
         };
             Ok::<_, AthenError>((stdout, stderr, exit_code))
@@ -457,18 +492,12 @@ impl ShellToolRegistry {
     }
 
     /// Canonicalize a path for read-state map keys. Falls back to a
-    /// lexically absolute path when the file doesn't yet exist.
+    /// workspace-anchored absolute path when the file doesn't yet exist.
     fn canonical_key(p: &Path) -> PathBuf {
         if let Ok(c) = std::fs::canonicalize(p) {
             return c;
         }
-        if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("/"))
-                .join(p)
-        }
+        paths::resolve_in_workspace(p)
     }
 
     /// Record the blake3 hash of `content` for `path`. Always hashes the
@@ -506,7 +535,7 @@ impl ShellToolRegistry {
 
     /// Read a file (or a slice of it) and return numbered lines.
     async fn do_read(&self, args: &serde_json::Value) -> Result<ToolResult> {
-        let path = args
+        let path_arg = args
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AthenError::Other("missing 'path' parameter".to_string()))?;
@@ -515,9 +544,15 @@ impl ShellToolRegistry {
         let offset = offset.max(1) as usize;
         let limit = limit.max(1) as usize;
 
+        // Relative paths resolve against the agent workspace, not the
+        // process cwd — that's where the agent's own files live.
+        let resolved = paths::resolve_in_workspace(Path::new(path_arg));
+        let path = resolved.to_string_lossy().to_string();
+        let path = path.as_str();
+
         tracing::info!(tool = "read", path, offset, limit, "Reading file");
         let start = Instant::now();
-        let p = Path::new(path);
+        let p = resolved.as_path();
 
         // Reject directories early with a clear message.
         match tokio::fs::metadata(p).await {
@@ -605,7 +640,7 @@ impl ShellToolRegistry {
 
     /// Edit a file by exact-string replacement.
     async fn do_edit(&self, args: &serde_json::Value) -> Result<ToolResult> {
-        let path = args
+        let path_arg = args
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AthenError::Other("missing 'path' parameter".to_string()))?;
@@ -628,9 +663,13 @@ impl ShellToolRegistry {
             ));
         }
 
+        let resolved = paths::resolve_in_workspace(Path::new(path_arg));
+        let path = resolved.to_string_lossy().to_string();
+        let path = path.as_str();
+
         tracing::info!(tool = "edit", path, replace_all, "Editing file");
         let start = Instant::now();
-        let p = Path::new(path);
+        let p = resolved.as_path();
 
         let current = tokio::fs::read(p)
             .await
@@ -677,7 +716,7 @@ impl ShellToolRegistry {
     /// Write the full contents of a file. New paths skip the read-required
     /// check; existing paths must have been Read first.
     async fn do_write(&self, args: &serde_json::Value) -> Result<ToolResult> {
-        let path = args
+        let path_arg = args
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AthenError::Other("missing 'path' parameter".to_string()))?;
@@ -686,9 +725,21 @@ impl ShellToolRegistry {
             .and_then(|v| v.as_str())
             .ok_or_else(|| AthenError::Other("missing 'content' parameter".to_string()))?;
 
+        let resolved = paths::resolve_in_workspace(Path::new(path_arg));
+        let path = resolved.to_string_lossy().to_string();
+        let path = path.as_str();
+
+        // Make sure the parent dir exists — relative paths often land in a
+        // freshly-resolved workspace subdir that doesn't exist yet.
+        if let Some(parent) = resolved.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+        }
+
         tracing::info!(tool = "write", path, "Writing file");
         let start = Instant::now();
-        let p = Path::new(path);
+        let p = resolved.as_path();
 
         if let Ok(existing) = tokio::fs::read(p).await {
             self.check_hash(p, &existing).await?;
@@ -716,7 +767,13 @@ impl ShellToolRegistry {
             .get("pattern")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AthenError::Other("missing 'pattern' parameter".to_string()))?;
-        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+        // Resolve the search target against the workspace dir so a bare
+        // `grep { pattern: "foo" }` searches the agent's own files, not
+        // whatever the host process happened to be launched from.
+        let path_arg = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+        let resolved_path = paths::resolve_in_workspace(Path::new(path_arg));
+        let path = resolved_path.to_string_lossy().to_string();
+        let path = path.as_str();
         let glob = args.get("glob").and_then(|v| v.as_str());
         let case_insensitive = args
             .get("case_insensitive")
@@ -1097,6 +1154,12 @@ impl ShellToolRegistry {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::from(stdout_file))
             .stderr(std::process::Stdio::from(stderr_file));
+        // Default cwd to the agent workspace so daemons like
+        // `python3 -m http.server` serve the agent's own files instead of
+        // whatever directory the host process happened to launch from.
+        if let Some(ws) = paths::athen_workspace_dir() {
+            cmd.current_dir(ws);
+        }
         // On Unix, put the child in its own process group so signals to us
         // don't propagate, and so `shell_kill` can target the whole tree.
         #[cfg(unix)]

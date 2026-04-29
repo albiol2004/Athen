@@ -231,18 +231,25 @@ impl DefaultExecutor {
             tz_offset,
         );
 
-        // Working directory + permission model. Helps the agent reason
-        // about relative paths and understand the approval flow it'll see
-        // the first time it touches an unprotected directory.
-        let cwd = std::env::current_dir()
+        // Workspace + permission model. We deliberately do NOT leak the
+        // host process's cwd here — when we did, the agent reflexively
+        // wrote test files into whatever directory the user happened to
+        // launch the app from (typically a real project folder), instead
+        // of using its own workspace.
+        let workspace = athen_core::paths::athen_workspace_dir()
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "<unknown>".to_string());
+            .unwrap_or_else(|| "<unavailable>".to_string());
         prompt.push_str(&format!(
-            "Current working directory: {cwd}\n\
-             You may pass absolute paths to file tools. The first time you touch a \
-             directory outside the agent's sandbox (~/.athen/files), the user will be \
-             asked to approve. Approvals can be made permanent for the current arc — \
-             after that, future operations on the same directory are silent.\n\n",
+            "Your workspace directory: {workspace}\n\
+             This is YOUR folder. Anything you create — test files, scratch scripts, \
+             HTML servers, etc. — goes here unless the user explicitly names a different \
+             location. Do NOT invent paths under the user's home or assume the existence \
+             of a 'project' directory: if the user wants a file somewhere else, they will \
+             tell you the exact path. Relative paths in file tools and shell commands \
+             already resolve against the workspace, so prefer them.\n\
+             For paths the user explicitly hands you (absolute paths outside the \
+             workspace), the first touch may prompt for approval; once granted, \
+             subsequent operations on the same directory are silent.\n\n",
         ));
 
         if has_context {
@@ -324,9 +331,17 @@ impl DefaultExecutor {
             ));
         }
 
-        // Shell guidance.
+        // Shell guidance. The WORKSPACE block uses the runtime-resolved
+        // workspace path so Windows / macOS users get their native location
+        // instead of a hardcoded `~/.athen/workspace`. We split this from
+        // the static rest of the section because the rest contains literal
+        // `{` / `}` braces (in shell_spawn examples) that would collide
+        // with `format!` placeholders.
         if has_shell {
-            prompt.push_str(
+            let ws_display = athen_core::paths::athen_workspace_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<unavailable>".to_string());
+            prompt.push_str(&format!(
                 "SHELL & FILES:\n\
                  Use shell_execute for system commands. For files use the dedicated tools: \
                  read (offset/limit, prefer over cat/head/tail), edit (exact-string replace, \
@@ -334,7 +349,18 @@ impl DefaultExecutor {
                  search, prefer over grep/find), list_directory.\n\
                  Edit and write require a prior read of the same file (except for new files).\n\
                  \n\
-                 LONG-RUNNING COMMANDS:\n\
+                 WORKSPACE:\n\
+                 Your default working directory is `{ws_display}`. Relative paths in \
+                 read/edit/write/grep AND in shell_execute/shell_spawn resolve there — NOT \
+                 against the directory the user happens to have launched the app from. \
+                 A bare `write` with path \"test.html\" lands in your workspace, and a \
+                 bare `shell_spawn` of `python3 -m http.server 8002` serves files from \
+                 there. To touch a file outside your workspace, pass an absolute path \
+                 the user has explicitly provided.\n\
+                 \n",
+            ));
+            prompt.push_str(
+                "LONG-RUNNING COMMANDS:\n\
                  shell_execute waits for the command to fully exit and EOF its stdio. A bare \
                  trailing `&` is NOT enough — the child inherits stdio pipes and keeps the call \
                  hanging. Patterns:\n\
