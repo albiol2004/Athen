@@ -9,6 +9,7 @@ athen-ipc = { workspace = true }
 athen-shell = { workspace = true }
 athen-sandbox = { workspace = true }
 athen-risk = { workspace = true }
+athen-web = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

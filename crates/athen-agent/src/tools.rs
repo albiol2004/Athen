@@ -20,6 +20,7 @@ use athen_core::traits::tool::ToolRegistry;
 use athen_risk::rules::RuleEngine;
 use athen_sandbox::UnifiedSandbox;
 use athen_shell::Shell;
+use athen_web::{DuckDuckGoSearch, LocalReader, PageReader, WebSearchProvider};
 
 /// Provider used by the shell tool to discover the per-arc set of writable
 /// directories that should be exposed to the sandbox in addition to the
@@ -66,6 +67,14 @@ pub struct ShellToolRegistry {
     /// Processes started via `shell_spawn`, keyed by PID. We only ever
     /// kill PIDs in this map — refusing to touch arbitrary system PIDs.
     spawned: Arc<Mutex<HashMap<u32, SpawnedProcess>>>,
+    /// Backend for the `web_search` tool. Defaults to bundled DuckDuckGo
+    /// HTML scraping (no key). Can be swapped for Tavily etc. via
+    /// [`Self::with_web_search`].
+    web_search: Arc<dyn WebSearchProvider>,
+    /// Backend for the `fetch_url` tool. Defaults to a local reqwest-based
+    /// reader. Can be swapped for Cloudflare's Browser Rendering via
+    /// [`Self::with_page_reader`].
+    page_reader: Arc<dyn PageReader>,
 }
 
 impl ShellToolRegistry {
@@ -130,7 +139,22 @@ impl ShellToolRegistry {
             extra_writable: None,
             read_state: Arc::new(Mutex::new(HashMap::new())),
             spawned: Arc::new(Mutex::new(HashMap::new())),
+            web_search: Arc::new(DuckDuckGoSearch::new()),
+            page_reader: Arc::new(LocalReader::new()),
         }
+    }
+
+    /// Replace the default DuckDuckGo search backend (e.g. with Tavily).
+    pub fn with_web_search(mut self, provider: Arc<dyn WebSearchProvider>) -> Self {
+        self.web_search = provider;
+        self
+    }
+
+    /// Replace the default local page reader (e.g. with Cloudflare's
+    /// Browser Rendering for JS-heavy sites).
+    pub fn with_page_reader(mut self, reader: Arc<dyn PageReader>) -> Self {
+        self.page_reader = reader;
+        self
     }
 
     /// Inject a provider that supplies additional writable paths for the
@@ -978,6 +1002,143 @@ impl ShellToolRegistry {
         })
     }
 
+    /// Build the JSON Schema for the `web_search` tool parameters.
+    fn web_search_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Natural-language search query."
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Maximum number of hits to return (default 5, max 20)."
+                }
+            },
+            "required": ["query"]
+        })
+    }
+
+    /// Build the JSON Schema for the `fetch_url` tool parameters.
+    fn fetch_url_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "Absolute http(s) URL to fetch and convert to markdown."
+                }
+            },
+            "required": ["url"]
+        })
+    }
+
+    /// Run a web search via the configured provider.
+    async fn do_web_search(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let query = args
+            .get("query")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AthenError::Other("missing 'query' parameter".to_string()))?;
+        let max_results = args
+            .get("max_results")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(5)
+            .clamp(1, 20) as usize;
+
+        tracing::info!(
+            tool = "web_search",
+            provider = self.web_search.name(),
+            query,
+            max_results,
+            "Running web search"
+        );
+
+        let start = Instant::now();
+        match self.web_search.search(query, max_results).await {
+            Ok(results) => {
+                let json_results: Vec<serde_json::Value> = results
+                    .iter()
+                    .map(|r| json!({
+                        "title": r.title,
+                        "url": r.url,
+                        "snippet": r.snippet,
+                    }))
+                    .collect();
+                Ok(ToolResult {
+                    success: true,
+                    output: json!({
+                        "provider": self.web_search.name(),
+                        "query": query,
+                        "results": json_results,
+                    }),
+                    error: None,
+                    execution_time_ms: start.elapsed().as_millis() as u64,
+                })
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                Ok(ToolResult {
+                    success: false,
+                    output: json!({ "error": msg, "provider": self.web_search.name() }),
+                    error: Some(msg),
+                    execution_time_ms: start.elapsed().as_millis() as u64,
+                })
+            }
+        }
+    }
+
+    /// Fetch a URL and convert it to clean markdown.
+    async fn do_fetch_url(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let url = args
+            .get("url")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AthenError::Other("missing 'url' parameter".to_string()))?;
+
+        // Reject obviously bad inputs early so we don't burn a network round-trip.
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            let msg = format!("fetch_url requires an http(s) URL, got: {url}");
+            return Ok(ToolResult {
+                success: false,
+                output: json!({ "error": msg }),
+                error: Some(msg),
+                execution_time_ms: 0,
+            });
+        }
+
+        tracing::info!(
+            tool = "fetch_url",
+            reader = self.page_reader.name(),
+            url,
+            "Fetching URL"
+        );
+
+        let start = Instant::now();
+        match self.page_reader.fetch(url).await {
+            Ok(result) => Ok(ToolResult {
+                success: true,
+                output: json!({
+                    "url": result.url,
+                    "title": result.title,
+                    "content": result.content,
+                    "source": result.source,
+                    "content_chars": result.content.chars().count(),
+                }),
+                error: None,
+                execution_time_ms: start.elapsed().as_millis() as u64,
+            }),
+            Err(e) => {
+                let msg = e.to_string();
+                Ok(ToolResult {
+                    success: false,
+                    output: json!({ "error": msg, "reader": self.page_reader.name() }),
+                    error: Some(msg),
+                    execution_time_ms: start.elapsed().as_millis() as u64,
+                })
+            }
+        }
+    }
+
     /// Build the JSON Schema for the `shell_spawn` tool parameters.
     fn shell_spawn_schema() -> serde_json::Value {
         json!({
@@ -1543,6 +1704,26 @@ impl ToolRegistry for ShellToolRegistry {
                 },
                 base_risk: BaseImpact::Read,
             },
+            ToolDefinition {
+                name: "web_search".to_string(),
+                description: "Search the web and return ranked hits (title, url, snippet). Use this for current/factual info the model may not know, or when fetch_url returns near-empty content on a JS-heavy site — the snippets are often enough to answer.".to_string(),
+                parameters: Self::web_search_schema(),
+                backend: ToolBackend::Shell {
+                    command: String::new(),
+                    native: false,
+                },
+                base_risk: BaseImpact::Read,
+            },
+            ToolDefinition {
+                name: "fetch_url".to_string(),
+                description: "Fetch a URL and return its readable content as markdown. Works well for docs/articles/blogs. Heavy React/SPA sites may return little content — if so, fall back to web_search for snippets.".to_string(),
+                parameters: Self::fetch_url_schema(),
+                backend: ToolBackend::Shell {
+                    command: String::new(),
+                    native: false,
+                },
+                base_risk: BaseImpact::Read,
+            },
         ])
     }
 
@@ -1563,6 +1744,8 @@ impl ToolRegistry for ShellToolRegistry {
             "list_directory" => self.do_list_directory(&args).await,
             "memory_store" => self.do_memory_store(&args).await,
             "memory_recall" => self.do_memory_recall(&args).await,
+            "web_search" => self.do_web_search(&args).await,
+            "fetch_url" => self.do_fetch_url(&args).await,
             _ => Err(AthenError::ToolNotFound(name.to_string())),
         }
     }

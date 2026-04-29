@@ -7,6 +7,7 @@ members = [
     "crates/athen-coordinador",
     "crates/athen-agent",
     "crates/athen-llm",
+    "crates/athen-web",
     "crates/athen-memory",
     "crates/athen-risk",
     "crates/athen-persistence",
@@ -34,6 +35,7 @@ athen-sentidos = { path = "crates/athen-sentidos" }
 athen-coordinador = { path = "crates/athen-coordinador" }
 athen-agent = { path = "crates/athen-agent" }
 athen-mcp = { path = "crates/athen-mcp" }
+athen-web = { path = "crates/athen-web" }
 
 # External
 tokio = { version = "1", features = ["full"] }
