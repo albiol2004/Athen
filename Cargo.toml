@@ -49,7 +49,7 @@ tracing = "0.1"
 async-trait = "0.1"
 url = { version = "2", features = ["serde"] }
 regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip", "brotli", "deflate"] }
 futures = "0.3"
 toml = "0.8"
 imap = { version = "2.4", default-features = false }

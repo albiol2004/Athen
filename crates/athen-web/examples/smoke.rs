@@ -1,7 +1,8 @@
-//! Live smoke test for the bundled DuckDuckGo + LocalReader stack.
+//! Live smoke test for the bundled web stack:
+//! DuckDuckGo search + HybridReader (Local → Jina → Wayback).
 //! Run with: `cargo run -p athen-web --example smoke`
 
-use athen_web::{DuckDuckGoSearch, LocalReader, PageReader, WebSearchProvider};
+use athen_web::{DuckDuckGoSearch, HybridReader, PageReader, WebSearchProvider};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -16,15 +17,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!();
 
-    println!("=== fetch_url (LocalReader) ===");
-    let reader = LocalReader::new();
-    let page = reader.fetch("https://example.com/").await?;
-    println!("source: {}", page.source);
-    println!("title: {:?}", page.title);
-    println!("url: {}", page.url);
-    println!("--- content ({} chars) ---", page.content.chars().count());
-    let preview = page.content.chars().take(400).collect::<String>();
-    println!("{preview}");
+    let reader = HybridReader::new();
+    let urls = [
+        ("static (expect: local-html)", "https://example.com/"),
+        ("personal blog (expect: local-html)", "https://alejandrogarcia.blog/"),
+        ("JS-heavy SPA (expect: jina or wayback)", "https://x.com/elonmusk"),
+    ];
+
+    for (label, url) in urls {
+        println!("=== web_fetch — {label} ===");
+        println!("url: {url}");
+        match reader.fetch(url).await {
+            Ok(page) => {
+                println!("source: {}", page.source);
+                println!("title: {:?}", page.title);
+                println!("content_chars: {}", page.content.chars().count());
+                let preview = page.content.chars().take(300).collect::<String>();
+                println!("--- preview ---\n{preview}");
+            }
+            Err(e) => println!("ERROR: {e}"),
+        }
+        println!();
+    }
 
     Ok(())
 }

@@ -6,7 +6,10 @@ use serde::{Deserialize, Serialize};
 use athen_core::error::Result;
 
 pub mod cloudflare;
+pub mod hybrid;
+pub mod jina;
 pub mod local;
+pub mod wayback;
 
 /// Cleaned page content ready for the LLM.
 #[derive(Debug, Clone, Serialize, Deserialize)]

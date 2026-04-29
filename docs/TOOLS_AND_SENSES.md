@@ -4,18 +4,42 @@
 
 ### Built-in Tool Registry (`ShellToolRegistry`)
 
-Defined in `crates/athen-agent/src/tools.rs`. Six built-in tools:
+Defined in `crates/athen-agent/src/tools.rs`. Thirteen built-in tools:
 
 | Tool | Risk | Backend |
 |------|------|---------|
 | `shell_execute` | `WritePersist` | `sh -c` (sandboxed when bwrap available) |
-| `read_file` | `Read` | `tokio::fs` direct (unsandboxed) |
-| `write_file` | `WritePersist` | `tokio::fs` direct (unsandboxed) |
-| `list_directory` | `Read` | `tokio::fs` direct (unsandboxed) |
+| `shell_spawn` | `WritePersist` | detached spawn, log file capture |
+| `shell_kill` | `WritePersist` | SIGTERM/SIGKILL on tracked PIDs only |
+| `shell_logs` | `Read` | tail of spawn log file |
+| `read` | `Read` | `tokio::fs`, `cat -n` style numbering, offset/limit |
+| `edit` | `WritePersist` | exact-string replace, requires prior `read`, atomic write |
+| `write` | `WritePersist` | full overwrite, atomic, prior `read` required for existing files |
+| `grep` | `Read` | ripgrep wrapper |
+| `list_directory` | `Read` | `tokio::fs` direct |
 | `memory_store` | `Read` | in-session `HashMap<String,String>` |
 | `memory_recall` | `Read` | same `HashMap` — key lookup or list-all |
+| `web_search` | `Read` | `WebSearchProvider` (default: DuckDuckGo HTML scrape) |
+| `web_fetch` | `Read` | `PageReader` (default: HybridReader, see below) |
 
-`shell_execute` passes the command through `RuleEngine` before dispatch; `Danger` or `Critical` risk score returns an error without executing (`tools.rs:167-199`).
+`shell_execute` passes the command through `RuleEngine` before dispatch; `Danger` or `Critical` risk score returns an error without executing.
+
+### Web access (`web_search`, `web_fetch`)
+
+Backed by the `athen-web` crate. Two ports, each with bundled no-key defaults plus optional key-gated upgrades.
+
+**`WebSearchProvider`** — `crates/athen-web/src/search/`:
+- `DuckDuckGoSearch` (bundled default) — POSTs to `html.duckduckgo.com/html/`, parses the SERP with `scraper`, unwraps DDG's `/l/?uddg=` redirect links so the agent gets real URLs. Handles HTTP 202 rate-limits with a clear error.
+- `TavilySearch` (key-gated) — `api.tavily.com/search`. Free tier: ~1k req/month, no card. Better answer-ready snippets than raw SERPs.
+
+**`PageReader`** — `crates/athen-web/src/reader/`:
+- `LocalReader` (no key) — plain `reqwest` GET with `Accept: text/markdown` header (Cloudflare-opted-in sites return clean markdown for free), then `html2md::parse_html` on HTML responses with `<script>`/`<style>` stripped first. UTF-8-safe truncation at 40k chars.
+- `JinaReader` (no key, free 500/min) — `r.jina.ai/<url>`, server-side JS rendering, returns markdown. Optional API key for higher quotas.
+- `WaybackReader` (no key) — `web.archive.org/web/2id_/<url>`, raw archived snapshot, last-resort fallback for paywalled / blocked / dead pages.
+- `CloudflareReader` (key-gated) — Browser Rendering REST API `/markdown` endpoint, $0.09/browser-hour. Built but not wired by default.
+- `HybridReader` (default reader) — chains `Local → Jina → Wayback`. Smart fallback heuristic: hard floor at 150 chars, soft band 150–800 chars triggers fallback only if explicit JS-required markers ("Please enable JavaScript" etc.) are present. Result's `source` field tells the agent which tier produced the content.
+
+The system prompt's `WEB ACCESS` section steers the model away from `curl`/`wget`/`lynx` for web content; both web tools are in `is_always_revealed` so their full schemas are inline every turn.
 
 ### Composition (`AppToolRegistry`)
 

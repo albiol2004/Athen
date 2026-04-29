@@ -12,7 +12,8 @@ pub mod reader;
 pub mod search;
 
 pub use reader::{
-    cloudflare::CloudflareReader, local::LocalReader, PageReader, ReadResult,
+    cloudflare::CloudflareReader, hybrid::HybridReader, jina::JinaReader,
+    local::LocalReader, wayback::WaybackReader, PageReader, ReadResult,
 };
 pub use search::{
     duckduckgo::DuckDuckGoSearch, tavily::TavilySearch, SearchResult, WebSearchProvider,

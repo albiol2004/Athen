@@ -20,7 +20,7 @@ use athen_core::traits::tool::ToolRegistry;
 use athen_risk::rules::RuleEngine;
 use athen_sandbox::UnifiedSandbox;
 use athen_shell::Shell;
-use athen_web::{DuckDuckGoSearch, LocalReader, PageReader, WebSearchProvider};
+use athen_web::{DuckDuckGoSearch, HybridReader, PageReader, WebSearchProvider};
 
 /// Provider used by the shell tool to discover the per-arc set of writable
 /// directories that should be exposed to the sandbox in addition to the
@@ -140,7 +140,10 @@ impl ShellToolRegistry {
             read_state: Arc::new(Mutex::new(HashMap::new())),
             spawned: Arc::new(Mutex::new(HashMap::new())),
             web_search: Arc::new(DuckDuckGoSearch::new()),
-            page_reader: Arc::new(LocalReader::new()),
+            // HybridReader chains Local → Jina → Wayback so SPAs and
+            // paywalled/blocked pages still produce content without any
+            // user configuration.
+            page_reader: Arc::new(HybridReader::new()),
         }
     }
 
@@ -1716,7 +1719,7 @@ impl ToolRegistry for ShellToolRegistry {
             },
             ToolDefinition {
                 name: "web_fetch".to_string(),
-                description: "Fetch a URL and return its readable content as markdown. Use this instead of curl/wget for any web page. Works well for docs/articles/blogs. Heavy React/SPA sites may return little content — if so, fall back to web_search for snippets.".to_string(),
+                description: "Fetch a URL and return its readable content as markdown. Use this instead of curl/wget for any web page. Auto-falls-back through a static fetch → JS-rendering reader → web archive, so JS-heavy SPAs and paywalled/blocked pages are usually still readable. The `source` field in the result tells you which tier produced the content (`local-*`, `jina`, or `wayback`).".to_string(),
                 parameters: Self::web_fetch_schema(),
                 backend: ToolBackend::Shell {
                     command: String::new(),
@@ -2563,5 +2566,163 @@ mod tests {
         let key_strs: Vec<&str> = keys.iter().map(|k| k.as_str().unwrap()).collect();
         assert!(key_strs.contains(&"a"));
         assert!(key_strs.contains(&"b"));
+    }
+
+    // ── Web tool wiring ────────────────────────────────────────────────────
+    //
+    // These stubs let us verify dispatch + output envelope shape without any
+    // network access. The real backends (DuckDuckGo, HybridReader, ...) have
+    // their own coverage in `athen-web`.
+
+    use athen_core::error::{AthenError, Result as CoreResult};
+    use athen_web::{PageReader, ReadResult, SearchResult, WebSearchProvider};
+
+    struct StubSearch {
+        results: Vec<SearchResult>,
+    }
+
+    #[async_trait]
+    impl WebSearchProvider for StubSearch {
+        fn name(&self) -> &'static str {
+            "stub-search"
+        }
+        async fn search(&self, _query: &str, max_results: usize) -> CoreResult<Vec<SearchResult>> {
+            Ok(self.results.iter().take(max_results).cloned().collect())
+        }
+    }
+
+    struct StubReader {
+        outcome: std::result::Result<ReadResult, String>,
+    }
+
+    #[async_trait]
+    impl PageReader for StubReader {
+        fn name(&self) -> &'static str {
+            "stub-reader"
+        }
+        async fn fetch(&self, _url: &str) -> CoreResult<ReadResult> {
+            self.outcome.clone().map_err(AthenError::Other)
+        }
+    }
+
+    #[tokio::test]
+    async fn web_search_dispatches_to_provider_and_caps_results() {
+        let stub = StubSearch {
+            results: vec![
+                SearchResult {
+                    title: "First".into(),
+                    url: "https://a.example/".into(),
+                    snippet: "snippet a".into(),
+                },
+                SearchResult {
+                    title: "Second".into(),
+                    url: "https://b.example/".into(),
+                    snippet: "snippet b".into(),
+                },
+                SearchResult {
+                    title: "Third".into(),
+                    url: "https://c.example/".into(),
+                    snippet: "snippet c".into(),
+                },
+            ],
+        };
+        let registry = ShellToolRegistry::new().await.with_web_search(Arc::new(stub));
+
+        let result = registry
+            .call_tool("web_search", json!({ "query": "rust", "max_results": 2 }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert_eq!(result.output["provider"], "stub-search");
+        let arr = result.output["results"].as_array().unwrap();
+        assert_eq!(arr.len(), 2, "max_results must be honored");
+        assert_eq!(arr[0]["title"], "First");
+        assert_eq!(arr[0]["url"], "https://a.example/");
+        assert_eq!(arr[0]["snippet"], "snippet a");
+    }
+
+    #[tokio::test]
+    async fn web_search_clamps_max_results_to_safe_range() {
+        let stub = StubSearch { results: Vec::new() };
+        let registry = ShellToolRegistry::new().await.with_web_search(Arc::new(stub));
+
+        // 0 must be raised to >=1, 999 must be clamped to <=20. The stub
+        // returns empty either way; success is what we're checking — a
+        // panic from `clamp` on an out-of-range max would surface here.
+        let r = registry
+            .call_tool("web_search", json!({ "query": "x", "max_results": 0 }))
+            .await
+            .unwrap();
+        assert!(r.success);
+
+        let r = registry
+            .call_tool("web_search", json!({ "query": "x", "max_results": 999 }))
+            .await
+            .unwrap();
+        assert!(r.success);
+    }
+
+    #[tokio::test]
+    async fn web_fetch_dispatches_to_reader_and_emits_full_envelope() {
+        let stub = StubReader {
+            outcome: Ok(ReadResult {
+                url: "https://example.com/".into(),
+                title: Some("Hello".into()),
+                content: "# Hello\n\nbody text".into(),
+                source: "stub-reader".into(),
+            }),
+        };
+        let registry = ShellToolRegistry::new().await.with_page_reader(Arc::new(stub));
+
+        let result = registry
+            .call_tool("web_fetch", json!({ "url": "https://example.com/" }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert_eq!(result.output["url"], "https://example.com/");
+        assert_eq!(result.output["title"], "Hello");
+        assert_eq!(result.output["source"], "stub-reader");
+        assert_eq!(result.output["content"], "# Hello\n\nbody text");
+        assert_eq!(result.output["content_chars"], 18);
+    }
+
+    #[tokio::test]
+    async fn web_fetch_rejects_non_http_url_without_calling_reader() {
+        // Reader would error if invoked — proves the URL guard short-circuits
+        // before any network round-trip.
+        let stub = StubReader {
+            outcome: Err("reader must not be called".into()),
+        };
+        let registry = ShellToolRegistry::new().await.with_page_reader(Arc::new(stub));
+
+        let result = registry
+            .call_tool("web_fetch", json!({ "url": "ftp://nope/" }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        let err = result.error.as_deref().unwrap_or("");
+        assert!(err.contains("http(s)"), "expected scheme guard error, got: {err}");
+    }
+
+    #[tokio::test]
+    async fn web_fetch_surfaces_reader_error_as_soft_failure() {
+        let stub = StubReader {
+            outcome: Err("simulated reader failure".into()),
+        };
+        let registry = ShellToolRegistry::new().await.with_page_reader(Arc::new(stub));
+
+        let result = registry
+            .call_tool("web_fetch", json!({ "url": "https://example.com/" }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        let err = result.error.as_deref().unwrap_or("");
+        assert!(err.contains("simulated reader failure"));
+        // The reader name is reported so the agent can see which tier failed.
+        assert_eq!(result.output["reader"], "stub-reader");
     }
 }

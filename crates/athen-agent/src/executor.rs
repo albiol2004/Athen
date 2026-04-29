@@ -400,10 +400,13 @@ impl DefaultExecutor {
                    enough — read them before deciding to fetch a full page.\n\
                  - web_fetch { url } → readable markdown of one page. Use after web_search \
                    when a snippet looks promising and you need the full content. Also use \
-                   when the user gives you a URL directly.\n\
-                 FALLBACK PATTERN: if web_fetch returns very short / empty content, the \
-                 page is likely a JS-heavy SPA — fall back to web_search and work from \
-                 the snippets instead of trying again.\n\
+                   when the user gives you a URL directly. web_fetch auto-falls-back through \
+                   a JS-rendering reader and the Wayback Machine, so SPAs and paywalled/blocked \
+                   pages usually still come back readable. The `source` field in the result \
+                   tells you which tier answered (`local-*`, `jina`, or `wayback`).\n\
+                 FALLBACK PATTERN: if web_fetch still returns near-empty content after all \
+                 tiers, the page is genuinely unscrapable — pivot to web_search and work \
+                 from the snippets instead of retrying.\n\
                  Do NOT use shell_execute with curl/wget/lynx for web content. The output \
                  is raw HTML the model wastes tokens parsing.\n\n",
             );
