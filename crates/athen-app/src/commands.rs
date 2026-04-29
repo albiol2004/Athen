@@ -648,7 +648,7 @@ pub async fn send_message(
                 .tool_registry(Box::new(registry))
                 .auditor(Box::new(auditor))
                 .max_steps(50)
-                .timeout(Duration::from_secs(90))
+                .timeout(Duration::from_secs(300))
                 .context_messages(context)
                 .stream_sender(stream_tx)
                 .cancel_flag(cancel_flag);
@@ -955,7 +955,7 @@ pub async fn approve_task(
                 .tool_registry(Box::new(registry))
                 .auditor(Box::new(auditor))
                 .max_steps(50)
-                .timeout(Duration::from_secs(90))
+                .timeout(Duration::from_secs(300))
                 .context_messages(context)
                 .stream_sender(stream_tx)
                 .cancel_flag(cancel_flag);

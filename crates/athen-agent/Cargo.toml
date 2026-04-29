@@ -20,6 +20,9 @@ futures = "0.3"
 tokio-stream = { workspace = true }
 blake3 = "1"
 
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["signal"] }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 tempfile = "3"

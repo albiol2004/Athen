@@ -137,6 +137,17 @@ pub struct AppState {
     /// Outstanding grant requests parked waiting for the user. Each entry
     /// holds a oneshot sender that resolves with the user's choice.
     pub pending_grants: PendingGrants,
+    /// Long-lived map of processes started via `shell_spawn`, shared into
+    /// every per-message `ShellToolRegistry` via
+    /// `with_spawned_processes`. Without this the spawn-tracking HashMap
+    /// would be lost between messages — the model could spawn a server in
+    /// turn N but be unable to kill or inspect it in turn N+1.
+    ///
+    // TODO: kill spawned on shutdown — Tauri exposes only a sync window
+    // event hook here, not an async one suitable for awaiting our locks.
+    // Workaround: process group leadership + parent-death signal would be
+    // a cleaner OS-level fix than wiring a custom Drop.
+    pub spawned_processes: athen_agent::SpawnedProcessMap,
 }
 
 impl AppState {
@@ -193,6 +204,8 @@ impl AppState {
         let grant_store = database.as_ref().map(|db| Arc::new(db.grant_store()));
         let pending_grants =
             Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let spawned_processes: athen_agent::SpawnedProcessMap =
+            Arc::new(Mutex::new(HashMap::new()));
 
         let state = Self {
             coordinator,
@@ -219,6 +232,7 @@ impl AppState {
             tool_doc_dir,
             grant_store,
             pending_grants,
+            spawned_processes,
         };
 
         if let Err(e) = state.refresh_tools_doc().await {
@@ -239,7 +253,9 @@ impl AppState {
         // Build the same registry the executor sees so the docs reflect
         // exactly what the agent has access to. The file gate is not
         // attached here — listing tools never invokes them.
-        let shell_registry = athen_agent::ShellToolRegistry::new().await;
+        let shell_registry = athen_agent::ShellToolRegistry::new()
+            .await
+            .with_spawned_processes(self.spawned_processes.clone());
         let registry = crate::app_tools::AppToolRegistry::new(
             shell_registry,
             self.calendar_store.clone(),
@@ -272,7 +288,9 @@ impl AppState {
         arc_id: &str,
         app_handle: Option<tauri::AppHandle>,
     ) -> crate::app_tools::AppToolRegistry {
-        let mut shell = athen_agent::ShellToolRegistry::new().await;
+        let mut shell = athen_agent::ShellToolRegistry::new()
+            .await
+            .with_spawned_processes(self.spawned_processes.clone());
         if let Some(store) = self.grant_store.clone() {
             let provider = Arc::new(crate::file_gate::ArcWritableProvider {
                 arc_id: crate::file_gate::arc_uuid(arc_id),
@@ -529,6 +547,7 @@ impl AppState {
         let notifier = self.notifier.clone();
         let grant_store_ref = self.grant_store.clone();
         let pending_grants_ref = self.pending_grants.clone();
+        let spawned_processes_ref = self.spawned_processes.clone();
 
         tauri::async_runtime::spawn(async move {
             if let Err(e) = monitor.init(&telegram_config).await {
@@ -587,6 +606,7 @@ impl AppState {
                                         notifier.as_ref(),
                                         grant_store_ref.as_ref(),
                                         &pending_grants_ref,
+                                        &spawned_processes_ref,
                                     )
                                     .await;
                                 }
@@ -655,6 +675,7 @@ async fn execute_owner_telegram_message(
     notifier: Option<&Arc<NotificationOrchestrator>>,
     grant_store: Option<&Arc<GrantStore>>,
     pending_grants: &PendingGrants,
+    spawned_processes: &athen_agent::SpawnedProcessMap,
 ) {
     use std::time::Duration;
 
@@ -751,7 +772,9 @@ async fn execute_owner_telegram_message(
     // Build the executor (mirrors send_message logic but without risk/coordinator).
     let exec_router: Box<dyn athen_core::traits::llm::LlmRouter> =
         Box::new(SharedRouter(Arc::clone(router)));
-    let mut shell_registry = ShellToolRegistry::new().await;
+    let mut shell_registry = ShellToolRegistry::new()
+        .await
+        .with_spawned_processes(spawned_processes.clone());
     if let (Some(store), Some(arc_id_str)) = (grant_store, target_arc_id.as_ref()) {
         let provider = Arc::new(crate::file_gate::ArcWritableProvider {
             arc_id: crate::file_gate::arc_uuid(arc_id_str),
@@ -779,7 +802,7 @@ async fn execute_owner_telegram_message(
         .tool_registry(Box::new(registry))
         .auditor(Box::new(auditor))
         .max_steps(50)
-        .timeout(Duration::from_secs(90))
+        .timeout(Duration::from_secs(300))
         .context_messages(context)
         .stream_sender(stream_tx)
         .cancel_flag(cancel_flag);

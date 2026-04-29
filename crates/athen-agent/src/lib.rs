@@ -16,7 +16,7 @@ pub use auditor::InMemoryAuditor;
 pub use executor::DefaultExecutor;
 pub use resource::DefaultResourceMonitor;
 pub use timeout::DefaultTimeoutGuard;
-pub use tools::ShellToolRegistry;
+pub use tools::{ShellToolRegistry, SpawnedProcess, SpawnedProcessMap};
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;

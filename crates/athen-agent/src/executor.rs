@@ -21,6 +21,51 @@ use crate::tool_grouping::{is_always_revealed, summarize_groups};
 use std::collections::HashSet;
 use std::path::PathBuf;
 
+/// Clamp a shell tool's `timeout_ms` argument to the executor's remaining
+/// budget (minus a 500ms buffer so the executor's own timeout always fires
+/// first with a clean message rather than racing the shell timeout).
+///
+/// Mutates `args` in place to inject the clamped value. Returns
+/// `Some(ToolResult)` to short-circuit the dispatch when there's effectively
+/// no budget left (< 1 second after the buffer); the caller should return
+/// that result instead of dispatching the tool.
+fn clamp_shell_timeout(
+    args: &mut serde_json::Value,
+    executor_remaining_ms: u64,
+) -> Option<athen_core::tool::ToolResult> {
+    const BUFFER_MS: u64 = 500;
+    const FLOOR_MS: u64 = 1000;
+
+    let requested_ms = args
+        .get("timeout_ms")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(60_000);
+
+    let budget_ms = executor_remaining_ms.saturating_sub(BUFFER_MS);
+    let clamped = requested_ms.min(budget_ms);
+
+    if clamped < FLOOR_MS {
+        return Some(athen_core::tool::ToolResult {
+            success: false,
+            output: serde_json::json!({
+                "error": "executor budget exhausted, cannot start command",
+                "executor_remaining_ms": executor_remaining_ms,
+                "requested_timeout_ms": requested_ms,
+            }),
+            error: Some("executor budget exhausted, cannot start command".to_string()),
+            execution_time_ms: 0,
+        });
+    }
+
+    if let Some(obj) = args.as_object_mut() {
+        obj.insert(
+            "timeout_ms".to_string(),
+            serde_json::Value::from(clamped),
+        );
+    }
+    None
+}
+
 /// Check if a text response is an empty JSON blob (e.g. `{"response": ""}`).
 ///
 /// Extract `<think>...</think>` blocks from model output.
@@ -289,16 +334,28 @@ impl DefaultExecutor {
                  search, prefer over grep/find), list_directory.\n\
                  Edit and write require a prior read of the same file (except for new files).\n\
                  \n\
-                 LONG-RUNNING COMMANDS (servers, daemons, watch processes):\n\
+                 LONG-RUNNING COMMANDS:\n\
                  shell_execute waits for the command to fully exit and EOF its stdio. A bare \
                  trailing `&` is NOT enough — the child inherits stdio pipes and keeps the call \
-                 hanging. Use one of these patterns:\n\
-                 - Detached daemon: `nohup CMD >/tmp/cmd.log 2>&1 &` then read the log later.\n\
+                 hanging. Patterns:\n\
                  - Time-bounded: `timeout 30 CMD` to cap runtime at 30s.\n\
                  - Multi-line input: HEREDOC, e.g. `python3 <<'EOF' ... EOF`.\n\
-                 The default tool timeout is 120s; pass `timeout_ms` up to 600000 for longer \
+                 - Fallback for one-shot detached jobs: `nohup CMD >/tmp/cmd.log 2>&1 &`.\n\
+                 The default tool timeout is 60s; pass `timeout_ms` up to 600000 for longer \
                  commands. On timeout the process is killed and you'll get a clear error — \
-                 fix the command pattern, don't just bump the timeout.\n\n",
+                 fix the command pattern, don't just bump the timeout.\n\
+                 \n\
+                 BACKGROUND PROCESSES (servers, watchers, anything that should outlive a single call):\n\
+                 Use shell_spawn instead of `nohup CMD &`. It returns a PID and a log file path:\n\
+                 - shell_spawn { command: \"python3 -m http.server 8002\", label: \"http-server\" }\n\
+                   → { pid: 12345, log_path: \"/home/.../spawn-logs/http-server-...log\" }\n\
+                 - shell_logs { pid: 12345, tail: 50 } → recent stdout/stderr\n\
+                 - shell_kill { pid: 12345 } → graceful SIGTERM, then SIGKILL if it doesn't exit\n\
+                 After spawning, give the process a moment (e.g. `sleep 1` via shell_execute) before \
+                 hitting it, then check shell_logs to confirm it started cleanly. \
+                 TIP: programs like Python buffer stderr when piped to a file — if shell_logs \
+                 returns empty, try `python3 -u` (unbuffered), `PYTHONUNBUFFERED=1 python3 ...`, \
+                 or `stdbuf -oL -eL <command>` for line-buffering.\n\n",
             );
         }
 
@@ -329,10 +386,13 @@ impl DefaultExecutor {
             prompt.push_str(
                 "MEMORY & KNOWLEDGE:\n\
                  You have persistent memory that survives across conversations.\n\
-                 - When the user asks you to remember something, use memory_store IMMEDIATELY.\n\
+                 - Use memory_store ONLY when the user explicitly asks to remember, save, or note \
+                   something (\"remember that...\", \"save this...\", \"note for later...\"). \
+                   Do NOT call memory_store for tasks like writing code, running commands, testing \
+                   features, or answering questions — those don't involve remembering.\n\
                  - When the user mentions a person (\"mi novia\", \"my boss\", a name), check memory_recall \
                    AND contacts_list to find what you know about them BEFORE responding.\n\
-                 - When writing something for/about a person, ALWAYS look up their name and details first.\n\
+                 - When writing something for/about a person, look up their name and details first.\n\
                  - Relevant memories from past conversations may be provided as system context — use them.\n\n",
             );
         }
@@ -902,12 +962,26 @@ impl AgentExecutor for DefaultExecutor {
                 }
             }
 
+            // Snapshot of executor budget at dispatch time. Shell tools
+            // that take a `timeout_ms` clamp to this so the executor's own
+            // timeout always fires first with a clean error rather than
+            // racing the shell's internal timeout.
+            let executor_remaining_ms = timeout_guard.remaining().as_millis() as u64;
+
             let dispatches = response.tool_calls.iter().enumerate().map(|(idx, tc)| {
                 let name = tc.name.clone();
-                let args = tc.arguments.clone();
+                let mut args = tc.arguments.clone();
                 let started_at = Utc::now();
                 let loop_guarded = should_loop_guard[idx];
                 let dedup_of = dedup_target[idx];
+
+                // Clamp timeout_ms for shell tools that accept it.
+                let clamped_short_circuit = if name == "shell_execute" || name == "shell_spawn" {
+                    clamp_shell_timeout(&mut args, executor_remaining_ms)
+                } else {
+                    None
+                };
+
                 async move {
                     if loop_guarded {
                         return (
@@ -915,8 +989,13 @@ impl AgentExecutor for DefaultExecutor {
                             Ok(athen_core::tool::ToolResult {
                                 success: false,
                                 output: serde_json::json!({
+                                    "loop_guard": true,
                                     "error": format!(
-                                        "Loop guard: '{name}' has been called more than {SIGNATURE_REPEAT_LIMIT} times with the same arguments. Stop repeating this call. If a tool isn't working, try a different approach or report the failure to the user."
+                                        "STOP. You have called '{name}' {SIGNATURE_REPEAT_LIMIT}+ times with identical arguments and made no progress. You are stuck in a loop. \
+                                        Re-read the user's ORIGINAL request right now. \
+                                        Identify what the user actually asked for — it is almost certainly NOT another call to '{name}'. \
+                                        Pick a DIFFERENT tool that addresses the real task, or if no tool fits, respond with text explaining what you cannot do. \
+                                        DO NOT call '{name}' again with these arguments."
                                     ),
                                 }),
                                 error: Some("loop_guard".to_string()),
@@ -939,6 +1018,9 @@ impl AgentExecutor for DefaultExecutor {
                                 execution_time_ms: 0,
                             }),
                         );
+                    }
+                    if let Some(short) = clamped_short_circuit {
+                        return (started_at, Ok(short));
                     }
                     let result = registry.call_tool(&name, args).await;
                     (started_at, result)
@@ -1783,9 +1865,8 @@ mod tests {
         let guarded = steps.iter().any(|s| {
             s.output
                 .as_ref()
-                .and_then(|o| o["result"]["error"].as_str())
-                .map(|e| e.contains("Loop guard"))
-                .unwrap_or(false)
+                .and_then(|o| o["result"]["loop_guard"].as_bool())
+                == Some(true)
         });
         assert!(guarded, "expected at least one loop-guarded step");
     }

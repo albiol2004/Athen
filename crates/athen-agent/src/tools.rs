@@ -33,6 +33,23 @@ pub trait ShellExtraWritableProvider: Send + Sync {
     async fn extra_writable_paths(&self) -> Vec<PathBuf>;
 }
 
+/// Metadata for a process started via `shell_spawn`. Kept in
+/// [`ShellToolRegistry::spawned`] so subsequent `shell_logs`/`shell_kill`
+/// calls can find the log file and validate the PID is one we own.
+#[derive(Clone, Debug)]
+pub struct SpawnedProcess {
+    pub pid: u32,
+    pub command: String,
+    pub label: Option<String>,
+    pub log_path: PathBuf,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Shared map of spawned processes. Hosted by `AppState` so it survives
+/// across the per-message `ShellToolRegistry` instances and the agent can
+/// kill in turn N a process it spawned in turn N-1.
+pub type SpawnedProcessMap = Arc<Mutex<HashMap<u32, SpawnedProcess>>>;
+
 /// A [`ToolRegistry`] that provides built-in tools for shell execution,
 /// filesystem operations, and in-session key-value memory,
 /// backed by [`athen_shell::Shell`].
@@ -46,6 +63,9 @@ pub struct ShellToolRegistry {
     /// `read`. Used by `edit` and `write` to enforce read-before-modify and
     /// detect external changes between reads and writes.
     read_state: Arc<Mutex<HashMap<PathBuf, blake3::Hash>>>,
+    /// Processes started via `shell_spawn`, keyed by PID. We only ever
+    /// kill PIDs in this map — refusing to touch arbitrary system PIDs.
+    spawned: Arc<Mutex<HashMap<u32, SpawnedProcess>>>,
 }
 
 impl ShellToolRegistry {
@@ -79,6 +99,7 @@ impl ShellToolRegistry {
             rule_engine: RuleEngine::new(),
             extra_writable: None,
             read_state: Arc::new(Mutex::new(HashMap::new())),
+            spawned: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -92,6 +113,15 @@ impl ShellToolRegistry {
         self
     }
 
+    /// Share the map of `shell_spawn`-tracked processes with another owner
+    /// (typically `AppState`). Without this, each per-message registry has
+    /// its own empty map and the agent can't kill in turn N+1 a server it
+    /// spawned in turn N.
+    pub fn with_spawned_processes(mut self, spawned: SpawnedProcessMap) -> Self {
+        self.spawned = spawned;
+        self
+    }
+
     /// Build the JSON Schema for the `shell_execute` tool parameters.
     fn shell_execute_schema() -> serde_json::Value {
         json!({
@@ -99,14 +129,13 @@ impl ShellToolRegistry {
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "The shell command to execute. For long-running or backgrounded \
-                                    processes (servers, daemons), redirect stdio: \
-                                    `nohup CMD >/tmp/log 2>&1 &`. Otherwise the inherited pipes \
-                                    keep this call hanging until timeout."
+                    "description": "The shell command to execute. For long-lived servers/daemons \
+                                    use shell_spawn instead — bare `&` leaves stdio inherited and \
+                                    hangs this call until timeout."
                 },
                 "timeout_ms": {
                     "type": "integer",
-                    "description": "Hard timeout in milliseconds (default 120000, max 600000). \
+                    "description": "Hard timeout in milliseconds (default 60000, max 600000). \
                                     On timeout the process is killed."
                 }
             },
@@ -255,7 +284,7 @@ impl ShellToolRegistry {
         let timeout_ms = args
             .get("timeout_ms")
             .and_then(|v| v.as_u64())
-            .unwrap_or(120_000)
+            .unwrap_or(60_000)
             .min(600_000);
 
         tracing::info!(tool = "shell_execute", command, timeout_ms, "Executing shell command");
@@ -390,8 +419,7 @@ impl ShellToolRegistry {
                 );
                 let msg = format!(
                     "command timed out after {}ms and was killed. \
-                     For long-running processes use: \
-                     `nohup CMD >/tmp/log 2>&1 &` so the process detaches from this call's pipes. \
+                     For long-lived servers/daemons use shell_spawn (returns a PID + log file). \
                      For commands that legitimately need longer, pass `timeout_ms` (max 600000).",
                     timeout_ms
                 );
@@ -893,6 +921,397 @@ impl ShellToolRegistry {
         })
     }
 
+    /// Build the JSON Schema for the `shell_spawn` tool parameters.
+    fn shell_spawn_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "The shell command to spawn detached. stdout+stderr are captured to a log file. The process survives this call."
+                },
+                "label": {
+                    "type": "string",
+                    "description": "Optional human label (e.g. 'http-server') used in the log file name."
+                }
+            },
+            "required": ["command"]
+        })
+    }
+
+    /// Build the JSON Schema for the `shell_kill` tool parameters.
+    fn shell_kill_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "pid": {
+                    "type": "integer",
+                    "description": "PID returned by shell_spawn"
+                },
+                "force": {
+                    "type": "boolean",
+                    "description": "Use SIGKILL immediately instead of SIGTERM (default false)"
+                }
+            },
+            "required": ["pid"]
+        })
+    }
+
+    /// Build the JSON Schema for the `shell_logs` tool parameters.
+    fn shell_logs_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "pid": {
+                    "type": "integer",
+                    "description": "PID returned by shell_spawn"
+                },
+                "tail": {
+                    "type": "integer",
+                    "description": "Number of lines from the end (default 100, max 5000)"
+                }
+            },
+            "required": ["pid"]
+        })
+    }
+
+    /// Spawn a detached shell command. Returns the PID and a log file path.
+    /// The child process outlives this call; use `shell_kill` to stop it
+    /// and `shell_logs` to inspect its output.
+    ///
+    /// NOT routed through the sandbox — bwrap's lifetime is bound to its
+    /// child, so sandboxed daemons don't really work. The rule engine still
+    /// blocks dangerous commands.
+    async fn do_shell_spawn(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let command = args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AthenError::Other("missing 'command' parameter".to_string()))?;
+        let label = args
+            .get("label")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        tracing::info!(tool = "shell_spawn", command, ?label, "Spawning detached process");
+        let start = Instant::now();
+
+        // Same risk check as shell_execute — a long-lived daemon can do as
+        // much damage as a one-shot command.
+        let risk_ctx = RiskContext {
+            trust_level: TrustLevel::AuthUser,
+            data_sensitivity: DataSensitivity::Plain,
+            llm_confidence: Some(1.0),
+            accumulated_risk: 0,
+        };
+        if let Some(score) = self.rule_engine.evaluate(command, &risk_ctx) {
+            if score.level == RiskLevel::Danger || score.level == RiskLevel::Critical {
+                tracing::warn!(
+                    tool = "shell_spawn",
+                    command,
+                    risk_score = score.total,
+                    risk_level = ?score.level,
+                    "Spawn blocked by risk evaluation"
+                );
+                return Ok(ToolResult {
+                    success: false,
+                    output: json!({
+                        "error": "Command blocked by safety system",
+                        "reason": format!(
+                            "This command was classified as {:?} risk (score: {:.0}). \
+                             It cannot be spawned without explicit user approval.",
+                            score.level, score.total
+                        ),
+                        "command": command,
+                    }),
+                    error: Some(format!(
+                        "Blocked: {:?} risk command (score {:.0})",
+                        score.level, score.total
+                    )),
+                    execution_time_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+        }
+
+        // Pick a log directory under ~/.athen/spawn-logs. Falls back to
+        // /tmp/athen-spawn-logs when home isn't resolvable.
+        let log_dir = paths::athen_data_dir()
+            .map(|p| p.join("spawn-logs"))
+            .or_else(|| paths::home_dir().map(|h| h.join(".athen").join("spawn-logs")))
+            .unwrap_or_else(|| PathBuf::from("/tmp/athen-spawn-logs"));
+
+        if let Err(e) = tokio::fs::create_dir_all(&log_dir).await {
+            let msg = format!("failed to create log dir '{}': {e}", log_dir.display());
+            return Ok(ToolResult {
+                success: false,
+                output: json!({ "error": msg }),
+                error: Some(msg),
+                execution_time_ms: start.elapsed().as_millis() as u64,
+            });
+        }
+
+        let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S-%f").to_string();
+        let stem = label
+            .clone()
+            .unwrap_or_else(|| "spawn".to_string());
+        // Sanitize label for filesystem use.
+        let safe_stem: String = stem
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+            .collect();
+        let log_path = log_dir.join(format!("{safe_stem}-{timestamp}.log"));
+
+        // Open the log file for stdout, then open it again (append) for
+        // stderr so both streams land in the same file. Two distinct OS
+        // file handles are simpler/safer than dup'ing.
+        let stdout_file = match std::fs::File::create(&log_path) {
+            Ok(f) => f,
+            Err(e) => {
+                let msg = format!("failed to create log file '{}': {e}", log_path.display());
+                return Ok(ToolResult {
+                    success: false,
+                    output: json!({ "error": msg }),
+                    error: Some(msg),
+                    execution_time_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+        };
+        let stderr_file = match std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                let msg = format!("failed to open log file for stderr '{}': {e}", log_path.display());
+                return Ok(ToolResult {
+                    success: false,
+                    output: json!({ "error": msg }),
+                    error: Some(msg),
+                    execution_time_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+        };
+
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(command)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::from(stdout_file))
+            .stderr(std::process::Stdio::from(stderr_file));
+        // On Unix, put the child in its own process group so signals to us
+        // don't propagate, and so `shell_kill` can target the whole tree.
+        #[cfg(unix)]
+        cmd.process_group(0);
+
+        let child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let msg = format!("failed to spawn '{command}': {e}");
+                return Ok(ToolResult {
+                    success: false,
+                    output: json!({ "error": msg }),
+                    error: Some(msg),
+                    execution_time_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+        };
+
+        let pid = match child.id() {
+            Some(p) => p,
+            None => {
+                let msg = "spawned process has no PID (already exited?)".to_string();
+                return Ok(ToolResult {
+                    success: false,
+                    output: json!({ "error": msg }),
+                    error: Some(msg),
+                    execution_time_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+        };
+
+        // Drop the Child handle so the OS keeps the process alive after
+        // this function returns. We track it via PID + log path instead.
+        std::mem::drop(child);
+
+        let entry = SpawnedProcess {
+            pid,
+            command: command.to_string(),
+            label,
+            log_path: log_path.clone(),
+            started_at: chrono::Utc::now(),
+        };
+        self.spawned.lock().await.insert(pid, entry);
+
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        Ok(ToolResult {
+            success: true,
+            output: json!({
+                "pid": pid,
+                "log_path": log_path.to_string_lossy(),
+                "command": command,
+            }),
+            error: None,
+            execution_time_ms: elapsed_ms,
+        })
+    }
+
+    /// Kill a process previously started via `shell_spawn`. Refuses to
+    /// touch PIDs that aren't in our map.
+    async fn do_shell_kill(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let pid_i64 = args
+            .get("pid")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| AthenError::Other("missing 'pid' parameter".to_string()))?;
+        if pid_i64 <= 0 || pid_i64 > u32::MAX as i64 {
+            return Err(AthenError::Other(format!("invalid pid: {pid_i64}")));
+        }
+        let pid: u32 = pid_i64 as u32;
+        let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        tracing::info!(tool = "shell_kill", pid, force, "Killing spawned process");
+        let start = Instant::now();
+
+        // Safety boundary: we only kill PIDs we spawned ourselves.
+        {
+            let map = self.spawned.lock().await;
+            if !map.contains_key(&pid) {
+                let msg =
+                    "PID not managed by shell_spawn; refusing to kill arbitrary processes"
+                        .to_string();
+                return Ok(ToolResult {
+                    success: false,
+                    output: json!({ "error": &msg, "pid": pid }),
+                    error: Some(msg),
+                    execution_time_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+        }
+
+        #[cfg(unix)]
+        let signal_used = {
+            use nix::sys::signal::{kill, Signal};
+            use nix::unistd::Pid;
+
+            // Negative PID = process group, since we set process_group(0).
+            let pgid = Pid::from_raw(-(pid as i32));
+            let direct = Pid::from_raw(pid as i32);
+
+            let initial_sig = if force { Signal::SIGKILL } else { Signal::SIGTERM };
+            // Best-effort: try the group first, then the bare PID as a
+            // fallback (group send fails if we're not the group leader).
+            let _ = kill(pgid, initial_sig);
+            let _ = kill(direct, initial_sig);
+
+            if force {
+                "SIGKILL"
+            } else {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                // Probe with signal 0 (no-op) to see if it's still alive.
+                let alive = kill(direct, None).is_ok();
+                if alive {
+                    let _ = kill(pgid, Signal::SIGKILL);
+                    let _ = kill(direct, Signal::SIGKILL);
+                    "SIGKILL"
+                } else {
+                    "SIGTERM"
+                }
+            }
+        };
+
+        #[cfg(windows)]
+        let signal_used = {
+            let mut cmd = tokio::process::Command::new("taskkill");
+            cmd.arg("/PID").arg(pid.to_string()).arg("/T");
+            if force {
+                cmd.arg("/F");
+            }
+            let _ = cmd.output().await;
+            "taskkill"
+        };
+
+        self.spawned.lock().await.remove(&pid);
+
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        Ok(ToolResult {
+            success: true,
+            output: json!({ "pid": pid, "signal": signal_used }),
+            error: None,
+            execution_time_ms: elapsed_ms,
+        })
+    }
+
+    /// Read recent stdout/stderr from a process spawned via `shell_spawn`.
+    async fn do_shell_logs(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let pid_i64 = args
+            .get("pid")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| AthenError::Other("missing 'pid' parameter".to_string()))?;
+        if pid_i64 <= 0 || pid_i64 > u32::MAX as i64 {
+            return Err(AthenError::Other(format!("invalid pid: {pid_i64}")));
+        }
+        let pid: u32 = pid_i64 as u32;
+        let tail = args
+            .get("tail")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(100)
+            .min(5000) as usize;
+
+        tracing::info!(tool = "shell_logs", pid, tail, "Reading spawn logs");
+        let start = Instant::now();
+
+        let entry = {
+            let map = self.spawned.lock().await;
+            match map.get(&pid) {
+                Some(e) => e.clone(),
+                None => {
+                    let msg = "PID not managed by shell_spawn".to_string();
+                    return Ok(ToolResult {
+                        success: false,
+                        output: json!({ "error": &msg, "pid": pid }),
+                        error: Some(msg),
+                        execution_time_ms: start.elapsed().as_millis() as u64,
+                    });
+                }
+            }
+        };
+
+        let contents = match tokio::fs::read_to_string(&entry.log_path).await {
+            Ok(c) => c,
+            Err(e) => {
+                let msg = format!(
+                    "failed to read log file '{}': {e}",
+                    entry.log_path.display()
+                );
+                return Ok(ToolResult {
+                    success: false,
+                    output: json!({ "error": msg, "log_path": entry.log_path.to_string_lossy() }),
+                    error: Some(msg),
+                    execution_time_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+        };
+
+        let all_lines: Vec<&str> = contents.lines().collect();
+        let total = all_lines.len();
+        let take = total.min(tail);
+        let logs: String = all_lines[total - take..].join("\n");
+
+        let alive = process_alive(pid);
+
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        Ok(ToolResult {
+            success: true,
+            output: json!({
+                "logs": logs,
+                "log_path": entry.log_path.to_string_lossy(),
+                "alive": alive,
+                "lines_returned": take,
+                "total_lines": total,
+            }),
+            error: None,
+            execution_time_ms: elapsed_ms,
+        })
+    }
+
     /// List entries in a directory.
     async fn do_list_directory(&self, args: &serde_json::Value) -> Result<ToolResult> {
         let path = args
@@ -1012,6 +1431,36 @@ impl ToolRegistry for ShellToolRegistry {
                 base_risk: BaseImpact::Read,
             },
             ToolDefinition {
+                name: "shell_spawn".to_string(),
+                description: "Spawn a long-lived shell command detached (servers, watchers). Returns a PID and a log file path. The process outlives this call. NOT sandboxed; the rule engine still blocks dangerous commands. Use shell_kill to stop it and shell_logs to inspect output.".to_string(),
+                parameters: Self::shell_spawn_schema(),
+                backend: ToolBackend::Shell {
+                    command: String::new(),
+                    native: false,
+                },
+                base_risk: BaseImpact::WritePersist,
+            },
+            ToolDefinition {
+                name: "shell_kill".to_string(),
+                description: "Kill a process previously started by shell_spawn. Refuses unmanaged PIDs. Sends SIGTERM, then SIGKILL if it doesn't exit (or SIGKILL immediately when force=true).".to_string(),
+                parameters: Self::shell_kill_schema(),
+                backend: ToolBackend::Shell {
+                    command: String::new(),
+                    native: false,
+                },
+                base_risk: BaseImpact::WritePersist,
+            },
+            ToolDefinition {
+                name: "shell_logs".to_string(),
+                description: "Read the last N lines (default 100, max 5000) of stdout/stderr from a process spawned via shell_spawn. Also reports whether the process is still alive.".to_string(),
+                parameters: Self::shell_logs_schema(),
+                backend: ToolBackend::Shell {
+                    command: String::new(),
+                    native: false,
+                },
+                base_risk: BaseImpact::Read,
+            },
+            ToolDefinition {
                 name: "memory_store".to_string(),
                 description: "Store a key-value pair in in-session memory for later recall".to_string(),
                 parameters: Self::memory_store_schema(),
@@ -1041,6 +1490,9 @@ impl ToolRegistry for ShellToolRegistry {
     ) -> Result<ToolResult> {
         match name {
             "shell_execute" => self.do_shell_execute(&args).await,
+            "shell_spawn" => self.do_shell_spawn(&args).await,
+            "shell_kill" => self.do_shell_kill(&args).await,
+            "shell_logs" => self.do_shell_logs(&args).await,
             "read" => self.do_read(&args).await,
             "edit" => self.do_edit(&args).await,
             "write" => self.do_write(&args).await,
@@ -1050,6 +1502,31 @@ impl ToolRegistry for ShellToolRegistry {
             "memory_recall" => self.do_memory_recall(&args).await,
             _ => Err(AthenError::ToolNotFound(name.to_string())),
         }
+    }
+}
+
+/// Best-effort liveness check for a PID. On Unix this uses `kill(pid, 0)`
+/// which doesn't actually send a signal — it just probes whether the
+/// kernel still has a process by that PID we're allowed to signal.
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+    kill(Pid::from_raw(pid as i32), None).is_ok()
+}
+
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    // Cheap probe via tasklist; sync std::process to keep this helper sync.
+    let out = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .output();
+    match out {
+        Ok(o) => {
+            let s = String::from_utf8_lossy(&o.stdout);
+            s.contains(&pid.to_string())
+        }
+        Err(_) => false,
     }
 }
 
@@ -1104,11 +1581,15 @@ mod tests {
         let registry = ShellToolRegistry::new().await;
         let tools = registry.list_tools().await.unwrap();
 
-        // shell_execute, read, edit, write, grep, list_directory, memory_store, memory_recall
-        assert_eq!(tools.len(), 8);
+        // shell_execute, shell_spawn, shell_kill, shell_logs, read, edit,
+        // write, grep, list_directory, memory_store, memory_recall
+        assert_eq!(tools.len(), 11);
 
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"shell_execute"));
+        assert!(names.contains(&"shell_spawn"));
+        assert!(names.contains(&"shell_kill"));
+        assert!(names.contains(&"shell_logs"));
         assert!(names.contains(&"read"));
         assert!(names.contains(&"edit"));
         assert!(names.contains(&"write"));
@@ -1605,6 +2086,205 @@ mod tests {
         assert!(result.success);
         assert_eq!(result.output["key"], "nonexistent");
         assert_eq!(result.output["found"], false);
+    }
+
+    #[tokio::test]
+    async fn test_shell_execute_default_timeout_is_60s() {
+        // Schema description should advertise the new default.
+        let schema = ShellToolRegistry::shell_execute_schema();
+        let desc = schema["properties"]["timeout_ms"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(desc.contains("60000"), "schema desc should mention 60000ms default: {desc}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_shell_spawn_returns_pid_and_log_path() {
+        let registry = ShellToolRegistry::new().await;
+        let result = registry
+            .call_tool(
+                "shell_spawn",
+                json!({"command": "sleep 5", "label": "test-sleep"}),
+            )
+            .await
+            .unwrap();
+        assert!(result.success, "spawn failed: {:?}", result.error);
+        let pid = result.output["pid"].as_u64().unwrap();
+        assert!(pid > 0);
+        let log_path = result.output["log_path"].as_str().unwrap();
+        assert!(std::path::Path::new(log_path).exists());
+
+        // Cleanup.
+        let _ = registry
+            .call_tool("shell_kill", json!({"pid": pid, "force": true}))
+            .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_shell_kill_rejects_unmanaged_pid() {
+        let registry = ShellToolRegistry::new().await;
+        // PID 1 is init — definitely not in our map.
+        let result = registry
+            .call_tool("shell_kill", json!({"pid": 1}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let err = result.error.unwrap();
+        assert!(
+            err.to_lowercase().contains("not managed"),
+            "expected refusal, got: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_shell_kill_terminates_spawned_process() {
+        use nix::sys::signal::kill;
+        use nix::unistd::Pid;
+
+        let registry = ShellToolRegistry::new().await;
+        let spawn = registry
+            .call_tool(
+                "shell_spawn",
+                json!({"command": "sleep 30", "label": "kill-target"}),
+            )
+            .await
+            .unwrap();
+        assert!(spawn.success);
+        let pid = spawn.output["pid"].as_u64().unwrap() as u32;
+
+        // Confirm it's alive before kill.
+        assert!(kill(Pid::from_raw(pid as i32), None).is_ok());
+
+        let kill_result = registry
+            .call_tool("shell_kill", json!({"pid": pid, "force": true}))
+            .await
+            .unwrap();
+        assert!(kill_result.success, "kill failed: {:?}", kill_result.error);
+
+        // Give the kernel a moment to reap.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            kill(Pid::from_raw(pid as i32), None).is_err(),
+            "process {pid} should be gone after SIGKILL"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_shell_logs_returns_content() {
+        let registry = ShellToolRegistry::new().await;
+        let spawn = registry
+            .call_tool(
+                "shell_spawn",
+                json!({"command": "sh -c 'echo hi; sleep 1'", "label": "log-test"}),
+            )
+            .await
+            .unwrap();
+        assert!(spawn.success);
+        let pid = spawn.output["pid"].as_u64().unwrap();
+
+        // Wait for the echo + sleep to finish.
+        tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+
+        let logs = registry
+            .call_tool("shell_logs", json!({"pid": pid, "tail": 50}))
+            .await
+            .unwrap();
+        assert!(logs.success);
+        let log_text = logs.output["logs"].as_str().unwrap();
+        assert!(log_text.contains("hi"), "expected 'hi' in logs: {log_text}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_shell_logs_reports_alive_false_after_exit() {
+        let registry = ShellToolRegistry::new().await;
+        let spawn = registry
+            .call_tool(
+                "shell_spawn",
+                json!({"command": "sh -c 'echo done'", "label": "exit-fast"}),
+            )
+            .await
+            .unwrap();
+        let pid = spawn.output["pid"].as_u64().unwrap();
+
+        // Give it time to exit and be reaped by the OS. Spawn dropped the
+        // Child handle, so the process becomes a zombie until init reaps it
+        // — but `kill(pid, 0)` returns ESRCH once the entry is fully gone.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let logs = registry
+            .call_tool("shell_logs", json!({"pid": pid}))
+            .await
+            .unwrap();
+        assert!(logs.success);
+        // Note: a freshly-exited child might briefly still appear "alive" as
+        // a zombie. Poll a bit before asserting.
+        let mut alive = logs.output["alive"].as_bool().unwrap();
+        for _ in 0..10 {
+            if !alive {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let again = registry
+                .call_tool("shell_logs", json!({"pid": pid}))
+                .await
+                .unwrap();
+            alive = again.output["alive"].as_bool().unwrap();
+        }
+        assert!(!alive, "process should not be alive after exit");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_spawned_map_is_shareable_across_registries() {
+        // Simulates the bug fix: turn 1's registry spawns a process,
+        // turn 2's registry — built fresh but with the same shared map —
+        // can find it and kill it. Without `with_spawned_processes`, the
+        // second registry would have an empty map and refuse the kill.
+        let shared: SpawnedProcessMap = Arc::new(Mutex::new(HashMap::new()));
+
+        let reg1 = ShellToolRegistry::new()
+            .await
+            .with_spawned_processes(shared.clone());
+        let reg2 = ShellToolRegistry::new()
+            .await
+            .with_spawned_processes(shared.clone());
+
+        let spawn = reg1
+            .call_tool(
+                "shell_spawn",
+                json!({"command": "sleep 30", "label": "cross-registry"}),
+            )
+            .await
+            .unwrap();
+        assert!(spawn.success, "spawn failed: {:?}", spawn.error);
+        let pid = spawn.output["pid"].as_u64().unwrap() as u32;
+
+        // The shared map is visible to both.
+        assert!(
+            shared.lock().await.contains_key(&pid),
+            "shared map should contain spawned PID"
+        );
+
+        // reg2 (a *different* registry instance) can kill the process
+        // spawned by reg1 — proving the map is actually shared, not just
+        // that an Arc was stored.
+        let kill_result = reg2
+            .call_tool("shell_kill", json!({"pid": pid, "force": true}))
+            .await
+            .unwrap();
+        assert!(
+            kill_result.success,
+            "second registry could not kill PID spawned by first: {:?}",
+            kill_result.error
+        );
+
+        // After kill, both views agree the entry is gone.
+        assert!(!shared.lock().await.contains_key(&pid));
     }
 
     #[tokio::test]
