@@ -284,6 +284,11 @@ function initTauri() {
         // IPC isn't answered within 10s of document load -- spreading
         // startup work across frames keeps the main thread responsive.
         requestAnimationFrame(() => requestAnimationFrame(() => {
+            // Onboarding check runs in parallel with normal data loads.
+            // The overlay sits on top so any partial UI behind it stays
+            // hidden, and skipping/completing onboarding reveals the
+            // already-loaded main UI immediately.
+            maybeRunOnboarding();
             startInitialDataLoads();
         }));
     } else {
@@ -4544,7 +4549,181 @@ document.getElementById('add-grant-btn')?.addEventListener('click', async () => 
     }
 });
 
+// ─── Onboarding wizard ───────────────────────────────────────────────
+//
+// On first launch (decided by the Rust side via invoke('is_first_launch'))
+// we surface a tiny modal that walks the user through picking an LLM
+// provider. Three terminating paths: skip, local-test-and-save, or
+// cloud-test-and-save. All three call `complete_onboarding` so this
+// never re-fires for the same user. Bug-paranoid: any IPC error in
+// onboarding falls through to the main UI rather than trapping the user.
+
+const ONB_LOCAL_DEFAULTS = {
+    ollama: 'http://localhost:11434',
+    llamacpp: 'http://localhost:8080',
+};
+const ONB_CLOUD_HINTS = {
+    anthropic: 'sk-ant-...',
+    deepseek: 'sk-...',
+    openai: 'sk-...',
+};
+
+function showOnboardingStep(name) {
+    const overlay = document.getElementById('onboarding-overlay');
+    if (!overlay) return;
+    overlay.querySelectorAll('.onboarding-step').forEach((s) => {
+        s.style.display = s.dataset.step === name ? '' : 'none';
+    });
+}
+
+function setOnbStatus(elId, kind, text) {
+    const el = document.getElementById(elId);
+    if (!el) return;
+    el.className = 'onb-status ' + kind;
+    el.textContent = text;
+}
+
+async function finishOnboarding() {
+    try {
+        await invoke('complete_onboarding');
+    } catch (e) {
+        // Hide the overlay anyway — better to land in a usable app than
+        // to trap the user behind a broken sentinel write.
+        console.warn('[athen] complete_onboarding failed:', e);
+    }
+    const overlay = document.getElementById('onboarding-overlay');
+    if (overlay) overlay.style.display = 'none';
+}
+
+async function onboardingTestAndSave({ statusElId, id, baseUrl, model, apiKey }) {
+    setOnbStatus(statusElId, 'busy', 'Testing connection…');
+    try {
+        const result = await invoke('test_provider', {
+            id,
+            baseUrl,
+            model,
+            apiKey: apiKey || null,
+        });
+        if (!result || !result.success) {
+            setOnbStatus(statusElId, 'err', (result && result.message) || 'Connection failed');
+            return false;
+        }
+    } catch (e) {
+        setOnbStatus(statusElId, 'err', String(e));
+        return false;
+    }
+
+    setOnbStatus(statusElId, 'busy', 'Saving…');
+    try {
+        await invoke('save_provider', {
+            id,
+            baseUrl,
+            model,
+            apiKey: apiKey || null,
+        });
+        await invoke('set_active_provider', { id });
+    } catch (e) {
+        setOnbStatus(statusElId, 'err', 'Save failed: ' + e);
+        return false;
+    }
+
+    setOnbStatus(statusElId, 'ok', 'Connected. Saved.');
+    return true;
+}
+
+function wireOnboardingButtons() {
+    document.getElementById('onb-start-btn')?.addEventListener('click', () => {
+        showOnboardingStep('pick');
+    });
+    document.getElementById('onb-skip-1')?.addEventListener('click', finishOnboarding);
+    document.getElementById('onb-skip-2')?.addEventListener('click', finishOnboarding);
+    document.getElementById('onb-back-2')?.addEventListener('click', () => showOnboardingStep('welcome'));
+    document.getElementById('onb-back-3')?.addEventListener('click', () => showOnboardingStep('pick'));
+    document.getElementById('onb-back-4')?.addEventListener('click', () => showOnboardingStep('pick'));
+
+    document.getElementById('onb-pick-local')?.addEventListener('click', () => {
+        const sel = document.getElementById('onb-local-type');
+        const url = document.getElementById('onb-local-url');
+        if (url && sel && !url.value) url.value = ONB_LOCAL_DEFAULTS[sel.value] || '';
+        showOnboardingStep('local');
+    });
+    document.getElementById('onb-pick-cloud')?.addEventListener('click', () => {
+        showOnboardingStep('cloud');
+    });
+
+    document.getElementById('onb-local-type')?.addEventListener('change', (e) => {
+        const url = document.getElementById('onb-local-url');
+        if (!url) return;
+        url.placeholder = ONB_LOCAL_DEFAULTS[e.target.value] || '';
+        // Clear stale URL so the new default placeholder shows.
+        if (Object.values(ONB_LOCAL_DEFAULTS).includes(url.value)) {
+            url.value = '';
+        }
+    });
+    document.getElementById('onb-cloud-type')?.addEventListener('change', (e) => {
+        const k = document.getElementById('onb-cloud-key');
+        if (k) k.placeholder = ONB_CLOUD_HINTS[e.target.value] || 'sk-...';
+    });
+
+    document.getElementById('onb-local-test')?.addEventListener('click', async () => {
+        const id = document.getElementById('onb-local-type').value;
+        const baseUrl = document.getElementById('onb-local-url').value
+            || ONB_LOCAL_DEFAULTS[id]
+            || '';
+        const model = document.getElementById('onb-local-model').value;
+        const ok = await onboardingTestAndSave({
+            statusElId: 'onb-local-status',
+            id,
+            baseUrl,
+            model,
+            apiKey: null,
+        });
+        if (ok) showOnboardingStep('done');
+    });
+
+    document.getElementById('onb-cloud-test')?.addEventListener('click', async () => {
+        const id = document.getElementById('onb-cloud-type').value;
+        const apiKey = document.getElementById('onb-cloud-key').value.trim();
+        const model = document.getElementById('onb-cloud-model').value;
+        if (!apiKey) {
+            setOnbStatus('onb-cloud-status', 'err', 'API key required.');
+            return;
+        }
+        const ok = await onboardingTestAndSave({
+            statusElId: 'onb-cloud-status',
+            id,
+            baseUrl: '', // empty → backend uses default for the chosen provider
+            model,
+            apiKey,
+        });
+        if (ok) showOnboardingStep('done');
+    });
+
+    document.getElementById('onb-finish')?.addEventListener('click', finishOnboarding);
+}
+
+async function maybeRunOnboarding() {
+    if (!invoke) return;
+    let isFirst = false;
+    try {
+        isFirst = await invoke('is_first_launch');
+    } catch (e) {
+        // If the predicate itself fails, do NOT show onboarding. The
+        // backend is conservative (returns false on any I/O ambiguity);
+        // a hard error here means something is genuinely broken and we
+        // shouldn't risk asking a returning user to reconfigure.
+        console.warn('[athen] is_first_launch failed, skipping onboarding:', e);
+        return;
+    }
+    if (!isFirst) return;
+    const overlay = document.getElementById('onboarding-overlay');
+    if (!overlay) return;
+    overlay.style.display = 'flex';
+    showOnboardingStep('welcome');
+}
+
 // ─── Initialize ───
 
 inputEl.focus();
+wireOnboardingButtons();
 initTauri();

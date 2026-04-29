@@ -50,6 +50,8 @@ pub fn run() {
             settings::test_provider,
             settings::save_settings,
             settings::set_active_provider,
+            settings::is_first_launch,
+            settings::complete_onboarding,
             settings::save_email_settings,
             settings::test_email_connection,
             settings::save_telegram_settings,

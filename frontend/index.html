@@ -650,6 +650,100 @@
         </div>
     </div>
 
+    <!-- ─── Onboarding wizard (first-launch only) ───
+         Hidden by default. JS reveals it when invoke('is_first_launch') is true.
+         Functional and intentionally bare; visual polish comes with the broader
+         UI redesign. -->
+    <div id="onboarding-overlay" class="onboarding-overlay" style="display: none;">
+        <div class="onboarding-card">
+            <div class="onboarding-step" data-step="welcome">
+                <h1>Welcome to Athen</h1>
+                <p>Athen is your personal AI agent. It runs on your machine, with your keys — or no keys at all.</p>
+                <p>This setup takes about 2 minutes.</p>
+                <div class="onboarding-buttons">
+                    <button id="onb-skip-1" class="btn-secondary">Skip for now</button>
+                    <button id="onb-start-btn" class="btn-primary">Get started</button>
+                </div>
+            </div>
+
+            <div class="onboarding-step" data-step="pick" style="display: none;">
+                <h1>Pick your AI brain</h1>
+                <p>Athen needs a language model. Run one yourself for free, or use a cloud provider for top quality.</p>
+                <div class="onboarding-pick-grid">
+                    <button id="onb-pick-local" class="onboarding-pick-btn" type="button">
+                        <strong>Local &amp; private</strong>
+                        <span>Run a model on your computer with Ollama or llama.cpp. Free, no key, your data never leaves.</span>
+                    </button>
+                    <button id="onb-pick-cloud" class="onboarding-pick-btn" type="button">
+                        <strong>Cloud (paste a key)</strong>
+                        <span>Use Anthropic, DeepSeek, or OpenAI. Faster and more capable, pay-per-use.</span>
+                    </button>
+                </div>
+                <div class="onboarding-buttons">
+                    <button id="onb-back-2" class="btn-secondary">Back</button>
+                    <button id="onb-skip-2" class="btn-secondary">Skip for now</button>
+                </div>
+            </div>
+
+            <div class="onboarding-step" data-step="local" style="display: none;">
+                <h1>Local model setup</h1>
+                <label>Which server?
+                    <select id="onb-local-type">
+                        <option value="ollama">Ollama (default port 11434)</option>
+                        <option value="llamacpp">llama.cpp (default port 8080)</option>
+                    </select>
+                </label>
+                <label>Server URL
+                    <input type="text" id="onb-local-url" placeholder="http://localhost:11434">
+                </label>
+                <label>Model name (optional, leave empty for default)
+                    <input type="text" id="onb-local-model" placeholder="">
+                </label>
+                <div id="onb-local-status" class="onb-status"></div>
+                <div class="onboarding-buttons">
+                    <button id="onb-back-3" class="btn-secondary">Back</button>
+                    <button id="onb-local-test" class="btn-primary">Test &amp; save</button>
+                </div>
+            </div>
+
+            <div class="onboarding-step" data-step="cloud" style="display: none;">
+                <h1>Cloud provider setup</h1>
+                <label>Provider
+                    <select id="onb-cloud-type">
+                        <option value="anthropic">Anthropic (Claude)</option>
+                        <option value="deepseek">DeepSeek</option>
+                        <option value="openai">OpenAI</option>
+                    </select>
+                </label>
+                <label>API key
+                    <input type="password" id="onb-cloud-key" placeholder="sk-ant-...">
+                </label>
+                <label>Model (optional, leave empty for default)
+                    <input type="text" id="onb-cloud-model" placeholder="">
+                </label>
+                <div id="onb-cloud-status" class="onb-status"></div>
+                <div class="onboarding-buttons">
+                    <button id="onb-back-4" class="btn-secondary">Back</button>
+                    <button id="onb-cloud-test" class="btn-primary">Test &amp; save</button>
+                </div>
+            </div>
+
+            <div class="onboarding-step" data-step="done" style="display: none;">
+                <h1>You're all set</h1>
+                <p>Athen is ready. Try asking it to:</p>
+                <ul>
+                    <li>"Search the web for the weather in Madrid today"</li>
+                    <li>"What's on my schedule this week?"</li>
+                    <li>"Help me draft an email to my landlord"</li>
+                </ul>
+                <p>Change anything later from settings.</p>
+                <div class="onboarding-buttons">
+                    <button id="onb-finish" class="btn-primary">Open Athen</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script src="app.js"></script>
 </body>
 </html>

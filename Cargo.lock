@@ -153,6 +153,7 @@ dependencies = [
  "serde_json",
  "tauri",
  "tauri-build",
+ "tempfile",
  "tokio",
  "tokio-util",
  "toml 0.8.23",

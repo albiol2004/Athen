@@ -172,6 +172,104 @@ fn save_main_config(config: &AthenConfig) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
+// Onboarding (first-launch detection)
+// ---------------------------------------------------------------------------
+//
+// We treat onboarding-completion conservatively: any sign of an existing
+// installation suppresses the wizard. The canonical "done" signal is the
+// `.onboarded` sentinel file in `~/.athen/`. Once it exists we never show
+// onboarding again. Before it exists, we still suppress the wizard if the
+// user has a `models.toml` with at least one provider configured, or a
+// `config.toml` from any prior install — this protects users who upgraded
+// from a version that predates the sentinel.
+
+/// Sentinel file name marking onboarding as completed.
+const ONBOARDED_SENTINEL: &str = ".onboarded";
+
+/// Pure predicate against an explicit Athen directory. Returns `true` only
+/// when we are confident this is a fresh install. All ambiguous states (I/O
+/// errors, malformed config, partial install) resolve to `false` so we
+/// never accidentally re-run onboarding for a returning user.
+fn is_first_launch_in(athen_dir: &std::path::Path) -> bool {
+    // Sentinel takes priority — if onboarding was ever completed, never again.
+    if athen_dir.join(ONBOARDED_SENTINEL).exists() {
+        return false;
+    }
+
+    // Pre-sentinel returning users: any models.toml with at least one
+    // provider means they're already set up.
+    let models_path = athen_dir.join("models.toml");
+    if models_path.exists() {
+        match std::fs::read_to_string(&models_path) {
+            Ok(content) => match toml::from_str::<ModelsConfig>(&content) {
+                Ok(cfg) if !cfg.providers.is_empty() => return false,
+                Ok(_) => {
+                    // Empty providers map — could be a stub from a wizard
+                    // that bailed midway. Be conservative: don't onboard.
+                    return false;
+                }
+                Err(_) => {
+                    // Parse error — file exists but unreadable. Assume
+                    // returning user; better to make them visit Settings
+                    // than to overwrite their broken config.
+                    return false;
+                }
+            },
+            Err(_) => return false,
+        }
+    }
+
+    // Any pre-existing main config also signals a returning user. Their
+    // models config might just live elsewhere (env vars, custom path).
+    if athen_dir.join("config.toml").exists() {
+        return false;
+    }
+
+    true
+}
+
+/// Write the onboarding sentinel. Idempotent: re-calling on an existing
+/// sentinel is a no-op (not an error).
+fn mark_onboarded_in(athen_dir: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(athen_dir)
+        .map_err(|e| format!("Failed to create {}: {e}", athen_dir.display()))?;
+    let sentinel = athen_dir.join(ONBOARDED_SENTINEL);
+    if sentinel.exists() {
+        return Ok(());
+    }
+    std::fs::write(&sentinel, b"")
+        .map_err(|e| format!("Failed to write onboarding sentinel: {e}"))?;
+    info!("Marked onboarding complete: {}", sentinel.display());
+    Ok(())
+}
+
+/// Returns `true` when the desktop app should show the onboarding wizard.
+/// Conservative: any ambiguity resolves to `false`.
+#[tauri::command]
+pub async fn is_first_launch() -> std::result::Result<bool, String> {
+    // If we can't even resolve `~/.athen/`, assume we're not on a fresh
+    // install — better to silently fall through to the main UI than to
+    // pop a wizard from a broken state.
+    let dir = match ensure_athen_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            warn!("is_first_launch: cannot resolve athen dir, treating as returning: {e}");
+            return Ok(false);
+        }
+    };
+    Ok(is_first_launch_in(&dir))
+}
+
+/// Mark onboarding as complete. Should be called by the frontend wizard's
+/// "Done" handler after the user has either configured a provider or
+/// explicitly chosen to skip. Idempotent.
+#[tauri::command]
+pub async fn complete_onboarding() -> std::result::Result<(), String> {
+    let dir = ensure_athen_dir()?;
+    mark_onboarded_in(&dir)
+}
+
+// ---------------------------------------------------------------------------
 // Helpers for provider info
 // ---------------------------------------------------------------------------
 
@@ -1360,5 +1458,242 @@ async fn test_anthropic(
             })
             .unwrap_or_else(|| text.chars().take(200).collect());
         Err(format!("HTTP {}: {}", status, detail))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — onboarding non-destructive behavior
+// ---------------------------------------------------------------------------
+//
+// These tests target the path-explicit helpers (`is_first_launch_in`,
+// `mark_onboarded_in`) so they can run with isolated `TempDir` state
+// without mutating the global `HOME` env var. The Tauri commands wrapping
+// these helpers just resolve `~/.athen/` from `HOME` and delegate.
+
+#[cfg(test)]
+mod onboarding_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn fresh_dir() -> TempDir {
+        TempDir::new().expect("tempdir creation should never fail in tests")
+    }
+
+    fn write_models_with_provider(dir: &std::path::Path, provider_id: &str) {
+        let toml = format!(
+            r#"
+[providers.{provider_id}]
+auth = {{ ApiKey = "sk-test-not-real" }}
+default_model = "test-model"
+"#
+        );
+        fs::write(dir.join("models.toml"), toml).unwrap();
+    }
+
+    // ── is_first_launch_in: positive cases ─────────────────────────────────
+
+    #[test]
+    fn empty_dir_is_first_launch() {
+        let dir = fresh_dir();
+        assert!(
+            is_first_launch_in(dir.path()),
+            "fresh empty directory should be detected as first launch"
+        );
+    }
+
+    #[test]
+    fn nonexistent_dir_is_first_launch() {
+        // Predicate must not panic on a path that doesn't exist yet —
+        // `ensure_athen_dir` would have created it before this fires, but
+        // defense in depth: confirm the predicate itself is robust.
+        let parent = fresh_dir();
+        let ghost = parent.path().join("nonexistent-subdir");
+        assert!(
+            is_first_launch_in(&ghost),
+            "missing directory should be treated as first launch"
+        );
+    }
+
+    // ── is_first_launch_in: sentinel takes priority ────────────────────────
+
+    #[test]
+    fn sentinel_suppresses_first_launch() {
+        let dir = fresh_dir();
+        fs::write(dir.path().join(ONBOARDED_SENTINEL), b"").unwrap();
+        assert!(
+            !is_first_launch_in(dir.path()),
+            "sentinel must always suppress onboarding"
+        );
+    }
+
+    #[test]
+    fn sentinel_suppresses_even_when_models_toml_is_empty() {
+        // Belt and suspenders: sentinel + empty models. Sentinel wins.
+        let dir = fresh_dir();
+        fs::write(dir.path().join(ONBOARDED_SENTINEL), b"").unwrap();
+        fs::write(dir.path().join("models.toml"), b"").unwrap();
+        assert!(!is_first_launch_in(dir.path()));
+    }
+
+    // ── is_first_launch_in: returning users without sentinel ───────────────
+
+    #[test]
+    fn existing_provider_in_models_suppresses_onboarding() {
+        let dir = fresh_dir();
+        write_models_with_provider(dir.path(), "deepseek");
+        assert!(
+            !is_first_launch_in(dir.path()),
+            "a configured provider must suppress onboarding even without sentinel"
+        );
+    }
+
+    #[test]
+    fn empty_models_toml_suppresses_onboarding() {
+        // A models.toml exists but has no providers. Conservative: assume
+        // the user got partway through some prior setup; don't re-prompt.
+        let dir = fresh_dir();
+        fs::write(dir.path().join("models.toml"), b"").unwrap();
+        assert!(!is_first_launch_in(dir.path()));
+    }
+
+    #[test]
+    fn malformed_models_toml_suppresses_onboarding() {
+        // Better to leave a corrupt config alone than to walk a user
+        // through onboarding that might overwrite it.
+        let dir = fresh_dir();
+        fs::write(
+            dir.path().join("models.toml"),
+            b"this is not valid {[ toml ]]",
+        )
+        .unwrap();
+        assert!(
+            !is_first_launch_in(dir.path()),
+            "malformed config must NOT trigger onboarding (don't overwrite user data)"
+        );
+    }
+
+    #[test]
+    fn config_toml_alone_suppresses_onboarding() {
+        // User has main config but never configured an LLM via UI (e.g.
+        // they set a key via env var). They're a returning user.
+        let dir = fresh_dir();
+        fs::write(dir.path().join("config.toml"), b"# real config goes here").unwrap();
+        assert!(!is_first_launch_in(dir.path()));
+    }
+
+    // ── mark_onboarded_in ──────────────────────────────────────────────────
+
+    #[test]
+    fn mark_onboarded_writes_sentinel() {
+        let dir = fresh_dir();
+        mark_onboarded_in(dir.path()).unwrap();
+        assert!(dir.path().join(ONBOARDED_SENTINEL).exists());
+    }
+
+    #[test]
+    fn mark_onboarded_creates_missing_dir() {
+        let parent = fresh_dir();
+        let nested = parent.path().join("does-not-exist-yet");
+        mark_onboarded_in(&nested).unwrap();
+        assert!(nested.join(ONBOARDED_SENTINEL).exists());
+    }
+
+    #[test]
+    fn mark_onboarded_is_idempotent() {
+        let dir = fresh_dir();
+        mark_onboarded_in(dir.path()).unwrap();
+        mark_onboarded_in(dir.path()).unwrap();
+        mark_onboarded_in(dir.path()).unwrap();
+        assert!(dir.path().join(ONBOARDED_SENTINEL).exists());
+    }
+
+    #[test]
+    fn mark_onboarded_does_not_touch_other_files() {
+        // CRITICAL: completing onboarding must never overwrite or delete
+        // an existing models.toml, config.toml, or any other state.
+        let dir = fresh_dir();
+        write_models_with_provider(dir.path(), "anthropic");
+        let original_models = fs::read(dir.path().join("models.toml")).unwrap();
+
+        fs::write(dir.path().join("config.toml"), b"# user main config").unwrap();
+        let original_config = fs::read(dir.path().join("config.toml")).unwrap();
+
+        let user_db_path = dir.path().join("athen.db");
+        fs::write(&user_db_path, b"pretend-sqlite-bytes").unwrap();
+        let original_db = fs::read(&user_db_path).unwrap();
+
+        mark_onboarded_in(dir.path()).unwrap();
+
+        assert_eq!(
+            fs::read(dir.path().join("models.toml")).unwrap(),
+            original_models,
+            "models.toml must not be modified by onboarding completion"
+        );
+        assert_eq!(
+            fs::read(dir.path().join("config.toml")).unwrap(),
+            original_config,
+            "config.toml must not be modified by onboarding completion"
+        );
+        assert_eq!(
+            fs::read(&user_db_path).unwrap(),
+            original_db,
+            "user database must not be modified by onboarding completion"
+        );
+    }
+
+    // ── End-to-end flow: completing onboarding suppresses re-prompts ───────
+
+    #[test]
+    fn completing_onboarding_suppresses_future_prompts() {
+        let dir = fresh_dir();
+        assert!(is_first_launch_in(dir.path()), "starts as first launch");
+
+        mark_onboarded_in(dir.path()).unwrap();
+        assert!(
+            !is_first_launch_in(dir.path()),
+            "after completion, must never prompt again"
+        );
+
+        // And again on a "subsequent boot"
+        assert!(!is_first_launch_in(dir.path()));
+    }
+
+    #[test]
+    fn returning_user_with_provider_then_marked_onboarded_stays_marked() {
+        // Migration scenario: pre-sentinel returning user with a configured
+        // provider. is_first_launch_in returns false (provider present).
+        // The frontend may then call complete_onboarding to upgrade them
+        // to the sentinel. After that, the sentinel keeps things stable
+        // even if their models.toml is later edited or briefly empty.
+        let dir = fresh_dir();
+        write_models_with_provider(dir.path(), "openai");
+        assert!(!is_first_launch_in(dir.path()));
+
+        mark_onboarded_in(dir.path()).unwrap();
+
+        // Simulate the user clearing their provider config later.
+        fs::write(dir.path().join("models.toml"), b"").unwrap();
+        assert!(
+            !is_first_launch_in(dir.path()),
+            "sentinel must override an emptied models.toml — \
+             a user clearing their config should NOT re-trigger onboarding"
+        );
+    }
+
+    #[test]
+    fn save_then_complete_then_verify_provider_intact() {
+        // Realistic flow: wizard saves a provider, then immediately calls
+        // complete_onboarding. The provider must survive completion.
+        let dir = fresh_dir();
+        write_models_with_provider(dir.path(), "deepseek");
+        let snapshot = fs::read_to_string(dir.path().join("models.toml")).unwrap();
+
+        mark_onboarded_in(dir.path()).unwrap();
+
+        let after = fs::read_to_string(dir.path().join("models.toml")).unwrap();
+        assert_eq!(snapshot, after);
+        let parsed: ModelsConfig = toml::from_str(&after).unwrap();
+        assert!(parsed.providers.contains_key("deepseek"));
     }
 }
