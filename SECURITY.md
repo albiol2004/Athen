@@ -10,7 +10,7 @@ If you've found a vulnerability in Athen, report it privately via one of:
   <https://github.com/albiol2004/Athen/security/advisories/new>. This
   gives us a private channel and lets you collaborate on a fix and an
   embargoed disclosure.
-- **Email** — `albiol2004@gmail.com` with `[Athen security]` in the subject.
+- **Email** — `contact@alejandrogarcia.blog` with `[Athen security]` in the subject.
 
 Please include:
 
