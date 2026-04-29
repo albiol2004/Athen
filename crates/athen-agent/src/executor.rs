@@ -264,6 +264,7 @@ impl DefaultExecutor {
         let has_shell = tools.iter().any(|t| t.name == "shell_execute");
         let has_contacts = tools.iter().any(|t| t.name.starts_with("contacts_"));
         let has_memory = tools.iter().any(|t| t.name == "memory_store");
+        let has_web = tools.iter().any(|t| t.name == "web_search" || t.name == "web_fetch");
 
         // ── Tier 1: capability index (always shown, one line per group) ──
         if !tools.is_empty() {
@@ -382,6 +383,29 @@ impl DefaultExecutor {
                  TIP: programs like Python buffer stderr when piped to a file — if shell_logs \
                  returns empty, try `python3 -u` (unbuffered), `PYTHONUNBUFFERED=1 python3 ...`, \
                  or `stdbuf -oL -eL <command>` for line-buffering.\n\n",
+            );
+        }
+
+        // Web guidance. Surfaced when web_search / web_fetch are wired so
+        // the model reaches for them instead of curl/wget via shell_execute.
+        if has_web {
+            prompt.push_str(
+                "WEB ACCESS:\n\
+                 You have two dedicated tools for the open web. ALWAYS prefer them over \
+                 shelling out to curl/wget/lynx — they return clean markdown/snippets and \
+                 strip noise (scripts, styles, CSS).\n\
+                 - web_search { query, max_results? } → ranked hits (title, url, snippet). \
+                   Use for: current/factual questions, finding canonical URLs, anything the \
+                   model might not know post-training cutoff. Often the snippets alone are \
+                   enough — read them before deciding to fetch a full page.\n\
+                 - web_fetch { url } → readable markdown of one page. Use after web_search \
+                   when a snippet looks promising and you need the full content. Also use \
+                   when the user gives you a URL directly.\n\
+                 FALLBACK PATTERN: if web_fetch returns very short / empty content, the \
+                 page is likely a JS-heavy SPA — fall back to web_search and work from \
+                 the snippets instead of trying again.\n\
+                 Do NOT use shell_execute with curl/wget/lynx for web content. The output \
+                 is raw HTML the model wastes tokens parsing.\n\n",
             );
         }
 

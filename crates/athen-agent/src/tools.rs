@@ -71,7 +71,7 @@ pub struct ShellToolRegistry {
     /// HTML scraping (no key). Can be swapped for Tavily etc. via
     /// [`Self::with_web_search`].
     web_search: Arc<dyn WebSearchProvider>,
-    /// Backend for the `fetch_url` tool. Defaults to a local reqwest-based
+    /// Backend for the `web_fetch` tool. Defaults to a local reqwest-based
     /// reader. Can be swapped for Cloudflare's Browser Rendering via
     /// [`Self::with_page_reader`].
     page_reader: Arc<dyn PageReader>,
@@ -1020,8 +1020,8 @@ impl ShellToolRegistry {
         })
     }
 
-    /// Build the JSON Schema for the `fetch_url` tool parameters.
-    fn fetch_url_schema() -> serde_json::Value {
+    /// Build the JSON Schema for the `web_fetch` tool parameters.
+    fn web_fetch_schema() -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
@@ -1089,7 +1089,7 @@ impl ShellToolRegistry {
     }
 
     /// Fetch a URL and convert it to clean markdown.
-    async fn do_fetch_url(&self, args: &serde_json::Value) -> Result<ToolResult> {
+    async fn do_web_fetch(&self, args: &serde_json::Value) -> Result<ToolResult> {
         let url = args
             .get("url")
             .and_then(|v| v.as_str())
@@ -1097,7 +1097,7 @@ impl ShellToolRegistry {
 
         // Reject obviously bad inputs early so we don't burn a network round-trip.
         if !(url.starts_with("http://") || url.starts_with("https://")) {
-            let msg = format!("fetch_url requires an http(s) URL, got: {url}");
+            let msg = format!("web_fetch requires an http(s) URL, got: {url}");
             return Ok(ToolResult {
                 success: false,
                 output: json!({ "error": msg }),
@@ -1107,7 +1107,7 @@ impl ShellToolRegistry {
         }
 
         tracing::info!(
-            tool = "fetch_url",
+            tool = "web_fetch",
             reader = self.page_reader.name(),
             url,
             "Fetching URL"
@@ -1596,7 +1596,7 @@ impl ToolRegistry for ShellToolRegistry {
         Ok(vec![
             ToolDefinition {
                 name: "shell_execute".to_string(),
-                description: "Run a shell command and return its output (stdout, stderr, exit code)".to_string(),
+                description: "Run a shell command and return its output (stdout, stderr, exit code). For fetching web pages or searching the web do NOT use curl/wget/lynx — use web_fetch and web_search, which return clean markdown/snippets.".to_string(),
                 parameters: Self::shell_execute_schema(),
                 backend: ToolBackend::Shell {
                     command: String::new(),
@@ -1706,7 +1706,7 @@ impl ToolRegistry for ShellToolRegistry {
             },
             ToolDefinition {
                 name: "web_search".to_string(),
-                description: "Search the web and return ranked hits (title, url, snippet). Use this for current/factual info the model may not know, or when fetch_url returns near-empty content on a JS-heavy site — the snippets are often enough to answer.".to_string(),
+                description: "Search the web and return ranked hits (title, url, snippet). Use this for current/factual info the model may not know, or when web_fetch returns near-empty content on a JS-heavy site — the snippets are often enough to answer.".to_string(),
                 parameters: Self::web_search_schema(),
                 backend: ToolBackend::Shell {
                     command: String::new(),
@@ -1715,9 +1715,9 @@ impl ToolRegistry for ShellToolRegistry {
                 base_risk: BaseImpact::Read,
             },
             ToolDefinition {
-                name: "fetch_url".to_string(),
-                description: "Fetch a URL and return its readable content as markdown. Works well for docs/articles/blogs. Heavy React/SPA sites may return little content — if so, fall back to web_search for snippets.".to_string(),
-                parameters: Self::fetch_url_schema(),
+                name: "web_fetch".to_string(),
+                description: "Fetch a URL and return its readable content as markdown. Use this instead of curl/wget for any web page. Works well for docs/articles/blogs. Heavy React/SPA sites may return little content — if so, fall back to web_search for snippets.".to_string(),
+                parameters: Self::web_fetch_schema(),
                 backend: ToolBackend::Shell {
                     command: String::new(),
                     native: false,
@@ -1745,7 +1745,7 @@ impl ToolRegistry for ShellToolRegistry {
             "memory_store" => self.do_memory_store(&args).await,
             "memory_recall" => self.do_memory_recall(&args).await,
             "web_search" => self.do_web_search(&args).await,
-            "fetch_url" => self.do_fetch_url(&args).await,
+            "web_fetch" => self.do_web_fetch(&args).await,
             _ => Err(AthenError::ToolNotFound(name.to_string())),
         }
     }
@@ -1828,8 +1828,9 @@ mod tests {
         let tools = registry.list_tools().await.unwrap();
 
         // shell_execute, shell_spawn, shell_kill, shell_logs, read, edit,
-        // write, grep, list_directory, memory_store, memory_recall
-        assert_eq!(tools.len(), 11);
+        // write, grep, list_directory, memory_store, memory_recall,
+        // web_search, web_fetch
+        assert_eq!(tools.len(), 13);
 
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"shell_execute"));
@@ -1843,6 +1844,8 @@ mod tests {
         assert!(names.contains(&"list_directory"));
         assert!(names.contains(&"memory_store"));
         assert!(names.contains(&"memory_recall"));
+        assert!(names.contains(&"web_search"));
+        assert!(names.contains(&"web_fetch"));
 
         // Each tool should have a non-empty description and valid parameters schema.
         for tool in &tools {

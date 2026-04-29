@@ -74,6 +74,7 @@ fn pretty_group_name(id: &str) -> String {
         "contacts" => "Contacts".to_string(),
         "shell" => "Shell".to_string(),
         "files" => "Files".to_string(),
+        "web" => "Web".to_string(),
         // Capitalize first letter for unknown groups (MCPs etc.)
         other => {
             let mut chars = other.chars();
@@ -93,6 +94,7 @@ fn group_one_liner(id: &str, tools: &[&ToolDefinition]) -> String {
         "contacts" => "manage contacts and their identifiers".to_string(),
         "shell" => "execute shell commands and basic file ops".to_string(),
         "files" => "read, write, list and organize files in a sandboxed folder".to_string(),
+        "web" => "search the web and fetch URLs as clean markdown".to_string(),
         // Fallback: show the bare tool names so the agent can recognise them.
         _ => format!("tools: {}", names.join(", ")),
     }
@@ -118,6 +120,8 @@ pub fn is_always_revealed(name: &str) -> bool {
             | "write"
             | "grep"
             | "list_directory"
+            | "web_search"
+            | "web_fetch"
     )
 }
 
