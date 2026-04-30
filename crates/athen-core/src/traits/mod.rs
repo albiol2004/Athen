@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod approval;
 pub mod coordinator;
 pub mod embedding;
 pub mod llm;

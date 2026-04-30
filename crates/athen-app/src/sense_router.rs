@@ -866,6 +866,7 @@ mod tests {
                 created_at: old.clone(),
                 updated_at: old,
                 entry_count: 3,
+                primary_reply_channel: None,
             },
             ArcMeta {
                 id: "arc_recent".into(),
@@ -877,6 +878,7 @@ mod tests {
                 created_at: recent.clone(),
                 updated_at: recent,
                 entry_count: 1,
+                primary_reply_channel: None,
             },
         ];
 

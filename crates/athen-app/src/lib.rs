@@ -4,6 +4,7 @@
 //! to the frontend through Tauri IPC commands.
 
 pub(crate) mod app_tools;
+pub(crate) mod approval;
 mod commands;
 mod contacts;
 pub(crate) mod file_gate;
@@ -33,6 +34,7 @@ pub fn run() {
             commands::send_message,
             commands::get_status,
             commands::approve_task,
+            commands::submit_approval,
             commands::cancel_task,
             commands::new_arc,
             commands::get_arc_history,
@@ -115,6 +117,11 @@ pub fn run() {
 
             // Initialize the notification orchestrator (needs AppHandle for InApp channel).
             state.init_notifier(app.handle().clone());
+
+            // Initialize the approval router (InApp + Telegram sinks). Must
+            // come before start_telegram_monitor so the poll loop can pick
+            // up the Telegram sink for callback resolution.
+            state.init_approval_router(app.handle().clone());
 
             // Start background monitor tasks before managing state.
             state.start_email_monitor(app.handle().clone());

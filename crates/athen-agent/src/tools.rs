@@ -77,6 +77,86 @@ pub struct ShellToolRegistry {
     page_reader: Arc<dyn PageReader>,
 }
 
+/// Defense-in-depth: tolerate args delivered as a JSON-encoded string
+/// instead of a JSON object. Some LLM providers occasionally emit the
+/// `arguments` field as a string when its value contains tricky escapes
+/// (large HTML/code with raw newlines, etc.). The provider layer
+/// repairs and parses these eagerly with a lenient pass, but if a
+/// `Value::String` ever reaches a `do_*` function we attempt the same
+/// repair here so the tool still works.
+///
+/// Returns a reference to either the original `args` (when it's already
+/// an object/array) or the parsed-into-`owned` value when it was a
+/// JSON-encoded string. If the string can't be parsed even after
+/// repair, returns the original — the caller surfaces a clean
+/// "missing 'X'" error.
+fn coerce_args<'a>(
+    args: &'a serde_json::Value,
+    owned: &'a mut serde_json::Value,
+) -> &'a serde_json::Value {
+    if let Some(s) = args.as_str() {
+        // Strict parse first.
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
+            *owned = parsed;
+            return owned;
+        }
+        // Same lenient repair the provider layer uses: re-escape raw
+        // control characters inside string literals and try again.
+        let repaired = repair_unescaped_control_chars(s);
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&repaired) {
+            tracing::warn!(
+                "Tool args reached do_* as Value::String; repaired and parsed (len={})",
+                s.len()
+            );
+            *owned = parsed;
+            return owned;
+        }
+    }
+    args
+}
+
+/// Walk the input and escape unescaped control characters inside JSON
+/// string literals only. Mirrors `escape_control_chars_in_strings` in
+/// the provider layer; duplicated here to avoid an inter-crate
+/// dependency on a private helper.
+fn repair_unescaped_control_chars(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 16);
+    let mut in_string = false;
+    let mut prev_backslash = false;
+    for ch in input.chars() {
+        if in_string {
+            if prev_backslash {
+                out.push(ch);
+                prev_backslash = false;
+                continue;
+            }
+            match ch {
+                '\\' => {
+                    out.push(ch);
+                    prev_backslash = true;
+                }
+                '"' => {
+                    out.push(ch);
+                    in_string = false;
+                }
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => {
+                    out.push_str(&format!("\\u{:04x}", c as u32));
+                }
+                c => out.push(c),
+            }
+        } else {
+            if ch == '"' {
+                in_string = true;
+            }
+            out.push(ch);
+        }
+    }
+    out
+}
+
 impl ShellToolRegistry {
     /// Wrap a shell command so it runs in the agent workspace directory by
     /// default. Returns the command unchanged if the workspace dir can't be
@@ -561,6 +641,8 @@ impl ShellToolRegistry {
 
     /// Read a file (or a slice of it) and return numbered lines.
     async fn do_read(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let mut owned = serde_json::Value::Null;
+        let args = coerce_args(args, &mut owned);
         let path_arg = args
             .get("path")
             .and_then(|v| v.as_str())
@@ -666,6 +748,8 @@ impl ShellToolRegistry {
 
     /// Edit a file by exact-string replacement.
     async fn do_edit(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let mut owned = serde_json::Value::Null;
+        let args = coerce_args(args, &mut owned);
         let path_arg = args
             .get("path")
             .and_then(|v| v.as_str())
@@ -742,6 +826,8 @@ impl ShellToolRegistry {
     /// Write the full contents of a file. New paths skip the read-required
     /// check; existing paths must have been Read first.
     async fn do_write(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let mut owned = serde_json::Value::Null;
+        let args = coerce_args(args, &mut owned);
         let path_arg = args
             .get("path")
             .and_then(|v| v.as_str())
@@ -1829,6 +1915,69 @@ async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         })?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod coerce_args_tests {
+    use super::*;
+
+    #[test]
+    fn coerce_args_passes_through_objects_unchanged() {
+        let v = serde_json::json!({"path": "/tmp/x"});
+        let mut owned = serde_json::Value::Null;
+        let coerced = coerce_args(&v, &mut owned);
+        assert_eq!(coerced["path"], "/tmp/x");
+    }
+
+    #[test]
+    fn coerce_args_parses_json_strings() {
+        let v = serde_json::Value::String(r#"{"path":"/tmp/x","content":"hi"}"#.into());
+        let mut owned = serde_json::Value::Null;
+        let coerced = coerce_args(&v, &mut owned);
+        assert_eq!(coerced["path"], "/tmp/x");
+        assert_eq!(coerced["content"], "hi");
+    }
+
+    #[test]
+    fn coerce_args_returns_original_when_string_is_not_json() {
+        let v = serde_json::Value::String("just a string".into());
+        let mut owned = serde_json::Value::Null;
+        let coerced = coerce_args(&v, &mut owned);
+        // Still a string — caller will surface a "missing 'path'" error.
+        assert!(coerced.is_string());
+    }
+
+    #[test]
+    fn do_write_via_coerce_extracts_path_from_stringified_args() {
+        // Simulates the bad path: provider couldn't parse args, fell
+        // back to Value::String. The coerce helper must still let us
+        // pull `path` and `content` out.
+        let stringified = serde_json::Value::String(
+            r#"{"path":"/tmp/coerce_x.html","content":"hello"}"#.into(),
+        );
+        let mut owned = serde_json::Value::Null;
+        let coerced = coerce_args(&stringified, &mut owned);
+        assert_eq!(coerced.get("path").and_then(|v| v.as_str()), Some("/tmp/coerce_x.html"));
+        assert_eq!(coerced.get("content").and_then(|v| v.as_str()), Some("hello"));
+    }
+
+    #[test]
+    fn coerce_repairs_raw_control_chars_in_stringified_args() {
+        // The actual production failure mode: DeepSeek emits args as a
+        // string with literal newlines inside the content value.
+        // serde_json::from_str rejects per spec; coerce_args must
+        // re-escape and parse.
+        let raw =
+            "{\"path\":\"/tmp/coerce_y.html\",\"content\":\"<html>\nhi\n</html>\"}".to_string();
+        let stringified = serde_json::Value::String(raw);
+        let mut owned = serde_json::Value::Null;
+        let coerced = coerce_args(&stringified, &mut owned);
+        assert_eq!(coerced.get("path").and_then(|v| v.as_str()), Some("/tmp/coerce_y.html"));
+        assert_eq!(
+            coerced.get("content").and_then(|v| v.as_str()),
+            Some("<html>\nhi\n</html>")
+        );
+    }
 }
 
 #[cfg(test)]

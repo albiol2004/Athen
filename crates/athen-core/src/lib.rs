@@ -1,3 +1,4 @@
+pub mod approval;
 pub mod config;
 pub mod config_loader;
 pub mod contact;

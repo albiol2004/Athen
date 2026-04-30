@@ -116,6 +116,17 @@ pub struct AppState {
     /// best available channel (in-app, Telegram, etc.) with quiet-hours
     /// support and escalation.  Initialized after setup via `init_notifier`.
     pub notifier: Option<Arc<NotificationOrchestrator>>,
+    /// Approval router for routing approve/deny questions to the user
+    /// across reply channels (InApp + Telegram), with escalation when
+    /// the primary channel doesn't answer in time.
+    pub approval_router: Option<Arc<crate::approval::ApprovalRouter>>,
+    /// Direct handle on the InApp approval sink so the
+    /// `submit_approval` Tauri command can resolve pending questions
+    /// when the frontend's approve/deny UI fires.
+    pub inapp_approval_sink: Option<Arc<crate::approval::InAppApprovalSink>>,
+    /// Direct handle on the Telegram approval sink so the Telegram
+    /// poll loop can forward `callback_query` events back to it.
+    pub telegram_approval_sink: Option<Arc<crate::approval::TelegramApprovalSink>>,
     /// Persistent semantic memory (vector search + knowledge graph).
     /// Used for auto-injecting relevant context before LLM calls and
     /// auto-remembering important interactions after task completion.
@@ -226,6 +237,9 @@ impl AppState {
             email_shutdown: None,
             telegram_shutdown: None,
             notifier: None,
+            approval_router: None,
+            inapp_approval_sink: None,
+            telegram_approval_sink: None,
             memory,
             mcp,
             mcp_store,
@@ -368,6 +382,60 @@ impl AppState {
         tauri::async_runtime::block_on(notifier.load_persisted());
 
         self.notifier = Some(notifier);
+    }
+
+    /// Initialize the approval router and its sinks.
+    ///
+    /// Must be called after `AppState::new()` but before `app.manage()`,
+    /// because it needs the Tauri `AppHandle` to create the `InApp`
+    /// sink. The router is wired against the existing arc store so it
+    /// can pick the right channel based on each arc's
+    /// `primary_reply_channel` (or its source as a fallback).
+    pub fn init_approval_router(&mut self, app_handle: tauri::AppHandle) {
+        use crate::approval::{
+            ApprovalRouter, InAppApprovalSink, TelegramApprovalSink,
+        };
+        use athen_core::traits::approval::ApprovalSink;
+
+        let config = load_config();
+
+        let inapp = Arc::new(InAppApprovalSink::new(app_handle));
+        let mut sinks: Vec<Arc<dyn ApprovalSink>> =
+            vec![inapp.clone() as Arc<dyn ApprovalSink>];
+
+        let mut telegram_sink: Option<Arc<TelegramApprovalSink>> = None;
+        if config.telegram.enabled {
+            let token = &config.telegram.bot_token;
+            // Use the configured owner_user_id as the approval chat.
+            // For a private chat with the bot, chat_id == user_id.
+            if let Some(owner_id) = config.telegram.owner_user_id {
+                if !token.is_empty() {
+                    let s = Arc::new(TelegramApprovalSink::new(token.clone(), owner_id));
+                    telegram_sink = Some(s.clone());
+                    sinks.push(s as Arc<dyn ApprovalSink>);
+                }
+            }
+        }
+
+        let mut router = ApprovalRouter::new(sinks);
+        if let Some(store) = self._database.as_ref().map(|db| db.arc_store()) {
+            router = router.with_arc_store(store);
+        }
+        // Use the configured notification escalation as a starting point
+        // for approval escalation too — it's the same "user not present"
+        // heuristic.
+        let escalation_secs = config.notifications.escalation_timeout_secs.max(15);
+        router = router
+            .with_escalation_after(std::time::Duration::from_secs(escalation_secs));
+
+        self.approval_router = Some(Arc::new(router));
+        self.inapp_approval_sink = Some(inapp);
+        self.telegram_approval_sink = telegram_sink;
+
+        info!(
+            "Approval router initialized (escalation after {}s)",
+            escalation_secs
+        );
     }
 
     /// Start the email monitor background polling task.
@@ -549,6 +617,7 @@ impl AppState {
         let grant_store_ref = self.grant_store.clone();
         let pending_grants_ref = self.pending_grants.clone();
         let spawned_processes_ref = self.spawned_processes.clone();
+        let telegram_approval_sink = self.telegram_approval_sink.clone();
 
         tauri::async_runtime::spawn(async move {
             if let Err(e) = monitor.init(&telegram_config).await {
@@ -564,6 +633,28 @@ impl AppState {
 
             let mut shutdown = shutdown_rx;
             loop {
+                // Drain any inline-keyboard taps captured during the
+                // previous poll and forward them to the approval sink.
+                let callbacks = monitor.take_callbacks();
+                if !callbacks.is_empty() {
+                    if let Some(ref sink) = telegram_approval_sink {
+                        for cb in callbacks {
+                            let resolved = sink.resolve_callback(&cb.callback_id, &cb.data).await;
+                            if !resolved {
+                                tracing::debug!(
+                                    callback_id = %cb.callback_id,
+                                    "Telegram callback for unknown question (likely already answered)"
+                                );
+                            }
+                        }
+                    } else {
+                        tracing::debug!(
+                            count = callbacks.len(),
+                            "Telegram callbacks ignored — no approval sink configured"
+                        );
+                    }
+                }
+
                 match monitor.poll().await {
                     Ok(events) if !events.is_empty() => {
                         info!("Telegram monitor received {} new event(s)", events.len());
@@ -754,6 +845,15 @@ async fn execute_owner_telegram_message(
         notifier.mark_arc_read(arc_id).await;
     }
 
+    // Record the channel the owner just engaged through. The approval
+    // router uses this to bias follow-up questions toward the channel
+    // the user is already actively reading.
+    if let (Some(store), Some(ref arc_id)) = (arc_store, &target_arc_id) {
+        if let Err(e) = store.set_primary_reply_channel(arc_id, "telegram").await {
+            tracing::debug!("Failed to update primary_reply_channel: {e}");
+        }
+    }
+
     // Load conversation history from the arc for context continuity.
     let context = if let (Some(store), Some(ref arc_id)) = (arc_store, &target_arc_id) {
         match store.load_entries(arc_id).await {
@@ -890,7 +990,42 @@ async fn execute_owner_telegram_message(
     let result = match executor.execute(task).await {
         Ok(r) => r,
         Err(e) => {
-            tracing::error!("Agent execution failed for owner Telegram message: {e}");
+            let raw = e.to_string();
+            tracing::error!("Agent execution failed for owner Telegram message: {raw}");
+
+            // Surface the failure in both places the user can see it:
+            // the persisted arc (so the in-app sidebar reflects what
+            // happened) and the Telegram chat (so they aren't left
+            // wondering why the bot went silent).
+            let user_msg = if raw.contains("Timeout") {
+                "Sorry, the task took too long and timed out. Try a simpler request or break it into smaller steps."
+                    .to_string()
+            } else {
+                format!("Sorry, the task failed: {}", crate::commands::simplify_error_public(&raw))
+            };
+
+            if let (Some(store), Some(ref arc_id)) = (arc_store, &target_arc_id) {
+                if let Err(e) = store
+                    .add_entry(
+                        arc_id,
+                        athen_persistence::arcs::EntryType::Message,
+                        "assistant",
+                        &user_msg,
+                        None,
+                        Some(&turn_id),
+                    )
+                    .await
+                {
+                    warn!("Failed to persist owner Telegram error reply: {e}");
+                }
+                if let Err(e) = store.touch_arc(arc_id).await {
+                    warn!("Failed to touch arc on error path: {e}");
+                }
+            }
+
+            if let Err(e) = send_telegram_reply(bot_token, chat_id, &user_msg).await {
+                warn!("Failed to send Telegram error reply: {e}");
+            }
             return;
         }
     };

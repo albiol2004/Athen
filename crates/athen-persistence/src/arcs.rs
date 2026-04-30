@@ -95,6 +95,11 @@ pub struct ArcMeta {
     pub created_at: String,
     pub updated_at: String,
     pub entry_count: u32,
+    /// Last channel the user actually replied through, used by the
+    /// approval router to pick where to ask follow-up questions. `None`
+    /// means "use the default for this arc's source" (e.g. Telegram for
+    /// a Messaging arc, in-app otherwise).
+    pub primary_reply_channel: Option<String>,
 }
 
 /// The type of an entry within an Arc.
@@ -196,6 +201,32 @@ impl ArcStore {
             )
             .map_err(|e| AthenError::Other(format!("Create turn_id index: {e}")))?;
 
+            // Column-level migration: `primary_reply_channel` was added so the
+            // approval router can remember which channel the user actually
+            // engages on for each arc. Older databases need the column added
+            // in place; new ones get it from ARC_SCHEMA_SQL.
+            let has_reply_channel: bool = conn
+                .prepare("PRAGMA table_info(arcs)")
+                .and_then(|mut stmt| {
+                    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+                    let mut found = false;
+                    for r in rows {
+                        if r? == "primary_reply_channel" {
+                            found = true;
+                            break;
+                        }
+                    }
+                    Ok(found)
+                })
+                .map_err(|e| AthenError::Other(format!("Inspect arcs cols: {e}")))?;
+            if !has_reply_channel {
+                conn.execute(
+                    "ALTER TABLE arcs ADD COLUMN primary_reply_channel TEXT",
+                    [],
+                )
+                .map_err(|e| AthenError::Other(format!("Add primary_reply_channel column: {e}")))?;
+            }
+
             Ok(())
         })
         .await
@@ -261,7 +292,8 @@ impl ArcStore {
                 .prepare(
                     "SELECT a.id, a.name, a.source, a.status, a.parent_arc_id, \
                             a.merged_into_arc_id, a.created_at, a.updated_at, \
-                            COALESCE(e.cnt, 0) AS entry_count \
+                            COALESCE(e.cnt, 0) AS entry_count, \
+                            a.primary_reply_channel \
                      FROM arcs a \
                      LEFT JOIN ( \
                          SELECT arc_id, COUNT(*) AS cnt \
@@ -283,6 +315,7 @@ impl ArcStore {
                         created_at: row.get(6)?,
                         updated_at: row.get(7)?,
                         entry_count: row.get::<_, u32>(8)?,
+                        primary_reply_channel: row.get(9)?,
                     })
                 })
                 .map_err(|e| AthenError::Other(format!("Query get arc: {e}")))?;
@@ -308,7 +341,8 @@ impl ArcStore {
                 .prepare(
                     "SELECT a.id, a.name, a.source, a.status, a.parent_arc_id, \
                             a.merged_into_arc_id, a.created_at, a.updated_at, \
-                            COALESCE(e.cnt, 0) AS entry_count \
+                            COALESCE(e.cnt, 0) AS entry_count, \
+                            a.primary_reply_channel \
                      FROM arcs a \
                      LEFT JOIN ( \
                          SELECT arc_id, COUNT(*) AS cnt \
@@ -330,6 +364,7 @@ impl ArcStore {
                         created_at: row.get(6)?,
                         updated_at: row.get(7)?,
                         entry_count: row.get::<_, u32>(8)?,
+                        primary_reply_channel: row.get(9)?,
                     })
                 })
                 .map_err(|e| AthenError::Other(format!("Query list arcs: {e}")))?;
@@ -432,6 +467,29 @@ impl ArcStore {
             )
             .map_err(|e| AthenError::Other(format!("Touch target arc: {e}")))?;
 
+            Ok(())
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
+    /// Record the channel the user most recently engaged this arc through.
+    ///
+    /// Used by the approval router to bias follow-up questions toward the
+    /// channel the user is already actively reading. Pass any value
+    /// recognised by [`athen_core::approval::ReplyChannelKind::from_str`]
+    /// (e.g. `"telegram"`, `"in_app"`).
+    pub async fn set_primary_reply_channel(&self, id: &str, channel: &str) -> Result<()> {
+        let conn = self.conn.clone();
+        let id = id.to_string();
+        let channel = channel.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE arcs SET primary_reply_channel = ?1 WHERE id = ?2",
+                params![channel, id],
+            )
+            .map_err(|e| AthenError::Other(format!("Set primary_reply_channel: {e}")))?;
             Ok(())
         })
         .await
@@ -703,7 +761,8 @@ CREATE TABLE IF NOT EXISTS arcs (
     parent_arc_id TEXT,
     merged_into_arc_id TEXT,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    primary_reply_channel TEXT
 );
 
 CREATE TABLE IF NOT EXISTS arc_entries (
@@ -1563,6 +1622,91 @@ mod tests {
         assert_eq!(entries[1].turn_id.as_deref(), Some("t1"));
 
         // Idempotency: running init_schema again must not error.
+        store.init_schema().await.expect("idempotent re-init");
+    }
+
+    /// New arcs default to no primary_reply_channel; setting it via the helper
+    /// is durable and visible through both `get_arc` and `list_arcs`.
+    #[tokio::test]
+    async fn test_primary_reply_channel_set_and_read() {
+        let store = setup_arc_store().await;
+        store
+            .create_arc("arc_1", "Telegram thread", ArcSource::Messaging)
+            .await
+            .unwrap();
+
+        let meta = store.get_arc("arc_1").await.unwrap().expect("arc present");
+        assert_eq!(meta.primary_reply_channel, None);
+
+        store
+            .set_primary_reply_channel("arc_1", "telegram")
+            .await
+            .unwrap();
+
+        let meta = store.get_arc("arc_1").await.unwrap().expect("arc present");
+        assert_eq!(meta.primary_reply_channel.as_deref(), Some("telegram"));
+
+        let arcs = store.list_arcs().await.unwrap();
+        let listed = arcs.iter().find(|a| a.id == "arc_1").unwrap();
+        assert_eq!(listed.primary_reply_channel.as_deref(), Some("telegram"));
+    }
+
+    /// init_schema must be idempotent and must add `primary_reply_channel` to a
+    /// pre-existing database that was created before the column existed.
+    #[tokio::test]
+    async fn test_primary_reply_channel_migration_on_legacy_db() {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        let conn = Arc::new(Mutex::new(conn));
+
+        // Simulate an old DB: arcs WITHOUT primary_reply_channel.
+        let conn_clone = conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let c = conn_clone.blocking_lock();
+            c.execute_batch(
+                "CREATE TABLE arcs (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'user_input',
+                    status TEXT NOT NULL DEFAULT 'active',
+                    parent_arc_id TEXT,
+                    merged_into_arc_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE arc_entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    arc_id TEXT NOT NULL,
+                    entry_type TEXT NOT NULL DEFAULT 'message',
+                    source TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    metadata TEXT,
+                    created_at TEXT NOT NULL
+                );
+                INSERT INTO arcs (id, name, source, status, created_at, updated_at)
+                  VALUES ('legacy', 'Legacy', 'messaging', 'active',
+                          '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z');",
+            )
+            .expect("seed legacy schema");
+        })
+        .await
+        .unwrap();
+
+        let store = ArcStore::new(conn);
+        store.init_schema().await.expect("init migrates legacy db");
+
+        // Pre-existing arcs default to None.
+        let meta = store.get_arc("legacy").await.unwrap().expect("arc present");
+        assert_eq!(meta.primary_reply_channel, None);
+
+        // Setting on the migrated db works.
+        store
+            .set_primary_reply_channel("legacy", "telegram")
+            .await
+            .unwrap();
+        let meta = store.get_arc("legacy").await.unwrap().expect("arc present");
+        assert_eq!(meta.primary_reply_channel.as_deref(), Some("telegram"));
+
+        // Idempotent.
         store.init_schema().await.expect("idempotent re-init");
     }
 }

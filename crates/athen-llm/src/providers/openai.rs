@@ -498,6 +498,81 @@ pub(crate) fn take_complete_lines(buf: &mut Vec<u8>) -> Vec<u8> {
     }
 }
 
+/// Parse tool-call arguments from the raw JSON string an OpenAI-shaped
+/// provider returns, repairing common quirks before falling back.
+///
+/// Tries strict `serde_json::from_str` first. When that fails (the
+/// known DeepSeek quirk of embedding raw control characters like
+/// literal newlines/tabs inside string values when the value is large
+/// HTML/code), retries with a lenient pass that re-escapes unescaped
+/// control characters inside string literals only. As a last resort
+/// the raw string is wrapped in `Value::String` so the executor still
+/// sees something — `do_*` helpers in `athen-agent::tools` then run a
+/// second-line `coerce_args` pass before extracting fields.
+pub(crate) fn parse_tool_arguments(raw: &str) -> serde_json::Value {
+    if let Ok(v) = serde_json::from_str(raw) {
+        return v;
+    }
+    let repaired = escape_control_chars_in_strings(raw);
+    if let Ok(v) = serde_json::from_str(&repaired) {
+        tracing::warn!(
+            "Tool args contained unescaped control characters; \
+             repaired and parsed (raw len={})",
+            raw.len()
+        );
+        return v;
+    }
+    tracing::warn!(
+        "Tool args could not be parsed even after repair; \
+         falling back to string wrapper (raw len={})",
+        raw.len()
+    );
+    serde_json::Value::String(raw.to_string())
+}
+
+/// Walk the input character by character, tracking whether we're
+/// inside a JSON string literal, and escape unescaped control chars
+/// (`\n`, `\r`, `\t`, etc.) into their proper escape sequences.
+/// Anything outside string literals is left alone (so the JSON
+/// structure itself is preserved).
+fn escape_control_chars_in_strings(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 16);
+    let mut in_string = false;
+    let mut prev_backslash = false;
+    for ch in input.chars() {
+        if in_string {
+            if prev_backslash {
+                out.push(ch);
+                prev_backslash = false;
+                continue;
+            }
+            match ch {
+                '\\' => {
+                    out.push(ch);
+                    prev_backslash = true;
+                }
+                '"' => {
+                    out.push(ch);
+                    in_string = false;
+                }
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => {
+                    out.push_str(&format!("\\u{:04x}", c as u32));
+                }
+                c => out.push(c),
+            }
+        } else {
+            if ch == '"' {
+                in_string = true;
+            }
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// Per-tool-call buffer used while assembling fragmented streaming deltas.
 #[derive(Debug, Default, Clone)]
 struct PartialToolCall {
@@ -566,8 +641,7 @@ impl ToolCallAccumulator {
                 let arguments = if p.arguments_buf.is_empty() {
                     serde_json::Value::Object(serde_json::Map::new())
                 } else {
-                    serde_json::from_str(&p.arguments_buf)
-                        .unwrap_or(serde_json::Value::String(p.arguments_buf))
+                    parse_tool_arguments(&p.arguments_buf)
                 };
                 Some(ToolCall {
                     id,

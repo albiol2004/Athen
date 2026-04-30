@@ -14,7 +14,9 @@ use athen_core::error::{AthenError, Result};
 use athen_core::llm::*;
 use athen_core::traits::llm::LlmProvider;
 
-use crate::providers::openai::{parse_sse_chunks, take_complete_lines, ToolCallAccumulator};
+use crate::providers::openai::{
+    parse_sse_chunks, parse_tool_arguments, take_complete_lines, ToolCallAccumulator,
+};
 
 const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
 const DEFAULT_MODEL: &str = "deepseek-chat";
@@ -256,8 +258,7 @@ impl LlmProvider for DeepSeekProvider {
                     .map(|tc| ToolCall {
                         id: tc.id.clone(),
                         name: tc.function.name.clone(),
-                        arguments: serde_json::from_str(&tc.function.arguments)
-                            .unwrap_or(serde_json::Value::String(tc.function.arguments.clone())),
+                        arguments: parse_tool_arguments(&tc.function.arguments),
                     })
                     .collect()
             })
@@ -518,4 +519,55 @@ struct OpenAiUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
     total_tokens: u32,
+}
+
+#[cfg(test)]
+mod arg_parse_tests {
+    use super::*;
+
+    #[test]
+    fn well_formed_json_is_parsed_directly() {
+        let v = parse_tool_arguments(r#"{"path":"/tmp/x","content":"hi"}"#);
+        assert_eq!(v["path"], "/tmp/x");
+        assert_eq!(v["content"], "hi");
+    }
+
+    #[test]
+    fn raw_newlines_in_string_value_are_repaired() {
+        // This is what DeepSeek emits: a literal LF inside the content
+        // value, which serde_json::from_str rejects per the JSON spec.
+        let raw = "{\"path\":\"/tmp/x.html\",\"content\":\"<html>\nhi\n</html>\"}";
+        let v = parse_tool_arguments(raw);
+        assert_eq!(v["path"], "/tmp/x.html");
+        assert_eq!(v["content"], "<html>\nhi\n</html>");
+    }
+
+    #[test]
+    fn raw_tabs_and_returns_in_string_value_are_repaired() {
+        let raw = "{\"path\":\"/x\",\"content\":\"a\tb\rc\"}";
+        let v = parse_tool_arguments(raw);
+        assert_eq!(v["content"], "a\tb\rc");
+    }
+
+    #[test]
+    fn already_escaped_sequences_are_preserved() {
+        let raw = r#"{"path":"/x","content":"line1\nline2"}"#;
+        let v = parse_tool_arguments(raw);
+        assert_eq!(v["content"], "line1\nline2");
+    }
+
+    #[test]
+    fn unrepairable_input_falls_back_to_string_wrapper() {
+        let v = parse_tool_arguments("not even close to json {");
+        assert!(v.is_string());
+    }
+
+    #[test]
+    fn control_chars_outside_strings_are_left_alone() {
+        // Newlines between fields are valid JSON whitespace. Make sure
+        // we don't munge them.
+        let raw = "{\n  \"path\": \"/x\",\n  \"content\": \"hi\"\n}";
+        let v = parse_tool_arguments(raw);
+        assert_eq!(v["path"], "/x");
+    }
 }

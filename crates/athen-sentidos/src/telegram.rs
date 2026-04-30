@@ -34,6 +34,33 @@ pub struct TelegramResponse<T> {
 pub struct TelegramUpdate {
     pub update_id: i64,
     pub message: Option<TelegramMessage>,
+    /// Inline-keyboard button taps. Used by the approval router to
+    /// resolve approve/deny questions delivered via Telegram.
+    pub callback_query: Option<TelegramCallbackQuery>,
+}
+
+/// A button tap on an inline keyboard, mapped from Telegram's
+/// `callback_query` update payload.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TelegramCallbackQuery {
+    pub id: String,
+    pub from: TelegramUser,
+    pub message: Option<TelegramMessage>,
+    /// The `callback_data` string we set when sending the keyboard.
+    pub data: Option<String>,
+}
+
+/// A drained callback_query, surfaced from the poll loop so the
+/// approval router can resolve the corresponding pending question.
+#[derive(Debug, Clone)]
+pub struct TelegramCallbackEvent {
+    pub callback_id: String,
+    pub data: String,
+    pub from_user_id: i64,
+    /// The chat the original keyboard message lives in. Needed to edit
+    /// the message after the user has answered.
+    pub chat_id: Option<i64>,
+    pub message_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -72,6 +99,9 @@ pub struct TelegramMonitor {
     config: TelegramConfig,
     client: reqwest::Client,
     last_update_id: Mutex<Option<i64>>,
+    /// Callback-query events collected during `process_updates` and
+    /// drained by callers via [`TelegramMonitor::take_callbacks`].
+    callbacks: Mutex<Vec<TelegramCallbackEvent>>,
 }
 
 impl TelegramMonitor {
@@ -81,7 +111,16 @@ impl TelegramMonitor {
             config,
             client: reqwest::Client::new(),
             last_update_id: Mutex::new(None),
+            callbacks: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Drain accumulated callback-query events. Called by the host after
+    /// each poll tick to forward inline-keyboard taps to the approval
+    /// router.
+    pub fn take_callbacks(&self) -> Vec<TelegramCallbackEvent> {
+        let mut guard = self.callbacks.lock().unwrap();
+        std::mem::take(&mut *guard)
     }
 
     /// Base URL for the Telegram Bot API.
@@ -103,6 +142,22 @@ impl TelegramMonitor {
         for update in updates {
             // Track the highest update_id we have seen.
             max_id = Some(max_id.map_or(update.update_id, |m| m.max(update.update_id)));
+
+            // Capture callback_query updates (inline-keyboard taps) into
+            // the callbacks queue so the host can route them to the
+            // approval router after the poll tick.
+            if let Some(cb) = update.callback_query.as_ref() {
+                if let Some(data) = cb.data.clone() {
+                    let event = TelegramCallbackEvent {
+                        callback_id: cb.id.clone(),
+                        data,
+                        from_user_id: cb.from.id,
+                        chat_id: cb.message.as_ref().map(|m| m.chat.id),
+                        message_id: cb.message.as_ref().map(|m| m.message_id),
+                    };
+                    self.callbacks.lock().unwrap().push(event);
+                }
+            }
 
             let message = match update.message {
                 Some(m) => m,
@@ -358,6 +413,114 @@ pub async fn send_message(
     Ok(())
 }
 
+/// Send a text message with an inline keyboard via the Bot API.
+///
+/// `buttons` is a single horizontal row of `(label, callback_data)`
+/// pairs. Returns the `message_id` of the sent message so the caller
+/// can later edit it (e.g. to confirm the user's choice).
+pub async fn send_message_with_keyboard(
+    bot_token: &str,
+    chat_id: i64,
+    text: &str,
+    buttons: &[(&str, &str)],
+) -> std::result::Result<i64, String> {
+    let client = reqwest::Client::new();
+    let url = format!("https://api.telegram.org/bot{bot_token}/sendMessage");
+
+    let row: Vec<serde_json::Value> = buttons
+        .iter()
+        .map(|(label, data)| {
+            serde_json::json!({
+                "text": label,
+                "callback_data": data,
+            })
+        })
+        .collect();
+
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "chat_id": chat_id,
+            "text": text,
+            "reply_markup": { "inline_keyboard": [row] },
+        }))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to send keyboard message: {e}"))?;
+
+    let status = resp.status();
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse Telegram response: {e}"))?;
+    if !status.is_success() || !body.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return Err(format!("Telegram sendMessage error {status}: {body}"));
+    }
+    let message_id = body
+        .get("result")
+        .and_then(|r| r.get("message_id"))
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| "Telegram response missing message_id".to_string())?;
+    Ok(message_id)
+}
+
+/// Acknowledge a callback_query so the user's button stops showing the
+/// loading spinner. `text`, if non-empty, is shown as a tooltip.
+pub async fn answer_callback_query(
+    bot_token: &str,
+    callback_id: &str,
+    text: &str,
+) -> std::result::Result<(), String> {
+    let client = reqwest::Client::new();
+    let url = format!("https://api.telegram.org/bot{bot_token}/answerCallbackQuery");
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "callback_query_id": callback_id,
+            "text": text,
+        }))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to answer callback: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Telegram answerCallbackQuery {status}: {body}"));
+    }
+    Ok(())
+}
+
+/// Edit a message's text (e.g. to remove the keyboard and confirm the
+/// user's choice after they answered an approval question).
+pub async fn edit_message_text(
+    bot_token: &str,
+    chat_id: i64,
+    message_id: i64,
+    text: &str,
+) -> std::result::Result<(), String> {
+    let client = reqwest::Client::new();
+    let url = format!("https://api.telegram.org/bot{bot_token}/editMessageText");
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+        }))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to edit message: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Telegram editMessageText {status}: {body}"));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -404,6 +567,42 @@ mod tests {
                 text: Some(text.to_string()),
                 caption: None,
             }),
+            callback_query: None,
+        }
+    }
+
+    /// Build a TelegramUpdate carrying a callback_query (inline-button tap).
+    fn make_callback_update(
+        update_id: i64,
+        callback_id: &str,
+        from_user_id: i64,
+        data: &str,
+        chat_id: i64,
+        message_id: i64,
+    ) -> TelegramUpdate {
+        TelegramUpdate {
+            update_id,
+            message: None,
+            callback_query: Some(TelegramCallbackQuery {
+                id: callback_id.to_string(),
+                from: TelegramUser {
+                    id: from_user_id,
+                    first_name: "Owner".into(),
+                    username: None,
+                },
+                message: Some(TelegramMessage {
+                    message_id,
+                    from: None,
+                    chat: TelegramChat {
+                        id: chat_id,
+                        chat_type: "private".to_string(),
+                    },
+                    date: 1700000000,
+                    text: Some("Approve?".into()),
+                    caption: None,
+                }),
+                data: Some(data.to_string()),
+            }),
         }
     }
 
@@ -438,6 +637,43 @@ mod tests {
     fn default_poll_interval_is_5s() {
         let config = TelegramConfig::default();
         assert_eq!(config.poll_interval_secs, 5);
+    }
+
+    #[test]
+    fn callback_queries_are_collected_and_drainable() {
+        let monitor = TelegramMonitor::new(test_config());
+        let updates = vec![
+            make_callback_update(1, "cb-1", 42, "qid-1|approve", 999, 7),
+            make_text_update(2, 8, 42, "Alex", None, 999, "hi"),
+            make_callback_update(3, "cb-2", 42, "qid-2|deny", 999, 9),
+        ];
+
+        let events = monitor.process_updates(updates);
+        // The text message yielded a SenseEvent; the callback queries did not.
+        assert_eq!(events.len(), 1);
+
+        let drained = monitor.take_callbacks();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].callback_id, "cb-1");
+        assert_eq!(drained[0].data, "qid-1|approve");
+        assert_eq!(drained[0].from_user_id, 42);
+        assert_eq!(drained[0].chat_id, Some(999));
+        assert_eq!(drained[0].message_id, Some(7));
+        assert_eq!(drained[1].data, "qid-2|deny");
+
+        // A second drain returns empty (drained on read).
+        assert!(monitor.take_callbacks().is_empty());
+    }
+
+    #[test]
+    fn callback_query_without_data_is_skipped() {
+        let monitor = TelegramMonitor::new(test_config());
+        let mut update = make_callback_update(1, "cb-1", 42, "x", 999, 7);
+        if let Some(ref mut cq) = update.callback_query {
+            cq.data = None;
+        }
+        let _ = monitor.process_updates(vec![update]);
+        assert!(monitor.take_callbacks().is_empty());
     }
 
     // ---------------------------------------------------------------
@@ -565,6 +801,7 @@ mod tests {
                 text: None,
                 caption: Some("Photo caption".to_string()),
             }),
+            callback_query: None,
         };
 
         let events = monitor.process_updates(vec![update]);
@@ -632,6 +869,7 @@ mod tests {
             TelegramUpdate {
                 update_id: 1,
                 message: None,
+                callback_query: None,
             },
             make_text_update(2, 10, 42, "Alex", None, 42, "Real message"),
         ];
@@ -661,6 +899,7 @@ mod tests {
                 text: None,
                 caption: None,
             }),
+            callback_query: None,
         };
 
         let events = monitor.process_updates(vec![update]);

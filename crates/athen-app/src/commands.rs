@@ -32,6 +32,94 @@ use crate::file_gate::{GrantDecision, PendingGrantSummary};
 use crate::notifier::NotificationInfo;
 use crate::state::{AppState, PendingApproval, SharedRouter};
 
+/// Fire an approval question through the router so the user can also
+/// answer via Telegram (in addition to the in-app card we always show).
+///
+/// Spawned in the background; the future polls the router and on
+/// answer drives the coordinator + emits an event the frontend can
+/// react to. Whichever channel responds first wins; the existing
+/// `approve_task` Tauri command stays the canonical execution path.
+fn spawn_router_approval(
+    state: &State<'_, AppState>,
+    app_handle: &AppHandle,
+    task_id: Uuid,
+    description: String,
+    risk_score: f64,
+    risk_level: String,
+) {
+    use athen_core::approval::ApprovalQuestion;
+    use athen_core::notification::{NotificationOrigin, NotificationUrgency};
+
+    // Skip if the router is not configured (e.g. tests without
+    // init_approval_router).
+    let Some(router) = state.approval_router.clone() else {
+        return;
+    };
+    // Skip if there's no Telegram sink — nothing extra to gain over the
+    // in-app card the frontend is already showing.
+    if state.telegram_approval_sink.is_none() {
+        return;
+    }
+
+    let arc_id = state.active_arc_id.try_lock().map(|g| g.clone()).ok();
+    let app_handle = app_handle.clone();
+
+    tauri::async_runtime::spawn(async move {
+        let prompt = format!("Action requires approval (risk {risk_score:.0}, {risk_level}).");
+        let description = if description.is_empty() {
+            None
+        } else {
+            Some(description)
+        };
+        let question = ApprovalQuestion {
+            id: Uuid::new_v4(),
+            prompt,
+            description,
+            choices: vec![
+                athen_core::approval::ApprovalChoice::approve(),
+                athen_core::approval::ApprovalChoice::deny(),
+            ],
+            arc_id: arc_id.clone(),
+            task_id: Some(task_id),
+            origin: NotificationOrigin::RiskSystem,
+            urgency: NotificationUrgency::High,
+            created_at: chrono::Utc::now(),
+        };
+
+        // Start by asking on the user's preferred channel for this arc.
+        let primary = router.pick_primary(arc_id.as_deref()).await;
+        let answer = match router.ask_with_escalation(question, primary).await {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!("Approval router failed for task {task_id}: {e}");
+                return;
+            }
+        };
+
+        let approved = answer.choice_key == "approve";
+        // Emit an event the frontend can listen to (e.g. to update the
+        // pending-approval card or auto-trigger approve_task).
+        let _ = app_handle.emit(
+            "approval-resolved",
+            serde_json::json!({
+                "task_id": task_id.to_string(),
+                "choice": answer.choice_key,
+                "approved": approved,
+            }),
+        );
+
+        tracing::info!(
+            task_id = %task_id,
+            choice = %answer.choice_key,
+            "Approval resolved via router"
+        );
+        // Note: actual task execution still flows through the existing
+        // approve_task Tauri command. Driving execution end-to-end from
+        // a Telegram-only answer is a separate follow-up — for now the
+        // event above is what the frontend uses to fast-path the user.
+    });
+}
+
 /// Convert a raw technical error string into a user-friendly message.
 ///
 /// Technical details are intentionally stripped — they are already logged
@@ -71,6 +159,12 @@ fn simplify_error(err: &str) -> String {
     }
     // Return the raw string if no simplification applies.
     err.to_string()
+}
+
+/// Public wrapper around [`simplify_error`] for callers in sibling
+/// modules (e.g. the Telegram error path in `state.rs`).
+pub(crate) fn simplify_error_public(err: &str) -> String {
+    simplify_error(err)
 }
 
 /// Extract key terms from a user message for broader memory search.
@@ -684,6 +778,18 @@ pub async fn send_message(
     // assistant reply). The frontend groups by this for the dropdown UI.
     let turn_id = Uuid::new_v4().to_string();
 
+    // Record that the user just engaged through the in-app UI on this
+    // arc — the approval router will prefer this channel for follow-up
+    // questions on the same arc.
+    {
+        let active_arc = state.active_arc_id.lock().await.clone();
+        if let Some(ref store) = state.arc_store {
+            if let Err(e) = store.set_primary_reply_channel(&active_arc, "in_app").await {
+                tracing::debug!("Failed to update primary_reply_channel: {e}");
+            }
+        }
+    }
+
     // Build a SenseEvent from the user's text input.
     let event = SenseEvent {
         id: Uuid::new_v4(),
@@ -771,6 +877,19 @@ pub async fn send_message(
             risk_score,
             risk_level: risk_level.clone(),
         };
+
+        // Fire the same question via the approval router so it can also
+        // reach the user on Telegram (or any future channel) if they're
+        // not at the UI. The in-app card is still shown so the user can
+        // also answer there; whichever channel responds first wins.
+        spawn_router_approval(
+            &state,
+            &app_handle,
+            awaiting_task.id,
+            awaiting_task.description.clone(),
+            risk_score,
+            risk_level.clone(),
+        );
 
         return Ok(ChatResponse {
             content: format!(
@@ -1107,6 +1226,17 @@ pub async fn approve_task(
         // Clear the stashed message.
         *state.pending_message.lock().await = None;
 
+        // Notify the frontend that the resolution happened in-app, so
+        // any router-driven Telegram waiter can be cancelled.
+        let _ = app_handle.emit(
+            "approval-resolved",
+            serde_json::json!({
+                "task_id": task_uuid.to_string(),
+                "choice": "deny",
+                "approved": false,
+            }),
+        );
+
         return Ok(ChatResponse {
             content: "Action denied. The task has been cancelled.".into(),
             risk_level: Some("Safe".into()),
@@ -1406,6 +1536,35 @@ pub async fn approve_task(
 pub async fn cancel_task(state: State<'_, AppState>) -> std::result::Result<(), String> {
     state.cancel_flag.store(true, Ordering::Relaxed);
     Ok(())
+}
+
+/// Resolve a pending [`ApprovalQuestion`] from the in-app UI.
+///
+/// Used by the new approval router flow: when the frontend renders an
+/// approval prompt it received via the `approval-question` event, the
+/// user's tap is forwarded here and the matching parked oneshot is
+/// completed. Returns `false` if the question id is unknown (e.g. it
+/// was already answered through another channel).
+#[tauri::command]
+pub async fn submit_approval(
+    question_id: String,
+    choice_key: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<bool, String> {
+    use athen_core::approval::ApprovalAnswer;
+
+    let q_id = Uuid::parse_str(&question_id)
+        .map_err(|e| format!("Invalid question_id: {e}"))?;
+    let Some(sink) = state.inapp_approval_sink.clone() else {
+        return Ok(false);
+    };
+    let resolved = sink
+        .resolve(ApprovalAnswer {
+            question_id: q_id,
+            choice_key,
+        })
+        .await;
+    Ok(resolved)
 }
 
 /// Return basic status information.
