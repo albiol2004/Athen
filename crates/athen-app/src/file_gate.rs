@@ -20,6 +20,7 @@ use uuid::Uuid;
 use athen_agent::tools::ShellExtraWritableProvider;
 use athen_core::contact::TrustLevel;
 use athen_core::error::{AthenError, Result};
+use athen_core::traits::approval::ApprovalSink;
 use athen_core::paths;
 use athen_core::risk::{DataSensitivity, RiskContext, RiskDecision};
 use athen_core::tool::ToolResult;
@@ -143,6 +144,11 @@ pub struct FileGate {
     grants: Arc<GrantStore>,
     pending: PendingGrants,
     app_handle: Option<AppHandle>,
+    /// Optional Telegram approval sink. When set, `ask_user` races the
+    /// in-app `grant-requested` event against a Telegram inline-keyboard
+    /// question so the user can also answer from Telegram if they're
+    /// not at the UI.
+    telegram_approval_sink: Option<Arc<crate::approval::TelegramApprovalSink>>,
 }
 
 impl FileGate {
@@ -161,7 +167,19 @@ impl FileGate {
             grants,
             pending,
             app_handle,
+            telegram_approval_sink: None,
         }
+    }
+
+    /// Attach a Telegram approval sink so file-permission prompts also
+    /// surface on Telegram while the in-app card is showing. The first
+    /// channel to answer wins; the loser is cancelled.
+    pub fn with_telegram_approval(
+        mut self,
+        sink: Arc<crate::approval::TelegramApprovalSink>,
+    ) -> Self {
+        self.telegram_approval_sink = Some(sink);
+        self
     }
 
     /// Returns true when this tool name is a file-touching operation the
@@ -261,7 +279,9 @@ impl FileGate {
     }
 
     /// Park a request and wait for the user. Emits `grant-requested` so the
-    /// frontend can surface the prompt.
+    /// frontend can surface the prompt. When a Telegram approval sink is
+    /// attached, races the in-app oneshot against a Telegram
+    /// inline-keyboard question; whichever channel answers first wins.
     async fn ask_user(
         &self,
         paths_in: Vec<PathBuf>,
@@ -271,7 +291,7 @@ impl FileGate {
         let (tx, rx) = oneshot::channel();
         let req = PendingGrantRequest {
             arc_id: self.arc_id_str.clone(),
-            paths: paths_in,
+            paths: paths_in.clone(),
             access,
             tool: tool.to_string(),
             responder: tx,
@@ -284,8 +304,44 @@ impl FileGate {
             let _ = handle.emit("grant-requested", &summary);
         }
 
-        rx.await
-            .map_err(|_| AthenError::Other("pending grant cancelled".to_string()))
+        // Without Telegram, the in-app event channel is the only path.
+        let Some(telegram) = self.telegram_approval_sink.clone() else {
+            return rx
+                .await
+                .map_err(|_| AthenError::Other("pending grant cancelled".to_string()));
+        };
+
+        // With Telegram, race the in-app oneshot vs a Telegram question.
+        let question = build_grant_question(
+            &paths_in,
+            access,
+            tool,
+            Some(self.arc_id_str.clone()),
+        );
+        let q_id = question.id;
+
+        let pending_for_cleanup = self.pending.clone();
+        let app_handle_for_cancel = self.app_handle.clone();
+
+        tokio::select! {
+            // In-app answered first.
+            inapp = rx => {
+                // Cancel the Telegram question so its keyboard message is edited.
+                let _ = telegram.cancel(q_id).await;
+                inapp.map_err(|_| AthenError::Other("pending grant cancelled".to_string()))
+            }
+            // Telegram answered first.
+            tg = telegram.ask(question) => {
+                // Drop the parked in-app entry so its responder oneshot is
+                // dropped (returning a "cancelled" error if anyone awaits
+                // it later) and tell the frontend to dismiss the prompt.
+                pending_for_cleanup.lock().await.remove(&id);
+                if let Some(handle) = app_handle_for_cancel {
+                    let _ = handle.emit("grant-resolved-elsewhere", id.to_string());
+                }
+                tg.map(approval_choice_to_grant_decision)
+            }
+        }
     }
 
     /// Top-level entry: classify, optionally ask, and dispatch the call
@@ -397,6 +453,71 @@ fn access_label(a: Access) -> &'static str {
     match a {
         Access::Read => "read",
         Access::Write => "write",
+    }
+}
+
+/// Build the [`ApprovalQuestion`] sent through the Telegram sink for a
+/// path-permission prompt.
+///
+/// Three choices map cleanly to [`GrantDecision`]:
+///   - "allow"        → Allow once (this call only)
+///   - "allow_always" → AllowAlways (grant stored, future calls auto-approve)
+///   - "deny"         → Deny
+fn build_grant_question(
+    paths_in: &[PathBuf],
+    access: Access,
+    tool: &str,
+    arc_id: Option<String>,
+) -> athen_core::approval::ApprovalQuestion {
+    use athen_core::approval::{ApprovalChoice, ApprovalChoiceKind, ApprovalQuestion};
+    use athen_core::notification::{NotificationOrigin, NotificationUrgency};
+
+    let prompt = format!(
+        "Allow {} access via {}?",
+        access_label(access),
+        tool,
+    );
+    let description = if paths_in.is_empty() {
+        None
+    } else {
+        Some(format!("Path: {}", display_paths(paths_in)))
+    };
+    ApprovalQuestion {
+        id: Uuid::new_v4(),
+        prompt,
+        description,
+        choices: vec![
+            ApprovalChoice {
+                key: "allow".to_string(),
+                label: "Allow once".to_string(),
+                kind: ApprovalChoiceKind::AllowOnce,
+            },
+            ApprovalChoice {
+                key: "allow_always".to_string(),
+                label: "Allow always".to_string(),
+                kind: ApprovalChoiceKind::AllowAlways,
+            },
+            ApprovalChoice {
+                key: "deny".to_string(),
+                label: "Deny".to_string(),
+                kind: ApprovalChoiceKind::Deny,
+            },
+        ],
+        arc_id,
+        task_id: None,
+        origin: NotificationOrigin::SenseRouter,
+        urgency: NotificationUrgency::High,
+        created_at: chrono::Utc::now(),
+    }
+}
+
+/// Map an [`ApprovalAnswer`] choice key back to [`GrantDecision`].
+/// Unknown keys default to `Deny` — fail-closed for permission prompts.
+fn approval_choice_to_grant_decision(answer: athen_core::approval::ApprovalAnswer) -> GrantDecision {
+    match answer.choice_key.as_str() {
+        "allow" => GrantDecision::Allow,
+        "allow_always" => GrantDecision::AllowAlways,
+        _ => GrantDecision::Deny,
     }
 }
 
@@ -844,5 +965,49 @@ mod tests {
         let scope = grants.check(arc_id, &target, Access::Write).await.unwrap();
         assert!(scope.is_some());
         let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn approval_choice_keys_map_to_grant_decisions() {
+        use athen_core::approval::ApprovalAnswer;
+        let q = Uuid::new_v4();
+        for (key, expected) in [
+            ("allow", GrantDecision::Allow),
+            ("allow_always", GrantDecision::AllowAlways),
+            ("deny", GrantDecision::Deny),
+        ] {
+            let answer = ApprovalAnswer {
+                question_id: q,
+                choice_key: key.to_string(),
+            };
+            assert_eq!(approval_choice_to_grant_decision(answer), expected);
+        }
+    }
+
+    #[test]
+    fn unknown_choice_key_fails_closed_to_deny() {
+        let answer = athen_core::approval::ApprovalAnswer {
+            question_id: Uuid::new_v4(),
+            choice_key: "garbage".into(),
+        };
+        assert_eq!(
+            approval_choice_to_grant_decision(answer),
+            GrantDecision::Deny
+        );
+    }
+
+    #[test]
+    fn build_grant_question_carries_paths_in_description_and_three_choices() {
+        let paths = vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")];
+        let q = build_grant_question(&paths, Access::Write, "write", Some("arc_x".into()));
+        assert!(q.prompt.contains("write"));
+        let desc = q.description.expect("description present");
+        assert!(desc.contains("/tmp/a"));
+        assert!(desc.contains("/tmp/b"));
+        assert_eq!(q.choices.len(), 3);
+        assert_eq!(q.choices[0].key, "allow");
+        assert_eq!(q.choices[1].key, "allow_always");
+        assert_eq!(q.choices[2].key, "deny");
+        assert_eq!(q.arc_id.as_deref(), Some("arc_x"));
     }
 }

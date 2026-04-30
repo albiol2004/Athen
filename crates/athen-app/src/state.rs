@@ -319,13 +319,19 @@ impl AppState {
         )
         .with_mcp(self.mcp.clone() as Arc<dyn athen_core::traits::mcp::McpClient>);
         if let Some(grants) = self.grant_store.clone() {
-            let gate = Arc::new(crate::file_gate::FileGate::new(
+            let mut gate = crate::file_gate::FileGate::new(
                 arc_id.to_string(),
                 grants,
                 self.pending_grants.clone(),
                 app_handle,
-            ));
-            registry = registry.with_file_gate(gate);
+            );
+            // Attach the Telegram approval sink so file-permission
+            // prompts also surface on Telegram alongside the in-app
+            // card; whichever channel responds first wins.
+            if let Some(ref sink) = self.telegram_approval_sink {
+                gate = gate.with_telegram_approval(sink.clone());
+            }
+            registry = registry.with_file_gate(Arc::new(gate));
         }
         registry
     }
@@ -633,28 +639,6 @@ impl AppState {
 
             let mut shutdown = shutdown_rx;
             loop {
-                // Drain any inline-keyboard taps captured during the
-                // previous poll and forward them to the approval sink.
-                let callbacks = monitor.take_callbacks();
-                if !callbacks.is_empty() {
-                    if let Some(ref sink) = telegram_approval_sink {
-                        for cb in callbacks {
-                            let resolved = sink.resolve_callback(&cb.callback_id, &cb.data).await;
-                            if !resolved {
-                                tracing::debug!(
-                                    callback_id = %cb.callback_id,
-                                    "Telegram callback for unknown question (likely already answered)"
-                                );
-                            }
-                        }
-                    } else {
-                        tracing::debug!(
-                            count = callbacks.len(),
-                            "Telegram callbacks ignored — no approval sink configured"
-                        );
-                    }
-                }
-
                 match monitor.poll().await {
                     Ok(events) if !events.is_empty() => {
                         info!("Telegram monitor received {} new event(s)", events.len());
@@ -700,6 +684,7 @@ impl AppState {
                                         grant_store_ref.as_ref(),
                                         &pending_grants_ref,
                                         &spawned_processes_ref,
+                                        telegram_approval_sink.as_ref(),
                                     )
                                     .await;
                                 }
@@ -722,6 +707,30 @@ impl AppState {
                     }
                     Err(e) => {
                         warn!("Telegram poll error: {e}");
+                    }
+                }
+
+                // Drain any inline-keyboard taps captured during this
+                // poll and forward them to the approval sink. Done
+                // *after* poll() so a tap is resolved on the same
+                // iteration it arrives, not the next one.
+                let callbacks = monitor.take_callbacks();
+                if !callbacks.is_empty() {
+                    if let Some(ref sink) = telegram_approval_sink {
+                        for cb in callbacks {
+                            let resolved = sink.resolve_callback(&cb.callback_id, &cb.data).await;
+                            if !resolved {
+                                tracing::debug!(
+                                    callback_id = %cb.callback_id,
+                                    "Telegram callback for unknown question (already answered or cancelled)"
+                                );
+                            }
+                        }
+                    } else {
+                        tracing::debug!(
+                            count = callbacks.len(),
+                            "Telegram callbacks ignored — no approval sink configured"
+                        );
                     }
                 }
 
@@ -769,6 +778,7 @@ async fn execute_owner_telegram_message(
     grant_store: Option<&Arc<GrantStore>>,
     pending_grants: &PendingGrants,
     spawned_processes: &athen_agent::SpawnedProcessMap,
+    telegram_approval_sink: Option<&Arc<crate::approval::TelegramApprovalSink>>,
 ) {
     use std::time::Duration;
 
@@ -900,13 +910,16 @@ async fn execute_owner_telegram_message(
     )
     .with_mcp(mcp.clone() as Arc<dyn athen_core::traits::mcp::McpClient>);
     if let (Some(store), Some(arc_id_str)) = (grant_store, target_arc_id.as_ref()) {
-        let gate = Arc::new(crate::file_gate::FileGate::new(
+        let mut gate = crate::file_gate::FileGate::new(
             arc_id_str.clone(),
             store.clone(),
             pending_grants.clone(),
             Some(app_handle.clone()),
-        ));
-        registry = registry.with_file_gate(gate);
+        );
+        if let Some(sink) = telegram_approval_sink {
+            gate = gate.with_telegram_approval(sink.clone());
+        }
+        registry = registry.with_file_gate(Arc::new(gate));
     }
     // Shared list of successful tool names; the auditor appends as steps
     // finish, and we read it after execute to build the Telegram footer.

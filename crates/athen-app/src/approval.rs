@@ -198,11 +198,20 @@ impl TelegramApprovalSink {
     /// the `data` payload encodes a known question, deliver the answer
     /// and ack the callback. Returns `true` if the callback was for a
     /// question this sink was waiting on.
+    ///
+    /// **Always** acks the callback (`answerCallbackQuery`), even when
+    /// the question is unknown — otherwise the user's button would
+    /// stay in a loading state forever. The most common unknown-id case
+    /// is "another channel won the race", which is healthy.
     pub async fn resolve_callback(
         &self,
         callback_id: &str,
         data: &str,
     ) -> bool {
+        // Always ack the button so it stops spinning, no matter what
+        // we decide below.
+        ack_callback(self.bot_token.clone(), callback_id.to_string(), "");
+
         let (q_id, choice_key) = match parse_callback_data(data) {
             Some(v) => v,
             None => return false,
@@ -214,6 +223,8 @@ impl TelegramApprovalSink {
             map.remove(&q_id)
         };
         let Some(sender) = sender else {
+            // Already answered through another channel, or expired.
+            // The cancel path edited the message; nothing more to do.
             return false;
         };
 
@@ -225,21 +236,6 @@ impl TelegramApprovalSink {
         let _ = sender.send(ApprovalAnswer {
             question_id: q_id,
             choice_key: choice_key.clone(),
-        });
-
-        // Ack the callback so the user's button stops spinning.
-        let token = self.bot_token.clone();
-        let cb_id = callback_id.to_string();
-        tokio::spawn(async move {
-            if let Err(e) = athen_sentidos::telegram::answer_callback_query(
-                &token,
-                &cb_id,
-                "",
-            )
-            .await
-            {
-                warn!("Failed to answer Telegram callback: {e}");
-            }
         });
 
         // Edit the message to show the user's choice instead of buttons.
@@ -371,6 +367,21 @@ impl ApprovalSink for TelegramApprovalSink {
 
 /// Parse the `callback_data` we set on inline-keyboard buttons. Returns
 /// `(question_id, choice_key)` on success.
+/// Spawn a fire-and-forget `answerCallbackQuery` so the inline-keyboard
+/// button stops showing the loading spinner. Safe to call even when we
+/// don't know the question — Telegram silently no-ops on already-acked
+/// callback ids.
+fn ack_callback(token: String, callback_id: String, text: &str) {
+    let text_owned = text.to_string();
+    tokio::spawn(async move {
+        if let Err(e) =
+            athen_sentidos::telegram::answer_callback_query(&token, &callback_id, &text_owned).await
+        {
+            warn!("Failed to answer Telegram callback: {e}");
+        }
+    });
+}
+
 pub fn parse_callback_data(data: &str) -> Option<(Uuid, String)> {
     let (id_part, choice_part) = data.split_once('|')?;
     let q_id = Uuid::parse_str(id_part).ok()?;
@@ -601,6 +612,24 @@ mod tests {
         let answer = ask_handle.await.unwrap().unwrap();
         assert_eq!(answer.choice_key, "approve");
         assert_eq!(answer.question_id, q_id);
+    }
+
+    #[tokio::test]
+    async fn telegram_resolve_callback_returns_false_for_unknown_question() {
+        // Don't actually hit the Telegram API: ack_callback's spawned
+        // task will fail to reach api.telegram.org and log a warning,
+        // but that's fine — we only assert the resolve_callback return.
+        let sink = TelegramApprovalSink::new("fake-token".to_string(), 0);
+        let unknown_data = format!("{}|approve", Uuid::new_v4());
+        let resolved = sink.resolve_callback("cb-fake", &unknown_data).await;
+        assert!(!resolved);
+    }
+
+    #[tokio::test]
+    async fn telegram_resolve_callback_returns_false_for_malformed_data() {
+        let sink = TelegramApprovalSink::new("fake-token".to_string(), 0);
+        let resolved = sink.resolve_callback("cb-fake", "not-a-valid-payload").await;
+        assert!(!resolved);
     }
 
     #[tokio::test]
