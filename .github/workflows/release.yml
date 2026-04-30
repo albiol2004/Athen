@@ -77,6 +77,18 @@ jobs:
         # Pin the major to keep CI deterministic across patch releases.
         run: cargo install tauri-cli --version "^2.0" --locked
 
+      - name: Fetch nushell sidecar (Unix)
+        if: runner.os != 'Windows'
+        env:
+          TARGET_TRIPLE: ${{ matrix.target }}
+        run: bash scripts/fetch-nushell.sh
+
+      - name: Fetch nushell sidecar (Windows)
+        if: runner.os == 'Windows'
+        env:
+          TARGET_TRIPLE: ${{ matrix.target }}
+        run: pwsh scripts/fetch-nushell.ps1
+
       - name: Build Tauri app
         # `cargo tauri build` resolves config relative to the cwd, so run
         # it from the crate that owns tauri.conf.json. The shared workspace

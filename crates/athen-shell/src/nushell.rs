@@ -59,15 +59,38 @@ impl NushellShell {
         self.nushell_path.as_ref()
     }
 
-    /// Try to find the `nu` binary on PATH.
+    /// Locate the `nu` binary, preferring the Tauri-bundled sidecar next to
+    /// the running executable, then falling back to PATH.
     async fn detect_nushell(native: &NativeShell) -> Option<PathBuf> {
+        if let Some(path) = Self::sidecar_path() {
+            debug!(?path, "using bundled nushell sidecar");
+            return Some(path);
+        }
+
         match native.which("nu").await {
             Ok(path) => path,
             Err(e) => {
-                debug!("failed to detect nushell: {}", e);
+                debug!("failed to detect nushell on PATH: {}", e);
                 None
             }
         }
+    }
+
+    /// Resolve the bundled `nu` sidecar next to the current executable.
+    /// `tauri-build` copies it to `target/<profile>/nu(.exe)` in dev; bundled
+    /// installs may retain the `nu-<triple>(.exe)` form, so check both.
+    fn sidecar_path() -> Option<PathBuf> {
+        let exe = std::env::current_exe().ok()?;
+        let dir = exe.parent()?;
+        let triple = env!("ATHEN_TARGET_TRIPLE");
+        let ext = std::env::consts::EXE_SUFFIX;
+        for name in [format!("nu{ext}"), format!("nu-{triple}{ext}")] {
+            let candidate = dir.join(&name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        None
     }
 
     /// Execute a command via the nushell binary.

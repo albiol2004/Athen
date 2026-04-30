@@ -1,0 +1,3 @@
+# Sidecar binaries fetched at build time by scripts/fetch-nushell.sh.
+# Never committed — each platform pulls its own build artifact.
+nu-*

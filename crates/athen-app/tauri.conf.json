@@ -23,6 +23,7 @@
     "bundle": {
         "active": true,
         "targets": "all",
-        "icon": []
+        "icon": [],
+        "externalBin": ["binaries/nu"]
     }
 }

@@ -52,6 +52,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Fetch nushell sidecar
+        # tauri-build resolves `externalBin` paths during regular builds,
+        # so the sidecar must exist before clippy runs.
+        run: bash scripts/fetch-nushell.sh
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 

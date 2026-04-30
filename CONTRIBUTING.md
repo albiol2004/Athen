@@ -9,6 +9,11 @@ to do — code, docs, design, and bug reports are all welcome.
 git clone https://github.com/albiol2004/Athen.git
 cd Athen
 
+# Fetch the nushell sidecar binary (required — tauri-build resolves
+# `externalBin` paths during normal cargo builds, so the file must exist).
+bash scripts/fetch-nushell.sh
+# Windows: pwsh scripts/fetch-nushell.ps1
+
 # Build the whole workspace
 cargo build --workspace
 
@@ -21,6 +26,14 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 System dependencies for building the Tauri desktop app are listed in the
 [README](README.md#system-dependencies).
+
+### Nushell sidecar
+
+Athen ships nushell as a Tauri sidecar so commands behave consistently across
+platforms without requiring a system-wide `nu` install. The fetch script
+downloads the binary for the host triple (override with `TARGET_TRIPLE` or
+`NU_VERSION`) and drops it at `crates/athen-app/binaries/nu-<triple>(.exe)`.
+The binaries directory is gitignored — each platform pulls its own.
 
 ## House rules
 
