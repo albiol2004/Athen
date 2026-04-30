@@ -833,14 +833,37 @@ header h1 {
     color: var(--text-2);
 }
 
-.tool-call-icon { font-size: 13px; opacity: 0.85; }
+.tool-call-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    flex-shrink: 0;
+    color: var(--brand-warm, var(--brand-solid));
+    opacity: 0.95;
+}
+.tool-call-icon svg { display: block; }
 .tool-call-name {
     font-family: var(--mono);
     font-size: 12px;
     color: var(--text);
     font-weight: 500;
 }
-.tool-call-summary { color: var(--text-3); font-size: 12px; }
+.tool-call.builtin .tool-call-name {
+    font-family: var(--font);
+    font-size: 13px;
+    font-weight: 500;
+    letter-spacing: -0.005em;
+}
+.tool-call-summary {
+    color: var(--text-3);
+    font-size: 12px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+}
 
 .tool-execution-card {
     display: flex;
@@ -870,6 +893,23 @@ header h1 {
     color: var(--text);
     font-weight: 500;
 }
+.tool-execution-card.builtin .tool-name {
+    font-family: var(--font);
+    font-size: 13px;
+    letter-spacing: -0.005em;
+}
+.tool-execution-card .tool-builtin-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    flex-shrink: 0;
+    margin-top: 1px;
+    color: var(--brand-warm, var(--brand-solid));
+    opacity: 0.95;
+}
+.tool-execution-card .tool-builtin-icon svg { display: block; }
 .tool-execution-card .tool-detail {
     color: var(--text-3);
     font-size: 11.5px;

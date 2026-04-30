@@ -54,6 +54,95 @@ function scheduleIdle(fn) {
     }
 }
 
+// ─── Built-in tool icons ───
+// Maps Athen built-in tool names to inline SVG markup so the chat UI can
+// show an icon + short label instead of the raw tool identifier. Tools not
+// in this map (user-installed MCPs, unknown names) render their raw name.
+function toolSvg(inner, w) {
+    const size = w || 14;
+    return `<svg viewBox="0 0 24 24" width="${size}" height="${size}" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${inner}</svg>`;
+}
+const ICON_FILE_TEXT   = toolSvg('<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><line x1="9" y1="13" x2="15" y2="13"/><line x1="9" y1="17" x2="15" y2="17"/>');
+const ICON_FOLDER      = toolSvg('<path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>');
+const ICON_FILE_SEARCH = toolSvg('<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h7"/><path d="M14 2v6h6"/><circle cx="17.5" cy="17.5" r="2.5"/><path d="M21 21l-1.5-1.5"/>');
+const ICON_PEN_DOC     = toolSvg('<path d="M11 4H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-5"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>');
+const ICON_TERMINAL    = toolSvg('<polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>');
+const ICON_STOP        = toolSvg('<rect x="6" y="6" width="12" height="12" rx="2"/>');
+const ICON_LOGS        = toolSvg('<line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="18" x2="14" y2="18"/>');
+const ICON_GLOBE       = toolSvg('<circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>');
+const ICON_SEARCH      = toolSvg('<circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>');
+const ICON_BOOKMARK    = toolSvg('<path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/>');
+const ICON_SPARKLES    = toolSvg('<path d="M12 3l1.5 4.5L18 9l-4.5 1.5L12 15l-1.5-4.5L6 9l4.5-1.5z"/><path d="M5.2 17l.6 1.8L7.6 19.4 5.8 20l-.6 1.8L4.6 20 2.8 19.4 4.6 18.8z"/>');
+const ICON_CALENDAR    = toolSvg('<rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>');
+const ICON_CAL_PLUS    = toolSvg('<rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/><line x1="12" y1="14" x2="12" y2="18"/><line x1="10" y1="16" x2="14" y2="16"/>');
+const ICON_TRASH       = toolSvg('<polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/><path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"/>');
+const ICON_USERS       = toolSvg('<path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>');
+const ICON_USER_SEARCH = toolSvg('<circle cx="9" cy="7" r="4"/><path d="M3 21v-2a4 4 0 0 1 4-4h4"/><circle cx="17" cy="17" r="3"/><line x1="21" y1="21" x2="19" y2="19"/>');
+const ICON_USER_PLUS   = toolSvg('<path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><line x1="20" y1="8" x2="20" y2="14"/><line x1="17" y1="11" x2="23" y2="11"/>');
+const ICON_USER        = toolSvg('<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>');
+const ICON_FOLDER_PLUS = toolSvg('<path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><line x1="12" y1="11" x2="12" y2="17"/><line x1="9" y1="14" x2="15" y2="14"/>');
+const ICON_ARROW_RIGHT = toolSvg('<line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/>');
+const ICON_INFO        = toolSvg('<circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/>');
+const ICON_CHECK       = toolSvg('<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/>');
+
+const BUILTIN_TOOL_ICONS = {
+    'read': ICON_FILE_TEXT, 'list_directory': ICON_FOLDER, 'grep': ICON_FILE_SEARCH,
+    'write': ICON_PEN_DOC, 'edit': ICON_PEN_DOC,
+    'shell_execute': ICON_TERMINAL, 'shell_spawn': ICON_TERMINAL,
+    'shell_kill': ICON_STOP, 'shell_logs': ICON_LOGS,
+    'web_search': ICON_SEARCH, 'web_fetch': ICON_GLOBE,
+    'memory_store': ICON_BOOKMARK, 'memory_recall': ICON_SPARKLES,
+    'calendar_list': ICON_CALENDAR, 'calendar_create': ICON_CAL_PLUS,
+    'calendar_update': ICON_CALENDAR, 'calendar_delete': ICON_TRASH,
+    'contacts_list': ICON_USERS, 'contacts_search': ICON_USER_SEARCH,
+    'contacts_create': ICON_USER_PLUS, 'contacts_update': ICON_USER,
+    'contacts_delete': ICON_TRASH,
+    // mcp-filesystem (matched via the suffix lookup in _normalizedToolKey)
+    'delete_path': ICON_TRASH, 'append_file': ICON_PEN_DOC,
+    'create_dir': ICON_FOLDER_PLUS, 'move_path': ICON_ARROW_RIGHT,
+    'exists': ICON_CHECK, 'stat': ICON_INFO,
+};
+
+const BUILTIN_TOOL_LABELS = {
+    'read': 'Read', 'list_directory': 'List', 'grep': 'Search files',
+    'write': 'Write', 'edit': 'Edit',
+    'shell_execute': 'Run', 'shell_spawn': 'Spawn',
+    'shell_kill': 'Stop', 'shell_logs': 'Logs',
+    'web_search': 'Search web', 'web_fetch': 'Fetch',
+    'memory_store': 'Save', 'memory_recall': 'Recall',
+    'calendar_list': 'Events', 'calendar_create': 'Create event',
+    'calendar_update': 'Update event', 'calendar_delete': 'Delete event',
+    'contacts_list': 'Contacts', 'contacts_search': 'Find contact',
+    'contacts_create': 'Add contact', 'contacts_update': 'Update contact',
+    'contacts_delete': 'Delete contact',
+    'delete_path': 'Delete', 'append_file': 'Append',
+    'create_dir': 'Create folder', 'move_path': 'Move',
+    'exists': 'Check', 'stat': 'Info',
+};
+
+// MCP-prefixed tools (e.g. `files__read_file`) — strip prefix and try common
+// suffix aliases so MCP filesystem tools pick up the same icons as built-ins.
+const MCP_SUFFIX_ALIASES = {
+    'read_file': 'read', 'write_file': 'write',
+    'list_dir': 'list_directory', 'list_files': 'list_directory',
+    'search_files': 'grep',
+};
+
+function _normalizedToolKey(toolName) {
+    if (!toolName) return null;
+    if (BUILTIN_TOOL_ICONS[toolName]) return toolName;
+    const sep = toolName.indexOf('__');
+    if (sep > 0) {
+        const suffix = toolName.slice(sep + 2);
+        if (BUILTIN_TOOL_ICONS[suffix]) return suffix;
+        const alias = MCP_SUFFIX_ALIASES[suffix];
+        if (alias && BUILTIN_TOOL_ICONS[alias]) return alias;
+    }
+    return null;
+}
+function builtinToolIcon(toolName)  { const k = _normalizedToolKey(toolName); return k ? BUILTIN_TOOL_ICONS[k] : null; }
+function builtinToolLabel(toolName) { const k = _normalizedToolKey(toolName); return k ? BUILTIN_TOOL_LABELS[k] : ''; }
+
 function registerTauriEventListeners() {
     if (!(window.__TAURI__.event && window.__TAURI__.event.listen)) return;
 
@@ -77,7 +166,10 @@ function registerTauriEventListeners() {
         const card = document.createElement('div');
         const statusClass = status === 'Completed' ? 'completed' :
                             status === 'Failed' ? 'failed' : 'in-progress';
-        card.className = `tool-execution-card ${statusClass}`;
+        const builtinIcon = builtinToolIcon(tool_name);
+        const builtinClass = builtinIcon ? ' builtin' : '';
+        card.className = `tool-execution-card ${statusClass}${builtinClass}`;
+        card.setAttribute('title', tool_name);
 
         const statusIcon = status === 'Completed' ? '&#10003;' :
                            status === 'Failed' ? '&#10007;' : '&#9679;';
@@ -88,9 +180,15 @@ function registerTauriEventListeners() {
             detailHtml = `<span class="tool-detail">${escapeHtml(truncated)}</span>`;
         }
 
+        const labelText = builtinIcon ? builtinToolLabel(tool_name) : tool_name;
+        const iconMarkup = builtinIcon
+            ? `<span class="tool-builtin-icon">${builtinIcon}</span>`
+            : '';
+
         card.innerHTML =
             `<span class="tool-status-icon">${statusIcon}</span>` +
-            `<span class="tool-name">${escapeHtml(tool_name)}</span>` +
+            iconMarkup +
+            `<span class="tool-name">${escapeHtml(labelText)}</span>` +
             detailHtml;
 
         currentToolContainer.appendChild(card);
@@ -1371,13 +1469,24 @@ formEl.addEventListener('submit', async (e) => {
         if (response.tool_calls && response.tool_calls.length > 0) {
             let toolsHtml = '';
             for (const tc of response.tool_calls) {
-                const name = escapeHtml(tc.name || '');
+                const rawName = tc.name || '';
                 const summary = escapeHtml(tc.summary || '');
-                toolsHtml += `<div class="tool-call">
-                    <span class="tool-call-icon">&#128295;</span>
-                    <span class="tool-call-name">${name}</span>
-                    <span class="tool-call-summary">${summary}</span>
-                </div>`;
+                const builtinIcon = builtinToolIcon(rawName);
+                if (builtinIcon) {
+                    const label = escapeHtml(builtinToolLabel(rawName));
+                    const titleAttr = escapeHtml(rawName);
+                    toolsHtml += `<div class="tool-call builtin" title="${titleAttr}">
+                        <span class="tool-call-icon">${builtinIcon}</span>
+                        <span class="tool-call-name">${label}</span>
+                        <span class="tool-call-summary">${summary}</span>
+                    </div>`;
+                } else {
+                    const name = escapeHtml(rawName);
+                    toolsHtml += `<div class="tool-call">
+                        <span class="tool-call-name">${name}</span>
+                        <span class="tool-call-summary">${summary}</span>
+                    </div>`;
+                }
             }
             meta.toolCallsHtml = toolsHtml;
         }
