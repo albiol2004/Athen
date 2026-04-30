@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <defs>
+    <linearGradient id="athenLogoGrad" x1="6" y1="6" x2="58" y2="58" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FF6B7A"/>
+      <stop offset="50%" stop-color="#FF8A5C"/>
+      <stop offset="100%" stop-color="#FFB570"/>
+    </linearGradient>
+    <radialGradient id="athenLogoInner" cx="32" cy="22" r="22" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.35"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <circle cx="32" cy="32" r="28" fill="url(#athenLogoGrad)"/>
+  <circle cx="32" cy="32" r="28" fill="url(#athenLogoInner)"/>
+  <path d="M 17 36 A 16 16 0 0 1 47 36" stroke="rgba(255,255,255,0.92)" stroke-width="2.4" stroke-linecap="round" fill="none"/>
+  <circle cx="32" cy="36" r="2.2" fill="rgba(255,255,255,0.95)"/>
+</svg>
