@@ -50,4 +50,18 @@ Out of scope (please don't report these):
 - Social-engineering scenarios that require the user to run a malicious
   binary they downloaded themselves.
 
+## Known accepted advisories
+
+Advisories the project is aware of and has consciously chosen not to act on.
+The corresponding suppression for tooling lives in `deny.toml`.
+
+- **RUSTSEC-2024-0429** — `glib::VariantStrIter::impl_get` unsoundness
+  (affected: glib `>=0.15.0, <0.20.0`; patched: `>=0.20.0`). Athen pulls
+  glib 0.18.5 transitively via `tauri 2.10.3 -> gtk 0.18.2`. No workspace
+  crate calls `VariantStrIter` or `g_variant_get_child` directly; the
+  unsound path is only reachable through gtk-rs internals. Tauri 2.x has
+  not bumped its gtk-rs pin and no 0.18.x backport of the upstream fix
+  exists on crates.io. Will be revisited once Tauri moves to gtk-rs
+  `>= 0.19` (which pulls glib `>= 0.20`).
+
 Thanks for helping keep Athen safe.
