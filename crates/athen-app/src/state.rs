@@ -682,7 +682,7 @@ async fn execute_owner_telegram_message(
     use std::time::Duration;
 
     use crate::app_tools::AppToolRegistry;
-    use crate::commands::{spawn_stream_forwarder, AgentProgress, TauriAuditor};
+    use crate::commands::{new_tool_log, spawn_stream_forwarder, AgentProgress, TauriAuditor};
     use athen_agent::{AgentBuilder, ShellToolRegistry};
     use athen_core::task::{DomainType, Task, TaskPriority, TaskStatus};
     use athen_core::traits::agent::AgentExecutor;
@@ -808,11 +808,15 @@ async fn execute_owner_telegram_message(
         ));
         registry = registry.with_file_gate(gate);
     }
+    // Shared list of successful tool names; the auditor appends as steps
+    // finish, and we read it after execute to build the Telegram footer.
+    let tool_log = new_tool_log();
     let auditor = TauriAuditor::new(
         app_handle.clone(),
         arc_store.clone(),
         target_arc_id.clone().unwrap_or_default(),
         turn_id.clone(),
+        tool_log.clone(),
     );
     let stream_tx = spawn_stream_forwarder(app_handle, target_arc_id.clone());
     let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -952,8 +956,16 @@ async fn execute_owner_telegram_message(
         let _ = app_handle.emit("arc-updated", serde_json::json!({ "arc_id": arc_id }));
     }
 
-    // Send the response back to Telegram.
-    if let Err(e) = send_telegram_reply(bot_token, chat_id, &content).await {
+    // Send the response back to Telegram, with a "Tools used" footer when
+    // the agent ran any. The Telegram client doesn't render our SVG icons,
+    // so this is a plain-text de-duplicated list.
+    let footer = build_telegram_tools_footer(&tool_log);
+    let outbound = if footer.is_empty() {
+        content.clone()
+    } else {
+        format!("{content}\n\n{footer}")
+    };
+    if let Err(e) = send_telegram_reply(bot_token, chat_id, &outbound).await {
         warn!("Failed to send Telegram reply: {e}");
     }
 
@@ -961,6 +973,46 @@ async fn execute_owner_telegram_message(
         "Owner Telegram message executed, response length: {} chars",
         content.len()
     );
+}
+
+/// Build a plain-text "Tools used" footer from the tools the agent ran.
+/// Returns an empty string when nothing useful happened so the caller can
+/// skip appending entirely.
+///
+/// Tools are de-duplicated in order of first appearance, with a `×N` suffix
+/// for repeated invocations, e.g. `Tools used: shell_execute ×3, read`.
+fn build_telegram_tools_footer(tool_log: &crate::commands::ToolLog) -> String {
+    let names = match tool_log.lock() {
+        Ok(g) => g.clone(),
+        Err(_) => return String::new(),
+    };
+    if names.is_empty() {
+        return String::new();
+    }
+
+    let mut order: Vec<String> = Vec::new();
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for name in names {
+        let entry = counts.entry(name.clone()).or_insert(0);
+        if *entry == 0 {
+            order.push(name);
+        }
+        *entry += 1;
+    }
+
+    let parts: Vec<String> = order
+        .iter()
+        .map(|n| {
+            let count = counts.get(n).copied().unwrap_or(1);
+            if count > 1 {
+                format!("{n} \u{00d7}{count}")
+            } else {
+                n.clone()
+            }
+        })
+        .collect();
+
+    format!("— Tools used: {}", parts.join(", "))
 }
 
 /// Send a text message to a Telegram chat via the Bot API.

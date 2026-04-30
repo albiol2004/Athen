@@ -457,6 +457,17 @@ pub(crate) struct AgentProgress {
     pub detail: Option<String>,
 }
 
+/// Shared list of tool names that completed successfully during a turn.
+///
+/// The `TauriAuditor` appends to it as steps finish; callers that need a
+/// post-execute summary (e.g. the Telegram handler appending a "Tools used"
+/// footer) hold a clone and read after `executor.execute` returns.
+pub(crate) type ToolLog = Arc<std::sync::Mutex<Vec<String>>>;
+
+pub(crate) fn new_tool_log() -> ToolLog {
+    Arc::new(std::sync::Mutex::new(Vec::new()))
+}
+
 /// Step auditor that emits Tauri events for real-time progress in the UI and
 /// also persists each completed tool invocation to the active arc.
 ///
@@ -469,6 +480,7 @@ pub(crate) struct TauriAuditor {
     arc_store: Option<arcs::ArcStore>,
     arc_id: String,
     turn_id: String,
+    tool_log: ToolLog,
 }
 
 impl TauriAuditor {
@@ -477,6 +489,7 @@ impl TauriAuditor {
         arc_store: Option<arcs::ArcStore>,
         arc_id: String,
         turn_id: String,
+        tool_log: ToolLog,
     ) -> Self {
         Self {
             inner: InMemoryAuditor::new(),
@@ -484,6 +497,7 @@ impl TauriAuditor {
             arc_store,
             arc_id,
             turn_id,
+            tool_log,
         }
     }
 
@@ -568,6 +582,22 @@ impl StepAuditor for TauriAuditor {
             step.status,
             athen_core::task::StepStatus::Completed | athen_core::task::StepStatus::Failed
         ) {
+            // Append successful tool names to the shared log so post-execute
+            // callers (Telegram footer, future activity feed) can summarize
+            // without re-querying SQLite.
+            if matches!(step.status, athen_core::task::StepStatus::Completed) {
+                if let Some(tool) = step
+                    .output
+                    .as_ref()
+                    .and_then(|o| o.get("tool"))
+                    .and_then(|t| t.as_str())
+                {
+                    if let Ok(mut log) = self.tool_log.lock() {
+                        log.push(tool.to_string());
+                    }
+                }
+            }
+
             if let (Some(store), Some(output)) = (self.arc_store.as_ref(), step.output.as_ref()) {
                 if let Some(tool) = output.get("tool").and_then(|t| t.as_str()) {
                     let metadata = serde_json::json!({
@@ -845,6 +875,7 @@ pub async fn send_message(
                 state.arc_store.clone(),
                 auditor_arc_id,
                 turn_id.clone(),
+                new_tool_log(),
             );
 
             // Set up streaming: forward LLM text chunks to the frontend
@@ -1170,6 +1201,7 @@ pub async fn approve_task(
                 state.arc_store.clone(),
                 auditor_arc_id,
                 turn_id.clone(),
+                new_tool_log(),
             );
 
             // Set up streaming for the approved task execution.
