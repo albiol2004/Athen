@@ -835,6 +835,27 @@ async function autoNameArc(message) {
 
 // ─── Markdown Renderer ───
 
+function parseTableRow(line) {
+    return line.trim()
+        .replace(/^\|/, '')
+        .replace(/\|$/, '')
+        .split('|')
+        .map((c) => c.trim());
+}
+function parseTableSeparator(line) {
+    if (!/^\s*\|?[\s:|-]+\|[\s:|-]+\|?\s*$/.test(line)) return null;
+    const cells = parseTableRow(line);
+    if (cells.length === 0) return null;
+    const aligns = [];
+    for (const c of cells) {
+        if (!/^:?-{3,}:?$/.test(c) && !/^:?-+:?$/.test(c)) return null;
+        const left = c.startsWith(':');
+        const right = c.endsWith(':');
+        aligns.push(left && right ? 'center' : right ? 'right' : left ? 'left' : null);
+    }
+    return aligns;
+}
+
 function renderMarkdown(text) {
     const codeBlocks = [];
     let processed = text.replace(/```(\w*)\n([\s\S]*?)```/g, (_match, lang, code) => {
@@ -891,6 +912,39 @@ function renderMarkdown(text) {
             continue;
         }
 
+        // GitHub-flavored markdown tables: header row + separator + data rows.
+        // The separator decides whether the lines are actually a table; without
+        // it we fall through and treat them as a paragraph (so a stray pipe in
+        // prose isn't promoted to a table).
+        if (/^\s*\|.*\|\s*$/.test(line) && i + 1 < lines.length) {
+            const aligns = parseTableSeparator(lines[i + 1]);
+            if (aligns) {
+                const headers = parseTableRow(line);
+                if (headers.length === aligns.length) {
+                    i += 2;
+                    const rows = [];
+                    while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i])) {
+                        rows.push(parseTableRow(lines[i]));
+                        i++;
+                    }
+                    const cellStyle = (idx) => {
+                        const a = aligns[idx];
+                        return a ? ` style="text-align:${a}"` : '';
+                    };
+                    const thead = `<thead><tr>${headers.map((h, idx) =>
+                        `<th${cellStyle(idx)}>${renderInline(h)}</th>`
+                    ).join('')}</tr></thead>`;
+                    const tbody = `<tbody>${rows.map(r =>
+                        `<tr>${r.map((c, idx) =>
+                            `<td${cellStyle(idx)}>${renderInline(c)}</td>`
+                        ).join('')}</tr>`
+                    ).join('')}</tbody>`;
+                    result.push(`<div class="md-table-wrap"><table class="md-table">${thead}${tbody}</table></div>`);
+                    continue;
+                }
+            }
+        }
+
         // Empty line — paragraph break
         if (line.trim() === '') {
             result.push('');
@@ -911,6 +965,7 @@ function renderMarkdown(text) {
                !/^#{1,3}\s+/.test(lines[i]) &&
                !/^[\s]*[-*]\s+/.test(lines[i]) &&
                !/^[\s]*\d+\.\s+/.test(lines[i]) &&
+               !/^\s*\|.*\|\s*$/.test(lines[i]) &&
                !/^\x00CODEBLOCK_\d+\x00$/.test(lines[i])) {
             paraLines.push(lines[i]);
             i++;
