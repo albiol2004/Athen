@@ -1094,6 +1094,7 @@ impl AgentExecutor for DefaultExecutor {
                         },
                         Some(serde_json::json!({
                             "tool": tool_call.name,
+                            "args": tool_call.arguments,
                             "result": result.output,
                         })),
                     ),
@@ -1101,6 +1102,7 @@ impl AgentExecutor for DefaultExecutor {
                         StepStatus::Failed,
                         Some(serde_json::json!({
                             "tool": tool_call.name,
+                            "args": tool_call.arguments,
                             "error": e.to_string(),
                         })),
                     ),

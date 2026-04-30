@@ -690,6 +690,10 @@ async fn execute_owner_telegram_message(
 
     info!("Executing owner Telegram message through agent: {}", text);
 
+    // Stable id for every entry produced by this Telegram turn — user msg,
+    // tool calls, assistant reply — so the UI groups them on rehydration.
+    let turn_id = uuid::Uuid::new_v4().to_string();
+
     // Find or create an arc for this Telegram conversation.
     // Use a 5-minute time window: if there's a recent Messaging arc, reuse it.
     let target_arc_id = if let Some(store) = arc_store {
@@ -804,7 +808,12 @@ async fn execute_owner_telegram_message(
         ));
         registry = registry.with_file_gate(gate);
     }
-    let auditor = TauriAuditor::new(app_handle.clone());
+    let auditor = TauriAuditor::new(
+        app_handle.clone(),
+        arc_store.clone(),
+        target_arc_id.clone().unwrap_or_default(),
+        turn_id.clone(),
+    );
     let stream_tx = spawn_stream_forwarder(app_handle, target_arc_id.clone());
     let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -909,6 +918,7 @@ async fn execute_owner_telegram_message(
                 "user",
                 text,
                 None,
+                Some(&turn_id),
             )
             .await
         {
@@ -922,6 +932,7 @@ async fn execute_owner_telegram_message(
                 "assistant",
                 &content,
                 None,
+                Some(&turn_id),
             )
             .await
         {

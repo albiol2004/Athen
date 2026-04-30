@@ -968,6 +968,69 @@ header h1 {
 .tool-execution-card.completed { border-color: rgba(123, 201, 122, 0.18); }
 .tool-execution-card.failed    { border-color: rgba(229, 72, 77, 0.22); }
 
+/* ─── Persisted tool group (collapsible dropdown on rehydration) ─── */
+.tool-group-history {
+    margin: 8px 0;
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
+    background: var(--surface-1);
+    overflow: hidden;
+}
+.tool-group-history > summary {
+    list-style: none;
+    cursor: pointer;
+    padding: 8px 12px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    user-select: none;
+}
+.tool-group-history > summary::-webkit-details-marker { display: none; }
+.tool-group-history > summary::after {
+    content: '\025BE';
+    margin-left: auto;
+    color: var(--text-3);
+    font-size: 11px;
+    transition: transform 120ms var(--ease);
+}
+.tool-group-history[open] > summary::after { transform: rotate(180deg); }
+.tool-group-history:hover > summary { background: rgba(255, 255, 255, 0.02); }
+.tool-group-icons {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+.tool-group-icon-slot {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    color: var(--brand-warm, var(--brand-solid));
+    opacity: 0.95;
+}
+.tool-group-icon-slot.fallback {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text-3);
+    background: var(--surface-2);
+    border-radius: 3px;
+    padding: 0 3px;
+    width: auto;
+    min-width: 18px;
+}
+.tool-group-icon-slot.failed { color: var(--danger); opacity: 0.85; }
+.tool-group-icon-slot svg { display: block; width: 14px; height: 14px; }
+.tool-group-count {
+    font-size: 12px;
+    color: var(--text-3);
+}
+.tool-group-body {
+    padding: 4px 12px 12px;
+    border-top: 1px solid var(--border);
+    margin: 0;
+}
+
 /* ─── Thinking blocks ─── */
 .thinking-block {
     margin: 8px 0;

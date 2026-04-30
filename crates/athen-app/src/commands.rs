@@ -370,18 +370,22 @@ async fn judge_worth_remembering(
 /// Persist an entry to the active Arc in SQLite (fire-and-forget; errors are logged, not propagated).
 ///
 /// Also updates the arc's `updated_at` timestamp.
+///
+/// `turn_id` groups this entry with the rest of the conversation turn (user
+/// message + tool calls + assistant reply) so the UI can render them together.
 async fn persist_entry(
     state: &AppState,
     source: &str,
     content: &str,
     entry_type: &str,
     metadata: Option<serde_json::Value>,
+    turn_id: Option<&str>,
 ) {
     if let Some(ref store) = state.arc_store {
         let arc_id = state.active_arc_id.lock().await.clone();
         let et = arcs::EntryType::from_str(entry_type);
         if let Err(e) = store
-            .add_entry(&arc_id, et, source, content, metadata)
+            .add_entry(&arc_id, et, source, content, metadata, turn_id)
             .await
         {
             warn!("Failed to persist arc entry: {e}");
@@ -401,6 +405,21 @@ pub struct ArcEntryResponse {
     pub content: String,
     pub metadata: Option<serde_json::Value>,
     pub created_at: String,
+    pub turn_id: Option<String>,
+}
+
+impl From<arcs::ArcEntry> for ArcEntryResponse {
+    fn from(e: arcs::ArcEntry) -> Self {
+        Self {
+            id: e.id,
+            entry_type: e.entry_type.as_str().to_string(),
+            source: e.source,
+            content: e.content,
+            metadata: e.metadata,
+            created_at: e.created_at,
+            turn_id: e.turn_id,
+        }
+    }
 }
 
 /// Response payload returned to the frontend after processing a chat message.
@@ -438,17 +457,33 @@ pub(crate) struct AgentProgress {
     pub detail: Option<String>,
 }
 
-/// Step auditor that emits Tauri events for real-time progress in the UI.
+/// Step auditor that emits Tauri events for real-time progress in the UI and
+/// also persists each completed tool invocation to the active arc.
+///
+/// Tool calls are written one row per invocation, sharing a `turn_id` with the
+/// surrounding user/assistant messages so the frontend can group them under
+/// the assistant message that owns them.
 pub(crate) struct TauriAuditor {
     inner: InMemoryAuditor,
     app_handle: AppHandle,
+    arc_store: Option<arcs::ArcStore>,
+    arc_id: String,
+    turn_id: String,
 }
 
 impl TauriAuditor {
-    pub(crate) fn new(app_handle: AppHandle) -> Self {
+    pub(crate) fn new(
+        app_handle: AppHandle,
+        arc_store: Option<arcs::ArcStore>,
+        arc_id: String,
+        turn_id: String,
+    ) -> Self {
         Self {
             inner: InMemoryAuditor::new(),
             app_handle,
+            arc_store,
+            arc_id,
+            turn_id,
         }
     }
 
@@ -519,11 +554,47 @@ impl StepAuditor for TauriAuditor {
             "agent-progress",
             AgentProgress {
                 step: step.index + 1,
-                tool_name,
+                tool_name: tool_name.clone(),
                 status: format!("{:?}", step.status),
-                detail,
+                detail: detail.clone(),
             },
         );
+
+        // Persist completed tool invocations so the UI can rehydrate them on
+        // restart. We only write on terminal states (Completed / Failed) and
+        // only when the step carries tool metadata — InProgress events would
+        // create duplicate rows for the same invocation.
+        if matches!(
+            step.status,
+            athen_core::task::StepStatus::Completed | athen_core::task::StepStatus::Failed
+        ) {
+            if let (Some(store), Some(output)) = (self.arc_store.as_ref(), step.output.as_ref()) {
+                if let Some(tool) = output.get("tool").and_then(|t| t.as_str()) {
+                    let metadata = serde_json::json!({
+                        "tool": tool,
+                        "args": output.get("args").cloned().unwrap_or(serde_json::Value::Null),
+                        "result": output.get("result").cloned().unwrap_or(serde_json::Value::Null),
+                        "error": output.get("error").cloned().unwrap_or(serde_json::Value::Null),
+                        "status": format!("{:?}", step.status),
+                        "summary": detail,
+                    });
+                    if let Err(e) = store
+                        .add_entry(
+                            &self.arc_id,
+                            arcs::EntryType::ToolCall,
+                            "assistant",
+                            tool,
+                            Some(metadata),
+                            Some(&self.turn_id),
+                        )
+                        .await
+                    {
+                        warn!("Failed to persist tool_call entry: {e}");
+                    }
+                }
+            }
+        }
+
         self.inner.record_step(task_id, step).await
     }
 
@@ -579,6 +650,10 @@ pub async fn send_message(
     state: State<'_, AppState>,
     app_handle: AppHandle,
 ) -> std::result::Result<ChatResponse, String> {
+    // Stable id for every entry produced by this turn (user msg, tool calls,
+    // assistant reply). The frontend groups by this for the dropdown UI.
+    let turn_id = Uuid::new_v4().to_string();
+
     // Build a SenseEvent from the user's text input.
     let event = SenseEvent {
         id: Uuid::new_v4(),
@@ -758,7 +833,13 @@ pub async fn send_message(
                 .build_tool_registry(&arc_for_registry, Some(app_handle.clone()))
                 .await;
 
-            let auditor = TauriAuditor::new(app_handle.clone());
+            let auditor_arc_id = state.active_arc_id.lock().await.clone();
+            let auditor = TauriAuditor::new(
+                app_handle.clone(),
+                state.arc_store.clone(),
+                auditor_arc_id,
+                turn_id.clone(),
+            );
 
             // Set up streaming: forward LLM text chunks to the frontend
             // in real time via Tauri events, tagged with the active arc.
@@ -825,8 +906,8 @@ pub async fn send_message(
                         content: MessageContent::Text(msg.clone()),
                     });
                     drop(history);
-                    persist_entry(&state, "user", &message, "message", None).await;
-                    persist_entry(&state, "assistant", &msg, "message", None).await;
+                    persist_entry(&state, "user", &message, "message", None, Some(&turn_id)).await;
+                    persist_entry(&state, "assistant", &msg, "message", None, Some(&turn_id)).await;
                     return Ok(ChatResponse {
                         content: msg,
                         risk_level: Some("Caution".into()),
@@ -884,8 +965,16 @@ pub async fn send_message(
                     content: MessageContent::Text(content.clone()),
                 });
             }
-            persist_entry(&state, "user", &message, "message", None).await;
-            persist_entry(&state, "assistant", &content, "message", None).await;
+            persist_entry(&state, "user", &message, "message", None, Some(&turn_id)).await;
+            persist_entry(
+                &state,
+                "assistant",
+                &content,
+                "message",
+                None,
+                Some(&turn_id),
+            )
+            .await;
 
             // Reinforce memories that were actually used in the response.
             if let Some(ref memory) = state.memory {
@@ -963,6 +1052,9 @@ pub async fn approve_task(
     state: State<'_, AppState>,
     app_handle: AppHandle,
 ) -> std::result::Result<ChatResponse, String> {
+    // Stable id for the user/tool/assistant entries this approval will produce.
+    let turn_id = Uuid::new_v4().to_string();
+
     let task_uuid: Uuid = task_id
         .parse()
         .map_err(|e| format!("Invalid task ID: {e}"))?;
@@ -1062,7 +1154,13 @@ pub async fn approve_task(
             let registry = state
                 .build_tool_registry(&arc_for_registry, Some(app_handle.clone()))
                 .await;
-            let auditor = TauriAuditor::new(app_handle.clone());
+            let auditor_arc_id = state.active_arc_id.lock().await.clone();
+            let auditor = TauriAuditor::new(
+                app_handle.clone(),
+                state.arc_store.clone(),
+                auditor_arc_id,
+                turn_id.clone(),
+            );
 
             // Set up streaming for the approved task execution.
             let current_arc = state.active_arc_id.lock().await.clone();
@@ -1127,8 +1225,8 @@ pub async fn approve_task(
                         content: MessageContent::Text(msg.clone()),
                     });
                     drop(history);
-                    persist_entry(&state, "user", &message, "message", None).await;
-                    persist_entry(&state, "assistant", &msg, "message", None).await;
+                    persist_entry(&state, "user", &message, "message", None, Some(&turn_id)).await;
+                    persist_entry(&state, "assistant", &msg, "message", None, Some(&turn_id)).await;
                     return Ok(ChatResponse {
                         content: msg,
                         risk_level: Some("Caution".into()),
@@ -1184,8 +1282,16 @@ pub async fn approve_task(
                     content: MessageContent::Text(content.clone()),
                 });
             }
-            persist_entry(&state, "user", &message, "message", None).await;
-            persist_entry(&state, "assistant", &content, "message", None).await;
+            persist_entry(&state, "user", &message, "message", None, Some(&turn_id)).await;
+            persist_entry(
+                &state,
+                "assistant",
+                &content,
+                "message",
+                None,
+                Some(&turn_id),
+            )
+            .await;
 
             // Reinforce memories that were actually used in the response.
             if let Some(ref memory) = state.memory {
@@ -1305,17 +1411,7 @@ pub async fn get_arc_history(
             .load_entries(&arc_id)
             .await
             .map_err(|e| e.to_string())?;
-        return Ok(entries
-            .into_iter()
-            .map(|e| ArcEntryResponse {
-                id: e.id,
-                entry_type: e.entry_type.as_str().to_string(),
-                source: e.source,
-                content: e.content,
-                metadata: e.metadata,
-                created_at: e.created_at,
-            })
-            .collect());
+        return Ok(entries.into_iter().map(Into::into).collect());
     }
 
     // Fallback to in-memory history.
@@ -1335,6 +1431,7 @@ pub async fn get_arc_history(
                 content,
                 metadata: None,
                 created_at: String::new(),
+                turn_id: None,
             })
         })
         .collect())
@@ -1374,14 +1471,7 @@ pub async fn get_timeline_data(
                 .await
                 .map_err(|e| e.to_string())?
                 .into_iter()
-                .map(|e| ArcEntryResponse {
-                    id: e.id,
-                    entry_type: e.entry_type.as_str().to_string(),
-                    source: e.source,
-                    content: e.content,
-                    metadata: e.metadata,
-                    created_at: e.created_at,
-                })
+                .map(Into::into)
                 .collect();
             result.push(TimelineArc { meta, entries });
         }
@@ -1429,17 +1519,7 @@ pub async fn switch_arc(
             notifier.mark_arc_read(&arc_id).await;
         }
 
-        return Ok(entries
-            .into_iter()
-            .map(|e| ArcEntryResponse {
-                id: e.id,
-                entry_type: e.entry_type.as_str().to_string(),
-                source: e.source,
-                content: e.content,
-                metadata: e.metadata,
-                created_at: e.created_at,
-            })
-            .collect());
+        return Ok(entries.into_iter().map(Into::into).collect());
     }
     Ok(Vec::new())
 }

@@ -190,6 +190,7 @@ pub async fn process_sense_event(
                 source_name,
                 &entry_content,
                 Some(entry_metadata.clone()),
+                None,
             )
             .await
         {
@@ -207,7 +208,14 @@ pub async fn process_sense_event(
             &triage,
         );
         if let Err(e) = store
-            .add_entry(&arc_id, EntryType::Message, "system", &context_msg, None)
+            .add_entry(
+                &arc_id,
+                EntryType::Message,
+                "system",
+                &context_msg,
+                None,
+                None,
+            )
             .await
         {
             warn!("Failed to persist sense context message: {e}");

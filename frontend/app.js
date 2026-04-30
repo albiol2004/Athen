@@ -692,18 +692,7 @@ async function handleSwitchArc(arcId) {
 
         // Clear the chat UI and render the loaded entries.
         clearChatUI();
-        if (entries && entries.length > 0) {
-            for (const entry of entries) {
-                if (entry.entry_type === 'message') {
-                    addMessage(entry.source, entry.content);
-                } else if (entry.entry_type === 'email_event') {
-                    const meta = entry.metadata ? (typeof entry.metadata === 'string' ? JSON.parse(entry.metadata) : entry.metadata) : {};
-                    addEmailEntry(entry.content, meta);
-                } else if (entry.entry_type === 'tool_call') {
-                    addSystemEntry(entry.content, 'tool');
-                }
-            }
-        }
+        renderEntries(entries);
 
         // Update active highlight in sidebar.
         document.querySelectorAll('.session-item').forEach((el) => {
@@ -733,21 +722,8 @@ async function handleDeleteArc(arcId) {
             try {
                 const entries = await invoke('get_arc_history');
                 clearChatUI();
-                if (entries && entries.length > 0) {
-                    for (const entry of entries) {
-                        if (entry.entry_type === 'message') {
-                            addMessage(entry.source, entry.content);
-                        } else if (entry.entry_type === 'email_event') {
-                            const meta = entry.metadata ? (typeof entry.metadata === 'string' ? JSON.parse(entry.metadata) : entry.metadata) : {};
-                            addEmailEntry(entry.content, meta);
-                        } else if (entry.entry_type === 'tool_call') {
-                            addSystemEntry(entry.content, 'tool');
-                        }
-                    }
-                    arcHasMessages = true;
-                } else {
-                    arcHasMessages = false;
-                }
+                renderEntries(entries);
+                arcHasMessages = !!(entries && entries.length > 0);
             } catch (err2) {
                 console.error('Failed to load history after delete:', err2);
                 clearChatUI();
@@ -1601,18 +1577,137 @@ document.addEventListener('keydown', (e) => {
 
 // ─── History Restoration ───
 
-// Render a single history entry. Pulled out so loadHistory can stream
-// entries across idle slices instead of rendering all of them in one go.
+function parseEntryMetadata(metadata) {
+    if (!metadata) return null;
+    if (typeof metadata !== 'string') return metadata;
+    try { return JSON.parse(metadata); } catch { return null; }
+}
+
+// Group consecutive tool_call entries into a single render unit so they can
+// be displayed as one collapsible dropdown attached to the assistant
+// message of the same turn. Other entry types are rendered as before.
+function buildRenderUnits(entries) {
+    const units = [];
+    let buffer = [];
+    const flush = () => {
+        if (buffer.length > 0) {
+            units.push({ kind: 'tool_group', entries: buffer });
+            buffer = [];
+        }
+    };
+    for (const entry of entries) {
+        if (entry.entry_type === 'tool_call') {
+            buffer.push(entry);
+        } else {
+            flush();
+            units.push({ kind: 'entry', entry });
+        }
+    }
+    flush();
+    return units;
+}
+
+function renderRenderUnit(unit) {
+    if (unit.kind === 'tool_group') {
+        renderToolGroup(unit.entries);
+    } else {
+        renderHistoryEntry(unit.entry);
+    }
+}
+
+function renderEntries(entries) {
+    if (!entries) return;
+    for (const unit of buildRenderUnits(entries)) renderRenderUnit(unit);
+}
+
+// Render a collapsed group of tool_call entries: a clickable strip showing
+// each tool's icon, expanding to reveal one card per invocation with its
+// status, label, and short result summary.
+function renderToolGroup(toolCalls) {
+    if (!toolCalls || toolCalls.length === 0) return;
+
+    const details = document.createElement('details');
+    details.className = 'tool-group-history';
+
+    const summary = document.createElement('summary');
+    summary.className = 'tool-group-summary';
+
+    const icons = document.createElement('span');
+    icons.className = 'tool-group-icons';
+    for (const tc of toolCalls) {
+        const meta = parseEntryMetadata(tc.metadata) || {};
+        const toolName = meta.tool || tc.content || '';
+        const icon = builtinToolIcon(toolName);
+        const slot = document.createElement('span');
+        slot.className = 'tool-group-icon-slot';
+        slot.title = toolName;
+        if (icon) {
+            slot.innerHTML = icon;
+        } else {
+            slot.textContent = toolName.slice(0, 2);
+            slot.classList.add('fallback');
+        }
+        const status = meta.status || 'Completed';
+        if (status === 'Failed') slot.classList.add('failed');
+        icons.appendChild(slot);
+    }
+    summary.appendChild(icons);
+
+    const count = document.createElement('span');
+    count.className = 'tool-group-count';
+    count.textContent = `${toolCalls.length} tool${toolCalls.length === 1 ? '' : 's'}`;
+    summary.appendChild(count);
+
+    details.appendChild(summary);
+
+    const body = document.createElement('div');
+    body.className = 'tool-group-body tool-steps-container';
+    for (const tc of toolCalls) {
+        const meta = parseEntryMetadata(tc.metadata) || {};
+        const toolName = meta.tool || tc.content || '';
+        const status = meta.status || 'Completed';
+        const summaryText = meta.summary || '';
+        const icon = builtinToolIcon(toolName);
+
+        const card = document.createElement('div');
+        const statusClass = status === 'Completed' ? 'completed'
+                          : status === 'Failed' ? 'failed' : 'in-progress';
+        const builtinClass = icon ? ' builtin' : '';
+        card.className = `tool-execution-card ${statusClass}${builtinClass}`;
+        card.title = toolName;
+
+        const statusIcon = status === 'Completed' ? '&#10003;'
+                         : status === 'Failed' ? '&#10007;' : '&#9679;';
+        const labelText = icon ? builtinToolLabel(toolName) : toolName;
+        const iconMarkup = icon ? `<span class="tool-builtin-icon">${icon}</span>` : '';
+        let detailHtml = '';
+        if (summaryText) {
+            const truncated = summaryText.length > 80 ? summaryText.substring(0, 80) + '...' : summaryText;
+            detailHtml = `<span class="tool-detail">${escapeHtml(truncated)}</span>`;
+        }
+        card.innerHTML =
+            `<span class="tool-status-icon">${statusIcon}</span>` +
+            iconMarkup +
+            `<span class="tool-name">${escapeHtml(labelText)}</span>` +
+            detailHtml;
+        body.appendChild(card);
+    }
+    details.appendChild(body);
+
+    messagesEl.appendChild(details);
+}
+
+// Render a single non-tool-call history entry. tool_call entries should be
+// routed through renderToolGroup via buildRenderUnits, not here.
 function renderHistoryEntry(entry) {
     if (entry.entry_type === 'message') {
         addMessage(entry.source, entry.content);
     } else if (entry.entry_type === 'email_event') {
-        const meta = entry.metadata
-            ? (typeof entry.metadata === 'string' ? JSON.parse(entry.metadata) : entry.metadata)
-            : {};
+        const meta = parseEntryMetadata(entry.metadata) || {};
         addEmailEntry(entry.content, meta);
     } else if (entry.entry_type === 'tool_call') {
-        addSystemEntry(entry.content, 'tool');
+        // Fallback for callers that didn't go through buildRenderUnits.
+        renderToolGroup([entry]);
     }
 }
 
@@ -1626,23 +1721,20 @@ async function loadHistory() {
             const welcome = messagesEl.querySelector('.welcome-message');
             if (welcome) welcome.remove();
 
-            // Render the first 2 entries (above the fold) eagerly,
-            // then stream the rest across idle slices to avoid stalling
-            // the WebKit main thread on long conversations.
-            const eagerCount = Math.min(2, entries.length);
-            for (let i = 0; i < eagerCount; i++) {
-                renderHistoryEntry(entries[i]);
-            }
+            // Group tool_calls into their dropdowns up-front, then stream
+            // the units across idle slices to avoid stalling WebKit on long
+            // conversations.
+            const units = buildRenderUnits(entries);
+            const eagerCount = Math.min(2, units.length);
+            for (let i = 0; i < eagerCount; i++) renderRenderUnit(units[i]);
 
-            if (entries.length > eagerCount) {
+            if (units.length > eagerCount) {
                 let idx = eagerCount;
                 const appendChunk = () => {
-                    // Two entries per slice -- markdown render dominates cost.
-                    const end = Math.min(idx + 2, entries.length);
-                    for (; idx < end; idx++) {
-                        renderHistoryEntry(entries[idx]);
-                    }
-                    if (idx < entries.length) scheduleIdle(appendChunk);
+                    // Two units per slice — markdown render dominates cost.
+                    const end = Math.min(idx + 2, units.length);
+                    for (; idx < end; idx++) renderRenderUnit(units[idx]);
+                    if (idx < units.length) scheduleIdle(appendChunk);
                 };
                 scheduleIdle(appendChunk);
             }

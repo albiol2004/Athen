@@ -140,9 +140,14 @@ pub struct ArcEntry {
     pub content: String,
     pub metadata: Option<serde_json::Value>,
     pub created_at: String,
+    /// Groups entries that belong to the same conversation turn so the UI can
+    /// render tool_call children under their assistant message. `None` for
+    /// legacy rows written before the column existed.
+    pub turn_id: Option<String>,
 }
 
-/// SQLite-backed Arc storage.
+/// SQLite-backed Arc storage. Cheap to clone — wraps a shared connection.
+#[derive(Clone)]
 pub struct ArcStore {
     conn: Arc<Mutex<Connection>>,
 }
@@ -153,13 +158,44 @@ impl ArcStore {
         Self { conn }
     }
 
-    /// Create the arcs and arc_entries tables if they do not exist.
+    /// Create the arcs and arc_entries tables if they do not exist, and run
+    /// any column-level migrations against existing databases.
     pub async fn init_schema(&self) -> Result<()> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             conn.execute_batch(ARC_SCHEMA_SQL)
                 .map_err(|e| AthenError::Other(format!("Failed to init arc schema: {e}")))?;
+
+            // Column-level migration: `turn_id` was added so the UI can group
+            // tool_call entries under their assistant message. Older databases
+            // created before this change need the column added in place.
+            let has_turn_id: bool = conn
+                .prepare("PRAGMA table_info(arc_entries)")
+                .and_then(|mut stmt| {
+                    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+                    let mut found = false;
+                    for r in rows {
+                        if r? == "turn_id" {
+                            found = true;
+                            break;
+                        }
+                    }
+                    Ok(found)
+                })
+                .map_err(|e| AthenError::Other(format!("Inspect arc_entries cols: {e}")))?;
+            if !has_turn_id {
+                conn.execute("ALTER TABLE arc_entries ADD COLUMN turn_id TEXT", [])
+                    .map_err(|e| AthenError::Other(format!("Add turn_id column: {e}")))?;
+            }
+
+            // Index supports the rehydration query that groups by turn_id.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_arc_entries_turn ON arc_entries(turn_id)",
+                [],
+            )
+            .map_err(|e| AthenError::Other(format!("Create turn_id index: {e}")))?;
+
             Ok(())
         })
         .await
@@ -421,6 +457,10 @@ impl ArcStore {
     }
 
     /// Add an entry to an arc. Returns the entry's auto-generated ID.
+    ///
+    /// `turn_id` groups entries belonging to the same conversation turn — the
+    /// user message, the agent's tool_call entries, and the final assistant
+    /// reply all share the same UUID so the UI can collapse them together.
     pub async fn add_entry(
         &self,
         arc_id: &str,
@@ -428,6 +468,7 @@ impl ArcStore {
         source: &str,
         content: &str,
         metadata: Option<serde_json::Value>,
+        turn_id: Option<&str>,
     ) -> Result<i64> {
         let conn = self.conn.clone();
         let arc_id = arc_id.to_string();
@@ -435,13 +476,14 @@ impl ArcStore {
         let source = source.to_string();
         let content = content.to_string();
         let metadata_str = metadata.map(|v| v.to_string());
+        let turn_id = turn_id.map(|s| s.to_string());
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             let now = Utc::now().to_rfc3339();
             conn.execute(
-                "INSERT INTO arc_entries (arc_id, entry_type, source, content, metadata, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![arc_id, entry_type_str, source, content, metadata_str, now],
+                "INSERT INTO arc_entries (arc_id, entry_type, source, content, metadata, created_at, turn_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![arc_id, entry_type_str, source, content, metadata_str, now, turn_id],
             )
             .map_err(|e| AthenError::Other(format!("Add arc entry: {e}")))?;
             Ok(conn.last_insert_rowid())
@@ -458,7 +500,7 @@ impl ArcStore {
             let conn = conn.blocking_lock();
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, arc_id, entry_type, source, content, metadata, created_at \
+                    "SELECT id, arc_id, entry_type, source, content, metadata, created_at, turn_id \
                      FROM arc_entries WHERE arc_id = ?1 ORDER BY id ASC",
                 )
                 .map_err(|e| AthenError::Other(format!("Prepare load entries: {e}")))?;
@@ -475,6 +517,7 @@ impl ArcStore {
                         content: row.get(4)?,
                         metadata,
                         created_at: row.get(6)?,
+                        turn_id: row.get(7)?,
                     })
                 })
                 .map_err(|e| AthenError::Other(format!("Query load entries: {e}")))?;
@@ -764,7 +807,7 @@ mod tests {
             .unwrap();
 
         store
-            .add_entry("arc_1", EntryType::Message, "user", "Hello!", None)
+            .add_entry("arc_1", EntryType::Message, "user", "Hello!", None, None)
             .await
             .unwrap();
         store
@@ -774,11 +817,19 @@ mod tests {
                 "assistant",
                 "Running ls",
                 None,
+                None,
             )
             .await
             .unwrap();
         store
-            .add_entry("arc_1", EntryType::Message, "assistant", "Done!", None)
+            .add_entry(
+                "arc_1",
+                EntryType::Message,
+                "assistant",
+                "Done!",
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -815,7 +866,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .add_entry("arc_1", EntryType::Message, "user", "Hello", None)
+            .add_entry("arc_1", EntryType::Message, "user", "Hello", None, None)
             .await
             .unwrap();
 
@@ -877,15 +928,36 @@ mod tests {
             .unwrap();
 
         store
-            .add_entry("source", EntryType::Message, "user", "From source 1", None)
+            .add_entry(
+                "source",
+                EntryType::Message,
+                "user",
+                "From source 1",
+                None,
+                None,
+            )
             .await
             .unwrap();
         store
-            .add_entry("source", EntryType::Message, "user", "From source 2", None)
+            .add_entry(
+                "source",
+                EntryType::Message,
+                "user",
+                "From source 2",
+                None,
+                None,
+            )
             .await
             .unwrap();
         store
-            .add_entry("target", EntryType::Message, "user", "In target", None)
+            .add_entry(
+                "target",
+                EntryType::Message,
+                "user",
+                "In target",
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -950,6 +1022,7 @@ mod tests {
                 "assistant",
                 "Executed ls",
                 Some(meta.clone()),
+                None,
             )
             .await
             .unwrap();
@@ -1051,15 +1124,15 @@ mod tests {
 
         // Add entries to source
         store
-            .add_entry("src", EntryType::EmailEvent, "email", "Email 1", None)
+            .add_entry("src", EntryType::EmailEvent, "email", "Email 1", None, None)
             .await
             .unwrap();
         store
-            .add_entry("src", EntryType::EmailEvent, "email", "Email 2", None)
+            .add_entry("src", EntryType::EmailEvent, "email", "Email 2", None, None)
             .await
             .unwrap();
         store
-            .add_entry("tgt", EntryType::Message, "user", "Hello", None)
+            .add_entry("tgt", EntryType::Message, "user", "Hello", None, None)
             .await
             .unwrap();
 
@@ -1108,7 +1181,7 @@ mod tests {
             .unwrap();
 
         store
-            .add_entry("a1", EntryType::Message, "user", "Hello", None)
+            .add_entry("a1", EntryType::Message, "user", "Hello", None, None)
             .await
             .unwrap();
         store
@@ -1118,11 +1191,19 @@ mod tests {
                 "assistant",
                 "shell_execute echo hi",
                 None,
+                None,
             )
             .await
             .unwrap();
         store
-            .add_entry("a1", EntryType::EmailEvent, "email", "From: bob", None)
+            .add_entry(
+                "a1",
+                EntryType::EmailEvent,
+                "email",
+                "From: bob",
+                None,
+                None,
+            )
             .await
             .unwrap();
         store
@@ -1131,6 +1212,7 @@ mod tests {
                 EntryType::SystemEvent,
                 "system",
                 "Monitor started",
+                None,
                 None,
             )
             .await
@@ -1141,6 +1223,7 @@ mod tests {
                 EntryType::CalendarEvent,
                 "calendar",
                 "Meeting at 3pm",
+                None,
                 None,
             )
             .await
@@ -1177,6 +1260,7 @@ mod tests {
                 "email",
                 "Content",
                 Some(meta.clone()),
+                None,
             )
             .await
             .unwrap();
@@ -1203,6 +1287,7 @@ mod tests {
                 "user",
                 "Original message",
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1212,7 +1297,14 @@ mod tests {
             .await
             .unwrap();
         store
-            .add_entry("child", EntryType::Message, "user", "Branch message", None)
+            .add_entry(
+                "child",
+                EntryType::Message,
+                "user",
+                "Branch message",
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -1235,15 +1327,22 @@ mod tests {
             .await
             .unwrap();
         store
-            .add_entry("a1", EntryType::Message, "user", "Msg 1", None)
+            .add_entry("a1", EntryType::Message, "user", "Msg 1", None, None)
             .await
             .unwrap();
         store
-            .add_entry("a1", EntryType::Message, "assistant", "Msg 2", None)
+            .add_entry("a1", EntryType::Message, "assistant", "Msg 2", None, None)
             .await
             .unwrap();
         store
-            .add_entry("a1", EntryType::ToolCall, "assistant", "Tool call", None)
+            .add_entry(
+                "a1",
+                EntryType::ToolCall,
+                "assistant",
+                "Tool call",
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -1305,11 +1404,11 @@ mod tests {
             .unwrap();
 
         let id1 = store
-            .add_entry("a1", EntryType::Message, "user", "First", None)
+            .add_entry("a1", EntryType::Message, "user", "First", None, None)
             .await
             .unwrap();
         let id2 = store
-            .add_entry("a1", EntryType::Message, "user", "Second", None)
+            .add_entry("a1", EntryType::Message, "user", "Second", None, None)
             .await
             .unwrap();
 
@@ -1328,15 +1427,142 @@ mod tests {
         assert_eq!(arcs[0].entry_count, 0);
 
         store
-            .add_entry("a1", EntryType::Message, "user", "One", None)
+            .add_entry("a1", EntryType::Message, "user", "One", None, None)
             .await
             .unwrap();
         store
-            .add_entry("a1", EntryType::Message, "user", "Two", None)
+            .add_entry("a1", EntryType::Message, "user", "Two", None, None)
             .await
             .unwrap();
 
         let arcs = store.list_arcs().await.unwrap();
         assert_eq!(arcs[0].entry_count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_turn_id_grouping() {
+        let store = setup_arc_store().await;
+        store
+            .create_arc("a1", "Turn test", ArcSource::UserInput)
+            .await
+            .unwrap();
+
+        let turn = "turn-abc";
+        store
+            .add_entry(
+                "a1",
+                EntryType::Message,
+                "user",
+                "do a thing",
+                None,
+                Some(turn),
+            )
+            .await
+            .unwrap();
+        store
+            .add_entry(
+                "a1",
+                EntryType::ToolCall,
+                "assistant",
+                "shell_execute",
+                Some(serde_json::json!({"tool": "shell_execute"})),
+                Some(turn),
+            )
+            .await
+            .unwrap();
+        store
+            .add_entry(
+                "a1",
+                EntryType::Message,
+                "assistant",
+                "done",
+                None,
+                Some(turn),
+            )
+            .await
+            .unwrap();
+        store
+            .add_entry("a1", EntryType::Message, "user", "next turn", None, None)
+            .await
+            .unwrap();
+
+        let entries = store.load_entries("a1").await.unwrap();
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].turn_id.as_deref(), Some(turn));
+        assert_eq!(entries[1].turn_id.as_deref(), Some(turn));
+        assert_eq!(entries[2].turn_id.as_deref(), Some(turn));
+        assert_eq!(entries[3].turn_id, None);
+    }
+
+    /// init_schema must be idempotent and must add the `turn_id` column to a
+    /// pre-existing database that was created before the column existed.
+    #[tokio::test]
+    async fn test_turn_id_migration_on_legacy_db() {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        let conn = Arc::new(Mutex::new(conn));
+
+        // Simulate an old DB: arcs + arc_entries WITHOUT the turn_id column.
+        let conn_clone = conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let c = conn_clone.blocking_lock();
+            c.execute_batch(
+                "CREATE TABLE arcs (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'user_input',
+                    status TEXT NOT NULL DEFAULT 'active',
+                    parent_arc_id TEXT,
+                    merged_into_arc_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE arc_entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    arc_id TEXT NOT NULL,
+                    entry_type TEXT NOT NULL DEFAULT 'message',
+                    source TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    metadata TEXT,
+                    created_at TEXT NOT NULL
+                );
+                INSERT INTO arcs (id, name, source, status, created_at, updated_at)
+                  VALUES ('legacy', 'Legacy', 'user_input', 'active',
+                          '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z');
+                INSERT INTO arc_entries (arc_id, entry_type, source, content, created_at)
+                  VALUES ('legacy', 'message', 'user', 'old hello',
+                          '2025-01-01T00:00:00Z');",
+            )
+            .expect("seed legacy schema");
+        })
+        .await
+        .unwrap();
+
+        // Now run init_schema — must add the turn_id column without losing data.
+        let store = ArcStore::new(conn);
+        store.init_schema().await.expect("init migrates legacy db");
+
+        let entries = store.load_entries("legacy").await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content, "old hello");
+        assert_eq!(entries[0].turn_id, None);
+
+        // And new writes with a turn_id work end-to-end on the migrated db.
+        store
+            .add_entry(
+                "legacy",
+                EntryType::Message,
+                "user",
+                "post-migration",
+                None,
+                Some("t1"),
+            )
+            .await
+            .unwrap();
+        let entries = store.load_entries("legacy").await.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].turn_id.as_deref(), Some("t1"));
+
+        // Idempotency: running init_schema again must not error.
+        store.init_schema().await.expect("idempotent re-init");
     }
 }
