@@ -865,6 +865,24 @@ async fn execute_owner_telegram_message(
         },
     );
 
+    // Persist user msg before the executor runs so its DB id sits before any
+    // tool_call rows the auditor writes during execution.
+    if let (Some(store), Some(ref arc_id)) = (arc_store, &target_arc_id) {
+        if let Err(e) = store
+            .add_entry(
+                arc_id,
+                athen_persistence::arcs::EntryType::Message,
+                "user",
+                text,
+                None,
+                Some(&turn_id),
+            )
+            .await
+        {
+            warn!("Failed to persist owner Telegram user entry: {e}");
+        }
+    }
+
     let result = match executor.execute(task).await {
         Ok(r) => r,
         Err(e) => {
@@ -908,23 +926,9 @@ async fn execute_owner_telegram_message(
         }
     };
 
-    // Persist the user message and assistant response to the arc.
+    // Persist the assistant response. (User msg was already persisted before
+    // the executor ran.)
     if let (Some(store), Some(ref arc_id)) = (arc_store, &target_arc_id) {
-        // Persist user entry.
-        if let Err(e) = store
-            .add_entry(
-                arc_id,
-                athen_persistence::arcs::EntryType::Message,
-                "user",
-                text,
-                None,
-                Some(&turn_id),
-            )
-            .await
-        {
-            warn!("Failed to persist owner Telegram user entry: {e}");
-        }
-        // Persist assistant response.
         if let Err(e) = store
             .add_entry(
                 arc_id,

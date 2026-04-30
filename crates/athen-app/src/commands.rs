@@ -826,6 +826,12 @@ pub async fn send_message(
                 }
             }
 
+            // Persist the user message before the executor runs so its DB id
+            // sits *before* any tool_call rows the auditor writes during
+            // execution. Otherwise the rehydrated UI shows the tool group
+            // above the user bubble that triggered it.
+            persist_entry(&state, "user", &message, "message", None, Some(&turn_id)).await;
+
             // Build executor with real tool execution (same as athen-cli).
             let exec_router: Box<dyn LlmRouter> = Box::new(SharedRouter(Arc::clone(&state.router)));
             let arc_for_registry = state.active_arc_id.lock().await.clone();
@@ -906,7 +912,7 @@ pub async fn send_message(
                         content: MessageContent::Text(msg.clone()),
                     });
                     drop(history);
-                    persist_entry(&state, "user", &message, "message", None, Some(&turn_id)).await;
+                    // User msg was already persisted before the executor ran.
                     persist_entry(&state, "assistant", &msg, "message", None, Some(&turn_id)).await;
                     return Ok(ChatResponse {
                         content: msg,
@@ -965,7 +971,7 @@ pub async fn send_message(
                     content: MessageContent::Text(content.clone()),
                 });
             }
-            persist_entry(&state, "user", &message, "message", None, Some(&turn_id)).await;
+            // User msg was already persisted before the executor ran.
             persist_entry(
                 &state,
                 "assistant",
@@ -1149,6 +1155,10 @@ pub async fn approve_task(
                 }
             }
 
+            // Persist user msg before the executor runs so its DB id sits
+            // before any tool_call rows the auditor writes during execution.
+            persist_entry(&state, "user", &message, "message", None, Some(&turn_id)).await;
+
             let exec_router: Box<dyn LlmRouter> = Box::new(SharedRouter(Arc::clone(&state.router)));
             let arc_for_registry = state.active_arc_id.lock().await.clone();
             let registry = state
@@ -1225,7 +1235,7 @@ pub async fn approve_task(
                         content: MessageContent::Text(msg.clone()),
                     });
                     drop(history);
-                    persist_entry(&state, "user", &message, "message", None, Some(&turn_id)).await;
+                    // User msg was already persisted before the executor ran.
                     persist_entry(&state, "assistant", &msg, "message", None, Some(&turn_id)).await;
                     return Ok(ChatResponse {
                         content: msg,
@@ -1282,7 +1292,7 @@ pub async fn approve_task(
                     content: MessageContent::Text(content.clone()),
                 });
             }
-            persist_entry(&state, "user", &message, "message", None, Some(&turn_id)).await;
+            // User msg was already persisted before the executor ran.
             persist_entry(
                 &state,
                 "assistant",
