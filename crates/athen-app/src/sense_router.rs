@@ -55,6 +55,7 @@ pub async fn process_sense_event(
     event: &SenseEvent,
     router: &Arc<RwLock<Arc<DefaultLlmRouter>>>,
     arc_store: &Option<ArcStore>,
+    profile_store: &Option<Arc<athen_persistence::profiles::SqliteProfileStore>>,
     app_handle: &AppHandle,
     notifier: Option<&Arc<NotificationOrchestrator>>,
 ) -> bool {
@@ -148,7 +149,7 @@ pub async fn process_sense_event(
             } else {
                 let id = generate_arc_id();
                 if let Some(store) = arc_store {
-                    if let Err(e) = store.create_arc(&id, name, arc_source).await {
+                    if let Err(e) = store.create_arc(&id, name, arc_source.clone()).await {
                         warn!("Failed to create arc for sense event: {e}");
                     }
                 }
@@ -156,6 +157,20 @@ pub async fn process_sense_event(
                     "Created new arc '{}' for {} from '{}'",
                     id, source_name, sender
                 );
+
+                // Route the new arc to a profile based on its source +
+                // content. Best-effort: any failure here just leaves the arc
+                // on the seeded default profile.
+                route_new_arc_to_profile(
+                    arc_store.as_ref(),
+                    profile_store.as_ref(),
+                    &id,
+                    arc_source.as_str(),
+                    summary,
+                    &body_text,
+                )
+                .await;
+
                 id
             }
         }
@@ -472,6 +487,67 @@ fn find_recent_arc_from_source(
             }
         })
         .map(|a| a.id.clone())
+}
+
+/// Best-effort: classify a freshly-created arc and assign the
+/// best-matching `AgentProfile` to it. Any failure (no profile store, lookup
+/// error, no positive match) leaves the arc on the default profile —
+/// today's behavior, fail-open.
+///
+/// We pass `summary + body_text` to the classifier so keyword matching has
+/// real content. The arc's source channel is the strongest signal and
+/// drives the domain tag directly.
+async fn route_new_arc_to_profile(
+    arc_store: Option<&ArcStore>,
+    profile_store: Option<&Arc<athen_persistence::profiles::SqliteProfileStore>>,
+    arc_id: &str,
+    source: &str,
+    summary: &str,
+    body_text: &str,
+) {
+    use athen_core::profile_routing::{classify_task, pick_profile};
+    use athen_core::traits::profile::ProfileStore;
+
+    let (Some(astore), Some(pstore)) = (arc_store, profile_store) else {
+        return;
+    };
+
+    // Classify from source + (summary, body) concatenated.
+    let combined_text = format!("{summary}\n{body_text}");
+    let classified = classify_task(Some(source), &combined_text);
+
+    // Fetch all profiles. If only the default exists, there's nothing to
+    // route to — leave the arc on default (None).
+    let profiles = match pstore.list_profiles().await {
+        Ok(list) => list,
+        Err(e) => {
+            warn!("Profile router: list_profiles failed: {e}");
+            return;
+        }
+    };
+    if profiles.iter().filter(|p| p.id != athen_core::agent_profile::AgentProfile::DEFAULT_ID).count() == 0 {
+        return;
+    }
+
+    let Some(decision) = pick_profile(&classified, &profiles) else {
+        info!(
+            "Profile router: no positive match for arc {arc_id} (source={source}); \
+             leaving on default"
+        );
+        return;
+    };
+
+    info!(
+        "Profile router: arc {} → profile {} (score {}, {})",
+        arc_id, decision.profile_id, decision.score, decision.reason
+    );
+
+    if let Err(e) = astore
+        .set_active_profile_id(arc_id, Some(&decision.profile_id))
+        .await
+    {
+        warn!("Profile router: set_active_profile_id failed: {e}");
+    }
 }
 
 pub(crate) fn format_entry_content(sender: &str, subject: &str, body: &str) -> String {

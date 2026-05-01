@@ -2303,6 +2303,46 @@ pub async fn merge_arcs(
 }
 
 // ---------------------------------------------------------------------------
+// Agent profile commands
+// ---------------------------------------------------------------------------
+
+/// List every `AgentProfile` known to the system, built-ins first.
+///
+/// The seeded `default` profile always appears, followed by any
+/// user-authored profiles. UI uses this to populate the per-arc profile
+/// picker.
+#[tauri::command]
+pub async fn list_agent_profiles(
+    state: State<'_, AppState>,
+) -> std::result::Result<Vec<athen_core::agent_profile::AgentProfile>, String> {
+    use athen_core::traits::profile::ProfileStore;
+    let Some(store) = state.profile_store.as_ref() else {
+        return Ok(Vec::new());
+    };
+    store.list_profiles().await.map_err(|e| e.to_string())
+}
+
+/// Set the agent profile this arc runs under.
+///
+/// Pass `None` (or omit the field) to clear the override and fall back to
+/// the seeded default profile. The change is durable — subsequent tasks in
+/// the arc run under the new profile.
+#[tauri::command]
+pub async fn set_arc_profile(
+    arc_id: String,
+    profile_id: Option<String>,
+    state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    let Some(arc_store) = state.arc_store.as_ref() else {
+        return Err("Arc store not available".into());
+    };
+    arc_store
+        .set_active_profile_id(&arc_id, profile_id.as_deref())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
 // Calendar commands
 // ---------------------------------------------------------------------------
 

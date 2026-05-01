@@ -495,6 +495,7 @@ impl AppState {
         let email_config = config.clone();
         let router = Arc::clone(&self.router);
         let arc_store_ref = self._database.as_ref().map(|db| db.arc_store());
+        let profile_store_ref = self.profile_store.clone();
         let notifier = self.notifier.clone();
 
         tauri::async_runtime::spawn(async move {
@@ -516,6 +517,7 @@ impl AppState {
                                 &event,
                                 &router,
                                 &arc_store_ref,
+                                &profile_store_ref,
                                 &app_handle,
                                 notifier.as_ref(),
                             )
@@ -558,6 +560,7 @@ impl AppState {
         let config = load_config();
         let router = Arc::clone(&self.router);
         let arc_store_ref = self._database.as_ref().map(|db| db.arc_store());
+        let profile_store_ref = self.profile_store.clone();
         let notifier = self.notifier.clone();
 
         tauri::async_runtime::spawn(async move {
@@ -581,6 +584,7 @@ impl AppState {
                                 &event,
                                 &router,
                                 &arc_store_ref,
+                                &profile_store_ref,
                                 &app_handle,
                                 notifier.as_ref(),
                             )
@@ -633,6 +637,7 @@ impl AppState {
         let telegram_config = config.clone();
         let router = Arc::clone(&self.router);
         let arc_store_ref = self._database.as_ref().map(|db| db.arc_store());
+        let profile_store_ref = self.profile_store.clone();
         let calendar_store_ref = self.calendar_store.clone();
         let contact_store_ref = self.contact_store.clone();
         let memory_ref = self.memory.clone();
@@ -739,6 +744,7 @@ impl AppState {
                                     event,
                                     &router,
                                     &arc_store_ref,
+                                    &profile_store_ref,
                                     &app_handle,
                                     notifier.as_ref(),
                                 )

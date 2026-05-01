@@ -98,6 +98,8 @@ pub fn run() {
             commands::add_global_grant,
             commands::revoke_arc_grant,
             commands::revoke_global_grant,
+            commands::list_agent_profiles,
+            commands::set_arc_profile,
         ])
         .setup(|app| {
             use tauri::Manager;
