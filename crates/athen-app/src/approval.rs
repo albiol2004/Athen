@@ -203,6 +203,19 @@ impl TelegramApprovalSink {
     /// the question is unknown — otherwise the user's button would
     /// stay in a loading state forever. The most common unknown-id case
     /// is "another channel won the race", which is healthy.
+    /// The chat_id this sink posts approvals to. Lets the caller know
+    /// where to send a follow-up reply once the approved task finishes.
+    pub fn chat_id(&self) -> i64 {
+        self.chat_id
+    }
+
+    /// The bot token configured for this sink. Lets the caller send a
+    /// follow-up reply through the same Telegram bot the approval was
+    /// asked on, without having to re-load config.
+    pub fn bot_token(&self) -> &str {
+        &self.bot_token
+    }
+
     pub async fn resolve_callback(
         &self,
         callback_id: &str,

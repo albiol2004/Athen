@@ -5,10 +5,11 @@
 //! Configuration is loaded from TOML files (`~/.athen/` or `./config/`)
 //! with environment variable overrides.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use uuid::Uuid;
 
 use async_trait::async_trait;
 use serde::Serialize;
@@ -77,9 +78,17 @@ pub struct PendingApproval {
     pub risk_level: String,
 }
 
+/// In-flight approval task ids: a task is inserted when its execution
+/// helper starts and removed when it finishes. Both `approve_task` (the
+/// in-app Tauri command) and `spawn_router_approval` (the Telegram path)
+/// race to drive execution after a risk-flagged task is approved; without
+/// a guard the same approval would execute twice — once for each channel.
+/// First caller to insert wins, the other no-ops.
+pub type InflightApprovals = Arc<Mutex<HashSet<Uuid>>>;
+
 /// Top-level application state managed by Tauri.
 pub struct AppState {
-    pub coordinator: Coordinator,
+    pub coordinator: Arc<Coordinator>,
     /// The LLM router, wrapped in `RwLock` so it can be swapped at runtime
     /// when the user switches active provider.
     pub router: Arc<RwLock<Arc<DefaultLlmRouter>>>,
@@ -159,6 +168,8 @@ pub struct AppState {
     // Workaround: process group leadership + parent-death signal would be
     // a cleaner OS-level fix than wiring a custom Drop.
     pub spawned_processes: athen_agent::SpawnedProcessMap,
+    /// Approvals currently being executed. See [`InflightApprovals`].
+    pub inflight_approvals: InflightApprovals,
 }
 
 impl AppState {
@@ -219,7 +230,7 @@ impl AppState {
             Arc::new(Mutex::new(HashMap::new()));
 
         let state = Self {
-            coordinator,
+            coordinator: Arc::new(coordinator),
             router,
             active_provider_id: Mutex::new(active_id),
             history: Mutex::new(history),
@@ -247,6 +258,7 @@ impl AppState {
             grant_store,
             pending_grants,
             spawned_processes,
+            inflight_approvals: Arc::new(Mutex::new(HashSet::new())),
         };
 
         if let Err(e) = state.refresh_tools_doc().await {
@@ -1158,7 +1170,7 @@ async fn execute_owner_telegram_message(
 ///
 /// Tools are de-duplicated in order of first appearance, with a `×N` suffix
 /// for repeated invocations, e.g. `Tools used: shell_execute ×3, read`.
-fn build_telegram_tools_footer(tool_log: &crate::commands::ToolLog) -> String {
+pub(crate) fn build_telegram_tools_footer(tool_log: &crate::commands::ToolLog) -> String {
     let names = match tool_log.lock() {
         Ok(g) => g.clone(),
         Err(_) => return String::new(),
@@ -1195,7 +1207,7 @@ fn build_telegram_tools_footer(tool_log: &crate::commands::ToolLog) -> String {
 /// Send a text message to a Telegram chat via the Bot API.
 ///
 /// Delegates to [`athen_sentidos::telegram::send_message`].
-async fn send_telegram_reply(
+pub(crate) async fn send_telegram_reply(
     bot_token: &str,
     chat_id: i64,
     text: &str,

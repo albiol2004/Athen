@@ -57,24 +57,44 @@ fn spawn_router_approval(
     };
     // Skip if there's no Telegram sink — nothing extra to gain over the
     // in-app card the frontend is already showing.
-    if state.telegram_approval_sink.is_none() {
+    let Some(telegram_sink) = state.telegram_approval_sink.clone() else {
         return;
-    }
+    };
 
     let arc_id = state.active_arc_id.try_lock().map(|g| g.clone()).ok();
     let app_handle = app_handle.clone();
 
+    // Clone every AppState bit the helper would need, so the bg task can
+    // drive execution without borrowing `&AppState`.
+    let bg_ctx = ApprovedTaskBgCtx {
+        coordinator: Arc::clone(&state.coordinator),
+        router_arc: Arc::clone(&state.router),
+        arc_store: state.arc_store.clone(),
+        calendar_store: state.calendar_store.clone(),
+        contact_store: state.contact_store.clone(),
+        memory: state.memory.clone(),
+        mcp: Arc::clone(&state.mcp),
+        tool_doc_dir: state.tool_doc_dir.clone(),
+        grant_store: state.grant_store.clone(),
+        pending_grants: state.pending_grants.clone(),
+        spawned_processes: state.spawned_processes.clone(),
+        telegram_sink: telegram_sink.clone(),
+        cancel_flag: Arc::clone(&state.cancel_flag),
+        active_arc_id: arc_id.clone().unwrap_or_default(),
+        inflight: state.inflight_approvals.clone(),
+    };
+
     tauri::async_runtime::spawn(async move {
         let prompt = format!("Action requires approval (risk {risk_score:.0}, {risk_level}).");
-        let description = if description.is_empty() {
+        let description_opt = if description.is_empty() {
             None
         } else {
-            Some(description)
+            Some(description.clone())
         };
         let question = ApprovalQuestion {
             id: Uuid::new_v4(),
             prompt,
-            description,
+            description: description_opt,
             choices: vec![
                 athen_core::approval::ApprovalChoice::approve(),
                 athen_core::approval::ApprovalChoice::deny(),
@@ -113,11 +133,125 @@ fn spawn_router_approval(
             choice = %answer.choice_key,
             "Approval resolved via router"
         );
-        // Note: actual task execution still flows through the existing
-        // approve_task Tauri command. Driving execution end-to-end from
-        // a Telegram-only answer is a separate follow-up — for now the
-        // event above is what the frontend uses to fast-path the user.
+
+        if !approved {
+            // Deny path: tell the coordinator, no execution.
+            // The in-app `approve_task` IPC handler does the same when the
+            // user taps Deny in the UI; the inflight guard in
+            // execute_approved_task isn't relevant here because we never
+            // call it on the deny branch.
+            if let Err(e) = bg_ctx.coordinator.deny_task(task_id).await {
+                tracing::debug!(
+                    task_id = %task_id,
+                    "Coordinator deny_task failed (likely already denied via in-app): {e}"
+                );
+            }
+            return;
+        }
+
+        // Approved → drive execution end-to-end so the user doesn't need
+        // the desktop UI to be open. The inflight guard inside
+        // execute_approved_task ensures we no-op cleanly if the in-app
+        // IPC `approve_task` already started this task.
+        let turn_id = Uuid::new_v4().to_string();
+        let ctx = ApprovedTaskCtx {
+            coordinator: bg_ctx.coordinator,
+            router: bg_ctx.router_arc,
+            arc_store: bg_ctx.arc_store,
+            calendar_store: bg_ctx.calendar_store,
+            contact_store: bg_ctx.contact_store,
+            memory: bg_ctx.memory,
+            mcp: bg_ctx.mcp,
+            tool_doc_dir: bg_ctx.tool_doc_dir,
+            grant_store: bg_ctx.grant_store,
+            pending_grants: bg_ctx.pending_grants,
+            spawned_processes: bg_ctx.spawned_processes,
+            telegram_approval_sink: Some(bg_ctx.telegram_sink.clone()),
+            cancel_flag: bg_ctx.cancel_flag,
+            active_arc_id: bg_ctx.active_arc_id,
+            inflight: bg_ctx.inflight,
+            app_handle: app_handle.clone(),
+            turn_id,
+            // Bg path doesn't have access to the stashed pending_message
+            // (that lives on `&AppState` and only the IPC handler can take
+            // it). Falling back to the coordinator task description is
+            // what the IPC path also does when nothing is stashed.
+            message_override: if description.is_empty() {
+                None
+            } else {
+                Some(description)
+            },
+        };
+
+        let outcome = match execute_approved_task(task_id, ctx).await {
+            Ok(Some(o)) => o,
+            Ok(None) => {
+                // In-app path won the race; the user already sees the
+                // result there. Nothing left to do for the bg path.
+                return;
+            }
+            Err(e) => {
+                tracing::error!(
+                    task_id = %task_id,
+                    "Background approved-task execution failed: {e}"
+                );
+                // Surface the failure on Telegram so the user isn't left
+                // wondering why the bot went silent after they tapped
+                // Approve.
+                let chat_id = telegram_sink.chat_id();
+                let token = telegram_sink.bot_token().to_string();
+                let msg = format!("Sorry, the approved task failed: {e}");
+                if let Err(e2) =
+                    crate::state::send_telegram_reply(&token, chat_id, &msg).await
+                {
+                    tracing::warn!("Failed to send Telegram failure notice: {e2}");
+                }
+                return;
+            }
+        };
+
+        // Reply on Telegram with the result (plus a "Tools used" footer when
+        // the agent ran any). The reply is unconditional from the bg path —
+        // even when the in-app UI is open, the user just answered through
+        // Telegram, so closing the loop on the same channel is the right
+        // UX. (If they answered in-app, the inflight guard above already
+        // returned None and we never get here.)
+        let chat_id = telegram_sink.chat_id();
+        let token = telegram_sink.bot_token().to_string();
+        let footer = crate::state::build_telegram_tools_footer(&outcome.tool_log);
+        let outbound = if footer.is_empty() {
+            outcome.content.clone()
+        } else {
+            format!("{}\n\n{}", outcome.content, footer)
+        };
+        if let Err(e) = crate::state::send_telegram_reply(&token, chat_id, &outbound).await {
+            tracing::warn!(
+                task_id = %task_id,
+                "Failed to send Telegram approved-task reply: {e}"
+            );
+        }
     });
+}
+
+/// Bag-of-fields used to ferry `AppState` bits into the bg approval
+/// waiter. Cheaper to pass than reaching for AppState through Tauri's
+/// `State<'_, AppState>` (which isn't `'static`).
+struct ApprovedTaskBgCtx {
+    coordinator: Arc<athen_coordinador::Coordinator>,
+    router_arc: Arc<tokio::sync::RwLock<Arc<athen_llm::router::DefaultLlmRouter>>>,
+    arc_store: Option<athen_persistence::arcs::ArcStore>,
+    calendar_store: Option<athen_persistence::calendar::CalendarStore>,
+    contact_store: Option<athen_persistence::contacts::SqliteContactStore>,
+    memory: Option<Arc<athen_memory::Memory>>,
+    mcp: Arc<athen_mcp::McpRegistry>,
+    tool_doc_dir: Option<std::path::PathBuf>,
+    grant_store: Option<Arc<athen_persistence::grants::GrantStore>>,
+    pending_grants: crate::file_gate::PendingGrants,
+    spawned_processes: athen_agent::SpawnedProcessMap,
+    telegram_sink: Arc<crate::approval::TelegramApprovalSink>,
+    cancel_flag: Arc<std::sync::atomic::AtomicBool>,
+    active_arc_id: String,
+    inflight: crate::state::InflightApprovals,
 }
 
 /// Convert a raw technical error string into a user-friendly message.
@@ -1246,8 +1380,177 @@ pub async fn approve_task(
         });
     }
 
+    // Take the stashed pending_message (if any) and let the helper resolve
+    // a fallback from the coordinator task description.
+    let message_override = state.pending_message.lock().await.take();
+
+    let active_arc = state.active_arc_id.lock().await.clone();
+
+    let ctx = ApprovedTaskCtx {
+        coordinator: Arc::clone(&state.coordinator),
+        router: Arc::clone(&state.router),
+        arc_store: state.arc_store.clone(),
+        calendar_store: state.calendar_store.clone(),
+        contact_store: state.contact_store.clone(),
+        memory: state.memory.clone(),
+        mcp: Arc::clone(&state.mcp),
+        tool_doc_dir: state.tool_doc_dir.clone(),
+        grant_store: state.grant_store.clone(),
+        pending_grants: state.pending_grants.clone(),
+        spawned_processes: state.spawned_processes.clone(),
+        telegram_approval_sink: state.telegram_approval_sink.clone(),
+        cancel_flag: Arc::clone(&state.cancel_flag),
+        active_arc_id: active_arc,
+        inflight: state.inflight_approvals.clone(),
+        app_handle: app_handle.clone(),
+        turn_id: turn_id.clone(),
+        message_override,
+    };
+
+    let outcome = match execute_approved_task(task_uuid, ctx).await {
+        Ok(Some(o)) => o,
+        // The other channel (Telegram) already drove this task to completion
+        // — nothing to return to the UI; fast-path a placeholder so the
+        // frontend's pending card clears.
+        Ok(None) => {
+            return Ok(ChatResponse {
+                content: "Task already handled via another channel.".into(),
+                risk_level: Some("Safe".into()),
+                domain: None,
+                tool_calls: vec![],
+                pending_approval: None,
+            });
+        }
+        Err(e) => return Err(e),
+    };
+
+    // Mirror the legacy in-app behaviour: append both the user msg and the
+    // assistant reply to the in-memory UI history. The bg path skips this.
+    {
+        let mut history = state.history.lock().await;
+        history.push(ChatMessage {
+            role: Role::User,
+            content: MessageContent::Text(outcome.message.clone()),
+        });
+        history.push(ChatMessage {
+            role: Role::Assistant,
+            content: MessageContent::Text(outcome.content.clone()),
+        });
+    }
+
+    Ok(ChatResponse {
+        content: outcome.content,
+        risk_level: Some(if outcome.success { "Safe" } else { "Caution" }.into()),
+        domain: Some(format!("{:?}", outcome.domain)),
+        tool_calls: vec![],
+        pending_approval: None,
+    })
+}
+
+
+/// Outcome of [`execute_approved_task`]. The caller decides how to surface
+/// `content`/`success`/`domain` (UI response, Telegram reply, …).
+pub(crate) struct ApprovedTaskOutcome {
+    pub content: String,
+    pub success: bool,
+    pub domain: DomainType,
+    /// The user message that was actually executed (resolved from the
+    /// stashed `pending_message` or the task description). Useful for
+    /// callers that want to mutate UI history.
+    pub message: String,
+    /// The chat-history snapshot fed into the executor, including any
+    /// memory injection. Callers use this to drive `reinforce_used_memories`.
+    #[allow(dead_code)]
+    pub context_snapshot: Vec<ChatMessage>,
+    /// Tools the agent actually ran. The Telegram-reply path uses this to
+    /// build the "Tools used: …" footer.
+    pub tool_log: ToolLog,
+}
+
+/// Inputs for [`execute_approved_task`]. Bundled into a struct because the
+/// helper needs ~15 fields and a positional signature is unreadable.
+///
+/// All references are owned/Arc-cloned so the helper can be invoked from a
+/// `tauri::async_runtime::spawn` closure without borrowing `&AppState`.
+pub(crate) struct ApprovedTaskCtx {
+    pub coordinator: Arc<athen_coordinador::Coordinator>,
+    pub router: Arc<tokio::sync::RwLock<Arc<athen_llm::router::DefaultLlmRouter>>>,
+    pub arc_store: Option<athen_persistence::arcs::ArcStore>,
+    pub calendar_store: Option<athen_persistence::calendar::CalendarStore>,
+    pub contact_store: Option<athen_persistence::contacts::SqliteContactStore>,
+    pub memory: Option<Arc<athen_memory::Memory>>,
+    pub mcp: Arc<athen_mcp::McpRegistry>,
+    pub tool_doc_dir: Option<std::path::PathBuf>,
+    pub grant_store: Option<Arc<athen_persistence::grants::GrantStore>>,
+    pub pending_grants: crate::file_gate::PendingGrants,
+    pub spawned_processes: athen_agent::SpawnedProcessMap,
+    pub telegram_approval_sink: Option<Arc<crate::approval::TelegramApprovalSink>>,
+    pub cancel_flag: Arc<std::sync::atomic::AtomicBool>,
+    pub active_arc_id: String,
+    pub inflight: crate::state::InflightApprovals,
+    pub app_handle: AppHandle,
+    pub turn_id: String,
+    /// User message override (typically the stashed `pending_message`); the
+    /// helper falls back to the coordinator task description when None.
+    pub message_override: Option<String>,
+}
+
+/// Drive a risk-flagged task all the way through approval, dispatch,
+/// executor build, execution, persistence, and memory reinforcement.
+///
+/// Returns `Ok(None)` when another channel already started executing this
+/// task (the inflight guard caught the second caller) — see
+/// [`crate::state::InflightApprovals`] for the dedup contract.
+///
+/// Does **not** mutate `AppState::history` (the in-memory UI history).
+/// Foreground callers can append to history themselves after this returns;
+/// background callers (Telegram path) intentionally skip that step because
+/// when the UI is closed the in-memory history is irrelevant — the SQLite
+/// arc is the source of truth on next load.
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn execute_approved_task(
+    task_uuid: Uuid,
+    ctx: ApprovedTaskCtx,
+) -> std::result::Result<Option<ApprovedTaskOutcome>, String> {
+    use athen_core::traits::agent::AgentExecutor;
+
+    // Dedup against the parallel approval channel. Whichever caller (in-app
+    // IPC or router-spawned bg waiter) inserts first owns this approval;
+    // the other no-ops cleanly. Without this both channels would race the
+    // coordinator + executor, double-charging the user and posting two
+    // assistant replies.
+    {
+        let mut inflight = ctx.inflight.lock().await;
+        if !inflight.insert(task_uuid) {
+            tracing::debug!(
+                task_id = %task_uuid,
+                "Skipping approved-task execution: already running on another channel"
+            );
+            return Ok(None);
+        }
+    }
+
+    // RAII-ish: ensure we always remove from the inflight set on exit.
+    struct InflightGuard {
+        set: crate::state::InflightApprovals,
+        task_id: Uuid,
+    }
+    impl Drop for InflightGuard {
+        fn drop(&mut self) {
+            let set = self.set.clone();
+            let id = self.task_id;
+            tokio::spawn(async move {
+                set.lock().await.remove(&id);
+            });
+        }
+    }
+    let _guard = InflightGuard {
+        set: ctx.inflight.clone(),
+        task_id: task_uuid,
+    };
+
     // Approve the task: move it to Pending and enqueue.
-    let approved_task = state
+    let approved_task = ctx
         .coordinator
         .approve_task(task_uuid)
         .await
@@ -1257,274 +1560,356 @@ pub async fn approve_task(
             format_user_error(&raw)
         })?;
 
-    // Retrieve the stashed user message for execution context.
-    let message = state
-        .pending_message
-        .lock()
-        .await
-        .take()
+    let message = ctx
+        .message_override
+        .clone()
         .unwrap_or_else(|| approved_task.description.clone());
 
     // Dispatch the now-enqueued task.
-    match state.coordinator.dispatch_next().await {
-        Ok(Some((coord_task_id, _))) => {
-            let mut context = state.history.lock().await.clone();
-
-            // Auto-inject relevant memories into context.
-            if let Some(ref memory) = state.memory {
-                let mut all_items = Vec::new();
-                let mut seen_ids = std::collections::HashSet::new();
-
-                if let Ok(items) = memory.recall(&message, 5).await {
-                    for item in items {
-                        if seen_ids.insert(item.id.clone()) {
-                            all_items.push(item);
-                        }
-                    }
-                }
-                let key_terms = extract_key_terms(&message);
-                for term in &key_terms {
-                    if let Ok(items) = memory.recall(term, 3).await {
-                        for item in items {
-                            if seen_ids.insert(item.id.clone()) {
-                                all_items.push(item);
-                            }
-                        }
-                    }
-                }
-                all_items.truncate(5);
-
-                if !all_items.is_empty() {
-                    tracing::info!(
-                        count = all_items.len(),
-                        "Injecting relevant memories into approved task context"
-                    );
-                    let memory_text = all_items
-                        .iter()
-                        .map(|m| format!("- {}", m.content))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    context.insert(
-                        0,
-                        ChatMessage {
-                            role: Role::System,
-                            content: MessageContent::Text(format!(
-                                "Relevant information from your memory:\n{memory_text}"
-                            )),
-                        },
-                    );
-                }
-            }
-
-            // Persist user msg before the executor runs so its DB id sits
-            // before any tool_call rows the auditor writes during execution.
-            persist_entry(&state, "user", &message, "message", None, Some(&turn_id)).await;
-
-            let exec_router: Box<dyn LlmRouter> = Box::new(SharedRouter(Arc::clone(&state.router)));
-            let arc_for_registry = state.active_arc_id.lock().await.clone();
-            let registry = state
-                .build_tool_registry(&arc_for_registry, Some(app_handle.clone()))
-                .await;
-            let auditor_arc_id = state.active_arc_id.lock().await.clone();
-            let auditor = TauriAuditor::new(
-                app_handle.clone(),
-                state.arc_store.clone(),
-                auditor_arc_id,
-                turn_id.clone(),
-                new_tool_log(),
-            );
-
-            // Set up streaming for the approved task execution.
-            let current_arc = state.active_arc_id.lock().await.clone();
-            let stream_tx = spawn_stream_forwarder(&app_handle, Some(current_arc));
-
-            // Reset and wire the cancellation flag.
-            let cancel_flag = Arc::clone(&state.cancel_flag);
-            cancel_flag.store(false, Ordering::Relaxed);
-
-            // Snapshot context for post-response reinforcement.
-            let context_snapshot = context.clone();
-
-            let mut builder = AgentBuilder::new()
-                .llm_router(exec_router)
-                .tool_registry(Box::new(registry))
-                .auditor(Box::new(auditor))
-                .max_steps(50)
-                .timeout(Duration::from_secs(300))
-                .context_messages(context)
-                .stream_sender(stream_tx)
-                .cancel_flag(cancel_flag);
-            if let Some(p) = state.tool_doc_dir.clone() {
-                builder = builder.tool_doc_dir(p);
-            }
-            let executor = builder.build().map_err(|e| {
-                let raw = e.to_string();
-                tracing::error!("AgentBuilder failed (approval): {raw}");
-                format_user_error(&raw)
-            })?;
-
-            let task = Task {
-                id: Uuid::new_v4(),
-                created_at: chrono::Utc::now(),
-                updated_at: chrono::Utc::now(),
-                source_event: None,
+    let coord_task_id = match ctx.coordinator.dispatch_next().await {
+        Ok(Some((id, _))) => id,
+        Ok(None) => {
+            return Ok(Some(ApprovedTaskOutcome {
+                content: "Task approved but no agent is available. Please try again.".into(),
+                success: false,
                 domain: approved_task.domain.clone(),
-                description: message.clone(),
-                priority: approved_task.priority,
-                status: TaskStatus::InProgress,
-                risk_score: approved_task.risk_score.clone(),
-                risk_budget: approved_task.risk_budget,
-                risk_used: approved_task.risk_used,
-                assigned_agent: None,
-                steps: vec![],
-                deadline: None,
-            };
-
-            let result = match executor.execute(task).await {
-                Ok(r) => r,
-                Err(e) => {
-                    let _ = state.coordinator.complete_task(coord_task_id).await;
-                    let raw = e.to_string();
-                    tracing::error!("Agent execution failed after approval: {raw}");
-                    let msg = format_user_error(&raw);
-                    let mut history = state.history.lock().await;
-                    history.push(ChatMessage {
-                        role: Role::User,
-                        content: MessageContent::Text(message.clone()),
-                    });
-                    history.push(ChatMessage {
-                        role: Role::Assistant,
-                        content: MessageContent::Text(msg.clone()),
-                    });
-                    drop(history);
-                    // User msg was already persisted before the executor ran.
-                    persist_entry(&state, "assistant", &msg, "message", None, Some(&turn_id)).await;
-                    return Ok(ChatResponse {
-                        content: msg,
-                        risk_level: Some("Caution".into()),
-                        domain: Some(format!("{:?}", approved_task.domain)),
-                        tool_calls: vec![],
-                        pending_approval: None,
-                    });
-                }
-            };
-
-            let content = if !result.success {
-                let reason = result
-                    .output
-                    .as_ref()
-                    .and_then(|o| o.get("reason"))
-                    .and_then(|r| r.as_str())
-                    .unwrap_or("unknown");
-                if reason == "cancelled" {
-                    "Task cancelled by user.".to_string()
-                } else {
-                    format!(
-                        "I ran out of steps ({} used) before finishing. Try a simpler request.",
-                        result.steps_completed
-                    )
-                }
-            } else {
-                let text = result
-                    .output
-                    .as_ref()
-                    .and_then(|o| o.get("response"))
-                    .and_then(|r| r.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if text.is_empty() {
-                    result
-                        .output
-                        .as_ref()
-                        .map(|o| serde_json::to_string_pretty(o).unwrap_or_default())
-                        .unwrap_or_else(|| "Task completed.".to_string())
-                } else {
-                    text
-                }
-            };
-
-            {
-                let mut history = state.history.lock().await;
-                history.push(ChatMessage {
-                    role: Role::User,
-                    content: MessageContent::Text(message.clone()),
-                });
-                history.push(ChatMessage {
-                    role: Role::Assistant,
-                    content: MessageContent::Text(content.clone()),
-                });
-            }
-            // User msg was already persisted before the executor ran.
-            persist_entry(
-                &state,
-                "assistant",
-                &content,
-                "message",
-                None,
-                Some(&turn_id),
-            )
-            .await;
-
-            // Reinforce memories that were actually used in the response.
-            if let Some(ref memory) = state.memory {
-                reinforce_used_memories(memory, &context_snapshot, &content).await;
-            }
-
-            // Auto-remember with LLM judge (same as send_message).
-            if let Some(ref memory) = state.memory {
-                let router = SharedRouter(Arc::clone(&state.router));
-                let arc_id = state.active_arc_id.lock().await.clone();
-                let msg_clone = message.clone();
-                let content_clone = content.clone();
-                let memory_clone = Arc::clone(memory);
-
-                tokio::spawn(async move {
-                    match judge_worth_remembering(&router, &msg_clone, &content_clone).await {
-                        Some(summary) => {
-                            tracing::info!("Memory judge: worth remembering (approved task)");
-                            let item = athen_core::traits::memory::MemoryItem {
-                                id: uuid::Uuid::new_v4().to_string(),
-                                content: summary,
-                                metadata: serde_json::json!({
-                                    "source": "conversation",
-                                    "arc_id": arc_id,
-                                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                                }),
-                            };
-                            if let Err(e) = memory_clone.remember(item).await {
-                                tracing::warn!("Failed to remember interaction: {e}");
-                            }
-                        }
-                        None => {
-                            tracing::debug!("Memory judge: not worth remembering (approved task)");
-                        }
-                    }
-                });
-            }
-
-            let _ = state.coordinator.complete_task(coord_task_id).await;
-
-            Ok(ChatResponse {
-                content,
-                risk_level: Some(if result.success { "Safe" } else { "Caution" }.into()),
-                domain: Some(format!("{:?}", approved_task.domain)),
-                tool_calls: vec![],
-                pending_approval: None,
-            })
+                message,
+                context_snapshot: vec![],
+                tool_log: new_tool_log(),
+            }));
         }
-        Ok(None) => Ok(ChatResponse {
-            content: "Task approved but no agent is available. Please try again.".into(),
-            risk_level: Some("Caution".into()),
-            domain: None,
-            tool_calls: vec![],
-            pending_approval: None,
-        }),
         Err(e) => {
             let raw = e.to_string();
             tracing::error!("Dispatch failed (approval): {raw}");
-            Err(format_user_error(&raw))
+            return Err(format_user_error(&raw));
+        }
+    };
+
+    // Build context (history from arc + injected memories). We can't reach
+    // the in-memory `state.history` from here (the bg path doesn't own
+    // `&AppState`), so we rebuild from SQLite — the arc is authoritative.
+    let mut context: Vec<ChatMessage> = if let Some(ref store) = ctx.arc_store {
+        match store.load_entries(&ctx.active_arc_id).await {
+            Ok(entries) => entries
+                .into_iter()
+                .filter(|e| e.entry_type == athen_persistence::arcs::EntryType::Message)
+                .filter_map(|e| {
+                    let role = match e.source.as_str() {
+                        "user" => Role::User,
+                        "assistant" => Role::Assistant,
+                        "system" => Role::System,
+                        "tool" => Role::Tool,
+                        _ => return None,
+                    };
+                    Some(ChatMessage {
+                        role,
+                        content: MessageContent::Text(e.content),
+                    })
+                })
+                .collect(),
+            Err(_) => vec![],
+        }
+    } else {
+        vec![]
+    };
+
+    // Auto-inject relevant memories into context.
+    if let Some(ref memory) = ctx.memory {
+        let mut all_items = Vec::new();
+        let mut seen_ids = std::collections::HashSet::new();
+        if let Ok(items) = memory.recall(&message, 5).await {
+            for item in items {
+                if seen_ids.insert(item.id.clone()) {
+                    all_items.push(item);
+                }
+            }
+        }
+        let key_terms = extract_key_terms(&message);
+        for term in &key_terms {
+            if let Ok(items) = memory.recall(term, 3).await {
+                for item in items {
+                    if seen_ids.insert(item.id.clone()) {
+                        all_items.push(item);
+                    }
+                }
+            }
+        }
+        all_items.truncate(5);
+
+        if !all_items.is_empty() {
+            tracing::info!(
+                count = all_items.len(),
+                "Injecting relevant memories into approved task context"
+            );
+            let memory_text = all_items
+                .iter()
+                .map(|m| format!("- {}", m.content))
+                .collect::<Vec<_>>()
+                .join("\n");
+            context.insert(
+                0,
+                ChatMessage {
+                    role: Role::System,
+                    content: MessageContent::Text(format!(
+                        "Relevant information from your memory:\n{memory_text}"
+                    )),
+                },
+            );
         }
     }
+
+    // Persist user msg before the executor runs so its DB id sits before
+    // any tool_call rows the auditor writes during execution.
+    if let Some(ref store) = ctx.arc_store {
+        if let Err(e) = store
+            .add_entry(
+                &ctx.active_arc_id,
+                athen_persistence::arcs::EntryType::Message,
+                "user",
+                &message,
+                None,
+                Some(&ctx.turn_id),
+            )
+            .await
+        {
+            warn!("Failed to persist approved-task user entry: {e}");
+        }
+        if let Err(e) = store.touch_arc(&ctx.active_arc_id).await {
+            warn!("Failed to touch arc: {e}");
+        }
+    }
+
+    // Build the tool registry, mirroring AppState::build_tool_registry —
+    // inlined here because the bg path doesn't own `&AppState`.
+    let mut shell_registry = athen_agent::ShellToolRegistry::new()
+        .await
+        .with_spawned_processes(ctx.spawned_processes.clone());
+    if let Some(ref store) = ctx.grant_store {
+        let provider = Arc::new(crate::file_gate::ArcWritableProvider {
+            arc_id: crate::file_gate::arc_uuid(&ctx.active_arc_id),
+            store: store.clone(),
+        });
+        shell_registry = shell_registry.with_extra_writable(provider);
+    }
+    let mut registry = crate::app_tools::AppToolRegistry::new(
+        shell_registry,
+        ctx.calendar_store.clone(),
+        ctx.contact_store.clone(),
+        ctx.memory.clone(),
+    )
+    .with_mcp(ctx.mcp.clone() as Arc<dyn athen_core::traits::mcp::McpClient>);
+    if let Some(ref store) = ctx.grant_store {
+        let mut gate = crate::file_gate::FileGate::new(
+            ctx.active_arc_id.clone(),
+            store.clone(),
+            ctx.pending_grants.clone(),
+            Some(ctx.app_handle.clone()),
+        );
+        if let Some(ref sink) = ctx.telegram_approval_sink {
+            gate = gate.with_telegram_approval(sink.clone());
+        }
+        registry = registry.with_file_gate(Arc::new(gate));
+    }
+
+    let exec_router: Box<dyn LlmRouter> =
+        Box::new(SharedRouter(Arc::clone(&ctx.router)));
+    let tool_log = new_tool_log();
+    let auditor = TauriAuditor::new(
+        ctx.app_handle.clone(),
+        ctx.arc_store.clone(),
+        ctx.active_arc_id.clone(),
+        ctx.turn_id.clone(),
+        tool_log.clone(),
+    );
+    let stream_tx =
+        spawn_stream_forwarder(&ctx.app_handle, Some(ctx.active_arc_id.clone()));
+
+    ctx.cancel_flag.store(false, Ordering::Relaxed);
+
+    let context_snapshot = context.clone();
+
+    let mut builder = AgentBuilder::new()
+        .llm_router(exec_router)
+        .tool_registry(Box::new(registry))
+        .auditor(Box::new(auditor))
+        .max_steps(50)
+        .timeout(Duration::from_secs(300))
+        .context_messages(context)
+        .stream_sender(stream_tx)
+        .cancel_flag(ctx.cancel_flag.clone());
+    if let Some(p) = ctx.tool_doc_dir.clone() {
+        builder = builder.tool_doc_dir(p);
+    }
+    let executor = builder.build().map_err(|e| {
+        let raw = e.to_string();
+        tracing::error!("AgentBuilder failed (approval): {raw}");
+        format_user_error(&raw)
+    })?;
+
+    let task = Task {
+        id: Uuid::new_v4(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        source_event: None,
+        domain: approved_task.domain.clone(),
+        description: message.clone(),
+        priority: approved_task.priority,
+        status: TaskStatus::InProgress,
+        risk_score: approved_task.risk_score.clone(),
+        risk_budget: approved_task.risk_budget,
+        risk_used: approved_task.risk_used,
+        assigned_agent: None,
+        steps: vec![],
+        deadline: None,
+    };
+
+    let result = match executor.execute(task).await {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = ctx.coordinator.complete_task(coord_task_id).await;
+            let raw = e.to_string();
+            tracing::error!("Agent execution failed after approval: {raw}");
+            let msg = format_user_error(&raw);
+
+            if let Some(ref store) = ctx.arc_store {
+                if let Err(e) = store
+                    .add_entry(
+                        &ctx.active_arc_id,
+                        athen_persistence::arcs::EntryType::Message,
+                        "assistant",
+                        &msg,
+                        None,
+                        Some(&ctx.turn_id),
+                    )
+                    .await
+                {
+                    warn!("Failed to persist approved-task error reply: {e}");
+                }
+                if let Err(e) = store.touch_arc(&ctx.active_arc_id).await {
+                    warn!("Failed to touch arc on error path: {e}");
+                }
+            }
+
+            return Ok(Some(ApprovedTaskOutcome {
+                content: msg,
+                success: false,
+                domain: approved_task.domain.clone(),
+                message,
+                context_snapshot,
+                tool_log,
+            }));
+        }
+    };
+
+    let content = if !result.success {
+        let reason = result
+            .output
+            .as_ref()
+            .and_then(|o| o.get("reason"))
+            .and_then(|r| r.as_str())
+            .unwrap_or("unknown");
+        if reason == "cancelled" {
+            "Task cancelled by user.".to_string()
+        } else {
+            format!(
+                "I ran out of steps ({} used) before finishing. Try a simpler request.",
+                result.steps_completed
+            )
+        }
+    } else {
+        let text = result
+            .output
+            .as_ref()
+            .and_then(|o| o.get("response"))
+            .and_then(|r| r.as_str())
+            .unwrap_or("")
+            .to_string();
+        if text.is_empty() {
+            result
+                .output
+                .as_ref()
+                .map(|o| serde_json::to_string_pretty(o).unwrap_or_default())
+                .unwrap_or_else(|| "Task completed.".to_string())
+        } else {
+            text
+        }
+    };
+
+    // Persist the assistant response.
+    if let Some(ref store) = ctx.arc_store {
+        if let Err(e) = store
+            .add_entry(
+                &ctx.active_arc_id,
+                athen_persistence::arcs::EntryType::Message,
+                "assistant",
+                &content,
+                None,
+                Some(&ctx.turn_id),
+            )
+            .await
+        {
+            warn!("Failed to persist approved-task assistant entry: {e}");
+        }
+        if let Err(e) = store.touch_arc(&ctx.active_arc_id).await {
+            warn!("Failed to touch arc: {e}");
+        }
+    }
+
+    // Reinforce memories that were actually used in the response.
+    if let Some(ref memory) = ctx.memory {
+        reinforce_used_memories(memory, &context_snapshot, &content).await;
+    }
+
+    // Auto-remember with the LLM judge.
+    if let Some(ref memory) = ctx.memory {
+        let router = SharedRouter(Arc::clone(&ctx.router));
+        let arc_id = ctx.active_arc_id.clone();
+        let msg_clone = message.clone();
+        let content_clone = content.clone();
+        let memory_clone = Arc::clone(memory);
+        tokio::spawn(async move {
+            match judge_worth_remembering(&router, &msg_clone, &content_clone).await {
+                Some(summary) => {
+                    tracing::info!("Memory judge: worth remembering (approved task)");
+                    let item = athen_core::traits::memory::MemoryItem {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        content: summary,
+                        metadata: serde_json::json!({
+                            "source": "conversation",
+                            "arc_id": arc_id,
+                            "timestamp": chrono::Utc::now().to_rfc3339(),
+                        }),
+                    };
+                    if let Err(e) = memory_clone.remember(item).await {
+                        tracing::warn!("Failed to remember interaction: {e}");
+                    }
+                }
+                None => {
+                    tracing::debug!(
+                        "Memory judge: not worth remembering (approved task)"
+                    );
+                }
+            }
+        });
+    }
+
+    let _ = ctx.coordinator.complete_task(coord_task_id).await;
+
+    // Notify the frontend so the sidebar refreshes (mirrors the Telegram
+    // owner-message handler — relevant when the bg path drives this).
+    let _ = ctx.app_handle.emit(
+        "arc-updated",
+        serde_json::json!({ "arc_id": ctx.active_arc_id }),
+    );
+
+    Ok(Some(ApprovedTaskOutcome {
+        content,
+        success: result.success,
+        domain: approved_task.domain.clone(),
+        message,
+        context_snapshot,
+        tool_log,
+    }))
 }
 
 /// Cancel the currently running agent task.
