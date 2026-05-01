@@ -48,6 +48,13 @@ use athen_risk::CombinedRiskEvaluator;
 
 use crate::file_gate::PendingGrants;
 
+/// Per-profile embedding cache: profile id → (the profile's `updated_at`
+/// at the time we cached, the embedding vector). The `updated_at` doubles
+/// as the cache key — when a user edits a profile we re-embed.
+pub type ProfileEmbeddingCache = Arc<
+    tokio::sync::RwLock<HashMap<String, (chrono::DateTime<chrono::Utc>, Vec<f32>)>>,
+>;
+
 /// Wrapper to share the router via `Arc<RwLock<Arc<...>>>` while satisfying
 /// the `LlmRouter` trait.  The `RwLock` allows the inner router to be swapped
 /// at runtime (e.g. when the user switches active provider).
@@ -159,6 +166,17 @@ pub struct AppState {
     /// `arcs.active_profile_id` so each conversation can run under its
     /// own persona + tool surface.
     pub profile_store: Option<Arc<athen_persistence::profiles::SqliteProfileStore>>,
+    /// Embedding provider used for semantic profile routing. Always wired
+    /// to a router that falls back to keyword embeddings when no neural
+    /// provider is available, so the per-call code path can assume `Some`.
+    /// Wrapped in `Arc` so background tasks (e.g. sense_router) can hold a
+    /// reference for the lifetime of an async task.
+    pub profile_embedder: Arc<dyn athen_core::traits::embedding::EmbeddingProvider>,
+    /// In-memory cache of embedded profile text, keyed by profile id and
+    /// invalidated by the profile's `updated_at`. Populated lazily during
+    /// routing — embedding 12 short strings is cheap, but caching makes
+    /// repeat routing on the same profile set instantaneous.
+    pub profile_embedding_cache: ProfileEmbeddingCache,
     /// Outstanding grant requests parked waiting for the user. Each entry
     /// holds a oneshot sender that resolves with the user's choice.
     pub pending_grants: PendingGrants,
@@ -231,6 +249,13 @@ impl AppState {
 
         let grant_store = database.as_ref().map(|db| Arc::new(db.grant_store()));
         let profile_store = database.as_ref().map(|db| Arc::new(db.profile_store()));
+        // Build an embedding router for profile routing. Same shape as the
+        // memory subsystem's embedder: real providers can be wired later
+        // from settings; until then it falls back to keyword embeddings,
+        // which still produce a usable cosine signal across short strings.
+        let profile_embedder: Arc<dyn athen_core::traits::embedding::EmbeddingProvider> =
+            Arc::new(athen_llm::embeddings::router::EmbeddingRouter::new(vec![]));
+        let profile_embedding_cache = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         let pending_grants = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let spawned_processes: athen_agent::SpawnedProcessMap =
             Arc::new(Mutex::new(HashMap::new()));
@@ -263,6 +288,8 @@ impl AppState {
             tool_doc_dir,
             grant_store,
             profile_store,
+            profile_embedder,
+            profile_embedding_cache,
             pending_grants,
             spawned_processes,
             inflight_approvals: Arc::new(Mutex::new(HashSet::new())),
@@ -518,6 +545,8 @@ impl AppState {
         let router = Arc::clone(&self.router);
         let arc_store_ref = self._database.as_ref().map(|db| db.arc_store());
         let profile_store_ref = self.profile_store.clone();
+        let profile_embedder_ref = Arc::clone(&self.profile_embedder);
+        let profile_embedding_cache_ref = Arc::clone(&self.profile_embedding_cache);
         let notifier = self.notifier.clone();
 
         tauri::async_runtime::spawn(async move {
@@ -540,6 +569,8 @@ impl AppState {
                                 &router,
                                 &arc_store_ref,
                                 &profile_store_ref,
+                                &profile_embedder_ref,
+                                &profile_embedding_cache_ref,
                                 &app_handle,
                                 notifier.as_ref(),
                             )
@@ -583,6 +614,8 @@ impl AppState {
         let router = Arc::clone(&self.router);
         let arc_store_ref = self._database.as_ref().map(|db| db.arc_store());
         let profile_store_ref = self.profile_store.clone();
+        let profile_embedder_ref = Arc::clone(&self.profile_embedder);
+        let profile_embedding_cache_ref = Arc::clone(&self.profile_embedding_cache);
         let notifier = self.notifier.clone();
 
         tauri::async_runtime::spawn(async move {
@@ -607,6 +640,8 @@ impl AppState {
                                 &router,
                                 &arc_store_ref,
                                 &profile_store_ref,
+                                &profile_embedder_ref,
+                                &profile_embedding_cache_ref,
                                 &app_handle,
                                 notifier.as_ref(),
                             )
@@ -660,6 +695,8 @@ impl AppState {
         let router = Arc::clone(&self.router);
         let arc_store_ref = self._database.as_ref().map(|db| db.arc_store());
         let profile_store_ref = self.profile_store.clone();
+        let profile_embedder_ref = Arc::clone(&self.profile_embedder);
+        let profile_embedding_cache_ref = Arc::clone(&self.profile_embedding_cache);
         let calendar_store_ref = self.calendar_store.clone();
         let contact_store_ref = self.contact_store.clone();
         let memory_ref = self.memory.clone();
@@ -767,6 +804,8 @@ impl AppState {
                                     &router,
                                     &arc_store_ref,
                                     &profile_store_ref,
+                                    &profile_embedder_ref,
+                                    &profile_embedding_cache_ref,
                                     &app_handle,
                                     notifier.as_ref(),
                                 )

@@ -3752,6 +3752,164 @@ footer {
 .onb-status.err   { background: var(--danger-soft);  color: var(--danger);  }
 .onb-status.busy  { background: var(--info-soft);    color: var(--info);    }
 
+/* ─── Profile manager ─── */
+.profile-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-bottom: 12px;
+}
+.profile-card {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    padding: 12px 14px;
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
+}
+.profile-card-main {
+    flex: 1;
+    min-width: 0;
+}
+.profile-card-name {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+}
+.profile-card-badge {
+    font-size: 10px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 2px 6px;
+    border-radius: var(--r-sm);
+    background: var(--surface-3);
+    color: var(--text-3);
+}
+.profile-card-badge.builtin {
+    background: var(--info-soft, rgba(122, 162, 247, 0.15));
+    color: var(--info, #7aa2f7);
+}
+.profile-card-desc {
+    margin-top: 4px;
+    font-size: 12px;
+    color: var(--text-2);
+    line-height: 1.4;
+}
+.profile-card-actions {
+    display: flex;
+    gap: 6px;
+    flex-shrink: 0;
+}
+.profile-card-actions button {
+    height: 26px;
+    padding: 0 10px;
+    font-size: 11px;
+    border-radius: var(--r-sm);
+    border: 1px solid var(--border);
+    background: var(--surface-2);
+    color: var(--text);
+    cursor: pointer;
+}
+.profile-card-actions button:hover:not(:disabled) {
+    background: var(--surface-3);
+    border-color: var(--border-strong);
+}
+.profile-card-actions button:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+.profile-card-actions .btn-danger {
+    color: var(--danger, #f7768e);
+    border-color: rgba(247, 118, 142, 0.4);
+}
+
+.profile-modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+    -webkit-backdrop-filter: blur(8px);
+    backdrop-filter: blur(8px);
+    display: grid;
+    place-items: center;
+    z-index: 220;
+    animation: fade-in var(--dur) var(--ease);
+}
+.profile-modal-overlay.hidden { display: none; }
+.profile-modal {
+    width: 100%;
+    max-width: 600px;
+    max-height: 88vh;
+    display: flex;
+    flex-direction: column;
+    background: var(--surface-1);
+    border-radius: var(--r-lg);
+    box-shadow: var(--shadow-modal);
+    overflow: hidden;
+}
+.profile-modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--border);
+}
+.profile-modal-header h2 {
+    margin: 0;
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text);
+}
+.profile-modal-body {
+    overflow-y: auto;
+    padding: 16px 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+.profile-modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    padding: 12px 18px;
+    border-top: 1px solid var(--border);
+    background: var(--surface-1);
+}
+.profile-modal-error {
+    color: var(--danger, #f7768e);
+    font-size: 12px;
+    margin: 0;
+}
+.profile-modal-error.hidden { display: none; }
+.profile-chip-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+.profile-chip {
+    display: inline-flex;
+    align-items: center;
+    padding: 4px 10px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    font-size: 11px;
+    color: var(--text-2);
+    cursor: pointer;
+    user-select: none;
+    background: var(--surface-2);
+    transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+.profile-chip:hover { border-color: var(--border-strong); }
+.profile-chip.selected {
+    background: rgba(122, 162, 247, 0.18);
+    border-color: rgba(122, 162, 247, 0.5);
+    color: var(--text);
+}
+
 /* ─── Responsive ─── */
 @media (min-width: 769px) {
     .sidebar-toggle { display: none; }

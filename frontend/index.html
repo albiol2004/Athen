@@ -161,6 +161,15 @@
             </section>
 
             <section class="settings-section">
+                <h2>Agent Profiles</h2>
+                <p class="settings-description">Specialists that handle different kinds of work. Built-ins ship with Athen and can be cloned to customize. Your own profiles can be edited or deleted freely.</p>
+                <div id="profile-list" class="profile-list"></div>
+                <div class="setting-actions">
+                    <button id="new-profile-btn" class="btn-primary">+ New Profile</button>
+                </div>
+            </section>
+
+            <section class="settings-section">
                 <h2>Permissions</h2>
                 <p class="settings-description">Directories Athen can access without asking. Global grants apply to every conversation; arc grants only apply to the current arc.</p>
 
@@ -645,6 +654,59 @@
     </div>
 
     <div id="sidebar-overlay" class="sidebar-overlay"></div>
+
+    <div id="profile-modal-overlay" class="profile-modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="profile-modal-title">
+        <div class="profile-modal">
+            <div class="profile-modal-header">
+                <h2 id="profile-modal-title">New Profile</h2>
+                <button id="profile-modal-close" class="cal-modal-close-btn" type="button">&times;</button>
+            </div>
+            <div class="profile-modal-body">
+                <input type="hidden" id="profile-edit-id">
+                <div class="cal-field">
+                    <label for="profile-display-name">Display name</label>
+                    <input type="text" id="profile-display-name" class="settings-input" placeholder="e.g. Cold Email Pro">
+                </div>
+                <div class="cal-field">
+                    <label for="profile-id">ID <span class="permissions-subnote">(letters, numbers, underscores)</span></label>
+                    <input type="text" id="profile-id" class="settings-input" placeholder="cold_email_pro">
+                </div>
+                <div class="cal-field">
+                    <label for="profile-description">Description</label>
+                    <input type="text" id="profile-description" class="settings-input" placeholder="One-line summary shown in the agent picker.">
+                </div>
+                <div class="cal-field">
+                    <label for="profile-persona">Persona instructions</label>
+                    <textarea id="profile-persona" rows="6" class="settings-input" placeholder="How should this agent behave? Voice, mission, constraints..."></textarea>
+                </div>
+                <div class="cal-field">
+                    <label>Domains</label>
+                    <div id="profile-domains" class="profile-chip-grid"></div>
+                </div>
+                <div class="cal-field">
+                    <label>Task kinds</label>
+                    <div id="profile-task-kinds" class="profile-chip-grid"></div>
+                </div>
+                <div class="cal-field">
+                    <label for="profile-strengths">Strengths <span class="permissions-subnote">(free-form, comma separated)</span></label>
+                    <input type="text" id="profile-strengths" class="settings-input" placeholder="e.g. linkedin posts, hashtag strategy">
+                </div>
+                <div class="cal-field">
+                    <label>Avoid <span class="permissions-subnote">(task kinds this agent shouldn't be routed to)</span></label>
+                    <div id="profile-avoid" class="profile-chip-grid"></div>
+                </div>
+                <div class="cal-field">
+                    <label for="profile-model-hint">Model hint <span class="permissions-subnote">(optional — defaults to your active model)</span></label>
+                    <input type="text" id="profile-model-hint" class="settings-input" placeholder="e.g. Smart">
+                </div>
+                <p id="profile-modal-error" class="profile-modal-error hidden"></p>
+            </div>
+            <div class="profile-modal-actions">
+                <button id="profile-modal-cancel" class="btn-secondary" type="button">Cancel</button>
+                <button id="profile-modal-save" class="btn-primary" type="button">Save</button>
+            </div>
+        </div>
+    </div>
 
     <div id="grant-modal-overlay" class="grant-modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="grant-modal-title">
         <div class="grant-modal">

@@ -2007,6 +2007,29 @@ if (arcProfilePicker) {
     arcProfilePicker.addEventListener('change', onProfileChange);
 }
 
+const newProfileBtn = document.getElementById('new-profile-btn');
+if (newProfileBtn) {
+    newProfileBtn.addEventListener('click', () => openProfileEditor('create', null));
+}
+const profileModalClose = document.getElementById('profile-modal-close');
+if (profileModalClose) {
+    profileModalClose.addEventListener('click', closeProfileEditor);
+}
+const profileModalCancel = document.getElementById('profile-modal-cancel');
+if (profileModalCancel) {
+    profileModalCancel.addEventListener('click', closeProfileEditor);
+}
+const profileModalSave = document.getElementById('profile-modal-save');
+if (profileModalSave) {
+    profileModalSave.addEventListener('click', saveProfileFromEditor);
+}
+const profileModalOverlay = document.getElementById('profile-modal-overlay');
+if (profileModalOverlay) {
+    profileModalOverlay.addEventListener('click', (ev) => {
+        if (ev.target === profileModalOverlay) closeProfileEditor();
+    });
+}
+
 // ─── Settings ───
 
 const settingsView = document.getElementById('settings-view');
@@ -2163,9 +2186,266 @@ async function loadSettings() {
         }
         await loadMcpCatalog();
         await loadGrants();
+        await loadProfileManager();
     } catch (err) {
         console.error('Failed to load settings:', err);
         showToast('Failed to load settings: ' + err, 'error');
+    }
+}
+
+// ─── Profile manager ──────────────────────────────────────────────────
+
+const PROFILE_DOMAINS = [
+    'Email', 'Calendar', 'Messaging', 'Coding', 'Research', 'Outreach',
+    'Marketing', 'Finance', 'Scheduling', 'DataAnalysis', 'Writing',
+    'Translation', 'Health', 'Legal', 'Infrastructure', 'Architecture',
+    'Support', 'SocialMedia', 'Other',
+];
+const PROFILE_TASK_KINDS = [
+    'Drafting', 'Editing', 'Summarizing', 'Researching', 'Scheduling',
+    'CodeReview', 'Coding', 'Debugging', 'DataAnalysis', 'Outreach',
+    'Triage', 'Other',
+];
+
+async function loadProfileManager() {
+    const listEl = document.getElementById('profile-list');
+    if (!listEl) return;
+    try {
+        // Reuse the cached list when possible — the per-arc picker keeps it
+        // fresh, and the manager re-fetches after each save anyway.
+        agentProfiles = await invoke('list_agent_profiles');
+        renderProfileList();
+        // Push the freshly loaded list back to the per-arc dropdown so the
+        // two views never disagree.
+        renderProfilePicker();
+    } catch (err) {
+        console.error('Failed to load profiles:', err);
+        listEl.innerHTML = '<p class="setting-hint">Failed to load profiles.</p>';
+    }
+}
+
+function renderProfileList() {
+    const listEl = document.getElementById('profile-list');
+    if (!listEl) return;
+    listEl.innerHTML = '';
+    if (!agentProfiles || agentProfiles.length === 0) {
+        listEl.innerHTML = '<p class="setting-hint">No profiles yet.</p>';
+        return;
+    }
+    for (const p of agentProfiles) {
+        listEl.appendChild(buildProfileCard(p));
+    }
+}
+
+function buildProfileCard(p) {
+    const card = document.createElement('div');
+    card.className = 'profile-card';
+    const isBuiltin = !!p.builtin;
+    const badge = isBuiltin
+        ? '<span class="profile-card-badge builtin">Built-in</span>'
+        : '<span class="profile-card-badge">Custom</span>';
+    const desc = p.description
+        ? `<div class="profile-card-desc">${escapeHtml(p.description)}</div>`
+        : '';
+    card.innerHTML = `
+        <div class="profile-card-main">
+            <div class="profile-card-name">${escapeHtml(p.display_name)} ${badge}</div>
+            ${desc}
+        </div>
+        <div class="profile-card-actions">
+            <button data-action="edit"${isBuiltin ? ' disabled title="Built-ins are immutable; clone first"' : ''}>Edit</button>
+            <button data-action="clone">Clone</button>
+            <button data-action="delete" class="btn-danger"${isBuiltin ? ' disabled title="Built-ins cannot be deleted"' : ''}>Delete</button>
+        </div>
+    `;
+    card.querySelector('[data-action="edit"]')?.addEventListener('click', () => openProfileEditor('edit', p));
+    card.querySelector('[data-action="clone"]')?.addEventListener('click', () => openProfileEditor('clone', p));
+    card.querySelector('[data-action="delete"]')?.addEventListener('click', () => deleteProfile(p));
+    return card;
+}
+
+async function deleteProfile(p) {
+    if (!invoke) return;
+    if (p.builtin) return; // Should be disabled in UI; defense in depth.
+    if (!confirm(`Delete profile "${p.display_name}"?\n\nArcs using this profile will fall back to the default.`)) {
+        return;
+    }
+    try {
+        await invoke('delete_agent_profile', { profileId: p.id });
+        await loadProfileManager();
+    } catch (err) {
+        showToast('Delete failed: ' + err, 'error');
+    }
+}
+
+// Mode is 'create' | 'edit' | 'clone'. For 'clone', we copy the source
+// profile's fields but suggest a new id/display name and force builtin=false.
+function openProfileEditor(mode, source) {
+    const overlay = document.getElementById('profile-modal-overlay');
+    const titleEl = document.getElementById('profile-modal-title');
+    const idEl = document.getElementById('profile-id');
+    const displayEl = document.getElementById('profile-display-name');
+    const descEl = document.getElementById('profile-description');
+    const personaEl = document.getElementById('profile-persona');
+    const strengthsEl = document.getElementById('profile-strengths');
+    const modelEl = document.getElementById('profile-model-hint');
+    const errEl = document.getElementById('profile-modal-error');
+    const editIdEl = document.getElementById('profile-edit-id');
+
+    errEl.classList.add('hidden');
+    errEl.textContent = '';
+
+    if (mode === 'edit' && source) {
+        titleEl.textContent = 'Edit profile';
+        idEl.value = source.id;
+        idEl.disabled = true;
+        editIdEl.value = source.id;
+        displayEl.value = source.display_name || '';
+        descEl.value = source.description || '';
+        personaEl.value = source.custom_persona_addendum || '';
+        strengthsEl.value = (source.expertise?.strengths || []).join(', ');
+        modelEl.value = source.model_profile_hint || '';
+        renderProfileChips(source.expertise || {});
+    } else if (mode === 'clone' && source) {
+        titleEl.textContent = 'Clone profile';
+        idEl.value = `${source.id}_copy`;
+        idEl.disabled = false;
+        editIdEl.value = '';
+        displayEl.value = `${source.display_name} (copy)`;
+        descEl.value = source.description || '';
+        personaEl.value = source.custom_persona_addendum || '';
+        strengthsEl.value = (source.expertise?.strengths || []).join(', ');
+        modelEl.value = source.model_profile_hint || '';
+        renderProfileChips(source.expertise || {});
+    } else {
+        titleEl.textContent = 'New profile';
+        idEl.value = '';
+        idEl.disabled = false;
+        editIdEl.value = '';
+        displayEl.value = '';
+        descEl.value = '';
+        personaEl.value = '';
+        strengthsEl.value = '';
+        modelEl.value = '';
+        renderProfileChips({});
+    }
+
+    overlay.classList.remove('hidden');
+    displayEl.focus();
+}
+
+function renderProfileChips(expertise) {
+    const domains = new Set(expertise.domains || []);
+    const taskKinds = new Set(expertise.task_kinds || []);
+    const avoid = new Set(expertise.avoid || []);
+
+    fillChipGrid('profile-domains', PROFILE_DOMAINS, domains);
+    fillChipGrid('profile-task-kinds', PROFILE_TASK_KINDS, taskKinds);
+    fillChipGrid('profile-avoid', PROFILE_TASK_KINDS, avoid);
+}
+
+function fillChipGrid(elementId, values, selectedSet) {
+    const grid = document.getElementById(elementId);
+    if (!grid) return;
+    grid.innerHTML = '';
+    for (const v of values) {
+        const chip = document.createElement('button');
+        chip.type = 'button';
+        chip.className = 'profile-chip' + (selectedSet.has(v) ? ' selected' : '');
+        chip.dataset.value = v;
+        chip.textContent = v;
+        chip.addEventListener('click', () => {
+            chip.classList.toggle('selected');
+        });
+        grid.appendChild(chip);
+    }
+}
+
+function readChipSelection(elementId) {
+    const grid = document.getElementById(elementId);
+    if (!grid) return [];
+    return Array.from(grid.querySelectorAll('.profile-chip.selected')).map(
+        (c) => c.dataset.value
+    );
+}
+
+function closeProfileEditor() {
+    document.getElementById('profile-modal-overlay').classList.add('hidden');
+}
+
+async function saveProfileFromEditor() {
+    if (!invoke) return;
+    const editId = document.getElementById('profile-edit-id').value;
+    const id = document.getElementById('profile-id').value.trim();
+    const displayName = document.getElementById('profile-display-name').value.trim();
+    const description = document.getElementById('profile-description').value.trim();
+    const persona = document.getElementById('profile-persona').value.trim();
+    const strengthsRaw = document.getElementById('profile-strengths').value;
+    const modelHint = document.getElementById('profile-model-hint').value.trim();
+    const errEl = document.getElementById('profile-modal-error');
+
+    const showError = (msg) => {
+        errEl.textContent = msg;
+        errEl.classList.remove('hidden');
+    };
+
+    if (!displayName) return showError('Display name is required.');
+    if (!id) return showError('ID is required.');
+    if (!/^[a-z0-9_]+$/.test(id)) {
+        return showError('ID must contain only lowercase letters, numbers, and underscores.');
+    }
+
+    const strengths = strengthsRaw
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+
+    const input = {
+        id,
+        displayName,
+        description,
+        customPersonaAddendum: persona || null,
+        toolSelection: { All: null },
+        expertise: {
+            domains: readChipSelection('profile-domains'),
+            taskKinds: readChipSelection('profile-task-kinds'),
+            languages: [],
+            strengths,
+            avoid: readChipSelection('profile-avoid'),
+        },
+        modelProfileHint: modelHint || null,
+    };
+
+    // Tauri's IPC encoder rewrites camelCase command args to snake_case for
+    // serde, but nested objects we own must already be snake_case-keyed.
+    const serdeInput = {
+        id: input.id,
+        display_name: input.displayName,
+        description: input.description,
+        custom_persona_addendum: input.customPersonaAddendum,
+        // ToolSelection is an enum — `"All"` (a unit variant) is the safest
+        // default. The manager UI doesn't expose group/explicit/deny yet.
+        tool_selection: 'All',
+        expertise: {
+            domains: input.expertise.domains,
+            task_kinds: input.expertise.taskKinds,
+            languages: input.expertise.languages,
+            strengths: input.expertise.strengths,
+            avoid: input.expertise.avoid,
+        },
+        model_profile_hint: input.modelProfileHint,
+    };
+
+    try {
+        if (editId) {
+            await invoke('update_agent_profile', { input: serdeInput });
+        } else {
+            await invoke('create_agent_profile', { input: serdeInput });
+        }
+        closeProfileEditor();
+        await loadProfileManager();
+    } catch (err) {
+        showError(String(err));
     }
 }
 

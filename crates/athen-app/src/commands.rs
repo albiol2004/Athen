@@ -2418,6 +2418,123 @@ pub async fn set_arc_profile(
         .map_err(|e| e.to_string())
 }
 
+/// Inputs the manager UI sends when creating or updating a user-authored
+/// profile. Mirrors `AgentProfile` minus the server-managed fields
+/// (`builtin`, `created_at`, `updated_at`) and the unused-yet
+/// `persona_template_ids`. Expertise is structured so the UI can drive it
+/// with checkboxes/chip pickers without duplicating the enum spelling.
+#[derive(serde::Deserialize, Debug)]
+pub struct AgentProfileInput {
+    pub id: String,
+    pub display_name: String,
+    pub description: String,
+    #[serde(default)]
+    pub custom_persona_addendum: Option<String>,
+    #[serde(default)]
+    pub tool_selection: Option<athen_core::agent_profile::ToolSelection>,
+    #[serde(default)]
+    pub expertise: athen_core::agent_profile::ExpertiseDeclaration,
+    #[serde(default)]
+    pub model_profile_hint: Option<String>,
+}
+
+fn input_to_profile(
+    input: AgentProfileInput,
+    created_at: chrono::DateTime<chrono::Utc>,
+) -> athen_core::agent_profile::AgentProfile {
+    use athen_core::agent_profile::{AgentProfile, ToolSelection};
+    let now = chrono::Utc::now();
+    AgentProfile {
+        id: input.id,
+        display_name: input.display_name,
+        description: input.description,
+        persona_template_ids: vec![],
+        custom_persona_addendum: input.custom_persona_addendum,
+        tool_selection: input.tool_selection.unwrap_or(ToolSelection::All),
+        expertise: input.expertise,
+        model_profile_hint: input.model_profile_hint,
+        builtin: false,
+        created_at,
+        updated_at: now,
+    }
+}
+
+/// Create a new user-authored profile.
+///
+/// Refuses to create a profile whose id collides with an existing one
+/// (built-in or user). Built-in id reuse is the most common collision —
+/// the UI's "Clone" flow appends a suffix to avoid it.
+#[tauri::command]
+pub async fn create_agent_profile(
+    input: AgentProfileInput,
+    state: State<'_, AppState>,
+) -> std::result::Result<athen_core::agent_profile::AgentProfile, String> {
+    use athen_core::traits::profile::ProfileStore;
+    let Some(store) = state.profile_store.as_ref() else {
+        return Err("Profile store not available".into());
+    };
+    let id = input.id.trim().to_string();
+    if id.is_empty() {
+        return Err("Profile id cannot be empty".into());
+    }
+    if store.get_profile(&id).await.map_err(|e| e.to_string())?.is_some() {
+        return Err(format!("Profile id '{id}' is already in use"));
+    }
+    let profile = input_to_profile(
+        AgentProfileInput { id, ..input },
+        chrono::Utc::now(),
+    );
+    store.save_profile(&profile).await.map_err(|e| e.to_string())?;
+    Ok(profile)
+}
+
+/// Update an existing user-authored profile in place.
+///
+/// Refuses to mutate built-ins (the underlying store enforces this; the
+/// command surfaces a friendly error). Uses the existing row's
+/// `created_at` so the UI doesn't have to round-trip it.
+#[tauri::command]
+pub async fn update_agent_profile(
+    input: AgentProfileInput,
+    state: State<'_, AppState>,
+) -> std::result::Result<athen_core::agent_profile::AgentProfile, String> {
+    use athen_core::traits::profile::ProfileStore;
+    let Some(store) = state.profile_store.as_ref() else {
+        return Err("Profile store not available".into());
+    };
+    let existing = store
+        .get_profile(&input.id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Profile '{}' not found", input.id))?;
+    if existing.builtin {
+        return Err(format!(
+            "'{}' is a built-in profile and cannot be edited. Clone it first.",
+            existing.display_name
+        ));
+    }
+    let profile = input_to_profile(input, existing.created_at);
+    store.save_profile(&profile).await.map_err(|e| e.to_string())?;
+    Ok(profile)
+}
+
+/// Delete a user-authored profile.
+///
+/// Refuses to delete built-ins. Any arcs referencing the deleted profile
+/// will fall back to the seeded default at next resolution (the
+/// `get_or_default` lookup tolerates dangling ids).
+#[tauri::command]
+pub async fn delete_agent_profile(
+    profile_id: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    use athen_core::traits::profile::ProfileStore;
+    let Some(store) = state.profile_store.as_ref() else {
+        return Err("Profile store not available".into());
+    };
+    store.delete_profile(&profile_id).await.map_err(|e| e.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Calendar commands
 // ---------------------------------------------------------------------------

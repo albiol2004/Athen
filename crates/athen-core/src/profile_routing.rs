@@ -22,6 +22,8 @@
 //! manually override) and for falling back to the default profile when
 //! `pick_profile` returns `None`.
 
+use std::collections::HashMap;
+
 use crate::agent_profile::{AgentProfile, DomainTag, ProfileId, TaskKindTag};
 
 /// What we inferred about a task from its source channel and description.
@@ -296,6 +298,144 @@ pub fn pick_profile(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Semantic blending — embeddings as a second-pass refinement
+// ---------------------------------------------------------------------------
+
+/// The text the embedder should index for a profile. Concatenates the
+/// fields that describe the profile's intent: name, one-line description,
+/// strengths, and any custom persona addendum. We deliberately exclude
+/// the closed-enum tags (domains/task_kinds) — those are already covered
+/// by the keyword stage; embeddings shine on the free-form fields.
+pub fn profile_embedding_text(profile: &AgentProfile) -> String {
+    let mut parts = Vec::with_capacity(4);
+    if !profile.display_name.is_empty() {
+        parts.push(profile.display_name.clone());
+    }
+    if !profile.description.is_empty() {
+        parts.push(profile.description.clone());
+    }
+    if !profile.expertise.strengths.is_empty() {
+        parts.push(profile.expertise.strengths.join(", "));
+    }
+    if let Some(addendum) = &profile.custom_persona_addendum {
+        if !addendum.is_empty() {
+            parts.push(addendum.clone());
+        }
+    }
+    parts.join("\n")
+}
+
+/// Cosine similarity between two equal-length vectors. Returns `0.0` if
+/// the lengths disagree or either side is the zero vector — both are
+/// real-world failure modes (a misconfigured embedder, a one-shot empty
+/// description) we'd rather treat as "no signal" than panic on.
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0f32;
+    let mut na = 0.0f32;
+    let mut nb = 0.0f32;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    dot / (na.sqrt() * nb.sqrt())
+}
+
+/// Multiplier applied to the cosine similarity before it's added to the
+/// keyword score. The keyword pass produces small integer scores (typically
+/// 0..6); we want semantic to nudge ties and promote close-but-untagged
+/// matches without overwhelming an explicit domain match. A weight of 4
+/// puts a "perfect cosine" semantic match on par with one keyword domain
+/// match; a 0.5-cosine match adds 2 — enough to break ties.
+const SEMANTIC_WEIGHT: f32 = 4.0;
+
+/// Pick the best-scoring profile, blending keyword scoring with embedding
+/// similarity when embeddings are available. Falls back to the keyword
+/// path verbatim when `query_embedding` is `None`, when a profile has no
+/// cached embedding, or when vectors don't line up.
+///
+/// Caller responsibilities (caching belongs at the call site so the cache
+/// can outlive any single classification):
+/// - Compute `query_embedding` from the task description (or pass `None`).
+/// - Maintain `profile_embeddings`, keyed by `profile.id`. Missing entries
+///   silently fall back to keyword-only for that profile.
+///
+/// Determinism: ties on the blended score break the same way as the
+/// keyword path — by profile id ascending.
+pub fn pick_profile_blended(
+    classified: &ClassifiedTask,
+    profiles: &[AgentProfile],
+    query_embedding: Option<&[f32]>,
+    profile_embeddings: &HashMap<ProfileId, Vec<f32>>,
+) -> Option<RoutingDecision> {
+    // First: keyword scoring. Profiles that score 0 on keywords AND have no
+    // semantic backing get filtered out. A profile with only semantic
+    // signal can still win — we don't require a positive keyword score
+    // when embeddings push it past the threshold.
+    let mut scored: Vec<(f32, &AgentProfile, i32, f32)> = profiles
+        .iter()
+        .filter(|p| p.id != AgentProfile::DEFAULT_ID)
+        .map(|p| {
+            let kw = score_profile(classified, p);
+            let sem = match (query_embedding, profile_embeddings.get(&p.id)) {
+                (Some(q), Some(pe)) => cosine_similarity(q, pe).max(0.0),
+                _ => 0.0,
+            };
+            let blended = kw as f32 + sem * SEMANTIC_WEIGHT;
+            (blended, p, kw, sem)
+        })
+        // Threshold: keep profiles with a positive keyword score OR a
+        // non-trivial semantic hit. 0.55 cosine is the floor where a
+        // semantic-only match is genuinely related; below that, the
+        // multiplied score would still be positive but would route random
+        // tasks to random profiles.
+        .filter(|(_, _, kw, sem)| *kw > 0 || *sem > 0.55)
+        .collect();
+
+    scored.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.id.cmp(&b.1.id))
+    });
+
+    scored.first().map(|(blended, profile, kw, sem)| {
+        let mut reason_parts = Vec::new();
+        if let Some(d) = classified.domain {
+            if profile.expertise.domains.contains(&d) {
+                reason_parts.push(format!("domain:{d:?}"));
+            }
+        }
+        if let Some(k) = classified.kind {
+            if profile.expertise.task_kinds.contains(&k) {
+                reason_parts.push(format!("kind:{k:?}"));
+            }
+        }
+        if *sem > 0.0 {
+            reason_parts.push(format!("semantic:{:.2}", *sem));
+        }
+        let reason = if reason_parts.is_empty() {
+            "no specific match (catch-all)".to_string()
+        } else {
+            format!("matched on {}", reason_parts.join(", "))
+        };
+        RoutingDecision {
+            profile_id: profile.id.clone(),
+            // Round the float score to an int for display continuity with
+            // the pure-keyword path. The internal blended value is what the
+            // sort used; the integer is only for the user-facing log.
+            score: blended.round() as i32,
+            reason: format!("{reason} (kw={kw}, sem={sem:.2})"),
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,5 +641,123 @@ mod tests {
         };
         let d = pick_profile(&classified, &[bravo, alpha]).unwrap();
         assert_eq!(d.profile_id, "alpha");
+    }
+
+    // ─── Semantic blending ────────────────────────────────────────────
+
+    #[test]
+    fn cosine_similarity_handles_edge_cases() {
+        assert_eq!(cosine_similarity(&[], &[]), 0.0);
+        assert_eq!(cosine_similarity(&[1.0, 0.0], &[1.0, 0.0, 0.0]), 0.0);
+        assert_eq!(cosine_similarity(&[0.0, 0.0], &[1.0, 1.0]), 0.0);
+        assert!((cosine_similarity(&[1.0, 0.0], &[1.0, 0.0]) - 1.0).abs() < 1e-6);
+        assert!((cosine_similarity(&[1.0, 0.0], &[0.0, 1.0])).abs() < 1e-6);
+    }
+
+    #[test]
+    fn profile_embedding_text_includes_signal_fields() {
+        let mut p = make_profile(
+            "social_media",
+            vec![DomainTag::SocialMedia],
+            vec![TaskKindTag::Drafting],
+            vec![],
+        );
+        p.display_name = "Social Media Expert".into();
+        p.description = "Platform-native posts.".into();
+        p.expertise.strengths = vec!["linkedin".into(), "tiktok".into()];
+        p.custom_persona_addendum = Some("Hooks first.".into());
+
+        let text = profile_embedding_text(&p);
+        assert!(text.contains("Social Media Expert"));
+        assert!(text.contains("Platform-native posts."));
+        assert!(text.contains("linkedin, tiktok"));
+        assert!(text.contains("Hooks first."));
+    }
+
+    #[test]
+    fn pick_profile_blended_falls_back_to_keywords_without_embeddings() {
+        let outreach = make_profile(
+            "outreach",
+            vec![DomainTag::Outreach, DomainTag::Email],
+            vec![TaskKindTag::Drafting],
+            vec![],
+        );
+        let coder = make_profile(
+            "coder",
+            vec![DomainTag::Coding],
+            vec![TaskKindTag::Coding],
+            vec![],
+        );
+        let classified = classify_task(Some("email"), "Draft a follow-up");
+
+        let no_embeddings: HashMap<ProfileId, Vec<f32>> = HashMap::new();
+        let d = pick_profile_blended(&classified, &[outreach, coder], None, &no_embeddings)
+            .unwrap();
+        assert_eq!(d.profile_id, "outreach");
+    }
+
+    #[test]
+    fn pick_profile_blended_uses_semantic_to_break_ties() {
+        // Both profiles have identical keyword scores. The semantic stage
+        // gives outreach a stronger cosine match → it wins despite the
+        // alphabetical tiebreak preferring "alpha".
+        let alpha = make_profile(
+            "alpha",
+            vec![DomainTag::Email],
+            vec![TaskKindTag::Drafting],
+            vec![],
+        );
+        let outreach = make_profile(
+            "outreach",
+            vec![DomainTag::Email],
+            vec![TaskKindTag::Drafting],
+            vec![],
+        );
+        let classified = classify_task(Some("email"), "Draft a follow-up");
+
+        let q = vec![1.0, 0.0, 0.0];
+        let mut embeds = HashMap::new();
+        embeds.insert("alpha".to_string(), vec![0.0, 1.0, 0.0]); // orthogonal
+        embeds.insert("outreach".to_string(), vec![0.9, 0.1, 0.0]); // close
+
+        let d = pick_profile_blended(&classified, &[alpha, outreach], Some(&q), &embeds)
+            .unwrap();
+        assert_eq!(d.profile_id, "outreach");
+        assert!(d.reason.contains("semantic:"));
+    }
+
+    #[test]
+    fn pick_profile_blended_promotes_semantic_only_match_above_threshold() {
+        // Profile claims no matching tags (keyword score 0) but its
+        // embedding is very close to the query — it should still win.
+        let mut social = make_profile(
+            "social_media",
+            vec![],
+            vec![],
+            vec![],
+        );
+        social.expertise.strengths = vec!["linkedin posts".into()];
+
+        let classified = classify_task(None, "write a thoughtful linkedin post about leadership");
+
+        let q = vec![1.0, 0.0];
+        let mut embeds = HashMap::new();
+        // Strong cosine match (~0.99).
+        embeds.insert("social_media".to_string(), vec![0.99, 0.05]);
+
+        let d = pick_profile_blended(&classified, &[social], Some(&q), &embeds);
+        assert!(d.is_some(), "semantic-only match above threshold should win");
+    }
+
+    #[test]
+    fn pick_profile_blended_rejects_weak_semantic_only_match() {
+        // No keyword signal, weak semantic (below 0.55 threshold) → None.
+        let candidate = make_profile("c", vec![], vec![], vec![]);
+        let classified = classify_task(None, "completely unrelated query");
+        let q = vec![1.0, 0.0];
+        let mut embeds = HashMap::new();
+        embeds.insert("c".to_string(), vec![0.3, 0.95]); // ~0.3 cosine
+        let d = pick_profile_blended(&classified, &[candidate], Some(&q), &embeds);
+        assert!(d.is_none());
     }
 }

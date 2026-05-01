@@ -51,11 +51,14 @@ pub enum TriageTarget {
 /// 4. Emit frontend event
 ///
 /// Returns `true` if the event was relevant and processed, `false` if ignored.
+#[allow(clippy::too_many_arguments)]
 pub async fn process_sense_event(
     event: &SenseEvent,
     router: &Arc<RwLock<Arc<DefaultLlmRouter>>>,
     arc_store: &Option<ArcStore>,
     profile_store: &Option<Arc<athen_persistence::profiles::SqliteProfileStore>>,
+    profile_embedder: &Arc<dyn athen_core::traits::embedding::EmbeddingProvider>,
+    profile_embedding_cache: &crate::state::ProfileEmbeddingCache,
     app_handle: &AppHandle,
     notifier: Option<&Arc<NotificationOrchestrator>>,
 ) -> bool {
@@ -164,6 +167,8 @@ pub async fn process_sense_event(
                 route_new_arc_to_profile(
                     arc_store.as_ref(),
                     profile_store.as_ref(),
+                    profile_embedder,
+                    profile_embedding_cache,
                     &id,
                     arc_source.as_str(),
                     summary,
@@ -497,15 +502,20 @@ fn find_recent_arc_from_source(
 /// We pass `summary + body_text` to the classifier so keyword matching has
 /// real content. The arc's source channel is the strongest signal and
 /// drives the domain tag directly.
+#[allow(clippy::too_many_arguments)]
 async fn route_new_arc_to_profile(
     arc_store: Option<&ArcStore>,
     profile_store: Option<&Arc<athen_persistence::profiles::SqliteProfileStore>>,
+    profile_embedder: &Arc<dyn athen_core::traits::embedding::EmbeddingProvider>,
+    profile_embedding_cache: &crate::state::ProfileEmbeddingCache,
     arc_id: &str,
     source: &str,
     summary: &str,
     body_text: &str,
 ) {
-    use athen_core::profile_routing::{classify_task, pick_profile};
+    use athen_core::profile_routing::{
+        classify_task, pick_profile_blended, profile_embedding_text,
+    };
     use athen_core::traits::profile::ProfileStore;
 
     let (Some(astore), Some(pstore)) = (arc_store, profile_store) else {
@@ -529,7 +539,58 @@ async fn route_new_arc_to_profile(
         return;
     }
 
-    let Some(decision) = pick_profile(&classified, &profiles) else {
+    // Best-effort: build the query embedding + per-profile embeddings.
+    // Any embedder error or missing entry just falls back to keyword-only
+    // scoring — `pick_profile_blended` tolerates partial coverage.
+    let query_embedding = match profile_embedder.embed(&combined_text).await {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::debug!("Profile router: query embedding failed: {e}");
+            None
+        }
+    };
+
+    let mut profile_embeddings: std::collections::HashMap<String, Vec<f32>> =
+        std::collections::HashMap::new();
+    if query_embedding.is_some() {
+        for p in &profiles {
+            // Cache hit: same id + same updated_at.
+            {
+                let cache = profile_embedding_cache.read().await;
+                if let Some((cached_at, vec)) = cache.get(&p.id) {
+                    if *cached_at == p.updated_at {
+                        profile_embeddings.insert(p.id.clone(), vec.clone());
+                        continue;
+                    }
+                }
+            }
+            // Miss or stale: embed and write back.
+            let text = profile_embedding_text(p);
+            if text.is_empty() {
+                continue;
+            }
+            match profile_embedder.embed(&text).await {
+                Ok(vec) => {
+                    let mut cache = profile_embedding_cache.write().await;
+                    cache.insert(p.id.clone(), (p.updated_at, vec.clone()));
+                    profile_embeddings.insert(p.id.clone(), vec);
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "Profile router: embed for profile {} failed: {e}",
+                        p.id
+                    );
+                }
+            }
+        }
+    }
+
+    let Some(decision) = pick_profile_blended(
+        &classified,
+        &profiles,
+        query_embedding.as_deref(),
+        &profile_embeddings,
+    ) else {
         info!(
             "Profile router: no positive match for arc {arc_id} (source={source}); \
              leaving on default"
