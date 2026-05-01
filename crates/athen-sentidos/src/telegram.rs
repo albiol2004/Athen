@@ -148,6 +148,12 @@ impl TelegramMonitor {
             // approval router after the poll tick.
             if let Some(cb) = update.callback_query.as_ref() {
                 if let Some(data) = cb.data.clone() {
+                    tracing::info!(
+                        callback_id = %cb.id,
+                        data = %data,
+                        from_user_id = cb.from.id,
+                        "Telegram callback_query buffered"
+                    );
                     let event = TelegramCallbackEvent {
                         callback_id: cb.id.clone(),
                         data,
@@ -156,6 +162,11 @@ impl TelegramMonitor {
                         message_id: cb.message.as_ref().map(|m| m.message_id),
                     };
                     self.callbacks.lock().unwrap().push(event);
+                } else {
+                    tracing::warn!(
+                        callback_id = %cb.id,
+                        "Telegram callback_query received without data field"
+                    );
                 }
             }
 
@@ -305,6 +316,30 @@ impl SenseMonitor for TelegramMonitor {
             tracing::info!(bot_username = %username, "TelegramMonitor initialized");
         }
 
+        // Best-effort: clear any stale webhook so getUpdates is the
+        // active delivery mechanism. Without this, `getUpdates` would
+        // return an error like "Conflict: can't use getUpdates while
+        // webhook is set" and we'd never see any updates at all,
+        // including callback_query.
+        let delete_webhook_url = self.api_url("deleteWebhook");
+        match self
+            .client
+            .post(&delete_webhook_url)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => {
+                tracing::debug!("Cleared any stale Telegram webhook");
+            }
+            Ok(r) => {
+                tracing::warn!("Telegram deleteWebhook returned {}", r.status());
+            }
+            Err(e) => {
+                tracing::warn!("Telegram deleteWebhook failed (non-fatal): {e}");
+            }
+        }
+
         Ok(())
     }
 
@@ -318,11 +353,21 @@ impl SenseMonitor for TelegramMonitor {
             guard.map(|id| id + 1)
         };
 
-        let mut url = self.api_url("getUpdates");
-        url.push_str("?timeout=0");
+        // Explicitly opt in to `callback_query` updates — by default
+        // Telegram remembers the previous `allowed_updates` setting,
+        // so a bot that was ever started with `["message"]` (or had a
+        // webhook configured) would silently never receive button
+        // taps. Sending an explicit list each call resets that.
+        //
+        // Build the URL by hand so it's easy to log and verify in
+        // production without dumping every reqwest builder field.
+        let base = self.api_url("getUpdates");
+        let allowed_updates_param = urlencode_param("[\"message\",\"callback_query\"]");
+        let mut url = format!("{base}?timeout=0&allowed_updates={allowed_updates_param}");
         if let Some(off) = offset {
             url.push_str(&format!("&offset={off}"));
         }
+        tracing::debug!(url = %url, "Telegram getUpdates URL");
 
         let resp = self
             .client
@@ -332,10 +377,22 @@ impl SenseMonitor for TelegramMonitor {
             .await
             .map_err(|e| AthenError::Other(format!("Telegram getUpdates failed: {e}")))?;
 
-        let body: TelegramResponse<Vec<TelegramUpdate>> = resp
-            .json()
+        // Read body as text first so we can log it on parse error AND
+        // count update kinds (message vs callback_query) without a
+        // second deserialization pass.
+        let body_text = resp
+            .text()
             .await
-            .map_err(|e| AthenError::Other(format!("Telegram getUpdates parse failed: {e}")))?;
+            .map_err(|e| AthenError::Other(format!("Telegram getUpdates body read: {e}")))?;
+
+        let body: TelegramResponse<Vec<TelegramUpdate>> =
+            serde_json::from_str(&body_text).map_err(|e| {
+                tracing::error!(
+                    body = %body_text.chars().take(500).collect::<String>(),
+                    "Telegram getUpdates parse failed: {e}"
+                );
+                AthenError::Other(format!("Telegram getUpdates parse failed: {e}"))
+            })?;
 
         if !body.ok {
             return Err(AthenError::Other(format!(
@@ -347,7 +404,33 @@ impl SenseMonitor for TelegramMonitor {
         let updates = body.result.unwrap_or_default();
 
         if !updates.is_empty() {
-            tracing::debug!(count = updates.len(), "Received Telegram updates");
+            // Count kinds to make it obvious in logs whether
+            // callback_query updates are arriving at all.
+            let mut msg_count = 0;
+            let mut cb_count = 0;
+            for u in &updates {
+                if u.message.is_some() {
+                    msg_count += 1;
+                }
+                if u.callback_query.is_some() {
+                    cb_count += 1;
+                }
+            }
+            tracing::info!(
+                total = updates.len(),
+                messages = msg_count,
+                callbacks = cb_count,
+                "Telegram getUpdates returned updates"
+            );
+            // If a callback was returned, also log the raw JSON keys of
+            // the first update so we can see what Telegram is actually
+            // sending vs. what our struct expects.
+            if cb_count == 0 && msg_count == 0 {
+                tracing::warn!(
+                    body = %body_text.chars().take(500).collect::<String>(),
+                    "Telegram returned updates but none parsed as message or callback_query"
+                );
+            }
         }
 
         Ok(self.process_updates(updates))
@@ -370,6 +453,24 @@ impl SenseMonitor for TelegramMonitor {
 /// Send a text message to a Telegram chat via the Bot API.
 ///
 /// Handles the 4096-character limit by splitting into multiple messages.
+/// Tiny URL-encoder for query parameter values. Escapes the characters
+/// that Telegram's getUpdates is sensitive about (`[`, `]`, `"`, `,`)
+/// without pulling in a full url-encoding crate just for this.
+fn urlencode_param(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() * 2);
+    for b in value.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        }
+    }
+    out
+}
+
 pub async fn send_message(
     bot_token: &str,
     chat_id: i64,

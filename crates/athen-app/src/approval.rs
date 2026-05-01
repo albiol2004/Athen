@@ -377,7 +377,15 @@ fn ack_callback(token: String, callback_id: String, text: &str) {
         if let Err(e) =
             athen_sentidos::telegram::answer_callback_query(&token, &callback_id, &text_owned).await
         {
-            warn!("Failed to answer Telegram callback: {e}");
+            // Stale callbacks (queued during a previous run, or older than
+            // Telegram's ack window) come back as "query is too old". Not
+            // worth a warn — drop to debug so a relaunch isn't noisy.
+            let msg = e.to_string();
+            if msg.contains("query is too old") || msg.contains("query ID is invalid") {
+                tracing::debug!("Skipping stale Telegram callback ack: {msg}");
+            } else {
+                warn!("Failed to answer Telegram callback: {e}");
+            }
         }
     });
 }

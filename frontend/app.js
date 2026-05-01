@@ -31,6 +31,10 @@ let activeArcId = null;
 let arcHasMessages = false;
 // Arcs with unread background activity (e.g. Telegram responses).
 const arcsWithNotifications = new Set();
+// Task IDs whose approval has already been initiated (UI click or
+// Telegram callback). Prevents the `approval-resolved` event — which
+// `approve_task` itself emits — from re-entering and double-executing.
+const approvalsInFlight = new Set();
 
 // ─── Error Retry State ───
 
@@ -355,6 +359,41 @@ function registerTauriEventListeners() {
     // Listen for path-grant requests from the file gate.
     window.__TAURI__.event.listen('grant-requested', (event) => {
         enqueueGrantRequest(event.payload);
+    });
+
+    // The file gate races in-app vs Telegram. When Telegram wins, the
+    // backend emits this event with the resolved request id; drop it
+    // from the queue (or close the modal if it's the in-flight one).
+    window.__TAURI__.event.listen('grant-resolved-elsewhere', (event) => {
+        const id = event.payload;
+        if (!id) return;
+        if (grantInFlight && grantInFlight.id === id) {
+            grantInFlight = null;
+            const overlay = document.getElementById('grant-modal-overlay');
+            if (overlay) overlay.classList.add('hidden');
+            showNextGrantRequest();
+            return;
+        }
+        const idx = grantQueue.findIndex((q) => q.id === id);
+        if (idx >= 0) {
+            grantQueue.splice(idx, 1);
+            updateGrantQueueIndicator();
+        }
+    });
+
+    // When the approval router resolves a question through Telegram,
+    // the UI card stays stale because it was driven by the legacy
+    // `approve_task` flow. Auto-invoke approve_task with the choice so
+    // the Telegram tap actually triggers execution and the card clears.
+    // The `approvalsInFlight` set + handleApproval's guard prevent
+    // re-entry (approve_task itself emits this same event).
+    window.__TAURI__.event.listen('approval-resolved', (event) => {
+        const { task_id, approved } = event.payload || {};
+        if (!task_id) return;
+        if (approvalsInFlight.has(task_id)) return;
+        const card = document.getElementById(`approval-${task_id}`);
+        if (!card) return;
+        handleApproval(task_id, !!approved);
     });
 
     // Listen for sense events (email, calendar, messaging, etc.)
@@ -1358,6 +1397,8 @@ function addApprovalDialog(approval) {
 
 async function handleApproval(taskId, approved) {
     if (!invoke) return;
+    if (approvalsInFlight.has(taskId)) return;
+    approvalsInFlight.add(taskId);
 
     // Disable the approval buttons immediately.
     const approvalEl = document.getElementById(`approval-${taskId}`);

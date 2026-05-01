@@ -668,25 +668,50 @@ impl AppState {
                                     .unwrap_or(0);
 
                                 if !text.is_empty() && chat_id != 0 {
-                                    execute_owner_telegram_message(
-                                        text,
-                                        chat_id,
-                                        &bot_token,
-                                        &router,
-                                        &arc_store_ref,
-                                        &calendar_store_ref,
-                                        &contact_store_ref,
-                                        &memory_ref,
-                                        &mcp_ref,
-                                        tool_doc_dir_ref.as_deref(),
-                                        &app_handle,
-                                        notifier.as_ref(),
-                                        grant_store_ref.as_ref(),
-                                        &pending_grants_ref,
-                                        &spawned_processes_ref,
-                                        telegram_approval_sink.as_ref(),
-                                    )
-                                    .await;
+                                    // Spawn the handler so the poll loop keeps
+                                    // ticking. If we awaited inline, callbacks
+                                    // (Telegram inline-keyboard taps) would
+                                    // pile up at Telegram while this message's
+                                    // approval sat blocked — the user would
+                                    // tap Approve and see no response until
+                                    // the agent finished some other way.
+                                    let text_owned = text.to_string();
+                                    let bot_token_c = bot_token.clone();
+                                    let router_c = Arc::clone(&router);
+                                    let arc_store_c = arc_store_ref.clone();
+                                    let calendar_store_c = calendar_store_ref.clone();
+                                    let contact_store_c = contact_store_ref.clone();
+                                    let memory_c = memory_ref.clone();
+                                    let mcp_c = Arc::clone(&mcp_ref);
+                                    let tool_doc_dir_c = tool_doc_dir_ref.clone();
+                                    let app_handle_c = app_handle.clone();
+                                    let notifier_c = notifier.clone();
+                                    let grant_store_c = grant_store_ref.clone();
+                                    let pending_grants_c = pending_grants_ref.clone();
+                                    let spawned_processes_c = spawned_processes_ref.clone();
+                                    let telegram_approval_sink_c =
+                                        telegram_approval_sink.clone();
+                                    tauri::async_runtime::spawn(async move {
+                                        execute_owner_telegram_message(
+                                            &text_owned,
+                                            chat_id,
+                                            &bot_token_c,
+                                            &router_c,
+                                            &arc_store_c,
+                                            &calendar_store_c,
+                                            &contact_store_c,
+                                            &memory_c,
+                                            &mcp_c,
+                                            tool_doc_dir_c.as_deref(),
+                                            &app_handle_c,
+                                            notifier_c.as_ref(),
+                                            grant_store_c.as_ref(),
+                                            &pending_grants_c,
+                                            &spawned_processes_c,
+                                            telegram_approval_sink_c.as_ref(),
+                                        )
+                                        .await;
+                                    });
                                 }
                             } else {
                                 // Non-owner messages go through the full sense
@@ -716,20 +741,24 @@ impl AppState {
                 // iteration it arrives, not the next one.
                 let callbacks = monitor.take_callbacks();
                 if !callbacks.is_empty() {
+                    info!(
+                        count = callbacks.len(),
+                        "Draining Telegram callback events"
+                    );
                     if let Some(ref sink) = telegram_approval_sink {
                         for cb in callbacks {
                             let resolved = sink.resolve_callback(&cb.callback_id, &cb.data).await;
-                            if !resolved {
-                                tracing::debug!(
-                                    callback_id = %cb.callback_id,
-                                    "Telegram callback for unknown question (already answered or cancelled)"
-                                );
-                            }
+                            info!(
+                                callback_id = %cb.callback_id,
+                                data = %cb.data,
+                                resolved,
+                                "Telegram callback dispatched"
+                            );
                         }
                     } else {
-                        tracing::debug!(
+                        warn!(
                             count = callbacks.len(),
-                            "Telegram callbacks ignored — no approval sink configured"
+                            "Telegram callbacks dropped — no approval sink configured"
                         );
                     }
                 }
