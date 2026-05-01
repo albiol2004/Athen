@@ -145,27 +145,42 @@ impl ToolRegistry for DelegationToolRegistry {
 
         let started = Instant::now();
 
-        // Recover from the OpenAI provider's "string wrapper" fallback:
-        // when the LLM emits malformed JSON (typically because it stuffed
-        // a huge HTML/code blob into a field), the provider hands us the
-        // raw payload as a `Value::String`. Try parsing that as JSON
-        // before giving up. Mirrors `athen-agent::tools::coerce_args`.
+        // Recovery ladder for malformed args:
+        //   1. `coerce_string_wrapper` re-parses Value::String as JSON
+        //      when the provider's repair worked but the wrapper
+        //      survived (rare; both providers strip it eagerly now).
+        //   2. `salvage_delegate_args_from_raw` regex-extracts the two
+        //      fields from a raw broken JSON string. This is the
+        //      hard-fallback that handles "LLM stuffed HTML/code with
+        //      unescaped quotes into the brief and broke the JSON
+        //      beyond what generic repair can fix".
         let coerced = coerce_string_wrapper(args);
 
         let parsed: DelegateArgs = match serde_json::from_value(coerced.clone()) {
             Ok(a) => a,
-            Err(e) => {
-                let hint = build_args_error_hint(&coerced);
-                return Ok(ToolResult {
-                    success: false,
-                    output: json!({
-                        "error": format!("invalid arguments: {e}"),
-                        "hint": hint,
-                    }),
-                    error: Some(format!("invalid arguments: {e}")),
-                    execution_time_ms: started.elapsed().as_millis() as u64,
-                });
-            }
+            Err(e) => match salvage_delegate_args_from_raw(&coerced) {
+                Some(salvaged) => {
+                    tracing::warn!(
+                        "delegate_to_agent: deserialize failed ({e}); \
+                         salvaged target_profile_id + brief via raw extraction \
+                         (brief len={})",
+                        salvaged.brief.len()
+                    );
+                    salvaged
+                }
+                None => {
+                    let hint = build_args_error_hint(&coerced);
+                    return Ok(ToolResult {
+                        success: false,
+                        output: json!({
+                            "error": format!("invalid arguments: {e}"),
+                            "hint": hint,
+                        }),
+                        error: Some(format!("invalid arguments: {e}")),
+                        execution_time_ms: started.elapsed().as_millis() as u64,
+                    });
+                }
+            },
         };
 
         if parsed.brief.trim().is_empty() {
@@ -213,16 +228,32 @@ async fn run_delegation(
 ) -> Result<(String, String, bool)> {
     use athen_core::traits::profile::ProfileStore;
 
+    let started = Instant::now();
+    tracing::info!(
+        target_profile_id = %args.target_profile_id,
+        brief_len = args.brief.len(),
+        parent_arc_id = %ctx.parent_arc_id,
+        "delegate_to_agent: run_delegation entered"
+    );
+
     // 1. Resolve target profile (fall back to default if unknown / empty).
     let target_id = if args.target_profile_id.trim().is_empty() {
         None
     } else {
         Some(args.target_profile_id.clone())
     };
-    let profile = ctx
-        .profile_store
-        .get_or_default(target_id.as_ref())
-        .await?;
+    let profile = match ctx.profile_store.get_or_default(target_id.as_ref()).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("delegate_to_agent: profile_store.get_or_default failed: {e}");
+            return Err(e);
+        }
+    };
+    tracing::info!(
+        profile_id = %profile.id,
+        profile_name = %profile.display_name,
+        "delegate_to_agent: profile resolved"
+    );
     let templates = ctx
         .profile_store
         .resolve_templates(&profile.persona_template_ids)
@@ -285,6 +316,11 @@ async fn run_delegation(
     let executor = builder
         .build()
         .map_err(|e| AthenError::Other(format!("delegation: build sub-executor: {e}")))?;
+    tracing::info!(
+        sub_arc_id = %sub_arc_id,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "delegate_to_agent: sub-executor built; starting sub-task"
+    );
 
     // 4. Synthesize a Task from the brief and run it.
     let task = Task {
@@ -304,7 +340,26 @@ async fn run_delegation(
         deadline: None,
     };
 
-    let result = executor.execute(task).await?;
+    let result = match executor.execute(task).await {
+        Ok(r) => {
+            tracing::info!(
+                sub_arc_id = %sub_arc_id,
+                success = r.success,
+                steps_completed = r.steps_completed,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "delegate_to_agent: sub-task finished"
+            );
+            r
+        }
+        Err(e) => {
+            tracing::warn!(
+                sub_arc_id = %sub_arc_id,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "delegate_to_agent: sub-task errored: {e}"
+            );
+            return Err(e);
+        }
+    };
 
     // Pull the human-readable response back out of the TaskResult.
     let content = result
@@ -342,6 +397,71 @@ fn coerce_string_wrapper(args: serde_json::Value) -> serde_json::Value {
         }
     }
     args
+}
+
+/// Last-resort salvage: pull `target_profile_id` and `brief` out of a
+/// malformed JSON args payload using positional string ops, treating
+/// the brief value as raw text (so embedded HTML / unescaped quotes /
+/// raw newlines don't matter).
+///
+/// Accepts either a `Value::String` (the openai provider's last-resort
+/// wrapper for unparseable args) OR a partially-parsed object that's
+/// still missing fields after a deserialize attempt — but in practice
+/// the salvage path only matters for the string case.
+///
+/// Strategy:
+///   - target_profile_id: regex-style extract `"target_profile_id"\s*:\s*"<short>"`.
+///     The id is a known short identifier (no special chars), so the
+///     "no embedded quotes" assumption is safe.
+///   - brief: find `"brief"\s*:\s*"`, take everything between that and
+///     the LAST `"` in the payload. We assume the LLM closed the
+///     string and the object at the very end, even if the middle is
+///     full of unescaped quotes.
+///
+/// Returns `None` if either field is missing entirely.
+fn salvage_delegate_args_from_raw(value: &serde_json::Value) -> Option<DelegateArgs> {
+    let raw = value.as_str()?;
+    let target_profile_id = extract_short_string_field(raw, "target_profile_id")
+        .unwrap_or_default();
+    let brief = extract_trailing_string_field(raw, "brief")?;
+    if brief.trim().is_empty() {
+        return None;
+    }
+    Some(DelegateArgs {
+        target_profile_id,
+        brief,
+    })
+}
+
+/// Find `"<field>"\s*:\s*"<value>"` and return `<value>`. Used for
+/// short identifier fields (no embedded quotes). Returns None if not
+/// found or the value would contain a quote.
+fn extract_short_string_field(raw: &str, field: &str) -> Option<String> {
+    let needle = format!("\"{field}\"");
+    let start = raw.find(&needle)?;
+    let after = &raw[start + needle.len()..];
+    let colon = after.find(':')?;
+    let after_colon = &after[colon + 1..];
+    let trimmed = after_colon.trim_start();
+    let rest = trimmed.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Find `"<field>"\s*:\s*"` and return everything from there until the
+/// LAST `"` in the input (which we assume is the closing quote of this
+/// field's value, since `brief` is the last field in the schema).
+/// Used for unbounded fields whose value may contain unescaped quotes.
+fn extract_trailing_string_field(raw: &str, field: &str) -> Option<String> {
+    let needle = format!("\"{field}\"");
+    let start = raw.find(&needle)?;
+    let after = &raw[start + needle.len()..];
+    let colon = after.find(':')?;
+    let after_colon = &after[colon + 1..];
+    let trimmed = after_colon.trim_start();
+    let rest = trimmed.strip_prefix('"')?;
+    let last_quote = rest.rfind('"')?;
+    Some(rest[..last_quote].to_string())
 }
 
 /// When delegate_to_agent args fail to deserialize, give the LLM a useful
@@ -509,6 +629,47 @@ mod tests {
         let hint = build_args_error_hint(&bad);
         assert!(hint.contains("raw string"));
         assert!(hint.contains("brief"));
+    }
+
+    /// Real-world failure mode: the LLM stuffs HTML with unescaped
+    /// quotes into the brief, so generic JSON repair fails and the args
+    /// arrive as a Value::String. The salvage path must still extract
+    /// both fields so the delegation can proceed.
+    #[test]
+    fn salvage_extracts_both_fields_from_raw_html_brief() {
+        // HTML with unescaped quotes inside the brief — the exact
+        // failure mode the user is hitting. We construct it as a plain
+        // string (not a raw literal) so `\"` correctly emits a literal
+        // double-quote into the input we want to salvage.
+        let raw = "{\"target_profile_id\":\"coder\",\"brief\":\"Crea un HTML con <h1 class=\"hero\">Hi</h1> y un <a href=\"#\">link</a>\"}";
+        let value = serde_json::Value::String(raw.to_string());
+        let salvaged = salvage_delegate_args_from_raw(&value).expect("salvage should succeed");
+        assert_eq!(salvaged.target_profile_id, "coder");
+        assert!(salvaged.brief.contains("class=\"hero\""));
+        assert!(salvaged.brief.contains("href=\"#\""));
+    }
+
+    #[test]
+    fn salvage_handles_empty_target_profile_id() {
+        // The schema allows an empty target_profile_id (means "default").
+        let raw = r#"{"target_profile_id":"","brief":"do a thing"}"#;
+        let salvaged =
+            salvage_delegate_args_from_raw(&serde_json::Value::String(raw.to_string())).unwrap();
+        assert_eq!(salvaged.target_profile_id, "");
+        assert_eq!(salvaged.brief, "do a thing");
+    }
+
+    #[test]
+    fn salvage_returns_none_when_brief_missing() {
+        let raw = r#"{"target_profile_id":"coder"}"#;
+        let value = serde_json::Value::String(raw.to_string());
+        assert!(salvage_delegate_args_from_raw(&value).is_none());
+    }
+
+    #[test]
+    fn salvage_returns_none_for_non_string_value() {
+        let value = json!({ "target_profile_id": "coder", "brief": "x" });
+        assert!(salvage_delegate_args_from_raw(&value).is_none());
     }
 
     #[test]

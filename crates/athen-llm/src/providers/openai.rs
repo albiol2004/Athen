@@ -537,10 +537,17 @@ pub(crate) fn parse_tool_arguments(raw: &str) -> serde_json::Value {
         );
         return v;
     }
+    // Emit head + tail of the raw payload at debug level so a developer
+    // staring at "still failing!" can see WHY repair gave up. Keep info
+    // logs quiet (the slice could be large).
+    let head = raw.chars().take(200).collect::<String>();
+    let tail: String = raw.chars().rev().take(200).collect::<Vec<_>>().into_iter().rev().collect();
     tracing::warn!(
         "Tool args could not be parsed even after aggressive repair; \
-         falling back to string wrapper (raw len={})",
-        raw.len()
+         falling back to string wrapper (raw len={})\nHEAD: {}\nTAIL: {}",
+        raw.len(),
+        head.replace('\n', "\\n"),
+        tail.replace('\n', "\\n"),
     );
     serde_json::Value::String(raw.to_string())
 }

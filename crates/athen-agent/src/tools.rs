@@ -115,6 +115,45 @@ fn coerce_args<'a>(
     args
 }
 
+/// Build the LLM-facing error returned when tool args arrive at a
+/// `do_*` helper as a `Value::String`. By the time we get here, the
+/// provider's strict + control-char + aggressive-quote repair passes
+/// have all failed — the overwhelmingly common cause is the LLM
+/// hitting the output token limit mid-string, leaving the args
+/// truncated. We tell the model exactly that, plus a tool-specific
+/// suggestion for how to retry without looping on the same too-large
+/// payload.
+fn args_truncated_result(
+    tool: &str,
+    raw: &str,
+    suggestion: &str,
+    started: Instant,
+) -> ToolResult {
+    let head: String = raw.chars().take(120).collect();
+    let tail: String = {
+        let s: String = raw.chars().rev().take(120).collect();
+        s.chars().rev().collect()
+    };
+    let msg = format!(
+        "{tool}: tool-call arguments could not be parsed as JSON \
+         (raw len={}). The most likely cause is that the model output \
+         was truncated by the token limit mid-string — the args buffer \
+         ends without a closing quote/brace. Suggestion: {suggestion}.",
+        raw.len()
+    );
+    ToolResult {
+        success: false,
+        output: serde_json::json!({
+            "error": msg,
+            "raw_len": raw.len(),
+            "raw_head": head,
+            "raw_tail": tail,
+        }),
+        error: Some(msg),
+        execution_time_ms: started.elapsed().as_millis() as u64,
+    }
+}
+
 /// Walk the input and escape unescaped control characters inside JSON
 /// string literals only. Mirrors `escape_control_chars_in_strings` in
 /// the provider layer; duplicated here to avoid an inter-crate
@@ -750,6 +789,18 @@ impl ShellToolRegistry {
     async fn do_edit(&self, args: &serde_json::Value) -> Result<ToolResult> {
         let mut owned = serde_json::Value::Null;
         let args = coerce_args(args, &mut owned);
+        // Same truncation guard as do_write: if args remained a string
+        // after coercion, the JSON tool call was cut off mid-payload.
+        if let Some(raw) = args.as_str() {
+            return Ok(args_truncated_result(
+                "edit",
+                raw,
+                "shrink the new_string (or chunk replacements across \
+                 multiple edit calls) so the JSON tool call fits the \
+                 model output budget",
+                Instant::now(),
+            ));
+        }
         let path_arg = args
             .get("path")
             .and_then(|v| v.as_str())
@@ -828,6 +879,21 @@ impl ShellToolRegistry {
     async fn do_write(&self, args: &serde_json::Value) -> Result<ToolResult> {
         let mut owned = serde_json::Value::Null;
         let args = coerce_args(args, &mut owned);
+        // If args is still a Value::String here, the provider could not
+        // parse the JSON tool call — most often because the LLM hit the
+        // output token limit mid-content and the args buffer is
+        // truncated. Surface that diagnosis so the model retries by
+        // chunking instead of looping on the same too-large write.
+        if let Some(raw) = args.as_str() {
+            return Ok(args_truncated_result(
+                "write",
+                raw,
+                "split the file into ~3-5KB chunks and emit them across \
+                 multiple write/edit calls (write the first chunk, then \
+                 use edit with replace_all=false to append the rest)",
+                Instant::now(),
+            ));
+        }
         let path_arg = args
             .get("path")
             .and_then(|v| v.as_str())
@@ -1959,6 +2025,24 @@ mod coerce_args_tests {
         let coerced = coerce_args(&stringified, &mut owned);
         assert_eq!(coerced.get("path").and_then(|v| v.as_str()), Some("/tmp/coerce_x.html"));
         assert_eq!(coerced.get("content").and_then(|v| v.as_str()), Some("hello"));
+    }
+
+    #[test]
+    fn args_truncated_result_emits_actionable_message() {
+        // Truncated raw payload (no closing quote/brace) — exactly what
+        // the user hit when DeepSeek ran out of output tokens mid-write.
+        let raw = "{\"path\":\"/tmp/x.html\",\"content\":\"<!DOCTYPE html>\n<html>...mid string";
+        let result = args_truncated_result("write", raw, "chunk via edit", Instant::now());
+        assert!(!result.success);
+        let err = result.error.unwrap_or_default();
+        assert!(err.contains("write"));
+        assert!(err.contains("token limit") || err.contains("truncated"));
+        assert!(err.contains("chunk via edit"));
+        // Output JSON exposes raw_len + head/tail for the LLM to see
+        // the cut-off shape and reason about how to retry.
+        assert!(result.output.get("raw_len").is_some());
+        assert!(result.output.get("raw_head").is_some());
+        assert!(result.output.get("raw_tail").is_some());
     }
 
     #[test]

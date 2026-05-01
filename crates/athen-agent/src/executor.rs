@@ -887,10 +887,15 @@ impl AgentExecutor for DefaultExecutor {
             }
 
             // Build LLM request — only the revealed tool subset is sent.
+            // 32K is well inside DeepSeek-V4-flash and Claude Sonnet/Opus
+            // model caps and gives the agent enough room to one-shot a
+            // multi-KB write tool call without truncation. If the provider
+            // honors a smaller cap we'll still see the truncation abort
+            // guard kick in cleanly downstream — no tight-loop risk.
             let request = LlmRequest {
                 profile: ModelProfile::Fast,
                 messages: conversation.clone(),
-                max_tokens: Some(4096),
+                max_tokens: Some(32_768),
                 temperature: Some(0.7),
                 tools: if revealed_tool_defs.is_empty() {
                     None
@@ -903,6 +908,21 @@ impl AgentExecutor for DefaultExecutor {
             // Call the LLM — use streaming when a stream sender is available.
             // Streaming allows the final text response to be forwarded chunk
             // by chunk for progressive rendering in the UI.
+            let llm_call_started = std::time::Instant::now();
+            let prompt_chars: usize = conversation
+                .iter()
+                .map(|m| match &m.content {
+                    MessageContent::Text(s) => s.len(),
+                    MessageContent::Structured(v) => v.to_string().len(),
+                })
+                .sum();
+            tracing::info!(
+                task_id = %task_id,
+                step = steps_completed,
+                prompt_chars,
+                streaming = self.stream_sender.is_some(),
+                "executor: calling LLM"
+            );
             let response = if self.stream_sender.is_some() {
                 // Try streaming first. If we get text content, the chunks
                 // have already been forwarded via the sender. If the
@@ -978,6 +998,61 @@ impl AgentExecutor for DefaultExecutor {
             } else {
                 self.llm_router.route(&request).await?
             };
+            tracing::info!(
+                task_id = %task_id,
+                step = steps_completed,
+                elapsed_ms = llm_call_started.elapsed().as_millis() as u64,
+                response_chars = response.content.len(),
+                tool_calls = response.tool_calls.len(),
+                "executor: LLM call returned"
+            );
+
+            // Truncation guard: when the model hits max_tokens mid-tool-call,
+            // the OpenAI provider falls back to wrapping unparseable args
+            // as `Value::String`. Letting the agent retry just balloons the
+            // conversation (each retry costs another full max_tokens budget
+            // because the broken assistant message stays in the prompt).
+            // Bail out with a user-facing summary instead.
+            if let Some(bad_call) = response
+                .tool_calls
+                .iter()
+                .find(|tc| tc.arguments.is_string())
+            {
+                let raw_len = bad_call
+                    .arguments
+                    .as_str()
+                    .map(|s| s.len())
+                    .unwrap_or(0);
+                tracing::warn!(
+                    task_id = %task_id,
+                    step = steps_completed,
+                    tool = %bad_call.name,
+                    raw_len,
+                    "executor: aborting — tool args truncated by max_tokens; \
+                     no point retrying same shape"
+                );
+                let user_msg = format!(
+                    "I tried to call `{}` with arguments too large to fit in a single \
+                     model response (the LLM hit its output token limit at ~{} chars and \
+                     the tool call was cut off mid-string). I stopped before retrying \
+                     blindly so we don't burn tokens looping. \
+                     Tip: ask me to break the operation into smaller pieces — e.g. \
+                     write a short skeleton first, then add sections via `edit`.",
+                    bad_call.name, raw_len
+                );
+                return Ok(TaskResult {
+                    task_id,
+                    success: false,
+                    output: Some(serde_json::json!({
+                        "reason": "tool_args_truncated",
+                        "response": user_msg,
+                        "tool": bad_call.name.clone(),
+                        "raw_len": raw_len,
+                    })),
+                    steps_completed,
+                    total_risk_used: 0,
+                });
+            }
 
             // Extract <think> tags from content (servers that embed thinking inline).
             let (stripped_content, inline_think) = extract_think_tags(&response.content);
