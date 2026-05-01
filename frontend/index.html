@@ -70,7 +70,13 @@
                         <span class="subtitle">Universal AI Agent</span>
                     </div>
                 </div>
-                <button id="new-chat-btn" title="Start a new conversation">New Arc</button>
+                <div class="header-right">
+                    <label class="profile-picker-wrap" title="Choose the specialist that handles this arc">
+                        <span class="profile-picker-label">Agent:</span>
+                        <select id="arc-profile-picker" class="profile-picker"></select>
+                    </label>
+                    <button id="new-chat-btn" title="Start a new conversation">New Arc</button>
+                </div>
             </header>
 
             <main id="chat-container">

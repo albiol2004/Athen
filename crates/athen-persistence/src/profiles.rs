@@ -26,8 +26,8 @@ use rusqlite::{params, Connection};
 use tokio::sync::Mutex;
 
 use athen_core::agent_profile::{
-    AgentProfile, ExpertiseDeclaration, PersonaCategory, PersonaTemplate, ProfileId,
-    TemplateId, ToolSelection,
+    AgentProfile, DomainTag, ExpertiseDeclaration, PersonaCategory, PersonaTemplate,
+    ProfileId, TaskKindTag, TemplateId, ToolSelection,
 };
 use athen_core::error::{AthenError, Result};
 use athen_core::traits::profile::ProfileStore;
@@ -79,30 +79,19 @@ impl SqliteProfileStore {
         .map_err(|e| AthenError::Other(format!("Spawn blocking: {e}")))?
     }
 
-    /// Insert the canonical built-in `default` profile if no built-in
-    /// profile exists yet. Idempotent: safe to call on every boot.
+    /// Seed every canonical built-in profile that doesn't already exist.
+    /// Idempotent: each profile is inserted only when its id is missing,
+    /// so adding a new built-in in a later release is automatic on next
+    /// boot. User edits to existing built-ins are out of scope (built-ins
+    /// are immutable; users clone to customize).
     pub async fn seed_builtins_if_empty(&self) -> Result<()> {
-        if self.get_profile(AgentProfile::DEFAULT_ID).await?.is_some() {
-            return Ok(());
-        }
         let now = Utc::now();
-        let default = AgentProfile {
-            id: AgentProfile::DEFAULT_ID.to_string(),
-            display_name: "Athen (default)".to_string(),
-            description:
-                "Universal proactive AI agent. Reproduces Athen's original behavior — \
-                 no profile-specific persona, no tool restrictions."
-                    .to_string(),
-            persona_template_ids: vec![],
-            custom_persona_addendum: None,
-            tool_selection: ToolSelection::All,
-            expertise: ExpertiseDeclaration::default(),
-            model_profile_hint: None,
-            builtin: true,
-            created_at: now,
-            updated_at: now,
-        };
-        self.save_profile_raw(&default).await
+        for profile in builtin_profiles(now) {
+            if self.get_profile(&profile.id).await?.is_none() {
+                self.save_profile_raw(&profile).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Internal save that bypasses the built-in protection in `save_profile`.
@@ -144,6 +133,273 @@ impl SqliteProfileStore {
         .await
         .map_err(|e| AthenError::Other(format!("Spawn blocking: {e}")))?
     }
+}
+
+/// Canonical list of built-in profiles seeded on first boot.
+///
+/// Adding a new entry here ships it on next launch (existing installs pick it
+/// up via `seed_builtins_if_empty`'s per-id check). Keep `tool_selection:
+/// ToolSelection::All` for now — the persona drives behavior, and aggressive
+/// group filtering risks hiding tools an agent actually needs. Phase 2's
+/// profile-manager UI will expose per-profile tool restrictions.
+///
+/// Lawyer and doctor profiles are research-oriented: they help locate
+/// authoritative sources and synthesize, with explicit disclaimers in their
+/// persona. Final responsibility for the LLM's safety behavior rests with the
+/// upstream provider.
+fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
+    let mk = |id: &str,
+              name: &str,
+              description: &str,
+              addendum: Option<&str>,
+              domains: Vec<DomainTag>,
+              task_kinds: Vec<TaskKindTag>,
+              strengths: Vec<&str>,
+              avoid: Vec<TaskKindTag>|
+     -> AgentProfile {
+        AgentProfile {
+            id: id.to_string(),
+            display_name: name.to_string(),
+            description: description.to_string(),
+            persona_template_ids: vec![],
+            custom_persona_addendum: addendum.map(|s| s.to_string()),
+            tool_selection: ToolSelection::All,
+            expertise: ExpertiseDeclaration {
+                domains,
+                task_kinds,
+                languages: vec![],
+                strengths: strengths.into_iter().map(|s| s.to_string()).collect(),
+                avoid,
+            },
+            model_profile_hint: None,
+            builtin: true,
+            created_at: now,
+            updated_at: now,
+        }
+    };
+
+    vec![
+        // The fallback. Empty persona = today's hardcoded "You are Athen…" runs.
+        AgentProfile {
+            id: AgentProfile::DEFAULT_ID.to_string(),
+            display_name: "Athen (default)".to_string(),
+            description:
+                "Universal proactive AI agent. Reproduces Athen's original behavior — \
+                 no profile-specific persona, no tool restrictions."
+                    .to_string(),
+            persona_template_ids: vec![],
+            custom_persona_addendum: None,
+            tool_selection: ToolSelection::All,
+            expertise: ExpertiseDeclaration::default(),
+            model_profile_hint: None,
+            builtin: true,
+            created_at: now,
+            updated_at: now,
+        },
+        mk(
+            "assistant",
+            "Personal Assistant",
+            "Day-to-day personal assistant: scheduling, reminders, drafting messages, \
+             quick research, keeping context across emails and calendar.",
+            Some(
+                "You are a personal assistant. Be concise, anticipate next steps, and \
+                 surface decisions the user needs to make rather than asking them to \
+                 micro-manage. Prefer doing > asking when the action is reversible.",
+            ),
+            vec![DomainTag::Email, DomainTag::Calendar, DomainTag::Scheduling, DomainTag::Writing],
+            vec![
+                TaskKindTag::Drafting,
+                TaskKindTag::Scheduling,
+                TaskKindTag::Triage,
+                TaskKindTag::Summarizing,
+            ],
+            vec!["calendar triage", "inbox zero", "follow-up tracking"],
+            vec![],
+        ),
+        mk(
+            "coder",
+            "Software Engineer",
+            "Implementation specialist: writes, refactors, and debugs code across \
+             languages. Strong on Rust, Python, TypeScript.",
+            Some(
+                "You are a senior software engineer. Read before writing — understand \
+                 the surrounding code first. Prefer the smallest change that solves the \
+                 problem; avoid speculative abstractions. Run tests after non-trivial \
+                 edits.",
+            ),
+            vec![DomainTag::Coding],
+            vec![TaskKindTag::Coding, TaskKindTag::Debugging, TaskKindTag::CodeReview],
+            vec!["rust", "python", "typescript", "refactoring", "test-driven debugging"],
+            vec![],
+        ),
+        mk(
+            "devops",
+            "DevOps & Deployments",
+            "Ships fast: containers, deploy targets (Vercel, Supabase, Fly, Railway), \
+             CI/CD, observability. Built for indie hackers and 'vibe coders' who need \
+             working infra without becoming infra experts.",
+            Some(
+                "You are a pragmatic DevOps engineer. Prefer the simplest deployment \
+                 that works for the target platform — Vercel/Supabase/Fly defaults are \
+                 usually fine. Surface cost/complexity tradeoffs explicitly. When \
+                 troubleshooting, ask for the actual error output before guessing.",
+            ),
+            vec![DomainTag::Infrastructure, DomainTag::Coding],
+            vec![TaskKindTag::Debugging, TaskKindTag::Coding],
+            vec![
+                "vercel", "supabase", "docker", "kubernetes", "github actions",
+                "ci/cd", "observability",
+            ],
+            vec![],
+        ),
+        mk(
+            "systems_architect",
+            "Systems Architect",
+            "Designs systems before they're built: data models, service boundaries, \
+             scalability tradeoffs, failure modes.",
+            Some(
+                "You are a systems architect. Start by clarifying constraints (scale, \
+                 team size, latency budgets) before recommending. Resist over-engineering \
+                 — match the design to the actual scale, not the imagined one. Always \
+                 surface the tradeoff being made.",
+            ),
+            vec![DomainTag::Architecture, DomainTag::Coding],
+            vec![TaskKindTag::CodeReview, TaskKindTag::Researching],
+            vec![
+                "system design", "data modeling", "service boundaries",
+                "scalability", "failure modes",
+            ],
+            vec![],
+        ),
+        mk(
+            "technical_support",
+            "Technical Support",
+            "Troubleshoots Linux/dev-environment issues: package managers, permissions, \
+             shell errors, broken installs, weird OS behavior.",
+            Some(
+                "You are technical support for developers on Linux/macOS. Always ask \
+                 for the exact error output and OS/version before suggesting fixes. \
+                 Prefer reading config files and logs over guessing. Step the user \
+                 through commands one at a time and explain what each does.",
+            ),
+            vec![DomainTag::Support, DomainTag::Coding],
+            vec![TaskKindTag::Debugging, TaskKindTag::Triage],
+            vec![
+                "linux", "shell debugging", "package managers", "systemd",
+                "environment troubleshooting",
+            ],
+            vec![],
+        ),
+        mk(
+            "researcher",
+            "Researcher",
+            "Deep research across the web: investigates topics, finds and cross-checks \
+             sources, synthesizes findings.",
+            Some(
+                "You are a research analyst. Cite sources inline. Distinguish primary \
+                 sources from secondary commentary. When sources disagree, surface the \
+                 disagreement instead of picking a side. End with a one-paragraph TL;DR.",
+            ),
+            vec![DomainTag::Research],
+            vec![TaskKindTag::Researching, TaskKindTag::Summarizing],
+            vec!["source triangulation", "literature review", "fact-checking"],
+            vec![],
+        ),
+        mk(
+            "marketing",
+            "Marketing",
+            "Funnels, conversion, ad copy, landing pages, positioning. Optimizes for \
+             measurable outcomes (CTR, conversion, retention).",
+            Some(
+                "You are a marketer. Speak in terms of audience, channel, and outcome. \
+                 Every recommendation should answer: who is this for, where does it \
+                 reach them, what does it move? Avoid generic copy.",
+            ),
+            vec![DomainTag::Marketing, DomainTag::Writing],
+            vec![TaskKindTag::Drafting, TaskKindTag::Editing, TaskKindTag::DataAnalysis],
+            vec!["positioning", "landing pages", "ad copy", "conversion optimization"],
+            vec![TaskKindTag::Coding, TaskKindTag::Debugging],
+        ),
+        mk(
+            "social_media",
+            "Social Media Expert",
+            "Platform-native expert on LinkedIn, TikTok, Instagram, X. Crafts posts, \
+             reels, and threads that fit each platform's voice and algorithmic norms.",
+            Some(
+                "You are a social media specialist. Each platform has its own voice — \
+                 LinkedIn rewards depth and personal stories, TikTok rewards hooks in \
+                 the first second, Instagram rewards visual cohesion, X rewards punchy \
+                 contrarian takes. Match the format the user is targeting; don't write \
+                 cross-platform mush. Suggest hashtags and posting times when relevant.",
+            ),
+            vec![DomainTag::SocialMedia, DomainTag::Writing, DomainTag::Marketing],
+            vec![TaskKindTag::Drafting, TaskKindTag::Editing],
+            vec![
+                "linkedin posts", "tiktok hooks", "instagram captions", "x threads",
+                "hashtag strategy", "content calendars",
+            ],
+            vec![TaskKindTag::Coding, TaskKindTag::Debugging],
+        ),
+        mk(
+            "outreach",
+            "Outreach",
+            "Cold email, lead generation, follow-ups. Personalizes at scale without \
+             sounding scripted.",
+            Some(
+                "You are an outreach specialist. Personalize the first line; the rest \
+                 of the email is permission to keep reading. Keep emails under 90 words \
+                 unless the recipient has already engaged. Always end with one specific \
+                 ask, never two.",
+            ),
+            vec![DomainTag::Outreach, DomainTag::Email],
+            vec![TaskKindTag::Drafting, TaskKindTag::Outreach],
+            vec!["cold email", "personalization", "subject lines", "follow-up cadences"],
+            vec![TaskKindTag::Coding, TaskKindTag::Debugging],
+        ),
+        mk(
+            "lawyer",
+            "Legal Researcher",
+            "Locates statutes, regulations, and case law; explains contract clauses; \
+             surfaces compliance considerations. Research-oriented — not legal advice.",
+            Some(
+                "You are a legal research assistant — not a lawyer giving advice. \
+                 Always begin substantive answers with: 'This is research, not legal \
+                 advice — consult a licensed attorney for your jurisdiction.' Cite \
+                 statutes, regulations, and case law by name and jurisdiction. \
+                 Distinguish 'the law says X' from 'commentators argue X'. When the \
+                 user's jurisdiction is unclear, ask before answering.",
+            ),
+            vec![DomainTag::Legal, DomainTag::Research],
+            vec![TaskKindTag::Researching, TaskKindTag::Summarizing],
+            vec![
+                "statute lookup", "case law research", "regulatory compliance",
+                "contract clause review", "gdpr", "ccpa",
+            ],
+            vec![],
+        ),
+        mk(
+            "doctor",
+            "Medical Researcher",
+            "Locates peer-reviewed sources on symptoms, treatments, drug interactions; \
+             explains medical literature. Research-oriented — not medical advice.",
+            Some(
+                "You are a medical research assistant — not a clinician giving advice. \
+                 Always begin substantive answers with: 'This is research, not medical \
+                 advice — consult a licensed clinician for your situation.' Prefer \
+                 peer-reviewed sources (PubMed, Cochrane, NEJM, NICE/CDC guidelines); \
+                 flag when something is preprint or anecdotal. For anything urgent or \
+                 red-flag (chest pain, suicidal ideation, severe allergic reactions), \
+                 redirect to emergency services first, research second.",
+            ),
+            vec![DomainTag::Health, DomainTag::Research],
+            vec![TaskKindTag::Researching, TaskKindTag::Summarizing],
+            vec![
+                "pubmed", "cochrane reviews", "clinical guidelines",
+                "drug interactions", "evidence grading",
+            ],
+            vec![],
+        ),
+    ]
 }
 
 fn category_to_str(c: PersonaCategory) -> &'static str {
@@ -524,7 +780,53 @@ mod tests {
         store.seed_builtins_if_empty().await.unwrap();
         store.seed_builtins_if_empty().await.unwrap();
         let all = store.list_profiles().await.unwrap();
-        assert_eq!(all.len(), 1);
+        // Re-seeding must not duplicate rows; the count equals the canonical
+        // built-in roster size from `builtin_profiles`.
+        let expected = builtin_profiles(Utc::now()).len();
+        assert_eq!(all.len(), expected);
+        // Every built-in is flagged as such.
+        assert!(all.iter().all(|p| p.builtin));
+    }
+
+    #[tokio::test]
+    async fn seeds_all_canonical_ids() {
+        let store = setup_store().await;
+        let all = store.list_profiles().await.unwrap();
+        let ids: std::collections::HashSet<_> = all.iter().map(|p| p.id.as_str()).collect();
+        for canonical in [
+            "default",
+            "assistant",
+            "coder",
+            "devops",
+            "systems_architect",
+            "technical_support",
+            "researcher",
+            "marketing",
+            "social_media",
+            "outreach",
+            "lawyer",
+            "doctor",
+        ] {
+            assert!(ids.contains(canonical), "missing built-in: {canonical}");
+        }
+    }
+
+    #[tokio::test]
+    async fn seeding_is_additive_when_some_already_exist() {
+        // Simulate an older install where only `default` was seeded: deleting
+        // the others mid-test wouldn't be possible (built-ins refuse delete),
+        // so we exercise the idempotency path by re-running the seed call
+        // and verifying no duplicates and no errors.
+        let conn = Connection::open_in_memory().unwrap();
+        let store = SqliteProfileStore::new(Arc::new(Mutex::new(conn)));
+        store.init_schema().await.unwrap();
+        // First seed: empty DB → all built-ins appear.
+        store.seed_builtins_if_empty().await.unwrap();
+        let after_first = store.list_profiles().await.unwrap().len();
+        // Second seed: nothing new should be added.
+        store.seed_builtins_if_empty().await.unwrap();
+        let after_second = store.list_profiles().await.unwrap().len();
+        assert_eq!(after_first, after_second);
     }
 
     #[tokio::test]
@@ -532,7 +834,7 @@ mod tests {
         let store = setup_store().await;
         let now = Utc::now();
         let p = AgentProfile {
-            id: "marketing".into(),
+            id: "marketing_custom".into(),
             display_name: "Marketing Expert".into(),
             description: "Landing-page and outreach optimizer.".into(),
             persona_template_ids: vec!["concise_voice".into()],
@@ -548,7 +850,7 @@ mod tests {
             updated_at: now,
         };
         store.save_profile(&p).await.unwrap();
-        let loaded = store.get_profile("marketing").await.unwrap().unwrap();
+        let loaded = store.get_profile("marketing_custom").await.unwrap().unwrap();
         assert_eq!(loaded.display_name, "Marketing Expert");
         assert_eq!(
             loaded.tool_selection,

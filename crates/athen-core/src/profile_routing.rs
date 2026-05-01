@@ -42,14 +42,18 @@ pub struct ClassifiedTask {
 /// match. Conservative on purpose: returns `None` for fields we can't
 /// reliably tag rather than guessing.
 pub fn classify_task(source: Option<&str>, description: &str) -> ClassifiedTask {
+    let lower = description.to_lowercase();
+
+    // Source channel wins for domain when present — email/calendar/messaging
+    // are unambiguous structural signals. Otherwise we fall back to keyword
+    // detection across the broader domain set.
     let domain = match source {
         Some("email") => Some(DomainTag::Email),
         Some("calendar") => Some(DomainTag::Calendar),
         Some("messaging") => Some(DomainTag::Messaging),
-        _ => None,
+        _ => infer_domain_from_keywords(&lower),
     };
 
-    let lower = description.to_lowercase();
     let kind = if contains_any(&lower, &["draft", "write", "compose", "reply", "respond"]) {
         Some(TaskKindTag::Drafting)
     } else if contains_any(
@@ -88,6 +92,109 @@ pub fn classify_task(source: Option<&str>, description: &str) -> ClassifiedTask 
         kind,
         language: None,
     }
+}
+
+/// Keyword-driven domain inference for free-form descriptions (no source
+/// channel). Order matters: more specific domains check first so that, e.g.,
+/// "deploy a kubernetes pod" wins Infrastructure before the broader Coding
+/// keyword `code` would steal it.
+fn infer_domain_from_keywords(lower: &str) -> Option<DomainTag> {
+    if contains_any(
+        lower,
+        &[
+            "kubernetes", "k8s", "docker", "podman", "vercel", "supabase",
+            "deploy", "deployment", "helm", "terraform", "ci/cd", "pipeline",
+            "github actions", "gitlab ci", "ansible", "nginx", "load balancer",
+            "kustomize", "rollout", "kubectl",
+        ],
+    ) {
+        return Some(DomainTag::Infrastructure);
+    }
+    if contains_any(
+        lower,
+        &[
+            "linkedin", "tiktok", "instagram", "twitter", "x.com",
+            "social media", "hashtag", "reel", "story", "carousel",
+            "creator", "post caption", "engagement rate", "follower",
+        ],
+    ) {
+        return Some(DomainTag::SocialMedia);
+    }
+    if contains_any(
+        lower,
+        &[
+            "legal", "lawyer", "attorney", "statute", "case law", "regulation",
+            "gdpr", "ccpa", "hipaa", "contract clause", "lawsuit", "court",
+            "compliance", "tort", "jurisdiction", "terms of service",
+        ],
+    ) {
+        return Some(DomainTag::Legal);
+    }
+    if contains_any(
+        lower,
+        &[
+            "symptom", "medication", "diagnosis", "medical", "illness",
+            "treatment", "side effect", "dosage", "patient", "prescription",
+            "clinical trial", "peer-reviewed", "peer reviewed",
+        ],
+    ) {
+        return Some(DomainTag::Health);
+    }
+    if contains_any(
+        lower,
+        &[
+            "architecture", "system design", "scalability", "microservice",
+            "monolith", "data model", "service boundary", "design pattern",
+            "high availability", "fault tolerance",
+        ],
+    ) {
+        return Some(DomainTag::Architecture);
+    }
+    if contains_any(
+        lower,
+        &[
+            "linux", "ubuntu", "fedora", "arch linux", "wsl", "systemd",
+            "permission denied", "command not found", "package manager",
+            "apt install", "dnf install", "pacman", "shell error",
+            "troubleshoot", "won't start", "won't run", "broken environment",
+        ],
+    ) {
+        return Some(DomainTag::Support);
+    }
+    if contains_any(
+        lower,
+        &[
+            "outreach", "cold email", "prospect", "lead generation",
+            "follow-up", "follow up email",
+        ],
+    ) {
+        return Some(DomainTag::Outreach);
+    }
+    if contains_any(
+        lower,
+        &[
+            "marketing", "conversion", "funnel", "ad copy", "landing page",
+            "campaign", "ctr", "click-through", "ctas",
+        ],
+    ) {
+        return Some(DomainTag::Marketing);
+    }
+    if contains_any(
+        lower,
+        &[
+            "implement", "refactor", "function", "module", "stack trace",
+            "bug fix", "debug", "compile", "type error", "unit test",
+        ],
+    ) {
+        return Some(DomainTag::Coding);
+    }
+    if contains_any(
+        lower,
+        &["research", "investigate", "look up", "find out", "what is", "what are"],
+    ) {
+        return Some(DomainTag::Research);
+    }
+    None
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {

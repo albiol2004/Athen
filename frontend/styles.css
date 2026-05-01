@@ -216,6 +216,55 @@ header h1 {
     border-color: var(--border-strong);
 }
 
+.header-right {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-shrink: 0;
+}
+
+.profile-picker-wrap {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 30px;
+    padding: 0 4px 0 10px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
+    transition: border-color var(--dur) var(--ease);
+}
+.profile-picker-wrap:hover {
+    border-color: var(--border-strong);
+}
+.profile-picker-label {
+    font-size: 11px;
+    color: var(--text-3);
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    user-select: none;
+}
+.profile-picker {
+    height: 26px;
+    background: transparent;
+    color: var(--text);
+    border: 0;
+    font-size: 12px;
+    font-weight: 500;
+    padding: 0 4px;
+    cursor: pointer;
+    outline: none;
+    max-width: 180px;
+}
+.profile-picker:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+.profile-picker option {
+    background: var(--surface-2);
+    color: var(--text);
+}
+
 /* ─── Sidebar ─── */
 .sidebar {
     width: var(--sidebar-w);

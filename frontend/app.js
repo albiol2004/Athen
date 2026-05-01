@@ -450,6 +450,8 @@ function startInitialDataLoads() {
     }).catch(() => {
         loadHistory();
     }).finally(() => {
+        // Profile list is non-critical — defer so the chat UI paints first.
+        scheduleIdle(() => loadAgentProfiles());
         performance.mark('athen-init-done');
         try {
             const t0 = performance.getEntriesByName('athen-init-start')[0];
@@ -486,13 +488,75 @@ const sidebarToggle = document.getElementById('sidebar-toggle');
 
 // ─── Sidebar Logic ───
 
+// Cached arc list, indexed by id. Populated by loadArcs() so UI elements
+// like the per-arc profile picker can read metadata (active_profile_id,
+// status, …) without a second IPC call.
+const arcMetaById = new Map();
+
 async function loadArcs() {
     if (!invoke) return;
     try {
         const arcs = await invoke('list_arcs');
+        arcMetaById.clear();
+        for (const a of arcs || []) {
+            arcMetaById.set(a.id, a);
+        }
         renderArcList(arcs || []);
+        renderProfilePicker();
     } catch (err) {
         console.error('Failed to load arcs:', err);
+    }
+}
+
+// ─── Agent profile picker ───
+
+// Cached profile list. Loaded once at init via list_agent_profiles. Built-ins
+// always sort first so the user sees curated specialists ahead of their own.
+let agentProfiles = [];
+
+async function loadAgentProfiles() {
+    if (!invoke) return;
+    try {
+        agentProfiles = await invoke('list_agent_profiles');
+        renderProfilePicker();
+    } catch (err) {
+        console.error('Failed to load agent profiles:', err);
+        agentProfiles = [];
+    }
+}
+
+function renderProfilePicker() {
+    const sel = document.getElementById('arc-profile-picker');
+    if (!sel) return;
+    if (!agentProfiles || agentProfiles.length === 0) {
+        sel.innerHTML = '<option value="default">Default</option>';
+        sel.disabled = true;
+        return;
+    }
+    sel.disabled = !activeArcId;
+    const meta = activeArcId ? arcMetaById.get(activeArcId) : null;
+    const activeId = (meta && meta.active_profile_id) || 'default';
+    const opts = agentProfiles.map((p) => {
+        const selected = p.id === activeId ? ' selected' : '';
+        return `<option value="${escapeHtml(p.id)}"${selected}>${escapeHtml(p.display_name)}</option>`;
+    });
+    sel.innerHTML = opts.join('');
+}
+
+async function onProfileChange(ev) {
+    if (!invoke || !activeArcId) return;
+    const chosen = ev.target.value;
+    // 'default' is the seeded fallback — clear the override on the arc so
+    // future tasks resolve via the default profile path.
+    const profileId = chosen === 'default' ? null : chosen;
+    try {
+        await invoke('set_arc_profile', { arcId: activeArcId, profileId });
+        const meta = arcMetaById.get(activeArcId);
+        if (meta) meta.active_profile_id = profileId;
+    } catch (err) {
+        console.error('set_arc_profile failed:', err);
+        // Roll the dropdown back to whatever the arc actually has.
+        renderProfilePicker();
     }
 }
 
@@ -727,6 +791,7 @@ async function handleSwitchArc(arcId) {
     try {
         const entries = await invoke('switch_arc', { arcId });
         activeArcId = arcId;
+        renderProfilePicker();
 
         // Clear notification dot for this arc.
         arcsWithNotifications.delete(arcId);
@@ -1935,6 +2000,11 @@ if (newChatBtn) {
 const sidebarNewChatBtn = document.getElementById('sidebar-new-chat-btn');
 if (sidebarNewChatBtn) {
     sidebarNewChatBtn.addEventListener('click', newArc);
+}
+
+const arcProfilePicker = document.getElementById('arc-profile-picker');
+if (arcProfilePicker) {
+    arcProfilePicker.addEventListener('change', onProfileChange);
 }
 
 // ─── Settings ───

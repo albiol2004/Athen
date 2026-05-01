@@ -81,6 +81,27 @@ pub enum DomainTag {
     DataAnalysis,
     Writing,
     Translation,
+    /// Medical/biomedical research — symptoms, treatments, drugs, peer-
+    /// reviewed sources. The doctor profile is research-oriented; the
+    /// LLM provider's safety layer enforces limits, not us.
+    Health,
+    /// Legal research — statutes, regulations, contracts, jurisdictional
+    /// research. Same research-oriented framing as `Health`.
+    Legal,
+    /// DevOps / infra — deployments, containers, cloud platforms (Vercel,
+    /// Supabase, AWS), CI/CD, observability. For "vibe coders" who need
+    /// fast help shipping.
+    Infrastructure,
+    /// Systems architecture — design, scalability, data modeling,
+    /// service boundaries.
+    Architecture,
+    /// Technical support — Linux/OS issues, environment debugging,
+    /// "why isn't my thing working" troubleshooting.
+    Support,
+    /// Social media — LinkedIn, TikTok, Instagram, X. Distinct from
+    /// Marketing (broader funnels/copy) — this is platform-native posts,
+    /// engagement, content scheduling.
+    SocialMedia,
     Other,
 }
 
