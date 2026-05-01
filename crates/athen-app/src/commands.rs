@@ -2537,6 +2537,24 @@ pub async fn delete_agent_profile(
     store.delete_profile(&profile_id).await.map_err(|e| e.to_string())
 }
 
+/// Rewrite a built-in profile back to its canonical seeded values.
+///
+/// Only valid for ids in the canonical built-in list. User-authored
+/// profiles return an error — they have no "default" to restore to.
+#[tauri::command]
+pub async fn restore_agent_profile(
+    profile_id: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<athen_core::agent_profile::AgentProfile, String> {
+    let Some(store) = state.profile_store.as_ref() else {
+        return Err("Profile store not available".into());
+    };
+    store
+        .restore_builtin(&profile_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Calendar commands
 // ---------------------------------------------------------------------------

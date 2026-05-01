@@ -105,6 +105,7 @@ pub fn run() {
             commands::create_agent_profile,
             commands::update_agent_profile,
             commands::delete_agent_profile,
+            commands::restore_agent_profile,
         ])
         .setup(|app| {
             use tauri::Manager;

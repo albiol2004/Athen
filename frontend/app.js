@@ -2279,6 +2279,11 @@ function buildProfileCard(p) {
     const desc = p.description
         ? `<div class="profile-card-desc">${escapeHtml(p.description)}</div>`
         : '';
+    // Built-ins get a "Restore default" affordance. User-authored profiles
+    // get a "Delete" instead — there's no canonical version to revert to.
+    const tailButton = isBuiltin
+        ? '<button data-action="restore" title="Revert this built-in to its shipped values">Restore default</button>'
+        : '<button data-action="delete" class="btn-danger">Delete</button>';
     card.innerHTML = `
         <div class="profile-card-main">
             <div class="profile-card-name">${escapeHtml(p.display_name)} ${badge}</div>
@@ -2287,13 +2292,27 @@ function buildProfileCard(p) {
         <div class="profile-card-actions">
             <button data-action="edit">Edit</button>
             <button data-action="clone">Clone</button>
-            <button data-action="delete" class="btn-danger"${isBuiltin ? ' disabled title="Built-ins cannot be deleted"' : ''}>Delete</button>
+            ${tailButton}
         </div>
     `;
     card.querySelector('[data-action="edit"]')?.addEventListener('click', () => openProfileEditor('edit', p));
     card.querySelector('[data-action="clone"]')?.addEventListener('click', () => openProfileEditor('clone', p));
     card.querySelector('[data-action="delete"]')?.addEventListener('click', () => deleteProfile(p));
+    card.querySelector('[data-action="restore"]')?.addEventListener('click', () => restoreProfile(p));
     return card;
+}
+
+async function restoreProfile(p) {
+    if (!invoke) return;
+    if (!confirm(`Restore "${p.display_name}" to its built-in defaults?\n\nYour edits to this profile will be lost.`)) {
+        return;
+    }
+    try {
+        await invoke('restore_agent_profile', { profileId: p.id });
+        await loadProfileManager();
+    } catch (err) {
+        showToast('Restore failed: ' + err, 'error');
+    }
 }
 
 async function deleteProfile(p) {

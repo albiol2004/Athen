@@ -82,8 +82,8 @@ impl SqliteProfileStore {
     /// Seed every canonical built-in profile that doesn't already exist.
     /// Idempotent: each profile is inserted only when its id is missing,
     /// so adding a new built-in in a later release is automatic on next
-    /// boot. User edits to existing built-ins are out of scope (built-ins
-    /// are immutable; users clone to customize).
+    /// boot. User edits to existing built-ins survive — the seeder skips
+    /// any id that's present, no matter what's in the row.
     pub async fn seed_builtins_if_empty(&self) -> Result<()> {
         let now = Utc::now();
         for profile in builtin_profiles(now) {
@@ -94,8 +94,41 @@ impl SqliteProfileStore {
         Ok(())
     }
 
+    /// Rewrite a built-in profile back to its canonical seeded values.
+    ///
+    /// Used by the "Restore default" UX when the user has edited a
+    /// built-in and wants to revert. Refuses on unknown ids — `id` must
+    /// be one that ships in `builtin_profiles`. The current row's
+    /// `created_at` is preserved so the row's identity (and any external
+    /// references to it) doesn't shift.
+    pub async fn restore_builtin(&self, id: &str) -> Result<AgentProfile> {
+        let canonical = canonical_builtin_profile(id).ok_or_else(|| {
+            AthenError::Other(format!("'{id}' is not a built-in profile"))
+        })?;
+        let mut to_save = canonical;
+        // Preserve created_at if a row exists; updated_at is freshly stamped.
+        if let Some(existing) = self.get_profile(id).await? {
+            to_save.created_at = existing.created_at;
+        }
+        to_save.updated_at = Utc::now();
+        self.save_profile_raw(&to_save).await?;
+        Ok(to_save)
+    }
+}
+
+/// Look up a canonical built-in profile by id. Used by `restore_builtin`
+/// and exposed for tests; not part of the trait surface (callers go
+/// through the store).
+pub fn canonical_builtin_profile(id: &str) -> Option<AgentProfile> {
+    builtin_profiles(Utc::now())
+        .into_iter()
+        .find(|p| p.id == id)
+}
+
+impl SqliteProfileStore {
     /// Internal save that bypasses the built-in protection in `save_profile`.
-    /// Used by `seed_builtins_if_empty` to insert built-in rows.
+    /// Used by `seed_builtins_if_empty` and `restore_builtin` to insert
+    /// canonical built-in rows.
     async fn save_profile_raw(&self, profile: &AgentProfile) -> Result<()> {
         let conn = self.conn.clone();
         let p = profile.clone();
@@ -854,6 +887,40 @@ mod tests {
         let store = setup_store().await;
         let err = store.delete_profile(AgentProfile::DEFAULT_ID).await.unwrap_err();
         assert!(err.to_string().contains("Cannot delete built-in"));
+    }
+
+    #[tokio::test]
+    async fn restore_builtin_reverts_user_edits() {
+        let store = setup_store().await;
+        // User customizes the coder built-in.
+        let mut coder = store.get_profile("coder").await.unwrap().unwrap();
+        let original_name = coder.display_name.clone();
+        coder.display_name = "My Coder".into();
+        coder.custom_persona_addendum = Some("Always speak like a pirate.".into());
+        store.save_profile(&coder).await.unwrap();
+
+        let edited = store.get_profile("coder").await.unwrap().unwrap();
+        assert_eq!(edited.display_name, "My Coder");
+
+        // Restore: name returns to canonical, builtin flag preserved.
+        let restored = store.restore_builtin("coder").await.unwrap();
+        assert_eq!(restored.display_name, original_name);
+        assert!(restored.builtin);
+        assert_ne!(
+            restored.custom_persona_addendum,
+            Some("Always speak like a pirate.".into())
+        );
+
+        // Re-reading from the store reflects the restore.
+        let after = store.get_profile("coder").await.unwrap().unwrap();
+        assert_eq!(after.display_name, original_name);
+    }
+
+    #[tokio::test]
+    async fn restore_builtin_rejects_unknown_id() {
+        let store = setup_store().await;
+        let err = store.restore_builtin("not_a_real_builtin").await.unwrap_err();
+        assert!(err.to_string().contains("not a built-in"));
     }
 
     #[tokio::test]
