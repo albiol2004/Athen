@@ -319,7 +319,7 @@ impl AppState {
         &self,
         arc_id: &str,
         app_handle: Option<tauri::AppHandle>,
-    ) -> crate::app_tools::AppToolRegistry {
+    ) -> Box<dyn athen_core::traits::tool::ToolRegistry> {
         let mut shell = athen_agent::ShellToolRegistry::new()
             .await
             .with_spawned_processes(self.spawned_processes.clone());
@@ -352,7 +352,27 @@ impl AppState {
             }
             registry = registry.with_file_gate(Arc::new(gate));
         }
-        registry
+
+        // Wrap the registry with the delegation layer when a profile store
+        // is available. The wrapped registry exposes `delegate_to_agent`
+        // on top of every other tool. Sub-agents spawned via that tool
+        // receive the bare AppToolRegistry — no delegate_to_agent — which
+        // is how depth=1 is enforced.
+        let base: Arc<dyn athen_core::traits::tool::ToolRegistry> = Arc::new(registry);
+        if let (Some(profile_store), Some(arc_store)) =
+            (self.profile_store.clone(), self._database.as_ref().map(|db| db.arc_store()))
+        {
+            let ctx = crate::delegation::DelegationContext {
+                profile_store,
+                arc_store,
+                llm_router: Arc::clone(&self.router),
+                parent_arc_id: arc_id.to_string(),
+                tool_doc_dir: self.tool_doc_dir.clone(),
+            };
+            Box::new(crate::delegation::DelegationToolRegistry::new(base, ctx))
+        } else {
+            Box::new(crate::delegation::ArcRegistryAdapter(base))
+        }
     }
 
     /// Initialize the notification orchestrator.

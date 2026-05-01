@@ -7,6 +7,7 @@ pub(crate) mod app_tools;
 pub(crate) mod approval;
 mod commands;
 mod contacts;
+pub(crate) mod delegation;
 pub(crate) mod file_gate;
 pub(crate) mod notifier;
 pub(crate) mod process;

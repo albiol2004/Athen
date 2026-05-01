@@ -1205,7 +1205,7 @@ pub async fn send_message(
 
             let mut builder = AgentBuilder::new()
                 .llm_router(exec_router)
-                .tool_registry(Box::new(registry))
+                .tool_registry(registry)
                 .auditor(Box::new(auditor))
                 .max_steps(50)
                 .timeout(Duration::from_secs(300))
@@ -1776,6 +1776,30 @@ pub(crate) async fn execute_approved_task(
         registry = registry.with_file_gate(Arc::new(gate));
     }
 
+    // Wrap in DelegationToolRegistry so the agent can spawn specialists.
+    // Sub-agents receive the bare AppToolRegistry — depth=1 by composition.
+    let base_registry: Arc<dyn athen_core::traits::tool::ToolRegistry> = Arc::new(registry);
+    let registry: Box<dyn athen_core::traits::tool::ToolRegistry> =
+        if let Some(profile_store) = ctx.profile_store.clone() {
+            if let Some(arc_store) = ctx.arc_store.clone() {
+                let dctx = crate::delegation::DelegationContext {
+                    profile_store,
+                    arc_store,
+                    llm_router: Arc::clone(&ctx.router),
+                    parent_arc_id: ctx.active_arc_id.clone(),
+                    tool_doc_dir: ctx.tool_doc_dir.clone(),
+                };
+                Box::new(crate::delegation::DelegationToolRegistry::new(
+                    base_registry,
+                    dctx,
+                ))
+            } else {
+                Box::new(crate::delegation::ArcRegistryAdapter(base_registry))
+            }
+        } else {
+            Box::new(crate::delegation::ArcRegistryAdapter(base_registry))
+        };
+
     let exec_router: Box<dyn LlmRouter> =
         Box::new(SharedRouter(Arc::clone(&ctx.router)));
     let tool_log = new_tool_log();
@@ -1802,7 +1826,7 @@ pub(crate) async fn execute_approved_task(
 
     let mut builder = AgentBuilder::new()
         .llm_router(exec_router)
-        .tool_registry(Box::new(registry))
+        .tool_registry(registry)
         .auditor(Box::new(auditor))
         .max_steps(50)
         .timeout(Duration::from_secs(300))
