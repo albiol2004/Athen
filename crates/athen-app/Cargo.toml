@@ -22,7 +22,7 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 async-trait = { workspace = true }
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
 toml = { workspace = true }
 reqwest = { workspace = true }
 imap = { workspace = true }

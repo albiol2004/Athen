@@ -133,17 +133,81 @@ pub fn run() {
             // Track window focus state for the notification orchestrator.
             // When the window loses focus, the orchestrator routes notifications
             // to external channels (Telegram) instead of in-app.
+            // Also intercept window close: hide to tray instead of exiting,
+            // so the Telegram poll loop and other background work keep
+            // running. The tray menu provides a real Quit.
             let state_ref = app.state::<AppState>();
             let notifier_for_focus = state_ref.notifier.clone();
             if let Some(window) = app.get_webview_window("main") {
+                let win_for_event = window.clone();
                 window.on_window_event(move |event| {
-                    if let Some(ref notifier) = notifier_for_focus {
-                        if let tauri::WindowEvent::Focused(focused) = event {
-                            notifier.set_user_present(*focused);
+                    match event {
+                        tauri::WindowEvent::Focused(focused) => {
+                            if let Some(ref notifier) = notifier_for_focus {
+                                notifier.set_user_present(*focused);
+                            }
                         }
+                        tauri::WindowEvent::CloseRequested { api, .. } => {
+                            api.prevent_close();
+                            let _ = win_for_event.hide();
+                        }
+                        _ => {}
                     }
                 });
             }
+
+            // Tray icon: left-click toggles the window, right-click menu
+            // exposes Show / Quit. `Quit` is the only path that actually
+            // exits the process now that close-to-tray is wired.
+            use tauri::menu::{MenuBuilder, MenuItemBuilder};
+            use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+
+            let show_item = MenuItemBuilder::with_id("show", "Show Athen").build(app)?;
+            let quit_item = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
+            let tray_menu = MenuBuilder::new(app)
+                .item(&show_item)
+                .separator()
+                .item(&quit_item)
+                .build()?;
+
+            let _tray = TrayIconBuilder::with_id("main")
+                .icon(app.default_window_icon().cloned().ok_or("missing default window icon")?)
+                .tooltip("Athen")
+                .menu(&tray_menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "show" => {
+                        if let Some(w) = app.get_webview_window("main") {
+                            let _ = w.show();
+                            let _ = w.unminimize();
+                            let _ = w.set_focus();
+                        }
+                    }
+                    "quit" => app.exit(0),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        let app = tray.app_handle();
+                        if let Some(w) = app.get_webview_window("main") {
+                            // Toggle: hide if visible+focused, show otherwise.
+                            let visible = w.is_visible().unwrap_or(false);
+                            if visible {
+                                let _ = w.hide();
+                            } else {
+                                let _ = w.show();
+                                let _ = w.unminimize();
+                                let _ = w.set_focus();
+                            }
+                        }
+                    }
+                })
+                .build(app)?;
 
             Ok(())
         })
