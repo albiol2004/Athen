@@ -2193,6 +2193,38 @@ async function loadSettings() {
     }
 }
 
+// Map well-known MCP catalog icon names to inline SVG markup. The
+// catalog stores short names like "folder" rather than emoji or paths so
+// the same string can drive different icon sets per UI; the frontend is
+// where those names get resolved. Returns `null` when the name is
+// unknown so the caller can render a fallback.
+function mcpIconSvg(name) {
+    const size = 18;
+    const wrap = (inner) =>
+        `<svg viewBox="0 0 24 24" width="${size}" height="${size}" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${inner}</svg>`;
+    switch ((name || '').toLowerCase()) {
+        case 'folder':
+        case 'files':
+            return wrap('<path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>');
+        case 'globe':
+        case 'web':
+            return wrap('<circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>');
+        case 'terminal':
+        case 'shell':
+            return wrap('<polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>');
+        case 'database':
+        case 'db':
+            return wrap('<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/>');
+        case 'mail':
+        case 'email':
+            return wrap('<path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/>');
+        case 'calendar':
+            return wrap('<rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>');
+        default:
+            return null;
+    }
+}
+
 // ─── Profile manager ──────────────────────────────────────────────────
 
 const PROFILE_DOMAINS = [
@@ -2253,7 +2285,7 @@ function buildProfileCard(p) {
             ${desc}
         </div>
         <div class="profile-card-actions">
-            <button data-action="edit"${isBuiltin ? ' disabled title="Built-ins are immutable; clone first"' : ''}>Edit</button>
+            <button data-action="edit">Edit</button>
             <button data-action="clone">Clone</button>
             <button data-action="delete" class="btn-danger"${isBuiltin ? ' disabled title="Built-ins cannot be deleted"' : ''}>Delete</button>
         </div>
@@ -2488,7 +2520,15 @@ function createMcpCard(entry) {
     if (entry.icon) {
         const icon = document.createElement('span');
         icon.className = 'mcp-card-icon';
-        icon.textContent = entry.icon;
+        const svg = mcpIconSvg(entry.icon);
+        if (svg) {
+            icon.innerHTML = svg;
+        } else {
+            // Unknown icon name → fall back to the literal string so we at
+            // least see something rather than a blank slot. Lets us notice
+            // and add the missing mapping.
+            icon.textContent = entry.icon;
+        }
         titleWrap.appendChild(icon);
     }
     const nameWrap = document.createElement('div');

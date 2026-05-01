@@ -2488,11 +2488,12 @@ pub async fn create_agent_profile(
     Ok(profile)
 }
 
-/// Update an existing user-authored profile in place.
+/// Update an existing profile in place.
 ///
-/// Refuses to mutate built-ins (the underlying store enforces this; the
-/// command surfaces a friendly error). Uses the existing row's
-/// `created_at` so the UI doesn't have to round-trip it.
+/// Both user-authored and built-in profiles can be edited. The store
+/// preserves the existing row's `builtin` flag — built-ins stay marked
+/// as built-in even after editing, so the seeder still treats the id as
+/// already-seeded and the UI keeps its badge.
 #[tauri::command]
 pub async fn update_agent_profile(
     input: AgentProfileInput,
@@ -2507,15 +2508,16 @@ pub async fn update_agent_profile(
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("Profile '{}' not found", input.id))?;
-    if existing.builtin {
-        return Err(format!(
-            "'{}' is a built-in profile and cannot be edited. Clone it first.",
-            existing.display_name
-        ));
-    }
     let profile = input_to_profile(input, existing.created_at);
     store.save_profile(&profile).await.map_err(|e| e.to_string())?;
-    Ok(profile)
+    // Re-read so the response reflects the store's authoritative `builtin`
+    // flag and the freshly-stamped `updated_at`.
+    let loaded = store
+        .get_profile(&profile.id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Profile '{}' missing after save", profile.id))?;
+    Ok(loaded)
 }
 
 /// Delete a user-authored profile.

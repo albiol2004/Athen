@@ -1,5 +1,10 @@
 /* ─── Tokens ─── */
 :root {
+    /* Tells the rendering engine to draw native UI (form controls, the
+     * option-list popup that opens from <select>, scrollbars, etc.) in
+     * dark mode. Without this, WebKitGTK falls back to the system theme
+     * and pops a white menu over our dark UI. */
+    color-scheme: dark;
     /* warm-dark palette — "Her" temperature */
     --bg:            #0E0B12;
     --bg-deep:       #09070C;
@@ -1734,6 +1739,21 @@ footer {
     flex: 1;
 }
 
+/* Native dropdown popups: keep them dark across the whole app. The
+ * `color-scheme: dark` on :root handles most of this in WebKit, but
+ * explicit option styling pins the colors in older renderers and any
+ * future contexts (e.g. macOS Aqua) where the system popup might still
+ * lean toward the OS theme. */
+select,
+option {
+    background-color: var(--surface-2);
+    color: var(--text);
+}
+option:checked,
+option:hover {
+    background-color: var(--surface-3);
+}
+
 /* ─── Inputs / forms ─── */
 .settings-input,
 .settings-select,
@@ -2271,7 +2291,16 @@ footer {
     gap: 10px;
     min-width: 0;
 }
-.mcp-card-icon { font-size: 16px; }
+.mcp-card-icon {
+    font-size: 16px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-2);
+    width: 20px;
+    height: 20px;
+    flex-shrink: 0;
+}
 .mcp-card-name-wrap {
     display: flex;
     flex-direction: column;

@@ -533,25 +533,16 @@ impl ProfileStore for SqliteProfileStore {
     }
 
     async fn save_profile(&self, profile: &AgentProfile) -> Result<()> {
-        // Refuse to overwrite a built-in row's `builtin` flag from outside.
-        // Existing built-ins are immutable in shape; user-driven edits should
-        // clone first then save with builtin=false.
-        if let Some(existing) = self.get_profile(&profile.id).await? {
-            if existing.builtin && !profile.builtin {
-                return Err(AthenError::Other(format!(
-                    "Cannot overwrite built-in profile '{}' with a non-built-in row; \
-                     clone it under a new id instead",
-                    profile.id
-                )));
-            }
-            if existing.builtin && profile.builtin {
-                return Err(AthenError::Other(format!(
-                    "Cannot mutate built-in profile '{}' in place; clone it first",
-                    profile.id
-                )));
-            }
-        }
+        // Built-ins can be edited. We preserve the `builtin` flag of the
+        // existing row so the row keeps its identity (the flag drives badges
+        // in the UI and also signals to `seed_builtins_if_empty` that this
+        // id was originally seeded — the seeder is per-id idempotent, so
+        // user edits survive future launches).
         let mut p = profile.clone();
+        if let Some(existing) = self.get_profile(&profile.id).await? {
+            p.builtin = existing.builtin;
+            p.created_at = existing.created_at;
+        }
         p.updated_at = Utc::now();
         self.save_profile_raw(&p).await
     }
@@ -866,12 +857,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cannot_overwrite_builtin_in_place() {
+    async fn editing_builtin_persists_changes_and_preserves_builtin_flag() {
+        // Built-ins can be edited (users want to tune the seeded personas).
+        // The `builtin` flag is preserved on save so the row keeps its
+        // identity in the UI and the seeder still treats this id as
+        // already-seeded.
         let store = setup_store().await;
         let mut default = store.get_profile(AgentProfile::DEFAULT_ID).await.unwrap().unwrap();
-        default.display_name = "hacked".into();
-        let err = store.save_profile(&default).await.unwrap_err();
-        assert!(err.to_string().contains("built-in"));
+        default.display_name = "Athen (tuned)".into();
+        // The caller may forget to flip this; the store ignores their value
+        // and uses the existing row's flag.
+        default.builtin = false;
+        store.save_profile(&default).await.unwrap();
+        let loaded = store.get_profile(AgentProfile::DEFAULT_ID).await.unwrap().unwrap();
+        assert_eq!(loaded.display_name, "Athen (tuned)");
+        assert!(loaded.builtin, "builtin flag must survive a save");
     }
 
     #[tokio::test]
