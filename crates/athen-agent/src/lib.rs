@@ -40,6 +40,7 @@ pub struct AgentBuilder {
     stream_sender: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     cancel_flag: Option<Arc<AtomicBool>>,
     tool_doc_path: Option<PathBuf>,
+    active_profile: Option<athen_core::agent_profile::ResolvedAgentProfile>,
 }
 
 impl AgentBuilder {
@@ -60,7 +61,20 @@ impl AgentBuilder {
             stream_sender: None,
             cancel_flag: None,
             tool_doc_path: None,
+            active_profile: None,
         }
+    }
+
+    /// Run this executor under the given resolved agent profile. The
+    /// profile's persona templates replace the hardcoded "You are Athen"
+    /// identity; its `tool_selection` filters the tool surface. Omit (or
+    /// pass the seeded default profile) to get today's behavior.
+    pub fn active_profile(
+        mut self,
+        profile: athen_core::agent_profile::ResolvedAgentProfile,
+    ) -> Self {
+        self.active_profile = Some(profile);
+        self
     }
 
     /// Set the LLM router.
@@ -165,6 +179,10 @@ impl AgentBuilder {
 
         if let Some(path) = self.tool_doc_path {
             executor.set_tool_doc_dir(path);
+        }
+
+        if let Some(profile) = self.active_profile {
+            executor.set_active_profile(profile);
         }
 
         Ok(executor)

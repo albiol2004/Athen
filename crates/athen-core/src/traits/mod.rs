@@ -7,6 +7,7 @@ pub mod mcp;
 pub mod memory;
 pub mod notification;
 pub mod persistence;
+pub mod profile;
 pub mod sandbox;
 pub mod sense;
 pub mod shell;

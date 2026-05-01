@@ -100,6 +100,9 @@ pub struct ArcMeta {
     /// means "use the default for this arc's source" (e.g. Telegram for
     /// a Messaging arc, in-app otherwise).
     pub primary_reply_channel: Option<String>,
+    /// `AgentProfile::id` to run this arc's tasks under. `None` means
+    /// "use the seeded default profile" — equivalent to today's behavior.
+    pub active_profile_id: Option<String>,
 }
 
 /// The type of an entry within an Arc.
@@ -227,6 +230,29 @@ impl ArcStore {
                 .map_err(|e| AthenError::Other(format!("Add primary_reply_channel column: {e}")))?;
             }
 
+            // Column-level migration: `active_profile_id` was added so each
+            // arc can run under a specific `AgentProfile`. Older databases
+            // get the column added in place; new ones get it from
+            // ARC_SCHEMA_SQL. NULL means "use the seeded default profile".
+            let has_profile_id: bool = conn
+                .prepare("PRAGMA table_info(arcs)")
+                .and_then(|mut stmt| {
+                    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+                    let mut found = false;
+                    for r in rows {
+                        if r? == "active_profile_id" {
+                            found = true;
+                            break;
+                        }
+                    }
+                    Ok(found)
+                })
+                .map_err(|e| AthenError::Other(format!("Inspect arcs cols (profile): {e}")))?;
+            if !has_profile_id {
+                conn.execute("ALTER TABLE arcs ADD COLUMN active_profile_id TEXT", [])
+                    .map_err(|e| AthenError::Other(format!("Add active_profile_id: {e}")))?;
+            }
+
             Ok(())
         })
         .await
@@ -293,7 +319,7 @@ impl ArcStore {
                     "SELECT a.id, a.name, a.source, a.status, a.parent_arc_id, \
                             a.merged_into_arc_id, a.created_at, a.updated_at, \
                             COALESCE(e.cnt, 0) AS entry_count, \
-                            a.primary_reply_channel \
+                            a.primary_reply_channel, a.active_profile_id \
                      FROM arcs a \
                      LEFT JOIN ( \
                          SELECT arc_id, COUNT(*) AS cnt \
@@ -316,6 +342,7 @@ impl ArcStore {
                         updated_at: row.get(7)?,
                         entry_count: row.get::<_, u32>(8)?,
                         primary_reply_channel: row.get(9)?,
+                        active_profile_id: row.get(10)?,
                     })
                 })
                 .map_err(|e| AthenError::Other(format!("Query get arc: {e}")))?;
@@ -342,7 +369,7 @@ impl ArcStore {
                     "SELECT a.id, a.name, a.source, a.status, a.parent_arc_id, \
                             a.merged_into_arc_id, a.created_at, a.updated_at, \
                             COALESCE(e.cnt, 0) AS entry_count, \
-                            a.primary_reply_channel \
+                            a.primary_reply_channel, a.active_profile_id \
                      FROM arcs a \
                      LEFT JOIN ( \
                          SELECT arc_id, COUNT(*) AS cnt \
@@ -365,6 +392,7 @@ impl ArcStore {
                         updated_at: row.get(7)?,
                         entry_count: row.get::<_, u32>(8)?,
                         primary_reply_channel: row.get(9)?,
+                        active_profile_id: row.get(10)?,
                     })
                 })
                 .map_err(|e| AthenError::Other(format!("Query list arcs: {e}")))?;
@@ -467,6 +495,29 @@ impl ArcStore {
             )
             .map_err(|e| AthenError::Other(format!("Touch target arc: {e}")))?;
 
+            Ok(())
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
+    /// Set the agent profile this arc runs under. Pass `None` to clear (which
+    /// makes the arc fall back to the seeded default profile).
+    pub async fn set_active_profile_id(
+        &self,
+        id: &str,
+        profile_id: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.clone();
+        let id = id.to_string();
+        let profile_id = profile_id.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE arcs SET active_profile_id = ?1 WHERE id = ?2",
+                params![profile_id, id],
+            )
+            .map_err(|e| AthenError::Other(format!("Set active_profile_id: {e}")))?;
             Ok(())
         })
         .await
@@ -762,7 +813,8 @@ CREATE TABLE IF NOT EXISTS arcs (
     merged_into_arc_id TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    primary_reply_channel TEXT
+    primary_reply_channel TEXT,
+    active_profile_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS arc_entries (
@@ -1649,6 +1701,93 @@ mod tests {
         let arcs = store.list_arcs().await.unwrap();
         let listed = arcs.iter().find(|a| a.id == "arc_1").unwrap();
         assert_eq!(listed.primary_reply_channel.as_deref(), Some("telegram"));
+    }
+
+    /// New arcs default to no active_profile_id; setting it via the helper
+    /// is durable and visible through both `get_arc` and `list_arcs`.
+    #[tokio::test]
+    async fn test_active_profile_id_set_and_read() {
+        let store = setup_arc_store().await;
+        store
+            .create_arc("arc_1", "Profile arc", ArcSource::UserInput)
+            .await
+            .unwrap();
+
+        let meta = store.get_arc("arc_1").await.unwrap().expect("arc present");
+        assert_eq!(meta.active_profile_id, None);
+
+        store
+            .set_active_profile_id("arc_1", Some("outreach"))
+            .await
+            .unwrap();
+        let meta = store.get_arc("arc_1").await.unwrap().expect("arc present");
+        assert_eq!(meta.active_profile_id.as_deref(), Some("outreach"));
+
+        let listed = store.list_arcs().await.unwrap();
+        let row = listed.iter().find(|a| a.id == "arc_1").unwrap();
+        assert_eq!(row.active_profile_id.as_deref(), Some("outreach"));
+
+        // Clearing falls back to None (i.e. seeded default profile).
+        store.set_active_profile_id("arc_1", None).await.unwrap();
+        let meta = store.get_arc("arc_1").await.unwrap().expect("arc present");
+        assert_eq!(meta.active_profile_id, None);
+    }
+
+    /// init_schema must be idempotent and must add `active_profile_id` to a
+    /// pre-existing database that was created before the column existed.
+    #[tokio::test]
+    async fn test_active_profile_id_migration_on_legacy_db() {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        let conn = Arc::new(Mutex::new(conn));
+
+        let conn_clone = conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let c = conn_clone.blocking_lock();
+            c.execute_batch(
+                "CREATE TABLE arcs (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'user_input',
+                    status TEXT NOT NULL DEFAULT 'active',
+                    parent_arc_id TEXT,
+                    merged_into_arc_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    primary_reply_channel TEXT
+                );
+                CREATE TABLE arc_entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    arc_id TEXT NOT NULL,
+                    entry_type TEXT NOT NULL DEFAULT 'message',
+                    source TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    metadata TEXT,
+                    created_at TEXT NOT NULL,
+                    turn_id TEXT
+                );
+                INSERT INTO arcs (id, name, source, status, created_at, updated_at)
+                  VALUES ('legacy', 'Legacy', 'user_input', 'active',
+                          '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z');",
+            )
+            .expect("seed legacy schema");
+        })
+        .await
+        .unwrap();
+
+        let store = ArcStore::new(conn);
+        store.init_schema().await.expect("init migrates legacy db");
+
+        let meta = store.get_arc("legacy").await.unwrap().expect("arc present");
+        assert_eq!(meta.active_profile_id, None);
+
+        store
+            .set_active_profile_id("legacy", Some("default"))
+            .await
+            .unwrap();
+        let meta = store.get_arc("legacy").await.unwrap().expect("arc present");
+        assert_eq!(meta.active_profile_id.as_deref(), Some("default"));
+
+        store.init_schema().await.expect("idempotent re-init");
     }
 
     /// init_schema must be idempotent and must add `primary_reply_channel` to a

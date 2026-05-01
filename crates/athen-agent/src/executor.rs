@@ -9,6 +9,7 @@ use chrono::Utc;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
+use athen_core::agent_profile::{ResolvedAgentProfile, ToolSelection};
 use athen_core::error::{AthenError, Result};
 use athen_core::llm::{ChatMessage, LlmRequest, MessageContent, ModelProfile, Role};
 use athen_core::task::{StepStatus, TaskStep};
@@ -17,9 +18,40 @@ use athen_core::traits::llm::LlmRouter;
 use athen_core::traits::tool::ToolRegistry;
 
 use crate::timeout::DefaultTimeoutGuard;
-use crate::tool_grouping::{is_always_revealed, summarize_groups};
+use crate::tool_grouping::{group_for, is_always_revealed, summarize_groups};
 use std::collections::HashSet;
 use std::path::PathBuf;
+
+/// Filter a tool list according to a profile's `ToolSelection`.
+///
+/// Default behavior (`ToolSelection::All`) returns the input unchanged, so
+/// the seeded default profile and "no profile" both reproduce today's tool
+/// surface byte-for-byte. Group whitelists/blacklists use the same
+/// `tool_grouping::group_for` resolver that the system prompt's index uses,
+/// so what the user sees in the UI matches what the agent can call.
+pub fn apply_tool_selection(
+    tools: &[athen_core::tool::ToolDefinition],
+    selection: &ToolSelection,
+) -> Vec<athen_core::tool::ToolDefinition> {
+    match selection {
+        ToolSelection::All => tools.to_vec(),
+        ToolSelection::Groups(allowed) => tools
+            .iter()
+            .filter(|t| allowed.iter().any(|g| g == group_for(&t.name)))
+            .cloned()
+            .collect(),
+        ToolSelection::Explicit(allowed) => tools
+            .iter()
+            .filter(|t| allowed.iter().any(|n| n == &t.name))
+            .cloned()
+            .collect(),
+        ToolSelection::Deny(denied) => tools
+            .iter()
+            .filter(|t| !denied.iter().any(|n| n == &t.name))
+            .cloned()
+            .collect(),
+    }
+}
 
 /// Clamp a shell tool's `timeout_ms` argument to the executor's remaining
 /// budget (minus a 500ms buffer so the executor's own timeout always fires
@@ -156,6 +188,12 @@ pub struct DefaultExecutor {
     /// `~/.athen/tools/`). When set, the system prompt instructs the agent
     /// to read the relevant `<group>.md` file for full schemas.
     tool_doc_dir: Option<PathBuf>,
+    /// Active agent profile bundled with its resolved persona templates.
+    /// `None` means "use the hardcoded Athen persona" (today's behavior).
+    /// A profile with empty templates and no addendum is treated identically
+    /// to `None` — the seeded default profile reproduces today's persona
+    /// without any wiring change.
+    active_profile: Option<ResolvedAgentProfile>,
 }
 
 impl DefaultExecutor {
@@ -178,7 +216,16 @@ impl DefaultExecutor {
             stream_sender: None,
             cancel_flag: None,
             tool_doc_dir: None,
+            active_profile: None,
         }
+    }
+
+    /// Set the agent profile this executor runs under. The profile's
+    /// persona templates replace the hardcoded "You are Athen" identity,
+    /// and its `tool_selection` filters the tool surface before each LLM
+    /// call. Pass `None` (the default) to run as today's universal Athen.
+    pub fn set_active_profile(&mut self, profile: ResolvedAgentProfile) {
+        self.active_profile = Some(profile);
     }
 
     /// Tell the executor where the per-group markdown reference files live.
@@ -206,6 +253,17 @@ impl DefaultExecutor {
 
     /// Build the system prompt for the agent.
     ///
+    /// Composed from four slots in fixed order:
+    ///   1. persona header (identity + datetime)
+    ///   2. workspace rules (workspace dir + ongoing-conversation flag)
+    ///   3. tool index (tier-1 group index, tier-2 detailed schemas, per-family guidance)
+    ///   4. persona rules (behavioral rules + bad/good examples)
+    ///
+    /// Slots 1 and 4 are the "persona" — what an `AgentProfile` will be allowed
+    /// to override. Slots 2 and 3 are non-negotiable: workspace safety and tool
+    /// discovery must hold for every profile, otherwise specialist agents
+    /// forget how to use their tools or leak files outside their workspace.
+    ///
     /// `tools` is the *complete* set of tools the agent can ever access this
     /// session. `revealed` is the subset whose full descriptions and schemas
     /// are surfaced inline — memory tools plus any tool the agent has already
@@ -217,26 +275,76 @@ impl DefaultExecutor {
         revealed: &HashSet<String>,
         has_context: bool,
         tool_doc_dir: Option<&std::path::Path>,
+        profile: Option<&ResolvedAgentProfile>,
     ) -> String {
+        let mut prompt = String::new();
+        prompt.push_str(&Self::build_persona_header(profile));
+        prompt.push_str(&Self::build_workspace_rules(has_context));
+        prompt.push_str(&Self::build_tool_index(tools, revealed, tool_doc_dir));
+        prompt.push_str(&Self::build_persona_rules());
+        prompt
+    }
+
+    /// Slot 1: identity + current datetime.
+    ///
+    /// When a `ResolvedAgentProfile` carries persona templates or an
+    /// addendum, those replace the hardcoded "You are Athen, a proactive
+    /// universal AI agent…" identity. Templates are concatenated in
+    /// declared order, then the addendum (if any) is appended. The
+    /// datetime line always follows.
+    ///
+    /// A profile with empty templates and no addendum (the seeded default)
+    /// falls back to the hardcoded identity, so today's behavior is
+    /// reproduced byte-for-byte.
+    fn build_persona_header(profile: Option<&ResolvedAgentProfile>) -> String {
         let now = chrono::Local::now();
-        let tz_offset = now.format("%:z"); // e.g. "+02:00"
-        let mut prompt = format!(
-            "You are Athen, a proactive universal AI agent. You ACT first and talk second.\n\
+        let tz_offset = now.format("%:z");
+
+        let identity =
+            match profile.filter(|p| p.has_custom_persona()) {
+                Some(p) => {
+                    let mut s = String::new();
+                    for t in &p.persona_templates {
+                        if !s.is_empty() {
+                            s.push_str("\n\n");
+                        }
+                        s.push_str(&t.body);
+                    }
+                    if let Some(addendum) = &p.profile.custom_persona_addendum {
+                        if !s.is_empty() {
+                            s.push_str("\n\n");
+                        }
+                        s.push_str(addendum);
+                    }
+                    s
+                }
+                None => {
+                    "You are Athen, a proactive universal AI agent. You ACT first and talk second.".to_string()
+                }
+            };
+
+        format!(
+            "{identity}\n\
              Current date and time: {} ({}, UTC{})\n\n",
             now.format("%A, %B %-d, %Y at %H:%M"),
             now.format("%Z"),
             tz_offset,
-        );
+        )
+    }
 
-        // Workspace + permission model. We deliberately do NOT leak the
-        // host process's cwd here — when we did, the agent reflexively
-        // wrote test files into whatever directory the user happened to
-        // launch the app from (typically a real project folder), instead
-        // of using its own workspace.
+    /// Slot 2: workspace directory + permission model + ongoing-conversation
+    /// flag. Always present, never overridden by a profile — specialist agents
+    /// must respect workspace boundaries the same as the default agent.
+    ///
+    /// We deliberately do NOT leak the host process's cwd here — when we did,
+    /// the agent reflexively wrote test files into whatever directory the user
+    /// happened to launch the app from (typically a real project folder),
+    /// instead of using its own workspace.
+    fn build_workspace_rules(has_context: bool) -> String {
         let workspace = athen_core::paths::athen_workspace_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "<unavailable>".to_string());
-        prompt.push_str(&format!(
+        let mut out = format!(
             "Your workspace directory: {workspace}\n\
              This is YOUR folder. Anything you create — test files, scratch scripts, \
              HTML servers, etc. — goes here unless the user explicitly names a different \
@@ -247,14 +355,30 @@ impl DefaultExecutor {
              For paths the user explicitly hands you (absolute paths outside the \
              workspace), the first touch may prompt for approval; once granted, \
              subsequent operations on the same directory are silent.\n\n",
-        ));
-
+        );
         if has_context {
-            prompt.push_str(
+            out.push_str(
                 "You are in an ongoing conversation. The message history is provided. \
                  Continue naturally from where the conversation left off.\n\n",
             );
         }
+        out
+    }
+
+    /// Slot 3: tier-1 capability index, tier-2 detailed schemas, per-family
+    /// guidance (calendar/shell/web/contacts/memory). Driven by the tool list
+    /// itself — when a profile filters tools out, the corresponding guidance
+    /// blocks naturally disappear.
+    ///
+    /// Always present. A profile cannot suppress this without breaking tool
+    /// discovery.
+    fn build_tool_index(
+        tools: &[athen_core::tool::ToolDefinition],
+        revealed: &HashSet<String>,
+        tool_doc_dir: Option<&std::path::Path>,
+    ) -> String {
+        let mut out = String::new();
+        let tz_offset = chrono::Local::now().format("%:z");
 
         // Categorize tools for smarter guidance.
         let has_calendar = tools.iter().any(|t| t.name.starts_with("calendar_"));
@@ -267,7 +391,7 @@ impl DefaultExecutor {
 
         // ── Tier 1: capability index (always shown, one line per group) ──
         if !tools.is_empty() {
-            prompt.push_str(
+            out.push_str(
                 "AVAILABLE TOOL GROUPS — every tool listed below exists and is callable. \
                  If you already know a tool's arguments, call it directly. If you're \
                  unsure of the arguments for a tool that isn't in DETAILED TOOLS, \
@@ -275,7 +399,7 @@ impl DefaultExecutor {
                  - Just try calling it; the response will tell you if anything is wrong.\n",
             );
             if let Some(dir) = tool_doc_dir {
-                prompt.push_str(&format!(
+                out.push_str(&format!(
                     "- Or read the schema file for the group you need: \
                      `read(path=\"{}/<group>.md\")` where `<group>` is one of \
                      the group ids below (e.g. `calendar`, `files`). Each file \
@@ -283,10 +407,10 @@ impl DefaultExecutor {
                     dir.display(),
                 ));
             }
-            prompt.push('\n');
+            out.push('\n');
             for group in summarize_groups(tools) {
                 let count = group.tool_count();
-                prompt.push_str(&format!(
+                out.push_str(&format!(
                     "- **{}** [id: `{}`] ({} tool{}): {}\n  Tools: {}\n",
                     group.display_name,
                     group.id,
@@ -296,7 +420,7 @@ impl DefaultExecutor {
                     group.tool_names.join(", "),
                 ));
             }
-            prompt.push('\n');
+            out.push('\n');
 
             // ── Tier 2: full schemas for revealed tools ──
             let revealed_tools: Vec<&athen_core::tool::ToolDefinition> = tools
@@ -304,17 +428,16 @@ impl DefaultExecutor {
                 .filter(|t| revealed.contains(&t.name))
                 .collect();
             if !revealed_tools.is_empty() {
-                prompt.push_str("DETAILED TOOLS (schemas already loaded — call directly):\n");
+                out.push_str("DETAILED TOOLS (schemas already loaded — call directly):\n");
                 for tool in revealed_tools {
-                    prompt.push_str(&format!("- **{}**: {}\n", tool.name, tool.description));
+                    out.push_str(&format!("- **{}**: {}\n", tool.name, tool.description));
                 }
-                prompt.push('\n');
+                out.push('\n');
             }
         }
 
-        // Calendar-specific guidance when tools are available.
         if has_calendar {
-            prompt.push_str(&format!(
+            out.push_str(&format!(
                 "CALENDAR CAPABILITIES:\n\
                  You manage the user's calendar. You can create, update, list, and delete events.\n\
                  - When the user asks to schedule something, use calendar_create immediately.\n\
@@ -341,7 +464,7 @@ impl DefaultExecutor {
             let ws_display = athen_core::paths::athen_workspace_dir()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "<unavailable>".to_string());
-            prompt.push_str(&format!(
+            out.push_str(&format!(
                 "SHELL & FILES:\n\
                  Use shell_execute for system commands. For files use the dedicated tools: \
                  read (offset/limit, prefer over cat/head/tail), edit (exact-string replace, \
@@ -359,7 +482,7 @@ impl DefaultExecutor {
                  the user has explicitly provided.\n\
                  \n",
             ));
-            prompt.push_str(
+            out.push_str(
                 "LONG-RUNNING COMMANDS:\n\
                  shell_execute waits for the command to fully exit and EOF its stdio. A bare \
                  trailing `&` is NOT enough — the child inherits stdio pipes and keeps the call \
@@ -385,10 +508,8 @@ impl DefaultExecutor {
             );
         }
 
-        // Web guidance. Surfaced when web_search / web_fetch are wired so
-        // the model reaches for them instead of curl/wget via shell_execute.
         if has_web {
-            prompt.push_str(
+            out.push_str(
                 "WEB ACCESS:\n\
                  You have two dedicated tools for the open web. ALWAYS prefer them over \
                  shelling out to curl/wget/lynx — they return clean markdown/snippets and \
@@ -411,9 +532,8 @@ impl DefaultExecutor {
             );
         }
 
-        // Contacts guidance.
         if has_contacts {
-            prompt.push_str(
+            out.push_str(
                 "CONTACTS CAPABILITIES:\n\
                  You manage the user's contacts. You can create, search, update, and delete contacts.\n\
                  - Each contact has a name and multiple identifiers (email, phone, Telegram, WhatsApp, etc.)\n\
@@ -433,9 +553,8 @@ impl DefaultExecutor {
             );
         }
 
-        // Memory guidance.
         if has_memory {
-            prompt.push_str(
+            out.push_str(
                 "MEMORY & KNOWLEDGE:\n\
                  You have persistent memory that survives across conversations.\n\
                  - Use memory_store ONLY when the user explicitly asks to remember, save, or note \
@@ -449,27 +568,34 @@ impl DefaultExecutor {
             );
         }
 
-        prompt.push_str(
-            "RULES YOU MUST FOLLOW:\n\
-             1. NEVER say \"I'll do X\" or \"Let me do X\" — just DO IT by calling tools.\n\
-             2. NEVER ask the user what to do next or suggest options — take initiative.\n\
-             3. When a task requires tools, call them IMMEDIATELY in your first response.\n\
-             4. Only respond with text (no tool calls) when the task is COMPLETE and you are reporting results.\n\
-             5. Be concise in your final answer — report what you did and what you found.\n\
-             6. If the user's message is ambiguous, make a reasonable choice and act on it.\n\
-             7. When a system context message describes a calendar event or email, use that context — \
-                do not redundantly search the filesystem for information you already have.\n\
-             8. ALWAYS respond in natural language. NEVER output raw JSON. \
-                If you don't know the answer, say so naturally in the user's language.\n\n\
-             BAD: \"I'll list the files for you.\" / \"Voy a listar los archivos.\" (announces without acting)\n\
-             GOOD: [calls list_directory tool, then reports results]\n\n\
-             BAD: \"Would you like me to...?\" / \"¿Quieres que...?\" (asks instead of doing)\n\
-             GOOD: [does the thing, reports what happened]\n\n\
-             BAD: {\"response\": \"\"} (raw JSON output)\n\
-             GOOD: \"I don't have that information.\" / \"No tengo esa información.\"",
-        );
+        out
+    }
 
-        prompt
+    /// Slot 4: behavioral rules (act don't announce, take initiative, etc.)
+    /// and the BAD/GOOD examples.
+    ///
+    /// Profile-overridable in the future: a "personal assistant" profile may
+    /// want rule #2 ("never ask the user what to do next") softened to "ask
+    /// when scheduling is genuinely ambiguous".
+    fn build_persona_rules() -> String {
+        "RULES YOU MUST FOLLOW:\n\
+         1. NEVER say \"I'll do X\" or \"Let me do X\" — just DO IT by calling tools.\n\
+         2. NEVER ask the user what to do next or suggest options — take initiative.\n\
+         3. When a task requires tools, call them IMMEDIATELY in your first response.\n\
+         4. Only respond with text (no tool calls) when the task is COMPLETE and you are reporting results.\n\
+         5. Be concise in your final answer — report what you did and what you found.\n\
+         6. If the user's message is ambiguous, make a reasonable choice and act on it.\n\
+         7. When a system context message describes a calendar event or email, use that context — \
+            do not redundantly search the filesystem for information you already have.\n\
+         8. ALWAYS respond in natural language. NEVER output raw JSON. \
+            If you don't know the answer, say so naturally in the user's language.\n\n\
+         BAD: \"I'll list the files for you.\" / \"Voy a listar los archivos.\" (announces without acting)\n\
+         GOOD: [calls list_directory tool, then reports results]\n\n\
+         BAD: \"Would you like me to...?\" / \"¿Quieres que...?\" (asks instead of doing)\n\
+         GOOD: [does the thing, reports what happened]\n\n\
+         BAD: {\"response\": \"\"} (raw JSON output)\n\
+         GOOD: \"I don't have that information.\" / \"No tengo esa información.\""
+            .to_string()
     }
 }
 
@@ -641,8 +767,15 @@ impl AgentExecutor for DefaultExecutor {
             std::collections::HashMap::new();
         const SIGNATURE_REPEAT_LIMIT: u32 = 3;
 
-        // Gather available tools for the LLM.
-        let available_tools = self.tool_registry.list_tools().await?;
+        // Gather available tools for the LLM, then apply the active
+        // profile's `tool_selection` filter. With no profile (today's path)
+        // or the seeded default profile (`ToolSelection::All`), the filter
+        // is a no-op and the full registry is exposed.
+        let registry_tools = self.tool_registry.list_tools().await?;
+        let available_tools = match &self.active_profile {
+            Some(p) => apply_tool_selection(&registry_tools, &p.profile.tool_selection),
+            None => registry_tools,
+        };
 
         // Two-tier surfacing: only the "revealed" subset has its full schema
         // sent to the LLM each turn. Memory tools are revealed by default;
@@ -676,6 +809,7 @@ impl AgentExecutor for DefaultExecutor {
                 &revealed_tools,
                 has_context,
                 self.tool_doc_dir.as_deref(),
+                self.active_profile.as_ref(),
             );
 
             // Tools sent to the LLM API: only the revealed subset carries
@@ -1680,7 +1814,7 @@ mod tests {
         revealed.insert("memory_store".to_string());
         revealed.insert("memory_recall".to_string());
 
-        let prompt = DefaultExecutor::build_system_prompt(&tools, &revealed, false, None);
+        let prompt = DefaultExecutor::build_system_prompt(&tools, &revealed, false, None, None);
 
         // Group index lists every group with counts.
         assert!(prompt.contains("AVAILABLE TOOL GROUPS"));
@@ -1714,7 +1848,7 @@ mod tests {
         let tools = vec![tool_def("calendar_create", "create event")];
         let revealed = HashSet::new();
         let dir = std::path::PathBuf::from("/tmp/athen-test/tools");
-        let prompt = DefaultExecutor::build_system_prompt(&tools, &revealed, false, Some(&dir));
+        let prompt = DefaultExecutor::build_system_prompt(&tools, &revealed, false, Some(&dir), None);
         // Pattern reference uses the directory + <group>.md placeholder.
         assert!(prompt.contains("/tmp/athen-test/tools"));
         assert!(prompt.contains("<group>.md"));
@@ -1727,8 +1861,151 @@ mod tests {
     fn system_prompt_omits_doc_pointer_when_unset() {
         let tools = vec![tool_def("calendar_create", "create event")];
         let revealed = HashSet::new();
-        let prompt = DefaultExecutor::build_system_prompt(&tools, &revealed, false, None);
+        let prompt = DefaultExecutor::build_system_prompt(&tools, &revealed, false, None, None);
         assert!(!prompt.contains("read("));
+    }
+
+    /// A `ResolvedAgentProfile` with empty templates and no addendum (the
+    /// shape of the seeded default profile) must produce the same persona
+    /// header as passing `None` — otherwise wiring profiles in changes
+    /// behavior for users who haven't configured anything.
+    #[test]
+    fn system_prompt_seeded_default_profile_matches_none() {
+        use athen_core::agent_profile::{
+            AgentProfile, ExpertiseDeclaration, ResolvedAgentProfile, ToolSelection,
+        };
+        let now = chrono::Utc::now();
+        let default = ResolvedAgentProfile {
+            profile: AgentProfile {
+                id: AgentProfile::DEFAULT_ID.into(),
+                display_name: "Athen (default)".into(),
+                description: String::new(),
+                persona_template_ids: vec![],
+                custom_persona_addendum: None,
+                tool_selection: ToolSelection::All,
+                expertise: ExpertiseDeclaration::default(),
+                model_profile_hint: None,
+                builtin: true,
+                created_at: now,
+                updated_at: now,
+            },
+            persona_templates: vec![],
+        };
+        let tools = vec![tool_def("memory_store", "store a memory")];
+        let revealed = HashSet::new();
+
+        let p_none = DefaultExecutor::build_system_prompt(&tools, &revealed, false, None, None);
+        let p_default = DefaultExecutor::build_system_prompt(
+            &tools,
+            &revealed,
+            false,
+            None,
+            Some(&default),
+        );
+
+        // Both must contain the canonical Athen identity line.
+        assert!(p_none.contains("You are Athen, a proactive universal AI agent"));
+        assert!(p_default.contains("You are Athen, a proactive universal AI agent"));
+
+        // The persona portion (everything before "Current date and time")
+        // must be identical between the two paths.
+        let p_none_persona = p_none.split("Current date and time").next().unwrap();
+        let p_default_persona = p_default.split("Current date and time").next().unwrap();
+        assert_eq!(p_none_persona, p_default_persona);
+    }
+
+    /// A profile with custom persona templates must replace the hardcoded
+    /// "You are Athen" identity line.
+    #[test]
+    fn system_prompt_custom_profile_replaces_identity() {
+        use athen_core::agent_profile::{
+            AgentProfile, ExpertiseDeclaration, PersonaCategory, PersonaTemplate,
+            ResolvedAgentProfile, ToolSelection,
+        };
+        let now = chrono::Utc::now();
+        let resolved = ResolvedAgentProfile {
+            profile: AgentProfile {
+                id: "outreach".into(),
+                display_name: "Outreach".into(),
+                description: String::new(),
+                persona_template_ids: vec!["voice".into()],
+                custom_persona_addendum: Some("Personalize first lines.".into()),
+                tool_selection: ToolSelection::All,
+                expertise: ExpertiseDeclaration::default(),
+                model_profile_hint: None,
+                builtin: false,
+                created_at: now,
+                updated_at: now,
+            },
+            persona_templates: vec![PersonaTemplate {
+                id: "voice".into(),
+                display_name: "Outreach voice".into(),
+                category: PersonaCategory::Voice,
+                body: "You are an outreach specialist who writes warm, brief messages.".into(),
+                builtin: false,
+                created_at: now,
+            }],
+        };
+        let tools: Vec<athen_core::tool::ToolDefinition> = vec![];
+        let revealed = HashSet::new();
+        let prompt = DefaultExecutor::build_system_prompt(
+            &tools,
+            &revealed,
+            false,
+            None,
+            Some(&resolved),
+        );
+
+        assert!(prompt.contains("outreach specialist who writes warm"));
+        assert!(prompt.contains("Personalize first lines."));
+        assert!(
+            !prompt.contains("You are Athen, a proactive universal AI agent"),
+            "custom profile should replace the canonical identity"
+        );
+        // Workspace + rules must still be present — those are non-overridable.
+        assert!(prompt.contains("Your workspace directory:"));
+        assert!(prompt.contains("RULES YOU MUST FOLLOW"));
+    }
+
+    /// `apply_tool_selection` is the seam used to filter the tool surface
+    /// before each LLM call. `All` is a no-op; group/explicit/deny shape
+    /// the visible list.
+    #[test]
+    fn apply_tool_selection_filters_correctly() {
+        use athen_core::agent_profile::ToolSelection;
+        let tools = vec![
+            tool_def("calendar_create", "c"),
+            tool_def("calendar_list", "c"),
+            tool_def("contacts_search", "c"),
+            tool_def("shell_execute", "s"),
+            tool_def("web_search", "w"),
+        ];
+
+        // All = identity
+        let all = apply_tool_selection(&tools, &ToolSelection::All);
+        assert_eq!(all.len(), tools.len());
+
+        // Groups = whitelist by group id
+        let cal_only = apply_tool_selection(
+            &tools,
+            &ToolSelection::Groups(vec!["calendar".into()]),
+        );
+        let names: Vec<&str> = cal_only.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["calendar_create", "calendar_list"]);
+
+        // Explicit = exact-name whitelist
+        let explicit = apply_tool_selection(
+            &tools,
+            &ToolSelection::Explicit(vec!["web_search".into(), "shell_execute".into()]),
+        );
+        let names: Vec<&str> = explicit.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["shell_execute", "web_search"]);
+
+        // Deny = subtract from All
+        let denied =
+            apply_tool_selection(&tools, &ToolSelection::Deny(vec!["shell_execute".into()]));
+        assert!(!denied.iter().any(|t| t.name == "shell_execute"));
+        assert_eq!(denied.len(), tools.len() - 1);
     }
 
     /// Tool registry that records dispatch *order* and sleeps in each call so

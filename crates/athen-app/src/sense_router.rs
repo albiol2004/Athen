@@ -867,6 +867,7 @@ mod tests {
                 updated_at: old,
                 entry_count: 3,
                 primary_reply_channel: None,
+                active_profile_id: None,
             },
             ArcMeta {
                 id: "arc_recent".into(),
@@ -879,6 +880,7 @@ mod tests {
                 updated_at: recent,
                 entry_count: 1,
                 primary_reply_channel: None,
+                active_profile_id: None,
             },
         ];
 

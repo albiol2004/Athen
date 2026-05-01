@@ -154,6 +154,11 @@ pub struct AppState {
     /// and the settings UI for managing grants. Always wired against the
     /// same SQLite connection as `_database`.
     pub grant_store: Option<Arc<GrantStore>>,
+    /// SQLite-backed agent profile store. Holds the seeded `default`
+    /// profile plus any user-authored profiles. Looked up per-arc via
+    /// `arcs.active_profile_id` so each conversation can run under its
+    /// own persona + tool surface.
+    pub profile_store: Option<Arc<athen_persistence::profiles::SqliteProfileStore>>,
     /// Outstanding grant requests parked waiting for the user. Each entry
     /// holds a oneshot sender that resolves with the user's choice.
     pub pending_grants: PendingGrants,
@@ -225,6 +230,7 @@ impl AppState {
         let tool_doc_dir = ensure_data_dir().map(|d| d.join("tools"));
 
         let grant_store = database.as_ref().map(|db| Arc::new(db.grant_store()));
+        let profile_store = database.as_ref().map(|db| Arc::new(db.profile_store()));
         let pending_grants = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let spawned_processes: athen_agent::SpawnedProcessMap =
             Arc::new(Mutex::new(HashMap::new()));
@@ -256,6 +262,7 @@ impl AppState {
             mcp_store,
             tool_doc_dir,
             grant_store,
+            profile_store,
             pending_grants,
             spawned_processes,
             inflight_approvals: Arc::new(Mutex::new(HashSet::new())),

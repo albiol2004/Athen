@@ -1,3 +1,4 @@
+pub mod agent_profile;
 pub mod approval;
 pub mod config;
 pub mod config_loader;

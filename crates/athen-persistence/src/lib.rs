@@ -10,6 +10,7 @@ pub mod contacts;
 pub mod grants;
 pub mod mcp;
 pub mod notifications;
+pub mod profiles;
 pub mod store;
 
 use std::path::Path;
@@ -27,6 +28,7 @@ use crate::contacts::SqliteContactStore;
 use crate::grants::GrantStore;
 use crate::mcp::McpStore;
 use crate::notifications::NotificationStore;
+use crate::profiles::SqliteProfileStore;
 use crate::store::SqliteStore;
 
 /// Owns the SQLite connection and provides access to the store.
@@ -80,7 +82,10 @@ impl Database {
         let mcp = self.mcp_store();
         mcp.init_schema().await?;
         let grants = self.grant_store();
-        grants.init_schema().await
+        grants.init_schema().await?;
+        let profiles = self.profile_store();
+        profiles.init_schema().await?;
+        profiles.seed_builtins_if_empty().await
     }
 
     /// Create a `SqliteStore` backed by this database's connection.
@@ -121,6 +126,11 @@ impl Database {
     /// Create a `GrantStore` backed by this database's connection.
     pub fn grant_store(&self) -> GrantStore {
         GrantStore::new(self.conn.clone())
+    }
+
+    /// Create a `SqliteProfileStore` backed by this database's connection.
+    pub fn profile_store(&self) -> SqliteProfileStore {
+        SqliteProfileStore::new(self.conn.clone())
     }
 }
 

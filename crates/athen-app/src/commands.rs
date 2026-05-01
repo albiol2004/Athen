@@ -76,6 +76,7 @@ fn spawn_router_approval(
         mcp: Arc::clone(&state.mcp),
         tool_doc_dir: state.tool_doc_dir.clone(),
         grant_store: state.grant_store.clone(),
+        profile_store: state.profile_store.clone(),
         pending_grants: state.pending_grants.clone(),
         spawned_processes: state.spawned_processes.clone(),
         telegram_sink: telegram_sink.clone(),
@@ -164,6 +165,7 @@ fn spawn_router_approval(
             mcp: bg_ctx.mcp,
             tool_doc_dir: bg_ctx.tool_doc_dir,
             grant_store: bg_ctx.grant_store,
+            profile_store: bg_ctx.profile_store,
             pending_grants: bg_ctx.pending_grants,
             spawned_processes: bg_ctx.spawned_processes,
             telegram_approval_sink: Some(bg_ctx.telegram_sink.clone()),
@@ -246,12 +248,63 @@ struct ApprovedTaskBgCtx {
     mcp: Arc<athen_mcp::McpRegistry>,
     tool_doc_dir: Option<std::path::PathBuf>,
     grant_store: Option<Arc<athen_persistence::grants::GrantStore>>,
+    profile_store: Option<Arc<athen_persistence::profiles::SqliteProfileStore>>,
     pending_grants: crate::file_gate::PendingGrants,
     spawned_processes: athen_agent::SpawnedProcessMap,
     telegram_sink: Arc<crate::approval::TelegramApprovalSink>,
     cancel_flag: Arc<std::sync::atomic::AtomicBool>,
     active_arc_id: String,
     inflight: crate::state::InflightApprovals,
+}
+
+/// Resolve the agent profile that should drive execution for a given arc.
+///
+/// Reads `arcs.active_profile_id` to pick a profile id (or falls back to
+/// the seeded default), then resolves the profile's persona templates into
+/// a `ResolvedAgentProfile` ready to hand to `AgentBuilder::active_profile`.
+///
+/// Returns `None` (and logs at debug level) on any error or missing wiring
+/// — callers continue without a profile, which preserves today's behavior.
+/// This is intentional: profiles are an enhancement, not a precondition,
+/// so a corrupt or unset DB row should never break the agent.
+async fn resolve_active_profile(
+    profile_store: Option<&Arc<athen_persistence::profiles::SqliteProfileStore>>,
+    arc_store: Option<&athen_persistence::arcs::ArcStore>,
+    arc_id: &str,
+) -> Option<athen_core::agent_profile::ResolvedAgentProfile> {
+    use athen_core::traits::profile::ProfileStore;
+
+    let pstore = profile_store?;
+    let astore = arc_store?;
+    let arc_meta = match astore.get_arc(arc_id).await {
+        Ok(Some(meta)) => meta,
+        Ok(None) => {
+            tracing::debug!(arc_id = %arc_id, "no arc row when resolving profile");
+            return None;
+        }
+        Err(e) => {
+            tracing::debug!(arc_id = %arc_id, error = %e, "get_arc failed when resolving profile");
+            return None;
+        }
+    };
+    let profile = match pstore
+        .get_or_default(arc_meta.active_profile_id.as_ref())
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!(error = %e, "profile lookup failed; falling back to no profile");
+            return None;
+        }
+    };
+    let templates = pstore
+        .resolve_templates(&profile.persona_template_ids)
+        .await
+        .unwrap_or_default();
+    Some(athen_core::agent_profile::ResolvedAgentProfile {
+        profile,
+        persona_templates: templates,
+    })
 }
 
 /// Convert a raw technical error string into a user-friendly message.
@@ -1134,7 +1187,7 @@ pub async fn send_message(
             // Set up streaming: forward LLM text chunks to the frontend
             // in real time via Tauri events, tagged with the active arc.
             let current_arc = state.active_arc_id.lock().await.clone();
-            let stream_tx = spawn_stream_forwarder(&app_handle, Some(current_arc));
+            let stream_tx = spawn_stream_forwarder(&app_handle, Some(current_arc.clone()));
 
             // Reset and wire the cancellation flag.
             let cancel_flag = Arc::clone(&state.cancel_flag);
@@ -1142,6 +1195,13 @@ pub async fn send_message(
 
             // Snapshot context for post-response reinforcement.
             let context_snapshot = context.clone();
+
+            let active_profile = resolve_active_profile(
+                state.profile_store.as_ref(),
+                state.arc_store.as_ref(),
+                &current_arc,
+            )
+            .await;
 
             let mut builder = AgentBuilder::new()
                 .llm_router(exec_router)
@@ -1154,6 +1214,9 @@ pub async fn send_message(
                 .cancel_flag(cancel_flag);
             if let Some(p) = state.tool_doc_dir.clone() {
                 builder = builder.tool_doc_dir(p);
+            }
+            if let Some(profile) = active_profile {
+                builder = builder.active_profile(profile);
             }
             let executor = builder.build().map_err(|e| {
                 let raw = e.to_string();
@@ -1396,6 +1459,7 @@ pub async fn approve_task(
         mcp: Arc::clone(&state.mcp),
         tool_doc_dir: state.tool_doc_dir.clone(),
         grant_store: state.grant_store.clone(),
+        profile_store: state.profile_store.clone(),
         pending_grants: state.pending_grants.clone(),
         spawned_processes: state.spawned_processes.clone(),
         telegram_approval_sink: state.telegram_approval_sink.clone(),
@@ -1482,6 +1546,7 @@ pub(crate) struct ApprovedTaskCtx {
     pub mcp: Arc<athen_mcp::McpRegistry>,
     pub tool_doc_dir: Option<std::path::PathBuf>,
     pub grant_store: Option<Arc<athen_persistence::grants::GrantStore>>,
+    pub profile_store: Option<Arc<athen_persistence::profiles::SqliteProfileStore>>,
     pub pending_grants: crate::file_gate::PendingGrants,
     pub spawned_processes: athen_agent::SpawnedProcessMap,
     pub telegram_approval_sink: Option<Arc<crate::approval::TelegramApprovalSink>>,
@@ -1728,6 +1793,13 @@ pub(crate) async fn execute_approved_task(
 
     let context_snapshot = context.clone();
 
+    let active_profile = resolve_active_profile(
+        ctx.profile_store.as_ref(),
+        ctx.arc_store.as_ref(),
+        &ctx.active_arc_id,
+    )
+    .await;
+
     let mut builder = AgentBuilder::new()
         .llm_router(exec_router)
         .tool_registry(Box::new(registry))
@@ -1739,6 +1811,9 @@ pub(crate) async fn execute_approved_task(
         .cancel_flag(ctx.cancel_flag.clone());
     if let Some(p) = ctx.tool_doc_dir.clone() {
         builder = builder.tool_doc_dir(p);
+    }
+    if let Some(profile) = active_profile {
+        builder = builder.active_profile(profile);
     }
     let executor = builder.build().map_err(|e| {
         let raw = e.to_string();
