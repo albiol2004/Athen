@@ -359,24 +359,45 @@ impl ArcStore {
         .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
     }
 
-    /// List all arcs ordered by most recently updated first, with entry counts.
+    /// List all arcs (including sub-arcs) ordered by most recently updated
+    /// first, with entry counts. Use [`Self::list_root_arcs`] for the sidebar
+    /// view that should hide delegation sub-arcs.
     pub async fn list_arcs(&self) -> Result<Vec<ArcMeta>> {
+        self.list_arcs_inner(false).await
+    }
+
+    /// List only root arcs (those with no `parent_arc_id`). Sub-arcs created
+    /// by `delegate_to_agent` are hidden — their content is meant to be
+    /// rendered inline under the parent's tool call, not as a separate
+    /// sidebar entry.
+    pub async fn list_root_arcs(&self) -> Result<Vec<ArcMeta>> {
+        self.list_arcs_inner(true).await
+    }
+
+    async fn list_arcs_inner(&self, roots_only: bool) -> Result<Vec<ArcMeta>> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
+            let where_clause = if roots_only {
+                "WHERE a.parent_arc_id IS NULL "
+            } else {
+                ""
+            };
+            let sql = format!(
+                "SELECT a.id, a.name, a.source, a.status, a.parent_arc_id, \
+                        a.merged_into_arc_id, a.created_at, a.updated_at, \
+                        COALESCE(e.cnt, 0) AS entry_count, \
+                        a.primary_reply_channel, a.active_profile_id \
+                 FROM arcs a \
+                 LEFT JOIN ( \
+                     SELECT arc_id, COUNT(*) AS cnt \
+                     FROM arc_entries GROUP BY arc_id \
+                 ) e ON a.id = e.arc_id \
+                 {}ORDER BY a.updated_at DESC",
+                where_clause
+            );
             let mut stmt = conn
-                .prepare(
-                    "SELECT a.id, a.name, a.source, a.status, a.parent_arc_id, \
-                            a.merged_into_arc_id, a.created_at, a.updated_at, \
-                            COALESCE(e.cnt, 0) AS entry_count, \
-                            a.primary_reply_channel, a.active_profile_id \
-                     FROM arcs a \
-                     LEFT JOIN ( \
-                         SELECT arc_id, COUNT(*) AS cnt \
-                         FROM arc_entries GROUP BY arc_id \
-                     ) e ON a.id = e.arc_id \
-                     ORDER BY a.updated_at DESC",
-                )
+                .prepare(&sql)
                 .map_err(|e| AthenError::Other(format!("Prepare list arcs: {e}")))?;
 
             let rows = stmt
@@ -1002,6 +1023,36 @@ mod tests {
 
         let arc = store.get_arc("arc_1").await.unwrap().unwrap();
         assert_eq!(arc.status, ArcStatus::Archived);
+    }
+
+    /// `list_root_arcs` powers the sidebar; sub-arcs created by
+    /// `delegate_to_agent` (carrying a `parent_arc_id`) must be hidden so
+    /// they don't clutter the sidebar with empty-looking entries.
+    #[tokio::test]
+    async fn test_list_root_arcs_hides_sub_arcs() {
+        let store = setup_arc_store().await;
+        store
+            .create_arc("parent", "Parent Arc", ArcSource::UserInput)
+            .await
+            .unwrap();
+        store
+            .create_arc_with_parent("sub", "Sub Arc", ArcSource::System, "parent")
+            .await
+            .unwrap();
+        store
+            .create_arc("standalone", "Standalone", ArcSource::UserInput)
+            .await
+            .unwrap();
+
+        let all = store.list_arcs().await.unwrap();
+        assert_eq!(all.len(), 3, "list_arcs returns every arc including sub");
+
+        let roots = store.list_root_arcs().await.unwrap();
+        assert_eq!(roots.len(), 2, "list_root_arcs hides sub-arcs");
+        let ids: Vec<&str> = roots.iter().map(|a| a.id.as_str()).collect();
+        assert!(ids.contains(&"parent"));
+        assert!(ids.contains(&"standalone"));
+        assert!(!ids.contains(&"sub"));
     }
 
     #[tokio::test]

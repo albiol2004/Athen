@@ -88,6 +88,8 @@ const ICON_FOLDER_PLUS = toolSvg('<path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V
 const ICON_ARROW_RIGHT = toolSvg('<line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/>');
 const ICON_INFO        = toolSvg('<circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/>');
 const ICON_CHECK       = toolSvg('<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/>');
+// "Hand off to a specialist": two figures with an arrow between them.
+const ICON_DELEGATE    = toolSvg('<circle cx="6" cy="8" r="3"/><path d="M2 21v-2a4 4 0 0 1 4-4h0"/><circle cx="18" cy="8" r="3"/><path d="M14 21v-2a4 4 0 0 1 4-4h0"/><line x1="9" y1="12" x2="15" y2="12"/><polyline points="13 10 15 12 13 14"/>');
 
 const BUILTIN_TOOL_ICONS = {
     'read': ICON_FILE_TEXT, 'list_directory': ICON_FOLDER, 'grep': ICON_FILE_SEARCH,
@@ -105,6 +107,8 @@ const BUILTIN_TOOL_ICONS = {
     'delete_path': ICON_TRASH, 'append_file': ICON_PEN_DOC,
     'create_dir': ICON_FOLDER_PLUS, 'move_path': ICON_ARROW_RIGHT,
     'exists': ICON_CHECK, 'stat': ICON_INFO,
+    // delegation
+    'delegate_to_agent': ICON_DELEGATE,
 };
 
 const BUILTIN_TOOL_LABELS = {
@@ -122,6 +126,7 @@ const BUILTIN_TOOL_LABELS = {
     'delete_path': 'Delete', 'append_file': 'Append',
     'create_dir': 'Create folder', 'move_path': 'Move',
     'exists': 'Check', 'stat': 'Info',
+    'delegate_to_agent': 'Consult specialist',
 };
 
 // MCP-prefixed tools (e.g. `files__read_file`) — strip prefix and try common
@@ -1705,37 +1710,125 @@ function renderToolGroup(toolCalls) {
     body.className = 'tool-group-body tool-steps-container';
     for (const tc of toolCalls) {
         const meta = parseEntryMetadata(tc.metadata) || {};
-        const toolName = meta.tool || tc.content || '';
-        const status = meta.status || 'Completed';
-        const summaryText = meta.summary || '';
-        const icon = builtinToolIcon(toolName);
-
-        const card = document.createElement('div');
-        const statusClass = status === 'Completed' ? 'completed'
-                          : status === 'Failed' ? 'failed' : 'in-progress';
-        const builtinClass = icon ? ' builtin' : '';
-        card.className = `tool-execution-card ${statusClass}${builtinClass}`;
-        card.title = toolName;
-
-        const statusIcon = status === 'Completed' ? '&#10003;'
-                         : status === 'Failed' ? '&#10007;' : '&#9679;';
-        const labelText = icon ? builtinToolLabel(toolName) : toolName;
-        const iconMarkup = icon ? `<span class="tool-builtin-icon">${icon}</span>` : '';
-        let detailHtml = '';
-        if (summaryText) {
-            const truncated = summaryText.length > 80 ? summaryText.substring(0, 80) + '...' : summaryText;
-            detailHtml = `<span class="tool-detail">${escapeHtml(truncated)}</span>`;
-        }
-        card.innerHTML =
-            `<span class="tool-status-icon">${statusIcon}</span>` +
-            iconMarkup +
-            `<span class="tool-name">${escapeHtml(labelText)}</span>` +
-            detailHtml;
-        body.appendChild(card);
+        body.appendChild(buildToolCardBlock(meta));
     }
     details.appendChild(body);
 
     messagesEl.appendChild(details);
+}
+
+// Build a single tool-call card. For `delegate_to_agent`, wraps the card
+// with a nested expandable view that lazily fetches the sub-arc's tool
+// calls and renders them inline (Claude-Code-style sub-agent activity).
+function buildToolCardBlock(meta) {
+    const toolName = meta.tool || '';
+    const card = buildToolCard(meta);
+
+    if (toolName !== 'delegate_to_agent') return card;
+
+    const result = meta.result && typeof meta.result === 'object' ? meta.result : null;
+    const subArcId = result ? result.sub_arc_id : null;
+    if (!subArcId) return card;
+
+    const wrapper = document.createElement('div');
+    wrapper.className = 'tool-card-block delegate-block';
+
+    const details = document.createElement('details');
+    details.className = 'sub-agent-steps';
+
+    const summary = document.createElement('summary');
+    summary.className = 'sub-agent-steps-summary';
+    summary.textContent = '⤷ specialist steps';
+    details.appendChild(summary);
+
+    const body = document.createElement('div');
+    body.className = 'sub-agent-steps-body';
+    body.textContent = 'Loading...';
+    details.appendChild(body);
+
+    let loaded = false;
+    details.addEventListener('toggle', async () => {
+        if (!details.open || loaded) return;
+        loaded = true;
+        try {
+            const entries = await invoke('get_arc_entries', { arcId: subArcId });
+            renderSubAgentSteps(body, entries || []);
+        } catch (e) {
+            body.textContent = `Could not load specialist steps: ${e}`;
+        }
+    });
+
+    wrapper.appendChild(card);
+    wrapper.appendChild(details);
+    return wrapper;
+}
+
+// Build the inner card element only — no wrappers, no nested rendering.
+function buildToolCard(meta) {
+    const toolName = meta.tool || '';
+    const status = meta.status || 'Completed';
+    const summaryText = meta.summary || '';
+    const icon = builtinToolIcon(toolName);
+
+    const card = document.createElement('div');
+    const statusClass = status === 'Completed' ? 'completed'
+                      : status === 'Failed' ? 'failed' : 'in-progress';
+    const builtinClass = icon ? ' builtin' : '';
+    card.className = `tool-execution-card ${statusClass}${builtinClass}`;
+    card.title = toolName;
+
+    const statusIcon = status === 'Completed' ? '&#10003;'
+                     : status === 'Failed' ? '&#10007;' : '&#9679;';
+    const labelText = icon ? builtinToolLabel(toolName) : toolName;
+    const iconMarkup = icon ? `<span class="tool-builtin-icon">${icon}</span>` : '';
+    let detailHtml = '';
+    if (summaryText) {
+        const truncated = summaryText.length > 80 ? summaryText.substring(0, 80) + '...' : summaryText;
+        detailHtml = `<span class="tool-detail">${escapeHtml(truncated)}</span>`;
+    }
+    card.innerHTML =
+        `<span class="tool-status-icon">${statusIcon}</span>` +
+        iconMarkup +
+        `<span class="tool-name">${escapeHtml(labelText)}</span>` +
+        detailHtml;
+    return card;
+}
+
+// Render the sub-agent's tool_call entries as a vertical list of cards,
+// each with a "view result" button that toggles the full JSON metadata.
+function renderSubAgentSteps(container, entries) {
+    container.innerHTML = '';
+    const toolCalls = (entries || []).filter(e => e.entry_type === 'tool_call');
+    if (toolCalls.length === 0) {
+        container.textContent = '(specialist used no tools)';
+        return;
+    }
+    for (const tc of toolCalls) {
+        const meta = parseEntryMetadata(tc.metadata) || {};
+        const row = document.createElement('div');
+        row.className = 'sub-agent-step-row';
+
+        row.appendChild(buildToolCard(meta));
+
+        // "View result" toggle: dumps the full meta.result/error JSON.
+        const detailToggle = document.createElement('details');
+        detailToggle.className = 'sub-agent-step-detail';
+        const sum = document.createElement('summary');
+        sum.textContent = 'view result';
+        detailToggle.appendChild(sum);
+        const pre = document.createElement('pre');
+        pre.className = 'sub-agent-step-json';
+        const payload = {
+            args: meta.args ?? null,
+            result: meta.result ?? null,
+            error: meta.error ?? null,
+        };
+        pre.textContent = JSON.stringify(payload, null, 2);
+        detailToggle.appendChild(pre);
+        row.appendChild(detailToggle);
+
+        container.appendChild(row);
+    }
 }
 
 // Render a single non-tool-call history entry. tool_call entries should be

@@ -320,6 +320,7 @@ impl AppState {
         arc_id: &str,
         app_handle: Option<tauri::AppHandle>,
     ) -> Box<dyn athen_core::traits::tool::ToolRegistry> {
+        let delegation_app_handle = app_handle.clone();
         let mut shell = athen_agent::ShellToolRegistry::new()
             .await
             .with_spawned_processes(self.spawned_processes.clone());
@@ -368,6 +369,7 @@ impl AppState {
                 llm_router: Arc::clone(&self.router),
                 parent_arc_id: arc_id.to_string(),
                 tool_doc_dir: self.tool_doc_dir.clone(),
+                app_handle: delegation_app_handle,
             };
             Box::new(crate::delegation::DelegationToolRegistry::new(base, ctx))
         } else {
@@ -1490,7 +1492,7 @@ fn generate_arc_id() -> String {
 /// If the store is unavailable or empty, create a new Arc with empty history.
 async fn restore_or_create_arc(arc_store: &Option<ArcStore>) -> (String, Vec<ChatMessage>) {
     if let Some(store) = arc_store {
-        match store.list_arcs().await {
+        match store.list_root_arcs().await {
             Ok(arcs) if !arcs.is_empty() => {
                 // Find the most recent active arc.
                 let active = arcs

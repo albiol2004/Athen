@@ -39,6 +39,7 @@ pub fn run() {
             commands::cancel_task,
             commands::new_arc,
             commands::get_arc_history,
+            commands::get_arc_entries,
             commands::list_arcs,
             commands::switch_arc,
             commands::rename_arc,

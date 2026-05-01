@@ -55,6 +55,11 @@ pub struct DelegationContext {
     pub parent_arc_id: String,
     /// Tool documentation directory passed to the sub-agent's executor.
     pub tool_doc_dir: Option<std::path::PathBuf>,
+    /// Tauri handle used to wire a silent auditor on the sub-executor so
+    /// the sub-agent's tool calls are persisted under `sub_arc_id`. None
+    /// means "no UI handle available" — sub-agent runs without persistence
+    /// (CLI / test paths).
+    pub app_handle: Option<tauri::AppHandle>,
 }
 
 /// Wraps a base tool registry and exposes `delegate_to_agent` as an
@@ -312,6 +317,25 @@ async fn run_delegation(
         .active_profile(resolved);
     if let Some(ref dir) = ctx.tool_doc_dir {
         builder = builder.tool_doc_dir(dir.clone());
+    }
+
+    // Wire a *silent* auditor on the sub-executor so its tool calls are
+    // persisted to `arc_entries` under the sub-arc id. The frontend reads
+    // these to render the inline expandable view under the parent's
+    // `delegate_to_agent` row. We deliberately skip `agent-progress` events
+    // (silent) and don't pass a stream sender — both would surface in the
+    // parent's UI as if the parent took those steps.
+    if let Some(ref handle) = ctx.app_handle {
+        let sub_turn_id = uuid::Uuid::new_v4().to_string();
+        let sub_tool_log = crate::commands::new_tool_log();
+        let sub_auditor = crate::commands::TauriAuditor::new_silent(
+            handle.clone(),
+            Some(ctx.arc_store.clone()),
+            sub_arc_id.clone(),
+            sub_turn_id,
+            sub_tool_log,
+        );
+        builder = builder.auditor(Box::new(sub_auditor));
     }
     let executor = builder
         .build()

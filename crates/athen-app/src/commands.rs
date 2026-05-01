@@ -762,6 +762,11 @@ pub(crate) struct TauriAuditor {
     arc_id: String,
     turn_id: String,
     tool_log: ToolLog,
+    /// When false, the auditor still persists tool_call rows to `arc_entries`
+    /// but skips emitting `agent-progress` events. Used for sub-agents spawned
+    /// by `delegate_to_agent` so their step-by-step progress doesn't leak into
+    /// the parent arc's progress UI.
+    emit_progress: bool,
 }
 
 impl TauriAuditor {
@@ -779,6 +784,29 @@ impl TauriAuditor {
             arc_id,
             turn_id,
             tool_log,
+            emit_progress: true,
+        }
+    }
+
+    /// Like [`Self::new`] but skips emitting `agent-progress` events. Tool
+    /// calls are still persisted to `arc_entries` for the given `arc_id` so
+    /// the frontend can render them inline later — but the parent UI's live
+    /// progress feed isn't polluted with the sub-agent's intermediate steps.
+    pub(crate) fn new_silent(
+        app_handle: AppHandle,
+        arc_store: Option<arcs::ArcStore>,
+        arc_id: String,
+        turn_id: String,
+        tool_log: ToolLog,
+    ) -> Self {
+        Self {
+            inner: InMemoryAuditor::new(),
+            app_handle,
+            arc_store,
+            arc_id,
+            turn_id,
+            tool_log,
+            emit_progress: false,
         }
     }
 
@@ -845,15 +873,17 @@ impl StepAuditor for TauriAuditor {
             None
         });
 
-        let _ = self.app_handle.emit(
-            "agent-progress",
-            AgentProgress {
-                step: step.index + 1,
-                tool_name: tool_name.clone(),
-                status: format!("{:?}", step.status),
-                detail: detail.clone(),
-            },
-        );
+        if self.emit_progress {
+            let _ = self.app_handle.emit(
+                "agent-progress",
+                AgentProgress {
+                    step: step.index + 1,
+                    tool_name: tool_name.clone(),
+                    status: format!("{:?}", step.status),
+                    detail: detail.clone(),
+                },
+            );
+        }
 
         // Persist completed tool invocations so the UI can rehydrate them on
         // restart. We only write on terminal states (Completed / Failed) and
@@ -1788,6 +1818,7 @@ pub(crate) async fn execute_approved_task(
                     llm_router: Arc::clone(&ctx.router),
                     parent_arc_id: ctx.active_arc_id.clone(),
                     tool_doc_dir: ctx.tool_doc_dir.clone(),
+                    app_handle: Some(ctx.app_handle.clone()),
                 };
                 Box::new(crate::delegation::DelegationToolRegistry::new(
                     base_registry,
@@ -2122,13 +2153,34 @@ pub async fn get_arc_history(
         .collect())
 }
 
-/// List all arcs with metadata for the sidebar.
+/// Load entries for a specific arc by id. Used by the frontend to fetch
+/// a delegation sub-arc's tool calls when rendering the inline expandable
+/// view under the parent's `delegate_to_agent` result.
+#[tauri::command]
+pub async fn get_arc_entries(
+    arc_id: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<Vec<ArcEntryResponse>, String> {
+    if let Some(ref store) = state.arc_store {
+        let entries = store
+            .load_entries(&arc_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(entries.into_iter().map(Into::into).collect())
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+/// List root arcs with metadata for the sidebar. Delegation sub-arcs
+/// (those with a `parent_arc_id`) are hidden — their content is rendered
+/// inline under the parent's `delegate_to_agent` tool call instead.
 #[tauri::command]
 pub async fn list_arcs(
     state: State<'_, AppState>,
 ) -> std::result::Result<Vec<arcs::ArcMeta>, String> {
     if let Some(ref store) = state.arc_store {
-        store.list_arcs().await.map_err(|e| e.to_string())
+        store.list_root_arcs().await.map_err(|e| e.to_string())
     } else {
         Ok(Vec::new())
     }
@@ -2243,7 +2295,7 @@ pub async fn delete_arc(
     let current = state.active_arc_id.lock().await.clone();
     if arc_id == current {
         if let Some(ref store) = state.arc_store {
-            let all_arcs = store.list_arcs().await.map_err(|e| e.to_string())?;
+            let all_arcs = store.list_root_arcs().await.map_err(|e| e.to_string())?;
             let next = all_arcs
                 .into_iter()
                 .find(|a| a.status == arcs::ArcStatus::Active)
