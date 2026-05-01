@@ -62,6 +62,24 @@ impl Memory {
     }
 }
 
+/// Tokenize a recall query into lowercased keyword tokens. Strips
+/// trivial punctuation and drops common English/Spanish stopwords plus
+/// tokens shorter than 3 chars. Used by the keyword-fallback path that
+/// runs when no embedder is configured.
+fn tokenize_query(query: &str) -> Vec<String> {
+    const STOPWORDS: &[&str] = &[
+        "the", "and", "for", "with", "that", "this", "from", "what", "when",
+        "where", "which", "about",
+        "los", "las", "del", "que", "con", "por", "para", "una", "uno",
+    ];
+    query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() >= 3)
+        .map(|t| t.to_lowercase())
+        .filter(|t| !STOPWORDS.contains(&t.as_str()))
+        .collect()
+}
+
 /// Extract entity names from vector search result metadata.
 fn extract_entity_names_from_metadata(metadata: &serde_json::Value) -> Vec<String> {
     let mut names = Vec::new();
@@ -181,11 +199,23 @@ impl MemoryStore for Memory {
     }
 
     async fn recall(&self, query: &str, limit: usize) -> Result<Vec<MemoryItem>> {
-        // Embed the query if an embedder is available.
-        let query_embedding = if let Some(ref embedder) = self.embedder {
-            embedder.embed(query).await?
-        } else {
-            vec![0.0f32; 0]
+        // No embedder configured (or embedding the query fails — API
+        // outage, rate limit, network timeout): fall back to a simple
+        // case-insensitive keyword overlap over the stored `_content`.
+        // Better than `found:false` (or surfacing a transient API error)
+        // when the user expects "look something up by name" to just work.
+        let Some(ref embedder) = self.embedder else {
+            return self.recall_keyword(query, limit).await;
+        };
+
+        let query_embedding = match embedder.embed(query).await {
+            Ok(emb) => emb,
+            Err(e) => {
+                warn!(
+                    "embedder failed during recall ({e}); falling back to keyword search"
+                );
+                return self.recall_keyword(query, limit).await;
+            }
         };
 
         // Phase 3: Hybrid retrieval — vector search + graph exploration.
@@ -312,6 +342,63 @@ impl MemoryStore for Memory {
 }
 
 impl Memory {
+    /// Keyword-overlap fallback used when no embedder is configured.
+    ///
+    /// Tokenizes the query into lowercased words (>=3 chars, stripped of
+    /// trivial punctuation) and scores each stored memory by how many
+    /// query tokens appear as substrings in its `_content`. A handful of
+    /// extremely common stopwords are dropped so single-word queries
+    /// don't return everything. Returns the top `limit` items with
+    /// score >= 1.
+    ///
+    /// This isn't semantic, but it's the *expected* behavior when the
+    /// user explicitly turned embeddings off — far better than the
+    /// previous "everything scores 0 → filtered out → found:false".
+    async fn recall_keyword(&self, query: &str, limit: usize) -> Result<Vec<MemoryItem>> {
+        let tokens = tokenize_query(query);
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        let all = self.vector.list_all().await?;
+        let mut scored: Vec<(usize, MemoryItem)> = all
+            .into_iter()
+            .filter_map(|r| {
+                let content_lc = r
+                    .metadata
+                    .get("_content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                if content_lc.is_empty() {
+                    return None;
+                }
+                let score = tokens
+                    .iter()
+                    .filter(|t| content_lc.contains(t.as_str()))
+                    .count();
+                if score == 0 {
+                    return None;
+                }
+                let content = r
+                    .metadata
+                    .get("_content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                Some((
+                    score,
+                    MemoryItem {
+                        id: r.id,
+                        content,
+                        metadata: r.metadata,
+                    },
+                ))
+            })
+            .collect();
+        scored.sort_by_key(|b| std::cmp::Reverse(b.0));
+        Ok(scored.into_iter().take(limit).map(|(_, m)| m).collect())
+    }
+
     /// List all stored memories for UI display.
     pub async fn list_all(&self) -> Result<Vec<MemoryItem>> {
         let results = self.vector.list_all().await?;
@@ -454,6 +541,111 @@ mod tests {
             Box::new(InMemoryGraph::new()),
         )
         .with_embedder(Box::new(KeywordEmbedding::new()))
+    }
+
+    /// Memory with NO embedder configured — exercises the keyword
+    /// fallback path in `recall`.
+    fn make_memory_no_embedder() -> Memory {
+        Memory::new(
+            Box::new(InMemoryVectorIndex::new()),
+            Box::new(InMemoryGraph::new()),
+        )
+    }
+
+    #[tokio::test]
+    async fn recall_without_embedder_uses_keyword_fallback() {
+        let mem = make_memory_no_embedder();
+        for (id, content) in &[
+            ("a", "Aldaran Analytics landing page audit notes"),
+            ("b", "Rust workspace structure overview"),
+            ("c", "Telegram approval routing details"),
+        ] {
+            mem.remember(MemoryItem {
+                id: id.to_string(),
+                content: content.to_string(),
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        }
+        let hits = mem
+            .recall("Aldaran landing page audit", 5)
+            .await
+            .unwrap();
+        assert!(!hits.is_empty(), "expected keyword hit for Aldaran query");
+        assert_eq!(hits[0].id, "a");
+    }
+
+    /// Embedding provider that always errors on `embed`. Used to verify
+    /// `recall` falls back to keyword search when the API is down /
+    /// rate-limited / network-timed-out, instead of surfacing the error.
+    struct FailingEmbedder;
+
+    #[async_trait]
+    impl athen_core::traits::embedding::EmbeddingProvider for FailingEmbedder {
+        fn provider_id(&self) -> &str {
+            "failing"
+        }
+        fn dimensions(&self) -> usize {
+            8
+        }
+        async fn embed(&self, _text: &str) -> Result<Vec<f32>> {
+            Err(athen_core::error::AthenError::Other(
+                "simulated embedder API failure".to_string(),
+            ))
+        }
+        async fn is_available(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn recall_falls_back_to_keyword_when_embedder_errors() {
+        // Stash entries with a working embedder so they have non-empty
+        // embeddings, then swap to a failing one for the recall to
+        // trigger the fallback path. We do this by remembering with the
+        // keyword embedder, then constructing a fresh Memory that
+        // shares the same vector store via list_all-style content.
+        //
+        // Simpler: build Memory with the failing embedder from the
+        // start. `remember` will hit the failing embed too, so we use
+        // the trait's default behavior (empty vec on error not allowed
+        // here) — instead, store entries via the no-embedder Memory and
+        // then assert keyword fallback works whenever embed errors. We
+        // approximate that by wiring a Memory with FailingEmbedder and
+        // pre-populating through the vector index directly.
+        use crate::vector::InMemoryVectorIndex;
+        let vector = InMemoryVectorIndex::new();
+        // Pre-populate via the underlying index so we don't need to
+        // call remember (which would itself hit the failing embedder).
+        vector
+            .upsert(
+                "a",
+                vec![],
+                serde_json::json!({ "_content": "Aldaran landing page audit notes" }),
+            )
+            .await
+            .unwrap();
+        let mem = Memory::new(Box::new(vector), Box::new(InMemoryGraph::new()))
+            .with_embedder(Box::new(FailingEmbedder));
+
+        let hits = mem.recall("Aldaran landing", 5).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "a");
+    }
+
+    #[tokio::test]
+    async fn recall_without_embedder_returns_empty_on_no_match() {
+        let mem = make_memory_no_embedder();
+        mem.remember(MemoryItem {
+            id: "x".into(),
+            content: "completely different topic".into(),
+            metadata: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+        let hits = mem.recall("zebra panda elephant", 5).await.unwrap();
+        assert!(hits.is_empty());
     }
 
     #[tokio::test]

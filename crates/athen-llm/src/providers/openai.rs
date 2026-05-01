@@ -513,8 +513,8 @@ pub(crate) fn parse_tool_arguments(raw: &str) -> serde_json::Value {
     if let Ok(v) = serde_json::from_str(raw) {
         return v;
     }
-    let repaired = escape_control_chars_in_strings(raw);
-    if let Ok(v) = serde_json::from_str(&repaired) {
+    let control_repaired = escape_control_chars_in_strings(raw);
+    if let Ok(v) = serde_json::from_str(&control_repaired) {
         tracing::warn!(
             "Tool args contained unescaped control characters; \
              repaired and parsed (raw len={})",
@@ -522,8 +522,23 @@ pub(crate) fn parse_tool_arguments(raw: &str) -> serde_json::Value {
         );
         return v;
     }
+    // Last resort: also escape unescaped double-quotes inside string
+    // literals. Triggered by HTML/code content where the LLM forgets to
+    // escape attribute quotes (e.g. `class="hero"`). Heuristic: a `"`
+    // is a real string terminator iff the next non-whitespace char is
+    // `,`, `}`, `]`, or end-of-input. Otherwise treat it as a literal
+    // quote and emit `\"` instead.
+    let aggressive = escape_unescaped_quotes_in_strings(&control_repaired);
+    if let Ok(v) = serde_json::from_str(&aggressive) {
+        tracing::warn!(
+            "Tool args contained unescaped quotes inside string values; \
+             aggressive repair succeeded (raw len={})",
+            raw.len()
+        );
+        return v;
+    }
     tracing::warn!(
-        "Tool args could not be parsed even after repair; \
+        "Tool args could not be parsed even after aggressive repair; \
          falling back to string wrapper (raw len={})",
         raw.len()
     );
@@ -569,6 +584,65 @@ fn escape_control_chars_in_strings(input: &str) -> String {
             }
             out.push(ch);
         }
+    }
+    out
+}
+
+/// Aggressive repair: walk the input and escape any unescaped `"` inside
+/// string literals. Heuristic for "is this `"` the real string end?" —
+/// peek ahead past whitespace; if the next char is `,`, `}`, `]`, `:`,
+/// or end-of-input, treat as terminator; otherwise escape it and stay
+/// in-string. This is what saves us when the LLM stuffs HTML or code
+/// (like `class="hero"`) into a string argument without escaping.
+///
+/// Imperfect — content like `"foo "bar","baz"` would be mis-parsed —
+/// but the failure mode here is "fall back to Value::String", same as
+/// before, so it's strictly better than not trying.
+fn escape_unescaped_quotes_in_strings(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len() + 16);
+    let mut i = 0;
+    let mut in_string = false;
+    let mut prev_backslash = false;
+    while i < chars.len() {
+        let ch = chars[i];
+        if in_string {
+            if prev_backslash {
+                out.push(ch);
+                prev_backslash = false;
+                i += 1;
+                continue;
+            }
+            match ch {
+                '\\' => {
+                    out.push(ch);
+                    prev_backslash = true;
+                }
+                '"' => {
+                    // Look ahead past whitespace for a terminator-like char.
+                    let mut j = i + 1;
+                    while j < chars.len() && chars[j].is_whitespace() {
+                        j += 1;
+                    }
+                    let is_terminator = j >= chars.len()
+                        || matches!(chars[j], ',' | '}' | ']' | ':');
+                    if is_terminator {
+                        out.push('"');
+                        in_string = false;
+                    } else {
+                        out.push('\\');
+                        out.push('"');
+                    }
+                }
+                _ => out.push(ch),
+            }
+        } else {
+            if ch == '"' {
+                in_string = true;
+            }
+            out.push(ch);
+        }
+        i += 1;
     }
     out
 }
@@ -963,6 +1037,49 @@ mod tests {
             .with_model("my-local-model".into())
             .with_provider_id("llamacpp".into())
             .with_cost_estimator(Box::new(ZeroCostEstimator))
+    }
+
+    #[test]
+    fn aggressive_repair_escapes_unescaped_html_quotes() {
+        // The exact failure mode from the field: HTML stuffed into the
+        // `content` arg of a `write` call, with `class="hero"` style
+        // attributes whose quotes are not JSON-escaped.
+        let raw = r#"{"path":"index.html","content":"<div class="hero">Hi</div>"}"#;
+        // Strict + control-char repair both fail.
+        assert!(serde_json::from_str::<serde_json::Value>(raw).is_err());
+        let v = parse_tool_arguments(raw);
+        // Aggressive repair recovered an object.
+        assert!(v.is_object(), "expected object, got {v:?}");
+        assert_eq!(v.get("path").and_then(|x| x.as_str()), Some("index.html"));
+        assert!(v.get("content").and_then(|x| x.as_str()).unwrap().contains("class="));
+    }
+
+    #[test]
+    fn aggressive_repair_handles_combined_quotes_and_newlines() {
+        // Both failure modes at once: raw newlines AND unescaped quotes.
+        let raw = "{\"path\":\"x.html\",\"content\":\"<a href=\"#\">\nlink</a>\"}";
+        let v = parse_tool_arguments(raw);
+        assert!(v.is_object(), "expected object, got {v:?}");
+        let content = v.get("content").and_then(|x| x.as_str()).unwrap();
+        assert!(content.contains("href="));
+        assert!(content.contains("link"));
+    }
+
+    #[test]
+    fn aggressive_repair_leaves_clean_json_alone() {
+        // Sanity: well-formed JSON shouldn't be touched.
+        let raw = r#"{"a":"hello","b":"world"}"#;
+        let v = parse_tool_arguments(raw);
+        assert_eq!(v.get("a").and_then(|x| x.as_str()), Some("hello"));
+        assert_eq!(v.get("b").and_then(|x| x.as_str()), Some("world"));
+    }
+
+    #[test]
+    fn aggressive_repair_unparseable_falls_back_to_string_wrapper() {
+        // Truly broken input still wraps to Value::String — no regression.
+        let raw = "this is not json at all { ;;;";
+        let v = parse_tool_arguments(raw);
+        assert!(v.is_string());
     }
 
     fn simple_request() -> LlmRequest {
