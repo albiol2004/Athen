@@ -81,11 +81,11 @@ impl DelegationToolRegistry {
             "properties": {
                 "target_profile_id": {
                     "type": "string",
-                    "description": "The id of the AgentProfile to spawn (e.g. 'marketing', 'coder'). Use list_agent_profiles or pick from what the user has configured. Pass an empty string to let the system pick the default profile."
+                    "description": "The id of the AgentProfile to spawn (e.g. 'marketing', 'coder'). Pass an empty string to let the system pick the default profile."
                 },
                 "brief": {
                     "type": "string",
-                    "description": "Self-contained instructions for the specialist. The specialist does NOT see your conversation history — write the brief as if handing the task to a stranger. Include any context, constraints, and the exact deliverable you expect."
+                    "description": "SPECIFICATION (not deliverable) for the specialist, under ~2000 characters. Describe what they should produce: goals, constraints, sections/structure, success criteria. Do NOT paste the deliverable itself — the specialist writes it. The specialist sees only this brief, not your conversation history, so make it self-contained but tight."
                 }
             },
             "required": ["target_profile_id", "brief"]
@@ -98,12 +98,21 @@ impl DelegationToolRegistry {
             description:
                 "Hand off a self-contained task to a specialist agent profile. \
                  Use when another profile is genuinely better-suited (e.g. marketing \
-                 expertise for a landing-page review). The specialist runs in a \
-                 fresh context with their own tools, completes the task, and returns \
-                 a structured result you can reason over. The specialist cannot \
-                 delegate further — depth is capped at 1, like a real-life referral. \
-                 Write the brief as a self-contained ask: the specialist sees only \
-                 the brief, not your conversation history."
+                 expertise for a landing-page review, coder profile for writing code). \
+                 The specialist runs in a fresh context with their own tools, completes \
+                 the task, and returns a structured result you can reason over. The \
+                 specialist cannot delegate further — depth is capped at 1, like a \
+                 real-life referral.\n\
+                 \n\
+                 IMPORTANT — the brief is a SPECIFICATION, not the deliverable. Describe \
+                 *what* the specialist should produce; do NOT paste the deliverable itself \
+                 inside the brief. If you ask the coder agent to write a landing page, the \
+                 brief should describe the sections, copy intent, CTAs, and constraints — \
+                 NOT contain the literal HTML you want them to emit. The specialist will \
+                 write the deliverable; you describe it.\n\
+                 \n\
+                 Keep the brief under ~2000 characters. The specialist sees only the \
+                 brief, not your conversation history, so make it self-contained but tight."
                     .to_string(),
             parameters: Self::delegate_schema(),
             backend: ToolBackend::Shell {
@@ -135,12 +144,24 @@ impl ToolRegistry for DelegationToolRegistry {
         }
 
         let started = Instant::now();
-        let parsed: DelegateArgs = match serde_json::from_value(args) {
+
+        // Recover from the OpenAI provider's "string wrapper" fallback:
+        // when the LLM emits malformed JSON (typically because it stuffed
+        // a huge HTML/code blob into a field), the provider hands us the
+        // raw payload as a `Value::String`. Try parsing that as JSON
+        // before giving up. Mirrors `athen-agent::tools::coerce_args`.
+        let coerced = coerce_string_wrapper(args);
+
+        let parsed: DelegateArgs = match serde_json::from_value(coerced.clone()) {
             Ok(a) => a,
             Err(e) => {
+                let hint = build_args_error_hint(&coerced);
                 return Ok(ToolResult {
                     success: false,
-                    output: json!({ "error": format!("invalid arguments: {e}") }),
+                    output: json!({
+                        "error": format!("invalid arguments: {e}"),
+                        "hint": hint,
+                    }),
                     error: Some(format!("invalid arguments: {e}")),
                     execution_time_ms: started.elapsed().as_millis() as u64,
                 });
@@ -302,6 +323,51 @@ async fn run_delegation(
     Ok((sub_arc_id, content, result.success))
 }
 
+/// Recover from the OpenAI provider's `Value::String` wrapper fallback
+/// (which kicks in when the LLM emits malformed JSON for tool args, e.g.
+/// embedding raw newlines inside a big HTML blob). If `args` is a string
+/// that re-parses as a JSON object, return that. Otherwise return as-is.
+///
+/// Mirrors the recovery in `athen-agent::tools::coerce_args` — duplicated
+/// here to avoid taking a cross-crate dep on a private helper.
+fn coerce_string_wrapper(args: serde_json::Value) -> serde_json::Value {
+    if let Some(s) = args.as_str() {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
+            tracing::warn!(
+                "delegate_to_agent args reached call_tool as Value::String; \
+                 re-parsed (len={})",
+                s.len()
+            );
+            return parsed;
+        }
+    }
+    args
+}
+
+/// When delegate_to_agent args fail to deserialize, give the LLM a useful
+/// hint about *what shape we expected*. The most common cause is the
+/// model embedding the deliverable inside the brief and breaking JSON;
+/// this hint nudges it to retry with a tighter spec next turn.
+fn build_args_error_hint(args: &serde_json::Value) -> String {
+    if args.is_string() {
+        "args came in as a raw string, not an object — this usually means the \
+         JSON tool_call was malformed because something large (like full HTML \
+         or code) was embedded inside a field. Retry with a tight specification \
+         in `brief` (under ~2000 chars), describing what the specialist should \
+         produce — do NOT paste the deliverable itself."
+            .to_string()
+    } else if let Some(obj) = args.as_object() {
+        let keys: Vec<&str> = obj.keys().map(|s| s.as_str()).collect();
+        format!(
+            "expected object with fields `target_profile_id` (string) and `brief` (string); \
+             received fields: [{}]",
+            keys.join(", ")
+        )
+    } else {
+        "expected object with fields `target_profile_id` (string) and `brief` (string)".into()
+    }
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -402,5 +468,54 @@ mod tests {
         // real DelegationContext (with SQLite). The forwarding logic is
         // a one-liner on the call_tool match; covered by the type-level
         // structure rather than execution here.
+    }
+
+    /// Recovery from the provider's `Value::String` wrapper fallback —
+    /// when the LLM embeds a huge HTML blob and breaks JSON parsing, the
+    /// raw payload arrives as a Value::String. We must re-parse it so
+    /// delegate_to_agent doesn't fail with a confusing "missing field"
+    /// when the actual problem was upstream JSON breakage.
+    #[test]
+    fn coerce_string_wrapper_reparses_inner_json() {
+        let inner = r#"{"target_profile_id":"coder","brief":"hello"}"#;
+        let wrapped = serde_json::Value::String(inner.to_string());
+        let coerced = coerce_string_wrapper(wrapped);
+        let parsed: DelegateArgs = serde_json::from_value(coerced).unwrap();
+        assert_eq!(parsed.target_profile_id, "coder");
+        assert_eq!(parsed.brief, "hello");
+    }
+
+    #[test]
+    fn coerce_string_wrapper_passes_objects_through_unchanged() {
+        let obj = json!({ "target_profile_id": "x", "brief": "y" });
+        let same = coerce_string_wrapper(obj.clone());
+        assert_eq!(same, obj);
+    }
+
+    #[test]
+    fn coerce_string_wrapper_leaves_unparseable_strings_as_string() {
+        let bad = serde_json::Value::String("not json at all".to_string());
+        let result = coerce_string_wrapper(bad.clone());
+        assert_eq!(result, bad);
+    }
+
+    /// The args-error hint is what the LLM sees when delegate_to_agent
+    /// fails to deserialize. It must surface the most common failure mode
+    /// (string-wrapped args = embedded huge blob) so the model retries
+    /// with a tighter brief.
+    #[test]
+    fn args_error_hint_calls_out_string_wrapper_case() {
+        let bad = serde_json::Value::String("garbage".to_string());
+        let hint = build_args_error_hint(&bad);
+        assert!(hint.contains("raw string"));
+        assert!(hint.contains("brief"));
+    }
+
+    #[test]
+    fn args_error_hint_lists_object_keys() {
+        let obj = json!({ "wrong_field": "x", "another": "y" });
+        let hint = build_args_error_hint(&obj);
+        assert!(hint.contains("wrong_field"));
+        assert!(hint.contains("another"));
     }
 }
