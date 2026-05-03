@@ -20,10 +20,10 @@ use uuid::Uuid;
 use athen_agent::tools::ShellExtraWritableProvider;
 use athen_core::contact::TrustLevel;
 use athen_core::error::{AthenError, Result};
-use athen_core::traits::approval::ApprovalSink;
 use athen_core::paths;
 use athen_core::risk::{DataSensitivity, RiskContext, RiskDecision};
 use athen_core::tool::ToolResult;
+use athen_core::traits::approval::ApprovalSink;
 use athen_persistence::grants::{Access, GrantStore};
 use athen_risk::path_eval::{GrantLookup, PathAccess, PathRiskEvaluator};
 
@@ -312,12 +312,7 @@ impl FileGate {
         };
 
         // With Telegram, race the in-app oneshot vs a Telegram question.
-        let question = build_grant_question(
-            &paths_in,
-            access,
-            tool,
-            Some(self.arc_id_str.clone()),
-        );
+        let question = build_grant_question(&paths_in, access, tool, Some(self.arc_id_str.clone()));
         let q_id = question.id;
 
         let pending_for_cleanup = self.pending.clone();
@@ -472,11 +467,7 @@ fn build_grant_question(
     use athen_core::approval::{ApprovalChoice, ApprovalChoiceKind, ApprovalQuestion};
     use athen_core::notification::{NotificationOrigin, NotificationUrgency};
 
-    let prompt = format!(
-        "Allow {} access via {}?",
-        access_label(access),
-        tool,
-    );
+    let prompt = format!("Allow {} access via {}?", access_label(access), tool,);
     let description = if paths_in.is_empty() {
         None
     } else {
@@ -513,7 +504,9 @@ fn build_grant_question(
 
 /// Map an [`ApprovalAnswer`] choice key back to [`GrantDecision`].
 /// Unknown keys default to `Deny` — fail-closed for permission prompts.
-fn approval_choice_to_grant_decision(answer: athen_core::approval::ApprovalAnswer) -> GrantDecision {
+fn approval_choice_to_grant_decision(
+    answer: athen_core::approval::ApprovalAnswer,
+) -> GrantDecision {
     match answer.choice_key.as_str() {
         "allow" => GrantDecision::Allow,
         "allow_always" => GrantDecision::AllowAlways,

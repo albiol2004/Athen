@@ -216,11 +216,7 @@ impl TelegramApprovalSink {
         &self.bot_token
     }
 
-    pub async fn resolve_callback(
-        &self,
-        callback_id: &str,
-        data: &str,
-    ) -> bool {
+    pub async fn resolve_callback(&self, callback_id: &str, data: &str) -> bool {
         // Always ack the button so it stops spinning, no matter what
         // we decide below.
         ack_callback(self.bot_token.clone(), callback_id.to_string(), "");
@@ -265,7 +261,10 @@ impl TelegramApprovalSink {
             let confirmation = format!("{label} ✓");
             tokio::spawn(async move {
                 if let Err(e) = athen_sentidos::telegram::edit_message_text(
-                    &token, chat_id, msg_id, &confirmation,
+                    &token,
+                    chat_id,
+                    msg_id,
+                    &confirmation,
                 )
                 .await
                 {
@@ -503,8 +502,7 @@ impl ApprovalRouter {
 
         let q1 = question.clone();
         let p_sink = primary_sink.clone();
-        let mut primary_handle =
-            tokio::spawn(async move { p_sink.ask(q1).await });
+        let mut primary_handle = tokio::spawn(async move { p_sink.ask(q1).await });
 
         let timer = tokio::time::sleep(escalation_after);
         tokio::pin!(timer);
@@ -540,8 +538,7 @@ impl ApprovalRouter {
 
         let q2 = question.clone();
         let s_sink = secondary.clone();
-        let mut secondary_handle =
-            tokio::spawn(async move { s_sink.ask(q2).await });
+        let mut secondary_handle = tokio::spawn(async move { s_sink.ask(q2).await });
 
         // Race primary vs secondary. First to answer wins; cancel the
         // other so it cleans up its waiter.
@@ -649,7 +646,9 @@ mod tests {
     #[tokio::test]
     async fn telegram_resolve_callback_returns_false_for_malformed_data() {
         let sink = TelegramApprovalSink::new("fake-token".to_string(), 0);
-        let resolved = sink.resolve_callback("cb-fake", "not-a-valid-payload").await;
+        let resolved = sink
+            .resolve_callback("cb-fake", "not-a-valid-payload")
+            .await;
         assert!(!resolved);
     }
 
@@ -738,8 +737,8 @@ mod tests {
             answer_key: "approve".into(),
         }) as Arc<dyn ApprovalSink>;
 
-        let router = ApprovalRouter::new(vec![primary])
-            .with_escalation_after(Duration::from_millis(10));
+        let router =
+            ApprovalRouter::new(vec![primary]).with_escalation_after(Duration::from_millis(10));
 
         let q = ApprovalQuestion::approve_or_deny("Test?");
         let answer = router

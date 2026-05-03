@@ -148,19 +148,17 @@ pub fn run() {
             let notifier_for_focus = state_ref.notifier.clone();
             if let Some(window) = app.get_webview_window("main") {
                 let win_for_event = window.clone();
-                window.on_window_event(move |event| {
-                    match event {
-                        tauri::WindowEvent::Focused(focused) => {
-                            if let Some(ref notifier) = notifier_for_focus {
-                                notifier.set_user_present(*focused);
-                            }
+                window.on_window_event(move |event| match event {
+                    tauri::WindowEvent::Focused(focused) => {
+                        if let Some(ref notifier) = notifier_for_focus {
+                            notifier.set_user_present(*focused);
                         }
-                        tauri::WindowEvent::CloseRequested { api, .. } => {
-                            api.prevent_close();
-                            let _ = win_for_event.hide();
-                        }
-                        _ => {}
                     }
+                    tauri::WindowEvent::CloseRequested { api, .. } => {
+                        api.prevent_close();
+                        let _ = win_for_event.hide();
+                    }
+                    _ => {}
                 });
             }
 
@@ -179,7 +177,11 @@ pub fn run() {
                 .build()?;
 
             let _tray = TrayIconBuilder::with_id("main")
-                .icon(app.default_window_icon().cloned().ok_or("missing default window icon")?)
+                .icon(
+                    app.default_window_icon()
+                        .cloned()
+                        .ok_or("missing default window icon")?,
+                )
                 .tooltip("Athen")
                 .menu(&tray_menu)
                 .show_menu_on_left_click(false)

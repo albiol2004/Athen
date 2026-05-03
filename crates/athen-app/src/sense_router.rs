@@ -535,7 +535,12 @@ async fn route_new_arc_to_profile(
             return;
         }
     };
-    if profiles.iter().filter(|p| p.id != athen_core::agent_profile::AgentProfile::DEFAULT_ID).count() == 0 {
+    if profiles
+        .iter()
+        .filter(|p| p.id != athen_core::agent_profile::AgentProfile::DEFAULT_ID)
+        .count()
+        == 0
+    {
         return;
     }
 
@@ -576,10 +581,7 @@ async fn route_new_arc_to_profile(
                     profile_embeddings.insert(p.id.clone(), vec);
                 }
                 Err(e) => {
-                    tracing::debug!(
-                        "Profile router: embed for profile {} failed: {e}",
-                        p.id
-                    );
+                    tracing::debug!("Profile router: embed for profile {} failed: {e}", p.id);
                 }
             }
         }

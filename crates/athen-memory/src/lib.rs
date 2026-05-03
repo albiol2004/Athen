@@ -68,9 +68,8 @@ impl Memory {
 /// runs when no embedder is configured.
 fn tokenize_query(query: &str) -> Vec<String> {
     const STOPWORDS: &[&str] = &[
-        "the", "and", "for", "with", "that", "this", "from", "what", "when",
-        "where", "which", "about",
-        "los", "las", "del", "que", "con", "por", "para", "una", "uno",
+        "the", "and", "for", "with", "that", "this", "from", "what", "when", "where", "which",
+        "about", "los", "las", "del", "que", "con", "por", "para", "una", "uno",
     ];
     query
         .split(|c: char| !c.is_alphanumeric())
@@ -211,9 +210,7 @@ impl MemoryStore for Memory {
         let query_embedding = match embedder.embed(query).await {
             Ok(emb) => emb,
             Err(e) => {
-                warn!(
-                    "embedder failed during recall ({e}); falling back to keyword search"
-                );
+                warn!("embedder failed during recall ({e}); falling back to keyword search");
                 return self.recall_keyword(query, limit).await;
             }
         };
@@ -568,10 +565,7 @@ mod tests {
             .await
             .unwrap();
         }
-        let hits = mem
-            .recall("Aldaran landing page audit", 5)
-            .await
-            .unwrap();
+        let hits = mem.recall("Aldaran landing page audit", 5).await.unwrap();
         assert!(!hits.is_empty(), "expected keyword hit for Aldaran query");
         assert_eq!(hits[0].id, "a");
     }

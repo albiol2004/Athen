@@ -385,8 +385,8 @@ impl SenseMonitor for TelegramMonitor {
             .await
             .map_err(|e| AthenError::Other(format!("Telegram getUpdates body read: {e}")))?;
 
-        let body: TelegramResponse<Vec<TelegramUpdate>> =
-            serde_json::from_str(&body_text).map_err(|e| {
+        let body: TelegramResponse<Vec<TelegramUpdate>> = serde_json::from_str(&body_text)
+            .map_err(|e| {
                 tracing::error!(
                     body = %body_text.chars().take(500).collect::<String>(),
                     "Telegram getUpdates parse failed: {e}"

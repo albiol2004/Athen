@@ -223,11 +223,10 @@ impl ArcStore {
                 })
                 .map_err(|e| AthenError::Other(format!("Inspect arcs cols: {e}")))?;
             if !has_reply_channel {
-                conn.execute(
-                    "ALTER TABLE arcs ADD COLUMN primary_reply_channel TEXT",
-                    [],
-                )
-                .map_err(|e| AthenError::Other(format!("Add primary_reply_channel column: {e}")))?;
+                conn.execute("ALTER TABLE arcs ADD COLUMN primary_reply_channel TEXT", [])
+                    .map_err(|e| {
+                        AthenError::Other(format!("Add primary_reply_channel column: {e}"))
+                    })?;
             }
 
             // Column-level migration: `active_profile_id` was added so each
@@ -524,11 +523,7 @@ impl ArcStore {
 
     /// Set the agent profile this arc runs under. Pass `None` to clear (which
     /// makes the arc fall back to the seeded default profile).
-    pub async fn set_active_profile_id(
-        &self,
-        id: &str,
-        profile_id: Option<&str>,
-    ) -> Result<()> {
+    pub async fn set_active_profile_id(&self, id: &str, profile_id: Option<&str>) -> Result<()> {
         let conn = self.conn.clone();
         let id = id.to_string();
         let profile_id = profile_id.map(|s| s.to_string());

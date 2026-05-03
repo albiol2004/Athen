@@ -195,8 +195,7 @@ impl ResolvedAgentProfile {
     /// the executor falls back to its hardcoded persona text — i.e. today's
     /// "You are Athen" behavior. The seeded default profile satisfies this.
     pub fn has_custom_persona(&self) -> bool {
-        !self.persona_templates.is_empty()
-            || self.profile.custom_persona_addendum.is_some()
+        !self.persona_templates.is_empty() || self.profile.custom_persona_addendum.is_some()
     }
 }
 

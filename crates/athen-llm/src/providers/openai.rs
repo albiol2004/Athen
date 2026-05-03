@@ -541,7 +541,14 @@ pub(crate) fn parse_tool_arguments(raw: &str) -> serde_json::Value {
     // staring at "still failing!" can see WHY repair gave up. Keep info
     // logs quiet (the slice could be large).
     let head = raw.chars().take(200).collect::<String>();
-    let tail: String = raw.chars().rev().take(200).collect::<Vec<_>>().into_iter().rev().collect();
+    let tail: String = raw
+        .chars()
+        .rev()
+        .take(200)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     tracing::warn!(
         "Tool args could not be parsed even after aggressive repair; \
          falling back to string wrapper (raw len={})\nHEAD: {}\nTAIL: {}",
@@ -631,8 +638,8 @@ fn escape_unescaped_quotes_in_strings(input: &str) -> String {
                     while j < chars.len() && chars[j].is_whitespace() {
                         j += 1;
                     }
-                    let is_terminator = j >= chars.len()
-                        || matches!(chars[j], ',' | '}' | ']' | ':');
+                    let is_terminator =
+                        j >= chars.len() || matches!(chars[j], ',' | '}' | ']' | ':');
                     if is_terminator {
                         out.push('"');
                         in_string = false;
@@ -1058,7 +1065,11 @@ mod tests {
         // Aggressive repair recovered an object.
         assert!(v.is_object(), "expected object, got {v:?}");
         assert_eq!(v.get("path").and_then(|x| x.as_str()), Some("index.html"));
-        assert!(v.get("content").and_then(|x| x.as_str()).unwrap().contains("class="));
+        assert!(v
+            .get("content")
+            .and_then(|x| x.as_str())
+            .unwrap()
+            .contains("class="));
     }
 
     #[test]

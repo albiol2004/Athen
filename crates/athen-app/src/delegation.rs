@@ -100,8 +100,7 @@ impl DelegationToolRegistry {
     fn delegate_tool_definition() -> ToolDefinition {
         ToolDefinition {
             name: DELEGATE_TOOL_NAME.to_string(),
-            description:
-                "Hand off a self-contained task to a specialist agent profile. \
+            description: "Hand off a self-contained task to a specialist agent profile. \
                  Use when another profile is genuinely better-suited (e.g. marketing \
                  expertise for a landing-page review, coder profile for writing code). \
                  The specialist runs in a fresh context with their own tools, completes \
@@ -118,7 +117,7 @@ impl DelegationToolRegistry {
                  \n\
                  Keep the brief under ~2000 characters. The specialist sees only the \
                  brief, not your conversation history, so make it self-contained but tight."
-                    .to_string(),
+                .to_string(),
             parameters: Self::delegate_schema(),
             backend: ToolBackend::Shell {
                 command: String::new(),
@@ -277,11 +276,7 @@ async fn run_delegation(
         chrono::Utc::now().format("%Y%m%d_%H%M%S"),
         &uuid::Uuid::new_v4().to_string()[..8]
     );
-    let arc_name = format!(
-        "[{}] {}",
-        profile.display_name,
-        truncate(&args.brief, 60)
-    );
+    let arc_name = format!("[{}] {}", profile.display_name, truncate(&args.brief, 60));
     if let Err(e) = ctx
         .arc_store
         .create_arc_with_parent(
@@ -445,8 +440,8 @@ fn coerce_string_wrapper(args: serde_json::Value) -> serde_json::Value {
 /// Returns `None` if either field is missing entirely.
 fn salvage_delegate_args_from_raw(value: &serde_json::Value) -> Option<DelegateArgs> {
     let raw = value.as_str()?;
-    let target_profile_id = extract_short_string_field(raw, "target_profile_id")
-        .unwrap_or_default();
+    let target_profile_id =
+        extract_short_string_field(raw, "target_profile_id").unwrap_or_default();
     let brief = extract_trailing_string_field(raw, "brief")?;
     if brief.trim().is_empty() {
         return None;
@@ -584,10 +579,7 @@ mod tests {
         assert!(def.description.contains("specialist"));
         // Required args present.
         let schema = &def.parameters;
-        let required = schema
-            .get("required")
-            .and_then(|v| v.as_array())
-            .unwrap();
+        let required = schema.get("required").and_then(|v| v.as_array()).unwrap();
         let required_names: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
         assert!(required_names.contains(&"target_profile_id"));
         assert!(required_names.contains(&"brief"));

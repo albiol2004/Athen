@@ -123,12 +123,7 @@ fn coerce_args<'a>(
 /// truncated. We tell the model exactly that, plus a tool-specific
 /// suggestion for how to retry without looping on the same too-large
 /// payload.
-fn args_truncated_result(
-    tool: &str,
-    raw: &str,
-    suggestion: &str,
-    started: Instant,
-) -> ToolResult {
+fn args_truncated_result(tool: &str, raw: &str, suggestion: &str, started: Instant) -> ToolResult {
     let head: String = raw.chars().take(120).collect();
     let tail: String = {
         let s: String = raw.chars().rev().take(120).collect();
@@ -2018,13 +2013,18 @@ mod coerce_args_tests {
         // Simulates the bad path: provider couldn't parse args, fell
         // back to Value::String. The coerce helper must still let us
         // pull `path` and `content` out.
-        let stringified = serde_json::Value::String(
-            r#"{"path":"/tmp/coerce_x.html","content":"hello"}"#.into(),
-        );
+        let stringified =
+            serde_json::Value::String(r#"{"path":"/tmp/coerce_x.html","content":"hello"}"#.into());
         let mut owned = serde_json::Value::Null;
         let coerced = coerce_args(&stringified, &mut owned);
-        assert_eq!(coerced.get("path").and_then(|v| v.as_str()), Some("/tmp/coerce_x.html"));
-        assert_eq!(coerced.get("content").and_then(|v| v.as_str()), Some("hello"));
+        assert_eq!(
+            coerced.get("path").and_then(|v| v.as_str()),
+            Some("/tmp/coerce_x.html")
+        );
+        assert_eq!(
+            coerced.get("content").and_then(|v| v.as_str()),
+            Some("hello")
+        );
     }
 
     #[test]
@@ -2056,7 +2056,10 @@ mod coerce_args_tests {
         let stringified = serde_json::Value::String(raw);
         let mut owned = serde_json::Value::Null;
         let coerced = coerce_args(&stringified, &mut owned);
-        assert_eq!(coerced.get("path").and_then(|v| v.as_str()), Some("/tmp/coerce_y.html"));
+        assert_eq!(
+            coerced.get("path").and_then(|v| v.as_str()),
+            Some("/tmp/coerce_y.html")
+        );
         assert_eq!(
             coerced.get("content").and_then(|v| v.as_str()),
             Some("<html>\nhi\n</html>")

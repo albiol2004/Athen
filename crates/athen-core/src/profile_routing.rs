@@ -65,8 +65,10 @@ pub fn classify_task(source: Option<&str>, description: &str) -> ClassifiedTask 
         Some(TaskKindTag::Scheduling)
     } else if contains_any(&lower, &["debug", "fix the bug", "stack trace", "error in"]) {
         Some(TaskKindTag::Debugging)
-    } else if contains_any(&lower, &["code", "implement", "function", "refactor", "module"])
-    {
+    } else if contains_any(
+        &lower,
+        &["code", "implement", "function", "refactor", "module"],
+    ) {
         Some(TaskKindTag::Coding)
     } else if contains_any(&lower, &["review", "critique", "feedback on"]) {
         Some(TaskKindTag::CodeReview)
@@ -104,10 +106,26 @@ fn infer_domain_from_keywords(lower: &str) -> Option<DomainTag> {
     if contains_any(
         lower,
         &[
-            "kubernetes", "k8s", "docker", "podman", "vercel", "supabase",
-            "deploy", "deployment", "helm", "terraform", "ci/cd", "pipeline",
-            "github actions", "gitlab ci", "ansible", "nginx", "load balancer",
-            "kustomize", "rollout", "kubectl",
+            "kubernetes",
+            "k8s",
+            "docker",
+            "podman",
+            "vercel",
+            "supabase",
+            "deploy",
+            "deployment",
+            "helm",
+            "terraform",
+            "ci/cd",
+            "pipeline",
+            "github actions",
+            "gitlab ci",
+            "ansible",
+            "nginx",
+            "load balancer",
+            "kustomize",
+            "rollout",
+            "kubectl",
         ],
     ) {
         return Some(DomainTag::Infrastructure);
@@ -115,9 +133,20 @@ fn infer_domain_from_keywords(lower: &str) -> Option<DomainTag> {
     if contains_any(
         lower,
         &[
-            "linkedin", "tiktok", "instagram", "twitter", "x.com",
-            "social media", "hashtag", "reel", "story", "carousel",
-            "creator", "post caption", "engagement rate", "follower",
+            "linkedin",
+            "tiktok",
+            "instagram",
+            "twitter",
+            "x.com",
+            "social media",
+            "hashtag",
+            "reel",
+            "story",
+            "carousel",
+            "creator",
+            "post caption",
+            "engagement rate",
+            "follower",
         ],
     ) {
         return Some(DomainTag::SocialMedia);
@@ -125,9 +154,22 @@ fn infer_domain_from_keywords(lower: &str) -> Option<DomainTag> {
     if contains_any(
         lower,
         &[
-            "legal", "lawyer", "attorney", "statute", "case law", "regulation",
-            "gdpr", "ccpa", "hipaa", "contract clause", "lawsuit", "court",
-            "compliance", "tort", "jurisdiction", "terms of service",
+            "legal",
+            "lawyer",
+            "attorney",
+            "statute",
+            "case law",
+            "regulation",
+            "gdpr",
+            "ccpa",
+            "hipaa",
+            "contract clause",
+            "lawsuit",
+            "court",
+            "compliance",
+            "tort",
+            "jurisdiction",
+            "terms of service",
         ],
     ) {
         return Some(DomainTag::Legal);
@@ -135,9 +177,19 @@ fn infer_domain_from_keywords(lower: &str) -> Option<DomainTag> {
     if contains_any(
         lower,
         &[
-            "symptom", "medication", "diagnosis", "medical", "illness",
-            "treatment", "side effect", "dosage", "patient", "prescription",
-            "clinical trial", "peer-reviewed", "peer reviewed",
+            "symptom",
+            "medication",
+            "diagnosis",
+            "medical",
+            "illness",
+            "treatment",
+            "side effect",
+            "dosage",
+            "patient",
+            "prescription",
+            "clinical trial",
+            "peer-reviewed",
+            "peer reviewed",
         ],
     ) {
         return Some(DomainTag::Health);
@@ -145,9 +197,16 @@ fn infer_domain_from_keywords(lower: &str) -> Option<DomainTag> {
     if contains_any(
         lower,
         &[
-            "architecture", "system design", "scalability", "microservice",
-            "monolith", "data model", "service boundary", "design pattern",
-            "high availability", "fault tolerance",
+            "architecture",
+            "system design",
+            "scalability",
+            "microservice",
+            "monolith",
+            "data model",
+            "service boundary",
+            "design pattern",
+            "high availability",
+            "fault tolerance",
         ],
     ) {
         return Some(DomainTag::Architecture);
@@ -155,10 +214,23 @@ fn infer_domain_from_keywords(lower: &str) -> Option<DomainTag> {
     if contains_any(
         lower,
         &[
-            "linux", "ubuntu", "fedora", "arch linux", "wsl", "systemd",
-            "permission denied", "command not found", "package manager",
-            "apt install", "dnf install", "pacman", "shell error",
-            "troubleshoot", "won't start", "won't run", "broken environment",
+            "linux",
+            "ubuntu",
+            "fedora",
+            "arch linux",
+            "wsl",
+            "systemd",
+            "permission denied",
+            "command not found",
+            "package manager",
+            "apt install",
+            "dnf install",
+            "pacman",
+            "shell error",
+            "troubleshoot",
+            "won't start",
+            "won't run",
+            "broken environment",
         ],
     ) {
         return Some(DomainTag::Support);
@@ -166,8 +238,12 @@ fn infer_domain_from_keywords(lower: &str) -> Option<DomainTag> {
     if contains_any(
         lower,
         &[
-            "outreach", "cold email", "prospect", "lead generation",
-            "follow-up", "follow up email",
+            "outreach",
+            "cold email",
+            "prospect",
+            "lead generation",
+            "follow-up",
+            "follow up email",
         ],
     ) {
         return Some(DomainTag::Outreach);
@@ -175,8 +251,15 @@ fn infer_domain_from_keywords(lower: &str) -> Option<DomainTag> {
     if contains_any(
         lower,
         &[
-            "marketing", "conversion", "funnel", "ad copy", "landing page",
-            "campaign", "ctr", "click-through", "ctas",
+            "marketing",
+            "conversion",
+            "funnel",
+            "ad copy",
+            "landing page",
+            "campaign",
+            "ctr",
+            "click-through",
+            "ctas",
         ],
     ) {
         return Some(DomainTag::Marketing);
@@ -184,15 +267,30 @@ fn infer_domain_from_keywords(lower: &str) -> Option<DomainTag> {
     if contains_any(
         lower,
         &[
-            "implement", "refactor", "function", "module", "stack trace",
-            "bug fix", "debug", "compile", "type error", "unit test",
+            "implement",
+            "refactor",
+            "function",
+            "module",
+            "stack trace",
+            "bug fix",
+            "debug",
+            "compile",
+            "type error",
+            "unit test",
         ],
     ) {
         return Some(DomainTag::Coding);
     }
     if contains_any(
         lower,
-        &["research", "investigate", "look up", "find out", "what is", "what are"],
+        &[
+            "research",
+            "investigate",
+            "look up",
+            "find out",
+            "what is",
+            "what are",
+        ],
     ) {
         return Some(DomainTag::Research);
     }
@@ -691,8 +789,8 @@ mod tests {
         let classified = classify_task(Some("email"), "Draft a follow-up");
 
         let no_embeddings: HashMap<ProfileId, Vec<f32>> = HashMap::new();
-        let d = pick_profile_blended(&classified, &[outreach, coder], None, &no_embeddings)
-            .unwrap();
+        let d =
+            pick_profile_blended(&classified, &[outreach, coder], None, &no_embeddings).unwrap();
         assert_eq!(d.profile_id, "outreach");
     }
 
@@ -720,8 +818,7 @@ mod tests {
         embeds.insert("alpha".to_string(), vec![0.0, 1.0, 0.0]); // orthogonal
         embeds.insert("outreach".to_string(), vec![0.9, 0.1, 0.0]); // close
 
-        let d = pick_profile_blended(&classified, &[alpha, outreach], Some(&q), &embeds)
-            .unwrap();
+        let d = pick_profile_blended(&classified, &[alpha, outreach], Some(&q), &embeds).unwrap();
         assert_eq!(d.profile_id, "outreach");
         assert!(d.reason.contains("semantic:"));
     }
@@ -730,12 +827,7 @@ mod tests {
     fn pick_profile_blended_promotes_semantic_only_match_above_threshold() {
         // Profile claims no matching tags (keyword score 0) but its
         // embedding is very close to the query — it should still win.
-        let mut social = make_profile(
-            "social_media",
-            vec![],
-            vec![],
-            vec![],
-        );
+        let mut social = make_profile("social_media", vec![], vec![], vec![]);
         social.expertise.strengths = vec!["linkedin posts".into()];
 
         let classified = classify_task(None, "write a thoughtful linkedin post about leadership");
@@ -746,7 +838,10 @@ mod tests {
         embeds.insert("social_media".to_string(), vec![0.99, 0.05]);
 
         let d = pick_profile_blended(&classified, &[social], Some(&q), &embeds);
-        assert!(d.is_some(), "semantic-only match above threshold should win");
+        assert!(
+            d.is_some(),
+            "semantic-only match above threshold should win"
+        );
     }
 
     #[test]

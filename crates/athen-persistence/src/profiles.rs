@@ -26,8 +26,8 @@ use rusqlite::{params, Connection};
 use tokio::sync::Mutex;
 
 use athen_core::agent_profile::{
-    AgentProfile, DomainTag, ExpertiseDeclaration, PersonaCategory, PersonaTemplate,
-    ProfileId, TaskKindTag, TemplateId, ToolSelection,
+    AgentProfile, DomainTag, ExpertiseDeclaration, PersonaCategory, PersonaTemplate, ProfileId,
+    TaskKindTag, TemplateId, ToolSelection,
 };
 use athen_core::error::{AthenError, Result};
 use athen_core::traits::profile::ProfileStore;
@@ -102,9 +102,8 @@ impl SqliteProfileStore {
     /// `created_at` is preserved so the row's identity (and any external
     /// references to it) doesn't shift.
     pub async fn restore_builtin(&self, id: &str) -> Result<AgentProfile> {
-        let canonical = canonical_builtin_profile(id).ok_or_else(|| {
-            AthenError::Other(format!("'{id}' is not a built-in profile"))
-        })?;
+        let canonical = canonical_builtin_profile(id)
+            .ok_or_else(|| AthenError::Other(format!("'{id}' is not a built-in profile")))?;
         let mut to_save = canonical;
         // Preserve created_at if a row exists; updated_at is freshly stamped.
         if let Some(existing) = self.get_profile(id).await? {
@@ -134,8 +133,8 @@ impl SqliteProfileStore {
         let p = profile.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            let template_ids_json =
-                serde_json::to_string(&p.persona_template_ids).map_err(AthenError::Serialization)?;
+            let template_ids_json = serde_json::to_string(&p.persona_template_ids)
+                .map_err(AthenError::Serialization)?;
             let tool_selection_json =
                 serde_json::to_string(&p.tool_selection).map_err(AthenError::Serialization)?;
             let expertise_json =
@@ -216,10 +215,9 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
         AgentProfile {
             id: AgentProfile::DEFAULT_ID.to_string(),
             display_name: "Athen (default)".to_string(),
-            description:
-                "Universal proactive AI agent. Reproduces Athen's original behavior — \
+            description: "Universal proactive AI agent. Reproduces Athen's original behavior — \
                  no profile-specific persona, no tool restrictions."
-                    .to_string(),
+                .to_string(),
             persona_template_ids: vec![],
             custom_persona_addendum: None,
             tool_selection: ToolSelection::All,
@@ -239,7 +237,12 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
                  surface decisions the user needs to make rather than asking them to \
                  micro-manage. Prefer doing > asking when the action is reversible.",
             ),
-            vec![DomainTag::Email, DomainTag::Calendar, DomainTag::Scheduling, DomainTag::Writing],
+            vec![
+                DomainTag::Email,
+                DomainTag::Calendar,
+                DomainTag::Scheduling,
+                DomainTag::Writing,
+            ],
             vec![
                 TaskKindTag::Drafting,
                 TaskKindTag::Scheduling,
@@ -261,8 +264,18 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
                  edits.",
             ),
             vec![DomainTag::Coding],
-            vec![TaskKindTag::Coding, TaskKindTag::Debugging, TaskKindTag::CodeReview],
-            vec!["rust", "python", "typescript", "refactoring", "test-driven debugging"],
+            vec![
+                TaskKindTag::Coding,
+                TaskKindTag::Debugging,
+                TaskKindTag::CodeReview,
+            ],
+            vec![
+                "rust",
+                "python",
+                "typescript",
+                "refactoring",
+                "test-driven debugging",
+            ],
             vec![],
         ),
         mk(
@@ -280,8 +293,13 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
             vec![DomainTag::Infrastructure, DomainTag::Coding],
             vec![TaskKindTag::Debugging, TaskKindTag::Coding],
             vec![
-                "vercel", "supabase", "docker", "kubernetes", "github actions",
-                "ci/cd", "observability",
+                "vercel",
+                "supabase",
+                "docker",
+                "kubernetes",
+                "github actions",
+                "ci/cd",
+                "observability",
             ],
             vec![],
         ),
@@ -299,8 +317,11 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
             vec![DomainTag::Architecture, DomainTag::Coding],
             vec![TaskKindTag::CodeReview, TaskKindTag::Researching],
             vec![
-                "system design", "data modeling", "service boundaries",
-                "scalability", "failure modes",
+                "system design",
+                "data modeling",
+                "service boundaries",
+                "scalability",
+                "failure modes",
             ],
             vec![],
         ),
@@ -318,7 +339,10 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
             vec![DomainTag::Support, DomainTag::Coding],
             vec![TaskKindTag::Debugging, TaskKindTag::Triage],
             vec![
-                "linux", "shell debugging", "package managers", "systemd",
+                "linux",
+                "shell debugging",
+                "package managers",
+                "systemd",
                 "environment troubleshooting",
             ],
             vec![],
@@ -349,8 +373,17 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
                  reach them, what does it move? Avoid generic copy.",
             ),
             vec![DomainTag::Marketing, DomainTag::Writing],
-            vec![TaskKindTag::Drafting, TaskKindTag::Editing, TaskKindTag::DataAnalysis],
-            vec!["positioning", "landing pages", "ad copy", "conversion optimization"],
+            vec![
+                TaskKindTag::Drafting,
+                TaskKindTag::Editing,
+                TaskKindTag::DataAnalysis,
+            ],
+            vec![
+                "positioning",
+                "landing pages",
+                "ad copy",
+                "conversion optimization",
+            ],
             vec![TaskKindTag::Coding, TaskKindTag::Debugging],
         ),
         mk(
@@ -365,11 +398,19 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
                  contrarian takes. Match the format the user is targeting; don't write \
                  cross-platform mush. Suggest hashtags and posting times when relevant.",
             ),
-            vec![DomainTag::SocialMedia, DomainTag::Writing, DomainTag::Marketing],
+            vec![
+                DomainTag::SocialMedia,
+                DomainTag::Writing,
+                DomainTag::Marketing,
+            ],
             vec![TaskKindTag::Drafting, TaskKindTag::Editing],
             vec![
-                "linkedin posts", "tiktok hooks", "instagram captions", "x threads",
-                "hashtag strategy", "content calendars",
+                "linkedin posts",
+                "tiktok hooks",
+                "instagram captions",
+                "x threads",
+                "hashtag strategy",
+                "content calendars",
             ],
             vec![TaskKindTag::Coding, TaskKindTag::Debugging],
         ),
@@ -386,7 +427,12 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
             ),
             vec![DomainTag::Outreach, DomainTag::Email],
             vec![TaskKindTag::Drafting, TaskKindTag::Outreach],
-            vec!["cold email", "personalization", "subject lines", "follow-up cadences"],
+            vec![
+                "cold email",
+                "personalization",
+                "subject lines",
+                "follow-up cadences",
+            ],
             vec![TaskKindTag::Coding, TaskKindTag::Debugging],
         ),
         mk(
@@ -405,8 +451,12 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
             vec![DomainTag::Legal, DomainTag::Research],
             vec![TaskKindTag::Researching, TaskKindTag::Summarizing],
             vec![
-                "statute lookup", "case law research", "regulatory compliance",
-                "contract clause review", "gdpr", "ccpa",
+                "statute lookup",
+                "case law research",
+                "regulatory compliance",
+                "contract clause review",
+                "gdpr",
+                "ccpa",
             ],
             vec![],
         ),
@@ -427,8 +477,11 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
             vec![DomainTag::Health, DomainTag::Research],
             vec![TaskKindTag::Researching, TaskKindTag::Summarizing],
             vec![
-                "pubmed", "cochrane reviews", "clinical guidelines",
-                "drug interactions", "evidence grading",
+                "pubmed",
+                "cochrane reviews",
+                "clinical guidelines",
+                "drug interactions",
+                "evidence grading",
             ],
             vec![],
         ),
@@ -450,7 +503,9 @@ fn str_to_category(s: &str) -> Result<PersonaCategory> {
         "Mission" => Ok(PersonaCategory::Mission),
         "Constraints" => Ok(PersonaCategory::Constraints),
         "OutputStyle" => Ok(PersonaCategory::OutputStyle),
-        other => Err(AthenError::Other(format!("Unknown PersonaCategory: {other}"))),
+        other => Err(AthenError::Other(format!(
+            "Unknown PersonaCategory: {other}"
+        ))),
     }
 }
 
@@ -768,8 +823,7 @@ impl ProfileStore for SqliteProfileStore {
         match self.get_profile(AgentProfile::DEFAULT_ID).await? {
             Some(p) => Ok(p),
             None => Err(AthenError::Other(
-                "Default profile not seeded — call seed_builtins_if_empty first"
-                    .to_string(),
+                "Default profile not seeded — call seed_builtins_if_empty first".to_string(),
             )),
         }
     }
@@ -874,7 +928,11 @@ mod tests {
             updated_at: now,
         };
         store.save_profile(&p).await.unwrap();
-        let loaded = store.get_profile("marketing_custom").await.unwrap().unwrap();
+        let loaded = store
+            .get_profile("marketing_custom")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.display_name, "Marketing Expert");
         assert_eq!(
             loaded.tool_selection,
@@ -885,7 +943,10 @@ mod tests {
     #[tokio::test]
     async fn cannot_delete_builtin() {
         let store = setup_store().await;
-        let err = store.delete_profile(AgentProfile::DEFAULT_ID).await.unwrap_err();
+        let err = store
+            .delete_profile(AgentProfile::DEFAULT_ID)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("Cannot delete built-in"));
     }
 
@@ -919,7 +980,10 @@ mod tests {
     #[tokio::test]
     async fn restore_builtin_rejects_unknown_id() {
         let store = setup_store().await;
-        let err = store.restore_builtin("not_a_real_builtin").await.unwrap_err();
+        let err = store
+            .restore_builtin("not_a_real_builtin")
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("not a built-in"));
     }
 
@@ -930,13 +994,21 @@ mod tests {
         // identity in the UI and the seeder still treats this id as
         // already-seeded.
         let store = setup_store().await;
-        let mut default = store.get_profile(AgentProfile::DEFAULT_ID).await.unwrap().unwrap();
+        let mut default = store
+            .get_profile(AgentProfile::DEFAULT_ID)
+            .await
+            .unwrap()
+            .unwrap();
         default.display_name = "Athen (tuned)".into();
         // The caller may forget to flip this; the store ignores their value
         // and uses the existing row's flag.
         default.builtin = false;
         store.save_profile(&default).await.unwrap();
-        let loaded = store.get_profile(AgentProfile::DEFAULT_ID).await.unwrap().unwrap();
+        let loaded = store
+            .get_profile(AgentProfile::DEFAULT_ID)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.display_name, "Athen (tuned)");
         assert!(loaded.builtin, "builtin flag must survive a save");
     }
@@ -966,7 +1038,10 @@ mod tests {
     #[tokio::test]
     async fn get_or_default_falls_back() {
         let store = setup_store().await;
-        let p = store.get_or_default(Some(&"nonexistent".to_string())).await.unwrap();
+        let p = store
+            .get_or_default(Some(&"nonexistent".to_string()))
+            .await
+            .unwrap();
         assert_eq!(p.id, AgentProfile::DEFAULT_ID);
         let p2 = store.get_or_default(None).await.unwrap();
         assert_eq!(p2.id, AgentProfile::DEFAULT_ID);

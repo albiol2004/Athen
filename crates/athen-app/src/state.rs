@@ -51,9 +51,8 @@ use crate::file_gate::PendingGrants;
 /// Per-profile embedding cache: profile id → (the profile's `updated_at`
 /// at the time we cached, the embedding vector). The `updated_at` doubles
 /// as the cache key — when a user edits a profile we re-embed.
-pub type ProfileEmbeddingCache = Arc<
-    tokio::sync::RwLock<HashMap<String, (chrono::DateTime<chrono::Utc>, Vec<f32>)>>,
->;
+pub type ProfileEmbeddingCache =
+    Arc<tokio::sync::RwLock<HashMap<String, (chrono::DateTime<chrono::Utc>, Vec<f32>)>>>;
 
 /// Wrapper to share the router via `Arc<RwLock<Arc<...>>>` while satisfying
 /// the `LlmRouter` trait.  The `RwLock` allows the inner router to be swapped
@@ -387,9 +386,10 @@ impl AppState {
         // receive the bare AppToolRegistry — no delegate_to_agent — which
         // is how depth=1 is enforced.
         let base: Arc<dyn athen_core::traits::tool::ToolRegistry> = Arc::new(registry);
-        if let (Some(profile_store), Some(arc_store)) =
-            (self.profile_store.clone(), self._database.as_ref().map(|db| db.arc_store()))
-        {
+        if let (Some(profile_store), Some(arc_store)) = (
+            self.profile_store.clone(),
+            self._database.as_ref().map(|db| db.arc_store()),
+        ) {
             let ctx = crate::delegation::DelegationContext {
                 profile_store,
                 arc_store,
@@ -466,16 +466,13 @@ impl AppState {
     /// can pick the right channel based on each arc's
     /// `primary_reply_channel` (or its source as a fallback).
     pub fn init_approval_router(&mut self, app_handle: tauri::AppHandle) {
-        use crate::approval::{
-            ApprovalRouter, InAppApprovalSink, TelegramApprovalSink,
-        };
+        use crate::approval::{ApprovalRouter, InAppApprovalSink, TelegramApprovalSink};
         use athen_core::traits::approval::ApprovalSink;
 
         let config = load_config();
 
         let inapp = Arc::new(InAppApprovalSink::new(app_handle));
-        let mut sinks: Vec<Arc<dyn ApprovalSink>> =
-            vec![inapp.clone() as Arc<dyn ApprovalSink>];
+        let mut sinks: Vec<Arc<dyn ApprovalSink>> = vec![inapp.clone() as Arc<dyn ApprovalSink>];
 
         let mut telegram_sink: Option<Arc<TelegramApprovalSink>> = None;
         if config.telegram.enabled {
@@ -499,8 +496,7 @@ impl AppState {
         // for approval escalation too — it's the same "user not present"
         // heuristic.
         let escalation_secs = config.notifications.escalation_timeout_secs.max(15);
-        router = router
-            .with_escalation_after(std::time::Duration::from_secs(escalation_secs));
+        router = router.with_escalation_after(std::time::Duration::from_secs(escalation_secs));
 
         self.approval_router = Some(Arc::new(router));
         self.inapp_approval_sink = Some(inapp);
@@ -772,8 +768,7 @@ impl AppState {
                                     let grant_store_c = grant_store_ref.clone();
                                     let pending_grants_c = pending_grants_ref.clone();
                                     let spawned_processes_c = spawned_processes_ref.clone();
-                                    let telegram_approval_sink_c =
-                                        telegram_approval_sink.clone();
+                                    let telegram_approval_sink_c = telegram_approval_sink.clone();
                                     tauri::async_runtime::spawn(async move {
                                         execute_owner_telegram_message(
                                             &text_owned,
@@ -827,10 +822,7 @@ impl AppState {
                 // iteration it arrives, not the next one.
                 let callbacks = monitor.take_callbacks();
                 if !callbacks.is_empty() {
-                    info!(
-                        count = callbacks.len(),
-                        "Draining Telegram callback events"
-                    );
+                    info!(count = callbacks.len(), "Draining Telegram callback events");
                     if let Some(ref sink) = telegram_approval_sink {
                         for cb in callbacks {
                             let resolved = sink.resolve_callback(&cb.callback_id, &cb.data).await;
@@ -1129,7 +1121,10 @@ async fn execute_owner_telegram_message(
                 "Sorry, the task took too long and timed out. Try a simpler request or break it into smaller steps."
                     .to_string()
             } else {
-                format!("Sorry, the task failed: {}", crate::commands::simplify_error_public(&raw))
+                format!(
+                    "Sorry, the task failed: {}",
+                    crate::commands::simplify_error_public(&raw)
+                )
             };
 
             if let (Some(store), Some(ref arc_id)) = (arc_store, &target_arc_id) {

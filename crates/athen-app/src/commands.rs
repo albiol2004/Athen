@@ -203,9 +203,7 @@ fn spawn_router_approval(
                 let chat_id = telegram_sink.chat_id();
                 let token = telegram_sink.bot_token().to_string();
                 let msg = format!("Sorry, the approved task failed: {e}");
-                if let Err(e2) =
-                    crate::state::send_telegram_reply(&token, chat_id, &msg).await
-                {
+                if let Err(e2) = crate::state::send_telegram_reply(&token, chat_id, &msg).await {
                     tracing::warn!("Failed to send Telegram failure notice: {e2}");
                 }
                 return;
@@ -1541,7 +1539,6 @@ pub async fn approve_task(
     })
 }
 
-
 /// Outcome of [`execute_approved_task`]. The caller decides how to surface
 /// `content`/`success`/`domain` (UI response, Telegram reply, …).
 pub(crate) struct ApprovedTaskOutcome {
@@ -1645,15 +1642,11 @@ pub(crate) async fn execute_approved_task(
     };
 
     // Approve the task: move it to Pending and enqueue.
-    let approved_task = ctx
-        .coordinator
-        .approve_task(task_uuid)
-        .await
-        .map_err(|e| {
-            let raw = e.to_string();
-            tracing::error!("Approve task failed: {raw}");
-            format_user_error(&raw)
-        })?;
+    let approved_task = ctx.coordinator.approve_task(task_uuid).await.map_err(|e| {
+        let raw = e.to_string();
+        tracing::error!("Approve task failed: {raw}");
+        format_user_error(&raw)
+    })?;
 
     let message = ctx
         .message_override
@@ -1831,8 +1824,7 @@ pub(crate) async fn execute_approved_task(
             Box::new(crate::delegation::ArcRegistryAdapter(base_registry))
         };
 
-    let exec_router: Box<dyn LlmRouter> =
-        Box::new(SharedRouter(Arc::clone(&ctx.router)));
+    let exec_router: Box<dyn LlmRouter> = Box::new(SharedRouter(Arc::clone(&ctx.router)));
     let tool_log = new_tool_log();
     let auditor = TauriAuditor::new(
         ctx.app_handle.clone(),
@@ -1841,8 +1833,7 @@ pub(crate) async fn execute_approved_task(
         ctx.turn_id.clone(),
         tool_log.clone(),
     );
-    let stream_tx =
-        spawn_stream_forwarder(&ctx.app_handle, Some(ctx.active_arc_id.clone()));
+    let stream_tx = spawn_stream_forwarder(&ctx.app_handle, Some(ctx.active_arc_id.clone()));
 
     ctx.cancel_flag.store(false, Ordering::Relaxed);
 
@@ -2015,9 +2006,7 @@ pub(crate) async fn execute_approved_task(
                     }
                 }
                 None => {
-                    tracing::debug!(
-                        "Memory judge: not worth remembering (approved task)"
-                    );
+                    tracing::debug!("Memory judge: not worth remembering (approved task)");
                 }
             }
         });
@@ -2068,8 +2057,7 @@ pub async fn submit_approval(
 ) -> std::result::Result<bool, String> {
     use athen_core::approval::ApprovalAnswer;
 
-    let q_id = Uuid::parse_str(&question_id)
-        .map_err(|e| format!("Invalid question_id: {e}"))?;
+    let q_id = Uuid::parse_str(&question_id).map_err(|e| format!("Invalid question_id: {e}"))?;
     let Some(sink) = state.inapp_approval_sink.clone() else {
         return Ok(false);
     };
@@ -2477,14 +2465,19 @@ pub async fn create_agent_profile(
     if id.is_empty() {
         return Err("Profile id cannot be empty".into());
     }
-    if store.get_profile(&id).await.map_err(|e| e.to_string())?.is_some() {
+    if store
+        .get_profile(&id)
+        .await
+        .map_err(|e| e.to_string())?
+        .is_some()
+    {
         return Err(format!("Profile id '{id}' is already in use"));
     }
-    let profile = input_to_profile(
-        AgentProfileInput { id, ..input },
-        chrono::Utc::now(),
-    );
-    store.save_profile(&profile).await.map_err(|e| e.to_string())?;
+    let profile = input_to_profile(AgentProfileInput { id, ..input }, chrono::Utc::now());
+    store
+        .save_profile(&profile)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(profile)
 }
 
@@ -2509,7 +2502,10 @@ pub async fn update_agent_profile(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("Profile '{}' not found", input.id))?;
     let profile = input_to_profile(input, existing.created_at);
-    store.save_profile(&profile).await.map_err(|e| e.to_string())?;
+    store
+        .save_profile(&profile)
+        .await
+        .map_err(|e| e.to_string())?;
     // Re-read so the response reflects the store's authoritative `builtin`
     // flag and the freshly-stamped `updated_at`.
     let loaded = store
@@ -2534,7 +2530,10 @@ pub async fn delete_agent_profile(
     let Some(store) = state.profile_store.as_ref() else {
         return Err("Profile store not available".into());
     };
-    store.delete_profile(&profile_id).await.map_err(|e| e.to_string())
+    store
+        .delete_profile(&profile_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Rewrite a built-in profile back to its canonical seeded values.

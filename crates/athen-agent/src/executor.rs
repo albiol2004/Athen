@@ -300,28 +300,26 @@ impl DefaultExecutor {
         let now = chrono::Local::now();
         let tz_offset = now.format("%:z");
 
-        let identity =
-            match profile.filter(|p| p.has_custom_persona()) {
-                Some(p) => {
-                    let mut s = String::new();
-                    for t in &p.persona_templates {
-                        if !s.is_empty() {
-                            s.push_str("\n\n");
-                        }
-                        s.push_str(&t.body);
+        let identity = match profile.filter(|p| p.has_custom_persona()) {
+            Some(p) => {
+                let mut s = String::new();
+                for t in &p.persona_templates {
+                    if !s.is_empty() {
+                        s.push_str("\n\n");
                     }
-                    if let Some(addendum) = &p.profile.custom_persona_addendum {
-                        if !s.is_empty() {
-                            s.push_str("\n\n");
-                        }
-                        s.push_str(addendum);
+                    s.push_str(&t.body);
+                }
+                if let Some(addendum) = &p.profile.custom_persona_addendum {
+                    if !s.is_empty() {
+                        s.push_str("\n\n");
                     }
-                    s
+                    s.push_str(addendum);
                 }
-                None => {
-                    "You are Athen, a proactive universal AI agent. You ACT first and talk second.".to_string()
-                }
-            };
+                s
+            }
+            None => "You are Athen, a proactive universal AI agent. You ACT first and talk second."
+                .to_string(),
+        };
 
         format!(
             "{identity}\n\
@@ -1018,11 +1016,7 @@ impl AgentExecutor for DefaultExecutor {
                 .iter()
                 .find(|tc| tc.arguments.is_string())
             {
-                let raw_len = bad_call
-                    .arguments
-                    .as_str()
-                    .map(|s| s.len())
-                    .unwrap_or(0);
+                let raw_len = bad_call.arguments.as_str().map(|s| s.len()).unwrap_or(0);
                 tracing::warn!(
                     task_id = %task_id,
                     step = steps_completed,
@@ -1923,7 +1917,8 @@ mod tests {
         let tools = vec![tool_def("calendar_create", "create event")];
         let revealed = HashSet::new();
         let dir = std::path::PathBuf::from("/tmp/athen-test/tools");
-        let prompt = DefaultExecutor::build_system_prompt(&tools, &revealed, false, Some(&dir), None);
+        let prompt =
+            DefaultExecutor::build_system_prompt(&tools, &revealed, false, Some(&dir), None);
         // Pattern reference uses the directory + <group>.md placeholder.
         assert!(prompt.contains("/tmp/athen-test/tools"));
         assert!(prompt.contains("<group>.md"));
@@ -1970,13 +1965,8 @@ mod tests {
         let revealed = HashSet::new();
 
         let p_none = DefaultExecutor::build_system_prompt(&tools, &revealed, false, None, None);
-        let p_default = DefaultExecutor::build_system_prompt(
-            &tools,
-            &revealed,
-            false,
-            None,
-            Some(&default),
-        );
+        let p_default =
+            DefaultExecutor::build_system_prompt(&tools, &revealed, false, None, Some(&default));
 
         // Both must contain the canonical Athen identity line.
         assert!(p_none.contains("You are Athen, a proactive universal AI agent"));
@@ -2023,13 +2013,8 @@ mod tests {
         };
         let tools: Vec<athen_core::tool::ToolDefinition> = vec![];
         let revealed = HashSet::new();
-        let prompt = DefaultExecutor::build_system_prompt(
-            &tools,
-            &revealed,
-            false,
-            None,
-            Some(&resolved),
-        );
+        let prompt =
+            DefaultExecutor::build_system_prompt(&tools, &revealed, false, None, Some(&resolved));
 
         assert!(prompt.contains("outreach specialist who writes warm"));
         assert!(prompt.contains("Personalize first lines."));
@@ -2061,10 +2046,8 @@ mod tests {
         assert_eq!(all.len(), tools.len());
 
         // Groups = whitelist by group id
-        let cal_only = apply_tool_selection(
-            &tools,
-            &ToolSelection::Groups(vec!["calendar".into()]),
-        );
+        let cal_only =
+            apply_tool_selection(&tools, &ToolSelection::Groups(vec!["calendar".into()]));
         let names: Vec<&str> = cal_only.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, vec!["calendar_create", "calendar_list"]);
 
