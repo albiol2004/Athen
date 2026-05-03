@@ -8,5 +8,14 @@ fn main() {
     #[cfg(target_os = "linux")]
     glib::set_prgname(Some("com.athen.app"));
 
+    // WORKAROUND: WebKitGTK 2.44+ DMABUF renderer + Mesa/RADV (AMD) stalls GPU
+    // command submission, causing system-wide compositor stutter (visible even
+    // when Athen is unfocused). Forcing the older GLX path avoids it. Confirmed
+    // on Fedora 44 + AMD iGPU, 2026-05-03. Revisit when WebKitGTK or Mesa ship
+    // a fix; on Intel/NVIDIA this just costs a small amount of perf.
+    // Must be set before Tauri/WebKitGTK initializes.
+    #[cfg(target_os = "linux")]
+    std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+
     athen_app::run();
 }

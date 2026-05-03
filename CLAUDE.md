@@ -106,6 +106,10 @@ cargo tauri dev    # (from crates/athen-app/)
 # webkit2gtk4.1-devel gtk3-devel libsoup3-devel libappindicator-gtk3-devel
 ```
 
+## Platform Workarounds
+
+- **Linux WebKitGTK + AMD/RADV stutter**: `crates/athen-app/src/main.rs` forces `WEBKIT_DISABLE_DMABUF_RENDERER=1` at startup. The DMABUF renderer in WebKitGTK 2.44+ stalls the compositor on AMD/Mesa, causing system-wide stutter. Remove once upstream ships a fix and the older GLX path is no longer needed.
+
 ## CI/CD
 
 - `.github/workflows/ci.yml` -- clippy + tests on push to main + PRs
