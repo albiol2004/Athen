@@ -727,6 +727,12 @@ pub struct StatusResponse {
 }
 
 /// Progress event emitted to the frontend during agent execution.
+///
+/// `arc_id` carries the arc this step belongs to so the frontend can
+/// drop events that don't match the currently-viewed arc. Without it,
+/// progress from a Telegram-driven background arc renders into whatever
+/// arc the user happens to be looking at — a real bug we hit when an
+/// inbound message creates a new arc while the user is on a different one.
 #[derive(Clone, Serialize)]
 pub(crate) struct AgentProgress {
     pub step: u32,
@@ -734,6 +740,7 @@ pub(crate) struct AgentProgress {
     pub status: String,
     /// Tool arguments or result summary (truncated to ~200 chars).
     pub detail: Option<String>,
+    pub arc_id: Option<String>,
 }
 
 /// Shared list of tool names that completed successfully during a turn.
@@ -879,6 +886,7 @@ impl StepAuditor for TauriAuditor {
                     tool_name: tool_name.clone(),
                     status: format!("{:?}", step.status),
                     detail: detail.clone(),
+                    arc_id: Some(self.arc_id.clone()),
                 },
             );
         }
@@ -996,8 +1004,8 @@ pub async fn send_message(
     // Record that the user just engaged through the in-app UI on this
     // arc — the approval router will prefer this channel for follow-up
     // questions on the same arc.
+    let active_arc = state.active_arc_id.lock().await.clone();
     {
-        let active_arc = state.active_arc_id.lock().await.clone();
         if let Some(ref store) = state.arc_store {
             if let Err(e) = store.set_primary_reply_channel(&active_arc, "in_app").await {
                 tracing::debug!("Failed to update primary_reply_channel: {e}");
@@ -1029,6 +1037,7 @@ pub async fn send_message(
             tool_name: "Evaluating risk...".to_string(),
             status: "InProgress".to_string(),
             detail: None,
+            arc_id: Some(active_arc.clone()),
         },
     );
 

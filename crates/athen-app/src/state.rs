@@ -1113,6 +1113,7 @@ async fn execute_owner_telegram_message(
             tool_name: "Processing Telegram message...".to_string(),
             status: "InProgress".to_string(),
             detail: Some(text.chars().take(200).collect()),
+            arc_id: target_arc_id.clone(),
         },
     );
 

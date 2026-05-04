@@ -156,7 +156,14 @@ function registerTauriEventListeners() {
     if (!(window.__TAURI__.event && window.__TAURI__.event.listen)) return;
 
     window.__TAURI__.event.listen('agent-progress', (event) => {
-        const { step, tool_name, status, detail } = event.payload;
+        const { step, tool_name, status, detail, arc_id } = event.payload;
+
+        // Drop progress for arcs the user isn't currently viewing — otherwise
+        // a Telegram-driven background arc renders its tool cards into
+        // whichever arc is on screen, then they vanish on tab-switch
+        // because they were never part of that arc's persisted history.
+        // Permissive when arc_id is missing (older code paths or frontend-only events).
+        if (arc_id && arc_id !== activeArcId) return;
 
         // Update status bar as before.
         setStatus('working', `Step ${step}: ${tool_name} (${status})`);
