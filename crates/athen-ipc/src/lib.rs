@@ -8,6 +8,17 @@
 //! - [`codec`] — Encode/decode `IpcMessage` with 4-byte length-prefixed JSON framing
 //! - [`transport`] — `IpcTransport` trait and `UnixTransport` implementation
 //! - [`server`] — `IpcServer` (coordinator) and `IpcClient` (monitors/agents/UI)
+//!
+//! # Platform support
+//!
+//! Unix-only today — the transport layer is built on `tokio::net::UnixStream`.
+//! Windows support requires a Named Pipe implementation; until that lands,
+//! the entire crate is gated on `cfg(unix)` so Windows workspace builds
+//! still succeed. Nothing in the workspace consumes `athen-ipc` yet — the
+//! multi-process architecture is planned but not wired — so this gate has
+//! no runtime impact.
+
+#![cfg(unix)]
 
 pub mod codec;
 pub mod server;

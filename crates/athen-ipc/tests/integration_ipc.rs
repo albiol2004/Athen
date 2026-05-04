@@ -2,7 +2,10 @@
 //!
 //! These tests exercise real IPC communication between `IpcServer` and
 //! `IpcClient` instances over Unix domain sockets, using `tempdir()` to
-//! avoid socket-path collisions.
+//! avoid socket-path collisions. Unix-only: `athen-ipc` itself is gated
+//! on `cfg(unix)`, so its symbols don't exist on Windows.
+
+#![cfg(unix)]
 
 use std::collections::HashSet;
 use std::time::Duration;
