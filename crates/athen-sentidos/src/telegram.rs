@@ -219,7 +219,8 @@ impl TelegramMonitor {
                 .unwrap_or_else(Utc::now);
 
             let summary = if text.len() > 100 {
-                format!("{}...", &text[..97])
+                let cap = text.floor_char_boundary(97);
+                format!("{}...", &text[..cap])
             } else {
                 text.clone()
             };

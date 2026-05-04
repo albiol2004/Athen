@@ -90,7 +90,8 @@ pub async fn process_sense_event(
 
     // Truncate body for LLM triage (save tokens).
     let body_for_triage: String = if body_text.len() > 1000 {
-        format!("{}...", &body_text[..1000])
+        let cap = body_text.floor_char_boundary(1000);
+        format!("{}...", &body_text[..cap])
     } else {
         body_text.clone()
     };
@@ -169,6 +170,7 @@ pub async fn process_sense_event(
                     profile_store.as_ref(),
                     profile_embedder,
                     profile_embedding_cache,
+                    Some(router),
                     &id,
                     arc_source.as_str(),
                     summary,
@@ -248,7 +250,8 @@ pub async fn process_sense_event(
 
     // Step 4: Emit frontend event.
     let body_preview: String = if body_text.len() > 500 {
-        format!("{}...", &body_text[..500])
+        let cap = body_text.floor_char_boundary(500);
+        format!("{}...", &body_text[..cap])
     } else {
         body_text.trim().to_string()
     };
@@ -278,7 +281,8 @@ pub async fn process_sense_event(
 
         let title = format!("{}: {}", source_name, summary);
         let body_notif = if body_preview.len() > 200 {
-            format!("{}...", &body_preview[..200])
+            let cap = body_preview.floor_char_boundary(200);
+            format!("{}...", &body_preview[..cap])
         } else {
             body_preview.clone()
         };
@@ -502,12 +506,15 @@ fn find_recent_arc_from_source(
 /// We pass `summary + body_text` to the classifier so keyword matching has
 /// real content. The arc's source channel is the strongest signal and
 /// drives the domain tag directly.
+/// `pub(crate)` so the owner-Telegram fast-path in `state.rs` (which
+/// bypasses `process_sense_event`) can also route freshly-created arcs.
 #[allow(clippy::too_many_arguments)]
-async fn route_new_arc_to_profile(
+pub(crate) async fn route_new_arc_to_profile(
     arc_store: Option<&ArcStore>,
     profile_store: Option<&Arc<athen_persistence::profiles::SqliteProfileStore>>,
     profile_embedder: &Arc<dyn athen_core::traits::embedding::EmbeddingProvider>,
     profile_embedding_cache: &crate::state::ProfileEmbeddingCache,
+    llm_router: Option<&Arc<RwLock<Arc<DefaultLlmRouter>>>>,
     arc_id: &str,
     source: &str,
     summary: &str,
@@ -587,18 +594,49 @@ async fn route_new_arc_to_profile(
         }
     }
 
-    let Some(decision) = pick_profile_blended(
+    let blended = pick_profile_blended(
         &classified,
         &profiles,
         query_embedding.as_deref(),
         &profile_embeddings,
-    ) else {
+    );
+
+    let decision = if let Some(d) = blended {
+        d
+    } else if let Some(router_handle) = llm_router {
+        // Tier 3: ask an LLM to classify when keyword + semantic both
+        // missed. This is where multilingual / generic-phrasing arcs that
+        // the heuristics can't catch get a second chance.
+        info!(
+            arc = arc_id,
+            source = source,
+            "Profile router: heuristics returned no match; asking LLM classifier"
+        );
+        let router_arc = router_handle.read().await.clone();
+        match athen_core::profile_routing::classify_with_llm(
+            router_arc.as_ref(),
+            &combined_text,
+            &profiles,
+        )
+        .await
+        {
+            Some(d) => d,
+            None => {
+                info!(
+                    arc = arc_id,
+                    source = source,
+                    "Profile router: LLM classifier also returned no match; leaving arc on default"
+                );
+                return;
+            }
+        }
+    } else {
         info!(
             arc = arc_id,
             source = source,
             domain = ?classified.domain,
             kind = ?classified.kind,
-            "Profile router: no positive match; leaving arc on default"
+            "Profile router: no positive match (no LLM router available); leaving arc on default"
         );
         return;
     };
@@ -644,7 +682,8 @@ async fn route_new_arc_to_profile(
 
 pub(crate) fn format_entry_content(sender: &str, subject: &str, body: &str) -> String {
     let preview = if body.len() > 500 {
-        format!("{}...", &body[..500])
+        let cap = body.floor_char_boundary(500);
+        format!("{}...", &body[..cap])
     } else {
         body.trim().to_string()
     };

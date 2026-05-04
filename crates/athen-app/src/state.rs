@@ -769,6 +769,10 @@ impl AppState {
                                     let pending_grants_c = pending_grants_ref.clone();
                                     let spawned_processes_c = spawned_processes_ref.clone();
                                     let telegram_approval_sink_c = telegram_approval_sink.clone();
+                                    let profile_store_c = profile_store_ref.clone();
+                                    let profile_embedder_c = Arc::clone(&profile_embedder_ref);
+                                    let profile_embedding_cache_c =
+                                        Arc::clone(&profile_embedding_cache_ref);
                                     tauri::async_runtime::spawn(async move {
                                         execute_owner_telegram_message(
                                             &text_owned,
@@ -787,6 +791,9 @@ impl AppState {
                                             &pending_grants_c,
                                             &spawned_processes_c,
                                             telegram_approval_sink_c.as_ref(),
+                                            &profile_store_c,
+                                            &profile_embedder_c,
+                                            &profile_embedding_cache_c,
                                         )
                                         .await;
                                     });
@@ -886,6 +893,9 @@ async fn execute_owner_telegram_message(
     pending_grants: &PendingGrants,
     spawned_processes: &athen_agent::SpawnedProcessMap,
     telegram_approval_sink: Option<&Arc<crate::approval::TelegramApprovalSink>>,
+    profile_store: &Option<Arc<athen_persistence::profiles::SqliteProfileStore>>,
+    profile_embedder: &Arc<dyn athen_core::traits::embedding::EmbeddingProvider>,
+    profile_embedding_cache: &ProfileEmbeddingCache,
 ) {
     use std::time::Duration;
 
@@ -929,7 +939,8 @@ async fn execute_owner_telegram_message(
                     // Create a new arc.
                     let arc_id = crate::sense_router::generate_arc_id();
                     let name = if text.len() > 30 {
-                        format!("{}...", &text[..27])
+                        let cap = text.floor_char_boundary(27);
+                        format!("{}...", &text[..cap])
                     } else {
                         text.to_string()
                     };
@@ -944,6 +955,22 @@ async fn execute_owner_telegram_message(
                         warn!("Failed to create arc for Telegram message: {e}");
                     }
                     info!("Created new Telegram arc: {}", arc_id);
+                    // Owner DMs are direct user input, not an inbound message
+                    // forwarded by a third party — pass `source="user_input"`
+                    // so classify_task runs domain inference from keywords
+                    // instead of forcing DomainTag::Messaging.
+                    crate::sense_router::route_new_arc_to_profile(
+                        Some(store),
+                        profile_store.as_ref(),
+                        profile_embedder,
+                        profile_embedding_cache,
+                        Some(router),
+                        &arc_id,
+                        "user_input",
+                        &name,
+                        text,
+                    )
+                    .await;
                     Some(arc_id)
                 }
             }

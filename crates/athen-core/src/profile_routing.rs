@@ -25,6 +25,8 @@
 use std::collections::HashMap;
 
 use crate::agent_profile::{AgentProfile, DomainTag, ProfileId, TaskKindTag};
+use crate::llm::{ChatMessage, LlmRequest, MessageContent, ModelProfile, Role};
+use crate::traits::llm::LlmRouter;
 
 /// What we inferred about a task from its source channel and description.
 /// Any field can be `None` — better to be uncertain than to misroute.
@@ -587,6 +589,178 @@ pub fn pick_profile_blended(
         ),
         candidates: all,
     })
+}
+
+// ---------------------------------------------------------------------------
+// LLM fallback — third tier when keyword + semantic both miss
+// ---------------------------------------------------------------------------
+
+/// Ask an LLM to pick the best profile for a task description. Used when
+/// `pick_profile_blended` returns `None` — typically because the task is
+/// in a language the keyword inference doesn't cover, the embedder is
+/// unavailable, or the description is too generic to score on tags.
+///
+/// Returns `None` on any failure (timeout, parse error, LLM picks nothing,
+/// LLM picks an id we don't recognize). Caller falls back to the default
+/// profile in all of those cases — same contract as the heuristic path.
+///
+/// Cost shape: one Fast-tier LLM call per *unrouted* arc. Profiles are
+/// formatted compactly (id + display_name + description + strengths) so
+/// the prompt stays well under 1k tokens for the 12-built-in case.
+pub async fn classify_with_llm(
+    router: &dyn LlmRouter,
+    description: &str,
+    profiles: &[AgentProfile],
+) -> Option<RoutingDecision> {
+    let candidates: Vec<&AgentProfile> = profiles
+        .iter()
+        .filter(|p| p.id != AgentProfile::DEFAULT_ID)
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let request = build_llm_classifier_request(description, &candidates);
+
+    // Tight timeout — routing is in the hot path of arc creation. If the
+    // LLM is slow or down, fall back to default rather than block the user.
+    // Caller logs the outcome — athen-core has no tracing dep.
+    let response = match tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        router.route(&request),
+    )
+    .await
+    {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(_)) | Err(_) => return None,
+    };
+
+    let (picked_id, reasoning) =
+        parse_llm_classifier_response(&response.content, llm_debug_enabled())?;
+
+    // Verify the LLM picked a real id (it can hallucinate). If not, treat
+    // as no-match — better than routing to a non-existent profile.
+    let chosen = candidates.iter().find(|p| p.id == picked_id)?;
+
+    Some(RoutingDecision {
+        profile_id: chosen.id.clone(),
+        // No numeric score for LLM picks — there's no comparable scale.
+        // Use a sentinel value (negative) so log readers can spot LLM picks.
+        score: -1,
+        reason: match reasoning {
+            Some(r) => format!("llm classifier: {r}"),
+            None => "llm classifier".to_string(),
+        },
+        // No per-candidate breakdown — the LLM evaluated holistically, not
+        // independently per candidate. Empty vec is honest about that.
+        candidates: Vec::new(),
+    })
+}
+
+/// Debug toggle for LLM-routing prompts. When set to `1`/`true`, the
+/// classifier prompt asks the LLM to include a free-form reasoning field;
+/// otherwise we ask only for `profile_id`. Off by default to save tokens
+/// and latency in the hot path.
+fn llm_debug_enabled() -> bool {
+    matches!(
+        std::env::var("ATHEN_LLM_VERBOSE_ROUTING").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    )
+}
+
+fn build_llm_classifier_request(description: &str, profiles: &[&AgentProfile]) -> LlmRequest {
+    let debug = llm_debug_enabled();
+    let schema_line = if debug {
+        concat!(
+            "- \"profile_id\": the id of the chosen profile, or null if none fit\n",
+            "- \"reasoning\": a brief one-sentence explanation\n\n"
+        )
+    } else {
+        "- \"profile_id\": the id of the chosen profile, or null if none fit\n\n"
+    };
+    let system_prompt = format!(
+        "{}{}{}",
+        concat!(
+            "You are a profile router for an AI agent system. Given a task ",
+            "description and a list of available agent profiles, pick the single ",
+            "profile whose expertise best fits the task. The task description may ",
+            "be in any language.\n\n",
+            "Respond ONLY with a JSON object (no markdown, no prose) with these fields:\n",
+        ),
+        schema_line,
+        concat!(
+            "Pick null when the task is generic (greetings, smalltalk, broad ",
+            "questions) or when no profile is meaningfully more relevant than the ",
+            "default. Be conservative — over-routing to a specialized profile is ",
+            "worse than letting the default handle it.",
+        ),
+    );
+
+    let mut profile_block = String::with_capacity(profiles.len() * 200);
+    for p in profiles {
+        profile_block.push_str(&format!("- id: \"{}\"\n", p.id));
+        profile_block.push_str(&format!("  name: {}\n", p.display_name));
+        if !p.description.is_empty() {
+            profile_block.push_str(&format!("  description: {}\n", p.description));
+        }
+        if !p.expertise.strengths.is_empty() {
+            profile_block.push_str(&format!(
+                "  strengths: {}\n",
+                p.expertise.strengths.join(", ")
+            ));
+        }
+    }
+
+    let user_message = format!(
+        "Available profiles:\n{profile_block}\n\
+         Task description:\n<<<TASK>>>\n{description}\n<<<END TASK>>>"
+    );
+
+    // Without reasoning the response is just `{"profile_id":"<id>"}` —
+    // tighten max_tokens accordingly so a babbling provider can't waste
+    // time generating prose we'd discard anyway.
+    let max_tokens = if debug { 200 } else { 60 };
+
+    LlmRequest {
+        profile: ModelProfile::Fast,
+        messages: vec![ChatMessage {
+            role: Role::User,
+            content: MessageContent::Text(user_message),
+        }],
+        max_tokens: Some(max_tokens),
+        temperature: Some(0.0),
+        tools: None,
+        system_prompt: Some(system_prompt),
+    }
+}
+
+/// Parse the LLM classifier response. Tolerant of code fences and
+/// surrounding whitespace — some providers can't help themselves.
+/// Returns the chosen profile id plus an optional reasoning string;
+/// `reasoning` is `Some` only when `debug` is enabled and the LLM
+/// actually returned the field.
+fn parse_llm_classifier_response(content: &str, debug: bool) -> Option<(ProfileId, Option<String>)> {
+    let trimmed = content.trim();
+    let json_str = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .map(|s| s.trim_end_matches("```").trim())
+        .unwrap_or(trimmed);
+
+    let v: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    let id = v.get("profile_id")?;
+    if id.is_null() {
+        return None;
+    }
+    let id_str = id.as_str()?.to_string();
+    let reasoning = if debug {
+        v.get("reasoning")
+            .and_then(|r| r.as_str())
+            .map(|s| s.to_string())
+    } else {
+        None
+    };
+    Some((id_str, reasoning))
 }
 
 #[cfg(test)]
