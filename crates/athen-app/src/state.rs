@@ -1107,16 +1107,20 @@ async fn execute_owner_telegram_message(
     };
 
     // Emit a progress event so the frontend knows execution started.
-    let _ = app_handle.emit(
-        "agent-progress",
-        AgentProgress {
-            step: 0,
-            tool_name: "Processing Telegram message...".to_string(),
-            status: "InProgress".to_string(),
-            detail: Some(text.chars().take(200).collect()),
-            arc_id: target_arc_id.clone(),
-        },
-    );
+    // Skip when we have no arc — the event would land in whatever arc
+    // the user is viewing, which is exactly the bug arc_id guards against.
+    if let Some(ref arc_id) = target_arc_id {
+        let _ = app_handle.emit(
+            "agent-progress",
+            AgentProgress {
+                step: 0,
+                tool_name: "Processing Telegram message...".to_string(),
+                status: "InProgress".to_string(),
+                detail: Some(text.chars().take(200).collect()),
+                arc_id: arc_id.clone(),
+            },
+        );
+    }
 
     // Persist user msg before the executor runs so its DB id sits before any
     // tool_call rows the auditor writes during execution.

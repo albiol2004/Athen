@@ -733,6 +733,8 @@ pub struct StatusResponse {
 /// progress from a Telegram-driven background arc renders into whatever
 /// arc the user happens to be looking at — a real bug we hit when an
 /// inbound message creates a new arc while the user is on a different one.
+/// `arc_id` is required (non-Option) as a regression guard: callers without
+/// an arc must skip the emit entirely rather than send a contextless event.
 #[derive(Clone, Serialize)]
 pub(crate) struct AgentProgress {
     pub step: u32,
@@ -740,7 +742,7 @@ pub(crate) struct AgentProgress {
     pub status: String,
     /// Tool arguments or result summary (truncated to ~200 chars).
     pub detail: Option<String>,
-    pub arc_id: Option<String>,
+    pub arc_id: String,
 }
 
 /// Shared list of tool names that completed successfully during a turn.
@@ -886,7 +888,7 @@ impl StepAuditor for TauriAuditor {
                     tool_name: tool_name.clone(),
                     status: format!("{:?}", step.status),
                     detail: detail.clone(),
-                    arc_id: Some(self.arc_id.clone()),
+                    arc_id: self.arc_id.clone(),
                 },
             );
         }
@@ -1037,7 +1039,7 @@ pub async fn send_message(
             tool_name: "Evaluating risk...".to_string(),
             status: "InProgress".to_string(),
             detail: None,
-            arc_id: Some(active_arc.clone()),
+            arc_id: active_arc.clone(),
         },
     );
 
