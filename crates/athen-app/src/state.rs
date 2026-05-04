@@ -31,6 +31,7 @@ use athen_core::llm::{
 };
 use athen_core::traits::llm::{LlmProvider, LlmRouter};
 use athen_llm::budget::BudgetTracker;
+use athen_llm::providers::anthropic::AnthropicProvider;
 use athen_llm::providers::deepseek::DeepSeekProvider;
 use athen_llm::providers::llamacpp::LlamaCppProvider;
 use athen_llm::providers::ollama::OllamaProvider;
@@ -1472,11 +1473,10 @@ fn resolve_api_key_for(
 
 /// Build a `DefaultLlmRouter` for a specific provider.
 ///
-/// Uses the appropriate provider type based on the ID:
-/// - `"deepseek"` -> `DeepSeekProvider`
-/// - `"ollama"` -> `OllamaProvider`
-/// - `"llamacpp"` -> `LlamaCppProvider`
-/// - anything else -> `OpenAiCompatibleProvider`
+/// Provider-specific adapters are used when the wire format diverges from
+/// the OpenAI Chat Completions shape (DeepSeek, Anthropic, Ollama, llama.cpp).
+/// Everything else (OpenAI proper, Mistral, OpenRouter, custom OpenAI-compat
+/// endpoints) goes through `OpenAiCompatibleProvider`.
 pub(crate) fn build_router_for_provider(
     provider_id: &str,
     base_url: &str,
@@ -1495,6 +1495,14 @@ pub(crate) fn build_router_for_provider(
             }
             Box::new(p)
         }
+        "anthropic" => {
+            let key = api_key.unwrap_or_default().to_string();
+            let mut p = AnthropicProvider::new(key, model.to_string());
+            if base_url != "https://api.anthropic.com" && !base_url.is_empty() {
+                p = p.with_base_url(base_url.to_string());
+            }
+            Box::new(p)
+        }
         "ollama" => {
             let mut p = OllamaProvider::new(model.to_string());
             if base_url != "http://localhost:11434" {
@@ -1507,17 +1515,11 @@ pub(crate) fn build_router_for_provider(
             model.to_string(),
         )),
         _ => {
-            // Generic OpenAI-compatible provider (openai, anthropic, custom).
             let mut p = OpenAiCompatibleProvider::new(base_url.to_string())
                 .with_model(model.to_string())
                 .with_provider_id(provider_id.to_string());
             if let Some(key) = api_key {
                 p = p.with_api_key(key.to_string());
-            }
-            // Local providers use zero-cost estimation.
-            if matches!(provider_id, "ollama" | "llamacpp") {
-                p = p
-                    .with_cost_estimator(Box::new(athen_llm::providers::openai::ZeroCostEstimator));
             }
             Box::new(p)
         }

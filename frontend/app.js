@@ -5372,6 +5372,24 @@ const ONB_CLOUD_HINTS = {
     anthropic: 'sk-ant-...',
     deepseek: 'sk-...',
     openai: 'sk-...',
+    mistral: 'paste your Mistral key',
+    openrouter: 'sk-or-...',
+};
+
+// Memory step state — captured cloud key from the LLM step is offered as
+// a default for the OpenAI embedding key so users don't paste twice.
+let onbCloudKeyCache = '';
+let onbCloudIdCache = '';
+let onbMemSelected = null; // 'cloud' | 'ollama' | 'skip'
+
+// Maps each step to which progress pill should light up. Welcome has no
+// pill (the indicator stays hidden until the user actually starts).
+const ONB_PROGRESS_FOR_STEP = {
+    pick: 'pick',
+    local: 'pick',
+    cloud: 'pick',
+    memory: 'memory',
+    done: 'done',
 };
 
 function showOnboardingStep(name) {
@@ -5380,6 +5398,19 @@ function showOnboardingStep(name) {
     overlay.querySelectorAll('.onboarding-step').forEach((s) => {
         s.style.display = s.dataset.step === name ? '' : 'none';
     });
+
+    const progress = document.getElementById('onb-progress');
+    if (progress) {
+        const target = ONB_PROGRESS_FOR_STEP[name];
+        if (target) {
+            progress.style.display = '';
+            progress.querySelectorAll('.onb-progress-step').forEach((p) => {
+                p.classList.toggle('active', p.dataset.step === target);
+            });
+        } else {
+            progress.style.display = 'none';
+        }
+    }
 }
 
 function setOnbStatus(elId, kind, text) {
@@ -5484,7 +5515,7 @@ function wireOnboardingButtons() {
             model,
             apiKey: null,
         });
-        if (ok) showOnboardingStep('done');
+        if (ok) enterMemoryStep();
     });
 
     document.getElementById('onb-cloud-test')?.addEventListener('click', async () => {
@@ -5498,14 +5529,139 @@ function wireOnboardingButtons() {
         const ok = await onboardingTestAndSave({
             statusElId: 'onb-cloud-status',
             id,
-            baseUrl: '', // empty → backend uses default for the chosen provider
+            baseUrl: '',
             model,
             apiKey,
         });
-        if (ok) showOnboardingStep('done');
+        if (ok) {
+            onbCloudKeyCache = apiKey;
+            onbCloudIdCache = id;
+            enterMemoryStep();
+        }
     });
 
+    wireMemoryStep();
+
     document.getElementById('onb-finish')?.addEventListener('click', finishOnboarding);
+}
+
+// ─── Memory (embeddings) step ───────────────────────────────────────
+//
+// Reached after the user successfully configures any LLM provider. The
+// device-tier hint comes from `detect_device_capabilities`; the three
+// pick buttons each unfold a small config panel before the test+save.
+
+async function enterMemoryStep() {
+    showOnboardingStep('memory');
+    onbMemSelected = null;
+    document.getElementById('onb-mem-config').style.display = 'none';
+    document.getElementById('onb-mem-status').textContent = '';
+
+    const tierEl = document.getElementById('onb-device-tier');
+    if (tierEl && !tierEl.dataset.loaded) {
+        try {
+            const caps = await invoke('detect_device_capabilities');
+            const reason = caps.tier_reason || '';
+            tierEl.textContent = reason;
+            tierEl.dataset.loaded = '1';
+        } catch (e) {
+            console.warn('[athen] detect_device_capabilities failed:', e);
+        }
+    }
+}
+
+function wireMemoryStep() {
+    document.getElementById('onb-back-mem')?.addEventListener('click', () => {
+        showOnboardingStep('pick');
+    });
+
+    document.getElementById('onb-mem-cloud')?.addEventListener('click', () => {
+        onbMemSelected = 'cloud';
+        document.getElementById('onb-mem-config').style.display = '';
+        document.getElementById('onb-mem-key-row').style.display = '';
+        document.getElementById('onb-mem-url-row').style.display = 'none';
+        const keyEl = document.getElementById('onb-mem-key');
+        if (keyEl && !keyEl.value && onbCloudIdCache === 'openai') {
+            keyEl.value = onbCloudKeyCache;
+        }
+        document.getElementById('onb-mem-model').placeholder = 'text-embedding-3-small';
+    });
+
+    document.getElementById('onb-mem-ollama')?.addEventListener('click', () => {
+        onbMemSelected = 'ollama';
+        document.getElementById('onb-mem-config').style.display = '';
+        document.getElementById('onb-mem-key-row').style.display = 'none';
+        document.getElementById('onb-mem-url-row').style.display = '';
+        const urlEl = document.getElementById('onb-mem-url');
+        if (urlEl && !urlEl.value) urlEl.value = 'http://localhost:11434';
+        document.getElementById('onb-mem-model').placeholder = 'nomic-embed-text';
+    });
+
+    document.getElementById('onb-mem-skip')?.addEventListener('click', async () => {
+        try {
+            await invoke('save_embedding_settings', {
+                mode: 'Off',
+                provider: 'keyword',
+                model: null,
+                baseUrl: null,
+                apiKey: null,
+            });
+        } catch (e) {
+            console.warn('[athen] save embedding (skip) failed:', e);
+        }
+        showOnboardingStep('done');
+    });
+
+    document.getElementById('onb-mem-test')?.addEventListener('click', async () => {
+        if (!onbMemSelected) return;
+        const provider = onbMemSelected === 'cloud' ? 'openai' : 'ollama';
+        const baseUrl = onbMemSelected === 'ollama'
+            ? (document.getElementById('onb-mem-url').value || 'http://localhost:11434')
+            : null;
+        const apiKey = onbMemSelected === 'cloud'
+            ? document.getElementById('onb-mem-key').value.trim()
+            : null;
+        const model = document.getElementById('onb-mem-model').value || null;
+
+        if (onbMemSelected === 'cloud' && !apiKey) {
+            setOnbStatus('onb-mem-status', 'err', 'API key required.');
+            return;
+        }
+
+        setOnbStatus('onb-mem-status', 'busy', 'Testing connection…');
+        try {
+            const result = await invoke('test_embedding_provider', {
+                provider,
+                model,
+                baseUrl,
+                apiKey,
+            });
+            if (!result || !result.success) {
+                setOnbStatus('onb-mem-status', 'err', (result && result.message) || 'Connection failed');
+                return;
+            }
+        } catch (e) {
+            setOnbStatus('onb-mem-status', 'err', String(e));
+            return;
+        }
+
+        setOnbStatus('onb-mem-status', 'busy', 'Saving…');
+        try {
+            await invoke('save_embedding_settings', {
+                mode: 'Specific',
+                provider,
+                model,
+                baseUrl,
+                apiKey,
+            });
+        } catch (e) {
+            setOnbStatus('onb-mem-status', 'err', 'Save failed: ' + e);
+            return;
+        }
+
+        setOnbStatus('onb-mem-status', 'ok', 'Saved.');
+        showOnboardingStep('done');
+    });
 }
 
 async function maybeRunOnboarding() {

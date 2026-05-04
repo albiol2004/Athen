@@ -270,6 +270,84 @@ pub async fn complete_onboarding() -> std::result::Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
+// Device capability detection
+// ---------------------------------------------------------------------------
+//
+// Used by the onboarding wizard to recommend a sensible embedding tier
+// without requiring the user to know what their machine can handle. We
+// inspect total RAM and logical core count and bucket the result into one
+// of three tiers. Conservative on purpose — when unsure, recommend the
+// lighter option so the user isn't fighting OOM kills on first run.
+
+/// Capability snapshot returned to the frontend.
+#[derive(Serialize)]
+pub struct DeviceCapabilities {
+    /// Total system RAM, in gigabytes (rounded down).
+    pub total_ram_gb: u64,
+    /// Logical CPU cores.
+    pub cpu_cores: usize,
+    /// OS family: "linux", "macos", "windows", or "other".
+    pub os: &'static str,
+    /// Recommended embedding tier: "standard" | "small" | "skip".
+    /// - `standard`: 16 GB+ RAM, 4+ cores. Local 80–250 MB models are fine.
+    /// - `small`:    8–16 GB RAM. Stick to ~80 MB MiniLM-class models.
+    /// - `skip`:     <8 GB RAM. Recommend cloud or keyword fallback.
+    pub recommended_tier: &'static str,
+    /// Short human-readable explanation for the chosen tier.
+    pub tier_reason: String,
+}
+
+/// Probe the host machine and return a capability snapshot. Cheap — only
+/// reads RAM/CPU info via `sysinfo`, no network or disk scans.
+#[tauri::command]
+pub async fn detect_device_capabilities() -> std::result::Result<DeviceCapabilities, String> {
+    use sysinfo::System;
+
+    let mut sys = System::new();
+    sys.refresh_memory();
+
+    let total_ram_gb = sys.total_memory() / (1024 * 1024 * 1024);
+    let cpu_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+
+    let os = if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        "other"
+    };
+
+    let (recommended_tier, tier_reason) = if total_ram_gb >= 16 && cpu_cores >= 4 {
+        (
+            "standard",
+            format!("{total_ram_gb} GB RAM and {cpu_cores} cores — comfortable for a local embedding model."),
+        )
+    } else if total_ram_gb >= 8 {
+        (
+            "small",
+            format!("{total_ram_gb} GB RAM — a small embedding model (~80 MB) will run fine."),
+        )
+    } else {
+        (
+            "skip",
+            format!("Only {total_ram_gb} GB RAM detected — recommend cloud embeddings or the keyword fallback."),
+        )
+    };
+
+    Ok(DeviceCapabilities {
+        total_ram_gb,
+        cpu_cores,
+        os,
+        recommended_tier,
+        tier_reason,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Helpers for provider info
 // ---------------------------------------------------------------------------
 
@@ -279,6 +357,8 @@ fn default_base_url(id: &str) -> &str {
         "deepseek" => "https://api.deepseek.com",
         "openai" => "https://api.openai.com",
         "anthropic" => "https://api.anthropic.com",
+        "mistral" => "https://api.mistral.ai",
+        "openrouter" => "https://openrouter.ai/api",
         "ollama" => "http://localhost:11434",
         "llamacpp" => "http://localhost:8080",
         _ => "",
@@ -291,6 +371,8 @@ fn default_model(id: &str) -> &str {
         "deepseek" => "deepseek-chat",
         "openai" => "gpt-4o",
         "anthropic" => "claude-sonnet-4-20250514",
+        "mistral" => "mistral-large-latest",
+        "openrouter" => "openai/gpt-4o-mini",
         "ollama" => "llama3",
         "llamacpp" => "default",
         _ => "",
@@ -303,6 +385,8 @@ fn display_name(id: &str) -> &str {
         "deepseek" => "DeepSeek",
         "openai" => "OpenAI",
         "anthropic" => "Anthropic",
+        "mistral" => "Mistral",
+        "openrouter" => "OpenRouter",
         "ollama" => "Ollama",
         "llamacpp" => "llama.cpp",
         _ => id,

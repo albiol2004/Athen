@@ -3781,6 +3781,48 @@ option:hover {
 .onb-status.err   { background: var(--danger-soft);  color: var(--danger);  }
 .onb-status.busy  { background: var(--info-soft);    color: var(--info);    }
 
+.onb-device-tier {
+    margin: 0 0 16px;
+    padding: 10px 12px;
+    border-radius: var(--r-sm);
+    background: var(--info-soft);
+    color: var(--info);
+    font-size: 12.5px;
+    line-height: 1.45;
+    text-align: center;
+}
+.onb-device-tier:empty { display: none; }
+
+.onb-progress {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 8px;
+    margin: -4px 0 18px;
+    font-size: 11px;
+    color: var(--text-3, var(--text-2));
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+.onb-progress-step {
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: var(--surface-2);
+    color: var(--text-3, var(--text-2));
+    transition: background 120ms ease, color 120ms ease;
+}
+.onb-progress-step.active {
+    background: var(--accent-soft, var(--info-soft));
+    color: var(--accent, var(--info));
+}
+
+.onboarding-hint {
+    color: var(--text-2);
+    font-size: 13px;
+    line-height: 1.5;
+    margin: 4px 0 16px;
+}
+
 /* ─── Profile manager ─── */
 .profile-list {
     display: flex;
