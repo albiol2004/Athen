@@ -2051,14 +2051,50 @@ const securityModeEl = document.getElementById('security-mode');
 const securityHintEl = document.getElementById('security-hint');
 const saveSecurityBtn = document.getElementById('save-security-btn');
 
-const PROVIDER_DEFAULTS = {
-    deepseek:  { name: 'DeepSeek',        base_url: 'https://api.deepseek.com',  model: 'deepseek-chat',           type: 'cloud' },
-    openai:    { name: 'OpenAI',           base_url: 'https://api.openai.com',    model: 'gpt-4o',                 type: 'cloud' },
-    anthropic: { name: 'Anthropic',        base_url: 'https://api.anthropic.com', model: 'claude-sonnet-4-20250514', type: 'cloud' },
-    ollama:    { name: 'Ollama',           base_url: 'http://localhost:11434',     model: 'llama3',                 type: 'local' },
-    llamacpp:  { name: 'llama.cpp',        base_url: 'http://localhost:8080',      model: 'default',                type: 'local' },
-    custom:    { name: 'Custom Provider',  base_url: '',                           model: '',                       type: 'cloud' },
+// Provider catalog — single source of truth. Populated at startup from
+// the backend's `list_provider_catalog` command and used by both the
+// onboarding wizard and the settings provider templates. The "custom"
+// entry stays frontend-only since it's a UI affordance rather than a
+// real provider id.
+let PROVIDER_CATALOG = [];
+const CUSTOM_PROVIDER_ENTRY = {
+    id: 'custom',
+    name: 'Custom Provider',
+    provider_type: 'cloud',
+    default_base_url: '',
+    default_model: '',
+    api_key_hint: 'sk-...',
 };
+
+function providerById(id) {
+    return PROVIDER_CATALOG.find((p) => p.id === id) || (id === 'custom' ? CUSTOM_PROVIDER_ENTRY : null);
+}
+
+// Legacy alias — kept so callers reading `PROVIDER_DEFAULTS[id].base_url`
+// keep working without churn. Lazily projects the catalog onto the old
+// shape: { name, base_url, model, type }.
+const PROVIDER_DEFAULTS = new Proxy({}, {
+    get(_, id) {
+        const entry = providerById(id);
+        if (!entry) return undefined;
+        return {
+            name: entry.name,
+            base_url: entry.default_base_url,
+            model: entry.default_model,
+            type: entry.provider_type,
+        };
+    },
+});
+
+async function loadProviderCatalog() {
+    if (!invoke || PROVIDER_CATALOG.length > 0) return;
+    try {
+        PROVIDER_CATALOG = await invoke('list_provider_catalog');
+    } catch (e) {
+        console.warn('[athen] list_provider_catalog failed:', e);
+        PROVIDER_CATALOG = [];
+    }
+}
 
 const SECURITY_HINTS = {
     assistant: 'Standard risk evaluation. The agent asks for approval on risky actions.',
@@ -2896,12 +2932,21 @@ async function handleDeleteProvider(id) {
     if (!invoke) return;
     if (!confirm('Delete provider "' + id + '"? You can re-add it later.')) return;
 
+    // Optimistic removal: drop the card immediately so the user gets
+    // instant feedback. If the backend call fails, loadSettings() in
+    // the catch arm puts it back.
+    const card = providerListEl.querySelector(
+        `.provider-card[data-provider-id="${id}"]`
+    );
+    if (card) card.remove();
+
     try {
         const msg = await invoke('delete_provider', { id: id });
         showToast(msg, 'success');
         await loadSettings();
     } catch (err) {
         showToast('Failed to delete: ' + err, 'error');
+        await loadSettings();
     }
 }
 
@@ -2954,20 +2999,40 @@ async function handleTestProvider(card, id) {
     testBtn.textContent = 'Test Connection';
 }
 
-// Add provider template buttons
+// Add provider template buttons — rendered dynamically from the catalog
+// so onboarding and settings always agree on the supported providers.
+
+function renderProviderTemplates() {
+    if (!providerTemplates) return;
+    providerTemplates.innerHTML = '';
+    const all = [...PROVIDER_CATALOG, CUSTOM_PROVIDER_ENTRY];
+    for (const entry of all) {
+        const btn = document.createElement('button');
+        btn.className = 'template-btn';
+        btn.dataset.provider = entry.id;
+        const suffix = entry.provider_type === 'local' ? ' (local)' : '';
+        btn.textContent = entry.name + suffix;
+        providerTemplates.appendChild(btn);
+    }
+}
+
 if (addProviderBtn) {
     addProviderBtn.addEventListener('click', () => {
         providerTemplates.classList.toggle('hidden');
     });
 }
 
-document.querySelectorAll('.template-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
+// Event delegation — buttons exist only after the catalog loads, and we
+// don't want to re-bind every render.
+if (providerTemplates) {
+    providerTemplates.addEventListener('click', (e) => {
+        const btn = e.target.closest('.template-btn');
+        if (!btn) return;
         const providerId = btn.dataset.provider;
         const defaults = PROVIDER_DEFAULTS[providerId];
+        if (!defaults) return;
         providerTemplates.classList.add('hidden');
 
-        // Check if this provider already exists in the list.
         const existingCard = providerListEl.querySelector(
             `.provider-card[data-provider-id="${providerId}"]`
         );
@@ -2977,7 +3042,6 @@ document.querySelectorAll('.template-btn').forEach(btn => {
             return;
         }
 
-        // Create a new card with template defaults.
         const newProvider = {
             id: providerId,
             name: defaults.name,
@@ -2994,7 +3058,7 @@ document.querySelectorAll('.template-btn').forEach(btn => {
         providerListEl.appendChild(card);
         card.scrollIntoView({ behavior: 'smooth', block: 'center' });
     });
-});
+}
 
 // Security mode change hint
 if (securityModeEl) {
@@ -5364,17 +5428,39 @@ document.getElementById('add-grant-btn')?.addEventListener('click', async () => 
 // never re-fires for the same user. Bug-paranoid: any IPC error in
 // onboarding falls through to the main UI rather than trapping the user.
 
-const ONB_LOCAL_DEFAULTS = {
-    ollama: 'http://localhost:11434',
-    llamacpp: 'http://localhost:8080',
-};
-const ONB_CLOUD_HINTS = {
-    anthropic: 'sk-ant-...',
-    deepseek: 'sk-...',
-    openai: 'sk-...',
-    mistral: 'paste your Mistral key',
-    openrouter: 'sk-or-...',
-};
+// Onboarding maps derived from PROVIDER_CATALOG so the wizard never gets
+// out of sync with what the backend actually supports. Populated by
+// `populateOnboardingProviderPickers` once the catalog is loaded.
+const ONB_LOCAL_DEFAULTS = {};
+const ONB_CLOUD_HINTS = {};
+
+function populateOnboardingProviderPickers() {
+    const cloudSel = document.getElementById('onb-cloud-type');
+    const localSel = document.getElementById('onb-local-type');
+    if (cloudSel) cloudSel.innerHTML = '';
+    if (localSel) localSel.innerHTML = '';
+
+    for (const p of PROVIDER_CATALOG) {
+        if (p.provider_type === 'cloud') {
+            ONB_CLOUD_HINTS[p.id] = p.api_key_hint || 'sk-...';
+            if (cloudSel) {
+                const opt = document.createElement('option');
+                opt.value = p.id;
+                opt.textContent = p.name;
+                cloudSel.appendChild(opt);
+            }
+        } else if (p.provider_type === 'local') {
+            ONB_LOCAL_DEFAULTS[p.id] = p.default_base_url;
+            if (localSel) {
+                const opt = document.createElement('option');
+                opt.value = p.id;
+                const portHint = p.default_base_url.match(/:(\d+)$/);
+                opt.textContent = p.name + (portHint ? ` (default port ${portHint[1]})` : '');
+                localSel.appendChild(opt);
+            }
+        }
+    }
+}
 
 // Memory step state — captured cloud key from the LLM step is offered as
 // a default for the OpenAI embedding key so users don't paste twice.
@@ -5666,6 +5752,13 @@ function wireMemoryStep() {
 
 async function maybeRunOnboarding() {
     if (!invoke) return;
+
+    // Catalog has to be loaded before we render the wizard or the
+    // settings template buttons, because both pull from it.
+    await loadProviderCatalog();
+    populateOnboardingProviderPickers();
+    renderProviderTemplates();
+
     let isFirst = false;
     try {
         isFirst = await invoke('is_first_launch');

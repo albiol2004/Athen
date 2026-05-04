@@ -143,14 +143,8 @@
                 <div id="provider-list"></div>
                 <div class="add-provider-area">
                     <button id="add-provider-btn" class="add-provider-btn">+ Add Provider</button>
-                    <div id="provider-templates" class="provider-templates hidden">
-                        <button class="template-btn" data-provider="deepseek">DeepSeek</button>
-                        <button class="template-btn" data-provider="openai">OpenAI</button>
-                        <button class="template-btn" data-provider="anthropic">Anthropic</button>
-                        <button class="template-btn" data-provider="ollama">Ollama (local)</button>
-                        <button class="template-btn" data-provider="llamacpp">llama.cpp (local)</button>
-                        <button class="template-btn" data-provider="custom">Custom</button>
-                    </div>
+                    <!-- Buttons rendered at runtime from list_provider_catalog. -->
+                    <div id="provider-templates" class="provider-templates hidden"></div>
                 </div>
             </section>
 
@@ -793,10 +787,8 @@
             <div class="onboarding-step" data-step="local" style="display: none;">
                 <h1>Local model setup</h1>
                 <label>Which server?
-                    <select id="onb-local-type">
-                        <option value="ollama">Ollama (default port 11434)</option>
-                        <option value="llamacpp">llama.cpp (default port 8080)</option>
-                    </select>
+                    <!-- Options populated at runtime from list_provider_catalog. -->
+                    <select id="onb-local-type"></select>
                 </label>
                 <label>Server URL
                     <input type="text" id="onb-local-url" placeholder="http://localhost:11434">
@@ -814,13 +806,8 @@
             <div class="onboarding-step" data-step="cloud" style="display: none;">
                 <h1>Cloud provider setup</h1>
                 <label>Provider
-                    <select id="onb-cloud-type">
-                        <option value="deepseek">DeepSeek (best value)</option>
-                        <option value="anthropic">Anthropic (Claude)</option>
-                        <option value="openai">OpenAI</option>
-                        <option value="mistral">Mistral</option>
-                        <option value="openrouter">OpenRouter (gateway)</option>
-                    </select>
+                    <!-- Options populated at runtime from list_provider_catalog. -->
+                    <select id="onb-cloud-type"></select>
                 </label>
                 <label>API key
                     <input type="password" id="onb-cloud-key" placeholder="sk-...">

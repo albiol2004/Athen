@@ -57,6 +57,7 @@ pub fn run() {
             settings::is_first_launch,
             settings::complete_onboarding,
             settings::detect_device_capabilities,
+            settings::list_provider_catalog,
             settings::save_email_settings,
             settings::test_email_connection,
             settings::save_telegram_settings,

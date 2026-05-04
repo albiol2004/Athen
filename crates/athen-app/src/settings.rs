@@ -401,6 +401,62 @@ fn provider_type(id: &str) -> &str {
     }
 }
 
+/// Placeholder text for the API key field in the UI. Empty for local
+/// providers (no key needed).
+fn api_key_hint(id: &str) -> &str {
+    match id {
+        "anthropic" => "sk-ant-...",
+        "openrouter" => "sk-or-...",
+        "deepseek" | "openai" | "mistral" => "sk-...",
+        _ => "",
+    }
+}
+
+/// Canonical list of provider IDs the backend knows how to talk to.
+/// Adding a new provider only requires adding it here plus implementing
+/// the matching `match` arms in `default_*`/`display_name`/`provider_type`/
+/// `api_key_hint` and `build_router_for_provider`. The frontend renders
+/// onboarding pickers and settings templates entirely from this list.
+const PROVIDER_IDS: &[&str] = &[
+    "deepseek",
+    "anthropic",
+    "openai",
+    "mistral",
+    "openrouter",
+    "ollama",
+    "llamacpp",
+];
+
+/// One entry in the provider catalog returned to the frontend.
+#[derive(Serialize)]
+pub struct ProviderCatalogEntry {
+    pub id: &'static str,
+    pub name: &'static str,
+    /// "cloud" or "local".
+    pub provider_type: &'static str,
+    pub default_base_url: &'static str,
+    pub default_model: &'static str,
+    /// Placeholder text for the API key input. Empty for local providers.
+    pub api_key_hint: &'static str,
+}
+
+/// Return the canonical list of providers the app supports. Single source
+/// of truth — onboarding and settings UI both render from this.
+#[tauri::command]
+pub async fn list_provider_catalog() -> std::result::Result<Vec<ProviderCatalogEntry>, String> {
+    Ok(PROVIDER_IDS
+        .iter()
+        .map(|id| ProviderCatalogEntry {
+            id,
+            name: display_name(id),
+            provider_type: provider_type(id),
+            default_base_url: default_base_url(id),
+            default_model: default_model(id),
+            api_key_hint: api_key_hint(id),
+        })
+        .collect())
+}
+
 /// Mask an API key, showing only the last 4 characters.
 fn mask_api_key(key: &str) -> String {
     if key.len() <= 4 {
@@ -475,30 +531,11 @@ pub async fn get_settings(
         .map(|(id, cfg)| provider_config_to_info(id, cfg, &active))
         .collect();
 
-    // If no providers configured at all, show the active provider as a template.
-    if providers.is_empty() {
-        let has_env_key = std::env::var("DEEPSEEK_API_KEY")
-            .ok()
-            .filter(|k| !k.is_empty())
-            .is_some();
-        let hint = if has_env_key {
-            let key = std::env::var("DEEPSEEK_API_KEY").unwrap_or_default();
-            format!("{}  (env)", mask_api_key(&key))
-        } else {
-            String::new()
-        };
-        let model = state.model_name.lock().await.clone();
-        providers.push(ProviderInfo {
-            id: active.clone(),
-            name: display_name(&active).to_string(),
-            provider_type: provider_type(&active).to_string(),
-            base_url: default_base_url(&active).to_string(),
-            model,
-            has_api_key: has_env_key,
-            api_key_hint: hint,
-            is_active: true,
-        });
-    }
+    // Note: we deliberately don't synthesize a placeholder card when the
+    // provider map is empty. Doing so caused a UI bug where deleting the
+    // last provider made it look like the delete failed (the synthesizer
+    // re-created a card for the now-orphan active id). The frontend's
+    // "Add provider" button already covers the empty-list state.
 
     // Sort: active first, then alphabetical.
     providers.sort_by(|a, b| b.is_active.cmp(&a.is_active).then(a.id.cmp(&b.id)));
