@@ -3154,6 +3154,62 @@ pub async fn revoke_global_grant(
         .map_err(|e| e.to_string())
 }
 
+#[derive(Serialize)]
+pub struct UpdateInfo {
+    pub available: bool,
+    pub version: Option<String>,
+    pub current_version: String,
+    pub notes: Option<String>,
+    pub date: Option<String>,
+}
+
+#[tauri::command]
+pub async fn check_for_update(app: AppHandle) -> std::result::Result<UpdateInfo, String> {
+    use tauri_plugin_updater::UpdaterExt;
+
+    let current_version = app.package_info().version.to_string();
+    let updater = app.updater().map_err(|e| e.to_string())?;
+    match updater.check().await {
+        Ok(Some(update)) => Ok(UpdateInfo {
+            available: true,
+            version: Some(update.version.clone()),
+            current_version,
+            notes: update.body.clone(),
+            date: update.date.map(|d| d.to_string()),
+        }),
+        Ok(None) => Ok(UpdateInfo {
+            available: false,
+            version: None,
+            current_version,
+            notes: None,
+            date: None,
+        }),
+        Err(e) => Err(format!("update check failed: {}", e)),
+    }
+}
+
+#[tauri::command]
+pub async fn install_update(app: AppHandle) -> std::result::Result<(), String> {
+    use tauri_plugin_updater::UpdaterExt;
+
+    let updater = app.updater().map_err(|e| e.to_string())?;
+    let update = updater
+        .check()
+        .await
+        .map_err(|e| format!("update check failed: {}", e))?
+        .ok_or_else(|| "no update available".to_string())?;
+
+    update
+        .download_and_install(|_chunk_len, _content_len| {}, || {})
+        .await
+        .map_err(|e| format!("download/install failed: {}", e))?;
+
+    // Restart so the freshly installed binary takes over. On Windows the
+    // installer already replaces the running .exe and `restart()` will
+    // re-launch from the new path.
+    app.restart();
+}
+
 #[cfg(test)]
 mod key_term_tests {
     use super::extract_key_terms;

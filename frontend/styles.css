@@ -166,6 +166,56 @@ body.window-blurred .traffic-btn {
     flex-shrink: 0;
 }
 
+/* ─── Update banner ─── */
+.update-banner {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 14px;
+    background: var(--surface-1);
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+    color: var(--text-1);
+    flex-shrink: 0;
+}
+
+.update-banner[hidden] { display: none; }
+
+.update-banner-text {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.update-banner-btn {
+    background: var(--brand-grad);
+    color: #fff;
+    border-radius: 8px;
+    padding: 5px 12px;
+    font-size: 12px;
+    font-weight: 600;
+    box-shadow: var(--shadow-card);
+}
+
+.update-banner-btn:hover { filter: brightness(1.05); }
+.update-banner-btn:disabled { opacity: 0.6; cursor: progress; }
+
+.update-banner-dismiss {
+    color: var(--text-2);
+    font-size: 18px;
+    line-height: 1;
+    width: 22px;
+    height: 22px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 6px;
+}
+
+.update-banner-dismiss:hover { background: var(--hover); color: var(--text-1); }
+
 button {
     font-family: inherit;
     font-size: inherit;

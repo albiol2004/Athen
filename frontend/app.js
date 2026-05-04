@@ -3185,6 +3185,63 @@ document.querySelectorAll('.settings-tab').forEach((btn) => {
     }
 })();
 
+// ─── Auto-updater ───
+
+const UPDATE_DISMISS_KEY = 'athen.update.dismissedVersion';
+
+(function wireUpdater() {
+    const banner = document.getElementById('update-banner');
+    const text = banner && banner.querySelector('.update-banner-text');
+    const installBtn = document.getElementById('update-install-btn');
+    const dismissBtn = document.getElementById('update-dismiss-btn');
+    if (!banner || !text || !installBtn || !dismissBtn) return;
+
+    let pendingVersion = null;
+
+    async function checkForUpdate() {
+        try {
+            if (!window.__TAURI__ || !window.__TAURI__.core) return;
+            const info = await window.__TAURI__.core.invoke('check_for_update');
+            if (!info || !info.available || !info.version) return;
+            // Skip if user already dismissed this exact version this install.
+            let dismissed = null;
+            try { dismissed = localStorage.getItem(UPDATE_DISMISS_KEY); } catch (_) {}
+            if (dismissed === info.version) return;
+            pendingVersion = info.version;
+            text.textContent = `Athen ${info.version} is available (you have ${info.current_version}).`;
+            banner.hidden = false;
+        } catch (err) {
+            // Silent: no network / no signed manifest yet — don't bother the user.
+            console.debug('update check failed:', err);
+        }
+    }
+
+    installBtn.addEventListener('click', async () => {
+        installBtn.disabled = true;
+        installBtn.textContent = 'Installing…';
+        try {
+            await window.__TAURI__.core.invoke('install_update');
+            // install_update calls app.restart() — execution stops here.
+        } catch (err) {
+            installBtn.disabled = false;
+            installBtn.textContent = 'Install & restart';
+            showToast('Update failed: ' + (err && err.message ? err.message : err), 'error');
+        }
+    });
+
+    dismissBtn.addEventListener('click', () => {
+        if (pendingVersion) {
+            try { localStorage.setItem(UPDATE_DISMISS_KEY, pendingVersion); } catch (_) {}
+        }
+        banner.hidden = true;
+    });
+
+    // Defer the first check so it doesn't compete with app startup work.
+    setTimeout(checkForUpdate, 5000);
+    // Re-check every 6 hours for long-running sessions.
+    setInterval(checkForUpdate, 6 * 60 * 60 * 1000);
+})();
+
 // ─── Toast Notification ───
 
 function showToast(message, type) {

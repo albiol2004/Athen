@@ -32,6 +32,18 @@
             "icons/icon.ico",
             "icons/icon.png"
         ],
-        "externalBin": ["binaries/nu"]
+        "externalBin": ["binaries/nu"],
+        "createUpdaterArtifacts": true
+    },
+    "plugins": {
+        "updater": {
+            "endpoints": [
+                "https://github.com/albiol2004/Athen/releases/latest/download/latest.json"
+            ],
+            "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEY1OTBFN0VERERGMUM4OTgKUldTWXlQSGQ3ZWVROWFlY1ZsOXROcWlUQ3QrQzVLU2xvTVNnaXJRMko2aFVpOGNOMnFicUVvUmoK",
+            "windows": {
+                "installMode": "passive"
+            }
+        }
     }
 }

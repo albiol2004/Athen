@@ -31,6 +31,8 @@ pub fn run() {
     // Both reqwest (for LLM calls) and rustls-connector (for IMAP) need this.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
             commands::send_message,
             commands::get_status,
@@ -108,6 +110,8 @@ pub fn run() {
             commands::update_agent_profile,
             commands::delete_agent_profile,
             commands::restore_agent_profile,
+            commands::check_for_update,
+            commands::install_update,
         ])
         .setup(|app| {
             use tauri::Manager;
