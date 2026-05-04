@@ -583,10 +583,7 @@ pub fn pick_profile_blended(
         // the pure-keyword path. The internal blended value is what the
         // sort used; the integer is only for the user-facing log.
         score: winner.blended.round() as i32,
-        reason: format!(
-            "{reason} (kw={}, sem={:.2})",
-            winner.kw, winner.semantic
-        ),
+        reason: format!("{reason} (kw={}, sem={:.2})", winner.kw, winner.semantic),
         candidates: all,
     })
 }
@@ -739,7 +736,10 @@ fn build_llm_classifier_request(description: &str, profiles: &[&AgentProfile]) -
 /// Returns the chosen profile id plus an optional reasoning string;
 /// `reasoning` is `Some` only when `debug` is enabled and the LLM
 /// actually returned the field.
-fn parse_llm_classifier_response(content: &str, debug: bool) -> Option<(ProfileId, Option<String>)> {
+fn parse_llm_classifier_response(
+    content: &str,
+    debug: bool,
+) -> Option<(ProfileId, Option<String>)> {
     let trimmed = content.trim();
     let json_str = trimmed
         .strip_prefix("```json")
