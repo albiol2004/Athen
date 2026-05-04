@@ -1,362 +1,301 @@
 # Athen
 
-> **AI agents for everyday people, on every platform.**
+> **An open, native AI agent that runs on your laptop, not someone's server.**
 
 [![CI](https://github.com/albiol2004/Athen/actions/workflows/ci.yml/badge.svg)](https://github.com/albiol2004/Athen/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Built with Rust](https://img.shields.io/badge/built_with-Rust-orange.svg)](https://www.rust-lang.org)
 [![Tauri 2](https://img.shields.io/badge/Tauri-2-24C8DB.svg)](https://tauri.app)
 
-Athen is a native desktop AI agent that watches your inbox, calendar, and
-messages, decides what needs doing, and does it — autonomously, with a risk
-system that knows when to act silently and when to ask first.
+Athen watches your inbox, calendar, and messages, decides what needs doing,
+and does it — autonomously, with a risk system that knows when to act
+silently and when to ask first.
 
-It's built for people who don't want to learn what an LLM is. **Single
-binary, zero runtime dependencies, runs on Linux, macOS, and Windows.** Bring
-your own API key, or run it fully offline against a local model.
+It's designed to be **easy for everyday people, powerful for power users**:
+a single native binary you double-click, with a tray icon and a clean
+window — but underneath, a hexagonal Rust core, a real risk model, MCP
+support, and a tool surface you can extend.
 
-> ⚠️ **Status: alpha.** The core agent loop, tool surface, and infrastructure
-> are working and well-tested. The desktop UI is intentionally rough — it's
-> the next thing we're polishing before a public launch. If you're here from
-> a launch post, you're early.
-
----
-
-## Table of contents
-
-- [Why Athen?](#why-athen)
-- [What works today](#what-works-today)
-- [Architecture](#architecture)
-- [Tech stack](#tech-stack)
-- [Getting started](#getting-started)
-- [LLM providers](#llm-providers)
-- [Tools the agent has](#tools-the-agent-has)
-- [Privacy & safety](#privacy--safety)
-- [Roadmap](#roadmap)
-- [Contributing](#contributing)
-- [License](#license)
+> ⚠️ **Status: alpha (v0.1.0) — very early.** This is the first public
+> release. Core agent loop, tools, risk system, and infrastructure are
+> working and well-tested, but the surface is intentionally small. The UI
+> is functional and being polished. Pre-built binaries are **unsigned**
+> for v0.1.0 — see [Install](#install) for the one-line workaround on
+> each OS.
+>
+> 🙏 **Feedback shapes the roadmap.** Athen ships with a small,
+> deliberately focused feature set. **What gets built next is driven by
+> the people using it.** Open an issue, leave a comment on a discussion,
+> or just tell me what's missing — every signal counts at this stage.
 
 ---
 
-## Why Athen?
+## Why Athen exists
 
-Today's AI assistants fall into two camps:
+Today's AI assistants come in two flavours, and neither fits an everyday
+person who just wants help with their life:
 
-- **Developer-first agents** like Claude Code, Cursor, Aider — incredible for
-  code, but they assume you live in a terminal and know what an LLM is.
-- **Cloud-native SaaS agents** — convenient, but you pay per seat, the agent
-  runs on someone else's machine, and your inbox/calendar/contacts get mailed
-  off to a third party to be processed.
+- **Developer-first agents** (Claude Code, Cursor, Aider) — incredible, but
+  they live in a terminal and assume you know what an LLM is.
+- **Cloud SaaS agents** — convenient until you realize your inbox,
+  calendar, and contacts are being mailed to a third party for
+  processing, you're paying per seat, and the agent stops working the
+  day the company pivots.
 
-There's nothing in the middle for the **everyday person** who just wants
-something that handles their email, schedules their calendar, reminds them
-about birthdays, drafts replies in their voice, and books their flights —
-running on **their own laptop**, with **their own keys** (or no keys at
-all), respecting **their data**.
+Athen sits in the middle: a **native desktop app** that runs on
+**your machine**, with **your keys** (or no keys at all), agnostic about
+which LLM you point it at, MIT-licensed, no telemetry, no lock-in.
+It's also **designed to run continuously** — it sits in the tray and keeps
+sensing, even when the window is closed. Same binary will eventually run
+headless on a server.
 
-Athen is that. A single native app, written in Rust for speed and a tiny
-footprint. Native UI via Tauri 2 — not a Chromium fork shipping with every
-release. Tools, sandboxing, risk evaluation, and persistence all live on
-your machine. The only thing that leaves is what you explicitly route to a
-remote LLM provider, and you can avoid even that by running locally.
+### Why Rust + Tauri (and not Electron)
 
----
-
-## What works today
-
-| Capability | Status | Notes |
-|---|---|---|
-| **Core agent loop** | ✅ Working | LLM-driven tool calling, streaming, cancellation, completion judge |
-| **Shell + filesystem tools** | ✅ Working | `shell_execute`/`shell_spawn`/`shell_kill`/`shell_logs`, `read`/`edit`/`write`/`grep`, `list_directory` — sandboxed when bubblewrap is available |
-| **In-session memory** | ✅ Working | `memory_store` / `memory_recall` — survives across the conversation |
-| **Persistent semantic memory** | ✅ Working | Vector index + knowledge graph in SQLite, Ollama / OpenAI / TF-IDF embeddings |
-| **Web search & fetch** | ✅ Working | DuckDuckGo (no key) + Tavily (optional). `web_fetch` chains a static reader → Jina Reader (no-key JS rendering) → Wayback Machine for paywalls/dead pages |
-| **Calendar & contacts** | ✅ Working | Local SQLite, trust-level model that grows risk multipliers for unknown senders |
-| **MCP runtime** | ✅ Working | Spawn and route tools through Model Context Protocol servers (stdio JSON-RPC) |
-| **Senses** | 🟡 Working | Email (IMAP), Calendar, Telegram, generic User input — solid pipeline, more sources coming |
-| **Risk system** | ✅ Working | Regex rule engine + LLM fallback, per-action base impact + contact trust multipliers |
-| **Sandbox** | ✅ Working | OS-native (bwrap/Landlock on Linux, macOS sandbox-exec, Windows job objects), Podman/Docker tier for higher risk |
-| **LLM provider routing** | ✅ Working | Failover, circuit breakers, budget tracker, supports Anthropic / DeepSeek / OpenAI-compatible / Ollama / llama.cpp |
-| **Desktop UI** | 🟠 Functional but ugly | Tauri 2 app loads, agent runs, basic chat works — visual design is the next focus |
-| **Onboarding flow** | ❌ Not yet | First-launch wizard for picking a provider and pasting keys is the next big UX piece |
-| **Vision (screenshots/images)** | ❌ Not yet | On the roadmap |
-| **Voice (STT/TTS)** | ❌ Not yet | On the roadmap |
+Because we don't want to ship a 200 MB browser per app. Athen is **a
+single native binary, ~30 MB**, that idles in the tray with negligible
+CPU and a few dozen MB of RAM. WebKitGTK (Linux), WebView2 (Windows), or
+WKWebView (macOS) — whatever the OS already has — renders the UI. No
+Chromium fork, no Node runtime, no React-on-Windows quirks.
 
 ---
 
-## Architecture
+## What it does, today
 
-Athen is built around **hexagonal architecture (ports and adapters)**. The
-`athen-core` crate defines every trait; every other crate is a swappable
-adapter that implements one. No internal crate depends on its siblings —
-they all depend on `athen-core`. The `athen-app` crate is the composition
-root that wires concrete implementations together.
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                   SENTIDOS (Monitors)                       │
-│   Email IMAP, Calendar polls, Telegram, user input, ...     │
-│   Each runs as its own process, normalizes to SenseEvents   │
-└──────────────────────┬──────────────────────────────────────┘
-                       │ IPC (Unix sockets / Named pipes)
-                       ▼
-┌─────────────────────────────────────────────────────────────┐
-│                  SENSE ROUTER (Tauri app)                   │
-│   Triage → Arc creation → routes high-relevance events on   │
-└──────────────────────┬──────────────────────────────────────┘
-                       │
-                       ▼
-┌─────────────────────────────────────────────────────────────┐
-│                       COORDINADOR                           │
-│   Risk evaluation, priority queue, dispatch to workers      │
-└──────────────────────┬──────────────────────────────────────┘
-                       │ TaskAssignments
-        ┌──────────────┼──────────────┐
-        ▼              ▼              ▼
-   ┌────────┐    ┌────────┐    ┌────────┐
-   │ Agent  │    │ Agent  │    │ Agent  │
-   │ worker │    │ worker │    │ worker │
-   └───┬────┘    └───┬────┘    └───┬────┘
-       └─────────────┼─────────────┘
-                     ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    EXECUTION LAYER                          │
-│   Tools: shell + files + web + memory + MCP + ...           │
-│   Sandboxed by risk tier (OS-native or container)           │
-└─────────────────────────────────────────────────────────────┘
-```
-
-Each crate is independently testable: mock the trait, not the service.
-
-```
-crates/
-├── athen-core/         # Trait definitions, shared types — depends on nothing internal
-├── athen-ipc/          # Multi-process IPC transport
-├── athen-sentidos/     # Sense monitors (email, calendar, telegram, ...)
-├── athen-coordinador/  # Coordinator: router, risk eval, queue, dispatch
-├── athen-agent/        # Agent worker: LLM executor, tools, auditor, timeout
-├── athen-llm/          # LLM provider adapters + router + failover + embeddings
-├── athen-web/          # Web search + page reader providers
-├── athen-mcp/          # MCP runtime catalog + registry
-├── athen-memory/       # Vector index + knowledge graph + SQLite
-├── athen-risk/         # Risk scoring: regex rules + LLM fallback
-├── athen-persistence/  # SQLite persistence, checkpoints, arcs, calendar, contacts
-├── athen-contacts/     # Contact trust model + risk multipliers
-├── athen-sandbox/      # OS-native + container sandboxing
-├── athen-shell/        # Nushell embedding + native shell fallback
-├── athen-cli/          # CLI runner (REPL)
-├── athen-app/          # Tauri 2 desktop app — the composition root
-└── mcps/
-    └── mcp-filesystem/ # Standalone MCP filesystem server
-```
-
-For a deeper dive see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+| Capability | Status |
+|---|---|
+| **Core agent loop** — LLM tool calling, streaming, cancellation, completion judge | ✅ |
+| **Shell + filesystem tools** — `shell_execute/spawn/kill/logs`, `read/edit/write/grep`, sandboxed via bwrap/Landlock/sandbox-exec/Job Objects | ✅ |
+| **Persistent semantic memory** — vector index + knowledge graph in SQLite, multiple embedding backends | ✅ |
+| **Web search & fetch** — DuckDuckGo (no key), Tavily (optional), Jina Reader → Wayback fallback chain | ✅ |
+| **Calendar & contacts** — local SQLite, trust-level model that adjusts risk for unknown senders | ✅ |
+| **MCP runtime** — spawn and route any Model Context Protocol server (stdio JSON-RPC) | ✅ |
+| **Senses** — Email (IMAP), Calendar, Telegram, generic User input | ✅ |
+| **Risk system** — regex rules + LLM fallback, base-impact × trust-multiplier scoring | ✅ |
+| **Sandbox** — OS-native (bwrap/Landlock/sandbox-exec/Job Objects) + Podman/Docker tier | ✅ |
+| **LLM provider routing** — failover, circuit breakers, budget tracker | ✅ |
+| **Auto-update** — minisign-signed in-app updates from GitHub Releases | ✅ |
+| **Onboarding wizard** — first-launch provider/key setup | ❌ planned for v0.1.x |
+| **Vision (image input)** | ❌ planned |
+| **Voice (STT/TTS)** | ❌ planned |
+| **Headless server mode** — daemon binary for always-on hosts | ❌ planned for v0.2 |
 
 ---
 
-## Tech stack
+## Install
 
-| Layer | Choice | Why |
-|---|---|---|
-| Language | **Rust** | Speed, memory safety, single static binary |
-| UI shell | **Tauri 2** | Native window per OS, much smaller than Electron |
-| Frontend | HTML/CSS/JS | Plain — no framework lock-in for a UI that will keep changing |
-| Database | **SQLite** | Embedded, serverless, portable. No external db to install |
-| Shell embed | **Nushell** + native fallback | Cross-platform consistent shell on every OS |
-| Sandbox | bwrap / Landlock / sandbox-exec / Job Objects, Podman/Docker | Tiered isolation. Zero user setup for the OS-native tier |
-| HTTP | reqwest + rustls | No OpenSSL dependency, builds clean everywhere |
-| LLM | Anthropic / DeepSeek / OpenAI-compat / Ollama / llama.cpp | Bring-your-own or run local |
+> **v0.1.0 binaries are unsigned.** Each OS will warn you the first time.
+> Below is the one-line workaround per platform — sorry, code-signing
+> certificates are coming in v0.1.1.
 
----
+Grab the latest release from
+**[github.com/albiol2004/Athen/releases](https://github.com/albiol2004/Athen/releases/latest)**.
 
-## Getting started
+### Linux
+- Download `Athen_<version>_amd64.AppImage`.
+- `chmod +x Athen_*.AppImage && ./Athen_*.AppImage`
+- Or install the `.deb`: `sudo dpkg -i athen_*.deb`
 
-> Pre-built binaries land with the v0.1.0 tag. Until then, build from source.
+### macOS
+- Download the `.dmg` for your CPU (`aarch64` for Apple Silicon, `x86_64` for Intel).
+- After dragging into Applications, the first launch will say *"Athen is damaged and can't be opened"*. **It isn't.** Run once:
+  ```bash
+  xattr -d com.apple.quarantine /Applications/Athen.app
+  ```
+  then open normally.
 
-### System dependencies
+### Windows
+- Download `Athen_<version>_x64-setup.exe`.
+- SmartScreen will say *"Windows protected your PC"*. Click **More info → Run anyway**.
 
-**Linux (Fedora):**
-```bash
-sudo dnf install webkit2gtk4.1-devel gtk3-devel libsoup3-devel \
-                 libappindicator-gtk3-devel
-```
+After the first launch, Athen will check for updates every few hours and
+offer them in-app via a minisign-signed manifest. **You won't have to
+re-download to upgrade.**
 
-**Linux (Ubuntu/Debian):**
-```bash
-sudo apt-get install libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev \
-                     libappindicator3-dev librsvg2-dev cmake nasm
-```
-
-**macOS:** Xcode Command Line Tools (`xcode-select --install`) is enough.
-
-**Windows:** the [Microsoft Visual C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) and [WebView2](https://developer.microsoft.com/en-us/microsoft-edge/webview2/) (preinstalled on Windows 10+).
-
-### Build & run
+### Build from source
 
 ```bash
-# Clone
-git clone https://github.com/albiol2004/Athen.git
-cd Athen
-
-# Build the workspace
-cargo build --workspace --release
-
-# Run the desktop app
+git clone https://github.com/albiol2004/Athen.git && cd Athen
 cargo run -p athen-app --release
-
-# Or run the CLI (REPL)
-cargo run -p athen-cli --release
 ```
 
-### Configuration
-
-Athen reads its config from `~/.athen/`. The plan is for everything to be
-configurable via the desktop UI (target: zero config files for end users).
-Today, while the onboarding UI is being built, you'll need to drop a config
-or set environment variables — see [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md)
-for the layout.
-
-For the local-only path, install [Ollama](https://ollama.com/) or
-[llama.cpp](https://github.com/ggerganov/llama.cpp), point Athen at the
-local server, and you're running with no API keys at all.
+System dependencies for Linux: see [the workflow](.github/workflows/release.yml#L55).
 
 ---
 
-## LLM providers
+## Bring your own LLM (or run local)
 
-Mix and match — Athen routes by **profile** (Powerful / Fast / Code /
-Cheap) so you can put Claude on the heavy work and a local model on the
-cheap work.
+Athen routes by **profile** (Powerful / Fast / Code / Cheap) so you can put
+a frontier model on hard work and a tiny local model on the easy stuff.
 
-| Provider | Type | Notes |
+| Provider | Mode | Notes |
 |---|---|---|
-| **Anthropic** | Cloud | Claude Opus / Sonnet / Haiku via `/v1/messages` |
-| **DeepSeek** | Cloud | OpenAI-compatible at `api.deepseek.com`. Cheap and capable |
-| **OpenAI-compatible** | Cloud or local | Generic adapter — works with OpenAI proper, Together, Groq, OpenRouter, etc. |
-| **Ollama** | Local | Wraps the OpenAI-compatible adapter against `localhost:11434` |
-| **llama.cpp** | Local | Wraps the OpenAI-compatible adapter against `localhost:8080`. Works great with Qwen, Llama, Mistral GGUFs |
+| **Anthropic** | Cloud | Claude Opus / Sonnet / Haiku |
+| **DeepSeek** | Cloud | Cheap and capable, OpenAI-compatible |
+| **OpenAI-compatible** | Cloud or local | Works with OpenAI, Together, Groq, OpenRouter, ... |
+| **Ollama** | **Local** | Talks to `localhost:11434` |
+| **llama.cpp** | **Local** | Talks to `localhost:8080`. Pair with a Qwen/Llama/Mistral GGUF |
 
-All providers support streaming. The router has per-provider circuit
-breakers and a failover chain — if your primary times out, it transparently
-falls through to the next one in the priority list.
+The local-only path means **zero data leaves your machine.** No API key,
+no third party, no telemetry.
 
 ---
 
 ## Tools the agent has
 
-The agent has 13 built-in tools, plus everything exposed through the MCP
-registry. See [`docs/TOOLS_AND_SENSES.md`](docs/TOOLS_AND_SENSES.md) for
-the full reference.
+13 built-in tools, plus anything you expose through MCP.
 
-**Shell & files:** `shell_execute`, `shell_spawn` / `shell_kill` /
-`shell_logs` (long-running processes), `read`, `edit` (exact-string
-replace, requires prior read), `write`, `grep` (ripgrep), `list_directory`.
+- **Shell & files:** `shell_execute`, `shell_spawn/kill/logs`, `read`, `edit`, `write`, `grep`, `list_directory`
+- **Memory:** `memory_store`, `memory_recall` (semantic, persistent)
+- **Web:** `web_search`, `web_fetch` (static → Jina → Wayback fallback)
+- **Calendar:** `calendar_list/create/update/delete`
+- **Contacts:** `contacts_list/search/create/update/delete`
+- **MCP:** any tool from any spawned MCP server, namespaced `<mcp_id>__<tool>`
 
-**Memory:** `memory_store` / `memory_recall` (in-session HashMap;
-overridden to persistent semantic memory when wired through
-`AppToolRegistry`).
+Full reference in [`docs/TOOLS_AND_SENSES.md`](docs/TOOLS_AND_SENSES.md).
 
-**Web:** `web_search` (DuckDuckGo by default, Tavily on opt-in), `web_fetch`
-(static → Jina Reader → Wayback Machine fallback chain — handles SPAs and
-paywalled pages without bundling a headless browser).
+---
 
-**Calendar:** `calendar_list` / `calendar_create` / `calendar_update` /
-`calendar_delete` — local SQLite, ISO-8601 with the user's local timezone.
+## Extensibility (for power users)
 
-**Contacts:** `contacts_list` / `contacts_search` / `contacts_create` /
-`contacts_update` / `contacts_delete` — trust levels learned implicitly
-from approval/rejection patterns.
+Athen is built so you don't have to fork it to make it do new things.
 
-**MCP servers:** any tool exposed by an enabled MCP server, namespaced
-`<mcp_id>__<tool_name>`. The bundled `mcp-filesystem` server is one example.
+- **Custom MCP servers** — point Athen at any binary speaking the
+  [Model Context Protocol](https://modelcontextprotocol.io) over stdio.
+  Bundled example: [`mcp-filesystem`](crates/mcps/mcp-filesystem). Tools
+  appear automatically; the same risk system gates them.
+- **Custom LLM providers** — `athen-llm` exposes the `LlmProvider` trait.
+  Implement once, register in the router, swap by profile. Local
+  llama.cpp wrapper is ~150 lines.
+- **Custom senses** — implement `SenseMonitor` in `athen-sentidos`. The
+  monitor runs in its own process and feeds normalized `SenseEvent`s back
+  over IPC. Good for hooking up an RSS feed, a webhook, a webcam, etc.
+- **Headless mode** — `cargo run -p athen-cli --release` gives you a REPL
+  against the same agent core. A proper `athend` daemon for servers is
+  on the v0.2 roadmap.
 
 ---
 
 ## Privacy & safety
 
-Athen is built around the assumption that **your data is yours**. A few
-concrete things that fall out of that:
-
-- **No telemetry.** Period. There's no analytics SDK, no crash reporter
-  that phones home, nothing. Your usage is between you and the LLM
-  provider you chose.
+- **No telemetry.** Period. No analytics SDK, no crash reporter, no
+  beacon — anywhere.
 - **All data stays local.** Calendar, contacts, memory, conversation
-  history — all in SQLite under `~/.athen/`. Nothing syncs to a cloud
-  unless you explicitly enable a sync feature (none are planned for v0.1).
+  history all live in SQLite under `~/.athen/`. Sync is opt-in and not
+  shipped yet.
 - **Risk system before action.** Every tool call carries a base impact
-  (Read / WritePersist) which is multiplied by contact trust level. High-risk
-  actions either prompt you or require explicit pre-grant. See
-  [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the threat model.
-- **Sandboxed shell.** `shell_execute` runs through `RuleEngine` (regex
-  rules + LLM fallback) which blocks Danger/Critical commands before
-  dispatch, then executes inside a `RestrictedWrite` sandbox: writable in
-  `/tmp`, your home dir, the agent workspace, and any per-arc grants;
-  read-only everywhere else. Falls back to unsandboxed only if no
-  sandboxing tier is available.
-- **Bring your own keys (or no keys).** The local-only path with Ollama or
-  llama.cpp doesn't ever talk to a third party. Cloud LLM keys, when used,
-  live in your config — they aren't bundled with the app or shared.
+  (Read / WritePersist) multiplied by contact trust. High-risk actions
+  prompt you or require pre-grant.
+- **Sandboxed shell.** `shell_execute` is gated by a regex+LLM rule
+  engine, then runs in a writable-only-where-allowed sandbox.
+- **Bring your own keys, or none at all.** The local Ollama/llama.cpp
+  path is a plain HTTP call to `localhost`; nothing leaves the box.
+
+Full threat model: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+---
+
+## Architecture in 30 seconds
+
+```
+SENTIDOS (sense monitors) ──IPC──► SENSE ROUTER ──► COORDINADOR
+                                                         │
+                                              risk eval, queue, dispatch
+                                                         │
+                                                  Agent workers
+                                                         │
+                                  ┌──────────────────────┴────────────┐
+                                  ▼                                   ▼
+                              Tool execution                      LLM router
+                       (shell, files, web, MCP, ...)        (failover + budget)
+```
+
+- **Hexagonal:** `athen-core` defines all traits. Every other crate is a
+  swappable adapter. No crate depends on a sibling.
+- **Multi-process:** sense monitors run as their own processes, talk over
+  Unix sockets / Named pipes. One bad monitor can't take the agent down.
+- **Independently testable:** mock the trait, not the service.
+
+```
+crates/
+  athen-core/         # Traits + types — the contracts
+  athen-ipc/          # IPC transport
+  athen-sentidos/     # Sense monitors
+  athen-coordinador/  # Router, risk, queue, dispatch
+  athen-agent/        # Agent worker (LLM executor + tools + auditor)
+  athen-llm/          # LLM provider adapters + router
+  athen-web/          # Web search / page reader providers
+  athen-mcp/          # MCP runtime catalog
+  athen-memory/       # Vector index + knowledge graph
+  athen-risk/         # Risk scoring
+  athen-persistence/  # SQLite, checkpoints, arcs, calendar, contacts
+  athen-contacts/     # Trust model
+  athen-sandbox/      # OS-native + container sandboxing
+  athen-shell/        # Nushell + native shell
+  athen-cli/          # CLI / REPL
+  athen-app/          # Tauri 2 desktop app — the composition root
+  mcps/mcp-filesystem # Standalone MCP filesystem server
+```
+
+For a deeper read see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ---
 
 ## Roadmap
 
-**Pre-launch (in flight):**
-- Onboarding flow + settings UI for provider keys
-- Visual polish on the desktop UI
-- Cross-platform CI matrix (Linux / macOS / Windows)
-- v0.1.0 tagged release with pre-built binaries
+**v0.1.x (post-launch polish):**
+- First-launch onboarding wizard
+- Code signing (macOS notarization, Windows Trusted Signing)
+- Vision (image input + screenshot tool)
 
-**Near-term after launch:**
-- Vision (screenshot tool, image-input LLM routing)
-- Voice (STT/TTS) for hands-free interaction
-- Multi-step planning tool for complex tasks
-- More senses: WhatsApp, Slack, Discord, RSS
+**v0.2:**
+- `athend` headless server mode (systemd unit, Docker image)
+- Voice (STT/TTS)
+- More senses (Slack, Discord, RSS, generic webhook)
 
 **Bigger picture:**
-- Mobile companion (React Native or native — undecided)
 - Plugin marketplace beyond MCP
-- Federated multi-device sync (CRDT-based, end-to-end encrypted)
+- Federated multi-device sync (CRDT, end-to-end encrypted)
+- Mobile companion
 
 ---
 
-## Contributing
+## Contributing & feedback
 
-Issues, PRs, and discussions are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md)
-for the dev loop and house style. Short version: clippy must be clean
-(`-D warnings`), tests must pass, and `athen-core` does not depend on its
-siblings. Each crate stays independently testable.
+This is a **very early release** with a deliberately narrow feature set.
+The single most useful thing you can do right now is **tell me what's
+missing or what's broken** — open an
+[issue](https://github.com/albiol2004/Athen/issues) or start a
+[discussion](https://github.com/albiol2004/Athen/discussions). Roadmap
+priorities are reweighted every cycle based on what real users ask for.
 
-For a deeper architectural orientation read these in order:
+PRs welcome too. House rules:
+- `cargo clippy --workspace -- -D warnings` must be clean
+- `cargo test --workspace` must pass
+- `athen-core` does not depend on its siblings
+- Each crate stays independently testable
 
-1. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — types, traits, risk model
-2. [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) — what every crate does
-3. [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) — config and LLM providers
-4. [`docs/TOOLS_AND_SENSES.md`](docs/TOOLS_AND_SENSES.md) — the tool surface
+Read the architecture before sending non-trivial PRs:
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) →
+[`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) →
+[`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) →
+[`docs/TOOLS_AND_SENSES.md`](docs/TOOLS_AND_SENSES.md).
 
----
-
-## Security
-
-Found a security issue? Please **don't** open a public issue. See
-[`SECURITY.md`](SECURITY.md) for the disclosure process.
+Security issues: see [`SECURITY.md`](SECURITY.md). Please don't open public issues for vulnerabilities.
 
 ---
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE). Use it however you like.
+[MIT](LICENSE). Use it however you like.
 
 ---
 
 ## Acknowledgements
 
-Athen stands on a lot of giants' shoulders:
-
-- [**Tauri**](https://tauri.app) for making native desktop apps in Rust actually pleasant
-- The [**Rust async ecosystem**](https://tokio.rs) — `tokio`, `reqwest`, `serde`, `tracing`
+- [**Tauri**](https://tauri.app) — native desktop in Rust without the Electron tax
+- [**Tokio / Reqwest / Serde / Tracing**](https://tokio.rs) — the Rust async backbone
 - [**SQLite**](https://sqlite.org) — the unsung hero of every desktop app
-- The [**Model Context Protocol**](https://modelcontextprotocol.io) team for a clean tool-server standard
-- [**Claude Code**](https://claude.com/claude-code) for showing what a great agent harness feels like
+- [**Model Context Protocol**](https://modelcontextprotocol.io) — the right standard at the right time
+- [**Claude Code**](https://claude.com/claude-code) — proof that great agent harnesses are possible
 
 Built by [Alejandro Garcia](https://alejandrogarcia.blog).
