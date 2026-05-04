@@ -20,14 +20,14 @@
     --text-3:        #6E6878;
     --text-inverse:  #0E0B12;
 
-    /* brand gradient — Athen coral → peach → amber */
-    --brand-grad:    linear-gradient(135deg, #FF6B7A 0%, #FF8A5C 50%, #FFB570 100%);
-    --brand-grad-soft: linear-gradient(135deg, rgba(255,107,122,0.18) 0%, rgba(255,138,92,0.18) 50%, rgba(255,181,112,0.18) 100%);
-    --brand-solid:   #FF7A6B;
-    --brand-warm:    #FF8A5C;
-    --brand-amber:   #FFB570;
-    --brand-glow:    rgba(255, 122, 107, 0.18);
-    --brand-glow-strong: rgba(255, 122, 107, 0.35);
+    /* brand — single deep coral, vertical lift, no rainbow */
+    --brand-grad:    linear-gradient(180deg, #C25868 0%, #A24556 100%);
+    --brand-grad-soft: linear-gradient(180deg, rgba(194,88,104,0.14) 0%, rgba(162,69,86,0.14) 100%);
+    --brand-solid:   #B95163;
+    --brand-warm:    #C25868;
+    --brand-amber:   #D78471;
+    --brand-glow:    rgba(185, 81, 99, 0.14);
+    --brand-glow-strong: rgba(185, 81, 99, 0.28);
 
     /* semantic */
     --success:       #7BC97A;
@@ -89,6 +89,83 @@ html, body {
     text-rendering: optimizeLegibility;
 }
 
+body {
+    display: flex;
+    flex-direction: column;
+}
+
+/* ─── Custom titlebar (macOS-style) ─── */
+:root {
+    --titlebar-h: 30px;
+}
+
+#titlebar {
+    height: var(--titlebar-h);
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    padding: 0 12px;
+    background: var(--surface-1);
+    border-bottom: 1px solid var(--border);
+    user-select: none;
+    -webkit-user-select: none;
+    position: relative;
+    z-index: 100;
+}
+
+.titlebar-traffic {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    padding-right: 14px;
+    -webkit-app-region: no-drag;
+}
+
+.traffic-btn {
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: transparent;
+    border: 0.5px solid rgba(0, 0, 0, 0.25);
+    transition: filter var(--dur-fast) var(--ease);
+    flex-shrink: 0;
+}
+
+.traffic-btn svg { width: 8px; height: 8px; opacity: 0; transition: opacity var(--dur-fast) var(--ease); }
+.traffic-btn:hover svg { opacity: 1; }
+
+.traffic-close { background: #FF5F57; color: #4D0000; }
+.traffic-min   { background: #FEBC2E; color: #5A3E00; }
+.traffic-max   { background: #28C840; color: #003D0E; }
+
+.traffic-btn:hover { filter: brightness(1.05); }
+.traffic-btn:active { filter: brightness(0.92); }
+
+body.window-blurred .traffic-btn {
+    background: #4A4754;
+    border-color: rgba(0, 0, 0, 0.2);
+}
+
+.titlebar-title {
+    flex: 1;
+    text-align: center;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-2);
+    letter-spacing: -0.005em;
+    pointer-events: none;
+}
+
+/* Reserve symmetric space on the right so the title sits visually centered. */
+.titlebar-spacer {
+    width: 76px;
+    flex-shrink: 0;
+}
+
 button {
     font-family: inherit;
     font-size: inherit;
@@ -133,7 +210,8 @@ a:hover { color: var(--brand-warm); }
 /* ─── Layout shell ─── */
 #app-layout {
     display: flex;
-    height: 100vh;
+    flex: 1;
+    min-height: 0;
     width: 100vw;
     background: var(--bg);
     position: relative;
@@ -156,9 +234,7 @@ header {
     align-items: center;
     justify-content: space-between;
     padding: 0 18px;
-    background: rgba(14, 11, 18, 0.72);
-    -webkit-backdrop-filter: blur(20px) saturate(140%);
-    backdrop-filter: blur(20px) saturate(140%);
+    background: var(--bg);
     border-bottom: 1px solid var(--border);
     position: sticky;
     top: 0;
@@ -273,10 +349,8 @@ header h1 {
 /* ─── Sidebar ─── */
 .sidebar {
     width: var(--sidebar-w);
-    height: 100vh;
-    background: rgba(22, 19, 28, 0.72);
-    -webkit-backdrop-filter: blur(24px) saturate(140%);
-    backdrop-filter: blur(24px) saturate(140%);
+    height: 100%;
+    background: var(--surface-1);
     border-right: 1px solid var(--border);
     display: flex;
     flex-direction: column;
@@ -495,9 +569,7 @@ header h1 {
 .sidebar-overlay {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.5);
-    -webkit-backdrop-filter: blur(4px);
-    backdrop-filter: blur(4px);
+    background: rgba(0, 0, 0, 0.6);
     z-index: 19;
     opacity: 0;
     pointer-events: none;
@@ -1626,9 +1698,7 @@ footer {
     align-items: center;
     justify-content: space-between;
     padding: 0 18px;
-    background: rgba(14, 11, 18, 0.72);
-    -webkit-backdrop-filter: blur(20px) saturate(140%);
-    backdrop-filter: blur(20px) saturate(140%);
+    background: var(--bg);
     border-bottom: 1px solid var(--border);
     flex-shrink: 0;
     gap: 12px;
@@ -1691,8 +1761,6 @@ footer {
     position: sticky;
     top: 0;
     z-index: 5;
-    -webkit-backdrop-filter: blur(12px);
-    backdrop-filter: blur(12px);
 }
 
 .settings-tab {
@@ -2193,9 +2261,7 @@ option:hover {
 .grant-modal-overlay {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.6);
-    -webkit-backdrop-filter: blur(8px);
-    backdrop-filter: blur(8px);
+    background: rgba(0, 0, 0, 0.7);
     display: grid;
     place-items: center;
     z-index: 200;
@@ -2682,9 +2748,7 @@ option:hover {
 .cal-modal-overlay {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.6);
-    -webkit-backdrop-filter: blur(8px);
-    backdrop-filter: blur(8px);
+    background: rgba(0, 0, 0, 0.7);
     display: grid;
     place-items: center;
     z-index: 200;
@@ -3691,9 +3755,7 @@ option:hover {
 .onboarding-overlay {
     position: fixed;
     inset: 0;
-    background: rgba(14, 11, 18, 0.92);
-    -webkit-backdrop-filter: blur(20px);
-    backdrop-filter: blur(20px);
+    background: var(--bg-deep);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -3956,9 +4018,7 @@ option:hover {
 .profile-modal-overlay {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.6);
-    -webkit-backdrop-filter: blur(8px);
-    backdrop-filter: blur(8px);
+    background: rgba(0, 0, 0, 0.7);
     display: grid;
     place-items: center;
     z-index: 220;

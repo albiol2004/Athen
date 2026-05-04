@@ -793,7 +793,11 @@ function startRenameArc(itemEl, arcId, currentName) {
 }
 
 async function handleSwitchArc(arcId) {
-    if (!invoke || arcId === activeArcId) return;
+    if (!invoke) return;
+    // If we're on Settings/Calendar/etc., bring chat back regardless of
+    // whether the arc is actually changing.
+    returnToChatIfOnSubView();
+    if (arcId === activeArcId) return;
 
     try {
         const entries = await invoke('switch_arc', { arcId });
@@ -1973,6 +1977,7 @@ async function newArc() {
         const newId = await invoke('new_arc');
         activeArcId = newId;
         arcHasMessages = false;
+        returnToChatIfOnSubView();
         clearChatUI();
         closeSidebar();
         await loadArcs();
@@ -2127,6 +2132,22 @@ function showChat() {
     if (timelineRefreshInterval) { clearInterval(timelineRefreshInterval); timelineRefreshInterval = null; }
     appView.style.display = 'flex';
     inputEl.focus();
+}
+
+// Returns true if any non-chat top-level view is currently visible.
+function isOnSubView() {
+    const ids = ['settings-view', 'timeline-view', 'calendar-view',
+                 'contacts-view', 'notifications-view', 'memory-view'];
+    return ids.some((id) => {
+        const el = document.getElementById(id);
+        return el && !el.classList.contains('hidden');
+    });
+}
+
+// If the user is on Settings/Contacts/etc., return them to chat. No-op otherwise.
+// Used by arc switching and new-arc so navigation feels seamless.
+function returnToChatIfOnSubView() {
+    if (isOnSubView()) showChat();
 }
 
 async function loadSettings() {
@@ -3095,6 +3116,39 @@ if (settingsBtn) {
 if (settingsBack) {
     settingsBack.addEventListener('click', showChat);
 }
+
+// ─── Custom titlebar window controls ───
+window.addEventListener('blur',  () => document.body.classList.add('window-blurred'));
+window.addEventListener('focus', () => document.body.classList.remove('window-blurred'));
+
+(function wireTitlebar() {
+    function currentWindow() {
+        const w = window.__TAURI__ && window.__TAURI__.window;
+        if (!w) return null;
+        if (typeof w.getCurrentWindow === 'function') return w.getCurrentWindow();
+        if (typeof w.getCurrent === 'function') return w.getCurrent();
+        return null;
+    }
+    const closeBtn = document.getElementById('win-close');
+    const minBtn   = document.getElementById('win-minimize');
+    const maxBtn   = document.getElementById('win-maximize');
+    if (closeBtn) closeBtn.addEventListener('click', async () => {
+        // Close-to-tray is handled in Rust (CloseRequested intercepted).
+        const w = currentWindow();
+        if (w) await w.close();
+    });
+    if (minBtn) minBtn.addEventListener('click', async () => {
+        const w = currentWindow();
+        if (w) await w.minimize();
+    });
+    if (maxBtn) maxBtn.addEventListener('click', async () => {
+        const w = currentWindow();
+        if (!w) return;
+        if (typeof w.toggleMaximize === 'function') await w.toggleMaximize();
+        else if (await w.isMaximized()) await w.unmaximize();
+        else await w.maximize();
+    });
+})();
 
 // ─── Settings tabs ───
 const SETTINGS_TAB_STORAGE_KEY = 'athen.settings.activeTab';
