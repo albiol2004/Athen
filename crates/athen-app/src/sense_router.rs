@@ -594,15 +594,44 @@ async fn route_new_arc_to_profile(
         &profile_embeddings,
     ) else {
         info!(
-            "Profile router: no positive match for arc {arc_id} (source={source}); \
-             leaving on default"
+            arc = arc_id,
+            source = source,
+            domain = ?classified.domain,
+            kind = ?classified.kind,
+            "Profile router: no positive match; leaving arc on default"
         );
         return;
     };
 
+    // Compact one-line breakdown of every candidate, e.g.
+    //   "outreach: kw=5 sem=0.78 blended=8.12 KEPT, coder: kw=0 sem=0.20 blended=0.80 drop"
+    // Lets you eyeball at a glance how close the runner-up was.
+    let candidates_breakdown = decision
+        .candidates
+        .iter()
+        .map(|c| {
+            format!(
+                "{}: kw={} sem={:.2} blended={:.2} {}",
+                c.profile_id,
+                c.kw,
+                c.semantic,
+                c.blended,
+                if c.kept { "KEPT" } else { "drop" }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
     info!(
-        "Profile router: arc {} → profile {} (score {}, {})",
-        arc_id, decision.profile_id, decision.score, decision.reason
+        arc = arc_id,
+        winner = decision.profile_id,
+        score = decision.score,
+        domain = ?classified.domain,
+        kind = ?classified.kind,
+        candidates = %candidates_breakdown,
+        "Profile router: arc → {} ({})",
+        decision.profile_id,
+        decision.reason
     );
 
     if let Err(e) = astore

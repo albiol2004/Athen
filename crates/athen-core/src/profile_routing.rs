@@ -303,13 +303,38 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
 
 /// The router's verdict, persisted on the arc so the user can see *why*
 /// a particular profile was chosen and override it if it's wrong.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `candidates` carries the full score breakdown for every non-default
+/// profile that was considered (including those filtered out below
+/// threshold). It exists for telemetry: developers tuning weights and
+/// thresholds need to see the second-place miss, not just the winner.
+#[derive(Debug, Clone, PartialEq)]
 pub struct RoutingDecision {
     pub profile_id: ProfileId,
     pub score: i32,
     /// Human-readable explanation, e.g. "matched on domain:Email,
     /// kind:Drafting". Shown verbatim in the UI sidebar.
     pub reason: String,
+    /// Per-candidate score breakdown, sorted by `blended` descending. Empty
+    /// when no profiles other than `default` exist.
+    pub candidates: Vec<CandidateScore>,
+}
+
+/// One profile's contribution to a routing decision. Captured for every
+/// non-default candidate, even when filtered out, so telemetry consumers
+/// can see why something *didn't* win.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CandidateScore {
+    pub profile_id: ProfileId,
+    /// Integer score from `score_profile` (the keyword pass).
+    pub kw: i32,
+    /// Cosine similarity in [0.0, 1.0]. 0.0 when no embedding was available
+    /// for either side.
+    pub semantic: f32,
+    /// `kw + semantic * SEMANTIC_WEIGHT`. The value the sort uses.
+    pub blended: f32,
+    /// Whether this candidate passed the keep filter (`kw > 0 || semantic > 0.55`).
+    pub kept: bool,
 }
 
 /// Score a single profile against a classified task. Higher = better fit.
@@ -362,37 +387,55 @@ pub fn pick_profile(
     classified: &ClassifiedTask,
     profiles: &[AgentProfile],
 ) -> Option<RoutingDecision> {
-    let mut scored: Vec<(i32, &AgentProfile)> = profiles
+    // Score every non-default profile and keep the breakdown for telemetry,
+    // even for filtered-out candidates.
+    let mut all: Vec<CandidateScore> = profiles
         .iter()
         .filter(|p| p.id != AgentProfile::DEFAULT_ID)
-        .map(|p| (score_profile(classified, p), p))
-        .filter(|(s, _)| *s > 0)
+        .map(|p| {
+            let kw = score_profile(classified, p);
+            CandidateScore {
+                profile_id: p.id.clone(),
+                kw,
+                semantic: 0.0,
+                blended: kw as f32,
+                kept: kw > 0,
+            }
+        })
         .collect();
 
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.id.cmp(&b.1.id)));
+    all.sort_by(|a, b| {
+        b.blended
+            .partial_cmp(&a.blended)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.profile_id.cmp(&b.profile_id))
+    });
 
-    scored.first().map(|(score, profile)| {
-        let mut reason_parts = Vec::new();
-        if let Some(d) = classified.domain {
-            if profile.expertise.domains.contains(&d) {
-                reason_parts.push(format!("domain:{d:?}"));
-            }
+    let winner = all.iter().find(|c| c.kept).cloned()?;
+    let profile = profiles.iter().find(|p| p.id == winner.profile_id)?;
+
+    let mut reason_parts = Vec::new();
+    if let Some(d) = classified.domain {
+        if profile.expertise.domains.contains(&d) {
+            reason_parts.push(format!("domain:{d:?}"));
         }
-        if let Some(k) = classified.kind {
-            if profile.expertise.task_kinds.contains(&k) {
-                reason_parts.push(format!("kind:{k:?}"));
-            }
+    }
+    if let Some(k) = classified.kind {
+        if profile.expertise.task_kinds.contains(&k) {
+            reason_parts.push(format!("kind:{k:?}"));
         }
-        let reason = if reason_parts.is_empty() {
-            "no specific match (catch-all)".to_string()
-        } else {
-            format!("matched on {}", reason_parts.join(", "))
-        };
-        RoutingDecision {
-            profile_id: profile.id.clone(),
-            score: *score,
-            reason,
-        }
+    }
+    let reason = if reason_parts.is_empty() {
+        "no specific match (catch-all)".to_string()
+    } else {
+        format!("matched on {}", reason_parts.join(", "))
+    };
+
+    Some(RoutingDecision {
+        profile_id: winner.profile_id.clone(),
+        score: winner.kw,
+        reason,
+        candidates: all,
     })
 }
 
@@ -473,11 +516,16 @@ pub fn pick_profile_blended(
     query_embedding: Option<&[f32]>,
     profile_embeddings: &HashMap<ProfileId, Vec<f32>>,
 ) -> Option<RoutingDecision> {
-    // First: keyword scoring. Profiles that score 0 on keywords AND have no
-    // semantic backing get filtered out. A profile with only semantic
-    // signal can still win — we don't require a positive keyword score
-    // when embeddings push it past the threshold.
-    let mut scored: Vec<(f32, &AgentProfile, i32, f32)> = profiles
+    // Score every non-default profile and capture the full breakdown,
+    // including filtered-out candidates. `kept` distinguishes contenders
+    // from also-rans for downstream telemetry.
+    //
+    // Threshold: keep profiles with a positive keyword score OR a
+    // non-trivial semantic hit. 0.55 cosine is the floor where a
+    // semantic-only match is genuinely related; below that, the
+    // multiplied score would still be positive but would route random
+    // tasks to random profiles.
+    let mut all: Vec<CandidateScore> = profiles
         .iter()
         .filter(|p| p.id != AgentProfile::DEFAULT_ID)
         .map(|p| {
@@ -487,50 +535,57 @@ pub fn pick_profile_blended(
                 _ => 0.0,
             };
             let blended = kw as f32 + sem * SEMANTIC_WEIGHT;
-            (blended, p, kw, sem)
+            CandidateScore {
+                profile_id: p.id.clone(),
+                kw,
+                semantic: sem,
+                blended,
+                kept: kw > 0 || sem > 0.55,
+            }
         })
-        // Threshold: keep profiles with a positive keyword score OR a
-        // non-trivial semantic hit. 0.55 cosine is the floor where a
-        // semantic-only match is genuinely related; below that, the
-        // multiplied score would still be positive but would route random
-        // tasks to random profiles.
-        .filter(|(_, _, kw, sem)| *kw > 0 || *sem > 0.55)
         .collect();
 
-    scored.sort_by(|a, b| {
-        b.0.partial_cmp(&a.0)
+    all.sort_by(|a, b| {
+        b.blended
+            .partial_cmp(&a.blended)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.1.id.cmp(&b.1.id))
+            .then_with(|| a.profile_id.cmp(&b.profile_id))
     });
 
-    scored.first().map(|(blended, profile, kw, sem)| {
-        let mut reason_parts = Vec::new();
-        if let Some(d) = classified.domain {
-            if profile.expertise.domains.contains(&d) {
-                reason_parts.push(format!("domain:{d:?}"));
-            }
+    let winner = all.iter().find(|c| c.kept).cloned()?;
+    let profile = profiles.iter().find(|p| p.id == winner.profile_id)?;
+
+    let mut reason_parts = Vec::new();
+    if let Some(d) = classified.domain {
+        if profile.expertise.domains.contains(&d) {
+            reason_parts.push(format!("domain:{d:?}"));
         }
-        if let Some(k) = classified.kind {
-            if profile.expertise.task_kinds.contains(&k) {
-                reason_parts.push(format!("kind:{k:?}"));
-            }
+    }
+    if let Some(k) = classified.kind {
+        if profile.expertise.task_kinds.contains(&k) {
+            reason_parts.push(format!("kind:{k:?}"));
         }
-        if *sem > 0.0 {
-            reason_parts.push(format!("semantic:{:.2}", *sem));
-        }
-        let reason = if reason_parts.is_empty() {
-            "no specific match (catch-all)".to_string()
-        } else {
-            format!("matched on {}", reason_parts.join(", "))
-        };
-        RoutingDecision {
-            profile_id: profile.id.clone(),
-            // Round the float score to an int for display continuity with
-            // the pure-keyword path. The internal blended value is what the
-            // sort used; the integer is only for the user-facing log.
-            score: blended.round() as i32,
-            reason: format!("{reason} (kw={kw}, sem={sem:.2})"),
-        }
+    }
+    if winner.semantic > 0.0 {
+        reason_parts.push(format!("semantic:{:.2}", winner.semantic));
+    }
+    let reason = if reason_parts.is_empty() {
+        "no specific match (catch-all)".to_string()
+    } else {
+        format!("matched on {}", reason_parts.join(", "))
+    };
+
+    Some(RoutingDecision {
+        profile_id: winner.profile_id.clone(),
+        // Round the float score to an int for display continuity with
+        // the pure-keyword path. The internal blended value is what the
+        // sort used; the integer is only for the user-facing log.
+        score: winner.blended.round() as i32,
+        reason: format!(
+            "{reason} (kw={}, sem={:.2})",
+            winner.kw, winner.semantic
+        ),
+        candidates: all,
     })
 }
 
