@@ -40,7 +40,7 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 tauri-build = { version = "2", features = [] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-glib = "0.18"
+glib = "0.20"
 
 [dev-dependencies]
 tempfile = "3"
