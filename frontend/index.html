@@ -137,6 +137,14 @@
         </header>
 
         <div class="settings-content">
+            <nav class="settings-tabs" role="tablist">
+                <button class="settings-tab active" data-settings-tab="models" role="tab" aria-selected="true">Models</button>
+                <button class="settings-tab" data-settings-tab="agents" role="tab" aria-selected="false">Agents &amp; Tools</button>
+                <button class="settings-tab" data-settings-tab="connections" role="tab" aria-selected="false">Connections</button>
+                <button class="settings-tab" data-settings-tab="security" role="tab" aria-selected="false">Security &amp; Access</button>
+            </nav>
+
+            <div class="settings-tab-pane active" data-settings-pane="models">
             <section class="settings-section">
                 <h2>LLM Providers</h2>
                 <p class="settings-description">Configure the AI models Athen uses. Changes take effect after restarting the app.</p>
@@ -149,11 +157,70 @@
             </section>
 
             <section class="settings-section">
-                <h2>Tools (MCP)</h2>
-                <p class="settings-description">Toggle which Model Context Protocol servers Athen can use. Enabled tools become available to the agent on the next turn — no restart needed.</p>
-                <div id="mcp-list"></div>
-            </section>
+                <h2>Memory &amp; Embeddings</h2>
+                <p class="settings-description">Configure how Athen processes and remembers information.</p>
 
+                <div class="setting-row">
+                    <label for="embedding-mode">Memory Quality</label>
+                    <select id="embedding-mode" class="settings-select">
+                        <option value="Automatic">Automatic (recommended)</option>
+                        <option value="Cloud">Cloud (highest quality)</option>
+                        <option value="LocalOnly">Local only (private)</option>
+                        <option value="Off">Off</option>
+                    </select>
+                    <p class="setting-hint" id="embedding-mode-hint">Auto-detects the best available provider for generating embeddings.</p>
+                </div>
+
+                <div class="setting-row">
+                    <label class="toggle-label advanced-toggle" id="embedding-advanced-toggle">
+                        <span class="advanced-arrow">&#9654;</span>
+                        <span>Advanced options</span>
+                    </label>
+                </div>
+
+                <div id="embedding-advanced" style="display: none;">
+                    <div class="setting-row">
+                        <label for="embedding-provider">Provider</label>
+                        <select id="embedding-provider" class="settings-select">
+                            <option value="">Auto-detect</option>
+                            <option value="ollama">Ollama (local)</option>
+                            <option value="openai">OpenAI</option>
+                            <option value="openai-compatible">OpenAI Compatible</option>
+                            <option value="keyword">Keyword fallback</option>
+                        </select>
+                    </div>
+
+                    <div class="setting-row">
+                        <label for="embedding-model">Model</label>
+                        <input type="text" id="embedding-model" class="settings-input" placeholder="e.g. nomic-embed-text, text-embedding-3-small">
+                    </div>
+
+                    <div class="setting-row">
+                        <label for="embedding-base-url">Base URL</label>
+                        <input type="text" id="embedding-base-url" class="settings-input" placeholder="e.g. http://localhost:11434">
+                    </div>
+
+                    <div class="setting-row">
+                        <label for="embedding-api-key">API Key</label>
+                        <div class="api-key-wrapper">
+                            <input type="password" id="embedding-api-key" class="settings-input" placeholder="Only needed for cloud providers" autocomplete="off">
+                            <button class="api-key-toggle" id="embedding-key-toggle" title="Show/hide key">&#128065;</button>
+                        </div>
+                    </div>
+
+                    <div class="setting-actions">
+                        <button id="test-embedding-btn" class="btn-secondary">Test Connection</button>
+                    </div>
+                    <div id="embedding-test-result" class="test-result hidden"></div>
+                </div>
+
+                <div class="setting-actions">
+                    <button id="save-embedding-btn" class="btn-primary">Save Embedding Settings</button>
+                </div>
+            </section>
+            </div>
+
+            <div class="settings-tab-pane" data-settings-pane="agents">
             <section class="settings-section">
                 <h2>Agent Profiles</h2>
                 <p class="settings-description">Specialists that handle different kinds of work. Built-ins ship with Athen and can be cloned to customize. Your own profiles can be edited or deleted freely.</p>
@@ -164,45 +231,13 @@
             </section>
 
             <section class="settings-section">
-                <h2>Permissions</h2>
-                <p class="settings-description">Directories Athen can access without asking. Global grants apply to every conversation; arc grants only apply to the current arc.</p>
-
-                <h3 class="permissions-subhead">Global grants</h3>
-                <div id="global-grants-list" class="grants-list">
-                    <p class="grants-empty">No global grants yet.</p>
-                </div>
-
-                <div class="add-grant-form">
-                    <input type="text" id="new-grant-path" class="settings-input" placeholder="/absolute/path/to/directory">
-                    <select id="new-grant-access" class="settings-select grants-access-select">
-                        <option value="read">Read</option>
-                        <option value="write">Write</option>
-                    </select>
-                    <button id="add-grant-btn" class="btn-primary">Add</button>
-                </div>
-
-                <h3 class="permissions-subhead">Arc grants <span class="permissions-subnote">(current conversation)</span></h3>
-                <div id="arc-grants-list" class="grants-list">
-                    <p class="grants-empty">No grants for this arc.</p>
-                </div>
+                <h2>Tools (MCP)</h2>
+                <p class="settings-description">Toggle which Model Context Protocol servers Athen can use. Enabled tools become available to the agent on the next turn — no restart needed.</p>
+                <div id="mcp-list"></div>
             </section>
+            </div>
 
-            <section class="settings-section">
-                <h2>Security</h2>
-                <div class="setting-row">
-                    <label for="security-mode">Security Mode</label>
-                    <select id="security-mode" class="settings-select">
-                        <option value="assistant">Assistant (recommended)</option>
-                        <option value="bunker">Bunker (extra cautious)</option>
-                        <option value="yolo">YOLO (minimal prompts)</option>
-                    </select>
-                    <p class="setting-hint" id="security-hint">Standard risk evaluation. The agent asks for approval on risky actions.</p>
-                </div>
-                <div class="setting-actions">
-                    <button id="save-security-btn" class="btn-primary">Save Security Settings</button>
-                </div>
-            </section>
-
+            <div class="settings-tab-pane" data-settings-pane="connections">
             <section class="settings-section">
                 <h2>Email Monitor</h2>
                 <p class="settings-description">Connect your email to let Athen monitor and act on incoming messages.</p>
@@ -358,69 +393,49 @@
                     <button id="save-notif-btn" class="btn-primary">Save Notification Settings</button>
                 </div>
             </section>
+            </div>
 
+            <div class="settings-tab-pane" data-settings-pane="security">
             <section class="settings-section">
-                <h2>Memory &amp; Embeddings</h2>
-                <p class="settings-description">Configure how Athen processes and remembers information.</p>
-
+                <h2>Security</h2>
                 <div class="setting-row">
-                    <label for="embedding-mode">Memory Quality</label>
-                    <select id="embedding-mode" class="settings-select">
-                        <option value="Automatic">Automatic (recommended)</option>
-                        <option value="Cloud">Cloud (highest quality)</option>
-                        <option value="LocalOnly">Local only (private)</option>
-                        <option value="Off">Off</option>
+                    <label for="security-mode">Security Mode</label>
+                    <select id="security-mode" class="settings-select">
+                        <option value="assistant">Assistant (recommended)</option>
+                        <option value="bunker">Bunker (extra cautious)</option>
+                        <option value="yolo">YOLO (minimal prompts)</option>
                     </select>
-                    <p class="setting-hint" id="embedding-mode-hint">Auto-detects the best available provider for generating embeddings.</p>
+                    <p class="setting-hint" id="security-hint">Standard risk evaluation. The agent asks for approval on risky actions.</p>
                 </div>
-
-                <div class="setting-row">
-                    <label class="toggle-label advanced-toggle" id="embedding-advanced-toggle">
-                        <span class="advanced-arrow">&#9654;</span>
-                        <span>Advanced options</span>
-                    </label>
-                </div>
-
-                <div id="embedding-advanced" style="display: none;">
-                    <div class="setting-row">
-                        <label for="embedding-provider">Provider</label>
-                        <select id="embedding-provider" class="settings-select">
-                            <option value="">Auto-detect</option>
-                            <option value="ollama">Ollama (local)</option>
-                            <option value="openai">OpenAI</option>
-                            <option value="openai-compatible">OpenAI Compatible</option>
-                            <option value="keyword">Keyword fallback</option>
-                        </select>
-                    </div>
-
-                    <div class="setting-row">
-                        <label for="embedding-model">Model</label>
-                        <input type="text" id="embedding-model" class="settings-input" placeholder="e.g. nomic-embed-text, text-embedding-3-small">
-                    </div>
-
-                    <div class="setting-row">
-                        <label for="embedding-base-url">Base URL</label>
-                        <input type="text" id="embedding-base-url" class="settings-input" placeholder="e.g. http://localhost:11434">
-                    </div>
-
-                    <div class="setting-row">
-                        <label for="embedding-api-key">API Key</label>
-                        <div class="api-key-wrapper">
-                            <input type="password" id="embedding-api-key" class="settings-input" placeholder="Only needed for cloud providers" autocomplete="off">
-                            <button class="api-key-toggle" id="embedding-key-toggle" title="Show/hide key">&#128065;</button>
-                        </div>
-                    </div>
-
-                    <div class="setting-actions">
-                        <button id="test-embedding-btn" class="btn-secondary">Test Connection</button>
-                    </div>
-                    <div id="embedding-test-result" class="test-result hidden"></div>
-                </div>
-
                 <div class="setting-actions">
-                    <button id="save-embedding-btn" class="btn-primary">Save Embedding Settings</button>
+                    <button id="save-security-btn" class="btn-primary">Save Security Settings</button>
                 </div>
             </section>
+
+            <section class="settings-section">
+                <h2>Permissions</h2>
+                <p class="settings-description">Directories Athen can access without asking. Global grants apply to every conversation; arc grants only apply to the current arc.</p>
+
+                <h3 class="permissions-subhead">Global grants</h3>
+                <div id="global-grants-list" class="grants-list">
+                    <p class="grants-empty">No global grants yet.</p>
+                </div>
+
+                <div class="add-grant-form">
+                    <input type="text" id="new-grant-path" class="settings-input" placeholder="/absolute/path/to/directory">
+                    <select id="new-grant-access" class="settings-select grants-access-select">
+                        <option value="read">Read</option>
+                        <option value="write">Write</option>
+                    </select>
+                    <button id="add-grant-btn" class="btn-primary">Add</button>
+                </div>
+
+                <h3 class="permissions-subhead">Arc grants <span class="permissions-subnote">(current conversation)</span></h3>
+                <div id="arc-grants-list" class="grants-list">
+                    <p class="grants-empty">No grants for this arc.</p>
+                </div>
+            </section>
+            </div>
         </div>
     </div>
 

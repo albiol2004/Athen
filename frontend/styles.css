@@ -1679,6 +1679,60 @@ footer {
     margin: 0 auto;
 }
 
+.settings-tabs {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 20px;
+    padding: 4px;
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
+    box-shadow: var(--shadow-card);
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    -webkit-backdrop-filter: blur(12px);
+    backdrop-filter: blur(12px);
+}
+
+.settings-tab {
+    flex: 1;
+    padding: 9px 14px;
+    background: transparent;
+    border: none;
+    border-radius: var(--r-sm);
+    color: var(--text-2);
+    font-size: 13px;
+    font-weight: 500;
+    letter-spacing: -0.005em;
+    cursor: pointer;
+    transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+
+.settings-tab:hover {
+    background: rgba(255, 255, 255, 0.04);
+    color: var(--text);
+}
+
+.settings-tab.active {
+    background: var(--accent);
+    color: #fff;
+}
+
+.settings-tab-pane {
+    display: none;
+    animation: settingsTabFade var(--dur) var(--ease);
+}
+
+.settings-tab-pane.active {
+    display: block;
+}
+
+@keyframes settingsTabFade {
+    from { opacity: 0; transform: translateY(2px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+
 .settings-section {
     margin-bottom: 24px;
     padding: 24px;

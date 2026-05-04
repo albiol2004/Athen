@@ -3096,6 +3096,41 @@ if (settingsBack) {
     settingsBack.addEventListener('click', showChat);
 }
 
+// ─── Settings tabs ───
+const SETTINGS_TAB_STORAGE_KEY = 'athen.settings.activeTab';
+
+function setSettingsTab(tabId) {
+    const tabs = document.querySelectorAll('.settings-tab');
+    const panes = document.querySelectorAll('.settings-tab-pane');
+    let matched = false;
+    tabs.forEach((btn) => {
+        const isActive = btn.dataset.settingsTab === tabId;
+        btn.classList.toggle('active', isActive);
+        btn.setAttribute('aria-selected', isActive ? 'true' : 'false');
+        if (isActive) matched = true;
+    });
+    panes.forEach((pane) => {
+        pane.classList.toggle('active', pane.dataset.settingsPane === tabId);
+    });
+    if (matched) {
+        try { localStorage.setItem(SETTINGS_TAB_STORAGE_KEY, tabId); } catch (_) {}
+        const content = document.querySelector('.settings-content');
+        if (content) content.scrollTop = 0;
+    }
+}
+
+document.querySelectorAll('.settings-tab').forEach((btn) => {
+    btn.addEventListener('click', () => setSettingsTab(btn.dataset.settingsTab));
+});
+
+(function restoreSettingsTab() {
+    let stored = null;
+    try { stored = localStorage.getItem(SETTINGS_TAB_STORAGE_KEY); } catch (_) {}
+    if (stored && document.querySelector(`.settings-tab[data-settings-tab="${stored}"]`)) {
+        setSettingsTab(stored);
+    }
+})();
+
 // ─── Toast Notification ───
 
 function showToast(message, type) {
