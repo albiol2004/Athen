@@ -39,14 +39,10 @@ jobs:
               target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
               target/aarch64-apple-darwin/release/bundle/macos/*.app.tar.gz
               target/aarch64-apple-darwin/release/bundle/macos/*.app.tar.gz.sig
-          - platform: macos-13  # Intel Mac runner — pin to a non-arm image
-            target: x86_64-apple-darwin
-            artifact_name: athen-macos-x86_64
-            updater_target: darwin-x86_64
-            artifact_globs: |
-              target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
-              target/x86_64-apple-darwin/release/bundle/macos/*.app.tar.gz
-              target/x86_64-apple-darwin/release/bundle/macos/*.app.tar.gz.sig
+          # Intel Mac (macos-13) is dropped from the v0.1.x matrix: GitHub's
+          # free-tier Intel runners are scarce (3+ hour queues observed). Re-add
+          # once code signing is in place and we can justify a self-hosted or
+          # paid macOS-13 runner.
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
             artifact_name: athen-windows-x86_64
@@ -168,9 +164,6 @@ jobs:
               ("artifacts/athen-macos-aarch64/**/*.app.tar.gz.sig",
                "artifacts/athen-macos-aarch64/**/*.app.tar.gz",
                "darwin-aarch64"),
-              ("artifacts/athen-macos-x86_64/**/*.app.tar.gz.sig",
-               "artifacts/athen-macos-x86_64/**/*.app.tar.gz",
-               "darwin-x86_64"),
               # Windows: prefer NSIS .exe over MSI when both signed bundles exist.
               ("artifacts/athen-windows-x86_64/**/*-setup.exe.sig",
                "artifacts/athen-windows-x86_64/**/*-setup.exe",

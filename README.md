@@ -95,8 +95,9 @@ Grab the latest release from
 - `chmod +x Athen_*.AppImage && ./Athen_*.AppImage`
 - Or install the `.deb`: `sudo dpkg -i athen_*.deb`
 
-### macOS
-- Download the `.dmg` for your CPU (`aarch64` for Apple Silicon, `x86_64` for Intel).
+### macOS (Apple Silicon)
+- Download `Athen_<version>_aarch64.dmg`.
+- v0.1.0 ships **Apple Silicon only**. Intel Mac builds will return in a later release once code signing is in place.
 - After dragging into Applications, the first launch will say *"Athen is damaged and can't be opened"*. **It isn't.** Run once:
   ```bash
   xattr -d com.apple.quarantine /Applications/Athen.app
