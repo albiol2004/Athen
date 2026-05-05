@@ -463,6 +463,9 @@ impl NotificationOrchestrator {
     /// language using a fast LLM call.  Falls back to the original text on
     /// failure or when no router is configured.
     async fn humanize(&self, mut notification: Notification) -> Notification {
+        if notification.skip_humanize {
+            return notification;
+        }
         let router = match &self.llm_router {
             Some(r) => r,
             None => return notification,
@@ -787,6 +790,7 @@ mod tests {
             task_id: None,
             created_at: Utc::now(),
             requires_response,
+            skip_humanize: false,
         }
     }
 
@@ -1120,6 +1124,7 @@ mod tests {
             task_id: None,
             created_at: Utc::now(),
             requires_response: false,
+            skip_humanize: false,
         }
     }
 

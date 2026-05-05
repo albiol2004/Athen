@@ -1452,6 +1452,15 @@ header h1 {
     border-color: transparent;
 }
 .email-action-primary:hover { filter: brightness(1.08); }
+.email-action-status {
+    display: inline-flex;
+    align-items: center;
+    height: 30px;
+    padding: 0 12px;
+    color: var(--text-muted);
+    font-size: 12px;
+    font-style: italic;
+}
 
 .email-inline-entry,
 .system-inline-entry {

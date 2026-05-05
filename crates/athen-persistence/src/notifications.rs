@@ -354,6 +354,10 @@ fn row_to_notification_with_read(
             task_id,
             created_at,
             requires_response: requires_response_int != 0,
+            // Not persisted: humanize-skip is a per-emit decision, never
+            // re-applied on reload. Default to false so reloaded entries
+            // pass through humanization the same as today.
+            skip_humanize: false,
         },
         is_read_int != 0,
     ))
@@ -380,6 +384,7 @@ mod tests {
             task_id: None,
             created_at: Utc::now(),
             requires_response: false,
+            skip_humanize: false,
         }
     }
 
@@ -396,6 +401,7 @@ mod tests {
             task_id: Some(Uuid::new_v4()),
             created_at: Utc::now(),
             requires_response: true,
+            skip_humanize: false,
         };
         let id = notif.id;
 

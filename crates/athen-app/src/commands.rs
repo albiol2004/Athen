@@ -1116,6 +1116,7 @@ pub async fn send_message(
                     task_id: Some(*task_id),
                     created_at: chrono::Utc::now(),
                     requires_response: false,
+                    skip_humanize: false,
                 };
                 notifier.notify(notification).await;
             }

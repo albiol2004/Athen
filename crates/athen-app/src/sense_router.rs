@@ -253,6 +253,11 @@ pub async fn process_sense_event(
         }
     }
 
+    // Whether the agent will run autonomously on this event. Computed once
+    // here so steps 4 and 5 can present accurate UX (no "Draft Reply" button
+    // when Athen is already drafting a reply).
+    let will_dispatch = coordinator.is_some() && should_dispatch_autonomously(&triage);
+
     // Step 4: Emit frontend event.
     let body_preview: String = if body_text.len() > 500 {
         let cap = body_text.floor_char_boundary(500);
@@ -273,6 +278,10 @@ pub async fn process_sense_event(
             "suggested_action": triage.suggested_action,
             "arc_id": arc_id,
             "event_id": event.id.to_string(),
+            // When true the frontend hides Draft Reply / Summarize / Add to
+            // Calendar buttons — Athen is already acting, so the user-action
+            // affordances would be misleading.
+            "dispatched": will_dispatch,
         }),
     );
 
@@ -284,8 +293,18 @@ pub async fn process_sense_event(
             _ => NotificationUrgency::Low,
         };
 
-        let title = format!("{}: {}", source_name, summary);
-        let body_notif = if body_preview.len() > 200 {
+        let title = if will_dispatch {
+            format!("Athen is handling {source_name} from {sender}")
+        } else {
+            format!("{source_name}: {summary}")
+        };
+        // For dispatched events the body shouldn't carry the raw email
+        // text — the title already says what's happening, and feeding the
+        // raw "Hey Athen, ..." salutation through any downstream rendering
+        // tends to confuse readers (and the humanizer LLM, when run).
+        let body_notif = if will_dispatch {
+            format!("Subject: {summary}")
+        } else if body_preview.len() > 200 {
             let cap = body_preview.floor_char_boundary(200);
             format!("{}...", &body_preview[..cap])
         } else {
@@ -302,6 +321,10 @@ pub async fn process_sense_event(
             task_id: None,
             created_at: Utc::now(),
             requires_response: false,
+            // Dispatched-path notifications already use structured copy
+            // ("Athen is handling email from Alex"); skip the LLM rewrite
+            // that would otherwise paraphrase or distort it.
+            skip_humanize: will_dispatch,
         };
 
         notifier.notify(notification).await;
@@ -312,7 +335,7 @@ pub async fn process_sense_event(
     // action (vs. just notifying the user). Best-effort: failures here
     // never invalidate the work the notification path already did.
     if let Some(coord) = coordinator {
-        if should_dispatch_autonomously(&triage) {
+        if will_dispatch {
             match coord.process_event(event.clone()).await {
                 Ok(decisions) => {
                     use athen_core::risk::RiskDecision;

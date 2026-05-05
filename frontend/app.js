@@ -440,9 +440,9 @@ function registerTauriEventListeners() {
     // Listen for sense events (email, calendar, messaging, etc.)
     window.__TAURI__.event.listen('sense-event', (event) => {
         const { source, from, subject, body_preview,
-                relevance, reason, suggested_action, arc_id } = event.payload;
+                relevance, reason, suggested_action, arc_id, dispatched } = event.payload;
         showSenseNotification(source, from, subject, body_preview,
-                              relevance, reason, suggested_action, arc_id);
+                              relevance, reason, suggested_action, arc_id, dispatched);
     });
 }
 
@@ -1133,7 +1133,7 @@ function escapeHtml(text) {
 // ─── Sense Notifications ───
 
 function showSenseNotification(source, from, subject, bodyPreview,
-                                relevance, reason, suggestedAction, arcId) {
+                                relevance, reason, suggestedAction, arcId, dispatched) {
     const container = document.getElementById('messages');
     if (!container) return;
 
@@ -1162,9 +1162,14 @@ function showSenseNotification(source, from, subject, bodyPreview,
         : '';
 
     // Build action buttons based on source and suggested_action.
+    // When `dispatched` is true the agent is already working on this event —
+    // showing user-action prompts (Draft Reply / Summarize / Add to Calendar)
+    // would be misleading. Show a status badge + Open Arc instead.
     let actionsHtml = '';
 
-    if (source === 'calendar') {
+    if (dispatched) {
+        actionsHtml += '<span class="email-action-status">Athen is on it…</span>';
+    } else if (source === 'calendar') {
         // Calendar-specific actions
         actionsHtml += '<button class="email-action-btn email-action-primary" onclick="askAboutSenseEvent(this, \'prepare\')">What should I prepare?</button>';
     } else {

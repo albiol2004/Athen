@@ -40,6 +40,13 @@ pub struct Notification {
     pub created_at: DateTime<Utc>,
     /// Whether the notification requires an explicit user response (e.g. approval).
     pub requires_response: bool,
+    /// Skip the LLM "humanize" rewrite step in `NotificationOrchestrator`.
+    /// Set this when the title/body are already structured assistant-voice
+    /// copy (e.g. "Athen is handling email from Alex") — the rewrite prompt
+    /// assumes raw event data and would otherwise paraphrase the structure
+    /// away or, worse, get confused by salutations addressing Athen itself.
+    #[serde(default)]
+    pub skip_humanize: bool,
 }
 
 /// Result of attempting to deliver a notification through a channel.
@@ -76,6 +83,7 @@ mod tests {
             task_id: None,
             created_at: Utc::now(),
             requires_response: true,
+            skip_humanize: false,
         };
 
         assert_eq!(notif.urgency, NotificationUrgency::High);
