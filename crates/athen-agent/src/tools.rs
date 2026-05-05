@@ -20,6 +20,31 @@ use athen_core::traits::tool::ToolRegistry;
 use athen_risk::rules::RuleEngine;
 use athen_sandbox::UnifiedSandbox;
 use athen_shell::Shell;
+
+/// Cached identifier of the shell `Shell::execute*` actually routes
+/// through. Probed once on first call. Returns `"nushell"` when the
+/// embedded nushell is available (bundled sidecar or `nu` on PATH),
+/// otherwise the platform native shell name (`"sh"` on Unix, `"cmd"`
+/// on Windows). Cheap to call repeatedly after first invocation.
+///
+/// The agent's system prompt uses this to teach shell-correct syntax:
+/// bash idioms (`&&`, `>file 2>&1`, `nohup CMD &`, `export X=Y`)
+/// silently fail under nushell or cmd, and conversely.
+pub async fn detect_shell_kind() -> &'static str {
+    static SHELL_KIND: tokio::sync::OnceCell<&'static str> = tokio::sync::OnceCell::const_new();
+    *SHELL_KIND
+        .get_or_init(|| async {
+            let s = Shell::new().await;
+            if s.has_nushell() {
+                "nushell"
+            } else if cfg!(windows) {
+                "cmd"
+            } else {
+                "sh"
+            }
+        })
+        .await
+}
 use athen_web::{DuckDuckGoSearch, HybridReader, PageReader, WebSearchProvider};
 
 /// Provider used by the shell tool to discover the per-arc set of writable

@@ -1116,7 +1116,9 @@ async fn execute_owner_telegram_message(
     if let Some(p) = tool_doc_dir {
         builder = builder.tool_doc_dir(p.to_path_buf());
     }
-    builder = builder.toolbox_info(athen_agent::toolbox::ToolboxPromptInfo::load().await);
+    builder = builder
+        .toolbox_info(athen_agent::toolbox::ToolboxPromptInfo::load().await)
+        .shell_kind(athen_agent::detect_shell_kind().await);
     let executor = match builder.build() {
         Ok(e) => e,
         Err(e) => {

@@ -198,6 +198,14 @@ pub struct DefaultExecutor {
     /// turn so the prompt-builder stays synchronous. `None` omits the
     /// toolbox slot entirely (no home dir, or simply not wired yet).
     toolbox_info: Option<crate::toolbox::ToolboxPromptInfo>,
+    /// Identifier of the shell `shell_execute` actually routes through:
+    /// `"nushell"`, `"sh"` (Unix native), or `"cmd"` (Windows native).
+    /// The system prompt uses this to teach the agent shell-correct
+    /// syntax — bash idioms (`&&`, `>file 2>&1`, `nohup CMD &`) silently
+    /// fail under nushell or cmd. `None` omits the SHELL ENVIRONMENT
+    /// slot, so old call-sites that don't wire this keep today's
+    /// behavior.
+    shell_kind: Option<&'static str>,
 }
 
 impl DefaultExecutor {
@@ -222,6 +230,7 @@ impl DefaultExecutor {
             tool_doc_dir: None,
             active_profile: None,
             toolbox_info: None,
+            shell_kind: None,
         }
     }
 
@@ -230,6 +239,13 @@ impl DefaultExecutor {
     /// packages so the agent doesn't reinstall what's already there.
     pub fn set_toolbox_info(&mut self, info: crate::toolbox::ToolboxPromptInfo) {
         self.toolbox_info = Some(info);
+    }
+
+    /// Tell the prompt builder which shell `shell_execute` actually
+    /// routes through. Pass `"nushell"`, `"sh"`, or `"cmd"`. Omit to
+    /// keep today's behavior (no SHELL ENVIRONMENT section).
+    pub fn set_shell_kind(&mut self, kind: &'static str) {
+        self.shell_kind = Some(kind);
     }
 
     /// Set the agent profile this executor runs under. The profile's
@@ -289,14 +305,80 @@ impl DefaultExecutor {
         tool_doc_dir: Option<&std::path::Path>,
         profile: Option<&ResolvedAgentProfile>,
         toolbox_info: Option<&crate::toolbox::ToolboxPromptInfo>,
+        shell_kind: Option<&'static str>,
     ) -> String {
         let mut prompt = String::new();
         prompt.push_str(&Self::build_persona_header(profile));
         prompt.push_str(&Self::build_workspace_rules(has_context));
+        prompt.push_str(&Self::build_shell_env_section(shell_kind));
         prompt.push_str(&Self::build_toolbox_section(toolbox_info));
         prompt.push_str(&Self::build_tool_index(tools, revealed, tool_doc_dir));
         prompt.push_str(&Self::build_persona_rules());
         prompt
+    }
+
+    /// Slot 2.4: SHELL ENVIRONMENT — what OS and shell `shell_execute`
+    /// actually runs commands through. Without this the agent treats
+    /// every host as bash and emits POSIX idioms (`&&`, `>file 2>&1`,
+    /// `nohup CMD &`, `python3`, `pip3`, `timeout 30 …`) which silently
+    /// fail under nushell or Windows cmd.
+    ///
+    /// Omitted entirely when no shell info is wired (CLI builds, tests)
+    /// so today's behavior is preserved byte-for-byte.
+    fn build_shell_env_section(shell_kind: Option<&'static str>) -> String {
+        let Some(kind) = shell_kind else {
+            return String::new();
+        };
+        let os = std::env::consts::OS;
+        let os_label = match os {
+            "linux" => "Linux",
+            "macos" => "macOS",
+            "windows" => "Windows",
+            other => other,
+        };
+
+        let mut out = format!(
+            "SHELL ENVIRONMENT:\n\
+             You are running on {os_label}. `shell_execute` and `shell_spawn` route \
+             commands through {kind}. Pick syntax that {kind} actually understands — \
+             do NOT assume bash everywhere.\n",
+        );
+
+        match kind {
+            "nushell" => {
+                out.push_str(
+                    "Nushell is NOT bash. Things that DO NOT work: `&&` (use `;` for sequencing or just `and` between expressions), \
+                     `||`, `>file 2>&1` (use `out+err> file`), `nohup CMD &` (use `shell_spawn` instead), \
+                     `export VAR=value` (Athen already wires PYTHONPATH/PATH for you — never set them yourself), \
+                     `( cmd1 && cmd2 )` subshell grouping (use `do { cmd1; cmd2 }`). Heredocs work but with \
+                     different delimiter syntax. When in doubt, run one command at a time and check the result \
+                     before chaining.\n",
+                );
+            }
+            "cmd" => {
+                out.push_str(
+                    "Windows cmd.exe is NOT bash. Things that DO NOT work: `export VAR=value` (use `set VAR=value`), \
+                     `:` as a PATH separator (Windows uses `;`), single-quoted strings (use double quotes), \
+                     `nohup CMD &` (use `shell_spawn` instead), most POSIX utilities (`grep`/`sed`/`awk`/`which` — use \
+                     the dedicated file tools or `findstr`/`where`). `&&` works. Forward slashes mostly work in \
+                     paths but backslashes are safer.\n",
+                );
+            }
+            _ => {}
+        }
+
+        if os == "windows" {
+            out.push_str(
+                "Windows-specific: the Python launcher is `python` (or `py`), not `python3`. The pip binary is \
+                 `pip` (and usually `pip3`). The npm wrapper is `npm.cmd`. When you serve HTTP for the user, \
+                 bind to `127.0.0.1` (e.g. `python -m http.server 8000 --bind 127.0.0.1`) — binding to `0.0.0.0` \
+                 trips the Windows Defender Firewall first-bind UAC prompt; if the user dismisses it, inbound \
+                 connections including the user's own browser get blocked. 127.0.0.1 always reaches the \
+                 user's browser without a prompt.\n",
+            );
+        }
+        out.push('\n');
+        out
     }
 
     /// Slot 2.5: persistent toolbox summary. Tells the agent what
@@ -330,10 +412,14 @@ impl DefaultExecutor {
         } else {
             summary
         };
+        let tb_display = athen_core::paths::athen_toolbox_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<athen toolbox dir>".to_string());
         format!(
-            "Toolbox: persistent shell tools at $HOME/.athen/toolbox/. \
+            "Toolbox: persistent shell tools at {tb_display}. \
              PYTHONPATH and PATH are auto-configured so you can \
-             `python3 -c \"import fpdf\"` or `playwright ...` directly. \
+             `python -c \"import fpdf\"` (use `python3` on Unix if \
+             available) or `playwright ...` directly. \
              Use list_installed_packages to check what's already \
              installed. Use install_package to add new ones (user \
              approval required, so include a clear reason). Use \
@@ -875,6 +961,7 @@ impl AgentExecutor for DefaultExecutor {
                 self.tool_doc_dir.as_deref(),
                 self.active_profile.as_ref(),
                 self.toolbox_info.as_ref(),
+                self.shell_kind,
             );
 
             // Tools sent to the LLM API: only the revealed subset carries
@@ -1951,7 +2038,7 @@ mod tests {
         revealed.insert("memory_recall".to_string());
 
         let prompt =
-            DefaultExecutor::build_system_prompt(&tools, &revealed, false, None, None, None);
+            DefaultExecutor::build_system_prompt(&tools, &revealed, false, None, None, None, None);
 
         // Group index lists every group with counts.
         assert!(prompt.contains("AVAILABLE TOOL GROUPS"));
@@ -1985,8 +2072,15 @@ mod tests {
         let tools = vec![tool_def("calendar_create", "create event")];
         let revealed = HashSet::new();
         let dir = std::path::PathBuf::from("/tmp/athen-test/tools");
-        let prompt =
-            DefaultExecutor::build_system_prompt(&tools, &revealed, false, Some(&dir), None, None);
+        let prompt = DefaultExecutor::build_system_prompt(
+            &tools,
+            &revealed,
+            false,
+            Some(&dir),
+            None,
+            None,
+            None,
+        );
         // Pattern reference uses the directory + <group>.md placeholder.
         assert!(prompt.contains("/tmp/athen-test/tools"));
         assert!(prompt.contains("<group>.md"));
@@ -2000,7 +2094,7 @@ mod tests {
         let tools = vec![tool_def("calendar_create", "create event")];
         let revealed = HashSet::new();
         let prompt =
-            DefaultExecutor::build_system_prompt(&tools, &revealed, false, None, None, None);
+            DefaultExecutor::build_system_prompt(&tools, &revealed, false, None, None, None, None);
         assert!(!prompt.contains("read("));
     }
 
@@ -2034,13 +2128,14 @@ mod tests {
         let revealed = HashSet::new();
 
         let p_none =
-            DefaultExecutor::build_system_prompt(&tools, &revealed, false, None, None, None);
+            DefaultExecutor::build_system_prompt(&tools, &revealed, false, None, None, None, None);
         let p_default = DefaultExecutor::build_system_prompt(
             &tools,
             &revealed,
             false,
             None,
             Some(&default),
+            None,
             None,
         );
 
@@ -2095,6 +2190,7 @@ mod tests {
             false,
             None,
             Some(&resolved),
+            None,
             None,
         );
 

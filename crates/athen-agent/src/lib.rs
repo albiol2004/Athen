@@ -18,7 +18,9 @@ pub use executor::DefaultExecutor;
 pub use resource::DefaultResourceMonitor;
 pub use timeout::DefaultTimeoutGuard;
 pub use toolbox::{InstalledPackage, Runtime as ToolboxRuntime, RuntimeProbe, ToolboxManifest};
-pub use tools::{ShellToolRegistry, SpawnedProcess, SpawnedProcessMap, ToolboxApprovalGate};
+pub use tools::{
+    detect_shell_kind, ShellToolRegistry, SpawnedProcess, SpawnedProcessMap, ToolboxApprovalGate,
+};
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -44,6 +46,7 @@ pub struct AgentBuilder {
     tool_doc_path: Option<PathBuf>,
     active_profile: Option<athen_core::agent_profile::ResolvedAgentProfile>,
     toolbox_info: Option<toolbox::ToolboxPromptInfo>,
+    shell_kind: Option<&'static str>,
 }
 
 impl AgentBuilder {
@@ -66,6 +69,7 @@ impl AgentBuilder {
             tool_doc_path: None,
             active_profile: None,
             toolbox_info: None,
+            shell_kind: None,
         }
     }
 
@@ -75,6 +79,17 @@ impl AgentBuilder {
     /// Without this, the toolbox prompt slot is omitted.
     pub fn toolbox_info(mut self, info: toolbox::ToolboxPromptInfo) -> Self {
         self.toolbox_info = Some(info);
+        self
+    }
+
+    /// Tell the agent which shell `shell_execute` actually routes
+    /// commands through (typically `ShellToolRegistry::shell_kind()`).
+    /// Pass `"nushell"`, `"sh"`, or `"cmd"`. Without this the SHELL
+    /// ENVIRONMENT prompt slot is omitted and the agent will assume
+    /// bash, generating commands that silently fail under nushell or
+    /// Windows cmd.
+    pub fn shell_kind(mut self, kind: &'static str) -> Self {
+        self.shell_kind = Some(kind);
         self
     }
 
@@ -200,6 +215,10 @@ impl AgentBuilder {
 
         if let Some(info) = self.toolbox_info {
             executor.set_toolbox_info(info);
+        }
+
+        if let Some(kind) = self.shell_kind {
+            executor.set_shell_kind(kind);
         }
 
         Ok(executor)

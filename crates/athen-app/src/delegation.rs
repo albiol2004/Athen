@@ -313,7 +313,9 @@ async fn run_delegation(
     if let Some(ref dir) = ctx.tool_doc_dir {
         builder = builder.tool_doc_dir(dir.clone());
     }
-    builder = builder.toolbox_info(athen_agent::toolbox::ToolboxPromptInfo::load().await);
+    builder = builder
+        .toolbox_info(athen_agent::toolbox::ToolboxPromptInfo::load().await)
+        .shell_kind(athen_agent::detect_shell_kind().await);
 
     // Wire a *silent* auditor on the sub-executor so its tool calls are
     // persisted to `arc_entries` under the sub-arc id. The frontend reads

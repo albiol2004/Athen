@@ -1302,7 +1302,9 @@ pub async fn send_message(
             if let Some(profile) = active_profile {
                 builder = builder.active_profile(profile);
             }
-            builder = builder.toolbox_info(athen_agent::toolbox::ToolboxPromptInfo::load().await);
+            builder = builder
+                .toolbox_info(athen_agent::toolbox::ToolboxPromptInfo::load().await)
+                .shell_kind(athen_agent::detect_shell_kind().await);
             let executor = builder.build().map_err(|e| {
                 let raw = e.to_string();
                 tracing::error!("AgentBuilder failed: {raw}");
@@ -1935,7 +1937,9 @@ pub(crate) async fn execute_approved_task(
     if let Some(profile) = active_profile {
         builder = builder.active_profile(profile);
     }
-    builder = builder.toolbox_info(athen_agent::toolbox::ToolboxPromptInfo::load().await);
+    builder = builder
+        .toolbox_info(athen_agent::toolbox::ToolboxPromptInfo::load().await)
+        .shell_kind(athen_agent::detect_shell_kind().await);
     let executor = builder.build().map_err(|e| {
         let raw = e.to_string();
         tracing::error!("AgentBuilder failed (approval): {raw}");

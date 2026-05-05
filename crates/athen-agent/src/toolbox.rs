@@ -89,17 +89,24 @@ pub struct RuntimeProbe {
 
 static RUNTIME_PROBE: OnceCell<RuntimeProbe> = OnceCell::const_new();
 
-/// Probe `python3`, `pip3`, `node`, `npm` once and cache the result.
-/// Each probe times out after 5s so a hung interpreter doesn't stall
-/// startup. Missing binaries are recorded as `None` rather than errors.
+/// Probe Python, pip, Node, and npm once and cache the result. Each
+/// probe walks a small list of platform-aware binary aliases, taking
+/// the first that responds with a version string. On Windows the
+/// official Python installer typically only exposes `python` and `pip`
+/// (no `python3`/`pip3`), and the npm wrapper is `npm.cmd`; without
+/// the alias list the toolbox prompt would always say "missing" on a
+/// freshly-installed Windows host even when the runtime is present.
+///
+/// Each individual probe times out after 5s so a hung interpreter
+/// doesn't stall startup. Missing binaries are recorded as `None`.
 pub async fn probe_runtimes() -> RuntimeProbe {
     RUNTIME_PROBE
         .get_or_init(|| async {
             let (python, pip, node, npm) = tokio::join!(
-                probe_one("python3", &["--version"]),
-                probe_one("pip3", &["--version"]),
-                probe_one("node", &["--version"]),
-                probe_one("npm", &["--version"]),
+                probe_first(python_aliases(), &["--version"]),
+                probe_first(pip_aliases(), &["--version"]),
+                probe_first(node_aliases(), &["--version"]),
+                probe_first(npm_aliases(), &["--version"]),
             );
             RuntimeProbe {
                 python: python.map(extract_version),
@@ -110,6 +117,86 @@ pub async fn probe_runtimes() -> RuntimeProbe {
         })
         .await
         .clone()
+}
+
+/// Order matters: the install / uninstall functions also iterate these
+/// lists and pick the first binary that successfully spawns, so the
+/// most-likely-correct name should be first per platform.
+pub(crate) fn python_aliases() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &["python", "py", "python3"]
+    } else {
+        &["python3", "python"]
+    }
+}
+
+pub(crate) fn pip_aliases() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &["pip", "pip3"]
+    } else {
+        &["pip3", "pip"]
+    }
+}
+
+pub(crate) fn node_aliases() -> &'static [&'static str] {
+    &["node"]
+}
+
+pub(crate) fn npm_aliases() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &["npm.cmd", "npm"]
+    } else {
+        &["npm"]
+    }
+}
+
+/// Probe each candidate in order and return the version output of the
+/// first one that exits successfully. `None` if every candidate fails
+/// to spawn or returns non-zero.
+async fn probe_first(candidates: &[&str], args: &[&str]) -> Option<String> {
+    for bin in candidates {
+        if let Some(out) = probe_one(bin, args).await {
+            return Some(out);
+        }
+    }
+    None
+}
+
+/// Spawn each candidate binary in order with the same args; the first
+/// one that successfully starts (i.e. is on PATH and is executable) is
+/// awaited and its `Output` returned, regardless of exit status. The
+/// caller decides what to do with a non-zero exit. Only fails when
+/// EVERY candidate yields an `ENOENT`-style spawn error — that's the
+/// signal "the runtime isn't installed" and the error message lists
+/// every name we tried so the user can install whichever one they
+/// prefer.
+async fn spawn_first(
+    candidates: &[&str],
+    fixed_args: &[&str],
+    extra_args: &[&std::ffi::OsStr],
+) -> std::result::Result<std::process::Output, String> {
+    let mut last_err: Option<String> = None;
+    for bin in candidates {
+        let mut cmd = Command::new(bin);
+        for a in fixed_args {
+            cmd.arg(a);
+        }
+        for a in extra_args {
+            cmd.arg(a);
+        }
+        match cmd.output().await {
+            Ok(out) => return Ok(out),
+            Err(e) => {
+                tracing::debug!(bin, error = %e, "spawn_first: candidate failed");
+                last_err = Some(format!("{bin}: {e}"));
+            }
+        }
+    }
+    Err(format!(
+        "none of [{names}] could be spawned (last error: {err})",
+        names = candidates.join(", "),
+        err = last_err.as_deref().unwrap_or("no candidates"),
+    ))
 }
 
 async fn probe_one(bin: &str, args: &[&str]) -> Option<String> {
@@ -249,19 +336,24 @@ pub async fn install_python_package(spec: &str, reason: &str) -> Result<Installe
     })?;
 
     tracing::info!(spec, target = %target.display(), "pip install --target");
-    let output = Command::new("pip3")
-        .args([
-            "install",
-            "--upgrade",
-            "--no-input",
-            "--disable-pip-version-check",
-            "--target",
-        ])
-        .arg(&target)
-        .arg(spec)
-        .output()
+    let pip_args = [
+        "install",
+        "--upgrade",
+        "--no-input",
+        "--disable-pip-version-check",
+        "--target",
+    ];
+    let extra: &[&std::ffi::OsStr] = &[target.as_os_str(), spec.as_ref()];
+    let output = spawn_first(pip_aliases(), &pip_args, extra)
         .await
-        .map_err(|e| AthenError::Other(format!("failed to spawn pip3: {e}")))?;
+        .map_err(|spawn_err| {
+            AthenError::Other(format!(
+                "{spawn_err}. Install Python (which provides pip) first; the toolbox \
+                 looked for: {names}",
+                spawn_err = spawn_err,
+                names = pip_aliases().join(", ")
+            ))
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -317,16 +409,24 @@ pub async fn install_node_package(spec: &str, reason: &str) -> Result<InstalledP
     let mut prefix_arg = std::ffi::OsString::from("--prefix=");
     prefix_arg.push(&target);
 
-    let output = Command::new("npm")
-        .arg("install")
-        .arg(prefix_arg)
-        .arg("--no-fund")
-        .arg("--no-audit")
-        .arg("--save")
-        .arg(spec)
-        .output()
+    let npm_args = ["install"];
+    let extra: &[&std::ffi::OsStr] = &[
+        prefix_arg.as_os_str(),
+        "--no-fund".as_ref(),
+        "--no-audit".as_ref(),
+        "--save".as_ref(),
+        spec.as_ref(),
+    ];
+    let output = spawn_first(npm_aliases(), &npm_args, extra)
         .await
-        .map_err(|e| AthenError::Other(format!("failed to spawn npm: {e}")))?;
+        .map_err(|spawn_err| {
+            AthenError::Other(format!(
+                "{spawn_err}. Install Node.js (which provides npm) first; the \
+                 toolbox looked for: {names}",
+                spawn_err = spawn_err,
+                names = npm_aliases().join(", ")
+            ))
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -458,21 +558,29 @@ pub async fn uninstall_node_package(name: &str) -> Result<InstalledPackage> {
     if target.is_dir() {
         let mut prefix_arg = std::ffi::OsString::from("--prefix=");
         prefix_arg.push(&target);
-        let output = Command::new("npm")
-            .arg("uninstall")
-            .arg(prefix_arg)
-            .arg("--no-fund")
-            .arg("--no-audit")
-            .arg(name)
-            .output()
-            .await
-            .map_err(|e| AthenError::Other(format!("failed to spawn npm: {e}")))?;
-        if !output.status.success() {
-            tracing::warn!(
-                package = name,
-                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
-                "npm uninstall reported non-zero; manifest entry removed regardless"
-            );
+        let npm_args = ["uninstall"];
+        let extra: &[&std::ffi::OsStr] = &[
+            prefix_arg.as_os_str(),
+            "--no-fund".as_ref(),
+            "--no-audit".as_ref(),
+            name.as_ref(),
+        ];
+        match spawn_first(npm_aliases(), &npm_args, extra).await {
+            Ok(output) if !output.status.success() => {
+                tracing::warn!(
+                    package = name,
+                    stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                    "npm uninstall reported non-zero; manifest entry removed regardless"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    package = name,
+                    error = %e,
+                    "could not invoke npm to uninstall; manifest entry removed regardless"
+                );
+            }
         }
     }
 
