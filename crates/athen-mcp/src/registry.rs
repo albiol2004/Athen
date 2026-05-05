@@ -186,14 +186,17 @@ async fn spawn_client(enabled: &EnabledEntry) -> Result<LiveClient> {
         let root = match configured {
             Some(r) => r,
             None => {
-                // Documented default: ~/.athen/files. We materialise it here
+                // Documented default: Athen's files sandbox under the
+                // platform's data dir (`~/.athen/files` on Unix,
+                // `%APPDATA%\Athen\files` on Windows). We materialise it here
                 // so the user can flip Files on without configuring anything.
-                let home = std::env::var("HOME").map_err(|_| {
+                let path = athen_core::paths::athen_files_sandbox().ok_or_else(|| {
                     AthenError::Other(
-                        "Files: HOME env var not set; cannot derive default sandbox_root".into(),
+                        "Files: cannot resolve Athen data directory for default sandbox_root"
+                            .into(),
                     )
                 })?;
-                format!("{home}/.athen/files")
+                path.to_string_lossy().into_owned()
             }
         };
         // Make sure the directory exists before handing it to the binary —

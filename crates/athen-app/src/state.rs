@@ -1372,11 +1372,10 @@ pub(crate) async fn send_telegram_reply(
 ///
 /// Returns the directory path if a config file is found, or None for defaults.
 fn find_config_dir() -> Option<PathBuf> {
-    // Try ~/.athen/
-    if let Some(home) = std::env::var_os("HOME") {
-        let home_config = PathBuf::from(home).join(".athen");
-        if home_config.join("config.toml").exists() {
-            return Some(home_config);
+    // Try Athen's data dir (~/.athen on Unix, %APPDATA%\Athen on Windows).
+    if let Some(data_dir) = athen_core::paths::athen_data_dir() {
+        if data_dir.join("config.toml").exists() {
+            return Some(data_dir);
         }
     }
 
@@ -1413,22 +1412,24 @@ fn load_config() -> AthenConfig {
 // System initialisation
 // ---------------------------------------------------------------------------
 
-/// Resolve the data directory (`~/.athen/`), creating it if needed.
+/// Resolve Athen's data directory, creating it if needed. Platform-aware:
+/// `~/.athen` on Unix, `%APPDATA%\Athen` on Windows.
 fn ensure_data_dir() -> Option<PathBuf> {
-    if let Some(home) = std::env::var_os("HOME") {
-        let data_dir = PathBuf::from(home).join(".athen");
-        if let Err(e) = std::fs::create_dir_all(&data_dir) {
-            warn!(
-                "Failed to create data directory {}: {e}",
-                data_dir.display()
-            );
+    let data_dir = match athen_core::paths::athen_data_dir() {
+        Some(d) => d,
+        None => {
+            warn!("Cannot resolve Athen data directory (no home).");
             return None;
         }
-        Some(data_dir)
-    } else {
-        warn!("HOME not set, cannot create data directory.");
-        None
+    };
+    if let Err(e) = std::fs::create_dir_all(&data_dir) {
+        warn!(
+            "Failed to create data directory {}: {e}",
+            data_dir.display()
+        );
+        return None;
     }
+    Some(data_dir)
 }
 
 /// Determine the active provider ID from config, falling back to "deepseek".

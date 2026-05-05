@@ -108,12 +108,16 @@ pub struct TestResult {
 // Helper: config directory
 // ---------------------------------------------------------------------------
 
-/// Resolve the `~/.athen/` directory, creating it if needed.
+/// Resolve Athen's per-user data directory, creating it if needed.
+///
+/// Path is platform-aware via [`athen_core::paths::athen_data_dir`]:
+/// - Unix: `~/.athen`
+/// - Windows: `%APPDATA%\Athen`
 fn ensure_athen_dir() -> Result<PathBuf, String> {
-    let home =
-        std::env::var_os("HOME").ok_or_else(|| "HOME environment variable not set".to_string())?;
-    let dir = PathBuf::from(home).join(".athen");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create ~/.athen/: {e}"))?;
+    let dir = athen_core::paths::athen_data_dir()
+        .ok_or_else(|| "Cannot resolve Athen data directory (no home).".to_string())?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("Failed to create {}: {e}", dir.display()))?;
     Ok(dir)
 }
 

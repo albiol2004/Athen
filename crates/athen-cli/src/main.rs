@@ -90,11 +90,10 @@ fn read_line_sync(prompt: &str) -> Option<String> {
 ///
 /// Returns the directory path if a config file is found, or None for defaults.
 fn find_config_dir() -> Option<PathBuf> {
-    // Try ~/.athen/
-    if let Some(home) = std::env::var_os("HOME") {
-        let home_config = PathBuf::from(home).join(".athen");
-        if home_config.join("config.toml").exists() {
-            return Some(home_config);
+    // Try Athen's data dir (~/.athen on Unix, %APPDATA%\Athen on Windows).
+    if let Some(data_dir) = athen_core::paths::athen_data_dir() {
+        if data_dir.join("config.toml").exists() {
+            return Some(data_dir);
         }
     }
 
