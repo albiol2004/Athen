@@ -178,11 +178,19 @@ function registerTauriEventListeners() {
         // Skip non-tool steps (e.g. "Evaluating risk...", "Task completed").
         if (step === 0 || tool_name === 'Task completed') return;
 
-        // Create tool container if it does not exist yet.
+        // Create tool container if it does not exist yet. In optimistic
+        // completion mode the assistant message can stream in before any
+        // tool starts; insert the container above the streaming row so
+        // tool cards always sit above the conclusion they belong to.
         if (!currentToolContainer) {
             currentToolContainer = document.createElement('div');
             currentToolContainer.className = 'tool-steps-container';
-            messagesEl.appendChild(currentToolContainer);
+            const streamingRow = messagesEl.querySelector('#streaming-message');
+            if (streamingRow) {
+                messagesEl.insertBefore(currentToolContainer, streamingRow);
+            } else {
+                messagesEl.appendChild(currentToolContainer);
+            }
         }
 
         // Build the tool execution card.
