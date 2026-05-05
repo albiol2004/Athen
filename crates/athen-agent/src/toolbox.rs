@@ -167,7 +167,10 @@ pub(crate) fn npm_aliases() -> &'static [&'static str] {
 /// to spawn or returns non-zero.
 async fn probe_first(candidates: &[&str], args: &[&str]) -> Option<String> {
     for bin in candidates {
-        if let Some(out) = probe_one(bin, args).await {
+        let Some(resolved) = resolve_executable(bin).await else {
+            continue;
+        };
+        if let Some(out) = probe_one(&resolved, args).await {
             return Some(out);
         }
     }
@@ -182,6 +185,12 @@ async fn probe_first(candidates: &[&str], args: &[&str]) -> Option<String> {
 /// signal "the runtime isn't installed" and the error message lists
 /// every name we tried so the user can install whichever one they
 /// prefer.
+///
+/// On Windows each candidate is first resolved through `where.exe`,
+/// and any hits under `Microsoft\WindowsApps\` are filtered out — those
+/// are the App Execution Alias stubs that open the Microsoft Store
+/// instead of running a real binary, and spawning one would either pop
+/// the Store at the user or hang waiting on a network check.
 async fn spawn_first(
     candidates: &[&str],
     fixed_args: &[&str],
@@ -189,7 +198,14 @@ async fn spawn_first(
 ) -> std::result::Result<std::process::Output, String> {
     let mut last_err: Option<String> = None;
     for bin in candidates {
-        let mut cmd = Command::new(bin);
+        let Some(resolved) = resolve_executable(bin).await else {
+            tracing::debug!(bin, "spawn_first: skipped (no real exe on PATH)");
+            last_err = Some(format!(
+                "{bin}: not on PATH (or only a Windows Store alias)"
+            ));
+            continue;
+        };
+        let mut cmd = Command::new(&resolved);
         for a in fixed_args {
             cmd.arg(a);
         }
@@ -199,7 +215,7 @@ async fn spawn_first(
         match cmd.output().await {
             Ok(out) => return Ok(out),
             Err(e) => {
-                tracing::debug!(bin, error = %e, "spawn_first: candidate failed");
+                tracing::debug!(bin, resolved = %resolved.display(), error = %e, "spawn_first: candidate failed");
                 last_err = Some(format!("{bin}: {e}"));
             }
         }
@@ -211,7 +227,7 @@ async fn spawn_first(
     ))
 }
 
-async fn probe_one(bin: &str, args: &[&str]) -> Option<String> {
+async fn probe_one(bin: &Path, args: &[&str]) -> Option<String> {
     let fut = async {
         Command::new(bin)
             .args(args)
@@ -226,14 +242,77 @@ async fn probe_one(bin: &str, args: &[&str]) -> Option<String> {
                 }
                 s
             })
+            .filter(|s| !is_windows_store_alias_output(s))
     };
     match tokio::time::timeout(Duration::from_secs(5), fut).await {
         Ok(v) => v,
         Err(_) => {
-            tracing::warn!("probe_runtimes: {bin} timed out after 5s");
+            tracing::warn!("probe_runtimes: {} timed out after 5s", bin.display());
             None
         }
     }
+}
+
+/// Belt-and-suspenders: even after PATH-level filtering, some Windows
+/// configurations route the alias through cmd.exe and we'd see the
+/// "Python was not found; run without arguments to install from the
+/// Microsoft Store" message in stdout WITH exit code 0. Treat any
+/// version output that mentions the Store stub as "not installed".
+fn is_windows_store_alias_output(s: &str) -> bool {
+    let s = s.trim();
+    s.contains("Microsoft Store") || s.contains("was not found")
+}
+
+/// Resolve `bin` to an absolute path. On Unix this is a passthrough —
+/// `Command::new("python3")` already walks PATH correctly. On Windows
+/// we run `where.exe <bin>` and pick the first hit that ISN'T under
+/// `%LOCALAPPDATA%\Microsoft\WindowsApps\`, which is where Windows
+/// puts the App Execution Alias shims for `python.exe`/`python3.exe`
+/// that redirect to the Microsoft Store on activation.
+///
+/// Returns `None` when the binary isn't on PATH at all, or when every
+/// hit is one of those Store shims (semantically: "no real interpreter
+/// installed").
+async fn resolve_executable(bin: &str) -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        // Already absolute (e.g. portable bin) — trust the caller.
+        let p = std::path::Path::new(bin);
+        if p.is_absolute() {
+            return Some(p.to_path_buf());
+        }
+        let out = Command::new("where.exe").arg(bin).output().await.ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if is_windows_apps_alias_path(line) {
+                tracing::debug!(
+                    bin,
+                    path = line,
+                    "skipping Microsoft Store App Execution Alias"
+                );
+                continue;
+            }
+            return Some(std::path::PathBuf::from(line));
+        }
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        Some(std::path::PathBuf::from(bin))
+    }
+}
+
+#[cfg(windows)]
+fn is_windows_apps_alias_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.contains(r"\microsoft\windowsapps\")
 }
 
 /// Extract the first version-looking token from a `--version` output line,
@@ -952,6 +1031,35 @@ Successfully installed defusedxml-0.7.1 fpdf2-2.8.1 Pillow-10.4.0
         let p2 = probe_runtimes().await;
         assert_eq!(p.python, p2.python);
         assert_eq!(p.node, p2.node);
+    }
+
+    #[test]
+    fn windows_store_alias_output_is_rejected() {
+        // Real Python output should pass:
+        assert!(!is_windows_store_alias_output("Python 3.12.7"));
+        assert!(!is_windows_store_alias_output("v22.11.0"));
+        // The Microsoft Store App Execution Alias message must be rejected
+        // even when it arrives on stdout with a successful exit code:
+        let alias = "Python was not found; run without arguments to install \
+                     from the Microsoft Store, or disable this shortcut from \
+                     Settings > Manage App Execution Aliases.";
+        assert!(is_windows_store_alias_output(alias));
+        assert!(is_windows_store_alias_output("Microsoft Store"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_apps_alias_path_detection() {
+        assert!(is_windows_apps_alias_path(
+            r"C:\Users\beta\AppData\Local\Microsoft\WindowsApps\python.exe"
+        ));
+        assert!(is_windows_apps_alias_path(
+            r"C:\USERS\BETA\APPDATA\LOCAL\MICROSOFT\WINDOWSAPPS\PYTHON3.EXE"
+        ));
+        assert!(!is_windows_apps_alias_path(r"C:\Python312\python.exe"));
+        assert!(!is_windows_apps_alias_path(
+            r"C:\Users\beta\AppData\Local\Programs\Python\Python312\python.exe"
+        ));
     }
 
     #[test]
