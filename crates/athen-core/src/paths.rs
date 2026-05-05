@@ -156,11 +156,38 @@ pub fn path_within(child: &Path, ancestor: &Path) -> bool {
 /// Canonicalize a path if it exists; otherwise normalize `.` and `..`
 /// components manually without touching the filesystem. The original case is
 /// preserved in the returned `PathBuf`.
+///
+/// On Windows the result is stripped of the `\\?\` verbatim prefix that
+/// `std::fs::canonicalize` always emits. Without that, an existing file
+/// canonicalizes to `\\?\C:\…` while a non-existent one normalizes to
+/// `C:\…`, and any `path_within` / `starts_with` comparison between the
+/// two yields a false negative — including the "inside Athen data dir →
+/// Safe" gate, which would then prompt the user for permission to write
+/// inside Athen's own workspace.
 pub fn canonicalize_loose(p: &Path) -> PathBuf {
     if let Ok(c) = std::fs::canonicalize(p) {
-        return c;
+        return strip_windows_verbatim(c);
     }
     normalize(p)
+}
+
+/// Strip the `\\?\` Win32 file-namespace prefix from an absolute Windows
+/// path so it compares equal to the non-canonical form (`C:\…`). On
+/// non-Windows targets this is a no-op.
+#[inline]
+fn strip_windows_verbatim(p: PathBuf) -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        let s = p.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            // \\?\UNC\server\share\… → \\server\share\…
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    p
 }
 
 /// Lexically resolve `.` and `..` against an absolute or relative path,
@@ -279,5 +306,39 @@ mod tests {
     fn resolve_absolute_unchanged() {
         let abs = Path::new("/tmp/x");
         assert_eq!(resolve_in_workspace(abs), PathBuf::from("/tmp/x"));
+    }
+
+    /// Regression: on Windows, `std::fs::canonicalize` emits paths with a
+    /// `\\?\` verbatim prefix when the file exists, but the lexical
+    /// `normalize` fallback used for non-existent paths does not. Without
+    /// stripping the prefix, `path_within` returned false for files about
+    /// to be created inside the Athen data dir → permission prompts on
+    /// every write inside Athen's own workspace.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn strip_verbatim_prefix_makes_canonical_and_lexical_match() {
+        let canonical = PathBuf::from(r"\\?\C:\Users\Bob\AppData\Roaming\Athen");
+        let lexical = PathBuf::from(r"C:\Users\Bob\AppData\Roaming\Athen\workspace\test.html");
+        let stripped = strip_windows_verbatim(canonical);
+        assert_eq!(
+            stripped,
+            PathBuf::from(r"C:\Users\Bob\AppData\Roaming\Athen")
+        );
+        // The lexical descendant must compare as inside the stripped ancestor.
+        assert!(lexical.starts_with(&stripped));
+
+        // UNC verbatim paths round-trip back to the non-verbatim UNC form.
+        let unc = PathBuf::from(r"\\?\UNC\server\share\dir");
+        assert_eq!(
+            strip_windows_verbatim(unc),
+            PathBuf::from(r"\\server\share\dir")
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn strip_verbatim_prefix_is_noop_on_unix() {
+        let p = PathBuf::from("/home/alex/.athen");
+        assert_eq!(strip_windows_verbatim(p.clone()), p);
     }
 }
