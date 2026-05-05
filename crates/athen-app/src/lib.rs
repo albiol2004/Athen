@@ -14,6 +14,7 @@ pub(crate) mod process;
 pub(crate) mod sense_router;
 mod settings;
 pub(crate) mod state;
+pub(crate) mod telegram_progress;
 
 use state::AppState;
 

@@ -1059,13 +1059,26 @@ async fn execute_owner_telegram_message(
     // Shared list of successful tool names; the auditor appends as steps
     // finish, and we read it after execute to build the Telegram footer.
     let tool_log = new_tool_log();
+
+    // Live progress reporter: a single status message edited in place as
+    // tools fire, plus a 4s typing-indicator loop. Without this the bot
+    // is mute from "send" until "final reply" — visibly broken on tasks
+    // that take >5s. Posted before execute so the user sees activity
+    // immediately, finalized below regardless of success/failure.
+    let progress = Arc::new(crate::telegram_progress::TelegramProgressReporter::new(
+        bot_token.to_string(),
+        chat_id,
+    ));
+    progress.start().await;
+
     let auditor = TauriAuditor::new(
         app_handle.clone(),
         arc_store.clone(),
         target_arc_id.clone().unwrap_or_default(),
         turn_id.clone(),
         tool_log.clone(),
-    );
+    )
+    .with_telegram_progress(Arc::clone(&progress));
     let stream_tx = spawn_stream_forwarder(app_handle, target_arc_id.clone());
     let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -1179,9 +1192,10 @@ async fn execute_owner_telegram_message(
                 }
             }
 
-            if let Err(e) = send_telegram_reply(bot_token, chat_id, &user_msg).await {
-                warn!("Failed to send Telegram error reply: {e}");
-            }
+            // Replace the live status message with the error so the
+            // user sees what went wrong in the same place they were
+            // watching for progress.
+            progress.finalize_with_text(&user_msg).await;
             return;
         }
     };
@@ -1247,18 +1261,18 @@ async fn execute_owner_telegram_message(
         let _ = app_handle.emit("arc-updated", serde_json::json!({ "arc_id": arc_id }));
     }
 
-    // Send the response back to Telegram, with a "Tools used" footer when
-    // the agent ran any. The Telegram client doesn't render our SVG icons,
-    // so this is a plain-text de-duplicated list.
+    // Replace the live status message with the final response, plus
+    // the deduplicated tools footer. Even though the user watched
+    // each tool appear live, they may scroll back later (or open the
+    // chat fresh on another device) — preserving the footer keeps
+    // the trail visible as a single self-contained message.
     let footer = build_telegram_tools_footer(&tool_log);
     let outbound = if footer.is_empty() {
         content.clone()
     } else {
         format!("{content}\n\n{footer}")
     };
-    if let Err(e) = send_telegram_reply(bot_token, chat_id, &outbound).await {
-        warn!("Failed to send Telegram reply: {e}");
-    }
+    progress.finalize_with_text(&outbound).await;
 
     info!(
         "Owner Telegram message executed, response length: {} chars",
@@ -1281,12 +1295,20 @@ pub(crate) fn build_telegram_tools_footer(tool_log: &crate::commands::ToolLog) -
         return String::new();
     }
 
+    // Map raw tool names to their UI labels (e.g. `shell_execute` →
+    // `Run`, `files__list_dir` → `List`) so the footer matches what
+    // the user just watched scroll past in the live status message
+    // and what the in-app UI shows for the same tool calls.
     let mut order: Vec<String> = Vec::new();
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for name in names {
-        let entry = counts.entry(name.clone()).or_insert(0);
+        let label = crate::telegram_progress::pretty_tool_label(&name);
+        if label.is_empty() {
+            continue;
+        }
+        let entry = counts.entry(label.clone()).or_insert(0);
         if *entry == 0 {
-            order.push(name);
+            order.push(label);
         }
         *entry += 1;
     }

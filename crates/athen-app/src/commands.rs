@@ -774,6 +774,11 @@ pub(crate) struct TauriAuditor {
     /// by `delegate_to_agent` so their step-by-step progress doesn't leak into
     /// the parent arc's progress UI.
     emit_progress: bool,
+    /// Live progress reporter for owner Telegram turns. When set, the
+    /// auditor edits a single status message in place as new tools fire,
+    /// so the user isn't watching dead air on a long task. `None` for
+    /// in-app turns (the frontend already renders progress directly).
+    telegram_progress: Option<Arc<crate::telegram_progress::TelegramProgressReporter>>,
 }
 
 impl TauriAuditor {
@@ -792,6 +797,7 @@ impl TauriAuditor {
             turn_id,
             tool_log,
             emit_progress: true,
+            telegram_progress: None,
         }
     }
 
@@ -814,7 +820,19 @@ impl TauriAuditor {
             turn_id,
             tool_log,
             emit_progress: false,
+            telegram_progress: None,
         }
+    }
+
+    /// Attach a live Telegram progress reporter. When set, the auditor
+    /// pushes each newly-started tool name into the reporter so it can
+    /// edit its status message in place.
+    pub(crate) fn with_telegram_progress(
+        mut self,
+        reporter: Arc<crate::telegram_progress::TelegramProgressReporter>,
+    ) -> Self {
+        self.telegram_progress = Some(reporter);
+        self
     }
 
     /// Truncate a detail string to `max_len` characters, appending "..." if truncated.
@@ -914,6 +932,26 @@ impl StepAuditor for TauriAuditor {
                     if let Ok(mut log) = self.tool_log.lock() {
                         log.push(tool.to_string());
                     }
+                }
+            }
+
+            // Push tool name to the live Telegram status message so the
+            // user watches a growing list instead of dead silence. We
+            // include failed tools too — they're informative even when
+            // the agent retries — and we run it in a detached task so a
+            // Telegram blip can't slow down the executor's audit path.
+            if let Some(reporter) = self.telegram_progress.as_ref() {
+                if let Some(tool) = step
+                    .output
+                    .as_ref()
+                    .and_then(|o| o.get("tool"))
+                    .and_then(|t| t.as_str())
+                {
+                    let reporter = Arc::clone(reporter);
+                    let tool = tool.to_string();
+                    tokio::spawn(async move {
+                        reporter.report_tool(&tool).await;
+                    });
                 }
             }
 

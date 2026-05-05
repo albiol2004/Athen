@@ -515,6 +515,70 @@ pub async fn send_message(
     Ok(())
 }
 
+/// Send a single text message and return its `message_id`, so the
+/// caller can later edit it via [`edit_message_text`]. Unlike
+/// [`send_message`] this does not chunk — pass text under the 4096-char
+/// Bot API limit. Used by the live-progress reporter, which posts one
+/// status message and then mutates it as the agent works.
+pub async fn send_message_returning_id(
+    bot_token: &str,
+    chat_id: i64,
+    text: &str,
+) -> std::result::Result<i64, String> {
+    let client = reqwest::Client::new();
+    let url = format!("https://api.telegram.org/bot{bot_token}/sendMessage");
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "chat_id": chat_id,
+            "text": text,
+        }))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to send Telegram message: {e}"))?;
+    let status = resp.status();
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse Telegram response: {e}"))?;
+    if !status.is_success() || !body.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return Err(format!("Telegram sendMessage error {status}: {body}"));
+    }
+    body.get("result")
+        .and_then(|r| r.get("message_id"))
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| "Telegram response missing message_id".to_string())
+}
+
+/// Send a chat action (e.g. "typing") so Telegram clients show the
+/// activity indicator. The indicator only persists ~5s, so callers
+/// that want a sustained "typing…" must call this on a loop.
+pub async fn send_chat_action(
+    bot_token: &str,
+    chat_id: i64,
+    action: &str,
+) -> std::result::Result<(), String> {
+    let client = reqwest::Client::new();
+    let url = format!("https://api.telegram.org/bot{bot_token}/sendChatAction");
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "chat_id": chat_id,
+            "action": action,
+        }))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to send chat action: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Telegram sendChatAction {status}: {body}"));
+    }
+    Ok(())
+}
+
 /// Send a text message with an inline keyboard via the Bot API.
 ///
 /// `buttons` is a single horizontal row of `(label, callback_data)`
