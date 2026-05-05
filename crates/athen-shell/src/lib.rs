@@ -14,7 +14,7 @@ use tracing::debug;
 
 use athen_core::error::Result;
 use athen_core::traits::sandbox::SandboxOutput;
-use athen_core::traits::shell::ShellExecutor;
+use athen_core::traits::shell::{ShellExecutor, ShellOptions};
 
 use crate::native::NativeShell;
 use crate::nushell::NushellShell;
@@ -88,6 +88,17 @@ impl ShellExecutor for Shell {
     /// Locate a program, preferring nushell's which if available.
     async fn which(&self, program: &str) -> Result<Option<PathBuf>> {
         self.nushell.which(program).await
+    }
+
+    /// Execute with extra env vars + cwd applied via the OS process API.
+    /// Routes through nushell when available; nushell inherits the env and
+    /// cwd from the spawned process so no shell-specific syntax is needed.
+    async fn execute_with(
+        &self,
+        command: &str,
+        opts: ShellOptions<'_>,
+    ) -> Result<SandboxOutput> {
+        self.nushell.execute_with(command, opts).await
     }
 }
 

@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 
 use athen_core::error::{AthenError, Result};
 use athen_core::traits::sandbox::SandboxOutput;
-use athen_core::traits::shell::ShellExecutor;
+use athen_core::traits::shell::{ShellExecutor, ShellOptions};
 
 use crate::native::NativeShell;
 
@@ -95,6 +95,17 @@ impl NushellShell {
 
     /// Execute a command via the nushell binary.
     async fn run_nushell(&self, command: &str) -> Result<SandboxOutput> {
+        self.run_nushell_with(command, ShellOptions::default()).await
+    }
+
+    /// Execute via nushell, applying extra env vars and cwd through the OS
+    /// process API. nushell inherits both as ordinary process state, so we
+    /// don't need to compose any nushell-specific syntax (`$env.X = ...`).
+    async fn run_nushell_with(
+        &self,
+        command: &str,
+        opts: ShellOptions<'_>,
+    ) -> Result<SandboxOutput> {
         let nu_path = self
             .nushell_path
             .as_ref()
@@ -106,6 +117,12 @@ impl NushellShell {
 
         let mut cmd = Command::new(nu_path);
         cmd.arg("-c").arg(command);
+        for (k, v) in opts.env {
+            cmd.env(k, v);
+        }
+        if let Some(cwd) = opts.cwd {
+            cmd.current_dir(cwd);
+        }
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
@@ -158,6 +175,18 @@ impl ShellExecutor for NushellShell {
     /// Always use the native platform shell for platform-specific commands.
     async fn execute_native(&self, command: &str) -> Result<SandboxOutput> {
         self.native.execute_native(command).await
+    }
+
+    async fn execute_with(
+        &self,
+        command: &str,
+        opts: ShellOptions<'_>,
+    ) -> Result<SandboxOutput> {
+        if self.is_available() {
+            self.run_nushell_with(command, opts).await
+        } else {
+            self.native.execute_with(command, opts).await
+        }
     }
 
     /// Check if a program exists. Prefers nushell's `which` if available.

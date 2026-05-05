@@ -9,7 +9,7 @@ use tracing::{debug, warn};
 
 use athen_core::error::{AthenError, Result};
 use athen_core::traits::sandbox::SandboxOutput;
-use athen_core::traits::shell::ShellExecutor;
+use athen_core::traits::shell::{ShellExecutor, ShellOptions};
 
 /// Default command timeout in seconds.
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
@@ -28,12 +28,29 @@ impl NativeShell {
     /// Execute a command string via the native platform shell, returning
     /// the captured output along with timing information.
     async fn run_command(&self, command: &str) -> Result<SandboxOutput> {
+        self.run_command_with(command, ShellOptions::default())
+            .await
+    }
+
+    /// Execute a command via the native shell, applying extra env vars and
+    /// cwd through the OS process API (no shell-specific syntax needed).
+    async fn run_command_with(
+        &self,
+        command: &str,
+        opts: ShellOptions<'_>,
+    ) -> Result<SandboxOutput> {
         debug!(command, "executing native shell command");
 
         let start = Instant::now();
 
         let mut cmd = self.build_command(command);
         cmd.kill_on_drop(true);
+        for (k, v) in opts.env {
+            cmd.env(k, v);
+        }
+        if let Some(cwd) = opts.cwd {
+            cmd.current_dir(cwd);
+        }
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
@@ -139,6 +156,14 @@ impl ShellExecutor for NativeShell {
     async fn which(&self, program: &str) -> Result<Option<PathBuf>> {
         self.find_program(program).await
     }
+
+    async fn execute_with(
+        &self,
+        command: &str,
+        opts: ShellOptions<'_>,
+    ) -> Result<SandboxOutput> {
+        self.run_command_with(command, opts).await
+    }
 }
 
 #[cfg(test)]
@@ -200,5 +225,50 @@ mod tests {
         let output = shell.execute_native("echo native").await.unwrap();
         assert_eq!(output.exit_code, 0);
         assert_eq!(output.stdout.trim(), "native");
+    }
+
+    /// Regression: `execute_with` must inject env vars through the OS
+    /// process API, not as shell-syntax (`export X=Y && …`). Without
+    /// this the wrapper breaks on nushell and on Windows cmd.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_execute_with_injects_env() {
+        let shell = NativeShell::new();
+        let env = vec![("ATHEN_TEST_VAR".to_string(), "wired".to_string())];
+        let output = shell
+            .execute_with(
+                "echo $ATHEN_TEST_VAR",
+                ShellOptions {
+                    env: &env,
+                    cwd: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.stdout.trim(), "wired");
+    }
+
+    /// Regression: `execute_with` must set the spawned process's cwd via
+    /// `Command::current_dir`, not by prefixing `cd <dir> &&`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_execute_with_sets_cwd() {
+        let shell = NativeShell::new();
+        let tmp = std::env::temp_dir();
+        let canonical = std::fs::canonicalize(&tmp).unwrap();
+        let output = shell
+            .execute_with(
+                "pwd",
+                ShellOptions {
+                    env: &[],
+                    cwd: Some(&tmp),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.exit_code, 0);
+        let pwd = std::fs::canonicalize(output.stdout.trim()).unwrap();
+        assert_eq!(pwd, canonical);
     }
 }

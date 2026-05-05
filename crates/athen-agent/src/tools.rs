@@ -15,7 +15,7 @@ use athen_core::paths;
 use athen_core::risk::{BaseImpact, DataSensitivity, RiskContext, RiskLevel};
 use athen_core::sandbox::{SandboxLevel, SandboxProfile};
 use athen_core::tool::{ToolBackend, ToolDefinition, ToolResult};
-use athen_core::traits::shell::ShellExecutor;
+use athen_core::traits::shell::{ShellExecutor, ShellOptions};
 use athen_core::traits::tool::ToolRegistry;
 use athen_risk::rules::RuleEngine;
 use athen_sandbox::UnifiedSandbox;
@@ -215,8 +215,10 @@ fn repair_unescaped_control_chars(input: &str) -> String {
 }
 
 impl ShellToolRegistry {
-    /// Compose the shell wrapper that runs around every `shell_execute`
-    /// command:
+    /// Compose the shell wrapper that the bwrap-sandboxed branch runs
+    /// around every `shell_execute` command. bwrap is Linux-only and the
+    /// inner command is always invoked through `sh -c`, so bash syntax is
+    /// safe here.
     ///
     /// 1. `cd <workspace>` so relative paths land in the agent workspace.
     /// 2. Export `PYTHONPATH=<toolbox/python>:<existing>` so `pip
@@ -226,8 +228,10 @@ impl ShellToolRegistry {
     /// 4. Run the user's command inside `( ... )` so embedded `;`
     ///    doesn't escape any of the above.
     ///
-    /// Each step is skipped silently if its inputs are unavailable
-    /// (e.g. no home dir → no toolbox dirs → no env exports).
+    /// For the unsandboxed path, prefer [`build_shell_env`] — it expresses
+    /// the same intent through the OS process API (`Command::env`/`cwd`)
+    /// and works on any shell (sh, bash, zsh, nushell, cmd, pwsh) on any
+    /// OS without embedding shell-specific syntax in the command string.
     fn build_shell_wrapper(command: &str) -> String {
         let mut out = String::new();
         if let Some(ws) = paths::athen_workspace_dir() {
@@ -258,6 +262,54 @@ impl ShellToolRegistry {
             out.push_str(&format!("( {command} )"));
             out
         }
+    }
+
+    /// Compute the env-var overrides and cwd to apply to a `shell_execute`
+    /// command via the OS process API. This is the cross-shell, cross-OS
+    /// counterpart to [`build_shell_wrapper`]: we never embed `export …`
+    /// or `cd …` in the command text, so the same options work for sh,
+    /// bash, zsh, nushell, cmd, and pwsh.
+    ///
+    /// PATH is composed with the platform-correct separator
+    /// (`std::env::join_paths`); on Windows that's `;` and Windows path
+    /// elements containing `:` (drive letters) survive unmangled. The npm
+    /// `--prefix` install target lives at `<toolbox>/node/bin` on Unix
+    /// and directly at `<toolbox>/node` on Windows, so we adapt the bin
+    /// path accordingly.
+    fn build_shell_env() -> (Vec<(String, String)>, Option<PathBuf>) {
+        let mut env: Vec<(String, String)> = Vec::new();
+
+        if let Some(pydir) = paths::athen_toolbox_python_dir() {
+            let existing = std::env::var_os("PYTHONPATH");
+            let mut parts: Vec<PathBuf> = vec![pydir];
+            if let Some(ref ex) = existing {
+                parts.extend(std::env::split_paths(ex));
+            }
+            if let Ok(joined) = std::env::join_paths(parts) {
+                env.push(("PYTHONPATH".to_string(), joined.to_string_lossy().into_owned()));
+            }
+        }
+
+        if let Some(nodedir) = paths::athen_toolbox_node_dir() {
+            let node_bin = if cfg!(windows) {
+                // npm on Windows installs binaries directly under the
+                // prefix (no `bin/` subdir).
+                nodedir
+            } else {
+                nodedir.join("bin")
+            };
+            let existing = std::env::var_os("PATH");
+            let mut parts: Vec<PathBuf> = vec![node_bin];
+            if let Some(ref ex) = existing {
+                parts.extend(std::env::split_paths(ex));
+            }
+            if let Ok(joined) = std::env::join_paths(parts) {
+                env.push(("PATH".to_string(), joined.to_string_lossy().into_owned()));
+            }
+        }
+
+        let cwd = paths::athen_workspace_dir();
+        (env, cwd)
     }
 
     /// Best-effort: create the agent workspace dir so relative paths in
@@ -576,8 +628,11 @@ impl ShellToolRegistry {
 
         // Default-cwd to the agent workspace. Risk evaluation and the
         // sandbox-allowed paths see the original command — the wrapper is
-        // only what actually runs.
+        // only what the bwrap-sandboxed (Linux) branch actually runs. The
+        // unsandboxed path uses structured env+cwd via the OS process API
+        // ([`build_shell_env`]) so it works on every shell on every OS.
         let wrapped_command = Self::build_shell_wrapper(command);
+        let (env_overrides, cwd) = Self::build_shell_env();
 
         tracing::info!(
             tool = "shell_execute",
@@ -678,7 +733,16 @@ impl ShellToolRegistry {
                                 stderr = %output.stderr.trim(),
                                 "Sandbox infrastructure failed, falling back to unsandboxed shell"
                             );
-                            let output = self.shell.execute(&wrapped_command).await?;
+                            let output = self
+                                .shell
+                                .execute_with(
+                                    command,
+                                    ShellOptions {
+                                        env: &env_overrides,
+                                        cwd: cwd.as_deref(),
+                                    },
+                                )
+                                .await?;
                             (output.stdout, output.stderr, output.exit_code)
                         } else {
                             tracing::debug!(
@@ -694,7 +758,16 @@ impl ShellToolRegistry {
                             error = %e,
                             "Sandbox execution failed, falling back to unsandboxed shell"
                         );
-                        let output = self.shell.execute(&wrapped_command).await?;
+                        let output = self
+                            .shell
+                            .execute_with(
+                                command,
+                                ShellOptions {
+                                    env: &env_overrides,
+                                    cwd: cwd.as_deref(),
+                                },
+                            )
+                            .await?;
                         (output.stdout, output.stderr, output.exit_code)
                     }
                 }
@@ -703,7 +776,16 @@ impl ShellToolRegistry {
                     tool = "shell_execute",
                     "No sandbox available, executing unsandboxed"
                 );
-                let output = self.shell.execute(&wrapped_command).await?;
+                let output = self
+                    .shell
+                    .execute_with(
+                        command,
+                        ShellOptions {
+                            env: &env_overrides,
+                            cwd: cwd.as_deref(),
+                        },
+                    )
+                    .await?;
                 (output.stdout, output.stderr, output.exit_code)
             };
             Ok::<_, AthenError>((stdout, stderr, exit_code))
@@ -1594,16 +1676,34 @@ impl ShellToolRegistry {
             }
         };
 
-        let mut cmd = tokio::process::Command::new("sh");
-        cmd.arg("-c")
-            .arg(command)
-            .stdin(std::process::Stdio::null())
+        // Pick the platform shell wrapper. On Unix we route through `sh
+        // -c`; on Windows through `cmd /C`. Hardcoding `sh` here used to
+        // break Windows entirely (no `sh` on PATH).
+        #[cfg(unix)]
+        let mut cmd = {
+            let mut c = tokio::process::Command::new("sh");
+            c.arg("-c").arg(command);
+            c
+        };
+        #[cfg(windows)]
+        let mut cmd = {
+            let mut c = tokio::process::Command::new("cmd");
+            c.arg("/C").arg(command);
+            c
+        };
+
+        cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::from(stdout_file))
             .stderr(std::process::Stdio::from(stderr_file));
-        // Default cwd to the agent workspace so daemons like
-        // `python3 -m http.server` serve the agent's own files instead of
-        // whatever directory the host process happened to launch from.
-        if let Some(ws) = paths::athen_workspace_dir() {
+
+        // Apply the same toolbox env (PYTHONPATH / PATH) and cwd as
+        // `shell_execute`, but via the OS process API so the wrapper
+        // works on every shell on every OS.
+        let (env_overrides, cwd) = Self::build_shell_env();
+        for (k, v) in &env_overrides {
+            cmd.env(k, v);
+        }
+        if let Some(ref ws) = cwd {
             cmd.current_dir(ws);
         }
         // On Unix, put the child in its own process group so signals to us
