@@ -9,6 +9,7 @@ pub mod executor;
 pub mod resource;
 pub mod timeout;
 pub mod tool_grouping;
+pub mod toolbox;
 pub mod tools;
 pub mod tools_doc;
 
@@ -16,7 +17,10 @@ pub use auditor::InMemoryAuditor;
 pub use executor::DefaultExecutor;
 pub use resource::DefaultResourceMonitor;
 pub use timeout::DefaultTimeoutGuard;
-pub use tools::{ShellToolRegistry, SpawnedProcess, SpawnedProcessMap};
+pub use toolbox::{
+    InstalledPackage, Runtime as ToolboxRuntime, RuntimeProbe, ToolboxManifest,
+};
+pub use tools::{ShellToolRegistry, SpawnedProcess, SpawnedProcessMap, ToolboxApprovalGate};
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -41,6 +45,7 @@ pub struct AgentBuilder {
     cancel_flag: Option<Arc<AtomicBool>>,
     tool_doc_path: Option<PathBuf>,
     active_profile: Option<athen_core::agent_profile::ResolvedAgentProfile>,
+    toolbox_info: Option<toolbox::ToolboxPromptInfo>,
 }
 
 impl AgentBuilder {
@@ -62,7 +67,17 @@ impl AgentBuilder {
             cancel_flag: None,
             tool_doc_path: None,
             active_profile: None,
+            toolbox_info: None,
         }
+    }
+
+    /// Inject pre-fetched toolbox runtime probe + manifest summary so
+    /// the built executor's system prompt can surface what the agent
+    /// already has installed and which language runtimes are available.
+    /// Without this, the toolbox prompt slot is omitted.
+    pub fn toolbox_info(mut self, info: toolbox::ToolboxPromptInfo) -> Self {
+        self.toolbox_info = Some(info);
+        self
     }
 
     /// Run this executor under the given resolved agent profile. The
@@ -183,6 +198,10 @@ impl AgentBuilder {
 
         if let Some(profile) = self.active_profile {
             executor.set_active_profile(profile);
+        }
+
+        if let Some(info) = self.toolbox_info {
+            executor.set_toolbox_info(info);
         }
 
         Ok(executor)

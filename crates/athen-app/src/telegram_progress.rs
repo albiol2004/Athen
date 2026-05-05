@@ -63,6 +63,9 @@ const BUILTIN_TOOL_LABELS: &[(&str, &str)] = &[
     ("exists", "Check"),
     ("stat", "Info"),
     ("delegate_to_agent", "Consult specialist"),
+    ("install_package", "Install package"),
+    ("uninstall_package", "Uninstall package"),
+    ("list_installed_packages", "List packages"),
 ];
 
 /// MCP suffixes that don't match a built-in tool name directly but should

@@ -43,6 +43,29 @@ pub fn athen_workspace_dir() -> Option<PathBuf> {
     athen_data_dir().map(|d| d.join("workspace"))
 }
 
+/// Persistent toolbox root for shell-installed packages (pip --target,
+/// npm --prefix). Lives under [`athen_data_dir`] so it survives reboots,
+/// unlike `/tmp`.
+pub fn athen_toolbox_dir() -> Option<PathBuf> {
+    athen_data_dir().map(|d| d.join("toolbox"))
+}
+
+/// Subdirectory the agent's `pip3 install --target=...` writes into.
+pub fn athen_toolbox_python_dir() -> Option<PathBuf> {
+    athen_toolbox_dir().map(|d| d.join("python"))
+}
+
+/// Subdirectory the agent's `npm install --prefix=...` writes into.
+/// Node's bin shims land in `<this>/bin`, the lib tree in `<this>/lib`.
+pub fn athen_toolbox_node_dir() -> Option<PathBuf> {
+    athen_toolbox_dir().map(|d| d.join("node"))
+}
+
+/// JSON manifest tracking what the agent has installed in the toolbox.
+pub fn athen_toolbox_manifest_path() -> Option<PathBuf> {
+    athen_toolbox_dir().map(|d| d.join("manifest.json"))
+}
+
 /// Resolve `p` against the agent workspace dir. Absolute paths pass through
 /// unchanged; relative paths are joined with [`athen_workspace_dir`], or
 /// with a `<temp>/athen-workspace` fallback when home isn't resolvable.
@@ -223,6 +246,26 @@ mod tests {
         assert!(ws.ends_with("workspace"));
         let data = athen_data_dir().expect("data");
         assert!(ws.starts_with(&data));
+    }
+
+    #[test]
+    fn toolbox_dirs_under_data_dir() {
+        let tb = athen_toolbox_dir().expect("toolbox");
+        assert!(tb.ends_with("toolbox"));
+        let data = athen_data_dir().expect("data");
+        assert!(tb.starts_with(&data));
+
+        let py = athen_toolbox_python_dir().expect("python");
+        assert!(py.ends_with("python"));
+        assert!(py.starts_with(&tb));
+
+        let node = athen_toolbox_node_dir().expect("node");
+        assert!(node.ends_with("node"));
+        assert!(node.starts_with(&tb));
+
+        let m = athen_toolbox_manifest_path().expect("manifest");
+        assert!(m.ends_with("manifest.json"));
+        assert!(m.starts_with(&tb));
     }
 
     #[test]

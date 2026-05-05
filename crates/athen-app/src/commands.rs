@@ -83,6 +83,7 @@ fn spawn_router_approval(
         cancel_flag: Arc::clone(&state.cancel_flag),
         active_arc_id: arc_id.clone().unwrap_or_default(),
         inflight: state.inflight_approvals.clone(),
+        approval_router: state.approval_router.clone(),
     };
 
     tauri::async_runtime::spawn(async move {
@@ -183,6 +184,7 @@ fn spawn_router_approval(
             } else {
                 Some(description)
             },
+            approval_router: bg_ctx.approval_router,
         };
 
         let outcome = match execute_approved_task(task_id, ctx).await {
@@ -253,6 +255,7 @@ struct ApprovedTaskBgCtx {
     cancel_flag: Arc<std::sync::atomic::AtomicBool>,
     active_arc_id: String,
     inflight: crate::state::InflightApprovals,
+    approval_router: Option<Arc<crate::approval::ApprovalRouter>>,
 }
 
 /// Resolve the agent profile that should drive execution for a given arc.
@@ -1295,6 +1298,8 @@ pub async fn send_message(
             if let Some(profile) = active_profile {
                 builder = builder.active_profile(profile);
             }
+            builder =
+                builder.toolbox_info(athen_agent::toolbox::ToolboxPromptInfo::load().await);
             let executor = builder.build().map_err(|e| {
                 let raw = e.to_string();
                 tracing::error!("AgentBuilder failed: {raw}");
@@ -1546,6 +1551,7 @@ pub async fn approve_task(
         app_handle: app_handle.clone(),
         turn_id: turn_id.clone(),
         message_override,
+        approval_router: state.approval_router.clone(),
     };
 
     let outcome = match execute_approved_task(task_uuid, ctx).await {
@@ -1634,6 +1640,10 @@ pub(crate) struct ApprovedTaskCtx {
     /// User message override (typically the stashed `pending_message`); the
     /// helper falls back to the coordinator task description when None.
     pub message_override: Option<String>,
+    /// Cross-channel approval router used by the toolbox install gate
+    /// (and re-used by file gates, etc.). `None` means no router was
+    /// initialized yet, so toolbox installs fail closed.
+    pub approval_router: Option<Arc<crate::approval::ApprovalRouter>>,
 }
 
 /// Drive a risk-flagged task all the way through approval, dispatch,
@@ -1828,6 +1838,14 @@ pub(crate) async fn execute_approved_task(
         });
         shell_registry = shell_registry.with_extra_writable(provider);
     }
+    if let Some(ref router) = ctx.approval_router {
+        shell_registry = shell_registry.with_toolbox_approval(Arc::new(
+            crate::file_gate::RouterToolboxApprovalGate::new(
+                Arc::clone(router),
+                Some(ctx.active_arc_id.clone()),
+            ),
+        ));
+    }
     let mut registry = crate::app_tools::AppToolRegistry::new(
         shell_registry,
         ctx.calendar_store.clone(),
@@ -1910,6 +1928,7 @@ pub(crate) async fn execute_approved_task(
     if let Some(profile) = active_profile {
         builder = builder.active_profile(profile);
     }
+    builder = builder.toolbox_info(athen_agent::toolbox::ToolboxPromptInfo::load().await);
     let executor = builder.build().map_err(|e| {
         let raw = e.to_string();
         tracing::error!("AgentBuilder failed (approval): {raw}");
@@ -3246,6 +3265,47 @@ pub async fn install_update(app: AppHandle) -> std::result::Result<(), String> {
     // installer already replaces the running .exe and `restart()` will
     // re-launch from the new path.
     app.restart();
+}
+
+/// Frontend-friendly view of an [`athen_agent::InstalledPackage`].
+/// `runtime` is serialized as `"python"` / `"node"` so the JS side
+/// doesn't need to know the Rust enum representation.
+#[derive(Serialize)]
+pub struct ToolboxPackageView {
+    pub runtime: String,
+    pub package: String,
+    pub version_spec: Option<String>,
+    pub installed_version: Option<String>,
+    pub reason: String,
+    pub installed_at: chrono::DateTime<chrono::Utc>,
+    pub runtime_version: Option<String>,
+}
+
+impl From<athen_agent::InstalledPackage> for ToolboxPackageView {
+    fn from(p: athen_agent::InstalledPackage) -> Self {
+        Self {
+            runtime: p.runtime.as_str().to_string(),
+            package: p.package,
+            version_spec: p.version_spec,
+            installed_version: p.installed_version,
+            reason: p.reason,
+            installed_at: p.installed_at,
+            runtime_version: p.runtime_version,
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn list_toolbox_packages() -> std::result::Result<Vec<ToolboxPackageView>, String> {
+    let manifest = athen_agent::toolbox::load_manifest().await;
+    Ok(manifest.installs.into_iter().map(Into::into).collect())
+}
+
+#[tauri::command]
+pub async fn clear_toolbox() -> std::result::Result<(), String> {
+    athen_agent::toolbox::clear_toolbox()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

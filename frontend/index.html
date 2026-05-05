@@ -255,6 +255,15 @@
                 <p class="settings-description">Toggle which Model Context Protocol servers Athen can use. Enabled tools become available to the agent on the next turn — no restart needed.</p>
                 <div id="mcp-list"></div>
             </section>
+
+            <section class="settings-section">
+                <h2>Shell Toolbox</h2>
+                <p class="settings-description">Persistent Python and Node packages the agent installed for itself under <code>~/.athen/toolbox</code>. PYTHONPATH and PATH are auto-injected into every shell command, so anything listed here is importable/runnable without further configuration. The agent asks for permission before installing.</p>
+                <div id="toolbox-list" class="toolbox-list"></div>
+                <div class="setting-actions">
+                    <button id="clear-toolbox-btn" class="btn-secondary">Clear toolbox</button>
+                </div>
+            </section>
             </div>
 
             <div class="settings-tab-pane" data-settings-pane="connections">

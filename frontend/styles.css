@@ -3989,6 +3989,62 @@ option:hover {
     margin: 4px 0 16px;
 }
 
+/* ─── Shell toolbox ─── */
+.toolbox-list {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    margin-bottom: 12px;
+}
+.toolbox-group {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+.toolbox-group-title {
+    font-size: 11px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-3);
+    margin: 0 0 4px 0;
+}
+.toolbox-row {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding: 10px 14px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
+}
+.toolbox-row-head {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+}
+.toolbox-row-name {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text);
+}
+.toolbox-row-version {
+    font-size: 11.5px;
+    color: var(--text-2);
+    font-variant-numeric: tabular-nums;
+}
+.toolbox-row-date {
+    margin-left: auto;
+    font-size: 11px;
+    color: var(--text-3);
+    font-variant-numeric: tabular-nums;
+}
+.toolbox-row-reason {
+    font-size: 11.5px;
+    color: var(--text-3);
+    line-height: 1.4;
+}
+
 /* ─── Profile manager ─── */
 .profile-list {
     display: flex;

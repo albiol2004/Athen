@@ -113,6 +113,8 @@ pub fn run() {
             commands::restore_agent_profile,
             commands::check_for_update,
             commands::install_update,
+            commands::list_toolbox_packages,
+            commands::clear_toolbox,
         ])
         .setup(|app| {
             use tauri::Manager;

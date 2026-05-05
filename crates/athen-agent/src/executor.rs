@@ -194,6 +194,10 @@ pub struct DefaultExecutor {
     /// to `None` — the seeded default profile reproduces today's persona
     /// without any wiring change.
     active_profile: Option<ResolvedAgentProfile>,
+    /// Toolbox runtime probe + manifest summary, pre-fetched once per
+    /// turn so the prompt-builder stays synchronous. `None` omits the
+    /// toolbox slot entirely (no home dir, or simply not wired yet).
+    toolbox_info: Option<crate::toolbox::ToolboxPromptInfo>,
 }
 
 impl DefaultExecutor {
@@ -217,7 +221,15 @@ impl DefaultExecutor {
             cancel_flag: None,
             tool_doc_dir: None,
             active_profile: None,
+            toolbox_info: None,
         }
+    }
+
+    /// Inject pre-fetched toolbox prompt info. The prompt builder uses
+    /// it to surface available runtimes and currently-installed
+    /// packages so the agent doesn't reinstall what's already there.
+    pub fn set_toolbox_info(&mut self, info: crate::toolbox::ToolboxPromptInfo) {
+        self.toolbox_info = Some(info);
     }
 
     /// Set the agent profile this executor runs under. The profile's
@@ -276,13 +288,57 @@ impl DefaultExecutor {
         has_context: bool,
         tool_doc_dir: Option<&std::path::Path>,
         profile: Option<&ResolvedAgentProfile>,
+        toolbox_info: Option<&crate::toolbox::ToolboxPromptInfo>,
     ) -> String {
         let mut prompt = String::new();
         prompt.push_str(&Self::build_persona_header(profile));
         prompt.push_str(&Self::build_workspace_rules(has_context));
+        prompt.push_str(&Self::build_toolbox_section(toolbox_info));
         prompt.push_str(&Self::build_tool_index(tools, revealed, tool_doc_dir));
         prompt.push_str(&Self::build_persona_rules());
         prompt
+    }
+
+    /// Slot 2.5: persistent toolbox summary. Tells the agent what
+    /// shell-installed packages are already available and which
+    /// runtimes the host has, so it doesn't reinstall fpdf2 every
+    /// turn or try `python3` on a Node-only host.
+    ///
+    /// Omitted entirely when no info is wired (no home dir / CLI
+    /// builds). Always present when toolbox dirs exist, even if no
+    /// packages are installed yet — the "(none yet)" line tells the
+    /// agent the toolbox is the place to install, not /tmp.
+    fn build_toolbox_section(info: Option<&crate::toolbox::ToolboxPromptInfo>) -> String {
+        let Some(info) = info else { return String::new() };
+        let py = info
+            .probe
+            .python
+            .as_deref()
+            .map(|v| format!("python3={v}"))
+            .unwrap_or_else(|| "python3=missing".to_string());
+        let node = info
+            .probe
+            .node
+            .as_deref()
+            .map(|v| format!("node={v}"))
+            .unwrap_or_else(|| "node=missing".to_string());
+        let summary = crate::toolbox::manifest_summary(&info.manifest);
+        let installed = if summary.is_empty() {
+            "(none yet)".to_string()
+        } else {
+            summary
+        };
+        format!(
+            "Toolbox: persistent shell tools at $HOME/.athen/toolbox/. \
+             PYTHONPATH and PATH are auto-configured so you can \
+             `python3 -c \"import fpdf\"` or `playwright ...` directly. \
+             Use list_installed_packages to check what's already \
+             installed. Use install_package to add new ones (user \
+             approval required, so include a clear reason). Use \
+             uninstall_package to remove a package you no longer need.\n\
+             Available runtimes: {py}, {node}.\n\
+             Already installed: {installed}.\n\n",
+        )
     }
 
     /// Slot 1: identity + current datetime.
@@ -808,6 +864,7 @@ impl AgentExecutor for DefaultExecutor {
                 has_context,
                 self.tool_doc_dir.as_deref(),
                 self.active_profile.as_ref(),
+                self.toolbox_info.as_ref(),
             );
 
             // Tools sent to the LLM API: only the revealed subset carries
@@ -1883,7 +1940,7 @@ mod tests {
         revealed.insert("memory_store".to_string());
         revealed.insert("memory_recall".to_string());
 
-        let prompt = DefaultExecutor::build_system_prompt(&tools, &revealed, false, None, None);
+        let prompt = DefaultExecutor::build_system_prompt(&tools, &revealed, false, None, None, None);
 
         // Group index lists every group with counts.
         assert!(prompt.contains("AVAILABLE TOOL GROUPS"));
@@ -1918,7 +1975,7 @@ mod tests {
         let revealed = HashSet::new();
         let dir = std::path::PathBuf::from("/tmp/athen-test/tools");
         let prompt =
-            DefaultExecutor::build_system_prompt(&tools, &revealed, false, Some(&dir), None);
+            DefaultExecutor::build_system_prompt(&tools, &revealed, false, Some(&dir), None, None);
         // Pattern reference uses the directory + <group>.md placeholder.
         assert!(prompt.contains("/tmp/athen-test/tools"));
         assert!(prompt.contains("<group>.md"));
@@ -1931,7 +1988,7 @@ mod tests {
     fn system_prompt_omits_doc_pointer_when_unset() {
         let tools = vec![tool_def("calendar_create", "create event")];
         let revealed = HashSet::new();
-        let prompt = DefaultExecutor::build_system_prompt(&tools, &revealed, false, None, None);
+        let prompt = DefaultExecutor::build_system_prompt(&tools, &revealed, false, None, None, None);
         assert!(!prompt.contains("read("));
     }
 
@@ -1964,9 +2021,9 @@ mod tests {
         let tools = vec![tool_def("memory_store", "store a memory")];
         let revealed = HashSet::new();
 
-        let p_none = DefaultExecutor::build_system_prompt(&tools, &revealed, false, None, None);
+        let p_none = DefaultExecutor::build_system_prompt(&tools, &revealed, false, None, None, None);
         let p_default =
-            DefaultExecutor::build_system_prompt(&tools, &revealed, false, None, Some(&default));
+            DefaultExecutor::build_system_prompt(&tools, &revealed, false, None, Some(&default), None);
 
         // Both must contain the canonical Athen identity line.
         assert!(p_none.contains("You are Athen, a proactive universal AI agent"));
@@ -2014,7 +2071,7 @@ mod tests {
         let tools: Vec<athen_core::tool::ToolDefinition> = vec![];
         let revealed = HashSet::new();
         let prompt =
-            DefaultExecutor::build_system_prompt(&tools, &revealed, false, None, Some(&resolved));
+            DefaultExecutor::build_system_prompt(&tools, &revealed, false, None, Some(&resolved), None);
 
         assert!(prompt.contains("outreach specialist who writes warm"));
         assert!(prompt.contains("Personalize first lines."));

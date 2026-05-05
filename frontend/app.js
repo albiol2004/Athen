@@ -109,6 +109,10 @@ const BUILTIN_TOOL_ICONS = {
     'exists': ICON_CHECK, 'stat': ICON_INFO,
     // delegation
     'delegate_to_agent': ICON_DELEGATE,
+    // toolbox (pip/npm package management)
+    'install_package': ICON_FOLDER_PLUS,
+    'uninstall_package': ICON_TRASH,
+    'list_installed_packages': ICON_BOOKMARK,
 };
 
 const BUILTIN_TOOL_LABELS = {
@@ -127,6 +131,9 @@ const BUILTIN_TOOL_LABELS = {
     'create_dir': 'Create folder', 'move_path': 'Move',
     'exists': 'Check', 'stat': 'Info',
     'delegate_to_agent': 'Consult specialist',
+    'install_package': 'Install package',
+    'uninstall_package': 'Uninstall package',
+    'list_installed_packages': 'List packages',
 };
 
 // MCP-prefixed tools (e.g. `files__read_file`) — strip prefix and try common
@@ -406,6 +413,20 @@ function registerTauriEventListeners() {
         const card = document.getElementById(`approval-${task_id}`);
         if (!card) return;
         handleApproval(task_id, !!approved);
+    });
+
+    // Approval router questions (e.g. install_package gate). Distinct
+    // from the legacy task-approval flow above: this comes from
+    // ApprovalRouter::ask -> InAppApprovalSink, with a question_id +
+    // explicit choice list. Resolved via submit_approval.
+    window.__TAURI__.event.listen('approval-question', (event) => {
+        addApprovalQuestionDialog(event.payload);
+    });
+    window.__TAURI__.event.listen('approval-cancel', (event) => {
+        const id = event.payload;
+        if (!id) return;
+        const card = document.getElementById(`approval-q-${id}`);
+        if (card) card.remove();
     });
 
     // Listen for sense events (email, calendar, messaging, etc.)
@@ -1476,6 +1497,100 @@ function addApprovalDialog(approval) {
     });
 }
 
+// Renderer for ApprovalRouter questions (install_package gate, future
+// router-based gates). Distinct from addApprovalDialog: no risk score,
+// caller-supplied choice list, resolved via submit_approval(question_id,
+// choice_key) instead of approve_task.
+function addApprovalQuestionDialog(question) {
+    if (!question || !question.id) return;
+    if (document.getElementById(`approval-q-${question.id}`)) return;
+
+    const welcome = messagesEl.querySelector('.welcome-message');
+    if (welcome) welcome.remove();
+
+    const row = document.createElement('div');
+    row.className = 'message-row assistant';
+    row.id = `approval-q-${question.id}`;
+
+    const avatar = document.createElement('div');
+    avatar.className = 'message-avatar';
+    avatar.textContent = 'A';
+
+    const wrap = document.createElement('div');
+    wrap.className = 'message-content-wrap';
+
+    const bubble = document.createElement('div');
+    bubble.className = 'message-bubble approval-bubble';
+
+    const description = question.description
+        ? `<div class="approval-description">${escapeHtml(question.description)}</div>`
+        : '';
+
+    bubble.innerHTML = `
+        <div class="approval-header">
+            <span class="approval-icon">&#9888;</span>
+            <span class="approval-title">${escapeHtml(question.prompt || 'Approval needed')}</span>
+        </div>
+        <div class="approval-details">
+            ${description}
+        </div>
+        <div class="approval-actions"></div>
+    `;
+
+    const actions = bubble.querySelector('.approval-actions');
+    const choices = Array.isArray(question.choices) && question.choices.length > 0
+        ? question.choices
+        : [{ key: 'approve', label: 'Approve', kind: 'approve' },
+           { key: 'deny', label: 'Deny', kind: 'deny' }];
+    for (const c of choices) {
+        const btn = document.createElement('button');
+        btn.textContent = c.label || c.key;
+        btn.dataset.choiceKey = c.key;
+        btn.className = (c.kind === 'approve' || c.kind === 'allow_once' || c.kind === 'allow_always')
+            ? 'btn-approve'
+            : 'btn-deny';
+        btn.addEventListener('click', () => {
+            handleApprovalQuestion(question.id, c.key, row);
+        });
+        actions.appendChild(btn);
+    }
+
+    wrap.appendChild(bubble);
+
+    const metaRow = document.createElement('div');
+    metaRow.className = 'message-meta';
+    metaRow.innerHTML = `<span class="message-time">${formatTime(new Date())}</span>`;
+    wrap.appendChild(metaRow);
+
+    row.appendChild(avatar);
+    row.appendChild(wrap);
+    messagesEl.appendChild(row);
+
+    requestAnimationFrame(() => {
+        messagesEl.parentElement.scrollTo({
+            top: messagesEl.parentElement.scrollHeight,
+            behavior: 'smooth'
+        });
+    });
+}
+
+async function handleApprovalQuestion(questionId, choiceKey, cardEl) {
+    if (!invoke) return;
+    if (cardEl) {
+        cardEl.querySelectorAll('button').forEach(b => { b.disabled = true; });
+    }
+    try {
+        await invoke('submit_approval', {
+            questionId: questionId,
+            choiceKey: choiceKey,
+        });
+    } catch (e) {
+        console.error('submit_approval failed:', e);
+    } finally {
+        if (cardEl) cardEl.remove();
+    }
+}
+
 async function handleApproval(taskId, approved) {
     if (!invoke) return;
     if (approvalsInFlight.has(taskId)) return;
@@ -2023,6 +2138,11 @@ const newProfileBtn = document.getElementById('new-profile-btn');
 if (newProfileBtn) {
     newProfileBtn.addEventListener('click', () => openProfileEditor('create', null));
 }
+
+const clearToolboxBtn = document.getElementById('clear-toolbox-btn');
+if (clearToolboxBtn) {
+    clearToolboxBtn.addEventListener('click', handleClearToolbox);
+}
 const profileModalClose = document.getElementById('profile-modal-close');
 if (profileModalClose) {
     profileModalClose.addEventListener('click', closeProfileEditor);
@@ -2249,6 +2369,7 @@ async function loadSettings() {
             }
         }
         await loadMcpCatalog();
+        await loadToolboxPackages();
         await loadGrants();
         await loadProfileManager();
     } catch (err) {
@@ -2561,6 +2682,125 @@ async function saveProfileFromEditor() {
         await loadProfileManager();
     } catch (err) {
         showError(String(err));
+    }
+}
+
+// ─── Shell toolbox ────────────────────────────────────────────────────
+
+async function loadToolboxPackages() {
+    const listEl = document.getElementById('toolbox-list');
+    if (!listEl) return;
+    try {
+        const pkgs = await invoke('list_toolbox_packages');
+        renderToolboxPackages(pkgs);
+    } catch (err) {
+        console.error('Failed to load toolbox packages:', err);
+        listEl.innerHTML = '<p class="setting-hint">Failed to load installed packages.</p>';
+    }
+}
+
+function renderToolboxPackages(pkgs) {
+    const listEl = document.getElementById('toolbox-list');
+    listEl.innerHTML = '';
+    if (!pkgs || pkgs.length === 0) {
+        listEl.innerHTML =
+            '<p class="setting-hint">No packages installed yet. The agent will install packages here when needed.</p>';
+        return;
+    }
+
+    const groups = { python: [], node: [] };
+    for (const p of pkgs) {
+        if (groups[p.runtime]) {
+            groups[p.runtime].push(p);
+        } else {
+            groups[p.runtime] = [p];
+        }
+    }
+
+    const titles = { python: 'Python', node: 'Node' };
+    for (const runtime of Object.keys(groups)) {
+        const items = groups[runtime];
+        if (!items || items.length === 0) continue;
+        items.sort((a, b) => a.package.localeCompare(b.package));
+        const groupEl = document.createElement('div');
+        groupEl.className = 'toolbox-group';
+
+        const heading = document.createElement('h3');
+        heading.className = 'toolbox-group-title';
+        heading.textContent = `${titles[runtime] || runtime} (${items.length})`;
+        groupEl.appendChild(heading);
+
+        for (const p of items) {
+            groupEl.appendChild(buildToolboxRow(p));
+        }
+        listEl.appendChild(groupEl);
+    }
+}
+
+function buildToolboxRow(p) {
+    const row = document.createElement('div');
+    row.className = 'toolbox-row';
+
+    const head = document.createElement('div');
+    head.className = 'toolbox-row-head';
+
+    const name = document.createElement('span');
+    name.className = 'toolbox-row-name';
+    name.textContent = p.package;
+    head.appendChild(name);
+
+    if (p.installed_version) {
+        const ver = document.createElement('span');
+        ver.className = 'toolbox-row-version';
+        ver.textContent = p.installed_version;
+        head.appendChild(ver);
+    }
+
+    const date = document.createElement('span');
+    date.className = 'toolbox-row-date';
+    date.textContent = formatRelativeTime(p.installed_at);
+    head.appendChild(date);
+
+    row.appendChild(head);
+
+    if (p.reason) {
+        const reason = document.createElement('div');
+        reason.className = 'toolbox-row-reason';
+        reason.textContent = p.reason;
+        row.appendChild(reason);
+    }
+    return row;
+}
+
+function formatRelativeTime(iso) {
+    if (!iso) return '';
+    const t = new Date(iso).getTime();
+    if (Number.isNaN(t)) return iso;
+    const diffSec = Math.floor((Date.now() - t) / 1000);
+    if (diffSec < 60) return 'just now';
+    const diffMin = Math.floor(diffSec / 60);
+    if (diffMin < 60) return `${diffMin}m ago`;
+    const diffHr = Math.floor(diffMin / 60);
+    if (diffHr < 24) return `${diffHr}h ago`;
+    const diffDay = Math.floor(diffHr / 24);
+    if (diffDay < 30) return `${diffDay}d ago`;
+    const diffMo = Math.floor(diffDay / 30);
+    if (diffMo < 12) return `${diffMo}mo ago`;
+    return `${Math.floor(diffMo / 12)}y ago`;
+}
+
+async function handleClearToolbox() {
+    const ok = window.confirm(
+        'Remove every package the agent has installed in ~/.athen/toolbox? \nThis cannot be undone.'
+    );
+    if (!ok) return;
+    try {
+        await invoke('clear_toolbox');
+        showToast('Toolbox cleared', 'success');
+        await loadToolboxPackages();
+    } catch (err) {
+        console.error('clear_toolbox failed:', err);
+        showToast('Failed to clear toolbox: ' + err, 'error');
     }
 }
 

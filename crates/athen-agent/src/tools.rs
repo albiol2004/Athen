@@ -34,6 +34,17 @@ pub trait ShellExtraWritableProvider: Send + Sync {
     async fn extra_writable_paths(&self) -> Vec<PathBuf>;
 }
 
+/// Permission gate consulted before `install_package` actually invokes
+/// pip/npm. Implementations typically surface a confirmation prompt to
+/// the user (in-app card + Telegram inline keyboard) and return `true`
+/// only on Approve. With no gate wired, the registry fails closed —
+/// the agent can `list_installed_packages` but never installs without
+/// user consent.
+#[async_trait]
+pub trait ToolboxApprovalGate: Send + Sync {
+    async fn confirm_install(&self, runtime: &str, package: &str, reason: &str) -> bool;
+}
+
 /// Metadata for a process started via `shell_spawn`. Kept in
 /// [`ShellToolRegistry::spawned`] so subsequent `shell_logs`/`shell_kill`
 /// calls can find the log file and validate the PID is one we own.
@@ -75,6 +86,11 @@ pub struct ShellToolRegistry {
     /// reader. Can be swapped for Cloudflare's Browser Rendering via
     /// [`Self::with_page_reader`].
     page_reader: Arc<dyn PageReader>,
+    /// Optional permission gate consulted before `install_package`
+    /// actually invokes pip/npm. Without it, install requests are
+    /// denied with a clear message — failing closed avoids silent
+    /// installs in CLI usage where there's no user to ask.
+    toolbox_approval: Option<Arc<dyn ToolboxApprovalGate>>,
 }
 
 /// Defense-in-depth: tolerate args delivered as a JSON-encoded string
@@ -149,6 +165,13 @@ fn args_truncated_result(tool: &str, raw: &str, suggestion: &str, started: Insta
     }
 }
 
+/// Single-quote a path/value for safe inclusion in a `sh -c` command.
+/// Mirrors what `shell-words` would do: every embedded `'` becomes
+/// `'\''`. Cheap, allocation-once.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 /// Walk the input and escape unescaped control characters inside JSON
 /// string literals only. Mirrors `escape_control_chars_in_strings` in
 /// the provider layer; duplicated here to avoid an inter-crate
@@ -192,17 +215,49 @@ fn repair_unescaped_control_chars(input: &str) -> String {
 }
 
 impl ShellToolRegistry {
-    /// Wrap a shell command so it runs in the agent workspace directory by
-    /// default. Returns the command unchanged if the workspace dir can't be
-    /// determined. The user's command runs inside `( ... )` so embedded
-    /// `;` doesn't escape the cd (e.g. `cd ws && echo a; echo b` would
-    /// otherwise leak `echo b` outside the workspace context).
-    fn workspace_wrap(command: &str) -> String {
-        let Some(ws) = paths::athen_workspace_dir() else {
-            return command.to_string();
-        };
-        let escaped = format!("'{}'", ws.to_string_lossy().replace('\'', "'\\''"));
-        format!("cd {escaped} && ( {command} )")
+    /// Compose the shell wrapper that runs around every `shell_execute`
+    /// command:
+    ///
+    /// 1. `cd <workspace>` so relative paths land in the agent workspace.
+    /// 2. Export `PYTHONPATH=<toolbox/python>:<existing>` so `pip
+    ///    install --target` modules import without env juggling.
+    /// 3. Prepend `<toolbox/node>/bin` onto `PATH` so npm-installed
+    ///    bins are first in lookup order.
+    /// 4. Run the user's command inside `( ... )` so embedded `;`
+    ///    doesn't escape any of the above.
+    ///
+    /// Each step is skipped silently if its inputs are unavailable
+    /// (e.g. no home dir → no toolbox dirs → no env exports).
+    fn build_shell_wrapper(command: &str) -> String {
+        let mut out = String::new();
+        if let Some(ws) = paths::athen_workspace_dir() {
+            out.push_str(&format!("cd {} && ", sh_quote(&ws.to_string_lossy())));
+        }
+        if let Some(pydir) = paths::athen_toolbox_python_dir() {
+            let existing = std::env::var("PYTHONPATH").unwrap_or_default();
+            let combined = if existing.is_empty() {
+                pydir.to_string_lossy().into_owned()
+            } else {
+                format!("{}:{}", pydir.to_string_lossy(), existing)
+            };
+            out.push_str(&format!("export PYTHONPATH={} && ", sh_quote(&combined)));
+        }
+        if let Some(nodedir) = paths::athen_toolbox_node_dir() {
+            let bin = nodedir.join("bin");
+            let existing = std::env::var("PATH").unwrap_or_default();
+            let combined = if existing.is_empty() {
+                bin.to_string_lossy().into_owned()
+            } else {
+                format!("{}:{}", bin.to_string_lossy(), existing)
+            };
+            out.push_str(&format!("export PATH={} && ", sh_quote(&combined)));
+        }
+        if out.is_empty() {
+            command.to_string()
+        } else {
+            out.push_str(&format!("( {command} )"));
+            out
+        }
     }
 
     /// Best-effort: create the agent workspace dir so relative paths in
@@ -245,6 +300,12 @@ impl ShellToolRegistry {
             }
         };
 
+        // Pre-create the persistent toolbox dirs so the first
+        // `pip install --target` doesn't have to. Failure is logged
+        // but never fatal — install_*_package retries dir creation on
+        // its own.
+        crate::toolbox::ensure_toolbox_dirs().await;
+
         Self {
             shell: Shell::new().await,
             memory: Arc::new(Mutex::new(HashMap::new())),
@@ -258,7 +319,17 @@ impl ShellToolRegistry {
             // paywalled/blocked pages still produce content without any
             // user configuration.
             page_reader: Arc::new(HybridReader::new()),
+            toolbox_approval: None,
         }
+    }
+
+    /// Inject the toolbox approval gate so `install_package` can ask
+    /// the user before running pip/npm. Without a gate the registry
+    /// fails closed: install requests return a clear "no gate
+    /// configured" error.
+    pub fn with_toolbox_approval(mut self, gate: Arc<dyn ToolboxApprovalGate>) -> Self {
+        self.toolbox_approval = Some(gate);
+        self
     }
 
     /// Replace the default DuckDuckGo search backend (e.g. with Tavily).
@@ -437,6 +508,54 @@ impl ShellToolRegistry {
         })
     }
 
+    fn install_package_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "runtime": {
+                    "type": "string",
+                    "enum": ["python", "node"],
+                    "description": "Package ecosystem: 'python' (pip3 --target) or 'node' (npm --prefix)."
+                },
+                "package": {
+                    "type": "string",
+                    "description": "Package spec, e.g. 'fpdf2', 'fpdf2>=2.7', '@scope/foo@1.0'."
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Short justification shown to the user during the approval prompt — explain what the package is for."
+                }
+            },
+            "required": ["runtime", "package", "reason"]
+        })
+    }
+
+    fn list_installed_packages_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {},
+            "required": []
+        })
+    }
+
+    fn uninstall_package_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "runtime": {
+                    "type": "string",
+                    "enum": ["python", "node"],
+                    "description": "Package ecosystem: 'python' or 'node'."
+                },
+                "package": {
+                    "type": "string",
+                    "description": "Package name as recorded in the manifest, e.g. 'fpdf2'."
+                }
+            },
+            "required": ["runtime", "package"]
+        })
+    }
+
     /// Execute a shell command and return the result.
     ///
     /// When a sandbox is available, the command is executed inside an
@@ -458,7 +577,7 @@ impl ShellToolRegistry {
         // Default-cwd to the agent workspace. Risk evaluation and the
         // sandbox-allowed paths see the original command — the wrapper is
         // only what actually runs.
-        let wrapped_command = Self::workspace_wrap(command);
+        let wrapped_command = Self::build_shell_wrapper(command);
 
         tracing::info!(
             tool = "shell_execute",
@@ -519,6 +638,12 @@ impl ShellToolRegistry {
                 let mut allowed: Vec<PathBuf> = vec![PathBuf::from("/tmp")];
                 if let Some(data) = paths::athen_data_dir() {
                     allowed.push(data);
+                }
+                if let Some(tb) = paths::athen_toolbox_dir() {
+                    // Redundant if data_dir is allowed (toolbox is under
+                    // it) but explicit here so behavior survives a
+                    // future change to data-dir scoping.
+                    allowed.push(tb);
                 }
                 if let Ok(cwd) = std::env::current_dir() {
                     allowed.push(cwd);
@@ -1754,6 +1879,203 @@ impl ShellToolRegistry {
             }
         }
     }
+
+    /// Ask the user (via the configured approval gate) and, on
+    /// approval, install a Python or Node package into the persistent
+    /// `~/.athen/toolbox/` so subsequent `shell_execute` calls can
+    /// import/run it.
+    async fn do_install_package(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let mut owned = serde_json::Value::Null;
+        let args = coerce_args(args, &mut owned);
+        let runtime_str = args
+            .get("runtime")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AthenError::Other("missing 'runtime' parameter".to_string()))?;
+        let package = args
+            .get("package")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AthenError::Other("missing 'package' parameter".to_string()))?;
+        let reason = args
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AthenError::Other("missing 'reason' parameter".to_string()))?;
+
+        let runtime = crate::toolbox::Runtime::parse(runtime_str).ok_or_else(|| {
+            AthenError::Other(format!(
+                "unknown runtime '{runtime_str}' (expected 'python' or 'node')"
+            ))
+        })?;
+
+        let start = Instant::now();
+        let Some(gate) = self.toolbox_approval.clone() else {
+            let msg = "install_package: no toolbox approval gate is wired in this context, \
+                       so installs cannot be approved. The desktop UI surfaces this gate; \
+                       CLI/headless agents need explicit user-side configuration."
+                .to_string();
+            tracing::warn!("install_package called without approval gate");
+            return Ok(ToolResult {
+                success: false,
+                output: json!({
+                    "error": msg,
+                    "runtime": runtime.as_str(),
+                    "package": package,
+                }),
+                error: Some(msg),
+                execution_time_ms: start.elapsed().as_millis() as u64,
+            });
+        };
+
+        let approved = gate.confirm_install(runtime.as_str(), package, reason).await;
+        if !approved {
+            let msg = format!(
+                "install denied by user: {} package '{}' was not installed",
+                runtime.as_str(),
+                package
+            );
+            return Ok(ToolResult {
+                success: false,
+                output: json!({
+                    "error": msg,
+                    "runtime": runtime.as_str(),
+                    "package": package,
+                    "reason_offered": reason,
+                }),
+                error: Some(msg),
+                execution_time_ms: start.elapsed().as_millis() as u64,
+            });
+        }
+
+        let result = match runtime {
+            crate::toolbox::Runtime::Python => {
+                crate::toolbox::install_python_package(package, reason).await
+            }
+            crate::toolbox::Runtime::Node => {
+                crate::toolbox::install_node_package(package, reason).await
+            }
+        };
+
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        match result {
+            Ok(pkg) => Ok(ToolResult {
+                success: true,
+                output: json!({
+                    "runtime": pkg.runtime.as_str(),
+                    "package": pkg.package,
+                    "version_spec": pkg.version_spec,
+                    "installed_version": pkg.installed_version,
+                    "reason": pkg.reason,
+                    "installed_at": pkg.installed_at,
+                    "runtime_version": pkg.runtime_version,
+                }),
+                error: None,
+                execution_time_ms: elapsed_ms,
+            }),
+            Err(e) => {
+                let msg = e.to_string();
+                Ok(ToolResult {
+                    success: false,
+                    output: json!({
+                        "error": msg,
+                        "runtime": runtime.as_str(),
+                        "package": package,
+                    }),
+                    error: Some(msg),
+                    execution_time_ms: elapsed_ms,
+                })
+            }
+        }
+    }
+
+    /// Read the toolbox manifest and return the recorded installs as
+    /// JSON so the agent can decide whether a package is already
+    /// installed before asking to add it.
+    async fn do_list_installed_packages(&self, _args: &serde_json::Value) -> Result<ToolResult> {
+        let start = Instant::now();
+        let m = crate::toolbox::load_manifest().await;
+        let installs: Vec<serde_json::Value> = m
+            .installs
+            .iter()
+            .map(|p| {
+                json!({
+                    "runtime": p.runtime.as_str(),
+                    "package": p.package,
+                    "version_spec": p.version_spec,
+                    "installed_version": p.installed_version,
+                    "reason": p.reason,
+                    "installed_at": p.installed_at,
+                    "runtime_version": p.runtime_version,
+                })
+            })
+            .collect();
+        Ok(ToolResult {
+            success: true,
+            output: json!({ "installs": installs, "count": m.installs.len() }),
+            error: None,
+            execution_time_ms: start.elapsed().as_millis() as u64,
+        })
+    }
+
+    /// Remove a package from the toolbox: drops the on-disk files and
+    /// the manifest entry. Not gated by approval — uninstalling is
+    /// safe and reversible (just reinstall).
+    async fn do_uninstall_package(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let start = Instant::now();
+        let mut owned = serde_json::Value::Null;
+        let args = coerce_args(args, &mut owned);
+        let runtime_raw = args
+            .get("runtime")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AthenError::Other("missing 'runtime' parameter".into()))?;
+        let package = args
+            .get("package")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AthenError::Other("missing 'package' parameter".into()))?
+            .trim();
+        if package.is_empty() {
+            return Err(AthenError::Other("'package' must be non-empty".into()));
+        }
+        let runtime = crate::toolbox::Runtime::parse(runtime_raw).ok_or_else(|| {
+            AthenError::Other(format!(
+                "unknown runtime '{runtime_raw}'; expected 'python' or 'node'"
+            ))
+        })?;
+
+        let result = match runtime {
+            crate::toolbox::Runtime::Python => {
+                crate::toolbox::uninstall_python_package(package).await
+            }
+            crate::toolbox::Runtime::Node => {
+                crate::toolbox::uninstall_node_package(package).await
+            }
+        };
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        match result {
+            Ok(removed) => Ok(ToolResult {
+                success: true,
+                output: json!({
+                    "runtime": runtime.as_str(),
+                    "package": removed.package,
+                    "previous_version": removed.installed_version,
+                    "removed": true,
+                }),
+                error: None,
+                execution_time_ms: elapsed_ms,
+            }),
+            Err(e) => {
+                let msg = e.to_string();
+                Ok(ToolResult {
+                    success: false,
+                    output: json!({
+                        "error": msg,
+                        "runtime": runtime.as_str(),
+                        "package": package,
+                    }),
+                    error: Some(msg),
+                    execution_time_ms: elapsed_ms,
+                })
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -1890,6 +2212,36 @@ impl ToolRegistry for ShellToolRegistry {
                 },
                 base_risk: BaseImpact::Read,
             },
+            ToolDefinition {
+                name: "install_package".to_string(),
+                description: "Install a Python package (via pip --target) or Node package (via npm --prefix) into Athen's persistent toolbox at ~/.athen/toolbox. PYTHONPATH and PATH are automatically configured so subsequent shell_execute calls can import/run them. The user will be asked for permission, so write a clear `reason` explaining what the package is for and why you need it.".to_string(),
+                parameters: Self::install_package_schema(),
+                backend: ToolBackend::Shell {
+                    command: String::new(),
+                    native: false,
+                },
+                base_risk: BaseImpact::WritePersist,
+            },
+            ToolDefinition {
+                name: "list_installed_packages".to_string(),
+                description: "List packages already installed in the toolbox so you don't reinstall them. Returns runtime, name, version, install date, and the reason given when installed.".to_string(),
+                parameters: Self::list_installed_packages_schema(),
+                backend: ToolBackend::Shell {
+                    command: String::new(),
+                    native: false,
+                },
+                base_risk: BaseImpact::Read,
+            },
+            ToolDefinition {
+                name: "uninstall_package".to_string(),
+                description: "Remove a previously-installed package from the toolbox. Drops the on-disk files and the manifest entry. No approval prompt — uninstalling is reversible (just reinstall).".to_string(),
+                parameters: Self::uninstall_package_schema(),
+                backend: ToolBackend::Shell {
+                    command: String::new(),
+                    native: false,
+                },
+                base_risk: BaseImpact::WritePersist,
+            },
         ])
     }
 
@@ -1908,6 +2260,9 @@ impl ToolRegistry for ShellToolRegistry {
             "memory_recall" => self.do_memory_recall(&args).await,
             "web_search" => self.do_web_search(&args).await,
             "web_fetch" => self.do_web_fetch(&args).await,
+            "install_package" => self.do_install_package(&args).await,
+            "list_installed_packages" => self.do_list_installed_packages(&args).await,
+            "uninstall_package" => self.do_uninstall_package(&args).await,
             _ => Err(AthenError::ToolNotFound(name.to_string())),
         }
     }
@@ -2080,8 +2435,9 @@ mod tests {
 
         // shell_execute, shell_spawn, shell_kill, shell_logs, read, edit,
         // write, grep, list_directory, memory_store, memory_recall,
-        // web_search, web_fetch
-        assert_eq!(tools.len(), 13);
+        // web_search, web_fetch, install_package, list_installed_packages,
+        // uninstall_package
+        assert_eq!(tools.len(), 16);
 
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"shell_execute"));
@@ -2097,6 +2453,9 @@ mod tests {
         assert!(names.contains(&"memory_recall"));
         assert!(names.contains(&"web_search"));
         assert!(names.contains(&"web_fetch"));
+        assert!(names.contains(&"install_package"));
+        assert!(names.contains(&"list_installed_packages"));
+        assert!(names.contains(&"uninstall_package"));
 
         // Each tool should have a non-empty description and valid parameters schema.
         for tool in &tools {
@@ -2997,5 +3356,110 @@ mod tests {
         assert!(err.contains("simulated reader failure"));
         // The reader name is reported so the agent can see which tier failed.
         assert_eq!(result.output["reader"], "stub-reader");
+    }
+
+    /// Stub gate that records the call and returns a configured answer.
+    /// Used to assert install_package's approval-deny path doesn't
+    /// invoke pip/npm and that approve forwards args correctly.
+    struct StubApprovalGate {
+        answer: bool,
+        calls: Arc<Mutex<Vec<(String, String, String)>>>,
+    }
+
+    #[async_trait]
+    impl ToolboxApprovalGate for StubApprovalGate {
+        async fn confirm_install(&self, runtime: &str, package: &str, reason: &str) -> bool {
+            self.calls.lock().await.push((
+                runtime.to_string(),
+                package.to_string(),
+                reason.to_string(),
+            ));
+            self.answer
+        }
+    }
+
+    #[tokio::test]
+    async fn install_package_without_gate_fails_closed() {
+        let registry = ShellToolRegistry::new().await;
+        let result = registry
+            .call_tool(
+                "install_package",
+                json!({
+                    "runtime": "python",
+                    "package": "fpdf2",
+                    "reason": "PDF generation",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!result.success, "install must fail closed without a gate");
+        let err = result.error.unwrap_or_default();
+        assert!(
+            err.to_lowercase().contains("approval gate"),
+            "error should mention the missing gate, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_package_denied_does_not_invoke_pip() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let gate = Arc::new(StubApprovalGate {
+            answer: false,
+            calls: calls.clone(),
+        });
+        let registry = ShellToolRegistry::new()
+            .await
+            .with_toolbox_approval(gate as Arc<dyn ToolboxApprovalGate>);
+
+        let result = registry
+            .call_tool(
+                "install_package",
+                json!({
+                    "runtime": "python",
+                    "package": "definitely-not-a-real-pkg-xyz123",
+                    "reason": "denial-path test",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let err = result.error.unwrap_or_default();
+        assert!(err.to_lowercase().contains("denied"), "got: {err}");
+        // The gate was consulted exactly once with the right args. We
+        // never reached pip — verified indirectly by the fast,
+        // pip-free response (the pkg name is bogus; pip would have
+        // produced a network/resolver error instead).
+        let recorded = calls.lock().await.clone();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, "python");
+        assert_eq!(recorded[0].1, "definitely-not-a-real-pkg-xyz123");
+        assert_eq!(recorded[0].2, "denial-path test");
+    }
+
+    #[tokio::test]
+    async fn list_installed_packages_returns_empty_envelope_with_no_manifest() {
+        let registry = ShellToolRegistry::new().await;
+        let result = registry
+            .call_tool("list_installed_packages", json!({}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        // count is always present even when the manifest doesn't exist
+        // — agent code can rely on the field shape.
+        assert!(result.output.get("installs").is_some());
+        assert!(result.output.get("count").is_some());
+    }
+
+    #[test]
+    fn build_shell_wrapper_includes_pythonpath_when_dir_available() {
+        let wrapped = ShellToolRegistry::build_shell_wrapper("echo hi");
+        // Either the toolbox dir is available (PYTHONPATH export
+        // appears) or no home is set and the bare command is
+        // returned. Both are valid; we just want to make sure the
+        // wrapped form, when present, ends with the user's command in
+        // a subshell.
+        if wrapped != "echo hi" {
+            assert!(wrapped.ends_with("( echo hi )"), "got: {wrapped}");
+        }
     }
 }

@@ -313,9 +313,14 @@ impl AppState {
         // Build the same registry the executor sees so the docs reflect
         // exactly what the agent has access to. The file gate is not
         // attached here — listing tools never invokes them.
-        let shell_registry = athen_agent::ShellToolRegistry::new()
+        let mut shell_registry = athen_agent::ShellToolRegistry::new()
             .await
             .with_spawned_processes(self.spawned_processes.clone());
+        if let Some(router) = self.approval_router.clone() {
+            shell_registry = shell_registry.with_toolbox_approval(Arc::new(
+                crate::file_gate::RouterToolboxApprovalGate::new(router, None),
+            ));
+        }
         let registry = crate::app_tools::AppToolRegistry::new(
             shell_registry,
             self.calendar_store.clone(),
@@ -357,6 +362,14 @@ impl AppState {
                 store,
             });
             shell = shell.with_extra_writable(provider);
+        }
+        if let Some(router) = self.approval_router.clone() {
+            shell = shell.with_toolbox_approval(Arc::new(
+                crate::file_gate::RouterToolboxApprovalGate::new(
+                    router,
+                    Some(arc_id.to_string()),
+                ),
+            ));
         }
         let mut registry = crate::app_tools::AppToolRegistry::new(
             shell,
@@ -704,6 +717,7 @@ impl AppState {
         let pending_grants_ref = self.pending_grants.clone();
         let spawned_processes_ref = self.spawned_processes.clone();
         let telegram_approval_sink = self.telegram_approval_sink.clone();
+        let approval_router_ref = self.approval_router.clone();
 
         tauri::async_runtime::spawn(async move {
             if let Err(e) = monitor.init(&telegram_config).await {
@@ -774,6 +788,7 @@ impl AppState {
                                     let profile_embedder_c = Arc::clone(&profile_embedder_ref);
                                     let profile_embedding_cache_c =
                                         Arc::clone(&profile_embedding_cache_ref);
+                                    let approval_router_c = approval_router_ref.clone();
                                     tauri::async_runtime::spawn(async move {
                                         execute_owner_telegram_message(
                                             &text_owned,
@@ -795,6 +810,7 @@ impl AppState {
                                             &profile_store_c,
                                             &profile_embedder_c,
                                             &profile_embedding_cache_c,
+                                            approval_router_c.as_ref(),
                                         )
                                         .await;
                                     });
@@ -897,6 +913,7 @@ async fn execute_owner_telegram_message(
     profile_store: &Option<Arc<athen_persistence::profiles::SqliteProfileStore>>,
     profile_embedder: &Arc<dyn athen_core::traits::embedding::EmbeddingProvider>,
     profile_embedding_cache: &ProfileEmbeddingCache,
+    approval_router: Option<&Arc<crate::approval::ApprovalRouter>>,
 ) {
     use std::time::Duration;
 
@@ -1037,6 +1054,14 @@ async fn execute_owner_telegram_message(
         });
         shell_registry = shell_registry.with_extra_writable(provider);
     }
+    if let Some(router) = approval_router {
+        shell_registry = shell_registry.with_toolbox_approval(Arc::new(
+            crate::file_gate::RouterToolboxApprovalGate::new(
+                Arc::clone(router),
+                target_arc_id.clone(),
+            ),
+        ));
+    }
     let mut registry = AppToolRegistry::new(
         shell_registry,
         calendar_store.clone(),
@@ -1094,6 +1119,7 @@ async fn execute_owner_telegram_message(
     if let Some(p) = tool_doc_dir {
         builder = builder.tool_doc_dir(p.to_path_buf());
     }
+    builder = builder.toolbox_info(athen_agent::toolbox::ToolboxPromptInfo::load().await);
     let executor = match builder.build() {
         Ok(e) => e,
         Err(e) => {

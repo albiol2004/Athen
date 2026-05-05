@@ -17,7 +17,7 @@ use tauri::{AppHandle, Emitter};
 use tokio::sync::{oneshot, Mutex};
 use uuid::Uuid;
 
-use athen_agent::tools::ShellExtraWritableProvider;
+use athen_agent::tools::{ShellExtraWritableProvider, ToolboxApprovalGate};
 use athen_core::contact::TrustLevel;
 use athen_core::error::{AthenError, Result};
 use athen_core::paths;
@@ -132,6 +132,55 @@ impl ShellExtraWritableProvider for ArcWritableProvider {
             }
         }
         out
+    }
+}
+
+/// Routes `install_package` approval prompts through the cross-channel
+/// [`crate::approval::ApprovalRouter`] (in-app card + Telegram inline
+/// keyboard, with escalation). Returns `true` only when the user
+/// taps "Approve" — every other outcome (Deny, timeout, router error,
+/// bad answer) maps to `false` so installs fail closed.
+pub struct RouterToolboxApprovalGate {
+    router: Arc<crate::approval::ApprovalRouter>,
+    arc_id: Option<String>,
+}
+
+impl RouterToolboxApprovalGate {
+    pub fn new(router: Arc<crate::approval::ApprovalRouter>, arc_id: Option<String>) -> Self {
+        Self { router, arc_id }
+    }
+}
+
+#[async_trait]
+impl ToolboxApprovalGate for RouterToolboxApprovalGate {
+    async fn confirm_install(&self, runtime: &str, package: &str, reason: &str) -> bool {
+        use athen_core::approval::{ApprovalChoice, ApprovalQuestion};
+        use athen_core::notification::{NotificationOrigin, NotificationUrgency};
+
+        let question = ApprovalQuestion {
+            id: Uuid::new_v4(),
+            prompt: format!("Install {package} ({runtime})?"),
+            description: Some(reason.to_string()),
+            choices: vec![ApprovalChoice::approve(), ApprovalChoice::deny()],
+            arc_id: self.arc_id.clone(),
+            task_id: None,
+            origin: NotificationOrigin::RiskSystem,
+            urgency: NotificationUrgency::High,
+            created_at: chrono::Utc::now(),
+        };
+        let primary = self.router.pick_primary(self.arc_id.as_deref()).await;
+        match self.router.ask_with_escalation(question, primary).await {
+            Ok(answer) => answer.choice_key == "approve",
+            Err(e) => {
+                tracing::warn!(
+                    package,
+                    runtime,
+                    error = %e,
+                    "toolbox install approval router failed; treating as deny"
+                );
+                false
+            }
+        }
     }
 }
 
