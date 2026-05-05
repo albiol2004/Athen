@@ -8,11 +8,11 @@
 //! packages Just Work without the model having to remember env vars.
 
 use std::path::Path;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
-use tokio::sync::OnceCell;
 
 use athen_core::error::{AthenError, Result};
 use athen_core::paths;
@@ -87,7 +87,7 @@ pub struct RuntimeProbe {
     pub npm: Option<String>,
 }
 
-static RUNTIME_PROBE: OnceCell<RuntimeProbe> = OnceCell::const_new();
+static RUNTIME_PROBE: StdMutex<Option<RuntimeProbe>> = StdMutex::new(None);
 
 /// Probe Python, pip, Node, and npm once and cache the result. Each
 /// probe walks a small list of platform-aware binary aliases, taking
@@ -99,24 +99,36 @@ static RUNTIME_PROBE: OnceCell<RuntimeProbe> = OnceCell::const_new();
 ///
 /// Each individual probe times out after 5s so a hung interpreter
 /// doesn't stall startup. Missing binaries are recorded as `None`.
+///
+/// Cached for the rest of the process lifetime; the wizard's runtime
+/// installer calls [`invalidate_runtime_probe_cache`] after a fresh
+/// install so the next probe picks up the newly portable interpreter.
 pub async fn probe_runtimes() -> RuntimeProbe {
-    RUNTIME_PROBE
-        .get_or_init(|| async {
-            let (python, pip, node, npm) = tokio::join!(
-                probe_first(python_aliases(), &["--version"]),
-                probe_first(pip_aliases(), &["--version"]),
-                probe_first(node_aliases(), &["--version"]),
-                probe_first(npm_aliases(), &["--version"]),
-            );
-            RuntimeProbe {
-                python: python.map(extract_version),
-                pip: pip.map(extract_version),
-                node: node.map(extract_version),
-                npm: npm.map(extract_version),
-            }
-        })
-        .await
-        .clone()
+    if let Some(p) = RUNTIME_PROBE.lock().expect("probe lock").clone() {
+        return p;
+    }
+    let (python, pip, node, npm) = tokio::join!(
+        probe_first(python_aliases(), &["--version"]),
+        probe_first(pip_aliases(), &["--version"]),
+        probe_first(node_aliases(), &["--version"]),
+        probe_first(npm_aliases(), &["--version"]),
+    );
+    let probe = RuntimeProbe {
+        python: python.map(extract_version),
+        pip: pip.map(extract_version),
+        node: node.map(extract_version),
+        npm: npm.map(extract_version),
+    };
+    *RUNTIME_PROBE.lock().expect("probe lock") = Some(probe.clone());
+    probe
+}
+
+/// Drop the cached runtime probe. Next call to [`probe_runtimes`] will
+/// re-spawn the version checks. Called by the wizard after installing a
+/// portable runtime so the new binary shows up in the prompt slot
+/// without restarting the app.
+pub fn invalidate_runtime_probe_cache() {
+    *RUNTIME_PROBE.lock().expect("probe lock") = None;
 }
 
 /// Order matters: the install / uninstall functions also iterate these

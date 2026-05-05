@@ -5869,6 +5869,7 @@ const ONB_PROGRESS_FOR_STEP = {
     local: 'pick',
     cloud: 'pick',
     memory: 'memory',
+    runtimes: 'runtimes',
     done: 'done',
 };
 
@@ -6021,6 +6022,7 @@ function wireOnboardingButtons() {
     });
 
     wireMemoryStep();
+    wireRuntimesStep();
 
     document.getElementById('onb-finish')?.addEventListener('click', finishOnboarding);
 }
@@ -6089,7 +6091,7 @@ function wireMemoryStep() {
         } catch (e) {
             console.warn('[athen] save embedding (skip) failed:', e);
         }
-        showOnboardingStep('done');
+        enterRuntimesStep();
     });
 
     document.getElementById('onb-mem-test')?.addEventListener('click', async () => {
@@ -6140,6 +6142,137 @@ function wireMemoryStep() {
         }
 
         setOnbStatus('onb-mem-status', 'ok', 'Saved.');
+        enterRuntimesStep();
+    });
+}
+
+// ─── Runtimes (Python / Node) step ──────────────────────────────────
+//
+// Last hop before "done". Probes for a system Python and Node and, if
+// either is missing, offers a one-click portable install. The install
+// runs entirely in the backend; we listen on `runtime-install-progress`
+// for live byte counters and re-render the row's status text. Skipping
+// is fully supported — Athen falls back to whatever the next probe
+// finds at runtime, same as before this step existed.
+
+let onbRuntimesUnlisten = null;
+let onbRuntimesInstalling = new Set();
+
+async function enterRuntimesStep() {
+    showOnboardingStep('runtimes');
+    if (!onbRuntimesUnlisten && window.__TAURI__?.event?.listen) {
+        try {
+            onbRuntimesUnlisten = await window.__TAURI__.event.listen(
+                'runtime-install-progress',
+                (e) => updateRuntimeProgress(e.payload),
+            );
+        } catch (err) {
+            console.warn('[athen] runtime-install-progress listen failed:', err);
+        }
+    }
+    await refreshRuntimesStatus();
+}
+
+function updateRuntimeProgress(payload) {
+    if (!payload) return;
+    const row = document.querySelector(
+        `.onb-runtime-status[data-kind="${payload.kind}"]`,
+    );
+    if (!row) return;
+    const phase = payload.progress?.phase;
+    if (phase === 'downloading') {
+        const dl = payload.progress.downloaded || 0;
+        const total = payload.progress.total;
+        if (total) {
+            const pct = Math.min(100, Math.floor((dl / total) * 100));
+            row.textContent = `Downloading… ${pct}% (${formatMB(dl)} / ${formatMB(total)})`;
+        } else {
+            row.textContent = `Downloading… ${formatMB(dl)}`;
+        }
+    } else if (phase === 'verifying') {
+        row.textContent = 'Verifying checksum…';
+    } else if (phase === 'extracting') {
+        row.textContent = 'Extracting…';
+    } else if (phase === 'resolving') {
+        row.textContent = 'Resolving download…';
+    }
+}
+
+function formatMB(bytes) {
+    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+async function refreshRuntimesStatus() {
+    let status = null;
+    try {
+        status = await invoke('get_runtime_status');
+    } catch (e) {
+        console.warn('[athen] get_runtime_status failed:', e);
+        return;
+    }
+    renderRuntimeRow('python', {
+        system: status.system_python,
+        portable: status.portable_python,
+        pinned: status.python_pinned_version,
+        supported: status.python_supported,
+    });
+    renderRuntimeRow('node', {
+        system: status.system_node,
+        portable: status.portable_node,
+        pinned: status.node_pinned_version,
+        supported: status.node_supported,
+    });
+}
+
+function renderRuntimeRow(kind, info) {
+    const statusEl = document.querySelector(`.onb-runtime-status[data-kind="${kind}"]`);
+    const btn = document.querySelector(`.onb-runtime-install[data-kind="${kind}"]`);
+    if (!statusEl || !btn) return;
+    if (onbRuntimesInstalling.has(kind)) return; // mid-install — leave the streamed text alone
+    if (info.system) {
+        statusEl.textContent = `Found on system: ${info.system}`;
+        btn.textContent = 'Reinstall portable';
+        btn.disabled = !info.supported;
+    } else if (info.portable) {
+        statusEl.textContent = `Portable installed: ${info.portable.version}`;
+        btn.textContent = 'Reinstall';
+        btn.disabled = !info.supported;
+    } else {
+        statusEl.textContent = info.supported
+            ? `Not detected — install portable v${info.pinned}`
+            : 'Not supported on this OS / architecture';
+        btn.textContent = 'Install';
+        btn.disabled = !info.supported;
+    }
+}
+
+function wireRuntimesStep() {
+    document.querySelectorAll('.onb-runtime-install').forEach((btn) => {
+        btn.addEventListener('click', async (ev) => {
+            const kind = ev.currentTarget.dataset.kind;
+            if (!kind) return;
+            ev.currentTarget.disabled = true;
+            onbRuntimesInstalling.add(kind);
+            const statusEl = document.querySelector(`.onb-runtime-status[data-kind="${kind}"]`);
+            if (statusEl) statusEl.textContent = 'Starting…';
+            try {
+                await invoke('install_runtime', { kind });
+                if (statusEl) statusEl.textContent = 'Installed.';
+            } catch (e) {
+                if (statusEl) statusEl.textContent = 'Install failed: ' + e;
+                console.warn('[athen] install_runtime failed:', e);
+            } finally {
+                onbRuntimesInstalling.delete(kind);
+                ev.currentTarget.disabled = false;
+                await refreshRuntimesStatus();
+            }
+        });
+    });
+
+    document.getElementById('onb-runtimes-skip')?.addEventListener('click', () => {
+        showOnboardingStep('done');
+    });
+    document.getElementById('onb-runtimes-continue')?.addEventListener('click', () => {
         showOnboardingStep('done');
     });
 }

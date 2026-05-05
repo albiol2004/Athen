@@ -3959,6 +3959,42 @@ option:hover {
 }
 .onb-device-tier:empty { display: none; }
 
+.onb-runtime-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin: 4px 0 0;
+}
+.onb-runtime-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 12px 14px;
+    border-radius: var(--r-sm);
+    background: var(--surface-2);
+    border: 1px solid var(--border, transparent);
+}
+.onb-runtime-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+}
+.onb-runtime-meta strong {
+    font-size: 13px;
+}
+.onb-runtime-status {
+    font-size: 12px;
+    color: var(--text-2);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.onb-runtime-action button {
+    white-space: nowrap;
+}
+
 .onb-progress {
     display: flex;
     justify-content: center;

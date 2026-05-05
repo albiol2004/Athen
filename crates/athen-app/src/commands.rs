@@ -3319,6 +3319,51 @@ pub async fn clear_toolbox() -> std::result::Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+// ─── Portable runtime install (onboarding wizard) ────────────────────
+//
+// The wizard probes for system Python / Node and, if either is missing,
+// offers to install a portable copy under
+// `<athen_data_dir>/toolbox/runtimes/`. These commands back that UI:
+// `get_runtime_status` for the snapshot, `install_runtime` for the
+// download. Progress is streamed back as `runtime-install-progress`
+// events keyed by runtime kind so the frontend can show a real bar.
+
+#[tauri::command]
+pub async fn get_runtime_status(
+) -> std::result::Result<athen_agent::runtimes::RuntimesStatus, String> {
+    Ok(athen_agent::runtimes::status().await)
+}
+
+#[derive(Serialize, Clone)]
+struct RuntimeInstallEvent {
+    kind: String,
+    progress: athen_agent::runtimes::InstallProgress,
+}
+
+#[tauri::command]
+pub async fn install_runtime(
+    app: AppHandle,
+    kind: String,
+) -> std::result::Result<athen_agent::runtimes::PortableRuntimeRecord, String> {
+    let parsed = athen_agent::runtimes::RuntimeKind::parse(&kind)
+        .ok_or_else(|| format!("unknown runtime kind '{kind}'"))?;
+    let kind_label = parsed.as_str().to_string();
+    let app_for_cb = app.clone();
+    let label_for_cb = kind_label.clone();
+    let progress: athen_agent::runtimes::ProgressCb = Arc::new(move |p| {
+        let _ = app_for_cb.emit(
+            "runtime-install-progress",
+            RuntimeInstallEvent {
+                kind: label_for_cb.clone(),
+                progress: p,
+            },
+        );
+    });
+    athen_agent::runtimes::install_runtime(parsed, progress)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod key_term_tests {
     use super::extract_key_terms;

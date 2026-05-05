@@ -786,7 +786,8 @@
             <div id="onb-progress" class="onb-progress" style="display: none;">
                 <span class="onb-progress-step" data-step="pick">1. Brain</span>
                 <span class="onb-progress-step" data-step="memory">2. Memory</span>
-                <span class="onb-progress-step" data-step="done">3. Ready</span>
+                <span class="onb-progress-step" data-step="runtimes">3. Runtimes</span>
+                <span class="onb-progress-step" data-step="done">4. Ready</span>
             </div>
 
             <div class="onboarding-step" data-step="welcome">
@@ -905,6 +906,45 @@
                 </div>
                 <div class="onboarding-buttons">
                     <button id="onb-back-mem" class="btn-secondary">Back</button>
+                </div>
+            </div>
+
+            <div class="onboarding-step" data-step="runtimes" style="display: none;">
+                <h1>Python &amp; Node</h1>
+                <p class="onboarding-hint">
+                    Athen installs and runs small scripts to do things like
+                    parse PDFs, build charts, or scrape pages. It needs Python
+                    and Node for that. If they're missing, Athen can drop
+                    portable copies into its own folder — no system install,
+                    nothing else touched.
+                </p>
+                <div id="onb-runtime-list" class="onb-runtime-list">
+                    <div class="onb-runtime-row" data-kind="python">
+                        <div class="onb-runtime-meta">
+                            <strong>Python</strong>
+                            <span class="onb-runtime-status" data-kind="python">Checking…</span>
+                        </div>
+                        <div class="onb-runtime-action">
+                            <button class="btn-secondary onb-runtime-install" data-kind="python" type="button" disabled>Install</button>
+                        </div>
+                    </div>
+                    <div class="onb-runtime-row" data-kind="node">
+                        <div class="onb-runtime-meta">
+                            <strong>Node.js</strong>
+                            <span class="onb-runtime-status" data-kind="node">Checking…</span>
+                        </div>
+                        <div class="onb-runtime-action">
+                            <button class="btn-secondary onb-runtime-install" data-kind="node" type="button" disabled>Install</button>
+                        </div>
+                    </div>
+                </div>
+                <p class="onboarding-hint" style="margin-top: 12px; font-size: 0.85em; opacity: 0.7;">
+                    You can do this later from Settings if you'd rather skip
+                    for now.
+                </p>
+                <div class="onboarding-buttons">
+                    <button id="onb-runtimes-skip" class="btn-secondary">Skip for now</button>
+                    <button id="onb-runtimes-continue" class="btn-primary">Continue</button>
                 </div>
             </div>
 

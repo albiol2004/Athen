@@ -20,6 +20,11 @@ chrono = { workspace = true }
 futures = "0.3"
 tokio-stream = { workspace = true }
 blake3 = "1"
+reqwest = { workspace = true }
+sha2 = "0.10"
+tar = "0.4"
+flate2 = "1"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["signal"] }

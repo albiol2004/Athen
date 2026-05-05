@@ -66,6 +66,81 @@ pub fn athen_toolbox_manifest_path() -> Option<PathBuf> {
     athen_toolbox_dir().map(|d| d.join("manifest.json"))
 }
 
+/// Root for portable language runtimes installed by the wizard when the
+/// host doesn't already have Python / Node. Each subdir is one runtime.
+pub fn athen_runtimes_dir() -> Option<PathBuf> {
+    athen_toolbox_dir().map(|d| d.join("runtimes"))
+}
+
+/// Portable Python install root (python-build-standalone `install_only`
+/// layout — `<root>/bin/python3` on Unix, `<root>/python.exe` on Windows).
+pub fn athen_portable_python_dir() -> Option<PathBuf> {
+    athen_runtimes_dir().map(|d| d.join("python"))
+}
+
+/// Where the portable Python interpreter actually lives. Used by the
+/// install completion check and to prepend onto PATH.
+pub fn athen_portable_python_bin() -> Option<PathBuf> {
+    let root = athen_portable_python_dir()?;
+    #[cfg(target_os = "windows")]
+    {
+        Some(root.join("python.exe"))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Some(root.join("bin").join("python3"))
+    }
+}
+
+/// Directories from the portable Python install that need to be on PATH
+/// for `python` / `pip` / installed entry-points to resolve.
+pub fn athen_portable_python_path_dirs() -> Vec<PathBuf> {
+    let Some(root) = athen_portable_python_dir() else {
+        return Vec::new();
+    };
+    #[cfg(target_os = "windows")]
+    {
+        // python.exe lives at the root; pip.exe + entry-point shims live
+        // under Scripts/.
+        vec![root.clone(), root.join("Scripts")]
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        vec![root.join("bin")]
+    }
+}
+
+/// Portable Node install root (nodejs.org dist tarball / zip layout).
+pub fn athen_portable_node_dir() -> Option<PathBuf> {
+    athen_runtimes_dir().map(|d| d.join("node"))
+}
+
+/// Where the portable `node` binary lives.
+pub fn athen_portable_node_bin() -> Option<PathBuf> {
+    let root = athen_portable_node_dir()?;
+    #[cfg(target_os = "windows")]
+    {
+        Some(root.join("node.exe"))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Some(root.join("bin").join("node"))
+    }
+}
+
+/// Directory containing portable Node binaries (node, npm, npx).
+pub fn athen_portable_node_bin_dir() -> Option<PathBuf> {
+    let root = athen_portable_node_dir()?;
+    #[cfg(target_os = "windows")]
+    {
+        Some(root)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Some(root.join("bin"))
+    }
+}
+
 /// Resolve `p` against the agent workspace dir. Absolute paths pass through
 /// unchanged; relative paths are joined with [`athen_workspace_dir`], or
 /// with a `<temp>/athen-workspace` fallback when home isn't resolvable.

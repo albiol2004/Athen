@@ -7,6 +7,7 @@
 pub mod auditor;
 pub mod executor;
 pub mod resource;
+pub mod runtimes;
 pub mod timeout;
 pub mod tool_grouping;
 pub mod toolbox;

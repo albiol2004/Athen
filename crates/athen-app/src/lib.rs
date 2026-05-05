@@ -31,6 +31,14 @@ pub fn run() {
     // Install the rustls crypto provider before anything else uses TLS.
     // Both reqwest (for LLM calls) and rustls-connector (for IMAP) need this.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    // If the wizard has previously installed portable Python / Node into
+    // <athen_data_dir>/toolbox/runtimes/, prepend their bin dirs to PATH
+    // BEFORE anything probes for runtimes or builds shell envs. Done at
+    // process scope so every later Command::new("python") / "node" /
+    // "pip" / "npm" resolves to the portable copy without per-call
+    // plumbing.
+    athen_agent::runtimes::init_portable_path();
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
@@ -115,6 +123,8 @@ pub fn run() {
             commands::install_update,
             commands::list_toolbox_packages,
             commands::clear_toolbox,
+            commands::get_runtime_status,
+            commands::install_runtime,
         ])
         .setup(|app| {
             use tauri::Manager;
