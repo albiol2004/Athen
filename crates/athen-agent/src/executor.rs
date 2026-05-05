@@ -617,10 +617,18 @@ impl DefaultExecutor {
                    something (\"remember that...\", \"save this...\", \"note for later...\"). \
                    Do NOT call memory_store for tasks like writing code, running commands, testing \
                    features, or answering questions — those don't involve remembering.\n\
-                 - When the user mentions a person (\"mi novia\", \"my boss\", a name), check memory_recall \
-                   AND contacts_list to find what you know about them BEFORE responding.\n\
-                 - When writing something for/about a person, look up their name and details first.\n\
-                 - Relevant memories from past conversations may be provided as system context — use them.\n\n",
+                 - When the user mentions a person (\"mi novia\", \"my boss\", a name) or any entity \
+                   you don't fully recognize, FIRST check whether a system message in this conversation \
+                   already provides what you need (look for a \"MEMORIES ALREADY LOADED\" block). \
+                   If it does, USE it directly without calling memory_recall again. \
+                   If it doesn't, or you need more detail beyond what's shown, then call memory_recall \
+                   AND contacts_list — when in doubt, recall: it is far better to fetch a memory \
+                   you didn't strictly need than to answer without one you did.\n\
+                 - When writing something for/about a person, make sure you have their name and details \
+                   (from the loaded block, or via memory_recall / contacts_list if missing).\n\
+                 - Treat any \"MEMORIES ALREADY LOADED\" system block as authoritative — those memories \
+                   were retrieved for you. Do not re-fetch the same entities; do reach for memory_recall \
+                   when the loaded block doesn't cover what you need.\n\n",
             );
         }
 

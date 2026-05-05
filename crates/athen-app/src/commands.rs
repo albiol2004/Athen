@@ -1233,7 +1233,11 @@ pub async fn send_message(
                         ChatMessage {
                             role: Role::System,
                             content: MessageContent::Text(format!(
-                                "Relevant information from your memory:\n{memory_text}"
+                                "MEMORIES ALREADY LOADED FROM YOUR PERSISTENT MEMORY \
+                                 (treat these as authoritative — do not call memory_recall \
+                                 to re-fetch the same entities listed below; only call \
+                                 memory_recall if you need *additional* information not \
+                                 covered here):\n{memory_text}"
                             )),
                         },
                     );
@@ -1797,7 +1801,11 @@ pub(crate) async fn execute_approved_task(
                 ChatMessage {
                     role: Role::System,
                     content: MessageContent::Text(format!(
-                        "Relevant information from your memory:\n{memory_text}"
+                        "MEMORIES ALREADY LOADED FROM YOUR PERSISTENT MEMORY \
+                         (treat these as authoritative — do not call memory_recall \
+                         to re-fetch the same entities listed below; only call \
+                         memory_recall if you need *additional* information not \
+                         covered here):\n{memory_text}"
                     )),
                 },
             );
