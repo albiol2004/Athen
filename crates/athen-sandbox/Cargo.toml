@@ -10,3 +10,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tempfile = "3"

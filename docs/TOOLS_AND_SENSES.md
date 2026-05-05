@@ -8,7 +8,7 @@ Defined in `crates/athen-agent/src/tools.rs`. Sixteen built-in tools:
 
 | Tool | Risk | Backend |
 |------|------|---------|
-| `shell_execute` | `WritePersist` | `sh -c` (sandboxed when bwrap available); auto-injects toolbox PYTHONPATH/PATH |
+| `shell_execute` | `WritePersist` | nushell when available; otherwise `sh -c` (Unix) or `cmd /C` (Windows); sandboxed via bwrap on Linux when available; PYTHONPATH/PATH/cwd injected through OS process API, not a shell-syntax wrapper |
 | `shell_spawn` | `WritePersist` | detached spawn, log file capture |
 | `shell_kill` | `WritePersist` | SIGTERM/SIGKILL on tracked PIDs only |
 | `shell_logs` | `Read` | tail of spawn log file |
@@ -31,20 +31,53 @@ Defined in `crates/athen-agent/src/tools.rs`. Sixteen built-in tools:
 
 Defined in `crates/athen-agent/src/toolbox.rs`. The agent has a writable, persistent install location at `~/.athen/toolbox/` for pip and npm packages it decides it needs. These are NOT first-class Athen tools — they are CLI dependencies the agent installs and consumes through `shell_execute`. The manifest is the agent's *memory* of what it installed; the registry contract is unchanged.
 
-**Layout:**
-- `~/.athen/toolbox/python/` — `pip install --target=…` destination, joined into `PYTHONPATH`.
-- `~/.athen/toolbox/node/` — `npm install --prefix=…` destination, `node/bin` prepended to `PATH`.
-- `~/.athen/toolbox/manifest.json` — atomic-written record of `{runtime, package, version_spec, installed_version, reason, installed_at, runtime_version}` per install.
+**Layout** (paths via `athen_core::paths`; on Windows the data root is `%APPDATA%\Athen` instead of `~/.athen`):
+- `<data>/toolbox/python/` — `pip install --target=…` destination, joined into `PYTHONPATH`.
+- `<data>/toolbox/node/` — `npm install --prefix=…` destination; on Unix `node/bin/` is prepended to `PATH`, on Windows the prefix root itself is prepended (npm puts shims directly under the prefix on Windows, not under `bin/`).
+- `<data>/toolbox/runtimes/{python,node}/` — portable runtimes installed by the onboarding wizard (see "Portable Runtimes" below). Their bin dirs are prepended to PATH at process startup.
+- `<data>/toolbox/manifest.json` — atomic-written record of `{runtime, package, version_spec, installed_version, reason, installed_at, runtime_version}` per install.
 
-**Shell wrapper** (`tools.rs::build_shell_wrapper`): every `shell_execute` command is wrapped as `cd '<workspace>' && export PYTHONPATH='<py>:<existing>' && export PATH='<node/bin>:<PATH>' && ( <user_command> )`, so installed packages are import-/exec-ready transparently. The toolbox dir is added to the sandbox writable set.
+**Shell env injection** (`tools.rs::build_shell_env`): every `shell_execute` command is dispatched through `Shell::execute_with(cmd, ShellOptions { env, cwd })`. `env` carries `PYTHONPATH=<toolbox/python>` joined with the existing value via `std::env::join_paths` (platform-correct separator: `:` on Unix, `;` on Windows) and the same join treatment for `PATH=<toolbox/node bin>`; `cwd` is the workspace dir. The shell adapters apply both via `Command::env()` / `current_dir()` instead of a bash-syntax `&& export …` prefix, so the same options work under nushell, cmd, sh, bash, zsh, and pwsh — the previous bash wrapper silently failed everywhere else.
 
 **Approval flow:** `install_package` requires a `ToolboxApprovalGate`; `RouterToolboxApprovalGate` (`athen-app/src/file_gate.rs`) routes a structured `ApprovalQuestion` (`Install <pkg> (<runtime>)?` + LLM-supplied reason) through `ApprovalRouter`. The frontend listens for `approval-question` Tauri events and renders an inline dialog; Telegram is the escalation sink. Uninstall is unrestricted because it is reversible.
 
-**Runtime probing:** `probe_runtimes` (process-scoped `OnceCell`, 5 s timeout per binary) detects `python`, `pip`, `node`, `npm` once at agent start. The result + manifest summary is injected into the system prompt so the model knows what's available and what's already installed without an extra tool call.
+**Runtime probing:** `probe_runtimes` detects `python` / `pip` / `node` / `npm` once with a 5 s per-binary timeout, cached in a `Mutex<Option<RuntimeProbe>>`. The probe walks per-platform alias lists in priority order:
+- Python: `["python3","python"]` on Unix; `["python","py","python3"]` on Windows (the official installer typically only exposes `python` and `py`).
+- pip: `["pip3","pip"]` on Unix; `["pip","pip3"]` on Windows.
+- npm: `["npm"]` on Unix; `["npm.cmd","npm"]` on Windows (the real binary is the `.cmd` shim).
+
+On Windows each candidate is first resolved through `where.exe` and any hit under `\Microsoft\WindowsApps\` is **skipped** — that's where Windows registers the App Execution Alias for `python.exe`/`python3.exe` that opens the Microsoft Store on activation rather than running anything. Belt-and-suspenders: any `--version` output mentioning "Microsoft Store" or "was not found" is also rejected, in case the alias reaches stdout with a successful exit code. The wizard's runtime installer calls `invalidate_runtime_probe_cache()` after a fresh portable install so the new interpreter shows up on the next probe without restarting.
+
+The probe result + manifest summary is injected into the system prompt so the model knows what's available and what's already installed without an extra tool call. The executor also injects a `SHELL ENVIRONMENT` slot (with the actual shell kind from `detect_shell_kind()` — `"nushell"`, `"sh"`, or `"cmd"`) listing per-shell don'ts and Windows-specific tips (`python` not `python3`, bind 127.0.0.1 for HTTP servers, etc.).
 
 **Uninstall internals:** Python uninstall walks `dist-info/RECORD` (PEP 503-normalized name match), since `pip uninstall` does not support `--target`. Node uses `npm uninstall --prefix=<node_dir>`. Manifest is updated atomically after success.
 
 **UI:** Settings → "Shell Toolbox" panel lists installed packages grouped by runtime (`list_toolbox_packages`/`clear_toolbox` Tauri commands); separate from the Tools panel because these are not registry tools.
+
+### Portable Runtimes (Onboarding Wizard)
+
+`crates/athen-agent/src/runtimes.rs`. When the host doesn't already have Python or Node, the onboarding wizard's "Runtimes" step offers a one-click portable install. Design rules:
+
+- **Never bundle in the installer** (would add ~50 MB for users who already have Python).
+- **Never copy the user's existing install** — breaks on Windows because of registry `PythonCore` keys for the `py` launcher, MSVC DLL linkage, and scattered files.
+- **Detect-then-install on demand** into `<data>/toolbox/runtimes/{python,node}/`; prepend the resulting bin dirs to the process PATH so every other code path keeps working unchanged.
+
+**Pinned versions** (single hardcoded source of truth, no external manifest file per the no-config-files rule):
+- Python `3.12.7` from the python-build-standalone `20241016` release, `install_only` archive (uniform `tar.gz` layout across Unix and Windows, includes pip — avoids the Python embeddable's "no pip, fetch get-pip.py" bootstrap).
+- Node `22.11.0` from `nodejs.org/dist`, `tar.gz` on Unix and `zip` on Windows.
+
+**Verification:** SHA-256 fetched from the published sidecar (`.sha256` for python-build-standalone, `SHASUMS256.txt` for Node) and compared against the downloaded archive. This is a tripwire against accidental corruption — it trusts the same TLS origin as the download, so it does not protect against a compromised origin.
+
+**Process integration:**
+- `init_portable_path()` runs at app startup (`athen-app/src/lib.rs`) and again after every successful install. It prepends the portable bin dirs to the process `PATH` (Windows: `<runtimes>/python/` + `<runtimes>/python/Scripts/` + `<runtimes>/node/`; Unix: `<runtimes>/python/bin/` + `<runtimes>/node/bin/`). Idempotent on repeated calls.
+- After install, `toolbox::invalidate_runtime_probe_cache()` is called so the next `probe_runtimes()` picks up the new interpreter.
+- Concurrent install attempts of the same runtime are serialised through a single `Mutex` (`INSTALL_LOCK`) so a fast double-click in the wizard doesn't race two extracts into the same dir.
+
+**Tauri surface:**
+- `get_runtime_status` → `RuntimesStatus { system_python, system_node, portable_python, portable_node, python_pinned_version, node_pinned_version, python_supported, node_supported }`.
+- `install_runtime { kind: "python" | "node" }` → streams `runtime-install-progress` events with `{ kind, progress: { phase: "resolving" | "downloading" | "verifying" | "extracting" | "done", downloaded?, total? } }`.
+
+Skipping the wizard step is fully supported; Athen falls back to whatever the next probe finds at runtime, same as before this step existed.
 
 ### Web access (`web_search`, `web_fetch`)
 
@@ -273,6 +306,13 @@ All in `crates/athen-app/src/contacts.rs`:
 
 ## Cross-Platform Shell
 
-Primary: embedded Nushell (`athen-shell`) — same commands on all platforms.
-Fallback: native shell (bash/zsh/pwsh) for platform-specific tools when Nushell is unavailable.
-`shell_execute` always goes through `Shell::execute` which handles the backend selection transparently.
+Primary: embedded Nushell shipped as a Tauri sidecar (`externalBin`), or `nu` on PATH if present. Same surface on all platforms when available.
+Fallback: native shell — `sh -c` on Unix, `cmd /C` on Windows.
+
+**Shell-agnostic env/cwd plumbing.** The trait extension `ShellExecutor::execute_with(cmd, ShellOptions { env, cwd })` carries environment variables and working directory as **structured options**, not as `cd … && export … && (cmd)` text wrapped around the user command. Each adapter (nushell, native) applies them via `tokio::process::Command::env()` / `current_dir()` so the same plumbing works under nushell, cmd, sh, bash, zsh, and pwsh — the previous bash-syntax wrapper silently failed under nushell on the first beta tester's Windows machine because the export-and-chain syntax isn't valid nushell. PATH composition uses `std::env::join_paths` so the platform-correct separator (`:` on Unix, `;` on Windows) is used and Windows path elements containing `:` (drive letters) survive unmangled.
+
+**Shell-kind detection.** `athen_agent::detect_shell_kind()` returns `"nushell"`, `"sh"`, or `"cmd"` (cached, computed once per process). The `AgentBuilder::shell_kind(kind)` builder threads it into the executor; the `SHELL ENVIRONMENT` slot in the system prompt then tells the agent what's actually running so it doesn't generate bash-only constructs the active shell rejects.
+
+**Sandboxing scope.** `bwrap` integration is **Linux-only**. macOS and Windows currently fall through to direct `tokio::process::Command` execution — the macOS Seatbelt and Windows backends are stubs (`crates/athen-sandbox/src/{macos,windows}.rs`). Risk evaluation (`RuleEngine`) still runs on every command on every platform, so dangerous commands remain blocked regardless of OS.
+
+**Windows path quirks.** `athen_core::paths::canonicalize_loose` strips the `\\?\` (and `\\?\UNC\`) verbatim prefix that `std::fs::canonicalize` adds on Windows. Without this, comparing a canonicalized path against a lexically-normalized one (e.g. for `path_within(target, athen_data_dir)` membership checks) returned false for paths inside Athen's own data dir, causing spurious file-grant approval prompts on Windows.
