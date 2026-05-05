@@ -83,7 +83,7 @@ Chromium fork, no Node runtime, no React-on-Windows quirks.
 | **Sandbox** — OS-native (bwrap/Landlock/sandbox-exec/Job Objects) + Podman/Docker tier | ✅ |
 | **LLM provider routing** — failover, circuit breakers, budget tracker | ✅ |
 | **Auto-update** — minisign-signed in-app updates from GitHub Releases | ✅ |
-| **Onboarding wizard** — first-launch provider/key setup | ❌ planned for v0.1.x |
+| **Onboarding wizard** — first-launch provider/key setup (local vs. cloud, memory backend) | ✅ |
 | **Vision (image input)** | ❌ planned |
 | **Voice (STT/TTS)** | ❌ planned |
 | **Headless server mode** — daemon binary for always-on hosts | ❌ planned for v0.2 |
@@ -262,7 +262,6 @@ For a deeper read see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 ## Roadmap
 
 **v0.1.x (post-launch polish):**
-- First-launch onboarding wizard
 - Code signing (macOS notarization, Windows Trusted Signing)
 - Vision (image input + screenshot tool)
 
