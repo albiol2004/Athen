@@ -84,6 +84,7 @@ fn spawn_router_approval(
         active_arc_id: arc_id.clone().unwrap_or_default(),
         inflight: state.inflight_approvals.clone(),
         approval_router: state.approval_router.clone(),
+        notifier: state.notifier.clone(),
     };
 
     tauri::async_runtime::spawn(async move {
@@ -185,6 +186,7 @@ fn spawn_router_approval(
                 Some(description)
             },
             approval_router: bg_ctx.approval_router,
+            notifier: bg_ctx.notifier.clone(),
         };
 
         let outcome = match execute_approved_task(task_id, ctx).await {
@@ -256,6 +258,7 @@ struct ApprovedTaskBgCtx {
     active_arc_id: String,
     inflight: crate::state::InflightApprovals,
     approval_router: Option<Arc<crate::approval::ApprovalRouter>>,
+    notifier: Option<Arc<crate::notifier::NotificationOrchestrator>>,
 }
 
 /// Resolve the agent profile that should drive execution for a given arc.
@@ -1558,6 +1561,7 @@ pub async fn approve_task(
         turn_id: turn_id.clone(),
         message_override,
         approval_router: state.approval_router.clone(),
+        notifier: state.notifier.clone(),
     };
 
     let outcome = match execute_approved_task(task_uuid, ctx).await {
@@ -1650,6 +1654,11 @@ pub(crate) struct ApprovedTaskCtx {
     /// (and re-used by file gates, etc.). `None` means no router was
     /// initialized yet, so toolbox installs fail closed.
     pub approval_router: Option<Arc<crate::approval::ApprovalRouter>>,
+    /// Notification orchestrator used by `execute_dispatched_task` to fire
+    /// the completion ping when an autonomous run finishes. `None` is
+    /// tolerated (no ping). User-driven `execute_approved_task` does not
+    /// use this — the user is already in the UI and will see the reply.
+    pub notifier: Option<Arc<crate::notifier::NotificationOrchestrator>>,
 }
 
 /// Drive a risk-flagged task all the way through approval, dispatch,
@@ -2511,6 +2520,43 @@ pub(crate) async fn execute_dispatched_task(
     let _ = ctx
         .app_handle
         .emit("arc-updated", serde_json::json!({ "arc_id": arc_id }));
+
+    // Completion ping. Only fires on success — early-return error branches
+    // above already surfaced their own assistant entry into the arc, and
+    // we don't want a "Athen finished" toast for a failed run.
+    if result.success {
+        if let Some(ref notifier) = ctx.notifier {
+            let arc_name = if let Some(ref store) = ctx.arc_store {
+                match store.get_arc(&arc_id).await {
+                    Ok(Some(meta)) => meta.name,
+                    _ => arc_id.clone(),
+                }
+            } else {
+                arc_id.clone()
+            };
+            let body_notif = if content.is_empty() {
+                "Task completed.".to_string()
+            } else if content.chars().count() > 140 {
+                let cap = content.floor_char_boundary(140);
+                format!("{}...", &content[..cap])
+            } else {
+                content.clone()
+            };
+            let notification = athen_core::notification::Notification {
+                id: Uuid::new_v4(),
+                urgency: athen_core::notification::NotificationUrgency::Low,
+                title: format!("Athen finished: {arc_name}"),
+                body: body_notif,
+                origin: athen_core::notification::NotificationOrigin::Agent,
+                arc_id: Some(arc_id.clone()),
+                task_id: None,
+                created_at: chrono::Utc::now(),
+                requires_response: false,
+                skip_humanize: true,
+            };
+            notifier.notify(notification).await;
+        }
+    }
 
     Ok(Some(ApprovedTaskOutcome {
         content,

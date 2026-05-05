@@ -20,7 +20,7 @@ use athen_core::llm::{
 use athen_core::notification::{Notification, NotificationOrigin, NotificationUrgency};
 use athen_core::traits::llm::LlmRouter;
 use athen_llm::router::DefaultLlmRouter;
-use athen_persistence::arcs::{ArcMeta, ArcSource, ArcStatus, ArcStore, EntryType};
+use athen_persistence::arcs::{ArcEntry, ArcMeta, ArcSource, ArcStatus, ArcStore, EntryType};
 
 use crate::notifier::NotificationOrchestrator;
 
@@ -66,6 +66,8 @@ pub async fn process_sense_event(
     coordinator: Option<&Arc<athen_coordinador::Coordinator>>,
     task_arc_map: Option<&crate::state::TaskArcMap>,
     dispatch_signal: Option<&Arc<tokio::sync::Notify>>,
+    approval_router: Option<&Arc<crate::approval::ApprovalRouter>>,
+    pending_email_marks: Option<&crate::state::PendingEmailMarks>,
 ) -> bool {
     let source_name = source_display_name(&event.source);
     let summary = event.content.summary.as_deref().unwrap_or("(no subject)");
@@ -115,6 +117,27 @@ pub async fn process_sense_event(
         Vec::new()
     };
 
+    // Step 0b: Fetch a short body snippet of each candidate arc's recent
+    // entries so the triage LLM can disambiguate arcs whose names alone
+    // collide. Best-effort: any load failure just falls back to an empty
+    // snippet (today's metadata-only behavior).
+    let mut recent_arcs_with_snippets: Vec<(ArcMeta, String)> =
+        Vec::with_capacity(recent_arcs.len());
+    for arc in recent_arcs.iter() {
+        let snippet = if let Some(store) = arc_store {
+            match store.load_entries(&arc.id).await {
+                Ok(entries) => build_arc_snippet(&entries),
+                Err(e) => {
+                    tracing::debug!(arc = %arc.id, error = %e, "snippet load_entries failed");
+                    String::new()
+                }
+            }
+        } else {
+            String::new()
+        };
+        recent_arcs_with_snippets.push((arc.clone(), snippet));
+    }
+
     // Step 1: Triage via LLM (with arc context for matching).
     let triage = triage_event(
         router,
@@ -122,7 +145,7 @@ pub async fn process_sense_event(
         sender,
         summary,
         &body_for_triage,
-        &recent_arcs,
+        &recent_arcs_with_snippets,
     )
     .await;
 
@@ -254,11 +277,10 @@ pub async fn process_sense_event(
     }
 
     // Whether the agent will run autonomously on this event. Computed once
-    // here so steps 4 and 5 can present accurate UX (no "Draft Reply" button
-    // when Athen is already drafting a reply).
+    // here so the frontend event and notification can present accurate UX
+    // (no "Draft Reply" button when Athen is already drafting a reply).
     let will_dispatch = coordinator.is_some() && should_dispatch_autonomously(&triage);
 
-    // Step 4: Emit frontend event.
     let body_preview: String = if body_text.len() > 500 {
         let cap = body_text.floor_char_boundary(500);
         format!("{}...", &body_text[..cap])
@@ -266,6 +288,114 @@ pub async fn process_sense_event(
         body_text.trim().to_string()
     };
 
+    // Step 4: Hand off to the coordinator for autonomous execution if
+    // wiring is present and the triage decided this event warrants
+    // action (vs. just notifying the user). We do this BEFORE step 5 so
+    // the notification can reflect the actual risk decision (e.g.
+    // "Athen wants to act…" when HumanConfirm is returned).
+    //
+    // Best-effort: failures here never invalidate the work the
+    // notification path already did.
+    use athen_core::risk::RiskDecision;
+    let mut final_decision: Option<RiskDecision> = None;
+    let mut pending_human_confirm: Option<athen_core::task::TaskId> = None;
+
+    // Pre-compute the email-mark coordinates once. Any decision that could
+    // lead to a successful autonomous run (SilentApprove, NotifyAndProceed,
+    // HumanConfirm) stashes these so the dispatch loop can flag the IMAP
+    // message `\Seen` after the agent succeeds. HardBlock never runs, so we
+    // never stash for it.
+    let email_mark_info: Option<crate::state::EmailMarkInfo> = if event.source == EventSource::Email
+    {
+        let uid = event.raw_id.as_deref().and_then(|s| s.parse::<u32>().ok());
+        let folder = event
+            .content
+            .body
+            .get("folder")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        match (uid, folder) {
+            (Some(uid), Some(folder)) => Some(crate::state::EmailMarkInfo { uid, folder }),
+            _ => {
+                tracing::debug!(
+                    raw_id = ?event.raw_id,
+                    "Email event missing UID or folder; will not auto-mark seen on success"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Some(coord) = coordinator {
+        if will_dispatch {
+            match coord.process_event(event.clone()).await {
+                Ok(decisions) => {
+                    for (task_id, decision) in &decisions {
+                        info!(
+                            arc = %arc_id,
+                            task_id = %task_id,
+                            ?decision,
+                            "Sense event handed to coordinator"
+                        );
+                        if matches!(
+                            decision,
+                            RiskDecision::SilentApprove | RiskDecision::NotifyAndProceed
+                        ) {
+                            if let Some(map) = task_arc_map {
+                                map.write().await.insert(*task_id, arc_id.clone());
+                            }
+                        }
+                        // Stash the email-mark coordinates for any decision
+                        // that can lead to a successful run. HumanConfirm
+                        // is included because the user may approve later;
+                        // dispatch loop drops the entry on failure either
+                        // way, so a denied/failed task can't leak.
+                        if matches!(
+                            decision,
+                            RiskDecision::SilentApprove
+                                | RiskDecision::NotifyAndProceed
+                                | RiskDecision::HumanConfirm
+                        ) {
+                            if let (Some(map), Some(info)) =
+                                (pending_email_marks, email_mark_info.as_ref())
+                            {
+                                map.write().await.insert(*task_id, info.clone());
+                            }
+                        }
+                        if matches!(decision, RiskDecision::HumanConfirm) {
+                            pending_human_confirm = Some(*task_id);
+                        }
+                    }
+                    if !decisions.is_empty() {
+                        if let Some(sig) = dispatch_signal {
+                            sig.notify_one();
+                        }
+                    }
+                    // Take the first decision as authoritative — sense
+                    // events realistically map to a single task.
+                    final_decision = decisions.first().map(|(_, d)| *d);
+                }
+                Err(e) => {
+                    warn!(arc = %arc_id, error = %e, "coordinator.process_event failed");
+                }
+            }
+        } else {
+            tracing::debug!(
+                arc = %arc_id,
+                relevance = %triage.relevance,
+                action = %triage.suggested_action,
+                "Sense event triaged as notify-only; not dispatching"
+            );
+        }
+    }
+
+    // Step 5: Emit frontend event. `decision` is informational so the
+    // frontend can future-render an "Awaiting your approval" state for
+    // HumanConfirm; today's UI just keys off `dispatched`.
+    let decision_str = final_decision.as_ref().map(decision_label);
     let _ = app_handle.emit(
         "sense-event",
         serde_json::json!({
@@ -282,100 +412,243 @@ pub async fn process_sense_event(
             // Calendar buttons — Athen is already acting, so the user-action
             // affordances would be misleading.
             "dispatched": will_dispatch,
+            "decision": decision_str,
         }),
     );
 
-    // Step 5: Notify through orchestrator channels.
+    // Step 6: Notify through orchestrator channels — title/body/urgency
+    // now reflect the actual risk decision so HumanConfirm doesn't lie
+    // about Athen "handling" something it's actually waiting on.
     if let Some(notifier) = notifier {
-        let urgency = match triage.relevance.as_str() {
+        let baseline_urgency = match triage.relevance.as_str() {
             "high" => NotificationUrgency::High,
             "medium" => NotificationUrgency::Medium,
             _ => NotificationUrgency::Low,
         };
 
-        let title = if will_dispatch {
-            format!("Athen is handling {source_name} from {sender}")
-        } else {
-            format!("{source_name}: {summary}")
-        };
-        // For dispatched events the body shouldn't carry the raw email
-        // text — the title already says what's happening, and feeding the
-        // raw "Hey Athen, ..." salutation through any downstream rendering
-        // tends to confuse readers (and the humanizer LLM, when run).
-        let body_notif = if will_dispatch {
-            format!("Subject: {summary}")
-        } else if body_preview.len() > 200 {
-            let cap = body_preview.floor_char_boundary(200);
-            format!("{}...", &body_preview[..cap])
-        } else {
-            body_preview.clone()
-        };
+        let copy = build_sense_notification_copy(
+            will_dispatch,
+            final_decision.as_ref(),
+            source_name,
+            sender,
+            summary,
+            &triage.reason,
+            &body_preview,
+            baseline_urgency,
+        );
 
         let notification = Notification {
             id: Uuid::new_v4(),
-            urgency,
-            title,
-            body: body_notif,
+            urgency: copy.urgency,
+            title: copy.title,
+            body: copy.body,
             origin: NotificationOrigin::SenseRouter,
             arc_id: Some(arc_id.clone()),
             task_id: None,
             created_at: Utc::now(),
             requires_response: false,
-            // Dispatched-path notifications already use structured copy
-            // ("Athen is handling email from Alex"); skip the LLM rewrite
-            // that would otherwise paraphrase or distort it.
-            skip_humanize: will_dispatch,
+            skip_humanize: copy.skip_humanize,
         };
 
         notifier.notify(notification).await;
     }
 
-    // Step 6: Hand off to the coordinator for autonomous execution if
-    // wiring is present and the triage decided this event warrants
-    // action (vs. just notifying the user). Best-effort: failures here
-    // never invalidate the work the notification path already did.
-    if let Some(coord) = coordinator {
-        if will_dispatch {
-            match coord.process_event(event.clone()).await {
-                Ok(decisions) => {
-                    use athen_core::risk::RiskDecision;
-                    for (task_id, decision) in &decisions {
-                        info!(
-                            arc = %arc_id,
-                            task_id = %task_id,
-                            ?decision,
-                            "Sense event handed to coordinator"
-                        );
-                        if matches!(
-                            decision,
-                            RiskDecision::SilentApprove | RiskDecision::NotifyAndProceed
-                        ) {
-                            if let Some(map) = task_arc_map {
-                                map.write().await.insert(*task_id, arc_id.clone());
+    // Step 7: HumanConfirm path — fire a real approval question through
+    // the cross-channel router. Without this, the task sits in
+    // `awaiting_approval` forever and the notification we just sent would
+    // be the only signal the user ever gets.
+    if let Some(task_id) = pending_human_confirm {
+        if let Some(router) = approval_router {
+            let router = Arc::clone(router);
+            let coordinator = coordinator.cloned();
+            let task_arc_map = task_arc_map.cloned();
+            let dispatch_signal = dispatch_signal.cloned();
+            let arc_id_c = arc_id.clone();
+            let source_c = source_name.to_string();
+            let sender_c = sender.to_string();
+            let summary_c = summary.to_string();
+            let reason_c = triage.reason.clone();
+            tokio::spawn(async move {
+                let prompt = format!("Act on {source_c} from {sender_c}? Subject: {summary_c}.");
+                let mut question = athen_core::approval::ApprovalQuestion::approve_or_deny(prompt);
+                question.arc_id = Some(arc_id_c.clone());
+                question.task_id = Some(task_id);
+                if !reason_c.is_empty() {
+                    question.description = Some(reason_c);
+                }
+
+                let primary = router.pick_primary(Some(&arc_id_c)).await;
+                match router.ask_with_escalation(question, primary).await {
+                    Ok(answer) => match answer.choice_key.as_str() {
+                        "approve" => {
+                            let Some(coord) = coordinator else {
+                                warn!(
+                                    task_id = %task_id,
+                                    "HumanConfirm approved but coordinator handle missing"
+                                );
+                                return;
+                            };
+                            if let Err(e) = coord.approve_task(task_id).await {
+                                warn!(task_id = %task_id, error = %e, "approve_task failed");
+                                return;
                             }
+                            if let Some(map) = task_arc_map {
+                                map.write().await.insert(task_id, arc_id_c.clone());
+                            }
+                            if let Some(sig) = dispatch_signal {
+                                sig.notify_one();
+                            }
+                            info!(
+                                arc = %arc_id_c,
+                                task_id = %task_id,
+                                "HumanConfirm approved — dispatched"
+                            );
                         }
-                    }
-                    if !decisions.is_empty() {
-                        if let Some(sig) = dispatch_signal {
-                            sig.notify_one();
+                        "deny" => {
+                            if let Some(coord) = coordinator {
+                                if let Err(e) = coord.deny_task(task_id).await {
+                                    warn!(task_id = %task_id, error = %e, "deny_task failed");
+                                }
+                            }
+                            info!(
+                                arc = %arc_id_c,
+                                task_id = %task_id,
+                                "HumanConfirm denied"
+                            );
                         }
+                        other => {
+                            warn!(
+                                task_id = %task_id,
+                                choice = %other,
+                                "HumanConfirm: unknown choice — leaving task awaiting approval"
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        warn!(
+                            task_id = %task_id,
+                            error = %e,
+                            "HumanConfirm approval router failed — task left awaiting approval"
+                        );
                     }
                 }
-                Err(e) => {
-                    warn!(arc = %arc_id, error = %e, "coordinator.process_event failed");
-                }
-            }
+            });
         } else {
-            tracing::debug!(
+            warn!(
+                task_id = %task_id,
                 arc = %arc_id,
-                relevance = %triage.relevance,
-                action = %triage.suggested_action,
-                "Sense event triaged as notify-only; not dispatching"
+                "HumanConfirm decision but no approval_router wired — task will sit unactioned"
             );
         }
     }
 
     true
+}
+
+/// Map a `RiskDecision` to a stable lowercase string the frontend can
+/// branch on. Kept private and snake_case so the UI doesn't need to know
+/// the Rust enum identifiers.
+fn decision_label(decision: &athen_core::risk::RiskDecision) -> &'static str {
+    use athen_core::risk::RiskDecision;
+    match decision {
+        RiskDecision::SilentApprove => "silent_approve",
+        RiskDecision::NotifyAndProceed => "notify_and_proceed",
+        RiskDecision::HumanConfirm => "human_confirm",
+        RiskDecision::HardBlock => "hard_block",
+    }
+}
+
+/// Notification copy chosen based on `(will_dispatch, decision)`.
+struct SenseNotifCopy {
+    title: String,
+    body: String,
+    urgency: NotificationUrgency,
+    skip_humanize: bool,
+}
+
+/// Pure helper: pick title/body/urgency/skip_humanize for a sense-event
+/// notification. Factored out so we can unit-test the branching without
+/// spinning up a full orchestrator.
+#[allow(clippy::too_many_arguments)]
+fn build_sense_notification_copy(
+    will_dispatch: bool,
+    decision: Option<&athen_core::risk::RiskDecision>,
+    source_name: &str,
+    sender: &str,
+    summary: &str,
+    reason: &str,
+    body_preview: &str,
+    baseline_urgency: NotificationUrgency,
+) -> SenseNotifCopy {
+    use athen_core::risk::RiskDecision;
+
+    // Notify-only path — preserve previous semantics byte-for-byte.
+    if !will_dispatch {
+        let body = if body_preview.len() > 200 {
+            let cap = body_preview.floor_char_boundary(200);
+            format!("{}...", &body_preview[..cap])
+        } else {
+            body_preview.to_string()
+        };
+        return SenseNotifCopy {
+            title: format!("{source_name}: {summary}"),
+            body,
+            urgency: baseline_urgency,
+            skip_humanize: false,
+        };
+    }
+
+    match decision {
+        Some(RiskDecision::SilentApprove | RiskDecision::NotifyAndProceed) => SenseNotifCopy {
+            title: format!("Athen is handling {source_name} from {sender}"),
+            body: format!("Subject: {summary}"),
+            urgency: baseline_urgency,
+            skip_humanize: true,
+        },
+        Some(RiskDecision::HumanConfirm) => {
+            let body = if reason.is_empty() {
+                "Approve in app or via Telegram.".to_string()
+            } else {
+                format!("Approve in app or via Telegram. {reason}")
+            };
+            SenseNotifCopy {
+                title: format!("Athen wants to act on {source_name} from {sender}"),
+                body,
+                urgency: NotificationUrgency::High,
+                skip_humanize: true,
+            }
+        }
+        Some(RiskDecision::HardBlock) => SenseNotifCopy {
+            title: format!("Athen blocked {source_name} from {sender}"),
+            body: if reason.is_empty() {
+                String::new()
+            } else {
+                reason.to_string()
+            },
+            urgency: NotificationUrgency::High,
+            skip_humanize: true,
+        },
+        None => {
+            // Bridge errored. Fall back to notify-only behavior.
+            tracing::warn!(
+                source = source_name,
+                sender = sender,
+                "Sense bridge returned no decision; falling back to notify-only copy"
+            );
+            let body = if body_preview.len() > 200 {
+                let cap = body_preview.floor_char_boundary(200);
+                format!("{}...", &body_preview[..cap])
+            } else {
+                body_preview.to_string()
+            };
+            SenseNotifCopy {
+                title: format!("{source_name}: {summary}"),
+                body,
+                urgency: baseline_urgency,
+                skip_humanize: false,
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -546,6 +819,53 @@ fn build_context_message(
     }
 
     msg
+}
+
+/// Build a short snippet from an arc's recent entries, suitable for feeding
+/// to the triage LLM as topic-disambiguation context.
+///
+/// Picks the last 2 entries whose `entry_type` is content-bearing (Message,
+/// EmailEvent, CalendarEvent — Messaging maps to Message), formats each as
+/// `"{source}: {content[..150]}"`, joins with ` | `, and caps the result at
+/// 300 chars on a char boundary with a `...` suffix.
+pub(crate) fn build_arc_snippet(entries: &[ArcEntry]) -> String {
+    let filtered: Vec<&ArcEntry> = entries
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.entry_type,
+                EntryType::Message | EntryType::EmailEvent | EntryType::CalendarEvent
+            )
+        })
+        .collect();
+
+    // Take the last 2 in chronological order.
+    let n = filtered.len();
+    let start = n.saturating_sub(2);
+    let parts: Vec<String> = filtered[start..]
+        .iter()
+        .map(|e| {
+            let trimmed = e.content.trim();
+            let cap = trimmed.floor_char_boundary(150);
+            // Replace newlines with spaces so the snippet stays one line in
+            // the prompt — multi-line snippets confuse the bullet list.
+            let oneline = trimmed[..cap].replace(['\n', '\r'], " ");
+            // Escape stray double-quotes so we don't break the surrounding
+            // quoted string in the prompt.
+            let escaped = oneline.replace('"', "'");
+            format!("{}: {}", e.source, escaped.trim())
+        })
+        .collect();
+
+    let joined = parts.join(" | ");
+    if joined.is_empty() {
+        return String::new();
+    }
+    if joined.chars().count() <= 300 {
+        return joined;
+    }
+    let cap = joined.floor_char_boundary(300);
+    format!("{}...", &joined[..cap])
 }
 
 /// Find a recent active arc from the same source updated within `window_secs` seconds.
@@ -777,7 +1097,7 @@ async fn triage_event(
     sender: &str,
     subject: &str,
     body: &str,
-    recent_arcs: &[ArcMeta],
+    recent_arcs: &[(ArcMeta, String)],
 ) -> SenseTriage {
     let source_name = source_display_name(source);
 
@@ -786,12 +1106,19 @@ async fn triage_event(
         String::new()
     } else {
         let mut ctx = String::from("\n\nExisting active Arcs (conversations/threads):\n");
-        for arc in recent_arcs {
+        for (arc, snippet) in recent_arcs {
             let source_label = arc.source.as_str();
-            ctx.push_str(&format!(
-                "- ID: \"{}\" | Name: \"{}\" | Source: {} | Entries: {}\n",
-                arc.id, arc.name, source_label, arc.entry_count,
-            ));
+            if snippet.is_empty() {
+                ctx.push_str(&format!(
+                    "- ID: \"{}\" | Name: \"{}\" | Source: {} | Entries: {}\n",
+                    arc.id, arc.name, source_label, arc.entry_count,
+                ));
+            } else {
+                ctx.push_str(&format!(
+                    "- ID: \"{}\" | Name: \"{}\" | Source: {} | Entries: {} | Recent: \"{}\"\n",
+                    arc.id, arc.name, source_label, arc.entry_count, snippet,
+                ));
+            }
         }
         ctx
     };
@@ -801,6 +1128,7 @@ async fn triage_event(
     } else {
         r#"IMPORTANT — Arc matching:
 Look at the existing Arcs listed above. If this message is CLEARLY related to one of them (same topic, same person, same thread, a reply to an ongoing conversation), set "existing_arc_id" to that arc's ID.
+Use the Recent snippet to verify topic match — names alone can be misleading.
 Only create a new arc ("arc_name") if the message is about a genuinely new topic not covered by any existing arc.
 When in doubt, prefer creating a new arc over merging into the wrong one.
 
@@ -1191,6 +1519,167 @@ mod tests {
         let id = generate_arc_id();
         assert!(id.starts_with("arc_"));
         assert!(id.len() > 10);
+    }
+
+    fn make_entry(entry_type: EntryType, source: &str, content: &str) -> ArcEntry {
+        ArcEntry {
+            id: 0,
+            arc_id: "arc_x".into(),
+            entry_type,
+            source: source.into(),
+            content: content.into(),
+            metadata: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            turn_id: None,
+        }
+    }
+
+    #[test]
+    fn build_arc_snippet_picks_last_two_content_entries() {
+        let entries = vec![
+            make_entry(EntryType::EmailEvent, "email", "First email body"),
+            make_entry(EntryType::ToolCall, "agent", "memory_recall"),
+            make_entry(EntryType::Message, "user", "Hi there"),
+            make_entry(EntryType::Message, "assistant", "Hello back"),
+        ];
+        let snippet = build_arc_snippet(&entries);
+        assert!(
+            !snippet.contains("memory_recall"),
+            "tool_call entries should be skipped"
+        );
+        assert!(snippet.contains("user: Hi there"));
+        assert!(snippet.contains("assistant: Hello back"));
+        assert!(snippet.contains(" | "));
+    }
+
+    #[test]
+    fn build_arc_snippet_empty_when_no_content_entries() {
+        let entries = vec![make_entry(EntryType::ToolCall, "agent", "do_thing")];
+        assert_eq!(build_arc_snippet(&entries), "");
+        assert_eq!(build_arc_snippet(&[]), "");
+    }
+
+    #[test]
+    fn build_arc_snippet_truncates_long_content_per_entry_and_overall() {
+        // Each entry has 200-char content; per-entry cap is 150, so two
+        // entries joined with " | " would be ~305 chars, hitting the
+        // overall 300-char cap as well.
+        let long_a = "a".repeat(200);
+        let long_b = "b".repeat(200);
+        let entries = vec![
+            make_entry(EntryType::Message, "user", &long_a),
+            make_entry(EntryType::Message, "assistant", &long_b),
+        ];
+        let snippet = build_arc_snippet(&entries);
+        // Hits the overall cap.
+        assert!(snippet.ends_with("..."));
+        assert!(snippet.len() <= 303);
+    }
+
+    #[test]
+    fn notif_copy_notify_only_preserves_legacy_format() {
+        let copy = build_sense_notification_copy(
+            false,
+            None,
+            "email",
+            "alice@x.com",
+            "Hello",
+            "ignored",
+            "Body line",
+            NotificationUrgency::Medium,
+        );
+        assert_eq!(copy.title, "email: Hello");
+        assert_eq!(copy.body, "Body line");
+        assert_eq!(copy.urgency, NotificationUrgency::Medium);
+        assert!(!copy.skip_humanize);
+    }
+
+    #[test]
+    fn notif_copy_silent_approve_says_handling() {
+        use athen_core::risk::RiskDecision;
+        let copy = build_sense_notification_copy(
+            true,
+            Some(&RiskDecision::SilentApprove),
+            "email",
+            "alice@x.com",
+            "Hello",
+            "reason",
+            "ignored",
+            NotificationUrgency::Medium,
+        );
+        assert_eq!(copy.title, "Athen is handling email from alice@x.com");
+        assert_eq!(copy.body, "Subject: Hello");
+        assert!(copy.skip_humanize);
+    }
+
+    #[test]
+    fn notif_copy_human_confirm_says_wants_to_act() {
+        use athen_core::risk::RiskDecision;
+        let copy = build_sense_notification_copy(
+            true,
+            Some(&RiskDecision::HumanConfirm),
+            "message",
+            "Bob",
+            "Send money?",
+            "Risky transfer request",
+            "ignored",
+            NotificationUrgency::Low,
+        );
+        assert_eq!(copy.title, "Athen wants to act on message from Bob");
+        assert!(copy.body.contains("Approve in app"));
+        assert!(copy.body.contains("Risky transfer request"));
+        assert_eq!(copy.urgency, NotificationUrgency::High);
+        assert!(copy.skip_humanize);
+    }
+
+    #[test]
+    fn notif_copy_hard_block_announces_block() {
+        use athen_core::risk::RiskDecision;
+        let copy = build_sense_notification_copy(
+            true,
+            Some(&RiskDecision::HardBlock),
+            "email",
+            "spammer",
+            "Click here!",
+            "Phishing pattern",
+            "ignored",
+            NotificationUrgency::Low,
+        );
+        assert_eq!(copy.title, "Athen blocked email from spammer");
+        assert_eq!(copy.body, "Phishing pattern");
+        assert_eq!(copy.urgency, NotificationUrgency::High);
+        assert!(copy.skip_humanize);
+    }
+
+    #[test]
+    fn notif_copy_dispatch_with_no_decision_falls_back() {
+        // Bridge errored: behave like notify-only.
+        let copy = build_sense_notification_copy(
+            true,
+            None,
+            "email",
+            "alice",
+            "Hello",
+            "reason",
+            "Body line",
+            NotificationUrgency::High,
+        );
+        assert_eq!(copy.title, "email: Hello");
+        assert_eq!(copy.body, "Body line");
+        assert_eq!(copy.urgency, NotificationUrgency::High);
+        assert!(!copy.skip_humanize);
+    }
+
+    #[test]
+    fn build_arc_snippet_strips_newlines_and_quotes() {
+        let entries = vec![make_entry(
+            EntryType::Message,
+            "user",
+            "line one\nline \"two\"",
+        )];
+        let snippet = build_arc_snippet(&entries);
+        assert!(!snippet.contains('\n'));
+        assert!(!snippet.contains('"'));
     }
 
     #[test]

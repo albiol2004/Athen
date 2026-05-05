@@ -203,7 +203,11 @@ fn extract_subject(parsed: &mailparse::ParsedMail<'_>) -> Option<String> {
 }
 
 /// Build a `SenseEvent` from a single fetched IMAP message.
-fn message_to_event(uid: u32, raw_body: &[u8]) -> Result<SenseEvent> {
+///
+/// `folder` is preserved in the event body so downstream consumers (e.g. the
+/// sense router) know where to mark the message `\Seen` after a successful
+/// agent run.
+fn message_to_event(uid: u32, folder: &str, raw_body: &[u8]) -> Result<SenseEvent> {
     let parsed = mailparse::parse_mail(raw_body)
         .map_err(|e| AthenError::Other(format!("Failed to parse email UID {uid}: {e}")))?;
 
@@ -221,6 +225,7 @@ fn message_to_event(uid: u32, raw_body: &[u8]) -> Result<SenseEvent> {
         "from": from_str,
         "text": text,
         "html": html,
+        "folder": folder,
     });
 
     Ok(SenseEvent {
@@ -325,7 +330,7 @@ fn fetch_folder<S: std::io::Read + std::io::Write>(
             }
         };
 
-        match message_to_event(uid, body) {
+        match message_to_event(uid, folder, body) {
             Ok(event) => events.push(event),
             Err(e) => {
                 tracing::warn!("Failed to parse email UID {uid} in '{folder}': {e}");
@@ -434,6 +439,110 @@ impl SenseMonitor for EmailMonitor {
         tracing::info!("EmailMonitor shutting down");
         Ok(())
     }
+}
+
+/// Mark an IMAP message as `\Seen` on the server.
+///
+/// Opens a fresh, single-purpose IMAP session, selects `folder`, runs
+/// `UID STORE <uid> +FLAGS (\Seen)`, and logs out cleanly. Used by the
+/// autonomous-agent dispatch path to flag emails the agent has already
+/// successfully acted on, so they don't re-trigger on the next
+/// `UID SEARCH UNSEEN` poll.
+///
+/// Mirrors the connection setup in `EmailMonitor::poll` (TLS / non-TLS
+/// branches via `spawn_blocking`) so it shares the same TLS / TCP
+/// behavior. Doesn't touch the polling session — concurrent IMAP calls on
+/// one session are not safe.
+///
+/// Errors are returned as-is for the caller to log; this function never
+/// retries. Callers that pass a wrong/disabled config get a clear
+/// error back rather than a silent no-op.
+pub async fn mark_uid_seen(config: &EmailConfig, folder: &str, uid: u32) -> Result<()> {
+    if !config.enabled {
+        return Err(AthenError::Other(
+            "mark_uid_seen called with disabled email config".into(),
+        ));
+    }
+    if config.imap_server.is_empty() {
+        return Err(AthenError::Other(
+            "mark_uid_seen called with empty imap_server".into(),
+        ));
+    }
+
+    let config = config.clone();
+    let folder = folder.to_string();
+
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let server = config.imap_server.as_str();
+        let port = config.imap_port;
+
+        if config.use_tls {
+            let tcp = std::net::TcpStream::connect((server, port))
+                .map_err(|e| AthenError::Other(format!("TCP connect to {server}:{port}: {e}")))?;
+
+            let connector = rustls_connector::RustlsConnector::new_with_native_certs()
+                .map_err(|e| AthenError::Other(format!("TLS connector setup: {e}")))?;
+
+            let tls_stream = connector
+                .connect(server, tcp)
+                .map_err(|e| AthenError::Other(format!("TLS handshake with {server}: {e}")))?;
+
+            let client = imap::Client::new(tls_stream);
+            let mut session = client
+                .login(&config.username, &config.password)
+                .map_err(|(e, _)| AthenError::Other(format!("IMAP login: {e}")))?;
+
+            let store_result = session
+                .select(&folder)
+                .map_err(|e| AthenError::Other(format!("IMAP select '{folder}': {e}")))
+                .and_then(|_| {
+                    session
+                        .uid_store(uid.to_string(), "+FLAGS (\\Seen)")
+                        .map(|_| ())
+                        .map_err(|e| {
+                            AthenError::Other(format!(
+                                "IMAP uid_store \\Seen for UID {uid} in '{folder}': {e}"
+                            ))
+                        })
+                });
+
+            if let Err(e) = session.logout() {
+                tracing::warn!("IMAP logout error after mark_uid_seen: {e}");
+            }
+
+            store_result
+        } else {
+            let tcp = std::net::TcpStream::connect((server, port))
+                .map_err(|e| AthenError::Other(format!("TCP connect to {server}:{port}: {e}")))?;
+
+            let client = imap::Client::new(tcp);
+            let mut session = client
+                .login(&config.username, &config.password)
+                .map_err(|(e, _)| AthenError::Other(format!("IMAP login: {e}")))?;
+
+            let store_result = session
+                .select(&folder)
+                .map_err(|e| AthenError::Other(format!("IMAP select '{folder}': {e}")))
+                .and_then(|_| {
+                    session
+                        .uid_store(uid.to_string(), "+FLAGS (\\Seen)")
+                        .map(|_| ())
+                        .map_err(|e| {
+                            AthenError::Other(format!(
+                                "IMAP uid_store \\Seen for UID {uid} in '{folder}': {e}"
+                            ))
+                        })
+                });
+
+            if let Err(e) = session.logout() {
+                tracing::warn!("IMAP logout error after mark_uid_seen: {e}");
+            }
+
+            store_result
+        }
+    })
+    .await
+    .map_err(|e| AthenError::Other(format!("mark_uid_seen task panicked: {e}")))?
 }
 
 #[cfg(test)]
@@ -613,7 +722,7 @@ Content-Type: text/plain; charset=utf-8\r\n\
 \r\n\
 This is the body.";
 
-        let event = message_to_event(42, raw).unwrap();
+        let event = message_to_event(42, "INBOX", raw).unwrap();
         assert_eq!(event.source, EventSource::Email);
         assert!(matches!(event.kind, EventKind::NewMessage));
         assert_eq!(event.source_risk, RiskLevel::Caution);
@@ -629,6 +738,7 @@ This is the body.";
         assert_eq!(body["from"], "test@example.com");
         assert!(body["text"].as_str().unwrap().contains("This is the body"));
         assert!(body["html"].is_null());
+        assert_eq!(body["folder"], "INBOX");
     }
 
     #[test]
@@ -733,7 +843,7 @@ Content-Type: text/plain\r\n\
 \r\n\
 Just a body, no subject";
 
-        let event = message_to_event(99, raw).unwrap();
+        let event = message_to_event(99, "INBOX", raw).unwrap();
         assert!(event.content.summary.is_none());
         assert_eq!(event.raw_id.as_deref(), Some("99"));
         assert!(event.content.body["text"]
@@ -749,9 +859,10 @@ Content-Type: text/plain\r\n\
 \r\n\
 Body without sender";
 
-        let event = message_to_event(100, raw).unwrap();
+        let event = message_to_event(100, "Archive", raw).unwrap();
         assert!(event.sender.is_none());
         assert_eq!(event.content.summary.as_deref(), Some("No From"));
+        assert_eq!(event.content.body["folder"], "Archive");
     }
 
     #[test]
@@ -774,6 +885,56 @@ Part two\r\n\
         let (text, _, _) = extract_email_body(raw);
         assert!(text.contains("Part one"));
         assert!(text.contains("Part two"));
+    }
+
+    #[tokio::test]
+    async fn mark_uid_seen_errors_on_disabled_config() {
+        // Disabled config should fail fast with a clear error rather than
+        // silently no-op or attempt a TCP connect.
+        let config = EmailConfig::default(); // enabled = false
+        let result = mark_uid_seen(&config, "INBOX", 1).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn mark_uid_seen_errors_on_missing_server() {
+        // Enabled but no imap_server configured.
+        let config = EmailConfig {
+            enabled: true,
+            imap_server: String::new(),
+            ..Default::default()
+        };
+        let result = mark_uid_seen(&config, "INBOX", 1).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn mark_uid_seen_errors_on_unreachable_host() {
+        // Enabled config pointing at an unroutable host: must return an
+        // error gracefully rather than panic. We use TEST-NET-1 (RFC 5737)
+        // with a short-lived expectation that TCP connect will fail.
+        let config = EmailConfig {
+            enabled: true,
+            imap_server: "192.0.2.1".to_string(),
+            imap_port: 1, // closed port; connect should refuse/timeout
+            use_tls: false,
+            username: "u".to_string(),
+            password: "p".to_string(),
+            ..Default::default()
+        };
+
+        // This may take a moment to fail (TCP connect timeout); cap it so the
+        // test stays fast even when the OS is slow to error out.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            mark_uid_seen(&config, "INBOX", 1),
+        )
+        .await;
+        match result {
+            Ok(Err(_)) => {} // expected: connect/login error
+            Ok(Ok(())) => panic!("mark_uid_seen unexpectedly succeeded against TEST-NET-1"),
+            Err(_) => {} // also acceptable: TCP connect just hangs in CI
+        }
     }
 
     #[test]

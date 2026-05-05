@@ -63,6 +63,23 @@ pub type ProfileEmbeddingCache =
 /// not to extend `Task` in athen-core for app-layer concerns).
 pub type TaskArcMap = Arc<tokio::sync::RwLock<HashMap<Uuid, String>>>;
 
+/// IMAP coordinates needed to mark a single message `\Seen` after the
+/// agent successfully acts on it. Stored in [`PendingEmailMarks`] keyed
+/// by the coordinator task id.
+#[derive(Debug, Clone)]
+pub struct EmailMarkInfo {
+    pub uid: u32,
+    pub folder: String,
+}
+
+/// Maps coordinator task ids → the IMAP UID/folder to mark `\Seen` on
+/// success. Populated by the sense router for any decision that could
+/// lead to an autonomous run (`SilentApprove`, `NotifyAndProceed`,
+/// `HumanConfirm`); consumed by the dispatch loop after the agent
+/// finishes successfully. Failed runs drop the entry without marking,
+/// so the next IMAP poll re-triggers the email.
+pub type PendingEmailMarks = Arc<tokio::sync::RwLock<HashMap<Uuid, EmailMarkInfo>>>;
+
 /// Wrapper to share the router via `Arc<RwLock<Arc<...>>>` while satisfying
 /// the `LlmRouter` trait.  The `RwLock` allows the inner router to be swapped
 /// at runtime (e.g. when the user switches active provider).
@@ -206,6 +223,14 @@ pub struct AppState {
     /// when it dispatches an autonomous task; consumed by the dispatch
     /// loop to persist replies into the right arc.
     pub task_arc_map: TaskArcMap,
+    /// Maps task ids → the IMAP UID/folder to flag `\Seen` once the
+    /// agent successfully acts on the originating email. Populated by
+    /// the sense router for any decision that could lead to an
+    /// autonomous run; drained by `start_dispatch_loop` after success.
+    /// Failed runs drop the entry (no mark), so the email re-triggers
+    /// on the next IMAP poll — that's the source of truth for
+    /// "still needs handling".
+    pub pending_email_marks: PendingEmailMarks,
     /// Notifies the dispatch loop when a new sense-originated task has
     /// been enqueued. The loop also wakes on a 2-second tick as a
     /// belt-and-brace; `notify_one` keeps latency low when events do
@@ -315,6 +340,7 @@ impl AppState {
             spawned_processes,
             inflight_approvals: Arc::new(Mutex::new(HashSet::new())),
             task_arc_map: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            pending_email_marks: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             dispatch_signal: Arc::new(tokio::sync::Notify::new()),
             dispatch_loop_shutdown: None,
         };
@@ -581,7 +607,9 @@ impl AppState {
         let notifier = self.notifier.clone();
         let coordinator_ref = Arc::clone(&self.coordinator);
         let task_arc_map_ref = Arc::clone(&self.task_arc_map);
+        let pending_email_marks_ref = Arc::clone(&self.pending_email_marks);
         let dispatch_signal_ref = Arc::clone(&self.dispatch_signal);
+        let approval_router_ref = self.approval_router.clone();
 
         tauri::async_runtime::spawn(async move {
             if let Err(e) = monitor.init(&email_config).await {
@@ -610,6 +638,8 @@ impl AppState {
                                 Some(&coordinator_ref),
                                 Some(&task_arc_map_ref),
                                 Some(&dispatch_signal_ref),
+                                approval_router_ref.as_ref(),
+                                Some(&pending_email_marks_ref),
                             )
                             .await;
                         }
@@ -656,7 +686,9 @@ impl AppState {
         let notifier = self.notifier.clone();
         let coordinator_ref = Arc::clone(&self.coordinator);
         let task_arc_map_ref = Arc::clone(&self.task_arc_map);
+        let pending_email_marks_ref = Arc::clone(&self.pending_email_marks);
         let dispatch_signal_ref = Arc::clone(&self.dispatch_signal);
+        let approval_router_ref = self.approval_router.clone();
 
         tauri::async_runtime::spawn(async move {
             if let Err(e) = monitor.init(&config).await {
@@ -687,6 +719,8 @@ impl AppState {
                                 Some(&coordinator_ref),
                                 Some(&task_arc_map_ref),
                                 Some(&dispatch_signal_ref),
+                                approval_router_ref.as_ref(),
+                                Some(&pending_email_marks_ref),
                             )
                             .await;
                         }
@@ -753,6 +787,7 @@ impl AppState {
         let approval_router_ref = self.approval_router.clone();
         let coordinator_ref = Arc::clone(&self.coordinator);
         let task_arc_map_ref = Arc::clone(&self.task_arc_map);
+        let pending_email_marks_ref = Arc::clone(&self.pending_email_marks);
         let dispatch_signal_ref = Arc::clone(&self.dispatch_signal);
 
         tauri::async_runtime::spawn(async move {
@@ -868,6 +903,8 @@ impl AppState {
                                     Some(&coordinator_ref),
                                     Some(&task_arc_map_ref),
                                     Some(&dispatch_signal_ref),
+                                    approval_router_ref.as_ref(),
+                                    Some(&pending_email_marks_ref),
                                 )
                                 .await;
                             }
@@ -949,6 +986,7 @@ impl AppState {
         let coordinator = Arc::clone(&self.coordinator);
         let dispatch_signal = Arc::clone(&self.dispatch_signal);
         let task_arc_map = Arc::clone(&self.task_arc_map);
+        let pending_email_marks = Arc::clone(&self.pending_email_marks);
         let router = Arc::clone(&self.router);
         let arc_store = self._database.as_ref().map(|db| db.arc_store());
         let calendar_store = self.calendar_store.clone();
@@ -962,6 +1000,7 @@ impl AppState {
         let spawned_processes = self.spawned_processes.clone();
         let telegram_approval_sink = self.telegram_approval_sink.clone();
         let approval_router = self.approval_router.clone();
+        let notifier = self.notifier.clone();
         let inflight = Arc::clone(&self.inflight_approvals);
 
         tauri::async_runtime::spawn(async move {
@@ -1040,14 +1079,23 @@ impl AppState {
                         turn_id: uuid::Uuid::new_v4().to_string(),
                         message_override: None,
                         approval_router: approval_router.clone(),
+                        notifier: notifier.clone(),
                     };
 
                     let task_arc_map_clone = Arc::clone(&task_arc_map);
+                    let pending_email_marks_clone = Arc::clone(&pending_email_marks);
                     tauri::async_runtime::spawn(async move {
                         let outcome =
                             crate::commands::execute_dispatched_task(task, arc_id.clone(), ctx)
                                 .await;
-                        match outcome {
+
+                        // Did the agent actually succeed at this task?
+                        // Only on a true success do we flag the source
+                        // email `\Seen` — failures must leave the email
+                        // UNSEEN so the next IMAP poll re-triggers it.
+                        let succeeded = matches!(&outcome, Ok(Some(o)) if o.success);
+
+                        match &outcome {
                             Ok(Some(o)) => {
                                 info!(
                                     task_id = %task_id,
@@ -1069,6 +1117,52 @@ impl AppState {
                         // Always remove the mapping entry so the table
                         // doesn't leak even on failure.
                         task_arc_map_clone.write().await.remove(&task_id);
+
+                        // Drain the pending-email-mark entry too. On
+                        // success: spawn a fire-and-forget IMAP STORE
+                        // call. On failure (or skip): just drop it —
+                        // the source email stays UNSEEN and will
+                        // re-trigger on next poll, which is the user's
+                        // explicit requirement.
+                        let mark_info = pending_email_marks_clone.write().await.remove(&task_id);
+                        if let Some(info) = mark_info {
+                            if succeeded {
+                                let config = load_config();
+                                let email_config = config.email.clone();
+                                tokio::spawn(async move {
+                                    match athen_sentidos::email::mark_uid_seen(
+                                        &email_config,
+                                        &info.folder,
+                                        info.uid,
+                                    )
+                                    .await
+                                    {
+                                        Ok(()) => {
+                                            info!(
+                                                uid = info.uid,
+                                                folder = %info.folder,
+                                                "Marked email \\Seen after successful autonomous run"
+                                            );
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                uid = info.uid,
+                                                folder = %info.folder,
+                                                error = %e,
+                                                "Failed to mark email \\Seen; will re-trigger on next poll"
+                                            );
+                                        }
+                                    }
+                                });
+                            } else {
+                                tracing::debug!(
+                                    task_id = %task_id,
+                                    uid = info.uid,
+                                    folder = %info.folder,
+                                    "task failed, leaving email UNSEEN, will re-trigger on next poll"
+                                );
+                            }
+                        }
                     });
                 }
             }
