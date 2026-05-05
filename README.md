@@ -91,9 +91,18 @@ Grab the latest release from
 **[github.com/albiol2004/Athen/releases](https://github.com/albiol2004/Athen/releases/latest)**.
 
 ### Linux
-- Download `Athen_<version>_amd64.AppImage`.
-- `chmod +x Athen_*.AppImage && ./Athen_*.AppImage`
-- Or install the `.deb`: `sudo dpkg -i athen_*.deb`
+Use the package that matches your distro — the AppImage is a fallback and
+may not work on every host (see note below).
+- **Debian / Ubuntu:** `sudo apt install ./athen_*_amd64.deb`
+- **Fedora / RHEL:** `sudo dnf install ./athen-*.x86_64.rpm`
+- **Other distros (AppImage):** `chmod +x Athen_*.AppImage && ./Athen_*.AppImage`
+
+> ⚠️ The AppImage bundles WebKitGTK and its Wayland/EGL stack. On some
+> hosts (notably Fedora 44+ with Mesa 26+) the bundled libs collide with
+> the system Mesa and the WebKit renderer aborts with `EGL_BAD_PARAMETER`.
+> If you hit this, install the `.deb` or `.rpm` instead. Tracking issue:
+> [#1](https://github.com/albiol2004/Athen/issues) (please file one if
+> you see it).
 
 ### macOS (Apple Silicon)
 - Download `Athen_<version>_aarch64.dmg`.

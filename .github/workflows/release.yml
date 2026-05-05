@@ -29,6 +29,7 @@ jobs:
             updater_target: linux-x86_64
             artifact_globs: |
               target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
+              target/x86_64-unknown-linux-gnu/release/bundle/rpm/*.rpm
               target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage
               target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage.sig
           - platform: macos-latest
@@ -70,7 +71,8 @@ jobs:
             libappindicator3-dev \
             librsvg2-dev \
             cmake \
-            nasm
+            nasm \
+            rpm
 
       - uses: dtolnay/rust-toolchain@stable
         with:
