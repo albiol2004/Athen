@@ -27,6 +27,13 @@ support, and a tool surface you can extend.
 > deliberately focused feature set. **What gets built next is driven by
 > the people using it.** Open an issue, leave a comment on a discussion,
 > or just tell me what's missing — every signal counts at this stage.
+>
+> 👤 **Athen is a one-person project.** I'm building it solo, in the open,
+> because I wanted this tool to exist and nothing on the market fit. That
+> means rough edges, but it also means **your feedback lands on a real
+> human's desk and genuinely steers what comes next** — no committee, no
+> backlog graveyard. Bug reports, feature requests, design critiques,
+> "this confused me" notes — all welcome and all read.
 
 ---
 
@@ -271,12 +278,14 @@ For a deeper read see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Contributing & feedback
 
-This is a **very early release** with a deliberately narrow feature set.
-The single most useful thing you can do right now is **tell me what's
-missing or what's broken** — open an
+This is a **very early release** of a **one-person project** with a
+deliberately narrow feature set. The single most useful thing you can do
+right now is **tell me what's missing or what's broken** — open an
 [issue](https://github.com/albiol2004/Athen/issues) or start a
-[discussion](https://github.com/albiol2004/Athen/discussions). Roadmap
-priorities are reweighted every cycle based on what real users ask for.
+[discussion](https://github.com/albiol2004/Athen/discussions). Every
+report is read by the same person who wrote the code; roadmap priorities
+are reweighted every cycle based on what real users ask for. If something
+feels off — say so. I genuinely appreciate it.
 
 PRs welcome too. House rules:
 - `cargo clippy --workspace -- -D warnings` must be clean

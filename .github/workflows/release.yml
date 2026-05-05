@@ -81,6 +81,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-${{ matrix.target }}
+          # The Windows post-step intermittently fails because vctip.exe
+          # holds files open while tar is archiving. The build itself has
+          # already succeeded by then — don't poison the matrix outcome
+          # over a flaky cache save.
+          save-if: ${{ runner.os != 'Windows' }}
 
       - name: Install Tauri CLI
         # Pin the major to keep CI deterministic across patch releases.
@@ -135,7 +140,11 @@ jobs:
   publish-manifest:
     name: Publish updater manifest
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Run even if some matrix legs fail (e.g. flaky cache-save post-step on
+    # Windows). The python script below already skips per-platform when the
+    # signature/payload artifacts are missing, so a partial manifest is the
+    # graceful failure mode rather than no manifest at all.
+    if: always() && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - name: Download all build artifacts
