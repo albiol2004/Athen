@@ -8,7 +8,7 @@ Defined in `crates/athen-agent/src/tools.rs`. Sixteen built-in tools:
 
 | Tool | Risk | Backend |
 |------|------|---------|
-| `shell_execute` | `WritePersist` | nushell when available; otherwise `sh -c` (Unix) or `cmd /C` (Windows); sandboxed via bwrap on Linux when available; PYTHONPATH/PATH/cwd injected through OS process API, not a shell-syntax wrapper |
+| `shell_execute` | `WritePersist` | nushell when available; otherwise `sh -c` (Unix) or `cmd /C` (Windows); sandboxed via bwrap (Linux) / Seatbelt (macOS) / Job Object + AppContainer (Windows) when available; PYTHONPATH/PATH/cwd injected through OS process API, not a shell-syntax wrapper |
 | `shell_spawn` | `WritePersist` | detached spawn, log file capture |
 | `shell_kill` | `WritePersist` | SIGTERM/SIGKILL on tracked PIDs only |
 | `shell_logs` | `Read` | tail of spawn log file |
@@ -221,12 +221,17 @@ Each monitor normalizes its input into `SenseEvent` (uuid, timestamp, `EventSour
 | Level | When used | Backend selection |
 |-------|-----------|-------------------|
 | `SandboxLevel::None` | Read-only ops, filesystem tools | Direct `tokio::process` |
-| `SandboxLevel::OsNative` | `shell_execute` (default) | bwrap (Linux, preferred) → landlock (Linux fallback) → sandbox-exec (macOS) → Job Objects (Windows) |
+| `SandboxLevel::OsNative` | `shell_execute` (default) | bwrap (Linux, preferred) → landlock (Linux fallback) → `sandbox-exec` Seatbelt (macOS) → Job Object + AppContainer (Windows) |
 | `SandboxLevel::Container` | High-risk / L3+ operations | Podman (preferred) → Docker fallback |
 
-`shell_execute` uses `SandboxProfile::RestrictedWrite { allowed_paths }` with default writable set of `/tmp` + `~/.athen/` + `cwd` + any arc grant paths provided by `ShellExtraWritableProvider` (`tools.rs:205-228`). System paths are always excluded from the extra writable set (`paths::is_system_path`).
+All three OS-native backends share the same `SandboxProfile` enum (`ReadOnly` / `RestrictedWrite { allowed_paths }` / `NoNetwork` / `Full`); each backend translates the profile into its native primitives:
+- **bwrap (Linux)** — `--ro-bind /` + per-path `--bind`; `--unshare-net` for `NoNetwork`; `--unshare-all` + minimal binds for `Full`. (`crates/athen-sandbox/src/bwrap.rs`)
+- **Seatbelt (macOS)** — Lisp profile with `(allow default)` + `(deny file-write*)` + per-path `(allow file-write* (subpath "..."))`; `(deny network*)` for `NoNetwork`/`Full`. Profile written to a tempfile and passed to `/usr/bin/sandbox-exec -f`. (`crates/athen-sandbox/src/macos.rs`)
+- **Job Object + AppContainer (Windows)** — Two-tier: a Job Object caps memory/process count and ties the child tree to the parent via `KILL_ON_JOB_CLOSE`; an AppContainer with a per-execution unique SID provides FS isolation via ACL grants on `allowed_paths` and the resolved binary. The `internetClient` capability is included only for `ReadOnly`/`RestrictedWrite`; `NoNetwork`/`Full` ship empty capability list, so the AppContainer has no socket access. AppContainer profiles ship since Win8/Server 2012. APIs reached by dynamic-load from `userenv.dll` because the `windows` 0.59 crate doesn't expose them through any feature flag. (`crates/athen-sandbox/src/windows.rs`)
 
-If bwrap fails at runtime (namespace creation errors on restricted CI), the executor falls back to unsandboxed shell rather than breaking the command (`tools.rs:235-247`).
+`shell_execute` uses `SandboxProfile::RestrictedWrite { allowed_paths }` with default writable set of `/tmp` + `~/.athen/` (or `%APPDATA%\Athen` on Windows) + `cwd` + any arc grant paths provided by `ShellExtraWritableProvider` (`tools.rs:205-228`). System paths are always excluded from the extra writable set (`paths::is_system_path`).
+
+If the OS-native backend fails at runtime (e.g. bwrap namespace errors on restricted CI; AppContainer profile-creation failure inside an existing container), the executor falls back to unsandboxed shell rather than breaking the command (`tools.rs:235-247`). Risk evaluation (`RuleEngine`) still runs on every command on every platform, so dangerous commands remain blocked regardless of sandbox availability.
 
 ---
 
@@ -313,6 +318,6 @@ Fallback: native shell — `sh -c` on Unix, `cmd /C` on Windows.
 
 **Shell-kind detection.** `athen_agent::detect_shell_kind()` returns `"nushell"`, `"sh"`, or `"cmd"` (cached, computed once per process). The `AgentBuilder::shell_kind(kind)` builder threads it into the executor; the `SHELL ENVIRONMENT` slot in the system prompt then tells the agent what's actually running so it doesn't generate bash-only constructs the active shell rejects.
 
-**Sandboxing scope.** `bwrap` integration is **Linux-only**. macOS and Windows currently fall through to direct `tokio::process::Command` execution — the macOS Seatbelt and Windows backends are stubs (`crates/athen-sandbox/src/{macos,windows}.rs`). Risk evaluation (`RuleEngine`) still runs on every command on every platform, so dangerous commands remain blocked regardless of OS.
+**Sandboxing scope.** All three desktop platforms have a real OS-native sandbox backend now: bwrap on Linux, `sandbox-exec` (Seatbelt) on macOS, Job Object + AppContainer on Windows. See the Sandbox tier-mapping table above for what each profile translates to. Backends are auto-detected at startup by `SandboxDetector`; if none is available the executor falls through to direct `tokio::process::Command` execution but still applies `RuleEngine` risk gating on the command string.
 
 **Windows path quirks.** `athen_core::paths::canonicalize_loose` strips the `\\?\` (and `\\?\UNC\`) verbatim prefix that `std::fs::canonicalize` adds on Windows. Without this, comparing a canonicalized path against a lexically-normalized one (e.g. for `path_within(target, athen_data_dir)` membership checks) returned false for paths inside Athen's own data dir, causing spurious file-grant approval prompts on Windows.

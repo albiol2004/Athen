@@ -67,6 +67,43 @@ Optional daily USD limit with warning threshold. Per-provider rate limits. Token
 
 ---
 
+## Portable Runtimes (Onboarding Wizard)
+
+If the host doesn't already have Python or Node when the user opens Athen, the onboarding wizard's "Runtimes" step offers a one-click portable install. Nothing is bundled in the installer (would add ~50 MB for users who already have Python); nothing is copied from the user's existing install (breaks on Windows because of registry `PythonCore` keys for the `py` launcher and MSVC DLL linkage).
+
+Install location:
+- Unix: `~/.athen/toolbox/runtimes/{python,node}/`
+- Windows: `%APPDATA%\Athen\toolbox\runtimes\{python,node}\`
+
+Pinned versions (single hardcoded source of truth, no manifest file per the no-config-files rule):
+- Python `3.12.7` from python-build-standalone `20241016` (`install_only` archive — uniform tar.gz across all OS, includes pip).
+- Node `22.11.0` from `nodejs.org/dist` (tar.gz on Unix, zip on Windows).
+
+SHA-256 verification fetched from the published sidecar (`.sha256` for python-build-standalone, `SHASUMS256.txt` for Node) — tripwire against accidental corruption, trusts the same TLS origin as the download. After a successful install, `init_portable_path()` re-prepends the portable bin dirs to the process PATH so every other code path keeps working unchanged. Skipping the wizard step is fully supported; Athen falls back to whatever the next runtime probe finds.
+
+Tauri commands: `get_runtime_status` returns `{ system_python, system_node, portable_python, portable_node, python_pinned_version, node_pinned_version, … }`. `install_runtime { kind: "python" | "node" }` streams `runtime-install-progress` events through the wizard.
+
+See `crates/athen-agent/src/runtimes.rs` and the "Portable Runtimes" subsection in `docs/TOOLS_AND_SENSES.md`.
+
+---
+
+## Sandbox Runtime Requirements
+
+Athen tries to run shell commands inside an OS-native sandbox. Requirements per platform:
+
+- **macOS** — zero install. `/usr/bin/sandbox-exec` (Seatbelt) ships with every macOS since 10.5.
+- **Windows** — zero install. Job Object (Win XP+) and AppContainer (Win 8 / Server 2012+) are Win32 kernel APIs. Reached via dynamic-load from `userenv.dll` because `windows` 0.59 doesn't expose them through any feature flag.
+- **Linux** — `bwrap` (bubblewrap) needed for full FS isolation. Already present on most desktops because Flatpak pulls it in as a dependency. Otherwise:
+  - Fedora: `dnf install bubblewrap`
+  - Debian/Ubuntu: `apt install bubblewrap`
+  - Arch: `pacman -S bubblewrap`
+  
+  If `bwrap` is missing, Athen falls through to direct (unsandboxed) execution but still applies its rule-engine risk gate on the command string. The Linux Landlock backend is a stub (kernel ≥ 5.13 + LSM enabled — would let us drop the bwrap dependency on modern kernels but isn't wired yet).
+
+`SandboxDetector::detect()` runs once at startup and reports the active backend through the unified facade. Fallbacks are logged at `info` level so a user who notices the kill-switch UI showing "Sandbox: Active (direct)" can install the missing primitive.
+
+---
+
 ## Embedding Configuration
 
 Embeddings are configured separately from LLM providers and controlled entirely via the Tauri UI. No config files.

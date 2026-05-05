@@ -129,7 +129,7 @@ ToolBackend::HttpApi { endpoint, method, auth }  // Direct HTTP API calls
 Tiered isolation based on risk:
 ```rust
 SandboxLevel::None                        // L1 read-only actions
-SandboxLevel::OsNative { profile }        // L2: bwrap/landlock (Linux), sandbox-exec (macOS), Job Objects (Windows)
+SandboxLevel::OsNative { profile }        // L2: bwrap/landlock (Linux), sandbox-exec/Seatbelt (macOS), Job Object + AppContainer (Windows)
 SandboxLevel::Container { image, mounts } // L3+: Podman/Docker
 ```
 
@@ -313,7 +313,14 @@ trait ShellExecutor: Send + Sync {
     async fn execute_native(&self, command: &str) -> Result<SandboxOutput>;
     async fn which(&self, program: &str) -> Result<Option<PathBuf>>;
 }
+
+// Extension trait for shell-agnostic env/cwd plumbing:
+trait ShellExecutorExt: ShellExecutor {
+    async fn execute_with(&self, command: &str, opts: ShellOptions) -> Result<SandboxOutput>;
+}
+struct ShellOptions { env: Vec<(String, String)>, cwd: Option<PathBuf> }
 ```
+`execute_with` carries env vars and working directory as **structured options**, not as `cd … && export … && (cmd)` text wrapped around the user command. Each adapter (nushell, native) applies them via `tokio::process::Command::env()` / `current_dir()`, so the same options work under nushell, cmd, sh, bash, zsh, and pwsh. The previous bash-syntax wrapper silently failed under nushell on Windows because the export-and-chain syntax isn't valid nushell.
 
 ### Memory System (VectorIndex, KnowledgeGraph, MemoryStore)
 Three complementary traits working together:
@@ -448,7 +455,7 @@ Rule engine evaluates the user's natural language input before any LLM call. Cat
 `ShellToolRegistry.do_shell_execute()` runs `RuleEngine.evaluate()` on every actual shell command before execution. This catches dangerous commands regardless of what language the user spoke -- the LLM may translate "borra todo" into `rm -rf /` and this layer catches it. Commands classified as Danger or Critical are blocked with an error returned to the LLM.
 
 **Layer 3: OS-Native Sandbox (Shell)**
-When bwrap is available, shell commands execute inside an OS-native sandbox with `SandboxProfile::RestrictedWrite`. Writable paths: `/tmp`, `$HOME`, current working directory. Everything else is read-only. Graceful fallback to unsandboxed execution if bwrap is not installed.
+Shell commands execute inside the platform's OS-native sandbox with `SandboxProfile::RestrictedWrite`. Writable paths: `/tmp`, `$HOME` (or `%APPDATA%\Athen` on Windows), current working directory. Everything else is read-only. Backends: bwrap (Linux), `sandbox-exec` Seatbelt (macOS), Job Object + AppContainer (Windows). All three auto-detected at startup; if the active backend errors out at runtime (e.g. bwrap namespace creation fails on restricted CI; AppContainer profile creation fails inside an existing container), the executor falls back to unsandboxed execution rather than breaking the command. Layers 1 and 2 still apply so dangerous commands remain blocked regardless of sandbox availability.
 
 ### Operation Modes
 - **Bunker**: Everything L2+ requires approval. Maximum caution.
