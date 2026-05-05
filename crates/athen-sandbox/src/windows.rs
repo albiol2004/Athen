@@ -49,8 +49,8 @@ use windows::Win32::Storage::FileSystem::{
     ReadFile, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
 };
 use windows::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
-    JobObjectExtendedLimitInformation, JOBOBJECT_BASIC_LIMIT_INFORMATION,
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, JOBOBJECT_BASIC_LIMIT_INFORMATION,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
 };
@@ -58,9 +58,9 @@ use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
     InitializeProcThreadAttributeList, ResumeThread, TerminateProcess, UpdateProcThreadAttribute,
-    WaitForSingleObject, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
-    LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    WaitForSingleObject, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
+    EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
+    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
 
 const NO_INHERITANCE_FLAG: u32 = 0;
@@ -362,26 +362,24 @@ impl AppContainerProfile {
             u32,
             *mut PSID,
         ) -> windows::core::HRESULT;
-        type DeriveFn =
-            unsafe extern "system" fn(PCWSTR, *mut PSID) -> windows::core::HRESULT;
+        type DeriveFn = unsafe extern "system" fn(PCWSTR, *mut PSID) -> windows::core::HRESULT;
 
         let userenv = LoadedLibrary::load("userenv.dll")?;
-        let create_proc: CreateFn = unsafe {
-            std::mem::transmute(
-                userenv
-                    .get_proc("CreateAppContainerProfile")
-                    .ok_or_else(|| AthenError::Sandbox(
-                        "userenv!CreateAppContainerProfile missing".into(),
-                    ))?,
-            )
-        };
+        let create_proc: CreateFn =
+            unsafe {
+                std::mem::transmute(userenv.get_proc("CreateAppContainerProfile").ok_or_else(
+                    || AthenError::Sandbox("userenv!CreateAppContainerProfile missing".into()),
+                )?)
+            };
         let derive_proc: DeriveFn = unsafe {
             std::mem::transmute(
                 userenv
                     .get_proc("DeriveAppContainerSidFromAppContainerName")
-                    .ok_or_else(|| AthenError::Sandbox(
-                        "userenv!DeriveAppContainerSidFromAppContainerName missing".into(),
-                    ))?,
+                    .ok_or_else(|| {
+                        AthenError::Sandbox(
+                            "userenv!DeriveAppContainerSidFromAppContainerName missing".into(),
+                        )
+                    })?,
             )
         };
 
@@ -407,8 +405,7 @@ impl AppContainerProfile {
         }
 
         // ERROR_ALREADY_EXISTS as HRESULT is 0x800700B7.
-        let already_exists =
-            hr.0 as u32 == 0x8007_0000u32 | (ERROR_ALREADY_EXISTS.0 & 0xFFFF);
+        let already_exists = hr.0 as u32 == 0x8007_0000u32 | (ERROR_ALREADY_EXISTS.0 & 0xFFFF);
         if !already_exists {
             return Err(AthenError::Sandbox(format!(
                 "CreateAppContainerProfile failed: hr={:#x}",
@@ -440,8 +437,7 @@ impl AppContainerProfile {
 
 impl Drop for AppContainerProfile {
     fn drop(&mut self) {
-        type DeleteFn =
-            unsafe extern "system" fn(PCWSTR) -> windows::core::HRESULT;
+        type DeleteFn = unsafe extern "system" fn(PCWSTR) -> windows::core::HRESULT;
         if let Ok(userenv) = LoadedLibrary::load("userenv.dll") {
             if let Some(p) = userenv.get_proc("DeleteAppContainerProfile") {
                 let f: DeleteFn = unsafe { std::mem::transmute(p) };
@@ -489,7 +485,12 @@ impl LoadedLibrary {
         use windows::Win32::System::LibraryLoader::GetProcAddress;
         let cstr = std::ffi::CString::new(name).ok()?;
         // SAFETY: cstr is null-terminated, handle is valid until self drops.
-        unsafe { GetProcAddress(self.handle, windows::core::PCSTR(cstr.as_ptr() as *const u8)) }
+        unsafe {
+            GetProcAddress(
+                self.handle,
+                windows::core::PCSTR(cstr.as_ptr() as *const u8),
+            )
+        }
     }
 }
 
@@ -601,12 +602,7 @@ impl ProcThreadAttributeList {
         // SAFETY: First call deliberately passes NULL to query required size;
         // returns ERROR_INSUFFICIENT_BUFFER which we ignore — size is the output.
         unsafe {
-            let _ = InitializeProcThreadAttributeList(
-                None,
-                attribute_count,
-                Some(0),
-                &mut size,
-            );
+            let _ = InitializeProcThreadAttributeList(None, attribute_count, Some(0), &mut size);
         }
         if size == 0 {
             return Err(AthenError::Sandbox(
@@ -659,7 +655,7 @@ impl Drop for ProcThreadAttributeList {
             // SAFETY: buf was initialized by InitializeProcThreadAttributeList.
             unsafe {
                 DeleteProcThreadAttributeList(LPPROC_THREAD_ATTRIBUTE_LIST(
-                    self.buf.as_mut_ptr() as *mut c_void,
+                    self.buf.as_mut_ptr() as *mut c_void
                 ));
             }
         }
@@ -692,11 +688,7 @@ impl StdPipe {
         // SAFETY: read is a valid handle just returned from CreatePipe.
         unsafe {
             use windows::Win32::Foundation::SetHandleInformation;
-            let _ = SetHandleInformation(
-                read,
-                HANDLE_FLAG_INHERIT,
-                HANDLE_FLAGS(0),
-            );
+            let _ = SetHandleInformation(read, HANDLE_FLAG_INHERIT, HANDLE_FLAGS(0));
         }
 
         Ok(Self {
@@ -732,14 +724,7 @@ impl StdPipe {
             loop {
                 let mut n: u32 = 0;
                 // SAFETY: buf is a valid mutable slice; n is a stack u32.
-                let res = unsafe {
-                    ReadFile(
-                        read.0,
-                        Some(&mut buf),
-                        Some(&mut n),
-                        None,
-                    )
-                };
+                let res = unsafe { ReadFile(read.0, Some(&mut buf), Some(&mut n), None) };
                 if res.is_err() || n == 0 {
                     break;
                 }
@@ -929,7 +914,10 @@ fn resolve_executable_blocking(bin: &str) -> Option<PathBuf> {
     if p.is_absolute() {
         return Some(p.to_path_buf());
     }
-    let out = std::process::Command::new("where.exe").arg(bin).output().ok()?;
+    let out = std::process::Command::new("where.exe")
+        .arg(bin)
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -1053,10 +1041,10 @@ mod tests {
 
     #[test]
     fn build_command_line_quotes_each_arg() {
-        let cl = build_command_line("C:\\bin\\foo.exe", &[
-            "simple".to_string(),
-            "two words".to_string(),
-        ]);
+        let cl = build_command_line(
+            "C:\\bin\\foo.exe",
+            &["simple".to_string(), "two words".to_string()],
+        );
         assert_eq!(cl, "C:\\bin\\foo.exe simple \"two words\"");
     }
 
@@ -1089,10 +1077,7 @@ mod tests {
                 allowed_paths: vec![],
             },
         };
-        let path_arg = format!(
-            "echo X > \"{}\\probe.txt\"",
-            blocked.display()
-        );
+        let path_arg = format!("echo X > \"{}\\probe.txt\"", blocked.display());
         let out = sandbox
             .execute("cmd.exe", &["/C", &path_arg], &level)
             .await
