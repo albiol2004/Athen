@@ -286,7 +286,10 @@ impl ShellToolRegistry {
                 parts.extend(std::env::split_paths(ex));
             }
             if let Ok(joined) = std::env::join_paths(parts) {
-                env.push(("PYTHONPATH".to_string(), joined.to_string_lossy().into_owned()));
+                env.push((
+                    "PYTHONPATH".to_string(),
+                    joined.to_string_lossy().into_owned(),
+                ));
             }
         }
 

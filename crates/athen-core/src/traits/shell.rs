@@ -37,11 +37,7 @@ pub trait ShellExecutor: Send + Sync {
     /// Execute a command with extra env vars and cwd applied via the OS
     /// process API. Default impl ignores `opts` and delegates to [`execute`];
     /// concrete adapters should override to honor the options.
-    async fn execute_with(
-        &self,
-        command: &str,
-        _opts: ShellOptions<'_>,
-    ) -> Result<SandboxOutput> {
+    async fn execute_with(&self, command: &str, _opts: ShellOptions<'_>) -> Result<SandboxOutput> {
         self.execute(command).await
     }
 }

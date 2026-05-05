@@ -95,7 +95,8 @@ impl NushellShell {
 
     /// Execute a command via the nushell binary.
     async fn run_nushell(&self, command: &str) -> Result<SandboxOutput> {
-        self.run_nushell_with(command, ShellOptions::default()).await
+        self.run_nushell_with(command, ShellOptions::default())
+            .await
     }
 
     /// Execute via nushell, applying extra env vars and cwd through the OS
@@ -177,11 +178,7 @@ impl ShellExecutor for NushellShell {
         self.native.execute_native(command).await
     }
 
-    async fn execute_with(
-        &self,
-        command: &str,
-        opts: ShellOptions<'_>,
-    ) -> Result<SandboxOutput> {
+    async fn execute_with(&self, command: &str, opts: ShellOptions<'_>) -> Result<SandboxOutput> {
         if self.is_available() {
             self.run_nushell_with(command, opts).await
         } else {

@@ -93,11 +93,7 @@ impl ShellExecutor for Shell {
     /// Execute with extra env vars + cwd applied via the OS process API.
     /// Routes through nushell when available; nushell inherits the env and
     /// cwd from the spawned process so no shell-specific syntax is needed.
-    async fn execute_with(
-        &self,
-        command: &str,
-        opts: ShellOptions<'_>,
-    ) -> Result<SandboxOutput> {
+    async fn execute_with(&self, command: &str, opts: ShellOptions<'_>) -> Result<SandboxOutput> {
         self.nushell.execute_with(command, opts).await
     }
 }

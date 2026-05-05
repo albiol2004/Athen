@@ -157,11 +157,7 @@ impl ShellExecutor for NativeShell {
         self.find_program(program).await
     }
 
-    async fn execute_with(
-        &self,
-        command: &str,
-        opts: ShellOptions<'_>,
-    ) -> Result<SandboxOutput> {
+    async fn execute_with(&self, command: &str, opts: ShellOptions<'_>) -> Result<SandboxOutput> {
         self.run_command_with(command, opts).await
     }
 }
