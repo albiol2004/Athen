@@ -1701,6 +1701,7 @@ mod tests {
                 entry_count: 3,
                 primary_reply_channel: None,
                 active_profile_id: None,
+                summarized_through_entry_id: None,
             },
             ArcMeta {
                 id: "arc_recent".into(),
@@ -1714,6 +1715,7 @@ mod tests {
                 entry_count: 1,
                 primary_reply_channel: None,
                 active_profile_id: None,
+                summarized_through_entry_id: None,
             },
         ];
 

@@ -103,6 +103,10 @@ pub struct ArcMeta {
     /// `AgentProfile::id` to run this arc's tasks under. `None` means
     /// "use the seeded default profile" — equivalent to today's behavior.
     pub active_profile_id: Option<String>,
+    /// Largest `arc_entries.id` covered by the latest compaction summary
+    /// for this arc. `None` means the arc has never been compacted; the
+    /// executor's context view falls through to raw entries.
+    pub summarized_through_entry_id: Option<i64>,
 }
 
 /// The type of an entry within an Arc.
@@ -113,6 +117,9 @@ pub enum EntryType {
     EmailEvent,
     CalendarEvent,
     SystemEvent,
+    /// Compactor-generated summary collapsing earlier entries. The covered
+    /// prefix is identified by `ArcMeta.summarized_through_entry_id`.
+    Summary,
 }
 
 impl EntryType {
@@ -123,6 +130,7 @@ impl EntryType {
             Self::EmailEvent => "email_event",
             Self::CalendarEvent => "calendar_event",
             Self::SystemEvent => "system_event",
+            Self::Summary => "summary",
         }
     }
 
@@ -133,6 +141,7 @@ impl EntryType {
             "email_event" => Self::EmailEvent,
             "calendar_event" => Self::CalendarEvent,
             "system_event" => Self::SystemEvent,
+            "summary" => Self::Summary,
             _ => Self::Message,
         }
     }
@@ -252,6 +261,33 @@ impl ArcStore {
                     .map_err(|e| AthenError::Other(format!("Add active_profile_id: {e}")))?;
             }
 
+            // Column-level migration: `summarized_through_entry_id` was added
+            // for the arc compaction system. It points at the largest
+            // `arc_entries.id` covered by the latest compaction summary.
+            // Older databases need the column added in place; new ones get
+            // it from ARC_SCHEMA_SQL. NULL means "never compacted".
+            let has_summarized_through: bool = conn
+                .prepare("PRAGMA table_info(arcs)")
+                .and_then(|mut stmt| {
+                    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+                    let mut found = false;
+                    for r in rows {
+                        if r? == "summarized_through_entry_id" {
+                            found = true;
+                            break;
+                        }
+                    }
+                    Ok(found)
+                })
+                .map_err(|e| AthenError::Other(format!("Inspect arcs cols (summarized): {e}")))?;
+            if !has_summarized_through {
+                conn.execute(
+                    "ALTER TABLE arcs ADD COLUMN summarized_through_entry_id INTEGER",
+                    [],
+                )
+                .map_err(|e| AthenError::Other(format!("Add summarized_through_entry_id: {e}")))?;
+            }
+
             Ok(())
         })
         .await
@@ -318,7 +354,8 @@ impl ArcStore {
                     "SELECT a.id, a.name, a.source, a.status, a.parent_arc_id, \
                             a.merged_into_arc_id, a.created_at, a.updated_at, \
                             COALESCE(e.cnt, 0) AS entry_count, \
-                            a.primary_reply_channel, a.active_profile_id \
+                            a.primary_reply_channel, a.active_profile_id, \
+                            a.summarized_through_entry_id \
                      FROM arcs a \
                      LEFT JOIN ( \
                          SELECT arc_id, COUNT(*) AS cnt \
@@ -342,6 +379,7 @@ impl ArcStore {
                         entry_count: row.get::<_, u32>(8)?,
                         primary_reply_channel: row.get(9)?,
                         active_profile_id: row.get(10)?,
+                        summarized_through_entry_id: row.get(11)?,
                     })
                 })
                 .map_err(|e| AthenError::Other(format!("Query get arc: {e}")))?;
@@ -386,7 +424,8 @@ impl ArcStore {
                 "SELECT a.id, a.name, a.source, a.status, a.parent_arc_id, \
                         a.merged_into_arc_id, a.created_at, a.updated_at, \
                         COALESCE(e.cnt, 0) AS entry_count, \
-                        a.primary_reply_channel, a.active_profile_id \
+                        a.primary_reply_channel, a.active_profile_id, \
+                        a.summarized_through_entry_id \
                  FROM arcs a \
                  LEFT JOIN ( \
                      SELECT arc_id, COUNT(*) AS cnt \
@@ -413,6 +452,7 @@ impl ArcStore {
                         entry_count: row.get::<_, u32>(8)?,
                         primary_reply_channel: row.get(9)?,
                         active_profile_id: row.get(10)?,
+                        summarized_through_entry_id: row.get(11)?,
                     })
                 })
                 .map_err(|e| AthenError::Other(format!("Query list arcs: {e}")))?;
@@ -534,6 +574,28 @@ impl ArcStore {
                 params![profile_id, id],
             )
             .map_err(|e| AthenError::Other(format!("Set active_profile_id: {e}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
+    /// Set the entry-id watermark covered by the latest compaction summary.
+    /// Pass `None` to clear (e.g. if a summary is invalidated).
+    pub async fn set_summarized_through_entry_id(
+        &self,
+        id: &str,
+        entry_id: Option<i64>,
+    ) -> Result<()> {
+        let conn = self.conn.clone();
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE arcs SET summarized_through_entry_id = ?1 WHERE id = ?2",
+                params![entry_id, id],
+            )
+            .map_err(|e| AthenError::Other(format!("Set summarized_through_entry_id: {e}")))?;
             Ok(())
         })
         .await
@@ -830,7 +892,8 @@ CREATE TABLE IF NOT EXISTS arcs (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     primary_reply_channel TEXT,
-    active_profile_id TEXT
+    active_profile_id TEXT,
+    summarized_through_entry_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS arc_entries (
@@ -1893,5 +1956,48 @@ mod tests {
 
         // Idempotent.
         store.init_schema().await.expect("idempotent re-init");
+    }
+
+    #[tokio::test]
+    async fn test_summarized_through_entry_id_round_trip() {
+        let store = setup_arc_store().await;
+        store
+            .create_arc("arc_c", "Compaction Arc", ArcSource::UserInput)
+            .await
+            .unwrap();
+
+        let meta = store.get_arc("arc_c").await.unwrap().expect("arc present");
+        assert_eq!(meta.summarized_through_entry_id, None);
+
+        store
+            .set_summarized_through_entry_id("arc_c", Some(42))
+            .await
+            .unwrap();
+        let meta = store.get_arc("arc_c").await.unwrap().expect("arc present");
+        assert_eq!(meta.summarized_through_entry_id, Some(42));
+
+        store
+            .set_summarized_through_entry_id("arc_c", None)
+            .await
+            .unwrap();
+        let meta = store.get_arc("arc_c").await.unwrap().expect("arc present");
+        assert_eq!(meta.summarized_through_entry_id, None);
+    }
+
+    #[test]
+    fn test_entry_type_summary_round_trip() {
+        assert_eq!(EntryType::Summary.as_str(), "summary");
+        assert_eq!(EntryType::from_str("summary"), EntryType::Summary);
+        // Round-trip every variant for safety.
+        for v in [
+            EntryType::Message,
+            EntryType::ToolCall,
+            EntryType::EmailEvent,
+            EntryType::CalendarEvent,
+            EntryType::SystemEvent,
+            EntryType::Summary,
+        ] {
+            assert_eq!(EntryType::from_str(v.as_str()), v);
+        }
     }
 }

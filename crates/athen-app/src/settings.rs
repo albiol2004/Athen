@@ -673,10 +673,23 @@ pub async fn save_provider(
         model.clone()
     };
 
+    let (context_window_tokens, compaction_trigger_pct, compaction_target_pct) = existing
+        .map(|p| {
+            (
+                p.context_window_tokens,
+                p.compaction_trigger_pct,
+                p.compaction_target_pct,
+            )
+        })
+        .unwrap_or((128_000, 65, 30));
+
     let provider = ProviderConfig {
         auth: auth.clone(),
         default_model: model,
         endpoint,
+        context_window_tokens,
+        compaction_trigger_pct,
+        compaction_target_pct,
     };
 
     models.providers.insert(id.clone(), provider);

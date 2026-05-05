@@ -217,6 +217,9 @@ base = "fast"
                 auth: AuthType::ApiKey("sk-ant-test".into()),
                 default_model: "claude-sonnet-4".into(),
                 endpoint: None,
+                context_window_tokens: 200_000,
+                compaction_trigger_pct: 65,
+                compaction_target_pct: 30,
             },
         );
         config.models.profiles.insert(

@@ -4,7 +4,7 @@
 
 ---
 
-### athen-core (20 source files, 12 tests)
+### athen-core (20 source files, 46 tests)
 **Status**: Complete -- all types, trait contracts, and config loading.
 - `error.rs`: `AthenError` enum (Io, Serialization, TaskNotFound, ToolNotFound, LlmProvider, RiskThresholdExceeded, Timeout, Sandbox, Ipc, Config, Other) + `Result<T>` alias
 - `event.rs`: `SenseEvent`, `EventSource`, `EventKind`, `SenderInfo`, `NormalizedContent`, `Attachment`
@@ -23,6 +23,8 @@
   - `traits/embedding.rs`: `EmbeddingProvider` trait with `provider_id()`, `dimensions()`, `embed()`, `embed_batch()`, `is_available()`
   - `traits/memory.rs`: `VectorIndex` trait: added `list_all()` default method. `KnowledgeGraph` trait: added `list_entities()`, `list_relations()`, `update_entity()`, `delete_entity()`, `delete_relation()` default methods. `EntityExtractor` trait with `extract()` method + `ExtractionResult` struct (entities: Vec<Entity>, relations: Vec<(String, String, String)>)
   - `traits/profile.rs`: `ProfileStore` trait — `list_profiles`, `load_profile(id)`, `save_profile`, `delete_profile`, `list_templates`, `resolve_templates(ids)`. Implemented in `athen-persistence`.
+  - `traits/compaction.rs`: `ArcCompactor` trait + `ContextEntry` (persistence-agnostic mirror of `ArcEntry`), `ArcContextView` (summary + tail + tool_cache), `CompactionOutcome`. Methods: `should_compact`, `compact`, `load_context_view` — all parameterised on `model_window_tokens` + `target_tokens` rather than a `ModelId` to stay provider-agnostic. PR-A (foundation) landed; the `LlmArcCompactor` implementation that drives an LLM through the §4 prompt is pending PR-B. Full design in `docs/ARC_COMPACTION.md`.
+  - `config.rs`: `ProviderConfig` gained `context_window_tokens` (default 128k), `compaction_trigger_pct` (default 65), `compaction_target_pct` (default 30) — read by the future compactor to derive per-arc budgets.
 - `agent_profile.rs`: AgentProfile system. `AgentProfile` (id, display_name, description, persona_template_ids, custom_persona_addendum, tool_selection, expertise, model_profile_hint, builtin, timestamps; `DEFAULT_ID = "default"`). `PersonaTemplate` (id, display_name, body, builtin) categorized by `PersonaCategory` (Voice/Mission/Constraints/OutputStyle). `ToolSelection` (All/Groups/Explicit/Deny — defaults to All). `ExpertiseDeclaration` (domains, task_kinds, languages, strengths, avoid). `DomainTag` closed enum (Email, Calendar, Messaging, Coding, Research, Outreach, Marketing, Finance, Scheduling, DataAnalysis, Writing, Translation, Health, Legal, Infrastructure, Architecture, Support, SocialMedia, Other) — additive-only. `TaskKindTag` closed enum (Drafting, Editing, Summarizing, Researching, Scheduling, CodeReview, Coding, Debugging, DataAnalysis, Outreach, Triage, Other). `ResolvedAgentProfile { profile, persona_templates }` is what the executor receives — `has_custom_persona()` returns false for the seeded default so today's hardcoded persona is preserved.
 - `profile_routing.rs`: Coordinator scoring helpers. `ClassifiedTask { domain, task_kind, language, raw_text }`. `classify_task(source, lower_text, language)` infers domain from `EventSource` first, falls back to `infer_domain_from_keywords(text)` when source is None or `Other` (keyword groups for Infrastructure/SocialMedia/Legal/Health/Architecture/Support/Outreach/Marketing/Coding/Research). `pick_profile(classified, profiles)` keyword-only scoring (domain match, task_kind match, anti-match penalty, builtin tiebreaker). `pick_profile_blended(classified, profiles, query_embedding, profile_embeddings)` adds semantic blend on top: `kw + sem * SEMANTIC_WEIGHT (4.0)`, filter `*kw > 0 || *sem > 0.55` so a weak embedding-only match cannot win over a clean keyword miss. `profile_embedding_text(p)` concatenates display_name + description + strengths + addendum for embedding. `cosine_similarity(a, b)` returns 0.0 on length mismatch / empty / zero norm. Backwards compatible: `None` query embedding falls through to keyword-only.
 
@@ -110,14 +112,15 @@
 - `nushell.rs`: `NushellShell` -- auto-detects `nu` binary. If available: `nu -c "command"`. If not: falls back to NativeShell with info log.
 - `lib.rs`: `Shell` unified facade. `execute()` prefers nushell, `execute_native()` always native. Convenience: `run()` returns stdout, `run_ok()` returns bool, `has_program()` checks existence.
 
-### athen-persistence (110 unit + 5 integration = 115 tests)
+### athen-persistence (131 unit + 5 integration = 136 tests)
 **Status**: Complete -- SQLite persistence with atomic checkpoints, arcs, calendar, contacts, notifications, and legacy chat history.
 - `lib.rs`: `Database` struct with `new(path)` and `in_memory()`. Auto-creates tables on init (including arc, calendar, contacts, notifications, and legacy chat tables). Provides `store()` -> `SqliteStore`, `chat_store()` -> `ChatStore`, `arc_store()` -> `ArcStore`, `calendar_store()` -> `CalendarStore`, `contact_store()` -> `SqliteContactStore`, and `notification_store()` -> `NotificationStore` accessors.
 - `store.rs`: `SqliteStore` implementing `PersistentStore`. Full CRUD for tasks (with steps serialized as JSON), checkpoints with SHA-256 integrity verification, pending messages with atomic pop (transaction-based select+update).
 - `checkpoint.rs`: `CheckpointManager` -- atomic file-based backup (write temp -> fsync -> rename). Integrity verification with SHA-256 checksums.
 - `arcs.rs`: `ArcStore` -- git-branch-like workflow containers replacing sessions. Types:
   - `ArcMeta`: id, name, source (`ArcSource`: UserInput/Email/Calendar/Messaging/System), status (`ArcStatus`: Active/Archived/Merged), parent_arc_id, merged_into_arc_id, created_at, updated_at
-  - `ArcEntry`: id, arc_id, entry_type (`EntryType`: Message/ToolCall/EmailEvent/CalendarEvent/SystemEvent), source, content, metadata (JSON), created_at
+  - `ArcEntry`: id, arc_id, entry_type (`EntryType`: Message/ToolCall/EmailEvent/CalendarEvent/SystemEvent/Summary), source, content, metadata (JSON), created_at, turn_id. The `Summary` variant is reserved for arc compaction (`docs/ARC_COMPACTION.md`); written by the compactor, never by the agent loop directly.
+  - `ArcMeta` includes `summarized_through_entry_id: Option<i64>` — points at the largest `arc_entries.id` covered by the latest compaction summary; `None` means "never compacted." Set by the compactor in the same SQLite transaction that writes the summary entry, so restart cannot lose compaction state.
   Methods:
   - `create_arc(name, source)` -- creates a new arc
   - `create_arc_with_parent(name, source, parent_id)` -- creates a branched child arc

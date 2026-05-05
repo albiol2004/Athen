@@ -139,6 +139,32 @@ pub struct ProviderConfig {
     pub auth: AuthType,
     pub default_model: String,
     pub endpoint: Option<String>,
+    /// Authoritative context-window ceiling for `default_model`. Used by
+    /// the arc compactor to size the trigger and target budgets. Defaulted
+    /// to 128k for legacy/UI-deserialised entries that predate the field;
+    /// new entries should set this explicitly.
+    #[serde(default = "default_context_window_tokens")]
+    pub context_window_tokens: u32,
+    /// Compact when the estimated arc-context size exceeds
+    /// `context_window_tokens * compaction_trigger_pct / 100`.
+    #[serde(default = "default_compaction_trigger_pct")]
+    pub compaction_trigger_pct: u8,
+    /// Aim for the compacted view to fit within
+    /// `context_window_tokens * compaction_target_pct / 100`.
+    #[serde(default = "default_compaction_target_pct")]
+    pub compaction_target_pct: u8,
+}
+
+fn default_context_window_tokens() -> u32 {
+    128_000
+}
+
+fn default_compaction_trigger_pct() -> u8 {
+    65
+}
+
+fn default_compaction_target_pct() -> u8 {
+    30
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

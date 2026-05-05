@@ -1232,19 +1232,20 @@ pub async fn send_message(
                         .map(|m| format!("- {}", m.content))
                         .collect::<Vec<_>>()
                         .join("\n");
-                    context.insert(
-                        0,
-                        ChatMessage {
-                            role: Role::System,
-                            content: MessageContent::Text(format!(
-                                "MEMORIES ALREADY LOADED FROM YOUR PERSISTENT MEMORY \
-                                 (treat these as authoritative — do not call memory_recall \
-                                 to re-fetch the same entities listed below; only call \
-                                 memory_recall if you need *additional* information not \
-                                 covered here):\n{memory_text}"
-                            )),
-                        },
-                    );
+                    // Append AFTER history. Memory recall is volatile per
+                    // turn; placing it at position 0 invalidates the
+                    // append-only arc-history prefix cache. See
+                    // docs/ARC_COMPACTION.md §10.
+                    context.push(ChatMessage {
+                        role: Role::System,
+                        content: MessageContent::Text(format!(
+                            "MEMORIES ALREADY LOADED FROM YOUR PERSISTENT MEMORY \
+                             (treat these as authoritative — do not call memory_recall \
+                             to re-fetch the same entities listed below; only call \
+                             memory_recall if you need *additional* information not \
+                             covered here):\n{memory_text}"
+                        )),
+                    });
                 } else {
                     tracing::debug!("No relevant memories found for query");
                 }
@@ -1808,19 +1809,19 @@ pub(crate) async fn execute_approved_task(
                 .map(|m| format!("- {}", m.content))
                 .collect::<Vec<_>>()
                 .join("\n");
-            context.insert(
-                0,
-                ChatMessage {
-                    role: Role::System,
-                    content: MessageContent::Text(format!(
-                        "MEMORIES ALREADY LOADED FROM YOUR PERSISTENT MEMORY \
-                         (treat these as authoritative — do not call memory_recall \
-                         to re-fetch the same entities listed below; only call \
-                         memory_recall if you need *additional* information not \
-                         covered here):\n{memory_text}"
-                    )),
-                },
-            );
+            // Append AFTER history. Memory recall is volatile per turn;
+            // placing it at position 0 invalidates the append-only
+            // arc-history prefix cache. See docs/ARC_COMPACTION.md §10.
+            context.push(ChatMessage {
+                role: Role::System,
+                content: MessageContent::Text(format!(
+                    "MEMORIES ALREADY LOADED FROM YOUR PERSISTENT MEMORY \
+                     (treat these as authoritative — do not call memory_recall \
+                     to re-fetch the same entities listed below; only call \
+                     memory_recall if you need *additional* information not \
+                     covered here):\n{memory_text}"
+                )),
+            });
         }
     }
 
@@ -2243,19 +2244,19 @@ pub(crate) async fn execute_dispatched_task(
                 .map(|m| format!("- {}", m.content))
                 .collect::<Vec<_>>()
                 .join("\n");
-            context.insert(
-                0,
-                ChatMessage {
-                    role: Role::System,
-                    content: MessageContent::Text(format!(
-                        "MEMORIES ALREADY LOADED FROM YOUR PERSISTENT MEMORY \
-                         (treat these as authoritative — do not call memory_recall \
-                         to re-fetch the same entities listed below; only call \
-                         memory_recall if you need *additional* information not \
-                         covered here):\n{memory_text}"
-                    )),
-                },
-            );
+            // Append AFTER history. Memory recall is volatile per turn;
+            // placing it at position 0 invalidates the append-only
+            // arc-history prefix cache. See docs/ARC_COMPACTION.md §10.
+            context.push(ChatMessage {
+                role: Role::System,
+                content: MessageContent::Text(format!(
+                    "MEMORIES ALREADY LOADED FROM YOUR PERSISTENT MEMORY \
+                     (treat these as authoritative — do not call memory_recall \
+                     to re-fetch the same entities listed below; only call \
+                     memory_recall if you need *additional* information not \
+                     covered here):\n{memory_text}"
+                )),
+            });
         }
     }
 
