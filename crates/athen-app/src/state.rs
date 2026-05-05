@@ -55,6 +55,14 @@ use crate::file_gate::PendingGrants;
 pub type ProfileEmbeddingCache =
     Arc<tokio::sync::RwLock<HashMap<String, (chrono::DateTime<chrono::Utc>, Vec<f32>)>>>;
 
+/// Maps coordinator task ids to the arc the originating sense event
+/// landed in. The sense_router populates this when it hands an event to
+/// the coordinator; the dispatch loop consumes it to know which arc to
+/// persist the executor's reply into. We need this side table because
+/// `Task` itself doesn't carry an arc id (and the architecture rule says
+/// not to extend `Task` in athen-core for app-layer concerns).
+pub type TaskArcMap = Arc<tokio::sync::RwLock<HashMap<Uuid, String>>>;
+
 /// Wrapper to share the router via `Arc<RwLock<Arc<...>>>` while satisfying
 /// the `LlmRouter` trait.  The `RwLock` allows the inner router to be swapped
 /// at runtime (e.g. when the user switches active provider).
@@ -193,6 +201,19 @@ pub struct AppState {
     pub spawned_processes: athen_agent::SpawnedProcessMap,
     /// Approvals currently being executed. See [`InflightApprovals`].
     pub inflight_approvals: InflightApprovals,
+    /// Maps coordinator task ids to the arc the originating sense
+    /// event landed in. Populated by `sense_router::process_sense_event`
+    /// when it dispatches an autonomous task; consumed by the dispatch
+    /// loop to persist replies into the right arc.
+    pub task_arc_map: TaskArcMap,
+    /// Notifies the dispatch loop when a new sense-originated task has
+    /// been enqueued. The loop also wakes on a 2-second tick as a
+    /// belt-and-brace; `notify_one` keeps latency low when events do
+    /// arrive between ticks.
+    pub dispatch_signal: Arc<tokio::sync::Notify>,
+    /// Shutdown sender for the autonomous dispatch loop. `None` until
+    /// `start_dispatch_loop` has been called.
+    pub dispatch_loop_shutdown: Option<tokio::sync::broadcast::Sender<()>>,
 }
 
 impl AppState {
@@ -293,6 +314,9 @@ impl AppState {
             pending_grants,
             spawned_processes,
             inflight_approvals: Arc::new(Mutex::new(HashSet::new())),
+            task_arc_map: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            dispatch_signal: Arc::new(tokio::sync::Notify::new()),
+            dispatch_loop_shutdown: None,
         };
 
         if let Err(e) = state.refresh_tools_doc().await {
@@ -555,6 +579,9 @@ impl AppState {
         let profile_embedder_ref = Arc::clone(&self.profile_embedder);
         let profile_embedding_cache_ref = Arc::clone(&self.profile_embedding_cache);
         let notifier = self.notifier.clone();
+        let coordinator_ref = Arc::clone(&self.coordinator);
+        let task_arc_map_ref = Arc::clone(&self.task_arc_map);
+        let dispatch_signal_ref = Arc::clone(&self.dispatch_signal);
 
         tauri::async_runtime::spawn(async move {
             if let Err(e) = monitor.init(&email_config).await {
@@ -580,6 +607,9 @@ impl AppState {
                                 &profile_embedding_cache_ref,
                                 &app_handle,
                                 notifier.as_ref(),
+                                Some(&coordinator_ref),
+                                Some(&task_arc_map_ref),
+                                Some(&dispatch_signal_ref),
                             )
                             .await;
                         }
@@ -624,6 +654,9 @@ impl AppState {
         let profile_embedder_ref = Arc::clone(&self.profile_embedder);
         let profile_embedding_cache_ref = Arc::clone(&self.profile_embedding_cache);
         let notifier = self.notifier.clone();
+        let coordinator_ref = Arc::clone(&self.coordinator);
+        let task_arc_map_ref = Arc::clone(&self.task_arc_map);
+        let dispatch_signal_ref = Arc::clone(&self.dispatch_signal);
 
         tauri::async_runtime::spawn(async move {
             if let Err(e) = monitor.init(&config).await {
@@ -651,6 +684,9 @@ impl AppState {
                                 &profile_embedding_cache_ref,
                                 &app_handle,
                                 notifier.as_ref(),
+                                Some(&coordinator_ref),
+                                Some(&task_arc_map_ref),
+                                Some(&dispatch_signal_ref),
                             )
                             .await;
                         }
@@ -715,6 +751,9 @@ impl AppState {
         let spawned_processes_ref = self.spawned_processes.clone();
         let telegram_approval_sink = self.telegram_approval_sink.clone();
         let approval_router_ref = self.approval_router.clone();
+        let coordinator_ref = Arc::clone(&self.coordinator);
+        let task_arc_map_ref = Arc::clone(&self.task_arc_map);
+        let dispatch_signal_ref = Arc::clone(&self.dispatch_signal);
 
         tauri::async_runtime::spawn(async move {
             if let Err(e) = monitor.init(&telegram_config).await {
@@ -814,7 +853,9 @@ impl AppState {
                                 }
                             } else {
                                 // Non-owner messages go through the full sense
-                                // router: LLM triage, arc creation, notification.
+                                // router: LLM triage, arc creation, notification,
+                                // and (when triage says it's action-worthy) hand
+                                // off to the coordinator for autonomous execution.
                                 crate::sense_router::process_sense_event(
                                     event,
                                     &router,
@@ -824,6 +865,9 @@ impl AppState {
                                     &profile_embedding_cache_ref,
                                     &app_handle,
                                     notifier.as_ref(),
+                                    Some(&coordinator_ref),
+                                    Some(&task_arc_map_ref),
+                                    Some(&dispatch_signal_ref),
                                 )
                                 .await;
                             }
@@ -875,6 +919,160 @@ impl AppState {
                 warn!("Telegram monitor shutdown error: {e}");
             }
             info!("Telegram monitor stopped");
+        });
+    }
+
+    /// Spawn the autonomous-execution dispatch loop.
+    ///
+    /// The loop pops sense-originated tasks from the coordinator queue
+    /// and runs each through the agent in autonomous mode. It only acts
+    /// on tasks whose id is registered in `task_arc_map` — i.e. tasks
+    /// the sense_router enqueued — so user-driven `send_message` flows
+    /// (which dispatch inline) are unaffected.
+    ///
+    /// Wakes on three triggers:
+    /// 1. `dispatch_signal.notify_one()` (low-latency: sense_router
+    ///    fires this right after enqueueing).
+    /// 2. A 2-second tick (belt-and-brace; covers signals dropped while
+    ///    the loop was busy with the previous batch).
+    /// 3. The shutdown channel (clean teardown).
+    ///
+    /// Must be called AFTER `state.coordinator` is fully wired and
+    /// AFTER the agent has been registered with the dispatcher,
+    /// otherwise `dispatch_next_with_task` will keep returning `None`.
+    pub fn start_dispatch_loop(&mut self, app_handle: tauri::AppHandle) {
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+        self.dispatch_loop_shutdown = Some(shutdown_tx);
+
+        // Snapshot every dependency the loop's per-task work needs into
+        // owned/Arc-cloned form. The spawned task can't borrow `self`.
+        let coordinator = Arc::clone(&self.coordinator);
+        let dispatch_signal = Arc::clone(&self.dispatch_signal);
+        let task_arc_map = Arc::clone(&self.task_arc_map);
+        let router = Arc::clone(&self.router);
+        let arc_store = self._database.as_ref().map(|db| db.arc_store());
+        let calendar_store = self.calendar_store.clone();
+        let contact_store = self.contact_store.clone();
+        let memory = self.memory.clone();
+        let mcp = Arc::clone(&self.mcp);
+        let tool_doc_dir = self.tool_doc_dir.clone();
+        let profile_store = self.profile_store.clone();
+        let grant_store = self.grant_store.clone();
+        let pending_grants = self.pending_grants.clone();
+        let spawned_processes = self.spawned_processes.clone();
+        let telegram_approval_sink = self.telegram_approval_sink.clone();
+        let approval_router = self.approval_router.clone();
+        let inflight = Arc::clone(&self.inflight_approvals);
+
+        tauri::async_runtime::spawn(async move {
+            use athen_core::traits::coordinator::TaskQueue;
+            info!("Autonomous dispatch loop started");
+            loop {
+                // Wait for the next wake-up trigger.
+                tokio::select! {
+                    _ = dispatch_signal.notified() => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+                    _ = shutdown_rx.recv() => {
+                        info!("Dispatch loop shutdown signal received");
+                        break;
+                    }
+                }
+
+                // Drain everything the queue currently has. We keep
+                // looping until dispatch_next returns Ok(None) or the
+                // re-enqueue counter says we've cycled through tasks
+                // we don't own — preventing a tight infinite loop when
+                // the queue holds non-sense tasks.
+                let mut foreign_seen: usize = 0;
+                loop {
+                    let dispatched = match coordinator.dispatch_next_with_task().await {
+                        Ok(Some(pair)) => pair,
+                        Ok(None) => break,
+                        Err(e) => {
+                            warn!(error = %e, "dispatch_next_with_task failed");
+                            break;
+                        }
+                    };
+                    let (task, _agent_id) = dispatched;
+
+                    // Only act on tasks the sense_router registered.
+                    // user-driven send_message tasks dispatch inline
+                    // and never appear in task_arc_map.
+                    let arc_id = task_arc_map.read().await.get(&task.id).cloned();
+                    let Some(arc_id) = arc_id else {
+                        // Re-enqueue and bail: this task belongs to a
+                        // different code path (e.g. user send_message).
+                        // Track foreign_seen so we eventually stop if
+                        // the queue is dominated by non-sense tasks —
+                        // otherwise we'd burn CPU recycling them.
+                        foreign_seen = foreign_seen.saturating_add(1);
+                        if let Err(e) = coordinator.queue().enqueue(task).await {
+                            warn!(error = %e, "Failed to re-enqueue foreign task");
+                        }
+                        if foreign_seen >= 8 {
+                            tracing::debug!(
+                                "Dispatch loop yielding after {foreign_seen} foreign tasks"
+                            );
+                            break;
+                        }
+                        continue;
+                    };
+
+                    let task_id = task.id;
+                    let ctx = crate::commands::ApprovedTaskCtx {
+                        coordinator: Arc::clone(&coordinator),
+                        router: Arc::clone(&router),
+                        arc_store: arc_store.clone(),
+                        calendar_store: calendar_store.clone(),
+                        contact_store: contact_store.clone(),
+                        memory: memory.clone(),
+                        mcp: Arc::clone(&mcp),
+                        tool_doc_dir: tool_doc_dir.clone(),
+                        grant_store: grant_store.clone(),
+                        profile_store: profile_store.clone(),
+                        pending_grants: pending_grants.clone(),
+                        spawned_processes: spawned_processes.clone(),
+                        telegram_approval_sink: telegram_approval_sink.clone(),
+                        cancel_flag: Arc::new(AtomicBool::new(false)),
+                        active_arc_id: arc_id.clone(),
+                        inflight: Arc::clone(&inflight),
+                        app_handle: app_handle.clone(),
+                        turn_id: uuid::Uuid::new_v4().to_string(),
+                        message_override: None,
+                        approval_router: approval_router.clone(),
+                    };
+
+                    let task_arc_map_clone = Arc::clone(&task_arc_map);
+                    tauri::async_runtime::spawn(async move {
+                        let outcome =
+                            crate::commands::execute_dispatched_task(task, arc_id.clone(), ctx)
+                                .await;
+                        match outcome {
+                            Ok(Some(o)) => {
+                                info!(
+                                    task_id = %task_id,
+                                    arc = %arc_id,
+                                    success = o.success,
+                                    "Autonomous task finished"
+                                );
+                            }
+                            Ok(None) => {
+                                tracing::debug!(
+                                    task_id = %task_id,
+                                    "Autonomous task skipped (already running on another channel)"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(task_id = %task_id, arc = %arc_id, error = %e, "Autonomous task failed");
+                            }
+                        }
+                        // Always remove the mapping entry so the table
+                        // doesn't leak even on failure.
+                        task_arc_map_clone.write().await.remove(&task_id);
+                    });
+                }
+            }
+            info!("Autonomous dispatch loop stopped");
         });
     }
 }

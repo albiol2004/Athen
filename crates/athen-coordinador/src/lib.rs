@@ -209,6 +209,28 @@ impl Coordinator {
         }
     }
 
+    /// Like [`Self::dispatch_next`] but returns the full `Task` along
+    /// with the assigned agent id, so the caller can drive the executor
+    /// using the task's description, source_event, and domain. Used by
+    /// the sense-event dispatch loop in `athen-app` — user-driven flows
+    /// that already have the user's message in hand should keep using
+    /// [`Self::dispatch_next`].
+    pub async fn dispatch_next_with_task(&self) -> Result<Option<(Task, AgentId)>> {
+        let task = match self.queue.dequeue().await? {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+
+        match self.dispatcher.assign_task(&task).await {
+            Some(agent_id) => Ok(Some((task, agent_id))),
+            None => {
+                // No agent available; re-enqueue the task.
+                self.queue.enqueue(task).await?;
+                Ok(None)
+            }
+        }
+    }
+
     /// Handle task completion: release the assigned agent and record
     /// a positive trust interaction for the originating contact.
     pub async fn complete_task(&self, task_id: TaskId) -> Result<()> {
@@ -497,6 +519,49 @@ mod tests {
 
         // Complete the task
         coordinator.complete_task(task_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_next_with_task_returns_full_task() {
+        let coordinator = Coordinator::new(Box::new(MockRiskEvaluator::new(5.0)));
+        let agent_id = Uuid::new_v4();
+
+        coordinator.dispatcher.register_agent(agent_id).await;
+
+        let event = make_event(EventSource::UserInput);
+        let event_id = event.id;
+        let routed = coordinator.process_event(event).await.unwrap();
+        let queued_task_id = routed[0].0;
+
+        let result = coordinator.dispatch_next_with_task().await.unwrap();
+        assert!(result.is_some());
+        let (task, dispatched_agent) = result.unwrap();
+        assert_eq!(dispatched_agent, agent_id);
+        // Same id the queue assigned during process_event, with the
+        // task's source_event / description preserved end-to-end.
+        assert_eq!(task.id, queued_task_id);
+        assert_eq!(
+            task.source_event,
+            Some(event_id),
+            "source_event should round-trip through the queue"
+        );
+        // Description is set by the router from the event content.
+        assert!(!task.description.is_empty());
+
+        coordinator.complete_task(task.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_next_with_task_no_agent_reenqueues() {
+        let coordinator = Coordinator::new(Box::new(MockRiskEvaluator::new(5.0)));
+
+        let event = make_event(EventSource::UserInput);
+        coordinator.process_event(event).await.unwrap();
+
+        // No agents → returns None and re-enqueues.
+        let result = coordinator.dispatch_next_with_task().await.unwrap();
+        assert!(result.is_none());
+        assert_eq!(coordinator.queue.pending_count().await.unwrap(), 1);
     }
 
     #[tokio::test]

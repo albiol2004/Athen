@@ -2110,6 +2110,417 @@ pub(crate) async fn execute_approved_task(
     }))
 }
 
+/// Execute a sense-originated task that the autonomous dispatch loop
+/// already pulled out of the coordinator queue.
+///
+/// Mirrors the post-dispatch portion of [`execute_approved_task`] but
+/// with three differences:
+///
+/// 1. We skip `coordinator.approve_task` and `coordinator.dispatch_next` —
+///    the dispatch loop already did both. The caller hands us the
+///    full `Task` and the arc id resolved from `task_arc_map`.
+/// 2. We do NOT persist a "user" message into the arc. The sense_router
+///    already wrote a `system` context entry describing the trigger
+///    (email body, calendar event, telegram message, ...) when it
+///    landed the event in the arc. Persisting another "user" turn would
+///    duplicate the trigger description.
+/// 3. The agent runs in autonomous mode (`AgentBuilder::autonomous_mode(true)`),
+///    so the system prompt warns the LLM there is no live user and
+///    steers uncertain actions through the approval router.
+///
+/// Returns `Ok(None)` if the inflight guard caught a duplicate (some
+/// other channel — e.g. the user opening the arc and tapping approve —
+/// already started the same task).
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn execute_dispatched_task(
+    task: athen_core::task::Task,
+    arc_id: String,
+    ctx: ApprovedTaskCtx,
+) -> std::result::Result<Option<ApprovedTaskOutcome>, String> {
+    use athen_core::traits::agent::AgentExecutor;
+
+    let coord_task_id = task.id;
+    let message = task.description.clone();
+
+    // Inflight dedup: same contract as execute_approved_task. If the
+    // user happens to tap approve in-app at the exact moment the
+    // dispatch loop is firing, only one channel runs the executor.
+    {
+        let mut inflight = ctx.inflight.lock().await;
+        if !inflight.insert(coord_task_id) {
+            tracing::debug!(
+                task_id = %coord_task_id,
+                "Skipping dispatched-task execution: already running on another channel"
+            );
+            return Ok(None);
+        }
+    }
+
+    struct InflightGuard {
+        set: crate::state::InflightApprovals,
+        task_id: Uuid,
+    }
+    impl Drop for InflightGuard {
+        fn drop(&mut self) {
+            let set = self.set.clone();
+            let id = self.task_id;
+            tokio::spawn(async move {
+                set.lock().await.remove(&id);
+            });
+        }
+    }
+    let _guard = InflightGuard {
+        set: ctx.inflight.clone(),
+        task_id: coord_task_id,
+    };
+
+    // Build context (history from arc + injected memories).
+    let mut context: Vec<ChatMessage> = if let Some(ref store) = ctx.arc_store {
+        match store.load_entries(&arc_id).await {
+            Ok(entries) => entries
+                .into_iter()
+                .filter(|e| e.entry_type == athen_persistence::arcs::EntryType::Message)
+                .filter_map(|e| {
+                    let role = match e.source.as_str() {
+                        "user" => Role::User,
+                        "assistant" => Role::Assistant,
+                        "system" => Role::System,
+                        "tool" => Role::Tool,
+                        _ => return None,
+                    };
+                    Some(ChatMessage {
+                        role,
+                        content: MessageContent::Text(e.content),
+                    })
+                })
+                .collect(),
+            Err(_) => vec![],
+        }
+    } else {
+        vec![]
+    };
+
+    // Auto-inject relevant memories into context.
+    if let Some(ref memory) = ctx.memory {
+        let mut all_items = Vec::new();
+        let mut seen_ids = std::collections::HashSet::new();
+        if let Ok(items) = memory.recall(&message, 5).await {
+            for item in items {
+                if seen_ids.insert(item.id.clone()) {
+                    all_items.push(item);
+                }
+            }
+        }
+        let key_terms = extract_key_terms(&message);
+        for term in &key_terms {
+            if let Ok(items) = memory.recall(term, 3).await {
+                for item in items {
+                    if seen_ids.insert(item.id.clone()) {
+                        all_items.push(item);
+                    }
+                }
+            }
+        }
+        all_items.truncate(5);
+
+        if !all_items.is_empty() {
+            tracing::info!(
+                count = all_items.len(),
+                "Injecting relevant memories into dispatched task context"
+            );
+            let memory_text = all_items
+                .iter()
+                .map(|m| format!("- {}", m.content))
+                .collect::<Vec<_>>()
+                .join("\n");
+            context.insert(
+                0,
+                ChatMessage {
+                    role: Role::System,
+                    content: MessageContent::Text(format!(
+                        "MEMORIES ALREADY LOADED FROM YOUR PERSISTENT MEMORY \
+                         (treat these as authoritative — do not call memory_recall \
+                         to re-fetch the same entities listed below; only call \
+                         memory_recall if you need *additional* information not \
+                         covered here):\n{memory_text}"
+                    )),
+                },
+            );
+        }
+    }
+
+    // NOTE: deliberately NOT persisting a "user" message here. The
+    // sense_router already wrote a "system" context message describing
+    // the original trigger (email body, calendar reminder, etc.) into
+    // this arc. A separate "user" turn would duplicate that.
+
+    // Build the tool registry, mirroring execute_approved_task.
+    let mut shell_registry = athen_agent::ShellToolRegistry::new()
+        .await
+        .with_spawned_processes(ctx.spawned_processes.clone());
+    if let Some(ref store) = ctx.grant_store {
+        let provider = Arc::new(crate::file_gate::ArcWritableProvider {
+            arc_id: crate::file_gate::arc_uuid(&arc_id),
+            store: store.clone(),
+        });
+        shell_registry = shell_registry.with_extra_writable(provider);
+    }
+    if let Some(ref router) = ctx.approval_router {
+        shell_registry = shell_registry.with_toolbox_approval(Arc::new(
+            crate::file_gate::RouterToolboxApprovalGate::new(
+                Arc::clone(router),
+                Some(arc_id.clone()),
+            ),
+        ));
+    }
+    let mut registry = crate::app_tools::AppToolRegistry::new(
+        shell_registry,
+        ctx.calendar_store.clone(),
+        ctx.contact_store.clone(),
+        ctx.memory.clone(),
+    )
+    .with_mcp(ctx.mcp.clone() as Arc<dyn athen_core::traits::mcp::McpClient>);
+    if let Some(ref store) = ctx.grant_store {
+        let mut gate = crate::file_gate::FileGate::new(
+            arc_id.clone(),
+            store.clone(),
+            ctx.pending_grants.clone(),
+            Some(ctx.app_handle.clone()),
+        );
+        if let Some(ref sink) = ctx.telegram_approval_sink {
+            gate = gate.with_telegram_approval(sink.clone());
+        }
+        registry = registry.with_file_gate(Arc::new(gate));
+    }
+
+    let base_registry: Arc<dyn athen_core::traits::tool::ToolRegistry> = Arc::new(registry);
+    let registry: Box<dyn athen_core::traits::tool::ToolRegistry> =
+        if let Some(profile_store) = ctx.profile_store.clone() {
+            if let Some(arc_store) = ctx.arc_store.clone() {
+                let dctx = crate::delegation::DelegationContext {
+                    profile_store,
+                    arc_store,
+                    llm_router: Arc::clone(&ctx.router),
+                    parent_arc_id: arc_id.clone(),
+                    tool_doc_dir: ctx.tool_doc_dir.clone(),
+                    app_handle: Some(ctx.app_handle.clone()),
+                };
+                Box::new(crate::delegation::DelegationToolRegistry::new(
+                    base_registry,
+                    dctx,
+                ))
+            } else {
+                Box::new(crate::delegation::ArcRegistryAdapter(base_registry))
+            }
+        } else {
+            Box::new(crate::delegation::ArcRegistryAdapter(base_registry))
+        };
+
+    let exec_router: Box<dyn LlmRouter> = Box::new(SharedRouter(Arc::clone(&ctx.router)));
+    let tool_log = new_tool_log();
+    let auditor = TauriAuditor::new(
+        ctx.app_handle.clone(),
+        ctx.arc_store.clone(),
+        arc_id.clone(),
+        ctx.turn_id.clone(),
+        tool_log.clone(),
+    );
+    let stream_tx = spawn_stream_forwarder(&ctx.app_handle, Some(arc_id.clone()));
+
+    ctx.cancel_flag.store(false, Ordering::Relaxed);
+
+    let context_snapshot = context.clone();
+
+    let active_profile =
+        resolve_active_profile(ctx.profile_store.as_ref(), ctx.arc_store.as_ref(), &arc_id).await;
+
+    let mut builder = AgentBuilder::new()
+        .llm_router(exec_router)
+        .tool_registry(registry)
+        .auditor(Box::new(auditor))
+        .max_steps(50)
+        .timeout(Duration::from_secs(300))
+        .context_messages(context)
+        .stream_sender(stream_tx)
+        .cancel_flag(ctx.cancel_flag.clone())
+        .autonomous_mode(true);
+    if let Some(p) = ctx.tool_doc_dir.clone() {
+        builder = builder.tool_doc_dir(p);
+    }
+    if let Some(profile) = active_profile {
+        builder = builder.active_profile(profile);
+    }
+    builder = builder.toolbox_info(athen_agent::toolbox::ToolboxPromptInfo::load().await);
+    let executor = builder.build().map_err(|e| {
+        let raw = e.to_string();
+        tracing::error!("AgentBuilder failed (dispatched): {raw}");
+        format_user_error(&raw)
+    })?;
+
+    // Build the task we hand to the executor. Reuse the source_event,
+    // domain, priority, and risk fields the coordinator already filled
+    // in — we just need a fresh inner id for executor bookkeeping.
+    let exec_task = Task {
+        id: Uuid::new_v4(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        source_event: task.source_event,
+        domain: task.domain.clone(),
+        description: message.clone(),
+        priority: task.priority,
+        status: TaskStatus::InProgress,
+        risk_score: task.risk_score.clone(),
+        risk_budget: task.risk_budget,
+        risk_used: task.risk_used,
+        assigned_agent: None,
+        steps: vec![],
+        deadline: None,
+    };
+
+    let result = match executor.execute(exec_task).await {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = ctx.coordinator.complete_task(coord_task_id).await;
+            let raw = e.to_string();
+            tracing::error!("Agent execution failed for dispatched task: {raw}");
+            let msg = format_user_error(&raw);
+
+            if let Some(ref store) = ctx.arc_store {
+                if let Err(e) = store
+                    .add_entry(
+                        &arc_id,
+                        athen_persistence::arcs::EntryType::Message,
+                        "assistant",
+                        &msg,
+                        None,
+                        Some(&ctx.turn_id),
+                    )
+                    .await
+                {
+                    warn!("Failed to persist dispatched-task error reply: {e}");
+                }
+                if let Err(e) = store.touch_arc(&arc_id).await {
+                    warn!("Failed to touch arc on error path: {e}");
+                }
+            }
+
+            return Ok(Some(ApprovedTaskOutcome {
+                content: msg,
+                success: false,
+                domain: task.domain.clone(),
+                message,
+                context_snapshot,
+                tool_log,
+            }));
+        }
+    };
+
+    let content = if !result.success {
+        let reason = result
+            .output
+            .as_ref()
+            .and_then(|o| o.get("reason"))
+            .and_then(|r| r.as_str())
+            .unwrap_or("unknown");
+        if reason == "cancelled" {
+            "Task cancelled.".to_string()
+        } else {
+            format!(
+                "Ran out of steps ({} used) before finishing.",
+                result.steps_completed
+            )
+        }
+    } else {
+        let text = result
+            .output
+            .as_ref()
+            .and_then(|o| o.get("response"))
+            .and_then(|r| r.as_str())
+            .unwrap_or("")
+            .to_string();
+        if text.is_empty() {
+            result
+                .output
+                .as_ref()
+                .map(|o| serde_json::to_string_pretty(o).unwrap_or_default())
+                .unwrap_or_else(|| "Task completed.".to_string())
+        } else {
+            text
+        }
+    };
+
+    // Persist the assistant response.
+    if let Some(ref store) = ctx.arc_store {
+        if let Err(e) = store
+            .add_entry(
+                &arc_id,
+                athen_persistence::arcs::EntryType::Message,
+                "assistant",
+                &content,
+                None,
+                Some(&ctx.turn_id),
+            )
+            .await
+        {
+            warn!("Failed to persist dispatched-task assistant entry: {e}");
+        }
+        if let Err(e) = store.touch_arc(&arc_id).await {
+            warn!("Failed to touch arc: {e}");
+        }
+    }
+
+    // Reinforce memories that were actually used.
+    if let Some(ref memory) = ctx.memory {
+        reinforce_used_memories(memory, &context_snapshot, &content).await;
+    }
+
+    // Auto-remember with the LLM judge.
+    if let Some(ref memory) = ctx.memory {
+        let router = SharedRouter(Arc::clone(&ctx.router));
+        let arc_id_clone = arc_id.clone();
+        let msg_clone = message.clone();
+        let content_clone = content.clone();
+        let memory_clone = Arc::clone(memory);
+        tokio::spawn(async move {
+            match judge_worth_remembering(&router, &msg_clone, &content_clone).await {
+                Some(summary) => {
+                    tracing::info!("Memory judge: worth remembering (dispatched task)");
+                    let item = athen_core::traits::memory::MemoryItem {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        content: summary,
+                        metadata: serde_json::json!({
+                            "source": "conversation",
+                            "arc_id": arc_id_clone,
+                            "timestamp": chrono::Utc::now().to_rfc3339(),
+                        }),
+                    };
+                    if let Err(e) = memory_clone.remember(item).await {
+                        tracing::warn!("Failed to remember interaction: {e}");
+                    }
+                }
+                None => {
+                    tracing::debug!("Memory judge: not worth remembering (dispatched task)");
+                }
+            }
+        });
+    }
+
+    let _ = ctx.coordinator.complete_task(coord_task_id).await;
+
+    let _ = ctx
+        .app_handle
+        .emit("arc-updated", serde_json::json!({ "arc_id": arc_id }));
+
+    Ok(Some(ApprovedTaskOutcome {
+        content,
+        success: result.success,
+        domain: task.domain.clone(),
+        message,
+        context_snapshot,
+        tool_log,
+    }))
+}
+
 /// Cancel the currently running agent task.
 ///
 /// Sets the shared cancellation flag to `true`, which the executor checks

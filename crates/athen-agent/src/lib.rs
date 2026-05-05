@@ -48,6 +48,7 @@ pub struct AgentBuilder {
     active_profile: Option<athen_core::agent_profile::ResolvedAgentProfile>,
     toolbox_info: Option<toolbox::ToolboxPromptInfo>,
     shell_kind: Option<&'static str>,
+    autonomous_mode: bool,
 }
 
 impl AgentBuilder {
@@ -71,7 +72,16 @@ impl AgentBuilder {
             active_profile: None,
             toolbox_info: None,
             shell_kind: None,
+            autonomous_mode: false,
         }
+    }
+
+    /// Run this executor in autonomous mode — i.e. driven by a sense
+    /// event with no live user. Defaults to `false` to preserve today's
+    /// behavior for user-driven `send_message` flows.
+    pub fn autonomous_mode(mut self, value: bool) -> Self {
+        self.autonomous_mode = value;
+        self
     }
 
     /// Inject pre-fetched toolbox runtime probe + manifest summary so
@@ -220,6 +230,10 @@ impl AgentBuilder {
 
         if let Some(kind) = self.shell_kind {
             executor.set_shell_kind(kind);
+        }
+
+        if self.autonomous_mode {
+            executor.set_autonomous_mode(true);
         }
 
         Ok(executor)

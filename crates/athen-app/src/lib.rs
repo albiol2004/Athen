@@ -155,6 +155,12 @@ pub fn run() {
             state.start_calendar_monitor(app.handle().clone());
             state.start_telegram_monitor(app.handle().clone());
 
+            // Start the autonomous-execution dispatch loop. Must come
+            // after the agent has been registered with the coordinator's
+            // dispatcher (above), otherwise dispatch_next_with_task
+            // can't assign anything.
+            state.start_dispatch_loop(app.handle().clone());
+
             app.manage(state);
 
             // Track window focus state for the notification orchestrator.

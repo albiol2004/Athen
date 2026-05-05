@@ -206,6 +206,12 @@ pub struct DefaultExecutor {
     /// slot, so old call-sites that don't wire this keep today's
     /// behavior.
     shell_kind: Option<&'static str>,
+    /// Whether this executor runs in autonomous mode (i.e. driven by a
+    /// sense event rather than an active user chat). When true, the
+    /// system prompt warns the agent that no user is reading replies in
+    /// real time and steers behavior toward the approval router for
+    /// uncertain actions.
+    autonomous_mode: bool,
 }
 
 impl DefaultExecutor {
@@ -231,7 +237,16 @@ impl DefaultExecutor {
             active_profile: None,
             toolbox_info: None,
             shell_kind: None,
+            autonomous_mode: false,
         }
+    }
+
+    /// Toggle autonomous mode. When `true`, the system prompt is
+    /// rewritten so the agent knows it's running in response to a
+    /// sense event with no live user, and falls back to the approval
+    /// router instead of asking "should I?" in chat.
+    pub fn set_autonomous_mode(&mut self, value: bool) {
+        self.autonomous_mode = value;
     }
 
     /// Inject pre-fetched toolbox prompt info. The prompt builder uses
@@ -298,6 +313,7 @@ impl DefaultExecutor {
     /// dispatched at least once this session. `tool_doc_dir` (when set)
     /// points at a directory of per-group markdown files the agent can read
     /// for full schemas of one group at a time.
+    #[cfg(test)]
     fn build_system_prompt(
         tools: &[athen_core::tool::ToolDefinition],
         revealed: &HashSet<String>,
@@ -307,13 +323,50 @@ impl DefaultExecutor {
         toolbox_info: Option<&crate::toolbox::ToolboxPromptInfo>,
         shell_kind: Option<&'static str>,
     ) -> String {
+        Self::build_system_prompt_with_mode(
+            tools,
+            revealed,
+            has_context,
+            tool_doc_dir,
+            profile,
+            toolbox_info,
+            shell_kind,
+            false,
+        )
+    }
+
+    /// Like [`Self::build_system_prompt`] but with an explicit
+    /// `autonomous` flag. When `true`, the prompt is prefixed with a
+    /// warning that there is no live user, and the persona rules slot
+    /// swaps the "take initiative, don't ask" rule for one that steers
+    /// uncertain actions through the approval system instead.
+    #[allow(clippy::too_many_arguments)]
+    fn build_system_prompt_with_mode(
+        tools: &[athen_core::tool::ToolDefinition],
+        revealed: &HashSet<String>,
+        has_context: bool,
+        tool_doc_dir: Option<&std::path::Path>,
+        profile: Option<&ResolvedAgentProfile>,
+        toolbox_info: Option<&crate::toolbox::ToolboxPromptInfo>,
+        shell_kind: Option<&'static str>,
+        autonomous: bool,
+    ) -> String {
         let mut prompt = String::new();
+        if autonomous {
+            prompt.push_str(
+                "You are running AUTONOMOUSLY in response to a sense event \
+                 (email/calendar/message). There is no user actively chatting \
+                 — your work will be reviewed later. If a tool call requires \
+                 approval, use the approval router; do NOT respond with text \
+                 asking the user 'should I?' — they will not see it in real time.\n\n",
+            );
+        }
         prompt.push_str(&Self::build_persona_header(profile));
         prompt.push_str(&Self::build_workspace_rules(has_context));
         prompt.push_str(&Self::build_shell_env_section(shell_kind));
         prompt.push_str(&Self::build_toolbox_section(toolbox_info));
         prompt.push_str(&Self::build_tool_index(tools, revealed, tool_doc_dir));
-        prompt.push_str(&Self::build_persona_rules());
+        prompt.push_str(&Self::build_persona_rules(autonomous));
         prompt
     }
 
@@ -727,25 +780,34 @@ impl DefaultExecutor {
     /// Profile-overridable in the future: a "personal assistant" profile may
     /// want rule #2 ("never ask the user what to do next") softened to "ask
     /// when scheduling is genuinely ambiguous".
-    fn build_persona_rules() -> String {
-        "RULES YOU MUST FOLLOW:\n\
-         1. NEVER say \"I'll do X\" or \"Let me do X\" — just DO IT by calling tools.\n\
-         2. NEVER ask the user what to do next or suggest options — take initiative.\n\
-         3. When a task requires tools, call them IMMEDIATELY in your first response.\n\
-         4. Only respond with text (no tool calls) when the task is COMPLETE and you are reporting results.\n\
-         5. Be concise in your final answer — report what you did and what you found.\n\
-         6. If the user's message is ambiguous, make a reasonable choice and act on it.\n\
-         7. When a system context message describes a calendar event or email, use that context — \
-            do not redundantly search the filesystem for information you already have.\n\
-         8. ALWAYS respond in natural language. NEVER output raw JSON. \
-            If you don't know the answer, say so naturally in the user's language.\n\n\
-         BAD: \"I'll list the files for you.\" / \"Voy a listar los archivos.\" (announces without acting)\n\
-         GOOD: [calls list_directory tool, then reports results]\n\n\
-         BAD: \"Would you like me to...?\" / \"¿Quieres que...?\" (asks instead of doing)\n\
-         GOOD: [does the thing, reports what happened]\n\n\
-         BAD: {\"response\": \"\"} (raw JSON output)\n\
-         GOOD: \"I don't have that information.\" / \"No tengo esa información.\""
-            .to_string()
+    fn build_persona_rules(autonomous: bool) -> String {
+        let rule_2 = if autonomous {
+            "There is no user available to ask. If the action is clearly safe \
+             and within your remit, just do it. If you are uncertain or the \
+             action is high-risk, request approval via the approval system \
+             rather than producing 'should I?' text in the arc."
+        } else {
+            "NEVER ask the user what to do next or suggest options — take initiative."
+        };
+        format!(
+            "RULES YOU MUST FOLLOW:\n\
+             1. NEVER say \"I'll do X\" or \"Let me do X\" — just DO IT by calling tools.\n\
+             2. {rule_2}\n\
+             3. When a task requires tools, call them IMMEDIATELY in your first response.\n\
+             4. Only respond with text (no tool calls) when the task is COMPLETE and you are reporting results.\n\
+             5. Be concise in your final answer — report what you did and what you found.\n\
+             6. If the user's message is ambiguous, make a reasonable choice and act on it.\n\
+             7. When a system context message describes a calendar event or email, use that context — \
+                do not redundantly search the filesystem for information you already have.\n\
+             8. ALWAYS respond in natural language. NEVER output raw JSON. \
+                If you don't know the answer, say so naturally in the user's language.\n\n\
+             BAD: \"I'll list the files for you.\" / \"Voy a listar los archivos.\" (announces without acting)\n\
+             GOOD: [calls list_directory tool, then reports results]\n\n\
+             BAD: \"Would you like me to...?\" / \"¿Quieres que...?\" (asks instead of doing)\n\
+             GOOD: [does the thing, reports what happened]\n\n\
+             BAD: {{\"response\": \"\"}} (raw JSON output)\n\
+             GOOD: \"I don't have that information.\" / \"No tengo esa información.\"",
+        )
     }
 }
 
@@ -954,7 +1016,7 @@ impl AgentExecutor for DefaultExecutor {
             // Rebuild the system prompt each iteration so newly-revealed
             // tools' full schemas appear inline. The prompt itself is small;
             // rebuilding is cheap.
-            let system_prompt = Self::build_system_prompt(
+            let system_prompt = Self::build_system_prompt_with_mode(
                 &available_tools,
                 &revealed_tools,
                 has_context,
@@ -962,6 +1024,7 @@ impl AgentExecutor for DefaultExecutor {
                 self.active_profile.as_ref(),
                 self.toolbox_info.as_ref(),
                 self.shell_kind,
+                self.autonomous_mode,
             );
 
             // Tools sent to the LLM API: only the revealed subset carries
@@ -2096,6 +2159,31 @@ mod tests {
         let prompt =
             DefaultExecutor::build_system_prompt(&tools, &revealed, false, None, None, None, None);
         assert!(!prompt.contains("read("));
+    }
+
+    #[test]
+    fn system_prompt_autonomous_mode_changes_prompt() {
+        let tools = vec![tool_def("memory_store", "store a memory")];
+        let revealed = HashSet::new();
+        let interactive = DefaultExecutor::build_system_prompt_with_mode(
+            &tools, &revealed, false, None, None, None, None, false,
+        );
+        let autonomous = DefaultExecutor::build_system_prompt_with_mode(
+            &tools, &revealed, false, None, None, None, None, true,
+        );
+
+        assert_ne!(
+            interactive, autonomous,
+            "autonomous prompt must differ from interactive"
+        );
+        // Autonomous mode injects the sense-event preamble.
+        assert!(autonomous.contains("AUTONOMOUSLY"));
+        assert!(!interactive.contains("AUTONOMOUSLY"));
+        // Rule #2 is swapped: interactive forbids asking the user;
+        // autonomous tells the agent to use the approval router.
+        assert!(interactive.contains("NEVER ask the user what to do next"));
+        assert!(autonomous.contains("approval system"));
+        assert!(!autonomous.contains("NEVER ask the user what to do next"));
     }
 
     /// A `ResolvedAgentProfile` with empty templates and no addendum (the

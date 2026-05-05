@@ -49,6 +49,8 @@ pub enum TriageTarget {
 /// 2. Find related existing arc or create new one
 /// 3. Persist as ArcEntry
 /// 4. Emit frontend event
+/// 5. Notify
+/// 6. (optional) Hand off to the coordinator for autonomous execution
 ///
 /// Returns `true` if the event was relevant and processed, `false` if ignored.
 #[allow(clippy::too_many_arguments)]
@@ -61,6 +63,9 @@ pub async fn process_sense_event(
     profile_embedding_cache: &crate::state::ProfileEmbeddingCache,
     app_handle: &AppHandle,
     notifier: Option<&Arc<NotificationOrchestrator>>,
+    coordinator: Option<&Arc<athen_coordinador::Coordinator>>,
+    task_arc_map: Option<&crate::state::TaskArcMap>,
+    dispatch_signal: Option<&Arc<tokio::sync::Notify>>,
 ) -> bool {
     let source_name = source_display_name(&event.source);
     let summary = event.content.summary.as_deref().unwrap_or("(no subject)");
@@ -300,6 +305,51 @@ pub async fn process_sense_event(
         };
 
         notifier.notify(notification).await;
+    }
+
+    // Step 6: Hand off to the coordinator for autonomous execution if
+    // wiring is present and the triage decided this event warrants
+    // action (vs. just notifying the user). Best-effort: failures here
+    // never invalidate the work the notification path already did.
+    if let Some(coord) = coordinator {
+        if should_dispatch_autonomously(&triage) {
+            match coord.process_event(event.clone()).await {
+                Ok(decisions) => {
+                    use athen_core::risk::RiskDecision;
+                    for (task_id, decision) in &decisions {
+                        info!(
+                            arc = %arc_id,
+                            task_id = %task_id,
+                            ?decision,
+                            "Sense event handed to coordinator"
+                        );
+                        if matches!(
+                            decision,
+                            RiskDecision::SilentApprove | RiskDecision::NotifyAndProceed
+                        ) {
+                            if let Some(map) = task_arc_map {
+                                map.write().await.insert(*task_id, arc_id.clone());
+                            }
+                        }
+                    }
+                    if !decisions.is_empty() {
+                        if let Some(sig) = dispatch_signal {
+                            sig.notify_one();
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(arc = %arc_id, error = %e, "coordinator.process_event failed");
+                }
+            }
+        } else {
+            tracing::debug!(
+                arc = %arc_id,
+                relevance = %triage.relevance,
+                action = %triage.suggested_action,
+                "Sense event triaged as notify-only; not dispatching"
+            );
+        }
     }
 
     true
@@ -881,9 +931,73 @@ pub(crate) fn parse_triage_response(text: &str) -> SenseTriage {
     }
 }
 
+/// Decide whether a triaged sense event should be dispatched to the
+/// coordinator for autonomous execution, or merely surfaced as a
+/// notification + arc entry.
+///
+/// We dispatch only when the triage indicates the event is both
+/// **relevant** (medium/high) and **action-worthy** (the LLM suggested
+/// reply/calendar/urgent — i.e. something the agent can plausibly do).
+/// Pure read-only stuff still creates an arc entry and notifies, but
+/// stops there. Spam/marketing (`ignore`/`low`) never gets here in the
+/// first place; the early bail-out at Step 1 already filtered it out.
+pub(crate) fn should_dispatch_autonomously(triage: &SenseTriage) -> bool {
+    matches!(triage.relevance.as_str(), "medium" | "high")
+        && matches!(
+            triage.suggested_action.as_str(),
+            "reply" | "calendar" | "urgent"
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_triage(relevance: &str, action: &str) -> SenseTriage {
+        SenseTriage {
+            relevance: relevance.into(),
+            reason: "test".into(),
+            suggested_action: action.into(),
+            target_arc: TriageTarget::NewArc {
+                name: "test".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn dispatch_gate_lets_action_worthy_events_through() {
+        assert!(should_dispatch_autonomously(&make_triage(
+            "medium", "reply"
+        )));
+        assert!(should_dispatch_autonomously(&make_triage("high", "reply")));
+        assert!(should_dispatch_autonomously(&make_triage("high", "urgent")));
+        assert!(should_dispatch_autonomously(&make_triage(
+            "medium", "calendar"
+        )));
+    }
+
+    #[test]
+    fn dispatch_gate_blocks_notify_only_actions() {
+        // Read-only / no-action triage should never autonomously execute.
+        assert!(!should_dispatch_autonomously(&make_triage(
+            "medium", "read"
+        )));
+        assert!(!should_dispatch_autonomously(&make_triage("high", "read")));
+        assert!(!should_dispatch_autonomously(&make_triage(
+            "medium", "none"
+        )));
+    }
+
+    #[test]
+    fn dispatch_gate_blocks_low_relevance() {
+        // Even action-worthy hints don't dispatch if the LLM thinks
+        // the event is irrelevant. (`ignore`/`low` events are skipped
+        // before they ever reach this helper, but we belt-and-brace.)
+        assert!(!should_dispatch_autonomously(&make_triage(
+            "ignore", "reply"
+        )));
+        assert!(!should_dispatch_autonomously(&make_triage("low", "urgent")));
+    }
 
     #[test]
     fn parse_new_arc_response() {
