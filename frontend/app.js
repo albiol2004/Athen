@@ -676,6 +676,17 @@ function buildArcItem(arc) {
         });
         actions.appendChild(renameBtn);
 
+        const compactBtn = document.createElement('button');
+        compactBtn.className = 'session-action-btn';
+        compactBtn.title = 'Compact this arc (summarize earlier turns to free context)';
+        // Stack icon \u2014 arrow pointing into a tray.
+        compactBtn.innerHTML = '&#x21A1;';
+        compactBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            handleCompactArc(arc.id, compactBtn);
+        });
+        actions.appendChild(compactBtn);
+
         const branchBtn = document.createElement('button');
         branchBtn.className = 'session-action-btn';
         branchBtn.title = 'Branch';
@@ -854,6 +865,45 @@ async function handleSwitchArc(arcId) {
         inputEl.focus();
     } catch (err) {
         console.error('Switch arc failed:', err);
+    }
+}
+
+async function handleCompactArc(arcId, btnEl) {
+    if (!invoke) return;
+    if (btnEl) {
+        btnEl.disabled = true;
+        btnEl.classList.add('busy');
+    }
+    try {
+        const result = await invoke('compact_arc', { arcId });
+        if (result && result.compacted) {
+            const before = result.tokens_before || 0;
+            const after = result.tokens_after || 0;
+            showToast(`Compacted: ${before} → ${after} tokens`, 'success');
+            // If the compacted arc is the active one, refresh the view
+            // so the new summary entry shows up in the timeline.
+            if (arcId === activeArcId) {
+                try {
+                    const entries = await invoke('get_arc_history');
+                    clearChatUI();
+                    renderEntries(entries);
+                } catch (err) {
+                    console.error('Refresh after compact failed:', err);
+                }
+            }
+            // Refresh sidebar so the entry_count badge updates.
+            await loadArcs();
+        } else {
+            showToast('Nothing to compact yet (arc too short).', '');
+        }
+    } catch (err) {
+        console.error('Compact arc failed:', err);
+        showToast('Compact failed: ' + (err && err.toString ? err.toString() : 'unknown error'), 'error');
+    } finally {
+        if (btnEl) {
+            btnEl.disabled = false;
+            btnEl.classList.remove('busy');
+        }
     }
 }
 
@@ -2043,10 +2093,42 @@ function renderHistoryEntry(entry) {
     } else if (entry.entry_type === 'email_event') {
         const meta = parseEntryMetadata(entry.metadata) || {};
         addEmailEntry(entry.content, meta);
+    } else if (entry.entry_type === 'summary') {
+        addSummaryEntry(entry.content, entry.metadata);
     } else if (entry.entry_type === 'tool_call') {
         // Fallback for callers that didn't go through buildRenderUnits.
         renderToolGroup([entry]);
     }
+}
+
+// Render a compaction summary as a collapsed "Earlier in this arc..."
+// block. The full summary is in the <details> body; the agent sees
+// this content during dispatch but the user can ignore it most of
+// the time. Older entries above the summary remain in the timeline
+// (they are not deleted), so the user can still scroll to see what
+// the summary covers.
+function addSummaryEntry(content, metadataRaw) {
+    const meta = parseEntryMetadata(metadataRaw) || {};
+    const row = document.createElement('div');
+    row.className = 'message-row system';
+    const details = document.createElement('details');
+    details.className = 'arc-summary-block';
+    const sum = document.createElement('summary');
+    let label = '\u{1F5C2}️  Earlier in this arc — compacted';
+    if (typeof meta.summarized_entries === 'number') {
+        label += ` (${meta.summarized_entries} entries)`;
+    }
+    if (typeof meta.tokens_before === 'number') {
+        label += ` · ~${meta.tokens_before} tokens collapsed`;
+    }
+    sum.textContent = label;
+    details.appendChild(sum);
+    const body = document.createElement('pre');
+    body.className = 'arc-summary-body';
+    body.textContent = content;
+    details.appendChild(body);
+    row.appendChild(details);
+    messagesEl.appendChild(row);
 }
 
 async function loadHistory() {

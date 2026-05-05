@@ -6,6 +6,7 @@
 pub(crate) mod app_tools;
 pub(crate) mod approval;
 mod commands;
+pub(crate) mod compaction;
 mod contacts;
 pub(crate) mod delegation;
 pub(crate) mod file_gate;
@@ -51,6 +52,7 @@ pub fn run() {
             commands::new_arc,
             commands::get_arc_history,
             commands::get_arc_entries,
+            commands::compact_arc,
             commands::list_arcs,
             commands::switch_arc,
             commands::rename_arc,

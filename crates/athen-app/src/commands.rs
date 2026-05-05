@@ -85,6 +85,7 @@ fn spawn_router_approval(
         inflight: state.inflight_approvals.clone(),
         approval_router: state.approval_router.clone(),
         notifier: state.notifier.clone(),
+        compactor: state.compactor.clone(),
     };
 
     tauri::async_runtime::spawn(async move {
@@ -187,6 +188,7 @@ fn spawn_router_approval(
             },
             approval_router: bg_ctx.approval_router,
             notifier: bg_ctx.notifier.clone(),
+            compactor: bg_ctx.compactor.clone(),
         };
 
         let outcome = match execute_approved_task(task_id, ctx).await {
@@ -259,6 +261,7 @@ struct ApprovedTaskBgCtx {
     inflight: crate::state::InflightApprovals,
     approval_router: Option<Arc<crate::approval::ApprovalRouter>>,
     notifier: Option<Arc<crate::notifier::NotificationOrchestrator>>,
+    compactor: Option<Arc<dyn athen_core::traits::compaction::ArcCompactor>>,
 }
 
 /// Resolve the agent profile that should drive execution for a given arc.
@@ -1563,6 +1566,7 @@ pub async fn approve_task(
         message_override,
         approval_router: state.approval_router.clone(),
         notifier: state.notifier.clone(),
+        compactor: state.compactor.clone(),
     };
 
     let outcome = match execute_approved_task(task_uuid, ctx).await {
@@ -1660,6 +1664,11 @@ pub(crate) struct ApprovedTaskCtx {
     /// tolerated (no ping). User-driven `execute_approved_task` does not
     /// use this — the user is already in the UI and will see the reply.
     pub notifier: Option<Arc<crate::notifier::NotificationOrchestrator>>,
+    /// Arc compactor — gateway into arc history for the executor path.
+    /// When `Some`, context is built via `load_context_view` (summary +
+    /// tail + tool cache). When `None`, the legacy `load_entries`
+    /// fallback runs. See `docs/ARC_COMPACTION.md` §8.
+    pub compactor: Option<Arc<dyn athen_core::traits::compaction::ArcCompactor>>,
 }
 
 /// Drive a risk-flagged task all the way through approval, dispatch,
@@ -1748,10 +1757,26 @@ pub(crate) async fn execute_approved_task(
         }
     };
 
-    // Build context (history from arc + injected memories). We can't reach
-    // the in-memory `state.history` from here (the bg path doesn't own
-    // `&AppState`), so we rebuild from SQLite — the arc is authoritative.
-    let mut context: Vec<ChatMessage> = if let Some(ref store) = ctx.arc_store {
+    // Build context. Routed through the compactor when available — the
+    // executor must never read raw `arc_entries` directly (see
+    // `docs/ARC_COMPACTION.md` §8 "the discipline rule"). Fall back to
+    // load_entries only when no compactor is wired (legacy boot/tests).
+    let mut context: Vec<ChatMessage> = if let Some(ref compactor) = ctx.compactor {
+        match compactor
+            .prepare_context(
+                &ctx.active_arc_id,
+                crate::compaction::DEFAULT_MODEL_WINDOW_TOKENS,
+                crate::compaction::DEFAULT_TARGET_TOKENS,
+            )
+            .await
+        {
+            Ok(view) => crate::compaction::view_to_messages(&view),
+            Err(e) => {
+                tracing::warn!(arc = %ctx.active_arc_id, error = %e, "compactor.prepare_context failed; using empty context");
+                Vec::new()
+            }
+        }
+    } else if let Some(ref store) = ctx.arc_store {
         match store.load_entries(&ctx.active_arc_id).await {
             Ok(entries) => entries
                 .into_iter()
@@ -2185,8 +2210,25 @@ pub(crate) async fn execute_dispatched_task(
         task_id: coord_task_id,
     };
 
-    // Build context (history from arc + injected memories).
-    let mut context: Vec<ChatMessage> = if let Some(ref store) = ctx.arc_store {
+    // Build context. Routed through the compactor when available — see
+    // `docs/ARC_COMPACTION.md` §8 ("the discipline rule"). Fall back to
+    // load_entries only when no compactor is wired.
+    let mut context: Vec<ChatMessage> = if let Some(ref compactor) = ctx.compactor {
+        match compactor
+            .prepare_context(
+                &arc_id,
+                crate::compaction::DEFAULT_MODEL_WINDOW_TOKENS,
+                crate::compaction::DEFAULT_TARGET_TOKENS,
+            )
+            .await
+        {
+            Ok(view) => crate::compaction::view_to_messages(&view),
+            Err(e) => {
+                tracing::warn!(arc = %arc_id, error = %e, "compactor.prepare_context failed; using empty context");
+                Vec::new()
+            }
+        }
+    } else if let Some(ref store) = ctx.arc_store {
         match store.load_entries(&arc_id).await {
             Ok(entries) => entries
                 .into_iter()
@@ -2696,6 +2738,49 @@ pub async fn get_arc_entries(
     } else {
         Ok(Vec::new())
     }
+}
+
+/// Outcome of a manual compaction request, shaped for the frontend.
+/// Mirrors `athen_core::traits::compaction::CompactionOutcome` but in a
+/// JSON-friendly form Tauri can serialize without leaking the trait
+/// type into the public API surface.
+#[derive(Serialize)]
+pub struct CompactArcResponse {
+    pub compacted: bool,
+    pub summarized_through_entry_id: Option<i64>,
+    pub tokens_before: u32,
+    pub tokens_after: u32,
+}
+
+/// User-triggered compaction. Forces a compaction pass on `arc_id`
+/// regardless of the current budget — the trigger is the user's
+/// intent, not the size estimate. Returns the outcome so the UI can
+/// surface "compacted N→M tokens" feedback.
+///
+/// No-op (returns `compacted: false`) when the arc has too few entries
+/// since the last summary to be worth collapsing — the per-impl floor
+/// still applies. That prevents a click on a near-empty arc from
+/// burning an LLM call to summarize one turn into nothing.
+#[tauri::command]
+pub async fn compact_arc(
+    arc_id: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<CompactArcResponse, String> {
+    let Some(ref compactor) = state.compactor else {
+        return Err("Compactor not wired (no arc store).".into());
+    };
+    // target_tokens = 0 is the trait's "force" signal — see
+    // `ArcCompactor::compact` docs.
+    let outcome = compactor
+        .compact(&arc_id, crate::compaction::DEFAULT_MODEL_WINDOW_TOKENS, 0)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(CompactArcResponse {
+        compacted: outcome.compacted,
+        summarized_through_entry_id: outcome.summarized_through_entry_id,
+        tokens_before: outcome.tokens_before,
+        tokens_after: outcome.tokens_after,
+    })
 }
 
 /// List root arcs with metadata for the sidebar. Delegation sub-arcs

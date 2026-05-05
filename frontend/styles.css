@@ -579,6 +579,18 @@ header h1 {
     background: var(--danger-soft);
     color: var(--danger);
 }
+.session-action-btn.busy {
+    opacity: 0.55;
+    pointer-events: none;
+    animation: compact-spin 1.2s linear infinite;
+}
+.session-action-btn:disabled {
+    cursor: default;
+}
+@keyframes compact-spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+}
 
 .session-rename-input {
     width: 100%;
@@ -4289,4 +4301,36 @@ option:hover {
     }
     .welcome-icon { font-size: 72px; }
     .welcome-message { padding: 32px 16px; }
+}
+
+/* Compaction summary block — collapsed "Earlier in this arc..." entry. */
+.arc-summary-block {
+    width: 100%;
+    background: var(--surface-2);
+    border: 1px dashed var(--border);
+    border-radius: var(--r-sm);
+    padding: 8px 12px;
+    color: var(--text-2);
+    font-size: 12px;
+}
+.arc-summary-block summary {
+    cursor: pointer;
+    list-style: none;
+    color: var(--text-2);
+    font-weight: 500;
+    user-select: none;
+}
+.arc-summary-block summary::-webkit-details-marker { display: none; }
+.arc-summary-block[open] summary {
+    margin-bottom: 8px;
+    color: var(--text);
+}
+.arc-summary-body {
+    margin: 0;
+    padding: 8px 0 0 0;
+    white-space: pre-wrap;
+    font-family: inherit;
+    font-size: 12px;
+    color: var(--text-2);
+    line-height: 1.5;
 }

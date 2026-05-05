@@ -719,6 +719,143 @@ impl ArcStore {
         .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
     }
 
+    /// Atomically write a compaction summary entry and advance the arc's
+    /// `summarized_through_entry_id` pointer in a single transaction.
+    ///
+    /// This is the only path that should write `EntryType::Summary` rows.
+    /// The single-transaction guarantee is what makes the design
+    /// restart-resilient: if the process dies mid-call, either both the
+    /// row insert and the pointer update happen, or neither does — there
+    /// is no half-state where a summary exists without a pointer or vice
+    /// versa.
+    ///
+    /// `summarized_through` is the largest `arc_entries.id` the summary
+    /// covers; it becomes the new `ArcMeta.summarized_through_entry_id`.
+    /// Returns the new summary entry's auto-generated id.
+    pub async fn compact_arc(
+        &self,
+        arc_id: &str,
+        summary_content: &str,
+        metadata: Option<serde_json::Value>,
+        summarized_through: i64,
+    ) -> Result<i64> {
+        let conn = self.conn.clone();
+        let arc_id = arc_id.to_string();
+        let summary_content = summary_content.to_string();
+        let metadata_str = metadata.map(|v| v.to_string());
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn.blocking_lock();
+            let tx = conn
+                .transaction()
+                .map_err(|e| AthenError::Other(format!("Begin compact tx: {e}")))?;
+            let now = Utc::now().to_rfc3339();
+            tx.execute(
+                "INSERT INTO arc_entries (arc_id, entry_type, source, content, metadata, created_at, turn_id) \
+                 VALUES (?1, 'summary', 'compactor', ?2, ?3, ?4, NULL)",
+                params![arc_id, summary_content, metadata_str, now],
+            )
+            .map_err(|e| AthenError::Other(format!("Insert summary entry: {e}")))?;
+            let new_id = tx.last_insert_rowid();
+            tx.execute(
+                "UPDATE arcs SET summarized_through_entry_id = ?1, updated_at = ?2 WHERE id = ?3",
+                params![summarized_through, now, arc_id],
+            )
+            .map_err(|e| AthenError::Other(format!("Update summarized_through: {e}")))?;
+            tx.commit()
+                .map_err(|e| AthenError::Other(format!("Commit compact tx: {e}")))?;
+            Ok(new_id)
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
+    /// Load only the entries with `id > after_entry_id`, ordered ascending.
+    /// Used by the compactor to fetch the verbatim tail past the latest
+    /// summary's coverage.
+    pub async fn load_entries_after(
+        &self,
+        arc_id: &str,
+        after_entry_id: i64,
+    ) -> Result<Vec<ArcEntry>> {
+        let conn = self.conn.clone();
+        let arc_id = arc_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, arc_id, entry_type, source, content, metadata, created_at, turn_id \
+                     FROM arc_entries WHERE arc_id = ?1 AND id > ?2 ORDER BY id ASC",
+                )
+                .map_err(|e| AthenError::Other(format!("Prepare load_entries_after: {e}")))?;
+            let rows = stmt
+                .query_map(params![arc_id, after_entry_id], |row| {
+                    let metadata_str: Option<String> = row.get(5)?;
+                    let metadata = metadata_str.and_then(|s| serde_json::from_str(&s).ok());
+                    Ok(ArcEntry {
+                        id: row.get(0)?,
+                        arc_id: row.get(1)?,
+                        entry_type: EntryType::from_str(&row.get::<_, String>(2)?),
+                        source: row.get(3)?,
+                        content: row.get(4)?,
+                        metadata,
+                        created_at: row.get(6)?,
+                        turn_id: row.get(7)?,
+                    })
+                })
+                .map_err(|e| AthenError::Other(format!("Query load_entries_after: {e}")))?;
+            let mut entries = Vec::new();
+            for row in rows {
+                entries.push(row.map_err(|e| AthenError::Other(format!("Entry row: {e}")))?);
+            }
+            Ok(entries)
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
+    /// Load the most recent compaction summary for `arc_id`, if any.
+    /// Returns the highest-id row with `entry_type = 'summary'`.
+    pub async fn load_latest_summary(&self, arc_id: &str) -> Result<Option<ArcEntry>> {
+        let conn = self.conn.clone();
+        let arc_id = arc_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, arc_id, entry_type, source, content, metadata, created_at, turn_id \
+                     FROM arc_entries WHERE arc_id = ?1 AND entry_type = 'summary' \
+                     ORDER BY id DESC LIMIT 1",
+                )
+                .map_err(|e| AthenError::Other(format!("Prepare load_latest_summary: {e}")))?;
+            let mut rows = stmt
+                .query_map(params![arc_id], |row| {
+                    let metadata_str: Option<String> = row.get(5)?;
+                    let metadata = metadata_str.and_then(|s| serde_json::from_str(&s).ok());
+                    Ok(ArcEntry {
+                        id: row.get(0)?,
+                        arc_id: row.get(1)?,
+                        entry_type: EntryType::from_str(&row.get::<_, String>(2)?),
+                        source: row.get(3)?,
+                        content: row.get(4)?,
+                        metadata,
+                        created_at: row.get(6)?,
+                        turn_id: row.get(7)?,
+                    })
+                })
+                .map_err(|e| AthenError::Other(format!("Query load_latest_summary: {e}")))?;
+            match rows.next() {
+                Some(row) => {
+                    Ok(Some(row.map_err(|e| {
+                        AthenError::Other(format!("Summary row: {e}"))
+                    })?))
+                }
+                None => Ok(None),
+            }
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
     /// Migrate data from legacy `chat_sessions` and `chat_messages` tables into arcs.
     ///
     /// Returns the number of arcs migrated. Idempotent: skips migration if arcs
@@ -1999,5 +2136,133 @@ mod tests {
         ] {
             assert_eq!(EntryType::from_str(v.as_str()), v);
         }
+    }
+
+    #[tokio::test]
+    async fn test_compact_arc_atomic_write_and_pointer() {
+        let store = setup_arc_store().await;
+        store
+            .create_arc("arc_x", "Compact Arc", ArcSource::UserInput)
+            .await
+            .unwrap();
+        for i in 0..5 {
+            store
+                .add_entry(
+                    "arc_x",
+                    EntryType::Message,
+                    "user",
+                    &format!("turn {i}"),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let entries_before = store.load_entries("arc_x").await.unwrap();
+        let last_id = entries_before.last().unwrap().id;
+
+        let summary_id = store
+            .compact_arc(
+                "arc_x",
+                "Arc covers 5 user turns about X.",
+                Some(json!({"covered_turns": 5})),
+                last_id,
+            )
+            .await
+            .unwrap();
+
+        let meta = store.get_arc("arc_x").await.unwrap().expect("arc");
+        assert_eq!(meta.summarized_through_entry_id, Some(last_id));
+
+        let summary = store
+            .load_latest_summary("arc_x")
+            .await
+            .unwrap()
+            .expect("summary present");
+        assert_eq!(summary.id, summary_id);
+        assert_eq!(summary.entry_type, EntryType::Summary);
+        assert_eq!(summary.source, "compactor");
+        assert_eq!(summary.content, "Arc covers 5 user turns about X.");
+        assert!(summary.metadata.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_load_entries_after_returns_only_tail() {
+        let store = setup_arc_store().await;
+        store
+            .create_arc("arc_t", "Tail Arc", ArcSource::UserInput)
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        for i in 0..4 {
+            let id = store
+                .add_entry(
+                    "arc_t",
+                    EntryType::Message,
+                    "user",
+                    &format!("m{i}"),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+
+        let after = store.load_entries_after("arc_t", ids[1]).await.unwrap();
+        assert_eq!(after.len(), 2);
+        assert_eq!(after[0].content, "m2");
+        assert_eq!(after[1].content, "m3");
+
+        // Sanity: pointing past the last id returns empty.
+        let none = store.load_entries_after("arc_t", ids[3]).await.unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_load_latest_summary_picks_most_recent() {
+        let store = setup_arc_store().await;
+        store
+            .create_arc("arc_m", "Multi-summary Arc", ArcSource::UserInput)
+            .await
+            .unwrap();
+        for i in 0..3 {
+            store
+                .add_entry(
+                    "arc_m",
+                    EntryType::Message,
+                    "user",
+                    &format!("e{i}"),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let entries = store.load_entries("arc_m").await.unwrap();
+        let mid_id = entries[1].id;
+        let last_id = entries[2].id;
+
+        let s1 = store
+            .compact_arc("arc_m", "summary one", None, mid_id)
+            .await
+            .unwrap();
+        let s2 = store
+            .compact_arc("arc_m", "summary two", None, last_id)
+            .await
+            .unwrap();
+
+        let latest = store
+            .load_latest_summary("arc_m")
+            .await
+            .unwrap()
+            .expect("summary");
+        assert_eq!(latest.id, s2);
+        assert!(s2 > s1);
+        assert_eq!(latest.content, "summary two");
+
+        // Pointer reflects the most recent compaction.
+        let meta = store.get_arc("arc_m").await.unwrap().expect("arc");
+        assert_eq!(meta.summarized_through_entry_id, Some(last_id));
     }
 }

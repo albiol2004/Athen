@@ -239,6 +239,15 @@ pub struct AppState {
     /// Shutdown sender for the autonomous dispatch loop. `None` until
     /// `start_dispatch_loop` has been called.
     pub dispatch_loop_shutdown: Option<tokio::sync::broadcast::Sender<()>>,
+    /// Arc compactor — the executor's gateway into arc history. The
+    /// context-build path goes through `load_context_view` so the
+    /// compaction summary (and tool-cache) replace raw entries when an
+    /// arc has been compacted. Direct reads of `arc_store.load_entries`
+    /// from the executor path are forbidden — see
+    /// `docs/ARC_COMPACTION.md` §8 ("the discipline rule"). Wired only
+    /// when `arc_store` is also present; `None` falls back to
+    /// load_entries-based context (for legacy boot paths and tests).
+    pub compactor: Option<Arc<dyn athen_core::traits::compaction::ArcCompactor>>,
 }
 
 impl AppState {
@@ -306,6 +315,17 @@ impl AppState {
         let spawned_processes: athen_agent::SpawnedProcessMap =
             Arc::new(Mutex::new(HashMap::new()));
 
+        // Wire the compactor whenever an arc store exists. The router
+        // shares the same RwLock the executor uses so a provider switch
+        // is reflected here too.
+        let compactor: Option<Arc<dyn athen_core::traits::compaction::ArcCompactor>> =
+            arc_store.as_ref().map(|store| {
+                let c: Arc<dyn athen_core::traits::compaction::ArcCompactor> = Arc::new(
+                    crate::compaction::LlmArcCompactor::new(store.clone(), router.clone()),
+                );
+                c
+            });
+
         let state = Self {
             coordinator: Arc::new(coordinator),
             router,
@@ -343,6 +363,7 @@ impl AppState {
             pending_email_marks: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             dispatch_signal: Arc::new(tokio::sync::Notify::new()),
             dispatch_loop_shutdown: None,
+            compactor,
         };
 
         if let Err(e) = state.refresh_tools_doc().await {
@@ -1001,6 +1022,7 @@ impl AppState {
         let telegram_approval_sink = self.telegram_approval_sink.clone();
         let approval_router = self.approval_router.clone();
         let notifier = self.notifier.clone();
+        let compactor = self.compactor.clone();
         let inflight = Arc::clone(&self.inflight_approvals);
 
         tauri::async_runtime::spawn(async move {
@@ -1080,6 +1102,7 @@ impl AppState {
                         message_override: None,
                         approval_router: approval_router.clone(),
                         notifier: notifier.clone(),
+                        compactor: compactor.clone(),
                     };
 
                     let task_arc_map_clone = Arc::clone(&task_arc_map);

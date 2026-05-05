@@ -1,0 +1,499 @@
+//! `LlmArcCompactor` — Phase-1 implementation of the [`ArcCompactor`] port.
+//!
+//! Drives an LLM through the §4 prompt in `docs/ARC_COMPACTION.md` to
+//! collapse an arc's prefix into a structured summary. Burst detection is
+//! the heuristic from §2: a contiguous run of `tool_call` entries between
+//! two `message` entries is one burst that closes when the next assistant
+//! message is emitted. Token estimation is `chars / 4`.
+//!
+//! Phase-2+ swaps for entropy/embedding-based scorers slot in as
+//! alternative `ArcCompactor` implementations behind the same trait — see
+//! `docs/ARC_COMPACTION.md` §7.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use tokio::sync::RwLock;
+
+use athen_core::error::{AthenError, Result};
+use athen_core::llm::{ChatMessage, LlmRequest, MessageContent, ModelProfile, Role};
+use athen_core::traits::compaction::{
+    ArcCompactor, ArcContextView, CompactionOutcome, ContextEntry,
+};
+use athen_core::traits::llm::LlmRouter;
+use athen_persistence::arcs::{ArcEntry, ArcStore, EntryType};
+
+/// Phase-1 placeholder budgets. The executor passes these to
+/// `prepare_context` until per-provider config (`context_window_tokens` /
+/// `compaction_trigger_pct` / `compaction_target_pct` on `ProviderConfig`)
+/// is wired into the dispatch path. The numbers correspond to a 128k
+/// window with the 30% post-compaction target from `docs/ARC_COMPACTION.md`
+/// §5 — safe defaults for every common provider.
+pub const DEFAULT_MODEL_WINDOW_TOKENS: u32 = 128_000;
+pub const DEFAULT_TARGET_TOKENS: u32 = 38_400;
+
+/// Convert an `ArcContextView` into the chat-message sequence the
+/// executor consumes. Order: optional summary as a system message,
+/// optional tool-cache as a system message, then tail entries with
+/// source→role mapping. Non-message tail entries (tool_call rows,
+/// system_event, etc.) are dropped because the executor's
+/// `context_messages` is a chat history, not a raw audit log — the
+/// auditor records tool calls separately.
+pub fn view_to_messages(view: &ArcContextView) -> Vec<ChatMessage> {
+    let mut out = Vec::new();
+    if let Some(ref s) = view.summary {
+        out.push(ChatMessage {
+            role: Role::System,
+            content: MessageContent::Text(format!(
+                "<<COMPACTION SUMMARY — covers earlier turns of this arc; \
+                 the verbatim history below picks up after this point>>\n{}",
+                s.content
+            )),
+        });
+    }
+    if !view.tool_cache.is_empty() {
+        let mut block =
+            String::from("<<LATEST TOOL RESULTS — most recent successful call per tool>>\n");
+        for e in &view.tool_cache {
+            block.push_str("- ");
+            block.push_str(&e.content.replace('\n', " "));
+            block.push('\n');
+        }
+        out.push(ChatMessage {
+            role: Role::System,
+            content: MessageContent::Text(block),
+        });
+    }
+    for e in &view.tail {
+        if e.entry_type != "message" {
+            continue;
+        }
+        let role = match e.source.as_str() {
+            "user" => Role::User,
+            "assistant" => Role::Assistant,
+            "system" => Role::System,
+            "tool" => Role::Tool,
+            _ => continue,
+        };
+        out.push(ChatMessage {
+            role,
+            content: MessageContent::Text(e.content.clone()),
+        });
+    }
+    out
+}
+
+/// Token estimation: `chars / 4`. Stable upper-bound estimator suitable
+/// for trigger decisions; per-provider tokenizers (Phase-3) would refine
+/// the number without changing the trigger contract.
+fn estimate_tokens(s: &str) -> u32 {
+    (s.chars().count() / 4) as u32
+}
+
+fn entry_token_estimate(e: &ArcEntry) -> u32 {
+    estimate_tokens(&e.content) + estimate_tokens(&e.source) + 4
+}
+
+fn to_context_entry(e: &ArcEntry) -> ContextEntry {
+    ContextEntry {
+        id: e.id,
+        source: e.source.clone(),
+        content: e.content.clone(),
+        entry_type: e.entry_type.as_str().to_string(),
+    }
+}
+
+/// LLM-driven compactor. Constructs a single LLM call per compaction
+/// using the §4 fixed-category prompt; never paraphrases user
+/// constraints (the prompt forbids it).
+#[derive(Clone)]
+pub struct LlmArcCompactor {
+    arc_store: ArcStore,
+    router: Arc<RwLock<Arc<athen_llm::router::DefaultLlmRouter>>>,
+}
+
+impl LlmArcCompactor {
+    pub fn new(
+        arc_store: ArcStore,
+        router: Arc<RwLock<Arc<athen_llm::router::DefaultLlmRouter>>>,
+    ) -> Self {
+        Self { arc_store, router }
+    }
+
+    /// Build the §4 summarization prompt over `entries`. Entries are
+    /// rendered in id-ascending order with role tags so the LLM can
+    /// recover structure without us pre-grouping into bursts (the LLM is
+    /// asked to identify open actions and pending approvals from the
+    /// raw stream).
+    fn build_summary_prompt(entries: &[ArcEntry]) -> String {
+        let mut body = String::with_capacity(entries.len() * 80);
+        for e in entries {
+            let kind = e.entry_type.as_str();
+            let tag = match (kind, e.source.as_str()) {
+                ("message", "user") => "USER".to_string(),
+                ("message", "assistant") => "ASSISTANT".to_string(),
+                ("message", "system") => "SYSTEM".to_string(),
+                ("message", other) => format!("MESSAGE/{other}"),
+                ("tool_call", _) => "TOOL_CALL".to_string(),
+                ("email_event", _) => "EMAIL".to_string(),
+                ("calendar_event", _) => "CALENDAR".to_string(),
+                ("system_event", _) => "SYS_EVENT".to_string(),
+                ("summary", _) => "PRIOR_SUMMARY".to_string(),
+                (other, _) => other.to_uppercase(),
+            };
+            let trimmed = e.content.replace('\n', " ");
+            body.push_str(&format!("[{tag}] {trimmed}\n"));
+        }
+        body
+    }
+
+    /// The static header. Hard-coded categories per §4 — the LLM does
+    /// not freelance the structure. The "do not paraphrase user-stated
+    /// constraints or decisions" clause is load-bearing.
+    fn summary_system_prompt() -> &'static str {
+        "You are compacting an arc of work for an autonomous assistant. \
+Produce a structured summary the assistant can act from on its next turn. \
+DO NOT paraphrase direct user quotes about constraints or decisions — \
+preserve them verbatim. DO NOT invent details not present in the input. \
+If failed-then-succeeded patterns exist for a tool, preserve the failure \
+mode (e.g. \"failed twice with X, succeeded after Y\").
+
+Output exactly these sections, in this order:
+
+ARC GOAL: <what the user/sense set this arc up to accomplish>
+PARTICIPANTS: <contacts, threads, channels involved>
+DECISIONS: <non-obvious choices the agent or user committed to>
+CONSTRAINTS: <user-stated rules, verbatim>
+PENDING APPROVALS: <anything currently waiting on the user, or 'none'>
+TOOL OUTCOMES: <one line per named tool series; preserve failure→success patterns>
+OPEN ACTION: <what the agent was about to do next, verbatim from the latest entries; or 'none'>"
+    }
+}
+
+#[async_trait]
+impl ArcCompactor for LlmArcCompactor {
+    async fn should_compact(
+        &self,
+        arc_id: &str,
+        _model_window_tokens: u32,
+        target_tokens: u32,
+    ) -> Result<bool> {
+        let entries = self.arc_store.load_entries(arc_id).await?;
+        let total: u32 = entries.iter().map(entry_token_estimate).sum();
+        Ok(total > target_tokens)
+    }
+
+    async fn compact(
+        &self,
+        arc_id: &str,
+        _model_window_tokens: u32,
+        target_tokens: u32,
+    ) -> Result<CompactionOutcome> {
+        let prior_summary = self.arc_store.load_latest_summary(arc_id).await?;
+        let cutoff = prior_summary.as_ref().map(|s| s.id).unwrap_or(0);
+        let entries = self.arc_store.load_entries_after(arc_id, cutoff).await?;
+        if entries.is_empty() {
+            return Ok(CompactionOutcome {
+                compacted: false,
+                summarized_through_entry_id: None,
+                tokens_before: 0,
+                tokens_after: 0,
+            });
+        }
+        let total: u32 = entries.iter().map(entry_token_estimate).sum();
+        if total <= target_tokens {
+            return Ok(CompactionOutcome {
+                compacted: false,
+                summarized_through_entry_id: None,
+                tokens_before: total,
+                tokens_after: total,
+            });
+        }
+
+        // Keep the last 25% of entries as verbatim tail; summarize the
+        // rest. This is a per-arc heuristic, not per-burst — burst-aware
+        // grouping lands in Phase-2 (`burst_id` column). We never
+        // summarize a single trailing entry: if there are <4 entries past
+        // the prior summary, no compaction happens at all.
+        if entries.len() < 4 {
+            return Ok(CompactionOutcome {
+                compacted: false,
+                summarized_through_entry_id: None,
+                tokens_before: total,
+                tokens_after: total,
+            });
+        }
+        let split = (entries.len() * 3) / 4;
+        let to_summarize = &entries[..split];
+        let summarized_through = to_summarize
+            .last()
+            .map(|e| e.id)
+            .ok_or_else(|| AthenError::Other("empty summarize range".into()))?;
+
+        let mut prompt_body = String::new();
+        if let Some(prev) = prior_summary.as_ref() {
+            prompt_body.push_str("[PRIOR_SUMMARY]\n");
+            prompt_body.push_str(&prev.content);
+            prompt_body.push_str("\n\n[NEW ENTRIES SINCE PRIOR SUMMARY]\n");
+        }
+        prompt_body.push_str(&Self::build_summary_prompt(to_summarize));
+
+        let request = LlmRequest {
+            profile: ModelProfile::Fast,
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: MessageContent::Text(prompt_body),
+            }],
+            max_tokens: Some(2048),
+            temperature: Some(0.0),
+            tools: None,
+            system_prompt: Some(Self::summary_system_prompt().to_string()),
+        };
+
+        let router = self.router.read().await.clone();
+        let response = router.route(&request).await.map_err(|e| {
+            AthenError::Other(format!("Compaction LLM call failed for arc {arc_id}: {e}"))
+        })?;
+        let summary_text = response.content.trim();
+        if summary_text.is_empty() {
+            return Err(AthenError::Other(format!(
+                "Compaction LLM returned empty summary for arc {arc_id}"
+            )));
+        }
+
+        let metadata = serde_json::json!({
+            "summarized_entries": to_summarize.len(),
+            "tokens_before": total,
+            "covers_through_id": summarized_through,
+        });
+        self.arc_store
+            .compact_arc(arc_id, summary_text, Some(metadata), summarized_through)
+            .await?;
+
+        let summary_tokens = estimate_tokens(summary_text);
+        let tail_tokens: u32 = entries[split..].iter().map(entry_token_estimate).sum();
+        Ok(CompactionOutcome {
+            compacted: true,
+            summarized_through_entry_id: Some(summarized_through),
+            tokens_before: total,
+            tokens_after: summary_tokens + tail_tokens,
+        })
+    }
+
+    async fn load_context_view(
+        &self,
+        arc_id: &str,
+        _model_window_tokens: u32,
+        _target_tokens: u32,
+    ) -> Result<ArcContextView> {
+        // The arc's `summarized_through_entry_id` is authoritative for
+        // "what the summary covers." The summary entry itself has an id
+        // strictly greater than the cutoff (it was inserted after the
+        // covered entries), so using `summary.id` as the cutoff would
+        // wrongly exclude entries the summary does NOT cover but which
+        // landed between the cutoff and the summary write. Always read
+        // the cutoff from `ArcMeta`.
+        let meta = self.arc_store.get_arc(arc_id).await?;
+        let cutoff = meta.as_ref().and_then(|m| m.summarized_through_entry_id);
+        let summary = if cutoff.is_some() {
+            self.arc_store.load_latest_summary(arc_id).await?
+        } else {
+            None
+        };
+        let after = cutoff.unwrap_or(0);
+        let raw_tail = self.arc_store.load_entries_after(arc_id, after).await?;
+        let tail: Vec<ContextEntry> = raw_tail
+            .iter()
+            .filter(|e| e.entry_type != EntryType::Summary)
+            .map(to_context_entry)
+            .collect();
+
+        // Tool-series cache: latest successful tool_call per distinct
+        // tool name, drawn from the COMPACTED prefix (entries with
+        // id <= cutoff). Without this, the agent re-loads historical
+        // tool state by re-running the tool. The latest call is enough
+        // because earlier calls are subsumed by the summary.
+        let tool_cache: Vec<ContextEntry> = if let Some(c) = cutoff {
+            self.build_tool_cache(arc_id, c).await?
+        } else {
+            Vec::new()
+        };
+
+        Ok(ArcContextView {
+            summary: summary.as_ref().map(to_context_entry),
+            tail,
+            tool_cache,
+        })
+    }
+}
+
+impl LlmArcCompactor {
+    /// Build the latest-per-tool-series cache from entries with id <=
+    /// `cutoff_id`. Tool name is read from the entry's metadata when
+    /// present; entries without a recoverable name are skipped.
+    async fn build_tool_cache(&self, arc_id: &str, cutoff_id: i64) -> Result<Vec<ContextEntry>> {
+        let all = self.arc_store.load_entries(arc_id).await?;
+        let mut latest: std::collections::BTreeMap<String, ArcEntry> =
+            std::collections::BTreeMap::new();
+        for e in all
+            .into_iter()
+            .filter(|e| e.id <= cutoff_id && e.entry_type == EntryType::ToolCall)
+        {
+            let tool_name = e
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("tool"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            if let Some(name) = tool_name {
+                latest.insert(name, e);
+            }
+        }
+        Ok(latest.values().map(to_context_entry).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc as StdArc;
+    use tokio::sync::Mutex as TMutex;
+
+    async fn empty_store() -> ArcStore {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let store = ArcStore::new(StdArc::new(TMutex::new(conn)));
+        store.init_schema().await.unwrap();
+        store
+    }
+
+    #[test]
+    fn estimate_tokens_chars_div_four() {
+        assert_eq!(estimate_tokens("abcd"), 1);
+        assert_eq!(estimate_tokens("abcdefgh"), 2);
+        assert_eq!(estimate_tokens(""), 0);
+    }
+
+    #[tokio::test]
+    async fn build_summary_prompt_tags_roles_and_strips_newlines() {
+        let store = empty_store().await;
+        store
+            .create_arc("a", "A", athen_persistence::arcs::ArcSource::UserInput)
+            .await
+            .unwrap();
+        store
+            .add_entry("a", EntryType::Message, "user", "hello\nworld", None, None)
+            .await
+            .unwrap();
+        store
+            .add_entry("a", EntryType::ToolCall, "agent", "ran X", None, None)
+            .await
+            .unwrap();
+        store
+            .add_entry("a", EntryType::Message, "assistant", "did X", None, None)
+            .await
+            .unwrap();
+        let entries = store.load_entries("a").await.unwrap();
+        let prompt = LlmArcCompactor::build_summary_prompt(&entries);
+        assert!(prompt.contains("[USER] hello world"));
+        assert!(prompt.contains("[TOOL_CALL] ran X"));
+        assert!(prompt.contains("[ASSISTANT] did X"));
+        assert!(prompt.contains('\n'));
+    }
+
+    #[tokio::test]
+    async fn load_context_view_with_no_summary_returns_all_tail() {
+        // Build a compactor with an unused router stub — load_context_view
+        // does not call the LLM. We construct via Arc<RwLock<Arc<...>>>
+        // matching the AppState plumbing; the inner DefaultLlmRouter is
+        // fine to leave unused for this read-only path.
+        let store = empty_store().await;
+        store
+            .create_arc("a", "A", athen_persistence::arcs::ArcSource::UserInput)
+            .await
+            .unwrap();
+        for i in 0..3 {
+            store
+                .add_entry(
+                    "a",
+                    EntryType::Message,
+                    "user",
+                    &format!("turn {i}"),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        // Build a compactor with a default router. We don't exercise it.
+        let router = athen_llm::router::DefaultLlmRouter::new(
+            Default::default(),
+            Default::default(),
+            athen_llm::budget::BudgetTracker::new(None),
+        );
+        let router = StdArc::new(tokio::sync::RwLock::new(StdArc::new(router)));
+        let compactor = LlmArcCompactor::new(store.clone(), router);
+
+        let view = compactor
+            .load_context_view("a", 128_000, 38_400)
+            .await
+            .unwrap();
+        assert!(view.summary.is_none());
+        assert_eq!(view.tail.len(), 3);
+        assert!(view.tool_cache.is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_context_view_with_summary_returns_summary_plus_tail() {
+        let store = empty_store().await;
+        store
+            .create_arc("a", "A", athen_persistence::arcs::ArcSource::UserInput)
+            .await
+            .unwrap();
+        for i in 0..4 {
+            store
+                .add_entry(
+                    "a",
+                    EntryType::Message,
+                    "user",
+                    &format!("e{i}"),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let entries = store.load_entries("a").await.unwrap();
+        let cutoff = entries[1].id;
+        store
+            .compact_arc("a", "summary text", None, cutoff)
+            .await
+            .unwrap();
+        // Add one more entry after the summary.
+        store
+            .add_entry("a", EntryType::Message, "user", "e4", None, None)
+            .await
+            .unwrap();
+
+        let router = athen_llm::router::DefaultLlmRouter::new(
+            Default::default(),
+            Default::default(),
+            athen_llm::budget::BudgetTracker::new(None),
+        );
+        let router = StdArc::new(tokio::sync::RwLock::new(StdArc::new(router)));
+        let compactor = LlmArcCompactor::new(store.clone(), router);
+
+        let view = compactor
+            .load_context_view("a", 128_000, 38_400)
+            .await
+            .unwrap();
+        let summary = view.summary.expect("summary present");
+        assert_eq!(summary.entry_type, "summary");
+        assert_eq!(summary.content, "summary text");
+        // Tail = entries with id > summary.id, excluding summary entries
+        // themselves: original e2, e3, e4.
+        assert_eq!(view.tail.len(), 3);
+        assert_eq!(view.tail[0].content, "e2");
+        assert_eq!(view.tail[2].content, "e4");
+    }
+}

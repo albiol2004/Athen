@@ -79,7 +79,16 @@ pub trait ArcCompactor: Send + Sync {
         target_tokens: u32,
     ) -> Result<bool>;
 
-    /// Run a compaction pass. Idempotent: a no-op if the arc already fits.
+    /// Run a compaction pass. Idempotent: a no-op if the arc already
+    /// fits within `target_tokens` (or has too few entries to be worth
+    /// summarizing).
+    ///
+    /// Pass `target_tokens = 0` to **force** compaction — useful for
+    /// user-triggered "compact now" commands. With target=0 the budget
+    /// gate is always exceeded, so the call collapses material whenever
+    /// there is enough of it to bother (the per-implementation
+    /// "minimum entries" floor still applies; it prevents a single
+    /// trailing turn being summarized into nothing).
     async fn compact(
         &self,
         arc_id: &str,
@@ -99,6 +108,40 @@ pub trait ArcCompactor: Send + Sync {
         model_window_tokens: u32,
         target_tokens: u32,
     ) -> Result<ArcContextView>;
+
+    /// Compaction-aware context build. The default runs `should_compact`
+    /// → optional `compact` → `load_context_view`, which is the idiomatic
+    /// entry point for the executor: one call yields the most up-to-date
+    /// view, transparently triggering a summarization pass when the arc
+    /// has crossed the budget.
+    ///
+    /// `compact` failures do not propagate — they are swallowed and the
+    /// call falls through to `load_context_view` over the
+    /// not-yet-compacted arc. Compaction is best-effort: a stale or
+    /// missing summary degrades gracefully into "all entries verbatim,"
+    /// never a hard failure on the dispatch path. Callers who want
+    /// telemetry should call `should_compact` + `compact` separately and
+    /// log the `CompactionOutcome` themselves (compactor implementations
+    /// live in app-level crates that own logging policy).
+    async fn prepare_context(
+        &self,
+        arc_id: &str,
+        model_window_tokens: u32,
+        target_tokens: u32,
+    ) -> Result<ArcContextView> {
+        if self
+            .should_compact(arc_id, model_window_tokens, target_tokens)
+            .await?
+        {
+            // Best-effort: discard errors so a failed summarization can
+            // never block dispatch.
+            let _ = self
+                .compact(arc_id, model_window_tokens, target_tokens)
+                .await;
+        }
+        self.load_context_view(arc_id, model_window_tokens, target_tokens)
+            .await
+    }
 }
 
 #[cfg(test)]

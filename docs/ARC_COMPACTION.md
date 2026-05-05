@@ -300,6 +300,28 @@ collapse to "edited foo.rs N times, final state is..."). Do not try
 to lift working files into a stable slot — their volatility is
 intrinsic and any stable position would be a lie within a few turns.
 
+**Reference docs are out of scope for the compactor.** Athen will grow
+CLAUDE.md-equivalent reference docs (global, per-profile, per-arc) the
+user maintains by hand. The compactor must NOT read, summarize, or
+budget these:
+
+- They live in their own store (separate table or columns), not in
+  `arc_entries`.
+- They are injected at executor-build time **AFTER** the compactor
+  produces its view, prepended/appended to the system prompt as part
+  of the static header — not into the messages array.
+- The user is responsible for keeping them concise. The compactor's
+  budget calculations only count `arc_entries` content; reference
+  docs are budget-free from the compactor's perspective (their cost
+  shows up in the static header, which the cache covers).
+- Updating a reference doc invalidates the static-prefix cache once,
+  then it stabilizes again.
+
+This boundary is the discipline rule from §8 applied to a different
+axis: anything the user maintains directly is the user's
+responsibility; only `arc_entries` (which the agent and senses
+generate) is the compactor's territory.
+
 **Content-addressed read results.** A small tool-layer optimization:
 when `read` runs, record the file's content hash; subsequent reads of
 the same path at the same hash return byte-identical results. This is
@@ -386,7 +408,10 @@ amortized cost still favors earlier compaction.
 
 - Log compaction events (`arc_id`, before/after token estimate, summary
   length, latency).
-- A `/compact <arc_id>` debug command in the CLI for manual trigger.
+- Manual compaction: the `compact_arc(arc_id)` Tauri command lands in
+  Phase 1 (forced compaction via `target_tokens = 0` on the trait
+  `compact` method); a `/compact <arc_id>` REPL variant for the CLI is
+  Phase-2.
 
 **Phase 3 — quality improvements:**
 
