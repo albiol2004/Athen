@@ -11,6 +11,8 @@ Athen watches your inbox, calendar, and messages, decides what needs doing,
 and does it — autonomously, with a risk system that knows when to act
 silently and when to ask first.
 
+![Athen building and hosting a task tracker app on port 8001](docs/screenshot.png)
+
 It's designed to be **easy for everyday people, powerful for power users**:
 a single native binary you double-click, with a tray icon and a clean
 window — but underneath, a hexagonal Rust core, a real risk model, MCP
