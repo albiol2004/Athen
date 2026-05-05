@@ -123,3 +123,4 @@ Read the relevant doc BEFORE working on a feature area:
 - [Implementation Status by Crate](docs/IMPLEMENTATION.md) — Read when: you need to understand what a crate does, its current state, test counts, or what files exist. Update this file after implementing changes.
 - [Configuration & LLM Providers](docs/CONFIGURATION.md) — Read when: working on config loading, LLM providers, model profiles, failover, or domain settings
 - [Tools, Senses & Notifications](docs/TOOLS_AND_SENSES.md) — Read when: working on agent tools, sense monitors, sandbox execution, or notification delivery
+- [Arc Compaction](docs/ARC_COMPACTION.md) — Read when: working on context-window management, arc summarization, or anything that touches `ArcStore::load_entries` in the executor path. Design doc; not yet implemented.
