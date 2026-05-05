@@ -4,11 +4,11 @@
 
 ### Built-in Tool Registry (`ShellToolRegistry`)
 
-Defined in `crates/athen-agent/src/tools.rs`. Thirteen built-in tools:
+Defined in `crates/athen-agent/src/tools.rs`. Sixteen built-in tools:
 
 | Tool | Risk | Backend |
 |------|------|---------|
-| `shell_execute` | `WritePersist` | `sh -c` (sandboxed when bwrap available) |
+| `shell_execute` | `WritePersist` | `sh -c` (sandboxed when bwrap available); auto-injects toolbox PYTHONPATH/PATH |
 | `shell_spawn` | `WritePersist` | detached spawn, log file capture |
 | `shell_kill` | `WritePersist` | SIGTERM/SIGKILL on tracked PIDs only |
 | `shell_logs` | `Read` | tail of spawn log file |
@@ -21,8 +21,30 @@ Defined in `crates/athen-agent/src/tools.rs`. Thirteen built-in tools:
 | `memory_recall` | `Read` | same `HashMap` — key lookup or list-all |
 | `web_search` | `Read` | `WebSearchProvider` (default: DuckDuckGo HTML scrape) |
 | `web_fetch` | `Read` | `PageReader` (default: HybridReader, see below) |
+| `install_package` | `WritePersist` | pip/npm install into `~/.athen/toolbox/`; gated by `ToolboxApprovalGate` |
+| `uninstall_package` | `WritePersist` | reversible removal from toolbox (no approval needed) |
+| `list_installed_packages` | `Read` | reads `~/.athen/toolbox/manifest.json` |
 
 `shell_execute` passes the command through `RuleEngine` before dispatch; `Danger` or `Critical` risk score returns an error without executing.
+
+### Persistent Toolbox
+
+Defined in `crates/athen-agent/src/toolbox.rs`. The agent has a writable, persistent install location at `~/.athen/toolbox/` for pip and npm packages it decides it needs. These are NOT first-class Athen tools — they are CLI dependencies the agent installs and consumes through `shell_execute`. The manifest is the agent's *memory* of what it installed; the registry contract is unchanged.
+
+**Layout:**
+- `~/.athen/toolbox/python/` — `pip install --target=…` destination, joined into `PYTHONPATH`.
+- `~/.athen/toolbox/node/` — `npm install --prefix=…` destination, `node/bin` prepended to `PATH`.
+- `~/.athen/toolbox/manifest.json` — atomic-written record of `{runtime, package, version_spec, installed_version, reason, installed_at, runtime_version}` per install.
+
+**Shell wrapper** (`tools.rs::build_shell_wrapper`): every `shell_execute` command is wrapped as `cd '<workspace>' && export PYTHONPATH='<py>:<existing>' && export PATH='<node/bin>:<PATH>' && ( <user_command> )`, so installed packages are import-/exec-ready transparently. The toolbox dir is added to the sandbox writable set.
+
+**Approval flow:** `install_package` requires a `ToolboxApprovalGate`; `RouterToolboxApprovalGate` (`athen-app/src/file_gate.rs`) routes a structured `ApprovalQuestion` (`Install <pkg> (<runtime>)?` + LLM-supplied reason) through `ApprovalRouter`. The frontend listens for `approval-question` Tauri events and renders an inline dialog; Telegram is the escalation sink. Uninstall is unrestricted because it is reversible.
+
+**Runtime probing:** `probe_runtimes` (process-scoped `OnceCell`, 5 s timeout per binary) detects `python`, `pip`, `node`, `npm` once at agent start. The result + manifest summary is injected into the system prompt so the model knows what's available and what's already installed without an extra tool call.
+
+**Uninstall internals:** Python uninstall walks `dist-info/RECORD` (PEP 503-normalized name match), since `pip uninstall` does not support `--target`. Node uses `npm uninstall --prefix=<node_dir>`. Manifest is updated atomically after success.
+
+**UI:** Settings → "Shell Toolbox" panel lists installed packages grouped by runtime (`list_toolbox_packages`/`clear_toolbox` Tauri commands); separate from the Tools panel because these are not registry tools.
 
 ### Web access (`web_search`, `web_fetch`)
 

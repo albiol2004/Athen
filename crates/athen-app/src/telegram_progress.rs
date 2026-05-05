@@ -170,12 +170,8 @@ impl TelegramProgressReporter {
     /// the user sees *something*, and finalize will fall back to a
     /// fresh send.
     pub async fn start(self: &Arc<Self>) {
-        let _ = athen_sentidos::telegram::send_chat_action(
-            &self.bot_token,
-            self.chat_id,
-            "typing",
-        )
-        .await;
+        let _ = athen_sentidos::telegram::send_chat_action(&self.bot_token, self.chat_id, "typing")
+            .await;
 
         match athen_sentidos::telegram::send_message_returning_id(
             &self.bot_token,
@@ -300,12 +296,9 @@ impl TelegramProgressReporter {
                 }
             }
             None => {
-                let _ = athen_sentidos::telegram::send_message(
-                    &self.bot_token,
-                    self.chat_id,
-                    &first,
-                )
-                .await;
+                let _ =
+                    athen_sentidos::telegram::send_message(&self.bot_token, self.chat_id, &first)
+                        .await;
             }
         }
 
@@ -313,12 +306,8 @@ impl TelegramProgressReporter {
             if chunk.is_empty() {
                 continue;
             }
-            let _ = athen_sentidos::telegram::send_message(
-                &self.bot_token,
-                self.chat_id,
-                &chunk,
-            )
-            .await;
+            let _ =
+                athen_sentidos::telegram::send_message(&self.bot_token, self.chat_id, &chunk).await;
         }
     }
 

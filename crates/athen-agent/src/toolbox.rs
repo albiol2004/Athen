@@ -110,7 +110,7 @@ pub async fn probe_runtimes() -> RuntimeProbe {
         })
         .await
         .clone()
-    }
+}
 
 async fn probe_one(bin: &str, args: &[&str]) -> Option<String> {
     let fut = async {
@@ -383,7 +383,9 @@ pub async fn uninstall_python_package(name: &str) -> Result<InstalledPackage> {
     let removed = m
         .installs
         .iter()
-        .position(|p| p.runtime == Runtime::Python && normalize_package_name(&p.package) == normalized)
+        .position(|p| {
+            p.runtime == Runtime::Python && normalize_package_name(&p.package) == normalized
+        })
         .map(|idx| m.installs.remove(idx))
         .ok_or_else(|| AthenError::Other(format!("'{name}' is not in the python toolbox")))?;
 
@@ -478,10 +480,7 @@ pub async fn uninstall_node_package(name: &str) -> Result<InstalledPackage> {
     Ok(removed)
 }
 
-async fn find_dist_info(
-    target: &Path,
-    normalized_pkg: &str,
-) -> Option<std::path::PathBuf> {
+async fn find_dist_info(target: &Path, normalized_pkg: &str) -> Option<std::path::PathBuf> {
     let mut rd = tokio::fs::read_dir(target).await.ok()?;
     while let Ok(Some(entry)) = rd.next_entry().await {
         let name = entry.file_name();
@@ -657,7 +656,10 @@ fn parse_npm_installed_version(stdout: &str, stderr: &str, pkg_name: &str) -> Op
 }
 
 fn read_npm_version_from_node_modules(prefix: &Path, pkg_name: &str) -> Option<String> {
-    let pj = prefix.join("node_modules").join(pkg_name).join("package.json");
+    let pj = prefix
+        .join("node_modules")
+        .join(pkg_name)
+        .join("package.json");
     let text = std::fs::read_to_string(pj).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
     v.get("version")
@@ -697,7 +699,10 @@ mod tests {
         assert_eq!(back.installs[0].runtime, Runtime::Python);
         assert_eq!(back.installs[0].package, "fpdf2");
         assert_eq!(back.installs[1].runtime, Runtime::Node);
-        assert_eq!(back.installs[1].installed_version.as_deref(), Some("1.45.0"));
+        assert_eq!(
+            back.installs[1].installed_version.as_deref(),
+            Some("1.45.0")
+        );
     }
 
     #[test]

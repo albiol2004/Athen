@@ -1925,7 +1925,9 @@ impl ShellToolRegistry {
             });
         };
 
-        let approved = gate.confirm_install(runtime.as_str(), package, reason).await;
+        let approved = gate
+            .confirm_install(runtime.as_str(), package, reason)
+            .await;
         if !approved {
             let msg = format!(
                 "install denied by user: {} package '{}' was not installed",
@@ -2044,9 +2046,7 @@ impl ShellToolRegistry {
             crate::toolbox::Runtime::Python => {
                 crate::toolbox::uninstall_python_package(package).await
             }
-            crate::toolbox::Runtime::Node => {
-                crate::toolbox::uninstall_node_package(package).await
-            }
+            crate::toolbox::Runtime::Node => crate::toolbox::uninstall_node_package(package).await,
         };
         let elapsed_ms = start.elapsed().as_millis() as u64;
         match result {

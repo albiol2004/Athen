@@ -309,7 +309,9 @@ impl DefaultExecutor {
     /// packages are installed yet — the "(none yet)" line tells the
     /// agent the toolbox is the place to install, not /tmp.
     fn build_toolbox_section(info: Option<&crate::toolbox::ToolboxPromptInfo>) -> String {
-        let Some(info) = info else { return String::new() };
+        let Some(info) = info else {
+            return String::new();
+        };
         let py = info
             .probe
             .python
@@ -1940,7 +1942,8 @@ mod tests {
         revealed.insert("memory_store".to_string());
         revealed.insert("memory_recall".to_string());
 
-        let prompt = DefaultExecutor::build_system_prompt(&tools, &revealed, false, None, None, None);
+        let prompt =
+            DefaultExecutor::build_system_prompt(&tools, &revealed, false, None, None, None);
 
         // Group index lists every group with counts.
         assert!(prompt.contains("AVAILABLE TOOL GROUPS"));
@@ -1988,7 +1991,8 @@ mod tests {
     fn system_prompt_omits_doc_pointer_when_unset() {
         let tools = vec![tool_def("calendar_create", "create event")];
         let revealed = HashSet::new();
-        let prompt = DefaultExecutor::build_system_prompt(&tools, &revealed, false, None, None, None);
+        let prompt =
+            DefaultExecutor::build_system_prompt(&tools, &revealed, false, None, None, None);
         assert!(!prompt.contains("read("));
     }
 
@@ -2021,9 +2025,16 @@ mod tests {
         let tools = vec![tool_def("memory_store", "store a memory")];
         let revealed = HashSet::new();
 
-        let p_none = DefaultExecutor::build_system_prompt(&tools, &revealed, false, None, None, None);
-        let p_default =
-            DefaultExecutor::build_system_prompt(&tools, &revealed, false, None, Some(&default), None);
+        let p_none =
+            DefaultExecutor::build_system_prompt(&tools, &revealed, false, None, None, None);
+        let p_default = DefaultExecutor::build_system_prompt(
+            &tools,
+            &revealed,
+            false,
+            None,
+            Some(&default),
+            None,
+        );
 
         // Both must contain the canonical Athen identity line.
         assert!(p_none.contains("You are Athen, a proactive universal AI agent"));
@@ -2070,8 +2081,14 @@ mod tests {
         };
         let tools: Vec<athen_core::tool::ToolDefinition> = vec![];
         let revealed = HashSet::new();
-        let prompt =
-            DefaultExecutor::build_system_prompt(&tools, &revealed, false, None, Some(&resolved), None);
+        let prompt = DefaultExecutor::build_system_prompt(
+            &tools,
+            &revealed,
+            false,
+            None,
+            Some(&resolved),
+            None,
+        );
 
         assert!(prompt.contains("outreach specialist who writes warm"));
         assert!(prompt.contains("Personalize first lines."));

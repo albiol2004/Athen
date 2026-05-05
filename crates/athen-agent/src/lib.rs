@@ -17,9 +17,7 @@ pub use auditor::InMemoryAuditor;
 pub use executor::DefaultExecutor;
 pub use resource::DefaultResourceMonitor;
 pub use timeout::DefaultTimeoutGuard;
-pub use toolbox::{
-    InstalledPackage, Runtime as ToolboxRuntime, RuntimeProbe, ToolboxManifest,
-};
+pub use toolbox::{InstalledPackage, Runtime as ToolboxRuntime, RuntimeProbe, ToolboxManifest};
 pub use tools::{ShellToolRegistry, SpawnedProcess, SpawnedProcessMap, ToolboxApprovalGate};
 
 use std::path::PathBuf;

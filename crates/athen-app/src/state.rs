@@ -365,10 +365,7 @@ impl AppState {
         }
         if let Some(router) = self.approval_router.clone() {
             shell = shell.with_toolbox_approval(Arc::new(
-                crate::file_gate::RouterToolboxApprovalGate::new(
-                    router,
-                    Some(arc_id.to_string()),
-                ),
+                crate::file_gate::RouterToolboxApprovalGate::new(router, Some(arc_id.to_string())),
             ));
         }
         let mut registry = crate::app_tools::AppToolRegistry::new(
