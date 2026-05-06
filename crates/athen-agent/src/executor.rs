@@ -250,10 +250,7 @@ impl DefaultExecutor {
     /// Attach images to the first user turn. Vision-capable LLMs receive a
     /// `MessageContent::Multimodal` for the initial task description; an
     /// empty vec is the default and reproduces today's text-only flow.
-    pub fn set_initial_user_images(
-        &mut self,
-        images: Vec<athen_core::llm::ImageInput>,
-    ) {
+    pub fn set_initial_user_images(&mut self, images: Vec<athen_core::llm::ImageInput>) {
         self.initial_user_images = images;
     }
 

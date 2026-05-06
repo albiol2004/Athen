@@ -762,10 +762,7 @@ pub async fn save_provider(
             }
         };
 
-        let supports_vision = models
-            .providers
-            .get(&id)
-            .is_some_and(|c| c.supports_vision);
+        let supports_vision = models.providers.get(&id).is_some_and(|c| c.supports_vision);
         let new_router = build_router_for_provider(
             &id,
             &resolved_base_url,

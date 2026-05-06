@@ -15,10 +15,9 @@ use athen_core::llm::{LlmRequest, MessageContent};
 /// at the top of `complete`/`complete_streaming` so images surface a clear
 /// error instead of being silently dropped on the wire.
 pub(crate) fn reject_multimodal(provider_id: &str, request: &LlmRequest) -> Result<()> {
-    let has_images = request
-        .messages
-        .iter()
-        .any(|m| matches!(&m.content, MessageContent::Multimodal { images, .. } if !images.is_empty()));
+    let has_images = request.messages.iter().any(
+        |m| matches!(&m.content, MessageContent::Multimodal { images, .. } if !images.is_empty()),
+    );
     if has_images {
         return Err(AthenError::LlmProvider {
             provider: provider_id.into(),
