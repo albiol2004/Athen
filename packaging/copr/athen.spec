@@ -14,8 +14,13 @@ BuildRequires:  webkit2gtk4.1-devel
 BuildRequires:  gtk3-devel
 BuildRequires:  libsoup3-devel
 BuildRequires:  libappindicator-gtk3-devel
+BuildRequires:  librsvg2-devel
 BuildRequires:  desktop-file-utils
 BuildRequires:  libxkbcommon-devel
+BuildRequires:  cmake
+BuildRequires:  nasm
+BuildRequires:  curl
+BuildRequires:  tar
 
 Requires:       webkit2gtk4.1
 Requires:       gtk3
@@ -37,6 +42,14 @@ executes tasks autonomously with a dynamic risk system.
 
 %prep
 %autosetup -n Athen-%{version}
+# Fetch the nushell sidecar that Tauri's build script expects at
+# crates/athen-app/binaries/nu-<triple>. Mirrors what CI does before cargo build.
+%ifarch x86_64
+TARGET_TRIPLE=x86_64-unknown-linux-gnu bash scripts/fetch-nushell.sh
+%endif
+%ifarch aarch64
+TARGET_TRIPLE=aarch64-unknown-linux-gnu bash scripts/fetch-nushell.sh
+%endif
 
 %build
 # Build only the desktop app crate; the workspace contains library crates and
