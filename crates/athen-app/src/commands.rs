@@ -897,6 +897,34 @@ impl StepAuditor for TauriAuditor {
                             .get("path")
                             .and_then(|s| s.as_str())
                             .map(|s| s.to_string()),
+                        "email_send" => {
+                            // Render as `to a@x, b@y — Subject` so the
+                            // user reads the action at a glance instead
+                            // of parsing JSON.
+                            let to = result
+                                .get("to")
+                                .and_then(|v| v.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|v| v.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                })
+                                .unwrap_or_default();
+                            let subject = result
+                                .get("subject")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            if to.is_empty() && subject.is_empty() {
+                                Some(serde_json::to_string(result).unwrap_or_default())
+                            } else if subject.is_empty() {
+                                Some(format!("to {to}"))
+                            } else if to.is_empty() {
+                                Some(subject.to_string())
+                            } else {
+                                Some(format!("to {to} — {subject}"))
+                            }
+                        }
                         _ => Some(serde_json::to_string(result).unwrap_or_default()),
                     };
                     return summary.map(|s| Self::truncate_detail(&s, 200));

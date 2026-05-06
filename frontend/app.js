@@ -90,6 +90,7 @@ const ICON_INFO        = toolSvg('<circle cx="12" cy="12" r="10"/><line x1="12" 
 const ICON_CHECK       = toolSvg('<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/>');
 // "Hand off to a specialist": two figures with an arrow between them.
 const ICON_DELEGATE    = toolSvg('<circle cx="6" cy="8" r="3"/><path d="M2 21v-2a4 4 0 0 1 4-4h0"/><circle cx="18" cy="8" r="3"/><path d="M14 21v-2a4 4 0 0 1 4-4h0"/><line x1="9" y1="12" x2="15" y2="12"/><polyline points="13 10 15 12 13 14"/>');
+const ICON_MAIL        = toolSvg('<path d="M4 4h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z"/><polyline points="22,6 12,13 2,6"/>');
 
 const BUILTIN_TOOL_ICONS = {
     'read': ICON_FILE_TEXT, 'list_directory': ICON_FOLDER, 'grep': ICON_FILE_SEARCH,
@@ -97,6 +98,7 @@ const BUILTIN_TOOL_ICONS = {
     'shell_execute': ICON_TERMINAL, 'shell_spawn': ICON_TERMINAL,
     'shell_kill': ICON_STOP, 'shell_logs': ICON_LOGS,
     'web_search': ICON_SEARCH, 'web_fetch': ICON_GLOBE,
+    'email_send': ICON_MAIL,
     'memory_store': ICON_BOOKMARK, 'memory_recall': ICON_SPARKLES,
     'calendar_list': ICON_CALENDAR, 'calendar_create': ICON_CAL_PLUS,
     'calendar_update': ICON_CALENDAR, 'calendar_delete': ICON_TRASH,
@@ -121,6 +123,7 @@ const BUILTIN_TOOL_LABELS = {
     'shell_execute': 'Run', 'shell_spawn': 'Spawn',
     'shell_kill': 'Stop', 'shell_logs': 'Logs',
     'web_search': 'Search web', 'web_fetch': 'Fetch',
+    'email_send': 'Send email',
     'memory_store': 'Save', 'memory_recall': 'Recall',
     'calendar_list': 'Events', 'calendar_create': 'Create event',
     'calendar_update': 'Update event', 'calendar_delete': 'Delete event',
