@@ -137,11 +137,18 @@ impl DeepSeekProvider {
                         tool_calls: None,
                     });
                 }
-                // All other messages: plain text or structured.
+                // All other messages: plain text or structured. Multimodal
+                // is rejected upstream by `reject_multimodal` before we ever
+                // get here; we degrade to the text-only fallback if it
+                // somehow slips through, never silently dropping images
+                // (the upstream rejection is the contract).
                 (_, content) => {
                     let content_value = match content {
                         MessageContent::Text(t) => serde_json::Value::String(t.clone()),
                         MessageContent::Structured(v) => v.clone(),
+                        MessageContent::Multimodal { text, .. } => {
+                            serde_json::Value::String(text.clone())
+                        }
                     };
 
                     messages.push(OpenAiMessageOut {
@@ -203,6 +210,7 @@ impl LlmProvider for DeepSeekProvider {
     }
 
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse> {
+        crate::providers::reject_multimodal("deepseek", request)?;
         let body = self.build_request_body(request);
         let url = format!("{}/v1/chat/completions", self.base_url);
 
@@ -303,6 +311,7 @@ impl LlmProvider for DeepSeekProvider {
     }
 
     async fn complete_streaming(&self, request: &LlmRequest) -> Result<LlmStream> {
+        crate::providers::reject_multimodal("deepseek", request)?;
         let mut body = self.build_request_body(request);
         body.stream = true;
         let url = format!("{}/v1/chat/completions", self.base_url);
@@ -569,5 +578,35 @@ mod arg_parse_tests {
         let raw = "{\n  \"path\": \"/x\",\n  \"content\": \"hi\"\n}";
         let v = parse_tool_arguments(raw);
         assert_eq!(v["path"], "/x");
+    }
+
+    #[tokio::test]
+    async fn complete_rejects_multimodal_with_clear_error() {
+        let provider = DeepSeekProvider::new("test-key".to_string());
+        let req = LlmRequest {
+            profile: ModelProfile::Powerful,
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: MessageContent::Multimodal {
+                    text: "describe this".to_string(),
+                    images: vec![ImageInput {
+                        mime_type: "image/png".to_string(),
+                        data: ImageData::Base64 {
+                            data: "AAAA".to_string(),
+                        },
+                    }],
+                },
+            }],
+            max_tokens: None,
+            temperature: None,
+            tools: None,
+            system_prompt: None,
+        };
+        let err = provider.complete(&req).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.to_lowercase().contains("does not support image"),
+            "expected vision rejection error, got: {msg}"
+        );
     }
 }

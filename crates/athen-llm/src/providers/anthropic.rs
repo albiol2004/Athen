@@ -19,6 +19,7 @@ pub struct AnthropicProvider {
     default_model: String,
     client: Client,
     base_url: String,
+    supports_vision: bool,
 }
 
 impl AnthropicProvider {
@@ -29,7 +30,16 @@ impl AnthropicProvider {
             default_model,
             client: Client::new(),
             base_url: DEFAULT_BASE_URL.to_string(),
+            supports_vision: false,
         }
+    }
+
+    /// Mark the configured `default_model` as vision-capable. Caller is
+    /// responsible for matching this to the actual model — passing images
+    /// to a non-vision Claude model returns a 400 from the API.
+    pub fn with_vision(mut self, supported: bool) -> Self {
+        self.supports_vision = supported;
+        self
     }
 
     /// Override the base URL (useful for testing or proxies).
@@ -50,16 +60,22 @@ impl AnthropicProvider {
             .messages
             .iter()
             .filter(|m| m.role != Role::System)
-            .map(|m| AnthropicMessage {
-                role: match m.role {
-                    Role::User | Role::Tool => "user".to_string(),
-                    Role::Assistant => "assistant".to_string(),
-                    Role::System => "user".to_string(), // filtered above
-                },
-                content: match &m.content {
+            .map(|m| {
+                let content = match &m.content {
                     MessageContent::Text(t) => serde_json::Value::String(t.clone()),
                     MessageContent::Structured(v) => v.clone(),
-                },
+                    MessageContent::Multimodal { text, images } => {
+                        anthropic_multimodal_blocks(text, images)
+                    }
+                };
+                AnthropicMessage {
+                    role: match m.role {
+                        Role::User | Role::Tool => "user".to_string(),
+                        Role::Assistant => "assistant".to_string(),
+                        Role::System => "user".to_string(), // filtered above
+                    },
+                    content,
+                }
             })
             .collect();
 
@@ -240,6 +256,39 @@ impl LlmProvider for AnthropicProvider {
         // Simple check — just verify we have an API key configured.
         !self.api_key.is_empty()
     }
+
+    fn supports_vision(&self) -> bool {
+        self.supports_vision
+    }
+}
+
+/// Build the Claude `content` array for a multimodal user turn.
+/// Anthropic accepts an array of content blocks; image blocks carry
+/// either `source.type = "base64"` (with `media_type` + `data`) or
+/// `source.type = "url"` (with `url`).
+fn anthropic_multimodal_blocks(text: &str, images: &[ImageInput]) -> serde_json::Value {
+    let mut blocks: Vec<serde_json::Value> = Vec::with_capacity(images.len() + 1);
+    if !text.is_empty() {
+        blocks.push(serde_json::json!({ "type": "text", "text": text }));
+    }
+    for img in images {
+        let source = match &img.data {
+            ImageData::Base64 { data } => serde_json::json!({
+                "type": "base64",
+                "media_type": img.mime_type,
+                "data": data,
+            }),
+            ImageData::Url { url } => serde_json::json!({
+                "type": "url",
+                "url": url,
+            }),
+        };
+        blocks.push(serde_json::json!({
+            "type": "image",
+            "source": source,
+        }));
+    }
+    serde_json::Value::Array(blocks)
 }
 
 /// Parse SSE text into LlmChunk results.
@@ -364,4 +413,88 @@ struct ContentBlock {
 struct AnthropicUsage {
     input_tokens: u32,
     output_tokens: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multimodal_emits_text_then_image_blocks() {
+        let images = vec![ImageInput {
+            mime_type: "image/png".to_string(),
+            data: ImageData::Base64 {
+                data: "AAAA".to_string(),
+            },
+        }];
+        let v = anthropic_multimodal_blocks("describe this", &images);
+        let arr = v.as_array().expect("array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["type"], "text");
+        assert_eq!(arr[0]["text"], "describe this");
+        assert_eq!(arr[1]["type"], "image");
+        assert_eq!(arr[1]["source"]["type"], "base64");
+        assert_eq!(arr[1]["source"]["media_type"], "image/png");
+        assert_eq!(arr[1]["source"]["data"], "AAAA");
+    }
+
+    #[test]
+    fn multimodal_url_source_passes_through() {
+        let images = vec![ImageInput {
+            mime_type: "image/jpeg".to_string(),
+            data: ImageData::Url {
+                url: "https://example.com/x.jpg".to_string(),
+            },
+        }];
+        let v = anthropic_multimodal_blocks("look", &images);
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr[1]["source"]["type"], "url");
+        assert_eq!(arr[1]["source"]["url"], "https://example.com/x.jpg");
+    }
+
+    #[test]
+    fn multimodal_empty_text_omits_text_block() {
+        let images = vec![ImageInput {
+            mime_type: "image/png".to_string(),
+            data: ImageData::Base64 {
+                data: "AAAA".to_string(),
+            },
+        }];
+        let v = anthropic_multimodal_blocks("", &images);
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["type"], "image");
+    }
+
+    #[test]
+    fn build_request_body_threads_multimodal_into_messages() {
+        let provider =
+            AnthropicProvider::new("test-key".to_string(), "claude-sonnet-4-6".to_string());
+        let req = LlmRequest {
+            profile: ModelProfile::Powerful,
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: MessageContent::Multimodal {
+                    text: "what's this?".to_string(),
+                    images: vec![ImageInput {
+                        mime_type: "image/png".to_string(),
+                        data: ImageData::Base64 {
+                            data: "AAAA".to_string(),
+                        },
+                    }],
+                },
+            }],
+            max_tokens: None,
+            temperature: None,
+            tools: None,
+            system_prompt: None,
+        };
+        let body = provider.build_request_body(&req);
+        assert_eq!(body.messages.len(), 1);
+        assert_eq!(body.messages[0].role, "user");
+        let blocks = body.messages[0].content.as_array().expect("array content");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[1]["type"], "image");
+    }
 }

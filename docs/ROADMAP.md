@@ -22,8 +22,7 @@ This is why some popular integrations are in *Not planned* below. It's not lazin
 
 Things being built right now.
 
-- **Athen acts on your email.** Reading inbound messages already works; soon Athen will draft, reply, and send on your behalf using your existing email account. SMTP-based, works with Gmail, Fastmail, ProtonMail Bridge, your own server — anywhere you can paste a password.
-- **Understanding images and documents.** Drop a screenshot or a PDF into a conversation and Athen will see it directly — invoice extraction, "what's in this picture", PDF summaries. Available on any provider that supports vision (Claude, GPT, Gemini, DeepSeek-VL).
+- **Understanding images and documents.** *Phase 1 shipped:* paste, drop, or attach an image to the composer and a vision-capable provider (Claude 3.5+, GPT-4o, Gemini 1.5+) will see it directly. *Coming next:* PDF ingestion, sense-side image awareness (so an emailed invoice attachment is visible without manual re-attaching), and persisted thumbnails on reopened arcs.
 
 ## Next
 

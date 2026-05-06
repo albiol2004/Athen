@@ -193,6 +193,7 @@ fn spawn_router_approval(
             compactor: bg_ctx.compactor.clone(),
             web_search: bg_ctx.web_search.clone(),
             email_sender: bg_ctx.email_sender.clone(),
+            initial_user_images: Vec::new(),
         };
 
         let outcome = match execute_approved_task(task_id, ctx).await {
@@ -1075,9 +1076,55 @@ pub(crate) fn spawn_stream_forwarder(
 #[tauri::command]
 pub async fn send_message(
     message: String,
+    images: Option<Vec<athen_core::llm::ImageInput>>,
     state: State<'_, AppState>,
     app_handle: AppHandle,
 ) -> std::result::Result<ChatResponse, String> {
+    let images = images.unwrap_or_default();
+    if !images.is_empty() {
+        tracing::info!(
+            count = images.len(),
+            "send_message: turn includes user-attached images"
+        );
+        // Pre-flight: if the active provider can't accept images, fail
+        // with a clear, actionable message instead of letting each
+        // adapter surface its own provider-specific rejection. The
+        // toggle in Settings is advisory — DeepSeek's standard chat,
+        // plain Ollama, and llama.cpp all reject Multimodal at the
+        // adapter level regardless. A vision-capable provider (Claude
+        // 3.5+, GPT-4o, Gemini 1.5+) needs to be both *configured* and
+        // *active* before we even try.
+        let active_id = state.active_provider_id.lock().await.clone();
+        let models = crate::settings::load_models_config();
+        let active_supports_vision = models
+            .providers
+            .get(&active_id)
+            .is_some_and(|c| c.supports_vision);
+        // Adapters that hard-reject multimodal regardless of the user's
+        // toggle: DeepSeek's standard chat API and the bare local OpenAI-
+        // compat wrappers (Ollama, llama.cpp). Google is a stub. The
+        // generic `OpenAiCompatibleProvider` (any other id) *does*
+        // serialise images and trusts the supports_vision flag.
+        let adapter_can_carry_vision = !matches!(
+            active_id.as_str(),
+            "deepseek" | "ollama" | "llamacpp" | "google"
+        );
+        if !(active_supports_vision && adapter_can_carry_vision) {
+            return Ok(ChatResponse {
+                content: format!(
+                    "Your active provider ({active_id}) doesn't accept image input. \
+                     Open Settings → LLM Providers and switch to a vision-capable \
+                     provider (Claude 3.5+, GPT-4o / GPT-4o-mini, Gemini 1.5+) — \
+                     tick the \"Vision-capable model\" box and activate it. Then \
+                     reattach the image and send again."
+                ),
+                risk_level: Some("Caution".into()),
+                domain: None,
+                tool_calls: vec![],
+                pending_approval: None,
+            });
+        }
+    }
     // Stable id for every entry produced by this turn (user msg, tool calls,
     // assistant reply). The frontend groups by this for the dropdown UI.
     let turn_id = Uuid::new_v4().to_string();
@@ -1345,6 +1392,9 @@ pub async fn send_message(
             builder = builder
                 .toolbox_info(athen_agent::toolbox::ToolboxPromptInfo::load().await)
                 .shell_kind(athen_agent::detect_shell_kind().await);
+            if !images.is_empty() {
+                builder = builder.initial_user_images(images.clone());
+            }
             let executor = builder.build().map_err(|e| {
                 let raw = e.to_string();
                 tracing::error!("AgentBuilder failed: {raw}");
@@ -1601,6 +1651,11 @@ pub async fn approve_task(
         compactor: state.compactor.clone(),
         web_search: Arc::clone(&state.web_search),
         email_sender: state.email_sender.clone(),
+        // Approved-via-card path: original images aren't restashed yet
+        // (Phase 2 will mirror `pending_message` for images). For now,
+        // images flow through the direct-execution path in `send_message`,
+        // not through the explicit-approval card.
+        initial_user_images: Vec::new(),
     };
 
     let outcome = match execute_approved_task(task_uuid, ctx).await {
@@ -1711,6 +1766,11 @@ pub(crate) struct ApprovedTaskCtx {
     /// Outbound SMTP transport for the `email_send` tool. `None` when
     /// SMTP isn't configured — the tool then refuses with a clear error.
     pub email_sender: Option<Arc<dyn athen_core::traits::email_sender::EmailSender>>,
+    /// Images attached to this turn's user message. Empty in the
+    /// background/Telegram path; the in-app composer populates this when
+    /// the user pastes or drops an image. Forwarded into the executor so
+    /// vision-capable LLMs see them on the first turn.
+    pub initial_user_images: Vec<athen_core::llm::ImageInput>,
 }
 
 /// Drive a risk-flagged task all the way through approval, dispatch,
@@ -2026,6 +2086,9 @@ pub(crate) async fn execute_approved_task(
     builder = builder
         .toolbox_info(athen_agent::toolbox::ToolboxPromptInfo::load().await)
         .shell_kind(athen_agent::detect_shell_kind().await);
+    if !ctx.initial_user_images.is_empty() {
+        builder = builder.initial_user_images(ctx.initial_user_images.clone());
+    }
     let executor = builder.build().map_err(|e| {
         let raw = e.to_string();
         tracing::error!("AgentBuilder failed (approval): {raw}");

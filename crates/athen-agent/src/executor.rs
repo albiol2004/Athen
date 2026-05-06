@@ -212,6 +212,11 @@ pub struct DefaultExecutor {
     /// real time and steers behavior toward the approval router for
     /// uncertain actions.
     autonomous_mode: bool,
+    /// Images to attach to the very first user turn. When non-empty, the
+    /// initial `task.description` is sent as `MessageContent::Multimodal`
+    /// instead of `Text` so vision-capable LLMs can see the images. Only
+    /// applies to the first turn; tool-result follow-ups stay text-only.
+    initial_user_images: Vec<athen_core::llm::ImageInput>,
 }
 
 impl DefaultExecutor {
@@ -238,7 +243,18 @@ impl DefaultExecutor {
             toolbox_info: None,
             shell_kind: None,
             autonomous_mode: false,
+            initial_user_images: Vec::new(),
         }
+    }
+
+    /// Attach images to the first user turn. Vision-capable LLMs receive a
+    /// `MessageContent::Multimodal` for the initial task description; an
+    /// empty vec is the default and reproduces today's text-only flow.
+    pub fn set_initial_user_images(
+        &mut self,
+        images: Vec<athen_core::llm::ImageInput>,
+    ) {
+        self.initial_user_images = images;
     }
 
     /// Toggle autonomous mode. When `true`, the system prompt is
@@ -1002,10 +1018,20 @@ impl AgentExecutor for DefaultExecutor {
         // current task's user message so the agent has session memory.
         conversation.extend(self.context_messages.iter().cloned());
 
-        // Seed the conversation with the task description as a user message
+        // Seed the conversation with the task description as a user message.
+        // If images were attached to this turn, send Multimodal so vision-
+        // capable LLMs can see them.
+        let initial_content = if self.initial_user_images.is_empty() {
+            MessageContent::Text(task.description.clone())
+        } else {
+            MessageContent::Multimodal {
+                text: task.description.clone(),
+                images: self.initial_user_images.clone(),
+            }
+        };
         conversation.push(ChatMessage {
             role: Role::User,
-            content: MessageContent::Text(task.description.clone()),
+            content: initial_content,
         });
 
         tracing::info!(task_id = %task_id, "Starting task execution");
@@ -1129,6 +1155,12 @@ impl AgentExecutor for DefaultExecutor {
                 .map(|m| match &m.content {
                     MessageContent::Text(s) => s.len(),
                     MessageContent::Structured(v) => v.to_string().len(),
+                    MessageContent::Multimodal { text, images } => {
+                        // Approximate cost: text length + a fixed per-image
+                        // estimate. Image bytes themselves don't count
+                        // toward the prompt char-count meaningfully.
+                        text.len() + images.len() * 1500
+                    }
                 })
                 .sum();
             tracing::info!(

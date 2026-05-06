@@ -17,6 +17,15 @@ pub trait LlmProvider: Send + Sync {
 
     /// Health check / availability.
     async fn is_available(&self) -> bool;
+
+    /// Whether this provider's currently-configured default model accepts
+    /// `MessageContent::Multimodal` requests with image parts. The router
+    /// uses this to pick a vision-capable provider when a turn carries
+    /// images, and the executor logs a friendly error if no candidate
+    /// supports vision.
+    fn supports_vision(&self) -> bool {
+        false
+    }
 }
 
 /// Routes requests to the appropriate provider based on profile,

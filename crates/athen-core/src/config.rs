@@ -156,6 +156,13 @@ pub struct ProviderConfig {
     /// `context_window_tokens * compaction_target_pct / 100`.
     #[serde(default = "default_compaction_target_pct")]
     pub compaction_target_pct: u8,
+    /// Whether the configured `default_model` accepts image input. Drives
+    /// the provider's `supports_vision()` capability and the router's
+    /// vision-aware routing decisions. Defaults to `false`; the user
+    /// flips it from the Settings UI when they wire a vision-capable
+    /// model (Claude 3.5+, GPT-4o, Gemini 1.5+, etc).
+    #[serde(default)]
+    pub supports_vision: bool,
 }
 
 fn default_context_window_tokens() -> u32 {

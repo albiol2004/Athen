@@ -131,6 +131,20 @@ Constructed eagerly with the first four; `mcp` and `file_gate` are attached via 
 4. **Built-in match** — calendar and contacts tools dispatch to `do_calendar_*` / `do_contacts_*` async methods.
 5. **Fallback** — anything else delegates to `inner.call_tool(name, args)` (the original `ShellToolRegistry`).
 
+### Vision input (Phase 1)
+
+The chat composer accepts images via paperclip button, drag-and-drop onto the input area, or Ctrl/Cmd-V paste. Each attached image becomes a chip with a thumbnail and a remove button. On submit, images are base64-encoded and forwarded to the `send_message` Tauri command as `images: Vec<ImageInput>`. The user message reaches the executor as `MessageContent::Multimodal { text, images }` for the first turn.
+
+End-to-end behaviour:
+- Provider with `supports_vision: true` (Claude 3.5+, GPT-4o, Gemini 1.5+): images are serialised into the provider-native content blocks and the model sees them.
+- Provider with `supports_vision: false` (DeepSeek standard, plain Ollama/llama.cpp): the request is rejected up-front by `providers::reject_multimodal()` with a clear "this provider/model does not support image input" error — never silently dropped.
+
+Phase 1 limits (deliberate cuts):
+- Up to 5 images per turn, 10 MB each (composer-side limits).
+- Images are not persisted — reopening the arc shows the text but not the picture. Phase 2 will add proper attachment storage.
+- Approval-card path (`approve_task`) does not yet restash images; the direct in-app execution path is the supported flow.
+- Sense-side images (e.g. an emailed picture) are not yet auto-forwarded into the agent's prompt.
+
 ### Two-Tier Tool Discovery
 
 The executor (`crates/athen-agent/src/executor.rs`) keeps the system prompt small by separating tools into two tiers:

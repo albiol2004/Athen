@@ -50,6 +50,7 @@ pub struct AgentBuilder {
     toolbox_info: Option<toolbox::ToolboxPromptInfo>,
     shell_kind: Option<&'static str>,
     autonomous_mode: bool,
+    initial_user_images: Vec<athen_core::llm::ImageInput>,
 }
 
 impl AgentBuilder {
@@ -74,7 +75,16 @@ impl AgentBuilder {
             toolbox_info: None,
             shell_kind: None,
             autonomous_mode: false,
+            initial_user_images: Vec::new(),
         }
+    }
+
+    /// Attach images to the first user turn. Vision-capable LLMs see
+    /// them as `MessageContent::Multimodal`; non-capable providers
+    /// reject the request with a clear error.
+    pub fn initial_user_images(mut self, images: Vec<athen_core::llm::ImageInput>) -> Self {
+        self.initial_user_images = images;
+        self
     }
 
     /// Run this executor in autonomous mode — i.e. driven by a sense
@@ -235,6 +245,10 @@ impl AgentBuilder {
 
         if self.autonomous_mode {
             executor.set_autonomous_mode(true);
+        }
+
+        if !self.initial_user_images.is_empty() {
+            executor.set_initial_user_images(self.initial_user_images);
         }
 
         Ok(executor)

@@ -47,6 +47,7 @@ pub struct OpenAiCompatibleProvider {
     base_url: String,
     provider_id: String,
     cost_estimator: Box<dyn CostEstimator>,
+    supports_vision: bool,
 }
 
 impl OpenAiCompatibleProvider {
@@ -62,7 +63,16 @@ impl OpenAiCompatibleProvider {
             base_url,
             provider_id: "openai".to_string(),
             cost_estimator: Box::new(OpenAiCostEstimator),
+            supports_vision: false,
         }
+    }
+
+    /// Mark the configured `default_model` as vision-capable. Caller is
+    /// responsible for matching this to the actual model — passing images
+    /// to a non-vision OpenAI-compat model returns a 400 from the API.
+    pub fn with_vision(mut self, supported: bool) -> Self {
+        self.supports_vision = supported;
+        self
     }
 
     /// Convenience constructor for OpenAI proper (with API key).
@@ -182,11 +192,14 @@ impl OpenAiCompatibleProvider {
                         tool_calls: None,
                     });
                 }
-                // All other messages: plain text or structured.
+                // All other messages: plain text, structured, or multimodal.
                 (_, content) => {
                     let content_value = match content {
                         MessageContent::Text(t) => serde_json::Value::String(t.clone()),
                         MessageContent::Structured(v) => v.clone(),
+                        MessageContent::Multimodal { text, images } => {
+                            openai_multimodal_parts(text, images)
+                        }
                     };
 
                     messages.push(OpenAiMessageOut {
@@ -467,6 +480,32 @@ impl LlmProvider for OpenAiCompatibleProvider {
         // Override this for local providers that need a health check.
         self.api_key.is_some()
     }
+
+    fn supports_vision(&self) -> bool {
+        self.supports_vision
+    }
+}
+
+/// Build the OpenAI `content` array for a multimodal user turn.
+/// OpenAI accepts an array of parts: `{ type: "text", text }` and
+/// `{ type: "image_url", image_url: { url } }`. Base64 inputs are
+/// folded into a `data:<mime>;base64,<...>` URL.
+fn openai_multimodal_parts(text: &str, images: &[ImageInput]) -> serde_json::Value {
+    let mut parts: Vec<serde_json::Value> = Vec::with_capacity(images.len() + 1);
+    if !text.is_empty() {
+        parts.push(serde_json::json!({ "type": "text", "text": text }));
+    }
+    for img in images {
+        let url = match &img.data {
+            ImageData::Base64 { data } => format!("data:{};base64,{}", img.mime_type, data),
+            ImageData::Url { url } => url.clone(),
+        };
+        parts.push(serde_json::json!({
+            "type": "image_url",
+            "image_url": { "url": url },
+        }));
+    }
+    serde_json::Value::Array(parts)
 }
 
 /// Per-stream state for the SSE `unfold` loop.
@@ -1643,5 +1682,77 @@ data: [DONE]
         assert_eq!(tc[0].id, "call_abc");
         assert_eq!(tc[0].function.name, "shell_execute");
         assert_eq!(resp.choices[0].finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    #[test]
+    fn multimodal_emits_text_then_image_url_parts() {
+        let v = openai_multimodal_parts(
+            "describe this",
+            &[ImageInput {
+                mime_type: "image/png".to_string(),
+                data: ImageData::Base64 {
+                    data: "AAAA".to_string(),
+                },
+            }],
+        );
+        let arr = v.as_array().expect("array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["type"], "text");
+        assert_eq!(arr[0]["text"], "describe this");
+        assert_eq!(arr[1]["type"], "image_url");
+        assert_eq!(arr[1]["image_url"]["url"], "data:image/png;base64,AAAA");
+    }
+
+    #[test]
+    fn multimodal_url_passes_through_unchanged() {
+        let v = openai_multimodal_parts(
+            "look",
+            &[ImageInput {
+                mime_type: "image/jpeg".to_string(),
+                data: ImageData::Url {
+                    url: "https://example.com/x.jpg".to_string(),
+                },
+            }],
+        );
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr[1]["image_url"]["url"], "https://example.com/x.jpg");
+    }
+
+    #[test]
+    fn build_request_body_threads_multimodal_into_messages() {
+        let provider = OpenAiCompatibleProvider::openai("test-key".to_string());
+        let request = LlmRequest {
+            profile: ModelProfile::Powerful,
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: MessageContent::Multimodal {
+                    text: "what's this?".to_string(),
+                    images: vec![ImageInput {
+                        mime_type: "image/png".to_string(),
+                        data: ImageData::Base64 {
+                            data: "AAAA".to_string(),
+                        },
+                    }],
+                },
+            }],
+            max_tokens: None,
+            temperature: None,
+            tools: None,
+            system_prompt: None,
+        };
+        let body = provider.build_request_body(&request);
+        let content = body.messages[0].content.as_ref().expect("content set");
+        let parts = content.as_array().expect("array");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "image_url");
+    }
+
+    #[test]
+    fn supports_vision_default_false_until_set() {
+        let p = OpenAiCompatibleProvider::openai("k".to_string());
+        assert!(!p.supports_vision());
+        let p = p.with_vision(true);
+        assert!(p.supports_vision());
     }
 }

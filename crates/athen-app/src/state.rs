@@ -1148,6 +1148,7 @@ impl AppState {
                         compactor: compactor.clone(),
                         web_search: Arc::clone(&web_search),
                         email_sender: email_sender.clone(),
+                        initial_user_images: Vec::new(),
                     };
 
                     let task_arc_map_clone = Arc::clone(&task_arc_map);
@@ -1903,7 +1904,15 @@ fn build_router_for_provider_from_config(
     // Resolve API key: env var first, then config.
     let api_key = resolve_api_key_for(provider_id, provider_cfg);
 
-    let router = build_router_for_provider(provider_id, &base_url, &model, api_key.as_deref());
+    let supports_vision = provider_cfg.is_some_and(|c| c.supports_vision);
+
+    let router = build_router_for_provider(
+        provider_id,
+        &base_url,
+        &model,
+        api_key.as_deref(),
+        supports_vision,
+    );
     (router, model)
 }
 
@@ -1967,6 +1976,7 @@ pub(crate) fn build_router_for_provider(
     base_url: &str,
     model: &str,
     api_key: Option<&str>,
+    supports_vision: bool,
 ) -> Arc<DefaultLlmRouter> {
     let provider: Box<dyn LlmProvider> = match provider_id {
         "deepseek" => {
@@ -1982,7 +1992,7 @@ pub(crate) fn build_router_for_provider(
         }
         "anthropic" => {
             let key = api_key.unwrap_or_default().to_string();
-            let mut p = AnthropicProvider::new(key, model.to_string());
+            let mut p = AnthropicProvider::new(key, model.to_string()).with_vision(supports_vision);
             if base_url != "https://api.anthropic.com" && !base_url.is_empty() {
                 p = p.with_base_url(base_url.to_string());
             }
@@ -2002,7 +2012,8 @@ pub(crate) fn build_router_for_provider(
         _ => {
             let mut p = OpenAiCompatibleProvider::new(base_url.to_string())
                 .with_model(model.to_string())
-                .with_provider_id(provider_id.to_string());
+                .with_provider_id(provider_id.to_string())
+                .with_vision(supports_vision);
             if let Some(key) = api_key {
                 p = p.with_api_key(key.to_string());
             }

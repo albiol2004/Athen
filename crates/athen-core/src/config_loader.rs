@@ -220,6 +220,7 @@ base = "fast"
                 context_window_tokens: 200_000,
                 compaction_trigger_pct: 65,
                 compaction_target_pct: 30,
+                supports_vision: false,
             },
         );
         config.models.profiles.insert(

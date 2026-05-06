@@ -52,6 +52,8 @@ Tasks are classified into domains with optimized flows:
 ### Providers
 Anthropic, OpenAI, Google, DeepSeek, Ollama (local), llama.cpp (local). Each configurable with API key or OAuth. Any OpenAI-compatible endpoint supported via `OpenAiCompatibleProvider`.
 
+`ProviderConfig.supports_vision` (per-provider, defaults `false`) flips a model from text-only to multimodal. Tick it in Settings when the configured `default_model` is one of: Claude Sonnet/Opus 3.5+, GPT-4o / GPT-4o-mini, Gemini 1.5+, or any other vision-capable model. With the flag on, Athen forwards images attached in the composer to the LLM via `MessageContent::Multimodal`. Adapters that can't accept images (DeepSeek standard models, plain Ollama/llama.cpp) reject the request up-front with a clear error rather than silently dropping the images.
+
 ### Model Profiles
 - **Powerful**: Claude Opus -> Gemini Ultra -> o3 (fallback: DeepSeek)
 - **Fast**: DeepSeek -> Gemini Pro -> Claude Sonnet

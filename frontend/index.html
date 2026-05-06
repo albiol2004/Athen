@@ -112,7 +112,12 @@
 
             <footer>
                 <form id="input-form">
+                    <div id="composer-attachments" class="composer-attachments hidden" aria-label="Attached images"></div>
+                    <input type="file" id="composer-image-input" accept="image/*" multiple class="hidden" aria-hidden="true">
                     <div class="input-wrapper">
+                        <button type="button" id="composer-attach-btn" title="Attach image" aria-label="Attach image">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+                        </button>
                         <textarea id="message-input" placeholder="Send a message..." rows="1" autofocus></textarea>
                         <button type="submit" id="send-btn" title="Send message" aria-label="Send message">
                             <span class="send-icon" aria-hidden="true">

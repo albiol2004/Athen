@@ -85,10 +85,12 @@ impl LlmProvider for OllamaProvider {
     }
 
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse> {
+        crate::providers::reject_multimodal("ollama", request)?;
         self.inner.complete(request).await
     }
 
     async fn complete_streaming(&self, request: &LlmRequest) -> Result<LlmStream> {
+        crate::providers::reject_multimodal("ollama", request)?;
         self.inner.complete_streaming(request).await
     }
 

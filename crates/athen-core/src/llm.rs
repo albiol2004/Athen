@@ -42,7 +42,34 @@ pub enum Role {
 #[serde(untagged)]
 pub enum MessageContent {
     Text(String),
+    /// Text accompanied by one or more inline images. Each provider adapter
+    /// is responsible for serialising this into its native multimodal wire
+    /// format (Anthropic content blocks, OpenAI image_url parts, Gemini
+    /// inlineData parts, etc). Providers without vision support must reject
+    /// this variant rather than silently dropping the images.
+    Multimodal {
+        text: String,
+        images: Vec<ImageInput>,
+    },
+    /// Pre-shaped, provider-specific JSON. Used for tool result blocks and
+    /// other cases where the wire representation is already finalised.
     Structured(serde_json::Value),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageInput {
+    /// IANA media type, e.g. `image/png`, `image/jpeg`, `image/webp`.
+    pub mime_type: String,
+    pub data: ImageData,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ImageData {
+    /// Raw bytes encoded as base64 (no data-URL prefix).
+    Base64 { data: String },
+    /// Public URL the provider can fetch directly.
+    Url { url: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -509,6 +509,15 @@ function startInitialDataLoads() {
     // Non-critical: defer to idle slices so they can't contend with first paint.
     scheduleIdle(() => updateNotifBadge());
     scheduleIdle(() => recoverPendingGrants());
+    // Initial composer-attach gate sync — loadSettings updates it later
+    // whenever the user opens Settings, but on cold start we need to
+    // run once so the paperclip's tooltip/state matches reality.
+    scheduleIdle(async () => {
+        try {
+            const settings = await invoke('get_settings');
+            updateComposerVisionGate(settings.providers);
+        } catch (_) { /* non-critical */ }
+    });
 }
 
 // ─── DOM References ───
@@ -1805,6 +1814,170 @@ async function handleApproval(taskId, approved) {
     loadArcs();
 }
 
+// ─── Composer image attachments ───
+//
+// Phase 1 vision support. The user can attach images to the next user
+// turn via:
+//   • the paperclip button (file picker, multi-select)
+//   • drag-and-drop onto the composer
+//   • Ctrl/Cmd-V paste while the composer is focused
+//
+// Images are kept entirely in-memory as { mime_type, dataUrl } and only
+// sent to Rust at submit time, base64-only, via the `images` parameter
+// of the `send_message` command. We do not persist them — Phase 2 will
+// add proper attachment storage so reopened arcs can show the picture.
+
+const MAX_COMPOSER_IMAGES = 5;
+const MAX_COMPOSER_IMAGE_BYTES = 10 * 1024 * 1024; // 10 MB per image
+const composerImagesEl = document.getElementById('composer-attachments');
+const composerImageInputEl = document.getElementById('composer-image-input');
+const composerAttachBtn = document.getElementById('composer-attach-btn');
+let composerImages = []; // [{ id, mime_type, base64, dataUrl, name }]
+
+function refreshComposerImagesUI() {
+    if (!composerImagesEl) return;
+    composerImagesEl.innerHTML = '';
+    if (composerImages.length === 0) {
+        composerImagesEl.classList.add('hidden');
+        return;
+    }
+    composerImagesEl.classList.remove('hidden');
+    for (const img of composerImages) {
+        const chip = document.createElement('div');
+        chip.className = 'composer-image-chip';
+        chip.title = img.name || img.mime_type;
+        chip.innerHTML = `
+            <img src="${img.dataUrl}" alt="">
+            <button type="button" class="composer-image-remove" aria-label="Remove image" data-id="${img.id}">×</button>
+        `;
+        composerImagesEl.appendChild(chip);
+    }
+}
+
+function addComposerImageFromFile(file) {
+    if (!file || !file.type || !file.type.startsWith('image/')) return;
+    if (file.size > MAX_COMPOSER_IMAGE_BYTES) {
+        addMessage('assistant', `Image "${file.name}" is too large (max ${(MAX_COMPOSER_IMAGE_BYTES / 1024 / 1024) | 0} MB).`, { isError: true });
+        return;
+    }
+    if (composerImages.length >= MAX_COMPOSER_IMAGES) {
+        addMessage('assistant', `Up to ${MAX_COMPOSER_IMAGES} images per turn.`, { isError: true });
+        return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+        const dataUrl = String(reader.result || '');
+        // Data URL shape: "data:<mime>;base64,<...>". Pull base64 out.
+        const m = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
+        if (!m) return;
+        composerImages.push({
+            id: `img-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            mime_type: m[1],
+            base64: m[2],
+            dataUrl,
+            name: file.name || '',
+        });
+        refreshComposerImagesUI();
+    };
+    reader.readAsDataURL(file);
+}
+
+if (composerAttachBtn && composerImageInputEl) {
+    composerAttachBtn.addEventListener('click', () => {
+        if (composerAttachBtn.dataset.visionOk !== '1') {
+            const hint = composerAttachBtn.title
+                || 'Active provider does not accept images.';
+            addMessage('assistant', hint, { isError: true });
+            return;
+        }
+        composerImageInputEl.click();
+    });
+    composerImageInputEl.addEventListener('change', () => {
+        for (const f of composerImageInputEl.files || []) {
+            addComposerImageFromFile(f);
+        }
+        composerImageInputEl.value = '';
+    });
+}
+
+if (composerImagesEl) {
+    composerImagesEl.addEventListener('click', (e) => {
+        const btn = e.target.closest('.composer-image-remove');
+        if (!btn) return;
+        const id = btn.dataset.id;
+        composerImages = composerImages.filter((i) => i.id !== id);
+        refreshComposerImagesUI();
+    });
+}
+
+if (inputEl) {
+    inputEl.addEventListener('paste', (e) => {
+        const items = e.clipboardData?.items || [];
+        for (const item of items) {
+            if (item.kind === 'file' && item.type.startsWith('image/')) {
+                const file = item.getAsFile();
+                if (file) addComposerImageFromFile(file);
+            }
+        }
+    });
+}
+
+if (formEl) {
+    formEl.addEventListener('dragover', (e) => {
+        if (e.dataTransfer && Array.from(e.dataTransfer.items || []).some((it) => it.kind === 'file')) {
+            e.preventDefault();
+            formEl.classList.add('dragover');
+        }
+    });
+    formEl.addEventListener('dragleave', () => formEl.classList.remove('dragover'));
+    formEl.addEventListener('drop', (e) => {
+        formEl.classList.remove('dragover');
+        const files = e.dataTransfer?.files || [];
+        if (!files.length) return;
+        e.preventDefault();
+        for (const f of files) addComposerImageFromFile(f);
+    });
+}
+
+function consumeComposerImagesForSend() {
+    if (composerImages.length === 0) return null;
+    const payload = composerImages.map((i) => ({
+        mime_type: i.mime_type,
+        data: { kind: 'base64', data: i.base64 },
+    }));
+    composerImages = [];
+    refreshComposerImagesUI();
+    return payload;
+}
+
+// Provider IDs whose adapters never accept multimodal regardless of the
+// `supports_vision` toggle (DeepSeek standard chat, plain Ollama and
+// llama.cpp wrappers, Google stub). Mirrors the backend gate in
+// commands.rs::send_message.
+const NON_VISION_ADAPTER_IDS = new Set(['deepseek', 'ollama', 'llamacpp', 'google']);
+
+function updateComposerVisionGate(providers) {
+    if (!composerAttachBtn) return;
+    let hint = '';
+    let visionOk = false;
+    if (Array.isArray(providers)) {
+        const active = providers.find((p) => p && p.is_active);
+        if (!active) {
+            hint = 'No active LLM provider — open Settings to add one.';
+        } else if (NON_VISION_ADAPTER_IDS.has(active.id)) {
+            hint = `Active provider (${active.name || active.id}) cannot accept images. Switch to Claude 3.5+, GPT-4o, or any other vision-capable provider in Settings.`;
+        } else if (!active.supports_vision) {
+            hint = `Tick "Vision-capable model" on the active provider (${active.name || active.id}) in Settings to enable image input.`;
+        } else {
+            visionOk = true;
+            hint = 'Attach image';
+        }
+    }
+    composerAttachBtn.title = hint;
+    composerAttachBtn.classList.toggle('disabled', !visionOk);
+    composerAttachBtn.dataset.visionOk = visionOk ? '1' : '0';
+}
+
 // ─── Form Submission ───
 
 formEl.addEventListener('submit', async (e) => {
@@ -1824,8 +1997,17 @@ formEl.addEventListener('submit', async (e) => {
     // Store for potential retry on transient errors.
     lastMessage = message;
 
-    // Show user message
-    addMessage('user', message);
+    // Snapshot any attached images and clear the composer chips before
+    // we render the user bubble so the next paste/drop starts clean.
+    const composerImagesPayload = consumeComposerImagesForSend();
+
+    // Show user message. Phase 1 omits inline thumbnails on the user
+    // bubble — the composer chips were already cleared above; the agent
+    // sees the images on the wire, the UI just renders the text.
+    const userText = composerImagesPayload && composerImagesPayload.length > 0
+        ? `${message}\n\n_(${composerImagesPayload.length} image${composerImagesPayload.length === 1 ? '' : 's'} attached)_`
+        : message;
+    addMessage('user', userText);
     inputEl.value = '';
     inputEl.style.height = 'auto';
 
@@ -1845,7 +2027,10 @@ formEl.addEventListener('submit', async (e) => {
     try {
         // Call Tauri backend. While this awaits, `agent-stream` events
         // may arrive and progressively build the streaming bubble.
-        const response = await invoke('send_message', { message });
+        const response = await invoke('send_message', {
+            message,
+            images: composerImagesPayload,
+        });
 
         // If the response contains a pending approval, show the approval dialog.
         if (response.pending_approval) {
@@ -2442,6 +2627,7 @@ async function loadSettings() {
     try {
         const settings = await invoke('get_settings');
         renderProviders(settings.providers);
+        updateComposerVisionGate(settings.providers);
         securityModeEl.value = settings.security_mode;
         securityHintEl.textContent = SECURITY_HINTS[settings.security_mode] || '';
 
@@ -3314,6 +3500,13 @@ function createProviderCard(provider) {
             ${provider.api_key_hint ? `<div class="api-key-hint">Current: ${escapeHtml(provider.api_key_hint)}</div>` : ''}
         </div>
         ` : ''}
+        <div class="provider-field provider-field-checkbox">
+            <label class="checkbox-row">
+                <input type="checkbox" class="provider-supports-vision" ${provider.supports_vision ? 'checked' : ''}>
+                <span>Vision-capable model (accepts image input)</span>
+            </label>
+            <div class="field-hint">Tick this when the model above is one of: Claude Sonnet/Opus 3.5+, GPT-4o / GPT-4o-mini, Gemini 1.5+, or any other multimodal model. Athen will only forward attached images when this is on.</div>
+        </div>
         <div class="provider-card-actions">
             <button class="btn-secondary test-btn">Test Connection</button>
             <button class="btn-primary save-btn">Save</button>
@@ -3363,6 +3556,8 @@ async function handleSaveProvider(card, id) {
             apiKey = val;
         }
     }
+    const visionInput = card.querySelector('.provider-supports-vision');
+    const supportsVision = visionInput ? !!visionInput.checked : null;
 
     const saveBtn = card.querySelector('.save-btn');
     saveBtn.disabled = true;
@@ -3374,6 +3569,7 @@ async function handleSaveProvider(card, id) {
             baseUrl: baseUrl,
             model: model,
             apiKey: apiKey,
+            supportsVision: supportsVision,
         });
         showToast(msg, 'success');
         // Reload to reflect changes.

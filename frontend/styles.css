@@ -1586,6 +1586,85 @@ footer {
     max-width: var(--content-max);
     margin: 0 auto;
 }
+#input-form.dragover .input-wrapper {
+    border-color: rgba(255, 122, 107, 0.6);
+    box-shadow: 0 0 0 3px rgba(255, 122, 107, 0.15);
+}
+
+.composer-attachments {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 8px;
+    padding: 0 4px;
+}
+.composer-attachments.hidden {
+    display: none;
+}
+.composer-image-chip {
+    position: relative;
+    width: 56px;
+    height: 56px;
+    border-radius: 8px;
+    overflow: hidden;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    flex: 0 0 auto;
+}
+.composer-image-chip img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+}
+.composer-image-remove {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    border: none;
+    background: rgba(0,0,0,0.65);
+    color: #fff;
+    font-size: 12px;
+    line-height: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    padding: 0;
+}
+.composer-image-remove:hover {
+    background: rgba(0,0,0,0.85);
+}
+
+#composer-attach-btn {
+    background: transparent;
+    border: none;
+    color: var(--text-soft, #888);
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    flex: 0 0 auto;
+    transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+#composer-attach-btn:hover {
+    background: var(--surface-3, rgba(255,255,255,0.04));
+    color: var(--text);
+}
+#composer-attach-btn.disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+#composer-attach-btn.disabled:hover {
+    background: transparent;
+    color: var(--text-soft, #888);
+}
 
 .input-wrapper {
     display: flex;
@@ -2269,6 +2348,27 @@ option:hover {
     font-size: 12px;
     color: var(--text-2);
     font-weight: 500;
+}
+.provider-field-checkbox {
+    margin-top: 4px;
+}
+.provider-field-checkbox label.checkbox-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 4px;
+    font-weight: 400;
+    font-size: 13px;
+    color: var(--text);
+}
+.provider-field-checkbox input[type="checkbox"] {
+    width: auto;
+    margin: 0;
+}
+.provider-field .field-hint {
+    font-size: 11px;
+    color: var(--text-2);
+    line-height: 1.45;
 }
 
 .provider-card-actions {

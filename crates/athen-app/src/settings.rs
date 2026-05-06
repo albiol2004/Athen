@@ -32,6 +32,8 @@ pub struct ProviderInfo {
     pub has_api_key: bool,
     pub api_key_hint: String,
     pub is_active: bool,
+    /// Whether the configured `default_model` accepts image input.
+    pub supports_vision: bool,
 }
 
 /// Email configuration info for the frontend.
@@ -141,7 +143,7 @@ fn ensure_athen_dir() -> Result<PathBuf, String> {
 
 /// Load the current models config from `~/.athen/models.toml`, or return
 /// an empty `ModelsConfig` if the file does not exist.
-fn load_models_config() -> ModelsConfig {
+pub(crate) fn load_models_config() -> ModelsConfig {
     if let Ok(dir) = ensure_athen_dir() {
         let path = dir.join("models.toml");
         if path.exists() {
@@ -529,6 +531,7 @@ fn provider_config_to_info(id: &str, config: &ProviderConfig, active_id: &str) -
         has_api_key: has_key,
         api_key_hint: hint,
         is_active: id == active_id,
+        supports_vision: config.supports_vision,
     }
 }
 
@@ -689,6 +692,7 @@ pub async fn save_provider(
     base_url: String,
     model: String,
     api_key: Option<String>,
+    supports_vision: Option<bool>,
     state: State<'_, AppState>,
 ) -> std::result::Result<String, String> {
     let mut models = load_models_config();
@@ -728,6 +732,11 @@ pub async fn save_provider(
         })
         .unwrap_or((128_000, 65, 30));
 
+    // If the caller didn't pass a flag, preserve the existing value
+    // (so editing other fields doesn't accidentally clear vision).
+    let supports_vision_resolved =
+        supports_vision.unwrap_or_else(|| existing.is_some_and(|p| p.supports_vision));
+
     let provider = ProviderConfig {
         auth: auth.clone(),
         default_model: model,
@@ -735,6 +744,7 @@ pub async fn save_provider(
         context_window_tokens,
         compaction_trigger_pct,
         compaction_target_pct,
+        supports_vision: supports_vision_resolved,
     };
 
     models.providers.insert(id.clone(), provider);
@@ -752,11 +762,16 @@ pub async fn save_provider(
             }
         };
 
+        let supports_vision = models
+            .providers
+            .get(&id)
+            .is_some_and(|c| c.supports_vision);
         let new_router = build_router_for_provider(
             &id,
             &resolved_base_url,
             &resolved_model,
             router_api_key.as_deref(),
+            supports_vision,
         );
 
         {
@@ -827,8 +842,14 @@ pub async fn delete_provider(
                 std::env::var(&env_var).ok().filter(|k| !k.is_empty())
             });
 
-        let new_router =
-            build_router_for_provider(&fallback_id, &base_url, &model, api_key.as_deref());
+        let supports_vision = fallback_cfg.is_some_and(|c| c.supports_vision);
+        let new_router = build_router_for_provider(
+            &fallback_id,
+            &base_url,
+            &model,
+            api_key.as_deref(),
+            supports_vision,
+        );
 
         {
             let mut router_guard = state.router.write().await;
@@ -962,7 +983,9 @@ pub async fn set_active_provider(
     }
 
     // Build the new router.
-    let new_router = build_router_for_provider(&id, &base_url, &model, api_key.as_deref());
+    let supports_vision = provider_cfg.is_some_and(|c| c.supports_vision);
+    let new_router =
+        build_router_for_provider(&id, &base_url, &model, api_key.as_deref(), supports_vision);
 
     // Swap the router atomically.
     {

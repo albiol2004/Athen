@@ -71,10 +71,12 @@ impl LlmProvider for LlamaCppProvider {
     }
 
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse> {
+        crate::providers::reject_multimodal("llamacpp", request)?;
         self.inner.complete(request).await
     }
 
     async fn complete_streaming(&self, request: &LlmRequest) -> Result<LlmStream> {
+        crate::providers::reject_multimodal("llamacpp", request)?;
         self.inner.complete_streaming(request).await
     }
 
