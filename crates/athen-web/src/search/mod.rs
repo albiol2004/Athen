@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 
 use athen_core::error::Result;
 
+pub mod brave;
 pub mod duckduckgo;
+pub mod multi;
 pub mod tavily;
 
 /// One ranked search hit. Adapters normalize provider-specific shapes into

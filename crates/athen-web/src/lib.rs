@@ -16,7 +16,11 @@ pub use reader::{
     wayback::WaybackReader, PageReader, ReadResult,
 };
 pub use search::{
-    duckduckgo::DuckDuckGoSearch, tavily::TavilySearch, SearchResult, WebSearchProvider,
+    brave::BraveSearch,
+    duckduckgo::DuckDuckGoSearch,
+    multi::{MultiSearchProvider, ProviderSlot},
+    tavily::TavilySearch,
+    SearchResult, WebSearchProvider,
 };
 
 /// Reusable [`reqwest::Client`] with a sane default timeout. Adapters that
