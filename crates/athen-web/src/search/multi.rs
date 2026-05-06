@@ -14,7 +14,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use tracing::{debug, warn};
+use tracing::{info, warn};
 
 use athen_core::error::{AthenError, Result};
 
@@ -104,11 +104,17 @@ impl WebSearchProvider for MultiSearchProvider {
         let mut last_idx: Option<usize> = None;
         for (idx, slot) in self.slots.iter().enumerate() {
             if slot.in_cooldown() {
-                debug!(provider = slot.inner.name(), "skipping (in cooldown)");
+                info!(provider = slot.inner.name(), "skipping (in cooldown)");
                 continue;
             }
+            info!(provider = slot.inner.name(), "trying provider");
             match slot.inner.search(query, max_results).await {
                 Ok(results) => {
+                    info!(
+                        provider = slot.inner.name(),
+                        hits = results.len(),
+                        "provider answered"
+                    );
                     self.record_used_index(idx);
                     return Ok(results);
                 }
@@ -124,7 +130,15 @@ impl WebSearchProvider for MultiSearchProvider {
                         );
                         slot.set_cooldown(dur);
                     } else {
-                        debug!(provider = slot.inner.name(), error = %msg, "provider failed");
+                        // Non-cooldown error — provider stays armed so the
+                        // next call retries it. Bumped to info so users can
+                        // see auth / region / format errors without
+                        // RUST_LOG=debug.
+                        info!(
+                            provider = slot.inner.name(),
+                            error = %msg,
+                            "provider failed (no cooldown), trying next"
+                        );
                     }
                     last_err = Some(e);
                     last_idx = Some(idx);

@@ -19,7 +19,7 @@ Defined in `crates/athen-agent/src/tools.rs`. Sixteen built-in tools:
 | `list_directory` | `Read` | `tokio::fs` direct |
 | `memory_store` | `Read` | in-session `HashMap<String,String>` |
 | `memory_recall` | `Read` | same `HashMap` — key lookup or list-all |
-| `web_search` | `Read` | `WebSearchProvider` (default: DuckDuckGo HTML scrape) |
+| `web_search` | `Read` | `WebSearchProvider` (production default: `MultiSearchProvider` chaining Brave → Tavily → DDG with quota-aware cooldowns) |
 | `web_fetch` | `Read` | `PageReader` (default: HybridReader, see below) |
 | `install_package` | `WritePersist` | pip/npm install into `~/.athen/toolbox/`; gated by `ToolboxApprovalGate` |
 | `uninstall_package` | `WritePersist` | reversible removal from toolbox (no approval needed) |
@@ -84,8 +84,12 @@ Skipping the wizard step is fully supported; Athen falls back to whatever the ne
 Backed by the `athen-web` crate. Two ports, each with bundled no-key defaults plus optional key-gated upgrades.
 
 **`WebSearchProvider`** — `crates/athen-web/src/search/`:
-- `DuckDuckGoSearch` (bundled default) — POSTs to `html.duckduckgo.com/html/`, parses the SERP with `scraper`, unwraps DDG's `/l/?uddg=` redirect links so the agent gets real URLs. Handles HTTP 202 rate-limits with a clear error.
+- `BraveSearch` (key-gated) — `api.search.brave.com/res/v1/web/search` with `X-Subscription-Token` header. Free tier: 2k req/month, no card. First-class SERP results from a fully independent index.
 - `TavilySearch` (key-gated) — `api.tavily.com/search`. Free tier: ~1k req/month, no card. Better answer-ready snippets than raw SERPs.
+- `DuckDuckGoSearch` (bundled, no key) — POSTs to `html.duckduckgo.com/html/`, parses the SERP with `scraper`, unwraps DDG's `/l/?uddg=` redirect links so the agent gets real URLs. Handles HTTP 202 rate-limits with a clear error. Always available as the chain's floor.
+- `MultiSearchProvider` (production wrapper) — quota-aware fan-out. `athen-app::state::build_web_search_provider` walks the user's configured keys and stacks slots in order: Brave (`keyed`) → Tavily (`keyed`) → DDG (`floor`). On a rate-limit (HTTP 429 / "too many requests") the slot cools for 15min; on a quota / subscription error (HTTP 402, "quota exceeded", "subscription") it cools for 24h; other errors (network / JSON / 5xx) leave the slot armed. The `floor` slot never cools, so something always answers. Cooldowns are in-memory: a restart retries every provider once and rediscovers state from responses. The wrapper exposes `last_used()` to surface which underlying provider answered the most recent call — the `web_search` tool returns this as the `answered_by` field so users can audit per-call routing without log diving. Per-attempt decisions log at `info!` (`trying provider=...`, `provider answered hits=N`, `provider failed (no cooldown), trying next`, `skipping (in cooldown)`).
+
+Keys are managed entirely through the UI (onboarding wizard's `search` step + Settings → Web Search). `save_web_search_settings(brave_api_key, tavily_api_key)` follows the same `None`/`Some("")`/`Some(value)` semantics as the LLM-key commands. Newly-saved keys take effect after a restart, since `MultiSearchProvider` is built once during `AppState::new()`.
 
 **`PageReader`** — `crates/athen-web/src/reader/`:
 - `LocalReader` (no key) — plain `reqwest` GET with `Accept: text/markdown` header (Cloudflare-opted-in sites return clean markdown for free), then `html2md::parse_html` on HTML responses with `<script>`/`<style>` stripped first. UTF-8-safe truncation at 40k chars.

@@ -23,7 +23,6 @@ This is why some popular integrations are in *Not planned* below. It's not lazin
 Things being built right now.
 
 - **Athen acts on your email.** Reading inbound messages already works; soon Athen will draft, reply, and send on your behalf using your existing email account. SMTP-based, works with Gmail, Fastmail, ProtonMail Bridge, your own server — anywhere you can paste a password.
-- **Smarter web search.** The current search tool falls over too often when one provider rate-limits. Rebuilding the failover chain and adding Brave Search as the default tier so research tasks just work.
 - **Understanding images and documents.** Drop a screenshot or a PDF into a conversation and Athen will see it directly — invoice extraction, "what's in this picture", PDF summaries. Available on any provider that supports vision (Claude, GPT, Gemini, DeepSeek-VL).
 
 ## Next

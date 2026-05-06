@@ -12,7 +12,7 @@ TOML-based configuration with split files and sensible defaults.
 Both `athen-cli` and `athen-app` use the same discovery logic. The Tauri app also creates `~/.athen/` if it does not exist and opens SQLite at `~/.athen/athen.db`.
 
 ### Config files
-- `config/config.toml` -- operation mode, security settings, persistence paths, email settings, telegram settings, notification settings (`[notifications]`: preferred_channels, escalation_timeout_secs, quiet_hours), embedding settings (`[embeddings]`: mode, provider, model, base_url, api_key)
+- `config/config.toml` -- operation mode, security settings, persistence paths, email settings, telegram settings, notification settings (`[notifications]`: preferred_channels, escalation_timeout_secs, quiet_hours), embedding settings (`[embeddings]`: mode, provider, model, base_url, api_key), web search settings (`[web_search]`: brave_api_key, tavily_api_key)
 - `config/models.toml` -- LLM providers (API keys, models), profiles (powerful/fast/code/cheap), domain-to-profile assignments
 - `config/domains.toml` -- per-domain settings (model profile, max steps, timeout)
 
@@ -125,6 +125,37 @@ Embeddings are configured separately from LLM providers and controlled entirely 
 - **Keyword** (fallback): TF-IDF-based hashing; no external calls needed
 
 See: `athen-core/config.rs:EmbeddingConfig` (lines 315–353), `athen-app/src/settings.rs:save_embedding_settings` (1154–1191) and `test_embedding_provider` (1195–1252).
+
+---
+
+## Web Search Configuration
+
+Configured entirely through the UI (onboarding wizard's `search` step + Settings → Web Search). No config files. Both providers are optional — Athen always falls back to bundled DuckDuckGo if neither key is set.
+
+### Provider chain (production)
+
+`athen-app::state::build_web_search_provider` constructs an `Arc<dyn WebSearchProvider>` from `WebSearchConfig` at startup:
+
+1. **Brave Search** (if `brave_api_key` set) — `keyed` slot, participates in cooldowns. Free tier: 2k req/month.
+2. **Tavily** (if `tavily_api_key` set) — `keyed` slot. Free tier: ~1k req/month.
+3. **DuckDuckGo** — always present as the chain's `floor` slot, never cools down.
+
+Slots are walked in order. On rate-limit (HTTP 429) the slot cools for 15min; on quota / subscription error (HTTP 402, "exceeded", "subscription") for 24h. Cooldowns are in-memory only — a restart retries every provider once and re-discovers each slot's state from the response. See `crates/athen-web/src/search/multi.rs` for the wrapper and classifier.
+
+### Tauri Commands for Web Search Settings
+
+- `save_web_search_settings(brave_api_key?, tavily_api_key?)` — Save provider keys. `None` preserves the existing key, `Some("")` clears it, `Some(value)` updates.
+- `test_web_search_provider(provider, api_key)` — Smoke-test connectivity by issuing a tiny search against `BraveSearch::new` or `TavilySearch::new`. Used by both onboarding (test-before-save) and the Settings page.
+
+### Restart semantics
+
+`MultiSearchProvider` is constructed once during `AppState::new()`. Newly-saved keys persist to `~/.athen/config.toml` immediately, but only take effect after the next launch — same convention as email/Telegram/embedding settings. The Settings page surfaces this with a "Restart to apply" hint.
+
+### Tool surface
+
+The agent's `web_search` tool returns `{ provider, answered_by, query, results: [...] }`. `provider` is the wrapper (`"multi"` or `"duckduckgo"`); `answered_by` is the underlying provider that actually handled the call (e.g. `"brave"`, `"tavily"`, `"duckduckgo"`) so the agent — and the user — can see per-call routing without enabling debug logs.
+
+See: `athen-core/config.rs:WebSearchConfig`, `athen-app/src/state.rs:build_web_search_provider`, `athen-app/src/settings.rs:save_web_search_settings` and `test_web_search_provider`.
 
 ---
 
