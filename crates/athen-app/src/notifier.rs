@@ -537,21 +537,16 @@ impl NotificationOrchestrator {
         }
     }
 
-    /// Select the first channel index, preferring InApp if user is present.
+    /// Select the first channel index, honoring the user's preferred-channel
+    /// order (the channels vec is pre-sorted in `state::init_notifier`).
+    /// When the user is away, InApp is skipped so external channels win.
     fn select_first_channel(&self) -> usize {
-        if self.is_user_present() {
-            for (i, ch) in self.channels.iter().enumerate() {
-                if ch.channel_kind() == NotificationChannelKind::InApp {
-                    return i;
-                }
+        let user_present = self.is_user_present();
+        for (i, ch) in self.channels.iter().enumerate() {
+            if !user_present && ch.channel_kind() == NotificationChannelKind::InApp {
+                continue;
             }
-        } else {
-            // User not present -- skip InApp, find first external channel.
-            for (i, ch) in self.channels.iter().enumerate() {
-                if ch.channel_kind() != NotificationChannelKind::InApp {
-                    return i;
-                }
-            }
+            return i;
         }
         0
     }
@@ -862,6 +857,41 @@ mod tests {
 
         assert_eq!(inapp_counter.load(Ordering::Relaxed), 1);
         assert_eq!(telegram_counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn test_user_present_honors_telegram_preferred_first() {
+        // Regression: when the user puts Telegram ahead of InApp in
+        // `preferred_channels`, the orchestrator must honor that order
+        // even while the user is present. Previously `select_first_channel`
+        // hardcoded "InApp first if present", silently overriding the
+        // user's preference.
+        let config = NotificationConfig {
+            preferred_channels: vec![
+                NotificationChannelKind::Telegram,
+                NotificationChannelKind::InApp,
+            ],
+            ..make_config()
+        };
+
+        // Build channels in the same order the user's preference yields
+        // after `state::init_notifier` sorts them (Telegram first).
+        let telegram = MockChannel::new(NotificationChannelKind::Telegram);
+        let inapp = MockChannel::new(NotificationChannelKind::InApp);
+        let telegram_counter = telegram.counter();
+        let inapp_counter = inapp.counter();
+
+        let orch = Arc::new(NotificationOrchestrator::new(
+            config,
+            vec![Box::new(telegram), Box::new(inapp)],
+        ));
+        orch.set_user_present(true);
+
+        let notif = make_notification(NotificationUrgency::Medium, false);
+        orch.notify(notif).await;
+
+        assert_eq!(telegram_counter.load(Ordering::Relaxed), 1);
+        assert_eq!(inapp_counter.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
