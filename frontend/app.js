@@ -2457,6 +2457,16 @@ async function loadSettings() {
             if (settings.email.has_password) {
                 pwField.placeholder = '••••••••  (saved)';
             }
+            // SMTP fields
+            document.getElementById('email-smtp-server').value = settings.email.smtp_server || '';
+            document.getElementById('email-smtp-port').value = settings.email.smtp_port || 587;
+            document.getElementById('email-smtp-username').value = settings.email.smtp_username || '';
+            document.getElementById('email-smtp-use-tls').checked = !!settings.email.smtp_use_tls;
+            document.getElementById('email-from-address').value = settings.email.from_address || '';
+            const smtpPwField = document.getElementById('email-smtp-password');
+            if (settings.email.has_smtp_password) {
+                smtpPwField.placeholder = '••••••••  (saved)';
+            }
             toggleEmailFields(settings.email.enabled);
         }
 
@@ -3824,6 +3834,63 @@ document.getElementById('test-email-btn')?.addEventListener('click', async funct
 
 function showEmailTestResult(success, message) {
     const el = document.getElementById('email-test-result');
+    if (!el) return;
+    el.className = 'test-result ' + (success ? 'test-success' : 'test-error');
+    el.textContent = message;
+    el.classList.remove('hidden');
+    setTimeout(() => el.classList.add('hidden'), 5000);
+}
+
+// ─── SMTP Settings (outbound) ───
+
+document.getElementById('email-smtp-password-toggle')?.addEventListener('click', function() {
+    const input = document.getElementById('email-smtp-password');
+    if (input) {
+        input.type = input.type === 'password' ? 'text' : 'password';
+    }
+});
+
+document.getElementById('save-smtp-btn')?.addEventListener('click', async function() {
+    const password = document.getElementById('email-smtp-password').value;
+    try {
+        const result = await window.__TAURI__.core.invoke('save_smtp_settings', {
+            smtpServer: document.getElementById('email-smtp-server').value,
+            smtpPort: parseInt(document.getElementById('email-smtp-port').value) || 587,
+            smtpUsername: document.getElementById('email-smtp-username').value,
+            smtpPassword: password || null,
+            smtpUseTls: document.getElementById('email-smtp-use-tls').checked,
+            fromAddress: document.getElementById('email-from-address').value,
+        });
+        showSmtpTestResult(true, result);
+    } catch (e) {
+        showSmtpTestResult(false, e.toString());
+    }
+});
+
+document.getElementById('test-smtp-btn')?.addEventListener('click', async function() {
+    const btn = this;
+    btn.disabled = true;
+    btn.textContent = 'Testing...';
+    try {
+        const result = await window.__TAURI__.core.invoke('test_smtp_connection', {
+            smtpServer: document.getElementById('email-smtp-server').value,
+            smtpPort: parseInt(document.getElementById('email-smtp-port').value) || 587,
+            smtpUsername: document.getElementById('email-smtp-username').value,
+            smtpPassword: document.getElementById('email-smtp-password').value,
+            smtpUseTls: document.getElementById('email-smtp-use-tls').checked,
+            fromAddress: document.getElementById('email-from-address').value,
+        });
+        showSmtpTestResult(result.success, result.message);
+    } catch (e) {
+        showSmtpTestResult(false, e.toString());
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Test SMTP';
+    }
+});
+
+function showSmtpTestResult(success, message) {
+    const el = document.getElementById('smtp-test-result');
     if (!el) return;
     el.className = 'test-result ' + (success ? 'test-success' : 'test-error');
     el.textContent = message;

@@ -246,6 +246,14 @@ pub struct EmailConfig {
     pub poll_interval_secs: u64,
     /// Only process emails newer than this many hours
     pub lookback_hours: u32,
+    pub smtp_server: String,
+    pub smtp_port: u16,
+    pub smtp_username: String,
+    pub smtp_password: String,
+    /// `true` = implicit TLS (typically port 465); `false` = STARTTLS upgrade (587).
+    pub smtp_use_tls: bool,
+    /// `"Alex <alex@example.com>"` or just `"alex@example.com"`.
+    pub from_address: String,
 }
 
 impl Default for EmailConfig {
@@ -260,6 +268,12 @@ impl Default for EmailConfig {
             folders: vec!["INBOX".to_string()],
             poll_interval_secs: 60,
             lookback_hours: 24,
+            smtp_server: String::new(),
+            smtp_port: 587,
+            smtp_username: String::new(),
+            smtp_password: String::new(),
+            smtp_use_tls: false,
+            from_address: String::new(),
         }
     }
 }

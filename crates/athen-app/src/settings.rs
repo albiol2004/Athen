@@ -46,6 +46,12 @@ pub struct EmailSettingsInfo {
     pub folders: String,
     pub poll_interval_secs: u64,
     pub lookback_hours: u32,
+    pub smtp_server: String,
+    pub smtp_port: u16,
+    pub smtp_username: String,
+    pub has_smtp_password: bool,
+    pub smtp_use_tls: bool,
+    pub from_address: String,
 }
 
 /// Telegram bot configuration info for the frontend.
@@ -568,6 +574,12 @@ pub async fn get_settings(
         folders: main_config.email.folders.join(", "),
         poll_interval_secs: main_config.email.poll_interval_secs,
         lookback_hours: main_config.email.lookback_hours,
+        smtp_server: main_config.email.smtp_server.clone(),
+        smtp_port: main_config.email.smtp_port,
+        smtp_username: main_config.email.smtp_username.clone(),
+        has_smtp_password: !main_config.email.smtp_password.is_empty(),
+        smtp_use_tls: main_config.email.smtp_use_tls,
+        from_address: main_config.email.from_address.clone(),
     };
 
     let telegram = TelegramSettingsInfo {
@@ -1120,6 +1132,88 @@ fn test_imap_connection(
             "Connected successfully. INBOX has {} messages.",
             count
         ))
+    }
+}
+
+/// Save SMTP outbound settings.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn save_smtp_settings(
+    smtp_server: String,
+    smtp_port: u16,
+    smtp_username: String,
+    smtp_password: Option<String>,
+    smtp_use_tls: bool,
+    from_address: String,
+) -> std::result::Result<String, String> {
+    let mut config = load_main_config();
+    config.email.smtp_server = smtp_server;
+    config.email.smtp_port = smtp_port;
+    config.email.smtp_username = smtp_username;
+    if let Some(pw) = smtp_password {
+        if !pw.is_empty() {
+            config.email.smtp_password = pw;
+        }
+    }
+    config.email.smtp_use_tls = smtp_use_tls;
+    config.email.from_address = from_address;
+    save_main_config(&config)?;
+    Ok("SMTP settings saved. Restart to apply.".to_string())
+}
+
+/// Test SMTP connection with the provided settings.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn test_smtp_connection(
+    smtp_server: String,
+    smtp_port: u16,
+    smtp_username: String,
+    smtp_password: String,
+    smtp_use_tls: bool,
+    from_address: String,
+) -> std::result::Result<TestResult, String> {
+    use athen_core::traits::email_sender::EmailSender;
+    use athen_sentidos::email_send::{LettreSmtpSender, SmtpSettings};
+
+    if smtp_server.trim().is_empty() {
+        return Ok(TestResult {
+            success: false,
+            message: "SMTP server required".into(),
+        });
+    }
+    if from_address.trim().is_empty() {
+        return Ok(TestResult {
+            success: false,
+            message: "From address required".into(),
+        });
+    }
+
+    let settings = SmtpSettings {
+        server: smtp_server,
+        port: smtp_port,
+        username: smtp_username,
+        password: smtp_password,
+        use_implicit_tls: smtp_use_tls,
+        from_address,
+    };
+    let sender = match LettreSmtpSender::new(settings) {
+        Ok(s) => s,
+        Err(e) => {
+            return Ok(TestResult {
+                success: false,
+                message: format!("Setup failed: {e}"),
+            })
+        }
+    };
+    match sender.test_connection().await {
+        Ok(()) => Ok(TestResult {
+            success: true,
+            message: "SMTP authenticated successfully.".into(),
+        }),
+        Err(e) => Ok(TestResult {
+            success: false,
+            message: format!("Connection failed: {e}"),
+        }),
     }
 }
 

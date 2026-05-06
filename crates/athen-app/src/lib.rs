@@ -9,6 +9,7 @@ mod commands;
 pub(crate) mod compaction;
 mod contacts;
 pub(crate) mod delegation;
+pub(crate) mod email_gate;
 pub(crate) mod file_gate;
 pub(crate) mod notifier;
 pub(crate) mod process;
@@ -73,6 +74,8 @@ pub fn run() {
             settings::list_provider_catalog,
             settings::save_email_settings,
             settings::test_email_connection,
+            settings::save_smtp_settings,
+            settings::test_smtp_connection,
             settings::save_telegram_settings,
             settings::test_telegram_connection,
             settings::save_web_search_settings,

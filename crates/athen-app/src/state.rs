@@ -258,6 +258,10 @@ pub struct AppState {
     /// stay consistent. The chain prefers Brave → Tavily → DDG; cooldowns
     /// for keyed providers are tracked inside the `MultiSearchProvider`.
     pub web_search: Arc<dyn WebSearchProvider>,
+    /// SMTP outbound. Built from `config.email` when SMTP fields are
+    /// populated. `None` means the `email_send` tool will refuse with a
+    /// "not configured" error until the user wires SMTP via Settings.
+    pub email_sender: Option<Arc<dyn athen_core::traits::email_sender::EmailSender>>,
 }
 
 impl AppState {
@@ -337,6 +341,8 @@ impl AppState {
             });
 
         let web_search = build_web_search_provider(&config.web_search);
+        let email_sender: Option<Arc<dyn athen_core::traits::email_sender::EmailSender>> =
+            build_email_sender(&config.email);
 
         let state = Self {
             coordinator: Arc::new(coordinator),
@@ -377,6 +383,7 @@ impl AppState {
             dispatch_loop_shutdown: None,
             compactor,
             web_search,
+            email_sender,
         };
 
         if let Err(e) = state.refresh_tools_doc().await {
@@ -400,11 +407,16 @@ impl AppState {
         let mut shell_registry = athen_agent::ShellToolRegistry::new()
             .await
             .with_spawned_processes(self.spawned_processes.clone())
-            .with_web_search(self.web_search.clone());
+            .with_web_search(self.web_search.clone())
+            .with_email_sender_opt(self.email_sender.clone());
         if let Some(router) = self.approval_router.clone() {
             shell_registry = shell_registry.with_toolbox_approval(Arc::new(
-                crate::file_gate::RouterToolboxApprovalGate::new(router, None),
+                crate::file_gate::RouterToolboxApprovalGate::new(router.clone(), None),
             ));
+            let gate: Arc<dyn athen_agent::EmailSendApprovalGate> = Arc::new(
+                crate::email_gate::RouterEmailApprovalGate::new(router, None),
+            );
+            shell_registry = shell_registry.with_email_approval(gate);
         }
         let registry = crate::app_tools::AppToolRegistry::new(
             shell_registry,
@@ -441,7 +453,8 @@ impl AppState {
         let mut shell = athen_agent::ShellToolRegistry::new()
             .await
             .with_spawned_processes(self.spawned_processes.clone())
-            .with_web_search(self.web_search.clone());
+            .with_web_search(self.web_search.clone())
+            .with_email_sender_opt(self.email_sender.clone());
         if let Some(store) = self.grant_store.clone() {
             let provider = Arc::new(crate::file_gate::ArcWritableProvider {
                 arc_id: crate::file_gate::arc_uuid(arc_id),
@@ -451,8 +464,15 @@ impl AppState {
         }
         if let Some(router) = self.approval_router.clone() {
             shell = shell.with_toolbox_approval(Arc::new(
-                crate::file_gate::RouterToolboxApprovalGate::new(router, Some(arc_id.to_string())),
+                crate::file_gate::RouterToolboxApprovalGate::new(
+                    router.clone(),
+                    Some(arc_id.to_string()),
+                ),
             ));
+            let gate: Arc<dyn athen_agent::EmailSendApprovalGate> = Arc::new(
+                crate::email_gate::RouterEmailApprovalGate::new(router, Some(arc_id.to_string())),
+            );
+            shell = shell.with_email_approval(gate);
         }
         let mut registry = crate::app_tools::AppToolRegistry::new(
             shell,
@@ -826,6 +846,7 @@ impl AppState {
         let pending_email_marks_ref = Arc::clone(&self.pending_email_marks);
         let dispatch_signal_ref = Arc::clone(&self.dispatch_signal);
         let web_search_ref = Arc::clone(&self.web_search);
+        let email_sender_ref = self.email_sender.clone();
 
         tauri::async_runtime::spawn(async move {
             if let Err(e) = monitor.init(&telegram_config).await {
@@ -898,6 +919,7 @@ impl AppState {
                                         Arc::clone(&profile_embedding_cache_ref);
                                     let approval_router_c = approval_router_ref.clone();
                                     let web_search_c = Arc::clone(&web_search_ref);
+                                    let email_sender_c = email_sender_ref.clone();
                                     tauri::async_runtime::spawn(async move {
                                         execute_owner_telegram_message(
                                             &text_owned,
@@ -921,6 +943,7 @@ impl AppState {
                                             &profile_embedding_cache_c,
                                             approval_router_c.as_ref(),
                                             &web_search_c,
+                                            &email_sender_c,
                                         )
                                         .await;
                                     });
@@ -1042,6 +1065,7 @@ impl AppState {
         let notifier = self.notifier.clone();
         let compactor = self.compactor.clone();
         let web_search = Arc::clone(&self.web_search);
+        let email_sender = self.email_sender.clone();
         let inflight = Arc::clone(&self.inflight_approvals);
 
         tauri::async_runtime::spawn(async move {
@@ -1123,6 +1147,7 @@ impl AppState {
                         notifier: notifier.clone(),
                         compactor: compactor.clone(),
                         web_search: Arc::clone(&web_search),
+                        email_sender: email_sender.clone(),
                     };
 
                     let task_arc_map_clone = Arc::clone(&task_arc_map);
@@ -1247,6 +1272,7 @@ async fn execute_owner_telegram_message(
     profile_embedding_cache: &ProfileEmbeddingCache,
     approval_router: Option<&Arc<crate::approval::ApprovalRouter>>,
     web_search: &Arc<dyn WebSearchProvider>,
+    email_sender: &Option<Arc<dyn athen_core::traits::email_sender::EmailSender>>,
 ) {
     use std::time::Duration;
 
@@ -1380,7 +1406,8 @@ async fn execute_owner_telegram_message(
     let mut shell_registry = ShellToolRegistry::new()
         .await
         .with_spawned_processes(spawned_processes.clone())
-        .with_web_search(web_search.clone());
+        .with_web_search(web_search.clone())
+        .with_email_sender_opt(email_sender.clone());
     if let (Some(store), Some(arc_id_str)) = (grant_store, target_arc_id.as_ref()) {
         let provider = Arc::new(crate::file_gate::ArcWritableProvider {
             arc_id: crate::file_gate::arc_uuid(arc_id_str),
@@ -1395,6 +1422,12 @@ async fn execute_owner_telegram_message(
                 target_arc_id.clone(),
             ),
         ));
+        let gate: Arc<dyn athen_agent::EmailSendApprovalGate> =
+            Arc::new(crate::email_gate::RouterEmailApprovalGate::new(
+                Arc::clone(router),
+                target_arc_id.clone(),
+            ));
+        shell_registry = shell_registry.with_email_approval(gate);
     }
     let mut registry = AppToolRegistry::new(
         shell_registry,
@@ -1760,6 +1793,34 @@ fn build_web_search_provider(
         !tavily_key.is_empty()
     );
     Arc::new(MultiSearchProvider::new(slots))
+}
+
+/// Build the SMTP outbound sender from `config.email`. Returns `None`
+/// when SMTP isn't configured — the `email_send` tool then refuses with
+/// a clear error rather than silently dropping mail.
+fn build_email_sender(
+    cfg: &athen_core::config::EmailConfig,
+) -> Option<Arc<dyn athen_core::traits::email_sender::EmailSender>> {
+    if cfg.smtp_server.trim().is_empty() || cfg.from_address.trim().is_empty() {
+        tracing::info!("SMTP sender not configured; email_send tool will refuse");
+        return None;
+    }
+    let settings = athen_sentidos::email_send::SmtpSettings::from_email_config(cfg);
+    match athen_sentidos::email_send::LettreSmtpSender::new(settings) {
+        Ok(sender) => {
+            tracing::info!(
+                smtp_server = %cfg.smtp_server,
+                smtp_port = cfg.smtp_port,
+                smtp_use_tls = cfg.smtp_use_tls,
+                "SMTP sender configured"
+            );
+            Some(Arc::new(sender))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to build SMTP sender; email_send disabled");
+            None
+        }
+    }
 }
 
 /// Load configuration from TOML files, falling back to defaults.

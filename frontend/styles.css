@@ -1949,6 +1949,16 @@ footer {
     line-height: 1.55;
 }
 
+.settings-subhead {
+    margin: 24px 0 6px;
+    padding-top: 20px;
+    border-top: 1px solid var(--border);
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text);
+    letter-spacing: -0.01em;
+}
+
 .setting-row {
     display: flex;
     flex-direction: column;

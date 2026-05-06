@@ -15,6 +15,7 @@ use athen_core::paths;
 use athen_core::risk::{BaseImpact, DataSensitivity, RiskContext, RiskLevel};
 use athen_core::sandbox::{SandboxLevel, SandboxProfile};
 use athen_core::tool::{ToolBackend, ToolDefinition, ToolResult};
+use athen_core::traits::email_sender::{EmailSender, OutboundEmail};
 use athen_core::traits::shell::{ShellExecutor, ShellOptions};
 use athen_core::traits::tool::ToolRegistry;
 use athen_risk::rules::RuleEngine;
@@ -70,6 +71,36 @@ pub trait ToolboxApprovalGate: Send + Sync {
     async fn confirm_install(&self, runtime: &str, package: &str, reason: &str) -> bool;
 }
 
+/// Summary handed to the email approval gate. Carries everything the
+/// user needs to decide without opening another screen — recipients,
+/// subject, a short preview of the body, and (for replies) the
+/// referenced message-id.
+#[derive(Debug, Clone)]
+pub struct EmailSendSummary {
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
+    pub subject: String,
+    /// First ~200 chars of the plain body for the approval prompt.
+    pub body_preview: String,
+    /// Set when the agent is replying to an existing thread.
+    pub in_reply_to: Option<String>,
+}
+
+/// Permission gate consulted before `email_send` hands a message to
+/// the SMTP transport. Mirrors [`ToolboxApprovalGate`] in spirit:
+/// implementations surface a confirmation prompt (in-app card +
+/// Telegram inline keyboard) and return `true` only on Approve.
+/// Every other outcome (deny, timeout, transport error) returns
+/// `false` so sends fail closed.
+#[async_trait]
+pub trait EmailSendApprovalGate: Send + Sync {
+    /// Returns `true` only when the user approves. Any other outcome
+    /// (deny, timeout, transport error) returns `false` so sends fail
+    /// closed.
+    async fn confirm_send(&self, summary: &EmailSendSummary) -> bool;
+}
+
 /// Metadata for a process started via `shell_spawn`. Kept in
 /// [`ShellToolRegistry::spawned`] so subsequent `shell_logs`/`shell_kill`
 /// calls can find the log file and validate the PID is one we own.
@@ -116,6 +147,14 @@ pub struct ShellToolRegistry {
     /// denied with a clear message — failing closed avoids silent
     /// installs in CLI usage where there's no user to ask.
     toolbox_approval: Option<Arc<dyn ToolboxApprovalGate>>,
+    /// Outbound SMTP transport for the `email_send` tool. `None` means
+    /// SMTP isn't configured; `email_send` refuses with a clear "not
+    /// configured" error rather than silently dropping mail.
+    email_sender: Option<Arc<dyn EmailSender>>,
+    /// Approval gate consulted before every `email_send`. `None` means
+    /// no gate is wired — the tool refuses to send so emails can never
+    /// leave without user consent.
+    email_approval: Option<Arc<dyn EmailSendApprovalGate>>,
 }
 
 /// Defense-in-depth: tolerate args delivered as a JSON-encoded string
@@ -400,6 +439,8 @@ impl ShellToolRegistry {
             // user configuration.
             page_reader: Arc::new(HybridReader::new()),
             toolbox_approval: None,
+            email_sender: None,
+            email_approval: None,
         }
     }
 
@@ -410,6 +451,38 @@ impl ShellToolRegistry {
     pub fn with_toolbox_approval(mut self, gate: Arc<dyn ToolboxApprovalGate>) -> Self {
         self.toolbox_approval = Some(gate);
         self
+    }
+
+    /// Inject an SMTP sender for the `email_send` tool. Without this,
+    /// the tool refuses with a "not configured" error so unconfigured
+    /// builds (CLI, tests) can't accidentally drop mail.
+    pub fn with_email_sender(mut self, sender: Arc<dyn EmailSender>) -> Self {
+        self.email_sender = Some(sender);
+        self
+    }
+
+    /// `Option`-flavoured variant for composition roots that build the
+    /// sender conditionally. A `None` keeps the registry unchanged.
+    pub fn with_email_sender_opt(self, sender: Option<Arc<dyn EmailSender>>) -> Self {
+        match sender {
+            Some(s) => self.with_email_sender(s),
+            None => self,
+        }
+    }
+
+    /// Inject the email approval gate so `email_send` can ask the user
+    /// before each send. Without a gate the tool fails closed.
+    pub fn with_email_approval(mut self, gate: Arc<dyn EmailSendApprovalGate>) -> Self {
+        self.email_approval = Some(gate);
+        self
+    }
+
+    /// `Option`-flavoured variant — see [`Self::with_email_sender_opt`].
+    pub fn with_email_approval_opt(self, gate: Option<Arc<dyn EmailSendApprovalGate>>) -> Self {
+        match gate {
+            Some(g) => self.with_email_approval(g),
+            None => self,
+        }
     }
 
     /// Replace the default DuckDuckGo search backend (e.g. with Tavily).
@@ -607,6 +680,48 @@ impl ShellToolRegistry {
                 }
             },
             "required": ["runtime", "package", "reason"]
+        })
+    }
+
+    /// JSON Schema for the `email_send` tool. Required: `to`, `subject`,
+    /// `body_text`. Optional: `cc`, `bcc`, `body_html`, `in_reply_to`.
+    fn email_send_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "to": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Recipient email addresses. Must be non-empty."
+                },
+                "cc": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional Cc recipients."
+                },
+                "bcc": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional Bcc recipients."
+                },
+                "subject": {
+                    "type": "string",
+                    "description": "Email subject. Shown in the approval prompt — keep it clear and specific."
+                },
+                "body_text": {
+                    "type": "string",
+                    "description": "Plain-text body. Always required (HTML alone is bad for accessibility/clients)."
+                },
+                "body_html": {
+                    "type": "string",
+                    "description": "Optional HTML body. When set the message is sent multipart/alternative with body_text as the plain fallback."
+                },
+                "in_reply_to": {
+                    "type": "string",
+                    "description": "Message-ID of the email you're replying to. Sets In-Reply-To/References for proper threading in the recipient's client."
+                }
+            },
+            "required": ["to", "subject", "body_text"]
         })
     }
 
@@ -2213,6 +2328,168 @@ impl ShellToolRegistry {
             }
         }
     }
+
+    /// Build an outbound email, ask the user (via the configured gate),
+    /// and on approval hand it to the SMTP sender. Fails closed when
+    /// either the sender or the gate is missing — the agent should
+    /// `list_*` instead of mailing into the void.
+    async fn do_email_send(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let mut owned = serde_json::Value::Null;
+        let args = coerce_args(args, &mut owned);
+        let start = Instant::now();
+
+        let Some(sender) = self.email_sender.clone() else {
+            let msg = "SMTP not configured. Configure email settings first.".to_string();
+            return Ok(ToolResult {
+                success: false,
+                output: json!({ "error": msg }),
+                error: Some(msg),
+                execution_time_ms: start.elapsed().as_millis() as u64,
+            });
+        };
+        let Some(gate) = self.email_approval.clone() else {
+            let msg = "Email approval gate not wired; refusing to send.".to_string();
+            return Ok(ToolResult {
+                success: false,
+                output: json!({ "error": msg }),
+                error: Some(msg),
+                execution_time_ms: start.elapsed().as_millis() as u64,
+            });
+        };
+
+        // Recipients: required, non-empty, all strings.
+        let to: Vec<String> = match args.get("to").and_then(|v| v.as_array()) {
+            Some(arr) if !arr.is_empty() => arr
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+            _ => {
+                let msg = "to must be a non-empty array of recipient addresses".to_string();
+                return Ok(ToolResult {
+                    success: false,
+                    output: json!({ "error": msg }),
+                    error: Some(msg),
+                    execution_time_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+        };
+        if to.is_empty() {
+            let msg = "to must be a non-empty array of recipient addresses".to_string();
+            return Ok(ToolResult {
+                success: false,
+                output: json!({ "error": msg }),
+                error: Some(msg),
+                execution_time_ms: start.elapsed().as_millis() as u64,
+            });
+        }
+        let cc: Vec<String> = args
+            .get("cc")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let bcc: Vec<String> = args
+            .get("bcc")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let subject = args
+            .get("subject")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AthenError::Other("missing 'subject' parameter".to_string()))?
+            .to_string();
+        let body_text = args
+            .get("body_text")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AthenError::Other("missing 'body_text' parameter".to_string()))?
+            .to_string();
+        let body_html = args
+            .get("body_html")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let in_reply_to = args
+            .get("in_reply_to")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+
+        // UTF-8 safe slice — `take(200)` walks chars, never bytes.
+        let body_preview: String = body_text.chars().take(200).collect();
+
+        let summary = EmailSendSummary {
+            to: to.clone(),
+            cc: cc.clone(),
+            bcc: bcc.clone(),
+            subject: subject.clone(),
+            body_preview,
+            in_reply_to: in_reply_to.clone(),
+        };
+
+        tracing::info!(
+            tool = "email_send",
+            to = ?to,
+            subject = %subject,
+            "sending email"
+        );
+
+        if !gate.confirm_send(&summary).await {
+            let msg = "User declined the send".to_string();
+            return Ok(ToolResult {
+                success: false,
+                output: json!({ "error": msg }),
+                error: Some(msg),
+                execution_time_ms: start.elapsed().as_millis() as u64,
+            });
+        }
+
+        let email = OutboundEmail {
+            to: to.clone(),
+            cc,
+            bcc,
+            subject: subject.clone(),
+            body_text,
+            body_html,
+            in_reply_to,
+        };
+
+        match sender.send(&email).await {
+            Ok(sent) => {
+                tracing::info!(
+                    tool = "email_send",
+                    to = ?to,
+                    subject = %subject,
+                    message_id = %sent.message_id,
+                    "email sent"
+                );
+                Ok(ToolResult {
+                    success: true,
+                    output: json!({
+                        "message_id": sent.message_id,
+                        "accepted_recipients": sent.accepted_recipients,
+                        "to": to,
+                        "subject": subject,
+                    }),
+                    error: None,
+                    execution_time_ms: start.elapsed().as_millis() as u64,
+                })
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                Ok(ToolResult {
+                    success: false,
+                    output: json!({ "error": msg }),
+                    error: Some(msg),
+                    execution_time_ms: start.elapsed().as_millis() as u64,
+                })
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -2350,6 +2627,16 @@ impl ToolRegistry for ShellToolRegistry {
                 base_risk: BaseImpact::Read,
             },
             ToolDefinition {
+                name: "email_send".to_string(),
+                description: "Send an email via the user's configured SMTP account. The user is asked for explicit approval before each send — the prompt shows recipients, subject, and a body preview, so write a clear subject and a body that makes sense out of context. Required: `to` (array of addresses), `subject`, `body_text`. Optional: `cc`, `bcc`, `body_html`, `in_reply_to` (Message-ID of the email you're replying to — sets In-Reply-To/References for proper threading). Returns the new message-id on success.".to_string(),
+                parameters: Self::email_send_schema(),
+                backend: ToolBackend::Shell {
+                    command: String::new(),
+                    native: false,
+                },
+                base_risk: BaseImpact::WritePersist,
+            },
+            ToolDefinition {
                 name: "install_package".to_string(),
                 description: "Install a Python package (via pip --target) or Node package (via npm --prefix) into Athen's persistent toolbox at ~/.athen/toolbox. PYTHONPATH and PATH are automatically configured so subsequent shell_execute calls can import/run them. The user will be asked for permission, so write a clear `reason` explaining what the package is for and why you need it.".to_string(),
                 parameters: Self::install_package_schema(),
@@ -2397,6 +2684,7 @@ impl ToolRegistry for ShellToolRegistry {
             "memory_recall" => self.do_memory_recall(&args).await,
             "web_search" => self.do_web_search(&args).await,
             "web_fetch" => self.do_web_fetch(&args).await,
+            "email_send" => self.do_email_send(&args).await,
             "install_package" => self.do_install_package(&args).await,
             "list_installed_packages" => self.do_list_installed_packages(&args).await,
             "uninstall_package" => self.do_uninstall_package(&args).await,
@@ -2572,9 +2860,9 @@ mod tests {
 
         // shell_execute, shell_spawn, shell_kill, shell_logs, read, edit,
         // write, grep, list_directory, memory_store, memory_recall,
-        // web_search, web_fetch, install_package, list_installed_packages,
-        // uninstall_package
-        assert_eq!(tools.len(), 16);
+        // web_search, web_fetch, email_send, install_package,
+        // list_installed_packages, uninstall_package
+        assert_eq!(tools.len(), 17);
 
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"shell_execute"));
@@ -3598,5 +3886,249 @@ mod tests {
         if wrapped != "echo hi" {
             assert!(wrapped.ends_with("( echo hi )"), "got: {wrapped}");
         }
+    }
+
+    /// Mock SMTP sender. Records every `send` call so the tests can
+    /// assert the wire-level `OutboundEmail` round-trips correctly,
+    /// and lets each test toggle success vs. failure via `should_fail`.
+    struct MockEmailSender {
+        sent: Arc<Mutex<Vec<OutboundEmail>>>,
+        should_fail: bool,
+        message_id: String,
+    }
+
+    #[async_trait]
+    impl EmailSender for MockEmailSender {
+        async fn send(
+            &self,
+            email: &OutboundEmail,
+        ) -> athen_core::error::Result<athen_core::traits::email_sender::SentEmail> {
+            self.sent.lock().await.push(email.clone());
+            if self.should_fail {
+                Err(athen_core::error::AthenError::Other(
+                    "smtp transport boom".into(),
+                ))
+            } else {
+                Ok(athen_core::traits::email_sender::SentEmail {
+                    message_id: self.message_id.clone(),
+                    accepted_recipients: email.to.clone(),
+                })
+            }
+        }
+
+        async fn test_connection(&self) -> athen_core::error::Result<()> {
+            Ok(())
+        }
+
+        fn name(&self) -> &'static str {
+            "mock-smtp"
+        }
+    }
+
+    /// Mock approval gate. Records every consultation so tests can
+    /// assert the gate was (or wasn't) called.
+    struct MockEmailApprovalGate {
+        answer: bool,
+        calls: Arc<Mutex<Vec<EmailSendSummary>>>,
+    }
+
+    #[async_trait]
+    impl EmailSendApprovalGate for MockEmailApprovalGate {
+        async fn confirm_send(&self, summary: &EmailSendSummary) -> bool {
+            self.calls.lock().await.push(summary.clone());
+            self.answer
+        }
+    }
+
+    fn well_formed_email_args() -> serde_json::Value {
+        json!({
+            "to": ["alice@example.com"],
+            "subject": "Hi",
+            "body_text": "hello there",
+        })
+    }
+
+    #[tokio::test]
+    async fn email_send_without_sender_fails_closed() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let gate = Arc::new(MockEmailApprovalGate {
+            answer: true,
+            calls: calls.clone(),
+        });
+        let registry = ShellToolRegistry::new()
+            .await
+            .with_email_approval(gate as Arc<dyn EmailSendApprovalGate>);
+        let result = registry
+            .call_tool("email_send", well_formed_email_args())
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let err = result.error.unwrap_or_default();
+        assert!(err.to_lowercase().contains("not configured"), "got: {err}");
+        // Gate must NOT be consulted when the transport is missing.
+        assert!(calls.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn email_send_without_gate_fails_closed() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sender = Arc::new(MockEmailSender {
+            sent: sent.clone(),
+            should_fail: false,
+            message_id: "<test@id>".into(),
+        });
+        let registry = ShellToolRegistry::new()
+            .await
+            .with_email_sender(sender as Arc<dyn EmailSender>);
+        let result = registry
+            .call_tool("email_send", well_formed_email_args())
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let err = result.error.unwrap_or_default();
+        assert!(err.to_lowercase().contains("gate"), "got: {err}");
+        assert!(sent.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn email_send_empty_to_fails_without_calls() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sender = Arc::new(MockEmailSender {
+            sent: sent.clone(),
+            should_fail: false,
+            message_id: "<id@x>".into(),
+        });
+        let gate = Arc::new(MockEmailApprovalGate {
+            answer: true,
+            calls: calls.clone(),
+        });
+        let registry = ShellToolRegistry::new()
+            .await
+            .with_email_sender(sender as Arc<dyn EmailSender>)
+            .with_email_approval(gate as Arc<dyn EmailSendApprovalGate>);
+
+        let args = json!({
+            "to": [],
+            "subject": "Hi",
+            "body_text": "hello",
+        });
+        let result = registry.call_tool("email_send", args).await.unwrap();
+        assert!(!result.success);
+        let err = result.error.unwrap_or_default();
+        assert!(err.contains("non-empty"), "got: {err}");
+        assert!(calls.lock().await.is_empty());
+        assert!(sent.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn email_send_gate_denies_skips_transport() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sender = Arc::new(MockEmailSender {
+            sent: sent.clone(),
+            should_fail: false,
+            message_id: "<id@x>".into(),
+        });
+        let gate = Arc::new(MockEmailApprovalGate {
+            answer: false,
+            calls: calls.clone(),
+        });
+        let registry = ShellToolRegistry::new()
+            .await
+            .with_email_sender(sender as Arc<dyn EmailSender>)
+            .with_email_approval(gate as Arc<dyn EmailSendApprovalGate>);
+
+        let result = registry
+            .call_tool("email_send", well_formed_email_args())
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let err = result.error.unwrap_or_default();
+        assert!(err.to_lowercase().contains("declined"), "got: {err}");
+        assert_eq!(calls.lock().await.len(), 1);
+        assert!(sent.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn email_send_gate_approves_calls_sender_with_full_payload() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sender = Arc::new(MockEmailSender {
+            sent: sent.clone(),
+            should_fail: false,
+            message_id: "<msg@athen>".into(),
+        });
+        let gate = Arc::new(MockEmailApprovalGate {
+            answer: true,
+            calls: calls.clone(),
+        });
+        let registry = ShellToolRegistry::new()
+            .await
+            .with_email_sender(sender as Arc<dyn EmailSender>)
+            .with_email_approval(gate as Arc<dyn EmailSendApprovalGate>);
+
+        let args = json!({
+            "to": ["alice@example.com", "bob@example.com"],
+            "cc": ["carol@example.com"],
+            "bcc": ["dave@example.com"],
+            "subject": "Project update",
+            "body_text": "Plain body",
+            "body_html": "<p>HTML body</p>",
+            "in_reply_to": "<prev@thread>",
+        });
+        let result = registry.call_tool("email_send", args).await.unwrap();
+        assert!(result.success, "expected success, got {result:?}");
+        assert_eq!(result.output["message_id"], "<msg@athen>");
+        let accepted = result.output["accepted_recipients"].as_array().unwrap();
+        assert_eq!(accepted.len(), 2);
+
+        // Sender called exactly once with the full payload round-tripped.
+        let sent = sent.lock().await.clone();
+        assert_eq!(sent.len(), 1);
+        let e = &sent[0];
+        assert_eq!(e.to, vec!["alice@example.com", "bob@example.com"]);
+        assert_eq!(e.cc, vec!["carol@example.com"]);
+        assert_eq!(e.bcc, vec!["dave@example.com"]);
+        assert_eq!(e.subject, "Project update");
+        assert_eq!(e.body_text, "Plain body");
+        assert_eq!(e.body_html.as_deref(), Some("<p>HTML body</p>"));
+        assert_eq!(e.in_reply_to.as_deref(), Some("<prev@thread>"));
+
+        // Gate consulted once with a body preview matching body_text.
+        let calls = calls.lock().await.clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].subject, "Project update");
+        assert_eq!(calls[0].body_preview, "Plain body");
+    }
+
+    #[tokio::test]
+    async fn email_send_surfaces_transport_error() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sender = Arc::new(MockEmailSender {
+            sent: sent.clone(),
+            should_fail: true,
+            message_id: "<unused@x>".into(),
+        });
+        let gate = Arc::new(MockEmailApprovalGate {
+            answer: true,
+            calls: calls.clone(),
+        });
+        let registry = ShellToolRegistry::new()
+            .await
+            .with_email_sender(sender as Arc<dyn EmailSender>)
+            .with_email_approval(gate as Arc<dyn EmailSendApprovalGate>);
+
+        let result = registry
+            .call_tool("email_send", well_formed_email_args())
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let err = result.error.unwrap_or_default();
+        assert!(err.contains("smtp transport boom"), "got: {err}");
+        // Sender was reached (so the gate approved), but the transport
+        // error propagated as a structured failure rather than a panic.
+        assert_eq!(sent.lock().await.len(), 1);
     }
 }

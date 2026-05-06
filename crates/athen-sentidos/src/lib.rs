@@ -6,6 +6,7 @@
 
 pub mod calendar;
 pub mod email;
+pub mod email_send;
 pub mod messaging;
 pub mod telegram;
 pub mod user_input;

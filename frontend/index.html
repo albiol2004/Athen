@@ -318,11 +318,54 @@
                     </div>
                 </div>
 
+                <h3 class="settings-subhead">Outbound (SMTP) — Sending Email</h3>
+                <p class="settings-description">Configure the same account for sending. Athen always asks before sending each email.</p>
+
+                <div id="smtp-settings-fields">
+                    <div class="setting-row">
+                        <label for="email-smtp-server">SMTP Server</label>
+                        <input type="text" id="email-smtp-server" class="settings-input" placeholder="smtp.gmail.com">
+                    </div>
+                    <div class="setting-row">
+                        <label for="email-smtp-port">Port</label>
+                        <input type="number" id="email-smtp-port" class="settings-input" value="587" min="1" max="65535">
+                        <p class="setting-hint">587 for STARTTLS (default), 465 for implicit TLS.</p>
+                    </div>
+                    <div class="setting-row">
+                        <label for="email-smtp-username">SMTP Username</label>
+                        <input type="text" id="email-smtp-username" class="settings-input" placeholder="you@gmail.com">
+                        <p class="setting-hint">Usually the same as your email address.</p>
+                    </div>
+                    <div class="setting-row">
+                        <label for="email-smtp-password">SMTP Password</label>
+                        <div class="api-key-wrapper">
+                            <input type="password" id="email-smtp-password" class="settings-input" placeholder="App password" autocomplete="off">
+                            <button class="api-key-toggle" id="email-smtp-password-toggle" title="Show/hide password" type="button">&#128065;</button>
+                        </div>
+                        <p class="setting-hint">Same app password works for both IMAP and SMTP on most providers.</p>
+                    </div>
+                    <div class="setting-row">
+                        <label class="toggle-label">
+                            <input type="checkbox" id="email-smtp-use-tls">
+                            <span>Implicit TLS (port 465 only)</span>
+                        </label>
+                        <p class="setting-hint">Leave unchecked for STARTTLS on port 587.</p>
+                    </div>
+                    <div class="setting-row">
+                        <label for="email-from-address">From Address</label>
+                        <input type="text" id="email-from-address" class="settings-input" placeholder="Alex &lt;alex@example.com&gt;">
+                        <p class="setting-hint">What recipients see. Plain "alex@example.com" or "Alex &lt;alex@example.com&gt;" both work.</p>
+                    </div>
+                </div>
+
                 <div class="setting-actions">
-                    <button id="test-email-btn" class="btn-secondary">Test Connection</button>
-                    <button id="save-email-btn" class="btn-primary">Save Email Settings</button>
+                    <button id="test-email-btn" class="btn-secondary">Test IMAP</button>
+                    <button id="save-email-btn" class="btn-primary">Save IMAP</button>
+                    <button id="test-smtp-btn" class="btn-secondary">Test SMTP</button>
+                    <button id="save-smtp-btn" class="btn-primary">Save SMTP</button>
                 </div>
                 <div id="email-test-result" class="test-result hidden"></div>
+                <div id="smtp-test-result" class="test-result hidden"></div>
             </section>
 
             <section class="settings-section">

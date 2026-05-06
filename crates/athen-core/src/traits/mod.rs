@@ -2,6 +2,7 @@ pub mod agent;
 pub mod approval;
 pub mod compaction;
 pub mod coordinator;
+pub mod email_sender;
 pub mod embedding;
 pub mod llm;
 pub mod mcp;

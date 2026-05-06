@@ -87,6 +87,7 @@ fn spawn_router_approval(
         notifier: state.notifier.clone(),
         compactor: state.compactor.clone(),
         web_search: Arc::clone(&state.web_search),
+        email_sender: state.email_sender.clone(),
     };
 
     tauri::async_runtime::spawn(async move {
@@ -191,6 +192,7 @@ fn spawn_router_approval(
             notifier: bg_ctx.notifier.clone(),
             compactor: bg_ctx.compactor.clone(),
             web_search: bg_ctx.web_search.clone(),
+            email_sender: bg_ctx.email_sender.clone(),
         };
 
         let outcome = match execute_approved_task(task_id, ctx).await {
@@ -265,6 +267,7 @@ struct ApprovedTaskBgCtx {
     notifier: Option<Arc<crate::notifier::NotificationOrchestrator>>,
     compactor: Option<Arc<dyn athen_core::traits::compaction::ArcCompactor>>,
     web_search: Arc<dyn athen_web::WebSearchProvider>,
+    email_sender: Option<Arc<dyn athen_core::traits::email_sender::EmailSender>>,
 }
 
 /// Resolve the agent profile that should drive execution for a given arc.
@@ -1571,6 +1574,7 @@ pub async fn approve_task(
         notifier: state.notifier.clone(),
         compactor: state.compactor.clone(),
         web_search: Arc::clone(&state.web_search),
+        email_sender: state.email_sender.clone(),
     };
 
     let outcome = match execute_approved_task(task_uuid, ctx).await {
@@ -1678,6 +1682,9 @@ pub(crate) struct ApprovedTaskCtx {
     /// rate-limit cooldown discovered on one task carries across to the
     /// next.
     pub web_search: Arc<dyn athen_web::WebSearchProvider>,
+    /// Outbound SMTP transport for the `email_send` tool. `None` when
+    /// SMTP isn't configured — the tool then refuses with a clear error.
+    pub email_sender: Option<Arc<dyn athen_core::traits::email_sender::EmailSender>>,
 }
 
 /// Drive a risk-flagged task all the way through approval, dispatch,
@@ -1885,7 +1892,8 @@ pub(crate) async fn execute_approved_task(
     let mut shell_registry = athen_agent::ShellToolRegistry::new()
         .await
         .with_spawned_processes(ctx.spawned_processes.clone())
-        .with_web_search(Arc::clone(&ctx.web_search));
+        .with_web_search(Arc::clone(&ctx.web_search))
+        .with_email_sender_opt(ctx.email_sender.clone());
     if let Some(ref store) = ctx.grant_store {
         let provider = Arc::new(crate::file_gate::ArcWritableProvider {
             arc_id: crate::file_gate::arc_uuid(&ctx.active_arc_id),
@@ -1900,6 +1908,12 @@ pub(crate) async fn execute_approved_task(
                 Some(ctx.active_arc_id.clone()),
             ),
         ));
+        let gate: Arc<dyn athen_agent::EmailSendApprovalGate> =
+            Arc::new(crate::email_gate::RouterEmailApprovalGate::new(
+                Arc::clone(router),
+                Some(ctx.active_arc_id.clone()),
+            ));
+        shell_registry = shell_registry.with_email_approval(gate);
     }
     let mut registry = crate::app_tools::AppToolRegistry::new(
         shell_registry,
@@ -2321,7 +2335,8 @@ pub(crate) async fn execute_dispatched_task(
     let mut shell_registry = athen_agent::ShellToolRegistry::new()
         .await
         .with_spawned_processes(ctx.spawned_processes.clone())
-        .with_web_search(Arc::clone(&ctx.web_search));
+        .with_web_search(Arc::clone(&ctx.web_search))
+        .with_email_sender_opt(ctx.email_sender.clone());
     if let Some(ref store) = ctx.grant_store {
         let provider = Arc::new(crate::file_gate::ArcWritableProvider {
             arc_id: crate::file_gate::arc_uuid(&arc_id),
@@ -2336,6 +2351,12 @@ pub(crate) async fn execute_dispatched_task(
                 Some(arc_id.clone()),
             ),
         ));
+        let gate: Arc<dyn athen_agent::EmailSendApprovalGate> =
+            Arc::new(crate::email_gate::RouterEmailApprovalGate::new(
+                Arc::clone(router),
+                Some(arc_id.clone()),
+            ));
+        shell_registry = shell_registry.with_email_approval(gate);
     }
     let mut registry = crate::app_tools::AppToolRegistry::new(
         shell_registry,

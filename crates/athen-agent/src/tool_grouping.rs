@@ -103,8 +103,11 @@ fn group_one_liner(id: &str, tools: &[&ToolDefinition]) -> String {
 /// Always-revealed tools are the universally-used core: memory (referenced on
 /// every turn) plus the shell + file primitives (the bread-and-butter coding
 /// tools). Without their schemas, small models fall back to whatever IS
-/// schema-visible and loop. Domain-specific tools (calendar, contacts, MCP)
-/// stay tier-2 to keep the prompt small.
+/// schema-visible and loop. `email_send` is included because it's a
+/// user-facing action tool gated behind explicit approval — keeping its
+/// schema inline prevents the agent from grepping config files or
+/// reaching for `shell_execute` / smtplib when it could just call the
+/// tool. Domain-specific tools (calendar, contacts, MCP) stay tier-2.
 pub fn is_always_revealed(name: &str) -> bool {
     matches!(
         name,
@@ -121,6 +124,7 @@ pub fn is_always_revealed(name: &str) -> bool {
             | "list_directory"
             | "web_search"
             | "web_fetch"
+            | "email_send"
     )
 }
 
@@ -168,6 +172,7 @@ mod tests {
         assert!(is_always_revealed("edit"));
         assert!(is_always_revealed("write"));
         assert!(is_always_revealed("grep"));
+        assert!(is_always_revealed("email_send"));
         assert!(!is_always_revealed("calendar_create"));
         assert!(!is_always_revealed("files__write_file"));
     }
