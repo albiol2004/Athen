@@ -1,0 +1,39 @@
+# Maintainer: Alejandro Garcia <albiol2004@gmail.com>
+pkgname=athen
+pkgver=0.1.1
+pkgrel=1
+pkgdesc="Universal proactive AI agent (Tauri 2 desktop app)"
+arch=('x86_64')
+url="https://github.com/albiol2004/Athen"
+license=('MIT')
+depends=('webkit2gtk-4.1' 'gtk3' 'libsoup3' 'libappindicator-gtk3')
+makedepends=('rust' 'cargo' 'nodejs' 'npm' 'pkgconf')
+optdepends=(
+    'podman: container-isolated tool sandbox'
+    'docker: container-isolated tool sandbox (alternative to podman)'
+    'nushell: cross-platform shell backend'
+)
+options=('!lto')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+    cd "Athen-$pkgver"
+    export CARGO_HOME="$srcdir/.cargo"
+    cargo fetch --locked
+}
+
+build() {
+    cd "Athen-$pkgver"
+    export CARGO_HOME="$srcdir/.cargo"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo build --release --frozen -p athen-app
+}
+
+package() {
+    cd "Athen-$pkgver"
+    install -Dm755 "target/release/athen-app" "$pkgdir/usr/bin/athen"
+    install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 "crates/athen-app/icons/icon.png" \
+        "$pkgdir/usr/share/icons/hicolor/512x512/apps/athen.png" 2>/dev/null || true
+}
