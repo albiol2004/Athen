@@ -3894,6 +3894,30 @@ pub struct UpdateInfo {
     pub current_version: String,
     pub notes: Option<String>,
     pub date: Option<String>,
+    /// "appimage" → in-app updater can swap the binary.
+    /// "system"   → packaged via rpm/deb/aur/dmg; user must update through their package manager.
+    pub installer_kind: String,
+    /// Release page URL — surfaced when `installer_kind == "system"` so the UI can
+    /// link the user to the right download instead of attempting an in-place update.
+    pub release_url: Option<String>,
+}
+
+/// Linux AppImage runtimes export `APPIMAGE` pointing at the .AppImage path.
+/// macOS/Windows installs are always self-updatable via tauri-plugin-updater.
+fn detect_installer_kind() -> &'static str {
+    if cfg!(target_os = "linux") {
+        if std::env::var_os("APPIMAGE").is_some() {
+            "appimage"
+        } else {
+            "system"
+        }
+    } else {
+        "appimage"
+    }
+}
+
+fn release_url_for(version: &str) -> String {
+    format!("https://github.com/albiol2004/Athen/releases/tag/v{version}")
 }
 
 #[tauri::command]
@@ -3901,6 +3925,7 @@ pub async fn check_for_update(app: AppHandle) -> std::result::Result<UpdateInfo,
     use tauri_plugin_updater::UpdaterExt;
 
     let current_version = app.package_info().version.to_string();
+    let installer_kind = detect_installer_kind().to_string();
     let updater = app.updater().map_err(|e| e.to_string())?;
     match updater.check().await {
         Ok(Some(update)) => Ok(UpdateInfo {
@@ -3909,6 +3934,8 @@ pub async fn check_for_update(app: AppHandle) -> std::result::Result<UpdateInfo,
             current_version,
             notes: update.body.clone(),
             date: update.date.map(|d| d.to_string()),
+            release_url: Some(release_url_for(&update.version)),
+            installer_kind,
         }),
         Ok(None) => Ok(UpdateInfo {
             available: false,
@@ -3916,14 +3943,47 @@ pub async fn check_for_update(app: AppHandle) -> std::result::Result<UpdateInfo,
             current_version,
             notes: None,
             date: None,
+            release_url: None,
+            installer_kind,
         }),
         Err(e) => Err(format!("update check failed: {}", e)),
     }
 }
 
+/// Open a URL in the user's default browser. Used by the update banner when the
+/// install is system-managed (rpm/deb/aur) and we can't self-update — we send
+/// the user to the GitHub release page instead.
+#[tauri::command]
+pub async fn open_external_url(url: String) -> std::result::Result<(), String> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err("only http(s) URLs are allowed".to_string());
+    }
+    let result = if cfg!(target_os = "linux") {
+        std::process::Command::new("xdg-open").arg(&url).spawn()
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(&url).spawn()
+    } else if cfg!(target_os = "windows") {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", &url])
+            .spawn()
+    } else {
+        return Err("unsupported platform".to_string());
+    };
+    result.map(|_| ()).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn install_update(app: AppHandle) -> std::result::Result<(), String> {
     use tauri_plugin_updater::UpdaterExt;
+
+    if detect_installer_kind() == "system" {
+        return Err(
+            "This install is managed by your system package manager (rpm/deb/aur). \
+             Update through it (e.g. `sudo dnf upgrade athen` or `yay -Syu athen-bin`) \
+             or download the new release from GitHub."
+                .to_string(),
+        );
+    }
 
     let updater = app.updater().map_err(|e| e.to_string())?;
     let update = updater

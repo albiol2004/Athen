@@ -128,6 +128,7 @@ pub fn run() {
             commands::restore_agent_profile,
             commands::check_for_update,
             commands::install_update,
+            commands::open_external_url,
             commands::list_toolbox_packages,
             commands::clear_toolbox,
             commands::get_runtime_status,

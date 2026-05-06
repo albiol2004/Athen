@@ -3830,6 +3830,8 @@ const UPDATE_DISMISS_KEY = 'athen.update.dismissedVersion';
     if (!banner || !text || !installBtn || !dismissBtn) return;
 
     let pendingVersion = null;
+    let pendingReleaseUrl = null;
+    let isSystemInstall = false;
 
     async function checkForUpdate() {
         try {
@@ -3841,7 +3843,10 @@ const UPDATE_DISMISS_KEY = 'athen.update.dismissedVersion';
             try { dismissed = localStorage.getItem(UPDATE_DISMISS_KEY); } catch (_) {}
             if (dismissed === info.version) return;
             pendingVersion = info.version;
+            pendingReleaseUrl = info.release_url || null;
+            isSystemInstall = info.installer_kind === 'system';
             text.textContent = `Athen ${info.version} is available (you have ${info.current_version}).`;
+            installBtn.textContent = isSystemInstall ? 'Open download page' : 'Install & restart';
             banner.hidden = false;
         } catch (err) {
             // Silent: no network / no signed manifest yet — don't bother the user.
@@ -3850,6 +3855,17 @@ const UPDATE_DISMISS_KEY = 'athen.update.dismissedVersion';
     }
 
     installBtn.addEventListener('click', async () => {
+        // System-managed installs (rpm/deb/aur): can't self-update — open the release page.
+        if (isSystemInstall) {
+            if (pendingReleaseUrl) {
+                try {
+                    await window.__TAURI__.core.invoke('open_external_url', { url: pendingReleaseUrl });
+                } catch (err) {
+                    showToast('Failed to open release page: ' + err, 'error');
+                }
+            }
+            return;
+        }
         installBtn.disabled = true;
         installBtn.textContent = 'Installing…';
         try {
