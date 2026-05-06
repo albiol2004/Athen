@@ -662,50 +662,19 @@ function buildArcItem(arc) {
         content.appendChild(metaEl);
         item.appendChild(content);
 
-        // Action buttons (rename + branch + delete)
+        // Overflow menu: single kebab button reveals Rename / Compact / Branch / Delete.
         const actions = document.createElement('div');
         actions.className = 'session-item-actions';
 
-        const renameBtn = document.createElement('button');
-        renameBtn.className = 'session-action-btn';
-        renameBtn.title = 'Rename';
-        renameBtn.innerHTML = '&#9998;'; // pencil
-        renameBtn.addEventListener('click', (e) => {
+        const menuBtn = document.createElement('button');
+        menuBtn.className = 'session-action-btn arc-menu-trigger';
+        menuBtn.title = 'More actions';
+        menuBtn.innerHTML = '&#x22EF;'; // horizontal ellipsis
+        menuBtn.addEventListener('click', (e) => {
             e.stopPropagation();
-            startRenameArc(item, arc.id, arc.name);
+            toggleArcMenu(menuBtn, arc, item);
         });
-        actions.appendChild(renameBtn);
-
-        const compactBtn = document.createElement('button');
-        compactBtn.className = 'session-action-btn';
-        compactBtn.title = 'Compact this arc (summarize earlier turns to free context)';
-        // Stack icon \u2014 arrow pointing into a tray.
-        compactBtn.innerHTML = '&#x21A1;';
-        compactBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            handleCompactArc(arc.id, compactBtn);
-        });
-        actions.appendChild(compactBtn);
-
-        const branchBtn = document.createElement('button');
-        branchBtn.className = 'session-action-btn';
-        branchBtn.title = 'Branch';
-        branchBtn.textContent = '\u21b3';
-        branchBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            branchFromArc(arc.id, arc.name);
-        });
-        actions.appendChild(branchBtn);
-
-        const deleteBtn = document.createElement('button');
-        deleteBtn.className = 'session-action-btn delete';
-        deleteBtn.title = 'Delete';
-        deleteBtn.innerHTML = '&#10005;'; // x mark
-        deleteBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            handleDeleteArc(arc.id);
-        });
-        actions.appendChild(deleteBtn);
+        actions.appendChild(menuBtn);
 
         item.appendChild(actions);
 
@@ -721,6 +690,106 @@ function buildArcItem(arc) {
         });
 
     return item;
+}
+
+// ─── Arc overflow menu ───
+let openArcMenuEl = null;
+let openArcMenuCleanup = null;
+let openArcMenuTrigger = null;
+
+function closeArcMenu() {
+    if (openArcMenuCleanup) {
+        openArcMenuCleanup();
+        openArcMenuCleanup = null;
+    }
+    if (openArcMenuEl) {
+        openArcMenuEl.remove();
+        openArcMenuEl = null;
+    }
+    if (openArcMenuTrigger) {
+        openArcMenuTrigger.classList.remove('active');
+        openArcMenuTrigger = null;
+    }
+}
+
+function toggleArcMenu(anchorEl, arc, itemEl) {
+    if (openArcMenuTrigger === anchorEl) {
+        closeArcMenu();
+        return;
+    }
+    closeArcMenu();
+
+    const menu = document.createElement('div');
+    menu.className = 'arc-menu';
+    menu.setAttribute('role', 'menu');
+
+    const mkItem = (label, icon, onclick, danger) => {
+        const btn = document.createElement('button');
+        btn.className = 'arc-menu-item' + (danger ? ' danger' : '');
+        btn.setAttribute('role', 'menuitem');
+        const iconSpan = document.createElement('span');
+        iconSpan.className = 'arc-menu-icon';
+        iconSpan.innerHTML = icon;
+        const labelSpan = document.createElement('span');
+        labelSpan.className = 'arc-menu-label';
+        labelSpan.textContent = label;
+        btn.appendChild(iconSpan);
+        btn.appendChild(labelSpan);
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            closeArcMenu();
+            onclick();
+        });
+        return btn;
+    };
+
+    menu.appendChild(mkItem('Rename', '&#9998;', () => startRenameArc(itemEl, arc.id, arc.name)));
+    menu.appendChild(mkItem('Compact', '&#x21A1;', () => {
+        showToast('Compacting arc…', '');
+        handleCompactArc(arc.id, null);
+    }));
+    menu.appendChild(mkItem('Branch', '&#x21B3;', () => branchFromArc(arc.id, arc.name)));
+
+    const sep = document.createElement('div');
+    sep.className = 'arc-menu-sep';
+    menu.appendChild(sep);
+
+    menu.appendChild(mkItem('Delete', '&#10005;', () => handleDeleteArc(arc.id), true));
+
+    document.body.appendChild(menu);
+
+    // Position relative to the trigger; flip up if it would overflow.
+    const r = anchorEl.getBoundingClientRect();
+    const menuW = menu.offsetWidth;
+    const menuH = menu.offsetHeight;
+    let left = r.right - menuW;
+    if (left < 8) left = 8;
+    if (left + menuW > window.innerWidth - 8) left = window.innerWidth - menuW - 8;
+    let top = r.bottom + 4;
+    if (top + menuH > window.innerHeight - 8) top = r.top - menuH - 4;
+    menu.style.left = `${Math.round(left)}px`;
+    menu.style.top = `${Math.round(top)}px`;
+
+    openArcMenuEl = menu;
+    openArcMenuTrigger = anchorEl;
+    anchorEl.classList.add('active');
+
+    const onDocClick = (e) => {
+        if (!menu.contains(e.target) && e.target !== anchorEl) closeArcMenu();
+    };
+    const onKey = (e) => { if (e.key === 'Escape') closeArcMenu(); };
+    const onScrollOrResize = () => closeArcMenu();
+    // Defer so the originating click doesn't immediately close the menu.
+    setTimeout(() => document.addEventListener('click', onDocClick, true), 0);
+    document.addEventListener('keydown', onKey);
+    sessionListEl.addEventListener('scroll', onScrollOrResize, true);
+    window.addEventListener('resize', onScrollOrResize);
+    openArcMenuCleanup = () => {
+        document.removeEventListener('click', onDocClick, true);
+        document.removeEventListener('keydown', onKey);
+        sessionListEl.removeEventListener('scroll', onScrollOrResize, true);
+        window.removeEventListener('resize', onScrollOrResize);
+    };
 }
 
 // Render the arc sidebar. The first ARC_EAGER_COUNT visible arcs are
