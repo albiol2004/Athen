@@ -60,6 +60,37 @@ impl BwrapSandbox {
                     bwrap_args.push(path_str);
                 }
 
+                // Mask credential files so shell-spawned processes cannot
+                // read them via `cat`, Python `open()`, etc. Only the
+                // bwrap-jailed child sees /dev/null in their place; the
+                // parent Athen process keeps its normal view. Bind targets
+                // must exist on the host or bwrap aborts setup, so skip
+                // missing entries silently.
+                if let Some(data) = athen_core::paths::athen_data_dir() {
+                    for name in [
+                        "config.toml",
+                        "athen.db",
+                        "athen.db-wal",
+                        "athen.db-shm",
+                        "athen.db-journal",
+                    ] {
+                        let masked = data.join(name);
+                        if masked.exists() {
+                            bwrap_args.push("--bind".to_string());
+                            bwrap_args.push("/dev/null".to_string());
+                            bwrap_args.push(masked.display().to_string());
+                        }
+                    }
+                    // Hide the whole runtimes tree — `--tmpfs` is the right
+                    // primitive for a directory; `--bind /dev/null` only
+                    // works on files.
+                    let runtimes = data.join("runtimes");
+                    if runtimes.exists() {
+                        bwrap_args.push("--tmpfs".to_string());
+                        bwrap_args.push(runtimes.display().to_string());
+                    }
+                }
+
                 bwrap_args.push("--proc".to_string());
                 bwrap_args.push("/proc".to_string());
                 bwrap_args.push("--dev".to_string());
@@ -255,6 +286,39 @@ mod tests {
         let len = args.len();
         assert_eq!(args[len - 2], "python");
         assert_eq!(args[len - 1], "script.py");
+    }
+
+    #[test]
+    fn restricted_write_masks_known_credential_files() {
+        // The mask step only fires for files that already exist on the host
+        // (bwrap aborts on missing bind targets). On dev machines with a
+        // real `~/.athen/config.toml` we assert the mask is present; on
+        // clean CI we just assert the build doesn't crash and the existing
+        // allowed_paths still flow through.
+        let profile = SandboxProfile::RestrictedWrite {
+            allowed_paths: vec![PathBuf::from("/tmp/work")],
+        };
+        let args = BwrapSandbox::build_bwrap_args("ls", &[], &profile);
+
+        if let Some(data) = athen_core::paths::athen_data_dir() {
+            let cfg = data.join("config.toml");
+            if cfg.exists() {
+                let cfg_str = cfg.display().to_string();
+                let mut found_mask = false;
+                for w in args.windows(3) {
+                    if w[0] == "--bind" && w[1] == "/dev/null" && w[2] == cfg_str {
+                        found_mask = true;
+                        break;
+                    }
+                }
+                assert!(
+                    found_mask,
+                    "config.toml exists but was not masked: {args:?}"
+                );
+            }
+        }
+        // Allowed paths still bind through.
+        assert!(args.contains(&"/tmp/work".to_string()));
     }
 
     #[test]

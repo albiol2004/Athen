@@ -911,10 +911,8 @@ impl StepAuditor for TauriAuditor {
                                         .join(", ")
                                 })
                                 .unwrap_or_default();
-                            let subject = result
-                                .get("subject")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
+                            let subject =
+                                result.get("subject").and_then(|v| v.as_str()).unwrap_or("");
                             if to.is_empty() && subject.is_empty() {
                                 Some(serde_json::to_string(result).unwrap_or_default())
                             } else if subject.is_empty() {

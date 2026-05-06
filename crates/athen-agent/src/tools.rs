@@ -278,6 +278,42 @@ fn repair_unescaped_control_chars(input: &str) -> String {
     out
 }
 
+/// Returns `Some(reason)` when `path` is a credential / data-store file the
+/// agent should not be able to read. Centralises the policy so `read`,
+/// `grep`, and `list_directory` enforce it consistently.
+///
+/// Blocklist over allowlist: `tools/`, `toolbox/`, `workspace/`, `files/`
+/// stay readable so the agent can still discover its toolset, list installed
+/// packages, and inspect its own workspace. Only the credential-bearing
+/// surfaces (`config.toml`, `athen.db` + WAL/SHM siblings) and the large
+/// binary `runtimes/` tree are off-limits.
+fn forbidden_data_path(path: &Path) -> Option<&'static str> {
+    let data = paths::athen_data_dir()?;
+    forbidden_data_path_in(path, &data)
+}
+
+/// Same as [`forbidden_data_path`] but takes the data dir explicitly so
+/// tests can inject a tempdir without mutating process env vars.
+fn forbidden_data_path_in(path: &Path, data: &Path) -> Option<&'static str> {
+    if path == data.join("config.toml") {
+        return Some("config.toml contains credentials and is not readable from tools");
+    }
+    for db_name in [
+        "athen.db",
+        "athen.db-wal",
+        "athen.db-shm",
+        "athen.db-journal",
+    ] {
+        if path == data.join(db_name) {
+            return Some("athen.db is not readable from tools");
+        }
+    }
+    if path.starts_with(data.join("runtimes")) {
+        return Some("~/.athen/runtimes is not readable from tools");
+    }
+    None
+}
+
 impl ShellToolRegistry {
     /// Compose the shell wrapper that the bwrap-sandboxed branch runs
     /// around every `shell_execute` command. bwrap is Linux-only and the
@@ -1044,6 +1080,15 @@ impl ShellToolRegistry {
 
         tracing::info!(tool = "read", path, offset, limit, "Reading file");
         let start = Instant::now();
+
+        if let Some(reason) = forbidden_data_path(&resolved) {
+            return Ok(ToolResult {
+                success: false,
+                output: json!({ "error": reason, "path": resolved.display().to_string() }),
+                error: Some(reason.to_string()),
+                execution_time_ms: start.elapsed().as_millis() as u64,
+            });
+        }
         let p = resolved.as_path();
 
         // Reject directories early with a clear message.
@@ -1319,6 +1364,15 @@ impl ShellToolRegistry {
 
         tracing::info!(tool = "grep", pattern, path, output_mode, "ripgrep search");
         let start = Instant::now();
+
+        if let Some(reason) = forbidden_data_path(&resolved_path) {
+            return Ok(ToolResult {
+                success: false,
+                output: json!({ "error": reason, "path": resolved_path.display().to_string() }),
+                error: Some(reason.to_string()),
+                execution_time_ms: start.elapsed().as_millis() as u64,
+            });
+        }
 
         let mut cmd = tokio::process::Command::new("rg");
         cmd.arg("--color=never");
@@ -2078,10 +2132,14 @@ impl ShellToolRegistry {
 
     /// List entries in a directory.
     async fn do_list_directory(&self, args: &serde_json::Value) -> Result<ToolResult> {
-        let path = args
+        let path_arg = args
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| AthenError::Other("missing 'path' parameter".to_string()))?;
+
+        let resolved = paths::resolve_in_workspace(Path::new(path_arg));
+        let path = resolved.to_string_lossy().to_string();
+        let path = path.as_str();
 
         tracing::info!(tool = "list_directory", path, "Listing directory");
         tracing::trace!(
@@ -2090,7 +2148,15 @@ impl ShellToolRegistry {
         );
 
         let start = Instant::now();
-        match tokio::fs::read_dir(path).await {
+        if let Some(reason) = forbidden_data_path(&resolved) {
+            return Ok(ToolResult {
+                success: false,
+                output: json!({ "error": reason, "path": resolved.display().to_string() }),
+                error: Some(reason.to_string()),
+                execution_time_ms: start.elapsed().as_millis() as u64,
+            });
+        }
+        match tokio::fs::read_dir(&resolved).await {
             Ok(mut reader) => {
                 let mut entries = Vec::new();
                 while let Ok(Some(entry)) = reader.next_entry().await {
@@ -4130,5 +4196,89 @@ mod tests {
         // Sender was reached (so the gate approved), but the transport
         // error propagated as a structured failure rather than a panic.
         assert_eq!(sent.lock().await.len(), 1);
+    }
+
+    // ---- Layer 1: forbidden_data_path policy ----
+
+    #[test]
+    fn forbidden_data_path_blocks_config_toml() {
+        let data = Path::new("/home/u/.athen");
+        let r = forbidden_data_path_in(&data.join("config.toml"), data);
+        assert_eq!(
+            r,
+            Some("config.toml contains credentials and is not readable from tools")
+        );
+    }
+
+    #[test]
+    fn forbidden_data_path_blocks_athen_db_and_wal() {
+        let data = Path::new("/home/u/.athen");
+        for name in [
+            "athen.db",
+            "athen.db-wal",
+            "athen.db-shm",
+            "athen.db-journal",
+        ] {
+            let r = forbidden_data_path_in(&data.join(name), data);
+            assert_eq!(
+                r,
+                Some("athen.db is not readable from tools"),
+                "expected block for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn forbidden_data_path_blocks_runtimes_tree() {
+        let data = Path::new("/home/u/.athen");
+        assert_eq!(
+            forbidden_data_path_in(&data.join("runtimes"), data),
+            Some("~/.athen/runtimes is not readable from tools")
+        );
+        assert_eq!(
+            forbidden_data_path_in(&data.join("runtimes/python/bin/python3"), data),
+            Some("~/.athen/runtimes is not readable from tools")
+        );
+    }
+
+    #[test]
+    fn forbidden_data_path_allows_tools_subdir() {
+        let data = Path::new("/home/u/.athen");
+        assert_eq!(forbidden_data_path_in(&data.join("tools"), data), None);
+        assert_eq!(
+            forbidden_data_path_in(&data.join("tools/foo.json"), data),
+            None
+        );
+    }
+
+    #[test]
+    fn forbidden_data_path_allows_toolbox_manifest() {
+        let data = Path::new("/home/u/.athen");
+        assert_eq!(
+            forbidden_data_path_in(&data.join("toolbox/manifest.json"), data),
+            None
+        );
+        assert_eq!(
+            forbidden_data_path_in(&data.join("toolbox/python/foo"), data),
+            None
+        );
+    }
+
+    #[test]
+    fn forbidden_data_path_allows_workspace_files() {
+        let data = Path::new("/home/u/.athen");
+        assert_eq!(
+            forbidden_data_path_in(&data.join("workspace/notes.md"), data),
+            None
+        );
+        assert_eq!(
+            forbidden_data_path_in(&data.join("files/x.txt"), data),
+            None
+        );
+        // Paths entirely outside the data dir are unaffected.
+        assert_eq!(
+            forbidden_data_path_in(Path::new("/tmp/something.toml"), data),
+            None
+        );
     }
 }
