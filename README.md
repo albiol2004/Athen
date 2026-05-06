@@ -100,16 +100,28 @@ Grab the latest release from
 **[github.com/albiol2004/Athen/releases](https://github.com/albiol2004/Athen/releases/latest)**.
 
 ### Linux
-Use the package that matches your distro — the AppImage is a fallback and
-may not work on every host (see note below).
-- **Debian / Ubuntu:** `sudo apt install ./athen_*_amd64.deb`
-- **Fedora / RHEL:** `sudo dnf install ./athen-*.x86_64.rpm`
-- **Other distros (AppImage):** `chmod +x Athen_*.AppImage && ./Athen_*.AppImage`
+
+Pick the channel that matches your distro. The first three are kept up to
+date automatically — `pacman -Syu`, `dnf upgrade`, `apt upgrade` will pull
+new Athen versions like any other system package.
+
+- **Arch / CachyOS / EndeavourOS / Manjaro (AUR):**
+  ```bash
+  yay -S athen-bin   # or paru, pikaur — any AUR helper
+  ```
+- **Fedora / RHEL / Alma / Rocky (COPR):**
+  ```bash
+  sudo dnf copr enable albiol2004/athen
+  sudo dnf install athen
+  ```
+- **Debian / Ubuntu (one-off `.deb`):** `sudo apt install ./athen_*_amd64.deb`
+- **Anything else (AppImage):** `chmod +x Athen_*.AppImage && ./Athen_*.AppImage`
 
 > ⚠️ The AppImage bundles WebKitGTK and its Wayland/EGL stack. On some
 > hosts (notably Fedora 44+ with Mesa 26+) the bundled libs collide with
 > the system Mesa and the WebKit renderer aborts with `EGL_BAD_PARAMETER`.
-> If you hit this, install the `.deb` or `.rpm` instead. Tracking issue:
+> If you hit this, install through your package manager (AUR / COPR / .deb)
+> instead. Tracking issue:
 > [#1](https://github.com/albiol2004/Athen/issues) (please file one if
 > you see it).
 
@@ -126,9 +138,12 @@ may not work on every host (see note below).
 - Download `Athen_<version>_x64-setup.exe`.
 - SmartScreen will say *"Windows protected your PC"*. Click **More info → Run anyway**.
 
-After the first launch, Athen will check for updates every few hours and
-offer them in-app via a minisign-signed manifest. **You won't have to
-re-download to upgrade.**
+After the first launch, Athen checks for updates every few hours.
+**AppImage, macOS, and Windows installs self-update in-app** via a
+minisign-signed manifest. **System-package installs (AUR, COPR, .deb)
+are managed by their respective package managers** — Athen will tell you
+when a new version is out and link to the release notes; the actual
+upgrade goes through `pacman` / `dnf` / `apt`.
 
 ### Build from source
 

@@ -409,6 +409,18 @@
 
 ---
 
+## Distribution Channels
+
+Linux users install through one of three channels; macOS/Windows ship via GitHub Releases. See [docs/PACKAGING.md](PACKAGING.md) for full rationale and per-release checklist.
+
+- **AUR** (`packaging/aur/athen-bin/`): published as `athen-bin`, a binary repackage of the upstream `.deb`. Per-release bump via `packaging/aur/bump.sh <version> <aur-clone>`. Source-build PKGBUILD also lives in `packaging/aur/athen/` but is not published.
+- **Fedora COPR** (`packaging/copr/athen.spec`): source-built RPM at `albiol2004/athen`. Auto-rebuilds on every release tag via GitHub webhook. Build runs with network enabled (cargo fetches crates from crates.io); switch to a vendored `Source1` tarball before any push for inclusion in official Fedora repos.
+- **GitHub Releases**: the canonical source — `.AppImage`, `.deb`, `.rpm`, `.dmg`, `.msi`, `_setup.exe` plus signed `latest.json` manifest. Built by `.github/workflows/release.yml`.
+
+Auto-updater behaviour splits on install kind via `commands::detect_installer_kind`: AppImage / macOS / Windows self-update through `tauri-plugin-updater`; system-package installs (rpm/deb/AUR) get a banner pointing to the GitHub release page and update through their package manager.
+
+---
+
 ## Integration Tests (28 integration tests + 15 app_tools tests + 23 notifier tests + memory management tests)
 
 Integration tests wire real implementations together (no mocks except LLM).
