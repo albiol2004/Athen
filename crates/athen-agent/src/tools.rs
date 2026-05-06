@@ -1451,10 +1451,15 @@ impl ShellToolRegistry {
                         })
                     })
                     .collect();
+                // `last_used()` returns the underlying provider that
+                // actually answered (e.g. "brave"); for plain providers
+                // it falls back to `name()`. Surfacing both makes
+                // multi-provider chains debuggable from the JSON output.
                 Ok(ToolResult {
                     success: true,
                     output: json!({
                         "provider": self.web_search.name(),
+                        "answered_by": self.web_search.last_used(),
                         "query": query,
                         "results": json_results,
                     }),
@@ -1466,7 +1471,11 @@ impl ShellToolRegistry {
                 let msg = e.to_string();
                 Ok(ToolResult {
                     success: false,
-                    output: json!({ "error": msg, "provider": self.web_search.name() }),
+                    output: json!({
+                        "error": msg,
+                        "provider": self.web_search.name(),
+                        "answered_by": self.web_search.last_used(),
+                    }),
                     error: Some(msg),
                     execution_time_ms: start.elapsed().as_millis() as u64,
                 })

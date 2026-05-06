@@ -86,6 +86,7 @@ fn spawn_router_approval(
         approval_router: state.approval_router.clone(),
         notifier: state.notifier.clone(),
         compactor: state.compactor.clone(),
+        web_search: Arc::clone(&state.web_search),
     };
 
     tauri::async_runtime::spawn(async move {
@@ -189,6 +190,7 @@ fn spawn_router_approval(
             approval_router: bg_ctx.approval_router,
             notifier: bg_ctx.notifier.clone(),
             compactor: bg_ctx.compactor.clone(),
+            web_search: bg_ctx.web_search.clone(),
         };
 
         let outcome = match execute_approved_task(task_id, ctx).await {
@@ -262,6 +264,7 @@ struct ApprovedTaskBgCtx {
     approval_router: Option<Arc<crate::approval::ApprovalRouter>>,
     notifier: Option<Arc<crate::notifier::NotificationOrchestrator>>,
     compactor: Option<Arc<dyn athen_core::traits::compaction::ArcCompactor>>,
+    web_search: Arc<dyn athen_web::WebSearchProvider>,
 }
 
 /// Resolve the agent profile that should drive execution for a given arc.
@@ -1567,6 +1570,7 @@ pub async fn approve_task(
         approval_router: state.approval_router.clone(),
         notifier: state.notifier.clone(),
         compactor: state.compactor.clone(),
+        web_search: Arc::clone(&state.web_search),
     };
 
     let outcome = match execute_approved_task(task_uuid, ctx).await {
@@ -1669,6 +1673,11 @@ pub(crate) struct ApprovedTaskCtx {
     /// tail + tool cache). When `None`, the legacy `load_entries`
     /// fallback runs. See `docs/ARC_COMPACTION.md` §8.
     pub compactor: Option<Arc<dyn athen_core::traits::compaction::ArcCompactor>>,
+    /// Quota-aware web search backend — Brave → Tavily → DDG-floor chain
+    /// built from `config.web_search`. Shared by every executor path so a
+    /// rate-limit cooldown discovered on one task carries across to the
+    /// next.
+    pub web_search: Arc<dyn athen_web::WebSearchProvider>,
 }
 
 /// Drive a risk-flagged task all the way through approval, dispatch,
@@ -1875,7 +1884,8 @@ pub(crate) async fn execute_approved_task(
     // inlined here because the bg path doesn't own `&AppState`.
     let mut shell_registry = athen_agent::ShellToolRegistry::new()
         .await
-        .with_spawned_processes(ctx.spawned_processes.clone());
+        .with_spawned_processes(ctx.spawned_processes.clone())
+        .with_web_search(Arc::clone(&ctx.web_search));
     if let Some(ref store) = ctx.grant_store {
         let provider = Arc::new(crate::file_gate::ArcWritableProvider {
             arc_id: crate::file_gate::arc_uuid(&ctx.active_arc_id),
@@ -2310,7 +2320,8 @@ pub(crate) async fn execute_dispatched_task(
     // Build the tool registry, mirroring execute_approved_task.
     let mut shell_registry = athen_agent::ShellToolRegistry::new()
         .await
-        .with_spawned_processes(ctx.spawned_processes.clone());
+        .with_spawned_processes(ctx.spawned_processes.clone())
+        .with_web_search(Arc::clone(&ctx.web_search));
     if let Some(ref store) = ctx.grant_store {
         let provider = Arc::new(crate::file_gate::ArcWritableProvider {
             arc_id: crate::file_gate::arc_uuid(&arc_id),

@@ -2532,6 +2532,26 @@ async function loadSettings() {
                 if (arrow) arrow.textContent = '\u25BC';
             }
         }
+        // Populate web search settings — keys are NOT echoed verbatim;
+        // backend returns has-key + masked hint. Empty inputs mean
+        // "leave unchanged" on save.
+        if (settings.web_search) {
+            const braveInput = document.getElementById('web-search-brave');
+            const tavilyInput = document.getElementById('web-search-tavily');
+            if (braveInput) {
+                braveInput.value = '';
+                braveInput.placeholder = settings.web_search.brave_configured
+                    ? settings.web_search.brave_hint + '  (saved — leave blank to keep)'
+                    : 'BSA…';
+            }
+            if (tavilyInput) {
+                tavilyInput.value = '';
+                tavilyInput.placeholder = settings.web_search.tavily_configured
+                    ? settings.web_search.tavily_hint + '  (saved — leave blank to keep)'
+                    : 'tvly-…';
+            }
+        }
+
         await loadMcpCatalog();
         await loadToolboxPackages();
         await loadGrants();
@@ -3881,6 +3901,96 @@ function showTelegramTestResult(success, message) {
     el.classList.remove('hidden');
     setTimeout(() => el.classList.add('hidden'), 5000);
 }
+
+// ─── Web Search Settings ───
+
+function showWebSearchTestResult(success, message) {
+    const el = document.getElementById('web-search-test-result');
+    if (!el) return;
+    el.className = 'test-result ' + (success ? 'test-success' : 'test-error');
+    el.textContent = message;
+    el.classList.remove('hidden');
+    setTimeout(() => el.classList.add('hidden'), 5000);
+}
+
+document.getElementById('web-search-brave-toggle')?.addEventListener('click', function (ev) {
+    ev.preventDefault();
+    const input = document.getElementById('web-search-brave');
+    if (!input) return;
+    input.type = input.type === 'password' ? 'text' : 'password';
+});
+
+document.getElementById('web-search-tavily-toggle')?.addEventListener('click', function (ev) {
+    ev.preventDefault();
+    const input = document.getElementById('web-search-tavily');
+    if (!input) return;
+    input.type = input.type === 'password' ? 'text' : 'password';
+});
+
+document.getElementById('test-web-search-brave-btn')?.addEventListener('click', async function () {
+    const btn = this;
+    const key = (document.getElementById('web-search-brave').value || '').trim();
+    if (!key) {
+        showWebSearchTestResult(false, 'Enter a Brave key first.');
+        return;
+    }
+    btn.disabled = true;
+    const orig = btn.textContent;
+    btn.textContent = 'Testing…';
+    try {
+        const result = await window.__TAURI__.core.invoke('test_web_search_provider', {
+            provider: 'brave',
+            apiKey: key,
+        });
+        showWebSearchTestResult(result.success, result.message);
+    } catch (e) {
+        showWebSearchTestResult(false, e.toString());
+    } finally {
+        btn.disabled = false;
+        btn.textContent = orig;
+    }
+});
+
+document.getElementById('test-web-search-tavily-btn')?.addEventListener('click', async function () {
+    const btn = this;
+    const key = (document.getElementById('web-search-tavily').value || '').trim();
+    if (!key) {
+        showWebSearchTestResult(false, 'Enter a Tavily key first.');
+        return;
+    }
+    btn.disabled = true;
+    const orig = btn.textContent;
+    btn.textContent = 'Testing…';
+    try {
+        const result = await window.__TAURI__.core.invoke('test_web_search_provider', {
+            provider: 'tavily',
+            apiKey: key,
+        });
+        showWebSearchTestResult(result.success, result.message);
+    } catch (e) {
+        showWebSearchTestResult(false, e.toString());
+    } finally {
+        btn.disabled = false;
+        btn.textContent = orig;
+    }
+});
+
+document.getElementById('save-web-search-btn')?.addEventListener('click', async function () {
+    // Empty input → null (preserve existing). Anything else → that
+    // value. Matches the convention save_provider uses for LLM keys.
+    const brave = document.getElementById('web-search-brave').value;
+    const tavily = document.getElementById('web-search-tavily').value;
+    try {
+        const result = await window.__TAURI__.core.invoke('save_web_search_settings', {
+            braveApiKey: brave === '' ? null : brave,
+            tavilyApiKey: tavily === '' ? null : tavily,
+        });
+        showWebSearchTestResult(true, result);
+        await loadSettings();
+    } catch (e) {
+        showWebSearchTestResult(false, e.toString());
+    }
+});
 
 // ─── Notification Settings ───
 
@@ -6025,6 +6135,7 @@ const ONB_PROGRESS_FOR_STEP = {
     local: 'pick',
     cloud: 'pick',
     memory: 'memory',
+    search: 'search',
     runtimes: 'runtimes',
     done: 'done',
 };
@@ -6178,6 +6289,7 @@ function wireOnboardingButtons() {
     });
 
     wireMemoryStep();
+    wireSearchStep();
     wireRuntimesStep();
 
     document.getElementById('onb-finish')?.addEventListener('click', finishOnboarding);
@@ -6247,7 +6359,7 @@ function wireMemoryStep() {
         } catch (e) {
             console.warn('[athen] save embedding (skip) failed:', e);
         }
-        enterRuntimesStep();
+        enterSearchStep();
     });
 
     document.getElementById('onb-mem-test')?.addEventListener('click', async () => {
@@ -6298,6 +6410,84 @@ function wireMemoryStep() {
         }
 
         setOnbStatus('onb-mem-status', 'ok', 'Saved.');
+        enterSearchStep();
+    });
+}
+
+// ─── Search step ────────────────────────────────────────────────────
+//
+// Optional. Brave / Tavily keys upgrade the keyless DDG fallback. Both
+// fields can be left blank — the runtime always has a working chain
+// because DuckDuckGo doesn't require a key.
+
+async function enterSearchStep() {
+    showOnboardingStep('search');
+}
+
+function wireSearchStep() {
+    document.getElementById('onb-search-skip')?.addEventListener('click', () => {
+        enterRuntimesStep();
+    });
+
+    document.getElementById('onb-search-save')?.addEventListener('click', async () => {
+        const brave = (document.getElementById('onb-search-brave').value || '').trim();
+        const tavily = (document.getElementById('onb-search-tavily').value || '').trim();
+
+        // Test whatever was provided before saving so the user gets a
+        // meaningful error if the key is wrong, instead of a silent
+        // restart.
+        if (brave) {
+            setOnbStatus('onb-search-status', 'busy', 'Testing Brave…');
+            try {
+                const result = await invoke('test_web_search_provider', {
+                    provider: 'brave',
+                    apiKey: brave,
+                });
+                if (!result || !result.success) {
+                    setOnbStatus(
+                        'onb-search-status',
+                        'err',
+                        'Brave: ' + ((result && result.message) || 'failed'),
+                    );
+                    return;
+                }
+            } catch (e) {
+                setOnbStatus('onb-search-status', 'err', 'Brave: ' + String(e));
+                return;
+            }
+        }
+        if (tavily) {
+            setOnbStatus('onb-search-status', 'busy', 'Testing Tavily…');
+            try {
+                const result = await invoke('test_web_search_provider', {
+                    provider: 'tavily',
+                    apiKey: tavily,
+                });
+                if (!result || !result.success) {
+                    setOnbStatus(
+                        'onb-search-status',
+                        'err',
+                        'Tavily: ' + ((result && result.message) || 'failed'),
+                    );
+                    return;
+                }
+            } catch (e) {
+                setOnbStatus('onb-search-status', 'err', 'Tavily: ' + String(e));
+                return;
+            }
+        }
+
+        setOnbStatus('onb-search-status', 'busy', 'Saving…');
+        try {
+            await invoke('save_web_search_settings', {
+                braveApiKey: brave,
+                tavilyApiKey: tavily,
+            });
+        } catch (e) {
+            setOnbStatus('onb-search-status', 'err', 'Save failed: ' + e);
+            return;
+        }
+        setOnbStatus('onb-search-status', 'ok', 'Saved.');
         enterRuntimesStep();
     });
 }

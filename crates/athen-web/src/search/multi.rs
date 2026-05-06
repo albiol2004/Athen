@@ -9,6 +9,7 @@
 //! DDG (or any provider added without a cooldown) acts as the floor — it
 //! never enters cooldown, so the chain always has *something* to fall back to.
 
+use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -71,11 +72,24 @@ impl ProviderSlot {
 
 pub struct MultiSearchProvider {
     slots: Vec<ProviderSlot>,
+    /// 1-based index (into `slots`) of the provider that handled the
+    /// most recent call. `0` means "no call yet, fall back to the
+    /// wrapper name". Stored atomically so [`WebSearchProvider::last_used`]
+    /// stays cheap and lock-free for read-heavy agent paths.
+    last_used_idx: std::sync::atomic::AtomicUsize,
 }
 
 impl MultiSearchProvider {
     pub fn new(slots: Vec<ProviderSlot>) -> Self {
-        Self { slots }
+        Self {
+            slots,
+            last_used_idx: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn record_used_index(&self, idx: usize) {
+        self.last_used_idx
+            .store(idx.saturating_add(1), Ordering::Relaxed);
     }
 }
 
@@ -87,13 +101,17 @@ impl WebSearchProvider for MultiSearchProvider {
 
     async fn search(&self, query: &str, max_results: usize) -> Result<Vec<SearchResult>> {
         let mut last_err: Option<AthenError> = None;
-        for slot in &self.slots {
+        let mut last_idx: Option<usize> = None;
+        for (idx, slot) in self.slots.iter().enumerate() {
             if slot.in_cooldown() {
                 debug!(provider = slot.inner.name(), "skipping (in cooldown)");
                 continue;
             }
             match slot.inner.search(query, max_results).await {
-                Ok(results) => return Ok(results),
+                Ok(results) => {
+                    self.record_used_index(idx);
+                    return Ok(results);
+                }
                 Err(e) => {
                     let msg = e.to_string();
                     let cooldown = classify_error(&msg);
@@ -109,12 +127,28 @@ impl WebSearchProvider for MultiSearchProvider {
                         debug!(provider = slot.inner.name(), error = %msg, "provider failed");
                     }
                     last_err = Some(e);
+                    last_idx = Some(idx);
                 }
             }
         }
-        Err(last_err.unwrap_or_else(|| {
-            AthenError::Other("no search providers configured".into())
-        }))
+        // No success — record whichever provider produced the final
+        // error so observers can still see who tried last.
+        if let Some(idx) = last_idx {
+            self.record_used_index(idx);
+        }
+        Err(last_err.unwrap_or_else(|| AthenError::Other("no search providers configured".into())))
+    }
+
+    fn last_used(&self) -> &'static str {
+        let raw = self.last_used_idx.load(Ordering::Relaxed);
+        if raw == 0 {
+            return self.name();
+        }
+        let idx = raw - 1;
+        match self.slots.get(idx) {
+            Some(slot) => slot.inner.name(),
+            None => self.name(),
+        }
     }
 }
 
@@ -153,8 +187,8 @@ fn classify_error(msg: &str) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     struct Stub {
         name: &'static str,
@@ -227,7 +261,11 @@ mod tests {
         assert_eq!(res[0].title, "from-b");
         // Second call must skip a entirely (it's in cooldown).
         let _ = multi.search("q", 5).await.unwrap();
-        assert_eq!(a.calls.load(Ordering::Relaxed), 1, "a should be skipped on retry");
+        assert_eq!(
+            a.calls.load(Ordering::Relaxed),
+            1,
+            "a should be skipped on retry"
+        );
         assert_eq!(b.calls.load(Ordering::Relaxed), 2);
     }
 
@@ -256,13 +294,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn last_used_reports_answering_provider() {
+        let a = Stub::err("a", "tavily HTTP 429: too many requests");
+        let b = Stub::ok("b", vec![hit("from-b")]);
+        let multi = MultiSearchProvider::new(vec![
+            ProviderSlot::keyed(a.clone()),
+            ProviderSlot::keyed(b.clone()),
+        ]);
+        // Before any call: falls back to the wrapper's own name.
+        assert_eq!(multi.last_used(), "multi");
+        let _ = multi.search("q", 5).await.unwrap();
+        // After: reports the provider that actually answered, not "multi".
+        assert_eq!(multi.last_used(), "b");
+    }
+
+    #[tokio::test]
     async fn returns_last_error_when_all_fail() {
         let a = Stub::err("a", "boom-a");
         let b = Stub::err("b", "boom-b");
-        let multi = MultiSearchProvider::new(vec![
-            ProviderSlot::keyed(a),
-            ProviderSlot::keyed(b),
-        ]);
+        let multi = MultiSearchProvider::new(vec![ProviderSlot::keyed(a), ProviderSlot::keyed(b)]);
         let err = multi.search("q", 5).await.unwrap_err();
         assert!(err.to_string().contains("boom-b"));
     }

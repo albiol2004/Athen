@@ -74,6 +74,17 @@ pub struct NotificationSettingsInfo {
     pub quiet_allow_critical: bool,
 }
 
+/// Web search provider configuration info for the frontend. Keys are not
+/// exposed verbatim — the frontend gets a boolean + masked hint so a
+/// settings refresh on a shared screen doesn't leak the credential.
+#[derive(Debug, Clone, Serialize)]
+pub struct WebSearchSettingsInfo {
+    pub brave_configured: bool,
+    pub brave_hint: String,
+    pub tavily_configured: bool,
+    pub tavily_hint: String,
+}
+
 /// Embedding provider configuration info for the frontend.
 #[derive(Debug, Clone, Serialize)]
 pub struct EmbeddingSettingsInfo {
@@ -95,6 +106,7 @@ pub struct SettingsResponse {
     pub telegram: TelegramSettingsInfo,
     pub notifications: NotificationSettingsInfo,
     pub embeddings: EmbeddingSettingsInfo,
+    pub web_search: WebSearchSettingsInfo,
 }
 
 /// Result of a provider connection test.
@@ -620,6 +632,26 @@ pub async fn get_settings(
         }
     };
 
+    let web_search = {
+        let ws = &main_config.web_search;
+        let brave_configured = !ws.brave_api_key.is_empty();
+        let tavily_configured = !ws.tavily_api_key.is_empty();
+        WebSearchSettingsInfo {
+            brave_configured,
+            brave_hint: if brave_configured {
+                mask_api_key(&ws.brave_api_key)
+            } else {
+                String::new()
+            },
+            tavily_configured,
+            tavily_hint: if tavily_configured {
+                mask_api_key(&ws.tavily_api_key)
+            } else {
+                String::new()
+            },
+        }
+    };
+
     Ok(SettingsResponse {
         providers,
         active_provider: active,
@@ -628,6 +660,7 @@ pub async fn get_settings(
         telegram,
         notifications,
         embeddings,
+        web_search,
     })
 }
 
@@ -1181,6 +1214,82 @@ pub async fn test_telegram_connection(
         Err(msg) => Ok(TestResult {
             success: false,
             message: msg,
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Web search settings commands
+// ---------------------------------------------------------------------------
+
+/// Save web search provider keys.
+///
+/// Each key follows the same convention as the LLM provider commands:
+/// - `None` keeps the existing value untouched.
+/// - `Some("")` clears the key.
+/// - `Some("key")` updates it.
+///
+/// Changes take effect after a restart — the runtime builds the
+/// MultiSearchProvider chain from this config in `AppState::new`.
+#[tauri::command]
+pub async fn save_web_search_settings(
+    brave_api_key: Option<String>,
+    tavily_api_key: Option<String>,
+) -> std::result::Result<String, String> {
+    let mut config = load_main_config();
+
+    if let Some(key) = brave_api_key {
+        config.web_search.brave_api_key = key;
+    }
+    if let Some(key) = tavily_api_key {
+        config.web_search.tavily_api_key = key;
+    }
+
+    save_main_config(&config)?;
+    Ok("Web search settings saved. Restart to apply.".to_string())
+}
+
+/// Test a web search provider key with a tiny smoke query. The provider
+/// `id` must be one of `"brave"` or `"tavily"`; DDG isn't keyed and
+/// doesn't need a test path.
+#[tauri::command]
+pub async fn test_web_search_provider(
+    provider: String,
+    api_key: String,
+) -> std::result::Result<TestResult, String> {
+    use athen_web::WebSearchProvider;
+
+    if api_key.trim().is_empty() {
+        return Ok(TestResult {
+            success: false,
+            message: "API key is required.".to_string(),
+        });
+    }
+
+    let backend: Box<dyn WebSearchProvider> = match provider.as_str() {
+        "brave" => Box::new(athen_web::BraveSearch::new(api_key)),
+        "tavily" => Box::new(athen_web::TavilySearch::new(api_key)),
+        other => {
+            return Ok(TestResult {
+                success: false,
+                message: format!("Unknown provider '{other}'. Use 'brave' or 'tavily'."),
+            });
+        }
+    };
+
+    match backend.search("athen ai agent", 1).await {
+        Ok(hits) if hits.is_empty() => Ok(TestResult {
+            success: true,
+            message: "Connected — provider returned no hits for the smoke query, but auth works."
+                .to_string(),
+        }),
+        Ok(hits) => Ok(TestResult {
+            success: true,
+            message: format!("Connected. Top result: {}", hits[0].title),
+        }),
+        Err(e) => Ok(TestResult {
+            success: false,
+            message: e.to_string(),
         }),
     }
 }

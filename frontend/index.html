@@ -369,6 +369,39 @@
             </section>
 
             <section class="settings-section">
+                <h2>Web Search</h2>
+                <p class="settings-description">
+                    Athen uses Brave first, falls back to Tavily, and only drops to keyless DuckDuckGo when both are exhausted.
+                    Either or both keys are optional — leave them blank to rely on the DDG fallback.
+                </p>
+
+                <div class="setting-row">
+                    <label for="web-search-brave">Brave Search API key</label>
+                    <div class="api-key-wrapper">
+                        <input type="password" id="web-search-brave" class="settings-input" placeholder="BSA…" autocomplete="off">
+                        <button class="api-key-toggle" id="web-search-brave-toggle" title="Show/hide key">&#128065;</button>
+                    </div>
+                    <p class="setting-hint" id="web-search-brave-hint">2,000 free queries/month. Sign up at <a href="https://api.search.brave.com" target="_blank">api.search.brave.com</a>.</p>
+                </div>
+
+                <div class="setting-row">
+                    <label for="web-search-tavily">Tavily API key</label>
+                    <div class="api-key-wrapper">
+                        <input type="password" id="web-search-tavily" class="settings-input" placeholder="tvly-…" autocomplete="off">
+                        <button class="api-key-toggle" id="web-search-tavily-toggle" title="Show/hide key">&#128065;</button>
+                    </div>
+                    <p class="setting-hint" id="web-search-tavily-hint">~1,000 free queries/month, answer-ready snippets. Sign up at <a href="https://tavily.com" target="_blank">tavily.com</a>.</p>
+                </div>
+
+                <div class="setting-actions">
+                    <button id="test-web-search-brave-btn" class="btn-secondary">Test Brave</button>
+                    <button id="test-web-search-tavily-btn" class="btn-secondary">Test Tavily</button>
+                    <button id="save-web-search-btn" class="btn-primary">Save Web Search Settings</button>
+                </div>
+                <div id="web-search-test-result" class="test-result hidden"></div>
+            </section>
+
+            <section class="settings-section">
                 <h2>Notifications</h2>
                 <p class="settings-description">Configure how Athen contacts you for important events and approvals.</p>
 
@@ -786,8 +819,9 @@
             <div id="onb-progress" class="onb-progress" style="display: none;">
                 <span class="onb-progress-step" data-step="pick">1. Brain</span>
                 <span class="onb-progress-step" data-step="memory">2. Memory</span>
-                <span class="onb-progress-step" data-step="runtimes">3. Runtimes</span>
-                <span class="onb-progress-step" data-step="done">4. Ready</span>
+                <span class="onb-progress-step" data-step="search">3. Search</span>
+                <span class="onb-progress-step" data-step="runtimes">4. Runtimes</span>
+                <span class="onb-progress-step" data-step="done">5. Ready</span>
             </div>
 
             <div class="onboarding-step" data-step="welcome">
@@ -906,6 +940,34 @@
                 </div>
                 <div class="onboarding-buttons">
                     <button id="onb-back-mem" class="btn-secondary">Back</button>
+                </div>
+            </div>
+
+            <div class="onboarding-step" data-step="search" style="display: none;">
+                <h1>Web search (recommended)</h1>
+                <p class="onboarding-hint">
+                    Athen can search the web to back up its answers and check facts.
+                    A keyless DuckDuckGo fallback is built in, but it rate-limits often —
+                    plug in a free Brave or Tavily key for far better results. You can
+                    add both: Athen uses whichever is available.
+                </p>
+                <details class="onb-help" style="margin-bottom: 12px;">
+                    <summary>Where do I get these keys?</summary>
+                    <ul style="margin: 8px 0 0 16px; padding: 0; font-size: 0.9em; opacity: 0.85;">
+                        <li><strong>Brave</strong>: sign up at <code>api.search.brave.com</code> — 2,000 free queries/month, no card required.</li>
+                        <li><strong>Tavily</strong>: sign up at <code>tavily.com</code> — ~1,000 free queries/month, answer-ready snippets.</li>
+                    </ul>
+                </details>
+                <label>Brave Search API key (optional)
+                    <input type="password" id="onb-search-brave" placeholder="BSA…">
+                </label>
+                <label>Tavily API key (optional)
+                    <input type="password" id="onb-search-tavily" placeholder="tvly-…">
+                </label>
+                <div id="onb-search-status" class="onb-status"></div>
+                <div class="onboarding-buttons">
+                    <button id="onb-search-skip" class="btn-secondary">Skip for now</button>
+                    <button id="onb-search-save" class="btn-primary">Save &amp; continue</button>
                 </div>
             </div>
 

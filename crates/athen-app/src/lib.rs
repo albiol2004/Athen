@@ -75,6 +75,8 @@ pub fn run() {
             settings::test_email_connection,
             settings::save_telegram_settings,
             settings::test_telegram_connection,
+            settings::save_web_search_settings,
+            settings::test_web_search_provider,
             commands::list_calendar_events,
             commands::create_calendar_event,
             commands::update_calendar_event,

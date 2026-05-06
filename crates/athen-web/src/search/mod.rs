@@ -28,4 +28,14 @@ pub trait WebSearchProvider: Send + Sync {
 
     /// Stable identifier for logs and tool output (`"duckduckgo"`, `"tavily"`).
     fn name(&self) -> &'static str;
+
+    /// For wrappers like [`multi::MultiSearchProvider`]: the name of the
+    /// underlying provider that answered the **most recent** successful
+    /// call (or the one that just emitted an error). Plain providers
+    /// return their own [`Self::name`]. The agent's `web_search` tool
+    /// surfaces this in its JSON output so the user can see whether
+    /// Brave, Tavily or DDG actually handled a query.
+    fn last_used(&self) -> &'static str {
+        self.name()
+    }
 }

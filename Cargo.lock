@@ -156,6 +156,7 @@ dependencies = [
  "athen-persistence",
  "athen-risk",
  "athen-sentidos",
+ "athen-web",
  "chrono",
  "futures",
  "glib 0.20.12",

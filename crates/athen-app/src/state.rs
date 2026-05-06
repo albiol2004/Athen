@@ -46,6 +46,10 @@ use athen_persistence::mcp::McpStore;
 use athen_persistence::Database;
 use athen_risk::llm_fallback::LlmRiskEvaluator;
 use athen_risk::CombinedRiskEvaluator;
+use athen_web::{
+    BraveSearch, DuckDuckGoSearch, MultiSearchProvider, ProviderSlot, TavilySearch,
+    WebSearchProvider,
+};
 
 use crate::file_gate::PendingGrants;
 
@@ -248,6 +252,12 @@ pub struct AppState {
     /// when `arc_store` is also present; `None` falls back to
     /// load_entries-based context (for legacy boot paths and tests).
     pub compactor: Option<Arc<dyn athen_core::traits::compaction::ArcCompactor>>,
+    /// Web search backend handed to every per-arc tool registry. Built once
+    /// from `config.web_search` so all three call sites
+    /// (`refresh_tools_doc`, `build_tool_registry`, owner-Telegram exec)
+    /// stay consistent. The chain prefers Brave → Tavily → DDG; cooldowns
+    /// for keyed providers are tracked inside the `MultiSearchProvider`.
+    pub web_search: Arc<dyn WebSearchProvider>,
 }
 
 impl AppState {
@@ -326,6 +336,8 @@ impl AppState {
                 c
             });
 
+        let web_search = build_web_search_provider(&config.web_search);
+
         let state = Self {
             coordinator: Arc::new(coordinator),
             router,
@@ -364,6 +376,7 @@ impl AppState {
             dispatch_signal: Arc::new(tokio::sync::Notify::new()),
             dispatch_loop_shutdown: None,
             compactor,
+            web_search,
         };
 
         if let Err(e) = state.refresh_tools_doc().await {
@@ -386,7 +399,8 @@ impl AppState {
         // attached here — listing tools never invokes them.
         let mut shell_registry = athen_agent::ShellToolRegistry::new()
             .await
-            .with_spawned_processes(self.spawned_processes.clone());
+            .with_spawned_processes(self.spawned_processes.clone())
+            .with_web_search(self.web_search.clone());
         if let Some(router) = self.approval_router.clone() {
             shell_registry = shell_registry.with_toolbox_approval(Arc::new(
                 crate::file_gate::RouterToolboxApprovalGate::new(router, None),
@@ -426,7 +440,8 @@ impl AppState {
         let delegation_app_handle = app_handle.clone();
         let mut shell = athen_agent::ShellToolRegistry::new()
             .await
-            .with_spawned_processes(self.spawned_processes.clone());
+            .with_spawned_processes(self.spawned_processes.clone())
+            .with_web_search(self.web_search.clone());
         if let Some(store) = self.grant_store.clone() {
             let provider = Arc::new(crate::file_gate::ArcWritableProvider {
                 arc_id: crate::file_gate::arc_uuid(arc_id),
@@ -810,6 +825,7 @@ impl AppState {
         let task_arc_map_ref = Arc::clone(&self.task_arc_map);
         let pending_email_marks_ref = Arc::clone(&self.pending_email_marks);
         let dispatch_signal_ref = Arc::clone(&self.dispatch_signal);
+        let web_search_ref = Arc::clone(&self.web_search);
 
         tauri::async_runtime::spawn(async move {
             if let Err(e) = monitor.init(&telegram_config).await {
@@ -881,6 +897,7 @@ impl AppState {
                                     let profile_embedding_cache_c =
                                         Arc::clone(&profile_embedding_cache_ref);
                                     let approval_router_c = approval_router_ref.clone();
+                                    let web_search_c = Arc::clone(&web_search_ref);
                                     tauri::async_runtime::spawn(async move {
                                         execute_owner_telegram_message(
                                             &text_owned,
@@ -903,6 +920,7 @@ impl AppState {
                                             &profile_embedder_c,
                                             &profile_embedding_cache_c,
                                             approval_router_c.as_ref(),
+                                            &web_search_c,
                                         )
                                         .await;
                                     });
@@ -1023,6 +1041,7 @@ impl AppState {
         let approval_router = self.approval_router.clone();
         let notifier = self.notifier.clone();
         let compactor = self.compactor.clone();
+        let web_search = Arc::clone(&self.web_search);
         let inflight = Arc::clone(&self.inflight_approvals);
 
         tauri::async_runtime::spawn(async move {
@@ -1103,6 +1122,7 @@ impl AppState {
                         approval_router: approval_router.clone(),
                         notifier: notifier.clone(),
                         compactor: compactor.clone(),
+                        web_search: Arc::clone(&web_search),
                     };
 
                     let task_arc_map_clone = Arc::clone(&task_arc_map);
@@ -1226,6 +1246,7 @@ async fn execute_owner_telegram_message(
     profile_embedder: &Arc<dyn athen_core::traits::embedding::EmbeddingProvider>,
     profile_embedding_cache: &ProfileEmbeddingCache,
     approval_router: Option<&Arc<crate::approval::ApprovalRouter>>,
+    web_search: &Arc<dyn WebSearchProvider>,
 ) {
     use std::time::Duration;
 
@@ -1358,7 +1379,8 @@ async fn execute_owner_telegram_message(
         Box::new(SharedRouter(Arc::clone(router)));
     let mut shell_registry = ShellToolRegistry::new()
         .await
-        .with_spawned_processes(spawned_processes.clone());
+        .with_spawned_processes(spawned_processes.clone())
+        .with_web_search(web_search.clone());
     if let (Some(store), Some(arc_id_str)) = (grant_store, target_arc_id.as_ref()) {
         let provider = Arc::new(crate::file_gate::ArcWritableProvider {
             arc_id: crate::file_gate::arc_uuid(arc_id_str),
@@ -1703,6 +1725,41 @@ fn find_config_dir() -> Option<PathBuf> {
     }
 
     None
+}
+
+/// Build the web-search provider chain from the user's configured keys.
+///
+/// Order: Brave (when key set) → Tavily (when key set) → DuckDuckGo (always
+/// last, no key, never cools down). Keyed providers enter cooldown when they
+/// return rate-limit / quota errors; the wrapper tries the next one and only
+/// surfaces an error if every provider in the chain fails.
+fn build_web_search_provider(
+    config: &athen_core::config::WebSearchConfig,
+) -> Arc<dyn WebSearchProvider> {
+    let mut slots: Vec<ProviderSlot> = Vec::new();
+
+    let brave_key = config.brave_api_key.trim();
+    if !brave_key.is_empty() {
+        let provider: Arc<dyn WebSearchProvider> = Arc::new(BraveSearch::new(brave_key));
+        slots.push(ProviderSlot::keyed(provider));
+    }
+
+    let tavily_key = config.tavily_api_key.trim();
+    if !tavily_key.is_empty() {
+        let provider: Arc<dyn WebSearchProvider> = Arc::new(TavilySearch::new(tavily_key));
+        slots.push(ProviderSlot::keyed(provider));
+    }
+
+    // DDG floor — always-available fallback, never cools down.
+    let ddg: Arc<dyn WebSearchProvider> = Arc::new(DuckDuckGoSearch::new());
+    slots.push(ProviderSlot::floor(ddg));
+
+    info!(
+        "Web search chain: brave={}, tavily={}, ddg=floor",
+        !brave_key.is_empty(),
+        !tavily_key.is_empty()
+    );
+    Arc::new(MultiSearchProvider::new(slots))
 }
 
 /// Load configuration from TOML files, falling back to defaults.

@@ -19,6 +19,8 @@ pub struct AthenConfig {
     pub notifications: NotificationConfig,
     #[serde(default)]
     pub embeddings: EmbeddingConfig,
+    #[serde(default)]
+    pub web_search: WebSearchConfig,
 }
 
 impl Default for AthenConfig {
@@ -34,6 +36,7 @@ impl Default for AthenConfig {
             telegram: TelegramConfig::default(),
             notifications: NotificationConfig::default(),
             embeddings: EmbeddingConfig::default(),
+            web_search: WebSearchConfig::default(),
         }
     }
 }
@@ -379,4 +382,19 @@ impl Default for EmbeddingConfig {
             api_key: None,
         }
     }
+}
+
+/// Web search provider keys. The runtime builds a quota-aware chain from
+/// whichever keys are present (Brave → Tavily → DuckDuckGo as the keyless
+/// floor). Empty strings mean "not configured", and the chain skips them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebSearchConfig {
+    /// Brave Search API token (`X-Subscription-Token`). Free tier is
+    /// generous (2k queries/month) and is the default first-tier provider
+    /// when set.
+    pub brave_api_key: String,
+    /// Tavily API key. Lower free tier (~1k/month) but answer-ready snippets
+    /// — used as the second tier when present.
+    pub tavily_api_key: String,
 }
