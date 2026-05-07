@@ -1740,21 +1740,23 @@ pub(crate) async fn send_telegram_reply(
 // ---------------------------------------------------------------------------
 
 /// Resolve the config directory, trying in order:
-/// 1. `~/.athen/config.toml`
-/// 2. `./config/config.toml` (project-local fallback)
+/// 1. Athen's per-user data dir (`~/.athen` / `%APPDATA%\Athen`)
+/// 2. `./config/` (project-local fallback for development)
 ///
-/// Returns the directory path if a config file is found, or None for defaults.
+/// Returns the directory whenever it exists, regardless of whether
+/// `config.toml` or `models.toml` is present individually.
+/// `load_config_dir` then loads each file independently — a user who has
+/// only configured an LLM provider via Settings (writing `models.toml`
+/// but never `config.toml`) must still have their provider keys loaded.
 fn find_config_dir() -> Option<PathBuf> {
-    // Try Athen's data dir (~/.athen on Unix, %APPDATA%\Athen on Windows).
     if let Some(data_dir) = athen_core::paths::athen_data_dir() {
-        if data_dir.join("config.toml").exists() {
+        if data_dir.exists() {
             return Some(data_dir);
         }
     }
 
-    // Try ./config/
     let local_config = PathBuf::from("config");
-    if local_config.join("config.toml").exists() {
+    if local_config.exists() {
         return Some(local_config);
     }
 

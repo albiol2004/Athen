@@ -196,6 +196,30 @@ base = "fast"
         assert_eq!(config.security.mode, SecurityMode::Assistant);
     }
 
+    /// A user who has only configured an LLM provider via Settings writes
+    /// `models.toml` but not `config.toml`. Loading must still surface the
+    /// provider keys — otherwise the router starts up with an empty
+    /// providers map and authenticated requests fail.
+    #[test]
+    fn test_load_config_dir_models_only_no_config_toml() {
+        let dir = TempDir::new().unwrap();
+        let models_toml = r#"
+[providers.deepseek]
+auth = { ApiKey = "sk-test-key" }
+default_model = "deepseek-chat"
+"#;
+        std::fs::write(dir.path().join("models.toml"), models_toml).unwrap();
+
+        let config = load_config_dir(dir.path()).unwrap();
+        assert!(config.models.providers.contains_key("deepseek"));
+        match &config.models.providers["deepseek"].auth {
+            crate::config::AuthType::ApiKey(key) => assert_eq!(key, "sk-test-key"),
+            _ => panic!("expected ApiKey auth"),
+        }
+        // Other config defaults to baseline values.
+        assert_eq!(config.security.mode, SecurityMode::Assistant);
+    }
+
     #[test]
     fn test_save_creates_parent_dirs() {
         let dir = TempDir::new().unwrap();
