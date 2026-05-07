@@ -22,6 +22,7 @@ use athen_core::traits::coordinator::TaskQueue;
 use athen_core::traits::llm::LlmRouter;
 use athen_llm::budget::BudgetTracker;
 use athen_llm::providers::deepseek::DeepSeekProvider;
+use athen_llm::providers::openai::OpenAiCompatibleProvider;
 use athen_llm::router::DefaultLlmRouter;
 use athen_risk::llm_fallback::LlmRiskEvaluator;
 use athen_risk::CombinedRiskEvaluator;
@@ -142,6 +143,144 @@ fn build_coordinator(router: &Arc<DefaultLlmRouter>) -> Coordinator {
 }
 
 // ---------------------------------------------------------------------------
+// Headless one-shot mode (benchmark harness driver)
+// ---------------------------------------------------------------------------
+
+/// Build a router backed by a single OpenAI-compatible provider. All model
+/// profiles are mapped to the same provider so any internal call routes back
+/// to the local backend.
+fn build_openai_compat_router(
+    base_url: String,
+    model: String,
+    api_key: Option<String>,
+) -> Arc<DefaultLlmRouter> {
+    let provider_id = "openai-compat".to_string();
+    let mut provider = OpenAiCompatibleProvider::new(base_url)
+        .with_model(model)
+        .with_provider_id(provider_id.clone());
+    if let Some(key) = api_key {
+        provider = provider.with_api_key(key);
+    }
+
+    let mut providers: HashMap<String, Box<dyn athen_core::traits::llm::LlmProvider>> =
+        HashMap::new();
+    providers.insert(provider_id.clone(), Box::new(provider));
+
+    let profile = ProfileConfig {
+        description: "OpenAI-compatible local backend".into(),
+        priority: vec![provider_id],
+        fallback: None,
+    };
+
+    let mut profiles = HashMap::new();
+    profiles.insert(ModelProfile::Powerful, profile.clone());
+    profiles.insert(ModelProfile::Fast, profile.clone());
+    profiles.insert(ModelProfile::Code, profile.clone());
+    profiles.insert(ModelProfile::Cheap, profile);
+
+    let budget = BudgetTracker::new(None);
+    Arc::new(DefaultLlmRouter::new(providers, profiles, budget))
+}
+
+fn print_usage() {
+    println!("Athen CLI — Universal AI Agent");
+    println!();
+    println!("USAGE:");
+    println!("    athen-cli                       Launch interactive REPL (uses DeepSeek)");
+    println!("    athen-cli --prompt <PROMPT>     Headless one-shot mode (OpenAI-compatible)");
+    println!("    athen-cli --help                Show this help");
+    println!();
+    println!("HEADLESS MODE ENV VARS:");
+    println!("    ATHEN_BASE_URL  (required)  e.g. http://localhost:8000/v1");
+    println!("    ATHEN_MODEL     (required)  e.g. Qwen3.5-9B");
+    println!("    ATHEN_API_KEY   (optional)  Bearer token, if backend needs one");
+    println!();
+    println!("In headless mode the agent runs against the current working directory,");
+    println!("auto-approves all actions (no risk gating), prints the final response to");
+    println!("stdout, and exits 0 on success or non-zero on error.");
+}
+
+/// Run the agent in headless one-shot mode for benchmark harnesses.
+async fn run_headless(prompt: String) -> std::result::Result<(), (i32, String)> {
+    // 1. Read required env vars.
+    let base_url = match std::env::var("ATHEN_BASE_URL") {
+        Ok(v) if !v.is_empty() => v,
+        _ => {
+            return Err((
+                2,
+                "Error: ATHEN_BASE_URL not set (required for headless mode).".into(),
+            ));
+        }
+    };
+    let model = match std::env::var("ATHEN_MODEL") {
+        Ok(v) if !v.is_empty() => v,
+        _ => {
+            return Err((
+                2,
+                "Error: ATHEN_MODEL not set (required for headless mode).".into(),
+            ));
+        }
+    };
+    let api_key = std::env::var("ATHEN_API_KEY").ok().filter(|s| !s.is_empty());
+
+    // 2. Build router (no coordinator, no risk gating — auto-approve).
+    let router = build_openai_compat_router(base_url, model, api_key);
+
+    // 3. Build executor. cwd is implicit — the agent's filesystem tools operate
+    //    on the harness's working directory.
+    let exec_router: Box<dyn LlmRouter> = Box::new(SharedRouter(Arc::clone(&router)));
+    let registry = ShellToolRegistry::new().await;
+
+    let executor = AgentBuilder::new()
+        .llm_router(exec_router)
+        .tool_registry(Box::new(registry))
+        .max_steps(50)
+        .timeout(Duration::from_secs(600))
+        .build()
+        .map_err(|e| (1, format!("Failed to build executor: {e}")))?;
+
+    let task = Task {
+        id: Uuid::new_v4(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        source_event: None,
+        domain: DomainType::Base,
+        description: prompt,
+        priority: TaskPriority::Normal,
+        status: TaskStatus::InProgress,
+        risk_score: None,
+        risk_budget: None,
+        risk_used: 0,
+        assigned_agent: None,
+        steps: vec![],
+        deadline: None,
+    };
+
+    // 4. Execute.
+    let result = executor
+        .execute(task)
+        .await
+        .map_err(|e| (1, format!("Agent execution error: {e}")))?;
+
+    // 5. Print final response to stdout.
+    if let Some(output) = &result.output {
+        if let Some(response) = output.get("response").and_then(|r| r.as_str()) {
+            println!("{response}");
+        } else {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(output).unwrap_or_default()
+            );
+        }
+    }
+
+    if !result.success {
+        return Err((1, "Task ended without full completion.".into()));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -153,6 +292,37 @@ async fn main() {
         .with_target(false)
         .compact()
         .init();
+
+    // Argv dispatch: --help / --prompt <PROMPT> / (default = REPL).
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 2 {
+        match args[1].as_str() {
+            "--help" | "-h" => {
+                print_usage();
+                return;
+            }
+            "--prompt" => {
+                let prompt = match args.get(2) {
+                    Some(p) if !p.is_empty() => p.clone(),
+                    _ => {
+                        eprintln!("Error: --prompt requires a non-empty argument.");
+                        eprintln!("Usage: athen-cli --prompt <PROMPT>");
+                        std::process::exit(2);
+                    }
+                };
+                match run_headless(prompt).await {
+                    Ok(()) => std::process::exit(0),
+                    Err((code, msg)) => {
+                        eprintln!("{msg}");
+                        std::process::exit(code);
+                    }
+                }
+            }
+            _ => {
+                // Unknown flag — fall through to REPL for backward compatibility.
+            }
+        }
+    }
 
     // Load configuration.
     let config = match find_config_dir() {
