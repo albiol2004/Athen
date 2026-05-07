@@ -160,12 +160,7 @@ mod tests {
     #[test]
     fn blocked_mime_always_skipped_even_for_owner() {
         let p = AttachmentPolicy::default();
-        let d = p.decide(
-            "application/x-msdownload",
-            1024,
-            TrustLevel::AuthUser,
-            0,
-        );
+        let d = p.decide("application/x-msdownload", 1024, TrustLevel::AuthUser, 0);
         assert_eq!(d, AttachmentDecision::Skip);
     }
 

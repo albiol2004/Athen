@@ -354,6 +354,12 @@ fn row_to_notification_with_read(
             task_id,
             created_at,
             requires_response: requires_response_int != 0,
+            // Not persisted: body_long is a per-emit channel hint for
+            // outbound Telegram delivery. By the time we're reloading
+            // a notification from disk for the InApp panel, the
+            // outbound channel work is already done — there's no
+            // reason to keep it on the row.
+            body_long: None,
             // Not persisted: humanize-skip is a per-emit decision, never
             // re-applied on reload. Default to false so reloaded entries
             // pass through humanization the same as today.
@@ -385,6 +391,7 @@ mod tests {
             created_at: Utc::now(),
             requires_response: false,
             skip_humanize: false,
+            body_long: None,
         }
     }
 
@@ -402,6 +409,7 @@ mod tests {
             created_at: Utc::now(),
             requires_response: true,
             skip_humanize: false,
+            body_long: None,
         };
         let id = notif.id;
 

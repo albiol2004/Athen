@@ -47,6 +47,12 @@ pub struct Notification {
     /// away or, worse, get confused by salutations addressing Athen itself.
     #[serde(default)]
     pub skip_humanize: bool,
+    /// Full long-form body for chat-style channels (Telegram, future
+    /// SMS/WhatsApp). When `Some`, channels that aren't space-constrained
+    /// SHOULD prefer this over `body`. `body` itself stays short for
+    /// in-app toast previews. `None` = use `body` everywhere.
+    #[serde(default)]
+    pub body_long: Option<String>,
 }
 
 /// Result of attempting to deliver a notification through a channel.
@@ -84,6 +90,7 @@ mod tests {
             created_at: Utc::now(),
             requires_response: true,
             skip_humanize: false,
+            body_long: None,
         };
 
         assert_eq!(notif.urgency, NotificationUrgency::High);
@@ -93,6 +100,27 @@ mod tests {
         assert_eq!(notif.arc_id, Some("arc-123".to_string()));
         assert!(notif.task_id.is_none());
         assert!(notif.requires_response);
+        assert!(notif.body_long.is_none());
+    }
+
+    /// Old payloads from before the `body_long` field landed must still
+    /// deserialize cleanly. The `#[serde(default)]` attribute is what
+    /// makes that work — easy to lose to a future refactor.
+    #[test]
+    fn deserializes_legacy_payload_without_body_long() {
+        let json = serde_json::json!({
+            "id": Uuid::new_v4().to_string(),
+            "urgency": "Low",
+            "title": "Old payload",
+            "body": "no body_long field on this row",
+            "origin": "Agent",
+            "arc_id": null,
+            "task_id": null,
+            "created_at": Utc::now().to_rfc3339(),
+            "requires_response": false,
+        });
+        let n: Notification = serde_json::from_value(json).expect("legacy payload");
+        assert!(n.body_long.is_none());
     }
 
     #[test]

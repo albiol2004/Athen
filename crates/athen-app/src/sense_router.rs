@@ -117,12 +117,7 @@ pub async fn process_sense_event(
             .content
             .attachments
             .iter()
-            .map(|a| {
-                format!(
-                    "  - \"{}\" ({}, {}B)",
-                    a.name, a.mime_type, a.size_bytes
-                )
-            })
+            .map(|a| format!("  - \"{}\" ({}, {}B)", a.name, a.mime_type, a.size_bytes))
             .collect();
         format!(
             "{body_for_triage}\n\n[Attachments on this message ({}):\n{}]",
@@ -496,6 +491,7 @@ pub async fn process_sense_event(
             created_at: Utc::now(),
             requires_response: false,
             skip_humanize: copy.skip_humanize,
+            body_long: None,
         };
 
         notifier.notify(notification).await;

@@ -934,8 +934,8 @@ impl AppState {
                                 // arrives with text="[photo]" anyway, but a future
                                 // change that sends only attachments still needs
                                 // to reach the executor.
-                                let has_payload = !text.is_empty()
-                                    || !event.content.attachments.is_empty();
+                                let has_payload =
+                                    !text.is_empty() || !event.content.attachments.is_empty();
                                 if has_payload && chat_id != 0 {
                                     // Spawn the handler so the poll loop keeps
                                     // ticking. If we awaited inline, callbacks

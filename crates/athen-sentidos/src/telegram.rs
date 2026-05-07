@@ -17,8 +17,7 @@ use uuid::Uuid;
 use athen_core::config::{AthenConfig, TelegramConfig};
 use athen_core::error::{AthenError, Result};
 use athen_core::event::{
-    Attachment, AttachmentSource, EventKind, EventSource, NormalizedContent, SenderInfo,
-    SenseEvent,
+    Attachment, AttachmentSource, EventKind, EventSource, NormalizedContent, SenderInfo, SenseEvent,
 };
 use athen_core::risk::RiskLevel;
 use athen_core::traits::sense::SenseMonitor;
@@ -416,9 +415,9 @@ impl TelegramMonitor {
                             .await
                             {
                                 Ok(Ok(sidecar)) => att.extracted_text_path = Some(sidecar),
-                                Ok(Err(e)) => tracing::warn!(
-                                    "pdf-extract sidecar failed for {path:?}: {e}"
-                                ),
+                                Ok(Err(e)) => {
+                                    tracing::warn!("pdf-extract sidecar failed for {path:?}: {e}")
+                                }
                                 Err(e) => tracing::warn!(
                                     "pdf-extract spawn_blocking panicked for {path:?}: {e}"
                                 ),
@@ -555,7 +554,10 @@ fn extract_attachments(message: &TelegramMessage) -> Vec<Attachment> {
     if let Some(voice) = message.voice.as_ref() {
         out.push(make_attachment(
             format!("voice_{message_id}.ogg"),
-            voice.mime_type.clone().unwrap_or_else(|| "audio/ogg".into()),
+            voice
+                .mime_type
+                .clone()
+                .unwrap_or_else(|| "audio/ogg".into()),
             voice.file_size.unwrap_or(0),
             &voice.file_id,
             chat_id,
@@ -660,8 +662,8 @@ fn synthesise_media_summary(attachments: &[Attachment]) -> String {
 /// name in the synthesised summary — auto-names are noise.
 fn classify_attachment(a: &Attachment) -> (&'static str, bool) {
     let synthetic_prefixes = ["photo_", "voice_", "audio_", "video_", "document_"];
-    let auto_synthesised = synthetic_prefixes.iter().any(|p| a.name.starts_with(p))
-        || a.name.is_empty();
+    let auto_synthesised =
+        synthetic_prefixes.iter().any(|p| a.name.starts_with(p)) || a.name.is_empty();
 
     let kind = if a.mime_type.starts_with("image/") {
         "photo"
@@ -1594,7 +1596,11 @@ mod tests {
         let att = &events[0].content.attachments[0];
         assert_eq!(att.mime_type, "image/jpeg");
         match att.source.as_ref().unwrap() {
-            AttachmentSource::Telegram { file_id, chat_id, message_id } => {
+            AttachmentSource::Telegram {
+                file_id,
+                chat_id,
+                message_id,
+            } => {
                 assert_eq!(file_id, "high"); // larger of the two
                 assert_eq!(*chat_id, 42);
                 assert_eq!(*message_id, 42);
@@ -1627,7 +1633,10 @@ mod tests {
             Some("[document: invoice.pdf]")
         );
         assert_eq!(events[0].content.attachments.len(), 1);
-        assert_eq!(events[0].content.attachments[0].mime_type, "application/pdf");
+        assert_eq!(
+            events[0].content.attachments[0].mime_type,
+            "application/pdf"
+        );
     }
 
     #[test]

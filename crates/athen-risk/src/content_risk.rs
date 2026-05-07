@@ -113,12 +113,14 @@ static CREDENTIAL_RE: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
-static RAW_IP_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"https?://\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}").unwrap()
-});
+static RAW_IP_URL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"https?://\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}").unwrap());
 
 static SHORTENER_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)https?://(bit\.ly|tinyurl\.com|t\.co|goo\.gl|ow\.ly|is\.gd|buff\.ly|rebrand\.ly)/").unwrap()
+    Regex::new(
+        r"(?i)https?://(bit\.ly|tinyurl\.com|t\.co|goo\.gl|ow\.ly|is\.gd|buff\.ly|rebrand\.ly)/",
+    )
+    .unwrap()
 });
 
 static DEEP_SUBDOMAIN_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -155,8 +157,7 @@ impl ContentRiskAnalyzer {
                 }
                 if let Some(brand) = matches_brand_lookalike(d) {
                     s.lookalike_domain = true;
-                    s.matched_patterns
-                        .push(format!("lookalike_domain:{brand}"));
+                    s.matched_patterns.push(format!("lookalike_domain:{brand}"));
                 }
             }
 
@@ -289,7 +290,10 @@ fn matches_brand_lookalike(domain: &str) -> Option<&'static str> {
 }
 
 fn strip_tld(domain: &str) -> &str {
-    domain.rsplit_once('.').map(|(host, _)| host).unwrap_or(domain)
+    domain
+        .rsplit_once('.')
+        .map(|(host, _)| host)
+        .unwrap_or(domain)
 }
 
 /// Iterative Levenshtein with a single-row buffer. Small inputs only
@@ -310,9 +314,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
         curr[0] = i + 1;
         for (j, cb) in b.iter().enumerate() {
             let cost = if ca == cb { 0 } else { 1 };
-            curr[j + 1] = (curr[j] + 1)
-                .min(prev[j + 1] + 1)
-                .min(prev[j] + cost);
+            curr[j + 1] = (curr[j] + 1).min(prev[j + 1] + 1).min(prev[j] + cost);
         }
         std::mem::swap(&mut prev, &mut curr);
     }
@@ -392,11 +394,7 @@ mod tests {
 
     #[test]
     fn flags_credential_request() {
-        let s = analyze(
-            "Please verify your password to continue",
-            None,
-            None,
-        );
+        let s = analyze("Please verify your password to continue", None, None);
         assert!(s.credential_request);
     }
 
@@ -414,11 +412,7 @@ mod tests {
 
     #[test]
     fn flags_shortener_with_urgency() {
-        let s = analyze(
-            "Verify immediately at https://bit.ly/abc123",
-            None,
-            None,
-        );
+        let s = analyze("Verify immediately at https://bit.ly/abc123", None, None);
         assert!(s.suspicious_link);
     }
 
@@ -426,11 +420,7 @@ mod tests {
     fn does_not_flag_shortener_alone() {
         // A shortener URL without urgency or credential phrasing is too
         // common (newsletter footers, share links) to flag on its own.
-        let s = analyze(
-            "Hey check out my photo: https://bit.ly/abc123",
-            None,
-            None,
-        );
+        let s = analyze("Hey check out my photo: https://bit.ly/abc123", None, None);
         assert!(!s.suspicious_link);
     }
 

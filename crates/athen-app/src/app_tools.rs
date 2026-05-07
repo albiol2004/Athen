@@ -959,9 +959,7 @@ impl AppToolRegistry {
                 .await
                 {
                     Ok(Ok(sidecar)) => {
-                        if let Err(e) =
-                            store.record_extracted_text(att.id, sidecar.clone()).await
-                        {
+                        if let Err(e) = store.record_extracted_text(att.id, sidecar.clone()).await {
                             tracing::warn!(
                                 attachment_id = %att.id,
                                 error = %e,
@@ -969,9 +967,7 @@ impl AppToolRegistry {
                             );
                         }
                         let text = tokio::fs::read_to_string(&sidecar).await.map_err(|e| {
-                            AthenError::Other(format!(
-                                "extracted PDF sidecar unreadable: {e}"
-                            ))
+                            AthenError::Other(format!("extracted PDF sidecar unreadable: {e}"))
                         })?;
                         let elapsed = start.elapsed().as_millis() as u64;
                         return Ok(ToolResult {
@@ -989,14 +985,10 @@ impl AppToolRegistry {
                         });
                     }
                     Ok(Err(e)) => {
-                        return Err(AthenError::Other(format!(
-                            "PDF extraction failed: {e}"
-                        )));
+                        return Err(AthenError::Other(format!("PDF extraction failed: {e}")));
                     }
                     Err(e) => {
-                        return Err(AthenError::Other(format!(
-                            "PDF extraction join error: {e}"
-                        )));
+                        return Err(AthenError::Other(format!("PDF extraction join error: {e}")));
                     }
                 }
             }
@@ -1005,9 +997,9 @@ impl AppToolRegistry {
         // 3. Text MIME — just read the bytes.
         if is_text {
             if let Some(local) = att.local_path.as_ref() {
-                let text = tokio::fs::read_to_string(local).await.map_err(|e| {
-                    AthenError::Other(format!("text attachment unreadable: {e}"))
-                })?;
+                let text = tokio::fs::read_to_string(local)
+                    .await
+                    .map_err(|e| AthenError::Other(format!("text attachment unreadable: {e}")))?;
                 let elapsed = start.elapsed().as_millis() as u64;
                 return Ok(ToolResult {
                     success: true,
@@ -2207,8 +2199,7 @@ mod tests {
             let store = db.attachment_store();
             store.init_schema().await.unwrap();
             let shell = ShellToolRegistry::new().await;
-            let registry = AppToolRegistry::new(shell, None, None, None)
-                .with_attachments(store);
+            let registry = AppToolRegistry::new(shell, None, None, None).with_attachments(store);
             (db, registry)
         }
 
@@ -2260,10 +2251,7 @@ mod tests {
             store.insert(event_id, &att).await.unwrap();
 
             let result = registry
-                .call_tool(
-                    "read_attachment_full",
-                    json!({ "id": att.id.to_string() }),
-                )
+                .call_tool("read_attachment_full", json!({ "id": att.id.to_string() }))
                 .await
                 .unwrap();
             assert!(result.success);
@@ -2280,28 +2268,16 @@ mod tests {
             let store = db.attachment_store();
             let event_id = uuid::Uuid::new_v4();
             let txt_path = write_temp("note.txt", b"Plain note body.");
-            let att = Attachment::new(
-                "note.txt",
-                "text/plain",
-                16,
-                Some(txt_path.clone()),
-                None,
-            );
+            let att = Attachment::new("note.txt", "text/plain", 16, Some(txt_path.clone()), None);
             store.insert(event_id, &att).await.unwrap();
 
             let result = registry
-                .call_tool(
-                    "read_attachment_full",
-                    json!({ "id": att.id.to_string() }),
-                )
+                .call_tool("read_attachment_full", json!({ "id": att.id.to_string() }))
                 .await
                 .unwrap();
             assert!(result.success);
             assert_eq!(result.output["source"].as_str().unwrap(), "local_text");
-            assert_eq!(
-                result.output["text"].as_str().unwrap(),
-                "Plain note body."
-            );
+            assert_eq!(result.output["text"].as_str().unwrap(), "Plain note body.");
         }
 
         #[tokio::test]
@@ -2309,10 +2285,7 @@ mod tests {
             let (_db, registry) = setup_with_attachments().await;
             let bogus = uuid::Uuid::new_v4();
             let err = registry
-                .call_tool(
-                    "read_attachment_full",
-                    json!({ "id": bogus.to_string() }),
-                )
+                .call_tool("read_attachment_full", json!({ "id": bogus.to_string() }))
                 .await
                 .unwrap_err();
             assert!(format!("{err}").contains("not found"));
@@ -2347,10 +2320,7 @@ mod tests {
             store.insert(event_id, &att).await.unwrap();
 
             let err = registry
-                .call_tool(
-                    "read_attachment_full",
-                    json!({ "id": att.id.to_string() }),
-                )
+                .call_tool("read_attachment_full", json!({ "id": att.id.to_string() }))
                 .await
                 .unwrap_err();
             let msg = format!("{err}");
@@ -2377,10 +2347,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(result.success);
-            assert_eq!(
-                result.output["status"].as_str().unwrap(),
-                "already_local"
-            );
+            assert_eq!(result.output["status"].as_str().unwrap(), "already_local");
         }
 
         #[tokio::test]
@@ -2410,10 +2377,7 @@ mod tests {
                 .unwrap();
             assert!(!result.success);
             assert_eq!(result.output["status"].as_str().unwrap(), "purged");
-            assert_eq!(
-                result.output["source"]["kind"].as_str().unwrap(),
-                "email"
-            );
+            assert_eq!(result.output["source"]["kind"].as_str().unwrap(), "email");
             assert_eq!(result.output["source"]["uid"].as_u64().unwrap(), 42);
         }
 

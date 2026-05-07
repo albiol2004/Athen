@@ -140,8 +140,7 @@ impl AttachmentStore {
                 .map_err(|e| AthenError::Other(format!("Query list_for_event: {e}")))?;
             let mut out = Vec::new();
             for row in rows {
-                let row = row
-                    .map_err(|e| AthenError::Other(format!("Row decode: {e}")))?;
+                let row = row.map_err(|e| AthenError::Other(format!("Row decode: {e}")))?;
                 out.push(row.into_domain()?);
             }
             Ok(out)
@@ -178,8 +177,7 @@ impl AttachmentStore {
                 .map_err(|e| AthenError::Other(format!("Query list_purgeable: {e}")))?;
             let mut out = Vec::new();
             for row in rows {
-                let (id, path) = row
-                    .map_err(|e| AthenError::Other(format!("Row decode: {e}")))?;
+                let (id, path) = row.map_err(|e| AthenError::Other(format!("Row decode: {e}")))?;
                 let id = Uuid::parse_str(&id)
                     .map_err(|e| AthenError::Other(format!("Bad attachment id: {e}")))?;
                 out.push((AttachmentId(id), PathBuf::from(path)));
@@ -235,11 +233,7 @@ impl AttachmentStore {
 
     /// Update the cached extracted-text sidecar path. Called after
     /// pdf-extract runs.
-    pub async fn record_extracted_text(
-        &self,
-        id: AttachmentId,
-        path: PathBuf,
-    ) -> Result<()> {
+    pub async fn record_extracted_text(&self, id: AttachmentId, path: PathBuf) -> Result<()> {
         let conn = self.conn.clone();
         let path_str = path.to_string_lossy().to_string();
         tokio::task::spawn_blocking(move || {
@@ -383,7 +377,10 @@ mod tests {
         assert_eq!(fetched.name, "invoice.pdf");
         assert_eq!(fetched.size_bytes, 12_345);
         assert!(fetched.is_local());
-        assert!(matches!(fetched.source, Some(AttachmentSource::Email { .. })));
+        assert!(matches!(
+            fetched.source,
+            Some(AttachmentSource::Email { .. })
+        ));
     }
 
     #[tokio::test]
@@ -413,7 +410,8 @@ mod tests {
         store.insert(event_id, &a).await.unwrap();
 
         // Cutoff in the future: row qualifies as purgeable.
-        let purgeable = store.list_purgeable(Utc::now() + chrono::Duration::seconds(1))
+        let purgeable = store
+            .list_purgeable(Utc::now() + chrono::Duration::seconds(1))
             .await
             .unwrap();
         assert_eq!(purgeable.len(), 1);
@@ -422,7 +420,8 @@ mod tests {
         store.mark_purged(a.id).await.unwrap();
 
         // After purge, no longer in purgeable list (local_path is null).
-        let after = store.list_purgeable(Utc::now() + chrono::Duration::seconds(1))
+        let after = store
+            .list_purgeable(Utc::now() + chrono::Duration::seconds(1))
             .await
             .unwrap();
         assert!(after.is_empty());
@@ -449,7 +448,10 @@ mod tests {
             .unwrap();
         let row = store.get(a.id).await.unwrap().unwrap();
         assert!(row.is_local());
-        assert_eq!(row.local_path.unwrap().to_str().unwrap(), "/tmp/refetch.pdf");
+        assert_eq!(
+            row.local_path.unwrap().to_str().unwrap(),
+            "/tmp/refetch.pdf"
+        );
     }
 
     #[tokio::test]

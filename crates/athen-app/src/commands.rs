@@ -1205,6 +1205,7 @@ pub async fn send_message(
                     created_at: chrono::Utc::now(),
                     requires_response: false,
                     skip_humanize: false,
+                    body_long: None,
                 };
                 notifier.notify(notification).await;
             }
@@ -1990,23 +1991,16 @@ pub(crate) async fn execute_approved_task(
     // turn-0 image / inline PDF text + the UUIDs the attachment tools
     // need. Mirrors execute_dispatched_task's surfacing block.
     let mut surfaced_images: Vec<athen_core::llm::ImageInput> = Vec::new();
-    if let (Some(arc_store), Some(astore)) =
-        (ctx.arc_store.as_ref(), ctx.attachment_store.as_ref())
+    if let (Some(arc_store), Some(astore)) = (ctx.arc_store.as_ref(), ctx.attachment_store.as_ref())
     {
-        if let Some(event_id) =
-            latest_sense_event_id_in_arc(arc_store, &ctx.active_arc_id).await
-        {
+        if let Some(event_id) = latest_sense_event_id_in_arc(arc_store, &ctx.active_arc_id).await {
             let router_guard = ctx.router.read().await;
             let supports_vision = router_guard.any_provider_supports_vision();
             let supports_documents = router_guard.any_provider_supports_documents();
             drop(router_guard);
-            let surfacing = prepare_attachment_surfacing(
-                event_id,
-                astore,
-                supports_vision,
-                supports_documents,
-            )
-            .await;
+            let surfacing =
+                prepare_attachment_surfacing(event_id, astore, supports_vision, supports_documents)
+                    .await;
             if let Some(msg) = surfacing.system_message {
                 tracing::info!(
                     arc_id = %ctx.active_arc_id,
@@ -2780,13 +2774,9 @@ pub(crate) async fn execute_dispatched_task(
         let supports_vision = router_guard.any_provider_supports_vision();
         let supports_documents = router_guard.any_provider_supports_documents();
         drop(router_guard);
-        let surfacing = prepare_attachment_surfacing(
-            event_id,
-            astore,
-            supports_vision,
-            supports_documents,
-        )
-        .await;
+        let surfacing =
+            prepare_attachment_surfacing(event_id, astore, supports_vision, supports_documents)
+                .await;
         if let Some(msg) = surfacing.system_message {
             tracing::info!(
                 event_id = %event_id,
@@ -3108,6 +3098,14 @@ pub(crate) async fn execute_dispatched_task(
             } else {
                 content.clone()
             };
+            // Carry the full content for chat-style channels (Telegram).
+            // The 140-char `body` above is for the InApp toast preview;
+            // Telegram should show the entire reply.
+            let body_long = if content.chars().count() > 140 && !content.is_empty() {
+                Some(content.clone())
+            } else {
+                None
+            };
             let notification = athen_core::notification::Notification {
                 id: Uuid::new_v4(),
                 urgency: athen_core::notification::NotificationUrgency::Low,
@@ -3119,6 +3117,7 @@ pub(crate) async fn execute_dispatched_task(
                 created_at: chrono::Utc::now(),
                 requires_response: false,
                 skip_humanize: true,
+                body_long,
             };
             notifier.notify(notification).await;
         }
@@ -4699,13 +4698,7 @@ mod attachment_surfacing_tests {
         let img_path = dir.join("photo.jpg");
         std::fs::write(&img_path, [0u8; 8]).unwrap();
 
-        let att = Attachment::new(
-            "photo.jpg",
-            "image/jpeg",
-            8,
-            Some(img_path),
-            None,
-        );
+        let att = Attachment::new("photo.jpg", "image/jpeg", 8, Some(img_path), None);
         store.insert(event_id, &att).await.unwrap();
 
         let result = prepare_attachment_surfacing(event_id, &store, false, false).await;
@@ -4837,7 +4830,10 @@ mod arc_event_lookup_tests {
         let db = Database::in_memory().await.unwrap();
         let store = db.arc_store();
         let arc_id = Uuid::new_v4().to_string();
-        store.create_arc(&arc_id, "Email", ArcSource::Email).await.unwrap();
+        store
+            .create_arc(&arc_id, "Email", ArcSource::Email)
+            .await
+            .unwrap();
 
         let older_event = Uuid::new_v4();
         let newer_event = Uuid::new_v4();
@@ -4875,16 +4871,12 @@ mod arc_event_lookup_tests {
         let db = Database::in_memory().await.unwrap();
         let store = db.arc_store();
         let arc_id = Uuid::new_v4().to_string();
-        store.create_arc(&arc_id, "Chat", ArcSource::UserInput).await.unwrap();
         store
-            .add_entry(
-                &arc_id,
-                EntryType::Message,
-                "user",
-                "hi",
-                None,
-                None,
-            )
+            .create_arc(&arc_id, "Chat", ArcSource::UserInput)
+            .await
+            .unwrap();
+        store
+            .add_entry(&arc_id, EntryType::Message, "user", "hi", None, None)
             .await
             .unwrap();
 
@@ -4897,7 +4889,10 @@ mod arc_event_lookup_tests {
         let db = Database::in_memory().await.unwrap();
         let store = db.arc_store();
         let arc_id = Uuid::new_v4().to_string();
-        store.create_arc(&arc_id, "Email", ArcSource::Email).await.unwrap();
+        store
+            .create_arc(&arc_id, "Email", ArcSource::Email)
+            .await
+            .unwrap();
 
         let valid = Uuid::new_v4();
         store

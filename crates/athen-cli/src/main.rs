@@ -186,9 +186,15 @@ fn print_usage() {
     println!("Athen CLI — Universal AI Agent");
     println!();
     println!("USAGE:");
-    println!("    athen-cli                                  Launch interactive REPL (uses DeepSeek)");
-    println!("    athen-cli --prompt <PROMPT>                Headless one-shot mode (OpenAI-compatible)");
-    println!("    athen-cli --profile <ID> --prompt <STR>    Headless mode with a seeded agent profile");
+    println!(
+        "    athen-cli                                  Launch interactive REPL (uses DeepSeek)"
+    );
+    println!(
+        "    athen-cli --prompt <PROMPT>                Headless one-shot mode (OpenAI-compatible)"
+    );
+    println!(
+        "    athen-cli --profile <ID> --prompt <STR>    Headless mode with a seeded agent profile"
+    );
     println!("    athen-cli --help                           Show this help");
     println!();
     println!("FLAGS:");
@@ -226,15 +232,17 @@ async fn load_resolved_profile(
         "Error: cannot resolve Athen data directory (no $HOME).".to_string(),
     ))?;
     if let Err(e) = std::fs::create_dir_all(&data_dir) {
-        return Err((
-            1,
-            format!("Failed to create {}: {e}", data_dir.display()),
-        ));
+        return Err((1, format!("Failed to create {}: {e}", data_dir.display())));
     }
     let db_path = data_dir.join("athen.db");
     let db = athen_persistence::Database::new(&db_path)
         .await
-        .map_err(|e| (1, format!("Failed to open DB at {}: {e}", db_path.display())))?;
+        .map_err(|e| {
+            (
+                1,
+                format!("Failed to open DB at {}: {e}", db_path.display()),
+            )
+        })?;
 
     let store = db.profile_store();
 
@@ -253,9 +261,7 @@ async fn load_resolved_profile(
             };
             return Err((
                 2,
-                format!(
-                    "Error: unknown profile id '{profile_id}'.\nValid profile ids: {listing}"
-                ),
+                format!("Error: unknown profile id '{profile_id}'.\nValid profile ids: {listing}"),
             ));
         }
         Err(e) => return Err((1, format!("Profile lookup failed: {e}"))),
@@ -301,7 +307,9 @@ async fn run_headless(
             ));
         }
     };
-    let api_key = std::env::var("ATHEN_API_KEY").ok().filter(|s| !s.is_empty());
+    let api_key = std::env::var("ATHEN_API_KEY")
+        .ok()
+        .filter(|s| !s.is_empty());
 
     // 2. Optionally resolve the agent profile BEFORE building the executor.
     //    Doing this first means an unknown id fails fast, before we touch
@@ -402,10 +410,7 @@ async fn main() {
     // Generic flag-pair extractor: returns the value that follows the named
     // flag, or `None` if the flag is absent. Returns `Err` with an error
     // message if the flag is present but missing/empty value.
-    fn extract_flag(
-        args: &[String],
-        flag: &str,
-    ) -> std::result::Result<Option<String>, String> {
+    fn extract_flag(args: &[String], flag: &str) -> std::result::Result<Option<String>, String> {
         match args.iter().position(|a| a == flag) {
             Some(idx) => match args.get(idx + 1) {
                 Some(v) if !v.is_empty() => Ok(Some(v.clone())),

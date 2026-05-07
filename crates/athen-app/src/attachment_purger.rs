@@ -76,11 +76,7 @@ pub async fn sweep_once(
     }
 
     if deleted > 0 {
-        tracing::info!(
-            considered,
-            deleted,
-            "Attachment TTL sweep complete"
-        );
+        tracing::info!(considered, deleted, "Attachment TTL sweep complete");
     }
     Ok((considered, deleted))
 }
@@ -131,7 +127,11 @@ mod tests {
 
     fn write_temp(name: &str, contents: &[u8]) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("athen-purger-test-{}-{}", uuid::Uuid::new_v4(), name));
+        p.push(format!(
+            "athen-purger-test-{}-{}",
+            uuid::Uuid::new_v4(),
+            name
+        ));
         let mut f = std::fs::File::create(&p).unwrap();
         f.write_all(contents).unwrap();
         p
@@ -176,13 +176,7 @@ mod tests {
         let event_id = uuid::Uuid::new_v4();
         let path = write_temp("old.pdf", b"%PDF-old");
         let sidecar = write_temp("old.pdf.txt", b"extracted text");
-        let mut att = Attachment::new(
-            "old.pdf",
-            "application/pdf",
-            10,
-            Some(path.clone()),
-            None,
-        );
+        let mut att = Attachment::new("old.pdf", "application/pdf", 10, Some(path.clone()), None);
         att.extracted_text_path = Some(sidecar.clone());
         store.insert(event_id, &att).await.unwrap();
 
@@ -209,8 +203,8 @@ mod tests {
     async fn sweep_handles_missing_file() {
         let (_db, store) = fresh_store().await;
         let event_id = uuid::Uuid::new_v4();
-        let bogus = std::env::temp_dir()
-            .join(format!("athen-missing-{}.pdf", uuid::Uuid::new_v4()));
+        let bogus =
+            std::env::temp_dir().join(format!("athen-missing-{}.pdf", uuid::Uuid::new_v4()));
         let att = Attachment::new(
             "missing.pdf",
             "application/pdf",
@@ -236,13 +230,7 @@ mod tests {
         let (_db, store) = fresh_store().await;
         let event_id = uuid::Uuid::new_v4();
         let path = write_temp("once.pdf", b"%PDF-once");
-        let att = Attachment::new(
-            "once.pdf",
-            "application/pdf",
-            10,
-            Some(path.clone()),
-            None,
-        );
+        let att = Attachment::new("once.pdf", "application/pdf", 10, Some(path.clone()), None);
         store.insert(event_id, &att).await.unwrap();
 
         let cutoff = Utc::now() + chrono::Duration::days(1);

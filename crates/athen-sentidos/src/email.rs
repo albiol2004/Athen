@@ -15,8 +15,7 @@ use uuid::Uuid;
 use athen_core::config::{AthenConfig, EmailConfig};
 use athen_core::error::{AthenError, Result};
 use athen_core::event::{
-    Attachment, AttachmentSource, EventKind, EventSource, NormalizedContent, SenderInfo,
-    SenseEvent,
+    Attachment, AttachmentSource, EventKind, EventSource, NormalizedContent, SenderInfo, SenseEvent,
 };
 use athen_core::risk::RiskLevel;
 use athen_core::traits::sense::SenseMonitor;
@@ -1206,8 +1205,7 @@ PDF-BYTES\r\n\
             bytes: b"hello".to_vec(),
             part_path: "2".into(),
         }];
-        let attachments =
-            persist_attachments(event_id, "INBOX", 42, 1, raws, Some(tmp.path()));
+        let attachments = persist_attachments(event_id, "INBOX", 42, 1, raws, Some(tmp.path()));
         assert_eq!(attachments.len(), 1);
         let a = &attachments[0];
         assert!(a.local_path.is_some());
@@ -1231,8 +1229,7 @@ PDF-BYTES\r\n\
             bytes: b"not a real pdf".to_vec(),
             part_path: "2".into(),
         }];
-        let attachments =
-            persist_attachments(event_id, "INBOX", 42, 1, raws, Some(tmp.path()));
+        let attachments = persist_attachments(event_id, "INBOX", 42, 1, raws, Some(tmp.path()));
         assert_eq!(attachments.len(), 1);
         assert!(attachments[0].local_path.is_some());
         // Extraction failed → no sidecar → metadata stays clean.
@@ -1249,8 +1246,7 @@ PDF-BYTES\r\n\
             bytes: b"\xff\xd8\xff\xe0fakebody".to_vec(),
             part_path: "2".into(),
         }];
-        let attachments =
-            persist_attachments(event_id, "INBOX", 42, 1, raws, Some(tmp.path()));
+        let attachments = persist_attachments(event_id, "INBOX", 42, 1, raws, Some(tmp.path()));
         // Non-PDFs never get extracted_text_path set.
         assert!(attachments[0].local_path.is_some());
         assert!(attachments[0].extracted_text_path.is_none());
@@ -1266,8 +1262,7 @@ PDF-BYTES\r\n\
             bytes: b"MZ".to_vec(),
             part_path: "2".into(),
         }];
-        let attachments =
-            persist_attachments(event_id, "INBOX", 42, 1, raws, Some(tmp.path()));
+        let attachments = persist_attachments(event_id, "INBOX", 42, 1, raws, Some(tmp.path()));
         assert_eq!(attachments.len(), 1);
         // Metadata recorded, bytes NOT saved.
         assert!(attachments[0].local_path.is_none());
@@ -1291,8 +1286,7 @@ PDF-BYTES\r\n\
             bytes,
             part_path: "2".into(),
         }];
-        let attachments =
-            persist_attachments(event_id, "INBOX", 42, 1, raws, Some(tmp.path()));
+        let attachments = persist_attachments(event_id, "INBOX", 42, 1, raws, Some(tmp.path()));
         assert!(attachments[0].local_path.is_none());
         assert_eq!(attachments[0].size_bytes, MAX_PERSIST_BYTES + 16);
     }

@@ -101,11 +101,18 @@ impl NotificationChannel for TelegramChannel {
     }
 
     async fn send(&self, notification: &Notification) -> Result<DeliveryResult> {
+        // Prefer the long-form body when present — Telegram has no real
+        // length budget (the transport layer chunks at 4096 chars
+        // automatically), so the InApp 140-char preview would just hide
+        // the agent's reply behind a "..." for no reason.
+        let body = notification
+            .body_long
+            .as_deref()
+            .unwrap_or(&notification.body);
         let text = if notification.title.is_empty() {
-            // Already humanized — send body as-is.
-            notification.body.clone()
+            body.to_string()
         } else {
-            format!("{}\n\n{}", notification.title, notification.body)
+            format!("{}\n\n{}", notification.title, body)
         };
 
         match athen_sentidos::telegram::send_message(&self.bot_token, self.owner_chat_id, &text)
@@ -786,6 +793,7 @@ mod tests {
             created_at: Utc::now(),
             requires_response,
             skip_humanize: false,
+            body_long: None,
         }
     }
 
@@ -1155,6 +1163,7 @@ mod tests {
             created_at: Utc::now(),
             requires_response: false,
             skip_humanize: false,
+            body_long: None,
         }
     }
 

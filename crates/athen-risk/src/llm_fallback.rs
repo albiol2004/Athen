@@ -168,10 +168,7 @@ impl LlmRiskEvaluator {
     /// trust-weighted conservative fallback on `None` — embedding a fixed
     /// "assume the worst" tuple here used to silently HardBlock trusted
     /// contacts on any local-model JSON wobble.
-    fn parse_response(
-        &self,
-        response: &LlmResponse,
-    ) -> Option<(BaseImpact, DataSensitivity, f64)> {
+    fn parse_response(&self, response: &LlmResponse) -> Option<(BaseImpact, DataSensitivity, f64)> {
         let content = &response.content;
         let v: serde_json::Value = serde_json::from_str(content).ok()?;
 
