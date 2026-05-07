@@ -5,6 +5,7 @@
 //! Uses the `getUpdates` long-polling endpoint with offset tracking to
 //! avoid processing the same message twice.
 
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -15,9 +16,17 @@ use uuid::Uuid;
 
 use athen_core::config::{AthenConfig, TelegramConfig};
 use athen_core::error::{AthenError, Result};
-use athen_core::event::{EventKind, EventSource, NormalizedContent, SenderInfo, SenseEvent};
+use athen_core::event::{
+    Attachment, AttachmentSource, EventKind, EventSource, NormalizedContent, SenderInfo,
+    SenseEvent,
+};
 use athen_core::risk::RiskLevel;
 use athen_core::traits::sense::SenseMonitor;
+
+/// Telegram caps `getFile` downloads at 20 MiB for bots. Anything
+/// bigger we record as metadata-only so the agent still sees it
+/// existed and can choose to ignore.
+const TELEGRAM_MAX_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Telegram Bot API response types (minimal)
@@ -71,6 +80,22 @@ pub struct TelegramMessage {
     pub date: i64,
     pub text: Option<String>,
     pub caption: Option<String>,
+    /// Photo sizes (Telegram delivers the same image at multiple
+    /// resolutions). We pick the largest one that fits the download cap.
+    #[serde(default)]
+    pub photo: Option<Vec<TelegramPhotoSize>>,
+    /// Generic file attachment (PDFs, archives, etc.).
+    #[serde(default)]
+    pub document: Option<TelegramDocument>,
+    /// Voice notes (Opus-encoded audio).
+    #[serde(default)]
+    pub voice: Option<TelegramVoice>,
+    /// Audio file with metadata (music, podcasts).
+    #[serde(default)]
+    pub audio: Option<TelegramAudio>,
+    /// Video file (.mp4 etc.).
+    #[serde(default)]
+    pub video: Option<TelegramVideo>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -85,6 +110,60 @@ pub struct TelegramChat {
     pub id: i64,
     #[serde(rename = "type")]
     pub chat_type: String,
+}
+
+/// One resolution of a photo. Telegram returns several per message.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TelegramPhotoSize {
+    pub file_id: String,
+    pub file_size: Option<u64>,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TelegramDocument {
+    pub file_id: String,
+    pub file_name: Option<String>,
+    pub mime_type: Option<String>,
+    pub file_size: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TelegramVoice {
+    pub file_id: String,
+    pub duration: u32,
+    pub mime_type: Option<String>,
+    pub file_size: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TelegramAudio {
+    pub file_id: String,
+    pub duration: u32,
+    pub file_name: Option<String>,
+    pub mime_type: Option<String>,
+    pub file_size: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TelegramVideo {
+    pub file_id: String,
+    pub duration: u32,
+    pub file_name: Option<String>,
+    pub mime_type: Option<String>,
+    pub file_size: Option<u64>,
+}
+
+/// `getFile` response payload. Combined with the bot token, the
+/// `file_path` becomes a download URL of
+/// `https://api.telegram.org/file/bot<TOKEN>/<file_path>`.
+#[derive(Debug, Clone, Deserialize)]
+struct TelegramFileMeta {
+    #[allow(dead_code)]
+    file_id: String,
+    file_path: Option<String>,
+    file_size: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -187,10 +266,24 @@ impl TelegramMonitor {
             }
 
             // Extract text content: prefer `text`, fall back to `caption`.
-            let text = match message.text.as_deref().or(message.caption.as_deref()) {
-                Some(t) if !t.is_empty() => t.to_string(),
-                _ => continue, // skip updates with no textual content
-            };
+            let text_opt = message
+                .text
+                .as_deref()
+                .or(message.caption.as_deref())
+                .filter(|t| !t.is_empty())
+                .map(|t| t.to_string());
+
+            // Extract media into Attachment records. We only set
+            // metadata + AttachmentSource here; bytes get fetched in a
+            // follow-up async pass (see [`fetch_pending_attachments`]).
+            let attachments = extract_attachments(&message);
+
+            // Skip updates with no textual content AND no media. Pure
+            // system events (chat-action, etc.) don't deserve a sense
+            // event — they'd just be noise to the agent.
+            if text_opt.is_none() && attachments.is_empty() {
+                continue;
+            }
 
             // Build sender info.
             let sender = message.from.as_ref().map(|user| {
@@ -218,21 +311,32 @@ impl TelegramMonitor {
                 .single()
                 .unwrap_or_else(Utc::now);
 
-            let summary = if text.len() > 100 {
-                let cap = text.floor_char_boundary(97);
-                format!("{}...", &text[..cap])
-            } else {
-                text.clone()
+            // Summary: use the text/caption if present; otherwise
+            // synthesise from the media kinds so a media-only message
+            // still triggers a useful sense event ("[photo]",
+            // "[document: invoice.pdf]") instead of being dropped.
+            let text_for_body = text_opt.clone().unwrap_or_default();
+            let summary = match text_opt.as_deref() {
+                Some(t) if !t.is_empty() => {
+                    if t.len() > 100 {
+                        let cap = t.floor_char_boundary(97);
+                        format!("{}...", &t[..cap])
+                    } else {
+                        t.to_string()
+                    }
+                }
+                _ => synthesise_media_summary(&attachments),
             };
 
             let body = serde_json::json!({
-                "text": text,
+                "text": text_for_body,
                 "chat_id": message.chat.id,
                 "chat_type": message.chat.chat_type,
                 "message_id": message.message_id,
                 "sender_user_id": message.from.as_ref().map(|u| u.id),
                 "sender_username": message.from.as_ref().and_then(|u| u.username.as_deref()),
                 "sender_first_name": message.from.as_ref().map(|u| u.first_name.as_str()),
+                "has_media": !attachments.is_empty(),
             });
 
             events.push(SenseEvent {
@@ -244,7 +348,7 @@ impl TelegramMonitor {
                 content: NormalizedContent {
                     summary: Some(summary),
                     body,
-                    attachments: vec![],
+                    attachments,
                 },
                 source_risk,
                 raw_id: Some(format!("telegram-{}", message.message_id)),
@@ -266,6 +370,309 @@ impl TelegramMonitor {
             (Some(owner_id), Some(user)) => user.id == owner_id,
             _ => false,
         }
+    }
+
+    /// Walk every attachment on `events` whose source is Telegram and
+    /// `local_path` is `None`, pull the bytes via `getFile` + the file
+    /// download endpoint, and save them under `<save_root>/<event_id>/`.
+    /// On failure for a single file the others still proceed; the
+    /// failed attachment stays metadata-only and the agent can still
+    /// see it existed.
+    pub async fn fetch_pending_attachments(
+        &self,
+        events: &mut [SenseEvent],
+        save_root: Option<&Path>,
+    ) {
+        for event in events.iter_mut() {
+            for att in event.content.attachments.iter_mut() {
+                if att.local_path.is_some() {
+                    continue;
+                }
+                let file_id = match &att.source {
+                    Some(AttachmentSource::Telegram { file_id, .. }) => file_id.clone(),
+                    _ => continue,
+                };
+                if att.size_bytes > TELEGRAM_MAX_DOWNLOAD_BYTES {
+                    tracing::info!(
+                        name = %att.name,
+                        size = att.size_bytes,
+                        "Telegram attachment exceeds 20 MiB cap; metadata-only"
+                    );
+                    continue;
+                }
+                match self
+                    .download_telegram_file(&file_id, event.id, &att.name, save_root)
+                    .await
+                {
+                    Ok(Some(path)) => att.local_path = Some(path),
+                    Ok(None) => {} // no save_root configured — degrade silently
+                    Err(e) => tracing::warn!(
+                        file_id = %file_id,
+                        "Telegram getFile/download failed: {e}"
+                    ),
+                }
+            }
+        }
+    }
+
+    async fn download_telegram_file(
+        &self,
+        file_id: &str,
+        event_id: Uuid,
+        name: &str,
+        save_root: Option<&Path>,
+    ) -> Result<Option<PathBuf>> {
+        let Some(root) = save_root else {
+            return Ok(None);
+        };
+
+        // Step 1: getFile to learn the file_path.
+        let meta_url = self.api_url("getFile");
+        let meta: TelegramResponse<TelegramFileMeta> = self
+            .client
+            .get(&meta_url)
+            .query(&[("file_id", file_id)])
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(|e| AthenError::Other(format!("getFile request: {e}")))?
+            .json()
+            .await
+            .map_err(|e| AthenError::Other(format!("getFile parse: {e}")))?;
+
+        if !meta.ok {
+            return Err(AthenError::Other(format!(
+                "Telegram getFile not ok: {}",
+                meta.description.unwrap_or_default()
+            )));
+        }
+        let result = meta
+            .result
+            .ok_or_else(|| AthenError::Other("getFile missing result".into()))?;
+        let file_path = result
+            .file_path
+            .ok_or_else(|| AthenError::Other("getFile missing file_path".into()))?;
+
+        // Defence-in-depth: re-check the size returned by getFile
+        // against our cap. The TelegramMessage size hint can lie or be
+        // missing; this is the authoritative number.
+        if let Some(sz) = result.file_size {
+            if sz > TELEGRAM_MAX_DOWNLOAD_BYTES {
+                return Err(AthenError::Other(format!(
+                    "telegram file too large: {sz} bytes"
+                )));
+            }
+        }
+
+        // Step 2: download the bytes from the file endpoint.
+        let download_url = format!(
+            "https://api.telegram.org/file/bot{}/{}",
+            self.config.bot_token, file_path
+        );
+        let bytes = self
+            .client
+            .get(&download_url)
+            .timeout(Duration::from_secs(60))
+            .send()
+            .await
+            .map_err(|e| AthenError::Other(format!("download request: {e}")))?
+            .bytes()
+            .await
+            .map_err(|e| AthenError::Other(format!("download body: {e}")))?;
+
+        // Sanitise + save under <root>/<event_id>/<sanitized_name>.
+        let dir = root.join(event_id.to_string());
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            return Err(AthenError::Other(format!(
+                "create attachment dir {dir:?}: {e}"
+            )));
+        }
+        let path = dir.join(sanitize_filename(name));
+        std::fs::write(&path, &bytes)
+            .map_err(|e| AthenError::Other(format!("write {path:?}: {e}")))?;
+        Ok(Some(path))
+    }
+}
+
+/// Pull every supported media kind out of a Telegram message into
+/// `Attachment` records. Metadata only — bytes get filled in later by
+/// [`TelegramMonitor::fetch_pending_attachments`].
+fn extract_attachments(message: &TelegramMessage) -> Vec<Attachment> {
+    let mut out = Vec::new();
+    let chat_id = message.chat.id;
+    let message_id = message.message_id;
+
+    // photo[] — pick the largest size that fits the download cap.
+    if let Some(photos) = message.photo.as_ref() {
+        if let Some(best) = pick_best_photo(photos) {
+            out.push(make_attachment(
+                format!("photo_{message_id}.jpg"),
+                "image/jpeg".into(),
+                best.file_size.unwrap_or(0),
+                &best.file_id,
+                chat_id,
+                message_id,
+            ));
+        }
+    }
+
+    if let Some(doc) = message.document.as_ref() {
+        out.push(make_attachment(
+            doc.file_name
+                .clone()
+                .unwrap_or_else(|| format!("document_{message_id}")),
+            doc.mime_type
+                .clone()
+                .unwrap_or_else(|| "application/octet-stream".into()),
+            doc.file_size.unwrap_or(0),
+            &doc.file_id,
+            chat_id,
+            message_id,
+        ));
+    }
+
+    if let Some(voice) = message.voice.as_ref() {
+        out.push(make_attachment(
+            format!("voice_{message_id}.ogg"),
+            voice.mime_type.clone().unwrap_or_else(|| "audio/ogg".into()),
+            voice.file_size.unwrap_or(0),
+            &voice.file_id,
+            chat_id,
+            message_id,
+        ));
+    }
+
+    if let Some(audio) = message.audio.as_ref() {
+        out.push(make_attachment(
+            audio
+                .file_name
+                .clone()
+                .unwrap_or_else(|| format!("audio_{message_id}.mp3")),
+            audio
+                .mime_type
+                .clone()
+                .unwrap_or_else(|| "audio/mpeg".into()),
+            audio.file_size.unwrap_or(0),
+            &audio.file_id,
+            chat_id,
+            message_id,
+        ));
+    }
+
+    if let Some(video) = message.video.as_ref() {
+        out.push(make_attachment(
+            video
+                .file_name
+                .clone()
+                .unwrap_or_else(|| format!("video_{message_id}.mp4")),
+            video
+                .mime_type
+                .clone()
+                .unwrap_or_else(|| "video/mp4".into()),
+            video.file_size.unwrap_or(0),
+            &video.file_id,
+            chat_id,
+            message_id,
+        ));
+    }
+
+    out
+}
+
+fn make_attachment(
+    name: String,
+    mime_type: String,
+    size_bytes: u64,
+    file_id: &str,
+    chat_id: i64,
+    message_id: i64,
+) -> Attachment {
+    Attachment::new(
+        name,
+        mime_type,
+        size_bytes,
+        None,
+        Some(AttachmentSource::Telegram {
+            chat_id,
+            message_id,
+            file_id: file_id.to_string(),
+        }),
+    )
+}
+
+/// Telegram returns photos at multiple resolutions — pick the largest
+/// one that's still under our download cap.
+fn pick_best_photo(photos: &[TelegramPhotoSize]) -> Option<&TelegramPhotoSize> {
+    photos
+        .iter()
+        .filter(|p| {
+            p.file_size
+                .map(|s| s <= TELEGRAM_MAX_DOWNLOAD_BYTES)
+                .unwrap_or(true)
+        })
+        .max_by_key(|p| (p.width as u64) * (p.height as u64))
+}
+
+/// Build a synthetic summary like `"[photo]"` or `"[document: foo.pdf]"`
+/// for media-only messages so they still produce a useful sense event.
+fn synthesise_media_summary(attachments: &[Attachment]) -> String {
+    if attachments.is_empty() {
+        return "[empty message]".into();
+    }
+    let parts: Vec<String> = attachments
+        .iter()
+        .map(|a| {
+            let (kind, has_user_name) = classify_attachment(a);
+            if has_user_name {
+                format!("[{kind}: {}]", a.name)
+            } else {
+                format!("[{kind}]")
+            }
+        })
+        .collect();
+    parts.join(" ")
+}
+
+/// Returns the human label for an attachment + whether the filename
+/// looks user-supplied (`true`) or auto-synthesised by us
+/// (`"voice_NN.ogg"` etc., `false`). Used to decide whether to put the
+/// name in the synthesised summary — auto-names are noise.
+fn classify_attachment(a: &Attachment) -> (&'static str, bool) {
+    let synthetic_prefixes = ["photo_", "voice_", "audio_", "video_", "document_"];
+    let auto_synthesised = synthetic_prefixes.iter().any(|p| a.name.starts_with(p))
+        || a.name.is_empty();
+
+    let kind = if a.mime_type.starts_with("image/") {
+        "photo"
+    } else if a.mime_type.starts_with("audio/") && a.name.starts_with("voice_") {
+        "voice note"
+    } else if a.mime_type.starts_with("audio/") {
+        "audio"
+    } else if a.mime_type.starts_with("video/") {
+        "video"
+    } else {
+        "document"
+    };
+
+    (kind, !auto_synthesised)
+}
+
+/// Same sanitiser as the email sense — drop directory separators and
+/// risky characters, fall back to `"file"` if the result is empty.
+fn sanitize_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches(|c: char| c == '.' || c.is_whitespace());
+    if trimmed.is_empty() {
+        "file".into()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -434,7 +841,14 @@ impl SenseMonitor for TelegramMonitor {
             }
         }
 
-        Ok(self.process_updates(updates))
+        let mut events = self.process_updates(updates);
+        // Second pass: pull the bytes for every Telegram-sourced
+        // attachment. Failures are logged but don't fail the poll —
+        // the agent still gets the metadata.
+        let save_root = athen_core::paths::athen_attachments_dir();
+        self.fetch_pending_attachments(&mut events, save_root.as_deref())
+            .await;
+        Ok(events)
     }
 
     fn poll_interval(&self) -> Duration {
@@ -732,6 +1146,11 @@ mod tests {
                 date: 1700000000,
                 text: Some(text.to_string()),
                 caption: None,
+                photo: None,
+                document: None,
+                voice: None,
+                audio: None,
+                video: None,
             }),
             callback_query: None,
         }
@@ -766,6 +1185,11 @@ mod tests {
                     date: 1700000000,
                     text: Some("Approve?".into()),
                     caption: None,
+                    photo: None,
+                    document: None,
+                    voice: None,
+                    audio: None,
+                    video: None,
                 }),
                 data: Some(data.to_string()),
             }),
@@ -966,6 +1390,11 @@ mod tests {
                 date: 1700000000,
                 text: None,
                 caption: Some("Photo caption".to_string()),
+                photo: None,
+                document: None,
+                voice: None,
+                audio: None,
+                video: None,
             }),
             callback_query: None,
         };
@@ -1064,12 +1493,185 @@ mod tests {
                 date: 1700000000,
                 text: None,
                 caption: None,
+                photo: None,
+                document: None,
+                voice: None,
+                audio: None,
+                video: None,
             }),
             callback_query: None,
         };
 
         let events = monitor.process_updates(vec![update]);
         assert!(events.is_empty());
+    }
+
+    fn make_media_update(
+        update_id: i64,
+        message_id: i64,
+        text: Option<&str>,
+        caption: Option<&str>,
+        photo: Option<Vec<TelegramPhotoSize>>,
+        document: Option<TelegramDocument>,
+        voice: Option<TelegramVoice>,
+    ) -> TelegramUpdate {
+        TelegramUpdate {
+            update_id,
+            message: Some(TelegramMessage {
+                message_id,
+                from: Some(TelegramUser {
+                    id: 42,
+                    first_name: "Alex".into(),
+                    username: None,
+                }),
+                chat: TelegramChat {
+                    id: 42,
+                    chat_type: "private".into(),
+                },
+                date: 1700000000,
+                text: text.map(|s| s.into()),
+                caption: caption.map(|s| s.into()),
+                photo,
+                document,
+                voice,
+                audio: None,
+                video: None,
+            }),
+            callback_query: None,
+        }
+    }
+
+    #[test]
+    fn pure_photo_message_emits_event_with_attachment() {
+        let monitor = TelegramMonitor::new(test_config());
+        let update = make_media_update(
+            300,
+            42,
+            None,
+            None,
+            Some(vec![
+                TelegramPhotoSize {
+                    file_id: "low".into(),
+                    file_size: Some(1_000),
+                    width: 100,
+                    height: 100,
+                },
+                TelegramPhotoSize {
+                    file_id: "high".into(),
+                    file_size: Some(50_000),
+                    width: 1024,
+                    height: 768,
+                },
+            ]),
+            None,
+            None,
+        );
+        let events = monitor.process_updates(vec![update]);
+        assert_eq!(events.len(), 1, "media-only message should emit an event");
+        assert_eq!(events[0].content.summary.as_deref(), Some("[photo]"));
+        assert_eq!(events[0].content.attachments.len(), 1);
+        let att = &events[0].content.attachments[0];
+        assert_eq!(att.mime_type, "image/jpeg");
+        match att.source.as_ref().unwrap() {
+            AttachmentSource::Telegram { file_id, chat_id, message_id } => {
+                assert_eq!(file_id, "high"); // larger of the two
+                assert_eq!(*chat_id, 42);
+                assert_eq!(*message_id, 42);
+            }
+            _ => panic!("expected Telegram source"),
+        }
+    }
+
+    #[test]
+    fn document_with_no_caption_synthesises_summary() {
+        let monitor = TelegramMonitor::new(test_config());
+        let update = make_media_update(
+            301,
+            10,
+            None,
+            None,
+            None,
+            Some(TelegramDocument {
+                file_id: "doc1".into(),
+                file_name: Some("invoice.pdf".into()),
+                mime_type: Some("application/pdf".into()),
+                file_size: Some(123_456),
+            }),
+            None,
+        );
+        let events = monitor.process_updates(vec![update]);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].content.summary.as_deref(),
+            Some("[document: invoice.pdf]")
+        );
+        assert_eq!(events[0].content.attachments.len(), 1);
+        assert_eq!(events[0].content.attachments[0].mime_type, "application/pdf");
+    }
+
+    #[test]
+    fn voice_note_synthesises_voice_summary() {
+        let monitor = TelegramMonitor::new(test_config());
+        let update = make_media_update(
+            302,
+            11,
+            None,
+            None,
+            None,
+            None,
+            Some(TelegramVoice {
+                file_id: "voice1".into(),
+                duration: 5,
+                mime_type: Some("audio/ogg".into()),
+                file_size: Some(8_000),
+            }),
+        );
+        let events = monitor.process_updates(vec![update]);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].content.summary.as_deref(), Some("[voice note]"));
+    }
+
+    #[test]
+    fn caption_with_photo_uses_caption_as_summary_and_keeps_photo_as_attachment() {
+        let monitor = TelegramMonitor::new(test_config());
+        let update = make_media_update(
+            303,
+            12,
+            None,
+            Some("Look at this!"),
+            Some(vec![TelegramPhotoSize {
+                file_id: "p".into(),
+                file_size: Some(5_000),
+                width: 800,
+                height: 600,
+            }]),
+            None,
+            None,
+        );
+        let events = monitor.process_updates(vec![update]);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].content.summary.as_deref(), Some("Look at this!"));
+        assert_eq!(events[0].content.attachments.len(), 1);
+    }
+
+    #[test]
+    fn pick_best_photo_skips_oversize() {
+        // Largest is over the 20 MiB cap → should fall back to the smaller.
+        let big = TelegramPhotoSize {
+            file_id: "big".into(),
+            file_size: Some(TELEGRAM_MAX_DOWNLOAD_BYTES + 1),
+            width: 4000,
+            height: 3000,
+        };
+        let small = TelegramPhotoSize {
+            file_id: "small".into(),
+            file_size: Some(1_000_000),
+            width: 800,
+            height: 600,
+        };
+        let photos = [big, small];
+        let picked = pick_best_photo(&photos).unwrap();
+        assert_eq!(picked.file_id, "small");
     }
 
     #[test]
