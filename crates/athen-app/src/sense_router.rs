@@ -21,6 +21,7 @@ use athen_core::notification::{Notification, NotificationOrigin, NotificationUrg
 use athen_core::traits::llm::LlmRouter;
 use athen_llm::router::DefaultLlmRouter;
 use athen_persistence::arcs::{ArcEntry, ArcMeta, ArcSource, ArcStatus, ArcStore, EntryType};
+use athen_persistence::attachments::AttachmentStore;
 
 use crate::notifier::NotificationOrchestrator;
 
@@ -68,6 +69,7 @@ pub async fn process_sense_event(
     dispatch_signal: Option<&Arc<tokio::sync::Notify>>,
     approval_router: Option<&Arc<crate::approval::ApprovalRouter>>,
     pending_email_marks: Option<&crate::state::PendingEmailMarks>,
+    attachment_store: Option<&AttachmentStore>,
 ) -> bool {
     let source_name = source_display_name(&event.source);
     let summary = event.content.summary.as_deref().unwrap_or("(no subject)");
@@ -101,6 +103,32 @@ pub async fn process_sense_event(
         format!("{}...", &body_text[..cap])
     } else {
         body_text.clone()
+    };
+
+    // Surface attachments to triage so the LLM doesn't dismiss messages
+    // like "Read this PDF" as "no PDF visible" — the bytes ARE on the
+    // message, they just don't live in the body text. Without this the
+    // triage prompt would only see the body and could (and did) misfire
+    // notify-only when the user clearly wanted Athen to read the file.
+    let body_for_triage = if event.content.attachments.is_empty() {
+        body_for_triage
+    } else {
+        let summary_lines: Vec<String> = event
+            .content
+            .attachments
+            .iter()
+            .map(|a| {
+                format!(
+                    "  - \"{}\" ({}, {}B)",
+                    a.name, a.mime_type, a.size_bytes
+                )
+            })
+            .collect();
+        format!(
+            "{body_for_triage}\n\n[Attachments on this message ({}):\n{}]",
+            event.content.attachments.len(),
+            summary_lines.join("\n"),
+        )
     };
 
     // Step 0: Fetch recent active arcs for context matching.
@@ -273,6 +301,26 @@ pub async fn process_sense_event(
 
         if let Err(e) = store.touch_arc(&arc_id).await {
             warn!("Failed to touch arc: {e}");
+        }
+    }
+
+    // Persist attachment refs so the executor can inline them on the
+    // first turn and so the agent's `read_attachment_full` /
+    // `fetch_attachment` tools can resolve by id later. Best-effort:
+    // any insert error is logged and skipped — the bytes are already on
+    // disk and the agent will still see metadata in the system context
+    // message; missing rows just mean refetch-after-purge won't work
+    // for that one attachment.
+    if let Some(astore) = attachment_store {
+        for att in &event.content.attachments {
+            if let Err(e) = astore.insert(event.id, att).await {
+                warn!(
+                    event_id = %event.id,
+                    attachment = %att.name,
+                    error = %e,
+                    "Failed to persist attachment ref"
+                );
+            }
         }
     }
 
@@ -1158,6 +1206,8 @@ Classification rules:
 - "high": urgent requests, deadlines, time-sensitive matters, security alerts
 
 IMPORTANT: Default to "medium" unless you are very confident it is spam or automated. Real messages from real people should NEVER be classified as "ignore".
+
+If the body is followed by an "[Attachments on this message ...]" block, those files ARE accessible to the agent — never say "no attachment is visible" in your reason. A message asking the agent to act on an attachment is a strong signal for "reply" or "urgent".
 
 {arc_matching_instruction}"#
     );

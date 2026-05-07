@@ -297,6 +297,7 @@ dependencies = [
  "athen-risk",
  "athen-sentidos",
  "athen-web",
+ "base64 0.22.1",
  "chrono",
  "futures",
  "glib 0.20.12",

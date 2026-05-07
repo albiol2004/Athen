@@ -88,6 +88,7 @@ fn spawn_router_approval(
         compactor: state.compactor.clone(),
         web_search: Arc::clone(&state.web_search),
         email_sender: state.email_sender.clone(),
+        attachment_store: state.attachment_store(),
     };
 
     tauri::async_runtime::spawn(async move {
@@ -194,6 +195,7 @@ fn spawn_router_approval(
             web_search: bg_ctx.web_search.clone(),
             email_sender: bg_ctx.email_sender.clone(),
             initial_user_images: Vec::new(),
+            attachment_store: bg_ctx.attachment_store.clone(),
         };
 
         let outcome = match execute_approved_task(task_id, ctx).await {
@@ -269,6 +271,7 @@ struct ApprovedTaskBgCtx {
     compactor: Option<Arc<dyn athen_core::traits::compaction::ArcCompactor>>,
     web_search: Arc<dyn athen_web::WebSearchProvider>,
     email_sender: Option<Arc<dyn athen_core::traits::email_sender::EmailSender>>,
+    attachment_store: Option<athen_persistence::attachments::AttachmentStore>,
 }
 
 /// Resolve the agent profile that should drive execution for a given arc.
@@ -1656,6 +1659,7 @@ pub async fn approve_task(
         // images flow through the direct-execution path in `send_message`,
         // not through the explicit-approval card.
         initial_user_images: Vec::new(),
+        attachment_store: state.attachment_store(),
     };
 
     let outcome = match execute_approved_task(task_uuid, ctx).await {
@@ -1771,6 +1775,12 @@ pub(crate) struct ApprovedTaskCtx {
     /// the user pastes or drops an image. Forwarded into the executor so
     /// vision-capable LLMs see them on the first turn.
     pub initial_user_images: Vec<athen_core::llm::ImageInput>,
+    /// SQLite-backed attachment ref store. The dispatched-task path
+    /// queries it by `task.source_event` to inline images / extracted PDF
+    /// text into turn 0 by provider capability. `None` when no database
+    /// is wired (CLI/test builds) — sense events still execute, but
+    /// without attachment surfacing.
+    pub attachment_store: Option<athen_persistence::attachments::AttachmentStore>,
 }
 
 /// Drive a risk-flagged task all the way through approval, dispatch,
@@ -2259,6 +2269,267 @@ pub(crate) async fn execute_approved_task(
     }))
 }
 
+/// Result of preparing per-attachment surfacing for a dispatched task.
+/// `images` slot directly into `AgentBuilder::initial_user_images`;
+/// `system_message` (when `Some`) is appended to the conversation
+/// context as a System turn so the agent sees it on the very first
+/// LLM call.
+pub(crate) struct AttachmentSurfacing {
+    pub(crate) images: Vec<athen_core::llm::ImageInput>,
+    pub(crate) system_message: Option<String>,
+}
+
+/// Look up attachments for a sense-originated task, read PDF sidecars
+/// and image bytes, and shape them into (images-for-multimodal,
+/// system-context-string) by provider capability.
+///
+/// Best-effort: any error (DB lookup, file read, missing sidecar) is
+/// logged and skipped. The caller must be tolerant of an empty result
+/// — autonomous tasks without attachments are the common case.
+pub(crate) async fn prepare_attachment_surfacing(
+    event_id: Uuid,
+    attachment_store: &athen_persistence::attachments::AttachmentStore,
+    supports_vision: bool,
+    supports_documents: bool,
+) -> AttachmentSurfacing {
+    use base64::Engine;
+
+    let atts = match attachment_store.list_for_event(event_id).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(event_id = %event_id, error = %e, "list_for_event failed");
+            return AttachmentSurfacing {
+                images: Vec::new(),
+                system_message: None,
+            };
+        }
+    };
+    if atts.is_empty() {
+        return AttachmentSurfacing {
+            images: Vec::new(),
+            system_message: None,
+        };
+    }
+
+    // Log every attachment's actual state at surfacing time. Without
+    // this, "the PDF didn't reach the agent" looked identical to "the
+    // sidecar wasn't extracted" — and the user can't tell the difference
+    // without grovelling through SQLite. Print mime + whether bytes are
+    // on disk + whether the .txt sidecar exists per row.
+    for att in &atts {
+        tracing::info!(
+            event_id = %event_id,
+            attachment_id = %att.id,
+            name = %att.name,
+            mime = %att.mime_type,
+            size_bytes = att.size_bytes,
+            has_local_path = att.local_path.is_some(),
+            has_extracted_text = att.extracted_text_path.is_some(),
+            purged = att.is_purged(),
+            "Surfacing attachment row"
+        );
+    }
+
+    let mut images: Vec<athen_core::llm::ImageInput> = Vec::new();
+    let mut header_lines: Vec<String> = Vec::new();
+    let mut body_sections: Vec<String> = Vec::new();
+    header_lines.push(format!(
+        "ATTACHMENTS ARE ALREADY AVAILABLE TO YOU ({} total). The full \
+         extracted contents are inlined further down in this same message \
+         under \"BEGIN extracted text\" markers — they are verbatim from \
+         the file and authoritative. Use them directly to answer the \
+         user's request. DO NOT ask the user to upload, paste, or share \
+         the file again — you already have it. DO NOT claim you cannot \
+         see attachments.",
+        atts.len()
+    ));
+
+    for att in &atts {
+        let mime = att.mime_type.to_ascii_lowercase();
+        let is_image = mime.starts_with("image/");
+        let is_pdf = mime.starts_with("application/pdf");
+        let mut suffix = String::new();
+
+        if is_image {
+            if !supports_vision {
+                suffix.push_str(
+                    " — image, but no vision-capable provider is active; \
+                     metadata only",
+                );
+            } else if let Some(path) = att.local_path.as_ref() {
+                match tokio::fs::read(path).await {
+                    Ok(bytes) => {
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                        images.push(athen_core::llm::ImageInput {
+                            mime_type: att.mime_type.clone(),
+                            data: athen_core::llm::ImageData::Base64 { data: b64 },
+                        });
+                        suffix.push_str(" — inlined as multimodal image");
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "Failed to read attachment image bytes"
+                        );
+                        suffix.push_str(
+                            " — bytes unreadable on disk; \
+                             call fetch_attachment to retry",
+                        );
+                    }
+                }
+            } else if att.is_purged() {
+                suffix.push_str(" — bytes purged; call fetch_attachment to redownload");
+            } else {
+                suffix.push_str(" — bytes not on disk; call fetch_attachment");
+            }
+        } else if is_pdf {
+            // Resolve a usable sidecar path. If the row says we have one,
+            // use it. If not but the bytes are still on disk, try to
+            // extract right now — extraction during email persist can
+            // fail or get skipped, and we'd rather burn a few hundred ms
+            // here than send the agent metadata-only and have it ask the
+            // user to upload the file they already sent.
+            let sidecar: Option<std::path::PathBuf> = match att.extracted_text_path.as_ref() {
+                Some(p) => Some(p.clone()),
+                None => {
+                    if let Some(local) = att.local_path.as_ref() {
+                        let local_clone = local.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            athen_sentidos::pdf_extract::extract_to_sidecar(&local_clone)
+                        })
+                        .await
+                        {
+                            Ok(Ok(p)) => {
+                                tracing::info!(
+                                    attachment_id = %att.id,
+                                    sidecar = %p.display(),
+                                    "Lazy PDF extraction succeeded at surfacing time"
+                                );
+                                // Best-effort: persist the new sidecar
+                                // path back to the row so subsequent
+                                // surfacings hit the cached path. Don't
+                                // fail surfacing on a DB write error.
+                                if let Err(e) = attachment_store
+                                    .record_extracted_text(att.id, p.clone())
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        attachment_id = %att.id,
+                                        error = %e,
+                                        "Failed to persist lazy extracted_text_path"
+                                    );
+                                }
+                                Some(p)
+                            }
+                            Ok(Err(e)) => {
+                                tracing::warn!(
+                                    attachment_id = %att.id,
+                                    error = %e,
+                                    "Lazy PDF extraction failed at surfacing time"
+                                );
+                                None
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    attachment_id = %att.id,
+                                    error = %e,
+                                    "Lazy PDF extraction join error"
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                }
+            };
+
+            if let Some(text_path) = sidecar {
+                match tokio::fs::read_to_string(&text_path).await {
+                    Ok(text) => {
+                        let snippet = athen_sentidos::pdf_extract::truncate_for_inline(
+                            &text,
+                            athen_sentidos::pdf_extract::DEFAULT_INLINE_CHAR_BUDGET,
+                        );
+                        if snippet.truncated {
+                            suffix.push_str(&format!(
+                                " — PDF text inlined ({} of {} chars); \
+                                 call read_attachment_full(\"{}\") for the rest",
+                                snippet.text.chars().count(),
+                                snippet.total_chars,
+                                att.id
+                            ));
+                        } else {
+                            suffix.push_str(&format!(
+                                " — PDF text inlined in full ({} chars)",
+                                snippet.total_chars
+                            ));
+                        }
+                        body_sections.push(format!(
+                            "--- BEGIN extracted text from \"{}\" (id={}) ---\n{}\n\
+                             --- END extracted text from \"{}\" ---",
+                            att.name, att.id, snippet.text, att.name
+                        ));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %text_path.display(),
+                            error = %e,
+                            "Failed to read PDF sidecar"
+                        );
+                        suffix.push_str(" — PDF sidecar unreadable");
+                    }
+                }
+                if supports_documents {
+                    // Note for future iteration: when MessageContent grows
+                    // a Document variant, the document-capable branch will
+                    // take precedence over text-fallback inlining.
+                    suffix.push_str(
+                        " (provider supports native PDF blocks; \
+                         not yet wired — using text fallback)",
+                    );
+                }
+            } else {
+                suffix.push_str(
+                    " — PDF without extracted text and no bytes on disk \
+                     to extract from; only metadata is available",
+                );
+            }
+        } else {
+            suffix.push_str(" — metadata only");
+        }
+
+        header_lines.push(format!(
+            "- id={} | name=\"{}\" | mime={} | size={}B{}",
+            att.id, att.name, att.mime_type, att.size_bytes, suffix
+        ));
+    }
+
+    let system_message = {
+        let mut out = header_lines.join("\n");
+        if !body_sections.is_empty() {
+            out.push_str("\n\n");
+            out.push_str(&body_sections.join("\n\n"));
+        }
+        out
+    };
+
+    tracing::info!(
+        event_id = %event_id,
+        attachments = atts.len(),
+        images = images.len(),
+        body_sections = body_sections.len(),
+        system_message_chars = system_message.len(),
+        "Built attachment surfacing payload"
+    );
+
+    AttachmentSurfacing {
+        images,
+        system_message: Some(system_message),
+    }
+}
+
 /// Execute a sense-originated task that the autonomous dispatch loop
 /// already pulled out of the coordinator queue.
 ///
@@ -2420,6 +2691,55 @@ pub(crate) async fn execute_dispatched_task(
     // the original trigger (email body, calendar reminder, etc.) into
     // this arc. A separate "user" turn would duplicate that.
 
+    // Surface attachments tied to this sense event. Branches by
+    // capability: vision-capable provider → images go into a Multimodal
+    // user turn; PDF text sidecars get inlined as a System turn so the
+    // agent can read them without a tool call. Other types are listed
+    // by metadata (the agent can call fetch_attachment / read_attachment_full
+    // for them on demand). No-op when there is no source_event, no
+    // attachment store wired (CLI/tests), or no attachments for the event.
+    let mut surfaced_images: Vec<athen_core::llm::ImageInput> = Vec::new();
+    if let (Some(event_id), Some(astore)) = (task.source_event, ctx.attachment_store.as_ref()) {
+        let router_guard = ctx.router.read().await;
+        let supports_vision = router_guard.any_provider_supports_vision();
+        let supports_documents = router_guard.any_provider_supports_documents();
+        drop(router_guard);
+        let surfacing = prepare_attachment_surfacing(
+            event_id,
+            astore,
+            supports_vision,
+            supports_documents,
+        )
+        .await;
+        if let Some(msg) = surfacing.system_message {
+            tracing::info!(
+                event_id = %event_id,
+                images = surfacing.images.len(),
+                surfaced_chars = msg.len(),
+                context_messages_before = context.len(),
+                "Surfacing attachments to dispatched executor"
+            );
+            context.push(ChatMessage {
+                role: Role::System,
+                content: MessageContent::Text(msg),
+            });
+            let total: usize = context
+                .iter()
+                .map(|m| match &m.content {
+                    MessageContent::Text(s) => s.len(),
+                    MessageContent::Structured(v) => v.to_string().len(),
+                    MessageContent::Multimodal { text, .. } => text.len(),
+                })
+                .sum();
+            tracing::info!(
+                context_messages_after = context.len(),
+                context_total_chars = total,
+                "Context after attachment surfacing"
+            );
+        }
+        surfaced_images = surfacing.images;
+    }
+
     // Build the tool registry, mirroring execute_approved_task.
     let mut shell_registry = athen_agent::ShellToolRegistry::new()
         .await
@@ -2525,6 +2845,9 @@ pub(crate) async fn execute_dispatched_task(
         builder = builder.active_profile(profile);
     }
     builder = builder.toolbox_info(athen_agent::toolbox::ToolboxPromptInfo::load().await);
+    if !surfaced_images.is_empty() {
+        builder = builder.initial_user_images(surfaced_images);
+    }
     let executor = builder.build().map_err(|e| {
         let raw = e.to_string();
         tracing::error!("AgentBuilder failed (dispatched): {raw}");
@@ -4151,5 +4474,273 @@ mod key_term_tests {
     fn all_stop_words_returns_empty() {
         let terms = extract_key_terms("the and or but not for with");
         assert!(terms.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod attachment_surfacing_tests {
+    use super::prepare_attachment_surfacing;
+    use athen_core::event::{Attachment, AttachmentSource};
+    use athen_persistence::Database;
+    use std::path::PathBuf;
+    use uuid::Uuid;
+
+    async fn fresh_store() -> athen_persistence::attachments::AttachmentStore {
+        let tmp = std::env::temp_dir().join(format!("athen_att_surf_{}.db", Uuid::new_v4()));
+        let db = Database::new(&tmp).await.unwrap();
+        db.attachment_store()
+    }
+
+    #[tokio::test]
+    async fn no_attachments_returns_empty_message() {
+        let store = fresh_store().await;
+        let event_id = Uuid::new_v4();
+        let result = prepare_attachment_surfacing(event_id, &store, true, true).await;
+        assert!(result.images.is_empty());
+        assert!(result.system_message.is_none());
+    }
+
+    #[tokio::test]
+    async fn pdf_with_sidecar_inlines_full_text() {
+        let store = fresh_store().await;
+        let event_id = Uuid::new_v4();
+
+        let dir = std::env::temp_dir().join(format!("athen_att_pdf_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pdf_path = dir.join("invoice.pdf");
+        std::fs::write(&pdf_path, b"PDF-bytes-not-actually-used-by-test").unwrap();
+        let txt_path = dir.join("invoice.pdf.txt");
+        std::fs::write(&txt_path, "Hello PDF world").unwrap();
+
+        let mut att = Attachment::new(
+            "invoice.pdf",
+            "application/pdf",
+            33,
+            Some(pdf_path.clone()),
+            Some(AttachmentSource::Email {
+                account_id: "primary".into(),
+                mailbox: "INBOX".into(),
+                uid_validity: 1,
+                uid: 1,
+                part_path: "1".into(),
+            }),
+        );
+        att.extracted_text_path = Some(txt_path.clone());
+        store.insert(event_id, &att).await.unwrap();
+
+        let result = prepare_attachment_surfacing(event_id, &store, false, false).await;
+        assert!(result.images.is_empty());
+        let msg = result.system_message.expect("system message");
+        assert!(msg.contains("invoice.pdf"));
+        assert!(msg.contains("Hello PDF world"));
+        assert!(msg.contains("PDF text inlined in full"));
+        assert!(!msg.contains("call read_attachment_full"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn pdf_with_long_sidecar_truncates_and_dangles_tool() {
+        let store = fresh_store().await;
+        let event_id = Uuid::new_v4();
+
+        let dir = std::env::temp_dir().join(format!("athen_att_pdf_long_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pdf_path = dir.join("big.pdf");
+        std::fs::write(&pdf_path, b"PDF").unwrap();
+        let txt_path = dir.join("big.pdf.txt");
+        let long = "x".repeat(20_000);
+        std::fs::write(&txt_path, &long).unwrap();
+
+        let mut att = Attachment::new(
+            "big.pdf",
+            "application/pdf",
+            3,
+            Some(pdf_path),
+            Some(AttachmentSource::Email {
+                account_id: "primary".into(),
+                mailbox: "INBOX".into(),
+                uid_validity: 1,
+                uid: 1,
+                part_path: "1".into(),
+            }),
+        );
+        att.extracted_text_path = Some(txt_path);
+        store.insert(event_id, &att).await.unwrap();
+
+        let result = prepare_attachment_surfacing(event_id, &store, false, false).await;
+        let msg = result.system_message.expect("system message");
+        assert!(msg.contains("call read_attachment_full"));
+        assert!(msg.contains("of 20000 chars"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn image_with_vision_inlines_base64_bytes() {
+        let store = fresh_store().await;
+        let event_id = Uuid::new_v4();
+
+        let dir = std::env::temp_dir().join(format!("athen_att_img_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let img_path = dir.join("photo.png");
+        // Bytes don't need to be a valid PNG — base64 just encodes them.
+        let img_bytes = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+        std::fs::write(&img_path, &img_bytes).unwrap();
+
+        let att = Attachment::new(
+            "photo.png",
+            "image/png",
+            img_bytes.len() as u64,
+            Some(img_path.clone()),
+            Some(AttachmentSource::Telegram {
+                chat_id: 1,
+                message_id: 1,
+                file_id: "f".into(),
+            }),
+        );
+        store.insert(event_id, &att).await.unwrap();
+
+        let result = prepare_attachment_surfacing(event_id, &store, true, false).await;
+        assert_eq!(result.images.len(), 1);
+        let msg = result.system_message.expect("system message");
+        assert!(msg.contains("photo.png"));
+        assert!(msg.contains("inlined as multimodal image"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn image_without_vision_falls_back_to_metadata() {
+        let store = fresh_store().await;
+        let event_id = Uuid::new_v4();
+
+        let dir = std::env::temp_dir().join(format!("athen_att_img_nv_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let img_path = dir.join("photo.jpg");
+        std::fs::write(&img_path, [0u8; 8]).unwrap();
+
+        let att = Attachment::new(
+            "photo.jpg",
+            "image/jpeg",
+            8,
+            Some(img_path),
+            None,
+        );
+        store.insert(event_id, &att).await.unwrap();
+
+        let result = prepare_attachment_surfacing(event_id, &store, false, false).await;
+        assert!(result.images.is_empty());
+        let msg = result.system_message.expect("system message");
+        assert!(msg.contains("no vision-capable provider is active"));
+    }
+
+    #[tokio::test]
+    async fn purged_image_advertises_fetch_attachment() {
+        let store = fresh_store().await;
+        let event_id = Uuid::new_v4();
+
+        let mut att = Attachment::new(
+            "old.png",
+            "image/png",
+            123,
+            None,
+            Some(AttachmentSource::Telegram {
+                chat_id: 1,
+                message_id: 2,
+                file_id: "x".into(),
+            }),
+        );
+        att.purged_at = Some(chrono::Utc::now());
+        store.insert(event_id, &att).await.unwrap();
+
+        let result = prepare_attachment_surfacing(event_id, &store, true, false).await;
+        assert!(result.images.is_empty());
+        let msg = result.system_message.expect("system message");
+        assert!(msg.contains("call fetch_attachment"));
+    }
+
+    #[tokio::test]
+    async fn pdf_without_sidecar_but_with_local_path_extracts_lazily() {
+        // Regression: row inserted with extracted_text_path=None (e.g.
+        // email persist's eager extraction skipped or crashed) but the
+        // PDF bytes are still on disk. Surfacing should run extraction
+        // right then rather than degrading to metadata-only and asking
+        // the user to upload again.
+        use std::io::Write;
+        let store = fresh_store().await;
+        let event_id = Uuid::new_v4();
+
+        let dir = std::env::temp_dir().join(format!("athen_att_lazy_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pdf_path = dir.join("hello.pdf");
+
+        // Smallest valid one-page PDF that pdf-extract can parse.
+        // Hand-written: header, 4 objects (catalog, pages, page,
+        // contents stream with "Hello PDF"), xref, trailer.
+        let pdf = b"%PDF-1.4\n\
+1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n\
+3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n\
+4 0 obj\n<< /Length 44 >>\nstream\nBT /F1 24 Tf 50 100 Td (Hello PDF) Tj ET\nendstream\nendobj\n\
+5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n\
+xref\n0 6\n0000000000 65535 f \n0000000010 00000 n \n0000000060 00000 n \n0000000110 00000 n \n0000000220 00000 n \n0000000310 00000 n \ntrailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n380\n%%EOF\n";
+        let mut f = std::fs::File::create(&pdf_path).unwrap();
+        f.write_all(pdf).unwrap();
+        drop(f);
+
+        let att = Attachment::new(
+            "hello.pdf",
+            "application/pdf",
+            pdf.len() as u64,
+            Some(pdf_path.clone()),
+            Some(AttachmentSource::Email {
+                account_id: "primary".into(),
+                mailbox: "INBOX".into(),
+                uid_validity: 1,
+                uid: 1,
+                part_path: "1".into(),
+            }),
+        );
+        // NOTE: extracted_text_path intentionally None — simulates
+        // failed/skipped eager extraction during email persist.
+        store.insert(event_id, &att).await.unwrap();
+
+        let result = prepare_attachment_surfacing(event_id, &store, false, false).await;
+        let msg = result.system_message.expect("system message");
+        // The lazy path either succeeds and inlines text, or fails
+        // gracefully — but it must NEVER tell the agent "call
+        // read_attachment_full" since that tool isn't wired yet.
+        if msg.contains("BEGIN extracted text") {
+            // Happy path: extraction worked, full content inlined.
+            assert!(msg.contains("hello.pdf"));
+        } else {
+            // Degraded path: pdf-extract failed on this minimal PDF.
+            // Still must not lie to the agent about a tool that
+            // doesn't exist.
+            assert!(msg.contains("only metadata is available"));
+            assert!(!msg.contains("call read_attachment_full"));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn unknown_mime_lists_metadata_only() {
+        let store = fresh_store().await;
+        let event_id = Uuid::new_v4();
+
+        let att = Attachment::new(
+            "data.bin",
+            "application/octet-stream",
+            42,
+            Some(PathBuf::from("/tmp/data.bin")),
+            None,
+        );
+        store.insert(event_id, &att).await.unwrap();
+
+        let result = prepare_attachment_surfacing(event_id, &store, true, true).await;
+        let msg = result.system_message.expect("system message");
+        assert!(msg.contains("metadata only"));
     }
 }

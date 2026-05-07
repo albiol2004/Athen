@@ -37,6 +37,7 @@ tokio-util = "0.7"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures = { workspace = true }
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+base64 = { workspace = true }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

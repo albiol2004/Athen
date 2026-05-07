@@ -393,6 +393,15 @@ impl AppState {
         state
     }
 
+    /// Borrow the attachment-ref store backed by the same SQLite
+    /// connection as `arc_store`. Returns `None` when no database is
+    /// wired (CLI/test builds). The store is cloneable (it's an
+    /// `Arc<Mutex<Connection>>` wrapper), so callers can move the value
+    /// freely into background tasks.
+    pub fn attachment_store(&self) -> Option<athen_persistence::attachments::AttachmentStore> {
+        self._database.as_ref().map(|db| db.attachment_store())
+    }
+
     /// Generate per-group markdown schema files into `tool_doc_dir`. Called
     /// at startup and whenever the available tool set changes (i.e. after a
     /// user enables or disables an MCP). Silently no-ops when no directory
@@ -657,6 +666,7 @@ impl AppState {
         let email_config = config.clone();
         let router = Arc::clone(&self.router);
         let arc_store_ref = self._database.as_ref().map(|db| db.arc_store());
+        let attachment_store_ref = self._database.as_ref().map(|db| db.attachment_store());
         let profile_store_ref = self.profile_store.clone();
         let profile_embedder_ref = Arc::clone(&self.profile_embedder);
         let profile_embedding_cache_ref = Arc::clone(&self.profile_embedding_cache);
@@ -696,6 +706,7 @@ impl AppState {
                                 Some(&dispatch_signal_ref),
                                 approval_router_ref.as_ref(),
                                 Some(&pending_email_marks_ref),
+                                attachment_store_ref.as_ref(),
                             )
                             .await;
                         }
@@ -736,6 +747,7 @@ impl AppState {
         let config = load_config();
         let router = Arc::clone(&self.router);
         let arc_store_ref = self._database.as_ref().map(|db| db.arc_store());
+        let attachment_store_ref = self._database.as_ref().map(|db| db.attachment_store());
         let profile_store_ref = self.profile_store.clone();
         let profile_embedder_ref = Arc::clone(&self.profile_embedder);
         let profile_embedding_cache_ref = Arc::clone(&self.profile_embedding_cache);
@@ -777,6 +789,7 @@ impl AppState {
                                 Some(&dispatch_signal_ref),
                                 approval_router_ref.as_ref(),
                                 Some(&pending_email_marks_ref),
+                                attachment_store_ref.as_ref(),
                             )
                             .await;
                         }
@@ -827,6 +840,7 @@ impl AppState {
         let telegram_config = config.clone();
         let router = Arc::clone(&self.router);
         let arc_store_ref = self._database.as_ref().map(|db| db.arc_store());
+        let attachment_store_ref = self._database.as_ref().map(|db| db.attachment_store());
         let profile_store_ref = self.profile_store.clone();
         let profile_embedder_ref = Arc::clone(&self.profile_embedder);
         let profile_embedding_cache_ref = Arc::clone(&self.profile_embedding_cache);
@@ -890,7 +904,14 @@ impl AppState {
                                     .and_then(|v| v.as_i64())
                                     .unwrap_or(0);
 
-                                if !text.is_empty() && chat_id != 0 {
+                                // Treat a message as actionable if it has either
+                                // text OR attachments. A bare photo (caption-less)
+                                // arrives with text="[photo]" anyway, but a future
+                                // change that sends only attachments still needs
+                                // to reach the executor.
+                                let has_payload = !text.is_empty()
+                                    || !event.content.attachments.is_empty();
+                                if has_payload && chat_id != 0 {
                                     // Spawn the handler so the poll loop keeps
                                     // ticking. If we awaited inline, callbacks
                                     // (Telegram inline-keyboard taps) would
@@ -902,6 +923,7 @@ impl AppState {
                                     let bot_token_c = bot_token.clone();
                                     let router_c = Arc::clone(&router);
                                     let arc_store_c = arc_store_ref.clone();
+                                    let attachment_store_c = attachment_store_ref.clone();
                                     let calendar_store_c = calendar_store_ref.clone();
                                     let contact_store_c = contact_store_ref.clone();
                                     let memory_c = memory_ref.clone();
@@ -920,13 +942,18 @@ impl AppState {
                                     let approval_router_c = approval_router_ref.clone();
                                     let web_search_c = Arc::clone(&web_search_ref);
                                     let email_sender_c = email_sender_ref.clone();
+                                    let event_id = event.id;
+                                    let attachments_owned = event.content.attachments.clone();
                                     tauri::async_runtime::spawn(async move {
                                         execute_owner_telegram_message(
                                             &text_owned,
                                             chat_id,
                                             &bot_token_c,
+                                            event_id,
+                                            &attachments_owned,
                                             &router_c,
                                             &arc_store_c,
+                                            attachment_store_c.as_ref(),
                                             &calendar_store_c,
                                             &contact_store_c,
                                             &memory_c,
@@ -967,6 +994,7 @@ impl AppState {
                                     Some(&dispatch_signal_ref),
                                     approval_router_ref.as_ref(),
                                     Some(&pending_email_marks_ref),
+                                    attachment_store_ref.as_ref(),
                                 )
                                 .await;
                             }
@@ -1066,6 +1094,7 @@ impl AppState {
         let compactor = self.compactor.clone();
         let web_search = Arc::clone(&self.web_search);
         let email_sender = self.email_sender.clone();
+        let attachment_store_loop = self.attachment_store();
         let inflight = Arc::clone(&self.inflight_approvals);
 
         tauri::async_runtime::spawn(async move {
@@ -1149,6 +1178,7 @@ impl AppState {
                         web_search: Arc::clone(&web_search),
                         email_sender: email_sender.clone(),
                         initial_user_images: Vec::new(),
+                        attachment_store: attachment_store_loop.clone(),
                     };
 
                     let task_arc_map_clone = Arc::clone(&task_arc_map);
@@ -1255,8 +1285,11 @@ async fn execute_owner_telegram_message(
     text: &str,
     chat_id: i64,
     bot_token: &str,
+    event_id: uuid::Uuid,
+    attachments: &[athen_core::event::Attachment],
     router: &Arc<RwLock<Arc<DefaultLlmRouter>>>,
     arc_store: &Option<ArcStore>,
+    attachment_store: Option<&athen_persistence::attachments::AttachmentStore>,
     calendar_store: &Option<CalendarStore>,
     contact_store: &Option<SqliteContactStore>,
     memory: &Option<Arc<Memory>>,
@@ -1377,7 +1410,7 @@ async fn execute_owner_telegram_message(
     }
 
     // Load conversation history from the arc for context continuity.
-    let context = if let (Some(store), Some(ref arc_id)) = (arc_store, &target_arc_id) {
+    let mut context = if let (Some(store), Some(ref arc_id)) = (arc_store, &target_arc_id) {
         match store.load_entries(arc_id).await {
             Ok(entries) => entries
                 .into_iter()
@@ -1400,6 +1433,55 @@ async fn execute_owner_telegram_message(
     } else {
         vec![]
     };
+
+    // Persist attachment refs so refetch / lookup tools can resolve by id
+    // later, and so prepare_attachment_surfacing can read them. Owner
+    // Telegram messages bypass process_sense_event entirely, so the
+    // insert that the email/non-owner path gets at sense_router::Step 3
+    // has to be done explicitly here.
+    if let Some(astore) = attachment_store {
+        for att in attachments {
+            if let Err(e) = astore.insert(event_id, att).await {
+                warn!(
+                    event_id = %event_id,
+                    attachment = %att.name,
+                    error = %e,
+                    "Failed to persist owner-Telegram attachment ref"
+                );
+            }
+        }
+    }
+
+    // Surface attachments into the executor's first turn — images go to
+    // the multimodal user content (when the active provider has vision)
+    // and PDF text sidecars get inlined as a System turn. This is the
+    // same path execute_dispatched_task takes for non-owner sense events.
+    let mut surfaced_images: Vec<athen_core::llm::ImageInput> = Vec::new();
+    if let Some(astore) = attachment_store {
+        let router_guard = router.read().await;
+        let supports_vision = router_guard.any_provider_supports_vision();
+        let supports_documents = router_guard.any_provider_supports_documents();
+        drop(router_guard);
+        let surfacing = crate::commands::prepare_attachment_surfacing(
+            event_id,
+            astore,
+            supports_vision,
+            supports_documents,
+        )
+        .await;
+        if let Some(msg) = surfacing.system_message {
+            tracing::info!(
+                event_id = %event_id,
+                images = surfacing.images.len(),
+                "Surfacing attachments to owner-Telegram executor"
+            );
+            context.push(athen_core::llm::ChatMessage {
+                role: athen_core::llm::Role::System,
+                content: athen_core::llm::MessageContent::Text(msg),
+            });
+        }
+        surfaced_images = surfacing.images;
+    }
 
     // Build the executor (mirrors send_message logic but without risk/coordinator).
     let exec_router: Box<dyn athen_core::traits::llm::LlmRouter> =
@@ -1490,6 +1572,9 @@ async fn execute_owner_telegram_message(
     builder = builder
         .toolbox_info(athen_agent::toolbox::ToolboxPromptInfo::load().await)
         .shell_kind(athen_agent::detect_shell_kind().await);
+    if !surfaced_images.is_empty() {
+        builder = builder.initial_user_images(surfaced_images);
+    }
     let executor = match builder.build() {
         Ok(e) => e,
         Err(e) => {
@@ -1502,7 +1587,7 @@ async fn execute_owner_telegram_message(
         id: uuid::Uuid::new_v4(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
-        source_event: None,
+        source_event: Some(event_id),
         domain: DomainType::Base,
         description: text.to_string(),
         priority: TaskPriority::Normal,

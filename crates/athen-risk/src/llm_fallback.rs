@@ -3,6 +3,7 @@
 //! When the fast regex rules cannot confidently classify an action,
 //! we ask an LLM to evaluate its risk.
 
+use athen_core::contact::TrustLevel;
 use athen_core::llm::{ChatMessage, LlmRequest, LlmResponse, MessageContent, ModelProfile, Role};
 use athen_core::risk::{BaseImpact, DataSensitivity, EvaluationMethod, RiskContext, RiskScore};
 use athen_core::traits::llm::LlmRouter;
@@ -56,7 +57,16 @@ impl LlmRiskEvaluator {
             }
         };
 
-        let (impact, sensitivity, confidence) = self.parse_response(&response);
+        let (impact, sensitivity, confidence) = match self.parse_response(&response) {
+            Some(parsed) => parsed,
+            None => {
+                tracing::warn!(
+                    "LLM risk evaluation returned unparseable JSON, \
+                     using trust-weighted conservative fallback"
+                );
+                return Ok(self.conservative_fallback(context));
+            }
+        };
 
         let effective_context = RiskContext {
             trust_level: context.trust_level,
@@ -74,19 +84,36 @@ impl LlmRiskEvaluator {
             .compute(impact, &effective_context, EvaluationMethod::LlmAssisted))
     }
 
-    /// Return a conservative risk score that lands in HumanConfirm range.
+    /// Return a conservative risk score when the LLM call fails or returns
+    /// unparseable output. Calibrated by sender trust so an explicit "I
+    /// trust this contact" signal from the user is honoured even when the
+    /// risk LLM hiccups — without this an offline DeepSeek can HardBlock a
+    /// trusted contact's "review this CV" email purely on fallback math.
+    ///
+    /// Trust-weighted defaults:
+    /// - AuthUser / Trusted: read + plain + 0.5 → low score, lands in
+    ///   NotifyAndProceed at worst. The user's explicit trust IS the signal.
+    /// - Known: write_temp + plain + 0.4 → mid-band, HumanConfirm.
+    /// - Neutral / Unknown: write_persist + personal_info + 0.3 → HardBlock,
+    ///   today's behavior preserved for senders the user hasn't vetted.
     fn conservative_fallback(&self, context: &RiskContext) -> RiskScore {
+        let (impact, sensitivity, confidence) = match context.trust_level {
+            TrustLevel::AuthUser | TrustLevel::Trusted => {
+                (BaseImpact::Read, DataSensitivity::Plain, 0.5)
+            }
+            TrustLevel::Known => (BaseImpact::WriteTemp, DataSensitivity::Plain, 0.4),
+            TrustLevel::Neutral | TrustLevel::Unknown => {
+                (BaseImpact::WritePersist, DataSensitivity::PersonalInfo, 0.3)
+            }
+        };
         let ctx = RiskContext {
             trust_level: context.trust_level,
-            data_sensitivity: DataSensitivity::PersonalInfo,
-            llm_confidence: Some(0.3),
+            data_sensitivity: sensitivity,
+            llm_confidence: Some(confidence),
             accumulated_risk: context.accumulated_risk,
         };
-        self.scorer.compute(
-            BaseImpact::WritePersist,
-            &ctx,
-            EvaluationMethod::LlmAssisted,
-        )
+        self.scorer
+            .compute(impact, &ctx, EvaluationMethod::LlmAssisted)
     }
 
     /// Build the LLM request for risk evaluation.
@@ -136,41 +163,40 @@ impl LlmRiskEvaluator {
         }
     }
 
-    /// Parse the LLM response to extract risk classification.
-    /// Falls back to conservative defaults if parsing fails.
-    fn parse_response(&self, response: &LlmResponse) -> (BaseImpact, DataSensitivity, f64) {
+    /// Parse the LLM response into a risk classification triple, or `None`
+    /// when the response can't be decoded. The caller drives the
+    /// trust-weighted conservative fallback on `None` — embedding a fixed
+    /// "assume the worst" tuple here used to silently HardBlock trusted
+    /// contacts on any local-model JSON wobble.
+    fn parse_response(
+        &self,
+        response: &LlmResponse,
+    ) -> Option<(BaseImpact, DataSensitivity, f64)> {
         let content = &response.content;
+        let v: serde_json::Value = serde_json::from_str(content).ok()?;
 
-        let parsed: Option<(BaseImpact, DataSensitivity, f64)> = (|| {
-            let v: serde_json::Value = serde_json::from_str(content).ok()?;
+        let impact = match v.get("impact")?.as_str()? {
+            "read" => BaseImpact::Read,
+            "write_temp" => BaseImpact::WriteTemp,
+            "write_persist" => BaseImpact::WritePersist,
+            "system" => BaseImpact::System,
+            _ => return None,
+        };
 
-            let impact = match v.get("impact")?.as_str()? {
-                "read" => BaseImpact::Read,
-                "write_temp" => BaseImpact::WriteTemp,
-                "write_persist" => BaseImpact::WritePersist,
-                "system" => BaseImpact::System,
-                _ => return None,
-            };
+        let sensitivity = match v.get("sensitivity")?.as_str()? {
+            "plain" => DataSensitivity::Plain,
+            "personal_info" => DataSensitivity::PersonalInfo,
+            "secrets" => DataSensitivity::Secrets,
+            _ => return None,
+        };
 
-            let sensitivity = match v.get("sensitivity")?.as_str()? {
-                "plain" => DataSensitivity::Plain,
-                "personal_info" => DataSensitivity::PersonalInfo,
-                "secrets" => DataSensitivity::Secrets,
-                _ => return None,
-            };
+        let confidence = v
+            .get("confidence")
+            .and_then(|c| c.as_f64())
+            .unwrap_or(0.5)
+            .clamp(0.0, 1.0);
 
-            let confidence = v
-                .get("confidence")
-                .and_then(|c| c.as_f64())
-                .unwrap_or(0.5)
-                .clamp(0.0, 1.0);
-
-            Some((impact, sensitivity, confidence))
-        })();
-
-        // Conservative fallback: if we can't parse the LLM response,
-        // assume the worst for safety.
-        parsed.unwrap_or((BaseImpact::WritePersist, DataSensitivity::PersonalInfo, 0.3))
+        Some((impact, sensitivity, confidence))
     }
 }
 
@@ -180,7 +206,7 @@ mod tests {
     use async_trait::async_trait;
     use athen_core::contact::TrustLevel;
     use athen_core::llm::{BudgetStatus, FinishReason, LlmResponse, TokenUsage};
-    use athen_core::risk::RiskLevel;
+    use athen_core::risk::{RiskDecision, RiskLevel};
 
     /// Mock LLM router that returns a fixed response.
     struct MockRouter {
@@ -285,13 +311,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn falls_back_on_invalid_json() {
+    async fn fallback_for_authuser_lands_below_human_confirm() {
+        // Auth user with unparseable response should NOT escalate. The
+        // trust-weighted fallback gives Read+Plain+0.5 confidence.
         let router = MockRouter::new("I don't know what to do");
         let evaluator = LlmRiskEvaluator::new(Box::new(router));
         let ctx = default_ctx();
         let score = evaluator.evaluate("something", &ctx).await.unwrap();
-        // Fallback: WritePersist(40) * AuthUser(0.5) * PersonalInfo(2) + (1-0.3)^2*100 = 40 + 49 = 89
-        assert!((score.total - 89.0).abs() < 0.01);
+        // Read(1) * AuthUser(0.5) * Plain(1) + (1-0.5)^2*100 = 0.5 + 25 = 25.5
+        assert!((score.total - 25.5).abs() < 0.01, "got {}", score.total);
+        assert!(score.total < 50.0); // never HumanConfirm or worse
+    }
+
+    #[tokio::test]
+    async fn fallback_for_trusted_contact_does_not_hardblock() {
+        // Regression: a Trusted contact's CV-review email used to HardBlock
+        // (129) on any LLM hiccup. Trust-weighted fallback now puts them in
+        // NotifyAndProceed range, honouring the user's explicit trust.
+        let router = MockRouter::new("garbage not json");
+        let evaluator = LlmRiskEvaluator::new(Box::new(router));
+        let ctx = RiskContext {
+            trust_level: TrustLevel::Trusted,
+            data_sensitivity: DataSensitivity::Plain,
+            llm_confidence: Some(1.0),
+            accumulated_risk: 0,
+        };
+        let score = evaluator.evaluate("Review CV", &ctx).await.unwrap();
+        // Read(1) * Trusted(1.0) * Plain(1) + (1-0.5)^2*100 = 1 + 25 = 26
+        assert!((score.total - 26.0).abs() < 0.01, "got {}", score.total);
+        assert_ne!(score.decision(), RiskDecision::HardBlock);
+    }
+
+    #[tokio::test]
+    async fn fallback_for_unknown_sender_still_hardblocks() {
+        // The harden-on-unknown stays the same — strangers we've never
+        // seen before still get the conservative WritePersist+PII+0.3
+        // fallback, which Unknown's 5x multiplier pushes to HardBlock.
+        let router = MockRouter::new("garbage");
+        let evaluator = LlmRiskEvaluator::new(Box::new(router));
+        let ctx = RiskContext {
+            trust_level: TrustLevel::Unknown,
+            data_sensitivity: DataSensitivity::Plain,
+            llm_confidence: Some(1.0),
+            accumulated_risk: 0,
+        };
+        let score = evaluator.evaluate("anything", &ctx).await.unwrap();
+        // WritePersist(40) * Unknown(5) * PersonalInfo(2) + 49 = 449
+        assert_eq!(score.decision(), RiskDecision::HardBlock);
     }
 
     #[tokio::test]
@@ -299,10 +365,17 @@ mod tests {
         let json = r#"{"impact":"destroy","sensitivity":"plain","confidence":0.9}"#;
         let router = MockRouter::new(json);
         let evaluator = LlmRiskEvaluator::new(Box::new(router));
-        let ctx = default_ctx();
+        // Use a Neutral sender so the fallback is loud enough to still
+        // exceed NotifyAndProceed — keeps the original test intent.
+        let ctx = RiskContext {
+            trust_level: TrustLevel::Neutral,
+            data_sensitivity: DataSensitivity::Plain,
+            llm_confidence: Some(1.0),
+            accumulated_risk: 0,
+        };
         let score = evaluator.evaluate("something", &ctx).await.unwrap();
-        // Fallback applies
-        assert!(score.total > 50.0);
+        // WritePersist(40) * Neutral(2) * PersonalInfo(2) + 49 = 209
+        assert!(score.total > 50.0, "got {}", score.total);
     }
 
     #[tokio::test]

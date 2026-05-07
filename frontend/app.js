@@ -3507,6 +3507,13 @@ function createProviderCard(provider) {
             </label>
             <div class="field-hint">Tick this when the model above is one of: Claude Sonnet/Opus 3.5+, GPT-4o / GPT-4o-mini, Gemini 1.5+, or any other multimodal model. Athen will only forward attached images when this is on.</div>
         </div>
+        <div class="provider-field provider-field-checkbox">
+            <label class="checkbox-row">
+                <input type="checkbox" class="provider-supports-documents" ${provider.supports_documents ? 'checked' : ''}>
+                <span>Document-capable model (accepts native PDF input)</span>
+            </label>
+            <div class="field-hint">Tick this when the model can render PDFs natively (Claude Sonnet/Opus 3.5+, Gemini 1.5+). Independent of vision. When off, Athen falls back to extracting PDF text locally and inlining it — your model still sees the contents either way.</div>
+        </div>
         <div class="provider-card-actions">
             <button class="btn-secondary test-btn">Test Connection</button>
             <button class="btn-primary save-btn">Save</button>
@@ -3558,6 +3565,8 @@ async function handleSaveProvider(card, id) {
     }
     const visionInput = card.querySelector('.provider-supports-vision');
     const supportsVision = visionInput ? !!visionInput.checked : null;
+    const documentsInput = card.querySelector('.provider-supports-documents');
+    const supportsDocuments = documentsInput ? !!documentsInput.checked : null;
 
     const saveBtn = card.querySelector('.save-btn');
     saveBtn.disabled = true;
@@ -3570,6 +3579,7 @@ async function handleSaveProvider(card, id) {
             model: model,
             apiKey: apiKey,
             supportsVision: supportsVision,
+            supportsDocuments: supportsDocuments,
         });
         showToast(msg, 'success');
         // Reload to reflect changes.

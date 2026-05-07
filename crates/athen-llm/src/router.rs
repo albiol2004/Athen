@@ -191,6 +191,25 @@ impl DefaultLlmRouter {
         self
     }
 
+    /// True if any registered provider claims vision support. Used by the
+    /// sense-event executor path to decide whether inlining attachment
+    /// images is worth the bytes — text-only providers reject Multimodal
+    /// requests, so we drop image inlining and fall back to metadata.
+    pub fn any_provider_supports_vision(&self) -> bool {
+        self.providers.values().any(|p| p.supports_vision())
+    }
+
+    /// True if any registered provider supports native document/PDF input
+    /// (Anthropic document blocks, Gemini `application/pdf` inlineData).
+    /// Until `MessageContent` grows a Document variant, this is purely
+    /// informational — the executor still falls back to inlining the
+    /// extracted text sidecar — but it lets us log a "model could have
+    /// rendered the PDF natively" hint, and it's the seam future native
+    /// document inlining will key off of.
+    pub fn any_provider_supports_documents(&self) -> bool {
+        self.providers.values().any(|p| p.supports_documents())
+    }
+
     /// Try each provider in the priority list for the requested profile (streaming).
     async fn route_streaming_with_failover(&self, request: &LlmRequest) -> Result<LlmStream> {
         let profile_config = self.profiles.get(&request.profile).ok_or_else(|| {
