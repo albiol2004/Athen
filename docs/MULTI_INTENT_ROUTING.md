@@ -114,6 +114,105 @@ Per-arc bullets, one merged tools footer (deduplicated across all intents). The 
 - **Parallel approval orchestration.** Mixed-risk batches send the auto intents immediately and the approval cards sequentially, not in a single multi-pane UI.
 - **New-arc creation during multi-intent.** All intents must map to existing arcs from the candidates list.
 
+## Adjacent idea: coordinator-as-agent with standing instructions
+
+The intent splitter above treats the coordinator as a *router* — pure function from message + state to N tasks. The next level up is treating it as an **agent in its own right** with persistent memory and time-bounded standing instructions that bias *every* downstream routing/risk/notification decision until they expire.
+
+Motivating example:
+
+> User about to head into a 4-hour meeting types into the chat composer:
+> *"For the next 4 hours, reply to everything on Telegram, and don't auto-send any emails — just draft and queue them for me to approve when I'm back."*
+
+Today this would have to be encoded as configuration changes (notification channel, security mode, …) per-arc. The coordinator-as-agent reads that as a single utterance, persists it as a `StandingInstruction { scope: "all_arcs", expires_at: now + 4h, rules: [...] }`, and applies it to every dispatch / notification / risk decision until 4h elapse.
+
+### What a standing instruction looks like
+
+```rust
+struct StandingInstruction {
+    id: Uuid,
+    created_at: DateTime<Utc>,
+    expires_at: Option<DateTime<Utc>>,  // None = until manually revoked
+    scope: InstructionScope,            // AllArcs | ArcsMatching{filter} | SingleArc{id}
+    directives: Vec<Directive>,
+    source_message: String,             // the verbatim user text, for audit
+}
+
+enum Directive {
+    PreferReplyChannel(ChannelKind),       // "reply on Telegram"
+    SuppressAutoSend { categories: Vec<DomainTag> }, // "draft but don't send emails"
+    ElevateRiskGate { min_human_confirm: RiskLevel }, // "ping me for anything riskier than Safe"
+    SilenceNotifications { except: Vec<NotificationUrgency> }, // "only critical pings"
+    QueueForReview,                        // "hold all autonomous actions for me"
+    // … extensible
+}
+```
+
+### Where it plugs into the existing pipeline
+
+```
+Sense event
+  │
+  ▼
+Triage  (unchanged)
+  │
+  ▼
+Coordinator decision  ◄─── consults active StandingInstructions before defaulting
+  │
+  ▼
+Risk gate          ◄─── elevated by ElevateRiskGate directives
+  │
+  ▼
+Notification       ◄─── filtered by SilenceNotifications, channel forced by PreferReplyChannel
+  │
+  ▼
+Dispatch / Approval / Reply
+```
+
+Every existing decision point gains a "consult standing instructions first" step. Defaults still fire when no instruction matches.
+
+### Risk interaction (the non-obvious part)
+
+Standing instructions can conflict with intrinsic risk decisions in ways that need careful sequencing:
+
+- **`ElevateRiskGate`** *raises* the bar: a Safe action becomes Caution-with-confirm because the user said "ping me for everything today". The coordinator must not silently downgrade — explicit elevation always wins.
+- **`SuppressAutoSend`** *also* raises the bar but selectively. The action is allowed to be drafted (executed up to but not including the side-effecting tool call), then queued for approval. Existing risk infra gates the call; the standing instruction just changes the gate's threshold for that specific category.
+- **`QueueForReview`** is the strongest: every autonomous action becomes a draft regardless of risk level. Not even Safe actions auto-execute. The user explicitly said "I want to see everything before it goes out" — respect that even when it costs latency.
+
+What standing instructions can *NOT* do: lower a risk gate. A user can't issue "approve everything for the next hour" because that breaks the principle that risk decisions are derived from action, not user mood. (The escape hatch for chronically-over-cautious gates is the security mode in Settings — a deliberate, persistent choice, not a one-line Telegram message.)
+
+### Memory shape
+
+These are first-class entries in `athen_memory`, not config rows. Two reasons:
+
+1. **Audit.** "Why did the agent draft instead of send?" must always trace back to a concrete instruction with timestamp + source message. Memory entries already serialize that cleanly.
+2. **Recall.** When the agent is composing a reply, it should *know* that a standing instruction is in effect ("the user is in a 4-hour meeting; this draft is for review later"). That context belongs in the same memory recall path that surfaces user facts today.
+
+Special memory category — `StandingInstructionMemory` — with a TTL filter applied at recall time so expired instructions stop influencing decisions automatically without needing a sweeper.
+
+### Sequencing vs multi-intent
+
+Standing instructions are a separate axis from multi-intent splitting:
+
+- **Multi-intent** = one message → N concurrent tasks routed to N arcs.
+- **Standing instructions** = one message → 1 long-lived directive applied to all future tasks for some scope.
+
+A single user message could absolutely do both: *"For the next 4 hours, reply on Telegram. And right now: ack the standup invite and tell Marta the report's coming Friday."* — that's one standing instruction + two multi-intent tasks. The intent splitter prompt needs to be aware of the standing-instruction shape so it can return both kinds of output:
+
+```json
+{
+  "standing_instructions": [{ "scope": "all_arcs", "expires_at": "...", "directives": [...] }],
+  "intents": [{ "arc_id": "...", "sub_message": "..." }, ...]
+}
+```
+
+### What v1 of this feature would NOT do
+
+- **Conflict resolution between standing instructions.** If the user issues two contradicting ones ("for 4h reply on Telegram", "for 2h reply in-app"), v1 picks the most-recent and warns. v2 could merge / scope by arc.
+- **LLM-derived expiry.** "Until I'm back from vacation" needs the agent to track an external state (return date). v1 only honors explicit durations or absolute datetimes.
+- **Recursive instructions.** A standing instruction can't issue another standing instruction. Whatever the user typed once is what's in effect.
+
+This sketch lives here because it's the natural extension of "the coordinator is an agent" and shares the same intent-splitter prompt surface as multi-intent routing — building both at once would let them inform each other's design. Tracked separately whenever the underlying multi-intent feature lands.
+
 ## Sequencing
 
 The heuristic fix (notification-hint slot, `/newarc`, arc footer in replies — task #149) handles the single-intent case well enough to ship. Multi-intent (#152) goes on top once we see how often the heuristic fails in practice; if 80% of mis-routings are single-message-single-arc, multi-intent is a polish feature, not a fix.
