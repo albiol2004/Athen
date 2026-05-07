@@ -42,6 +42,18 @@ pub fn run() {
     // plumbing.
     athen_agent::runtimes::init_portable_path();
     tauri::Builder::default()
+        // Single-instance must be registered first: when a second launch
+        // happens (app runner, desktop file, CLI), the plugin's lock
+        // bounces it and runs this callback in the original process so
+        // we can raise the existing window instead of starting a new one.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            use tauri::Manager;
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![

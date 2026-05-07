@@ -26,6 +26,7 @@ async-trait = { workspace = true }
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+tauri-plugin-single-instance = "2"
 toml = { workspace = true }
 reqwest = { workspace = true }
 imap = { workspace = true }
