@@ -2848,6 +2848,7 @@ async function loadSettings() {
         await loadToolboxPackages();
         await loadGrants();
         await loadProfileManager();
+        await loadAttachmentPolicySettings();
     } catch (err) {
         console.error('Failed to load settings:', err);
         showToast('Failed to load settings: ' + err, 'error');
@@ -4376,6 +4377,59 @@ document.getElementById('save-web-search-btn')?.addEventListener('click', async 
         showWebSearchTestResult(false, e.toString());
     }
 });
+
+// ─── Attachment Policy ───
+
+function showAttachmentPolicyResult(success, message) {
+    const el = document.getElementById('attachment-policy-result');
+    if (!el) return;
+    el.classList.remove('hidden');
+    el.classList.toggle('success', !!success);
+    el.classList.toggle('error', !success);
+    el.textContent = message;
+}
+
+async function loadAttachmentPolicySettings() {
+    try {
+        const s = await window.__TAURI__.core.invoke('get_attachment_policy_settings');
+        const setVal = (id, v) => {
+            const el = document.getElementById(id);
+            if (el != null && v != null) el.value = v;
+        };
+        setVal('att-mime-allowlist', s.mime_allowlist);
+        setVal('att-max-attachment-mb', s.max_attachment_mb);
+        setVal('att-max-event-mb', s.max_event_mb);
+        setVal('att-min-inline-trust', s.min_inline_trust);
+        setVal('att-min-download-trust', s.min_download_trust);
+        setVal('att-byte-ttl-days', s.byte_ttl_days);
+    } catch (e) {
+        console.warn('Failed to load attachment policy settings:', e);
+    }
+}
+
+document
+    .getElementById('save-attachment-policy-btn')
+    ?.addEventListener('click', async function () {
+        const mime = document.getElementById('att-mime-allowlist').value;
+        const maxAtt = parseInt(document.getElementById('att-max-attachment-mb').value, 10);
+        const maxEvent = parseInt(document.getElementById('att-max-event-mb').value, 10);
+        const inline = document.getElementById('att-min-inline-trust').value;
+        const download = document.getElementById('att-min-download-trust').value;
+        const ttl = parseInt(document.getElementById('att-byte-ttl-days').value, 10);
+        try {
+            const result = await window.__TAURI__.core.invoke('save_attachment_policy_settings', {
+                mimeAllowlist: mime,
+                maxAttachmentMb: maxAtt,
+                maxEventMb: maxEvent,
+                minInlineTrust: inline,
+                minDownloadTrust: download,
+                byteTtlDays: ttl,
+            });
+            showAttachmentPolicyResult(true, result);
+        } catch (e) {
+            showAttachmentPolicyResult(false, e.toString());
+        }
+    });
 
 // ─── Notification Settings ───
 

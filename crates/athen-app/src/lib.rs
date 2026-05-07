@@ -93,6 +93,8 @@ pub fn run() {
             settings::test_telegram_connection,
             settings::save_web_search_settings,
             settings::test_web_search_provider,
+            settings::get_attachment_policy_settings,
+            settings::save_attachment_policy_settings,
             commands::list_calendar_events,
             commands::create_calendar_event,
             commands::update_calendar_event,

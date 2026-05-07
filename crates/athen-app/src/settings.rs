@@ -173,6 +173,13 @@ fn save_models_config(config: &ModelsConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Module-friendly wrapper so other crates inside `athen-app` (notably
+/// `state::start_attachment_purger`) can read persisted settings without
+/// duplicating the load path.
+pub(crate) fn load_main_config_public() -> AthenConfig {
+    load_main_config()
+}
+
 /// Load the main config from `~/.athen/config.toml`, or return defaults.
 fn load_main_config() -> AthenConfig {
     if let Ok(dir) = ensure_athen_dir() {
@@ -1385,6 +1392,112 @@ pub async fn save_web_search_settings(
     Ok("Web search settings saved. Restart to apply.".to_string())
 }
 
+/// Frontend-shaped view of the attachment policy. Sizes go to/from the
+/// UI in MB so users don't have to count zeros; the backend round-trips
+/// to bytes. `mime_allowlist` is a comma-joined string in the UI for the
+/// same reason — a Vec<String> across the IPC boundary plays poorly with
+/// the existing settings form patterns and a comma list is the same
+/// shape as the existing email "folders" field.
+#[derive(Debug, Clone, Serialize)]
+pub struct AttachmentPolicySettings {
+    pub mime_allowlist: String,
+    pub max_attachment_mb: u64,
+    pub max_event_mb: u64,
+    pub min_inline_trust: String,
+    pub min_download_trust: String,
+    pub byte_ttl_days: u32,
+}
+
+fn trust_level_to_string(t: athen_core::contact::TrustLevel) -> &'static str {
+    use athen_core::contact::TrustLevel;
+    match t {
+        TrustLevel::Unknown => "Unknown",
+        TrustLevel::Neutral => "Neutral",
+        TrustLevel::Known => "Known",
+        TrustLevel::Trusted => "Trusted",
+        TrustLevel::AuthUser => "AuthUser",
+    }
+}
+
+fn trust_level_from_string(s: &str) -> Option<athen_core::contact::TrustLevel> {
+    use athen_core::contact::TrustLevel;
+    match s {
+        "Unknown" => Some(TrustLevel::Unknown),
+        "Neutral" => Some(TrustLevel::Neutral),
+        "Known" => Some(TrustLevel::Known),
+        "Trusted" => Some(TrustLevel::Trusted),
+        "AuthUser" => Some(TrustLevel::AuthUser),
+        _ => None,
+    }
+}
+
+#[tauri::command]
+pub async fn get_attachment_policy_settings() -> std::result::Result<AttachmentPolicySettings, String>
+{
+    let cfg = load_main_config();
+    let p = cfg.attachment_policy;
+    Ok(AttachmentPolicySettings {
+        mime_allowlist: p.mime_allowlist.join(", "),
+        max_attachment_mb: p.max_attachment_bytes / (1024 * 1024),
+        max_event_mb: p.max_event_bytes / (1024 * 1024),
+        min_inline_trust: trust_level_to_string(p.min_inline_trust).to_string(),
+        min_download_trust: trust_level_to_string(p.min_download_trust).to_string(),
+        byte_ttl_days: p.byte_ttl_days,
+    })
+}
+
+#[tauri::command]
+pub async fn save_attachment_policy_settings(
+    mime_allowlist: String,
+    max_attachment_mb: u64,
+    max_event_mb: u64,
+    min_inline_trust: String,
+    min_download_trust: String,
+    byte_ttl_days: u32,
+) -> std::result::Result<String, String> {
+    let mut cfg = load_main_config();
+
+    let allowlist: Vec<String> = mime_allowlist
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if allowlist.is_empty() {
+        return Err("MIME allowlist can't be empty — leave the default if you're unsure.".into());
+    }
+
+    let inline = trust_level_from_string(&min_inline_trust)
+        .ok_or_else(|| format!("Invalid min_inline_trust: {min_inline_trust}"))?;
+    let download = trust_level_from_string(&min_download_trust)
+        .ok_or_else(|| format!("Invalid min_download_trust: {min_download_trust}"))?;
+    if inline < download {
+        return Err(
+            "Inline trust must be at or above download trust — auto-inlining \
+             a sender we wouldn't even download from is incoherent."
+                .into(),
+        );
+    }
+
+    if max_event_mb < max_attachment_mb {
+        return Err(
+            "Per-event budget must be at least as large as the per-attachment cap.".into(),
+        );
+    }
+    if byte_ttl_days == 0 {
+        return Err("TTL must be at least 1 day. Use a long value to effectively disable.".into());
+    }
+
+    cfg.attachment_policy.mime_allowlist = allowlist;
+    cfg.attachment_policy.max_attachment_bytes = max_attachment_mb.saturating_mul(1024 * 1024);
+    cfg.attachment_policy.max_event_bytes = max_event_mb.saturating_mul(1024 * 1024);
+    cfg.attachment_policy.min_inline_trust = inline;
+    cfg.attachment_policy.min_download_trust = download;
+    cfg.attachment_policy.byte_ttl_days = byte_ttl_days;
+
+    save_main_config(&cfg)?;
+    Ok("Attachment policy saved. Restart to apply.".to_string())
+}
+
 /// Test a web search provider key with a tiny smoke query. The provider
 /// `id` must be one of `"brave"` or `"tavily"`; DDG isn't keyed and
 /// doesn't need a test path.
@@ -2078,5 +2191,71 @@ default_model = "test-model"
         assert_eq!(snapshot, after);
         let parsed: ModelsConfig = toml::from_str(&after).unwrap();
         assert!(parsed.providers.contains_key("deepseek"));
+    }
+}
+
+#[cfg(test)]
+mod attachment_policy_settings_tests {
+    use super::*;
+    use athen_core::attachment_policy::AttachmentPolicy;
+    use athen_core::contact::TrustLevel;
+
+    #[test]
+    fn trust_level_round_trip() {
+        for tl in [
+            TrustLevel::Unknown,
+            TrustLevel::Neutral,
+            TrustLevel::Known,
+            TrustLevel::Trusted,
+            TrustLevel::AuthUser,
+        ] {
+            let s = trust_level_to_string(tl);
+            assert_eq!(trust_level_from_string(s), Some(tl), "round-trip for {s}");
+        }
+    }
+
+    #[test]
+    fn trust_level_unknown_string_is_none() {
+        assert!(trust_level_from_string("Banana").is_none());
+        assert!(trust_level_from_string("").is_none());
+    }
+
+    #[test]
+    fn config_round_trip_keeps_policy() {
+        // The whole point of #148 is that the persisted TOML survives.
+        // Mutate every field, serialize, reload, assert no drift.
+        let mut cfg = AthenConfig::default();
+        cfg.attachment_policy.mime_allowlist = vec!["image/".into(), "text/csv".into()];
+        cfg.attachment_policy.max_attachment_bytes = 5 * 1024 * 1024;
+        cfg.attachment_policy.max_event_bytes = 50 * 1024 * 1024;
+        cfg.attachment_policy.min_inline_trust = TrustLevel::Trusted;
+        cfg.attachment_policy.min_download_trust = TrustLevel::Neutral;
+        cfg.attachment_policy.byte_ttl_days = 7;
+
+        let s = toml::to_string(&cfg).expect("serialize");
+        let back: AthenConfig = toml::from_str(&s).expect("parse");
+        assert_eq!(
+            back.attachment_policy.mime_allowlist,
+            vec!["image/".to_string(), "text/csv".to_string()]
+        );
+        assert_eq!(back.attachment_policy.max_attachment_bytes, 5 * 1024 * 1024);
+        assert_eq!(back.attachment_policy.max_event_bytes, 50 * 1024 * 1024);
+        assert_eq!(back.attachment_policy.min_inline_trust, TrustLevel::Trusted);
+        assert_eq!(back.attachment_policy.min_download_trust, TrustLevel::Neutral);
+        assert_eq!(back.attachment_policy.byte_ttl_days, 7);
+    }
+
+    #[test]
+    fn legacy_config_without_policy_loads_with_defaults() {
+        // A pre-#148 config.toml has no [attachment_policy] table.
+        // serde(default) on the field must keep parsing those.
+        let toml = "workspace_path = \".athen\"\n";
+        let cfg: AthenConfig = toml::from_str(toml).expect("parse legacy");
+        let default = AttachmentPolicy::default();
+        assert_eq!(cfg.attachment_policy.byte_ttl_days, default.byte_ttl_days);
+        assert_eq!(
+            cfg.attachment_policy.max_attachment_bytes,
+            default.max_attachment_bytes
+        );
     }
 }

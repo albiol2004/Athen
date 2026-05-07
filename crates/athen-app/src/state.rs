@@ -746,20 +746,22 @@ impl AppState {
     /// Polls the local calendar database every 60 seconds for upcoming events
     /// and fires reminder SenseEvents through the sense router.
     /// Spawn the attachment TTL purger. No-op when no database is wired
-    /// (CLI / test paths). Reads `byte_ttl_days` from the active
-    /// `AttachmentPolicy` once #148 ships UI control over it; until
-    /// then, falls back to the policy default (30 days).
+    /// (CLI / test paths). Reads `byte_ttl_days` from the persisted
+    /// `AttachmentPolicy` so user changes in Settings take effect on
+    /// restart; falls back to the policy default if the config can't be
+    /// loaded (fresh install, parse error).
     pub fn start_attachment_purger(&self) {
         let Some(store) = self.attachment_store() else {
             tracing::debug!("No attachment store wired; skipping TTL purger");
             return;
         };
-        let policy = athen_core::attachment_policy::AttachmentPolicy::default();
+        let cfg = crate::settings::load_main_config_public();
+        let ttl_days = cfg.attachment_policy.byte_ttl_days;
         // JoinHandle deliberately dropped — the loop runs until the
         // process exits, same as the calendar/email/telegram monitors.
         drop(crate::attachment_purger::spawn_loop(
             store,
-            policy.byte_ttl_days,
+            ttl_days,
             crate::attachment_purger::DEFAULT_SWEEP_INTERVAL,
         ));
     }

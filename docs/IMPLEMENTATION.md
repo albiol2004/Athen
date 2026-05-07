@@ -360,6 +360,7 @@
   - `test_embedding_provider(provider, model, base_url, api_key)` -- tests embedding provider connectivity.
   - `get_notification_settings` -- returns notification config (preferred channels, escalation timeout, quiet hours).
   - `save_notification_settings(preferred_channels, escalation_timeout_secs, quiet_hours)` -- saves notification config to `~/.athen/config.toml`.
+  - `get_attachment_policy_settings` / `save_attachment_policy_settings(...)` -- attachment policy round-trip (#148). UI sees sizes in MB; persisted as bytes. Validates inline-trust >= download-trust, per-event budget >= per-attachment cap, ttl >= 1 day. `byte_ttl_days` is consumed by `state::start_attachment_purger` on next app launch; the other fields persist for sense-side gates that #139 will wire on. 4 unit tests cover trust-level round-trip, unknown-string rejection, full-policy TOML round-trip, and legacy-config-without-policy parses with defaults via `#[serde(default)]`.
   - `EmbeddingSettingsInfo` response type for embedding settings UI.
   - Helper types: `ProviderInfo` (id, name, type, base_url, model, has_api_key, api_key_hint, is_active), `SettingsResponse` (includes `TelegramSettingsInfo` with the actual `bot_token` so fields populate on reload), `TestResult`. `mask_api_key()` shows first 3 + last 4 chars.
 - `src/process.rs`: Child process lifecycle management (stub).

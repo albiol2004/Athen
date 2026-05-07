@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use crate::attachment_policy::AttachmentPolicy;
 use crate::llm::ModelProfile;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,6 +22,8 @@ pub struct AthenConfig {
     pub embeddings: EmbeddingConfig,
     #[serde(default)]
     pub web_search: WebSearchConfig,
+    #[serde(default)]
+    pub attachment_policy: AttachmentPolicy,
 }
 
 impl Default for AthenConfig {
@@ -37,6 +40,7 @@ impl Default for AthenConfig {
             notifications: NotificationConfig::default(),
             embeddings: EmbeddingConfig::default(),
             web_search: WebSearchConfig::default(),
+            attachment_policy: AttachmentPolicy::default(),
         }
     }
 }
