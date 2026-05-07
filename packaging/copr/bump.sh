@@ -16,7 +16,7 @@ if [[ -z "$VERSION" ]]; then
 fi
 
 DATE=$(LC_ALL=C date "+%a %b %d %Y")
-MAINTAINER="Alejandro Garcia <albiol2004@gmail.com>"
+MAINTAINER="Alejandro Garcia <contact@alejandrogarcia.blog>"
 
 echo "==> Bumping spec to $VERSION"
 
