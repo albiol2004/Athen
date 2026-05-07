@@ -1639,6 +1639,50 @@ footer {
     background: rgba(0,0,0,0.85);
 }
 
+.composer-file-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 28px;
+    padding: 0 8px 0 6px;
+    border-radius: 14px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    font-size: 12px;
+    color: var(--text-1);
+    flex: 0 0 auto;
+    max-width: 240px;
+}
+.composer-file-icon {
+    font-size: 14px;
+    line-height: 1;
+}
+.composer-file-name {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    flex: 1 1 auto;
+    min-width: 0;
+}
+.composer-file-size {
+    color: var(--text-3);
+    font-size: 11px;
+    flex: 0 0 auto;
+}
+.composer-attachment-remove {
+    border: none;
+    background: transparent;
+    color: var(--text-2);
+    font-size: 14px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0 2px;
+    margin-left: 2px;
+}
+.composer-attachment-remove:hover {
+    color: var(--text-1);
+}
+
 #composer-attach-btn {
     background: transparent;
     border: none;

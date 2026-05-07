@@ -32,6 +32,19 @@ use crate::file_gate::{GrantDecision, PendingGrantSummary};
 use crate::notifier::NotificationInfo;
 use crate::state::{AppState, PendingApproval, SharedRouter};
 
+/// One file the user attached in the chat composer (paperclip / drop /
+/// paste). The frontend already has the bytes — this just shuttles
+/// them across the IPC boundary; once persisted they flow through the
+/// same `AttachmentStore` machinery as inbound email/Telegram files,
+/// so `prepare_attachment_surfacing` can inline PDFs and the agent can
+/// call `read_attachment_full` / `fetch_attachment` against them.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct UploadedAttachment {
+    pub name: String,
+    pub mime_type: String,
+    pub base64: String,
+}
+
 /// Fire an approval question through the router so the user can also
 /// answer via Telegram (in addition to the in-app card we always show).
 ///
@@ -1069,6 +1082,172 @@ pub(crate) fn spawn_stream_forwarder(
     tx
 }
 
+/// Strip path separators and other risky characters out of a
+/// user-supplied filename so it can land safely under
+/// `<sense-attachments>/<event_id>/<name>`. Mirrors
+/// `athen-sentidos::email::sanitize_filename` (kept separate to avoid
+/// re-exporting an internal helper).
+fn sanitize_upload_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches(|c: char| c == '.' || c.is_whitespace());
+    if trimmed.is_empty() {
+        "file".into()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Persist composer-uploaded attachments to disk + AttachmentStore +
+/// stamp an arc entry whose metadata carries the synthesized
+/// `event_id`. The existing surfacing path
+/// (`latest_sense_event_id_in_arc` → `prepare_attachment_surfacing`)
+/// then picks them up automatically — no executor changes needed.
+///
+/// Returns the synthesized event_id on success so the caller can log
+/// it. Returns `None` when there's nothing to persist.
+async fn persist_uploaded_attachments(
+    arc_store: Option<&athen_persistence::arcs::ArcStore>,
+    attachment_store: Option<&athen_persistence::attachments::AttachmentStore>,
+    arc_id: &str,
+    uploads: &[UploadedAttachment],
+) -> std::result::Result<Option<Uuid>, String> {
+    use base64::Engine;
+
+    if uploads.is_empty() {
+        return Ok(None);
+    }
+    let astore = match attachment_store {
+        Some(s) => s,
+        None => return Ok(None), // CLI / test path: no DB, no persistence.
+    };
+
+    let event_id = Uuid::new_v4();
+    let root = athen_core::paths::athen_attachments_dir()
+        .ok_or_else(|| "no athen data dir".to_string())?
+        .join(event_id.to_string());
+    tokio::fs::create_dir_all(&root)
+        .await
+        .map_err(|e| format!("create upload dir: {e}"))?;
+
+    let mut summaries: Vec<String> = Vec::with_capacity(uploads.len());
+    for upload in uploads {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(upload.base64.as_bytes())
+            .map_err(|e| format!("invalid base64 for {}: {e}", upload.name))?;
+        let safe_name = sanitize_upload_filename(&upload.name);
+        let path = root.join(&safe_name);
+        tokio::fs::write(&path, &bytes)
+            .await
+            .map_err(|e| format!("write {}: {e}", path.display()))?;
+
+        let att = athen_core::event::Attachment::new(
+            safe_name.clone(),
+            upload.mime_type.clone(),
+            bytes.len() as u64,
+            Some(path.clone()),
+            None, // No source: local upload, never re-fetchable.
+        );
+        let att_id = att.id;
+        if let Err(e) = astore.insert(event_id, &att).await {
+            tracing::warn!(
+                attachment = %safe_name,
+                error = %e,
+                "Failed to insert composer attachment row"
+            );
+            continue;
+        }
+
+        // Eager PDF extraction on the side, mirroring email persist.
+        // Failure is logged but not fatal — the surfacing path will
+        // lazy-extract again on first read.
+        if upload.mime_type.eq_ignore_ascii_case("application/pdf") {
+            let pdf_path = path.clone();
+            match tokio::task::spawn_blocking(move || {
+                athen_sentidos::pdf_extract::extract_to_sidecar(&pdf_path)
+            })
+            .await
+            {
+                Ok(Ok(sidecar)) => {
+                    if let Err(e) = astore.record_extracted_text(att_id, sidecar).await {
+                        tracing::warn!(
+                            attachment_id = %att_id,
+                            error = %e,
+                            "Failed to record extracted text path for upload"
+                        );
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        attachment_id = %att_id,
+                        error = %e,
+                        "PDF extraction failed for composer upload"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        attachment_id = %att_id,
+                        error = %e,
+                        "PDF extraction join error for composer upload"
+                    );
+                }
+            }
+        }
+
+        summaries.push(format!(
+            "  - \"{safe_name}\" ({}, {}B)",
+            upload.mime_type,
+            bytes.len()
+        ));
+    }
+
+    // Stamp an arc entry the surfacing walker can find by metadata.
+    // The body is intentionally short and human-readable so users
+    // scrolling the arc see a clear record of what they uploaded.
+    if let Some(store) = arc_store {
+        let body = format!(
+            "📎 {} file(s) uploaded:\n{}",
+            uploads.len(),
+            summaries.join("\n")
+        );
+        let metadata = serde_json::json!({
+            "event_id": event_id.to_string(),
+            "source": "user_upload",
+            "count": uploads.len(),
+        });
+        if let Err(e) = store
+            .add_entry(
+                arc_id,
+                athen_persistence::arcs::EntryType::Message,
+                "system",
+                &body,
+                Some(metadata),
+                None,
+            )
+            .await
+        {
+            tracing::warn!(
+                arc_id = %arc_id,
+                error = %e,
+                "Failed to persist upload-marker arc entry"
+            );
+        }
+    }
+
+    tracing::info!(
+        event_id = %event_id,
+        count = uploads.len(),
+        "Persisted composer uploads"
+    );
+    Ok(Some(event_id))
+}
+
 /// Process a user message through the coordinator and agent executor.
 ///
 /// 1. Creates a `SenseEvent` from the user input.
@@ -1080,10 +1259,12 @@ pub(crate) fn spawn_stream_forwarder(
 pub async fn send_message(
     message: String,
     images: Option<Vec<athen_core::llm::ImageInput>>,
+    attachments: Option<Vec<UploadedAttachment>>,
     state: State<'_, AppState>,
     app_handle: AppHandle,
 ) -> std::result::Result<ChatResponse, String> {
     let images = images.unwrap_or_default();
+    let attachments = attachments.unwrap_or_default();
     if !images.is_empty() {
         tracing::info!(
             count = images.len(),
@@ -1142,6 +1323,23 @@ pub async fn send_message(
                 tracing::debug!("Failed to update primary_reply_channel: {e}");
             }
         }
+    }
+
+    // Persist composer-uploaded files (PDFs, docs, etc.) before the
+    // executor runs so the existing surfacing path picks them up
+    // exactly the same way it picks up email/Telegram attachments.
+    // The arc-entry metadata stamp is the hook
+    // `latest_sense_event_id_in_arc` walks for.
+    let attachment_store_handle = state.attachment_store();
+    if let Err(e) = persist_uploaded_attachments(
+        state.arc_store.as_ref(),
+        attachment_store_handle.as_ref(),
+        &active_arc,
+        &attachments,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, "Failed to persist composer uploads");
     }
 
     // Build a SenseEvent from the user's text input.
@@ -4924,5 +5122,169 @@ mod arc_event_lookup_tests {
             .await
             .expect("expected an event id");
         assert_eq!(found, valid);
+    }
+}
+
+#[cfg(test)]
+mod composer_upload_tests {
+    use super::*;
+    use athen_persistence::arcs::ArcSource;
+    use athen_persistence::Database;
+    use base64::Engine;
+
+    #[test]
+    fn sanitize_strips_path_separators() {
+        assert_eq!(sanitize_upload_filename("../etc/passwd"), "_etc_passwd");
+        assert_eq!(sanitize_upload_filename("CV<final>.pdf"), "CV_final_.pdf");
+        assert_eq!(sanitize_upload_filename(""), "file");
+        assert_eq!(sanitize_upload_filename("..."), "file");
+        assert_eq!(sanitize_upload_filename("normal.pdf"), "normal.pdf");
+    }
+
+    #[tokio::test]
+    async fn empty_uploads_short_circuits() {
+        let db = Database::in_memory().await.unwrap();
+        let arc_store = db.arc_store();
+        let attachment_store = db.attachment_store();
+        attachment_store.init_schema().await.unwrap();
+        let arc_id = "arc-empty".to_string();
+        arc_store
+            .create_arc(&arc_id, "Test", ArcSource::UserInput)
+            .await
+            .unwrap();
+
+        let result =
+            persist_uploaded_attachments(Some(&arc_store), Some(&attachment_store), &arc_id, &[])
+                .await
+                .unwrap();
+        assert!(result.is_none());
+
+        // Confirm: no arc entry stamped, no attachment row inserted.
+        let entries = arc_store.load_entries(&arc_id).await.unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_attachment_store_returns_none() {
+        let db = Database::in_memory().await.unwrap();
+        let arc_store = db.arc_store();
+        let arc_id = "arc-none".to_string();
+        arc_store
+            .create_arc(&arc_id, "Test", ArcSource::UserInput)
+            .await
+            .unwrap();
+
+        let upload = UploadedAttachment {
+            name: "x.txt".into(),
+            mime_type: "text/plain".into(),
+            base64: base64::engine::general_purpose::STANDARD.encode(b"hi"),
+        };
+        // No AttachmentStore wired (CLI / test path) — must short-circuit
+        // gracefully without touching the arc.
+        let result = persist_uploaded_attachments(Some(&arc_store), None, &arc_id, &[upload])
+            .await
+            .unwrap();
+        assert!(result.is_none());
+        let entries = arc_store.load_entries(&arc_id).await.unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn persists_text_upload_and_stamps_arc_metadata() {
+        let db = Database::in_memory().await.unwrap();
+        let arc_store = db.arc_store();
+        let attachment_store = db.attachment_store();
+        attachment_store.init_schema().await.unwrap();
+        let arc_id = "arc-text-upload".to_string();
+        arc_store
+            .create_arc(&arc_id, "Upload", ArcSource::UserInput)
+            .await
+            .unwrap();
+
+        let upload = UploadedAttachment {
+            name: "note.txt".into(),
+            mime_type: "text/plain".into(),
+            base64: base64::engine::general_purpose::STANDARD.encode(b"plain note body"),
+        };
+        let event_id = persist_uploaded_attachments(
+            Some(&arc_store),
+            Some(&attachment_store),
+            &arc_id,
+            &[upload],
+        )
+        .await
+        .unwrap()
+        .expect("expected a synthesized event id");
+
+        // The AttachmentStore row exists and points to a real on-disk file.
+        let rows = attachment_store.list_for_event(event_id).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.name, "note.txt");
+        assert_eq!(row.mime_type, "text/plain");
+        let path = row.local_path.as_ref().expect("local_path must be set");
+        assert!(path.exists(), "uploaded file must be on disk");
+        let body = tokio::fs::read_to_string(path).await.unwrap();
+        assert_eq!(body, "plain note body");
+
+        // The arc walker can find this event_id from the metadata stamp,
+        // which is exactly the hook execute_approved_task uses to surface
+        // the upload on the agent's first turn.
+        let found = latest_sense_event_id_in_arc(&arc_store, &arc_id)
+            .await
+            .expect("walker must find synthesized event_id");
+        assert_eq!(found, event_id);
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn malicious_filename_is_sanitized_on_disk() {
+        let db = Database::in_memory().await.unwrap();
+        let arc_store = db.arc_store();
+        let attachment_store = db.attachment_store();
+        attachment_store.init_schema().await.unwrap();
+        let arc_id = "arc-bad-name".to_string();
+        arc_store
+            .create_arc(&arc_id, "X", ArcSource::UserInput)
+            .await
+            .unwrap();
+
+        let upload = UploadedAttachment {
+            name: "../../../etc/passwd".into(),
+            mime_type: "text/plain".into(),
+            base64: base64::engine::general_purpose::STANDARD.encode(b"x"),
+        };
+        let event_id = persist_uploaded_attachments(
+            Some(&arc_store),
+            Some(&attachment_store),
+            &arc_id,
+            &[upload],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let rows = attachment_store.list_for_event(event_id).await.unwrap();
+        let path = rows[0].local_path.as_ref().unwrap();
+        // Path separators replaced by underscores: the file lands in
+        // exactly one component under the per-event_id directory.
+        let parent = path.parent().unwrap();
+        assert!(parent.ends_with(event_id.to_string()));
+        let file_name = path.file_name().unwrap().to_string_lossy();
+        assert!(!file_name.contains('/'));
+        assert!(!file_name.contains('\\'));
+        // Defense-in-depth: every traversal `..` becomes `_..` after
+        // separator scrubbing, so the on-disk name has no path
+        // components that could escape the parent dir.
+        assert_eq!(
+            std::path::Path::new(file_name.as_ref())
+                .components()
+                .count(),
+            1
+        );
+
+        let _ = std::fs::remove_dir_all(parent);
     }
 }

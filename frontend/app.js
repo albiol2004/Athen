@@ -1829,15 +1829,24 @@ async function handleApproval(taskId, approved) {
 
 const MAX_COMPOSER_IMAGES = 5;
 const MAX_COMPOSER_IMAGE_BYTES = 10 * 1024 * 1024; // 10 MB per image
+const MAX_COMPOSER_ATTACHMENTS = 5;
+const MAX_COMPOSER_ATTACHMENT_BYTES = 25 * 1024 * 1024; // 25 MB per file
 const composerImagesEl = document.getElementById('composer-attachments');
 const composerImageInputEl = document.getElementById('composer-image-input');
 const composerAttachBtn = document.getElementById('composer-attach-btn');
 let composerImages = []; // [{ id, mime_type, base64, dataUrl, name }]
+let composerAttachments = []; // [{ id, mime_type, base64, name, size }]
+
+function fmtBytes(n) {
+    if (n < 1024) return `${n}B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}KB`;
+    return `${(n / 1024 / 1024).toFixed(1)}MB`;
+}
 
 function refreshComposerImagesUI() {
     if (!composerImagesEl) return;
     composerImagesEl.innerHTML = '';
-    if (composerImages.length === 0) {
+    if (composerImages.length === 0 && composerAttachments.length === 0) {
         composerImagesEl.classList.add('hidden');
         return;
     }
@@ -1849,6 +1858,18 @@ function refreshComposerImagesUI() {
         chip.innerHTML = `
             <img src="${img.dataUrl}" alt="">
             <button type="button" class="composer-image-remove" aria-label="Remove image" data-id="${img.id}">×</button>
+        `;
+        composerImagesEl.appendChild(chip);
+    }
+    for (const att of composerAttachments) {
+        const chip = document.createElement('div');
+        chip.className = 'composer-file-chip';
+        chip.title = `${att.name} (${att.mime_type}, ${fmtBytes(att.size)})`;
+        chip.innerHTML = `
+            <span class="composer-file-icon" aria-hidden="true">📄</span>
+            <span class="composer-file-name">${att.name}</span>
+            <span class="composer-file-size">${fmtBytes(att.size)}</span>
+            <button type="button" class="composer-attachment-remove" aria-label="Remove file" data-id="${att.id}">×</button>
         `;
         composerImagesEl.appendChild(chip);
     }
@@ -1867,7 +1888,6 @@ function addComposerImageFromFile(file) {
     const reader = new FileReader();
     reader.onload = () => {
         const dataUrl = String(reader.result || '');
-        // Data URL shape: "data:<mime>;base64,<...>". Pull base64 out.
         const m = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
         if (!m) return;
         composerImages.push({
@@ -1882,19 +1902,62 @@ function addComposerImageFromFile(file) {
     reader.readAsDataURL(file);
 }
 
+// Non-image attachment (PDF, text/*). Distinct from images because the
+// backend pipeline treats them differently — images go in as a
+// multimodal user turn, attachments persist to AttachmentStore and get
+// surfaced via the same path that handles inbound email/Telegram.
+function addComposerAttachmentFromFile(file) {
+    if (!file || !file.type) return;
+    if (file.size > MAX_COMPOSER_ATTACHMENT_BYTES) {
+        addMessage('assistant', `File "${file.name}" is too large (max ${(MAX_COMPOSER_ATTACHMENT_BYTES / 1024 / 1024) | 0} MB).`, { isError: true });
+        return;
+    }
+    if (composerAttachments.length >= MAX_COMPOSER_ATTACHMENTS) {
+        addMessage('assistant', `Up to ${MAX_COMPOSER_ATTACHMENTS} files per turn.`, { isError: true });
+        return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+        const dataUrl = String(reader.result || '');
+        const m = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
+        if (!m) return;
+        composerAttachments.push({
+            id: `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            mime_type: m[1],
+            base64: m[2],
+            name: file.name || 'file',
+            size: file.size,
+        });
+        refreshComposerImagesUI();
+    };
+    reader.readAsDataURL(file);
+}
+
+// Route a dropped/picked/pasted file to the right bucket based on MIME.
+// Vision-gated paths still validate against the active provider; PDFs
+// and text/* always work because the surfacing pipeline is provider-
+// agnostic (text fallback + agent tools).
+function addComposerFileFromFile(file) {
+    if (!file || !file.type) return;
+    if (file.type.startsWith('image/')) {
+        addComposerImageFromFile(file);
+    } else {
+        addComposerAttachmentFromFile(file);
+    }
+}
+
 if (composerAttachBtn && composerImageInputEl) {
     composerAttachBtn.addEventListener('click', () => {
-        if (composerAttachBtn.dataset.visionOk !== '1') {
-            const hint = composerAttachBtn.title
-                || 'Active provider does not accept images.';
-            addMessage('assistant', hint, { isError: true });
-            return;
-        }
+        // Always open the picker. The active provider may refuse images,
+        // but PDFs / text files flow through a text-based pipeline that
+        // works regardless of vision support — so the paperclip is no
+        // longer hard-gated. The change handler enforces the per-bucket
+        // rules below.
         composerImageInputEl.click();
     });
     composerImageInputEl.addEventListener('change', () => {
         for (const f of composerImageInputEl.files || []) {
-            addComposerImageFromFile(f);
+            addComposerFileFromFile(f);
         }
         composerImageInputEl.value = '';
     });
@@ -1902,11 +1965,19 @@ if (composerAttachBtn && composerImageInputEl) {
 
 if (composerImagesEl) {
     composerImagesEl.addEventListener('click', (e) => {
-        const btn = e.target.closest('.composer-image-remove');
-        if (!btn) return;
-        const id = btn.dataset.id;
-        composerImages = composerImages.filter((i) => i.id !== id);
-        refreshComposerImagesUI();
+        const imgBtn = e.target.closest('.composer-image-remove');
+        if (imgBtn) {
+            const id = imgBtn.dataset.id;
+            composerImages = composerImages.filter((i) => i.id !== id);
+            refreshComposerImagesUI();
+            return;
+        }
+        const attBtn = e.target.closest('.composer-attachment-remove');
+        if (attBtn) {
+            const id = attBtn.dataset.id;
+            composerAttachments = composerAttachments.filter((a) => a.id !== id);
+            refreshComposerImagesUI();
+        }
     });
 }
 
@@ -1914,9 +1985,9 @@ if (inputEl) {
     inputEl.addEventListener('paste', (e) => {
         const items = e.clipboardData?.items || [];
         for (const item of items) {
-            if (item.kind === 'file' && item.type.startsWith('image/')) {
+            if (item.kind === 'file') {
                 const file = item.getAsFile();
-                if (file) addComposerImageFromFile(file);
+                if (file) addComposerFileFromFile(file);
             }
         }
     });
@@ -1935,7 +2006,7 @@ if (formEl) {
         const files = e.dataTransfer?.files || [];
         if (!files.length) return;
         e.preventDefault();
-        for (const f of files) addComposerImageFromFile(f);
+        for (const f of files) addComposerFileFromFile(f);
     });
 }
 
@@ -1946,6 +2017,18 @@ function consumeComposerImagesForSend() {
         data: { kind: 'base64', data: i.base64 },
     }));
     composerImages = [];
+    refreshComposerImagesUI();
+    return payload;
+}
+
+function consumeComposerAttachmentsForSend() {
+    if (composerAttachments.length === 0) return null;
+    const payload = composerAttachments.map((a) => ({
+        name: a.name,
+        mime_type: a.mime_type,
+        base64: a.base64,
+    }));
+    composerAttachments = [];
     refreshComposerImagesUI();
     return payload;
 }
@@ -2000,13 +2083,22 @@ formEl.addEventListener('submit', async (e) => {
     // Snapshot any attached images and clear the composer chips before
     // we render the user bubble so the next paste/drop starts clean.
     const composerImagesPayload = consumeComposerImagesForSend();
+    const composerAttachmentsPayload = consumeComposerAttachmentsForSend();
 
     // Show user message. Phase 1 omits inline thumbnails on the user
     // bubble — the composer chips were already cleared above; the agent
     // sees the images on the wire, the UI just renders the text.
-    const userText = composerImagesPayload && composerImagesPayload.length > 0
-        ? `${message}\n\n_(${composerImagesPayload.length} image${composerImagesPayload.length === 1 ? '' : 's'} attached)_`
-        : message;
+    const imgCount = composerImagesPayload?.length || 0;
+    const fileCount = composerAttachmentsPayload?.length || 0;
+    let attachmentSuffix = '';
+    if (imgCount && fileCount) {
+        attachmentSuffix = `\n\n_(${imgCount} image${imgCount === 1 ? '' : 's'} + ${fileCount} file${fileCount === 1 ? '' : 's'} attached)_`;
+    } else if (imgCount) {
+        attachmentSuffix = `\n\n_(${imgCount} image${imgCount === 1 ? '' : 's'} attached)_`;
+    } else if (fileCount) {
+        attachmentSuffix = `\n\n_(${fileCount} file${fileCount === 1 ? '' : 's'} attached)_`;
+    }
+    const userText = `${message}${attachmentSuffix}`;
     addMessage('user', userText);
     inputEl.value = '';
     inputEl.style.height = 'auto';
@@ -2030,6 +2122,7 @@ formEl.addEventListener('submit', async (e) => {
         const response = await invoke('send_message', {
             message,
             images: composerImagesPayload,
+            attachments: composerAttachmentsPayload,
         });
 
         // If the response contains a pending approval, show the approval dialog.
