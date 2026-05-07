@@ -17,6 +17,16 @@ use tokio::process::Command;
 use athen_core::error::{AthenError, Result};
 use athen_core::paths;
 
+/// Suppress the cmd.exe / console window flash that Windows attaches to GUI
+/// parents when they spawn console subprocesses. No-op on non-Windows.
+/// `CREATE_NO_WINDOW = 0x0800_0000`.
+#[inline]
+fn hide_console(cmd: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
+    cmd
+}
+
 /// Which language runtime an entry in the toolbox belongs to.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -206,6 +216,7 @@ async fn spawn_first(
             continue;
         };
         let mut cmd = Command::new(&resolved);
+        hide_console(&mut cmd);
         for a in fixed_args {
             cmd.arg(a);
         }
@@ -229,8 +240,9 @@ async fn spawn_first(
 
 async fn probe_one(bin: &Path, args: &[&str]) -> Option<String> {
     let fut = async {
-        Command::new(bin)
-            .args(args)
+        let mut cmd = Command::new(bin);
+        hide_console(&mut cmd);
+        cmd.args(args)
             .output()
             .await
             .ok()
@@ -281,7 +293,9 @@ async fn resolve_executable(bin: &str) -> Option<std::path::PathBuf> {
         if p.is_absolute() {
             return Some(p.to_path_buf());
         }
-        let out = Command::new("where.exe").arg(bin).output().await.ok()?;
+        let mut cmd = Command::new("where.exe");
+        hide_console(&mut cmd);
+        let out = cmd.arg(bin).output().await.ok()?;
         if !out.status.success() {
             return None;
         }

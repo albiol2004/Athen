@@ -103,8 +103,14 @@ impl SandboxDetector {
 
 /// Check if a command binary exists in PATH by running `which` / looking it up.
 async fn command_exists(name: &str) -> bool {
-    Command::new("which")
-        .arg(name)
+    #[cfg(windows)]
+    let probe = "where";
+    #[cfg(not(windows))]
+    let probe = "which";
+    let mut cmd = Command::new(probe);
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
+    cmd.arg(name)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -115,8 +121,10 @@ async fn command_exists(name: &str) -> bool {
 
 /// Check if a command runs successfully (exit code 0).
 async fn command_succeeds(program: &str, args: &[&str]) -> bool {
-    Command::new(program)
-        .args(args)
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
+    cmd.args(args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()

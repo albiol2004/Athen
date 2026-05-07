@@ -7,6 +7,15 @@ use std::time::Instant;
 use tokio::process::Command;
 use tracing::{debug, warn};
 
+/// Suppress the cmd.exe / console window flash that Windows attaches to GUI
+/// parents when they spawn console subprocesses. No-op on non-Windows.
+#[inline]
+fn hide_console(cmd: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
+    cmd
+}
+
 /// Which container runtime to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContainerRuntime {
@@ -56,8 +65,9 @@ impl ContainerExecutor {
 
     /// Check whether a runtime binary is available.
     async fn runtime_available(runtime: ContainerRuntime) -> bool {
-        Command::new(runtime.binary())
-            .arg("--version")
+        let mut cmd = Command::new(runtime.binary());
+        hide_console(&mut cmd);
+        cmd.arg("--version")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
@@ -79,7 +89,9 @@ impl ContainerExecutor {
     /// Pull an image to ensure it is available locally.
     pub async fn pull_image(&self, image: &str) -> Result<()> {
         debug!(runtime = ?self.runtime, image, "Pulling container image");
-        let output = Command::new(self.runtime.binary())
+        let mut cmd = Command::new(self.runtime.binary());
+        hide_console(&mut cmd);
+        let output = cmd
             .args(["pull", image])
             .output()
             .await
@@ -189,7 +201,9 @@ impl ContainerExecutor {
         );
 
         let start = Instant::now();
-        let output = Command::new(self.runtime.binary())
+        let mut cmd = Command::new(self.runtime.binary());
+        hide_console(&mut cmd);
+        let output = cmd
             .args(&run_args)
             .output()
             .await

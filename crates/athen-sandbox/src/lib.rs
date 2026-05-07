@@ -113,7 +113,11 @@ impl UnifiedSandbox {
         debug!(command, "Executing command without sandbox");
         let start = Instant::now();
 
-        let output = tokio::process::Command::new(command)
+        let mut cmd = tokio::process::Command::new(command);
+        // Suppress the console window flash on Windows GUI parents.
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000);
+        let output = cmd
             .args(args)
             .output()
             .await

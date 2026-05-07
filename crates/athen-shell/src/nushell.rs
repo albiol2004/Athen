@@ -118,6 +118,9 @@ impl NushellShell {
 
         let mut cmd = Command::new(nu_path);
         cmd.arg("-c").arg(command);
+        // Suppress the console window flash on Windows GUI parents.
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000);
         for (k, v) in opts.env {
             cmd.env(k, v);
         }

@@ -175,6 +175,10 @@ async fn spawn_client(enabled: &EnabledEntry) -> Result<LiveClient> {
 
     // Per-entry argument shaping. For now only "files" needs a sandbox root.
     let mut cmd = Command::new(&path);
+    // MCP sidecars are headless JSON-RPC servers; suppress the cmd-window flash
+    // Windows would otherwise attach to GUI parents.
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
     if enabled.entry.id == "files" {
         let configured = enabled
             .config

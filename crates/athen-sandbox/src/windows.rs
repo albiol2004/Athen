@@ -58,7 +58,7 @@ use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
     InitializeProcThreadAttributeList, ResumeThread, TerminateProcess, UpdateProcThreadAttribute,
-    WaitForSingleObject, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
+    WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
     EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
     PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
@@ -260,7 +260,10 @@ fn run_sandboxed_blocking(
             None,
             None,
             true,
-            EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+            EXTENDED_STARTUPINFO_PRESENT
+                | CREATE_SUSPENDED
+                | CREATE_UNICODE_ENVIRONMENT
+                | CREATE_NO_WINDOW,
             None,
             PCWSTR::null(),
             &startup_info.StartupInfo,
@@ -914,7 +917,9 @@ fn resolve_executable_blocking(bin: &str) -> Option<PathBuf> {
     if p.is_absolute() {
         return Some(p.to_path_buf());
     }
+    use std::os::windows::process::CommandExt;
     let out = std::process::Command::new("where.exe")
+        .creation_flags(0x0800_0000)
         .arg(bin)
         .output()
         .ok()?;

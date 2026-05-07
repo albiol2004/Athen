@@ -3958,17 +3958,23 @@ pub async fn open_external_url(url: String) -> std::result::Result<(), String> {
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         return Err("only http(s) URLs are allowed".to_string());
     }
-    let result = if cfg!(target_os = "linux") {
-        std::process::Command::new("xdg-open").arg(&url).spawn()
-    } else if cfg!(target_os = "macos") {
-        std::process::Command::new("open").arg(&url).spawn()
-    } else if cfg!(target_os = "windows") {
+    #[cfg(target_os = "linux")]
+    let result = std::process::Command::new("xdg-open").arg(&url).spawn();
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").arg(&url).spawn();
+    #[cfg(windows)]
+    let result = {
+        use std::os::windows::process::CommandExt;
         std::process::Command::new("cmd")
+            .creation_flags(0x0800_0000)
             .args(["/C", "start", "", &url])
             .spawn()
-    } else {
-        return Err("unsupported platform".to_string());
     };
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    let result: std::io::Result<std::process::Child> = Err(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        "unsupported platform",
+    ));
     result.map(|_| ()).map_err(|e| e.to_string())
 }
 

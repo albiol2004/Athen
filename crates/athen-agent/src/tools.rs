@@ -22,6 +22,23 @@ use athen_risk::rules::RuleEngine;
 use athen_sandbox::UnifiedSandbox;
 use athen_shell::Shell;
 
+/// Suppress the cmd.exe / console window flash that Windows attaches to GUI
+/// parents when they spawn console subprocesses. No-op on non-Windows.
+/// `CREATE_NO_WINDOW = 0x0800_0000`.
+#[inline]
+fn hide_console_tokio(cmd: &mut tokio::process::Command) -> &mut tokio::process::Command {
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
+    cmd
+}
+
+#[cfg(windows)]
+#[inline]
+fn hide_console_std(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(0x0800_0000)
+}
+
 /// Cached identifier of the shell `Shell::execute*` actually routes
 /// through. Probed once on first call. Returns `"nushell"` when the
 /// embedded nushell is available (bundled sidecar or `nu` on PATH),
@@ -1375,6 +1392,7 @@ impl ShellToolRegistry {
         }
 
         let mut cmd = tokio::process::Command::new("rg");
+        hide_console_tokio(&mut cmd);
         cmd.arg("--color=never");
         if case_insensitive {
             cmd.arg("-i");
@@ -1895,6 +1913,7 @@ impl ShellToolRegistry {
         let mut cmd = {
             let mut c = tokio::process::Command::new("cmd");
             c.arg("/C").arg(command);
+            hide_console_tokio(&mut c);
             c
         };
 
@@ -2038,6 +2057,7 @@ impl ShellToolRegistry {
         #[cfg(windows)]
         let signal_used = {
             let mut cmd = tokio::process::Command::new("taskkill");
+            hide_console_tokio(&mut cmd);
             cmd.arg("/PID").arg(pid.to_string()).arg("/T");
             if force {
                 cmd.arg("/F");
@@ -2772,9 +2792,9 @@ fn process_alive(pid: u32) -> bool {
 #[cfg(windows)]
 fn process_alive(pid: u32) -> bool {
     // Cheap probe via tasklist; sync std::process to keep this helper sync.
-    let out = std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-        .output();
+    let mut cmd = std::process::Command::new("tasklist");
+    hide_console_std(&mut cmd);
+    let out = cmd.args(["/FI", &format!("PID eq {pid}"), "/NH"]).output();
     match out {
         Ok(o) => {
             let s = String::from_utf8_lossy(&o.stdout);

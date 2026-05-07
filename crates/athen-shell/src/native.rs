@@ -96,6 +96,9 @@ impl NativeShell {
     fn build_command(&self, command: &str) -> Command {
         let mut cmd = Command::new("cmd");
         cmd.arg("/C").arg(command);
+        // Suppress the cmd.exe console flash that GUI parents would otherwise
+        // inherit: CREATE_NO_WINDOW = 0x0800_0000.
+        cmd.creation_flags(0x0800_0000);
         cmd
     }
 
