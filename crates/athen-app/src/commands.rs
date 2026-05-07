@@ -2018,6 +2018,9 @@ pub(crate) async fn execute_approved_task(
         ctx.memory.clone(),
     )
     .with_mcp(ctx.mcp.clone() as Arc<dyn athen_core::traits::mcp::McpClient>);
+    if let Some(ref astore) = ctx.attachment_store {
+        registry = registry.with_attachments(astore.clone());
+    }
     if let Some(ref store) = ctx.grant_store {
         let mut gate = crate::file_gate::FileGate::new(
             ctx.active_arc_id.clone(),
@@ -2774,6 +2777,9 @@ pub(crate) async fn execute_dispatched_task(
         ctx.memory.clone(),
     )
     .with_mcp(ctx.mcp.clone() as Arc<dyn athen_core::traits::mcp::McpClient>);
+    if let Some(ref astore) = ctx.attachment_store {
+        registry = registry.with_attachments(astore.clone());
+    }
     if let Some(ref store) = ctx.grant_store {
         let mut gate = crate::file_gate::FileGate::new(
             arc_id.clone(),
@@ -4709,15 +4715,16 @@ xref\n0 6\n0000000000 65535 f \n0000000010 00000 n \n0000000060 00000 n \n000000
         let result = prepare_attachment_surfacing(event_id, &store, false, false).await;
         let msg = result.system_message.expect("system message");
         // The lazy path either succeeds and inlines text, or fails
-        // gracefully — but it must NEVER tell the agent "call
-        // read_attachment_full" since that tool isn't wired yet.
+        // gracefully. In the failure branch there's nothing for
+        // read_attachment_full to read, so the surfacing message must
+        // not advertise it (the tool itself exists, but it would only
+        // re-confirm "no readable representation").
         if msg.contains("BEGIN extracted text") {
             // Happy path: extraction worked, full content inlined.
             assert!(msg.contains("hello.pdf"));
         } else {
             // Degraded path: pdf-extract failed on this minimal PDF.
-            // Still must not lie to the agent about a tool that
-            // doesn't exist.
+            // Don't direct the agent to a tool call that has no payload.
             assert!(msg.contains("only metadata is available"));
             assert!(!msg.contains("call read_attachment_full"));
         }

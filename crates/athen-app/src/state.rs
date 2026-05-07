@@ -427,13 +427,16 @@ impl AppState {
             );
             shell_registry = shell_registry.with_email_approval(gate);
         }
-        let registry = crate::app_tools::AppToolRegistry::new(
+        let mut registry = crate::app_tools::AppToolRegistry::new(
             shell_registry,
             self.calendar_store.clone(),
             self.contact_store.clone(),
             self.memory.clone(),
         )
         .with_mcp(self.mcp.clone() as Arc<dyn athen_core::traits::mcp::McpClient>);
+        if let Some(astore) = self.attachment_store() {
+            registry = registry.with_attachments(astore);
+        }
         let tools = athen_core::traits::tool::ToolRegistry::list_tools(&registry).await?;
         let written = athen_agent::tools_doc::write_per_group(&dir, &tools).map_err(|e| {
             athen_core::error::AthenError::Other(format!(
@@ -490,6 +493,9 @@ impl AppState {
             self.memory.clone(),
         )
         .with_mcp(self.mcp.clone() as Arc<dyn athen_core::traits::mcp::McpClient>);
+        if let Some(astore) = self.attachment_store() {
+            registry = registry.with_attachments(astore);
+        }
         if let Some(grants) = self.grant_store.clone() {
             let mut gate = crate::file_gate::FileGate::new(
                 arc_id.to_string(),
@@ -1519,6 +1525,9 @@ async fn execute_owner_telegram_message(
         memory.clone(),
     )
     .with_mcp(mcp.clone() as Arc<dyn athen_core::traits::mcp::McpClient>);
+    if let Some(astore) = attachment_store {
+        registry = registry.with_attachments(astore.clone());
+    }
     if let (Some(store), Some(arc_id_str)) = (grant_store, target_arc_id.as_ref()) {
         let mut gate = crate::file_gate::FileGate::new(
             arc_id_str.clone(),

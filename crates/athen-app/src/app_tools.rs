@@ -15,12 +15,14 @@ use athen_agent::ShellToolRegistry;
 use athen_contacts::ContactStore;
 use athen_core::contact::{Contact, ContactIdentifier, IdentifierKind, TrustLevel};
 use athen_core::error::{AthenError, Result};
+use athen_core::event::AttachmentId;
 use athen_core::risk::BaseImpact;
 use athen_core::tool::{ToolBackend, ToolDefinition, ToolResult};
 use athen_core::traits::mcp::McpClient;
 use athen_core::traits::memory::{MemoryItem, MemoryStore};
 use athen_core::traits::tool::ToolRegistry;
 use athen_memory::Memory;
+use athen_persistence::attachments::AttachmentStore;
 use athen_persistence::calendar::{CalendarEvent, CalendarStore, EventCreator};
 use athen_persistence::contacts::SqliteContactStore;
 
@@ -38,6 +40,7 @@ pub struct AppToolRegistry {
     memory: Option<Arc<Memory>>,
     mcp: Option<Arc<dyn McpClient>>,
     file_gate: Option<Arc<FileGate>>,
+    attachments: Option<AttachmentStore>,
 }
 
 impl AppToolRegistry {
@@ -55,6 +58,7 @@ impl AppToolRegistry {
             memory,
             mcp: None,
             file_gate: None,
+            attachments: None,
         }
     }
 
@@ -70,6 +74,14 @@ impl AppToolRegistry {
     /// underlying registry or MCP client.
     pub fn with_file_gate(mut self, gate: Arc<FileGate>) -> Self {
         self.file_gate = Some(gate);
+        self
+    }
+
+    /// Attach the attachment store so the agent can call
+    /// `read_attachment_full` / `fetch_attachment` against rows that
+    /// `prepare_attachment_surfacing` already advertised in turn 0.
+    pub fn with_attachments(mut self, store: AttachmentStore) -> Self {
+        self.attachments = Some(store);
         self
     }
 
@@ -828,6 +840,289 @@ impl AppToolRegistry {
         })
     }
 
+    // ── Attachment schema helpers ───────────────────────────────────
+
+    fn read_attachment_full_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description": "Attachment ID (UUID) — exactly as listed in the attachment surfacing message at the top of the conversation."
+                }
+            },
+            "required": ["id"]
+        })
+    }
+
+    fn fetch_attachment_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description": "Attachment ID (UUID) — exactly as listed in the attachment surfacing message."
+                }
+            },
+            "required": ["id"]
+        })
+    }
+
+    // ── Attachment tool implementations ─────────────────────────────
+
+    fn attachment_store(&self) -> Result<&AttachmentStore> {
+        self.attachments
+            .as_ref()
+            .ok_or_else(|| AthenError::Other("Attachment store not available".into()))
+    }
+
+    fn parse_attachment_id(args: &serde_json::Value) -> Result<AttachmentId> {
+        let id_str = args
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AthenError::Other("missing 'id' parameter".into()))?;
+        let uuid = uuid::Uuid::parse_str(id_str)
+            .map_err(|e| AthenError::Other(format!("invalid attachment id '{id_str}': {e}")))?;
+        Ok(AttachmentId(uuid))
+    }
+
+    /// Implementation of `read_attachment_full`. Returns the full
+    /// extracted text for an attachment without truncation.
+    ///
+    /// Resolution order:
+    /// 1. If a sidecar already exists, read it.
+    /// 2. Else if it's a PDF with bytes still local, lazy-extract and
+    ///    persist the new sidecar.
+    /// 3. Else if the MIME starts with `text/`, read the local bytes
+    ///    directly as UTF-8.
+    /// 4. Otherwise return an error explaining what's missing.
+    async fn do_read_attachment_full(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let store = self.attachment_store()?;
+        let id = Self::parse_attachment_id(args)?;
+        let start = Instant::now();
+
+        let att = store
+            .get(id)
+            .await?
+            .ok_or_else(|| AthenError::Other(format!("attachment {id} not found")))?;
+
+        tracing::info!(
+            attachment_id = %att.id,
+            name = %att.name,
+            mime = %att.mime_type,
+            has_local_path = att.local_path.is_some(),
+            has_extracted_text = att.extracted_text_path.is_some(),
+            purged = att.is_purged(),
+            "read_attachment_full"
+        );
+
+        let mime = att.mime_type.to_ascii_lowercase();
+        let is_pdf = mime.starts_with("application/pdf");
+        let is_text = mime.starts_with("text/");
+
+        // 1. Existing sidecar.
+        if let Some(sidecar) = att.extracted_text_path.as_ref() {
+            match tokio::fs::read_to_string(sidecar).await {
+                Ok(text) => {
+                    let elapsed = start.elapsed().as_millis() as u64;
+                    return Ok(ToolResult {
+                        success: true,
+                        output: json!({
+                            "id": id.to_string(),
+                            "name": att.name,
+                            "mime_type": att.mime_type,
+                            "source": "sidecar",
+                            "chars": text.chars().count(),
+                            "text": text,
+                        }),
+                        error: None,
+                        execution_time_ms: elapsed,
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %sidecar.display(),
+                        error = %e,
+                        "Failed to read attachment sidecar"
+                    );
+                }
+            }
+        }
+
+        // 2. Lazy PDF extraction.
+        if is_pdf {
+            if let Some(local) = att.local_path.as_ref() {
+                let local_clone = local.clone();
+                match tokio::task::spawn_blocking(move || {
+                    athen_sentidos::pdf_extract::extract_to_sidecar(&local_clone)
+                })
+                .await
+                {
+                    Ok(Ok(sidecar)) => {
+                        if let Err(e) =
+                            store.record_extracted_text(att.id, sidecar.clone()).await
+                        {
+                            tracing::warn!(
+                                attachment_id = %att.id,
+                                error = %e,
+                                "Failed to persist lazy extracted_text_path"
+                            );
+                        }
+                        let text = tokio::fs::read_to_string(&sidecar).await.map_err(|e| {
+                            AthenError::Other(format!(
+                                "extracted PDF sidecar unreadable: {e}"
+                            ))
+                        })?;
+                        let elapsed = start.elapsed().as_millis() as u64;
+                        return Ok(ToolResult {
+                            success: true,
+                            output: json!({
+                                "id": id.to_string(),
+                                "name": att.name,
+                                "mime_type": att.mime_type,
+                                "source": "lazy_extract",
+                                "chars": text.chars().count(),
+                                "text": text,
+                            }),
+                            error: None,
+                            execution_time_ms: elapsed,
+                        });
+                    }
+                    Ok(Err(e)) => {
+                        return Err(AthenError::Other(format!(
+                            "PDF extraction failed: {e}"
+                        )));
+                    }
+                    Err(e) => {
+                        return Err(AthenError::Other(format!(
+                            "PDF extraction join error: {e}"
+                        )));
+                    }
+                }
+            }
+        }
+
+        // 3. Text MIME — just read the bytes.
+        if is_text {
+            if let Some(local) = att.local_path.as_ref() {
+                let text = tokio::fs::read_to_string(local).await.map_err(|e| {
+                    AthenError::Other(format!("text attachment unreadable: {e}"))
+                })?;
+                let elapsed = start.elapsed().as_millis() as u64;
+                return Ok(ToolResult {
+                    success: true,
+                    output: json!({
+                        "id": id.to_string(),
+                        "name": att.name,
+                        "mime_type": att.mime_type,
+                        "source": "local_text",
+                        "chars": text.chars().count(),
+                        "text": text,
+                    }),
+                    error: None,
+                    execution_time_ms: elapsed,
+                });
+            }
+        }
+
+        // 4. Nothing readable.
+        let reason = if att.is_purged() {
+            "bytes have been purged and no extracted text sidecar exists; \
+             call fetch_attachment to redownload"
+        } else if att.local_path.is_none() {
+            "no bytes on disk and no extracted text sidecar — only metadata \
+             was preserved (likely policy refused download); call \
+             fetch_attachment to attempt redownload"
+        } else if !is_pdf && !is_text {
+            "binary attachment (not PDF, not text) — extraction is not \
+             supported; the bytes are on disk but cannot be read as text"
+        } else {
+            "no readable representation available"
+        };
+        Err(AthenError::Other(format!(
+            "read_attachment_full: cannot read '{}' (id={}, mime={}): {}",
+            att.name, att.id, att.mime_type, reason
+        )))
+    }
+
+    /// Implementation of `fetch_attachment`. The actual per-source refetch
+    /// (Email IMAP `BODY[part]` / Telegram `getFile`) is wired alongside
+    /// the TTL purger; until then this surfaces the row's current state +
+    /// source coordinates so the agent can decide whether to ask the user
+    /// to forward the file again or proceed without it.
+    async fn do_fetch_attachment(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let store = self.attachment_store()?;
+        let id = Self::parse_attachment_id(args)?;
+        let start = Instant::now();
+
+        let att = store
+            .get(id)
+            .await?
+            .ok_or_else(|| AthenError::Other(format!("attachment {id} not found")))?;
+
+        tracing::info!(
+            attachment_id = %att.id,
+            name = %att.name,
+            has_local_path = att.local_path.is_some(),
+            purged = att.is_purged(),
+            "fetch_attachment"
+        );
+
+        let elapsed = start.elapsed().as_millis() as u64;
+        if att.is_local() {
+            return Ok(ToolResult {
+                success: true,
+                output: json!({
+                    "id": id.to_string(),
+                    "name": att.name,
+                    "mime_type": att.mime_type,
+                    "size_bytes": att.size_bytes,
+                    "status": "already_local",
+                    "message": "Bytes are still on disk — call read_attachment_full \
+                                to read the text representation, or use the file \
+                                tools if the path is needed.",
+                }),
+                error: None,
+                execution_time_ms: elapsed,
+            });
+        }
+
+        // Purged or never-fetched: surface the source and ask the agent to
+        // proceed without the bytes (the sidecar may still satisfy text
+        // questions). Per-source auto-refetch lands with #147.
+        let source_summary = match att.source.as_ref() {
+            Some(athen_core::event::AttachmentSource::Email { mailbox, uid, .. }) => {
+                json!({ "kind": "email", "mailbox": mailbox, "uid": uid })
+            }
+            Some(athen_core::event::AttachmentSource::Telegram {
+                chat_id,
+                message_id,
+                ..
+            }) => {
+                json!({ "kind": "telegram", "chat_id": chat_id, "message_id": message_id })
+            }
+            None => serde_json::Value::Null,
+        };
+
+        Ok(ToolResult {
+            success: false,
+            output: json!({
+                "id": id.to_string(),
+                "name": att.name,
+                "mime_type": att.mime_type,
+                "size_bytes": att.size_bytes,
+                "status": if att.is_purged() { "purged" } else { "metadata_only" },
+                "has_extracted_text": att.extracted_text_path.is_some(),
+                "source": source_summary,
+                "message": "Automatic refetch is not yet wired. If a text sidecar \
+                            exists, call read_attachment_full instead. Otherwise \
+                            ask the user to forward the file again.",
+            }),
+            error: Some("fetch_attachment: bytes unavailable, refetch not wired".into()),
+            execution_time_ms: elapsed,
+        })
+    }
+
     // ── Persistent memory tool implementations ─────────────────────
 
     async fn do_persistent_memory_store(
@@ -1003,6 +1298,29 @@ impl ToolRegistry for AppToolRegistry {
             }
         }
 
+        if self.attachments.is_some() {
+            tools.push(ToolDefinition {
+                name: "read_attachment_full".to_string(),
+                description: "Read the FULL extracted text of an attachment that was already announced in the attachment surfacing message at the top of the conversation. Use this when the inlined snippet was truncated (look for 'PDF text inlined (X of Y chars)' in the surfacing message) or when you need to re-read text after compaction. Returns the entire text, no character budget. Pass the exact UUID from the surfacing message.".to_string(),
+                parameters: Self::read_attachment_full_schema(),
+                backend: ToolBackend::Shell {
+                    command: String::new(),
+                    native: false,
+                },
+                base_risk: BaseImpact::Read,
+            });
+            tools.push(ToolDefinition {
+                name: "fetch_attachment".to_string(),
+                description: "Re-confirm or attempt to redownload the bytes of an attachment whose local copy was purged after TTL. Returns the attachment's current state: 'already_local' if the bytes are still on disk (in which case prefer read_attachment_full), or 'purged'/'metadata_only' with the original source coordinates so you can decide how to proceed. Pass the exact UUID from the surfacing message.".to_string(),
+                parameters: Self::fetch_attachment_schema(),
+                backend: ToolBackend::Shell {
+                    command: String::new(),
+                    native: false,
+                },
+                base_risk: BaseImpact::Read,
+            });
+        }
+
         if self.contacts.is_some() {
             tools.push(ToolDefinition {
                 name: "contacts_list".to_string(),
@@ -1166,6 +1484,8 @@ impl ToolRegistry for AppToolRegistry {
             "contacts_create" => self.do_contacts_create(&args).await,
             "contacts_update" => self.do_contacts_update(&args).await,
             "contacts_delete" => self.do_contacts_delete(&args).await,
+            "read_attachment_full" => self.do_read_attachment_full(&args).await,
+            "fetch_attachment" => self.do_fetch_attachment(&args).await,
             _ => self.inner.call_tool(name, args).await,
         }
     }
@@ -1873,5 +2193,242 @@ mod tests {
         let id = uuid::Uuid::parse_str(id_str).unwrap();
         let loaded = contact_store.load(id).await.unwrap().unwrap();
         assert_eq!(loaded.trust_level, TrustLevel::Trusted);
+    }
+
+    // ── Attachment tool tests ───────────────────────────────────────
+
+    mod attachment_tools {
+        use super::*;
+        use athen_core::event::{Attachment, AttachmentSource};
+        use std::io::Write;
+
+        async fn setup_with_attachments() -> (Database, AppToolRegistry) {
+            let db = Database::in_memory().await.unwrap();
+            let store = db.attachment_store();
+            store.init_schema().await.unwrap();
+            let shell = ShellToolRegistry::new().await;
+            let registry = AppToolRegistry::new(shell, None, None, None)
+                .with_attachments(store);
+            (db, registry)
+        }
+
+        fn write_temp(name: &str, contents: &[u8]) -> std::path::PathBuf {
+            let mut p = std::env::temp_dir();
+            p.push(format!("athen-test-{}-{}", uuid::Uuid::new_v4(), name));
+            let mut f = std::fs::File::create(&p).unwrap();
+            f.write_all(contents).unwrap();
+            p
+        }
+
+        #[tokio::test]
+        async fn list_tools_includes_attachment_tools_when_store_present() {
+            let (_db, registry) = setup_with_attachments().await;
+            let tools = registry.list_tools().await.unwrap();
+            let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+            assert!(names.contains(&"read_attachment_full"));
+            assert!(names.contains(&"fetch_attachment"));
+        }
+
+        #[tokio::test]
+        async fn list_tools_omits_attachment_tools_without_store() {
+            let shell = ShellToolRegistry::new().await;
+            let registry = AppToolRegistry::new(shell, None, None, None);
+            let tools = registry.list_tools().await.unwrap();
+            let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+            assert!(!names.contains(&"read_attachment_full"));
+            assert!(!names.contains(&"fetch_attachment"));
+        }
+
+        #[tokio::test]
+        async fn read_attachment_full_returns_sidecar_text() {
+            let (db, registry) = setup_with_attachments().await;
+            let store = db.attachment_store();
+            let event_id = uuid::Uuid::new_v4();
+            let pdf_path = write_temp("doc.pdf", b"%PDF-1.4\n");
+            let sidecar = write_temp(
+                "doc.pdf.txt",
+                b"Full extracted CV text. Languages: English C1.",
+            );
+            let mut att = Attachment::new(
+                "doc.pdf",
+                "application/pdf",
+                10,
+                Some(pdf_path.clone()),
+                None,
+            );
+            att.extracted_text_path = Some(sidecar.clone());
+            store.insert(event_id, &att).await.unwrap();
+
+            let result = registry
+                .call_tool(
+                    "read_attachment_full",
+                    json!({ "id": att.id.to_string() }),
+                )
+                .await
+                .unwrap();
+            assert!(result.success);
+            assert_eq!(result.output["source"].as_str().unwrap(), "sidecar");
+            assert!(result.output["text"]
+                .as_str()
+                .unwrap()
+                .contains("English C1"));
+        }
+
+        #[tokio::test]
+        async fn read_attachment_full_text_mime_reads_local_bytes() {
+            let (db, registry) = setup_with_attachments().await;
+            let store = db.attachment_store();
+            let event_id = uuid::Uuid::new_v4();
+            let txt_path = write_temp("note.txt", b"Plain note body.");
+            let att = Attachment::new(
+                "note.txt",
+                "text/plain",
+                16,
+                Some(txt_path.clone()),
+                None,
+            );
+            store.insert(event_id, &att).await.unwrap();
+
+            let result = registry
+                .call_tool(
+                    "read_attachment_full",
+                    json!({ "id": att.id.to_string() }),
+                )
+                .await
+                .unwrap();
+            assert!(result.success);
+            assert_eq!(result.output["source"].as_str().unwrap(), "local_text");
+            assert_eq!(
+                result.output["text"].as_str().unwrap(),
+                "Plain note body."
+            );
+        }
+
+        #[tokio::test]
+        async fn read_attachment_full_unknown_id_errors() {
+            let (_db, registry) = setup_with_attachments().await;
+            let bogus = uuid::Uuid::new_v4();
+            let err = registry
+                .call_tool(
+                    "read_attachment_full",
+                    json!({ "id": bogus.to_string() }),
+                )
+                .await
+                .unwrap_err();
+            assert!(format!("{err}").contains("not found"));
+        }
+
+        #[tokio::test]
+        async fn read_attachment_full_invalid_uuid_errors() {
+            let (_db, registry) = setup_with_attachments().await;
+            let err = registry
+                .call_tool("read_attachment_full", json!({ "id": "not-a-uuid" }))
+                .await
+                .unwrap_err();
+            assert!(format!("{err}").contains("invalid attachment id"));
+        }
+
+        #[tokio::test]
+        async fn read_attachment_full_purged_pdf_no_sidecar_errors_clearly() {
+            let (db, registry) = setup_with_attachments().await;
+            let store = db.attachment_store();
+            let event_id = uuid::Uuid::new_v4();
+            let att = Attachment::new(
+                "purged.pdf",
+                "application/pdf",
+                100,
+                None,
+                Some(AttachmentSource::Telegram {
+                    chat_id: 1,
+                    message_id: 2,
+                    file_id: "abc".into(),
+                }),
+            );
+            store.insert(event_id, &att).await.unwrap();
+
+            let err = registry
+                .call_tool(
+                    "read_attachment_full",
+                    json!({ "id": att.id.to_string() }),
+                )
+                .await
+                .unwrap_err();
+            let msg = format!("{err}");
+            assert!(msg.contains("only metadata"));
+        }
+
+        #[tokio::test]
+        async fn fetch_attachment_local_returns_already_local() {
+            let (db, registry) = setup_with_attachments().await;
+            let store = db.attachment_store();
+            let event_id = uuid::Uuid::new_v4();
+            let pdf_path = write_temp("doc.pdf", b"%PDF-1.4\n");
+            let att = Attachment::new(
+                "doc.pdf",
+                "application/pdf",
+                10,
+                Some(pdf_path.clone()),
+                None,
+            );
+            store.insert(event_id, &att).await.unwrap();
+
+            let result = registry
+                .call_tool("fetch_attachment", json!({ "id": att.id.to_string() }))
+                .await
+                .unwrap();
+            assert!(result.success);
+            assert_eq!(
+                result.output["status"].as_str().unwrap(),
+                "already_local"
+            );
+        }
+
+        #[tokio::test]
+        async fn fetch_attachment_purged_returns_source_metadata() {
+            let (db, registry) = setup_with_attachments().await;
+            let store = db.attachment_store();
+            let event_id = uuid::Uuid::new_v4();
+            let mut att = Attachment::new(
+                "doc.pdf",
+                "application/pdf",
+                10,
+                None,
+                Some(AttachmentSource::Email {
+                    account_id: "acct".into(),
+                    mailbox: "INBOX".into(),
+                    uid_validity: 1,
+                    uid: 42,
+                    part_path: "2.1".into(),
+                }),
+            );
+            att.purged_at = Some(chrono::Utc::now());
+            store.insert(event_id, &att).await.unwrap();
+
+            let result = registry
+                .call_tool("fetch_attachment", json!({ "id": att.id.to_string() }))
+                .await
+                .unwrap();
+            assert!(!result.success);
+            assert_eq!(result.output["status"].as_str().unwrap(), "purged");
+            assert_eq!(
+                result.output["source"]["kind"].as_str().unwrap(),
+                "email"
+            );
+            assert_eq!(result.output["source"]["uid"].as_u64().unwrap(), 42);
+        }
+
+        #[tokio::test]
+        async fn read_attachment_full_without_store_errors() {
+            let shell = ShellToolRegistry::new().await;
+            let registry = AppToolRegistry::new(shell, None, None, None);
+            let err = registry
+                .call_tool(
+                    "read_attachment_full",
+                    json!({ "id": uuid::Uuid::new_v4().to_string() }),
+                )
+                .await
+                .unwrap_err();
+            assert!(format!("{err}").contains("Attachment store not available"));
+        }
     }
 }
