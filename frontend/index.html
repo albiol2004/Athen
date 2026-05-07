@@ -457,9 +457,50 @@
                 </p>
 
                 <div class="setting-row">
-                    <label for="att-mime-allowlist">Allowed MIME prefixes</label>
-                    <input type="text" id="att-mime-allowlist" class="settings-input" placeholder="image/, application/pdf, text/, …">
-                    <p class="setting-hint">Comma-separated. Anything not starting with one of these is dropped on arrival. Executables and archives are blocked by omission.</p>
+                    <label>Allowed file types</label>
+                    <p class="setting-hint">Anything not in a checked category is dropped on arrival. Executables and archives are blocked by being absent.</p>
+                    <div class="att-mime-bundle-grid">
+                        <label class="att-mime-bundle">
+                            <input type="checkbox" class="att-mime-bundle-checkbox" data-bundle="images">
+                            <span class="att-mime-bundle-icon" aria-hidden="true">🖼️</span>
+                            <span class="att-mime-bundle-label">
+                                <strong>Images</strong>
+                                <span class="att-mime-bundle-detail">PNG, JPEG, GIF, WebP, …</span>
+                            </span>
+                        </label>
+                        <label class="att-mime-bundle">
+                            <input type="checkbox" class="att-mime-bundle-checkbox" data-bundle="pdfs">
+                            <span class="att-mime-bundle-icon" aria-hidden="true">📕</span>
+                            <span class="att-mime-bundle-label">
+                                <strong>PDFs</strong>
+                                <span class="att-mime-bundle-detail">Documents, scans, forms</span>
+                            </span>
+                        </label>
+                        <label class="att-mime-bundle">
+                            <input type="checkbox" class="att-mime-bundle-checkbox" data-bundle="text">
+                            <span class="att-mime-bundle-icon" aria-hidden="true">📝</span>
+                            <span class="att-mime-bundle-label">
+                                <strong>Text &amp; code</strong>
+                                <span class="att-mime-bundle-detail">.txt, .md, .csv, source files</span>
+                            </span>
+                        </label>
+                        <label class="att-mime-bundle">
+                            <input type="checkbox" class="att-mime-bundle-checkbox" data-bundle="office">
+                            <span class="att-mime-bundle-icon" aria-hidden="true">📊</span>
+                            <span class="att-mime-bundle-label">
+                                <strong>Office documents</strong>
+                                <span class="att-mime-bundle-detail">Word, Excel, PowerPoint</span>
+                            </span>
+                        </label>
+                        <label class="att-mime-bundle">
+                            <input type="checkbox" class="att-mime-bundle-checkbox" data-bundle="data">
+                            <span class="att-mime-bundle-icon" aria-hidden="true">🔧</span>
+                            <span class="att-mime-bundle-label">
+                                <strong>Data files</strong>
+                                <span class="att-mime-bundle-detail">JSON, XML</span>
+                            </span>
+                        </label>
+                    </div>
                 </div>
 
                 <div class="settings-field-row">

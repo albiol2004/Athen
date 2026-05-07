@@ -2118,6 +2118,54 @@ footer {
     flex: 1;
 }
 
+/* ─── Attachment MIME bundle picker ─── */
+.att-mime-bundle-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 8px;
+    margin-top: 8px;
+}
+.att-mime-bundle {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface-2);
+    cursor: pointer;
+    transition: background 120ms ease, border-color 120ms ease;
+}
+.att-mime-bundle:hover {
+    background: var(--surface-3);
+}
+.att-mime-bundle:has(input:checked) {
+    border-color: var(--brand);
+    background: var(--surface-3);
+}
+.att-mime-bundle-checkbox {
+    flex: 0 0 auto;
+    margin: 0;
+}
+.att-mime-bundle-icon {
+    font-size: 22px;
+    line-height: 1;
+}
+.att-mime-bundle-label {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    line-height: 1.25;
+}
+.att-mime-bundle-label strong {
+    font-weight: 600;
+    color: var(--text);
+}
+.att-mime-bundle-detail {
+    font-size: 12px;
+    color: var(--text-muted);
+}
+
 /* Native dropdown popups: keep them dark across the whole app. The
  * `color-scheme: dark` on :root handles most of this in WebKit, but
  * explicit option styling pins the colors in older renderers and any

@@ -4396,7 +4396,10 @@ async function loadAttachmentPolicySettings() {
             const el = document.getElementById(id);
             if (el != null && v != null) el.value = v;
         };
-        setVal('att-mime-allowlist', s.mime_allowlist);
+        const checked = new Set(s.mime_bundles || []);
+        for (const cb of document.querySelectorAll('.att-mime-bundle-checkbox')) {
+            cb.checked = checked.has(cb.dataset.bundle);
+        }
         setVal('att-max-attachment-mb', s.max_attachment_mb);
         setVal('att-max-event-mb', s.max_event_mb);
         setVal('att-min-inline-trust', s.min_inline_trust);
@@ -4410,7 +4413,11 @@ async function loadAttachmentPolicySettings() {
 document
     .getElementById('save-attachment-policy-btn')
     ?.addEventListener('click', async function () {
-        const mime = document.getElementById('att-mime-allowlist').value;
+        const bundles = Array.from(
+            document.querySelectorAll('.att-mime-bundle-checkbox')
+        )
+            .filter((cb) => cb.checked)
+            .map((cb) => cb.dataset.bundle);
         const maxAtt = parseInt(document.getElementById('att-max-attachment-mb').value, 10);
         const maxEvent = parseInt(document.getElementById('att-max-event-mb').value, 10);
         const inline = document.getElementById('att-min-inline-trust').value;
@@ -4418,7 +4425,7 @@ document
         const ttl = parseInt(document.getElementById('att-byte-ttl-days').value, 10);
         try {
             const result = await window.__TAURI__.core.invoke('save_attachment_policy_settings', {
-                mimeAllowlist: mime,
+                mimeBundles: bundles,
                 maxAttachmentMb: maxAtt,
                 maxEventMb: maxEvent,
                 minInlineTrust: inline,

@@ -1394,18 +1394,74 @@ pub async fn save_web_search_settings(
 
 /// Frontend-shaped view of the attachment policy. Sizes go to/from the
 /// UI in MB so users don't have to count zeros; the backend round-trips
-/// to bytes. `mime_allowlist` is a comma-joined string in the UI for the
-/// same reason — a Vec<String> across the IPC boundary plays poorly with
-/// the existing settings form patterns and a comma list is the same
-/// shape as the existing email "folders" field.
+/// to bytes. MIME types are grouped into named bundles (images, pdfs,
+/// office, …) instead of raw prefixes — the UI shows checkboxes with
+/// friendly labels and the backend expands those into the underlying
+/// `mime_allowlist` prefix list.
 #[derive(Debug, Clone, Serialize)]
 pub struct AttachmentPolicySettings {
-    pub mime_allowlist: String,
+    pub mime_bundles: Vec<String>,
     pub max_attachment_mb: u64,
     pub max_event_mb: u64,
     pub min_inline_trust: String,
     pub min_download_trust: String,
     pub byte_ttl_days: u32,
+}
+
+/// Bundle id -> the set of `mime_allowlist` prefixes it expands to.
+///
+/// Treated as the single source of truth: a bundle is "checked" iff any
+/// of its prefixes is present in the persisted policy; saving a checked
+/// bundle re-emits all of its prefixes. Bundles are all-or-nothing on
+/// purpose — non-technical users shouldn't have to pick "Word but not
+/// Excel". Power users editing `config.toml` directly are not the
+/// audience here.
+const MIME_BUNDLES: &[(&str, &[&str])] = &[
+    ("images", &["image/"]),
+    ("pdfs", &["application/pdf"]),
+    ("text", &["text/"]),
+    (
+        "office",
+        &[
+            "application/vnd.openxmlformats-officedocument",
+            "application/msword",
+            "application/vnd.ms-excel",
+            "application/vnd.ms-powerpoint",
+        ],
+    ),
+    ("data", &["application/json", "application/xml"]),
+];
+
+fn prefixes_to_bundles(prefixes: &[String]) -> Vec<String> {
+    let lower: Vec<String> = prefixes.iter().map(|p| p.to_ascii_lowercase()).collect();
+    MIME_BUNDLES
+        .iter()
+        .filter_map(|(id, members)| {
+            let any_present = members
+                .iter()
+                .any(|m| lower.iter().any(|p| p == &m.to_ascii_lowercase()));
+            if any_present {
+                Some((*id).to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn bundles_to_prefixes(bundles: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (id, members) in MIME_BUNDLES {
+        if bundles.iter().any(|b| b == id) {
+            for m in members.iter() {
+                let s = (*m).to_string();
+                if !out.contains(&s) {
+                    out.push(s);
+                }
+            }
+        }
+    }
+    out
 }
 
 fn trust_level_to_string(t: athen_core::contact::TrustLevel) -> &'static str {
@@ -1432,12 +1488,12 @@ fn trust_level_from_string(s: &str) -> Option<athen_core::contact::TrustLevel> {
 }
 
 #[tauri::command]
-pub async fn get_attachment_policy_settings() -> std::result::Result<AttachmentPolicySettings, String>
-{
+pub async fn get_attachment_policy_settings(
+) -> std::result::Result<AttachmentPolicySettings, String> {
     let cfg = load_main_config();
     let p = cfg.attachment_policy;
     Ok(AttachmentPolicySettings {
-        mime_allowlist: p.mime_allowlist.join(", "),
+        mime_bundles: prefixes_to_bundles(&p.mime_allowlist),
         max_attachment_mb: p.max_attachment_bytes / (1024 * 1024),
         max_event_mb: p.max_event_bytes / (1024 * 1024),
         min_inline_trust: trust_level_to_string(p.min_inline_trust).to_string(),
@@ -1448,7 +1504,7 @@ pub async fn get_attachment_policy_settings() -> std::result::Result<AttachmentP
 
 #[tauri::command]
 pub async fn save_attachment_policy_settings(
-    mime_allowlist: String,
+    mime_bundles: Vec<String>,
     max_attachment_mb: u64,
     max_event_mb: u64,
     min_inline_trust: String,
@@ -1457,13 +1513,13 @@ pub async fn save_attachment_policy_settings(
 ) -> std::result::Result<String, String> {
     let mut cfg = load_main_config();
 
-    let allowlist: Vec<String> = mime_allowlist
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let allowlist = bundles_to_prefixes(&mime_bundles);
     if allowlist.is_empty() {
-        return Err("MIME allowlist can't be empty — leave the default if you're unsure.".into());
+        return Err(
+            "Pick at least one file category — leaving everything off would \
+             drop every attachment Athen ever sees."
+                .into(),
+        );
     }
 
     let inline = trust_level_from_string(&min_inline_trust)
@@ -1479,9 +1535,7 @@ pub async fn save_attachment_policy_settings(
     }
 
     if max_event_mb < max_attachment_mb {
-        return Err(
-            "Per-event budget must be at least as large as the per-attachment cap.".into(),
-        );
+        return Err("Per-message total must be at least as large as the per-file cap.".into());
     }
     if byte_ttl_days == 0 {
         return Err("TTL must be at least 1 day. Use a long value to effectively disable.".into());
@@ -2201,6 +2255,55 @@ mod attachment_policy_settings_tests {
     use athen_core::contact::TrustLevel;
 
     #[test]
+    fn default_policy_maps_to_all_bundles() {
+        // The shipped default allowlist covers every bundle. If someone
+        // adds/removes a bundle without updating the default, this test
+        // forces them to think about it.
+        let p = AttachmentPolicy::default();
+        let bundles = prefixes_to_bundles(&p.mime_allowlist);
+        for (id, _) in MIME_BUNDLES {
+            assert!(bundles.iter().any(|b| b == id), "bundle {id} missing");
+        }
+    }
+
+    #[test]
+    fn bundles_to_prefixes_expands_full_office_set() {
+        let prefixes = bundles_to_prefixes(&["office".to_string()]);
+        // Office expands to 4 distinct legacy/modern prefixes.
+        assert!(prefixes.contains(&"application/msword".to_string()));
+        assert!(prefixes
+            .iter()
+            .any(|p| p.contains("openxmlformats-officedocument")));
+        assert_eq!(prefixes.len(), 4, "office bundle expands to 4 prefixes");
+    }
+
+    #[test]
+    fn bundle_round_trip_preserves_identity() {
+        let original = vec!["images".to_string(), "pdfs".to_string()];
+        let prefixes = bundles_to_prefixes(&original);
+        let back = prefixes_to_bundles(&prefixes);
+        assert_eq!(back, original);
+    }
+
+    #[test]
+    fn unknown_bundle_id_silently_dropped() {
+        // Adversarial frontend: send a junk bundle id. Save shouldn't
+        // panic; the unknown id just doesn't expand to anything.
+        let prefixes = bundles_to_prefixes(&["images".into(), "banana".into()]);
+        assert_eq!(prefixes, vec!["image/".to_string()]);
+    }
+
+    #[test]
+    fn case_insensitive_prefix_match_for_bundle_detection() {
+        // Some legacy configs may have mixed-case prefixes saved by hand.
+        // The bundle detector lowercases on both sides.
+        let prefixes = vec!["IMAGE/".to_string(), "Application/PDF".to_string()];
+        let bundles = prefixes_to_bundles(&prefixes);
+        assert!(bundles.iter().any(|b| b == "images"));
+        assert!(bundles.iter().any(|b| b == "pdfs"));
+    }
+
+    #[test]
     fn trust_level_round_trip() {
         for tl in [
             TrustLevel::Unknown,
@@ -2241,7 +2344,10 @@ mod attachment_policy_settings_tests {
         assert_eq!(back.attachment_policy.max_attachment_bytes, 5 * 1024 * 1024);
         assert_eq!(back.attachment_policy.max_event_bytes, 50 * 1024 * 1024);
         assert_eq!(back.attachment_policy.min_inline_trust, TrustLevel::Trusted);
-        assert_eq!(back.attachment_policy.min_download_trust, TrustLevel::Neutral);
+        assert_eq!(
+            back.attachment_policy.min_download_trust,
+            TrustLevel::Neutral
+        );
         assert_eq!(back.attachment_policy.byte_ttl_days, 7);
     }
 
