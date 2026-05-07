@@ -19,6 +19,9 @@ mailparse = { workspace = true }
 lettre = { workspace = true }
 rusqlite = { version = "0.32", features = ["bundled"] }
 reqwest = { workspace = true }
+# Pure-Rust PDF text extraction. Used eagerly when an attachment lands so
+# the agent always has the cached text even after the bytes are TTL-purged.
+pdf-extract = "0.9"
 
 [dev-dependencies]
 tempfile = "3"

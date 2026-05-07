@@ -8,6 +8,7 @@ pub mod calendar;
 pub mod email;
 pub mod email_send;
 pub mod messaging;
+pub mod pdf_extract;
 pub mod telegram;
 pub mod user_input;
 

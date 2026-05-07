@@ -404,7 +404,28 @@ impl TelegramMonitor {
                     .download_telegram_file(&file_id, event.id, &att.name, save_root)
                     .await
                 {
-                    Ok(Some(path)) => att.local_path = Some(path),
+                    Ok(Some(path)) => {
+                        // Eager PDF text extraction on a blocking pool —
+                        // pdf-extract is CPU-bound and sync, so we keep
+                        // it off the runtime worker thread.
+                        if att.mime_type.starts_with("application/pdf") {
+                            let pdf_path = path.clone();
+                            match tokio::task::spawn_blocking(move || {
+                                crate::pdf_extract::extract_to_sidecar(&pdf_path)
+                            })
+                            .await
+                            {
+                                Ok(Ok(sidecar)) => att.extracted_text_path = Some(sidecar),
+                                Ok(Err(e)) => tracing::warn!(
+                                    "pdf-extract sidecar failed for {path:?}: {e}"
+                                ),
+                                Err(e) => tracing::warn!(
+                                    "pdf-extract spawn_blocking panicked for {path:?}: {e}"
+                                ),
+                            }
+                        }
+                        att.local_path = Some(path);
+                    }
                     Ok(None) => {} // no save_root configured — degrade silently
                     Err(e) => tracing::warn!(
                         file_id = %file_id,

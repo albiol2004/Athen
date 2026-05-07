@@ -296,13 +296,27 @@ fn persist_attachments(
             save_root.and_then(|root| save_bytes(root, event_id, &raw.name, &raw.bytes))
         };
 
-        out.push(Attachment::new(
-            raw.name,
-            raw.mime_type,
-            size,
-            local_path,
-            Some(source),
-        ));
+        // For PDFs that landed on disk, eagerly extract a `.txt`
+        // sidecar so the executor can inline truncated text without
+        // doing any IO at turn-build time, and so the agent can still
+        // recall what the file said after the bytes are TTL-purged.
+        let extracted_text_path = local_path.as_ref().and_then(|p| {
+            if mime_lower.starts_with("application/pdf") {
+                match crate::pdf_extract::extract_to_sidecar(p) {
+                    Ok(side) => Some(side),
+                    Err(e) => {
+                        tracing::warn!("pdf-extract sidecar failed for {p:?}: {e}");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        });
+
+        let mut att = Attachment::new(raw.name, raw.mime_type, size, local_path, Some(source));
+        att.extracted_text_path = extracted_text_path;
+        out.push(att);
     }
     out
 }
@@ -1200,6 +1214,46 @@ PDF-BYTES\r\n\
         assert!(matches!(a.source, Some(AttachmentSource::Email { .. })));
         let on_disk = std::fs::read(a.local_path.as_ref().unwrap()).unwrap();
         assert_eq!(on_disk, b"hello");
+    }
+
+    #[test]
+    fn persist_attachments_pdf_with_garbage_bytes_does_not_poison_record() {
+        // A PDF mime with garbage bytes — pdf-extract will reject it,
+        // and we should still produce a clean Attachment with the raw
+        // bytes saved and `extracted_text_path` left None. Earlier
+        // versions could have panicked or emitted an Err that bubbled
+        // out of the persist loop.
+        let tmp = tempfile::tempdir().unwrap();
+        let event_id = Uuid::new_v4();
+        let raws = vec![RawEmailAttachment {
+            name: "broken.pdf".into(),
+            mime_type: "application/pdf".into(),
+            bytes: b"not a real pdf".to_vec(),
+            part_path: "2".into(),
+        }];
+        let attachments =
+            persist_attachments(event_id, "INBOX", 42, 1, raws, Some(tmp.path()));
+        assert_eq!(attachments.len(), 1);
+        assert!(attachments[0].local_path.is_some());
+        // Extraction failed → no sidecar → metadata stays clean.
+        assert!(attachments[0].extracted_text_path.is_none());
+    }
+
+    #[test]
+    fn persist_attachments_non_pdf_does_not_attempt_extraction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let event_id = Uuid::new_v4();
+        let raws = vec![RawEmailAttachment {
+            name: "photo.jpg".into(),
+            mime_type: "image/jpeg".into(),
+            bytes: b"\xff\xd8\xff\xe0fakebody".to_vec(),
+            part_path: "2".into(),
+        }];
+        let attachments =
+            persist_attachments(event_id, "INBOX", 42, 1, raws, Some(tmp.path()));
+        // Non-PDFs never get extracted_text_path set.
+        assert!(attachments[0].local_path.is_some());
+        assert!(attachments[0].extracted_text_path.is_none());
     }
 
     #[test]
