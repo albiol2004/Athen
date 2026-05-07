@@ -170,10 +170,13 @@ impl SqliteProfileStore {
 /// Canonical list of built-in profiles seeded on first boot.
 ///
 /// Adding a new entry here ships it on next launch (existing installs pick it
-/// up via `seed_builtins_if_empty`'s per-id check). Keep `tool_selection:
-/// ToolSelection::All` for now — the persona drives behavior, and aggressive
-/// group filtering risks hiding tools an agent actually needs. Phase 2's
-/// profile-manager UI will expose per-profile tool restrictions.
+/// up via `seed_builtins_if_empty`'s per-id check). Most profiles ship with
+/// `ToolSelection::All` — the persona drives behavior and we don't want to
+/// hide tools an agent might need. Profiles that benefit from a tighter
+/// surface (e.g. `coder` on small models, where every KB of prompt matters)
+/// can pass a narrower `ToolSelection` to `mk`. Users can always edit any of
+/// these via the profile UI; "Restore default" reseeds whatever this function
+/// returns.
 ///
 /// Lawyer and doctor profiles are research-oriented: they help locate
 /// authoritative sources and synthesize, with explicit disclaimers in their
@@ -187,7 +190,8 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
               domains: Vec<DomainTag>,
               task_kinds: Vec<TaskKindTag>,
               strengths: Vec<&str>,
-              avoid: Vec<TaskKindTag>|
+              avoid: Vec<TaskKindTag>,
+              tool_selection: ToolSelection|
      -> AgentProfile {
         AgentProfile {
             id: id.to_string(),
@@ -195,7 +199,7 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
             description: description.to_string(),
             persona_template_ids: vec![],
             custom_persona_addendum: addendum.map(|s| s.to_string()),
-            tool_selection: ToolSelection::All,
+            tool_selection,
             expertise: ExpertiseDeclaration {
                 domains,
                 task_kinds,
@@ -251,6 +255,7 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
             ],
             vec!["calendar triage", "inbox zero", "follow-up tracking"],
             vec![],
+            ToolSelection::All,
         ),
         mk(
             "coder",
@@ -277,6 +282,24 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
                 "test-driven debugging",
             ],
             vec![],
+            // Narrow tool surface for the coder profile. Small local models
+            // (Qwen 9B class) can't afford the ~25% prompt overhead of
+            // calendar/contacts/web/email schemas they will never call on a
+            // pure coding task. Groups listed here cover read-before-edit,
+            // shell access, scratch memory, and package management — every
+            // group needed to land code, none that aren't. Users can edit
+            // this via the profile UI; "Restore default" reseeds it.
+            ToolSelection::Groups(vec![
+                "shell".into(),
+                "read".into(),
+                "edit".into(),
+                "write".into(),
+                "grep".into(),
+                "list".into(),
+                "memory".into(),
+                "install".into(),
+                "uninstall".into(),
+            ]),
         ),
         mk(
             "devops",
@@ -302,6 +325,7 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
                 "observability",
             ],
             vec![],
+            ToolSelection::All,
         ),
         mk(
             "systems_architect",
@@ -324,6 +348,7 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
                 "failure modes",
             ],
             vec![],
+            ToolSelection::All,
         ),
         mk(
             "technical_support",
@@ -346,6 +371,7 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
                 "environment troubleshooting",
             ],
             vec![],
+            ToolSelection::All,
         ),
         mk(
             "researcher",
@@ -361,6 +387,7 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
             vec![TaskKindTag::Researching, TaskKindTag::Summarizing],
             vec!["source triangulation", "literature review", "fact-checking"],
             vec![],
+            ToolSelection::All,
         ),
         mk(
             "marketing",
@@ -385,6 +412,7 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
                 "conversion optimization",
             ],
             vec![TaskKindTag::Coding, TaskKindTag::Debugging],
+            ToolSelection::All,
         ),
         mk(
             "social_media",
@@ -413,6 +441,7 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
                 "content calendars",
             ],
             vec![TaskKindTag::Coding, TaskKindTag::Debugging],
+            ToolSelection::All,
         ),
         mk(
             "outreach",
@@ -434,6 +463,7 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
                 "follow-up cadences",
             ],
             vec![TaskKindTag::Coding, TaskKindTag::Debugging],
+            ToolSelection::All,
         ),
         mk(
             "lawyer",
@@ -459,6 +489,7 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
                 "ccpa",
             ],
             vec![],
+            ToolSelection::All,
         ),
         mk(
             "doctor",
@@ -484,6 +515,7 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
                 "evidence grading",
             ],
             vec![],
+            ToolSelection::All,
         ),
     ]
 }
@@ -886,6 +918,45 @@ mod tests {
             "doctor",
         ] {
             assert!(ids.contains(canonical), "missing built-in: {canonical}");
+        }
+    }
+
+    /// The coder profile ships a narrow `ToolSelection::Groups` rather than
+    /// `All` so small local models don't pay the prompt-overhead of
+    /// calendar/contacts/web/email schemas they will never call. If this
+    /// reverts to `All` someone has accidentally regressed the small-model
+    /// fix — bring it back or document the new strategy in the seed comment.
+    #[tokio::test]
+    async fn coder_seed_uses_narrow_tool_groups() {
+        let store = setup_store().await;
+        let coder = store
+            .get_profile("coder")
+            .await
+            .unwrap()
+            .expect("coder profile seeded");
+        match &coder.tool_selection {
+            ToolSelection::Groups(groups) => {
+                for required in [
+                    "shell", "read", "edit", "write", "grep", "list", "memory", "install",
+                    "uninstall",
+                ] {
+                    assert!(
+                        groups.iter().any(|g| g == required),
+                        "coder profile missing required group `{required}`"
+                    );
+                }
+                // Tightening guard: groups the coder explicitly should NOT
+                // ship with by default. Adding one of these would silently
+                // bloat small-model prompts. If you want them, edit via UI
+                // or add an explicit reason in the seed comment.
+                for forbidden in ["calendar", "contacts", "web", "email"] {
+                    assert!(
+                        !groups.iter().any(|g| g == forbidden),
+                        "coder profile should not ship with `{forbidden}` by default"
+                    );
+                }
+            }
+            other => panic!("coder must seed with ToolSelection::Groups, got {other:?}"),
         }
     }
 

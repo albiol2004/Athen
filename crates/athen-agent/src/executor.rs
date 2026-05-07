@@ -380,6 +380,11 @@ impl DefaultExecutor {
         prompt.push_str(&Self::build_toolbox_section(toolbox_info));
         prompt.push_str(&Self::build_tool_index(tools, revealed, tool_doc_dir));
         prompt.push_str(&Self::build_persona_rules(autonomous));
+        // Volatile suffix MUST stay last — anything that changes per-turn
+        // (current date/time, future ephemeral context) lives here so the
+        // static prefix above is byte-identical between turns and the LLM
+        // backend's prefix cache (e.g. llama.cpp) can match it.
+        prompt.push_str(&Self::build_volatile_state());
         prompt
     }
 
@@ -495,21 +500,21 @@ impl DefaultExecutor {
         )
     }
 
-    /// Slot 1: identity + current datetime.
+    /// Slot 1: identity (static).
     ///
     /// When a `ResolvedAgentProfile` carries persona templates or an
     /// addendum, those replace the hardcoded "You are Athen, a proactive
     /// universal AI agent…" identity. Templates are concatenated in
-    /// declared order, then the addendum (if any) is appended. The
-    /// datetime line always follows.
+    /// declared order, then the addendum (if any) is appended.
     ///
     /// A profile with empty templates and no addendum (the seeded default)
-    /// falls back to the hardcoded identity, so today's behavior is
-    /// reproduced byte-for-byte.
+    /// falls back to the hardcoded identity.
+    ///
+    /// Per-turn date/time intentionally lives in
+    /// [`Self::build_volatile_state`] at the END of the system prompt, so
+    /// every section above the volatile suffix is byte-identical
+    /// turn-to-turn for prefix-cache reuse.
     fn build_persona_header(profile: Option<&ResolvedAgentProfile>) -> String {
-        let now = chrono::Local::now();
-        let tz_offset = now.format("%:z");
-
         let identity = match profile.filter(|p| p.has_custom_persona()) {
             Some(p) => {
                 let mut s = String::new();
@@ -531,12 +536,24 @@ impl DefaultExecutor {
                 .to_string(),
         };
 
+        format!("{identity}\n\n")
+    }
+
+    /// Trailing volatile suffix — everything that changes per-turn lives
+    /// here so the static prefix of the system prompt above is
+    /// byte-identical between turns. llama.cpp / vLLM / other prefix
+    /// caches can then reuse all earlier KV state and only need to
+    /// re-prefill this short tail.
+    ///
+    /// Add new ephemeral context to this section, never to slot 1 or
+    /// the tool index.
+    fn build_volatile_state() -> String {
+        let now = chrono::Local::now();
         format!(
-            "{identity}\n\
-             Current date and time: {} ({}, UTC{})\n\n",
+            "Current date and time: {} ({}, UTC{})\n",
             now.format("%A, %B %-d, %Y at %H:%M"),
             now.format("%Z"),
-            tz_offset,
+            now.format("%:z"),
         )
     }
 
@@ -2320,6 +2337,39 @@ mod tests {
         // Workspace + rules must still be present — those are non-overridable.
         assert!(prompt.contains("Your workspace directory:"));
         assert!(prompt.contains("RULES YOU MUST FOLLOW"));
+    }
+
+    /// The system prompt is split into a static prefix and a volatile
+    /// suffix so prefix caches (llama.cpp, vLLM) can reuse KV state across
+    /// turns. Two builds of the same prompt with the same inputs must have
+    /// byte-identical prefixes up to the start of "Current date and time:".
+    /// If you add per-turn data, route it through `build_volatile_state`,
+    /// not into earlier sections.
+    #[test]
+    fn system_prompt_static_prefix_is_byte_identical_between_builds() {
+        let tools = vec![tool_def("memory_store", "store a memory")];
+        let revealed = HashSet::new();
+
+        let a =
+            DefaultExecutor::build_system_prompt(&tools, &revealed, false, None, None, None, None);
+        let b =
+            DefaultExecutor::build_system_prompt(&tools, &revealed, false, None, None, None, None);
+
+        let split = "Current date and time:";
+        let a_prefix = a.split(split).next().unwrap();
+        let b_prefix = b.split(split).next().unwrap();
+        assert_eq!(
+            a_prefix, b_prefix,
+            "static prefix drifted between builds — something volatile leaked above the suffix"
+        );
+        // Sanity: the volatile marker really is at the END (no trailing
+        // sections after it). RULES must come BEFORE the timestamp.
+        let rules_pos = a.find("RULES YOU MUST FOLLOW").expect("rules section present");
+        let date_pos = a.find(split).expect("volatile suffix present");
+        assert!(
+            rules_pos < date_pos,
+            "RULES must precede the volatile suffix — keep ephemeral content trailing"
+        );
     }
 
     /// `apply_tool_selection` is the seam used to filter the tool surface
