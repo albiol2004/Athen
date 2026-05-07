@@ -5,6 +5,7 @@
 
 pub(crate) mod app_tools;
 pub(crate) mod approval;
+pub(crate) mod attachment_purger;
 mod commands;
 pub(crate) mod compaction;
 mod contacts;
@@ -174,6 +175,11 @@ pub fn run() {
             state.start_email_monitor(app.handle().clone());
             state.start_calendar_monitor(app.handle().clone());
             state.start_telegram_monitor(app.handle().clone());
+
+            // Sweep attachment bytes past the policy TTL. Cheap, runs
+            // hourly, only deletes the bytes — extracted-text sidecars
+            // outlive the purge so arc continuity is preserved.
+            state.start_attachment_purger();
 
             // Start the autonomous-execution dispatch loop. Must come
             // after the agent has been registered with the coordinator's
