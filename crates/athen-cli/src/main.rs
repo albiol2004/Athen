@@ -186,9 +186,15 @@ fn print_usage() {
     println!("Athen CLI — Universal AI Agent");
     println!();
     println!("USAGE:");
-    println!("    athen-cli                       Launch interactive REPL (uses DeepSeek)");
-    println!("    athen-cli --prompt <PROMPT>     Headless one-shot mode (OpenAI-compatible)");
-    println!("    athen-cli --help                Show this help");
+    println!("    athen-cli                                  Launch interactive REPL (uses DeepSeek)");
+    println!("    athen-cli --prompt <PROMPT>                Headless one-shot mode (OpenAI-compatible)");
+    println!("    athen-cli --profile <ID> --prompt <STR>    Headless mode with a seeded agent profile");
+    println!("    athen-cli --help                           Show this help");
+    println!();
+    println!("FLAGS:");
+    println!("    --prompt <STR>     Prompt for headless one-shot execution.");
+    println!("    --profile <ID>     Activate a seeded AgentProfile (e.g. 'coder', 'researcher')");
+    println!("                       on the executor. Ignored when --prompt is absent.");
     println!();
     println!("HEADLESS MODE ENV VARS:");
     println!("    ATHEN_BASE_URL  (required)  e.g. http://localhost:8000/v1");
@@ -200,8 +206,82 @@ fn print_usage() {
     println!("stdout, and exits 0 on success or non-zero on error.");
 }
 
+/// Open Athen's SQLite database (creating it if needed) and resolve the
+/// requested profile id into a `ResolvedAgentProfile`. On unknown id,
+/// returns an error message that lists the valid profile ids and exits
+/// with code 2 (caller's responsibility).
+///
+/// Built-in profiles seed automatically on connection (`Database::new`
+/// runs migrations + `seed_builtins_if_empty`), so a fresh install will
+/// still resolve `coder`, `researcher`, etc. without user intervention.
+async fn load_resolved_profile(
+    profile_id: &str,
+) -> std::result::Result<athen_core::agent_profile::ResolvedAgentProfile, (i32, String)> {
+    use athen_core::traits::profile::ProfileStore;
+
+    // Resolve DB path: <athen_data_dir>/athen.db. Create the directory if
+    // needed so first runs against a clean home don't fail.
+    let data_dir = athen_core::paths::athen_data_dir().ok_or((
+        1,
+        "Error: cannot resolve Athen data directory (no $HOME).".to_string(),
+    ))?;
+    if let Err(e) = std::fs::create_dir_all(&data_dir) {
+        return Err((
+            1,
+            format!("Failed to create {}: {e}", data_dir.display()),
+        ));
+    }
+    let db_path = data_dir.join("athen.db");
+    let db = athen_persistence::Database::new(&db_path)
+        .await
+        .map_err(|e| (1, format!("Failed to open DB at {}: {e}", db_path.display())))?;
+
+    let store = db.profile_store();
+
+    let profile = match store.get_profile(profile_id).await {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            // Unknown id — list the valid built-ins for the user.
+            let valid: Vec<String> = match store.list_profiles().await {
+                Ok(profiles) => profiles.into_iter().map(|p| p.id).collect(),
+                Err(_) => Vec::new(),
+            };
+            let listing = if valid.is_empty() {
+                "(unable to list valid profiles)".to_string()
+            } else {
+                valid.join(", ")
+            };
+            return Err((
+                2,
+                format!(
+                    "Error: unknown profile id '{profile_id}'.\nValid profile ids: {listing}"
+                ),
+            ));
+        }
+        Err(e) => return Err((1, format!("Profile lookup failed: {e}"))),
+    };
+
+    let templates = store
+        .resolve_templates(&profile.persona_template_ids)
+        .await
+        .unwrap_or_default();
+
+    Ok(athen_core::agent_profile::ResolvedAgentProfile {
+        profile,
+        persona_templates: templates,
+    })
+}
+
 /// Run the agent in headless one-shot mode for benchmark harnesses.
-async fn run_headless(prompt: String) -> std::result::Result<(), (i32, String)> {
+///
+/// When `profile_id` is `Some`, the corresponding seeded `AgentProfile`
+/// is loaded and activated on the executor (e.g. "coder" swaps the
+/// universal Athen persona for the senior-software-engineer prompt).
+/// When `None`, behavior is unchanged: the universal persona runs.
+async fn run_headless(
+    prompt: String,
+    profile_id: Option<String>,
+) -> std::result::Result<(), (i32, String)> {
     // 1. Read required env vars.
     let base_url = match std::env::var("ATHEN_BASE_URL") {
         Ok(v) if !v.is_empty() => v,
@@ -223,19 +303,31 @@ async fn run_headless(prompt: String) -> std::result::Result<(), (i32, String)> 
     };
     let api_key = std::env::var("ATHEN_API_KEY").ok().filter(|s| !s.is_empty());
 
-    // 2. Build router (no coordinator, no risk gating — auto-approve).
+    // 2. Optionally resolve the agent profile BEFORE building the executor.
+    //    Doing this first means an unknown id fails fast, before we touch
+    //    the LLM backend.
+    let resolved_profile = match profile_id.as_deref() {
+        Some(id) => Some(load_resolved_profile(id).await?),
+        None => None,
+    };
+
+    // 3. Build router (no coordinator, no risk gating — auto-approve).
     let router = build_openai_compat_router(base_url, model, api_key);
 
-    // 3. Build executor. cwd is implicit — the agent's filesystem tools operate
+    // 4. Build executor. cwd is implicit — the agent's filesystem tools operate
     //    on the harness's working directory.
     let exec_router: Box<dyn LlmRouter> = Box::new(SharedRouter(Arc::clone(&router)));
     let registry = ShellToolRegistry::new().await;
 
-    let executor = AgentBuilder::new()
+    let mut builder = AgentBuilder::new()
         .llm_router(exec_router)
         .tool_registry(Box::new(registry))
         .max_steps(50)
-        .timeout(Duration::from_secs(600))
+        .timeout(Duration::from_secs(600));
+    if let Some(rp) = resolved_profile {
+        builder = builder.active_profile(rp);
+    }
+    let executor = builder
         .build()
         .map_err(|e| (1, format!("Failed to build executor: {e}")))?;
 
@@ -293,36 +385,64 @@ async fn main() {
         .compact()
         .init();
 
-    // Argv dispatch: --help / --prompt <PROMPT> / (default = REPL).
+    // Argv dispatch:
+    //   --help                         → usage
+    //   --prompt <STR>                 → headless, universal persona
+    //   --profile <ID> --prompt <STR>  → headless, profile-specific persona
+    //   --prompt <STR> --profile <ID>  → same, either flag order
+    //   (default)                      → REPL
+    //
+    // `--profile` without `--prompt` is silently ignored (REPL stays as-is).
     let args: Vec<String> = std::env::args().collect();
-    if args.len() >= 2 {
-        match args[1].as_str() {
-            "--help" | "-h" => {
-                print_usage();
-                return;
-            }
-            "--prompt" => {
-                let prompt = match args.get(2) {
-                    Some(p) if !p.is_empty() => p.clone(),
-                    _ => {
-                        eprintln!("Error: --prompt requires a non-empty argument.");
-                        eprintln!("Usage: athen-cli --prompt <PROMPT>");
-                        std::process::exit(2);
-                    }
-                };
-                match run_headless(prompt).await {
-                    Ok(()) => std::process::exit(0),
-                    Err((code, msg)) => {
-                        eprintln!("{msg}");
-                        std::process::exit(code);
-                    }
-                }
-            }
-            _ => {
-                // Unknown flag — fall through to REPL for backward compatibility.
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_usage();
+        return;
+    }
+
+    // Generic flag-pair extractor: returns the value that follows the named
+    // flag, or `None` if the flag is absent. Returns `Err` with an error
+    // message if the flag is present but missing/empty value.
+    fn extract_flag(
+        args: &[String],
+        flag: &str,
+    ) -> std::result::Result<Option<String>, String> {
+        match args.iter().position(|a| a == flag) {
+            Some(idx) => match args.get(idx + 1) {
+                Some(v) if !v.is_empty() => Ok(Some(v.clone())),
+                _ => Err(format!("{flag} requires a non-empty argument.")),
+            },
+            None => Ok(None),
+        }
+    }
+
+    let prompt_arg = match extract_flag(&args, "--prompt") {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("Error: {msg}");
+            eprintln!("Usage: athen-cli --prompt <PROMPT> [--profile <ID>]");
+            std::process::exit(2);
+        }
+    };
+    let profile_arg = match extract_flag(&args, "--profile") {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("Error: {msg}");
+            eprintln!("Usage: athen-cli --prompt <PROMPT> [--profile <ID>]");
+            std::process::exit(2);
+        }
+    };
+
+    if let Some(prompt) = prompt_arg {
+        match run_headless(prompt, profile_arg).await {
+            Ok(()) => std::process::exit(0),
+            Err((code, msg)) => {
+                eprintln!("{msg}");
+                std::process::exit(code);
             }
         }
     }
+    // No --prompt → fall through to REPL (any --profile is intentionally
+    // ignored here; REPL profile support is future work).
 
     // Load configuration.
     let config = match find_config_dir() {
