@@ -3,6 +3,7 @@
 //! Tasks, checkpoints, pending messages, chat history, arcs, and operational state.
 
 pub mod arcs;
+pub mod attachments;
 pub mod calendar;
 pub mod chat;
 pub mod checkpoint;
@@ -22,6 +23,7 @@ use tokio::sync::Mutex;
 use athen_core::error::{AthenError, Result};
 
 use crate::arcs::ArcStore;
+use crate::attachments::AttachmentStore;
 use crate::calendar::CalendarStore;
 use crate::chat::ChatStore;
 use crate::contacts::SqliteContactStore;
@@ -85,6 +87,8 @@ impl Database {
         grants.init_schema().await?;
         let profiles = self.profile_store();
         profiles.init_schema().await?;
+        let attachments = self.attachment_store();
+        attachments.init_schema().await?;
         profiles.seed_builtins_if_empty().await
     }
 
@@ -131,6 +135,11 @@ impl Database {
     /// Create a `SqliteProfileStore` backed by this database's connection.
     pub fn profile_store(&self) -> SqliteProfileStore {
         SqliteProfileStore::new(self.conn.clone())
+    }
+
+    /// Create an `AttachmentStore` backed by this database's connection.
+    pub fn attachment_store(&self) -> AttachmentStore {
+        AttachmentStore::new(self.conn.clone())
     }
 }
 

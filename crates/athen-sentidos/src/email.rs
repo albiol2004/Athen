@@ -4,6 +4,7 @@
 //! and converts each into a [`SenseEvent`] with [`RiskLevel::Caution`] since
 //! email is an external input channel.
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -14,10 +15,31 @@ use uuid::Uuid;
 use athen_core::config::{AthenConfig, EmailConfig};
 use athen_core::error::{AthenError, Result};
 use athen_core::event::{
-    Attachment, EventKind, EventSource, NormalizedContent, SenderInfo, SenseEvent,
+    Attachment, AttachmentSource, EventKind, EventSource, NormalizedContent, SenderInfo,
+    SenseEvent,
 };
 use athen_core::risk::RiskLevel;
 use athen_core::traits::sense::SenseMonitor;
+
+/// Hard cap below which we save email attachment bytes to disk.
+/// Anything above is recorded as metadata-only (size + name + source
+/// pointer) so the agent can still see "an attachment was here" and
+/// optionally re-download via the source coordinates. Set roomy enough
+/// for typical invoices/receipts but tight enough to survive spam.
+const MAX_PERSIST_BYTES: u64 = 25 * 1024 * 1024;
+
+/// MIME prefixes we never persist bytes for, regardless of size. The
+/// orchestrator can still receive the metadata record. Defence-in-depth
+/// against malware-laden attachments — full policy still lives upstream.
+const MIME_BLOCKLIST_PREFIXES: &[&str] = &[
+    "application/x-msdownload",
+    "application/x-msi",
+    "application/x-executable",
+    "application/x-sh",
+    "application/x-bat",
+];
+
+const ACCOUNT_ID_PRIMARY: &str = "primary";
 
 /// Email sense monitor backed by IMAP.
 ///
@@ -61,14 +83,42 @@ impl Default for EmailMonitor {
     }
 }
 
-/// Extract the text body, optional HTML body, and attachments from raw email bytes.
-///
-/// Returns `(text_body, html_body, attachments)`. If no text part is found the
-/// text body will be an empty string.
+/// Bytes + IMAP part path captured during MIME extraction. Internal to
+/// the email crate — the public `extract_email_body` discards the
+/// bytes for tests that only care about metadata, while the persist
+/// path consumes them in `extract_email_body_internal`.
+struct RawEmailAttachment {
+    name: String,
+    mime_type: String,
+    bytes: Vec<u8>,
+    /// Dotted IMAP part path (`"2.1"`) so we can `BODY[<path>]` re-fetch
+    /// just this attachment after the bytes are TTL-purged.
+    part_path: String,
+}
+
+/// Extract text + html bodies and attachment **metadata** from raw bytes.
+/// Public wrapper over [`extract_email_body_internal`] for tests that
+/// don't need the per-part bytes.
+#[cfg(test)]
 pub(crate) fn extract_email_body(raw_bytes: &[u8]) -> (String, Option<String>, Vec<Attachment>) {
+    let (text, html, raws) = extract_email_body_internal(raw_bytes);
+    let attachments = raws
+        .into_iter()
+        .map(|r| Attachment::new(r.name, r.mime_type, r.bytes.len() as u64, None, None))
+        .collect();
+    (text, html, attachments)
+}
+
+/// Internal version that yields the raw bytes + IMAP part path for each
+/// attachment. The persist step consumes these to save bytes to disk
+/// and build final `Attachment` records with `AttachmentSource::Email`
+/// populated for refetch-after-TTL.
+fn extract_email_body_internal(
+    raw_bytes: &[u8],
+) -> (String, Option<String>, Vec<RawEmailAttachment>) {
     let mut text_body = String::new();
     let mut html_body: Option<String> = None;
-    let mut attachments = Vec::new();
+    let mut attachments: Vec<RawEmailAttachment> = Vec::new();
 
     let parsed = match mailparse::parse_mail(raw_bytes) {
         Ok(p) => p,
@@ -78,17 +128,27 @@ pub(crate) fn extract_email_body(raw_bytes: &[u8]) -> (String, Option<String>, V
         }
     };
 
-    collect_parts(&parsed, &mut text_body, &mut html_body, &mut attachments);
+    collect_parts(
+        &parsed,
+        &mut Vec::new(),
+        &mut text_body,
+        &mut html_body,
+        &mut attachments,
+    );
 
     (text_body, html_body, attachments)
 }
 
-/// Recursively walk MIME parts extracting text, HTML, and attachments.
+/// Recursively walk MIME parts extracting text, HTML, and attachment
+/// bytes. `path` is the dotted IMAP part-path stack accumulated as we
+/// recurse — so the first sub-part of the second top-level part lands
+/// at `"2.1"`, matching what `BODY[2.1]` would re-fetch.
 fn collect_parts(
     mail: &mailparse::ParsedMail<'_>,
+    path: &mut Vec<usize>,
     text_body: &mut String,
     html_body: &mut Option<String>,
-    attachments: &mut Vec<Attachment>,
+    attachments: &mut Vec<RawEmailAttachment>,
 ) {
     let content_type = mail.ctype.mimetype.to_lowercase();
 
@@ -110,16 +170,24 @@ fn collect_parts(
             .cloned()
             .unwrap_or_else(|| "unnamed".to_string());
 
-        let size = mail.get_body_raw().map(|b| b.len() as u64).unwrap_or(0);
+        let bytes = mail.get_body_raw().unwrap_or_default();
 
-        attachments.push(Attachment::new(filename, content_type.clone(), size, None, None));
+        attachments.push(RawEmailAttachment {
+            name: filename,
+            mime_type: content_type.clone(),
+            bytes,
+            part_path: format_imap_part_path(path),
+        });
         return;
     }
 
-    // If this part has sub-parts, recurse into them.
+    // If this part has sub-parts, recurse into them. IMAP numbers
+    // sub-parts from 1.
     if !mail.subparts.is_empty() {
-        for part in &mail.subparts {
-            collect_parts(part, text_body, html_body, attachments);
+        for (idx, part) in mail.subparts.iter().enumerate() {
+            path.push(idx + 1);
+            collect_parts(part, path, text_body, html_body, attachments);
+            path.pop();
         }
         return;
     }
@@ -147,9 +215,114 @@ fn collect_parts(
             .cloned()
             .unwrap_or_else(|| "unnamed".to_string());
 
-        let size = mail.get_body_raw().map(|b| b.len() as u64).unwrap_or(0);
+        let bytes = mail.get_body_raw().unwrap_or_default();
 
-        attachments.push(Attachment::new(filename, content_type, size, None, None));
+        attachments.push(RawEmailAttachment {
+            name: filename,
+            mime_type: content_type,
+            bytes,
+            part_path: format_imap_part_path(path),
+        });
+    }
+}
+
+fn format_imap_part_path(path: &[usize]) -> String {
+    if path.is_empty() {
+        // Top-level (single-part email) — IMAP convention: BODY[1].
+        return "1".into();
+    }
+    path.iter()
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// Sanitize a filename for on-disk storage: drop directory separators
+/// and any character that's risky on either Linux or Windows. Falls
+/// back to `"file"` if the result is empty.
+fn sanitize_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches(|c: char| c == '.' || c.is_whitespace());
+    if trimmed.is_empty() {
+        "file".into()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Save raw attachment bytes under `<save_root>/<event_id>/` and build
+/// final [`Attachment`] records with `AttachmentSource::Email`
+/// populated. Skips bytes for blocklisted MIMEs and oversize parts but
+/// still records metadata so the agent can see "an attachment exists"
+/// — orchestrator decides downstream whether to re-download.
+///
+/// `save_root: None` is the test-friendly path: builds metadata-only
+/// records without touching the filesystem.
+fn persist_attachments(
+    event_id: Uuid,
+    folder: &str,
+    uid: u32,
+    uid_validity: u32,
+    raws: Vec<RawEmailAttachment>,
+    save_root: Option<&Path>,
+) -> Vec<Attachment> {
+    let mut out = Vec::with_capacity(raws.len());
+    for raw in raws {
+        let size = raw.bytes.len() as u64;
+        let mime_lower = raw.mime_type.to_ascii_lowercase();
+        let is_blocked = MIME_BLOCKLIST_PREFIXES
+            .iter()
+            .any(|p| mime_lower.starts_with(p));
+        let is_oversize = size > MAX_PERSIST_BYTES;
+
+        let source = AttachmentSource::Email {
+            account_id: ACCOUNT_ID_PRIMARY.into(),
+            mailbox: folder.into(),
+            uid_validity,
+            uid,
+            part_path: raw.part_path.clone(),
+        };
+
+        let local_path = if is_blocked || is_oversize {
+            None
+        } else {
+            save_root.and_then(|root| save_bytes(root, event_id, &raw.name, &raw.bytes))
+        };
+
+        out.push(Attachment::new(
+            raw.name,
+            raw.mime_type,
+            size,
+            local_path,
+            Some(source),
+        ));
+    }
+    out
+}
+
+/// Write `bytes` to `<root>/<event_id>/<sanitized_name>` and return the
+/// final path. Returns `None` on any I/O error so callers degrade
+/// gracefully to metadata-only.
+fn save_bytes(root: &Path, event_id: Uuid, name: &str, bytes: &[u8]) -> Option<PathBuf> {
+    let dir = root.join(event_id.to_string());
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!("Failed to create attachment dir {dir:?}: {e}");
+        return None;
+    }
+    let path = dir.join(sanitize_filename(name));
+    match std::fs::write(&path, bytes) {
+        Ok(()) => Some(path),
+        Err(e) => {
+            tracing::warn!("Failed to save attachment {path:?}: {e}");
+            None
+        }
     }
 }
 
@@ -197,13 +370,22 @@ fn extract_subject(parsed: &mailparse::ParsedMail<'_>) -> Option<String> {
 /// `folder` is preserved in the event body so downstream consumers (e.g. the
 /// sense router) know where to mark the message `\Seen` after a successful
 /// agent run.
-fn message_to_event(uid: u32, folder: &str, raw_body: &[u8]) -> Result<SenseEvent> {
+fn message_to_event(
+    uid: u32,
+    uid_validity: u32,
+    folder: &str,
+    raw_body: &[u8],
+    save_root: Option<&Path>,
+) -> Result<SenseEvent> {
     let parsed = mailparse::parse_mail(raw_body)
         .map_err(|e| AthenError::Other(format!("Failed to parse email UID {uid}: {e}")))?;
 
     let subject = extract_subject(&parsed);
     let sender = extract_sender(&parsed);
-    let (text, html, attachments) = extract_email_body(raw_body);
+    let (text, html, raws) = extract_email_body_internal(raw_body);
+
+    let event_id = Uuid::new_v4();
+    let attachments = persist_attachments(event_id, folder, uid, uid_validity, raws, save_root);
 
     let from_str = sender
         .as_ref()
@@ -216,10 +398,11 @@ fn message_to_event(uid: u32, folder: &str, raw_body: &[u8]) -> Result<SenseEven
         "text": text,
         "html": html,
         "folder": folder,
+        "uid_validity": uid_validity,
     });
 
     Ok(SenseEvent {
-        id: Uuid::new_v4(),
+        id: event_id,
         timestamp: Utc::now(),
         source: EventSource::Email,
         kind: EventKind::NewMessage,
@@ -239,12 +422,13 @@ fn poll_all_folders<S: std::io::Read + std::io::Write>(
     session: &mut imap::Session<S>,
     folders: &[String],
     current_last: Option<u32>,
+    save_root: Option<&Path>,
 ) -> Result<(Vec<SenseEvent>, Option<u32>)> {
     let mut all_events = Vec::new();
     let mut global_max_uid = current_last;
 
     for folder in folders {
-        match fetch_folder(session, folder, current_last) {
+        match fetch_folder(session, folder, current_last, save_root) {
             Ok((events, max_uid)) => {
                 all_events.extend(events);
                 if let Some(mu) = max_uid {
@@ -267,10 +451,12 @@ fn fetch_folder<S: std::io::Read + std::io::Write>(
     session: &mut imap::Session<S>,
     folder: &str,
     min_uid: Option<u32>,
+    save_root: Option<&Path>,
 ) -> Result<(Vec<SenseEvent>, Option<u32>)> {
-    session
+    let mailbox = session
         .select(folder)
         .map_err(|e| AthenError::Other(format!("IMAP select '{folder}': {e}")))?;
+    let uid_validity = mailbox.uid_validity.unwrap_or(0);
 
     let uids = session
         .uid_search("UNSEEN")
@@ -320,7 +506,7 @@ fn fetch_folder<S: std::io::Read + std::io::Write>(
             }
         };
 
-        match message_to_event(uid, folder, body) {
+        match message_to_event(uid, uid_validity, folder, body, save_root) {
             Ok(event) => events.push(event),
             Err(e) => {
                 tracing::warn!("Failed to parse email UID {uid} in '{folder}': {e}");
@@ -358,9 +544,14 @@ impl SenseMonitor for EmailMonitor {
         };
 
         let last_seen = Arc::clone(&self.last_seen_uid);
+        // Resolve the on-disk root once per poll. None means "host
+        // hasn't been initialised with a writable data dir" — fine for
+        // tests, just degrades to metadata-only attachments.
+        let save_root = athen_core::paths::athen_attachments_dir();
 
         let result = tokio::task::spawn_blocking(move || -> Result<Vec<SenseEvent>> {
             let current_last = *last_seen.lock().unwrap();
+            let save_root = save_root.as_deref();
 
             let server = config.imap_server.as_str();
             let port = config.imap_port;
@@ -382,7 +573,8 @@ impl SenseMonitor for EmailMonitor {
                     .login(&config.username, &config.password)
                     .map_err(|(e, _)| AthenError::Other(format!("IMAP login: {e}")))?;
 
-                let result = poll_all_folders(&mut session, &config.folders, current_last);
+                let result =
+                    poll_all_folders(&mut session, &config.folders, current_last, save_root);
                 if let Err(e) = session.logout() {
                     tracing::warn!("IMAP logout error: {e}");
                 }
@@ -397,7 +589,8 @@ impl SenseMonitor for EmailMonitor {
                     .login(&config.username, &config.password)
                     .map_err(|(e, _)| AthenError::Other(format!("IMAP login: {e}")))?;
 
-                let result = poll_all_folders(&mut session, &config.folders, current_last);
+                let result =
+                    poll_all_folders(&mut session, &config.folders, current_last, save_root);
                 if let Err(e) = session.logout() {
                     tracing::warn!("IMAP logout error: {e}");
                 }
@@ -712,7 +905,7 @@ Content-Type: text/plain; charset=utf-8\r\n\
 \r\n\
 This is the body.";
 
-        let event = message_to_event(42, "INBOX", raw).unwrap();
+        let event = message_to_event(42, 1, "INBOX", raw, None).unwrap();
         assert_eq!(event.source, EventSource::Email);
         assert!(matches!(event.kind, EventKind::NewMessage));
         assert_eq!(event.source_risk, RiskLevel::Caution);
@@ -833,7 +1026,7 @@ Content-Type: text/plain\r\n\
 \r\n\
 Just a body, no subject";
 
-        let event = message_to_event(99, "INBOX", raw).unwrap();
+        let event = message_to_event(99, 1, "INBOX", raw, None).unwrap();
         assert!(event.content.summary.is_none());
         assert_eq!(event.raw_id.as_deref(), Some("99"));
         assert!(event.content.body["text"]
@@ -849,7 +1042,7 @@ Content-Type: text/plain\r\n\
 \r\n\
 Body without sender";
 
-        let event = message_to_event(100, "Archive", raw).unwrap();
+        let event = message_to_event(100, 1, "Archive", raw, None).unwrap();
         assert!(event.sender.is_none());
         assert_eq!(event.content.summary.as_deref(), Some("No From"));
         assert_eq!(event.content.body["folder"], "Archive");
@@ -951,5 +1144,144 @@ Content-Transfer-Encoding: base64\r\n\
         // Inline non-text parts should be treated as attachments
         assert_eq!(attachments.len(), 1);
         assert_eq!(attachments[0].mime_type, "image/jpeg");
+    }
+
+    #[test]
+    fn part_path_is_dotted_for_nested_multipart() {
+        // multipart/mixed → [text/plain, multipart/alternative → [text/plain, text/html]],
+        // followed by an attachment at top level. We expect part_path = "2"
+        // for the attachment (second top-level sub-part).
+        let raw = b"From: sender@example.com\r\n\
+Subject: With attachment\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"outer\"\r\n\
+\r\n\
+--outer\r\n\
+Content-Type: multipart/alternative; boundary=\"inner\"\r\n\
+\r\n\
+--inner\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+plain body\r\n\
+--inner\r\n\
+Content-Type: text/html\r\n\
+\r\n\
+<p>html body</p>\r\n\
+--inner--\r\n\
+--outer\r\n\
+Content-Type: application/pdf; name=\"invoice.pdf\"\r\n\
+Content-Disposition: attachment; filename=\"invoice.pdf\"\r\n\
+\r\n\
+PDF-BYTES\r\n\
+--outer--\r\n";
+
+        let (_text, _html, raws) = extract_email_body_internal(raw);
+        assert_eq!(raws.len(), 1);
+        assert_eq!(raws[0].part_path, "2");
+        assert_eq!(raws[0].name, "invoice.pdf");
+        assert!(!raws[0].bytes.is_empty());
+    }
+
+    #[test]
+    fn persist_attachments_writes_bytes_when_save_root_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let event_id = Uuid::new_v4();
+        let raws = vec![RawEmailAttachment {
+            name: "doc.pdf".into(),
+            mime_type: "application/pdf".into(),
+            bytes: b"hello".to_vec(),
+            part_path: "2".into(),
+        }];
+        let attachments =
+            persist_attachments(event_id, "INBOX", 42, 1, raws, Some(tmp.path()));
+        assert_eq!(attachments.len(), 1);
+        let a = &attachments[0];
+        assert!(a.local_path.is_some());
+        assert!(matches!(a.source, Some(AttachmentSource::Email { .. })));
+        let on_disk = std::fs::read(a.local_path.as_ref().unwrap()).unwrap();
+        assert_eq!(on_disk, b"hello");
+    }
+
+    #[test]
+    fn persist_attachments_skips_blocklisted_mime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let event_id = Uuid::new_v4();
+        let raws = vec![RawEmailAttachment {
+            name: "evil.exe".into(),
+            mime_type: "application/x-msdownload".into(),
+            bytes: b"MZ".to_vec(),
+            part_path: "2".into(),
+        }];
+        let attachments =
+            persist_attachments(event_id, "INBOX", 42, 1, raws, Some(tmp.path()));
+        assert_eq!(attachments.len(), 1);
+        // Metadata recorded, bytes NOT saved.
+        assert!(attachments[0].local_path.is_none());
+        assert!(matches!(
+            attachments[0].source,
+            Some(AttachmentSource::Email { .. })
+        ));
+    }
+
+    #[test]
+    fn persist_attachments_skips_oversize() {
+        let tmp = tempfile::tempdir().unwrap();
+        let event_id = Uuid::new_v4();
+        // Spoofing size by making a vec that's "officially" oversize.
+        // We just need vec.len() > MAX_PERSIST_BYTES — keeping the vec
+        // a few bytes over the limit avoids huge allocs in the test.
+        let bytes = vec![0u8; (MAX_PERSIST_BYTES + 16) as usize];
+        let raws = vec![RawEmailAttachment {
+            name: "big.bin".into(),
+            mime_type: "application/octet-stream".into(),
+            bytes,
+            part_path: "2".into(),
+        }];
+        let attachments =
+            persist_attachments(event_id, "INBOX", 42, 1, raws, Some(tmp.path()));
+        assert!(attachments[0].local_path.is_none());
+        assert_eq!(attachments[0].size_bytes, MAX_PERSIST_BYTES + 16);
+    }
+
+    #[test]
+    fn persist_attachments_no_save_root_yields_metadata_only() {
+        let event_id = Uuid::new_v4();
+        let raws = vec![RawEmailAttachment {
+            name: "doc.pdf".into(),
+            mime_type: "application/pdf".into(),
+            bytes: b"hello".to_vec(),
+            part_path: "2".into(),
+        }];
+        let attachments = persist_attachments(event_id, "INBOX", 42, 1, raws, None);
+        assert_eq!(attachments.len(), 1);
+        assert!(attachments[0].local_path.is_none());
+        // Source is still populated so we can refetch.
+        match attachments[0].source.as_ref().unwrap() {
+            AttachmentSource::Email {
+                mailbox,
+                uid,
+                uid_validity,
+                part_path,
+                account_id,
+            } => {
+                assert_eq!(mailbox, "INBOX");
+                assert_eq!(*uid, 42);
+                assert_eq!(*uid_validity, 1);
+                assert_eq!(part_path, "2");
+                assert_eq!(account_id, ACCOUNT_ID_PRIMARY);
+            }
+            _ => panic!("expected Email source"),
+        }
+    }
+
+    #[test]
+    fn sanitize_filename_strips_dangerous_chars() {
+        // Slashes become underscores; leading dots are stripped so a
+        // crafted "../foo" can't resolve out of the event dir or create
+        // a dotfile.
+        assert_eq!(sanitize_filename("../etc/passwd"), "_etc_passwd");
+        assert_eq!(sanitize_filename("invoice<>.pdf"), "invoice__.pdf");
+        assert_eq!(sanitize_filename(""), "file");
+        assert_eq!(sanitize_filename("..."), "file");
     }
 }

@@ -31,6 +31,15 @@ pub fn athen_files_sandbox() -> Option<PathBuf> {
     athen_data_dir().map(|d| d.join("files"))
 }
 
+/// Where sense crates persist downloaded attachments (email parts,
+/// Telegram media). Each attachment lands under
+/// `<root>/<event_id>/<index>_<sanitized_name>`. Lives under
+/// [`athen_data_dir`] so a TTL purger can sweep it without walking the
+/// whole data dir.
+pub fn athen_attachments_dir() -> Option<PathBuf> {
+    athen_data_dir().map(|d| d.join("sense-attachments"))
+}
+
 /// Default workspace directory the agent works inside when the user hasn't
 /// pointed at a specific location. Relative paths in built-in file tools and
 /// shell commands resolve against this dir, NOT the process cwd — so a fresh
