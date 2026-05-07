@@ -1983,6 +1983,48 @@ pub(crate) async fn execute_approved_task(
         }
     }
 
+    // Surface attachments tied to the most recent sense event in this
+    // arc. Without this, the user typing "what does the PDF say?" in an
+    // arc spawned by an email-with-PDF would see the agent guess at
+    // `fetch_attachment` with no UUID — the surfacing is what feeds the
+    // turn-0 image / inline PDF text + the UUIDs the attachment tools
+    // need. Mirrors execute_dispatched_task's surfacing block.
+    let mut surfaced_images: Vec<athen_core::llm::ImageInput> = Vec::new();
+    if let (Some(arc_store), Some(astore)) =
+        (ctx.arc_store.as_ref(), ctx.attachment_store.as_ref())
+    {
+        if let Some(event_id) =
+            latest_sense_event_id_in_arc(arc_store, &ctx.active_arc_id).await
+        {
+            let router_guard = ctx.router.read().await;
+            let supports_vision = router_guard.any_provider_supports_vision();
+            let supports_documents = router_guard.any_provider_supports_documents();
+            drop(router_guard);
+            let surfacing = prepare_attachment_surfacing(
+                event_id,
+                astore,
+                supports_vision,
+                supports_documents,
+            )
+            .await;
+            if let Some(msg) = surfacing.system_message {
+                tracing::info!(
+                    arc_id = %ctx.active_arc_id,
+                    event_id = %event_id,
+                    images = surfacing.images.len(),
+                    surfaced_chars = msg.len(),
+                    context_messages_before = context.len(),
+                    "Surfacing attachments to user-chat executor"
+                );
+                context.push(ChatMessage {
+                    role: Role::System,
+                    content: MessageContent::Text(msg),
+                });
+            }
+            surfaced_images = surfacing.images;
+        }
+    }
+
     // Build the tool registry, mirroring AppState::build_tool_registry —
     // inlined here because the bg path doesn't own `&AppState`.
     let mut shell_registry = athen_agent::ShellToolRegistry::new()
@@ -2099,8 +2141,13 @@ pub(crate) async fn execute_approved_task(
     builder = builder
         .toolbox_info(athen_agent::toolbox::ToolboxPromptInfo::load().await)
         .shell_kind(athen_agent::detect_shell_kind().await);
-    if !ctx.initial_user_images.is_empty() {
-        builder = builder.initial_user_images(ctx.initial_user_images.clone());
+    // Stack the originally-attached user images (uploaded via the chat
+    // composer) on top of any images surfaced from the arc's most recent
+    // sense event — both belong on the very first user turn.
+    let mut combined_images = ctx.initial_user_images.clone();
+    combined_images.extend(surfaced_images);
+    if !combined_images.is_empty() {
+        builder = builder.initial_user_images(combined_images);
     }
     let executor = builder.build().map_err(|e| {
         let raw = e.to_string();
@@ -2280,6 +2327,32 @@ pub(crate) async fn execute_approved_task(
 pub(crate) struct AttachmentSurfacing {
     pub(crate) images: Vec<athen_core::llm::ImageInput>,
     pub(crate) system_message: Option<String>,
+}
+
+/// Walk an arc's entries newest-first and return the most recent sense
+/// `event_id` recorded in entry metadata. Lets the user-chat executor
+/// path locate "the email/telegram message I'm asking about" without
+/// needing the original task carry a `source_event` (which only the
+/// autonomous dispatch path sets).
+///
+/// Returns `None` if the arc has no sense entries, the metadata column
+/// is empty, or the stored `event_id` isn't a parseable UUID.
+pub(crate) async fn latest_sense_event_id_in_arc(
+    arc_store: &athen_persistence::arcs::ArcStore,
+    arc_id: &str,
+) -> Option<Uuid> {
+    let entries = arc_store.load_entries(arc_id).await.ok()?;
+    for entry in entries.into_iter().rev() {
+        let Some(meta) = entry.metadata.as_ref() else {
+            continue;
+        };
+        if let Some(id_str) = meta.get("event_id").and_then(|v| v.as_str()) {
+            if let Ok(uuid) = Uuid::parse_str(id_str) {
+                return Some(uuid);
+            }
+        }
+    }
+    None
 }
 
 /// Look up attachments for a sense-originated task, read PDF sidecars
@@ -4749,5 +4822,112 @@ xref\n0 6\n0000000000 65535 f \n0000000010 00000 n \n0000000060 00000 n \n000000
         let result = prepare_attachment_surfacing(event_id, &store, true, true).await;
         let msg = result.system_message.expect("system message");
         assert!(msg.contains("metadata only"));
+    }
+}
+
+#[cfg(test)]
+mod arc_event_lookup_tests {
+    use super::latest_sense_event_id_in_arc;
+    use athen_persistence::arcs::{ArcSource, EntryType};
+    use athen_persistence::Database;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn returns_most_recent_event_id_from_metadata() {
+        let db = Database::in_memory().await.unwrap();
+        let store = db.arc_store();
+        let arc_id = Uuid::new_v4().to_string();
+        store.create_arc(&arc_id, "Email", ArcSource::Email).await.unwrap();
+
+        let older_event = Uuid::new_v4();
+        let newer_event = Uuid::new_v4();
+        store
+            .add_entry(
+                &arc_id,
+                EntryType::Message,
+                "system",
+                "older email body",
+                Some(serde_json::json!({ "event_id": older_event.to_string() })),
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .add_entry(
+                &arc_id,
+                EntryType::Message,
+                "system",
+                "newer email body",
+                Some(serde_json::json!({ "event_id": newer_event.to_string() })),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let found = latest_sense_event_id_in_arc(&store, &arc_id)
+            .await
+            .expect("expected an event id");
+        assert_eq!(found, newer_event);
+    }
+
+    #[tokio::test]
+    async fn returns_none_when_no_metadata() {
+        let db = Database::in_memory().await.unwrap();
+        let store = db.arc_store();
+        let arc_id = Uuid::new_v4().to_string();
+        store.create_arc(&arc_id, "Chat", ArcSource::UserInput).await.unwrap();
+        store
+            .add_entry(
+                &arc_id,
+                EntryType::Message,
+                "user",
+                "hi",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let found = latest_sense_event_id_in_arc(&store, &arc_id).await;
+        assert!(found.is_none());
+    }
+
+    #[tokio::test]
+    async fn skips_non_uuid_event_ids() {
+        let db = Database::in_memory().await.unwrap();
+        let store = db.arc_store();
+        let arc_id = Uuid::new_v4().to_string();
+        store.create_arc(&arc_id, "Email", ArcSource::Email).await.unwrap();
+
+        let valid = Uuid::new_v4();
+        store
+            .add_entry(
+                &arc_id,
+                EntryType::Message,
+                "system",
+                "valid",
+                Some(serde_json::json!({ "event_id": valid.to_string() })),
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .add_entry(
+                &arc_id,
+                EntryType::Message,
+                "system",
+                "garbage",
+                Some(serde_json::json!({ "event_id": "not-a-uuid" })),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Newest entry's event_id is invalid → walker keeps going and
+        // surfaces the older valid one.
+        let found = latest_sense_event_id_in_arc(&store, &arc_id)
+            .await
+            .expect("expected an event id");
+        assert_eq!(found, valid);
     }
 }

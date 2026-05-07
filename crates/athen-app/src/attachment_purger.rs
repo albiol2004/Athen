@@ -89,12 +89,17 @@ pub async fn sweep_once(
 /// `cutoff = now - ttl_days`, runs `sweep_once`, then sleeps. Owned by
 /// `AppState` via the spawned join handle (not awaited — runs until
 /// the process exits).
+///
+/// Uses `tauri::async_runtime::spawn` rather than `tokio::spawn` so the
+/// purger can be started from `setup()` (synchronous Tauri callback,
+/// no enclosing runtime). The Tauri runtime is itself tokio-backed, so
+/// this is the same as `tokio::spawn` from a runtime-aware context.
 pub fn spawn_loop(
     store: AttachmentStore,
     ttl_days: u32,
     interval: Duration,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+) -> tauri::async_runtime::JoinHandle<()> {
+    tauri::async_runtime::spawn(async move {
         tracing::info!(
             ttl_days,
             interval_secs = interval.as_secs(),
