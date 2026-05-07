@@ -48,6 +48,7 @@ pub struct OpenAiCompatibleProvider {
     provider_id: String,
     cost_estimator: Box<dyn CostEstimator>,
     supports_vision: bool,
+    supports_documents: bool,
 }
 
 impl OpenAiCompatibleProvider {
@@ -64,6 +65,7 @@ impl OpenAiCompatibleProvider {
             provider_id: "openai".to_string(),
             cost_estimator: Box::new(OpenAiCostEstimator),
             supports_vision: false,
+            supports_documents: false,
         }
     }
 
@@ -72,6 +74,14 @@ impl OpenAiCompatibleProvider {
     /// to a non-vision OpenAI-compat model returns a 400 from the API.
     pub fn with_vision(mut self, supported: bool) -> Self {
         self.supports_vision = supported;
+        self
+    }
+
+    /// Mark the configured `default_model` as document-capable (e.g.
+    /// Gemini via OpenAI-compat with native PDF inlineData). Caller is
+    /// responsible for matching to the actual model.
+    pub fn with_documents(mut self, supported: bool) -> Self {
+        self.supports_documents = supported;
         self
     }
 
@@ -483,6 +493,10 @@ impl LlmProvider for OpenAiCompatibleProvider {
 
     fn supports_vision(&self) -> bool {
         self.supports_vision
+    }
+
+    fn supports_documents(&self) -> bool {
+        self.supports_documents
     }
 }
 

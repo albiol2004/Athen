@@ -245,6 +245,7 @@ default_model = "deepseek-chat"
                 compaction_trigger_pct: 65,
                 compaction_target_pct: 30,
                 supports_vision: false,
+                supports_documents: false,
             },
         );
         config.models.profiles.insert(

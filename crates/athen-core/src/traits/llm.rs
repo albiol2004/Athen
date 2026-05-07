@@ -26,6 +26,14 @@ pub trait LlmProvider: Send + Sync {
     fn supports_vision(&self) -> bool {
         false
     }
+
+    /// Whether this provider's currently-configured default model accepts
+    /// native document/PDF input (Anthropic document blocks, Gemini
+    /// `application/pdf` inlineData). When false, the executor falls back
+    /// to inlining `pdf-extract`'d text. Independent of `supports_vision`.
+    fn supports_documents(&self) -> bool {
+        false
+    }
 }
 
 /// Routes requests to the appropriate provider based on profile,

@@ -2,6 +2,7 @@
 //!
 //! Two-step evaluation: fast regex rules, then LLM fallback for ambiguous cases.
 
+pub mod content_risk;
 pub mod llm_fallback;
 pub mod path_eval;
 pub mod rules;

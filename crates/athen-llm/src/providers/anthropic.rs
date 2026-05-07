@@ -20,6 +20,7 @@ pub struct AnthropicProvider {
     client: Client,
     base_url: String,
     supports_vision: bool,
+    supports_documents: bool,
 }
 
 impl AnthropicProvider {
@@ -31,6 +32,7 @@ impl AnthropicProvider {
             client: Client::new(),
             base_url: DEFAULT_BASE_URL.to_string(),
             supports_vision: false,
+            supports_documents: false,
         }
     }
 
@@ -39,6 +41,13 @@ impl AnthropicProvider {
     /// to a non-vision Claude model returns a 400 from the API.
     pub fn with_vision(mut self, supported: bool) -> Self {
         self.supports_vision = supported;
+        self
+    }
+
+    /// Mark the configured `default_model` as document-capable (native
+    /// PDF input via Anthropic document content blocks). Claude 3.5+.
+    pub fn with_documents(mut self, supported: bool) -> Self {
+        self.supports_documents = supported;
         self
     }
 
@@ -259,6 +268,10 @@ impl LlmProvider for AnthropicProvider {
 
     fn supports_vision(&self) -> bool {
         self.supports_vision
+    }
+
+    fn supports_documents(&self) -> bool {
+        self.supports_documents
     }
 }
 

@@ -1,5 +1,6 @@
 pub mod agent_profile;
 pub mod approval;
+pub mod attachment_policy;
 pub mod config;
 pub mod config_loader;
 pub mod contact;

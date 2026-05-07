@@ -34,6 +34,9 @@ pub struct ProviderInfo {
     pub is_active: bool,
     /// Whether the configured `default_model` accepts image input.
     pub supports_vision: bool,
+    /// Whether the configured `default_model` accepts native PDF/document
+    /// input. Independent of `supports_vision`.
+    pub supports_documents: bool,
 }
 
 /// Email configuration info for the frontend.
@@ -532,6 +535,7 @@ fn provider_config_to_info(id: &str, config: &ProviderConfig, active_id: &str) -
         api_key_hint: hint,
         is_active: id == active_id,
         supports_vision: config.supports_vision,
+        supports_documents: config.supports_documents,
     }
 }
 
@@ -693,6 +697,7 @@ pub async fn save_provider(
     model: String,
     api_key: Option<String>,
     supports_vision: Option<bool>,
+    supports_documents: Option<bool>,
     state: State<'_, AppState>,
 ) -> std::result::Result<String, String> {
     let mut models = load_models_config();
@@ -733,9 +738,11 @@ pub async fn save_provider(
         .unwrap_or((128_000, 65, 30));
 
     // If the caller didn't pass a flag, preserve the existing value
-    // (so editing other fields doesn't accidentally clear vision).
+    // (so editing other fields doesn't accidentally clear vision/documents).
     let supports_vision_resolved =
         supports_vision.unwrap_or_else(|| existing.is_some_and(|p| p.supports_vision));
+    let supports_documents_resolved =
+        supports_documents.unwrap_or_else(|| existing.is_some_and(|p| p.supports_documents));
 
     let provider = ProviderConfig {
         auth: auth.clone(),
@@ -745,6 +752,7 @@ pub async fn save_provider(
         compaction_trigger_pct,
         compaction_target_pct,
         supports_vision: supports_vision_resolved,
+        supports_documents: supports_documents_resolved,
     };
 
     models.providers.insert(id.clone(), provider);
@@ -763,12 +771,17 @@ pub async fn save_provider(
         };
 
         let supports_vision = models.providers.get(&id).is_some_and(|c| c.supports_vision);
+        let supports_documents = models
+            .providers
+            .get(&id)
+            .is_some_and(|c| c.supports_documents);
         let new_router = build_router_for_provider(
             &id,
             &resolved_base_url,
             &resolved_model,
             router_api_key.as_deref(),
             supports_vision,
+            supports_documents,
         );
 
         {
@@ -840,12 +853,14 @@ pub async fn delete_provider(
             });
 
         let supports_vision = fallback_cfg.is_some_and(|c| c.supports_vision);
+        let supports_documents = fallback_cfg.is_some_and(|c| c.supports_documents);
         let new_router = build_router_for_provider(
             &fallback_id,
             &base_url,
             &model,
             api_key.as_deref(),
             supports_vision,
+            supports_documents,
         );
 
         {
@@ -981,8 +996,15 @@ pub async fn set_active_provider(
 
     // Build the new router.
     let supports_vision = provider_cfg.is_some_and(|c| c.supports_vision);
-    let new_router =
-        build_router_for_provider(&id, &base_url, &model, api_key.as_deref(), supports_vision);
+    let supports_documents = provider_cfg.is_some_and(|c| c.supports_documents);
+    let new_router = build_router_for_provider(
+        &id,
+        &base_url,
+        &model,
+        api_key.as_deref(),
+        supports_vision,
+        supports_documents,
+    );
 
     // Swap the router atomically.
     {

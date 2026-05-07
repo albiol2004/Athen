@@ -112,12 +112,7 @@ fn collect_parts(
 
         let size = mail.get_body_raw().map(|b| b.len() as u64).unwrap_or(0);
 
-        attachments.push(Attachment {
-            name: filename,
-            mime_type: content_type.clone(),
-            size_bytes: size,
-            path: None,
-        });
+        attachments.push(Attachment::new(filename, content_type.clone(), size, None, None));
         return;
     }
 
@@ -154,12 +149,7 @@ fn collect_parts(
 
         let size = mail.get_body_raw().map(|b| b.len() as u64).unwrap_or(0);
 
-        attachments.push(Attachment {
-            name: filename,
-            mime_type: content_type,
-            size_bytes: size,
-            path: None,
-        });
+        attachments.push(Attachment::new(filename, content_type, size, None, None));
     }
 }
 

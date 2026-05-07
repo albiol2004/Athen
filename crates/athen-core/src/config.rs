@@ -163,6 +163,13 @@ pub struct ProviderConfig {
     /// model (Claude 3.5+, GPT-4o, Gemini 1.5+, etc).
     #[serde(default)]
     pub supports_vision: bool,
+    /// Whether the configured `default_model` accepts native PDF/document
+    /// input (Anthropic Claude 3.5+ document blocks, Gemini 1.5+ inlineData
+    /// with `application/pdf`). When false, the executor falls back to
+    /// pdf-extract'd text inlined as plain text. Independent of
+    /// `supports_vision`: a model can support one without the other.
+    #[serde(default)]
+    pub supports_documents: bool,
 }
 
 fn default_context_window_tokens() -> u32 {
