@@ -79,10 +79,26 @@ impl NotificationChannel for InAppChannel {
 // TelegramChannel
 // ---------------------------------------------------------------------------
 
+/// In-memory slot recording the most recent outbound Telegram
+/// notification's arc id + timestamp. The owner-Telegram message handler
+/// reads it to bias arc matching: if the user replies right after a
+/// notification fired, the reply is overwhelmingly likely about that
+/// arc — even when its source is Email or Calendar, not Telegram.
+///
+/// The arc id is the persistence-layer string id (e.g.
+/// `"arc_20260507_185835"`), not a UUID — that's what `Notification.arc_id`
+/// carries and what `ArcStore` keys by.
+pub type TelegramOutboundHint =
+    std::sync::Arc<std::sync::Mutex<Option<(String, chrono::DateTime<chrono::Utc>)>>>;
+
 /// Telegram notification channel -- sends messages via Bot API.
 pub struct TelegramChannel {
     bot_token: String,
     owner_chat_id: i64,
+    /// Optional shared slot the channel writes after a successful send.
+    /// `None` for tests / mock contexts; set in production via
+    /// `with_outbound_hint`.
+    outbound_hint: Option<TelegramOutboundHint>,
 }
 
 impl TelegramChannel {
@@ -90,7 +106,24 @@ impl TelegramChannel {
         Self {
             bot_token,
             owner_chat_id,
+            outbound_hint: None,
         }
+    }
+
+    /// Wire the shared hint slot. Called by `AppState::init_notifier`.
+    pub fn with_outbound_hint(mut self, hint: TelegramOutboundHint) -> Self {
+        self.outbound_hint = Some(hint);
+        self
+    }
+}
+
+/// Stamp the most-recent-outbound-Telegram-notification hint. Best-effort:
+/// a poisoned mutex (extremely rare; only happens if a previous holder
+/// panicked while writing) just means future replies fall through to the
+/// older `primary_reply_channel` / messaging-arc heuristics.
+pub(crate) fn stamp_outbound_hint(hint: &TelegramOutboundHint, arc_id: &str) {
+    if let Ok(mut slot) = hint.lock() {
+        *slot = Some((arc_id.to_string(), chrono::Utc::now()));
     }
 }
 
@@ -118,7 +151,14 @@ impl NotificationChannel for TelegramChannel {
         match athen_sentidos::telegram::send_message(&self.bot_token, self.owner_chat_id, &text)
             .await
         {
-            Ok(_) => Ok(DeliveryResult::Delivered),
+            Ok(_) => {
+                if let (Some(hint), Some(arc_id)) =
+                    (self.outbound_hint.as_ref(), notification.arc_id.as_deref())
+                {
+                    stamp_outbound_hint(hint, arc_id);
+                }
+                Ok(DeliveryResult::Delivered)
+            }
             Err(e) => Ok(DeliveryResult::Failed(e)),
         }
     }
@@ -1400,5 +1440,33 @@ mod tests {
         let list = orch.list_notifications().await;
         assert!(list.iter().all(|n| n.is_read));
         assert_eq!(orch.unread_count().await, 0);
+    }
+
+    #[test]
+    fn stamp_outbound_hint_writes_arc_and_recent_timestamp() {
+        let hint: TelegramOutboundHint = std::sync::Arc::new(std::sync::Mutex::new(None));
+        super::stamp_outbound_hint(&hint, "arc_20260507_185835");
+
+        let snapshot = hint.lock().unwrap().clone();
+        let (arc_id, ts) = snapshot.expect("hint slot must be populated");
+        assert_eq!(arc_id, "arc_20260507_185835");
+        // Timestamp must be very recent — well within the 2-min window
+        // the consumer uses.
+        let age = chrono::Utc::now().signed_duration_since(ts).num_seconds();
+        assert!(
+            (0..5).contains(&age),
+            "hint timestamp drift unreasonable: {age} s"
+        );
+    }
+
+    #[test]
+    fn stamp_outbound_hint_overwrites_previous_slot() {
+        // Two notifications fire in quick succession. The latest wins —
+        // matches user instinct ("the thing that just pinged me").
+        let hint: TelegramOutboundHint = std::sync::Arc::new(std::sync::Mutex::new(None));
+        super::stamp_outbound_hint(&hint, "arc_first");
+        super::stamp_outbound_hint(&hint, "arc_second");
+        let snapshot = hint.lock().unwrap().clone().unwrap();
+        assert_eq!(snapshot.0, "arc_second");
     }
 }

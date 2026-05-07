@@ -220,6 +220,12 @@ pub struct AppState {
     // Workaround: process group leadership + parent-death signal would be
     // a cleaner OS-level fix than wiring a custom Drop.
     pub spawned_processes: athen_agent::SpawnedProcessMap,
+    /// Single-slot hint recording the most recent outbound Telegram
+    /// notification's arc + timestamp. Written by `TelegramChannel::send`,
+    /// read by `execute_owner_telegram_message` to bias arc matching for
+    /// short follow-ups that arrive right after a notification fires.
+    /// See `docs/MULTI_INTENT_ROUTING.md` for the multi-arc extension.
+    pub telegram_outbound_hint: crate::notifier::TelegramOutboundHint,
     /// Approvals currently being executed. See [`InflightApprovals`].
     pub inflight_approvals: InflightApprovals,
     /// Maps coordinator task ids to the arc the originating sense
@@ -376,6 +382,7 @@ impl AppState {
             profile_embedding_cache,
             pending_grants,
             spawned_processes,
+            telegram_outbound_hint: std::sync::Arc::new(std::sync::Mutex::new(None)),
             inflight_approvals: Arc::new(Mutex::new(HashSet::new())),
             task_arc_map: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             pending_email_marks: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
@@ -554,7 +561,10 @@ impl AppState {
             let token = &config.telegram.bot_token;
             if let Some(owner_id) = config.telegram.owner_user_id {
                 if !token.is_empty() {
-                    channels.push(Box::new(TelegramChannel::new(token.clone(), owner_id)));
+                    channels.push(Box::new(
+                        TelegramChannel::new(token.clone(), owner_id)
+                            .with_outbound_hint(self.telegram_outbound_hint.clone()),
+                    ));
                 }
             }
         }
@@ -888,6 +898,7 @@ impl AppState {
         let dispatch_signal_ref = Arc::clone(&self.dispatch_signal);
         let web_search_ref = Arc::clone(&self.web_search);
         let email_sender_ref = self.email_sender.clone();
+        let telegram_outbound_hint_ref = self.telegram_outbound_hint.clone();
 
         tauri::async_runtime::spawn(async move {
             if let Err(e) = monitor.init(&telegram_config).await {
@@ -969,6 +980,8 @@ impl AppState {
                                     let approval_router_c = approval_router_ref.clone();
                                     let web_search_c = Arc::clone(&web_search_ref);
                                     let email_sender_c = email_sender_ref.clone();
+                                    let telegram_outbound_hint_c =
+                                        telegram_outbound_hint_ref.clone();
                                     let event_id = event.id;
                                     let attachments_owned = event.content.attachments.clone();
                                     tauri::async_runtime::spawn(async move {
@@ -998,6 +1011,7 @@ impl AppState {
                                             approval_router_c.as_ref(),
                                             &web_search_c,
                                             &email_sender_c,
+                                            &telegram_outbound_hint_c,
                                         )
                                         .await;
                                     });
@@ -1334,6 +1348,7 @@ async fn execute_owner_telegram_message(
     approval_router: Option<&Arc<crate::approval::ApprovalRouter>>,
     web_search: &Arc<dyn WebSearchProvider>,
     email_sender: &Option<Arc<dyn athen_core::traits::email_sender::EmailSender>>,
+    telegram_outbound_hint: &crate::notifier::TelegramOutboundHint,
 ) {
     use std::time::Duration;
 
@@ -1350,35 +1365,127 @@ async fn execute_owner_telegram_message(
     // tool calls, assistant reply — so the UI groups them on rehydration.
     let turn_id = uuid::Uuid::new_v4().to_string();
 
-    // Find or create an arc for this Telegram conversation.
-    // Use a 5-minute time window: if there's a recent Messaging arc, reuse it.
-    let target_arc_id = if let Some(store) = arc_store {
+    // Strip a leading `/newarc` command. When present, force a fresh arc
+    // regardless of any heuristic match — this is the user's escape hatch
+    // when arc routing guesses wrong. Stripped text gets sent to the agent
+    // so a bare `/newarc` produces a new empty arc with no agent action.
+    let (force_new_arc, stripped_text) = parse_newarc_command(text);
+    let text = stripped_text.as_str();
+
+    // Track whether the arc was reused vs freshly created so we can append
+    // a visibility footer to reused arcs only — fresh arcs are obviously
+    // theirs, the bot's reply is the first content in them.
+    let mut arc_was_reused = false;
+    let mut arc_match_reason: Option<&'static str> = None;
+
+    // Find or create an arc for this Telegram conversation. Priority order:
+    //   1. /newarc command → force fresh.
+    //   2. Most recent outbound Telegram notification (≤ 2 min) → highest
+    //      signal that this short reply is about that arc, even cross-
+    //      channel (an Email arc can match here).
+    //   3. Active arc with primary_reply_channel = "telegram" updated in
+    //      the last 5 min → ongoing Telegram thread.
+    //   4. Any Messaging-source arc updated in the last 5 min → fallback.
+    //   5. Create new.
+    let target_arc_id: Option<String> = if !force_new_arc {
+        if let Some(store) = arc_store {
+            // Tier 2: outbound-notification hint. Read the slot once,
+            // then verify the arc still exists and isn't archived (the
+            // hint is in-memory and survives DB archive/delete writes).
+            let hint_match = telegram_outbound_hint
+                .lock()
+                .ok()
+                .and_then(|guard| guard.clone())
+                .and_then(|(arc_id, ts)| {
+                    let now = chrono::Utc::now();
+                    if now.signed_duration_since(ts).num_seconds() < 120 {
+                        Some(arc_id)
+                    } else {
+                        None
+                    }
+                });
+            match hint_match {
+                Some(arc_id) => match store.get_arc(&arc_id).await {
+                    Ok(Some(meta)) if meta.status == athen_persistence::arcs::ArcStatus::Active => {
+                        info!(
+                            arc = %arc_id,
+                            "Routing owner Telegram message via outbound-notification hint"
+                        );
+                        arc_match_reason = Some("notification_hint");
+                        Some(arc_id)
+                    }
+                    _ => None,
+                },
+                None => None,
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Tier 3+4 + creation, only if tiers 1 and 2 didn't claim the arc.
+    let target_arc_id = if let Some(id) = target_arc_id {
+        arc_was_reused = true;
+        Some(id)
+    } else if let Some(store) = arc_store {
         match store.list_arcs().await {
             Ok(arcs) => {
                 let now = chrono::Utc::now();
-                // Look for a recent active Messaging arc within 5 minutes.
-                let recent = arcs
-                    .iter()
-                    .filter(|a| {
-                        a.source == athen_persistence::arcs::ArcSource::Messaging
-                            && a.status == athen_persistence::arcs::ArcStatus::Active
-                    })
-                    .find(|a| {
-                        chrono::DateTime::parse_from_rfc3339(&a.updated_at)
-                            .map(|t| now.signed_duration_since(t).num_seconds() < 300)
-                            .unwrap_or(false)
-                    })
-                    .map(|a| a.id.clone());
+                let within_window = |a: &athen_persistence::arcs::ArcMeta, secs: i64| -> bool {
+                    chrono::DateTime::parse_from_rfc3339(&a.updated_at)
+                        .map(|t| now.signed_duration_since(t).num_seconds() < secs)
+                        .unwrap_or(false)
+                };
 
-                if let Some(id) = recent {
-                    info!("Reusing recent Telegram arc: {}", id);
+                // Tier 3: arcs the owner has been actively replying to via
+                // Telegram. primary_reply_channel is set to "telegram" by
+                // this same handler (line below) every time the owner
+                // engages, so multi-turn Telegram threads stay sticky.
+                let tier3 = if force_new_arc {
+                    None
+                } else {
+                    arcs.iter()
+                        .filter(|a| a.status == athen_persistence::arcs::ArcStatus::Active)
+                        .filter(|a| a.primary_reply_channel.as_deref() == Some("telegram"))
+                        .find(|a| within_window(a, 300))
+                        .map(|a| a.id.clone())
+                };
+
+                // Tier 4: any recent Messaging-source arc. Today's
+                // pre-#149 behaviour, kept as a last-resort fallback.
+                let tier4 = if force_new_arc {
+                    None
+                } else {
+                    arcs.iter()
+                        .filter(|a| {
+                            a.source == athen_persistence::arcs::ArcSource::Messaging
+                                && a.status == athen_persistence::arcs::ArcStatus::Active
+                        })
+                        .find(|a| within_window(a, 300))
+                        .map(|a| a.id.clone())
+                };
+
+                if let Some(id) = tier3 {
+                    info!(arc = %id, "Routing owner Telegram message via primary_reply_channel hint");
+                    arc_match_reason = Some("primary_reply_channel");
+                    arc_was_reused = true;
+                    Some(id)
+                } else if let Some(id) = tier4 {
+                    info!(arc = %id, "Routing owner Telegram message via recent-messaging fallback");
+                    arc_match_reason = Some("recent_messaging");
+                    arc_was_reused = true;
                     Some(id)
                 } else {
-                    // Create a new arc.
                     let arc_id = crate::sense_router::generate_arc_id();
                     let name = if text.len() > 30 {
                         let cap = text.floor_char_boundary(27);
                         format!("{}...", &text[..cap])
+                    } else if text.is_empty() {
+                        // Bare /newarc: give it a placeholder name. The
+                        // agent's first real message will rename it.
+                        "New Telegram arc".to_string()
                     } else {
                         text.to_string()
                     };
@@ -1420,6 +1527,21 @@ async fn execute_owner_telegram_message(
     } else {
         None
     };
+
+    // If `/newarc` arrived with no follow-up text, the agent has nothing
+    // to do — confirm the reset and return without spinning the executor.
+    if force_new_arc && text.is_empty() {
+        if let Err(e) = athen_sentidos::telegram::send_message(
+            bot_token,
+            chat_id,
+            "📍 New arc started. Send your message.",
+        )
+        .await
+        {
+            warn!("Failed to send /newarc ack: {e}");
+        }
+        return;
+    }
 
     // Mark any pending notifications for this arc as read — the owner is
     // actively engaging via Telegram, so in-app notifications are redundant.
@@ -1778,10 +1900,36 @@ async fn execute_owner_telegram_message(
     // chat fresh on another device) — preserving the footer keeps
     // the trail visible as a single self-contained message.
     let footer = build_telegram_tools_footer(&tool_log);
-    let outbound = if footer.is_empty() {
-        content.clone()
+    let arc_footer = if arc_was_reused {
+        // Surface which arc the message landed on + how to escape.
+        // Only when an existing arc was reused — fresh arcs are obviously
+        // owned by this very turn and would just be noise.
+        match (arc_store, target_arc_id.as_ref()) {
+            (Some(store), Some(arc_id)) => match store.get_arc(arc_id).await {
+                Ok(Some(meta)) => {
+                    let reason_label = match arc_match_reason {
+                        Some("notification_hint") => "matched recent notification",
+                        Some("primary_reply_channel") => "ongoing Telegram thread",
+                        Some("recent_messaging") => "recent message fallback",
+                        _ => "reused",
+                    };
+                    Some(format!(
+                        "📍 Arc: \"{}\" ({}). Send /newarc to start fresh.",
+                        meta.name, reason_label
+                    ))
+                }
+                _ => None,
+            },
+            _ => None,
+        }
     } else {
-        format!("{content}\n\n{footer}")
+        None
+    };
+    let outbound = match (footer.is_empty(), arc_footer) {
+        (true, None) => content.clone(),
+        (false, None) => format!("{content}\n\n{footer}"),
+        (true, Some(af)) => format!("{content}\n\n{af}"),
+        (false, Some(af)) => format!("{content}\n\n{footer}\n\n{af}"),
     };
     progress.finalize_with_text(&outbound).await;
 
@@ -1789,6 +1937,29 @@ async fn execute_owner_telegram_message(
         "Owner Telegram message executed, response length: {} chars",
         content.len()
     );
+}
+
+/// Parse a leading `/newarc` command from an owner Telegram message.
+///
+/// Returns `(force_new_arc, remaining_text)`. The command must appear as
+/// the very first token (whitespace allowed before it); a `/newarc`
+/// embedded mid-message is treated as content, not a command — this
+/// matches Telegram bot conventions where slash-commands lead the line.
+///
+/// Trailing text after `/newarc` is preserved as the actual message
+/// content, so `/newarc check my email` resets the arc AND sends the
+/// follow-up to the agent in the fresh arc.
+pub(crate) fn parse_newarc_command(text: &str) -> (bool, String) {
+    let trimmed = text.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("/newarc") {
+        // Require a word boundary after /newarc so `/newarchaeology` (a
+        // hypothetical user message) doesn't trigger. Either end-of-input
+        // or whitespace counts.
+        if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+            return (true, rest.trim_start().to_string());
+        }
+    }
+    (false, text.to_string())
 }
 
 /// Build a plain-text "Tools used" footer from the tools the agent ran.
@@ -2357,4 +2528,56 @@ async fn build_memory(router: &Arc<RwLock<Arc<DefaultLlmRouter>>>) -> Option<Arc
 
     info!("Memory system initialized with SQLite persistence");
     Some(Arc::new(memory))
+}
+
+#[cfg(test)]
+mod newarc_command_tests {
+    use super::parse_newarc_command;
+
+    #[test]
+    fn bare_newarc_resets_with_empty_remainder() {
+        let (force, rest) = parse_newarc_command("/newarc");
+        assert!(force);
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn newarc_with_followup_keeps_followup() {
+        let (force, rest) = parse_newarc_command("/newarc check my email");
+        assert!(force);
+        assert_eq!(rest, "check my email");
+    }
+
+    #[test]
+    fn leading_whitespace_does_not_block_command() {
+        let (force, rest) = parse_newarc_command("   /newarc reset please");
+        assert!(force);
+        assert_eq!(rest, "reset please");
+    }
+
+    #[test]
+    fn newarc_mid_message_is_content() {
+        // The command only fires when /newarc is the leading token. A
+        // user typing "we should /newarc this thread" is not asking for
+        // a reset — they're discussing the command in the body of a
+        // genuine message. Don't swallow it.
+        let (force, rest) = parse_newarc_command("we should /newarc this thread");
+        assert!(!force);
+        assert_eq!(rest, "we should /newarc this thread");
+    }
+
+    #[test]
+    fn similar_command_prefix_does_not_match() {
+        // Hypothetical pathology: /newarchaeology — must not trigger.
+        let (force, rest) = parse_newarc_command("/newarchaeology check");
+        assert!(!force);
+        assert_eq!(rest, "/newarchaeology check");
+    }
+
+    #[test]
+    fn newarc_with_tab_separator() {
+        let (force, rest) = parse_newarc_command("/newarc\tafter tab");
+        assert!(force);
+        assert_eq!(rest, "after tab");
+    }
 }

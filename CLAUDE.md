@@ -124,4 +124,5 @@ Read the relevant doc BEFORE working on a feature area:
 - [Configuration & LLM Providers](docs/CONFIGURATION.md) — Read when: working on config loading, LLM providers, model profiles, failover, domain settings, embeddings, or web search keys/chain
 - [Tools, Senses & Notifications](docs/TOOLS_AND_SENSES.md) — Read when: working on agent tools, sense monitors, sandbox execution, notification delivery, or the web search/page-reader providers
 - [Arc Compaction](docs/ARC_COMPACTION.md) — Read when: working on context-window management, arc summarization, or anything that touches `ArcStore::load_entries` in the executor path. Design doc; not yet implemented.
+- [Multi-Intent Routing](docs/MULTI_INTENT_ROUTING.md) — Read when: extending the Telegram owner-message path to split a single message into N per-arc intents (task #152). Design doc; not yet implemented. Builds on #149's single-intent heuristic.
 - [Packaging & Distribution](docs/PACKAGING.md) — Read when: cutting a release, debugging the auto-updater, or adding a distribution channel. Covers AUR, COPR, GitHub Releases, the `installer_kind` self-update vs system-package split, and the per-release checklist.

@@ -38,6 +38,7 @@ What we're planning to do after Now lands.
 
 Ideas we like but aren't committed to yet. Feedback here matters most.
 
+- **One Telegram message that lands on multiple arcs.** When two notifications hit your phone in quick succession and you reply once with "reply to him with looks great, and for the meeting postpone it to Friday", Athen splits that into per-arc intents and routes each independently — including separate risk decisions per intent (the email reply auto-sends; the calendar move waits for approval). One merged reply summarises both outcomes. Design sketch in [docs/MULTI_INTENT_ROUTING.md](MULTI_INTENT_ROUTING.md).
 - **Cloud-hosted Athen.** A managed option for people who don't want their PC running 24/7. You'd still own your data, still bring your own LLM keys; we'd just run the headless instance on a European server so your assistant keeps working when your laptop is closed. Self-hosting stays free and supported regardless.
 - **Google Calendar (read + write).** Pending OAuth verification with Google — a multi-week paperwork process we'll start once Athen has a public homepage and privacy policy live. Read-only via iCal subscription is a possible interim step.
 - **Voice input.** Whisper-based dictation, local or via API.
