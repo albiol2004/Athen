@@ -1541,6 +1541,58 @@ pub async fn send_message(
             // above the user bubble that triggered it.
             persist_entry(&state, "user", &message, "message", None, Some(&turn_id)).await;
 
+            // Surface attachments tied to the most recent sense event in this
+            // arc (composer uploads, inbound email/Telegram with attachments).
+            // Without this, a user follow-up like "what does the PDF say?"
+            // sees the agent guess at fetch_attachment with no UUID.
+            //
+            // Embed the surfacing into the user task description rather than
+            // pushing as a Role::System message: DeepSeek and other OpenAI-
+            // compat providers de-emphasize or merge mid-stream system roles
+            // away from the leading system slot, and we kept seeing models
+            // reply "I don't see any attachment" even with 6 KB of inlined
+            // PDF text further up the wire. Stuffing it into the user turn
+            // is universally honored, costs nothing extra, and the arc-
+            // persisted user message stays clean (it's persisted as `message`
+            // earlier — only the executor sees the enriched description).
+            let mut surfaced_images: Vec<athen_core::llm::ImageInput> = Vec::new();
+            let mut executor_message = message.clone();
+            {
+                let arc_store_opt = state.arc_store.as_ref();
+                let attachment_store_opt = state.attachment_store();
+                if let (Some(arc_store), Some(astore)) =
+                    (arc_store_opt, attachment_store_opt.as_ref())
+                {
+                    let arc_id_for_surface = state.active_arc_id.lock().await.clone();
+                    if let Some(event_id) =
+                        latest_sense_event_id_in_arc(arc_store, &arc_id_for_surface).await
+                    {
+                        let router_guard = state.router.read().await;
+                        let supports_vision = router_guard.any_provider_supports_vision();
+                        let supports_documents = router_guard.any_provider_supports_documents();
+                        drop(router_guard);
+                        let surfacing = prepare_attachment_surfacing(
+                            event_id,
+                            astore,
+                            supports_vision,
+                            supports_documents,
+                        )
+                        .await;
+                        if let Some(msg) = surfacing.system_message {
+                            tracing::info!(
+                                arc_id = %arc_id_for_surface,
+                                event_id = %event_id,
+                                images = surfacing.images.len(),
+                                surfaced_chars = msg.len(),
+                                "Embedding attachment surfacing into direct-dispatch user turn"
+                            );
+                            executor_message = format!("{msg}\n\n---\n\n{message}");
+                        }
+                        surfaced_images = surfacing.images;
+                    }
+                }
+            }
+
             // Build executor with real tool execution (same as athen-cli).
             let exec_router: Box<dyn LlmRouter> = Box::new(SharedRouter(Arc::clone(&state.router)));
             let arc_for_registry = state.active_arc_id.lock().await.clone();
@@ -1594,8 +1646,15 @@ pub async fn send_message(
             builder = builder
                 .toolbox_info(athen_agent::toolbox::ToolboxPromptInfo::load().await)
                 .shell_kind(athen_agent::detect_shell_kind().await);
-            if !images.is_empty() {
-                builder = builder.initial_user_images(images.clone());
+            // Stack composer-attached user images on top of any images
+            // surfaced from arc attachments (currently surfaced_images is
+            // typically empty for upload-only flows because the upload chip
+            // for image MIMEs goes through `composerImages`, but PDFs which
+            // are surfaced as text have an empty image list).
+            let mut combined_images = images.clone();
+            combined_images.extend(surfaced_images);
+            if !combined_images.is_empty() {
+                builder = builder.initial_user_images(combined_images);
             }
             let executor = builder.build().map_err(|e| {
                 let raw = e.to_string();
@@ -1603,14 +1662,18 @@ pub async fn send_message(
                 format_user_error(&raw)
             })?;
 
-            // Create a task for the executor with the user's message.
+            // Create a task for the executor with the user's message. Uses
+            // `executor_message` (= message + optional surfacing prelude),
+            // not the bare `message` — the arc-persisted version already
+            // wrote the bare `message` above, so the surfacing only travels
+            // to the LLM, not to the user-visible history.
             let task = Task {
                 id: Uuid::new_v4(),
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
                 source_event: None,
                 domain: DomainType::Base,
-                description: message.clone(),
+                description: executor_message,
                 priority: TaskPriority::Normal,
                 status: TaskStatus::InProgress,
                 risk_score: None,
