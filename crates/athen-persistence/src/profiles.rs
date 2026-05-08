@@ -937,7 +937,14 @@ mod tests {
         match &coder.tool_selection {
             ToolSelection::Groups(groups) => {
                 for required in [
-                    "shell", "read", "edit", "write", "grep", "list", "memory", "install",
+                    "shell",
+                    "read",
+                    "edit",
+                    "write",
+                    "grep",
+                    "list",
+                    "memory",
+                    "install",
                     "uninstall",
                 ] {
                     assert!(

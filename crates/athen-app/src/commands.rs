@@ -2150,47 +2150,48 @@ pub(crate) async fn execute_approved_task(
     // mid-stream `Role::System` messages but now folds into the leading
     // system message via `external_system_suffix` so strict chat
     // templates (Qwen, Llama) accept it.
-    let (context, compaction_suffix): (Vec<ChatMessage>, String) =
-        if let Some(ref compactor) = ctx.compactor {
-            match compactor
-                .prepare_context(
-                    &ctx.active_arc_id,
-                    crate::compaction::DEFAULT_MODEL_WINDOW_TOKENS,
-                    crate::compaction::DEFAULT_TARGET_TOKENS,
-                )
-                .await
-            {
-                Ok(view) => crate::compaction::view_to_messages(&view),
-                Err(e) => {
-                    tracing::warn!(arc = %ctx.active_arc_id, error = %e, "compactor.prepare_context failed; using empty context");
-                    (Vec::new(), String::new())
-                }
+    let (context, compaction_suffix): (Vec<ChatMessage>, String) = if let Some(ref compactor) =
+        ctx.compactor
+    {
+        match compactor
+            .prepare_context(
+                &ctx.active_arc_id,
+                crate::compaction::DEFAULT_MODEL_WINDOW_TOKENS,
+                crate::compaction::DEFAULT_TARGET_TOKENS,
+            )
+            .await
+        {
+            Ok(view) => crate::compaction::view_to_messages(&view),
+            Err(e) => {
+                tracing::warn!(arc = %ctx.active_arc_id, error = %e, "compactor.prepare_context failed; using empty context");
+                (Vec::new(), String::new())
             }
-        } else if let Some(ref store) = ctx.arc_store {
-            let messages = match store.load_entries(&ctx.active_arc_id).await {
-                Ok(entries) => entries
-                    .into_iter()
-                    .filter(|e| e.entry_type == athen_persistence::arcs::EntryType::Message)
-                    .filter_map(|e| {
-                        let role = match e.source.as_str() {
-                            "user" => Role::User,
-                            "assistant" => Role::Assistant,
-                            "system" => Role::System,
-                            "tool" => Role::Tool,
-                            _ => return None,
-                        };
-                        Some(ChatMessage {
-                            role,
-                            content: MessageContent::Text(e.content),
-                        })
+        }
+    } else if let Some(ref store) = ctx.arc_store {
+        let messages = match store.load_entries(&ctx.active_arc_id).await {
+            Ok(entries) => entries
+                .into_iter()
+                .filter(|e| e.entry_type == athen_persistence::arcs::EntryType::Message)
+                .filter_map(|e| {
+                    let role = match e.source.as_str() {
+                        "user" => Role::User,
+                        "assistant" => Role::Assistant,
+                        "system" => Role::System,
+                        "tool" => Role::Tool,
+                        _ => return None,
+                    };
+                    Some(ChatMessage {
+                        role,
+                        content: MessageContent::Text(e.content),
                     })
-                    .collect(),
-                Err(_) => vec![],
-            };
-            (messages, String::new())
-        } else {
-            (vec![], String::new())
+                })
+                .collect(),
+            Err(_) => vec![],
         };
+        (messages, String::new())
+    } else {
+        (vec![], String::new())
+    };
 
     // `system_suffix` accumulates host-supplied volatile content that
     // used to ride as mid-stream `Role::System` messages. Strict chat
@@ -2959,47 +2960,48 @@ pub(crate) async fn execute_dispatched_task(
     // of mid-stream `Role::System` messages but now folds into the
     // leading system message via `external_system_suffix` so strict
     // chat templates (Qwen, Llama) accept it.
-    let (context, compaction_suffix): (Vec<ChatMessage>, String) =
-        if let Some(ref compactor) = ctx.compactor {
-            match compactor
-                .prepare_context(
-                    &arc_id,
-                    crate::compaction::DEFAULT_MODEL_WINDOW_TOKENS,
-                    crate::compaction::DEFAULT_TARGET_TOKENS,
-                )
-                .await
-            {
-                Ok(view) => crate::compaction::view_to_messages(&view),
-                Err(e) => {
-                    tracing::warn!(arc = %arc_id, error = %e, "compactor.prepare_context failed; using empty context");
-                    (Vec::new(), String::new())
-                }
+    let (context, compaction_suffix): (Vec<ChatMessage>, String) = if let Some(ref compactor) =
+        ctx.compactor
+    {
+        match compactor
+            .prepare_context(
+                &arc_id,
+                crate::compaction::DEFAULT_MODEL_WINDOW_TOKENS,
+                crate::compaction::DEFAULT_TARGET_TOKENS,
+            )
+            .await
+        {
+            Ok(view) => crate::compaction::view_to_messages(&view),
+            Err(e) => {
+                tracing::warn!(arc = %arc_id, error = %e, "compactor.prepare_context failed; using empty context");
+                (Vec::new(), String::new())
             }
-        } else if let Some(ref store) = ctx.arc_store {
-            let messages = match store.load_entries(&arc_id).await {
-                Ok(entries) => entries
-                    .into_iter()
-                    .filter(|e| e.entry_type == athen_persistence::arcs::EntryType::Message)
-                    .filter_map(|e| {
-                        let role = match e.source.as_str() {
-                            "user" => Role::User,
-                            "assistant" => Role::Assistant,
-                            "system" => Role::System,
-                            "tool" => Role::Tool,
-                            _ => return None,
-                        };
-                        Some(ChatMessage {
-                            role,
-                            content: MessageContent::Text(e.content),
-                        })
+        }
+    } else if let Some(ref store) = ctx.arc_store {
+        let messages = match store.load_entries(&arc_id).await {
+            Ok(entries) => entries
+                .into_iter()
+                .filter(|e| e.entry_type == athen_persistence::arcs::EntryType::Message)
+                .filter_map(|e| {
+                    let role = match e.source.as_str() {
+                        "user" => Role::User,
+                        "assistant" => Role::Assistant,
+                        "system" => Role::System,
+                        "tool" => Role::Tool,
+                        _ => return None,
+                    };
+                    Some(ChatMessage {
+                        role,
+                        content: MessageContent::Text(e.content),
                     })
-                    .collect(),
-                Err(_) => vec![],
-            };
-            (messages, String::new())
-        } else {
-            (vec![], String::new())
+                })
+                .collect(),
+            Err(_) => vec![],
         };
+        (messages, String::new())
+    } else {
+        (vec![], String::new())
+    };
 
     // `system_suffix` accumulates host-supplied volatile content that
     // used to ride as mid-stream `Role::System` messages. Strict chat

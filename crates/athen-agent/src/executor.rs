@@ -595,8 +595,10 @@ impl DefaultExecutor {
         tools: &[athen_core::tool::ToolDefinition],
         revealed: &HashSet<String>,
     ) -> String {
-        let revealed_tools: Vec<&athen_core::tool::ToolDefinition> =
-            tools.iter().filter(|t| revealed.contains(&t.name)).collect();
+        let revealed_tools: Vec<&athen_core::tool::ToolDefinition> = tools
+            .iter()
+            .filter(|t| revealed.contains(&t.name))
+            .collect();
         if revealed_tools.is_empty() {
             return String::new();
         }
@@ -2435,7 +2437,9 @@ mod tests {
         );
         // Sanity: the volatile marker really is at the END (no trailing
         // sections after it). RULES must come BEFORE the timestamp.
-        let rules_pos = a.find("RULES YOU MUST FOLLOW").expect("rules section present");
+        let rules_pos = a
+            .find("RULES YOU MUST FOLLOW")
+            .expect("rules section present");
         let date_pos = a.find(split).expect("volatile suffix present");
         assert!(
             rules_pos < date_pos,
