@@ -1,5 +1,5 @@
 Name:           athen
-Version:        0.1.2
+Version:        0.1.3
 Release:        1%{?dist}
 Summary:        Universal proactive AI agent (Tauri 2 desktop app)
 
@@ -91,6 +91,9 @@ rm %{buildroot}/Athen.desktop
 %{_datadir}/icons/hicolor/*/apps/athen-app.png
 
 %changelog
+* Fri May 08 2026 Alejandro Garcia <contact@alejandrogarcia.blog> - 0.1.3-1
+- Release 0.1.3
+
 * Thu May 07 2026 Alejandro Garcia <contact@alejandrogarcia.blog> - 0.1.2-1
 - Load models.toml at startup even when config.toml is absent (fixes
   empty-providers router build for users who only configured an LLM key).
