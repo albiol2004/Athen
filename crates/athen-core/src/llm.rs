@@ -206,6 +206,43 @@ impl ModelFamily {
         }
     }
 
+    /// Stable wire identifier — round-trips through configs, the
+    /// settings IPC layer, and the headless CLI's `--family` flag.
+    /// Matches the enum variant name verbatim.
+    pub fn wire_id(self) -> &'static str {
+        match self {
+            ModelFamily::Default => "Default",
+            ModelFamily::ClaudeOpus47 => "ClaudeOpus47",
+            ModelFamily::ClaudeSonnet46 => "ClaudeSonnet46",
+            ModelFamily::ClaudeHaiku45 => "ClaudeHaiku45",
+            ModelFamily::Gpt5 => "Gpt5",
+            ModelFamily::OpenAiO3 => "OpenAiO3",
+            ModelFamily::Gemini3Pro => "Gemini3Pro",
+            ModelFamily::DeepSeekV4Chat => "DeepSeekV4Chat",
+            ModelFamily::DeepSeekR1 => "DeepSeekR1",
+            ModelFamily::Qwen35Local => "Qwen35Local",
+            ModelFamily::Qwen36Local => "Qwen36Local",
+            ModelFamily::Gemma4Local => "Gemma4Local",
+            ModelFamily::KimiK26Cloud => "KimiK26Cloud",
+            ModelFamily::MiniMaxM25Cloud => "MiniMaxM25Cloud",
+            ModelFamily::Llama32Instruct => "Llama32Instruct",
+            ModelFamily::Llama33Instruct => "Llama33Instruct",
+            ModelFamily::Llama4Instruct => "Llama4Instruct",
+            ModelFamily::MistralLarge3 => "MistralLarge3",
+            ModelFamily::MagistralMedium => "MagistralMedium",
+            ModelFamily::Codestral2508 => "Codestral2508",
+            ModelFamily::DeepSeekV4Pro => "DeepSeekV4Pro",
+            ModelFamily::Qwen3CoderNext => "Qwen3CoderNext",
+            ModelFamily::Grok4 => "Grok4",
+        }
+    }
+
+    /// Inverse of `wire_id`. Returns `None` for unknown identifiers so
+    /// the caller can decide whether to fall back to `Default` or hard-error.
+    pub fn from_wire_id(s: &str) -> Option<Self> {
+        Self::all().iter().copied().find(|f| f.wire_id() == s)
+    }
+
     /// Every variant, in display order. Used by the provider-config UI to
     /// populate the family dropdown.
     pub fn all() -> &'static [ModelFamily] {
@@ -257,5 +294,27 @@ mod model_family_tests {
         for f in listed {
             assert!(seen.insert(*f), "duplicate family in all(): {:?}", f);
         }
+    }
+
+    #[test]
+    fn wire_id_round_trips_for_every_variant() {
+        for f in ModelFamily::all() {
+            let id = f.wire_id();
+            assert!(!id.is_empty(), "empty wire_id for {:?}", f);
+            assert_eq!(
+                ModelFamily::from_wire_id(id),
+                Some(*f),
+                "round-trip failed for {:?} (wire_id={id})",
+                f
+            );
+        }
+    }
+
+    #[test]
+    fn from_wire_id_rejects_unknown() {
+        assert_eq!(ModelFamily::from_wire_id(""), None);
+        assert_eq!(ModelFamily::from_wire_id("nope"), None);
+        // case-sensitive — wire ids match enum variant names exactly
+        assert_eq!(ModelFamily::from_wire_id("default"), None);
     }
 }

@@ -546,73 +546,8 @@ fn provider_config_to_info(id: &str, config: &ProviderConfig, active_id: &str) -
         is_active: id == active_id,
         supports_vision: config.supports_vision,
         supports_documents: config.supports_documents,
-        family: model_family_to_wire(config.family).to_string(),
+        family: config.family.wire_id().to_string(),
     }
-}
-
-/// Map a `ModelFamily` enum value to its stable wire string used by the
-/// frontend dropdown. Mirrors `parse_model_family` below.
-fn model_family_to_wire(family: athen_core::llm::ModelFamily) -> &'static str {
-    use athen_core::llm::ModelFamily;
-    match family {
-        ModelFamily::Default => "Default",
-        ModelFamily::ClaudeOpus47 => "ClaudeOpus47",
-        ModelFamily::ClaudeSonnet46 => "ClaudeSonnet46",
-        ModelFamily::ClaudeHaiku45 => "ClaudeHaiku45",
-        ModelFamily::Gpt5 => "Gpt5",
-        ModelFamily::OpenAiO3 => "OpenAiO3",
-        ModelFamily::Gemini3Pro => "Gemini3Pro",
-        ModelFamily::DeepSeekV4Chat => "DeepSeekV4Chat",
-        ModelFamily::DeepSeekR1 => "DeepSeekR1",
-        ModelFamily::Qwen35Local => "Qwen35Local",
-        ModelFamily::Qwen36Local => "Qwen36Local",
-        ModelFamily::Gemma4Local => "Gemma4Local",
-        ModelFamily::KimiK26Cloud => "KimiK26Cloud",
-        ModelFamily::MiniMaxM25Cloud => "MiniMaxM25Cloud",
-        ModelFamily::Llama32Instruct => "Llama32Instruct",
-        ModelFamily::Llama33Instruct => "Llama33Instruct",
-        ModelFamily::Llama4Instruct => "Llama4Instruct",
-        ModelFamily::MistralLarge3 => "MistralLarge3",
-        ModelFamily::MagistralMedium => "MagistralMedium",
-        ModelFamily::Codestral2508 => "Codestral2508",
-        ModelFamily::DeepSeekV4Pro => "DeepSeekV4Pro",
-        ModelFamily::Qwen3CoderNext => "Qwen3CoderNext",
-        ModelFamily::Grok4 => "Grok4",
-    }
-}
-
-/// Parse a wire string from the frontend back into the typed enum.
-/// Returns `None` for unknown strings; callers fall back to the existing
-/// (or default) family rather than erroring, so a stale frontend can't
-/// break Settings save.
-fn parse_model_family(s: &str) -> Option<athen_core::llm::ModelFamily> {
-    use athen_core::llm::ModelFamily;
-    Some(match s {
-        "Default" => ModelFamily::Default,
-        "ClaudeOpus47" => ModelFamily::ClaudeOpus47,
-        "ClaudeSonnet46" => ModelFamily::ClaudeSonnet46,
-        "ClaudeHaiku45" => ModelFamily::ClaudeHaiku45,
-        "Gpt5" => ModelFamily::Gpt5,
-        "OpenAiO3" => ModelFamily::OpenAiO3,
-        "Gemini3Pro" => ModelFamily::Gemini3Pro,
-        "DeepSeekV4Chat" => ModelFamily::DeepSeekV4Chat,
-        "DeepSeekR1" => ModelFamily::DeepSeekR1,
-        "Qwen35Local" => ModelFamily::Qwen35Local,
-        "Qwen36Local" => ModelFamily::Qwen36Local,
-        "Gemma4Local" => ModelFamily::Gemma4Local,
-        "KimiK26Cloud" => ModelFamily::KimiK26Cloud,
-        "MiniMaxM25Cloud" => ModelFamily::MiniMaxM25Cloud,
-        "Llama32Instruct" => ModelFamily::Llama32Instruct,
-        "Llama33Instruct" => ModelFamily::Llama33Instruct,
-        "Llama4Instruct" => ModelFamily::Llama4Instruct,
-        "MistralLarge3" => ModelFamily::MistralLarge3,
-        "MagistralMedium" => ModelFamily::MagistralMedium,
-        "Codestral2508" => ModelFamily::Codestral2508,
-        "DeepSeekV4Pro" => ModelFamily::DeepSeekV4Pro,
-        "Qwen3CoderNext" => ModelFamily::Qwen3CoderNext,
-        "Grok4" => ModelFamily::Grok4,
-        _ => return None,
-    })
 }
 
 /// One row in the family-dropdown catalog returned to the frontend.
@@ -636,7 +571,7 @@ pub async fn list_model_families() -> std::result::Result<Vec<ModelFamilyEntry>,
     Ok(ModelFamily::all()
         .iter()
         .map(|f| ModelFamilyEntry {
-            id: model_family_to_wire(*f),
+            id: f.wire_id(),
             label: f.display_label(),
             default_slug: athen_llm::quirks::seed::default_slug_for_family(*f),
         })
@@ -856,7 +791,8 @@ pub async fn save_provider(
     // settings save can't break for a stale frontend.
     let family_resolved = match family.as_deref() {
         Some(s) if !s.is_empty() => {
-            parse_model_family(s).unwrap_or_else(|| existing.map(|p| p.family).unwrap_or_default())
+            athen_core::llm::ModelFamily::from_wire_id(s)
+                .unwrap_or_else(|| existing.map(|p| p.family).unwrap_or_default())
         }
         _ => existing.map(|p| p.family).unwrap_or_default(),
     };

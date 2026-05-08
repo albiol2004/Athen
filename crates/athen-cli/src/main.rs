@@ -14,7 +14,7 @@ use athen_core::config::{AuthType, ProfileConfig};
 use athen_core::config_loader;
 use athen_core::error::Result;
 use athen_core::event::{EventKind, EventSource, NormalizedContent, SenseEvent};
-use athen_core::llm::{BudgetStatus, LlmRequest, LlmResponse, ModelProfile};
+use athen_core::llm::{BudgetStatus, LlmRequest, LlmResponse, ModelFamily, ModelProfile};
 use athen_core::risk::RiskLevel;
 use athen_core::task::{DomainType, Task, TaskPriority, TaskStatus};
 use athen_core::traits::agent::AgentExecutor;
@@ -153,11 +153,13 @@ fn build_openai_compat_router(
     base_url: String,
     model: String,
     api_key: Option<String>,
+    family: ModelFamily,
 ) -> Arc<DefaultLlmRouter> {
     let provider_id = "openai-compat".to_string();
     let mut provider = OpenAiCompatibleProvider::new(base_url)
         .with_model(model)
-        .with_provider_id(provider_id.clone());
+        .with_provider_id(provider_id.clone())
+        .with_family(family);
     if let Some(key) = api_key {
         provider = provider.with_api_key(key);
     }
@@ -201,10 +203,14 @@ fn print_usage() {
     println!("    --prompt <STR>     Prompt for headless one-shot execution.");
     println!("    --profile <ID>     Activate a seeded AgentProfile (e.g. 'coder', 'researcher')");
     println!("                       on the executor. Ignored when --prompt is absent.");
+    println!("    --family <ID>      Model-family wire ID for per-model quirks (e.g. 'Qwen35Local',");
+    println!("                       'DeepSeekR1', 'Llama4Instruct'). Overrides ATHEN_FAMILY.");
+    println!("                       Defaults to 'Default' (baseline structured-tool-call behavior).");
     println!();
     println!("HEADLESS MODE ENV VARS:");
     println!("    ATHEN_BASE_URL  (required)  e.g. http://localhost:8000/v1");
     println!("    ATHEN_MODEL     (required)  e.g. Qwen3.5-9B");
+    println!("    ATHEN_FAMILY    (optional)  e.g. Qwen35Local — see --family.");
     println!("    ATHEN_API_KEY   (optional)  Bearer token, if backend needs one");
     println!();
     println!("In headless mode the agent runs against the current working directory,");
@@ -287,6 +293,7 @@ async fn load_resolved_profile(
 async fn run_headless(
     prompt: String,
     profile_id: Option<String>,
+    family: ModelFamily,
 ) -> std::result::Result<(), (i32, String)> {
     // 1. Read required env vars.
     let base_url = match std::env::var("ATHEN_BASE_URL") {
@@ -320,7 +327,7 @@ async fn run_headless(
     };
 
     // 3. Build router (no coordinator, no risk gating — auto-approve).
-    let router = build_openai_compat_router(base_url, model, api_key);
+    let router = build_openai_compat_router(base_url, model, api_key, family);
 
     // 4. Build executor. cwd is implicit — the agent's filesystem tools operate
     //    on the harness's working directory.
@@ -432,13 +439,48 @@ async fn main() {
         Ok(v) => v,
         Err(msg) => {
             eprintln!("Error: {msg}");
-            eprintln!("Usage: athen-cli --prompt <PROMPT> [--profile <ID>]");
+            eprintln!("Usage: athen-cli --prompt <PROMPT> [--profile <ID>] [--family <ID>]");
             std::process::exit(2);
         }
     };
+    // Family selection: `--family <ID>` overrides `ATHEN_FAMILY`, which
+    // overrides `Default`. Unknown wire IDs hard-error so a benchmark run
+    // can't silently fall back to baseline behavior and look like a quirks
+    // regression.
+    let family_arg = match extract_flag(&args, "--family") {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("Error: {msg}");
+            eprintln!("Usage: athen-cli --prompt <PROMPT> [--profile <ID>] [--family <ID>]");
+            std::process::exit(2);
+        }
+    };
+    let family_str = family_arg.or_else(|| {
+        std::env::var("ATHEN_FAMILY")
+            .ok()
+            .filter(|s| !s.is_empty())
+    });
+    let family = match family_str.as_deref() {
+        None => ModelFamily::Default,
+        Some(s) => match ModelFamily::from_wire_id(s) {
+            Some(f) => f,
+            None => {
+                eprintln!("Error: unknown model family '{s}'.");
+                eprintln!(
+                    "Known wire IDs: {}",
+                    ModelFamily::all()
+                        .iter()
+                        .map(|f| f.wire_id())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                std::process::exit(2);
+            }
+        },
+    };
 
     if let Some(prompt) = prompt_arg {
-        match run_headless(prompt, profile_arg).await {
+        match run_headless(prompt, profile_arg, family).await {
             Ok(()) => std::process::exit(0),
             Err((code, msg)) => {
                 eprintln!("{msg}");
