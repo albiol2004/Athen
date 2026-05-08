@@ -158,10 +158,22 @@ pub enum ModelFamily {
     KimiK26Cloud,
     MiniMaxM25Cloud,
     Llama32Instruct,
+    Llama33Instruct,
     Llama4Instruct,
     MistralLarge3,
     MagistralMedium,
     Codestral2508,
+    /// DeepSeek V4 Pro (flagship MoE, 2026). Structured + control-char
+    /// repair. Add `with_family(DeepSeekR1)` if pointing at the thinking-mode
+    /// variant of the same endpoint.
+    DeepSeekV4Pro,
+    /// Qwen3-Coder Next (Feb 2026). Inline XML tool calls with a different
+    /// shape than Qwen3.5/3.6: `<TOOL_NAME><parameter=KEY>VAL</parameter></TOOL_NAME>`
+    /// instead of `<tool_call><function=NAME>...`.
+    Qwen3CoderNext,
+    /// xAI Grok 4 (Grok 4.3 lineage). 1M context, OpenAI-compat structured
+    /// tool calls, lenient template.
+    Grok4,
 }
 
 impl ModelFamily {
@@ -182,11 +194,15 @@ impl ModelFamily {
             ModelFamily::Gemma4Local => "Gemma 4 (local)",
             ModelFamily::KimiK26Cloud => "Kimi K2.6 cloud",
             ModelFamily::MiniMaxM25Cloud => "MiniMax M2.5 cloud",
-            ModelFamily::Llama32Instruct => "Llama 3.2 instruct",
-            ModelFamily::Llama4Instruct => "Llama 4 instruct",
+            ModelFamily::Llama32Instruct => "Llama 3.2 instruct (Vision / 70B class)",
+            ModelFamily::Llama33Instruct => "Llama 3.3 70B instruct",
+            ModelFamily::Llama4Instruct => "Llama 4 (Scout / Maverick)",
             ModelFamily::MistralLarge3 => "Mistral Large 3",
             ModelFamily::MagistralMedium => "Magistral Medium",
             ModelFamily::Codestral2508 => "Codestral 25.08",
+            ModelFamily::DeepSeekV4Pro => "DeepSeek V4 Pro",
+            ModelFamily::Qwen3CoderNext => "Qwen3-Coder Next",
+            ModelFamily::Grok4 => "xAI Grok 4",
         }
     }
 
@@ -209,10 +225,14 @@ impl ModelFamily {
             ModelFamily::KimiK26Cloud,
             ModelFamily::MiniMaxM25Cloud,
             ModelFamily::Llama32Instruct,
+            ModelFamily::Llama33Instruct,
             ModelFamily::Llama4Instruct,
             ModelFamily::MistralLarge3,
             ModelFamily::MagistralMedium,
             ModelFamily::Codestral2508,
+            ModelFamily::DeepSeekV4Pro,
+            ModelFamily::Qwen3CoderNext,
+            ModelFamily::Grok4,
         ]
     }
 }

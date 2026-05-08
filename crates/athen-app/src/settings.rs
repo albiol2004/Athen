@@ -570,10 +570,14 @@ fn model_family_to_wire(family: athen_core::llm::ModelFamily) -> &'static str {
         ModelFamily::KimiK26Cloud => "KimiK26Cloud",
         ModelFamily::MiniMaxM25Cloud => "MiniMaxM25Cloud",
         ModelFamily::Llama32Instruct => "Llama32Instruct",
+        ModelFamily::Llama33Instruct => "Llama33Instruct",
         ModelFamily::Llama4Instruct => "Llama4Instruct",
         ModelFamily::MistralLarge3 => "MistralLarge3",
         ModelFamily::MagistralMedium => "MagistralMedium",
         ModelFamily::Codestral2508 => "Codestral2508",
+        ModelFamily::DeepSeekV4Pro => "DeepSeekV4Pro",
+        ModelFamily::Qwen3CoderNext => "Qwen3CoderNext",
+        ModelFamily::Grok4 => "Grok4",
     }
 }
 
@@ -599,10 +603,14 @@ fn parse_model_family(s: &str) -> Option<athen_core::llm::ModelFamily> {
         "KimiK26Cloud" => ModelFamily::KimiK26Cloud,
         "MiniMaxM25Cloud" => ModelFamily::MiniMaxM25Cloud,
         "Llama32Instruct" => ModelFamily::Llama32Instruct,
+        "Llama33Instruct" => ModelFamily::Llama33Instruct,
         "Llama4Instruct" => ModelFamily::Llama4Instruct,
         "MistralLarge3" => ModelFamily::MistralLarge3,
         "MagistralMedium" => ModelFamily::MagistralMedium,
         "Codestral2508" => ModelFamily::Codestral2508,
+        "DeepSeekV4Pro" => ModelFamily::DeepSeekV4Pro,
+        "Qwen3CoderNext" => ModelFamily::Qwen3CoderNext,
+        "Grok4" => ModelFamily::Grok4,
         _ => return None,
     })
 }

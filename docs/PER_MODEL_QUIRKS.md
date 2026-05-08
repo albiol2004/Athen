@@ -203,37 +203,173 @@ Result:
 This makes adding a new model a one-line PR (new row in the seed
 table + a UI label) rather than a parser change.
 
-## 5. Seed table (latest models, 2026-05)
+## 5. Seed table (the wire-format families the code knows about)
 
-Initial entries cover the latest of each family the research covered.
-Older versions (Qwen 2.x, Llama 2/3, Mistral 7B v0.1, DeepSeek V2)
-land via PR on demand per the "latest first, backwards on community
-feedback" rule.
+The code carries one row per **wire format**, not per model SKU. A user
+running any GPT-5.x chat model picks `Gpt5`; the slug field is where
+they put their exact model id. The full per-vendor SKU list lives in §5b.
 
-| Family preset (UI label) | Default slug | tool_extraction | reasoning_surface | template_strictness | tool_arg_repair | other |
-|---|---|---|---|---|---|---|
-| Claude Opus 4.7 | `claude-opus-4-7` | Structured | NativeContentBlock | Lenient | — | — |
-| Claude Sonnet 4.6 | `claude-sonnet-4-6` | Structured | NativeContentBlock | Lenient | — | — |
-| Claude Haiku 4.5 | `claude-haiku-4-5` | Structured | NativeContentBlock | Lenient | — | — |
-| GPT-5 | `gpt-5` | Structured | HiddenServerSide | Lenient | — | — |
-| OpenAI o3 | `o3` | Structured | HiddenServerSide | Lenient | — | — |
-| Gemini 3 Pro | `gemini-3-pro` | Structured | NativeContentBlock | Lenient | — | — |
-| DeepSeek-V4 chat | `deepseek-chat` | Structured | None | Lenient | ControlCharsToUnicodeEscape | — |
-| DeepSeek-R1 reasoner | `deepseek-reasoner` | Structured | SeparateField | Lenient | ControlCharsToUnicodeEscape | echo_reasoning_on_tool_turn |
-| Qwen 3.5 (local) | `qwen3.5-9b-instruct` | InlineXmlQwenStyle | InlineThinkTags | SystemMustBeFirst | — | — |
-| Qwen 3.6 (local) | `qwen3.6-27b-instruct` | InlineXmlQwenStyle | InlineThinkTags | SystemMustBeFirst | — | — |
-| Gemma 4 (local) | `gemma-4-27b-it` | Structured | InlineThinkTags | SystemMustBeFirst | UnescapeDoubleEncodedJsonArrays | system_message_required |
-| Kimi K2.6 cloud | `kimi-k2-6` | Structured | SeparateField | Lenient | — | — |
-| MiniMax M2.5 cloud | `minimax-m2-5` | InlineXmlVendorTagged("minimax") | InlineThinkTags | Lenient | — | — |
-| Llama 3.2 instruct | `llama-3.2-90b-instruct` | InlineJsonLlama | None | Lenient | — | — |
-| Llama 4 instruct | `llama-4-maverick-instruct` | InlineJsonLlama | None | Lenient | — | — |
-| Mistral Large 3 | `mistral-large-latest` | Structured (cloud) / SpecialTokenBlock("[TOOL_CALLS]") (local) | None | SystemAbsorbedIntoUser | — | — |
-| Magistral Medium | `magistral-medium-latest` | Structured | InlineThinkTags | SystemAbsorbedIntoUser | — | — |
-| Codestral 25.08 | `codestral-latest` | Structured | None | SystemAbsorbedIntoUser | — | — |
-| **(Default — fallback)** | _whatever_ | Structured | None | Lenient | — | — |
+Last verified: **2026-05-08** (8-agent vendor sweep + Anthropic / OpenAI /
+Google / DeepSeek / Qwen / Llama / Mistral docs).
 
-The default row is the safety net: any slug whose family the user
-hasn't picked falls through to it and reproduces today's behavior.
+| Family preset (code) | UI label | Default slug | tool_extraction | reasoning_surface | template_strictness | tool_arg_repair | sub-flags |
+|---|---|---|---|---|---|---|---|
+| `ClaudeOpus47` | Claude Opus 4.7 | `claude-opus-4-7` | Structured | NativeContentBlock | Lenient | — | — |
+| `ClaudeSonnet46` | Claude Sonnet 4.6 | `claude-sonnet-4-6` | Structured | NativeContentBlock | Lenient | — | — |
+| `ClaudeHaiku45` | Claude Haiku 4.5 | `claude-haiku-4-5` | Structured | None | Lenient | — | — |
+| `Gpt5` | GPT-5 chat (5 / 5.4 / 5.5 family) | `gpt-5.5` | Structured | None | Lenient | — | — |
+| `OpenAiO3` | OpenAI o-series (o3, o4-mini) | `o4-mini` | Structured | HiddenServerSide | Lenient | — | — |
+| `Gemini3Pro` | Gemini 3 / 3.1 Pro / Deep Think | `gemini-3.1-pro` | Structured | NativeContentBlock | Lenient | — | — |
+| `DeepSeekV4Chat` | DeepSeek V4 chat (V4-Flash) | `deepseek-v4-flash` | Structured | None | Lenient | ControlCharsToUnicodeEscape | — |
+| `DeepSeekV4Pro` | DeepSeek V4 Pro | `deepseek-v4-pro` | Structured | None | Lenient | ControlCharsToUnicodeEscape | — |
+| `DeepSeekR1` | DeepSeek-R1 / V4 thinking mode | `deepseek-reasoner` | Structured | SeparateField | Lenient | ControlCharsToUnicodeEscape | echo_reasoning_on_tool_turn |
+| `Qwen35Local` | Qwen 3.5 (local) | `qwen3.5-9b-instruct` | InlineXmlQwenStyle | InlineThinkTags | SystemMustBeFirst | — | — |
+| `Qwen36Local` | Qwen 3.6 (local) | `qwen3.6-27b-instruct` | InlineXmlQwenStyle | InlineThinkTags | SystemMustBeFirst | — | — |
+| `Qwen3CoderNext` | Qwen3-Coder Next | `Qwen/Qwen3-Coder-Next` | InlineXmlQwenStyle [a] | InlineThinkTags | SystemMustBeFirst | — | — |
+| `Gemma4Local` | Gemma 4 (local) | `gemma-4-27b-it` | Structured [b] | InlineThinkTags | SystemMustBeFirst | UnescapeDoubleEncodedJsonArrays | system_message_required |
+| `KimiK26Cloud` | Kimi K2.6 cloud | `kimi-k2-6` | Structured | SeparateField | Lenient | — | — |
+| `MiniMaxM25Cloud` | MiniMax M2.5 cloud | `minimax-m2-5` | InlineXmlVendorTagged("minimax") | InlineThinkTags | Lenient | — | — |
+| `Llama32Instruct` | Llama 3.2 (Vision / 70B class) | `llama-3.2-90b-vision-instruct` | InlineJsonLlama | None | Lenient | — | — |
+| `Llama33Instruct` | Llama 3.3 70B instruct | `meta-llama/Llama-3.3-70B-Instruct` | InlineJsonLlama | None | Lenient | — | — |
+| `Llama4Instruct` | Llama 4 (Scout / Maverick) | `llama-4-maverick-17b-128e-instruct` | InlinePythonicLlama | None | Lenient | — | — |
+| `MistralLarge3` | Mistral Large 3 | `mistral-large-latest` | Structured | None | SystemAbsorbedIntoUser | — | — |
+| `MagistralMedium` | Magistral Medium | `magistral-medium-latest` | Structured | InlineThinkTags | SystemAbsorbedIntoUser | — | — |
+| `Codestral2508` | Codestral 25.08 | `codestral-latest` | Structured | None | SystemAbsorbedIntoUser | — | — |
+| `Grok4` | xAI Grok 4 | `grok-4` | Structured | None | Lenient | — | — |
+| `Default` | _(fallback)_ | _whatever_ | Structured | None | Lenient | — | — |
+
+Notes:
+- **[a]** Qwen3-Coder Next emits `<TOOL_NAME>...<parameter=KEY>VAL</parameter></TOOL_NAME>`
+  (tool name as the wrapper tag) instead of the standard `<tool_call><function=NAME>...`.
+  Today this rides on the same extractor as a best-effort fallback; a
+  dedicated `InlineXmlQwenCoderStyle` strategy is tracked but not yet
+  implemented — open a PR if you hit a real Qwen3-Coder payload that
+  doesn't extract.
+- **[b]** Gemma 4's tool-call wire format is contested: Anthropic-style
+  `<|tool_call>...<tool_call|>` special tokens have been observed when
+  running Gemma 4 via Ollama with `--functions`; the official Google
+  guide describes the same format. Athen currently treats Gemma 4 as
+  `Structured` because the Ollama OpenAI-compat shim usually parses the
+  special tokens before they reach us. Revisit if a user reports raw
+  `<|tool_call>` markup leaking into responses.
+
+The `Default` row is the safety net: any provider whose user hasn't
+picked a family falls through to it and reproduces today's OpenAI-compat
+baseline behavior.
+
+## 5b. Per-vendor model registry
+
+Every shipping API SKU we know about, mapped to the family in §5. The
+slug column shows the **canonical 2026 slug**; deprecated aliases are
+noted. When a vendor ships a new model with the same wire format,
+update this table, leave the family unchanged, and users edit the slug
+field in Settings to opt in.
+
+### Anthropic Claude
+
+| Model | Canonical slug | Maps to family | Notes |
+|---|---|---|---|
+| Claude Opus 4.7 | `claude-opus-4-7` | `ClaudeOpus47` | Flagship reasoning, 1M ctx, adaptive thinking required |
+| Claude Sonnet 4.6 | `claude-sonnet-4-6` | `ClaudeSonnet46` | Speed + intelligence, 1M ctx, adaptive thinking |
+| Claude Haiku 4.5 | `claude-haiku-4-5` (alias `-20251001`) | `ClaudeHaiku45` | Cost-optimized, 200k ctx, **no extended thinking** |
+| Claude Opus 4.6 (legacy) | `claude-opus-4-6` | `ClaudeOpus47` | Migrate to 4.7; same wire format |
+| Claude Sonnet 4.5 (legacy) | `claude-sonnet-4-5-20250929` | `ClaudeSonnet46` | Same wire format |
+| Claude Opus 4.5 (legacy) | `claude-opus-4-5-20251101` | `ClaudeOpus47` | Same wire format |
+| Claude Mythos Preview | `claude-mythos-preview` | `ClaudeOpus47` | Invitation-only; defensive cybersecurity focus |
+
+### OpenAI
+
+| Model | Canonical slug | Maps to family | Notes |
+|---|---|---|---|
+| GPT-5.5 | `gpt-5.5` | `Gpt5` | Current default flagship (Apr 2026); 1M ctx |
+| GPT-5.5 Pro | `gpt-5.5-pro` | `Gpt5` | Responses API only; extended compute |
+| GPT-5.4 | `gpt-5.4` | `Gpt5` | Lower cost frontier, enhanced vision |
+| GPT-5.4 Mini | `gpt-5.4-mini` | `Gpt5` | Production fast-path |
+| GPT-5.3-Codex | `gpt-5.3-codex` | `Gpt5` | Agentic coding specialization |
+| o4-mini | `o4-mini` | `OpenAiO3` | Small reasoning model; 50% o3-mini cost |
+| o3 | `o3` | `OpenAiO3` | Advanced reasoning; CoT persists across tool calls |
+| o3-mini (deprecated) | `o3-mini` | `OpenAiO3` | Superseded by o4-mini |
+
+### Google Gemini
+
+| Model | Canonical slug | Maps to family | Notes |
+|---|---|---|---|
+| Gemini 3.1 Pro | `gemini-3.1-pro-preview` | `Gemini3Pro` | Flagship; 1–2M ctx; adaptive thinking |
+| Gemini 3.1 Deep Think | `gemini-3.1-deep-think` | `Gemini3Pro` | Early access; PhD-level math/science |
+| Gemini 3 Flash | `gemini-3-flash-preview` | `Default` | Fast tier; no thinking surface |
+| Gemini 3.1 Flash-Lite | `gemini-3.1-flash-lite` | `Default` | Ultra-low-latency; high-volume |
+| Gemini 3.1 Flash Live | `gemini-3.1-flash-live-preview` | `Default` | Real-time streaming dialogue |
+| Gemini 2.5 Pro (legacy) | `gemini-2.5-pro` | `Default` | Mature predecessor; reasoning hidden |
+| Gemini 2.5 Flash (legacy) | `gemini-2.5-flash` | `Default` | Best price/perf prior gen |
+
+### DeepSeek
+
+| Model | Canonical slug | Maps to family | Notes |
+|---|---|---|---|
+| DeepSeek V4 Pro | `deepseek-v4-pro` | `DeepSeekV4Pro` | Flagship MoE (1.6T / 49B active); 1M ctx |
+| DeepSeek V4 Flash | `deepseek-v4-flash` | `DeepSeekV4Chat` | Cost-efficient (284B / 13B active); 1M ctx |
+| (Both above with thinking enabled) | same slug + `thinking: true` | `DeepSeekR1` | Reasoning surfaces as `reasoning_content`; must be echoed on tool turns |
+| DeepSeek-V4 chat (BC alias) | `deepseek-chat` | `DeepSeekV4Chat` | Backward-compatible alias for V4 Flash; deprecated 2026-07-24 |
+| DeepSeek reasoner (BC alias) | `deepseek-reasoner` | `DeepSeekR1` | Backward-compatible alias for V4 Flash thinking-mode; deprecated 2026-07-24 |
+| DeepSeek-R1 (open weights) | (HuggingFace) | `DeepSeekR1` | Self-hosted; same wire shape |
+
+### Qwen (local / open-weights)
+
+| Model | HF slug | Maps to family | Notes |
+|---|---|---|---|
+| Qwen 3.5 (4B/9B/27B/MoE) | `Qwen/Qwen3.5-{SIZE}` | `Qwen35Local` | Hermes-JSON in `<tool_call>`; multimodal |
+| Qwen 3.6 (27B/35B-A3B) | `Qwen/Qwen3.6-{SIZE}` | `Qwen36Local` | Same wire format as 3.5; MoE variant |
+| Qwen3-Coder Next | `Qwen/Qwen3-Coder-Next` | `Qwen3CoderNext` | 80B MoE / 3B active; **different XML shape** ([a] in §5) |
+| Qwen-VL (vision) | `Qwen/Qwen3.5-VL-*` | `Qwen35Local` | Multimodal variant; same tool-call format |
+
+### Meta Llama
+
+| Model | HF / cloud slug | Maps to family | Notes |
+|---|---|---|---|
+| Llama 4 Scout 17B-16E | `llama-4-scout-17b-16e-instruct` | `Llama4Instruct` | MoE (16 experts); pythonic tool calls |
+| Llama 4 Maverick 17B-128E | `llama-4-maverick-17b-128e-instruct` | `Llama4Instruct` | MoE (128 experts); pythonic tool calls |
+| Llama 3.3 70B | `meta-llama/Llama-3.3-70B-Instruct` | `Llama33Instruct` | Pure text successor to 3.1; JSON arrays |
+| Llama 3.2 11B / 90B Vision | `meta-llama/Llama-3.2-{11B,90B}-Vision-Instruct` | `Llama32Instruct` | JSON arrays; tool-calling disables when images present |
+| Llama 3.2 1B / 3B | `meta-llama/Llama-3.2-{1B,3B}-Instruct` | `Llama4Instruct` [c] | **Pythonic** tool calls — same shape as Llama 4 |
+
+[c] Small Llama 3.2 (1B / 3B) reuses the `Llama4Instruct` family because
+both emit pythonic `[func(p=v)]`. Eventually a dedicated `Llama32Edge`
+row would clarify intent, but the wire format is identical so today
+this is fine.
+
+### Mistral
+
+| Model | Slug | Maps to family | Notes |
+|---|---|---|---|
+| Mistral Large 3 | `mistral-large-latest` (`-2512`) | `MistralLarge3` | 256k ctx; 41B active / 675B total MoE |
+| Mistral Small 4 | `mistral-small-4-latest` | `MagistralMedium` | Unified reasoning + vision + code; `<think>` tags |
+| Mistral Medium 3.5 | `mistral-medium-3.5-latest` | `MagistralMedium` | 8x cheaper than Large; reasoning + agents |
+| Magistral Medium | `magistral-medium-latest` (`-2509`) | `MagistralMedium` | Reasoning-tuned; tokenized `<think>` |
+| Codestral 25.08 | `codestral-latest` (`-2508`) | `Codestral2508` | Code-specific; agentic workflows |
+| Ministral (3B / 8B / 14B) | `ministral-{SIZE}-2512` | `MistralLarge3` | Edge variants; same wire format |
+| Pixtral / Devstral | (integrated in Small 4) | `MagistralMedium` | Vision / code specialists merged into Small 4 |
+
+### Other
+
+| Model | Slug | Maps to family | Notes |
+|---|---|---|---|
+| Kimi K2.6 cloud | `kimi-k2-6` | `KimiK26Cloud` | `reasoning_content` field; preserve-thinking |
+| Kimi K2 Thinking | `kimi-k2-thinking` | `KimiK26Cloud` | Explicit thinking mode |
+| MiniMax M2.5 | `minimax-m2-5` | `MiniMaxM25Cloud` | `<minimax:tool_call>` namespaced XML when not via vLLM |
+| Gemma 4 (Apache 2.0) | `gemma-4-27b-it` | `Gemma4Local` | Special-token tool format; verify on report |
+| xAI Grok 4 | `grok-4` | `Grok4` | 1M ctx; OpenAI-compat structured |
+| Yi-Lightning | `yi-lightning` | `Default` | OpenAI-compat baseline; no special quirks |
+| Nemotron 70B | `llama-3.1-nemotron-70b-instruct` | `Llama33Instruct` | Llama-3.1 base; reuse Llama family |
+
+**Skipped (different API entirely, not OpenAI-compat agent backends):**
+Cohere Command (native `tool_plan`/`tool_calls` shape), Perplexity Sonar
+(built-in tools only, no custom function calling), Inflection Pi (no
+public API yet).
+
+**Updating this table:** when a vendor ships a new model with the same
+wire format as a row above, just append a new line under that vendor.
+When a new wire format appears, see §7 (adding a new family) and §8
+(adding a new axis).
 
 ## 6. Where this plugs in
 
