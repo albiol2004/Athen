@@ -17,6 +17,7 @@ use athen_core::traits::llm::LlmProvider;
 use crate::providers::openai::{
     parse_sse_chunks, parse_tool_arguments, take_complete_lines, ToolCallAccumulator,
 };
+use crate::quirks::{self, seed, ModelQuirks};
 
 const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
 const DEFAULT_MODEL: &str = "deepseek-chat";
@@ -27,6 +28,11 @@ pub struct DeepSeekProvider {
     default_model: String,
     client: Client,
     base_url: String,
+    /// Resolved at construction from the user-selected `ModelFamily`.
+    /// Defaults to the `DeepSeekV4Chat` quirks (control-char repair, no
+    /// reasoning); switch to `DeepSeekR1` to enable reasoning_content
+    /// promotion + echo-on-tool-turn.
+    quirks: ModelQuirks,
 }
 
 impl DeepSeekProvider {
@@ -37,7 +43,19 @@ impl DeepSeekProvider {
             default_model: DEFAULT_MODEL.to_string(),
             client: Client::new(),
             base_url: DEFAULT_BASE_URL.to_string(),
+            // DeepSeek-V4 chat is the typical default for this provider.
+            // Callers can override via `with_family(ModelFamily::DeepSeekR1)`
+            // if they're pointed at the reasoner endpoint.
+            quirks: seed::quirks_for_family(ModelFamily::DeepSeekV4Chat),
         }
+    }
+
+    /// Set the model family. The default constructor seeds
+    /// `DeepSeekV4Chat`; switch to `DeepSeekR1` when pointing at the
+    /// reasoner endpoint so reasoning_content is promoted and echoed.
+    pub fn with_family(mut self, family: ModelFamily) -> Self {
+        self.quirks = seed::quirks_for_family(family);
+        self
     }
 
     /// Override the base URL (useful for testing or proxies).
@@ -299,7 +317,7 @@ impl LlmProvider for DeepSeekProvider {
             }
         };
 
-        Ok(LlmResponse {
+        let mut response = LlmResponse {
             content,
             reasoning_content,
             model_used: api_response.model,
@@ -307,7 +325,9 @@ impl LlmProvider for DeepSeekProvider {
             usage,
             tool_calls,
             finish_reason,
-        })
+        };
+        quirks::apply_to_response(&self.quirks, &mut response);
+        Ok(response)
     }
 
     async fn complete_streaming(&self, request: &LlmRequest) -> Result<LlmStream> {

@@ -52,6 +52,18 @@ impl LlamaCppProvider {
         Self::new(DEFAULT_BASE_URL.to_string(), model)
     }
 
+    /// Set the model family — passes through to the inner OpenAI-compat
+    /// provider so quirks (Qwen XML, Gemma double-encoded JSON, etc) are
+    /// applied to llama.cpp responses. See `quirks::seed`.
+    pub fn with_family(mut self, family: ModelFamily) -> Self {
+        self.inner = std::mem::replace(
+            &mut self.inner,
+            OpenAiCompatibleProvider::new(self.base_url.clone()),
+        )
+        .with_family(family);
+        self
+    }
+
     /// Override the HTTP client (useful for testing).
     pub fn with_client(mut self, client: Client) -> Self {
         self.client = client.clone();

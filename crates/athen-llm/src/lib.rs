@@ -6,4 +6,5 @@
 pub mod budget;
 pub mod embeddings;
 pub mod providers;
+pub mod quirks;
 pub mod router;

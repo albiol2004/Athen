@@ -10,6 +10,8 @@ use athen_core::error::{AthenError, Result};
 use athen_core::llm::*;
 use athen_core::traits::llm::LlmProvider;
 
+use crate::quirks::{self, seed, ModelQuirks};
+
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
@@ -21,6 +23,11 @@ pub struct AnthropicProvider {
     base_url: String,
     supports_vision: bool,
     supports_documents: bool,
+    /// Quirks profile. Anthropic's wire format already exposes thinking as
+    /// native typed content blocks, so the `apply_to_response` pipeline is
+    /// a no-op for Claude families — kept for consistency with the other
+    /// providers.
+    quirks: ModelQuirks,
 }
 
 impl AnthropicProvider {
@@ -33,7 +40,18 @@ impl AnthropicProvider {
             base_url: DEFAULT_BASE_URL.to_string(),
             supports_vision: false,
             supports_documents: false,
+            // Default quirks; callers pick a Claude family via with_family
+            // for symmetry — the values don't affect Claude parsing today.
+            quirks: ModelQuirks::default(),
         }
+    }
+
+    /// Set the model family. Cosmetic for Anthropic (Claude exposes
+    /// thinking as native typed blocks, no inline extraction needed) but
+    /// keeps the construction surface uniform across providers.
+    pub fn with_family(mut self, family: ModelFamily) -> Self {
+        self.quirks = seed::quirks_for_family(family);
+        self
     }
 
     /// Mark the configured `default_model` as vision-capable. Caller is
@@ -204,7 +222,7 @@ impl LlmProvider for AnthropicProvider {
             )),
         };
 
-        Ok(LlmResponse {
+        let mut response = LlmResponse {
             content,
             reasoning_content: None,
             model_used: api_response.model,
@@ -212,7 +230,9 @@ impl LlmProvider for AnthropicProvider {
             usage,
             tool_calls,
             finish_reason,
-        })
+        };
+        quirks::apply_to_response(&self.quirks, &mut response);
+        Ok(response)
     }
 
     async fn complete_streaming(&self, request: &LlmRequest) -> Result<LlmStream> {

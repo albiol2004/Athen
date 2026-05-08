@@ -126,3 +126,116 @@ pub struct BudgetStatus {
 
 /// Type alias for LLM streaming response
 pub type LlmStream = Pin<Box<dyn Stream<Item = Result<LlmChunk>> + Send>>;
+
+/// User-selected model family. Drives the per-model quirks lookup
+/// (`athen-llm::quirks`) and the default slug pre-fill in provider config UI.
+///
+/// We do **not** auto-detect family from the slug: the user picks the family
+/// in the dropdown and edits the slug independently, so a same-format model
+/// version drop ships same-day without a code change. See
+/// `docs/PER_MODEL_QUIRKS.md` §4.
+///
+/// `Default` is the safety net: any provider config whose user has not
+/// explicitly selected a family falls through to `Default`, which the quirks
+/// table maps to "trust structured fields, no extraction, no repair" —
+/// reproducing today's behavior for every unprofiled model.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum ModelFamily {
+    /// Catch-all preset for any model the user hasn't profiled.
+    #[default]
+    Default,
+    ClaudeOpus47,
+    ClaudeSonnet46,
+    ClaudeHaiku45,
+    Gpt5,
+    OpenAiO3,
+    Gemini3Pro,
+    DeepSeekV4Chat,
+    DeepSeekR1,
+    Qwen35Local,
+    Qwen36Local,
+    Gemma4Local,
+    KimiK26Cloud,
+    MiniMaxM25Cloud,
+    Llama32Instruct,
+    Llama4Instruct,
+    MistralLarge3,
+    MagistralMedium,
+    Codestral2508,
+}
+
+impl ModelFamily {
+    /// Human-readable label for UI dropdowns.
+    pub fn display_label(self) -> &'static str {
+        match self {
+            ModelFamily::Default => "Default (unknown / generic)",
+            ModelFamily::ClaudeOpus47 => "Claude Opus 4.7",
+            ModelFamily::ClaudeSonnet46 => "Claude Sonnet 4.6",
+            ModelFamily::ClaudeHaiku45 => "Claude Haiku 4.5",
+            ModelFamily::Gpt5 => "GPT-5",
+            ModelFamily::OpenAiO3 => "OpenAI o3",
+            ModelFamily::Gemini3Pro => "Gemini 3 Pro",
+            ModelFamily::DeepSeekV4Chat => "DeepSeek-V4 chat",
+            ModelFamily::DeepSeekR1 => "DeepSeek-R1 reasoner",
+            ModelFamily::Qwen35Local => "Qwen 3.5 (local)",
+            ModelFamily::Qwen36Local => "Qwen 3.6 (local)",
+            ModelFamily::Gemma4Local => "Gemma 4 (local)",
+            ModelFamily::KimiK26Cloud => "Kimi K2.6 cloud",
+            ModelFamily::MiniMaxM25Cloud => "MiniMax M2.5 cloud",
+            ModelFamily::Llama32Instruct => "Llama 3.2 instruct",
+            ModelFamily::Llama4Instruct => "Llama 4 instruct",
+            ModelFamily::MistralLarge3 => "Mistral Large 3",
+            ModelFamily::MagistralMedium => "Magistral Medium",
+            ModelFamily::Codestral2508 => "Codestral 25.08",
+        }
+    }
+
+    /// Every variant, in display order. Used by the provider-config UI to
+    /// populate the family dropdown.
+    pub fn all() -> &'static [ModelFamily] {
+        &[
+            ModelFamily::Default,
+            ModelFamily::ClaudeOpus47,
+            ModelFamily::ClaudeSonnet46,
+            ModelFamily::ClaudeHaiku45,
+            ModelFamily::Gpt5,
+            ModelFamily::OpenAiO3,
+            ModelFamily::Gemini3Pro,
+            ModelFamily::DeepSeekV4Chat,
+            ModelFamily::DeepSeekR1,
+            ModelFamily::Qwen35Local,
+            ModelFamily::Qwen36Local,
+            ModelFamily::Gemma4Local,
+            ModelFamily::KimiK26Cloud,
+            ModelFamily::MiniMaxM25Cloud,
+            ModelFamily::Llama32Instruct,
+            ModelFamily::Llama4Instruct,
+            ModelFamily::MistralLarge3,
+            ModelFamily::MagistralMedium,
+            ModelFamily::Codestral2508,
+        ]
+    }
+}
+
+#[cfg(test)]
+mod model_family_tests {
+    use super::*;
+
+    #[test]
+    fn default_is_the_fallback_variant() {
+        assert_eq!(ModelFamily::default(), ModelFamily::Default);
+    }
+
+    #[test]
+    fn every_variant_has_a_label_and_appears_in_all() {
+        let listed = ModelFamily::all();
+        for f in listed {
+            assert!(!f.display_label().is_empty());
+        }
+        // round-trip: every variant produced by `all()` should be unique
+        let mut seen = std::collections::HashSet::new();
+        for f in listed {
+            assert!(seen.insert(*f), "duplicate family in all(): {:?}", f);
+        }
+    }
+}

@@ -16,6 +16,8 @@ use athen_core::error::{AthenError, Result};
 use athen_core::llm::*;
 use athen_core::traits::llm::LlmProvider;
 
+use crate::quirks::{self, seed, ModelQuirks};
+
 const DEFAULT_BASE_URL: &str = "https://api.openai.com";
 const DEFAULT_MODEL: &str = "gpt-4o";
 
@@ -49,6 +51,12 @@ pub struct OpenAiCompatibleProvider {
     cost_estimator: Box<dyn CostEstimator>,
     supports_vision: bool,
     supports_documents: bool,
+    /// Resolved at construction from the user-selected `ModelFamily`.
+    /// Drives response post-processing (tool-call extraction, reasoning
+    /// promotion, arg repair). The default (`ModelFamily::Default`) yields
+    /// the OpenAI-baseline `ModelQuirks::default()` — every code path becomes
+    /// a no-op and behavior is byte-identical to the pre-quirks executor.
+    quirks: ModelQuirks,
 }
 
 impl OpenAiCompatibleProvider {
@@ -66,6 +74,7 @@ impl OpenAiCompatibleProvider {
             cost_estimator: Box::new(OpenAiCostEstimator),
             supports_vision: false,
             supports_documents: false,
+            quirks: ModelQuirks::default(),
         }
     }
 
@@ -120,6 +129,15 @@ impl OpenAiCompatibleProvider {
     /// Override the cost estimator (e.g. zero-cost for local providers).
     pub fn with_cost_estimator(mut self, estimator: Box<dyn CostEstimator>) -> Self {
         self.cost_estimator = estimator;
+        self
+    }
+
+    /// Set the model family. Resolves to a `ModelQuirks` profile via
+    /// `quirks::seed::quirks_for_family` and gates response post-processing.
+    /// `ModelFamily::Default` (the default) reproduces today's behavior for
+    /// any unprofiled model.
+    pub fn with_family(mut self, family: ModelFamily) -> Self {
+        self.quirks = seed::quirks_for_family(family);
         self
     }
 
@@ -376,7 +394,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
             }
         };
 
-        Ok(LlmResponse {
+        let mut response = LlmResponse {
             content,
             reasoning_content,
             model_used: api_response.model,
@@ -384,7 +402,9 @@ impl LlmProvider for OpenAiCompatibleProvider {
             usage,
             tool_calls,
             finish_reason,
-        })
+        };
+        quirks::apply_to_response(&self.quirks, &mut response);
+        Ok(response)
     }
 
     async fn complete_streaming(&self, request: &LlmRequest) -> Result<LlmStream> {

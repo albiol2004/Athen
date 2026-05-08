@@ -69,6 +69,18 @@ impl OllamaProvider {
         self
     }
 
+    /// Set the model family — passes through to the inner OpenAI-compat
+    /// provider so quirks (Qwen XML, Gemma double-encoded JSON, etc) are
+    /// applied to Ollama responses. See `quirks::seed`.
+    pub fn with_family(mut self, family: ModelFamily) -> Self {
+        self.inner = std::mem::replace(
+            &mut self.inner,
+            OpenAiCompatibleProvider::new(self.base_url.clone()),
+        )
+        .with_family(family);
+        self
+    }
+
     /// Read the current model name (for rebuilding the inner provider).
     fn inner_model(&self) -> String {
         // We don't have a getter on the inner provider, so we store
