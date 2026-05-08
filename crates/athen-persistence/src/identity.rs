@@ -88,8 +88,8 @@ impl SqliteIdentityStore {
         let cat = category.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            let applies_to_json =
-                serde_json::to_string(&cat.default_applies_to).map_err(AthenError::Serialization)?;
+            let applies_to_json = serde_json::to_string(&cat.default_applies_to)
+                .map_err(AthenError::Serialization)?;
             conn.execute(
                 "INSERT OR REPLACE INTO identity_categories \
                  (name, description, default_applies_to_json, sort_order, is_seed) \
@@ -120,18 +120,16 @@ fn seed_categories() -> Vec<IdentityCategory> {
     vec![
         IdentityCategory {
             name: "personality".into(),
-            description:
-                "Voice, warmth, refusal style, humor level. How Athen sounds to people."
-                    .into(),
+            description: "Voice, warmth, refusal style, humor level. How Athen sounds to people."
+                .into(),
             default_applies_to: vec![ProfileTag::Always],
             sort_order: 10,
             is_seed: true,
         },
         IdentityCategory {
             name: "rules".into(),
-            description:
-                "Hard constraints — 'never X', 'always Y'. Survives profile switches."
-                    .into(),
+            description: "Hard constraints — 'never X', 'always Y'. Survives profile switches."
+                .into(),
             default_applies_to: vec![ProfileTag::Always],
             sort_order: 20,
             is_seed: true,
@@ -145,9 +143,7 @@ fn seed_categories() -> Vec<IdentityCategory> {
         },
         IdentityCategory {
             name: "team".into(),
-            description:
-                "Org chart, business identity, escalation chain. For business use."
-                    .into(),
+            description: "Org chart, business identity, escalation chain. For business use.".into(),
             default_applies_to: vec![
                 ProfileTag::Profile("assistant".into()),
                 ProfileTag::Profile("outreach".into()),
@@ -158,10 +154,8 @@ fn seed_categories() -> Vec<IdentityCategory> {
     ]
 }
 
-const CATEGORY_COLS: &str =
-    "name, description, default_applies_to_json, sort_order, is_seed";
-const ENTRY_COLS: &str =
-    "id, category, body, applies_to_json, pinned, created_at, updated_at";
+const CATEGORY_COLS: &str = "name, description, default_applies_to_json, sort_order, is_seed";
+const ENTRY_COLS: &str = "id, category, body, applies_to_json, pinned, created_at, updated_at";
 
 fn read_category_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IdentityCategory> {
     let name: String = row.get(0)?;
@@ -171,11 +165,7 @@ fn read_category_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IdentityCatego
     let is_seed: i64 = row.get(4)?;
     let default_applies_to: Vec<ProfileTag> = serde_json::from_str(&default_applies_to_json)
         .map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(
-                2,
-                rusqlite::types::Type::Text,
-                Box::new(e),
-            )
+            rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e))
         })?;
     Ok(IdentityCategory {
         name,
@@ -198,30 +188,17 @@ fn read_entry_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(IdentityEntry, (
     let id = Uuid::parse_str(&id_str).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
     })?;
-    let applies_to: Vec<ProfileTag> =
-        serde_json::from_str(&applies_to_json).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(
-                3,
-                rusqlite::types::Type::Text,
-                Box::new(e),
-            )
-        })?;
+    let applies_to: Vec<ProfileTag> = serde_json::from_str(&applies_to_json).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     let created_at = chrono::DateTime::parse_from_rfc3339(&created_at)
         .map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(
-                5,
-                rusqlite::types::Type::Text,
-                Box::new(e),
-            )
+            rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e))
         })?
         .with_timezone(&chrono::Utc);
     let updated_at = chrono::DateTime::parse_from_rfc3339(&updated_at)
         .map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(
-                6,
-                rusqlite::types::Type::Text,
-                Box::new(e),
-            )
+            rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(e))
         })?
         .with_timezone(&chrono::Utc);
 
@@ -270,8 +247,7 @@ impl IdentityStore for SqliteIdentityStore {
         let name = name.to_string();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
-            let sql =
-                format!("SELECT {CATEGORY_COLS} FROM identity_categories WHERE name = ?1");
+            let sql = format!("SELECT {CATEGORY_COLS} FROM identity_categories WHERE name = ?1");
             let mut stmt = conn
                 .prepare(&sql)
                 .map_err(|e| AthenError::Other(format!("Prepare get_category: {e}")))?;
@@ -470,9 +446,7 @@ impl IdentityStore for SqliteIdentityStore {
             let matched: Vec<IdentityEntry> = entries
                 .iter()
                 .filter(|e| e.category == cat.name)
-                .filter(|e| {
-                    athen_core::identity::applies_to_profile(&e.applies_to, profile_id)
-                })
+                .filter(|e| athen_core::identity::applies_to_profile(&e.applies_to, profile_id))
                 .cloned()
                 .collect();
             if !matched.is_empty() {
@@ -542,7 +516,11 @@ mod tests {
     async fn upsert_and_list_entries() {
         let store = setup_store().await;
         let e1 = mk_entry("personality", "Be warm.", vec![ProfileTag::Always]);
-        let e2 = mk_entry("rules", "Never auto-send to legal@.", vec![ProfileTag::Always]);
+        let e2 = mk_entry(
+            "rules",
+            "Never auto-send to legal@.",
+            vec![ProfileTag::Always],
+        );
         store.upsert_entry(&e1).await.unwrap();
         store.upsert_entry(&e2).await.unwrap();
         let all = store.list_entries(None).await.unwrap();

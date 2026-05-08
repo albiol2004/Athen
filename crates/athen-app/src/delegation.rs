@@ -48,6 +48,10 @@ const DELEGATE_TOOL_NAME: &str = "delegate_to_agent";
 #[derive(Clone)]
 pub struct DelegationContext {
     pub profile_store: Arc<athen_persistence::profiles::SqliteProfileStore>,
+    /// Identity store for rendering the user's hand-maintained personality
+    /// / rules / knowledge / team block into the sub-agent's system prefix.
+    /// Optional because pre-identity tests may build a context without it.
+    pub identity_store: Option<Arc<athen_persistence::identity::SqliteIdentityStore>>,
     pub arc_store: athen_persistence::arcs::ArcStore,
     pub llm_router: Arc<tokio::sync::RwLock<Arc<athen_llm::router::DefaultLlmRouter>>>,
     /// The arc the *parent* agent is running under. Each delegation creates
@@ -316,12 +320,22 @@ async fn run_delegation(
         crate::compaction::resolve_provider_temperature(&cfg, &active_id)
     };
 
+    // Identity block follows the *sub-agent's* profile, not the parent's —
+    // a personal-assistant who delegates to coder gives the sub-agent the
+    // coding-style entries, not the personal-assistant ones.
+    let identity_block = crate::identity_render::render_identity_block(
+        ctx.identity_store.as_ref(),
+        &resolved.profile.id,
+    )
+    .await;
+
     let mut builder = AgentBuilder::new()
         .llm_router(exec_router)
         .tool_registry(sub_registry)
         .max_steps(30)
         .timeout(Duration::from_secs(180))
         .active_profile(resolved)
+        .identity_block(identity_block)
         .default_temperature(sampling_temperature);
     if let Some(ref dir) = ctx.tool_doc_dir {
         builder = builder.tool_doc_dir(dir.clone());

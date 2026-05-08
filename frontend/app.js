@@ -2862,6 +2862,7 @@ async function loadSettings() {
         await loadToolboxPackages();
         await loadGrants();
         await loadProfileManager();
+        await loadIdentityManager();
         await loadAttachmentPolicySettings();
     } catch (err) {
         console.error('Failed to load settings:', err);
@@ -3175,6 +3176,448 @@ async function saveProfileFromEditor() {
         showError(String(err));
     }
 }
+
+// ─── Identity ─────────────────────────────────────────────────────────
+//
+// User-editable identity store. Each entry is markdown body + applies_to
+// scope tags + pinned flag. Categories are user-editable too — the four
+// seeds (personality, rules, knowledge, team) ship pre-configured but can
+// be renamed, deleted, or extended.
+
+let identityCategories = [];
+let identityEntries = [];
+let identitySelectedCategory = null;
+
+// Rough char-to-token heuristic. Matches the chars/4 estimate the
+// compaction subsystem uses (athen-app::compaction). Identity is plain
+// English markdown; this estimate is conservative but consistent with
+// what the user sees in compaction warnings.
+function estimateTokens(text) {
+    if (!text) return 0;
+    return Math.ceil(text.length / 4);
+}
+
+async function loadIdentityManager() {
+    if (!invoke) return;
+    try {
+        const [cats, entries] = await Promise.all([
+            invoke('list_identity_categories'),
+            invoke('list_identity_entries', { category: null }),
+        ]);
+        identityCategories = cats || [];
+        identityEntries = entries || [];
+        // Preserve selection across reloads when possible; otherwise pick
+        // the first category so users always see something.
+        if (
+            !identitySelectedCategory ||
+            !identityCategories.find((c) => c.name === identitySelectedCategory)
+        ) {
+            identitySelectedCategory = identityCategories.length
+                ? identityCategories[0].name
+                : null;
+        }
+        renderIdentitySidebar();
+        renderIdentityDetail();
+        updateIdentityTokenFooter();
+    } catch (err) {
+        console.error('Failed to load identity store:', err);
+    }
+}
+
+function renderIdentitySidebar() {
+    const listEl = document.getElementById('identity-category-list');
+    if (!listEl) return;
+    listEl.innerHTML = '';
+    if (identityCategories.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'identity-detail-empty';
+        empty.textContent = 'No categories yet.';
+        listEl.appendChild(empty);
+        return;
+    }
+    for (const cat of identityCategories) {
+        const count = identityEntries.filter((e) => e.category === cat.name).length;
+        const item = document.createElement('div');
+        item.className = 'identity-category-item';
+        if (cat.is_seed) item.classList.add('seed');
+        if (cat.name === identitySelectedCategory) item.classList.add('selected');
+        item.innerHTML = `
+            <span class="identity-cat-name">${escapeHtml(cat.name)}</span>
+            <span class="identity-cat-count">(${count})</span>
+        `;
+        item.addEventListener('click', () => {
+            identitySelectedCategory = cat.name;
+            renderIdentitySidebar();
+            renderIdentityDetail();
+        });
+        listEl.appendChild(item);
+    }
+}
+
+function renderIdentityDetail() {
+    const detail = document.getElementById('identity-detail');
+    if (!detail) return;
+    if (!identitySelectedCategory) {
+        detail.innerHTML =
+            '<p class="setting-hint">Add a category to start defining identity.</p>';
+        return;
+    }
+    const cat = identityCategories.find((c) => c.name === identitySelectedCategory);
+    if (!cat) {
+        detail.innerHTML = '<p class="setting-hint">Category not found.</p>';
+        return;
+    }
+    detail.innerHTML = '';
+
+    const header = document.createElement('div');
+    header.className = 'identity-detail-header';
+    header.innerHTML = `
+        <h3>${escapeHtml(cat.name)}</h3>
+        <div class="identity-detail-header-actions">
+            <button data-action="edit-cat">Edit</button>
+            <button data-action="delete-cat" class="btn-danger">Delete</button>
+        </div>
+    `;
+    header.querySelector('[data-action="edit-cat"]').addEventListener('click', () =>
+        openIdentityCategoryModal('edit', cat),
+    );
+    header.querySelector('[data-action="delete-cat"]').addEventListener('click', () =>
+        deleteIdentityCategory(cat),
+    );
+    detail.appendChild(header);
+
+    if (cat.description) {
+        const desc = document.createElement('div');
+        desc.className = 'identity-detail-description';
+        desc.textContent = cat.description;
+        detail.appendChild(desc);
+    }
+
+    const entriesWrap = document.createElement('div');
+    entriesWrap.className = 'identity-entries';
+    const entries = identityEntries.filter((e) => e.category === cat.name);
+    if (entries.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'identity-detail-empty';
+        empty.textContent = 'No entries yet — add one below.';
+        entriesWrap.appendChild(empty);
+    } else {
+        for (const entry of entries) {
+            entriesWrap.appendChild(buildIdentityEntryCard(entry, cat));
+        }
+    }
+    detail.appendChild(entriesWrap);
+
+    const addBtn = document.createElement('button');
+    addBtn.className = 'btn-secondary identity-add-entry-btn';
+    addBtn.type = 'button';
+    addBtn.textContent = '+ Add entry';
+    addBtn.addEventListener('click', () => addIdentityEntry(cat));
+    detail.appendChild(addBtn);
+}
+
+function buildIdentityEntryCard(entry, cat) {
+    const card = document.createElement('div');
+    card.className = 'identity-entry-card';
+
+    const body = document.createElement('textarea');
+    body.className = 'identity-entry-body';
+    body.value = entry.body;
+    body.placeholder = 'Free-form markdown — describe the trait, rule, or fact.';
+    card.appendChild(body);
+
+    const controls = document.createElement('div');
+    controls.className = 'identity-entry-controls';
+
+    const scopeRow = document.createElement('div');
+    scopeRow.className = 'identity-scope-chip-row';
+    // Local mutable copy — the card holds onto it until Save commits.
+    const localScope = JSON.parse(JSON.stringify(entry.applies_to || []));
+    renderScopeChips(scopeRow, localScope);
+    controls.appendChild(scopeRow);
+
+    const pinToggle = document.createElement('span');
+    pinToggle.className = 'identity-pin-toggle' + (entry.pinned ? ' active' : '');
+    pinToggle.innerHTML = (entry.pinned ? '★' : '☆') + ' pinned';
+    let localPinned = !!entry.pinned;
+    pinToggle.addEventListener('click', () => {
+        localPinned = !localPinned;
+        pinToggle.classList.toggle('active', localPinned);
+        pinToggle.innerHTML = (localPinned ? '★' : '☆') + ' pinned';
+    });
+    controls.appendChild(pinToggle);
+
+    const actions = document.createElement('div');
+    actions.className = 'identity-entry-actions';
+    const saveBtn = document.createElement('button');
+    saveBtn.textContent = 'Save';
+    saveBtn.addEventListener('click', async () => {
+        try {
+            await invoke('upsert_identity_entry', {
+                input: {
+                    id: entry.id,
+                    category: cat.name,
+                    body: body.value,
+                    applies_to: localScope,
+                    pinned: localPinned,
+                },
+            });
+            await loadIdentityManager();
+            showToast('Saved.', 'success');
+        } catch (err) {
+            showToast('Save failed: ' + err, 'error');
+        }
+    });
+    const delBtn = document.createElement('button');
+    delBtn.className = 'btn-danger';
+    delBtn.textContent = 'Delete';
+    delBtn.addEventListener('click', async () => {
+        if (!confirm('Delete this entry?')) return;
+        try {
+            await invoke('delete_identity_entry', { id: entry.id });
+            await loadIdentityManager();
+        } catch (err) {
+            showToast('Delete failed: ' + err, 'error');
+        }
+    });
+    actions.appendChild(saveBtn);
+    actions.appendChild(delBtn);
+    controls.appendChild(actions);
+
+    card.appendChild(controls);
+    return card;
+}
+
+// Renders the applies_to chip row in-place. `tags` is mutated by user
+// clicks; the caller is responsible for re-rendering siblings if needed.
+function renderScopeChips(container, tags) {
+    container.innerHTML = '';
+    const profiles = agentProfiles || [];
+    const choices = [{ id: '__always__', label: 'Always' }];
+    for (const p of profiles) {
+        choices.push({ id: p.id, label: p.id });
+    }
+    for (const c of choices) {
+        const chip = document.createElement('span');
+        chip.className = 'identity-scope-chip';
+        chip.textContent = c.label;
+        const isSelected =
+            (c.id === '__always__' && tags.some((t) => t === 'Always')) ||
+            (c.id !== '__always__' &&
+                tags.some((t) => t && typeof t === 'object' && t.Profile === c.id));
+        if (isSelected) chip.classList.add('selected');
+        chip.addEventListener('click', () => {
+            if (c.id === '__always__') {
+                const has = tags.some((t) => t === 'Always');
+                if (has) {
+                    const idx = tags.findIndex((t) => t === 'Always');
+                    if (idx >= 0) tags.splice(idx, 1);
+                } else {
+                    // Always supersedes per-profile chips; clear them for
+                    // clarity. The store still accepts mixed sets, but the
+                    // UI keeps the model crisp.
+                    tags.length = 0;
+                    tags.push('Always');
+                }
+            } else {
+                // Selecting a specific profile turns off Always.
+                const alwaysIdx = tags.findIndex((t) => t === 'Always');
+                if (alwaysIdx >= 0) tags.splice(alwaysIdx, 1);
+                const idx = tags.findIndex(
+                    (t) => t && typeof t === 'object' && t.Profile === c.id,
+                );
+                if (idx >= 0) {
+                    tags.splice(idx, 1);
+                } else {
+                    tags.push({ Profile: c.id });
+                }
+            }
+            renderScopeChips(container, tags);
+        });
+        container.appendChild(chip);
+    }
+}
+
+async function addIdentityEntry(cat) {
+    if (!invoke) return;
+    // Use the category's default_applies_to as the seed for new entries.
+    const scope = cat.default_applies_to && cat.default_applies_to.length
+        ? cat.default_applies_to
+        : ['Always'];
+    try {
+        await invoke('upsert_identity_entry', {
+            input: {
+                id: null,
+                category: cat.name,
+                body: '',
+                applies_to: scope,
+                pinned: false,
+            },
+        });
+        await loadIdentityManager();
+    } catch (err) {
+        showToast('Add failed: ' + err, 'error');
+    }
+}
+
+async function deleteIdentityCategory(cat) {
+    if (!invoke) return;
+    const count = identityEntries.filter((e) => e.category === cat.name).length;
+    const msg =
+        count > 0
+            ? `Delete category "${cat.name}" and its ${count} entrie${count === 1 ? 'y' : 's'}?`
+            : `Delete category "${cat.name}"?`;
+    if (!confirm(msg)) return;
+    try {
+        await invoke('delete_identity_category', { name: cat.name });
+        if (identitySelectedCategory === cat.name) identitySelectedCategory = null;
+        await loadIdentityManager();
+    } catch (err) {
+        showToast('Delete failed: ' + err, 'error');
+    }
+}
+
+function updateIdentityTokenFooter() {
+    const countEl = document.getElementById('identity-token-count');
+    const pctEl = document.getElementById('identity-token-pct');
+    const warnEl = document.getElementById('identity-token-warning');
+    if (!countEl || !pctEl || !warnEl) return;
+    let chars = 0;
+    for (const e of identityEntries) {
+        chars += (e.body || '').length;
+        chars += (e.category || '').length + 4; // approximate "## name\n"
+    }
+    const tokens = Math.ceil(chars / 4);
+    // Reference window: assume 8K. We don't know the user's smallest model
+    // here; this is a rough indicator. Settings could later populate the
+    // real value once we wire model context windows into the frontend.
+    const referenceWindow = 8000;
+    const pct = referenceWindow > 0 ? Math.round((tokens / referenceWindow) * 100) : 0;
+    countEl.textContent = tokens.toLocaleString();
+    pctEl.textContent = pct;
+    warnEl.classList.remove('warn-yellow', 'warn-red');
+    if (pct >= 15) {
+        warnEl.classList.remove('hidden');
+        warnEl.classList.add('warn-red');
+        warnEl.textContent =
+            'Long identity blocks crowd out task context on smaller models. Consider trimming or scoping entries to fewer profiles.';
+    } else if (pct >= 5) {
+        warnEl.classList.remove('hidden');
+        warnEl.classList.add('warn-yellow');
+        warnEl.textContent =
+            'Identity is getting sizeable. Smaller models (8K context) will feel this.';
+    } else {
+        warnEl.classList.add('hidden');
+        warnEl.textContent = '';
+    }
+}
+
+// ─── Identity category modal ───
+
+function openIdentityCategoryModal(mode, source) {
+    const overlay = document.getElementById('identity-category-modal-overlay');
+    const titleEl = document.getElementById('identity-category-modal-title');
+    const nameEl = document.getElementById('identity-category-name');
+    const descEl = document.getElementById('identity-category-description');
+    const errEl = document.getElementById('identity-category-modal-error');
+    const origNameEl = document.getElementById('identity-category-original-name');
+    const scopeEl = document.getElementById('identity-category-default-scope');
+    if (!overlay || !nameEl) return;
+
+    errEl.classList.add('hidden');
+    errEl.textContent = '';
+
+    let scopeTags;
+    if (mode === 'edit' && source) {
+        titleEl.textContent = 'Edit category';
+        nameEl.value = source.name;
+        nameEl.disabled = true; // renaming is destructive — drop+create instead.
+        descEl.value = source.description || '';
+        origNameEl.value = source.name;
+        scopeTags = JSON.parse(JSON.stringify(source.default_applies_to || ['Always']));
+    } else {
+        titleEl.textContent = 'New category';
+        nameEl.value = '';
+        nameEl.disabled = false;
+        descEl.value = '';
+        origNameEl.value = '';
+        scopeTags = ['Always'];
+    }
+    renderScopeChips(scopeEl, scopeTags);
+    // Stash the live array on the overlay so the save handler reads the
+    // user's clicks. renderScopeChips mutates `scopeTags` in place when
+    // chips are toggled, so no manual sync is needed.
+    overlay.__identityScopeTags = scopeTags;
+
+    overlay.classList.remove('hidden');
+    nameEl.focus();
+}
+
+function closeIdentityCategoryModal() {
+    const overlay = document.getElementById('identity-category-modal-overlay');
+    if (!overlay) return;
+    delete overlay.__identityScopeTags;
+    overlay.classList.add('hidden');
+}
+
+async function saveIdentityCategoryFromModal() {
+    const overlay = document.getElementById('identity-category-modal-overlay');
+    const nameEl = document.getElementById('identity-category-name');
+    const descEl = document.getElementById('identity-category-description');
+    const errEl = document.getElementById('identity-category-modal-error');
+    const origNameEl = document.getElementById('identity-category-original-name');
+    if (!overlay || !nameEl) return;
+
+    const name = (nameEl.value || '').trim();
+    if (!name) {
+        errEl.textContent = 'Name is required.';
+        errEl.classList.remove('hidden');
+        return;
+    }
+    const scopeTags = overlay.__identityScopeTags || ['Always'];
+    const isEdit = !!origNameEl.value;
+    // For new categories pick a sort_order that puts them at the end.
+    const maxSort = identityCategories.reduce(
+        (m, c) => Math.max(m, c.sort_order || 0),
+        0,
+    );
+    const existing = identityCategories.find((c) => c.name === name);
+    const sortOrder = existing ? existing.sort_order : maxSort + 10;
+    try {
+        await invoke('upsert_identity_category', {
+            input: {
+                name,
+                description: descEl.value || '',
+                default_applies_to: scopeTags,
+                sort_order: sortOrder,
+            },
+        });
+        identitySelectedCategory = name;
+        closeIdentityCategoryModal();
+        await loadIdentityManager();
+    } catch (err) {
+        errEl.textContent = String(err);
+        errEl.classList.remove('hidden');
+    }
+}
+
+// Wire identity-modal buttons once on first load.
+(function wireIdentityModalButtons() {
+    const closeBtn = document.getElementById('identity-category-modal-close');
+    const cancelBtn = document.getElementById('identity-category-modal-cancel');
+    const saveBtn = document.getElementById('identity-category-modal-save');
+    const overlay = document.getElementById('identity-category-modal-overlay');
+    if (closeBtn) closeBtn.addEventListener('click', closeIdentityCategoryModal);
+    if (cancelBtn) cancelBtn.addEventListener('click', closeIdentityCategoryModal);
+    if (saveBtn) saveBtn.addEventListener('click', saveIdentityCategoryFromModal);
+    if (overlay) {
+        overlay.addEventListener('click', (ev) => {
+            if (ev.target === overlay) closeIdentityCategoryModal();
+        });
+    }
+    const newBtn = document.getElementById('identity-new-category-btn');
+    if (newBtn) newBtn.addEventListener('click', () => openIdentityCategoryModal('create'));
+})();
 
 // ─── Shell toolbox ────────────────────────────────────────────────────
 

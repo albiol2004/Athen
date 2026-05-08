@@ -12,6 +12,7 @@ mod contacts;
 pub(crate) mod delegation;
 pub(crate) mod email_gate;
 pub(crate) mod file_gate;
+pub(crate) mod identity_render;
 pub(crate) mod notifier;
 pub(crate) mod process;
 pub(crate) mod sense_router;

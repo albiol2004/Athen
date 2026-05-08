@@ -54,6 +54,7 @@ pub struct AgentBuilder {
     initial_user_images: Vec<athen_core::llm::ImageInput>,
     external_system_suffix: Option<String>,
     default_temperature: Option<f32>,
+    identity_block: Option<String>,
 }
 
 impl AgentBuilder {
@@ -81,7 +82,18 @@ impl AgentBuilder {
             initial_user_images: Vec::new(),
             external_system_suffix: None,
             default_temperature: None,
+            identity_block: None,
         }
+    }
+
+    /// Inject a pre-rendered identity block (the user's hand-maintained
+    /// personality / rules / knowledge / team statements, profile-filtered
+    /// upstream). The host (athen-app) reads the identity store and
+    /// formats this string; the executor splices it as-is into the static
+    /// system header. Empty / `None` reproduces today's prompt byte-for-byte.
+    pub fn identity_block(mut self, block: Option<String>) -> Self {
+        self.identity_block = block.filter(|s| !s.trim().is_empty());
+        self
     }
 
     /// Sampling temperature for the main agent loop. `None` keeps the
@@ -281,6 +293,10 @@ impl AgentBuilder {
 
         if self.default_temperature.is_some() {
             executor.set_default_temperature(self.default_temperature);
+        }
+
+        if self.identity_block.is_some() {
+            executor.set_identity_block(self.identity_block);
         }
 
         Ok(executor)

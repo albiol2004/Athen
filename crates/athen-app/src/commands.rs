@@ -110,6 +110,7 @@ fn spawn_router_approval(
         tool_doc_dir: state.tool_doc_dir.clone(),
         grant_store: state.grant_store.clone(),
         profile_store: state.profile_store.clone(),
+        identity_store: state.identity_store.clone(),
         pending_grants: state.pending_grants.clone(),
         spawned_processes: state.spawned_processes.clone(),
         telegram_sink: telegram_sink.clone(),
@@ -208,6 +209,7 @@ fn spawn_router_approval(
             tool_doc_dir: bg_ctx.tool_doc_dir,
             grant_store: bg_ctx.grant_store,
             profile_store: bg_ctx.profile_store,
+            identity_store: bg_ctx.identity_store,
             pending_grants: bg_ctx.pending_grants,
             spawned_processes: bg_ctx.spawned_processes,
             telegram_approval_sink: Some(bg_ctx.telegram_sink.clone()),
@@ -299,6 +301,7 @@ struct ApprovedTaskBgCtx {
     tool_doc_dir: Option<std::path::PathBuf>,
     grant_store: Option<Arc<athen_persistence::grants::GrantStore>>,
     profile_store: Option<Arc<athen_persistence::profiles::SqliteProfileStore>>,
+    identity_store: Option<Arc<athen_persistence::identity::SqliteIdentityStore>>,
     pending_grants: crate::file_gate::PendingGrants,
     spawned_processes: athen_agent::SpawnedProcessMap,
     telegram_sink: Arc<crate::approval::TelegramApprovalSink>,
@@ -1670,6 +1673,19 @@ pub async fn send_message(
             )
             .await;
 
+            // Resolve identity *after* active_profile so we can scope by id.
+            // Falls back to the default profile id when the arc has no
+            // override — matches `resolve_active_profile`'s own fallback.
+            let identity_profile_id = active_profile
+                .as_ref()
+                .map(|p| p.profile.id.clone())
+                .unwrap_or_else(|| athen_core::agent_profile::AgentProfile::DEFAULT_ID.to_string());
+            let identity_block = crate::identity_render::render_identity_block(
+                state.identity_store.as_ref(),
+                &identity_profile_id,
+            )
+            .await;
+
             let sampling_temperature = crate::compaction::resolve_provider_temperature(
                 &crate::state::load_config(),
                 &state.active_provider_id.lock().await.clone(),
@@ -1684,6 +1700,7 @@ pub async fn send_message(
                 .stream_sender(stream_tx)
                 .cancel_flag(cancel_flag)
                 .external_system_suffix(Some(system_suffix))
+                .identity_block(identity_block)
                 .default_temperature(sampling_temperature);
             if let Some(p) = state.tool_doc_dir.clone() {
                 builder = builder.tool_doc_dir(p);
@@ -1961,6 +1978,7 @@ pub async fn approve_task(
         tool_doc_dir: state.tool_doc_dir.clone(),
         grant_store: state.grant_store.clone(),
         profile_store: state.profile_store.clone(),
+        identity_store: state.identity_store.clone(),
         pending_grants: state.pending_grants.clone(),
         spawned_processes: state.spawned_processes.clone(),
         telegram_approval_sink: state.telegram_approval_sink.clone(),
@@ -2061,6 +2079,7 @@ pub(crate) struct ApprovedTaskCtx {
     pub tool_doc_dir: Option<std::path::PathBuf>,
     pub grant_store: Option<Arc<athen_persistence::grants::GrantStore>>,
     pub profile_store: Option<Arc<athen_persistence::profiles::SqliteProfileStore>>,
+    pub identity_store: Option<Arc<athen_persistence::identity::SqliteIdentityStore>>,
     pub pending_grants: crate::file_gate::PendingGrants,
     pub spawned_processes: athen_agent::SpawnedProcessMap,
     pub telegram_approval_sink: Option<Arc<crate::approval::TelegramApprovalSink>>,
@@ -2430,6 +2449,7 @@ pub(crate) async fn execute_approved_task(
             if let Some(arc_store) = ctx.arc_store.clone() {
                 let dctx = crate::delegation::DelegationContext {
                     profile_store,
+                    identity_store: ctx.identity_store.clone(),
                     arc_store,
                     llm_router: Arc::clone(&ctx.router),
                     parent_arc_id: ctx.active_arc_id.clone(),
@@ -2469,6 +2489,16 @@ pub(crate) async fn execute_approved_task(
     )
     .await;
 
+    let identity_profile_id = active_profile
+        .as_ref()
+        .map(|p| p.profile.id.clone())
+        .unwrap_or_else(|| athen_core::agent_profile::AgentProfile::DEFAULT_ID.to_string());
+    let identity_block = crate::identity_render::render_identity_block(
+        ctx.identity_store.as_ref(),
+        &identity_profile_id,
+    )
+    .await;
+
     let mut builder = AgentBuilder::new()
         .llm_router(exec_router)
         .tool_registry(registry)
@@ -2479,6 +2509,7 @@ pub(crate) async fn execute_approved_task(
         .stream_sender(stream_tx)
         .cancel_flag(ctx.cancel_flag.clone())
         .external_system_suffix(Some(system_suffix))
+        .identity_block(identity_block)
         .default_temperature(ctx.sampling_temperature);
     if let Some(p) = ctx.tool_doc_dir.clone() {
         builder = builder.tool_doc_dir(p);
@@ -3226,6 +3257,7 @@ pub(crate) async fn execute_dispatched_task(
             if let Some(arc_store) = ctx.arc_store.clone() {
                 let dctx = crate::delegation::DelegationContext {
                     profile_store,
+                    identity_store: ctx.identity_store.clone(),
                     arc_store,
                     llm_router: Arc::clone(&ctx.router),
                     parent_arc_id: arc_id.clone(),
@@ -3261,6 +3293,16 @@ pub(crate) async fn execute_dispatched_task(
     let active_profile =
         resolve_active_profile(ctx.profile_store.as_ref(), ctx.arc_store.as_ref(), &arc_id).await;
 
+    let identity_profile_id = active_profile
+        .as_ref()
+        .map(|p| p.profile.id.clone())
+        .unwrap_or_else(|| athen_core::agent_profile::AgentProfile::DEFAULT_ID.to_string());
+    let identity_block = crate::identity_render::render_identity_block(
+        ctx.identity_store.as_ref(),
+        &identity_profile_id,
+    )
+    .await;
+
     let mut builder = AgentBuilder::new()
         .llm_router(exec_router)
         .tool_registry(registry)
@@ -3272,6 +3314,7 @@ pub(crate) async fn execute_dispatched_task(
         .cancel_flag(ctx.cancel_flag.clone())
         .external_system_suffix(Some(system_suffix))
         .autonomous_mode(true)
+        .identity_block(identity_block)
         .default_temperature(ctx.sampling_temperature);
     if let Some(p) = ctx.tool_doc_dir.clone() {
         builder = builder.tool_doc_dir(p);
@@ -5007,7 +5050,10 @@ pub async fn delete_identity_category(
     let Some(store) = state.identity_store.as_ref() else {
         return Err("Identity store not available".into());
     };
-    store.delete_category(&name).await.map_err(|e| e.to_string())
+    store
+        .delete_category(&name)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// List entries, optionally scoped to a single category. With no filter,
@@ -5070,7 +5116,10 @@ pub async fn upsert_identity_entry(
         created_at: now,
         updated_at: now,
     };
-    store.upsert_entry(&entry).await.map_err(|e| e.to_string())?;
+    store
+        .upsert_entry(&entry)
+        .await
+        .map_err(|e| e.to_string())?;
     let loaded = store
         .get_entry(id)
         .await

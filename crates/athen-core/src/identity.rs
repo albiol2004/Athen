@@ -136,10 +136,7 @@ mod tests {
 
     #[test]
     fn applies_to_profile_always_dominates() {
-        let tags = vec![
-            ProfileTag::NotProfile("coder".into()),
-            ProfileTag::Always,
-        ];
+        let tags = vec![ProfileTag::NotProfile("coder".into()), ProfileTag::Always];
         // Always wins the OR even though NotProfile would exclude coder.
         assert!(applies_to_profile(&tags, "coder"));
     }

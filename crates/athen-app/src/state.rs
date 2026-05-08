@@ -538,6 +538,7 @@ impl AppState {
         ) {
             let ctx = crate::delegation::DelegationContext {
                 profile_store,
+                identity_store: self.identity_store.clone(),
                 arc_store,
                 llm_router: Arc::clone(&self.router),
                 parent_arc_id: arc_id.to_string(),
@@ -1133,6 +1134,7 @@ impl AppState {
         let mcp = Arc::clone(&self.mcp);
         let tool_doc_dir = self.tool_doc_dir.clone();
         let profile_store = self.profile_store.clone();
+        let identity_store = self.identity_store.clone();
         let grant_store = self.grant_store.clone();
         let pending_grants = self.pending_grants.clone();
         let spawned_processes = self.spawned_processes.clone();
@@ -1235,6 +1237,7 @@ impl AppState {
                         tool_doc_dir: tool_doc_dir.clone(),
                         grant_store: grant_store.clone(),
                         profile_store: profile_store.clone(),
+                        identity_store: identity_store.clone(),
                         pending_grants: pending_grants.clone(),
                         spawned_processes: spawned_processes.clone(),
                         telegram_approval_sink: telegram_approval_sink.clone(),

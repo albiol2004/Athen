@@ -256,6 +256,24 @@
             </section>
 
             <section class="settings-section">
+                <h2>Identity</h2>
+                <p class="settings-description">Who Athen is across every agent — personality, rules, knowledge about you, team. Each entry can be scoped to specific profiles so the coder doesn't pay tokens for personality content it never uses. Long identity blocks crowd out task context on smaller models.</p>
+                <div class="identity-pane">
+                    <div class="identity-sidebar">
+                        <div id="identity-category-list" class="identity-category-list"></div>
+                        <button id="identity-new-category-btn" class="btn-secondary identity-new-category-btn" type="button">+ Add category</button>
+                        <div class="identity-token-footer" id="identity-token-footer">
+                            <div class="identity-token-line"><span id="identity-token-count">0</span> tokens (~<span id="identity-token-pct">0</span>%)</div>
+                            <div class="identity-token-warning hidden" id="identity-token-warning"></div>
+                        </div>
+                    </div>
+                    <div class="identity-detail" id="identity-detail">
+                        <p class="setting-hint">Pick a category to see its entries.</p>
+                    </div>
+                </div>
+            </section>
+
+            <section class="settings-section">
                 <h2>Tools (MCP)</h2>
                 <p class="settings-description">Toggle which Model Context Protocol servers Athen can use. Enabled tools become available to the agent on the next turn — no restart needed.</p>
                 <div id="mcp-list"></div>
@@ -926,6 +944,35 @@
             <div class="profile-modal-actions">
                 <button id="profile-modal-cancel" class="btn-secondary" type="button">Cancel</button>
                 <button id="profile-modal-save" class="btn-primary" type="button">Save</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="identity-category-modal-overlay" class="profile-modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="identity-category-modal-title">
+        <div class="profile-modal">
+            <div class="profile-modal-header">
+                <h2 id="identity-category-modal-title">New category</h2>
+                <button id="identity-category-modal-close" class="cal-modal-close-btn" type="button">&times;</button>
+            </div>
+            <div class="profile-modal-body">
+                <input type="hidden" id="identity-category-original-name">
+                <div class="cal-field">
+                    <label for="identity-category-name">Name <span class="permissions-subnote">(lowercase, snake_case)</span></label>
+                    <input type="text" id="identity-category-name" class="settings-input" placeholder="e.g. coding_style">
+                </div>
+                <div class="cal-field">
+                    <label for="identity-category-description">Description</label>
+                    <input type="text" id="identity-category-description" class="settings-input" placeholder="What goes in this category?">
+                </div>
+                <div class="cal-field">
+                    <label>Default scope <span class="permissions-subnote">(applied to new entries here)</span></label>
+                    <div id="identity-category-default-scope" class="identity-scope-chip-row"></div>
+                </div>
+                <p id="identity-category-modal-error" class="profile-modal-error hidden"></p>
+            </div>
+            <div class="profile-modal-actions">
+                <button id="identity-category-modal-cancel" class="btn-secondary" type="button">Cancel</button>
+                <button id="identity-category-modal-save" class="btn-primary" type="button">Save</button>
             </div>
         </div>
     </div>

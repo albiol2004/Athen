@@ -233,6 +233,17 @@ pub struct DefaultExecutor {
     /// (0.0) and summarization helpers (0.5) keep their own settings so
     /// determinism guarantees there don't drift with the loop knob.
     default_temperature: Option<f32>,
+    /// Pre-rendered identity block — the user's hand-maintained
+    /// personality/rules/knowledge/team statements (plus any custom
+    /// categories), profile-filtered upstream so this string already
+    /// contains only what applies to the active profile.
+    ///
+    /// The host (athen-app) resolves this by reading the identity store
+    /// once per turn — the executor never reads SQLite. `None` reproduces
+    /// today's behavior (no identity section). Lives in the static prefix
+    /// between persona header and workspace rules so the cache only
+    /// invalidates when the user edits identity, not per-request.
+    identity_block: Option<String>,
 }
 
 impl DefaultExecutor {
@@ -262,6 +273,7 @@ impl DefaultExecutor {
             initial_user_images: Vec::new(),
             external_system_suffix: None,
             default_temperature: None,
+            identity_block: None,
         }
     }
 
@@ -270,6 +282,16 @@ impl DefaultExecutor {
     /// provider so users see whatever error the backend raises for OOR.
     pub fn set_default_temperature(&mut self, t: Option<f32>) {
         self.default_temperature = t;
+    }
+
+    /// Inject a pre-rendered identity block into the static system header.
+    ///
+    /// The block must already be profile-filtered — the executor splices
+    /// the string in as-is, between persona header and workspace rules.
+    /// Empty / whitespace-only / `None` clears the section entirely so
+    /// installs with no identity entries get today's prompt byte-for-byte.
+    pub fn set_identity_block(&mut self, block: Option<String>) {
+        self.identity_block = block.filter(|s| !s.trim().is_empty());
     }
 
     /// Inject host-supplied volatile content (e.g. memory recall,
@@ -389,6 +411,7 @@ impl DefaultExecutor {
             toolbox_info,
             shell_kind,
             false,
+            None,
         )
     }
 
@@ -407,6 +430,7 @@ impl DefaultExecutor {
         toolbox_info: Option<&crate::toolbox::ToolboxPromptInfo>,
         shell_kind: Option<&'static str>,
         autonomous: bool,
+        identity_block: Option<&str>,
     ) -> String {
         let mut prompt = String::new();
         if autonomous {
@@ -419,6 +443,10 @@ impl DefaultExecutor {
             );
         }
         prompt.push_str(&Self::build_persona_header(profile));
+        // Identity sits between the agent persona and workspace rules. It
+        // changes only when the user edits identity (not per-request), so
+        // its position keeps the cacheable static prefix stable.
+        prompt.push_str(&Self::build_identity_section(identity_block));
         prompt.push_str(&Self::build_workspace_rules(has_context));
         prompt.push_str(&Self::build_shell_env_section(shell_kind));
         prompt.push_str(&Self::build_toolbox_section(toolbox_info));
@@ -587,6 +615,25 @@ impl DefaultExecutor {
         };
 
         format!("{identity}\n\n")
+    }
+
+    /// Render the identity block, framed so the agent recognises it as a
+    /// distinct contract from the agent persona above. Empty input returns
+    /// an empty string — no header is emitted, so installs without
+    /// identity entries get today's prompt byte-for-byte.
+    ///
+    /// The block is host-rendered (athen-app reads SQLite, filters by
+    /// active profile, formats the markdown). The executor only frames it.
+    fn build_identity_section(block: Option<&str>) -> String {
+        let body = match block {
+            Some(b) if !b.trim().is_empty() => b.trim(),
+            _ => return String::new(),
+        };
+        format!(
+            "--- IDENTITY (who Athen is, across every agent) ---\n\
+             {body}\n\
+             --- END IDENTITY ---\n\n"
+        )
     }
 
     /// Append-only revealed-tool schemas, placed between the static
@@ -1143,6 +1190,7 @@ impl AgentExecutor for DefaultExecutor {
                 self.toolbox_info.as_ref(),
                 self.shell_kind,
                 self.autonomous_mode,
+                self.identity_block.as_deref(),
             );
             // Append host-supplied volatile content (memory recall,
             // attachment summaries, compaction state). Lives at the very
@@ -2310,10 +2358,10 @@ mod tests {
         let tools = vec![tool_def("memory_store", "store a memory")];
         let revealed = HashSet::new();
         let interactive = DefaultExecutor::build_system_prompt_with_mode(
-            &tools, &revealed, false, None, None, None, None, false,
+            &tools, &revealed, false, None, None, None, None, false, None,
         );
         let autonomous = DefaultExecutor::build_system_prompt_with_mode(
-            &tools, &revealed, false, None, None, None, None, true,
+            &tools, &revealed, false, None, None, None, None, true, None,
         );
 
         assert_ne!(
@@ -2380,6 +2428,70 @@ mod tests {
         let p_none_persona = p_none.split("Current date and time").next().unwrap();
         let p_default_persona = p_default.split("Current date and time").next().unwrap();
         assert_eq!(p_none_persona, p_default_persona);
+    }
+
+    /// Identity is omitted entirely when no block is provided, so installs
+    /// without identity entries get today's prompt byte-for-byte.
+    #[test]
+    fn system_prompt_no_identity_block_byte_identical() {
+        let tools = vec![tool_def("memory_store", "store a memory")];
+        let revealed = HashSet::new();
+        let with_none = DefaultExecutor::build_system_prompt_with_mode(
+            &tools, &revealed, false, None, None, None, None, false, None,
+        );
+        let with_empty = DefaultExecutor::build_system_prompt_with_mode(
+            &tools,
+            &revealed,
+            false,
+            None,
+            None,
+            None,
+            None,
+            false,
+            Some("   \n\n  "),
+        );
+        // Whitespace-only block must be treated as no-block.
+        assert_eq!(with_none, with_empty);
+        assert!(!with_none.contains("--- IDENTITY"));
+    }
+
+    /// A non-empty identity block is framed and inserted between the
+    /// persona header and the workspace rules — i.e. before any tool
+    /// listing — so the LLM sees identity as a separate contract from
+    /// per-arc tool surface.
+    #[test]
+    fn system_prompt_identity_block_position_and_framing() {
+        let tools = vec![tool_def("memory_store", "store a memory")];
+        let revealed = HashSet::new();
+        let block = "## personality\nBe warm but concise.\n\n## rules\nNever auto-send to legal@.";
+        let prompt = DefaultExecutor::build_system_prompt_with_mode(
+            &tools,
+            &revealed,
+            false,
+            None,
+            None,
+            None,
+            None,
+            false,
+            Some(block),
+        );
+        assert!(prompt.contains("--- IDENTITY (who Athen is, across every agent) ---"));
+        assert!(prompt.contains("--- END IDENTITY ---"));
+        assert!(prompt.contains("Be warm but concise."));
+        assert!(prompt.contains("Never auto-send to legal@."));
+
+        // Identity sits AFTER the canonical persona header...
+        let persona_idx = prompt
+            .find("You are Athen, a proactive universal AI agent")
+            .expect("persona header present");
+        let identity_idx = prompt.find("--- IDENTITY").expect("identity present");
+        assert!(persona_idx < identity_idx);
+
+        // ...and BEFORE the available-tools index.
+        let tools_idx = prompt
+            .find("AVAILABLE TOOL GROUPS")
+            .expect("tool index present");
+        assert!(identity_idx < tools_idx);
     }
 
     /// A profile with custom persona templates must replace the hardcoded
