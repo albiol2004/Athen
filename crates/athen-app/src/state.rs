@@ -1207,11 +1207,16 @@ impl AppState {
                     // config TOML each dispatch is cheap (small file, only
                     // fires on user-driven sense events) and lets the user
                     // tune compaction without restarting the loop.
+                    let cfg_for_resolvers = crate::state::load_config();
                     let (compaction_trigger_tokens, compaction_target_tokens) =
                         crate::compaction::resolve_compaction_budget(
-                            &crate::state::load_config(),
+                            &cfg_for_resolvers,
                             &active_provider_id_snapshot,
                         );
+                    let sampling_temperature = crate::compaction::resolve_provider_temperature(
+                        &cfg_for_resolvers,
+                        &active_provider_id_snapshot,
+                    );
                     let ctx = crate::commands::ApprovedTaskCtx {
                         coordinator: Arc::clone(&coordinator),
                         router: Arc::clone(&router),
@@ -1241,6 +1246,7 @@ impl AppState {
                         attachment_store: attachment_store_loop.clone(),
                         compaction_trigger_tokens,
                         compaction_target_tokens,
+                        sampling_temperature,
                     };
 
                     let task_arc_map_clone = Arc::clone(&task_arc_map);
@@ -1730,6 +1736,18 @@ async fn execute_owner_telegram_message(
     let stream_tx = spawn_stream_forwarder(app_handle, target_arc_id.clone());
     let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    // Resolve sampling-temperature override for the active provider here
+    // — this Telegram path doesn't carry an `ApprovedTaskCtx`, so the
+    // load_config + resolver pair is the simplest way to honor the
+    // provider's Advanced setting. Cheap (small TOML, fires per Telegram
+    // owner message) and matches the same snapshot-per-task semantics as
+    // the in-app and dispatched paths.
+    let sampling_temperature = {
+        let cfg = crate::state::load_config();
+        let active_id = resolve_active_provider(&cfg);
+        crate::compaction::resolve_provider_temperature(&cfg, &active_id)
+    };
+
     let mut builder = AgentBuilder::new()
         .llm_router(exec_router)
         .tool_registry(Box::new(registry))
@@ -1738,7 +1756,8 @@ async fn execute_owner_telegram_message(
         .timeout(Duration::from_secs(300))
         .context_messages(context)
         .stream_sender(stream_tx)
-        .cancel_flag(cancel_flag);
+        .cancel_flag(cancel_flag)
+        .default_temperature(sampling_temperature);
     if let Some(p) = tool_doc_dir {
         builder = builder.tool_doc_dir(p.to_path_buf());
     }
@@ -2181,7 +2200,7 @@ fn ensure_data_dir() -> Option<PathBuf> {
 ///
 /// Looks for `active_provider` in `config.models.assignments` (we reuse the
 /// existing assignments map with a special key), or defaults to "deepseek".
-fn resolve_active_provider(config: &AthenConfig) -> String {
+pub(crate) fn resolve_active_provider(config: &AthenConfig) -> String {
     config
         .models
         .assignments

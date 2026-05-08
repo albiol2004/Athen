@@ -74,6 +74,24 @@ pub fn resolve_compaction_budget(
     (trigger, target)
 }
 
+/// Resolve the active provider's sampling temperature override. Returns
+/// `None` if no provider entry exists or the user has not set a value —
+/// the agent builder treats that as "let the provider adapter pick its
+/// baked-in default" (currently 0.7 across the OpenAI-compat / DeepSeek
+/// paths). Lives next to `resolve_compaction_budget` so every per-task
+/// resolver call site reads from the same provider entry without
+/// re-fetching the config.
+pub fn resolve_provider_temperature(
+    config: &athen_core::config::AthenConfig,
+    active_provider_id: &str,
+) -> Option<f32> {
+    config
+        .models
+        .providers
+        .get(active_provider_id)
+        .and_then(|p| p.temperature)
+}
+
 /// Convert an `ArcContextView` into the inputs the executor consumes.
 ///
 /// Returns `(messages, system_suffix)`:
@@ -412,6 +430,7 @@ mod tests {
             supports_vision: false,
             supports_documents: false,
             family: athen_core::llm::ModelFamily::Default,
+            temperature: None,
         }
     }
 
@@ -442,6 +461,26 @@ mod tests {
             FALLBACK_CONTEXT_WINDOW_TOKENS as u64 * FALLBACK_COMPACTION_TARGET_PCT as u64 / 100;
         assert_eq!(trigger as u64, expected_trigger);
         assert_eq!(target as u64, expected_target);
+    }
+
+    /// Temperature resolver returns the active provider's override and
+    /// falls through to `None` when the field is unset or the provider
+    /// is unknown — `None` is the agent builder's signal to use the
+    /// adapter's baked-in default.
+    #[test]
+    fn resolve_provider_temperature_reads_active_override_or_returns_none() {
+        use athen_core::config::AthenConfig;
+        let mut cfg = AthenConfig::default();
+        let mut p_set = mk_provider_for_test(32_000, 65, 30);
+        p_set.temperature = Some(0.2);
+        cfg.models.providers.insert("set".into(), p_set);
+        cfg.models
+            .providers
+            .insert("unset".into(), mk_provider_for_test(32_000, 65, 30));
+
+        assert_eq!(resolve_provider_temperature(&cfg, "set"), Some(0.2));
+        assert_eq!(resolve_provider_temperature(&cfg, "unset"), None);
+        assert_eq!(resolve_provider_temperature(&cfg, "no-such-provider"), None);
     }
 
     /// Hysteresis invariant: even a misconfigured provider where

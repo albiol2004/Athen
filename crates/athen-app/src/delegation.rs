@@ -304,12 +304,25 @@ async fn run_delegation(
         Box::new(crate::state::SharedRouter(Arc::clone(&ctx.llm_router)));
     let sub_registry: Box<dyn ToolRegistry> = Box::new(ArcRegistryAdapter(base));
 
+    // Sub-agent inherits the parent's router (and therefore the parent's
+    // provider), so the temperature override comes from the same active
+    // provider entry. Re-read config here rather than threading
+    // `active_provider_id` through `DelegationContext` — the alternative
+    // adds a field that has no other use, and `load_config` is already
+    // cheap (small TOML, fires per delegation, which is rare).
+    let sampling_temperature = {
+        let cfg = crate::state::load_config();
+        let active_id = crate::state::resolve_active_provider(&cfg);
+        crate::compaction::resolve_provider_temperature(&cfg, &active_id)
+    };
+
     let mut builder = AgentBuilder::new()
         .llm_router(exec_router)
         .tool_registry(sub_registry)
         .max_steps(30)
         .timeout(Duration::from_secs(180))
-        .active_profile(resolved);
+        .active_profile(resolved)
+        .default_temperature(sampling_temperature);
     if let Some(ref dir) = ctx.tool_doc_dir {
         builder = builder.tool_doc_dir(dir.clone());
     }

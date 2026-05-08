@@ -40,6 +40,15 @@ pub struct ProviderInfo {
     /// User-selected model family (e.g. "Qwen35Local"). Drives the
     /// per-model quirks system. `"Default"` for unprofiled providers.
     pub family: String,
+    /// Authoritative context-window ceiling used by the arc compactor.
+    pub context_window_tokens: u32,
+    /// Compact when arc tokens exceed this percentage of `context_window_tokens`.
+    pub compaction_trigger_pct: u8,
+    /// Compaction target as a percentage of `context_window_tokens`.
+    pub compaction_target_pct: u8,
+    /// Sampling temperature override. `None` lets the provider adapter pick
+    /// its baked-in default.
+    pub temperature: Option<f32>,
 }
 
 /// Email configuration info for the frontend.
@@ -547,6 +556,10 @@ fn provider_config_to_info(id: &str, config: &ProviderConfig, active_id: &str) -
         supports_vision: config.supports_vision,
         supports_documents: config.supports_documents,
         family: config.family.wire_id().to_string(),
+        context_window_tokens: config.context_window_tokens,
+        compaction_trigger_pct: config.compaction_trigger_pct,
+        compaction_target_pct: config.compaction_target_pct,
+        temperature: config.temperature,
     }
 }
 
@@ -739,6 +752,10 @@ pub async fn save_provider(
     supports_vision: Option<bool>,
     supports_documents: Option<bool>,
     family: Option<String>,
+    context_window_tokens: Option<u32>,
+    compaction_trigger_pct: Option<u8>,
+    compaction_target_pct: Option<u8>,
+    temperature: Option<f32>,
     state: State<'_, AppState>,
 ) -> std::result::Result<String, String> {
     let mut models = load_models_config();
@@ -768,15 +785,33 @@ pub async fn save_provider(
         model.clone()
     };
 
-    let (context_window_tokens, compaction_trigger_pct, compaction_target_pct) = existing
-        .map(|p| {
-            (
-                p.context_window_tokens,
-                p.compaction_trigger_pct,
-                p.compaction_target_pct,
-            )
-        })
-        .unwrap_or((128_000, 65, 30));
+    // Advanced fields preserve existing values when the caller omits
+    // them (e.g. an older frontend that doesn't yet send them). When
+    // present, percentages are clamped to [1, 100] so a fat-fingered 0
+    // or 200 can't poison `resolve_compaction_budget`. The temperature
+    // field is `Option<f32>` end-to-end: the frontend sends `Some(f32)`
+    // when the user typed a number and `None` when they cleared the
+    // field — mirroring the provider-config schema (None = adapter
+    // default). There is no "preserve" sentinel for temperature
+    // because the Save flow always renders the whole card; an empty
+    // box is an explicit reset to the adapter default.
+    let context_window_tokens = context_window_tokens
+        .filter(|w| *w > 0)
+        .or_else(|| existing.map(|p| p.context_window_tokens))
+        .unwrap_or(128_000);
+    let compaction_trigger_pct = compaction_trigger_pct
+        .map(|p| p.clamp(1, 100))
+        .or_else(|| existing.map(|p| p.compaction_trigger_pct))
+        .unwrap_or(65);
+    let compaction_target_pct = compaction_target_pct
+        .map(|p| p.clamp(1, 100))
+        .or_else(|| existing.map(|p| p.compaction_target_pct))
+        .unwrap_or(30);
+    // Clamp trigger above target so the user can't configure the
+    // hysteresis backwards (a 30% trigger / 50% target would ping-pong).
+    // Bumps trigger to target+1 if the user supplied an inverted pair.
+    let compaction_trigger_pct =
+        compaction_trigger_pct.max(compaction_target_pct.saturating_add(1).min(100));
 
     // If the caller didn't pass a flag, preserve the existing value
     // (so editing other fields doesn't accidentally clear vision/documents).
@@ -805,6 +840,7 @@ pub async fn save_provider(
         supports_vision: supports_vision_resolved,
         supports_documents: supports_documents_resolved,
         family: family_resolved,
+        temperature,
     };
 
     models.providers.insert(id.clone(), provider);

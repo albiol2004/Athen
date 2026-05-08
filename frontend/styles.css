@@ -2273,6 +2273,36 @@ option:hover {
     transition: transform var(--dur) var(--ease);
 }
 
+.provider-advanced-toggle {
+    cursor: pointer;
+    user-select: none;
+    display: inline-flex;
+    gap: 6px;
+    align-items: center;
+}
+.provider-advanced {
+    border-top: 1px dashed var(--border);
+    margin-top: 8px;
+    padding-top: 12px;
+}
+.provider-field-row {
+    display: flex;
+    gap: 12px;
+}
+.provider-field-row .provider-subfield {
+    flex: 1 1 0;
+    min-width: 0;
+}
+.provider-field-row .provider-subfield label {
+    display: block;
+    margin-bottom: 4px;
+    font-size: 12px;
+    color: var(--text-2);
+}
+.provider-field-row .provider-subfield input {
+    width: 100%;
+}
+
 /* ─── API key wrapper ─── */
 .api-key-wrapper {
     position: relative;

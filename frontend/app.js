@@ -3634,6 +3634,34 @@ function createProviderCard(provider) {
             </label>
             <div class="field-hint">Tick this when the model can render PDFs natively (Claude Sonnet/Opus 3.5+, Gemini 1.5+). Independent of vision. When off, Athen falls back to extracting PDF text locally and inlining it — your model still sees the contents either way.</div>
         </div>
+        <div class="provider-field">
+            <label class="advanced-toggle provider-advanced-toggle">
+                <span class="advanced-arrow">&#9654;</span>
+                <span>Advanced</span>
+            </label>
+        </div>
+        <div class="provider-advanced" style="display: none;">
+            <div class="provider-field">
+                <label>Context window (tokens)</label>
+                <input type="number" class="provider-context-window" min="1024" step="1024" value="${provider.context_window_tokens}" placeholder="e.g. 32000">
+                <div class="field-hint">Authoritative ceiling used by arc compaction. Set this to your model's real context length (32k for Qwen3.5 9B local, 200k for Claude, 128k for GPT-4o). Compaction fires when arc tokens exceed Trigger %, summarises down to Target %.</div>
+            </div>
+            <div class="provider-field provider-field-row">
+                <div class="provider-subfield">
+                    <label>Compaction trigger %</label>
+                    <input type="number" class="provider-compaction-trigger" min="1" max="100" value="${provider.compaction_trigger_pct}">
+                </div>
+                <div class="provider-subfield">
+                    <label>Compaction target %</label>
+                    <input type="number" class="provider-compaction-target" min="1" max="100" value="${provider.compaction_target_pct}">
+                </div>
+            </div>
+            <div class="provider-field">
+                <label>Sampling temperature</label>
+                <input type="number" class="provider-temperature" min="0" max="2" step="0.05" value="${provider.temperature ?? ''}" placeholder="Adapter default (~0.7)">
+                <div class="field-hint">Lower = more deterministic. Leave blank for the provider's default (0.7 across most APIs). Try 0.0–0.3 for benchmarking, code, or strict tool-calling; 0.7+ for creative tasks.</div>
+            </div>
+        </div>
         <div class="provider-card-actions">
             <button class="btn-secondary test-btn">Test Connection</button>
             <button class="btn-primary save-btn">Save</button>
@@ -3665,6 +3693,21 @@ function createProviderCard(provider) {
             const slug = opt ? opt.getAttribute('data-default-slug') : '';
             if (slug) {
                 modelInput.value = slug;
+            }
+        });
+    }
+
+    const advToggle = body.querySelector('.provider-advanced-toggle');
+    const advPane = body.querySelector('.provider-advanced');
+    if (advToggle && advPane) {
+        advToggle.addEventListener('click', () => {
+            const arrow = advToggle.querySelector('.advanced-arrow');
+            if (advPane.style.display === 'none') {
+                advPane.style.display = 'block';
+                if (arrow) arrow.innerHTML = '&#9660;';
+            } else {
+                advPane.style.display = 'none';
+                if (arrow) arrow.innerHTML = '&#9654;';
             }
         });
     }
@@ -3705,6 +3748,31 @@ async function handleSaveProvider(card, id) {
     const familySelect = card.querySelector('.provider-family');
     const family = familySelect ? familySelect.value : null;
 
+    // Advanced fields. Empty inputs map to null so the backend preserves
+    // existing values for window/triggers and treats null-temperature as
+    // "use the adapter's baked-in default" (currently 0.7 across the
+    // OpenAI-compat / DeepSeek paths).
+    const ctxWindowInput = card.querySelector('.provider-context-window');
+    const ctxWindowVal = ctxWindowInput ? ctxWindowInput.value.trim() : '';
+    const contextWindowTokens = ctxWindowVal === '' ? null : parseInt(ctxWindowVal, 10);
+
+    const trigInput = card.querySelector('.provider-compaction-trigger');
+    const trigVal = trigInput ? trigInput.value.trim() : '';
+    const compactionTriggerPct = trigVal === '' ? null : parseInt(trigVal, 10);
+
+    const tgtInput = card.querySelector('.provider-compaction-target');
+    const tgtVal = tgtInput ? tgtInput.value.trim() : '';
+    const compactionTargetPct = tgtVal === '' ? null : parseInt(tgtVal, 10);
+
+    const tempInput = card.querySelector('.provider-temperature');
+    const tempVal = tempInput ? tempInput.value.trim() : '';
+    const temperature = tempVal === '' ? null : parseFloat(tempVal);
+
+    if (compactionTriggerPct !== null && compactionTargetPct !== null
+        && compactionTriggerPct <= compactionTargetPct) {
+        showToast('Compaction trigger must be greater than target — bumping trigger.', 'info');
+    }
+
     const saveBtn = card.querySelector('.save-btn');
     saveBtn.disabled = true;
     saveBtn.textContent = 'Saving...';
@@ -3718,6 +3786,10 @@ async function handleSaveProvider(card, id) {
             supportsVision: supportsVision,
             supportsDocuments: supportsDocuments,
             family: family,
+            contextWindowTokens: contextWindowTokens,
+            compactionTriggerPct: compactionTriggerPct,
+            compactionTargetPct: compactionTargetPct,
+            temperature: temperature,
         });
         showToast(msg, 'success');
         // Reload to reflect changes.

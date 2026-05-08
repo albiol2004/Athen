@@ -184,6 +184,13 @@ pub struct ProviderConfig {
     /// See `docs/PER_MODEL_QUIRKS.md`.
     #[serde(default)]
     pub family: crate::llm::ModelFamily,
+    /// Sampling temperature for the main agent loop. `None` lets the
+    /// provider adapter pick its baked-in default (currently 0.7 across
+    /// the OpenAI-compat / DeepSeek paths). The settings UI exposes this
+    /// behind the per-provider Advanced dropdown so power users can tune
+    /// determinism without it surfacing for non-technical users.
+    #[serde(default)]
+    pub temperature: Option<f32>,
 }
 
 fn default_context_window_tokens() -> u32 {

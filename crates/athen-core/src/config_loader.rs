@@ -247,6 +247,7 @@ default_model = "deepseek-chat"
                 supports_vision: false,
                 supports_documents: false,
                 family: crate::llm::ModelFamily::Default,
+                temperature: None,
             },
         );
         config.models.profiles.insert(

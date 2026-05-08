@@ -86,11 +86,16 @@ fn spawn_router_approval(
         .try_lock()
         .map(|g| g.clone())
         .unwrap_or_default();
+    let cfg_for_resolvers = crate::state::load_config();
     let (compaction_trigger_tokens, compaction_target_tokens) =
         crate::compaction::resolve_compaction_budget(
-            &crate::state::load_config(),
+            &cfg_for_resolvers,
             &active_provider_id_snapshot,
         );
+    let sampling_temperature = crate::compaction::resolve_provider_temperature(
+        &cfg_for_resolvers,
+        &active_provider_id_snapshot,
+    );
 
     // Clone every AppState bit the helper would need, so the bg task can
     // drive execution without borrowing `&AppState`.
@@ -119,6 +124,7 @@ fn spawn_router_approval(
         attachment_store: state.attachment_store(),
         compaction_trigger_tokens,
         compaction_target_tokens,
+        sampling_temperature,
     };
 
     tauri::async_runtime::spawn(async move {
@@ -228,6 +234,7 @@ fn spawn_router_approval(
             attachment_store: bg_ctx.attachment_store.clone(),
             compaction_trigger_tokens: bg_ctx.compaction_trigger_tokens,
             compaction_target_tokens: bg_ctx.compaction_target_tokens,
+            sampling_temperature: bg_ctx.sampling_temperature,
         };
 
         let outcome = match execute_approved_task(task_id, ctx).await {
@@ -306,6 +313,12 @@ struct ApprovedTaskBgCtx {
     attachment_store: Option<athen_persistence::attachments::AttachmentStore>,
     compaction_trigger_tokens: u32,
     compaction_target_tokens: u32,
+    /// Active provider's sampling-temperature override. `None` means
+    /// "let the provider adapter pick its baked-in default" (currently
+    /// 0.7 across OpenAI-compat / DeepSeek). Snapshotted at ctx
+    /// construction so a mid-task settings change can't move the
+    /// goalposts.
+    sampling_temperature: Option<f32>,
 }
 
 /// Resolve the agent profile that should drive execution for a given arc.
@@ -1657,6 +1670,10 @@ pub async fn send_message(
             )
             .await;
 
+            let sampling_temperature = crate::compaction::resolve_provider_temperature(
+                &crate::state::load_config(),
+                &state.active_provider_id.lock().await.clone(),
+            );
             let mut builder = AgentBuilder::new()
                 .llm_router(exec_router)
                 .tool_registry(registry)
@@ -1666,7 +1683,8 @@ pub async fn send_message(
                 .context_messages(context)
                 .stream_sender(stream_tx)
                 .cancel_flag(cancel_flag)
-                .external_system_suffix(Some(system_suffix));
+                .external_system_suffix(Some(system_suffix))
+                .default_temperature(sampling_temperature);
             if let Some(p) = state.tool_doc_dir.clone() {
                 builder = builder.tool_doc_dir(p);
             }
@@ -1921,11 +1939,16 @@ pub async fn approve_task(
 
     let active_arc = state.active_arc_id.lock().await.clone();
     let active_provider_id_snapshot = state.active_provider_id.lock().await.clone();
+    let cfg_for_resolvers = crate::state::load_config();
     let (compaction_trigger_tokens, compaction_target_tokens) =
         crate::compaction::resolve_compaction_budget(
-            &crate::state::load_config(),
+            &cfg_for_resolvers,
             &active_provider_id_snapshot,
         );
+    let sampling_temperature = crate::compaction::resolve_provider_temperature(
+        &cfg_for_resolvers,
+        &active_provider_id_snapshot,
+    );
 
     let ctx = ApprovedTaskCtx {
         coordinator: Arc::clone(&state.coordinator),
@@ -1960,6 +1983,7 @@ pub async fn approve_task(
         attachment_store: state.attachment_store(),
         compaction_trigger_tokens,
         compaction_target_tokens,
+        sampling_temperature,
     };
 
     let outcome = match execute_approved_task(task_uuid, ctx).await {
@@ -2088,6 +2112,11 @@ pub(crate) struct ApprovedTaskCtx {
     /// agent run. See `crate::compaction::resolve_compaction_budget`.
     pub compaction_trigger_tokens: u32,
     pub compaction_target_tokens: u32,
+    /// Sampling temperature override resolved from the active provider's
+    /// `temperature` field. `None` means "use the adapter's baked-in
+    /// default". Same snapshot semantics as the compaction budget so a
+    /// mid-task settings tweak doesn't change behavior inside one run.
+    pub sampling_temperature: Option<f32>,
 }
 
 /// Drive a risk-flagged task all the way through approval, dispatch,
@@ -2449,7 +2478,8 @@ pub(crate) async fn execute_approved_task(
         .context_messages(context)
         .stream_sender(stream_tx)
         .cancel_flag(ctx.cancel_flag.clone())
-        .external_system_suffix(Some(system_suffix));
+        .external_system_suffix(Some(system_suffix))
+        .default_temperature(ctx.sampling_temperature);
     if let Some(p) = ctx.tool_doc_dir.clone() {
         builder = builder.tool_doc_dir(p);
     }
@@ -3241,7 +3271,8 @@ pub(crate) async fn execute_dispatched_task(
         .stream_sender(stream_tx)
         .cancel_flag(ctx.cancel_flag.clone())
         .external_system_suffix(Some(system_suffix))
-        .autonomous_mode(true);
+        .autonomous_mode(true)
+        .default_temperature(ctx.sampling_temperature);
     if let Some(p) = ctx.tool_doc_dir.clone() {
         builder = builder.tool_doc_dir(p);
     }
