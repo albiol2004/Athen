@@ -6,6 +6,7 @@ pub mod config_loader;
 pub mod contact;
 pub mod error;
 pub mod event;
+pub mod identity;
 pub mod ipc;
 pub mod llm;
 pub mod notification;

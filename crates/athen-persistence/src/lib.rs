@@ -9,6 +9,7 @@ pub mod chat;
 pub mod checkpoint;
 pub mod contacts;
 pub mod grants;
+pub mod identity;
 pub mod mcp;
 pub mod notifications;
 pub mod profiles;
@@ -28,6 +29,7 @@ use crate::calendar::CalendarStore;
 use crate::chat::ChatStore;
 use crate::contacts::SqliteContactStore;
 use crate::grants::GrantStore;
+use crate::identity::SqliteIdentityStore;
 use crate::mcp::McpStore;
 use crate::notifications::NotificationStore;
 use crate::profiles::SqliteProfileStore;
@@ -89,6 +91,9 @@ impl Database {
         profiles.init_schema().await?;
         let attachments = self.attachment_store();
         attachments.init_schema().await?;
+        let identity = self.identity_store();
+        identity.init_schema().await?;
+        identity.seed_categories_if_empty().await?;
         profiles.seed_builtins_if_empty().await
     }
 
@@ -140,6 +145,11 @@ impl Database {
     /// Create an `AttachmentStore` backed by this database's connection.
     pub fn attachment_store(&self) -> AttachmentStore {
         AttachmentStore::new(self.conn.clone())
+    }
+
+    /// Create a `SqliteIdentityStore` backed by this database's connection.
+    pub fn identity_store(&self) -> SqliteIdentityStore {
+        SqliteIdentityStore::new(self.conn.clone())
     }
 }
 
