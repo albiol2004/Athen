@@ -442,13 +442,17 @@ wins until the code or doc gets updated.
 
 ## 10. Open questions / future work
 
-- **Streaming semantics for inline tool extraction**: the non-streaming
-  path lands in `quirks::apply_to_response` and is wired into every
-  provider's `complete()`. The streaming path
-  (`complete_streaming`) does not yet run extractors — currently the
-  desktop app is non-functional on Qwen3.5 in streaming mode (cloud
-  providers stay fine because their `Structured` strategy is a no-op).
-  Tracked as the next quirks-system slice.
+- **Streaming markup leak**: the streaming path now runs the inline tool-call
+  extractor at end-of-stream via `quirks::extract_streaming_tail`, so the
+  agent loop receives the recovered tool calls correctly. *However*, the
+  raw `<tool_call>...</tool_call>` markup is still streamed to the consumer
+  in the visible deltas — we can't retroactively edit chunks already sent.
+  The agent works; the chat UI briefly shows the markup before the model
+  finalises its turn. Two ways to fix: (a) buffer all visible content for
+  non-`Structured` strategies and only emit at end-of-stream (loses
+  streaming UX for those models, but Qwen local is fast), or (b) frontend
+  CSS / regex filter on rendered chat content. Frontend filter is cheaper
+  and is the intended path.
 - **Vision/multimodal axis**: image input shape varies (URL vs
   base64 vs Files API; Bedrock-Llama is PNG-only). Not yet modeled
   here because it lives in request construction, not response

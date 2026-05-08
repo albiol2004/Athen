@@ -17,7 +17,7 @@
 //! - `extractors/` — concrete `ToolExtractionStrategy` implementations
 //!   (slice 3 will populate this).
 
-use athen_core::llm::LlmResponse;
+use athen_core::llm::{LlmChunk, LlmResponse};
 use serde::{Deserialize, Serialize};
 
 pub mod extractors;
@@ -249,6 +249,56 @@ pub fn apply_to_response(quirks: &ModelQuirks, response: &mut LlmResponse) {
     }
 }
 
+/// Streaming counterpart to `apply_to_response`. Provider streaming
+/// loops call this once at end-of-stream, after they've drained any
+/// structured tool-call accumulator. It runs the inline-extraction
+/// pipeline on the full buffered content text — only when the quirks
+/// say so AND no structured tool calls were observed during the stream.
+///
+/// If the strategy recovers tool calls, the function returns a synthetic
+/// terminal `LlmChunk` carrying them; the provider should push it to the
+/// stream output. Returns `None` when no extraction is needed or no calls
+/// were recovered.
+///
+/// Note: the prose markup (e.g. `<tool_call>...</tool_call>`) has already
+/// been streamed to the consumer by the time this fires — we can't
+/// retroactively strip the user-visible deltas. The agent loop still
+/// receives the recovered tool calls as a final chunk, which is what
+/// matters for correctness; the cosmetic markup leak is a known UX
+/// trade-off documented in `docs/PER_MODEL_QUIRKS.md` §10.
+pub fn extract_streaming_tail(
+    quirks: &ModelQuirks,
+    buffered_content: &str,
+    saw_structured_tool_calls: bool,
+) -> Option<LlmChunk> {
+    if saw_structured_tool_calls {
+        return None;
+    }
+    if matches!(quirks.tool_extraction, ToolExtractionStrategy::Structured) {
+        return None;
+    }
+    let (_, calls) = match quirks.tool_extraction {
+        ToolExtractionStrategy::InlineXmlQwenStyle => extractors::extract_qwen_style(buffered_content),
+        // Other inline strategies land in later slices.
+        _ => return None,
+    };
+    if calls.is_empty() {
+        return None;
+    }
+    let mut tool_calls = calls;
+    if quirks.tool_arg_repair.any() {
+        for call in tool_calls.iter_mut() {
+            repair::apply(&quirks.tool_arg_repair, &mut call.arguments);
+        }
+    }
+    Some(LlmChunk {
+        delta: String::new(),
+        is_final: true,
+        is_thinking: false,
+        tool_calls,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,6 +382,45 @@ mod tests {
         resp.reasoning_content = Some("Background reasoning.".into());
         apply_to_response(&r1_quirks, &mut resp);
         assert_eq!(resp.content, "Real answer.");
+    }
+
+    #[test]
+    fn streaming_tail_extracts_qwen_inline_tool_call() {
+        let qwen = seed::quirks_for_family(athen_core::llm::ModelFamily::Qwen35Local);
+        let buffered = "Working on it.\n<tool_call><function=read_file><parameter=path>foo.rs</parameter></function></tool_call>";
+        let chunk = extract_streaming_tail(&qwen, buffered, false).expect("should extract");
+        assert!(chunk.is_final);
+        assert_eq!(chunk.tool_calls.len(), 1);
+        assert_eq!(chunk.tool_calls[0].name, "read_file");
+        assert_eq!(chunk.tool_calls[0].arguments["path"], "foo.rs");
+    }
+
+    #[test]
+    fn streaming_tail_skipped_when_structured_calls_already_seen() {
+        let qwen = seed::quirks_for_family(athen_core::llm::ModelFamily::Qwen35Local);
+        let buffered = "<tool_call><function=read_file><parameter=path>x</parameter></function></tool_call>";
+        // saw_structured_tool_calls = true → don't double-emit.
+        assert!(extract_streaming_tail(&qwen, buffered, true).is_none());
+    }
+
+    #[test]
+    fn streaming_tail_no_op_for_default_quirks() {
+        let buffered = "<tool_call><function=read_file><parameter=path>x</parameter></function></tool_call>";
+        assert!(extract_streaming_tail(&ModelQuirks::default(), buffered, false).is_none());
+    }
+
+    #[test]
+    fn streaming_tail_runs_arg_repair_on_extracted_calls() {
+        // Synthetic quirks: Qwen extraction + control-char repair (not a real
+        // family combo today, but exercises the wiring).
+        let mut q = seed::quirks_for_family(athen_core::llm::ModelFamily::Qwen35Local);
+        q.tool_arg_repair = ToolArgRepair {
+            control_chars_to_unicode_escape: true,
+            ..ToolArgRepair::empty()
+        };
+        let buffered = "<tool_call><function=shell><parameter=cmd>ls\u{0001}-la</parameter></function></tool_call>";
+        let chunk = extract_streaming_tail(&q, buffered, false).expect("should extract");
+        assert_eq!(chunk.tool_calls[0].arguments["cmd"], "ls -la");
     }
 
     #[test]

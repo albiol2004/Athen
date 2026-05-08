@@ -358,31 +358,40 @@ impl LlmProvider for DeepSeekProvider {
         }
 
         let byte_stream = http_response.bytes_stream();
+        let quirks_snapshot = self.quirks;
 
         // DeepSeek is OpenAI-compatible — reuse the stateful SSE parser so
         // fragmented tool-call deltas are correctly assembled across chunks,
         // and buffer raw bytes across HTTP chunks so SSE lines and multi-byte
         // UTF-8 codepoints split at chunk boundaries reassemble correctly.
+        // The `content_buffer` + `saw_structured` fields drive the
+        // end-of-stream inline tool-call extraction (a no-op for the
+        // baseline `Structured` strategy DeepSeek's chat-class models use).
         let chunk_stream = futures::stream::unfold(
-            (
+            DeepSeekStreamState {
                 byte_stream,
-                ToolCallAccumulator::default(),
-                Vec::<u8>::new(),
-                false,
-            ),
-            |(mut byte_stream, mut acc, mut pending, mut done)| async move {
-                if done {
+                acc: ToolCallAccumulator::default(),
+                pending: Vec::<u8>::new(),
+                done: false,
+                content_buffer: String::new(),
+                saw_structured: false,
+                quirks: quirks_snapshot,
+            },
+            |mut s| async move {
+                if s.done {
                     return None;
                 }
-                let parsed = match byte_stream.next().await {
+                let parsed = match s.byte_stream.next().await {
                     Some(Ok(bytes)) => {
-                        pending.extend_from_slice(&bytes);
-                        let complete = take_complete_lines(&mut pending);
+                        s.pending.extend_from_slice(&bytes);
+                        let complete = take_complete_lines(&mut s.pending);
                         if complete.is_empty() {
                             Vec::new()
                         } else {
                             let text = String::from_utf8_lossy(&complete);
-                            parse_sse_chunks(&text, "deepseek", &mut acc)
+                            let chunks = parse_sse_chunks(&text, "deepseek", &mut s.acc);
+                            observe_deepseek_chunks(&chunks, &mut s);
+                            chunks
                         }
                     }
                     Some(Err(e)) => vec![Err(AthenError::LlmProvider {
@@ -390,16 +399,19 @@ impl LlmProvider for DeepSeekProvider {
                         message: format!("stream error: {}", e),
                     })],
                     None => {
-                        done = true;
+                        s.done = true;
                         let mut out = Vec::new();
-                        if !pending.is_empty() {
-                            let tail = std::mem::take(&mut pending);
+                        if !s.pending.is_empty() {
+                            let tail = std::mem::take(&mut s.pending);
                             let text = String::from_utf8_lossy(&tail);
-                            out.extend(parse_sse_chunks(&text, "deepseek", &mut acc));
+                            let chunks = parse_sse_chunks(&text, "deepseek", &mut s.acc);
+                            observe_deepseek_chunks(&chunks, &mut s);
+                            out.extend(chunks);
                         }
-                        if !acc.is_empty() {
-                            let tool_calls = acc.drain();
+                        if !s.acc.is_empty() {
+                            let tool_calls = s.acc.drain();
                             if !tool_calls.is_empty() {
+                                s.saw_structured = true;
                                 out.push(Ok(LlmChunk {
                                     delta: String::new(),
                                     is_final: true,
@@ -408,13 +420,17 @@ impl LlmProvider for DeepSeekProvider {
                                 }));
                             }
                         }
+                        if let Some(tail) = quirks::extract_streaming_tail(
+                            &s.quirks,
+                            &s.content_buffer,
+                            s.saw_structured,
+                        ) {
+                            out.push(Ok(tail));
+                        }
                         out
                     }
                 };
-                Some((
-                    futures::stream::iter(parsed),
-                    (byte_stream, acc, pending, done),
-                ))
+                Some((futures::stream::iter(parsed), s))
             },
         )
         .flatten();
@@ -424,6 +440,40 @@ impl LlmProvider for DeepSeekProvider {
 
     async fn is_available(&self) -> bool {
         true
+    }
+}
+
+/// Streaming state for DeepSeek's `complete_streaming` unfold. Mirrors
+/// `OpenAiCompatibleProvider::StreamState` but flattens the byte-stream
+/// generic so the unfold closure stays inferable.
+struct DeepSeekStreamState<S> {
+    byte_stream: S,
+    acc: ToolCallAccumulator,
+    pending: Vec<u8>,
+    done: bool,
+    content_buffer: String,
+    saw_structured: bool,
+    quirks: ModelQuirks,
+}
+
+/// Per-batch chunk observer: appends visible deltas to the content buffer
+/// (only when extraction will be needed at end-of-stream) and flips the
+/// `saw_structured` flag on any chunk that surfaced a structured tool call.
+fn observe_deepseek_chunks<S>(
+    chunks: &[Result<athen_core::llm::LlmChunk>],
+    state: &mut DeepSeekStreamState<S>,
+) {
+    let needs_buffer = !matches!(
+        state.quirks.tool_extraction,
+        crate::quirks::ToolExtractionStrategy::Structured
+    );
+    for c in chunks.iter().flatten() {
+        if !c.tool_calls.is_empty() {
+            state.saw_structured = true;
+        }
+        if needs_buffer && !c.delta.is_empty() && !c.is_thinking {
+            state.content_buffer.push_str(&c.delta);
+        }
     }
 }
 

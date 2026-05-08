@@ -452,6 +452,9 @@ impl LlmProvider for OpenAiCompatibleProvider {
                 pending_bytes: Vec::new(),
                 provider_id,
                 done: false,
+                content_buffer: String::new(),
+                saw_structured_tool_calls: false,
+                quirks: self.quirks,
             },
             |mut state| async move {
                 if state.done {
@@ -465,7 +468,9 @@ impl LlmProvider for OpenAiCompatibleProvider {
                             Vec::new()
                         } else {
                             let text = String::from_utf8_lossy(&complete);
-                            parse_sse_chunks(&text, &state.provider_id, &mut state.acc)
+                            let chunks = parse_sse_chunks(&text, &state.provider_id, &mut state.acc);
+                            observe_chunks_for_quirks(&chunks, &mut state);
+                            chunks
                         }
                     }
                     Some(Err(e)) => vec![Err(AthenError::LlmProvider {
@@ -481,11 +486,14 @@ impl LlmProvider for OpenAiCompatibleProvider {
                         if !state.pending_bytes.is_empty() {
                             let tail = std::mem::take(&mut state.pending_bytes);
                             let text = String::from_utf8_lossy(&tail);
-                            out.extend(parse_sse_chunks(&text, &state.provider_id, &mut state.acc));
+                            let chunks = parse_sse_chunks(&text, &state.provider_id, &mut state.acc);
+                            observe_chunks_for_quirks(&chunks, &mut state);
+                            out.extend(chunks);
                         }
                         if !state.acc.is_empty() {
                             let tool_calls = state.acc.drain();
                             if !tool_calls.is_empty() {
+                                state.saw_structured_tool_calls = true;
                                 out.push(Ok(LlmChunk {
                                     delta: String::new(),
                                     is_final: true,
@@ -493,6 +501,17 @@ impl LlmProvider for OpenAiCompatibleProvider {
                                     tool_calls,
                                 }));
                             }
+                        }
+                        // Inline tool-call extraction tail: when the model
+                        // emits `<tool_call>...` markup inside content text
+                        // (Qwen-style) instead of structured tool_calls,
+                        // recover them now.
+                        if let Some(tail) = quirks::extract_streaming_tail(
+                            &state.quirks,
+                            &state.content_buffer,
+                            state.saw_structured_tool_calls,
+                        ) {
+                            out.push(Ok(tail));
                         }
                         out
                     }
@@ -547,12 +566,45 @@ fn openai_multimodal_parts(text: &str, images: &[ImageInput]) -> serde_json::Val
 /// Generic over the byte-stream type so both this provider and DeepSeek
 /// (which reuses the same buffering logic) can share it without naming
 /// `reqwest`'s private `Bytes` stream type explicitly.
+/// Inspect a freshly-parsed batch of `LlmChunk`s and update the streaming
+/// state's `content_buffer` + `saw_structured_tool_calls` flag. Only buffers
+/// when `quirks.tool_extraction != Structured` to avoid unnecessary
+/// allocations for the cloud-baseline streaming path.
+fn observe_chunks_for_quirks<S>(
+    chunks: &[Result<LlmChunk>],
+    state: &mut StreamState<S>,
+) {
+    let needs_buffer = !matches!(
+        state.quirks.tool_extraction,
+        crate::quirks::ToolExtractionStrategy::Structured
+    );
+    for c in chunks.iter().flatten() {
+        if !c.tool_calls.is_empty() {
+            state.saw_structured_tool_calls = true;
+        }
+        if needs_buffer && !c.delta.is_empty() && !c.is_thinking {
+            state.content_buffer.push_str(&c.delta);
+        }
+    }
+}
+
 struct StreamState<S> {
     byte_stream: S,
     acc: ToolCallAccumulator,
     pending_bytes: Vec<u8>,
     provider_id: String,
     done: bool,
+    /// Buffered visible content text (excluding thinking) for end-of-stream
+    /// inline tool-call extraction (Qwen-style models). Only populated when
+    /// `quirks.tool_extraction` is non-Structured; left empty otherwise so
+    /// the structured-streaming path stays allocation-free.
+    content_buffer: String,
+    /// True once any chunk from the SSE accumulator surfaced structured
+    /// `tool_calls`. Suppresses the inline extractor at end-of-stream.
+    saw_structured_tool_calls: bool,
+    /// Snapshot of the provider's quirks at request time. Cheap to copy
+    /// (all enums + bools).
+    quirks: ModelQuirks,
 }
 
 /// Split off the longest prefix of `buf` that ends in `\n`, returning it.
