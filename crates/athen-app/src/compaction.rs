@@ -32,38 +32,39 @@ use athen_persistence::arcs::{ArcEntry, ArcStore, EntryType};
 pub const DEFAULT_MODEL_WINDOW_TOKENS: u32 = 128_000;
 pub const DEFAULT_TARGET_TOKENS: u32 = 38_400;
 
-/// Convert an `ArcContextView` into the chat-message sequence the
-/// executor consumes. Order: optional summary as a system message,
-/// optional tool-cache as a system message, then tail entries with
-/// source→role mapping. Non-message tail entries (tool_call rows,
-/// system_event, etc.) are dropped because the executor's
-/// `context_messages` is a chat history, not a raw audit log — the
-/// auditor records tool calls separately.
-pub fn view_to_messages(view: &ArcContextView) -> Vec<ChatMessage> {
-    let mut out = Vec::new();
+/// Convert an `ArcContextView` into the inputs the executor consumes.
+///
+/// Returns `(messages, system_suffix)`:
+/// - `messages` — verbatim tail history with `source → role` mapping.
+///   Non-message tail entries (tool_call rows, system_event, etc.) are
+///   dropped because the executor's `context_messages` is a chat history,
+///   not a raw audit log.
+/// - `system_suffix` — compaction summary and most-recent-tool-result
+///   cache, packaged as text intended to be appended to the leading
+///   system message (via `AgentBuilder::external_system_suffix`). These
+///   used to ride as mid-stream `Role::System` messages, but strict chat
+///   templates (Qwen, Llama) raise on system roles past position 0, so
+///   they now live inside the single leading system message.
+pub fn view_to_messages(view: &ArcContextView) -> (Vec<ChatMessage>, String) {
+    let mut suffix = String::new();
     if let Some(ref s) = view.summary {
-        out.push(ChatMessage {
-            role: Role::System,
-            content: MessageContent::Text(format!(
-                "<<COMPACTION SUMMARY — covers earlier turns of this arc; \
-                 the verbatim history below picks up after this point>>\n{}",
-                s.content
-            )),
-        });
+        suffix.push_str(&format!(
+            "<<COMPACTION SUMMARY — covers earlier turns of this arc; \
+             the verbatim history below picks up after this point>>\n{}\n\n",
+            s.content
+        ));
     }
     if !view.tool_cache.is_empty() {
-        let mut block =
-            String::from("<<LATEST TOOL RESULTS — most recent successful call per tool>>\n");
+        suffix.push_str("<<LATEST TOOL RESULTS — most recent successful call per tool>>\n");
         for e in &view.tool_cache {
-            block.push_str("- ");
-            block.push_str(&e.content.replace('\n', " "));
-            block.push('\n');
+            suffix.push_str("- ");
+            suffix.push_str(&e.content.replace('\n', " "));
+            suffix.push('\n');
         }
-        out.push(ChatMessage {
-            role: Role::System,
-            content: MessageContent::Text(block),
-        });
+        suffix.push('\n');
     }
+
+    let mut tail = Vec::new();
     for e in &view.tail {
         if e.entry_type != "message" {
             continue;
@@ -75,12 +76,12 @@ pub fn view_to_messages(view: &ArcContextView) -> Vec<ChatMessage> {
             "tool" => Role::Tool,
             _ => continue,
         };
-        out.push(ChatMessage {
+        tail.push(ChatMessage {
             role,
             content: MessageContent::Text(e.content.clone()),
         });
     }
-    out
+    (tail, suffix)
 }
 
 /// Token estimation: `chars / 4`. Stable upper-bound estimator suitable

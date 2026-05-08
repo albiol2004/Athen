@@ -1473,7 +1473,15 @@ pub async fn send_message(
     match dispatch_result {
         Ok(Some((task_id, _))) => {
             // Snapshot the current conversation history for context.
-            let mut context = state.history.lock().await.clone();
+            let context = state.history.lock().await.clone();
+
+            // `system_suffix` accumulates host-supplied volatile content
+            // (memory recall, attachment summaries) that used to be
+            // pushed as mid-stream `Role::System` messages. Strict chat
+            // templates (Qwen, Llama) raise on system messages past
+            // position 0, so we now fold this content into the leading
+            // system message via `AgentBuilder::external_system_suffix`.
+            let mut system_suffix = String::new();
 
             // Auto-inject relevant memories into context.
             // Search with the full message AND with individual key terms
@@ -1516,20 +1524,20 @@ pub async fn send_message(
                         .map(|m| format!("- {}", m.content))
                         .collect::<Vec<_>>()
                         .join("\n");
-                    // Append AFTER history. Memory recall is volatile per
-                    // turn; placing it at position 0 invalidates the
-                    // append-only arc-history prefix cache. See
-                    // docs/ARC_COMPACTION.md §10.
-                    context.push(ChatMessage {
-                        role: Role::System,
-                        content: MessageContent::Text(format!(
-                            "MEMORIES ALREADY LOADED FROM YOUR PERSISTENT MEMORY \
-                             (treat these as authoritative — do not call memory_recall \
-                             to re-fetch the same entities listed below; only call \
-                             memory_recall if you need *additional* information not \
-                             covered here):\n{memory_text}"
-                        )),
-                    });
+                    // Fold into the leading system message via
+                    // `external_system_suffix` instead of pushing as a
+                    // mid-stream `Role::System` — strict chat templates
+                    // (Qwen, Llama) raise on non-leading system roles.
+                    // The executor appends this after its own volatile
+                    // state (timestamp), so the static prefix above the
+                    // suffix stays byte-identical between turns.
+                    system_suffix.push_str(&format!(
+                        "MEMORIES ALREADY LOADED FROM YOUR PERSISTENT MEMORY \
+                         (treat these as authoritative — do not call memory_recall \
+                         to re-fetch the same entities listed below; only call \
+                         memory_recall if you need *additional* information not \
+                         covered here):\n{memory_text}\n\n"
+                    ));
                 } else {
                     tracing::debug!("No relevant memories found for query");
                 }
@@ -1636,7 +1644,8 @@ pub async fn send_message(
                 .timeout(Duration::from_secs(300))
                 .context_messages(context)
                 .stream_sender(stream_tx)
-                .cancel_flag(cancel_flag);
+                .cancel_flag(cancel_flag)
+                .external_system_suffix(Some(system_suffix));
             if let Some(p) = state.tool_doc_dir.clone() {
                 builder = builder.tool_doc_dir(p);
             }
@@ -2135,45 +2144,61 @@ pub(crate) async fn execute_approved_task(
     // executor must never read raw `arc_entries` directly (see
     // `docs/ARC_COMPACTION.md` §8 "the discipline rule"). Fall back to
     // load_entries only when no compactor is wired (legacy boot/tests).
-    let mut context: Vec<ChatMessage> = if let Some(ref compactor) = ctx.compactor {
-        match compactor
-            .prepare_context(
-                &ctx.active_arc_id,
-                crate::compaction::DEFAULT_MODEL_WINDOW_TOKENS,
-                crate::compaction::DEFAULT_TARGET_TOKENS,
-            )
-            .await
-        {
-            Ok(view) => crate::compaction::view_to_messages(&view),
-            Err(e) => {
-                tracing::warn!(arc = %ctx.active_arc_id, error = %e, "compactor.prepare_context failed; using empty context");
-                Vec::new()
+    //
+    // The compactor returns `(tail messages, system suffix)`: the suffix
+    // (compaction summary + tool-result cache) used to be a pair of
+    // mid-stream `Role::System` messages but now folds into the leading
+    // system message via `external_system_suffix` so strict chat
+    // templates (Qwen, Llama) accept it.
+    let (context, compaction_suffix): (Vec<ChatMessage>, String) =
+        if let Some(ref compactor) = ctx.compactor {
+            match compactor
+                .prepare_context(
+                    &ctx.active_arc_id,
+                    crate::compaction::DEFAULT_MODEL_WINDOW_TOKENS,
+                    crate::compaction::DEFAULT_TARGET_TOKENS,
+                )
+                .await
+            {
+                Ok(view) => crate::compaction::view_to_messages(&view),
+                Err(e) => {
+                    tracing::warn!(arc = %ctx.active_arc_id, error = %e, "compactor.prepare_context failed; using empty context");
+                    (Vec::new(), String::new())
+                }
             }
-        }
-    } else if let Some(ref store) = ctx.arc_store {
-        match store.load_entries(&ctx.active_arc_id).await {
-            Ok(entries) => entries
-                .into_iter()
-                .filter(|e| e.entry_type == athen_persistence::arcs::EntryType::Message)
-                .filter_map(|e| {
-                    let role = match e.source.as_str() {
-                        "user" => Role::User,
-                        "assistant" => Role::Assistant,
-                        "system" => Role::System,
-                        "tool" => Role::Tool,
-                        _ => return None,
-                    };
-                    Some(ChatMessage {
-                        role,
-                        content: MessageContent::Text(e.content),
+        } else if let Some(ref store) = ctx.arc_store {
+            let messages = match store.load_entries(&ctx.active_arc_id).await {
+                Ok(entries) => entries
+                    .into_iter()
+                    .filter(|e| e.entry_type == athen_persistence::arcs::EntryType::Message)
+                    .filter_map(|e| {
+                        let role = match e.source.as_str() {
+                            "user" => Role::User,
+                            "assistant" => Role::Assistant,
+                            "system" => Role::System,
+                            "tool" => Role::Tool,
+                            _ => return None,
+                        };
+                        Some(ChatMessage {
+                            role,
+                            content: MessageContent::Text(e.content),
+                        })
                     })
-                })
-                .collect(),
-            Err(_) => vec![],
-        }
-    } else {
-        vec![]
-    };
+                    .collect(),
+                Err(_) => vec![],
+            };
+            (messages, String::new())
+        } else {
+            (vec![], String::new())
+        };
+
+    // `system_suffix` accumulates host-supplied volatile content that
+    // used to ride as mid-stream `Role::System` messages. Strict chat
+    // templates (Qwen, Llama) raise on non-leading system roles, so we
+    // fold it into the leading system message via
+    // `AgentBuilder::external_system_suffix`. Compaction output goes
+    // first so the summary precedes memory recall.
+    let mut system_suffix = compaction_suffix;
 
     // Auto-inject relevant memories into context.
     if let Some(ref memory) = ctx.memory {
@@ -2208,19 +2233,17 @@ pub(crate) async fn execute_approved_task(
                 .map(|m| format!("- {}", m.content))
                 .collect::<Vec<_>>()
                 .join("\n");
-            // Append AFTER history. Memory recall is volatile per turn;
-            // placing it at position 0 invalidates the append-only
-            // arc-history prefix cache. See docs/ARC_COMPACTION.md §10.
-            context.push(ChatMessage {
-                role: Role::System,
-                content: MessageContent::Text(format!(
-                    "MEMORIES ALREADY LOADED FROM YOUR PERSISTENT MEMORY \
-                     (treat these as authoritative — do not call memory_recall \
-                     to re-fetch the same entities listed below; only call \
-                     memory_recall if you need *additional* information not \
-                     covered here):\n{memory_text}"
-                )),
-            });
+            // Fold into the leading system message via
+            // `external_system_suffix` instead of a mid-stream
+            // `Role::System` push — strict chat templates (Qwen, Llama)
+            // raise on non-leading system roles.
+            system_suffix.push_str(&format!(
+                "MEMORIES ALREADY LOADED FROM YOUR PERSISTENT MEMORY \
+                 (treat these as authoritative — do not call memory_recall \
+                 to re-fetch the same entities listed below; only call \
+                 memory_recall if you need *additional* information not \
+                 covered here):\n{memory_text}\n\n"
+            ));
         }
     }
 
@@ -2271,10 +2294,12 @@ pub(crate) async fn execute_approved_task(
                     context_messages_before = context.len(),
                     "Surfacing attachments to user-chat executor"
                 );
-                context.push(ChatMessage {
-                    role: Role::System,
-                    content: MessageContent::Text(msg),
-                });
+                // Fold into the leading system message instead of a
+                // mid-stream `Role::System` push (Qwen/Llama Jinja).
+                system_suffix.push_str(&msg);
+                if !system_suffix.ends_with("\n\n") {
+                    system_suffix.push_str("\n\n");
+                }
             }
             surfaced_images = surfacing.images;
         }
@@ -2386,7 +2411,8 @@ pub(crate) async fn execute_approved_task(
         .timeout(Duration::from_secs(300))
         .context_messages(context)
         .stream_sender(stream_tx)
-        .cancel_flag(ctx.cancel_flag.clone());
+        .cancel_flag(ctx.cancel_flag.clone())
+        .external_system_suffix(Some(system_suffix));
     if let Some(p) = ctx.tool_doc_dir.clone() {
         builder = builder.tool_doc_dir(p);
     }
@@ -2928,45 +2954,60 @@ pub(crate) async fn execute_dispatched_task(
     // Build context. Routed through the compactor when available — see
     // `docs/ARC_COMPACTION.md` §8 ("the discipline rule"). Fall back to
     // load_entries only when no compactor is wired.
-    let mut context: Vec<ChatMessage> = if let Some(ref compactor) = ctx.compactor {
-        match compactor
-            .prepare_context(
-                &arc_id,
-                crate::compaction::DEFAULT_MODEL_WINDOW_TOKENS,
-                crate::compaction::DEFAULT_TARGET_TOKENS,
-            )
-            .await
-        {
-            Ok(view) => crate::compaction::view_to_messages(&view),
-            Err(e) => {
-                tracing::warn!(arc = %arc_id, error = %e, "compactor.prepare_context failed; using empty context");
-                Vec::new()
+    // The compactor returns `(tail messages, system suffix)`: the
+    // suffix (compaction summary + tool-result cache) used to be a pair
+    // of mid-stream `Role::System` messages but now folds into the
+    // leading system message via `external_system_suffix` so strict
+    // chat templates (Qwen, Llama) accept it.
+    let (context, compaction_suffix): (Vec<ChatMessage>, String) =
+        if let Some(ref compactor) = ctx.compactor {
+            match compactor
+                .prepare_context(
+                    &arc_id,
+                    crate::compaction::DEFAULT_MODEL_WINDOW_TOKENS,
+                    crate::compaction::DEFAULT_TARGET_TOKENS,
+                )
+                .await
+            {
+                Ok(view) => crate::compaction::view_to_messages(&view),
+                Err(e) => {
+                    tracing::warn!(arc = %arc_id, error = %e, "compactor.prepare_context failed; using empty context");
+                    (Vec::new(), String::new())
+                }
             }
-        }
-    } else if let Some(ref store) = ctx.arc_store {
-        match store.load_entries(&arc_id).await {
-            Ok(entries) => entries
-                .into_iter()
-                .filter(|e| e.entry_type == athen_persistence::arcs::EntryType::Message)
-                .filter_map(|e| {
-                    let role = match e.source.as_str() {
-                        "user" => Role::User,
-                        "assistant" => Role::Assistant,
-                        "system" => Role::System,
-                        "tool" => Role::Tool,
-                        _ => return None,
-                    };
-                    Some(ChatMessage {
-                        role,
-                        content: MessageContent::Text(e.content),
+        } else if let Some(ref store) = ctx.arc_store {
+            let messages = match store.load_entries(&arc_id).await {
+                Ok(entries) => entries
+                    .into_iter()
+                    .filter(|e| e.entry_type == athen_persistence::arcs::EntryType::Message)
+                    .filter_map(|e| {
+                        let role = match e.source.as_str() {
+                            "user" => Role::User,
+                            "assistant" => Role::Assistant,
+                            "system" => Role::System,
+                            "tool" => Role::Tool,
+                            _ => return None,
+                        };
+                        Some(ChatMessage {
+                            role,
+                            content: MessageContent::Text(e.content),
+                        })
                     })
-                })
-                .collect(),
-            Err(_) => vec![],
-        }
-    } else {
-        vec![]
-    };
+                    .collect(),
+                Err(_) => vec![],
+            };
+            (messages, String::new())
+        } else {
+            (vec![], String::new())
+        };
+
+    // `system_suffix` accumulates host-supplied volatile content that
+    // used to ride as mid-stream `Role::System` messages. Strict chat
+    // templates (Qwen, Llama) raise on non-leading system roles, so we
+    // fold it into the leading system message via
+    // `AgentBuilder::external_system_suffix`. Compaction output goes
+    // first so the summary precedes memory recall.
+    let mut system_suffix = compaction_suffix;
 
     // Auto-inject relevant memories into context.
     if let Some(ref memory) = ctx.memory {
@@ -3001,19 +3042,17 @@ pub(crate) async fn execute_dispatched_task(
                 .map(|m| format!("- {}", m.content))
                 .collect::<Vec<_>>()
                 .join("\n");
-            // Append AFTER history. Memory recall is volatile per turn;
-            // placing it at position 0 invalidates the append-only
-            // arc-history prefix cache. See docs/ARC_COMPACTION.md §10.
-            context.push(ChatMessage {
-                role: Role::System,
-                content: MessageContent::Text(format!(
-                    "MEMORIES ALREADY LOADED FROM YOUR PERSISTENT MEMORY \
-                     (treat these as authoritative — do not call memory_recall \
-                     to re-fetch the same entities listed below; only call \
-                     memory_recall if you need *additional* information not \
-                     covered here):\n{memory_text}"
-                )),
-            });
+            // Fold into the leading system message via
+            // `external_system_suffix` instead of a mid-stream
+            // `Role::System` push — strict chat templates (Qwen, Llama)
+            // raise on non-leading system roles.
+            system_suffix.push_str(&format!(
+                "MEMORIES ALREADY LOADED FROM YOUR PERSISTENT MEMORY \
+                 (treat these as authoritative — do not call memory_recall \
+                 to re-fetch the same entities listed below; only call \
+                 memory_recall if you need *additional* information not \
+                 covered here):\n{memory_text}\n\n"
+            ));
         }
     }
 
@@ -3046,21 +3085,17 @@ pub(crate) async fn execute_dispatched_task(
                 context_messages_before = context.len(),
                 "Surfacing attachments to dispatched executor"
             );
-            context.push(ChatMessage {
-                role: Role::System,
-                content: MessageContent::Text(msg),
-            });
-            let total: usize = context
-                .iter()
-                .map(|m| match &m.content {
-                    MessageContent::Text(s) => s.len(),
-                    MessageContent::Structured(v) => v.to_string().len(),
-                    MessageContent::Multimodal { text, .. } => text.len(),
-                })
-                .sum();
+            // Fold into the leading system message instead of a
+            // mid-stream `Role::System` push (Qwen/Llama Jinja).
+            let surfaced_chars = msg.len();
+            system_suffix.push_str(&msg);
+            if !system_suffix.ends_with("\n\n") {
+                system_suffix.push_str("\n\n");
+            }
             tracing::info!(
                 context_messages_after = context.len(),
-                context_total_chars = total,
+                system_suffix_chars = system_suffix.len(),
+                surfaced_chars,
                 "Context after attachment surfacing"
             );
         }
@@ -3167,6 +3202,7 @@ pub(crate) async fn execute_dispatched_task(
         .context_messages(context)
         .stream_sender(stream_tx)
         .cancel_flag(ctx.cancel_flag.clone())
+        .external_system_suffix(Some(system_suffix))
         .autonomous_mode(true);
     if let Some(p) = ctx.tool_doc_dir.clone() {
         builder = builder.tool_doc_dir(p);

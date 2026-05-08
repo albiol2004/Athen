@@ -51,6 +51,7 @@ pub struct AgentBuilder {
     shell_kind: Option<&'static str>,
     autonomous_mode: bool,
     initial_user_images: Vec<athen_core::llm::ImageInput>,
+    external_system_suffix: Option<String>,
 }
 
 impl AgentBuilder {
@@ -76,7 +77,18 @@ impl AgentBuilder {
             shell_kind: None,
             autonomous_mode: false,
             initial_user_images: Vec::new(),
+            external_system_suffix: None,
         }
+    }
+
+    /// Set host-supplied volatile content (memory recall, attachment
+    /// summaries, compaction state) to ride along inside the leading
+    /// system message. Use this instead of pushing mid-stream
+    /// `Role::System` messages — those are rejected by strict chat
+    /// templates (Qwen, Llama). Empty / `None` clears.
+    pub fn external_system_suffix(mut self, suffix: Option<String>) -> Self {
+        self.external_system_suffix = suffix.filter(|s| !s.is_empty());
+        self
     }
 
     /// Attach images to the first user turn. Vision-capable LLMs see
@@ -249,6 +261,10 @@ impl AgentBuilder {
 
         if !self.initial_user_images.is_empty() {
             executor.set_initial_user_images(self.initial_user_images);
+        }
+
+        if let Some(suffix) = self.external_system_suffix {
+            executor.set_external_system_suffix(Some(suffix));
         }
 
         Ok(executor)

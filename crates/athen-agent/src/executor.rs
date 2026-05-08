@@ -217,6 +217,16 @@ pub struct DefaultExecutor {
     /// instead of `Text` so vision-capable LLMs can see the images. Only
     /// applies to the first turn; tool-result follow-ups stay text-only.
     initial_user_images: Vec<athen_core::llm::ImageInput>,
+    /// External volatile system content the host (athen-app) wants to
+    /// inject into the leading system message instead of pushing as
+    /// mid-stream `Role::System` messages.
+    ///
+    /// Strict chat templates (Qwen, Llama) raise on system messages past
+    /// position 0, so memory dumps / attachment summaries / compaction
+    /// summaries must travel inside the single leading system message.
+    /// Appended after the executor's own volatile state (timestamp), so
+    /// the static prefix above stays byte-identical between turns.
+    external_system_suffix: Option<String>,
 }
 
 impl DefaultExecutor {
@@ -244,7 +254,27 @@ impl DefaultExecutor {
             shell_kind: None,
             autonomous_mode: false,
             initial_user_images: Vec::new(),
+            external_system_suffix: None,
         }
+    }
+
+    /// Inject host-supplied volatile content (e.g. memory recall,
+    /// attachment summaries, compaction state) that should ride along in
+    /// the leading system message rather than as mid-stream
+    /// `Role::System` messages.
+    ///
+    /// The string is appended at the very end of every turn's system
+    /// prompt — after the executor's own volatile state (timestamp) — so
+    /// the byte-identical static prefix above is preserved. Strict chat
+    /// templates (Qwen, Llama) accept this because there's still only
+    /// one system message at position 0; permissive templates (DeepSeek,
+    /// OpenAI) see the same content they would have seen as a trailing
+    /// system message, just folded into slot 0.
+    ///
+    /// Pass `None` to clear. Callers must rebuild the suffix per user
+    /// turn — the executor itself does NOT recompute it across the loop.
+    pub fn set_external_system_suffix(&mut self, suffix: Option<String>) {
+        self.external_system_suffix = suffix.filter(|s| !s.is_empty());
     }
 
     /// Attach images to the first user turn. Vision-capable LLMs receive a
@@ -1088,7 +1118,7 @@ impl AgentExecutor for DefaultExecutor {
             // Rebuild the system prompt each iteration so newly-revealed
             // tools' full schemas appear inline. The prompt itself is small;
             // rebuilding is cheap.
-            let system_prompt = Self::build_system_prompt_with_mode(
+            let mut system_prompt = Self::build_system_prompt_with_mode(
                 &available_tools,
                 &revealed_tools,
                 has_context,
@@ -1098,6 +1128,15 @@ impl AgentExecutor for DefaultExecutor {
                 self.shell_kind,
                 self.autonomous_mode,
             );
+            // Append host-supplied volatile content (memory recall,
+            // attachment summaries, compaction state). Lives at the very
+            // end of the leading system message so strict chat templates
+            // (Qwen, Llama) accept it — they raise on system messages
+            // past position 0, which is why we no longer push these as
+            // mid-stream `Role::System`.
+            if let Some(ref suffix) = self.external_system_suffix {
+                system_prompt.push_str(suffix);
+            }
 
             // Tools sent to the LLM API: only the revealed subset carries
             // schemas. The model sees others in the system-prompt index;
