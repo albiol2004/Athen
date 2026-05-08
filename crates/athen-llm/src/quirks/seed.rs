@@ -287,7 +287,10 @@ mod tests {
         // Llama 4 Scout / Maverick emit pythonic `[func(p=v)]`, NOT JSON
         // arrays — that's the upstream `llama4_pythonic` parser shape.
         let q = quirks_for_family(ModelFamily::Llama4Instruct);
-        assert_eq!(q.tool_extraction, ToolExtractionStrategy::InlinePythonicLlama);
+        assert_eq!(
+            q.tool_extraction,
+            ToolExtractionStrategy::InlinePythonicLlama
+        );
     }
 
     #[test]
@@ -299,7 +302,10 @@ mod tests {
     #[test]
     fn grok_4_default_baseline() {
         // No wire-level quirks vs OpenAI baseline.
-        assert_eq!(quirks_for_family(ModelFamily::Grok4), ModelQuirks::default());
+        assert_eq!(
+            quirks_for_family(ModelFamily::Grok4),
+            ModelQuirks::default()
+        );
     }
 
     #[test]

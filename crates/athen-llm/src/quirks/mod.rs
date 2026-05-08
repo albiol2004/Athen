@@ -278,7 +278,9 @@ pub fn extract_streaming_tail(
         return None;
     }
     let (_, calls) = match quirks.tool_extraction {
-        ToolExtractionStrategy::InlineXmlQwenStyle => extractors::extract_qwen_style(buffered_content),
+        ToolExtractionStrategy::InlineXmlQwenStyle => {
+            extractors::extract_qwen_style(buffered_content)
+        }
         // Other inline strategies land in later slices.
         _ => return None,
     };
@@ -398,14 +400,16 @@ mod tests {
     #[test]
     fn streaming_tail_skipped_when_structured_calls_already_seen() {
         let qwen = seed::quirks_for_family(athen_core::llm::ModelFamily::Qwen35Local);
-        let buffered = "<tool_call><function=read_file><parameter=path>x</parameter></function></tool_call>";
+        let buffered =
+            "<tool_call><function=read_file><parameter=path>x</parameter></function></tool_call>";
         // saw_structured_tool_calls = true → don't double-emit.
         assert!(extract_streaming_tail(&qwen, buffered, true).is_none());
     }
 
     #[test]
     fn streaming_tail_no_op_for_default_quirks() {
-        let buffered = "<tool_call><function=read_file><parameter=path>x</parameter></function></tool_call>";
+        let buffered =
+            "<tool_call><function=read_file><parameter=path>x</parameter></function></tool_call>";
         assert!(extract_streaming_tail(&ModelQuirks::default(), buffered, false).is_none());
     }
 

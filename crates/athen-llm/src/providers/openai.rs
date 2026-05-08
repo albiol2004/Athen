@@ -468,7 +468,8 @@ impl LlmProvider for OpenAiCompatibleProvider {
                             Vec::new()
                         } else {
                             let text = String::from_utf8_lossy(&complete);
-                            let chunks = parse_sse_chunks(&text, &state.provider_id, &mut state.acc);
+                            let chunks =
+                                parse_sse_chunks(&text, &state.provider_id, &mut state.acc);
                             observe_chunks_for_quirks(&chunks, &mut state);
                             chunks
                         }
@@ -486,7 +487,8 @@ impl LlmProvider for OpenAiCompatibleProvider {
                         if !state.pending_bytes.is_empty() {
                             let tail = std::mem::take(&mut state.pending_bytes);
                             let text = String::from_utf8_lossy(&tail);
-                            let chunks = parse_sse_chunks(&text, &state.provider_id, &mut state.acc);
+                            let chunks =
+                                parse_sse_chunks(&text, &state.provider_id, &mut state.acc);
                             observe_chunks_for_quirks(&chunks, &mut state);
                             out.extend(chunks);
                         }
@@ -570,10 +572,7 @@ fn openai_multimodal_parts(text: &str, images: &[ImageInput]) -> serde_json::Val
 /// state's `content_buffer` + `saw_structured_tool_calls` flag. Only buffers
 /// when `quirks.tool_extraction != Structured` to avoid unnecessary
 /// allocations for the cloud-baseline streaming path.
-fn observe_chunks_for_quirks<S>(
-    chunks: &[Result<LlmChunk>],
-    state: &mut StreamState<S>,
-) {
+fn observe_chunks_for_quirks<S>(chunks: &[Result<LlmChunk>], state: &mut StreamState<S>) {
     let needs_buffer = !matches!(
         state.quirks.tool_extraction,
         crate::quirks::ToolExtractionStrategy::Structured

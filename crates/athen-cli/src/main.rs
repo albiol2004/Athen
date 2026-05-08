@@ -203,9 +203,13 @@ fn print_usage() {
     println!("    --prompt <STR>     Prompt for headless one-shot execution.");
     println!("    --profile <ID>     Activate a seeded AgentProfile (e.g. 'coder', 'researcher')");
     println!("                       on the executor. Ignored when --prompt is absent.");
-    println!("    --family <ID>      Model-family wire ID for per-model quirks (e.g. 'Qwen35Local',");
+    println!(
+        "    --family <ID>      Model-family wire ID for per-model quirks (e.g. 'Qwen35Local',"
+    );
     println!("                       'DeepSeekR1', 'Llama4Instruct'). Overrides ATHEN_FAMILY.");
-    println!("                       Defaults to 'Default' (baseline structured-tool-call behavior).");
+    println!(
+        "                       Defaults to 'Default' (baseline structured-tool-call behavior)."
+    );
     println!();
     println!("HEADLESS MODE ENV VARS:");
     println!("    ATHEN_BASE_URL  (required)  e.g. http://localhost:8000/v1");
@@ -455,11 +459,8 @@ async fn main() {
             std::process::exit(2);
         }
     };
-    let family_str = family_arg.or_else(|| {
-        std::env::var("ATHEN_FAMILY")
-            .ok()
-            .filter(|s| !s.is_empty())
-    });
+    let family_str =
+        family_arg.or_else(|| std::env::var("ATHEN_FAMILY").ok().filter(|s| !s.is_empty()));
     let family = match family_str.as_deref() {
         None => ModelFamily::Default,
         Some(s) => match ModelFamily::from_wire_id(s) {

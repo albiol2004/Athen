@@ -790,10 +790,8 @@ pub async fn save_provider(
     // strings fall back to existing → Default rather than erroring so the
     // settings save can't break for a stale frontend.
     let family_resolved = match family.as_deref() {
-        Some(s) if !s.is_empty() => {
-            athen_core::llm::ModelFamily::from_wire_id(s)
-                .unwrap_or_else(|| existing.map(|p| p.family).unwrap_or_default())
-        }
+        Some(s) if !s.is_empty() => athen_core::llm::ModelFamily::from_wire_id(s)
+            .unwrap_or_else(|| existing.map(|p| p.family).unwrap_or_default()),
         _ => existing.map(|p| p.family).unwrap_or_default(),
     };
 
