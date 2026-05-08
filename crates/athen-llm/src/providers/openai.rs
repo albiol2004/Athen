@@ -403,7 +403,51 @@ impl LlmProvider for OpenAiCompatibleProvider {
             tool_calls,
             finish_reason,
         };
+        debug!(
+            provider = %self.provider_id,
+            phase = "pre_quirks",
+            content_len = response.content.len(),
+            tool_calls = response.tool_calls.len(),
+            reasoning_present = response.reasoning_content.is_some(),
+            finish_reason = ?response.finish_reason,
+            tool_extraction = ?self.quirks.tool_extraction,
+            reasoning_surface = ?self.quirks.reasoning_surface,
+            "complete: parsed wire response"
+        );
+        let pre_content_len = response.content.len();
+        let pre_tool_calls = response.tool_calls.len();
         quirks::apply_to_response(&self.quirks, &mut response);
+        if pre_content_len != response.content.len() || pre_tool_calls != response.tool_calls.len()
+        {
+            debug!(
+                provider = %self.provider_id,
+                phase = "post_quirks",
+                content_len = response.content.len(),
+                tool_calls = response.tool_calls.len(),
+                finish_reason = ?response.finish_reason,
+                content_delta = response.content.len() as i64 - pre_content_len as i64,
+                tool_calls_delta = response.tool_calls.len() as i64 - pre_tool_calls as i64,
+                "complete: quirks transformed response"
+            );
+        }
+        // Canary: an empty-content + no-tool-calls turn is the precondition
+        // for the executor's hardcoded "I don't have enough information"
+        // fallback. Surface it at WARN so benchmark runs don't fail silently
+        // even when RUST_LOG isn't cranked up.
+        if response.content.trim().is_empty() && response.tool_calls.is_empty() {
+            tracing::warn!(
+                provider = %self.provider_id,
+                model = %response.model_used,
+                reasoning_present = response.reasoning_content.is_some(),
+                pre_content_len,
+                pre_tool_calls,
+                tool_extraction = ?self.quirks.tool_extraction,
+                reasoning_surface = ?self.quirks.reasoning_surface,
+                "complete: response has no content and no tool calls — \
+                 executor will fall back to placeholder. Inline tool-call \
+                 extraction may have failed to match this model's wire format."
+            );
+        }
         Ok(response)
     }
 

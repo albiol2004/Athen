@@ -397,10 +397,15 @@ async fn run_headless(
 
 #[tokio::main]
 async fn main() {
-    // Minimal tracing — only warnings, no noisy info/debug.
+    // Tracing: honor `RUST_LOG` when set; otherwise default to WARN to keep
+    // the headless run quiet for benchmark harnesses. Examples:
+    //   RUST_LOG=athen_llm=debug,athen_agent=info  athen-cli --prompt ...
+    //   RUST_LOG=debug                              (everything, very noisy)
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::WARN)
-        .with_target(false)
+        .with_env_filter(env_filter)
+        .with_target(true)
         .compact()
         .init();
 

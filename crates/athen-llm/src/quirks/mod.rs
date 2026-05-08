@@ -192,6 +192,15 @@ pub fn apply_to_response(quirks: &ModelQuirks, response: &mut LlmResponse) {
     // --- Tool call extraction --------------------------------------
     // Non-Structured strategies recover tool calls from `content` when the
     // response's `tool_calls` field is empty, then strip them from the prose.
+    //
+    // Two surfaces are scanned in order: `content` first (the standard place),
+    // then `reasoning_content` as a fallback. The fallback handles the
+    // llama.cpp `--jinja --reasoning-format` case: when the parser strips
+    // `<think>...</think>` server-side, anything *inside* the think block —
+    // including `<tool_call>...</tool_call>` payloads emitted by Qwen mid-
+    // chain-of-thought — ends up in `reasoning_content` and never reaches
+    // `content`. Without this fallback the agent loop sees an empty turn and
+    // falls back to the placeholder.
     if response.tool_calls.is_empty() {
         match quirks.tool_extraction {
             ToolExtractionStrategy::Structured => {}
@@ -200,10 +209,15 @@ pub fn apply_to_response(quirks: &ModelQuirks, response: &mut LlmResponse) {
                 if !calls.is_empty() {
                     response.content = stripped;
                     response.tool_calls = calls;
-                    // The provider already set finish_reason to Stop; if we
-                    // recovered tool calls, surface ToolUse so the executor
-                    // dispatches them instead of treating the turn as final.
                     response.finish_reason = athen_core::llm::FinishReason::ToolUse;
+                } else if let Some(reasoning) = response.reasoning_content.as_ref() {
+                    let (reasoning_stripped, reasoning_calls) =
+                        extractors::extract_qwen_style(reasoning);
+                    if !reasoning_calls.is_empty() {
+                        response.reasoning_content = Some(reasoning_stripped);
+                        response.tool_calls = reasoning_calls;
+                        response.finish_reason = athen_core::llm::FinishReason::ToolUse;
+                    }
                 }
             }
             // Other inline strategies land in later slices.
@@ -223,19 +237,22 @@ pub fn apply_to_response(quirks: &ModelQuirks, response: &mut LlmResponse) {
         response.content = extractors::strip_leading_think_tag(&response.content);
     }
 
-    // For separate-field models (DeepSeek-R1, Kimi K2 thinking), promote
-    // reasoning into content when both content and tool_calls are empty —
-    // otherwise the executor falls back to the hardcoded "I don't have
-    // enough information" placeholder.
+    // Promote reasoning_content -> content when both content and tool_calls
+    // are empty — otherwise the executor falls back to the hardcoded
+    // placeholder. Applies to BOTH `SeparateField` (DeepSeek-R1, Kimi K2
+    // thinking) AND `InlineThinkTags` (Qwen, Gemma, etc.) because
+    // llama.cpp's `--jinja --reasoning-format` parser routes inline `<think>`
+    // blocks into `reasoning_content` server-side, making the "inline" model
+    // look like a "separate field" model on the wire.
     if response.content.is_empty()
         && response.tool_calls.is_empty()
-        && matches!(quirks.reasoning_surface, ReasoningSurface::SeparateField)
+        && matches!(
+            quirks.reasoning_surface,
+            ReasoningSurface::SeparateField | ReasoningSurface::InlineThinkTags
+        )
     {
         if let Some(reasoning) = response.reasoning_content.as_ref() {
             if !reasoning.trim().is_empty() {
-                // The reasoning sometimes carries its own leading think
-                // tag (especially when proxied through llama.cpp); strip it
-                // for the same UX reason as the inline path.
                 response.content = extractors::strip_leading_think_tag(reasoning);
             }
         }
@@ -384,6 +401,84 @@ mod tests {
         resp.reasoning_content = Some("Background reasoning.".into());
         apply_to_response(&r1_quirks, &mut resp);
         assert_eq!(resp.content, "Real answer.");
+    }
+
+    /// llama.cpp `--jinja --reasoning-format` strips `<think>` server-side and
+    /// routes the contents into `reasoning_content`. When Qwen plans a tool
+    /// call mid-thought, the `<tool_call>` payload lands there too. The
+    /// extractor must scan `reasoning_content` as a fallback or the agent
+    /// loop sees an empty turn and bails.
+    #[test]
+    fn apply_to_response_qwen_extracts_tool_call_from_reasoning_content() {
+        let qwen_quirks = seed::quirks_for_family(athen_core::llm::ModelFamily::Qwen35Local);
+        let mut resp = empty_response();
+        resp.content = String::new();
+        resp.reasoning_content = Some(
+            "Let me read the file to understand the bug.\n\
+             <tool_call><function=read_file><parameter=path>src/app/date_utils.py</parameter></function></tool_call>"
+                .into(),
+        );
+        apply_to_response(&qwen_quirks, &mut resp);
+        assert_eq!(resp.tool_calls.len(), 1);
+        assert_eq!(resp.tool_calls[0].name, "read_file");
+        assert_eq!(
+            resp.tool_calls[0].arguments["path"],
+            "src/app/date_utils.py"
+        );
+        assert_eq!(resp.finish_reason, FinishReason::ToolUse);
+        // The reasoning surface keeps the prose minus the extracted call.
+        assert!(resp
+            .reasoning_content
+            .as_deref()
+            .unwrap()
+            .contains("Let me read the file"));
+        assert!(!resp
+            .reasoning_content
+            .as_deref()
+            .unwrap()
+            .contains("<tool_call>"));
+    }
+
+    /// `content` takes precedence — when both surfaces carry a tool call, only
+    /// the content one is hoisted (the model already transitioned out of
+    /// thinking, so reasoning_content is just history at that point).
+    #[test]
+    fn apply_to_response_qwen_prefers_content_over_reasoning_for_tool_calls() {
+        let qwen_quirks = seed::quirks_for_family(athen_core::llm::ModelFamily::Qwen35Local);
+        let mut resp = empty_response();
+        resp.content =
+            "<tool_call><function=read_file><parameter=path>a</parameter></function></tool_call>"
+                .into();
+        resp.reasoning_content = Some(
+            "<tool_call><function=write_file><parameter=path>b</parameter></function></tool_call>"
+                .into(),
+        );
+        apply_to_response(&qwen_quirks, &mut resp);
+        assert_eq!(resp.tool_calls.len(), 1);
+        assert_eq!(resp.tool_calls[0].name, "read_file");
+        // Reasoning_content untouched when content extraction succeeded.
+        assert!(resp
+            .reasoning_content
+            .as_deref()
+            .unwrap()
+            .contains("write_file"));
+    }
+
+    /// When no tool call is recoverable anywhere, fall back to promoting
+    /// reasoning_content into content so the user sees the model's thinking
+    /// rather than the executor's "I don't have enough information"
+    /// placeholder. Applies to InlineThinkTags families (Qwen, Gemma) too —
+    /// not just SeparateField — because llama.cpp routes inline think blocks
+    /// into reasoning_content.
+    #[test]
+    fn apply_to_response_qwen_promotes_reasoning_when_no_tool_call_recoverable() {
+        let qwen_quirks = seed::quirks_for_family(athen_core::llm::ModelFamily::Qwen35Local);
+        let mut resp = empty_response();
+        resp.content = String::new();
+        resp.reasoning_content = Some("I'm not sure how to proceed here.".into());
+        apply_to_response(&qwen_quirks, &mut resp);
+        assert!(resp.tool_calls.is_empty());
+        assert_eq!(resp.content, "I'm not sure how to proceed here.");
     }
 
     #[test]
