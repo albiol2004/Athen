@@ -80,6 +80,17 @@ control-char repair (`feedback_deepseek_tool_args_repair.md`) runs on
 the resulting JSON args before dispatch — every strategy must produce
 output that flows through that pipeline, not bypass it.
 
+**Reasoning-content fallback for inline strategies.** When the
+provider routes the entire reply (think tags + tool call markup) into
+`reasoning_content` instead of `content` — which llama.cpp does under
+`--jinja --reasoning-format` for Qwen-class models — the inline
+extractor must scan `reasoning_content` as a fallback when `content`
+is empty and no `tool_calls` came through. Implemented at
+`crates/athen-llm/src/quirks/mod.rs:213–221`. Without this, Qwen3.5/3.6
+under `--reasoning-format` returns "no tool calls" and the executor
+fires its hardcoded fallback string. See
+`feedback_quirks_scan_reasoning_content.md`.
+
 ### Axis 2 — `ReasoningSurface`
 
 Where the model's chain-of-thought lives in the response.
@@ -439,6 +450,11 @@ wins until the code or doc gets updated.
   prefix-cache strategy, etc.) — those belong in provider config.
 - **Not** the place for credential handling — keys and base URLs stay
   in `ProviderConfig`.
+- **Not** the place for sampling parameters. Temperature is per-provider
+  (`ProviderConfig.temperature: Option<f32>`, surfaced in Settings UI as
+  `provider-temperature`) and applied at request construction, not via
+  this table. A future per-task / per-profile override mechanism is
+  tracked in `project_per_task_model_selection.md`.
 
 ## 10. Open questions / future work
 

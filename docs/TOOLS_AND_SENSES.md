@@ -174,6 +174,52 @@ After a text-only response (no tool calls) the executor calls a second cheap LLM
 
 `try_streaming_call()` (`executor.rs:435-495`) collects both text deltas and tool calls from SSE chunks. If streaming yields no content and no tool calls, the executor falls back to a non-streaming call to recover tool call data (`executor.rs:678-714`).
 
+### Tool Output Truncation
+
+Centralised at `crates/athen-agent/src/tool_truncation.rs`, applied at the executor's tool-result serialisation point (`executor.rs:1691–1694`) — the audit trail keeps the **full** untruncated result, only the model-visible bytes are capped.
+
+**Three policies:**
+
+- `TruncationPolicy::None` — pass through unchanged. Used for tools whose output is bounded at source (`memory_recall`, `email_send` ack, `web_search` clamped to 20 results upstream).
+- `TruncationPolicy::Chars { max }` — keep the first `max` bytes, append a marker. UTF-8 boundary-safe slicing.
+- `TruncationPolicy::HeadTail { head, tail }` — keep prologue + epilogue, drop the middle. Best for shell output where the interesting bits cluster at start (command echo) and end (exit code, last error line).
+
+Markers are explicit so the model knows it was cut and can re-query:
+
+```text
+[TRUNCATED: N bytes elided of M total. Refine your query...]
+[TRUNCATED: N bytes elided in the middle of M total. Refine your query...]
+```
+
+**Per-tool limits** (`tool_truncation.rs::policy_for`, lines 37–65):
+
+| Tool | Policy | Limit |
+|---|---|---|
+| `shell_execute` | HeadTail | 8 KB head + 4 KB tail |
+| `shell_logs` | HeadTail | 4 KB head + 8 KB tail |
+| `shell_spawn`, `shell_kill` | None | unbounded (small output) |
+| `read` | Chars | 40 KB |
+| `grep` | Chars | 20 KB |
+| `list_directory` | Chars | 8 KB |
+| `write`, `edit` | Chars | 2 KB |
+| `web_fetch` | Chars | 20 KB |
+| `web_search` | None | clamped to 20 results upstream |
+| `memory_store`, `memory_recall` | None | bounded at source |
+| `email_send` | None | small ack |
+| `install_package`, `uninstall_package`, `list_installed_packages` | Chars | 8 KB |
+| Unknown / MCP tools (fallback) | Chars | 20 KB |
+
+Limits are **fixed**, not configurable via UI — keeping them off the settings surface is deliberate (they're plumbing, not user policy).
+
+**Independent of compaction.** Tool truncation caps the LLM context per-turn at the result-serialisation point; compaction (`docs/ARC_COMPACTION.md`) summarises old conversation history. Different layers, no interference.
+
+**Other truncation points** (separate from `tool_truncation.rs`, but worth knowing):
+
+- **PDF inline budget** (`crates/athen-sentidos/src/pdf_extract.rs:35`) — `DEFAULT_INLINE_CHAR_BUDGET = 6000`. Beyond this, PDFs surface a "PDF text inlined (X of Y chars); call read_attachment_full(...) for the rest" hint and the agent fetches the rest on demand.
+- **Web reader body cap** (`crates/athen-web/src/reader/local.rs:17–18`) — 5 MB body cap + 40 K char output cap with `[... truncated, original was longer than N chars ...]` marker.
+
+**Test coverage**: 8 tests in `tool_truncation::tests` (`tool_truncation.rs:126–213`) cover passthrough, both truncation modes, UTF-8 boundary safety, known-tool dispatch, and the unknown-tool fallback.
+
 ---
 
 ## 2. MCP Servers

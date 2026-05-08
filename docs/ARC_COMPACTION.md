@@ -1,15 +1,22 @@
 # Arc Compaction
 
-Arcs are durable conversation/work threads persisted in `arc_entries` (see
-`crates/athen-persistence/src/arcs.rs`). Today, every executor dispatch loads
-the **entire** arc into the LLM context (`commands.rs::execute_approved_task`
-and `execute_dispatched_task`, both via `ArcStore::load_entries`). This works
-while arcs are short. It will not work once a single arc accumulates dozens of
-turns plus tool-call bursts — the prompt blows past the model's context window,
-costs scale linearly with arc age, and latency degrades.
+> **Status (2026-05-08): Phase-1 shipped.** The `ArcCompactor` trait, the
+> `LlmArcCompactor` implementation, summary persistence, per-provider
+> budgets, settings UI, and executor integration are all live. Phase-2/3
+> items (explicit `burst_id`, entropy pre-pass, embedding salience,
+> hierarchical re-compaction, post-compaction verification turn) remain
+> open. See §12 for a per-section implementation map.
 
-This document describes how Athen will compact arcs without losing the
-information the agent will actually reach for on its next turn.
+Arcs are durable conversation/work threads persisted in `arc_entries` (see
+`crates/athen-persistence/src/arcs.rs`). Before Phase-1, every executor dispatch
+loaded the **entire** arc into the LLM context. That broke once a single arc
+accumulated dozens of turns plus tool-call bursts — the prompt blew past the
+model's context window, costs scaled linearly with arc age, and latency
+degraded.
+
+This document describes how Athen compacts arcs without losing the
+information the agent will actually reach for on its next turn. The body
+below is the canonical design; §12 reports what is currently implemented.
 
 ## 1. The principle: the "Continue" test
 
@@ -423,3 +430,63 @@ amortized cost still favors earlier compaction.
 Phase 1 is the smallest end-to-end slice that delivers value (arcs no
 longer break when long). Phases 2–3 are improvements layered on the same
 trait surface.
+
+## 12. Implementation status (2026-05-08)
+
+This section is the live status map; sections 1–11 above are the design.
+Update this section, not the design body, when implementation moves.
+
+### What's live
+
+| Design section | Status | File:line |
+|---|---|---|
+| §3 Summary entry + `summarized_through_entry_id` pointer | ✅ | `EntryType::Summary` row written via `ArcStore::compact_arc`; `ArcMeta.summarized_through_entry_id` updated in the same transaction |
+| §3 Latest-per-tool-series cache | ✅ | `crates/athen-app/src/compaction.rs:380–399` — `BTreeMap` keyed by tool name, scans `id ≤ cutoff_id` of type `ToolCall`, keeps latest per tool |
+| §4 Hard-coded summarization prompt | ✅ | `crates/athen-app/src/compaction.rs:214–231`; `ModelProfile::Fast`, `max_tokens=2048`, `temperature=0.0` |
+| §5 Per-model budgets + trigger thresholds | ✅ | `ProviderConfig.context_window_tokens` / `compaction_trigger_pct` / `compaction_target_pct` (defaults 128k / 65 / 30); resolution in `resolve_compaction_budget` |
+| §2 Phase-1 burst heuristic (keep last 25% verbatim) | ✅ | `compaction.rs:264–276`; refuses to compact if <4 entries |
+| §7 Trait shape | ✅ | `athen-core::traits::compaction::ArcCompactor` |
+| §7 `LlmArcCompactor` Phase-1 implementation | ✅ | `crates/athen-app/src/compaction.rs` (the trait impl, ~420 LoC) |
+| §8 Atomic SQLite write (summary + pointer) | ✅ | Inside `arc_store.compact_arc()` |
+| §8 Discipline rule: executor goes through `load_context_view` | ✅ | Executor path runs `compactor.prepare_context(...)` at `crates/athen-app/src/commands.rs:2218–2234`; `view_to_messages()` at `compaction.rs:108–145` converts to `(Vec<ChatMessage>, system_suffix)` |
+| §9 UI shows full history including originals | ✅ | Summary entries render as collapsed `<details>` block "Earlier in this arc" in `frontend/app.js:2467` |
+| §10 Memory recall fix (no `context.insert(0, ...)`) | ✅ | Memory now flows through `external_system_suffix` appended to leading system prompt; the §10 violation is resolved |
+| §11 Phase-1.5 manual `compact_arc` Tauri command | ✅ | `crates/athen-app/src/commands.rs:3653`; force via `target_tokens = 0` |
+| Settings UI for budgets | ✅ | `frontend/app.js:3646–3656` (`provider-context-window`, `provider-compaction-trigger`, `provider-compaction-target`); validators in `crates/athen-app/src/settings.rs:791–839` |
+
+### What's not yet implemented
+
+| Design section | Status | Notes |
+|---|---|---|
+| §6 Post-compaction verification turn | ❌ | The "state restatement before next dispatch" + divergence warning hasn't landed. Highest-leverage gap left in Phase-1 — without it, divergence is silent. |
+| §2 Phase-2 explicit `burst_id` column | ❌ | Heuristic 25% rule is good enough for now; revisit if interleaved approvals start producing wrong burst boundaries. |
+| §7 Phase-2 deterministic entropy/dedup pre-pass | ❌ | Trait shape supports it as a stage; not implemented. |
+| §7 Phase-3 embedding-driven salience | ❌ | Trait shape supports it; not implemented. |
+| §7 Phase-3 hierarchical re-compaction | ❌ | The data model handles re-compaction (older summaries stay in `arc_entries`); the *pass* that combines `S_old + tail → S_new` when the tail itself overflows is not yet wired. |
+| §10 HashMap iteration audit, JSON-roundtrip audit | ⚠️ | The known cache-buster (`context.insert(0, ...)`) is fixed; a broader audit of remaining HashMap → BTreeMap conversions in prompt-construction paths is still open. |
+
+### Test coverage
+
+`crates/athen-app/src/compaction.rs::tests` — 8 tests:
+
+- `estimate_tokens_chars_div_four` — token estimator
+- `resolve_compaction_budget_uses_active_provider` — budget resolution
+- `resolve_compaction_budget_falls_back_for_unknown_provider` — fallback defaults
+- `resolve_compaction_budget_clamps_trigger_above_target` — hysteresis clamp
+- `resolve_provider_temperature_reads_active_override_or_returns_none` — temperature resolver (lives here because it shares the provider-resolver helper)
+- `build_summary_prompt_tags_roles_and_strips_newlines` — prompt construction
+- `load_context_view_with_no_summary_returns_all_tail` — loader fresh arc
+- `load_context_view_with_summary_returns_summary_plus_tail` — loader post-compaction
+
+Plus `crates/athen-core/src/traits/compaction.rs:125–164` — dyn-compatibility sanity check on the trait.
+
+### Known limitations to keep in mind when building on this
+
+- Token estimation is `chars / 4`. Stable upper-bound, but not exact —
+  per-provider tokenizers haven't been wired.
+- Compaction is **always-on** when a budget is configured; there is no
+  per-arc opt-out toggle. Add only if real users ask.
+- The summary prompt is hard-coded English. Localization policy for it is
+  open (see `project_athen_small_model_gaps.md`).
+- The `load_context_view` query is one round-trip per dispatch. Not cached;
+  cheap so far, audit if dispatch latency regresses.
