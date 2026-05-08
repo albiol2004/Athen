@@ -306,12 +306,13 @@ wins until the code or doc gets updated.
 
 ## 10. Open questions / future work
 
-- **Streaming semantics for inline tool extraction**: today's prototype
-  in `feedback_*` memos handled the non-streaming path only. The
-  streaming path (`OpenAiCompatibleProvider::complete_streaming`)
-  needs the same extractor pipeline before it ships to athen-app
-  users — currently the desktop app is non-functional on Qwen3.5
-  in streaming mode.
+- **Streaming semantics for inline tool extraction**: the non-streaming
+  path lands in `quirks::apply_to_response` and is wired into every
+  provider's `complete()`. The streaming path
+  (`complete_streaming`) does not yet run extractors — currently the
+  desktop app is non-functional on Qwen3.5 in streaming mode (cloud
+  providers stay fine because their `Structured` strategy is a no-op).
+  Tracked as the next quirks-system slice.
 - **Vision/multimodal axis**: image input shape varies (URL vs
   base64 vs Files API; Bedrock-Llama is PNG-only). Not yet modeled
   here because it lives in request construction, not response

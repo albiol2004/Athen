@@ -174,6 +174,16 @@ pub struct ProviderConfig {
     /// `supports_vision`: a model can support one without the other.
     #[serde(default)]
     pub supports_documents: bool,
+    /// User-selected model family for the per-model quirks system. Drives
+    /// response post-processing (inline tool-call extraction, reasoning
+    /// promotion, control-char repair). Defaults to `ModelFamily::Default`
+    /// for any provider config — including pre-existing serialized configs
+    /// that predate this field — so behavior is unchanged until the user
+    /// explicitly picks a family in Settings.
+    ///
+    /// See `docs/PER_MODEL_QUIRKS.md`.
+    #[serde(default)]
+    pub family: crate::llm::ModelFamily,
 }
 
 fn default_context_window_tokens() -> u32 {

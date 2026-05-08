@@ -246,6 +246,7 @@ default_model = "deepseek-chat"
                 compaction_target_pct: 30,
                 supports_vision: false,
                 supports_documents: false,
+                family: crate::llm::ModelFamily::Default,
             },
         );
         config.models.profiles.insert(

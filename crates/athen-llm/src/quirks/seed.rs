@@ -189,12 +189,12 @@ mod tests {
     #[test]
     fn qwen_local_quirks_match_design_doc() {
         let q = quirks_for_family(ModelFamily::Qwen35Local);
-        assert_eq!(q.tool_extraction, ToolExtractionStrategy::InlineXmlQwenStyle);
-        assert_eq!(q.reasoning_surface, ReasoningSurface::InlineThinkTags);
         assert_eq!(
-            q.template_strictness,
-            TemplateStrictness::SystemMustBeFirst
+            q.tool_extraction,
+            ToolExtractionStrategy::InlineXmlQwenStyle
         );
+        assert_eq!(q.reasoning_surface, ReasoningSurface::InlineThinkTags);
+        assert_eq!(q.template_strictness, TemplateStrictness::SystemMustBeFirst);
     }
 
     #[test]

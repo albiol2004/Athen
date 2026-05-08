@@ -2666,6 +2666,20 @@ async function loadProviderCatalog() {
     }
 }
 
+// Per-model quirks: family catalog. Loaded once and reused by every provider
+// card's Model-family dropdown. Each entry: { id, label, default_slug }.
+let MODEL_FAMILIES = [];
+
+async function loadModelFamilies() {
+    if (!invoke || MODEL_FAMILIES.length > 0) return;
+    try {
+        MODEL_FAMILIES = await invoke('list_model_families');
+    } catch (e) {
+        console.warn('[athen] list_model_families failed:', e);
+        MODEL_FAMILIES = [];
+    }
+}
+
 const SECURITY_HINTS = {
     assistant: 'Standard risk evaluation. The agent asks for approval on risky actions.',
     bunker:    'Maximum caution. Everything above read-only requires your approval.',
@@ -3575,13 +3589,25 @@ function createProviderCard(provider) {
 
     const isLocal = provider.provider_type === 'local';
 
+    const familyOptions = (MODEL_FAMILIES.length > 0 ? MODEL_FAMILIES : [{ id: 'Default', label: 'Default (unknown / generic)', default_slug: '' }])
+        .map((f) => {
+            const sel = (f.id === (provider.family || 'Default')) ? ' selected' : '';
+            return `<option value="${escapeHtml(f.id)}" data-default-slug="${escapeHtml(f.default_slug)}"${sel}>${escapeHtml(f.label)}</option>`;
+        })
+        .join('');
+
     body.innerHTML = `
         <div class="provider-field">
             <label>Base URL</label>
             <input type="text" class="provider-url" value="${escapeHtml(provider.base_url)}" placeholder="https://api.example.com">
         </div>
         <div class="provider-field">
-            <label>Model</label>
+            <label>Model family</label>
+            <select class="provider-family">${familyOptions}</select>
+            <div class="field-hint">Picks the per-model quirks profile (tool-call format, reasoning surface, template strictness). Leave on Default if unsure — it reproduces the OpenAI-compat baseline. Selecting a family pre-fills the model slug below; you can edit the slug for dated or fine-tuned variants of the same family.</div>
+        </div>
+        <div class="provider-field">
+            <label>Model slug</label>
             <input type="text" class="provider-model" value="${escapeHtml(provider.model)}" placeholder="model-name">
         </div>
         ${!isLocal ? `
@@ -3628,6 +3654,21 @@ function createProviderCard(provider) {
         });
     }
 
+    // Family dropdown: pre-fill the model slug with the family's default
+    // when the user picks a new family. Empty default ("Default" family)
+    // leaves the slug alone — that's a useful no-op for the safety-net case.
+    const familySelect = body.querySelector('.provider-family');
+    const modelInput = body.querySelector('.provider-model');
+    if (familySelect && modelInput) {
+        familySelect.addEventListener('change', () => {
+            const opt = familySelect.options[familySelect.selectedIndex];
+            const slug = opt ? opt.getAttribute('data-default-slug') : '';
+            if (slug) {
+                modelInput.value = slug;
+            }
+        });
+    }
+
     body.querySelector('.test-btn').addEventListener('click', () => {
         handleTestProvider(card, provider.id);
     });
@@ -3661,6 +3702,8 @@ async function handleSaveProvider(card, id) {
     const supportsVision = visionInput ? !!visionInput.checked : null;
     const documentsInput = card.querySelector('.provider-supports-documents');
     const supportsDocuments = documentsInput ? !!documentsInput.checked : null;
+    const familySelect = card.querySelector('.provider-family');
+    const family = familySelect ? familySelect.value : null;
 
     const saveBtn = card.querySelector('.save-btn');
     saveBtn.disabled = true;
@@ -3674,6 +3717,7 @@ async function handleSaveProvider(card, id) {
             apiKey: apiKey,
             supportsVision: supportsVision,
             supportsDocuments: supportsDocuments,
+            family: family,
         });
         showToast(msg, 'success');
         // Reload to reflect changes.
@@ -7075,6 +7119,7 @@ async function maybeRunOnboarding() {
     // Catalog has to be loaded before we render the wizard or the
     // settings template buttons, because both pull from it.
     await loadProviderCatalog();
+    await loadModelFamilies();
     populateOnboardingProviderPickers();
     renderProviderTemplates();
 

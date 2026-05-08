@@ -37,6 +37,9 @@ pub struct ProviderInfo {
     /// Whether the configured `default_model` accepts native PDF/document
     /// input. Independent of `supports_vision`.
     pub supports_documents: bool,
+    /// User-selected model family (e.g. "Qwen35Local"). Drives the
+    /// per-model quirks system. `"Default"` for unprofiled providers.
+    pub family: String,
 }
 
 /// Email configuration info for the frontend.
@@ -543,7 +546,93 @@ fn provider_config_to_info(id: &str, config: &ProviderConfig, active_id: &str) -
         is_active: id == active_id,
         supports_vision: config.supports_vision,
         supports_documents: config.supports_documents,
+        family: model_family_to_wire(config.family).to_string(),
     }
+}
+
+/// Map a `ModelFamily` enum value to its stable wire string used by the
+/// frontend dropdown. Mirrors `parse_model_family` below.
+fn model_family_to_wire(family: athen_core::llm::ModelFamily) -> &'static str {
+    use athen_core::llm::ModelFamily;
+    match family {
+        ModelFamily::Default => "Default",
+        ModelFamily::ClaudeOpus47 => "ClaudeOpus47",
+        ModelFamily::ClaudeSonnet46 => "ClaudeSonnet46",
+        ModelFamily::ClaudeHaiku45 => "ClaudeHaiku45",
+        ModelFamily::Gpt5 => "Gpt5",
+        ModelFamily::OpenAiO3 => "OpenAiO3",
+        ModelFamily::Gemini3Pro => "Gemini3Pro",
+        ModelFamily::DeepSeekV4Chat => "DeepSeekV4Chat",
+        ModelFamily::DeepSeekR1 => "DeepSeekR1",
+        ModelFamily::Qwen35Local => "Qwen35Local",
+        ModelFamily::Qwen36Local => "Qwen36Local",
+        ModelFamily::Gemma4Local => "Gemma4Local",
+        ModelFamily::KimiK26Cloud => "KimiK26Cloud",
+        ModelFamily::MiniMaxM25Cloud => "MiniMaxM25Cloud",
+        ModelFamily::Llama32Instruct => "Llama32Instruct",
+        ModelFamily::Llama4Instruct => "Llama4Instruct",
+        ModelFamily::MistralLarge3 => "MistralLarge3",
+        ModelFamily::MagistralMedium => "MagistralMedium",
+        ModelFamily::Codestral2508 => "Codestral2508",
+    }
+}
+
+/// Parse a wire string from the frontend back into the typed enum.
+/// Returns `None` for unknown strings; callers fall back to the existing
+/// (or default) family rather than erroring, so a stale frontend can't
+/// break Settings save.
+fn parse_model_family(s: &str) -> Option<athen_core::llm::ModelFamily> {
+    use athen_core::llm::ModelFamily;
+    Some(match s {
+        "Default" => ModelFamily::Default,
+        "ClaudeOpus47" => ModelFamily::ClaudeOpus47,
+        "ClaudeSonnet46" => ModelFamily::ClaudeSonnet46,
+        "ClaudeHaiku45" => ModelFamily::ClaudeHaiku45,
+        "Gpt5" => ModelFamily::Gpt5,
+        "OpenAiO3" => ModelFamily::OpenAiO3,
+        "Gemini3Pro" => ModelFamily::Gemini3Pro,
+        "DeepSeekV4Chat" => ModelFamily::DeepSeekV4Chat,
+        "DeepSeekR1" => ModelFamily::DeepSeekR1,
+        "Qwen35Local" => ModelFamily::Qwen35Local,
+        "Qwen36Local" => ModelFamily::Qwen36Local,
+        "Gemma4Local" => ModelFamily::Gemma4Local,
+        "KimiK26Cloud" => ModelFamily::KimiK26Cloud,
+        "MiniMaxM25Cloud" => ModelFamily::MiniMaxM25Cloud,
+        "Llama32Instruct" => ModelFamily::Llama32Instruct,
+        "Llama4Instruct" => ModelFamily::Llama4Instruct,
+        "MistralLarge3" => ModelFamily::MistralLarge3,
+        "MagistralMedium" => ModelFamily::MagistralMedium,
+        "Codestral2508" => ModelFamily::Codestral2508,
+        _ => return None,
+    })
+}
+
+/// One row in the family-dropdown catalog returned to the frontend.
+#[derive(Serialize)]
+pub struct ModelFamilyEntry {
+    /// Stable wire identifier (e.g. `"Qwen35Local"`).
+    pub id: &'static str,
+    /// Human-readable label for the dropdown (e.g. `"Qwen 3.5 (local)"`).
+    pub label: &'static str,
+    /// Default model slug to pre-fill when this family is selected.
+    pub default_slug: &'static str,
+}
+
+/// Return the catalog of `ModelFamily` presets the per-model quirks system
+/// knows about. Frontend renders this as the family dropdown next to the
+/// model-slug field on each provider card. Selecting a family pre-fills the
+/// slug field with `default_slug`; the user can edit the slug freely.
+#[tauri::command]
+pub async fn list_model_families() -> std::result::Result<Vec<ModelFamilyEntry>, String> {
+    use athen_core::llm::ModelFamily;
+    Ok(ModelFamily::all()
+        .iter()
+        .map(|f| ModelFamilyEntry {
+            id: model_family_to_wire(*f),
+            label: f.display_label(),
+            default_slug: athen_llm::quirks::seed::default_slug_for_family(*f),
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -698,6 +787,7 @@ pub async fn get_settings(
 ///
 /// Saves to `~/.athen/models.toml`. Changes require an app restart.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn save_provider(
     id: String,
     base_url: String,
@@ -705,6 +795,7 @@ pub async fn save_provider(
     api_key: Option<String>,
     supports_vision: Option<bool>,
     supports_documents: Option<bool>,
+    family: Option<String>,
     state: State<'_, AppState>,
 ) -> std::result::Result<String, String> {
     let mut models = load_models_config();
@@ -751,6 +842,17 @@ pub async fn save_provider(
     let supports_documents_resolved =
         supports_documents.unwrap_or_else(|| existing.is_some_and(|p| p.supports_documents));
 
+    // Family: parse the wire string (e.g. "Qwen35Local") into the typed enum,
+    // preserving the existing value if absent or unrecognised. Unrecognised
+    // strings fall back to existing → Default rather than erroring so the
+    // settings save can't break for a stale frontend.
+    let family_resolved = match family.as_deref() {
+        Some(s) if !s.is_empty() => {
+            parse_model_family(s).unwrap_or_else(|| existing.map(|p| p.family).unwrap_or_default())
+        }
+        _ => existing.map(|p| p.family).unwrap_or_default(),
+    };
+
     let provider = ProviderConfig {
         auth: auth.clone(),
         default_model: model,
@@ -760,6 +862,7 @@ pub async fn save_provider(
         compaction_target_pct,
         supports_vision: supports_vision_resolved,
         supports_documents: supports_documents_resolved,
+        family: family_resolved,
     };
 
     models.providers.insert(id.clone(), provider);
@@ -782,6 +885,11 @@ pub async fn save_provider(
             .providers
             .get(&id)
             .is_some_and(|c| c.supports_documents);
+        let family_for_router = models
+            .providers
+            .get(&id)
+            .map(|c| c.family)
+            .unwrap_or_default();
         let new_router = build_router_for_provider(
             &id,
             &resolved_base_url,
@@ -789,6 +897,7 @@ pub async fn save_provider(
             router_api_key.as_deref(),
             supports_vision,
             supports_documents,
+            family_for_router,
         );
 
         {
@@ -861,6 +970,7 @@ pub async fn delete_provider(
 
         let supports_vision = fallback_cfg.is_some_and(|c| c.supports_vision);
         let supports_documents = fallback_cfg.is_some_and(|c| c.supports_documents);
+        let family_for_router = fallback_cfg.map(|c| c.family).unwrap_or_default();
         let new_router = build_router_for_provider(
             &fallback_id,
             &base_url,
@@ -868,6 +978,7 @@ pub async fn delete_provider(
             api_key.as_deref(),
             supports_vision,
             supports_documents,
+            family_for_router,
         );
 
         {
@@ -1004,6 +1115,7 @@ pub async fn set_active_provider(
     // Build the new router.
     let supports_vision = provider_cfg.is_some_and(|c| c.supports_vision);
     let supports_documents = provider_cfg.is_some_and(|c| c.supports_documents);
+    let family_for_router = provider_cfg.map(|c| c.family).unwrap_or_default();
     let new_router = build_router_for_provider(
         &id,
         &base_url,
@@ -1011,6 +1123,7 @@ pub async fn set_active_provider(
         api_key.as_deref(),
         supports_vision,
         supports_documents,
+        family_for_router,
     );
 
     // Swap the router atomically.

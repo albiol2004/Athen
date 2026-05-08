@@ -20,6 +20,8 @@
 use athen_core::llm::LlmResponse;
 use serde::{Deserialize, Serialize};
 
+pub mod extractors;
+pub mod repair;
 pub mod seed;
 
 /// How tool calls should be recovered from a model's response.
@@ -188,36 +190,86 @@ impl Default for ModelQuirks {
 /// `provider_id` or `model_used` here.
 pub fn apply_to_response(quirks: &ModelQuirks, response: &mut LlmResponse) {
     // --- Tool call extraction --------------------------------------
-    // Non-Structured strategies recover tool calls from `content` when
-    // the response's `tool_calls` field is empty, then strip them from
-    // the prose.
-    if response.tool_calls.is_empty()
-        && !matches!(quirks.tool_extraction, ToolExtractionStrategy::Structured)
-    {
-        // Slice 3: dispatch to extractor implementations.
-        // Intentionally a no-op until then.
+    // Non-Structured strategies recover tool calls from `content` when the
+    // response's `tool_calls` field is empty, then strip them from the prose.
+    if response.tool_calls.is_empty() {
+        match quirks.tool_extraction {
+            ToolExtractionStrategy::Structured => {}
+            ToolExtractionStrategy::InlineXmlQwenStyle => {
+                let (stripped, calls) = extractors::extract_qwen_style(&response.content);
+                if !calls.is_empty() {
+                    response.content = stripped;
+                    response.tool_calls = calls;
+                    // The provider already set finish_reason to Stop; if we
+                    // recovered tool calls, surface ToolUse so the executor
+                    // dispatches them instead of treating the turn as final.
+                    response.finish_reason = athen_core::llm::FinishReason::ToolUse;
+                }
+            }
+            // Other inline strategies land in later slices.
+            ToolExtractionStrategy::InlineXmlVendorTagged(_)
+            | ToolExtractionStrategy::InlineJsonLlama
+            | ToolExtractionStrategy::InlinePythonicLlama
+            | ToolExtractionStrategy::SpecialTokenBlock(_) => {}
+        }
     }
 
-    // --- Reasoning surface promotion -------------------------------
-    // When content + tool_calls are both empty but reasoning text exists,
-    // promote it so the executor doesn't render the "I don't have enough
-    // information" hardcoded fallback.
+    // --- Reasoning surface handling --------------------------------
+    // For inline-think-tag models, strip a single leading think block from
+    // content regardless of whether anything is empty — keeps the user view
+    // clean. (Reasoning-content stays accessible via response.reasoning_content
+    // for tools that want it.)
+    if matches!(quirks.reasoning_surface, ReasoningSurface::InlineThinkTags) {
+        response.content = extractors::strip_leading_think_tag(&response.content);
+    }
+
+    // For separate-field models (DeepSeek-R1, Kimi K2 thinking), promote
+    // reasoning into content when both content and tool_calls are empty —
+    // otherwise the executor falls back to the hardcoded "I don't have
+    // enough information" placeholder.
     if response.content.is_empty()
         && response.tool_calls.is_empty()
         && matches!(quirks.reasoning_surface, ReasoningSurface::SeparateField)
     {
-        // Slice 3 will copy `reasoning_content` into `content` here.
+        if let Some(reasoning) = response.reasoning_content.as_ref() {
+            if !reasoning.trim().is_empty() {
+                // The reasoning sometimes carries its own leading think
+                // tag (especially when proxied through llama.cpp); strip it
+                // for the same UX reason as the inline path.
+                response.content = extractors::strip_leading_think_tag(reasoning);
+            }
+        }
     }
 
     // --- Tool arg repair -------------------------------------------
     if quirks.tool_arg_repair.any() && !response.tool_calls.is_empty() {
-        // Slice 3 will run repair flags here.
+        for call in response.tool_calls.iter_mut() {
+            repair::apply(&quirks.tool_arg_repair, &mut call.arguments);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use athen_core::llm::{FinishReason, TokenUsage};
+
+    fn empty_response() -> LlmResponse {
+        LlmResponse {
+            content: String::new(),
+            reasoning_content: None,
+            model_used: "test".into(),
+            provider: "test".into(),
+            usage: TokenUsage {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+                estimated_cost_usd: None,
+            },
+            tool_calls: vec![],
+            finish_reason: FinishReason::Stop,
+        }
+    }
 
     #[test]
     fn default_quirks_reproduce_baseline_behavior() {
@@ -228,6 +280,71 @@ mod tests {
         assert!(!q.tool_arg_repair.any());
         assert!(!q.echo_reasoning_on_tool_turn);
         assert!(!q.system_message_required);
+    }
+
+    #[test]
+    fn apply_to_response_default_is_byte_identical_no_op() {
+        let mut resp = empty_response();
+        resp.content = "Hello.".into();
+        let before = resp.clone();
+        apply_to_response(&ModelQuirks::default(), &mut resp);
+        assert_eq!(resp.content, before.content);
+        assert!(resp.tool_calls.is_empty());
+        assert_eq!(resp.finish_reason, FinishReason::Stop);
+    }
+
+    #[test]
+    fn apply_to_response_qwen_extracts_inline_tool_call_and_flips_finish_reason() {
+        let qwen_quirks = seed::quirks_for_family(athen_core::llm::ModelFamily::Qwen35Local);
+        let mut resp = empty_response();
+        resp.content = "Reading file.\n<tool_call><function=read_file><parameter=path>src/main.rs</parameter></function></tool_call>".into();
+        apply_to_response(&qwen_quirks, &mut resp);
+        assert_eq!(resp.tool_calls.len(), 1);
+        assert_eq!(resp.tool_calls[0].name, "read_file");
+        assert_eq!(resp.finish_reason, FinishReason::ToolUse);
+        assert_eq!(resp.content, "Reading file.");
+    }
+
+    #[test]
+    fn apply_to_response_qwen_strips_leading_think_block() {
+        let qwen_quirks = seed::quirks_for_family(athen_core::llm::ModelFamily::Qwen35Local);
+        let mut resp = empty_response();
+        resp.content = "<think>let me think</think>\nThe answer is here.".into();
+        apply_to_response(&qwen_quirks, &mut resp);
+        assert_eq!(resp.content, "The answer is here.");
+    }
+
+    #[test]
+    fn apply_to_response_deepseek_r1_promotes_reasoning_when_content_empty() {
+        let r1_quirks = seed::quirks_for_family(athen_core::llm::ModelFamily::DeepSeekR1);
+        let mut resp = empty_response();
+        resp.content = String::new();
+        resp.reasoning_content = Some("Here is my answer.".into());
+        apply_to_response(&r1_quirks, &mut resp);
+        assert_eq!(resp.content, "Here is my answer.");
+    }
+
+    #[test]
+    fn apply_to_response_deepseek_r1_does_not_overwrite_real_content() {
+        let r1_quirks = seed::quirks_for_family(athen_core::llm::ModelFamily::DeepSeekR1);
+        let mut resp = empty_response();
+        resp.content = "Real answer.".into();
+        resp.reasoning_content = Some("Background reasoning.".into());
+        apply_to_response(&r1_quirks, &mut resp);
+        assert_eq!(resp.content, "Real answer.");
+    }
+
+    #[test]
+    fn apply_to_response_runs_arg_repair_for_deepseek_v4() {
+        let v4_quirks = seed::quirks_for_family(athen_core::llm::ModelFamily::DeepSeekV4Chat);
+        let mut resp = empty_response();
+        resp.tool_calls = vec![athen_core::llm::ToolCall {
+            id: "x".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({"cmd": "ls\u{0001}-la"}),
+        }];
+        apply_to_response(&v4_quirks, &mut resp);
+        assert_eq!(resp.tool_calls[0].arguments["cmd"], "ls -la");
     }
 
     #[test]

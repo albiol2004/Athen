@@ -2194,6 +2194,9 @@ fn build_router_for_provider_from_config(
 
     let supports_vision = provider_cfg.is_some_and(|c| c.supports_vision);
     let supports_documents = provider_cfg.is_some_and(|c| c.supports_documents);
+    let family = provider_cfg
+        .map(|c| c.family)
+        .unwrap_or(athen_core::llm::ModelFamily::Default);
 
     let router = build_router_for_provider(
         provider_id,
@@ -2202,6 +2205,7 @@ fn build_router_for_provider_from_config(
         api_key.as_deref(),
         supports_vision,
         supports_documents,
+        family,
     );
     (router, model)
 }
@@ -2268,11 +2272,12 @@ pub(crate) fn build_router_for_provider(
     api_key: Option<&str>,
     supports_vision: bool,
     supports_documents: bool,
+    family: athen_core::llm::ModelFamily,
 ) -> Arc<DefaultLlmRouter> {
     let provider: Box<dyn LlmProvider> = match provider_id {
         "deepseek" => {
             let key = api_key.unwrap_or_default().to_string();
-            let mut p = DeepSeekProvider::new(key);
+            let mut p = DeepSeekProvider::new(key).with_family(family);
             if base_url != "https://api.deepseek.com" {
                 p = p.with_base_url(base_url.to_string());
             }
@@ -2284,6 +2289,7 @@ pub(crate) fn build_router_for_provider(
         "anthropic" => {
             let key = api_key.unwrap_or_default().to_string();
             let mut p = AnthropicProvider::new(key, model.to_string())
+                .with_family(family)
                 .with_vision(supports_vision)
                 .with_documents(supports_documents);
             if base_url != "https://api.anthropic.com" && !base_url.is_empty() {
@@ -2292,20 +2298,20 @@ pub(crate) fn build_router_for_provider(
             Box::new(p)
         }
         "ollama" => {
-            let mut p = OllamaProvider::new(model.to_string());
+            let mut p = OllamaProvider::new(model.to_string()).with_family(family);
             if base_url != "http://localhost:11434" {
                 p = p.with_base_url(base_url.to_string());
             }
             Box::new(p)
         }
-        "llamacpp" => Box::new(LlamaCppProvider::new(
-            base_url.to_string(),
-            model.to_string(),
-        )),
+        "llamacpp" => Box::new(
+            LlamaCppProvider::new(base_url.to_string(), model.to_string()).with_family(family),
+        ),
         _ => {
             let mut p = OpenAiCompatibleProvider::new(base_url.to_string())
                 .with_model(model.to_string())
                 .with_provider_id(provider_id.to_string())
+                .with_family(family)
                 .with_vision(supports_vision)
                 .with_documents(supports_documents);
             if let Some(key) = api_key {
