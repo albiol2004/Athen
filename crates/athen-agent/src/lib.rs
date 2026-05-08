@@ -52,6 +52,7 @@ pub struct AgentBuilder {
     autonomous_mode: bool,
     initial_user_images: Vec<athen_core::llm::ImageInput>,
     external_system_suffix: Option<String>,
+    default_temperature: Option<f32>,
 }
 
 impl AgentBuilder {
@@ -78,7 +79,17 @@ impl AgentBuilder {
             autonomous_mode: false,
             initial_user_images: Vec::new(),
             external_system_suffix: None,
+            default_temperature: None,
         }
+    }
+
+    /// Sampling temperature for the main agent loop. `None` keeps the
+    /// historical 0.7 default; `Some(t)` overrides it. The cheap
+    /// completion-judge and summarization helpers keep their own
+    /// hardcoded settings so determinism guarantees there don't drift.
+    pub fn default_temperature(mut self, t: Option<f32>) -> Self {
+        self.default_temperature = t;
+        self
     }
 
     /// Set host-supplied volatile content (memory recall, attachment
@@ -265,6 +276,10 @@ impl AgentBuilder {
 
         if let Some(suffix) = self.external_system_suffix {
             executor.set_external_system_suffix(Some(suffix));
+        }
+
+        if self.default_temperature.is_some() {
+            executor.set_default_temperature(self.default_temperature);
         }
 
         Ok(executor)

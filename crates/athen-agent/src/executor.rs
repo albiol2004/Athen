@@ -227,6 +227,12 @@ pub struct DefaultExecutor {
     /// Appended after the executor's own volatile state (timestamp), so
     /// the static prefix above stays byte-identical between turns.
     external_system_suffix: Option<String>,
+    /// Override for the main agent-loop sampling temperature. `None` keeps
+    /// the historical 0.7 default; `Some(t)` clamps to [0.0, 2.0]. Only
+    /// affects the primary tool-driving turn — the cheap completion-judge
+    /// (0.0) and summarization helpers (0.5) keep their own settings so
+    /// determinism guarantees there don't drift with the loop knob.
+    default_temperature: Option<f32>,
 }
 
 impl DefaultExecutor {
@@ -255,7 +261,15 @@ impl DefaultExecutor {
             autonomous_mode: false,
             initial_user_images: Vec::new(),
             external_system_suffix: None,
+            default_temperature: None,
         }
+    }
+
+    /// Set the sampling temperature for the main agent loop. `None` keeps
+    /// the 0.7 default. Values are not clamped here — pass through to the
+    /// provider so users see whatever error the backend raises for OOR.
+    pub fn set_default_temperature(&mut self, t: Option<f32>) {
+        self.default_temperature = t;
     }
 
     /// Inject host-supplied volatile content (e.g. memory recall,
@@ -1224,7 +1238,7 @@ impl AgentExecutor for DefaultExecutor {
                 profile: ModelProfile::Fast,
                 messages: conversation.clone(),
                 max_tokens: Some(32_768),
-                temperature: Some(0.7),
+                temperature: Some(self.default_temperature.unwrap_or(0.7)),
                 tools: if revealed_tool_defs.is_empty() {
                     None
                 } else {

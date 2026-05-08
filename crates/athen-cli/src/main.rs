@@ -210,12 +210,16 @@ fn print_usage() {
     println!(
         "                       Defaults to 'Default' (baseline structured-tool-call behavior)."
     );
+    println!("    --temperature <F>  Sampling temperature for the main agent loop (e.g. 0.2 for");
+    println!("                       benchmark determinism, 0.7 default, 1.0+ for exploration).");
+    println!("                       Overrides ATHEN_TEMPERATURE. Not clamped.");
     println!();
     println!("HEADLESS MODE ENV VARS:");
-    println!("    ATHEN_BASE_URL  (required)  e.g. http://localhost:8000/v1");
-    println!("    ATHEN_MODEL     (required)  e.g. Qwen3.5-9B");
-    println!("    ATHEN_FAMILY    (optional)  e.g. Qwen35Local — see --family.");
-    println!("    ATHEN_API_KEY   (optional)  Bearer token, if backend needs one");
+    println!("    ATHEN_BASE_URL    (required)  e.g. http://localhost:8000/v1");
+    println!("    ATHEN_MODEL       (required)  e.g. Qwen3.5-9B");
+    println!("    ATHEN_FAMILY      (optional)  e.g. Qwen35Local — see --family.");
+    println!("    ATHEN_TEMPERATURE (optional)  e.g. 0.2 — see --temperature.");
+    println!("    ATHEN_API_KEY     (optional)  Bearer token, if backend needs one");
     println!();
     println!("In headless mode the agent runs against the current working directory,");
     println!("auto-approves all actions (no risk gating), prints the final response to");
@@ -298,6 +302,7 @@ async fn run_headless(
     prompt: String,
     profile_id: Option<String>,
     family: ModelFamily,
+    temperature: Option<f32>,
 ) -> std::result::Result<(), (i32, String)> {
     // 1. Read required env vars.
     let base_url = match std::env::var("ATHEN_BASE_URL") {
@@ -342,7 +347,8 @@ async fn run_headless(
         .llm_router(exec_router)
         .tool_registry(Box::new(registry))
         .max_steps(50)
-        .timeout(Duration::from_secs(600));
+        .timeout(Duration::from_secs(600))
+        .default_temperature(temperature);
     if let Some(rp) = resolved_profile {
         builder = builder.active_profile(rp);
     }
@@ -485,8 +491,39 @@ async fn main() {
         },
     };
 
+    // Sampling temperature for the main agent loop. `--temperature` overrides
+    // `ATHEN_TEMPERATURE`, which falls through to the executor default (0.7).
+    // No clamping — pass through to the provider so backend-side errors
+    // surface verbatim. Lower values (0.0–0.3) = more reproducible benchmark
+    // runs and tighter tool-call discipline; higher = more exploration.
+    let temperature_arg = match extract_flag(&args, "--temperature") {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("Error: {msg}");
+            eprintln!(
+                "Usage: athen-cli --prompt <PROMPT> [--profile <ID>] [--family <ID>] [--temperature <FLOAT>]"
+            );
+            std::process::exit(2);
+        }
+    };
+    let temperature_str = temperature_arg.or_else(|| {
+        std::env::var("ATHEN_TEMPERATURE")
+            .ok()
+            .filter(|s| !s.is_empty())
+    });
+    let temperature = match temperature_str.as_deref() {
+        None => None,
+        Some(s) => match s.parse::<f32>() {
+            Ok(t) => Some(t),
+            Err(_) => {
+                eprintln!("Error: --temperature expects a float (e.g. 0.2), got '{s}'.");
+                std::process::exit(2);
+            }
+        },
+    };
+
     if let Some(prompt) = prompt_arg {
-        match run_headless(prompt, profile_arg, family).await {
+        match run_headless(prompt, profile_arg, family, temperature).await {
             Ok(()) => std::process::exit(0),
             Err((code, msg)) => {
                 eprintln!("{msg}");
