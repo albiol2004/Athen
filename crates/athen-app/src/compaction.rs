@@ -23,14 +23,56 @@ use athen_core::traits::compaction::{
 use athen_core::traits::llm::LlmRouter;
 use athen_persistence::arcs::{ArcEntry, ArcStore, EntryType};
 
-/// Phase-1 placeholder budgets. The executor passes these to
-/// `prepare_context` until per-provider config (`context_window_tokens` /
-/// `compaction_trigger_pct` / `compaction_target_pct` on `ProviderConfig`)
-/// is wired into the dispatch path. The numbers correspond to a 128k
-/// window with the 30% post-compaction target from `docs/ARC_COMPACTION.md`
-/// §5 — safe defaults for every common provider.
-pub const DEFAULT_MODEL_WINDOW_TOKENS: u32 = 128_000;
-pub const DEFAULT_TARGET_TOKENS: u32 = 38_400;
+/// Fallback budgets used only when no provider config can be resolved
+/// (e.g. tests, broken config). 128k window with §5's 65/30 split, which
+/// is conservative for every common cloud provider and won't fire eagerly
+/// even on small local models — those should be configured properly via
+/// `ProviderConfig`. Resolution happens through `resolve_compaction_budget`.
+pub const FALLBACK_CONTEXT_WINDOW_TOKENS: u32 = 128_000;
+pub const FALLBACK_COMPACTION_TRIGGER_PCT: u8 = 65;
+pub const FALLBACK_COMPACTION_TARGET_PCT: u8 = 30;
+
+/// Resolve the per-arc compaction budget from the active provider's
+/// settings, falling back to the conservative defaults when the provider
+/// is missing (legacy boot, fresh install, or test fixture).
+///
+/// Returns `(trigger_tokens, target_tokens)` already converted from the
+/// per-provider `compaction_trigger_pct` / `compaction_target_pct` and
+/// `context_window_tokens`. The two values are derived from the SAME
+/// active provider so trigger and target are guaranteed to come from one
+/// coherent policy — never mixed across providers.
+///
+/// Trigger is clamped above target so the hysteresis invariant
+/// (`trigger > target`) holds even if a user configures a profile where
+/// trigger_pct <= target_pct. Without that clamp, `should_compact` would
+/// fire above the target, `compact` would no-op (already under target),
+/// and we'd ping-pong every turn.
+pub fn resolve_compaction_budget(
+    config: &athen_core::config::AthenConfig,
+    active_provider_id: &str,
+) -> (u32, u32) {
+    let (window, trigger_pct, target_pct) = config
+        .models
+        .providers
+        .get(active_provider_id)
+        .map(|p| {
+            (
+                p.context_window_tokens,
+                p.compaction_trigger_pct,
+                p.compaction_target_pct,
+            )
+        })
+        .unwrap_or((
+            FALLBACK_CONTEXT_WINDOW_TOKENS,
+            FALLBACK_COMPACTION_TRIGGER_PCT,
+            FALLBACK_COMPACTION_TARGET_PCT,
+        ));
+
+    let target = (window as u64 * target_pct as u64 / 100) as u32;
+    let trigger_raw = (window as u64 * trigger_pct as u64 / 100) as u32;
+    let trigger = trigger_raw.max(target.saturating_add(1));
+    (trigger, target)
+}
 
 /// Convert an `ArcContextView` into the inputs the executor consumes.
 ///
@@ -173,23 +215,13 @@ OPEN ACTION: <what the agent was about to do next, verbatim from the latest entr
 
 #[async_trait]
 impl ArcCompactor for LlmArcCompactor {
-    async fn should_compact(
-        &self,
-        arc_id: &str,
-        _model_window_tokens: u32,
-        target_tokens: u32,
-    ) -> Result<bool> {
+    async fn should_compact(&self, arc_id: &str, trigger_tokens: u32) -> Result<bool> {
         let entries = self.arc_store.load_entries(arc_id).await?;
         let total: u32 = entries.iter().map(entry_token_estimate).sum();
-        Ok(total > target_tokens)
+        Ok(total > trigger_tokens)
     }
 
-    async fn compact(
-        &self,
-        arc_id: &str,
-        _model_window_tokens: u32,
-        target_tokens: u32,
-    ) -> Result<CompactionOutcome> {
+    async fn compact(&self, arc_id: &str, target_tokens: u32) -> Result<CompactionOutcome> {
         let prior_summary = self.arc_store.load_latest_summary(arc_id).await?;
         let cutoff = prior_summary.as_ref().map(|s| s.id).unwrap_or(0);
         let entries = self.arc_store.load_entries_after(arc_id, cutoff).await?;
@@ -281,12 +313,7 @@ impl ArcCompactor for LlmArcCompactor {
         })
     }
 
-    async fn load_context_view(
-        &self,
-        arc_id: &str,
-        _model_window_tokens: u32,
-        _target_tokens: u32,
-    ) -> Result<ArcContextView> {
+    async fn load_context_view(&self, arc_id: &str) -> Result<ArcContextView> {
         // The arc's `summarized_through_entry_id` is authoritative for
         // "what the summary covers." The summary entry itself has an id
         // strictly greater than the cutoff (it was inserted after the
@@ -374,6 +401,67 @@ mod tests {
         assert_eq!(estimate_tokens(""), 0);
     }
 
+    fn mk_provider_for_test(window: u32, trig: u8, tgt: u8) -> athen_core::config::ProviderConfig {
+        athen_core::config::ProviderConfig {
+            auth: athen_core::config::AuthType::None,
+            default_model: "test".into(),
+            endpoint: None,
+            context_window_tokens: window,
+            compaction_trigger_pct: trig,
+            compaction_target_pct: tgt,
+            supports_vision: false,
+            supports_documents: false,
+            family: athen_core::llm::ModelFamily::Default,
+        }
+    }
+
+    /// Resolver returns the per-provider tokens with hysteresis preserved.
+    #[test]
+    fn resolve_compaction_budget_uses_active_provider() {
+        use athen_core::config::AthenConfig;
+        let mut cfg = AthenConfig::default();
+        cfg.models
+            .providers
+            .insert("qwen-local".into(), mk_provider_for_test(32_000, 70, 25));
+        let (trigger, target) = resolve_compaction_budget(&cfg, "qwen-local");
+        assert_eq!(target, 8_000);
+        assert_eq!(trigger, 22_400);
+        assert!(trigger > target);
+    }
+
+    /// Unknown provider id falls back to the conservative defaults rather
+    /// than 0/0 (which would compact every turn) or panicking.
+    #[test]
+    fn resolve_compaction_budget_falls_back_for_unknown_provider() {
+        use athen_core::config::AthenConfig;
+        let cfg = AthenConfig::default();
+        let (trigger, target) = resolve_compaction_budget(&cfg, "no-such-provider");
+        let expected_trigger =
+            FALLBACK_CONTEXT_WINDOW_TOKENS as u64 * FALLBACK_COMPACTION_TRIGGER_PCT as u64 / 100;
+        let expected_target =
+            FALLBACK_CONTEXT_WINDOW_TOKENS as u64 * FALLBACK_COMPACTION_TARGET_PCT as u64 / 100;
+        assert_eq!(trigger as u64, expected_trigger);
+        assert_eq!(target as u64, expected_target);
+    }
+
+    /// Hysteresis invariant: even a misconfigured provider where
+    /// trigger_pct <= target_pct must yield trigger > target so the
+    /// should_compact / compact pair doesn't ping-pong every turn.
+    #[test]
+    fn resolve_compaction_budget_clamps_trigger_above_target() {
+        use athen_core::config::AthenConfig;
+        let mut cfg = AthenConfig::default();
+        cfg.models
+            .providers
+            .insert("broken".into(), mk_provider_for_test(10_000, 20, 50));
+        let (trigger, target) = resolve_compaction_budget(&cfg, "broken");
+        assert_eq!(target, 5_000);
+        assert!(
+            trigger > target,
+            "trigger ({trigger}) must exceed target ({target})"
+        );
+    }
+
     #[tokio::test]
     async fn build_summary_prompt_tags_roles_and_strips_newlines() {
         let store = empty_store().await;
@@ -435,10 +523,7 @@ mod tests {
         let router = StdArc::new(tokio::sync::RwLock::new(StdArc::new(router)));
         let compactor = LlmArcCompactor::new(store.clone(), router);
 
-        let view = compactor
-            .load_context_view("a", 128_000, 38_400)
-            .await
-            .unwrap();
+        let view = compactor.load_context_view("a").await.unwrap();
         assert!(view.summary.is_none());
         assert_eq!(view.tail.len(), 3);
         assert!(view.tool_cache.is_empty());
@@ -484,10 +569,7 @@ mod tests {
         let router = StdArc::new(tokio::sync::RwLock::new(StdArc::new(router)));
         let compactor = LlmArcCompactor::new(store.clone(), router);
 
-        let view = compactor
-            .load_context_view("a", 128_000, 38_400)
-            .await
-            .unwrap();
+        let view = compactor.load_context_view("a").await.unwrap();
         let summary = view.summary.expect("summary present");
         assert_eq!(summary.entry_type, "summary");
         assert_eq!(summary.content, "summary text");

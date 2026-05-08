@@ -1135,6 +1135,16 @@ impl AppState {
         let compactor = self.compactor.clone();
         let web_search = Arc::clone(&self.web_search);
         let email_sender = self.email_sender.clone();
+        // Snapshot the active provider id so the dispatch loop can resolve
+        // the per-arc compaction budget on each iteration. A mid-session
+        // provider switch won't propagate into already-spawned dispatch
+        // loops — acceptable, and clearly bounded scope. TODO: switch to
+        // an Arc<Mutex<String>> on AppState if we ever need live reloads.
+        let active_provider_id_snapshot = self
+            .active_provider_id
+            .try_lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
         let attachment_store_loop = self.attachment_store();
         let inflight = Arc::clone(&self.inflight_approvals);
 
@@ -1193,6 +1203,15 @@ impl AppState {
                     };
 
                     let task_id = task.id;
+                    // Resolve compaction budget per task. Re-reading the
+                    // config TOML each dispatch is cheap (small file, only
+                    // fires on user-driven sense events) and lets the user
+                    // tune compaction without restarting the loop.
+                    let (compaction_trigger_tokens, compaction_target_tokens) =
+                        crate::compaction::resolve_compaction_budget(
+                            &crate::state::load_config(),
+                            &active_provider_id_snapshot,
+                        );
                     let ctx = crate::commands::ApprovedTaskCtx {
                         coordinator: Arc::clone(&coordinator),
                         router: Arc::clone(&router),
@@ -1220,6 +1239,8 @@ impl AppState {
                         email_sender: email_sender.clone(),
                         initial_user_images: Vec::new(),
                         attachment_store: attachment_store_loop.clone(),
+                        compaction_trigger_tokens,
+                        compaction_target_tokens,
                     };
 
                     let task_arc_map_clone = Arc::clone(&task_arc_map);
@@ -2113,7 +2134,7 @@ fn build_email_sender(
 }
 
 /// Load configuration from TOML files, falling back to defaults.
-fn load_config() -> AthenConfig {
+pub(crate) fn load_config() -> AthenConfig {
     match find_config_dir() {
         Some(dir) => {
             info!("Loading config from: {}", dir.display());

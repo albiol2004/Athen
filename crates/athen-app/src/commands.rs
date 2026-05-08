@@ -77,6 +77,21 @@ fn spawn_router_approval(
     let arc_id = state.active_arc_id.try_lock().map(|g| g.clone()).ok();
     let app_handle = app_handle.clone();
 
+    // Resolve per-arc compaction budget from the active provider's
+    // `context_window_tokens` × `compaction_trigger_pct` /
+    // `compaction_target_pct` once at construction. Snapshot semantics
+    // means a mid-task provider switch can't move the goalposts.
+    let active_provider_id_snapshot = state
+        .active_provider_id
+        .try_lock()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    let (compaction_trigger_tokens, compaction_target_tokens) =
+        crate::compaction::resolve_compaction_budget(
+            &crate::state::load_config(),
+            &active_provider_id_snapshot,
+        );
+
     // Clone every AppState bit the helper would need, so the bg task can
     // drive execution without borrowing `&AppState`.
     let bg_ctx = ApprovedTaskBgCtx {
@@ -102,6 +117,8 @@ fn spawn_router_approval(
         web_search: Arc::clone(&state.web_search),
         email_sender: state.email_sender.clone(),
         attachment_store: state.attachment_store(),
+        compaction_trigger_tokens,
+        compaction_target_tokens,
     };
 
     tauri::async_runtime::spawn(async move {
@@ -209,6 +226,8 @@ fn spawn_router_approval(
             email_sender: bg_ctx.email_sender.clone(),
             initial_user_images: Vec::new(),
             attachment_store: bg_ctx.attachment_store.clone(),
+            compaction_trigger_tokens: bg_ctx.compaction_trigger_tokens,
+            compaction_target_tokens: bg_ctx.compaction_target_tokens,
         };
 
         let outcome = match execute_approved_task(task_id, ctx).await {
@@ -285,6 +304,8 @@ struct ApprovedTaskBgCtx {
     web_search: Arc<dyn athen_web::WebSearchProvider>,
     email_sender: Option<Arc<dyn athen_core::traits::email_sender::EmailSender>>,
     attachment_store: Option<athen_persistence::attachments::AttachmentStore>,
+    compaction_trigger_tokens: u32,
+    compaction_target_tokens: u32,
 }
 
 /// Resolve the agent profile that should drive execution for a given arc.
@@ -1899,6 +1920,12 @@ pub async fn approve_task(
     let message_override = state.pending_message.lock().await.take();
 
     let active_arc = state.active_arc_id.lock().await.clone();
+    let active_provider_id_snapshot = state.active_provider_id.lock().await.clone();
+    let (compaction_trigger_tokens, compaction_target_tokens) =
+        crate::compaction::resolve_compaction_budget(
+            &crate::state::load_config(),
+            &active_provider_id_snapshot,
+        );
 
     let ctx = ApprovedTaskCtx {
         coordinator: Arc::clone(&state.coordinator),
@@ -1931,6 +1958,8 @@ pub async fn approve_task(
         // not through the explicit-approval card.
         initial_user_images: Vec::new(),
         attachment_store: state.attachment_store(),
+        compaction_trigger_tokens,
+        compaction_target_tokens,
     };
 
     let outcome = match execute_approved_task(task_uuid, ctx).await {
@@ -2052,6 +2081,13 @@ pub(crate) struct ApprovedTaskCtx {
     /// is wired (CLI/test builds) — sense events still execute, but
     /// without attachment surfacing.
     pub attachment_store: Option<athen_persistence::attachments::AttachmentStore>,
+    /// Per-arc compaction budget resolved from the active provider's
+    /// `context_window_tokens` × `compaction_trigger_pct` /
+    /// `compaction_target_pct`. Computed once when the ctx is built so a
+    /// mid-task provider switch doesn't change thresholds inside a single
+    /// agent run. See `crate::compaction::resolve_compaction_budget`.
+    pub compaction_trigger_tokens: u32,
+    pub compaction_target_tokens: u32,
 }
 
 /// Drive a risk-flagged task all the way through approval, dispatch,
@@ -2156,8 +2192,8 @@ pub(crate) async fn execute_approved_task(
         match compactor
             .prepare_context(
                 &ctx.active_arc_id,
-                crate::compaction::DEFAULT_MODEL_WINDOW_TOKENS,
-                crate::compaction::DEFAULT_TARGET_TOKENS,
+                ctx.compaction_trigger_tokens,
+                ctx.compaction_target_tokens,
             )
             .await
         {
@@ -2966,8 +3002,8 @@ pub(crate) async fn execute_dispatched_task(
         match compactor
             .prepare_context(
                 &arc_id,
-                crate::compaction::DEFAULT_MODEL_WINDOW_TOKENS,
-                crate::compaction::DEFAULT_TARGET_TOKENS,
+                ctx.compaction_trigger_tokens,
+                ctx.compaction_target_tokens,
             )
             .await
         {
@@ -3593,7 +3629,7 @@ pub async fn compact_arc(
     // target_tokens = 0 is the trait's "force" signal — see
     // `ArcCompactor::compact` docs.
     let outcome = compactor
-        .compact(&arc_id, crate::compaction::DEFAULT_MODEL_WINDOW_TOKENS, 0)
+        .compact(&arc_id, 0)
         .await
         .map_err(|e| e.to_string())?;
     Ok(CompactArcResponse {

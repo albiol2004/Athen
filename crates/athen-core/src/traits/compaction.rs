@@ -61,23 +61,19 @@ pub struct CompactionOutcome {
 /// drives an LLM through the §4 prompt; later phases swap in deterministic
 /// or embedding-driven scorers behind the same trait.
 ///
-/// Design note on the `model_window_tokens` / `target_tokens` parameter
-/// pair: there is no shared `ModelId` type yet (model identity is split
-/// across `ProviderConfig` and `ModelProfile`), and synthesising one purely
-/// for this trait would couple compaction to the model-config schema. The
-/// trait stays provider-agnostic by taking the two numbers it actually
-/// needs — the model's authoritative context window and the per-arc
-/// budget the caller has resolved from
-/// `compaction_trigger_pct` / `compaction_target_pct`.
+/// Two thresholds carry the policy: `trigger_tokens` (when to fire
+/// compaction) and `target_tokens` (what size to compact down to). These
+/// come from the active provider's `compaction_trigger_pct` and
+/// `compaction_target_pct` resolved against `context_window_tokens`. The
+/// trait stays provider-agnostic by taking the resolved token counts, not
+/// the model-config schema.
 #[async_trait]
 pub trait ArcCompactor: Send + Sync {
-    /// Decide whether `arc_id` needs compaction under the given budget.
-    async fn should_compact(
-        &self,
-        arc_id: &str,
-        model_window_tokens: u32,
-        target_tokens: u32,
-    ) -> Result<bool>;
+    /// Fire compaction iff the arc's total token estimate exceeds
+    /// `trigger_tokens`. With hysteresis, `trigger_tokens > target_tokens`,
+    /// so a single compaction pass leaves us comfortably under the
+    /// trigger and avoids ping-pong.
+    async fn should_compact(&self, arc_id: &str, trigger_tokens: u32) -> Result<bool>;
 
     /// Run a compaction pass. Idempotent: a no-op if the arc already
     /// fits within `target_tokens` (or has too few entries to be worth
@@ -89,31 +85,19 @@ pub trait ArcCompactor: Send + Sync {
     /// there is enough of it to bother (the per-implementation
     /// "minimum entries" floor still applies; it prevents a single
     /// trailing turn being summarized into nothing).
-    async fn compact(
-        &self,
-        arc_id: &str,
-        model_window_tokens: u32,
-        target_tokens: u32,
-    ) -> Result<CompactionOutcome>;
+    async fn compact(&self, arc_id: &str, target_tokens: u32) -> Result<CompactionOutcome>;
 
     /// Build the LLM context view for `arc_id`. Returns the latest summary
-    /// (if any) plus the verbatim tail and tool-series cache.
-    ///
-    /// `target_tokens` is advisory — the implementation may return a view
-    /// slightly above or below it, but should never silently drop the open
-    /// action or the latest outbound state per channel.
-    async fn load_context_view(
-        &self,
-        arc_id: &str,
-        model_window_tokens: u32,
-        target_tokens: u32,
-    ) -> Result<ArcContextView>;
+    /// (if any) plus the verbatim tail and tool-series cache. The
+    /// implementation never silently drops the open action or the latest
+    /// outbound state per channel.
+    async fn load_context_view(&self, arc_id: &str) -> Result<ArcContextView>;
 
     /// Compaction-aware context build. The default runs `should_compact`
     /// → optional `compact` → `load_context_view`, which is the idiomatic
     /// entry point for the executor: one call yields the most up-to-date
     /// view, transparently triggering a summarization pass when the arc
-    /// has crossed the budget.
+    /// has crossed `trigger_tokens`.
     ///
     /// `compact` failures do not propagate — they are swallowed and the
     /// call falls through to `load_context_view` over the
@@ -126,21 +110,15 @@ pub trait ArcCompactor: Send + Sync {
     async fn prepare_context(
         &self,
         arc_id: &str,
-        model_window_tokens: u32,
+        trigger_tokens: u32,
         target_tokens: u32,
     ) -> Result<ArcContextView> {
-        if self
-            .should_compact(arc_id, model_window_tokens, target_tokens)
-            .await?
-        {
+        if self.should_compact(arc_id, trigger_tokens).await? {
             // Best-effort: discard errors so a failed summarization can
             // never block dispatch.
-            let _ = self
-                .compact(arc_id, model_window_tokens, target_tokens)
-                .await;
+            let _ = self.compact(arc_id, target_tokens).await;
         }
-        self.load_context_view(arc_id, model_window_tokens, target_tokens)
-            .await
+        self.load_context_view(arc_id).await
     }
 }
 
@@ -154,11 +132,11 @@ mod tests {
 
     #[async_trait]
     impl ArcCompactor for Noop {
-        async fn should_compact(&self, _: &str, _: u32, _: u32) -> Result<bool> {
+        async fn should_compact(&self, _: &str, _: u32) -> Result<bool> {
             Ok(false)
         }
 
-        async fn compact(&self, _: &str, _: u32, _: u32) -> Result<CompactionOutcome> {
+        async fn compact(&self, _: &str, _: u32) -> Result<CompactionOutcome> {
             Ok(CompactionOutcome {
                 compacted: false,
                 summarized_through_entry_id: None,
@@ -167,7 +145,7 @@ mod tests {
             })
         }
 
-        async fn load_context_view(&self, _: &str, _: u32, _: u32) -> Result<ArcContextView> {
+        async fn load_context_view(&self, _: &str) -> Result<ArcContextView> {
             Ok(ArcContextView::default())
         }
     }
@@ -175,10 +153,10 @@ mod tests {
     #[tokio::test]
     async fn trait_is_dyn_compatible() {
         let c: Box<dyn ArcCompactor> = Box::new(Noop);
-        assert!(!c.should_compact("arc", 128_000, 38_400).await.unwrap());
-        let outcome = c.compact("arc", 128_000, 38_400).await.unwrap();
+        assert!(!c.should_compact("arc", 83_200).await.unwrap());
+        let outcome = c.compact("arc", 38_400).await.unwrap();
         assert!(!outcome.compacted);
-        let view = c.load_context_view("arc", 128_000, 38_400).await.unwrap();
+        let view = c.load_context_view("arc").await.unwrap();
         assert!(view.summary.is_none());
         assert!(view.tail.is_empty());
         assert!(view.tool_cache.is_empty());
