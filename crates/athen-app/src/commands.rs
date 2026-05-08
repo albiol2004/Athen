@@ -4921,6 +4921,178 @@ mod key_term_tests {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Identity store commands
+// ---------------------------------------------------------------------------
+//
+// CRUD over the user-editable identity store: categories (groupings like
+// `personality`, `rules`, plus user-invented ones) and entries (the actual
+// statements). Always returns the full row so the UI can update its local
+// state without an immediate re-list.
+
+/// List every identity category, ordered by `sort_order` ascending.
+#[tauri::command]
+pub async fn list_identity_categories(
+    state: State<'_, AppState>,
+) -> std::result::Result<Vec<athen_core::identity::IdentityCategory>, String> {
+    use athen_core::traits::identity::IdentityStore;
+    let Some(store) = state.identity_store.as_ref() else {
+        return Ok(Vec::new());
+    };
+    store.list_categories().await.map_err(|e| e.to_string())
+}
+
+/// Input shape for upserting a category. The `is_seed` flag is preserved
+/// from the existing row when present, so a user-edited seed stays flagged
+/// as a seed.
+#[derive(serde::Deserialize, Debug)]
+pub struct IdentityCategoryInput {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub default_applies_to: Vec<athen_core::identity::ProfileTag>,
+    pub sort_order: u32,
+}
+
+/// Insert or update a category by `name`.
+///
+/// Names are user-controlled; trim happens before validation so a name of
+/// just whitespace is rejected. The seed flag of an existing row survives —
+/// renaming a seed category still shows the seed badge.
+#[tauri::command]
+pub async fn upsert_identity_category(
+    input: IdentityCategoryInput,
+    state: State<'_, AppState>,
+) -> std::result::Result<athen_core::identity::IdentityCategory, String> {
+    use athen_core::traits::identity::IdentityStore;
+    let Some(store) = state.identity_store.as_ref() else {
+        return Err("Identity store not available".into());
+    };
+    let name = input.name.trim().to_string();
+    if name.is_empty() {
+        return Err("Category name cannot be empty".into());
+    }
+    let existing_seed = store
+        .get_category(&name)
+        .await
+        .map_err(|e| e.to_string())?
+        .map(|c| c.is_seed)
+        .unwrap_or(false);
+    let category = athen_core::identity::IdentityCategory {
+        name: name.clone(),
+        description: input.description,
+        default_applies_to: input.default_applies_to,
+        sort_order: input.sort_order,
+        is_seed: existing_seed,
+    };
+    store
+        .upsert_category(&category)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(category)
+}
+
+/// Delete a category and cascade-delete its entries.
+///
+/// Allowed for both seed and user categories — the user can clear any
+/// category they want. The UI surfaces a confirm before calling this when
+/// the category has entries or is a seed.
+#[tauri::command]
+pub async fn delete_identity_category(
+    name: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    use athen_core::traits::identity::IdentityStore;
+    let Some(store) = state.identity_store.as_ref() else {
+        return Err("Identity store not available".into());
+    };
+    store.delete_category(&name).await.map_err(|e| e.to_string())
+}
+
+/// List entries, optionally scoped to a single category. With no filter,
+/// returns every entry ordered by `(category sort_order, updated_at DESC)`.
+#[tauri::command]
+pub async fn list_identity_entries(
+    category: Option<String>,
+    state: State<'_, AppState>,
+) -> std::result::Result<Vec<athen_core::identity::IdentityEntry>, String> {
+    use athen_core::traits::identity::IdentityStore;
+    let Some(store) = state.identity_store.as_ref() else {
+        return Ok(Vec::new());
+    };
+    store
+        .list_entries(category.as_deref())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Input shape for upserting an entry. `id` is `None` on create.
+#[derive(serde::Deserialize, Debug)]
+pub struct IdentityEntryInput {
+    #[serde(default)]
+    pub id: Option<String>,
+    pub category: String,
+    pub body: String,
+    #[serde(default)]
+    pub applies_to: Vec<athen_core::identity::ProfileTag>,
+    #[serde(default)]
+    pub pinned: bool,
+}
+
+/// Insert or update an entry. Returns the persisted row including the
+/// store-stamped `updated_at`.
+///
+/// When `id` is omitted, a fresh UUID is generated. Empty applies_to is
+/// allowed but will scope the entry to no profiles — the UI shows a warning.
+#[tauri::command]
+pub async fn upsert_identity_entry(
+    input: IdentityEntryInput,
+    state: State<'_, AppState>,
+) -> std::result::Result<athen_core::identity::IdentityEntry, String> {
+    use athen_core::traits::identity::IdentityStore;
+    let Some(store) = state.identity_store.as_ref() else {
+        return Err("Identity store not available".into());
+    };
+    let id = match input.id {
+        Some(s) => uuid::Uuid::parse_str(&s).map_err(|e| format!("Invalid entry id: {e}"))?,
+        None => uuid::Uuid::new_v4(),
+    };
+    let now = chrono::Utc::now();
+    let entry = athen_core::identity::IdentityEntry {
+        id,
+        category: input.category,
+        body: input.body,
+        applies_to: input.applies_to,
+        pinned: input.pinned,
+        // upsert_entry preserves created_at on replace and stamps
+        // updated_at, so these "now" values are the create-path defaults.
+        created_at: now,
+        updated_at: now,
+    };
+    store.upsert_entry(&entry).await.map_err(|e| e.to_string())?;
+    let loaded = store
+        .get_entry(id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Entry missing after save".to_string())?;
+    Ok(loaded)
+}
+
+/// Delete an entry by id.
+#[tauri::command]
+pub async fn delete_identity_entry(
+    id: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    use athen_core::traits::identity::IdentityStore;
+    let Some(store) = state.identity_store.as_ref() else {
+        return Err("Identity store not available".into());
+    };
+    let uuid = uuid::Uuid::parse_str(&id).map_err(|e| format!("Invalid entry id: {e}"))?;
+    store.delete_entry(uuid).await.map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod attachment_surfacing_tests {
     use super::prepare_attachment_surfacing;

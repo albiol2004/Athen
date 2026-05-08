@@ -195,6 +195,11 @@ pub struct AppState {
     /// `arcs.active_profile_id` so each conversation can run under its
     /// own persona + tool surface.
     pub profile_store: Option<Arc<athen_persistence::profiles::SqliteProfileStore>>,
+    /// SQLite-backed identity store. Holds the user's hand-maintained
+    /// personality / rules / knowledge / team statements (plus any custom
+    /// categories). Read at prompt-build time and folded into the static
+    /// system header so every agent shares the same "who Athen is".
+    pub identity_store: Option<Arc<athen_persistence::identity::SqliteIdentityStore>>,
     /// Embedding provider used for semantic profile routing. Always wired
     /// to a router that falls back to keyword embeddings when no neural
     /// provider is available, so the per-call code path can assume `Some`.
@@ -324,6 +329,7 @@ impl AppState {
 
         let grant_store = database.as_ref().map(|db| Arc::new(db.grant_store()));
         let profile_store = database.as_ref().map(|db| Arc::new(db.profile_store()));
+        let identity_store = database.as_ref().map(|db| Arc::new(db.identity_store()));
         // Build an embedding router for profile routing. Same shape as the
         // memory subsystem's embedder: real providers can be wired later
         // from settings; until then it falls back to keyword embeddings,
@@ -378,6 +384,7 @@ impl AppState {
             tool_doc_dir,
             grant_store,
             profile_store,
+            identity_store,
             profile_embedder,
             profile_embedding_cache,
             pending_grants,
