@@ -378,8 +378,14 @@ impl DefaultExecutor {
         prompt.push_str(&Self::build_workspace_rules(has_context));
         prompt.push_str(&Self::build_shell_env_section(shell_kind));
         prompt.push_str(&Self::build_toolbox_section(toolbox_info));
-        prompt.push_str(&Self::build_tool_index(tools, revealed, tool_doc_dir));
+        prompt.push_str(&Self::build_tool_index(tools, tool_doc_dir));
         prompt.push_str(&Self::build_persona_rules(autonomous));
+        // Append-only block: revealed-tool schemas grow as the agent
+        // discovers tools. Placed AFTER the static sections so adding a
+        // new tool's schema only invalidates the prefix from this point
+        // forward — the static prefix above stays byte-identical, and
+        // llama.cpp / vLLM can LCP-match through it cleanly.
+        prompt.push_str(&Self::build_revealed_tool_schemas(tools, revealed));
         // Volatile suffix MUST stay last — anything that changes per-turn
         // (current date/time, future ephemeral context) lives here so the
         // static prefix above is byte-identical between turns and the LLM
@@ -539,6 +545,39 @@ impl DefaultExecutor {
         format!("{identity}\n\n")
     }
 
+    /// Append-only revealed-tool schemas, placed between the static
+    /// prefix and the volatile suffix.
+    ///
+    /// Why this is its own section: the agent reveals new tools as it
+    /// discovers them at runtime, so this content grows turn-by-turn.
+    /// If it lived inside [`Self::build_tool_index`] (which used to be
+    /// the case), inserting a new tool's schema mid-prompt shifted
+    /// every byte after it and invalidated llama.cpp's KV cache from
+    /// that offset onward. Placing it here means the static prefix
+    /// above is unchanged across turns and the cache only invalidates
+    /// from the first new schema — which the next turn's prompt also
+    /// includes, so the LCP keeps growing append-only.
+    ///
+    /// Within this block tools are emitted in the same order as
+    /// `tools`, so the byte layout is also stable across reveals (only
+    /// new entries get appended at the end).
+    fn build_revealed_tool_schemas(
+        tools: &[athen_core::tool::ToolDefinition],
+        revealed: &HashSet<String>,
+    ) -> String {
+        let revealed_tools: Vec<&athen_core::tool::ToolDefinition> =
+            tools.iter().filter(|t| revealed.contains(&t.name)).collect();
+        if revealed_tools.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from("DETAILED TOOLS (schemas already loaded — call directly):\n");
+        for tool in revealed_tools {
+            out.push_str(&format!("- **{}**: {}\n", tool.name, tool.description));
+        }
+        out.push('\n');
+        out
+    }
+
     /// Trailing volatile suffix — everything that changes per-turn lives
     /// here so the static prefix of the system prompt above is
     /// byte-identical between turns. llama.cpp / vLLM / other prefix
@@ -599,7 +638,6 @@ impl DefaultExecutor {
     /// discovery.
     fn build_tool_index(
         tools: &[athen_core::tool::ToolDefinition],
-        revealed: &HashSet<String>,
         tool_doc_dir: Option<&std::path::Path>,
     ) -> String {
         let mut out = String::new();
@@ -646,19 +684,13 @@ impl DefaultExecutor {
                 ));
             }
             out.push('\n');
-
-            // ── Tier 2: full schemas for revealed tools ──
-            let revealed_tools: Vec<&athen_core::tool::ToolDefinition> = tools
-                .iter()
-                .filter(|t| revealed.contains(&t.name))
-                .collect();
-            if !revealed_tools.is_empty() {
-                out.push_str("DETAILED TOOLS (schemas already loaded — call directly):\n");
-                for tool in revealed_tools {
-                    out.push_str(&format!("- **{}**: {}\n", tool.name, tool.description));
-                }
-                out.push('\n');
-            }
+            // NOTE: Tier 2 (DETAILED TOOLS — schemas for revealed tools) used
+            // to live here, but it grew per-turn as the agent revealed more
+            // tools. Inserting bytes mid-prompt invalidated every prefix-cache
+            // checkpoint after the insertion point. The detailed-tool block
+            // now lives in `build_revealed_tool_schemas`, called as the last
+            // section before the volatile suffix — append-only growth that
+            // llama.cpp / vLLM can LCP-match cleanly.
         }
 
         if has_calendar {
@@ -2369,6 +2401,71 @@ mod tests {
         assert!(
             rules_pos < date_pos,
             "RULES must precede the volatile suffix — keep ephemeral content trailing"
+        );
+    }
+
+    /// Revealed-tool schemas must be append-only: when a new tool is
+    /// revealed, the prompt up to where the new schema appears must be
+    /// byte-identical to the prior turn's prompt. This is what lets
+    /// llama.cpp's LCP keep growing instead of resetting at the first
+    /// reveal — the failure mode we hit pre-fix where DETAILED TOOLS
+    /// lived inside `build_tool_index`, ahead of the per-family guidance.
+    ///
+    /// Concretely: build with revealed set {A}, then with {A, B}.
+    /// Everything up to "DETAILED TOOLS" must match, the prior {A} block
+    /// must be a prefix of the {A, B} block, and the per-family +
+    /// rules sections must NOT have moved.
+    #[test]
+    fn revealed_tool_schemas_grow_append_only() {
+        let tools = vec![
+            tool_def("memory_store", "store a memory"),
+            tool_def("read", "read a file"),
+            tool_def("calendar_create", "create event"),
+        ];
+        let mut revealed_a: HashSet<String> = HashSet::new();
+        revealed_a.insert("memory_store".to_string());
+        let mut revealed_ab = revealed_a.clone();
+        revealed_ab.insert("read".to_string());
+
+        let pa = DefaultExecutor::build_system_prompt(
+            &tools,
+            &revealed_a,
+            false,
+            None,
+            None,
+            None,
+            None,
+        );
+        let pab = DefaultExecutor::build_system_prompt(
+            &tools,
+            &revealed_ab,
+            false,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        // The static prefix up to the DETAILED TOOLS section header
+        // must be identical: the RULES section and tool-group index
+        // must NOT have shifted just because a new tool got revealed.
+        // (We use the unique full header — "DETAILED TOOLS" alone also
+        // appears in the AVAILABLE TOOL GROUPS preamble text.)
+        let marker = "DETAILED TOOLS (schemas already loaded";
+        let pa_static = pa.split(marker).next().unwrap();
+        let pab_static = pab.split(marker).next().unwrap();
+        assert_eq!(
+            pa_static, pab_static,
+            "static prefix shifted when a new tool was revealed — append-only invariant broken"
+        );
+
+        // RULES must come BEFORE the detailed-tools section (the whole
+        // point of the move was to keep rules in the static section).
+        let rules_pos = pa.find("RULES YOU MUST FOLLOW").expect("rules present");
+        let detail_pos = pa.find(marker).expect("detailed tools present");
+        assert!(
+            rules_pos < detail_pos,
+            "RULES must precede DETAILED TOOLS — otherwise revealed-tool growth invalidates rules"
         );
     }
 
