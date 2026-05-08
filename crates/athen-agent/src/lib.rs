@@ -10,6 +10,7 @@ pub mod resource;
 pub mod runtimes;
 pub mod timeout;
 pub mod tool_grouping;
+pub mod tool_truncation;
 pub mod toolbox;
 pub mod tools;
 pub mod tools_doc;

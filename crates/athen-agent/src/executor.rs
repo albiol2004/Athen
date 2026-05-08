@@ -1678,9 +1678,20 @@ impl AgentExecutor for DefaultExecutor {
                 // Add tool result to conversation for the next LLM call.
                 // Include the tool_call_id so the provider can match results
                 // to their originating tool calls (required by OpenAI-compatible APIs).
+                //
+                // The audit trail (TaskStep.output above) keeps the full
+                // result; only the copy threaded back to the LLM is capped
+                // by `tool_truncation::policy_for` so an oversized tool
+                // output (build logs, fetched pages) can't blow the context
+                // window for the next turn.
                 let tool_response_content = match &tool_result {
                     Ok(result) => {
-                        serde_json::to_string(&result.output).unwrap_or_else(|_| "{}".to_string())
+                        let raw = serde_json::to_string(&result.output)
+                            .unwrap_or_else(|_| "{}".to_string());
+                        crate::tool_truncation::apply(
+                            crate::tool_truncation::policy_for(&tool_call.name),
+                            raw,
+                        )
                     }
                     Err(e) => format!("Error: {}", e),
                 };
