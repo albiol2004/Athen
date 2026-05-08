@@ -458,12 +458,46 @@ impl DefaultExecutor {
         // forward — the static prefix above stays byte-identical, and
         // llama.cpp / vLLM can LCP-match through it cleanly.
         prompt.push_str(&Self::build_revealed_tool_schemas(tools, revealed));
-        // Volatile suffix MUST stay last — anything that changes per-turn
-        // (current date/time, future ephemeral context) lives here so the
-        // static prefix above is byte-identical between turns and the LLM
-        // backend's prefix cache (e.g. llama.cpp) can match it.
-        prompt.push_str(&Self::build_volatile_state());
+        // NOTE: per-turn volatile content (current time, recalled memories,
+        // attachment summaries, compaction state) used to live here at the
+        // end of the system message. It now travels in the first user
+        // turn's body via [`build_context_preamble`] — system stays fully
+        // stable so breakpoint caches (Anthropic / Bedrock) get a clean
+        // boundary, and prefix caches (llama.cpp / vLLM) match the entire
+        // system message turn after turn instead of just up to the time
+        // line. See `feedback_volatile_content_belongs_in_body.md`.
         prompt
+    }
+
+    /// Render the per-turn context preamble that gets prepended to the
+    /// first user message's text. Bundles current wall-clock time and the
+    /// host's `external_system_suffix` (memory recall, attachment
+    /// summaries, compaction state) into a single `<CONTEXT>...</CONTEXT>`
+    /// block that the model can recognise as scaffolding rather than the
+    /// user's literal words.
+    ///
+    /// Returns `""` when neither time nor suffix needs to ride along — in
+    /// that case the user's task description is sent unchanged. Today
+    /// time is always present, so the empty-output path is mostly a
+    /// safety net for tests that want byte-identical output.
+    fn build_context_preamble(external_suffix: Option<&str>) -> String {
+        let mut body = String::new();
+        body.push_str(&Self::build_volatile_state());
+        if let Some(suffix) = external_suffix {
+            let trimmed = suffix.trim();
+            if !trimmed.is_empty() {
+                if !body.is_empty() {
+                    body.push('\n');
+                }
+                body.push_str(trimmed);
+                body.push('\n');
+            }
+        }
+        let trimmed = body.trim_end();
+        if trimmed.is_empty() {
+            return String::new();
+        }
+        format!("<CONTEXT>\n{trimmed}\n</CONTEXT>\n\n")
     }
 
     /// Slot 2.4: SHELL ENVIRONMENT — what OS and shell `shell_execute`
@@ -1160,11 +1194,25 @@ impl AgentExecutor for DefaultExecutor {
         // Seed the conversation with the task description as a user message.
         // If images were attached to this turn, send Multimodal so vision-
         // capable LLMs can see them.
+        //
+        // Per-turn volatile context (current time + host-supplied memory
+        // recall / attachment summaries / compaction state) rides in front
+        // of the user's actual words inside a `<CONTEXT>...</CONTEXT>`
+        // wrapper so the LLM can tell scaffolding apart from the user's
+        // literal request. Computed once at dispatch start; the loop's
+        // tool-result follow-ups reuse the same prefix-cached system
+        // message instead of refreshing time mid-conversation.
+        let context_preamble = Self::build_context_preamble(self.external_system_suffix.as_deref());
+        let user_text = if context_preamble.is_empty() {
+            task.description.clone()
+        } else {
+            format!("{}{}", context_preamble, task.description)
+        };
         let initial_content = if self.initial_user_images.is_empty() {
-            MessageContent::Text(task.description.clone())
+            MessageContent::Text(user_text)
         } else {
             MessageContent::Multimodal {
-                text: task.description.clone(),
+                text: user_text,
                 images: self.initial_user_images.clone(),
             }
         };
@@ -1181,7 +1229,7 @@ impl AgentExecutor for DefaultExecutor {
             // Rebuild the system prompt each iteration so newly-revealed
             // tools' full schemas appear inline. The prompt itself is small;
             // rebuilding is cheap.
-            let mut system_prompt = Self::build_system_prompt_with_mode(
+            let system_prompt = Self::build_system_prompt_with_mode(
                 &available_tools,
                 &revealed_tools,
                 has_context,
@@ -1192,15 +1240,11 @@ impl AgentExecutor for DefaultExecutor {
                 self.autonomous_mode,
                 self.identity_block.as_deref(),
             );
-            // Append host-supplied volatile content (memory recall,
-            // attachment summaries, compaction state). Lives at the very
-            // end of the leading system message so strict chat templates
-            // (Qwen, Llama) accept it — they raise on system messages
-            // past position 0, which is why we no longer push these as
-            // mid-stream `Role::System`.
-            if let Some(ref suffix) = self.external_system_suffix {
-                system_prompt.push_str(suffix);
-            }
+            // Volatile content (current time, host memory recall,
+            // attachment summaries, compaction state) used to be appended
+            // here. It now rides in the first user turn's body via
+            // `build_context_preamble`, so the system message above stays
+            // byte-identical across the loop and across turns.
 
             // Tools sent to the LLM API: only the revealed subset carries
             // schemas. The model sees others in the system-prompt index;
@@ -2423,11 +2467,60 @@ mod tests {
         assert!(p_none.contains("You are Athen, a proactive universal AI agent"));
         assert!(p_default.contains("You are Athen, a proactive universal AI agent"));
 
-        // The persona portion (everything before "Current date and time")
-        // must be identical between the two paths.
-        let p_none_persona = p_none.split("Current date and time").next().unwrap();
-        let p_default_persona = p_default.split("Current date and time").next().unwrap();
-        assert_eq!(p_none_persona, p_default_persona);
+        // System prompts must now be byte-identical end-to-end: per-turn
+        // volatile content moved to the user-side `<CONTEXT>` block, so
+        // there's nothing left in system that could differ between the
+        // two paths.
+        assert_eq!(p_none, p_default);
+    }
+
+    /// The user-side context preamble bundles current time + any
+    /// host-supplied suffix into a `<CONTEXT>...</CONTEXT>` wrapper. With
+    /// no suffix it still includes the time line. With a suffix the
+    /// suffix is appended on its own paragraph.
+    #[test]
+    fn context_preamble_wraps_time_and_suffix() {
+        let only_time = DefaultExecutor::build_context_preamble(None);
+        assert!(only_time.starts_with("<CONTEXT>\n"));
+        assert!(only_time.contains("Current date and time:"));
+        assert!(only_time.trim_end().ends_with("</CONTEXT>"));
+
+        let with_suffix = DefaultExecutor::build_context_preamble(Some(
+            "Recalled memories:\n- user's mother is Inés\n",
+        ));
+        assert!(with_suffix.contains("Current date and time:"));
+        assert!(with_suffix.contains("Recalled memories:"));
+        assert!(with_suffix.contains("user's mother is Inés"));
+        // Time precedes recalled-memory content.
+        let t = with_suffix.find("Current date").unwrap();
+        let m = with_suffix.find("Recalled memories").unwrap();
+        assert!(t < m, "time should come before host-supplied suffix");
+    }
+
+    /// Whitespace-only suffix is ignored — the preamble still contains
+    /// time, but no empty paragraph is emitted from the suffix slot.
+    #[test]
+    fn context_preamble_ignores_whitespace_suffix() {
+        let with_real =
+            DefaultExecutor::build_context_preamble(Some("Recalled memories:\n- foo\n"));
+        let with_blank = DefaultExecutor::build_context_preamble(Some("   \n\n  "));
+        let no_suffix = DefaultExecutor::build_context_preamble(None);
+
+        // Whitespace-only suffix collapses to the same shape as no suffix.
+        // (Time stamps differ, but both lack any non-time content lines.)
+        let blank_lines: Vec<&str> = with_blank
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with("<CONTEXT") && !l.starts_with("</CONTEXT"))
+            .collect();
+        let none_lines: Vec<&str> = no_suffix
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with("<CONTEXT") && !l.starts_with("</CONTEXT"))
+            .collect();
+        assert_eq!(blank_lines.len(), none_lines.len());
+        assert_eq!(blank_lines.len(), 1);
+        assert!(blank_lines[0].starts_with("Current date and time:"));
+        // And the real suffix path *does* add lines.
+        assert!(with_real.contains("Recalled memories:"));
     }
 
     /// Identity is omitted entirely when no block is provided, so installs
@@ -2549,14 +2642,18 @@ mod tests {
         assert!(prompt.contains("RULES YOU MUST FOLLOW"));
     }
 
-    /// The system prompt is split into a static prefix and a volatile
-    /// suffix so prefix caches (llama.cpp, vLLM) can reuse KV state across
-    /// turns. Two builds of the same prompt with the same inputs must have
-    /// byte-identical prefixes up to the start of "Current date and time:".
-    /// If you add per-turn data, route it through `build_volatile_state`,
-    /// not into earlier sections.
+    /// The system prompt is now fully stable across builds — every per-turn
+    /// volatile field (current time, recalled memories, attachment summaries,
+    /// compaction state) lives in the first user message's `<CONTEXT>` block,
+    /// not in system. Two builds with the same inputs must therefore be
+    /// byte-identical end-to-end so prefix caches (llama.cpp / vLLM) can
+    /// match the entire system message turn after turn, and breakpoint
+    /// caches (Anthropic / Bedrock) get a clean stable boundary.
+    ///
+    /// If you add per-turn data, route it through `build_context_preamble`
+    /// (user-side), not the system prompt.
     #[test]
-    fn system_prompt_static_prefix_is_byte_identical_between_builds() {
+    fn system_prompt_is_fully_stable_between_builds() {
         let tools = vec![tool_def("memory_store", "store a memory")];
         let revealed = HashSet::new();
 
@@ -2564,23 +2661,16 @@ mod tests {
             DefaultExecutor::build_system_prompt(&tools, &revealed, false, None, None, None, None);
         let b =
             DefaultExecutor::build_system_prompt(&tools, &revealed, false, None, None, None, None);
-
-        let split = "Current date and time:";
-        let a_prefix = a.split(split).next().unwrap();
-        let b_prefix = b.split(split).next().unwrap();
         assert_eq!(
-            a_prefix, b_prefix,
-            "static prefix drifted between builds — something volatile leaked above the suffix"
+            a, b,
+            "system prompt drifted between builds — something volatile leaked into system"
         );
-        // Sanity: the volatile marker really is at the END (no trailing
-        // sections after it). RULES must come BEFORE the timestamp.
-        let rules_pos = a
-            .find("RULES YOU MUST FOLLOW")
-            .expect("rules section present");
-        let date_pos = a.find(split).expect("volatile suffix present");
+        // Date/time is no longer in system — it rides in the user-side
+        // context preamble. Asserting absence is what guards against the
+        // regression of putting it back inline.
         assert!(
-            rules_pos < date_pos,
-            "RULES must precede the volatile suffix — keep ephemeral content trailing"
+            !a.contains("Current date and time:"),
+            "current-time line must not appear in system; it belongs to <CONTEXT> on the user turn"
         );
     }
 
