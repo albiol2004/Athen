@@ -17,3 +17,4 @@ pub mod sandbox;
 pub mod task;
 pub mod tool;
 pub mod traits;
+pub mod wakeup;

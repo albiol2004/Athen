@@ -14,6 +14,7 @@ pub mod mcp;
 pub mod notifications;
 pub mod profiles;
 pub mod store;
+pub mod wakeups;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -34,6 +35,7 @@ use crate::mcp::McpStore;
 use crate::notifications::NotificationStore;
 use crate::profiles::SqliteProfileStore;
 use crate::store::SqliteStore;
+use crate::wakeups::SqliteWakeupStore;
 
 /// Owns the SQLite connection and provides access to the store.
 pub struct Database {
@@ -94,6 +96,8 @@ impl Database {
         let identity = self.identity_store();
         identity.init_schema().await?;
         identity.seed_categories_if_empty().await?;
+        let wakeups = self.wakeup_store();
+        wakeups.init_schema().await?;
         profiles.seed_builtins_if_empty().await
     }
 
@@ -150,6 +154,11 @@ impl Database {
     /// Create a `SqliteIdentityStore` backed by this database's connection.
     pub fn identity_store(&self) -> SqliteIdentityStore {
         SqliteIdentityStore::new(self.conn.clone())
+    }
+
+    /// Create a `SqliteWakeupStore` backed by this database's connection.
+    pub fn wakeup_store(&self) -> SqliteWakeupStore {
+        SqliteWakeupStore::new(self.conn.clone())
     }
 }
 
