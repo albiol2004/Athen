@@ -938,6 +938,216 @@ impl TauriAuditor {
     }
 }
 
+/// Build a one-line summary for a tool call based on its arguments and
+/// (optionally) its result. The intent — what the agent did — lives in
+/// the args, so we lean on those first; the result fills in
+/// confirmations like "wrote 432B" or `next_fire_at`.
+///
+/// Returns `None` when neither side produces something meaningful; the
+/// caller can then fall back to the raw output blob.
+pub(crate) fn summarize_tool_call(
+    tool: &str,
+    args: Option<&serde_json::Value>,
+    result: Option<&serde_json::Value>,
+) -> Option<String> {
+    let s_str =
+        |v: Option<&serde_json::Value>, k: &str| -> Option<String> {
+            v.and_then(|v| v.get(k))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        };
+    let s_u64 = |v: Option<&serde_json::Value>, k: &str| -> Option<u64> {
+        v.and_then(|v| v.get(k)).and_then(|v| v.as_u64())
+    };
+
+    match tool {
+        "read" => {
+            let path = s_str(args, "path")?;
+            let offset = s_u64(args, "offset");
+            let limit = s_u64(args, "limit");
+            match (offset, limit) {
+                (Some(o), Some(l)) => Some(format!("{path} (lines {o}–{})", o + l)),
+                (Some(o), None) => Some(format!("{path} (from line {o})")),
+                (None, Some(l)) => Some(format!("{path} (first {l} lines)")),
+                (None, None) => Some(path),
+            }
+        }
+        "write" => {
+            let path = s_str(args, "path")?;
+            if let Some(bytes) = s_u64(result, "bytes_written") {
+                Some(format!("{path} ({})", human_bytes(bytes)))
+            } else {
+                Some(path)
+            }
+        }
+        "edit" => {
+            let path = s_str(args, "path")?;
+            if let Some(n) = s_u64(result, "replacements") {
+                let unit = if n == 1 { "edit" } else { "edits" };
+                Some(format!("{path} ({n} {unit})"))
+            } else {
+                Some(path)
+            }
+        }
+        "list_directory" => {
+            let path = s_str(args, "path").unwrap_or_else(|| ".".to_string());
+            if let Some(n) = s_u64(result, "count") {
+                let unit = if n == 1 { "entry" } else { "entries" };
+                Some(format!("{path} ({n} {unit})"))
+            } else {
+                Some(path)
+            }
+        }
+        "grep" => {
+            let pattern = s_str(args, "pattern")?;
+            let path = s_str(args, "path").unwrap_or_else(|| ".".to_string());
+            let glob = s_str(args, "glob");
+            match glob {
+                Some(g) => Some(format!("\"{pattern}\" in {path} ({g})")),
+                None => Some(format!("\"{pattern}\" in {path}")),
+            }
+        }
+        "shell_execute" | "shell_spawn" => s_str(args, "command"),
+        "shell_kill" | "shell_logs" => s_str(args, "pid"),
+        "web_search" => s_str(args, "query"),
+        "web_fetch" => s_str(args, "url"),
+        "email_send" => {
+            // Pull from args (richer than result, which echoes only ids).
+            let to = args
+                .and_then(|v| v.get("to"))
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            let subject = s_str(args, "subject").unwrap_or_default();
+            match (to.is_empty(), subject.is_empty()) {
+                (true, true) => None,
+                (true, false) => Some(subject),
+                (false, true) => Some(format!("to {to}")),
+                (false, false) => Some(format!("to {to} — {subject}")),
+            }
+        }
+        "memory_store" => s_str(args, "key"),
+        "memory_recall" => s_str(args, "query"),
+        "calendar_create" => {
+            let title = s_str(args, "title").unwrap_or_default();
+            let start = s_str(args, "start").unwrap_or_default();
+            match (title.is_empty(), start.is_empty()) {
+                (true, true) => None,
+                (true, false) => Some(start),
+                (false, true) => Some(title),
+                (false, false) => Some(format!("{title} — {start}")),
+            }
+        }
+        "calendar_list" => {
+            let start = s_str(args, "start_date");
+            let end = s_str(args, "end_date");
+            match (start, end) {
+                (Some(s), Some(e)) => Some(format!("{s} → {e}")),
+                (Some(s), None) => Some(s),
+                (None, Some(e)) => Some(format!("until {e}")),
+                (None, None) => None,
+            }
+        }
+        "calendar_update" | "calendar_delete" | "contacts_update" | "contacts_delete" => {
+            s_str(args, "id")
+        }
+        "contacts_search" => s_str(args, "query"),
+        "contacts_create" => s_str(args, "name"),
+        "delegate_to_agent" => {
+            let profile = s_str(args, "profile").or_else(|| s_str(args, "agent"));
+            let task = s_str(args, "task").or_else(|| s_str(args, "instruction"));
+            match (profile, task) {
+                (Some(p), Some(t)) => Some(format!("{p}: {t}")),
+                (Some(p), None) => Some(p),
+                (None, Some(t)) => Some(t),
+                (None, None) => None,
+            }
+        }
+        "install_package" | "uninstall_package" => {
+            let runtime = s_str(args, "runtime").unwrap_or_default();
+            let pkg = s_str(args, "package").unwrap_or_default();
+            match (runtime.is_empty(), pkg.is_empty()) {
+                (true, true) => None,
+                (true, false) => Some(pkg),
+                (false, true) => Some(runtime),
+                (false, false) => Some(format!("{runtime}: {pkg}")),
+            }
+        }
+        "create_wakeup" => {
+            let when = args
+                .and_then(|v| v.get("schedule"))
+                .map(format_wakeup_when)
+                .unwrap_or_else(|| "?".to_string());
+            let instruction = s_str(args, "instruction").unwrap_or_default();
+            if instruction.is_empty() {
+                Some(when)
+            } else {
+                Some(format!("{when} — {instruction}"))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Render a wake-up `schedule` JSON object as a short human label:
+/// `in 2h`, `at 2026-05-09 17:00`, `every 1h`, `cron: 0 8 * * *`.
+fn format_wakeup_when(schedule: &serde_json::Value) -> String {
+    let kind = schedule.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    match kind {
+        "one_shot" => {
+            if let Some(rel) = schedule.get("in").and_then(|v| v.as_str()) {
+                return format!("in {rel}");
+            }
+            if let Some(at) = schedule.get("at").and_then(|v| v.as_str()) {
+                let pretty = chrono::DateTime::parse_from_rfc3339(at)
+                    .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
+                    .unwrap_or_else(|_| at.to_string());
+                return format!("at {pretty}");
+            }
+            "one-shot".to_string()
+        }
+        "interval" => match schedule.get("every_seconds").and_then(|v| v.as_u64()) {
+            Some(n) => format!("every {}", human_duration(n)),
+            None => "interval".to_string(),
+        },
+        "cron" => {
+            let expr = schedule
+                .get("expr")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            format!("cron: {expr}")
+        }
+        other => other.to_string(),
+    }
+}
+
+fn human_duration(secs: u64) -> String {
+    if secs >= 86_400 && secs.is_multiple_of(86_400) {
+        format!("{}d", secs / 86_400)
+    } else if secs >= 3_600 && secs.is_multiple_of(3_600) {
+        format!("{}h", secs / 3_600)
+    } else if secs >= 60 && secs.is_multiple_of(60) {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+fn human_bytes(n: u64) -> String {
+    if n < 1024 {
+        format!("{n}B")
+    } else if n < 1024 * 1024 {
+        format!("{:.1}KB", n as f64 / 1024.0)
+    } else {
+        format!("{:.1}MB", n as f64 / (1024.0 * 1024.0))
+    }
+}
+
 #[async_trait]
 impl StepAuditor for TauriAuditor {
     async fn record_step(&self, task_id: TaskId, step: &TaskStep) -> AthenResult<()> {
@@ -949,55 +1159,22 @@ impl StepAuditor for TauriAuditor {
             .to_string();
 
         // Extract a useful detail string from the step output.
+        // Prefer args-based summaries — what the agent did (paths, commands,
+        // queries) is the user-meaningful part. Fall back to the raw result
+        // blob only when no per-tool formatter recognised the call.
         let detail = step.output.as_ref().and_then(|output| {
-            // For tool calls, show the command/path/key from the arguments or result.
             if let Some(tool) = output.get("tool").and_then(|t| t.as_str()) {
-                // Try to build a summary from the tool result.
-                if let Some(result) = output.get("result") {
-                    let summary = match tool {
-                        "shell_execute" => result
-                            .get("stdout")
-                            .and_then(|s| s.as_str())
-                            .map(|s| s.to_string()),
-                        "read" | "write" | "edit" => result
-                            .get("path")
-                            .and_then(|s| s.as_str())
-                            .map(|s| s.to_string()),
-                        "list_directory" => result
-                            .get("path")
-                            .and_then(|s| s.as_str())
-                            .map(|s| s.to_string()),
-                        "email_send" => {
-                            // Render as `to a@x, b@y — Subject` so the
-                            // user reads the action at a glance instead
-                            // of parsing JSON.
-                            let to = result
-                                .get("to")
-                                .and_then(|v| v.as_array())
-                                .map(|arr| {
-                                    arr.iter()
-                                        .filter_map(|v| v.as_str())
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                })
-                                .unwrap_or_default();
-                            let subject =
-                                result.get("subject").and_then(|v| v.as_str()).unwrap_or("");
-                            if to.is_empty() && subject.is_empty() {
-                                Some(serde_json::to_string(result).unwrap_or_default())
-                            } else if subject.is_empty() {
-                                Some(format!("to {to}"))
-                            } else if to.is_empty() {
-                                Some(subject.to_string())
-                            } else {
-                                Some(format!("to {to} — {subject}"))
-                            }
-                        }
-                        _ => Some(serde_json::to_string(result).unwrap_or_default()),
-                    };
-                    return summary.map(|s| Self::truncate_detail(&s, 200));
+                let args = output.get("args");
+                let result = output.get("result");
+                if let Some(s) = summarize_tool_call(tool, args, result) {
+                    return Some(Self::truncate_detail(&s, 200));
                 }
-                // If there was an error, show it.
+                if let Some(result) = result {
+                    return Some(Self::truncate_detail(
+                        &serde_json::to_string(result).unwrap_or_default(),
+                        200,
+                    ));
+                }
                 if let Some(err) = output.get("error").and_then(|e| e.as_str()) {
                     return Some(Self::truncate_detail(err, 200));
                 }
@@ -6097,5 +6274,144 @@ mod composer_upload_tests {
         );
 
         let _ = std::fs::remove_dir_all(parent);
+    }
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use super::summarize_tool_call;
+    use serde_json::json;
+
+    fn s(tool: &str, args: serde_json::Value, result: serde_json::Value) -> Option<String> {
+        summarize_tool_call(tool, Some(&args), Some(&result))
+    }
+
+    #[test]
+    fn read_uses_args_path_even_when_result_omits_it() {
+        // The actual `read` tool returns {content, lines_returned, ...} —
+        // no `path` field. The old summarizer relied on result.path and
+        // returned None, so the UI showed an empty card. Regression-guard
+        // that we now read the path out of the args.
+        let out = s(
+            "read",
+            json!({ "path": "/etc/hosts" }),
+            json!({ "content": "...", "lines_returned": 5 }),
+        );
+        assert_eq!(out.as_deref(), Some("/etc/hosts"));
+    }
+
+    #[test]
+    fn read_includes_offset_and_limit_when_present() {
+        let out = s(
+            "read",
+            json!({ "path": "/big.log", "offset": 100, "limit": 50 }),
+            json!({}),
+        );
+        assert_eq!(out.as_deref(), Some("/big.log (lines 100–150)"));
+    }
+
+    #[test]
+    fn list_directory_uses_args_path_and_count() {
+        let out = s("list_directory", json!({ "path": "/tmp" }), json!({ "count": 3 }));
+        assert_eq!(out.as_deref(), Some("/tmp (3 entries)"));
+        let out_one = s("list_directory", json!({ "path": "/tmp" }), json!({ "count": 1 }));
+        assert_eq!(out_one.as_deref(), Some("/tmp (1 entry)"));
+    }
+
+    #[test]
+    fn grep_renders_pattern_in_path() {
+        let out = s(
+            "grep",
+            json!({ "pattern": "TODO", "path": "src", "glob": "*.rs" }),
+            json!({}),
+        );
+        assert_eq!(out.as_deref(), Some("\"TODO\" in src (*.rs)"));
+    }
+
+    #[test]
+    fn shell_execute_summarises_command_not_stdout() {
+        // Old behaviour: dump stdout. New behaviour: show the command —
+        // *what the agent did* matters more than how it answered.
+        let out = s(
+            "shell_execute",
+            json!({ "command": "ls -la /tmp" }),
+            json!({ "stdout": "lots of output here" }),
+        );
+        assert_eq!(out.as_deref(), Some("ls -la /tmp"));
+    }
+
+    #[test]
+    fn write_includes_human_byte_count() {
+        let out = s(
+            "write",
+            json!({ "path": "/tmp/x.md" }),
+            json!({ "path": "/tmp/x.md", "bytes_written": 2048 }),
+        );
+        assert_eq!(out.as_deref(), Some("/tmp/x.md (2.0KB)"));
+    }
+
+    #[test]
+    fn edit_includes_replacement_count() {
+        let out = s(
+            "edit",
+            json!({ "path": "/tmp/x.md" }),
+            json!({ "replacements": 3 }),
+        );
+        assert_eq!(out.as_deref(), Some("/tmp/x.md (3 edits)"));
+    }
+
+    #[test]
+    fn create_wakeup_one_shot_relative() {
+        let out = s(
+            "create_wakeup",
+            json!({
+                "instruction": "Check the form",
+                "schedule": { "kind": "one_shot", "in": "1h" }
+            }),
+            json!({}),
+        );
+        assert_eq!(out.as_deref(), Some("in 1h — Check the form"));
+    }
+
+    #[test]
+    fn create_wakeup_interval_uses_human_duration() {
+        let out = s(
+            "create_wakeup",
+            json!({
+                "instruction": "Refresh stats",
+                "schedule": { "kind": "interval", "every_seconds": 3600 }
+            }),
+            json!({}),
+        );
+        assert_eq!(out.as_deref(), Some("every 1h — Refresh stats"));
+    }
+
+    #[test]
+    fn create_wakeup_cron_passes_expression_through() {
+        let out = s(
+            "create_wakeup",
+            json!({
+                "instruction": "Daily news",
+                "schedule": { "kind": "cron", "expr": "0 8 * * *" }
+            }),
+            json!({}),
+        );
+        assert_eq!(out.as_deref(), Some("cron: 0 8 * * * — Daily news"));
+    }
+
+    #[test]
+    fn delegate_to_agent_combines_profile_and_task() {
+        let out = s(
+            "delegate_to_agent",
+            json!({ "profile": "researcher", "task": "Summarise the docs" }),
+            json!({}),
+        );
+        assert_eq!(out.as_deref(), Some("researcher: Summarise the docs"));
+    }
+
+    #[test]
+    fn unknown_tool_returns_none_so_caller_can_fall_back() {
+        let out = s("frobnicate", json!({ "x": 1 }), json!({ "ok": true }));
+        assert!(out.is_none());
     }
 }
