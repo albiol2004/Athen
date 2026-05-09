@@ -3,14 +3,17 @@
 //! Adding a new entry here makes it appear in the Tools tab of the UI.
 //! Whether the underlying binary actually ships (or has to be downloaded)
 //! is encoded in `McpSource`.
+//!
+//! Currently empty: the original `files` entry was removed once the
+//! built-in `read`/`edit`/`write`/`grep`/`list_directory` tools became
+//! canonical. The catalog stays as the extension point for future
+//! branded MCPs (Slack, Notion, etc.).
 
-use athen_core::risk::BaseImpact;
-use athen_core::traits::mcp::{McpCatalogEntry, McpSource};
-use serde_json::json;
+use athen_core::traits::mcp::McpCatalogEntry;
 
 /// Return the full hardcoded catalog of branded MCPs.
 pub fn builtin_catalog() -> Vec<McpCatalogEntry> {
-    vec![files_entry()]
+    Vec::new()
 }
 
 /// Find an entry by id.
@@ -18,46 +21,18 @@ pub fn lookup(id: &str) -> Option<McpCatalogEntry> {
     builtin_catalog().into_iter().find(|e| e.id == id)
 }
 
-fn files_entry() -> McpCatalogEntry {
-    McpCatalogEntry {
-        id: "files".to_string(),
-        display_name: "Files".to_string(),
-        description: "Read, write, and organize files in a sandboxed folder. \
-                      All operations are confined to the folder you choose."
-            .to_string(),
-        icon: Some("folder".to_string()),
-        config_schema: json!({
-            "type": "object",
-            "properties": {
-                "sandbox_root": {
-                    "type": "string",
-                    "title": "Sandbox folder",
-                    "description": "Absolute path to the folder Files can access. \
-                                    Defaults to ~/.athen/files."
-                }
-            },
-            "required": ["sandbox_root"]
-        }),
-        source: McpSource::Bundled {
-            binary_name: "mcp-filesystem".to_string(),
-        },
-        base_risk: BaseImpact::WritePersist,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn catalog_has_files() {
-        let cat = builtin_catalog();
-        assert!(cat.iter().any(|e| e.id == "files"));
+    fn catalog_is_empty_after_files_removal() {
+        assert!(builtin_catalog().is_empty());
     }
 
     #[test]
-    fn lookup_works() {
-        assert!(lookup("files").is_some());
+    fn lookup_returns_none_for_removed_files_entry() {
+        assert!(lookup("files").is_none());
         assert!(lookup("does-not-exist").is_none());
     }
 }

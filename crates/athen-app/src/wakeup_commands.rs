@@ -463,10 +463,7 @@ fn humanize(name: &str) -> String {
 ///
 /// Each entry carries a human-readable `display_name` + `category` so
 /// the UI can render grouped collapsible sections instead of a flat
-/// alphabetical wall of internal tool ids. Filesystem MCP duplicates
-/// (`files__read_file`, `__write_file`, etc.) are dropped upstream by
-/// `AppToolRegistry::list_tools` so the LLM and this picker agree on
-/// the canonical surface (the gated built-ins).
+/// alphabetical wall of internal tool ids.
 #[tauri::command]
 pub async fn list_available_tools(
     state: State<'_, AppState>,

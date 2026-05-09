@@ -105,10 +105,6 @@ const BUILTIN_TOOL_ICONS = {
     'contacts_list': ICON_USERS, 'contacts_search': ICON_USER_SEARCH,
     'contacts_create': ICON_USER_PLUS, 'contacts_update': ICON_USER,
     'contacts_delete': ICON_TRASH,
-    // mcp-filesystem (matched via the suffix lookup in _normalizedToolKey)
-    'delete_path': ICON_TRASH, 'append_file': ICON_PEN_DOC,
-    'create_dir': ICON_FOLDER_PLUS, 'move_path': ICON_ARROW_RIGHT,
-    'exists': ICON_CHECK, 'stat': ICON_INFO,
     // delegation
     'delegate_to_agent': ICON_DELEGATE,
     // toolbox (pip/npm package management)
@@ -130,17 +126,15 @@ const BUILTIN_TOOL_LABELS = {
     'contacts_list': 'Contacts', 'contacts_search': 'Find contact',
     'contacts_create': 'Add contact', 'contacts_update': 'Update contact',
     'contacts_delete': 'Delete contact',
-    'delete_path': 'Delete', 'append_file': 'Append',
-    'create_dir': 'Create folder', 'move_path': 'Move',
-    'exists': 'Check', 'stat': 'Info',
     'delegate_to_agent': 'Consult specialist',
     'install_package': 'Install package',
     'uninstall_package': 'Uninstall package',
     'list_installed_packages': 'List packages',
 };
 
-// MCP-prefixed tools (e.g. `files__read_file`) — strip prefix and try common
-// suffix aliases so MCP filesystem tools pick up the same icons as built-ins.
+// MCP-prefixed tools (e.g. `slack__post_message`) — strip prefix and try common
+// suffix aliases so third-party MCP file-like tools pick up the same icons
+// as the built-ins when the names happen to match.
 const MCP_SUFFIX_ALIASES = {
     'read_file': 'read', 'write_file': 'write',
     'list_dir': 'list_directory', 'list_files': 'list_directory',

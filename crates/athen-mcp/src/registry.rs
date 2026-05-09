@@ -173,45 +173,12 @@ async fn spawn_client(enabled: &EnabledEntry) -> Result<LiveClient> {
     };
     let path = resolve_bundled_binary(&binary_name);
 
-    // Per-entry argument shaping. For now only "files" needs a sandbox root.
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut cmd = Command::new(&path);
     // MCP sidecars are headless JSON-RPC servers; suppress the cmd-window flash
     // Windows would otherwise attach to GUI parents.
     #[cfg(windows)]
     cmd.creation_flags(0x0800_0000);
-    if enabled.entry.id == "files" {
-        let configured = enabled
-            .config
-            .get("sandbox_root")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(String::from);
-        let root = match configured {
-            Some(r) => r,
-            None => {
-                // Documented default: Athen's files sandbox under the
-                // platform's data dir (`~/.athen/files` on Unix,
-                // `%APPDATA%\Athen\files` on Windows). We materialise it here
-                // so the user can flip Files on without configuring anything.
-                let path = athen_core::paths::athen_files_sandbox().ok_or_else(|| {
-                    AthenError::Other(
-                        "Files: cannot resolve Athen data directory for default sandbox_root"
-                            .into(),
-                    )
-                })?;
-                path.to_string_lossy().into_owned()
-            }
-        };
-        // Make sure the directory exists before handing it to the binary —
-        // mcp-filesystem will refuse to start if the path isn't there.
-        if let Err(e) = std::fs::create_dir_all(&root) {
-            return Err(AthenError::Other(format!(
-                "Files: cannot create sandbox root {root}: {e}"
-            )));
-        }
-        cmd.arg(&root);
-    }
 
     tracing::info!(
         mcp = enabled.entry.id,
@@ -311,57 +278,6 @@ impl McpClient for McpRegistry {
 mod tests {
     use super::*;
 
-    /// All tests that need the filesystem binary serialise on this mutex
-    /// because they share one symlink path under `current_exe` parent.
-    /// Tokio mutex (not std) so the await across the lock is safe.
-    static BINARY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    /// Make `mcp-filesystem` resolvable from `current_exe` parent (where
-    /// `resolve_bundled_binary` looks first). Returns the symlink path so
-    /// callers can clean it up. Returns `None` if the binary isn't built
-    /// yet, so tests can skip gracefully.
-    fn link_filesystem_binary() -> Option<std::path::PathBuf> {
-        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap();
-        let bin = [
-            "target/debug/mcp-filesystem",
-            "target/release/mcp-filesystem",
-        ]
-        .iter()
-        .map(|c| workspace_root.join(c))
-        .find(|p| p.exists())?;
-        let exe_dir = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .to_path_buf();
-        let link = exe_dir.join("mcp-filesystem");
-        let _ = std::fs::remove_file(&link);
-        std::os::unix::fs::symlink(&bin, &link).ok()?;
-        Some(link)
-    }
-
-    #[tokio::test]
-    async fn enable_disable_tracks_state() {
-        let _guard = BINARY_LOCK.lock().await;
-        let Some(link) = link_filesystem_binary() else {
-            eprintln!("skipping: mcp-filesystem binary not built");
-            return;
-        };
-        let tmp = tempfile::tempdir().unwrap();
-        let reg = McpRegistry::new();
-        reg.enable("files", serde_json::json!({"sandbox_root": tmp.path()}))
-            .await
-            .unwrap();
-        assert_eq!(reg.enabled_ids().await, vec!["files"]);
-        reg.disable("files").await;
-        assert!(reg.enabled_ids().await.is_empty());
-        let _ = std::fs::remove_file(&link);
-    }
-
     #[tokio::test]
     async fn unknown_id_rejected() {
         let reg = McpRegistry::new();
@@ -372,54 +288,15 @@ mod tests {
     async fn call_tool_when_disabled_errors() {
         let reg = McpRegistry::new();
         let res = reg
-            .call_tool("files", "read_file", serde_json::json!({}))
+            .call_tool("nonexistent", "anything", serde_json::json!({}))
             .await;
         assert!(res.is_err());
     }
 
-    /// End-to-end: spawn the real `mcp-filesystem` binary (if it has been
-    /// built) and exercise list_tools + a write/read round trip. Skipped
-    /// silently when the binary isn't on disk.
     #[tokio::test]
-    async fn end_to_end_with_real_binary() {
-        let _guard = BINARY_LOCK.lock().await;
-        let Some(link) = link_filesystem_binary() else {
-            eprintln!("skipping: mcp-filesystem binary not built");
-            return;
-        };
-        let tmp = tempfile::tempdir().unwrap();
+    async fn empty_registry_lists_no_tools() {
         let reg = McpRegistry::new();
-        reg.enable("files", serde_json::json!({"sandbox_root": tmp.path()}))
-            .await
-            .unwrap();
-
         let tools = reg.list_tools().await.unwrap();
-        assert!(
-            tools.iter().any(|t| t.name == "read_file"),
-            "expected read_file in tools: {:?}",
-            tools.iter().map(|t| &t.name).collect::<Vec<_>>()
-        );
-
-        let _ = reg
-            .call_tool(
-                "files",
-                "write_file",
-                serde_json::json!({"path": "hello.txt", "contents": "hi"}),
-            )
-            .await
-            .unwrap();
-        let read = reg
-            .call_tool(
-                "files",
-                "read_file",
-                serde_json::json!({"path": "hello.txt"}),
-            )
-            .await
-            .unwrap();
-        assert!(read.success);
-        assert_eq!(read.text, "hi");
-
-        // Cleanup
-        let _ = std::fs::remove_file(&link);
+        assert!(tools.is_empty());
     }
 }

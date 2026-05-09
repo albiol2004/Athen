@@ -117,7 +117,7 @@ mod tests {
             def("calendar_create", "Create event", json!({"type": "object"})),
             def("calendar_list", "List events", json!({"type": "object"})),
             def(
-                "files__write_file",
+                "write",
                 "Write file",
                 json!({"type": "object", "required": ["path"]}),
             ),
@@ -132,10 +132,10 @@ mod tests {
         assert!(cal.contains("calendar_create"));
         assert!(cal.contains("calendar_list"));
         // Calendar file should NOT contain files schemas.
-        assert!(!cal.contains("files__write_file"));
+        assert!(!cal.contains("Write file"));
 
         let files = std::fs::read_to_string(tmp.path().join("files.md")).unwrap();
-        assert!(files.contains("files__write_file"));
+        assert!(files.contains("`write`"));
         assert!(!files.contains("calendar_create"));
     }
 
@@ -180,12 +180,12 @@ mod tests {
         // First write: calendar + files.
         let initial = vec![
             def("calendar_list", "x", json!({})),
-            def("files__read_file", "x", json!({})),
+            def("read", "x", json!({})),
         ];
         write_per_group(tmp.path(), &initial).unwrap();
         assert!(tmp.path().join("files.md").exists());
 
-        // Second write: only calendar (user disabled the Files MCP).
+        // Second write: only calendar (file primitives swapped out).
         let after = vec![def("calendar_list", "x", json!({}))];
         write_per_group(tmp.path(), &after).unwrap();
         assert!(tmp.path().join("calendar.md").exists());

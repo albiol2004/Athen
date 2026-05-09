@@ -120,7 +120,7 @@ Constructed eagerly with the first four; `mcp` and `file_gate` are attached via 
 **Tools added on top of the inner six:**
 - 4 calendar tools when `calendar.is_some()` — `calendar_list/create/update/delete` (`Read`, `WritePersist`, `WritePersist`, `WritePersist`).
 - 5 contacts tools when `contacts.is_some()` — `contacts_list/search/create/update/delete` (`Read`, `Read`, `WritePersist`, `WritePersist`, `WritePersist`).
-- N MCP tools when `mcp.is_some()` — each tool returned by `McpClient::list_tools` is namespaced `<mcp_id>__<tool_name>` (e.g. `files__read_file`) using `MCP_TOOL_SEPARATOR`.
+- N MCP tools when `mcp.is_some()` — each tool returned by `McpClient::list_tools` is namespaced `<mcp_id>__<tool_name>` (e.g. `slack__post_message`) using `MCP_TOOL_SEPARATOR`.
 
 **Description override:** when `memory.is_some()`, the inner `memory_store` / `memory_recall` descriptions are rewritten to point at persistent semantic memory rather than the in-session `HashMap` (`app_tools.rs:820-829`).
 
@@ -239,12 +239,6 @@ Tauri commands in `crates/athen-app/src/commands.rs`:
 - `disable_mcp(mcp_id)` — calls `McpRegistry::disable`, persists to SQLite.
 
 Enabled state survives restarts via SQLite; the registry is rebuilt on startup from persisted state.
-
-### Filesystem MCP (`mcp-filesystem`)
-
-`crates/mcps/mcp-filesystem/` — standalone rmcp server binary speaking JSON-RPC over stdio. Takes a single `SANDBOX_ROOT` argument. All paths are validated: absolute paths rejected, `..` traversal blocked (`lib.rs:72-100`). Tools exposed: `read_file`, `write_file`, `list_dir`, `move_file`, `create_dir`, `delete_file`, `delete_dir`.
-
-Default sandbox root: `~/.athen/files` (auto-created on first enable, `registry.rs:186-196`).
 
 ### Directory Grant System
 

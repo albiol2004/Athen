@@ -30,7 +30,7 @@ const STATUS_HEADER: &str = "🤔 Working on it…";
 
 /// Mirror of `frontend/app.js::BUILTIN_TOOL_LABELS`. Kept in sync by hand
 /// because Telegram users see the same friendly labels the in-app UI does
-/// — "Run" instead of `shell_execute`, "List" instead of `files__list_dir`.
+/// — "Run" instead of `shell_execute`, "List" instead of `list_directory`.
 /// Anything not in the table falls through to a humanized form of the raw
 /// tool name in `pretty_tool_label`.
 const BUILTIN_TOOL_LABELS: &[(&str, &str)] = &[
@@ -78,7 +78,7 @@ const MCP_SUFFIX_ALIASES: &[(&str, &str)] = &[
     ("search_files", "grep"),
 ];
 
-/// Convert a raw tool name (e.g. `files__list_dir`, `shell_execute`) into
+/// Convert a raw tool name (e.g. `slack__post_message`, `shell_execute`) into
 /// the friendly label the user sees in the in-app UI. Falls back to a
 /// humanized form of the raw name (`some_tool` → `Some tool`) when no
 /// mapping exists, so unknown / new MCP tools still read decently.
@@ -213,7 +213,7 @@ impl TelegramProgressReporter {
     }
 
     /// Append `tool_name` to the running list (if new) and re-render
-    /// the status message. The raw tool name (e.g. `files__list_dir`)
+    /// the status message. The raw tool name (e.g. `list_directory`)
     /// is mapped to its UI label (`List`) before storage so the user
     /// sees the same friendly names they see in-app, and so two MCP
     /// tools that round-trip to the same UI label don't show up twice.
@@ -427,12 +427,13 @@ mod tests {
 
     #[test]
     fn pretty_label_mcp_tools_resolve_via_suffix() {
-        // Direct suffix match.
-        assert_eq!(pretty_tool_label("files__read"), "Read");
+        // Direct suffix match — third-party MCP that happens to expose a
+        // tool whose name matches a built-in label.
+        assert_eq!(pretty_tool_label("storage__read"), "Read");
         // Alias map (the suffix isn't a built-in but maps to one).
-        assert_eq!(pretty_tool_label("files__list_dir"), "List");
-        assert_eq!(pretty_tool_label("files__read_file"), "Read");
-        assert_eq!(pretty_tool_label("files__search_files"), "Search files");
+        assert_eq!(pretty_tool_label("storage__list_dir"), "List");
+        assert_eq!(pretty_tool_label("storage__read_file"), "Read");
+        assert_eq!(pretty_tool_label("storage__search_files"), "Search files");
     }
 
     #[test]

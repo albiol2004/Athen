@@ -51,9 +51,7 @@ athen/
 │   ├── athen-sandbox/            # OS-native + container sandboxing
 │   ├── athen-shell/              # Nushell embedding + native shell fallback
 │   ├── athen-cli/                # CLI runner (REPL)
-│   ├── athen-app/                # Tauri desktop app (composition root)
-│   └── mcps/
-│       └── mcp-filesystem/       # Standalone MCP filesystem tool
+│   └── athen-app/                # Tauri desktop app (composition root)
 ```
 
 ## Design Principles (CRITICAL)
@@ -66,9 +64,9 @@ athen/
 
 - `athen-core` depends on NOTHING internal (only serde, chrono, uuid, thiserror, async-trait, url, tokio-stream)
 - All other crates depend on `athen-core` for trait definitions
-- MCPs (`crates/mcps/*`) do NOT depend on `athen-core` -- standalone JSON-RPC servers
 - Crates NEVER depend on sibling crates (except through `athen-core` traits)
 - `athen-app` is the ONLY crate that depends on multiple siblings
+- Future bundled MCPs (Slack, Notion, ...) will live under `crates/mcps/` as standalone JSON-RPC servers that do NOT depend on `athen-core`
 
 ### 3. Independent Testability
 

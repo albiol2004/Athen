@@ -1461,7 +1461,7 @@ data: [DONE]
 
     #[test]
     fn test_parse_sse_chunks_fragmented_tool_call() {
-        let sse = "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_abc\",\"type\":\"function\",\"function\":{\"name\":\"files__list_dir\",\"arguments\":\"\"}}]}}]}\n\n\
+        let sse = "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_abc\",\"type\":\"function\",\"function\":{\"name\":\"list_directory\",\"arguments\":\"\"}}]}}]}\n\n\
                    data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"pa\"}}]}}]}\n\n\
                    data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"th\\\":\\\"/h\"}}]}}]}\n\n\
                    data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"ome\\\"}\"}}]}}]}\n\n\
@@ -1480,7 +1480,7 @@ data: [DONE]
 
         let tc = &final_chunks[0].tool_calls[0];
         assert_eq!(tc.id, "call_abc");
-        assert_eq!(tc.name, "files__list_dir");
+        assert_eq!(tc.name, "list_directory");
         assert_eq!(tc.arguments, serde_json::json!({"path": "/home"}));
 
         let mid_tool_chunks: Vec<&LlmChunk> = chunks

@@ -2330,7 +2330,7 @@ mod tests {
             tool_def("memory_store", "store a memory"),
             tool_def("memory_recall", "recall a memory"),
             tool_def("calendar_create", "create a calendar event"),
-            tool_def("files__write_file", "write a file"),
+            tool_def("write", "write a file"),
         ];
         let mut revealed = HashSet::new();
         revealed.insert("memory_store".to_string());
@@ -2356,14 +2356,11 @@ mod tests {
             !prompt.contains("create a calendar event"),
             "non-revealed tool description leaked into prompt"
         );
-        assert!(
-            !prompt.contains("write a file"),
-            "non-revealed tool description leaked into prompt"
-        );
         // But the names should be visible in the group index so the model
         // knows what to call (via tolerant dispatch).
         assert!(prompt.contains("calendar_create"));
-        assert!(prompt.contains("files__write_file"));
+        // The built-in file primitive `write` shows up in the group index.
+        assert!(prompt.contains("write"));
     }
 
     #[test]

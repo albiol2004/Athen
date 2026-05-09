@@ -17,7 +17,6 @@ members = [
     "crates/athen-app",
     "crates/athen-mcp",
     "crates/athen-scheduler",
-    "crates/mcps/mcp-filesystem",
     "crates/athen-cli",
 ]
 

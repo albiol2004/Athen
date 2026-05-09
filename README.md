@@ -195,8 +195,7 @@ Athen is built so you don't have to fork it to make it do new things.
 
 - **Custom MCP servers** — point Athen at any binary speaking the
   [Model Context Protocol](https://modelcontextprotocol.io) over stdio.
-  Bundled example: [`mcp-filesystem`](crates/mcps/mcp-filesystem). Tools
-  appear automatically; the same risk system gates them.
+  Tools appear automatically; the same risk system gates them.
 - **Custom LLM providers** — `athen-llm` exposes the `LlmProvider` trait.
   Implement once, register in the router, swap by profile. Local
   llama.cpp wrapper is ~150 lines.
@@ -267,7 +266,6 @@ crates/
   athen-shell/        # Nushell + native shell
   athen-cli/          # CLI / REPL
   athen-app/          # Tauri 2 desktop app — the composition root
-  mcps/mcp-filesystem # Standalone MCP filesystem server
 ```
 
 For a deeper read see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).

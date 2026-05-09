@@ -2172,7 +2172,7 @@ pub(crate) fn build_telegram_tools_footer(tool_log: &crate::commands::ToolLog) -
     }
 
     // Map raw tool names to their UI labels (e.g. `shell_execute` →
-    // `Run`, `files__list_dir` → `List`) so the footer matches what
+    // `Run`, `list_directory` → `List`) so the footer matches what
     // the user just watched scroll past in the live status message
     // and what the in-app UI shows for the same tool calls.
     let mut order: Vec<String> = Vec::new();

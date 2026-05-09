@@ -1,10 +1,10 @@
 //! Path-based permission gate for file-touching tools.
 //!
 //! Sits between the agent's tool calls and the underlying executors
-//! (built-in tokio::fs ops, Files MCP). Every call carrying a path is
-//! routed through `PathRiskEvaluator`, which classifies the access into
-//! one of four bands; the gate then either runs the operation, asks the
-//! user via `pending_grants`, or rejects it outright.
+//! (built-in tokio::fs ops). Every call carrying a path is routed
+//! through `PathRiskEvaluator`, which classifies the access into one of
+//! four bands; the gate then either runs the operation, asks the user
+//! via `pending_grants`, or rejects it outright.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -232,41 +232,25 @@ impl FileGate {
     }
 
     /// Returns true when this tool name is a file-touching operation the
-    /// gate must intercept. Covers built-in tools and the `files__*`
-    /// MCP tools.
+    /// gate must intercept.
     pub fn is_file_tool(name: &str) -> bool {
         matches!(
             name,
-            "read"
-                | "edit"
-                | "write"
-                | "grep"
-                | "list_directory"
-                | "files__read_file"
-                | "files__write_file"
-                | "files__append_file"
-                | "files__list_dir"
-                | "files__create_dir"
-                | "files__delete_path"
-                | "files__move_path"
-                | "files__exists"
-                | "files__stat"
+            "read" | "edit" | "write" | "grep" | "list_directory"
         )
     }
 
     /// Map a tool name to the access kind it needs, for risk classification.
     fn access_for(name: &str) -> PathAccess {
         match name {
-            "read" | "grep" | "list_directory" | "files__read_file" | "files__list_dir"
-            | "files__exists" | "files__stat" => PathAccess::Read,
+            "read" | "grep" | "list_directory" => PathAccess::Read,
             _ => PathAccess::Write,
         }
     }
 
-    /// Pull the path argument(s) from the JSON payload. `move_path`
-    /// carries two; `grep` defaults to the current working directory
-    /// when `path` is omitted; everything else carries a single
-    /// required `path`.
+    /// Pull the path argument from the JSON payload. `grep` defaults to
+    /// the agent workspace when `path` is omitted; everything else
+    /// carries a single required `path`.
     fn paths_from_args(name: &str, args: &Value) -> Result<Vec<PathBuf>> {
         let extract = |key: &str| -> Result<PathBuf> {
             let s = args
@@ -276,7 +260,6 @@ impl FileGate {
             Ok(PathBuf::from(s))
         };
         match name {
-            "files__move_path" => Ok(vec![extract("from")?, extract("to")?]),
             "grep" => {
                 let p = args
                     .get("path")
@@ -389,16 +372,14 @@ impl FileGate {
     }
 
     /// Top-level entry: classify, optionally ask, and dispatch the call
-    /// to either tokio::fs (absolute paths outside the sandbox) or the
-    /// underlying registry (paths inside the sandbox).
+    /// to either tokio::fs (for `list_directory`, which is stateless) or
+    /// the underlying registry (for `read`/`edit`/`write`/`grep`, which
+    /// carry stateful read-state in the inner registry).
     pub async fn handle(
         &self,
         name: &str,
         args: Value,
-        dispatch_inside_sandbox: impl FnOnce(
-            Value,
-        )
-            -> futures::future::BoxFuture<'static, Result<ToolResult>>,
+        dispatch_inner: impl FnOnce(Value) -> futures::future::BoxFuture<'static, Result<ToolResult>>,
     ) -> Result<ToolResult> {
         let raw_paths = Self::paths_from_args(name, &args)?;
         let abs_paths: Vec<PathBuf> = raw_paths.iter().map(|p| Self::absolutize(p)).collect();
@@ -441,32 +422,15 @@ impl FileGate {
             }
         }
 
-        // Dispatch. The MCP `files__*` tools accept only relative paths
-        // anchored to the sandbox root; when the user pointed at a path
-        // inside the sandbox we rewrite + delegate. The new built-in
-        // file tools (`read`, `edit`, `write`, `grep`) carry stateful
-        // read-state in the inner registry, so we always route them
-        // through the dispatch closure rather than reimplementing here.
-        // `list_directory` is stateless and runs directly via tokio::fs.
-        let is_mcp = name.starts_with("files__");
-        if is_mcp {
-            let sandbox_root = paths::athen_files_sandbox();
-            let inside_sandbox = sandbox_root
-                .as_ref()
-                .map(|root| abs_paths.iter().all(|p| paths::path_within(p, root)))
-                .unwrap_or(false);
-            if inside_sandbox {
-                let root = sandbox_root.unwrap();
-                let rewritten = rewrite_args_relative(name, &args, &root)?;
-                return dispatch_inside_sandbox(rewritten).await;
-            }
-        }
-
+        // `read`/`edit`/`write`/`grep` carry stateful read-state in the
+        // inner registry, so they must be routed through the dispatch
+        // closure. `list_directory` is stateless and runs directly via
+        // tokio::fs.
         if matches!(name, "read" | "edit" | "write" | "grep") {
-            return dispatch_inside_sandbox(args).await;
+            return dispatch_inner(args).await;
         }
 
-        execute_direct(name, &abs_paths, &args).await
+        execute_direct(name, &abs_paths).await
     }
 }
 
@@ -563,86 +527,15 @@ fn approval_choice_to_grant_decision(
     }
 }
 
-/// Re-write absolute paths in the arg payload so they become relative to
-/// the Files MCP sandbox root. Used only on the "inside sandbox" branch.
-fn rewrite_args_relative(name: &str, args: &Value, root: &Path) -> Result<Value> {
-    let mut new_args = args.clone();
-    let rewrite_one = |key: &str, val: &mut Value| -> Result<()> {
-        let s = val
-            .get(key)
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| AthenError::Other(format!("missing '{key}' parameter")))?
-            .to_string();
-        let abs = FileGate::absolutize(Path::new(&s));
-        let rel = abs
-            .strip_prefix(root)
-            .map(|p| p.to_path_buf())
-            .unwrap_or(abs);
-        let rel_str = if rel.as_os_str().is_empty() {
-            ".".to_string()
-        } else {
-            rel.display().to_string()
-        };
-        val[key] = Value::String(rel_str);
-        Ok(())
-    };
-
-    match name {
-        "files__move_path" => {
-            rewrite_one("from", &mut new_args)?;
-            rewrite_one("to", &mut new_args)?;
-        }
-        _ => rewrite_one("path", &mut new_args)?,
-    }
-    Ok(new_args)
-}
-
 /// Run the file operation directly against the absolute path with
-/// `tokio::fs`. Used when the target is outside the Files MCP sandbox.
-async fn execute_direct(name: &str, abs: &[PathBuf], args: &Value) -> Result<ToolResult> {
+/// `tokio::fs`. Used for the stateless `list_directory` tool. The
+/// stateful built-ins (`read`/`edit`/`write`/`grep`) route through the
+/// inner registry instead so their per-arc read-state survives.
+async fn execute_direct(name: &str, abs: &[PathBuf]) -> Result<ToolResult> {
     let start = std::time::Instant::now();
     let path = &abs[0];
     let res: std::result::Result<Value, String> = match name {
-        "files__read_file" => match tokio::fs::read_to_string(path).await {
-            Ok(c) => Ok(json!({ "content": c })),
-            Err(e) => Err(e.to_string()),
-        },
-        "files__write_file" => {
-            let contents = args
-                .get("contents")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| AthenError::Other("missing 'contents' parameter".to_string()))?;
-            ensure_parent_dir(path).await;
-            match tokio::fs::write(path, contents).await {
-                Ok(()) => Ok(
-                    json!({ "path": path.display().to_string(), "bytes_written": contents.len() }),
-                ),
-                Err(e) => Err(e.to_string()),
-            }
-        }
-        "files__append_file" => {
-            let contents = args
-                .get("contents")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| AthenError::Other("missing 'contents' parameter".to_string()))?;
-            ensure_parent_dir(path).await;
-            use tokio::io::AsyncWriteExt;
-            match tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .await
-            {
-                Ok(mut f) => match f.write_all(contents.as_bytes()).await {
-                    Ok(()) => Ok(
-                        json!({ "path": path.display().to_string(), "bytes_appended": contents.len() }),
-                    ),
-                    Err(e) => Err(e.to_string()),
-                },
-                Err(e) => Err(e.to_string()),
-            }
-        }
-        "list_directory" | "files__list_dir" => match tokio::fs::read_dir(path).await {
+        "list_directory" => match tokio::fs::read_dir(path).await {
             Ok(mut reader) => {
                 let mut entries = Vec::new();
                 while let Ok(Some(entry)) = reader.next_entry().await {
@@ -666,43 +559,6 @@ async fn execute_direct(name: &str, abs: &[PathBuf], args: &Value) -> Result<Too
             }
             Err(e) => Err(e.to_string()),
         },
-        "files__create_dir" => match tokio::fs::create_dir_all(path).await {
-            Ok(()) => Ok(json!({ "path": path.display().to_string(), "created": true })),
-            Err(e) => Err(e.to_string()),
-        },
-        "files__delete_path" => {
-            let meta = tokio::fs::metadata(path).await;
-            let res = match meta {
-                Ok(m) if m.is_dir() => tokio::fs::remove_dir_all(path).await,
-                Ok(_) => tokio::fs::remove_file(path).await,
-                Err(e) => return Ok(tool_err(e.to_string(), start)),
-            };
-            match res {
-                Ok(()) => Ok(json!({ "path": path.display().to_string(), "deleted": true })),
-                Err(e) => Err(e.to_string()),
-            }
-        }
-        "files__move_path" => {
-            let to = &abs[1];
-            ensure_parent_dir(to).await;
-            match tokio::fs::rename(path, to).await {
-                Ok(()) => Ok(
-                    json!({ "from": path.display().to_string(), "to": to.display().to_string() }),
-                ),
-                Err(e) => Err(e.to_string()),
-            }
-        }
-        "files__exists" => match tokio::fs::metadata(path).await {
-            Ok(_) => Ok(json!({ "exists": true })),
-            Err(_) => Ok(json!({ "exists": false })),
-        },
-        "files__stat" => match tokio::fs::metadata(path).await {
-            Ok(m) => {
-                let kind = if m.is_dir() { "directory" } else { "file" };
-                Ok(json!({ "type": kind, "size_bytes": m.len() }))
-            }
-            Err(e) => Err(e.to_string()),
-        },
         other => return Err(AthenError::ToolNotFound(other.to_string())),
     };
 
@@ -713,25 +569,13 @@ async fn execute_direct(name: &str, abs: &[PathBuf], args: &Value) -> Result<Too
             error: None,
             execution_time_ms: start.elapsed().as_millis() as u64,
         },
-        Err(e) => tool_err(e, start),
+        Err(e) => ToolResult {
+            success: false,
+            output: json!({ "error": e }),
+            error: Some(e),
+            execution_time_ms: start.elapsed().as_millis() as u64,
+        },
     })
-}
-
-fn tool_err(msg: String, start: std::time::Instant) -> ToolResult {
-    ToolResult {
-        success: false,
-        output: json!({ "error": msg }),
-        error: Some(msg.clone()),
-        execution_time_ms: start.elapsed().as_millis() as u64,
-    }
-}
-
-async fn ensure_parent_dir(p: &Path) {
-    if let Some(parent) = p.parent() {
-        if !parent.as_os_str().is_empty() {
-            let _ = tokio::fs::create_dir_all(parent).await;
-        }
-    }
 }
 
 #[cfg(test)]
@@ -759,15 +603,6 @@ mod tests {
         assert_eq!(a, b);
         let c = arc_uuid("arc_20260101_120001");
         assert_ne!(a, c);
-    }
-
-    #[test]
-    fn paths_from_args_handles_move() {
-        let args = json!({ "from": "/tmp/a", "to": "/tmp/b" });
-        let v = FileGate::paths_from_args("files__move_path", &args).unwrap();
-        assert_eq!(v.len(), 2);
-        assert_eq!(v[0], PathBuf::from("/tmp/a"));
-        assert_eq!(v[1], PathBuf::from("/tmp/b"));
     }
 
     #[test]
@@ -809,14 +644,9 @@ mod tests {
     fn classifies_read_vs_write() {
         assert_eq!(FileGate::access_for("read"), PathAccess::Read);
         assert_eq!(FileGate::access_for("grep"), PathAccess::Read);
-        assert_eq!(FileGate::access_for("files__exists"), PathAccess::Read);
+        assert_eq!(FileGate::access_for("list_directory"), PathAccess::Read);
         assert_eq!(FileGate::access_for("write"), PathAccess::Write);
         assert_eq!(FileGate::access_for("edit"), PathAccess::Write);
-        assert_eq!(
-            FileGate::access_for("files__delete_path"),
-            PathAccess::Write
-        );
-        assert_eq!(FileGate::access_for("files__move_path"), PathAccess::Write);
     }
 
     #[test]
@@ -825,11 +655,12 @@ mod tests {
         assert!(FileGate::is_file_tool("edit"));
         assert!(FileGate::is_file_tool("write"));
         assert!(FileGate::is_file_tool("grep"));
-        assert!(FileGate::is_file_tool("files__write_file"));
+        assert!(FileGate::is_file_tool("list_directory"));
         assert!(!FileGate::is_file_tool("shell_execute"));
         assert!(!FileGate::is_file_tool("calendar_create"));
         assert!(!FileGate::is_file_tool("read_file"));
         assert!(!FileGate::is_file_tool("write_file"));
+        assert!(!FileGate::is_file_tool("files__read_file"));
     }
 
     #[test]

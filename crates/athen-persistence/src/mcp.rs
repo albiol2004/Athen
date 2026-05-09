@@ -120,13 +120,13 @@ mod tests {
         let db = Database::in_memory().await.unwrap();
         let store = db.mcp_store();
         store
-            .enable("files", &serde_json::json!({"sandbox_root": "/tmp"}))
+            .enable("slack", &serde_json::json!({"workspace": "athen"}))
             .await
             .unwrap();
         let listed = store.list_enabled().await.unwrap();
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].mcp_id, "files");
-        assert_eq!(listed[0].config["sandbox_root"], "/tmp");
+        assert_eq!(listed[0].mcp_id, "slack");
+        assert_eq!(listed[0].config["workspace"], "athen");
     }
 
     #[tokio::test]
@@ -134,24 +134,24 @@ mod tests {
         let db = Database::in_memory().await.unwrap();
         let store = db.mcp_store();
         store
-            .enable("files", &serde_json::json!({"sandbox_root": "/tmp"}))
+            .enable("slack", &serde_json::json!({"workspace": "first"}))
             .await
             .unwrap();
         store
-            .enable("files", &serde_json::json!({"sandbox_root": "/home"}))
+            .enable("slack", &serde_json::json!({"workspace": "second"}))
             .await
             .unwrap();
         let listed = store.list_enabled().await.unwrap();
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].config["sandbox_root"], "/home");
+        assert_eq!(listed[0].config["workspace"], "second");
     }
 
     #[tokio::test]
     async fn disable_removes() {
         let db = Database::in_memory().await.unwrap();
         let store = db.mcp_store();
-        store.enable("files", &serde_json::json!({})).await.unwrap();
-        store.disable("files").await.unwrap();
+        store.enable("slack", &serde_json::json!({})).await.unwrap();
+        store.disable("slack").await.unwrap();
         assert!(store.list_enabled().await.unwrap().is_empty());
     }
 
@@ -159,6 +159,6 @@ mod tests {
     async fn get_returns_none_when_disabled() {
         let db = Database::in_memory().await.unwrap();
         let store = db.mcp_store();
-        assert!(store.get("files").await.unwrap().is_none());
+        assert!(store.get("slack").await.unwrap().is_none());
     }
 }

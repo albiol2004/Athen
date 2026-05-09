@@ -18,9 +18,16 @@ pub fn group_for(name: &str) -> &str {
     if let Some((prefix, _)) = name.split_once("__") {
         return prefix;
     }
+    // The built-in file primitives (`read`, `edit`, `write`, `grep`,
+    // `list_directory`) don't share a `<group>_<verb>` prefix the way
+    // `calendar_*` / `shell_*` do, but they belong in one group from the
+    // user's and the model's point of view.
+    if matches!(name, "read" | "edit" | "write" | "grep" | "list_directory") {
+        return "files";
+    }
     // Built-in tools follow a "<group>_<verb>" convention. Single-word tools
-    // (e.g. "shell_execute" → "shell", "read_file" → "read") fall back to
-    // the part before the first underscore.
+    // (e.g. "shell_execute" → "shell") fall back to the part before the first
+    // underscore.
     if let Some((prefix, _)) = name.split_once('_') {
         return prefix;
     }
@@ -91,8 +98,8 @@ fn group_one_liner(id: &str, tools: &[&ToolDefinition]) -> String {
         "memory" => "persistent memory across conversations".to_string(),
         "calendar" => "create, list, update, delete calendar events".to_string(),
         "contacts" => "manage contacts and their identifiers".to_string(),
-        "shell" => "execute shell commands and basic file ops".to_string(),
-        "files" => "read, write, list and organize files in a sandboxed folder".to_string(),
+        "shell" => "execute shell commands".to_string(),
+        "files" => "read, edit, write, search and list files".to_string(),
         "web" => "search the web and fetch URLs as clean markdown".to_string(),
         // Fallback: show the bare tool names so the agent can recognise them.
         _ => format!("tools: {}", names.join(", ")),
@@ -158,8 +165,19 @@ mod tests {
 
     #[test]
     fn group_for_mcp_uses_double_underscore() {
-        assert_eq!(group_for("files__read_file"), "files");
+        assert_eq!(group_for("slack__post_message"), "slack");
         assert_eq!(group_for("calendar__list_events"), "calendar");
+    }
+
+    #[test]
+    fn group_for_builtin_file_primitives_collapses_into_files() {
+        // The five canonical file built-ins don't share a `<group>_<verb>`
+        // prefix, but they belong in one group for the system prompt.
+        assert_eq!(group_for("read"), "files");
+        assert_eq!(group_for("edit"), "files");
+        assert_eq!(group_for("write"), "files");
+        assert_eq!(group_for("grep"), "files");
+        assert_eq!(group_for("list_directory"), "files");
     }
 
     #[test]
@@ -174,7 +192,6 @@ mod tests {
         assert!(is_always_revealed("grep"));
         assert!(is_always_revealed("email_send"));
         assert!(!is_always_revealed("calendar_create"));
-        assert!(!is_always_revealed("files__write_file"));
     }
 
     #[test]
@@ -184,9 +201,9 @@ mod tests {
             def("memory_recall"),
             def("calendar_create"),
             def("calendar_list"),
-            def("files__read_file"),
-            def("files__write_file"),
-            def("files__list_dir"),
+            def("read"),
+            def("write"),
+            def("list_directory"),
         ];
         let summary = summarize_groups(&tools);
         let by_id: std::collections::HashMap<_, _> = summary
@@ -197,7 +214,7 @@ mod tests {
         assert_eq!(by_id.get("calendar"), Some(&2));
         assert_eq!(by_id.get("files"), Some(&3));
         let files = summary.iter().find(|g| g.id == "files").unwrap();
-        assert!(files.tool_names.contains(&"files__read_file".to_string()));
-        assert!(files.tool_names.contains(&"files__write_file".to_string()));
+        assert!(files.tool_names.contains(&"read".to_string()));
+        assert!(files.tool_names.contains(&"write".to_string()));
     }
 }

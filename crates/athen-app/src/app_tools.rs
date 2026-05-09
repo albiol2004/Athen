@@ -29,7 +29,7 @@ use athen_persistence::contacts::SqliteContactStore;
 use crate::file_gate::FileGate;
 
 /// Prefix MCP-routed tools use to avoid name collisions with built-in tools.
-/// `files__read_file` resolves to mcp_id="files", tool="read_file".
+/// `slack__post_message` resolves to mcp_id="slack", tool="post_message".
 const MCP_TOOL_SEPARATOR: &str = "__";
 
 /// Wraps [`ShellToolRegistry`] and adds calendar, contact, memory, and MCP tools.
@@ -1265,30 +1265,9 @@ impl ToolRegistry for AppToolRegistry {
         }
 
         if let Some(mcp) = &self.mcp {
-            // The built-in `read`/`edit`/`write`/`grep`/`list_directory`
-            // tools above shadow the `files__*` MCP server: same gate, same
-            // semantics, but the built-ins have stateful read-tracking,
-            // friendlier descriptions, and skip the MCP indirection. Hide
-            // the duplicates from the LLM so it doesn't have to pick
-            // between two of everything. Other MCPs (Slack, Notion, etc.)
-            // bring net-new capability and pass through unchanged.
-            const FILES_MCP_DUPLICATES: &[&str] = &[
-                "read_file",
-                "write_file",
-                "append_file",
-                "list_dir",
-                "create_dir",
-                "delete_path",
-                "move_path",
-                "exists",
-                "stat",
-            ];
             match mcp.list_tools().await {
                 Ok(mcp_tools) => {
                     for t in mcp_tools {
-                        if t.mcp_id == "files" && FILES_MCP_DUPLICATES.contains(&t.name.as_str()) {
-                            continue;
-                        }
                         let prefixed_name = format!("{}{MCP_TOOL_SEPARATOR}{}", t.mcp_id, t.name);
                         tools.push(ToolDefinition {
                             name: prefixed_name,
@@ -1389,74 +1368,24 @@ impl ToolRegistry for AppToolRegistry {
         // for paths inside the sandbox / built-in tools.
         if let Some(gate) = self.file_gate.clone() {
             if FileGate::is_file_tool(name) {
+                // The gate handles `list_directory` directly via tokio::fs;
+                // for `read`/`edit`/`write`/`grep` it calls back through
+                // this closure so the inner ShellToolRegistry can apply
+                // its stateful read-state (the hash check that prevents
+                // blind overwrites).
                 let name_owned = name.to_string();
-                let mcp = self.mcp.clone();
-                // The `dispatch_inside_sandbox` closure: routes either
-                // to the MCP server (for `files__*` inside sandbox) or
-                // to the inner ShellToolRegistry (for the new built-in
-                // file tools `read`/`edit`/`write`/`grep`, which carry
-                // stateful read-state).
-                //
-                // The gate calls this closure only when it can't (or
-                // shouldn't) execute the op directly with `tokio::fs`.
-                let inner_clone_name = name_owned.clone();
-                // We need the inner registry to dispatch built-in calls.
-                // ShellToolRegistry is held inside `self`, but we can't
-                // move `&self` into a 'static closure. The gate's
-                // `dispatch` is invoked synchronously inside `handle()`,
-                // so a raw pointer borrow would be unsound. Instead,
-                // since the inner registry is `Send + Sync`, we rebuild
-                // the dispatch by running the gate first with a closure
-                // that delegates to a *channel*. That's overkill for our
-                // needs — a simpler workaround is to capture an Arc.
-                //
-                // ShellToolRegistry isn't behind an Arc here; rather
-                // than restructure the field, we route built-in calls
-                // by re-invoking `self.inner.call_tool` after the gate
-                // handle returns its own result. To do that cleanly, we
-                // package the args and recurse via a helper.
-                let mcp_opt_for_closure = mcp.clone();
                 let inner_for_closure = self.inner.clone();
                 let dispatch = move |rewritten: serde_json::Value| {
-                    let name = inner_clone_name.clone();
-                    let mcp_opt = mcp_opt_for_closure.clone();
+                    let name = name_owned.clone();
                     let inner_for_closure = inner_for_closure.clone();
-                    Box::pin(async move {
-                        // MCP path.
-                        if let Some((mcp_id, tool)) = name.split_once(MCP_TOOL_SEPARATOR) {
-                            if let Some(mcp_client) = mcp_opt {
-                                let started = Instant::now();
-                                let outcome = mcp_client.call_tool(mcp_id, tool, rewritten).await?;
-                                let elapsed = started.elapsed().as_millis() as u64;
-                                return Ok(ToolResult {
-                                    success: outcome.success,
-                                    output: serde_json::json!({
-                                        "text": outcome.text,
-                                        "content": outcome.raw,
-                                    }),
-                                    error: if outcome.success {
-                                        None
-                                    } else {
-                                        Some(outcome.text.clone())
-                                    },
-                                    execution_time_ms: elapsed,
-                                });
-                            }
-                            return Err(AthenError::Other("MCP client not available".into()));
-                        }
-                        // Built-in file tool path: delegate to the inner
-                        // ShellToolRegistry so stateful behaviors (e.g.
-                        // the read-state hash for `edit`/`write`) are
-                        // preserved.
-                        inner_for_closure.call_tool(&name, rewritten).await
-                    })
+                    Box::pin(async move { inner_for_closure.call_tool(&name, rewritten).await })
                         as futures::future::BoxFuture<'static, Result<ToolResult>>
                 };
                 return gate.handle(name, args, dispatch).await;
             }
         }
 
-        // Route MCP-prefixed tool names (e.g. "files__read_file") to the registry.
+        // Route MCP-prefixed tool names (e.g. "slack__post_message") to the registry.
         if let Some(mcp) = &self.mcp {
             if let Some((mcp_id, tool)) = name.split_once(MCP_TOOL_SEPARATOR) {
                 let started = Instant::now();
