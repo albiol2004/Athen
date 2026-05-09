@@ -237,6 +237,11 @@ fn spawn_router_approval(
             compaction_trigger_tokens: bg_ctx.compaction_trigger_tokens,
             compaction_target_tokens: bg_ctx.compaction_target_tokens,
             sampling_temperature: bg_ctx.sampling_temperature,
+            // Bg path drives Telegram-originated approvals; composer
+            // uploads live on the desktop side, so this turn never has
+            // an upload event_id to thread through. Same rationale as
+            // `message_override` above.
+            upload_event_id: None,
         };
 
         let outcome = match execute_approved_task(task_id, ctx).await {
@@ -1141,18 +1146,23 @@ fn sanitize_upload_filename(name: &str) -> String {
     }
 }
 
-/// Persist composer-uploaded attachments to disk + AttachmentStore +
-/// stamp an arc entry whose metadata carries the synthesized
-/// `event_id`. The existing surfacing path
-/// (`latest_sense_event_id_in_arc` → `prepare_attachment_surfacing`)
-/// then picks them up automatically — no executor changes needed.
+/// Persist composer-uploaded attachments to disk + AttachmentStore.
+/// Returns the synthesized `event_id` on success; the caller stamps it
+/// onto the user-message arc entry so `latest_sense_event_id_in_arc`
+/// picks it up for surfacing AND the frontend can hydrate thumbnails
+/// on arc reload via `list_attachments_for_event`.
 ///
-/// Returns the synthesized event_id on success so the caller can log
-/// it. Returns `None` when there's nothing to persist.
+/// Note: the legacy "📎 N file(s) uploaded" marker arc entry is no
+/// longer written here — the user-bubble itself carries the attachments
+/// (renders thumbnails inline) once the caller passes the returned
+/// event_id through `persist_entry`'s metadata. `arc_store` is kept in
+/// the signature for future re-use but currently unused.
+///
+/// Returns `Ok(None)` when there's nothing to persist.
 async fn persist_uploaded_attachments(
-    arc_store: Option<&athen_persistence::arcs::ArcStore>,
+    _arc_store: Option<&athen_persistence::arcs::ArcStore>,
     attachment_store: Option<&athen_persistence::attachments::AttachmentStore>,
-    arc_id: &str,
+    _arc_id: &str,
     uploads: &[UploadedAttachment],
 ) -> std::result::Result<Option<Uuid>, String> {
     use base64::Engine;
@@ -1173,7 +1183,6 @@ async fn persist_uploaded_attachments(
         .await
         .map_err(|e| format!("create upload dir: {e}"))?;
 
-    let mut summaries: Vec<String> = Vec::with_capacity(uploads.len());
     for upload in uploads {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(upload.base64.as_bytes())
@@ -1235,45 +1244,6 @@ async fn persist_uploaded_attachments(
                     );
                 }
             }
-        }
-
-        summaries.push(format!(
-            "  - \"{safe_name}\" ({}, {}B)",
-            upload.mime_type,
-            bytes.len()
-        ));
-    }
-
-    // Stamp an arc entry the surfacing walker can find by metadata.
-    // The body is intentionally short and human-readable so users
-    // scrolling the arc see a clear record of what they uploaded.
-    if let Some(store) = arc_store {
-        let body = format!(
-            "📎 {} file(s) uploaded:\n{}",
-            uploads.len(),
-            summaries.join("\n")
-        );
-        let metadata = serde_json::json!({
-            "event_id": event_id.to_string(),
-            "source": "user_upload",
-            "count": uploads.len(),
-        });
-        if let Err(e) = store
-            .add_entry(
-                arc_id,
-                athen_persistence::arcs::EntryType::Message,
-                "system",
-                &body,
-                Some(metadata),
-                None,
-            )
-            .await
-        {
-            tracing::warn!(
-                arc_id = %arc_id,
-                error = %e,
-                "Failed to persist upload-marker arc entry"
-            );
         }
     }
 
@@ -1362,22 +1332,62 @@ pub async fn send_message(
         }
     }
 
-    // Persist composer-uploaded files (PDFs, docs, etc.) before the
-    // executor runs so the existing surfacing path picks them up
-    // exactly the same way it picks up email/Telegram attachments.
-    // The arc-entry metadata stamp is the hook
-    // `latest_sense_event_id_in_arc` walks for.
+    // Persist composer-uploaded files (PDFs, docs, etc.) AND composer
+    // images before the executor runs. We unify both into the same
+    // AttachmentStore so the surfacing path picks them up uniformly,
+    // arc reload can render thumbnails by `attachment_event_id`, and
+    // there's a single durable representation of "media the user
+    // attached to this turn." Images are converted to UploadedAttachment
+    // shape so they share the persist path.
+    let mut all_uploads: Vec<UploadedAttachment> =
+        Vec::with_capacity(attachments.len() + images.len());
+    all_uploads.extend(attachments.iter().cloned());
+    for (idx, img) in images.iter().enumerate() {
+        let base64_data = match &img.data {
+            athen_core::llm::ImageData::Base64 { data } => data.clone(),
+            // URL-form composer images aren't produced by today's UI; if a
+            // future code path emits one, skip persistence (we'd need to
+            // download bytes first to stash them) and let it flow through
+            // the live `images` arg only.
+            athen_core::llm::ImageData::Url { .. } => continue,
+        };
+        let ext = match img.mime_type.as_str() {
+            "image/png" => "png",
+            "image/jpeg" => "jpg",
+            "image/webp" => "webp",
+            "image/gif" => "gif",
+            _ => "bin",
+        };
+        all_uploads.push(UploadedAttachment {
+            name: format!("pasted-image-{}.{ext}", idx + 1),
+            mime_type: img.mime_type.clone(),
+            base64: base64_data,
+        });
+    }
+
     let attachment_store_handle = state.attachment_store();
-    if let Err(e) = persist_uploaded_attachments(
+    let upload_event_id = match persist_uploaded_attachments(
         state.arc_store.as_ref(),
         attachment_store_handle.as_ref(),
         &active_arc,
-        &attachments,
+        &all_uploads,
     )
     .await
     {
-        tracing::warn!(error = %e, "Failed to persist composer uploads");
-    }
+        Ok(eid) => eid,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to persist composer uploads");
+            None
+        }
+    };
+    // Persisted images now live in AttachmentStore and the surfacing
+    // path will inline them as multimodal — drop the live `images` arg
+    // to avoid duplicating each image on the wire (live + surfaced).
+    let images: Vec<athen_core::llm::ImageInput> = if upload_event_id.is_some() {
+        Vec::new()
+    } else {
+        images
+    };
 
     // Build a SenseEvent from the user's text input.
     let event = SenseEvent {
@@ -1462,6 +1472,11 @@ pub async fn send_message(
 
         // Stash the original message so we can replay it after approval.
         *state.pending_message.lock().await = Some(message.clone());
+        // Stash the upload event_id so the approved-task user-message
+        // persist can stamp `attachment_event_id` metadata — without
+        // this, thumbnails wouldn't hydrate on arc reload after an
+        // approval round-trip.
+        *state.pending_upload_event_id.lock().await = upload_event_id;
 
         let approval = PendingApproval {
             task_id: awaiting_task.id.to_string(),
@@ -1583,8 +1598,25 @@ pub async fn send_message(
             // Persist the user message before the executor runs so its DB id
             // sits *before* any tool_call rows the auditor writes during
             // execution. Otherwise the rehydrated UI shows the tool group
-            // above the user bubble that triggered it.
-            persist_entry(&state, "user", &message, "message", None, Some(&turn_id)).await;
+            // above the user bubble that triggered it. When this turn carried
+            // composer attachments, stamp the synthesized event_id so (a)
+            // `latest_sense_event_id_in_arc` finds it for surfacing and (b)
+            // the frontend can hydrate inline thumbnails on arc reload.
+            let user_msg_metadata = upload_event_id.map(|eid| {
+                serde_json::json!({
+                    "attachment_event_id": eid.to_string(),
+                    "event_id": eid.to_string(),
+                })
+            });
+            persist_entry(
+                &state,
+                "user",
+                &message,
+                "message",
+                user_msg_metadata,
+                Some(&turn_id),
+            )
+            .await;
 
             // Surface attachments tied to the most recent sense event in this
             // arc (composer uploads, inbound email/Telegram with attachments).
@@ -1927,8 +1959,9 @@ pub async fn approve_task(
             format_user_error(&raw)
         })?;
 
-        // Clear the stashed message.
+        // Clear the stashed message + any upload tied to it.
         *state.pending_message.lock().await = None;
+        *state.pending_upload_event_id.lock().await = None;
 
         // Notify the frontend that the resolution happened in-app, so
         // any router-driven Telegram waiter can be cancelled.
@@ -1953,6 +1986,7 @@ pub async fn approve_task(
     // Take the stashed pending_message (if any) and let the helper resolve
     // a fallback from the coordinator task description.
     let message_override = state.pending_message.lock().await.take();
+    let upload_event_id = state.pending_upload_event_id.lock().await.take();
 
     let active_arc = state.active_arc_id.lock().await.clone();
     let active_provider_id_snapshot = state.active_provider_id.lock().await.clone();
@@ -2002,6 +2036,7 @@ pub async fn approve_task(
         compaction_trigger_tokens,
         compaction_target_tokens,
         sampling_temperature,
+        upload_event_id,
     };
 
     let outcome = match execute_approved_task(task_uuid, ctx).await {
@@ -2136,6 +2171,12 @@ pub(crate) struct ApprovedTaskCtx {
     /// default". Same snapshot semantics as the compaction budget so a
     /// mid-task settings tweak doesn't change behavior inside one run.
     pub sampling_temperature: Option<f32>,
+    /// Synthesized `event_id` for composer uploads carried into this
+    /// approved-task turn. Stamped onto the user-message arc entry so
+    /// reload-time thumbnail hydration works after an approval round-
+    /// trip. `None` for sense-originated tasks and for approved turns
+    /// with no composer attachments.
+    pub upload_event_id: Option<uuid::Uuid>,
 }
 
 /// Drive a risk-flagged task all the way through approval, dispatch,
@@ -2333,15 +2374,24 @@ pub(crate) async fn execute_approved_task(
     }
 
     // Persist user msg before the executor runs so its DB id sits before
-    // any tool_call rows the auditor writes during execution.
+    // any tool_call rows the auditor writes during execution. When this
+    // turn carries a composer upload (threaded through approval via
+    // `pending_upload_event_id`), stamp the metadata so reload-time
+    // thumbnail hydration matches the dispatch path.
     if let Some(ref store) = ctx.arc_store {
+        let user_msg_metadata = ctx.upload_event_id.map(|eid| {
+            serde_json::json!({
+                "attachment_event_id": eid.to_string(),
+                "event_id": eid.to_string(),
+            })
+        });
         if let Err(e) = store
             .add_entry(
                 &ctx.active_arc_id,
                 athen_persistence::arcs::EntryType::Message,
                 "user",
                 &message,
-                None,
+                user_msg_metadata,
                 Some(&ctx.turn_id),
             )
             .await
@@ -5142,6 +5192,85 @@ pub async fn delete_identity_entry(
     store.delete_entry(uuid).await.map_err(|e| e.to_string())
 }
 
+/// Wire shape for an attachment thumbnail returned to the frontend.
+/// Image rows ship `data_url` populated with a `data:<mime>;base64,...`
+/// payload so the UI can render them inline without a second round-trip;
+/// non-image rows ship `data_url: None` and the UI shows a name + icon
+/// chip. After TTL purge, even image rows go to `data_url: None` —
+/// `purged: true` lets the UI gray them out instead of trying to fetch.
+#[derive(Serialize)]
+pub struct AttachmentThumbnail {
+    pub id: String,
+    pub name: String,
+    pub mime_type: String,
+    pub size_bytes: u64,
+    pub purged: bool,
+    pub data_url: Option<String>,
+}
+
+/// List attachments tied to a synthesized `event_id` and shape them
+/// into thumbnail wire records for the frontend. Used by the chat
+/// renderer when a user-message arc entry's metadata carries
+/// `attachment_event_id` — the bubble can then render images inline
+/// and file chips for non-image MIMEs.
+///
+/// Image bytes are inlined (≤ ~2MB per file in practice; AttachmentPolicy
+/// already caps inbound size). For the rare oversize image, we fall
+/// back to no data_url and the UI shows a chip so the user still sees
+/// it existed.
+#[tauri::command]
+pub async fn list_attachments_for_event(
+    event_id: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<Vec<AttachmentThumbnail>, String> {
+    use base64::Engine;
+
+    const MAX_INLINE_IMAGE_BYTES: u64 = 4 * 1024 * 1024;
+
+    let Some(store) = state.attachment_store() else {
+        return Ok(Vec::new());
+    };
+    let event_uuid = Uuid::parse_str(&event_id).map_err(|e| format!("Invalid event id: {e}"))?;
+    let atts = store
+        .list_for_event(event_uuid)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut out = Vec::with_capacity(atts.len());
+    for att in atts {
+        let is_image = att.mime_type.to_ascii_lowercase().starts_with("image/");
+        let purged = att.is_purged();
+        let data_url = match att.local_path.as_ref() {
+            Some(path) if is_image && !purged && att.size_bytes <= MAX_INLINE_IMAGE_BYTES => {
+                match tokio::fs::read(path).await {
+                    Ok(bytes) => {
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                        Some(format!("data:{};base64,{}", att.mime_type, b64))
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            attachment_id = %att.id,
+                            error = %e,
+                            "Failed to read attachment bytes for thumbnail"
+                        );
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        out.push(AttachmentThumbnail {
+            id: att.id.0.to_string(),
+            name: att.name,
+            mime_type: att.mime_type,
+            size_bytes: att.size_bytes,
+            purged,
+            data_url,
+        });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod attachment_surfacing_tests {
     use super::prepare_attachment_surfacing;
@@ -5579,7 +5708,7 @@ mod composer_upload_tests {
     }
 
     #[tokio::test]
-    async fn persists_text_upload_and_stamps_arc_metadata() {
+    async fn persists_text_upload_returns_event_id_and_writes_row() {
         let db = Database::in_memory().await.unwrap();
         let arc_store = db.arc_store();
         let attachment_store = db.attachment_store();
@@ -5616,13 +5745,15 @@ mod composer_upload_tests {
         let body = tokio::fs::read_to_string(path).await.unwrap();
         assert_eq!(body, "plain note body");
 
-        // The arc walker can find this event_id from the metadata stamp,
-        // which is exactly the hook execute_approved_task uses to surface
-        // the upload on the agent's first turn.
-        let found = latest_sense_event_id_in_arc(&arc_store, &arc_id)
-            .await
-            .expect("walker must find synthesized event_id");
-        assert_eq!(found, event_id);
+        // The helper itself no longer writes a marker arc entry — the
+        // caller is responsible for stamping the user-message entry's
+        // metadata with `attachment_event_id`. Verify no spurious arc
+        // entries leaked through.
+        let entries = arc_store.load_entries(&arc_id).await.unwrap();
+        assert!(
+            entries.is_empty(),
+            "persist_uploaded_attachments must not write arc entries"
+        );
 
         // Cleanup.
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

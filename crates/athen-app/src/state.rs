@@ -135,6 +135,13 @@ pub struct AppState {
     /// The user's original message for a task pending approval, so it can
     /// be replayed through the executor once approved.
     pub pending_message: Mutex<Option<String>>,
+    /// The synthesized `event_id` for composer uploads attached to a
+    /// pending-approval turn. On approval, the dispatched task persists
+    /// the user-message arc entry — this lets that persist stamp the
+    /// `attachment_event_id` metadata so reload-time thumbnail
+    /// hydration still works in the approval flow. Cleared alongside
+    /// `pending_message` after replay.
+    pub pending_upload_event_id: Mutex<Option<uuid::Uuid>>,
     /// The model name reported to the frontend (from config or default).
     pub model_name: Mutex<String>,
     /// Current active Arc identifier (format: `arc_YYYYMMDD_HHMMSS`).
@@ -362,6 +369,7 @@ impl AppState {
             active_provider_id: Mutex::new(active_id),
             history: Mutex::new(history),
             pending_message: Mutex::new(None),
+            pending_upload_event_id: Mutex::new(None),
             model_name: Mutex::new(model_name),
             active_arc_id: Mutex::new(active_arc_id),
             arc_store,
@@ -1257,6 +1265,11 @@ impl AppState {
                         compaction_trigger_tokens,
                         compaction_target_tokens,
                         sampling_temperature,
+                        // Sense-originated tasks don't carry composer
+                        // uploads; the surfacing path uses the original
+                        // event_id stamped on the email/Telegram arc
+                        // entry, not on the user-message entry.
+                        upload_event_id: None,
                     };
 
                     let task_arc_map_clone = Arc::clone(&task_arc_map);

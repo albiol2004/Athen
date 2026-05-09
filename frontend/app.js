@@ -1388,6 +1388,74 @@ function formatTime(date) {
 
 // ─── Message Rendering ───
 
+// Fetch persisted attachments for an arc-reload bubble and splice
+// thumbnails in just above the meta line. The list_for_event call may
+// fail (no DB, expired event_id, etc.) — we silently skip in that case
+// so the bubble still reads cleanly without an error chip.
+async function hydrateAttachmentsAsync(messageRow, eventId) {
+    if (!invoke || !messageRow) return;
+    try {
+        const items = await invoke('list_attachments_for_event', { eventId });
+        if (!Array.isArray(items) || items.length === 0) return;
+        const wrap = messageRow.querySelector('.message-content-wrap');
+        if (!wrap) return;
+        // Insert above the meta row if present, otherwise at the end.
+        const chips = renderAttachmentChips(items);
+        const metaRow = wrap.querySelector('.message-meta');
+        if (metaRow) {
+            wrap.insertBefore(chips, metaRow);
+        } else {
+            wrap.appendChild(chips);
+        }
+    } catch (err) {
+        console.debug('hydrateAttachmentsAsync skipped:', err);
+    }
+}
+
+// Build a row of inline attachment chips for a message bubble.
+// Images render as a thumbnail (clickable to open full-size in a new
+// tab via the data URL); non-image MIMEs render as a name + icon chip.
+// `purged` rows are grayed out — bytes are gone but the user still sees
+// the file existed in this turn.
+function renderAttachmentChips(attachments) {
+    const row = document.createElement('div');
+    row.className = 'message-attachments';
+    for (const att of attachments) {
+        const isImage = (att.mime_type || '').toLowerCase().startsWith('image/');
+        if (isImage && att.data_url && !att.purged) {
+            const img = document.createElement('img');
+            img.className = 'message-attachment-thumb';
+            img.src = att.data_url;
+            img.alt = att.name || 'image';
+            img.title = att.name || '';
+            img.addEventListener('click', () => {
+                window.open(att.data_url, '_blank');
+            });
+            row.appendChild(img);
+        } else {
+            const chip = document.createElement('span');
+            chip.className = 'message-attachment-chip';
+            if (att.purged) chip.classList.add('purged');
+            const icon = isImage ? '\u{1F5BC}️' : '\u{1F4CE}';
+            const sizeStr = formatAttachmentSize(att.size_bytes);
+            chip.innerHTML =
+                `<span class="att-icon">${icon}</span>` +
+                `<span class="att-name">${escapeHtml(att.name || 'attachment')}</span>` +
+                (sizeStr ? `<span class="att-size">${sizeStr}</span>` : '') +
+                (att.purged ? '<span class="att-purged">expired</span>' : '');
+            row.appendChild(chip);
+        }
+    }
+    return row;
+}
+
+function formatAttachmentSize(bytes) {
+    if (typeof bytes !== 'number' || bytes <= 0) return '';
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
 function addMessage(role, content, meta) {
     // Remove welcome message on first real message
     const welcome = messagesEl.querySelector('.welcome-message');
@@ -1467,6 +1535,15 @@ function addMessage(role, content, meta) {
     }
 
     wrap.appendChild(bubble);
+
+    // Inline attachment thumbnails (composer uploads on live send;
+    // hydrated from `list_attachments_for_event` on arc reload). Sits
+    // *under* the bubble — same row as the meta line — so the message
+    // text reads first, then the chips, then the timestamp.
+    if (meta && Array.isArray(meta.attachments) && meta.attachments.length) {
+        const chips = renderAttachmentChips(meta.attachments);
+        wrap.appendChild(chips);
+    }
 
     // Meta line (time, risk badge, domain)
     const metaRow = document.createElement('div');
@@ -2085,21 +2162,28 @@ formEl.addEventListener('submit', async (e) => {
     const composerImagesPayload = consumeComposerImagesForSend();
     const composerAttachmentsPayload = consumeComposerAttachmentsForSend();
 
-    // Show user message. Phase 1 omits inline thumbnails on the user
-    // bubble — the composer chips were already cleared above; the agent
-    // sees the images on the wire, the UI just renders the text.
-    const imgCount = composerImagesPayload?.length || 0;
-    const fileCount = composerAttachmentsPayload?.length || 0;
-    let attachmentSuffix = '';
-    if (imgCount && fileCount) {
-        attachmentSuffix = `\n\n_(${imgCount} image${imgCount === 1 ? '' : 's'} + ${fileCount} file${fileCount === 1 ? '' : 's'} attached)_`;
-    } else if (imgCount) {
-        attachmentSuffix = `\n\n_(${imgCount} image${imgCount === 1 ? '' : 's'} attached)_`;
-    } else if (fileCount) {
-        attachmentSuffix = `\n\n_(${fileCount} file${fileCount === 1 ? '' : 's'} attached)_`;
-    }
-    const userText = `${message}${attachmentSuffix}`;
-    addMessage('user', userText);
+    // Show user message with inline thumbnails for any composer-attached
+    // media. The wire payload is shaped for the backend (no dataUrl), so
+    // we reconstruct a data URL from the base64 we already have. This
+    // matches the shape that `list_attachments_for_event` returns on
+    // arc reload, so renderHistoryEntry can use the same renderer.
+    const liveAttachments = [
+        ...(composerImagesPayload || []).map((img, idx) => ({
+            name: `pasted-image-${idx + 1}`,
+            mime_type: img.mime_type,
+            data_url: `data:${img.mime_type};base64,${img.data.data}`,
+            purged: false,
+        })),
+        ...(composerAttachmentsPayload || []).map((a) => ({
+            name: a.name,
+            mime_type: a.mime_type,
+            // size_bytes is approximate (raw base64 length × 3/4) but
+            // good enough for the chip's "1.2 KB" hint.
+            size_bytes: Math.floor((a.base64.length * 3) / 4),
+            purged: false,
+        })),
+    ];
+    addMessage('user', message, liveAttachments.length ? { attachments: liveAttachments } : undefined);
     inputEl.value = '';
     inputEl.style.height = 'auto';
 
@@ -2439,7 +2523,22 @@ function renderSubAgentSteps(container, entries) {
 // routed through renderToolGroup via buildRenderUnits, not here.
 function renderHistoryEntry(entry) {
     if (entry.entry_type === 'message') {
-        addMessage(entry.source, entry.content);
+        const meta = parseEntryMetadata(entry.metadata) || {};
+        const eventId = meta.attachment_event_id || (meta.source === 'user_upload' ? meta.event_id : null);
+        if (eventId) {
+            // Render synchronously without thumbnails first, then patch
+            // them in once the bytes have been hydrated from disk.
+            // Splitting it this way avoids stalling history render on the
+            // file reads — long arcs with many attachments would
+            // otherwise serialize behind every Tauri round-trip.
+            addMessage(entry.source, entry.content);
+            const lastRow = messagesEl.lastElementChild;
+            if (lastRow && lastRow.classList.contains('message-row')) {
+                hydrateAttachmentsAsync(lastRow, eventId);
+            }
+        } else {
+            addMessage(entry.source, entry.content);
+        }
     } else if (entry.entry_type === 'email_event') {
         const meta = parseEntryMetadata(entry.metadata) || {};
         addEmailEntry(entry.content, meta);

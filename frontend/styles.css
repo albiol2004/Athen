@@ -931,6 +931,61 @@ header h1 {
 
 .message-time { color: var(--text-3); }
 
+/* Inline attachment thumbnails on user/assistant message bubbles. */
+.message-attachments {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 4px;
+}
+.message-row.user .message-attachments {
+    justify-content: flex-end;
+}
+.message-attachment-thumb {
+    max-width: 240px;
+    max-height: 180px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    cursor: zoom-in;
+    object-fit: cover;
+    background: var(--surface-1);
+}
+.message-attachment-thumb:hover {
+    border-color: var(--brand);
+}
+.message-attachment-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: var(--r-pill);
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    font-size: 12px;
+    color: var(--text-2);
+    max-width: 320px;
+}
+.message-attachment-chip.purged {
+    opacity: 0.55;
+    text-decoration: line-through;
+}
+.message-attachment-chip .att-icon { font-size: 13px; }
+.message-attachment-chip .att-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 200px;
+}
+.message-attachment-chip .att-size {
+    color: var(--text-3);
+    font-size: 11px;
+}
+.message-attachment-chip .att-purged {
+    color: var(--danger, #c0392b);
+    font-size: 10px;
+    margin-left: 4px;
+}
+
 /* Markdown bits inside messages */
 .message-bubble h1,
 .message-bubble h2,

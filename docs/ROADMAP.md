@@ -22,14 +22,13 @@ This is why some popular integrations are in *Not planned* below. It's not lazin
 
 Things being built right now.
 
-- **Understanding images and documents.** *Phase 1 shipped:* paste, drop, or attach an image to the composer and a vision-capable provider (Claude 3.5+, GPT-4o, Gemini 1.5+) will see it directly. *Coming next:* PDF ingestion, sense-side image awareness (so an emailed invoice attachment is visible without manual re-attaching), and persisted thumbnails on reopened arcs.
+- **Athen shows its work.** Render code, files, HTML pages, charts, and images inline rather than dumping them as text. Save artifacts to disk with one click. *In flight:* persisted thumbnails on reopened arcs, so an image or document you attached two days ago still renders inline when you scroll back to that conversation instead of degrading to a "_(1 image attached)_" placeholder.
 
 ## Next
 
 What we're planning to do after Now lands.
 
 - **Athen wakes itself up at the right time.** Schedule recurring or one-shot wake-ups — "remind me to follow up if no reply in 3 days", "every Monday at 9am summarize my week", "check on this in 2 hours". A proactive assistant without time-based triggers is missing half its identity.
-- **Athen shows its work.** Render code, files, HTML pages, charts, and images inline rather than dumping them as text. Save artifacts to disk with one click.
 - **Athen survives crashes and reboots.** Pending actions persist so a closed laptop or a power cut never drops work mid-flight. Includes:
   - *Stale-action confirmation:* if Athen was about to send an email six hours ago, it asks "still relevant?" before acting on the resumed approval.
   - *Sense-driven invalidation:* if you reply to that email yourself in the meantime, or the calendar event was cancelled externally, Athen notices and quietly drops the obsolete task.
@@ -38,7 +37,6 @@ What we're planning to do after Now lands.
 
 Ideas we like but aren't committed to yet. Feedback here matters most.
 
-- **An identity Athen carries across every agent.** A hand-maintained store for personality, rules, knowledge about you and your team — anything that should be true regardless of which agent is acting. Categories are user-editable (the four seeds — personality, rules, knowledge, team — are starting points, not a closed enum), with `applies_to` tags so the coder agent doesn't pay tokens for personality entries that only matter to the personal-assistant agent. A live token estimate in Settings warns when the identity grows past what smaller models can comfortably absorb. Design sketch in [docs/IDENTITY.md](IDENTITY.md).
 - **One Telegram message that lands on multiple arcs.** When two notifications hit your phone in quick succession and you reply once with "reply to him with looks great, and for the meeting postpone it to Friday", Athen splits that into per-arc intents and routes each independently — including separate risk decisions per intent (the email reply auto-sends; the calendar move waits for approval). One merged reply summarises both outcomes. Design sketch in [docs/MULTI_INTENT_ROUTING.md](MULTI_INTENT_ROUTING.md).
 - **Standing instructions for the coordinator.** Tell Athen "for the next 4 hours, reply on Telegram and don't auto-send any emails — just draft them for me to approve when I'm back" once, and every subsequent decision (channel, risk gate, notification routing) honors that until the window expires. The coordinator becomes an agent in its own right with persistent memory, not just a deterministic router. Design captured alongside multi-intent in [docs/MULTI_INTENT_ROUTING.md](MULTI_INTENT_ROUTING.md#adjacent-idea-coordinator-as-agent-with-standing-instructions).
 - **Cloud-hosted Athen.** A managed option for people who don't want their PC running 24/7. You'd still own your data, still bring your own LLM keys; we'd just run the headless instance on a European server so your assistant keeps working when your laptop is closed. Self-hosting stays free and supported regardless.
