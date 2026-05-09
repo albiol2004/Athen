@@ -38,7 +38,19 @@ use athen_core::wakeup::AutonomyBand;
 /// contact allowlist. Keep tight: only tools that actually contact a
 /// person belong here. `shell_execute` is *not* outbound; the file/email
 /// gate already protects it.
-const OUTBOUND_TOOL_NAMES: &[&str] = &["email_send"];
+pub(crate) const OUTBOUND_TOOL_NAMES: &[&str] = &["email_send"];
+
+/// Tools that effectively bypass any restriction the wake-up declares,
+/// because they hand work off to *another* agent that today does NOT
+/// inherit the wake-up's wrapper (see `crates/athen-app/src/delegation.rs:309`
+/// — sub-agents receive the bare `AppToolRegistry`). Until task #175
+/// refactors delegation to propagate the wake-up surface, we hide
+/// `delegate_to_agent` from the wake-up's tool list and reject calls so
+/// a locked-down wake-up can't be sidestepped via "delegate to a
+/// specialist that has every tool". The user can still tick this in the
+/// `tool_allowlist` to opt back in — the multi-select includes it under
+/// "Delegation".
+pub(crate) const ESCAPE_HATCH_TOOL_NAMES: &[&str] = &["delegate_to_agent"];
 
 pub struct WakeupRestrictedRegistry {
     inner: Box<dyn ToolRegistry>,
@@ -103,9 +115,15 @@ impl WakeupRestrictedRegistry {
         {
             return false;
         }
+        // Escape-hatch tools (today: `delegate_to_agent`) are hidden by
+        // default because the sub-agent they spawn does NOT inherit this
+        // wrapper — see ESCAPE_HATCH_TOOL_NAMES. The user can still
+        // explicitly opt in via `tool_allowlist`; presence in the list
+        // counts as informed consent.
+        let is_escape_hatch = ESCAPE_HATCH_TOOL_NAMES.contains(&name);
         match &self.tool_allowlist {
             Some(set) => set.contains(name),
-            None => true,
+            None => !is_escape_hatch,
         }
     }
 
@@ -285,6 +303,62 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{err}").contains("notify_only"));
+    }
+
+    #[tokio::test]
+    async fn delegate_to_agent_hidden_by_default_until_explicit_opt_in() {
+        #[derive(Default)]
+        struct DelegRegistry;
+        #[async_trait]
+        impl ToolRegistry for DelegRegistry {
+            async fn list_tools(&self) -> Result<Vec<ToolDefinition>> {
+                Ok(vec![ToolDefinition {
+                    name: "delegate_to_agent".into(),
+                    description: "Hand off to a specialist".into(),
+                    parameters: json!({}),
+                    backend: ToolBackend::Shell {
+                        command: String::new(),
+                        native: false,
+                    },
+                    base_risk: BaseImpact::WritePersist,
+                }])
+            }
+            async fn call_tool(
+                &self,
+                _name: &str,
+                _args: serde_json::Value,
+            ) -> Result<ToolResult> {
+                Ok(ToolResult {
+                    success: true,
+                    output: json!({}),
+                    error: None,
+                    execution_time_ms: 0,
+                })
+            }
+        }
+        // No allowlist + no opt-in → delegate is hidden and rejected.
+        let r = WakeupRestrictedRegistry::new(
+            Box::new(DelegRegistry),
+            None,
+            None,
+            AutonomyBand::Auto,
+            None,
+        )
+        .await;
+        assert!(r.list_tools().await.unwrap().is_empty());
+        assert!(r.call_tool("delegate_to_agent", json!({})).await.is_err());
+
+        // Opt-in via allowlist → delegate becomes available again.
+        let r2 = WakeupRestrictedRegistry::new(
+            Box::new(DelegRegistry),
+            Some(vec!["delegate_to_agent".into()]),
+            None,
+            AutonomyBand::Auto,
+            None,
+        )
+        .await;
+        assert_eq!(r2.list_tools().await.unwrap().len(), 1);
+        assert!(r2.call_tool("delegate_to_agent", json!({})).await.is_ok());
     }
 
     #[tokio::test]

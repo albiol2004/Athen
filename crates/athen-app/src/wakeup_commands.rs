@@ -384,6 +384,11 @@ pub struct ToolInventoryItem {
     /// Hint for the UI: outbound tools get a small "sends" badge so the
     /// user knows which ones are actually network-/world-affecting.
     pub outbound: bool,
+    /// Hint for the UI: escape-hatch tools (today: `delegate_to_agent`)
+    /// get a "delegates" warning badge because the sub-agent they spawn
+    /// does NOT inherit this wake-up's restriction set today (see task
+    /// #175). Hidden by default; the user has to opt in explicitly.
+    pub escape_hatch: bool,
 }
 
 /// Friendly label + category for the well-known built-in tools. The
@@ -458,11 +463,10 @@ fn humanize(name: &str) -> String {
 ///
 /// Each entry carries a human-readable `display_name` + `category` so
 /// the UI can render grouped collapsible sections instead of a flat
-/// alphabetical wall of internal tool ids. The MCP filesystem tools
-/// (`<mcp>__read_file`, `__write_file`, `__list_dir`, etc.) are dropped
-/// from this list because the gated built-ins (`read`/`write`/`edit`/
-/// `grep`/`list_directory`) cover the same ground and run through the
-/// permission gate; exposing both would just bloat the picker.
+/// alphabetical wall of internal tool ids. Filesystem MCP duplicates
+/// (`files__read_file`, `__write_file`, etc.) are dropped upstream by
+/// `AppToolRegistry::list_tools` so the LLM and this picker agree on
+/// the canonical surface (the gated built-ins).
 #[tauri::command]
 pub async fn list_available_tools(
     state: State<'_, AppState>,
@@ -474,42 +478,18 @@ pub async fn list_available_tools(
         .list_tools()
         .await
         .map_err(|e| format!("List tools: {e}"))?;
-    let outbound: std::collections::HashSet<&str> = ["email_send"].into_iter().collect();
-
-    // The filesystem MCP exposes `<mcp_id>__read_file`, `__write_file`,
-    // `__list_dir`, `__create_dir`, `__delete`, etc. Built-ins cover the
-    // same ground and route through the file-permission gate, so listing
-    // both confuses the picker. Hide the MCP duplicates here; users who
-    // genuinely need a non-default MCP filesystem can still allow the
-    // server-prefixed name by typing it (future: an "advanced" toggle).
-    const MCP_FILE_DUPLICATES: &[&str] = &[
-        "read_file",
-        "write_file",
-        "append_file",
-        "list_dir",
-        "list_directory",
-        "create_dir",
-        "create_directory",
-        "delete",
-        "delete_file",
-        "remove",
-        "remove_file",
-        "stat",
-        "exists",
-    ];
+    let outbound: std::collections::HashSet<&str> = crate::wakeup_registry::OUTBOUND_TOOL_NAMES
+        .iter()
+        .copied()
+        .collect();
+    let escape_hatch: std::collections::HashSet<&str> =
+        crate::wakeup_registry::ESCAPE_HATCH_TOOL_NAMES
+            .iter()
+            .copied()
+            .collect();
 
     let mut out: Vec<ToolInventoryItem> = tools
         .into_iter()
-        .filter(|t| {
-            // Drop filesystem MCP duplicates — keep MCPs that bring new
-            // capability (Slack, Notion, etc.).
-            if let Some((_, suffix)) = t.name.split_once("__") {
-                if MCP_FILE_DUPLICATES.contains(&suffix) {
-                    return false;
-                }
-            }
-            true
-        })
         .map(|t| {
             let (display_name, category) = match tool_metadata(&t.name) {
                 Some((label, cat)) => (label.to_string(), cat.to_string()),
@@ -520,6 +500,7 @@ pub async fn list_available_tools(
             };
             ToolInventoryItem {
                 outbound: outbound.contains(t.name.as_str()),
+                escape_hatch: escape_hatch.contains(t.name.as_str()),
                 name: t.name,
                 display_name,
                 category,

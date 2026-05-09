@@ -1265,9 +1265,30 @@ impl ToolRegistry for AppToolRegistry {
         }
 
         if let Some(mcp) = &self.mcp {
+            // The built-in `read`/`edit`/`write`/`grep`/`list_directory`
+            // tools above shadow the `files__*` MCP server: same gate, same
+            // semantics, but the built-ins have stateful read-tracking,
+            // friendlier descriptions, and skip the MCP indirection. Hide
+            // the duplicates from the LLM so it doesn't have to pick
+            // between two of everything. Other MCPs (Slack, Notion, etc.)
+            // bring net-new capability and pass through unchanged.
+            const FILES_MCP_DUPLICATES: &[&str] = &[
+                "read_file",
+                "write_file",
+                "append_file",
+                "list_dir",
+                "create_dir",
+                "delete_path",
+                "move_path",
+                "exists",
+                "stat",
+            ];
             match mcp.list_tools().await {
                 Ok(mcp_tools) => {
                     for t in mcp_tools {
+                        if t.mcp_id == "files" && FILES_MCP_DUPLICATES.contains(&t.name.as_str()) {
+                            continue;
+                        }
                         let prefixed_name = format!("{}{MCP_TOOL_SEPARATOR}{}", t.mcp_id, t.name);
                         tools.push(ToolDefinition {
                             name: prefixed_name,

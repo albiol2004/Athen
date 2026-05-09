@@ -5051,6 +5051,11 @@ option:hover {
     color: #ff8a72;
 }
 
+.wakeup-allowlist-badge-warn {
+    background: rgba(255, 200, 80, 0.15);
+    color: #ffc857;
+}
+
 .wakeup-allowlist-loading,
 .wakeup-allowlist-empty,
 .wakeup-allowlist-error {

@@ -8145,6 +8145,13 @@ async function populateWakeupToolAllowlist(selectedNames) {
                     badge.textContent = 'sends';
                     head.appendChild(badge);
                 }
+                if (t.escape_hatch) {
+                    const badge = document.createElement('span');
+                    badge.className = 'wakeup-allowlist-badge wakeup-allowlist-badge-warn';
+                    badge.textContent = 'bypasses limits';
+                    badge.title = 'Spawns a sub-agent that does NOT inherit this wake-up\'s tool/contact restrictions yet (tracked under task #175). Only enable if you intend that.';
+                    head.appendChild(badge);
+                }
                 const desc = document.createElement('span');
                 desc.className = 'wakeup-allowlist-desc';
                 desc.textContent = t.description || '';
