@@ -1148,9 +1148,39 @@ impl AppToolRegistry {
         tracing::info!(tool = "memory_store", key, "Storing in persistent memory");
 
         let start = Instant::now();
+        let lookup = format!("{key}: {value}");
+
+        // Pre-store dedup: skip if a sufficiently similar memory already
+        // exists. Recall is gated by the global min-relevance threshold
+        // (0.6 cosine), so any hit is a high-confidence overlap. Returning
+        // success-with-status lets the LLM see the existing memory and
+        // decide whether to retry with a genuinely new fact.
+        if let Ok(hits) = memory.recall(&lookup, 1).await {
+            if let Some(existing) = hits.first() {
+                tracing::info!(
+                    tool = "memory_store",
+                    key,
+                    existing_id = %existing.id,
+                    "Skipping duplicate memory_store; similar entry already known"
+                );
+                return Ok(ToolResult {
+                    success: true,
+                    output: json!({
+                        "status": "skipped",
+                        "reason": "already_known",
+                        "existing_id": existing.id,
+                        "existing_content": existing.content,
+                        "hint": "A similar memory is already stored. If you have genuinely NEW information beyond what's shown above, call memory_store again with the new fact only.",
+                    }),
+                    error: None,
+                    execution_time_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+        }
+
         let item = MemoryItem {
             id: format!("agent_{key}"),
-            content: format!("{key}: {value}"),
+            content: lookup,
             metadata: json!({
                 "key": key,
                 "value": value,
