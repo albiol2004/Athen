@@ -655,6 +655,7 @@ async fn reinforce_used_memories(
 /// (better to skip than to store garbage).
 async fn judge_worth_remembering(
     router: &dyn LlmRouter,
+    memory: &dyn athen_core::traits::memory::MemoryStore,
     user_msg: &str,
     assistant_msg: &str,
 ) -> Option<String> {
@@ -663,16 +664,30 @@ async fn judge_worth_remembering(
         Role as LlmRole,
     };
 
+    let existing_block = match memory.recall(user_msg, 3).await {
+        Ok(items) if !items.is_empty() => {
+            let lines = items
+                .iter()
+                .map(|m| format!("- {}", m.content))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("\n\nMEMORIES ALREADY STORED that may overlap:\n{lines}\n")
+        }
+        _ => String::new(),
+    };
+
     let prompt = format!(
         "Analyze this conversation exchange and decide if it contains information worth remembering for future conversations.\n\n\
          User: {user_msg}\n\
-         Assistant: {assistant_msg}\n\n\
+         Assistant: {assistant_msg}\
+         {existing_block}\n\n\
          Worth remembering: facts about people, preferences, relationships, decisions, plans, \
          important events, personal details the user shared, or things the user explicitly asked to remember.\n\
          NOT worth remembering: greetings, small talk, questions about capabilities, \
-         generic requests (write a poem, translate), or information the assistant already has from tools.\n\n\
-         If worth remembering, respond with ONLY a concise summary of the key facts (1-2 sentences, no fluff).\n\
-         If NOT worth remembering, respond with exactly: SKIP"
+         generic requests (write a poem, translate), or information the assistant already has from tools, \
+         OR anything already covered by the memories listed above.\n\n\
+         If worth remembering AND not already covered above, respond with ONLY a concise summary of the new facts (1-2 sentences, no fluff).\n\
+         If NOT worth remembering, or if everything is already covered above, respond with exactly: SKIP"
     );
 
     let request = LlmRequest {
@@ -2089,7 +2104,14 @@ pub async fn send_message(
 
                 // Fire-and-forget in background so it doesn't block the response.
                 tokio::spawn(async move {
-                    match judge_worth_remembering(&router, &msg_clone, &content_clone).await {
+                    match judge_worth_remembering(
+                        &router,
+                        memory_clone.as_ref(),
+                        &msg_clone,
+                        &content_clone,
+                    )
+                    .await
+                    {
                         Some(summary) => {
                             tracing::info!("Memory judge: worth remembering");
                             let item = athen_core::traits::memory::MemoryItem {
@@ -3033,7 +3055,14 @@ pub(crate) async fn execute_approved_task(
         let content_clone = content.clone();
         let memory_clone = Arc::clone(memory);
         tokio::spawn(async move {
-            match judge_worth_remembering(&router, &msg_clone, &content_clone).await {
+            match judge_worth_remembering(
+                &router,
+                memory_clone.as_ref(),
+                &msg_clone,
+                &content_clone,
+            )
+            .await
+            {
                 Some(summary) => {
                     tracing::info!("Memory judge: worth remembering (approved task)");
                     let item = athen_core::traits::memory::MemoryItem {
@@ -3923,7 +3952,14 @@ pub(crate) async fn execute_dispatched_task(
         let content_clone = content.clone();
         let memory_clone = Arc::clone(memory);
         tokio::spawn(async move {
-            match judge_worth_remembering(&router, &msg_clone, &content_clone).await {
+            match judge_worth_remembering(
+                &router,
+                memory_clone.as_ref(),
+                &msg_clone,
+                &content_clone,
+            )
+            .await
+            {
                 Some(summary) => {
                     tracing::info!("Memory judge: worth remembering (dispatched task)");
                     let item = athen_core::traits::memory::MemoryItem {
