@@ -4860,3 +4860,184 @@ option:hover {
     color: var(--text-2);
     line-height: 1.5;
 }
+
+/* ─── Wake-ups (scheduled triggers) ─── */
+
+.wakeups-view {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    background: var(--bg);
+}
+
+.wakeups-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 24px;
+    border-bottom: 1px solid var(--border);
+    gap: 16px;
+}
+
+.wakeups-header h2 {
+    margin: 0;
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--text-1);
+    flex: 1;
+    text-align: center;
+}
+
+.wakeups-header .header-left,
+.wakeups-header .header-right {
+    flex: 0 0 auto;
+    min-width: 120px;
+}
+
+.wakeups-header .header-right {
+    text-align: right;
+}
+
+.wakeups-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px 24px 32px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.wakeups-form {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 16px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-2, var(--bg));
+}
+
+.wakeups-form-row {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.wakeups-form-row label {
+    font-size: 12px;
+    color: var(--text-2);
+    font-weight: 500;
+}
+
+.wakeups-form-row .wakeup-sub-label {
+    margin-top: 8px;
+}
+
+.wakeups-form-row textarea,
+.wakeups-form-row input,
+.wakeups-form-row select {
+    background: var(--bg);
+    color: var(--text-1);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-family: inherit;
+    font-size: 13px;
+}
+
+.wakeups-form-row textarea {
+    resize: vertical;
+    min-height: 60px;
+}
+
+.wakeups-form-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+}
+
+.wakeups-form-error {
+    color: #f7768e;
+    font-size: 12px;
+    padding: 4px 0;
+}
+
+.wakeups-empty {
+    text-align: center;
+    color: var(--text-2);
+    padding: 48px 16px;
+}
+
+.wakeups-empty p {
+    margin: 0 0 6px 0;
+}
+
+.wakeups-empty-sub {
+    font-size: 12px;
+    color: var(--text-3, var(--text-2));
+}
+
+.wakeups-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.wakeup-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 12px 14px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-2, var(--bg));
+}
+
+.wakeup-row-disabled {
+    opacity: 0.55;
+}
+
+.wakeup-row-main {
+    flex: 1;
+    min-width: 0;
+}
+
+.wakeup-row-instruction {
+    font-size: 13px;
+    color: var(--text-1);
+    margin-bottom: 4px;
+    overflow-wrap: break-word;
+}
+
+.wakeup-row-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    font-size: 11px;
+    color: var(--text-2);
+}
+
+.wakeup-row-meta span {
+    white-space: nowrap;
+}
+
+.wakeup-row-actions {
+    display: flex;
+    gap: 6px;
+    flex: 0 0 auto;
+}
+
+.wakeup-row-actions button {
+    font-size: 12px;
+    padding: 4px 10px;
+}
+
+.wakeups-error {
+    color: #f7768e;
+    padding: 12px;
+    border: 1px solid #f7768e44;
+    border-radius: 6px;
+    font-size: 12px;
+}

@@ -207,6 +207,15 @@ pub struct AppState {
     /// categories). Read at prompt-build time and folded into the static
     /// system header so every agent shares the same "who Athen is".
     pub identity_store: Option<Arc<athen_persistence::identity::SqliteIdentityStore>>,
+    /// SQLite-backed wake-up store. Holds scheduled / recurring / one-shot
+    /// proactive triggers (see `docs/WAKEUPS.md`). Read by the wake-up
+    /// scheduler background task; written by Tauri commands and (Phase 5)
+    /// the agent's `create_wakeup` tool.
+    pub wakeup_store: Option<Arc<athen_persistence::wakeups::SqliteWakeupStore>>,
+    /// Shutdown signal for the wake-up scheduler loop. `None` until
+    /// `start_wakeup_scheduler` has been called. Sending on this channel
+    /// causes the scheduler to exit at the next select boundary.
+    pub wakeup_scheduler_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     /// Embedding provider used for semantic profile routing. Always wired
     /// to a router that falls back to keyword embeddings when no neural
     /// provider is available, so the per-call code path can assume `Some`.
@@ -337,6 +346,7 @@ impl AppState {
         let grant_store = database.as_ref().map(|db| Arc::new(db.grant_store()));
         let profile_store = database.as_ref().map(|db| Arc::new(db.profile_store()));
         let identity_store = database.as_ref().map(|db| Arc::new(db.identity_store()));
+        let wakeup_store = database.as_ref().map(|db| Arc::new(db.wakeup_store()));
         // Build an embedding router for profile routing. Same shape as the
         // memory subsystem's embedder: real providers can be wired later
         // from settings; until then it falls back to keyword embeddings,
@@ -393,6 +403,8 @@ impl AppState {
             grant_store,
             profile_store,
             identity_store,
+            wakeup_store,
+            wakeup_scheduler_shutdown: None,
             profile_embedder,
             profile_embedding_cache,
             pending_grants,
@@ -790,6 +802,48 @@ impl AppState {
             ttl_days,
             crate::attachment_purger::DEFAULT_SWEEP_INTERVAL,
         ));
+    }
+
+    /// Spawn the wake-up scheduler loop. Idempotent — does nothing if the
+    /// store isn't wired or the loop is already running. Calls
+    /// `arm_unscheduled(now)` first so freshly-created rows that lack a
+    /// `next_fire_at` get armed before the first tick.
+    pub fn start_wakeup_scheduler(&mut self) {
+        let Some(store) = self.wakeup_store.clone() else {
+            tracing::debug!("No wake-up store wired; skipping scheduler");
+            return;
+        };
+        if self.wakeup_scheduler_shutdown.is_some() {
+            tracing::debug!("Wake-up scheduler already running");
+            return;
+        }
+        let arc_store = self.arc_store.clone();
+        let sink: Arc<dyn athen_core::traits::wakeup::WakeupFireSink> =
+            Arc::new(crate::wakeup_sink::LoggingWakeupSink::new(arc_store));
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        self.wakeup_scheduler_shutdown = Some(tx);
+
+        // Tick every 5 seconds. Fast enough that "remind me in 30 seconds"
+        // feels prompt; slow enough that an idle laptop burns no real CPU.
+        // Production-grade scheduling would key off the earliest
+        // next_fire_at; for v1 a coarse poll is fine.
+        let period = std::time::Duration::from_secs(5);
+        // Tauri's setup hook is synchronous; use the Tauri-managed async
+        // runtime for the same reason the email/calendar/telegram monitors
+        // do — `tokio::spawn` here panics because no reactor is running on
+        // this thread.
+        tauri::async_runtime::spawn(async move {
+            let scheduler = athen_scheduler::WakeupScheduler::new(store, sink);
+            // Arm any rows that lack next_fire_at (created via Tauri
+            // command without pre-computing the time).
+            match scheduler.arm_unscheduled(chrono::Utc::now()).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!("Armed {n} fresh wake-up(s)"),
+                Err(e) => tracing::warn!("Failed to arm fresh wake-ups: {e}"),
+            }
+            scheduler.run(period, rx).await;
+            tracing::info!("Wake-up scheduler loop exited");
+        });
     }
 
     pub fn start_calendar_monitor(&mut self, app_handle: tauri::AppHandle) {

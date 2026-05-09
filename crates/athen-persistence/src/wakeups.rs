@@ -120,10 +120,7 @@ fn read_wakeup_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Wakeup> {
         Some(j) => Some(serde_json::from_str(&j).map_err(|e| parse_err(6, e))?),
         None => None,
     };
-    let arc_id = match arc_id_str {
-        Some(s) => Some(Uuid::parse_str(&s).map_err(|e| uuid_err(8, e))?),
-        None => None,
-    };
+    let arc_id = arc_id_str;
     let origin: WakeupOrigin = serde_json::from_str(&origin_json).map_err(|e| parse_err(9, e))?;
     let created_at = chrono::DateTime::parse_from_rfc3339(&created_at_str)
         .map_err(|e| chrono_err(10, e))?
@@ -359,7 +356,7 @@ fn insert_or_replace(conn: &Connection, w: &Wakeup) -> Result<()> {
             tool_allowlist_json,
             contact_allowlist_json,
             w.profile,
-            w.arc_id.map(|u| u.to_string()),
+            w.arc_id.clone(),
             origin_json,
             datetime_to_str(w.created_at),
             w.last_fired_at.map(datetime_to_str),
@@ -411,7 +408,8 @@ mod tests {
     #[tokio::test]
     async fn create_and_get_round_trips_all_fields() {
         let store = setup().await;
-        let arc_id = Uuid::new_v4();
+        let arc_id = "arc_20260509_120000".to_string();
+        let authoring_arc_id = Uuid::new_v4();
         let contact_id = Uuid::new_v4();
         let now = Utc::now();
         let w = Wakeup {
@@ -426,10 +424,8 @@ mod tests {
             tool_allowlist: Some(vec!["web_search".into(), "read_page".into()]),
             contact_allowlist: Some(vec![contact_id]),
             profile: "assistant".into(),
-            arc_id: Some(arc_id),
-            origin: WakeupOrigin::Agent {
-                authoring_arc_id: arc_id,
-            },
+            arc_id: Some(arc_id.clone()),
+            origin: WakeupOrigin::Agent { authoring_arc_id },
             created_at: now,
             last_fired_at: Some(now - Duration::hours(2)),
             next_fire_at: Some(now + Duration::hours(22)),

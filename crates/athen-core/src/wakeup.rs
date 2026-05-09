@@ -41,8 +41,9 @@ pub struct Wakeup {
     /// Which agent profile runs the work.
     pub profile: String,
     /// If set, the wake-up appends to that arc. If `None`, a fresh arc is
-    /// spawned per fire.
-    pub arc_id: Option<Uuid>,
+    /// spawned per fire. Arc ids are strings (the existing
+    /// `arc_YYYYMMDD_HHMMSS` format used by `ArcStore`); not UUIDs.
+    pub arc_id: Option<String>,
     pub origin: WakeupOrigin,
     pub created_at: DateTime<Utc>,
     pub last_fired_at: Option<DateTime<Utc>>,

@@ -61,6 +61,12 @@
                     </span>
                     <span>Calendar</span>
                 </button>
+                <button id="wakeups-btn" class="sidebar-footer-btn" title="Scheduled wake-ups">
+                    <span class="wakeups-icon" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="13" r="8"/><polyline points="12 9 12 13 15 15"/><line x1="5" y1="3" x2="2" y2="6"/><line x1="22" y1="6" x2="19" y2="3"/></svg>
+                    </span>
+                    <span>Scheduled</span>
+                </button>
                 <button id="memory-btn" class="sidebar-footer-btn" title="Memory">
                     <span class="memory-icon" aria-hidden="true">
                         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.5 4.5L18 9l-4.5 1.5L12 15l-1.5-4.5L6 9l4.5-1.5z"/><path d="M5.2 17l.6 1.8L7.6 19.4 5.8 20l-.6 1.8L4.6 20 2.8 19.4 4.6 18.8z"/></svg>
@@ -860,6 +866,63 @@
                         </div>
                     </div>
                 </div>
+            </div>
+        </div>
+
+        <div id="wakeups-view" class="wakeups-view hidden">
+            <header class="wakeups-header">
+                <div class="header-left">
+                    <button id="wakeups-back" class="settings-back-btn" title="Back">
+                        <span>&#8592;</span> Back
+                    </button>
+                </div>
+                <h2>Scheduled</h2>
+                <div class="header-right">
+                    <button id="wakeups-new-btn" class="btn-primary" type="button">+ New wake-up</button>
+                </div>
+            </header>
+
+            <div class="wakeups-body">
+                <form id="wakeups-form" class="wakeups-form hidden" autocomplete="off">
+                    <div class="wakeups-form-row">
+                        <label for="wakeup-instruction">What should Athen do when this fires?</label>
+                        <textarea id="wakeup-instruction" rows="3" placeholder="e.g. Summarize today's tech news, post to Telegram"></textarea>
+                    </div>
+                    <div class="wakeups-form-row">
+                        <label for="wakeup-schedule-kind">Schedule</label>
+                        <select id="wakeup-schedule-kind">
+                            <option value="one_shot">One-time</option>
+                            <option value="interval">Every N seconds</option>
+                            <option value="cron">Cron expression</option>
+                        </select>
+                    </div>
+                    <div class="wakeups-form-row" id="wakeup-oneshot-fields">
+                        <label for="wakeup-at">When</label>
+                        <input type="datetime-local" id="wakeup-at">
+                    </div>
+                    <div class="wakeups-form-row hidden" id="wakeup-cron-fields">
+                        <label for="wakeup-cron-expr">Cron expression</label>
+                        <input type="text" id="wakeup-cron-expr" placeholder="0 8 * * *">
+                        <label for="wakeup-cron-tz" class="wakeup-sub-label">Timezone</label>
+                        <input type="text" id="wakeup-cron-tz" placeholder="Europe/Madrid" value="UTC">
+                    </div>
+                    <div class="wakeups-form-row hidden" id="wakeup-interval-fields">
+                        <label for="wakeup-interval-secs">Every (seconds)</label>
+                        <input type="number" id="wakeup-interval-secs" min="60" step="60" value="3600">
+                    </div>
+                    <div class="wakeups-form-actions">
+                        <button type="button" id="wakeup-form-cancel" class="btn-secondary">Cancel</button>
+                        <button type="submit" id="wakeup-form-save" class="btn-primary">Create wake-up</button>
+                    </div>
+                    <div id="wakeup-form-error" class="wakeups-form-error hidden"></div>
+                </form>
+
+                <div id="wakeups-empty" class="wakeups-empty hidden">
+                    <p>No scheduled wake-ups yet.</p>
+                    <p class="wakeups-empty-sub">Create one to have Athen run something on a timer — daily news, weekly digests, deferred reminders.</p>
+                </div>
+
+                <div id="wakeups-list" class="wakeups-list"></div>
             </div>
         </div>
 

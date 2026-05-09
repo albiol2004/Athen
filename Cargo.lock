@@ -295,6 +295,7 @@ dependencies = [
  "athen-memory",
  "athen-persistence",
  "athen-risk",
+ "athen-scheduler",
  "athen-sentidos",
  "athen-web",
  "base64 0.22.1",

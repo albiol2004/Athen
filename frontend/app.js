@@ -2810,6 +2810,7 @@ function showSettings() {
     appView.style.display = 'none';
     timelineView?.classList.add('hidden');
     calendarView?.classList.add('hidden');
+    document.getElementById('wakeups-view')?.classList.add('hidden');
     contactsView?.classList.add('hidden');
     notificationsView?.classList.add('hidden');
     document.getElementById('memory-view')?.classList.add('hidden');
@@ -2824,6 +2825,7 @@ function showChat() {
     settingsView.classList.add('hidden');
     timelineView?.classList.add('hidden');
     calendarView?.classList.add('hidden');
+    document.getElementById('wakeups-view')?.classList.add('hidden');
     contactsView?.classList.add('hidden');
     notificationsView?.classList.add('hidden');
     document.getElementById('memory-view')?.classList.add('hidden');
@@ -5311,6 +5313,7 @@ function showTimeline() {
     appView.style.display = 'none';
     settingsView.classList.add('hidden');
     calendarView?.classList.add('hidden');
+    document.getElementById('wakeups-view')?.classList.add('hidden');
     contactsView?.classList.add('hidden');
     notificationsView?.classList.add('hidden');
     document.getElementById('memory-view')?.classList.add('hidden');
@@ -6206,6 +6209,7 @@ function showNotifications() {
     settingsView.classList.add('hidden');
     timelineView?.classList.add('hidden');
     calendarView?.classList.add('hidden');
+    document.getElementById('wakeups-view')?.classList.add('hidden');
     contactsView?.classList.add('hidden');
     document.getElementById('memory-view')?.classList.add('hidden');
     document.getElementById('sidebar').style.display = '';
@@ -6386,6 +6390,7 @@ function showContacts() {
     settingsView.classList.add('hidden');
     timelineView?.classList.add('hidden');
     calendarView?.classList.add('hidden');
+    document.getElementById('wakeups-view')?.classList.add('hidden');
     notificationsView?.classList.add('hidden');
     document.getElementById('memory-view')?.classList.add('hidden');
     document.getElementById('sidebar').style.display = '';
@@ -6751,6 +6756,7 @@ function showMemory() {
     settingsView.classList.add('hidden');
     timelineView?.classList.add('hidden');
     calendarView?.classList.add('hidden');
+    document.getElementById('wakeups-view')?.classList.add('hidden');
     notificationsView?.classList.add('hidden');
     contactsView?.classList.add('hidden');
     document.getElementById('sidebar').style.display = '';
@@ -7774,6 +7780,251 @@ async function maybeRunOnboarding() {
     if (!overlay) return;
     overlay.style.display = 'flex';
     showOnboardingStep('welcome');
+}
+
+// ─── Wake-ups (scheduled / recurring / one-shot triggers) ───
+
+const wakeupsView = document.getElementById('wakeups-view');
+const wakeupsBtn = document.getElementById('wakeups-btn');
+const wakeupsBack = document.getElementById('wakeups-back');
+const wakeupsListEl = document.getElementById('wakeups-list');
+const wakeupsEmptyEl = document.getElementById('wakeups-empty');
+const wakeupsForm = document.getElementById('wakeups-form');
+const wakeupsNewBtn = document.getElementById('wakeups-new-btn');
+const wakeupFormCancel = document.getElementById('wakeup-form-cancel');
+const wakeupFormError = document.getElementById('wakeup-form-error');
+const wakeupScheduleKindEl = document.getElementById('wakeup-schedule-kind');
+const wakeupOneshotFields = document.getElementById('wakeup-oneshot-fields');
+const wakeupCronFields = document.getElementById('wakeup-cron-fields');
+const wakeupIntervalFields = document.getElementById('wakeup-interval-fields');
+const wakeupAtEl = document.getElementById('wakeup-at');
+const wakeupCronExprEl = document.getElementById('wakeup-cron-expr');
+const wakeupCronTzEl = document.getElementById('wakeup-cron-tz');
+const wakeupIntervalSecsEl = document.getElementById('wakeup-interval-secs');
+const wakeupInstructionEl = document.getElementById('wakeup-instruction');
+
+function showWakeups() {
+    if (!wakeupsView) return;
+    if (typeof appView !== 'undefined' && appView) appView.style.display = 'none';
+    settingsView?.classList.add('hidden');
+    timelineView?.classList.add('hidden');
+    calendarView?.classList.add('hidden');
+    document.getElementById('wakeups-view')?.classList.add('hidden');
+    notificationsView?.classList.add('hidden');
+    contactsView?.classList.add('hidden');
+    memoryView?.classList.add('hidden');
+    document.getElementById('sidebar').style.display = '';
+    if (typeof timelineRefreshInterval !== 'undefined' && timelineRefreshInterval) {
+        clearInterval(timelineRefreshInterval);
+        timelineRefreshInterval = null;
+    }
+    wakeupsView.classList.remove('hidden');
+    closeSidebar();
+    loadWakeups();
+}
+
+function hideWakeups() {
+    wakeupsView?.classList.add('hidden');
+    document.getElementById('sidebar').style.display = '';
+    if (typeof appView !== 'undefined' && appView) appView.style.display = 'flex';
+    inputEl?.focus();
+}
+
+function setWakeupScheduleKind(kind) {
+    wakeupOneshotFields?.classList.toggle('hidden', kind !== 'one_shot');
+    wakeupCronFields?.classList.toggle('hidden', kind !== 'cron');
+    wakeupIntervalFields?.classList.toggle('hidden', kind !== 'interval');
+}
+
+function openWakeupForm() {
+    if (!wakeupsForm) return;
+    // Default the one-shot picker to "now + 1 minute" so the user can fire
+    // it almost immediately for a smoke test.
+    if (wakeupAtEl) {
+        const dt = new Date(Date.now() + 60_000);
+        // datetime-local needs YYYY-MM-DDTHH:MM in *local* time.
+        const pad = (n) => String(n).padStart(2, '0');
+        wakeupAtEl.value = `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}T${pad(dt.getHours())}:${pad(dt.getMinutes())}`;
+    }
+    wakeupInstructionEl.value = '';
+    wakeupScheduleKindEl.value = 'one_shot';
+    setWakeupScheduleKind('one_shot');
+    wakeupFormError?.classList.add('hidden');
+    wakeupsForm.classList.remove('hidden');
+    wakeupInstructionEl.focus();
+}
+
+function closeWakeupForm() {
+    wakeupsForm?.classList.add('hidden');
+    wakeupFormError?.classList.add('hidden');
+}
+
+function buildSchedulePayload() {
+    const kind = wakeupScheduleKindEl.value;
+    if (kind === 'one_shot') {
+        const v = wakeupAtEl.value;
+        if (!v) throw new Error('Pick a date and time');
+        // datetime-local has no timezone; treat as local, convert to UTC ISO.
+        const local = new Date(v);
+        if (Number.isNaN(local.getTime())) throw new Error('Invalid date');
+        if (local.getTime() <= Date.now()) throw new Error('Time must be in the future');
+        return { kind: 'one_shot', at: local.toISOString() };
+    }
+    if (kind === 'cron') {
+        const expr = (wakeupCronExprEl.value || '').trim();
+        const tz = (wakeupCronTzEl.value || '').trim() || 'UTC';
+        if (!expr) throw new Error('Cron expression is required');
+        return { kind: 'cron', expr, tz };
+    }
+    if (kind === 'interval') {
+        const secs = parseInt(wakeupIntervalSecsEl.value, 10);
+        if (!Number.isFinite(secs) || secs <= 0) throw new Error('Interval must be a positive number of seconds');
+        return { kind: 'interval', every_seconds: secs, anchor: null };
+    }
+    throw new Error(`Unknown schedule kind: ${kind}`);
+}
+
+async function submitWakeup(ev) {
+    ev.preventDefault();
+    if (!invoke) return;
+    wakeupFormError?.classList.add('hidden');
+    let schedule;
+    try {
+        schedule = buildSchedulePayload();
+    } catch (e) {
+        wakeupFormError.textContent = e.message;
+        wakeupFormError.classList.remove('hidden');
+        return;
+    }
+    const instruction = wakeupInstructionEl.value.trim();
+    if (!instruction) {
+        wakeupFormError.textContent = 'Instruction is required';
+        wakeupFormError.classList.remove('hidden');
+        return;
+    }
+    try {
+        await invoke('create_wakeup', {
+            req: { instruction, schedule },
+        });
+        closeWakeupForm();
+        await loadWakeups();
+    } catch (e) {
+        wakeupFormError.textContent = String(e);
+        wakeupFormError.classList.remove('hidden');
+    }
+}
+
+function fmtWakeupTime(iso) {
+    if (!iso) return '—';
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return iso;
+    const now = Date.now();
+    const diffMs = d.getTime() - now;
+    const absSec = Math.round(Math.abs(diffMs) / 1000);
+    const local = d.toLocaleString();
+    if (Math.abs(diffMs) < 90_000) return `${local}  (${diffMs >= 0 ? 'in ' : ''}${absSec}s${diffMs >= 0 ? '' : ' ago'})`;
+    return local;
+}
+
+function renderWakeupRow(w) {
+    const row = document.createElement('div');
+    row.className = 'wakeup-row';
+    row.dataset.id = w.id;
+
+    const main = document.createElement('div');
+    main.className = 'wakeup-row-main';
+    const instr = document.createElement('div');
+    instr.className = 'wakeup-row-instruction';
+    instr.textContent = w.instruction;
+    const meta = document.createElement('div');
+    meta.className = 'wakeup-row-meta';
+    const scheduleSpan = document.createElement('span');
+    scheduleSpan.textContent = w.schedule_summary;
+    const nextSpan = document.createElement('span');
+    nextSpan.textContent = w.next_fire_at ? `Next: ${fmtWakeupTime(w.next_fire_at)}` : 'Done';
+    const lastSpan = document.createElement('span');
+    lastSpan.textContent = w.last_fired_at ? `Last fired: ${fmtWakeupTime(w.last_fired_at)}` : 'Never fired';
+    meta.appendChild(scheduleSpan);
+    meta.appendChild(nextSpan);
+    meta.appendChild(lastSpan);
+    main.appendChild(instr);
+    main.appendChild(meta);
+
+    const actions = document.createElement('div');
+    actions.className = 'wakeup-row-actions';
+
+    const enableBtn = document.createElement('button');
+    enableBtn.className = 'btn-secondary wakeup-toggle-btn';
+    enableBtn.type = 'button';
+    enableBtn.textContent = w.enabled ? 'Disable' : 'Enable';
+    enableBtn.addEventListener('click', async () => {
+        try {
+            await invoke('set_wakeup_enabled', { id: w.id, enabled: !w.enabled });
+            await loadWakeups();
+        } catch (e) {
+            alert(`Toggle failed: ${e}`);
+        }
+    });
+
+    const deleteBtn = document.createElement('button');
+    deleteBtn.className = 'btn-secondary wakeup-delete-btn';
+    deleteBtn.type = 'button';
+    deleteBtn.textContent = 'Delete';
+    deleteBtn.addEventListener('click', async () => {
+        if (!confirm(`Delete this wake-up?\n\n"${w.instruction}"`)) return;
+        try {
+            await invoke('delete_wakeup', { id: w.id });
+            await loadWakeups();
+        } catch (e) {
+            alert(`Delete failed: ${e}`);
+        }
+    });
+
+    actions.appendChild(enableBtn);
+    actions.appendChild(deleteBtn);
+
+    if (!w.enabled) row.classList.add('wakeup-row-disabled');
+    row.appendChild(main);
+    row.appendChild(actions);
+    return row;
+}
+
+async function loadWakeups() {
+    if (!invoke || !wakeupsListEl) return;
+    try {
+        const rows = await invoke('list_wakeups');
+        wakeupsListEl.innerHTML = '';
+        if (!Array.isArray(rows) || rows.length === 0) {
+            wakeupsEmptyEl?.classList.remove('hidden');
+            return;
+        }
+        wakeupsEmptyEl?.classList.add('hidden');
+        // Sort: enabled+pending first by next_fire_at asc, then disabled, then completed.
+        rows.sort((a, b) => {
+            const aActive = a.enabled && a.next_fire_at;
+            const bActive = b.enabled && b.next_fire_at;
+            if (aActive !== bActive) return aActive ? -1 : 1;
+            if (a.next_fire_at && b.next_fire_at) return new Date(a.next_fire_at) - new Date(b.next_fire_at);
+            return new Date(b.created_at) - new Date(a.created_at);
+        });
+        for (const w of rows) {
+            wakeupsListEl.appendChild(renderWakeupRow(w));
+        }
+    } catch (e) {
+        console.error('Failed to load wakeups:', e);
+        wakeupsListEl.innerHTML = `<div class="wakeups-error">Failed to load wake-ups: ${e}</div>`;
+    }
+}
+
+if (wakeupsBtn) wakeupsBtn.addEventListener('click', showWakeups);
+if (wakeupsBack) wakeupsBack.addEventListener('click', hideWakeups);
+if (wakeupsNewBtn) wakeupsNewBtn.addEventListener('click', openWakeupForm);
+if (wakeupFormCancel) wakeupFormCancel.addEventListener('click', closeWakeupForm);
+if (wakeupsForm) wakeupsForm.addEventListener('submit', submitWakeup);
+if (wakeupScheduleKindEl) {
+    wakeupScheduleKindEl.addEventListener('change', () => {
+        setWakeupScheduleKind(wakeupScheduleKindEl.value);
+    });
 }
 
 // ─── Initialize ───
