@@ -209,7 +209,7 @@ pub fn run() {
             // sink that persists a system arc entry on each fire — Phase
             // 3b will swap in a coordinator-backed sink that turns fires
             // into Tasks.
-            state.start_wakeup_scheduler();
+            state.start_wakeup_scheduler(app.handle().clone());
 
             app.manage(state);
 

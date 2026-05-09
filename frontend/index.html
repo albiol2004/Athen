@@ -889,6 +889,15 @@
                         <textarea id="wakeup-instruction" rows="3" placeholder="e.g. Summarize today's tech news, post to Telegram"></textarea>
                     </div>
                     <div class="wakeups-form-row">
+                        <label for="wakeup-autonomy">Autonomy</label>
+                        <select id="wakeup-autonomy">
+                            <option value="safe_only" selected>Safe only — execute low-risk; pause anything else (default)</option>
+                            <option value="notify_only">Notify only — read &amp; summarize, never send anything outward</option>
+                            <option value="auto">Auto — run anything except critical (use with care)</option>
+                        </select>
+                        <span class="wakeup-sub-label wakeup-arc-hint">Determines what happens when the agent hits a risky action while running unattended.</span>
+                    </div>
+                    <div class="wakeups-form-row">
                         <label for="wakeup-arc">Where to log the result</label>
                         <select id="wakeup-arc">
                             <option value="">New arc (created on fire)</option>

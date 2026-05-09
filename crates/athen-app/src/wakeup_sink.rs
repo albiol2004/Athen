@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use tauri::{AppHandle, Emitter};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -24,7 +25,7 @@ use athen_core::traits::wakeup::WakeupFireSink;
 use athen_core::wakeup::{Wakeup, WakeupOrigin};
 use athen_persistence::arcs::{ArcSource, ArcStore, EntryType};
 
-use crate::state::TaskArcMap;
+use crate::state::{TaskArcMap, TaskWakeupMap};
 
 /// Coordinator-backed sink. Each fire becomes a synthetic sense event
 /// processed by the coordinator, and (on `SilentApprove` /
@@ -34,7 +35,12 @@ pub struct CoordinatorWakeupSink {
     coordinator: Arc<athen_coordinador::Coordinator>,
     arc_store: Option<ArcStore>,
     task_arc_map: TaskArcMap,
+    task_wakeup_map: TaskWakeupMap,
     dispatch_signal: Arc<tokio::sync::Notify>,
+    /// `None` in tests / non-Tauri builds. When `Some`, the sink emits a
+    /// `wakeup-fired` event so the frontend can refresh its arc list and
+    /// surface a toast.
+    app_handle: Option<AppHandle>,
 }
 
 impl CoordinatorWakeupSink {
@@ -42,13 +48,17 @@ impl CoordinatorWakeupSink {
         coordinator: Arc<athen_coordinador::Coordinator>,
         arc_store: Option<ArcStore>,
         task_arc_map: TaskArcMap,
+        task_wakeup_map: TaskWakeupMap,
         dispatch_signal: Arc<tokio::sync::Notify>,
+        app_handle: Option<AppHandle>,
     ) -> Self {
         Self {
             coordinator,
             arc_store,
             task_arc_map,
+            task_wakeup_map,
             dispatch_signal,
+            app_handle,
         }
     }
 }
@@ -68,8 +78,16 @@ impl WakeupFireSink for CoordinatorWakeupSink {
         // Resolve the arc up-front so the agent has a place to write
         // even if coordinator dispatch errors out.
         let target_arc_id = if let Some(store) = self.arc_store.as_ref() {
-            Some(resolve_target_arc(store, wakeup).await?)
+            let id = resolve_target_arc(store, wakeup).await?;
+            info!(
+                wakeup_id = %wakeup.id,
+                arc_id = %id,
+                declared = ?wakeup.arc_id,
+                "Wake-up resolved target arc"
+            );
+            Some(id)
         } else {
+            warn!(wakeup_id = %wakeup.id, "Sink has no arc_store — running headless");
             None
         };
 
@@ -136,14 +154,8 @@ impl WakeupFireSink for CoordinatorWakeupSink {
             .map(|(_, d)| decision_label(d))
             .unwrap_or("no_decision");
         if let (Some(store), Some(arc_id)) = (self.arc_store.as_ref(), &target_arc_id) {
-            if let Err(e) = persist_fire_marker(
-                store,
-                arc_id,
-                wakeup,
-                fired_at,
-                Some(decision_label),
-            )
-            .await
+            if let Err(e) =
+                persist_fire_marker(store, arc_id, wakeup, fired_at, Some(decision_label)).await
             {
                 warn!(
                     wakeup_id = %wakeup.id,
@@ -166,6 +178,10 @@ impl WakeupFireSink for CoordinatorWakeupSink {
                     if let Some(arc_id) = target_arc_id.clone() {
                         self.task_arc_map.write().await.insert(*task_id, arc_id);
                     }
+                    self.task_wakeup_map
+                        .write()
+                        .await
+                        .insert(*task_id, wakeup.id);
                     any_dispatched = true;
                 }
                 RiskDecision::HumanConfirm => {
@@ -175,6 +191,10 @@ impl WakeupFireSink for CoordinatorWakeupSink {
                     if let Some(arc_id) = target_arc_id.clone() {
                         self.task_arc_map.write().await.insert(*task_id, arc_id);
                     }
+                    self.task_wakeup_map
+                        .write()
+                        .await
+                        .insert(*task_id, wakeup.id);
                     info!(
                         wakeup_id = %wakeup.id,
                         task_id = %task_id,
@@ -193,6 +213,36 @@ impl WakeupFireSink for CoordinatorWakeupSink {
 
         if any_dispatched {
             self.dispatch_signal.notify_one();
+        }
+
+        // Tell the frontend a wake-up just fired so it can:
+        //   - refresh its arc list (so a freshly-created wake-up arc
+        //     shows up in the sidebar without an app restart),
+        //   - surface a toast / sense-event-style notification linking
+        //     to the arc.
+        // Best-effort: emit failures don't invalidate the fire.
+        if let Some(app) = &self.app_handle {
+            let payload = serde_json::json!({
+                "wakeup_id": wakeup.id.to_string(),
+                "arc_id": target_arc_id,
+                "instruction": wakeup.instruction,
+                "fired_at": fired_at.to_rfc3339(),
+                "decision": decision_label,
+                "autonomy": wakeup.autonomy.as_str(),
+            });
+            match app.emit("wakeup-fired", payload) {
+                Ok(()) => info!(
+                    wakeup_id = %wakeup.id,
+                    arc_id = ?target_arc_id,
+                    decision = %decision_label,
+                    "wakeup-fired event emitted to frontend"
+                ),
+                Err(e) => {
+                    warn!(wakeup_id = %wakeup.id, error = %e, "Failed to emit wakeup-fired event")
+                }
+            }
+        } else {
+            info!(wakeup_id = %wakeup.id, "Sink has no AppHandle; not emitting wakeup-fired");
         }
 
         Ok(())
@@ -249,10 +299,7 @@ async fn persist_fire_marker(
         "decision": note.unwrap_or(""),
     });
     let content = match note {
-        Some(extra) => format!(
-            "Wake-up fired: {}\n\n[risk: {}]",
-            wakeup.instruction, extra
-        ),
+        Some(extra) => format!("Wake-up fired: {}\n\n[risk: {}]", wakeup.instruction, extra),
         None => format!("Wake-up fired: {}", wakeup.instruction),
     };
     store

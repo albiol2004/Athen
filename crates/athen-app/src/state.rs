@@ -84,6 +84,15 @@ pub struct EmailMarkInfo {
 /// so the next IMAP poll re-triggers the email.
 pub type PendingEmailMarks = Arc<tokio::sync::RwLock<HashMap<Uuid, EmailMarkInfo>>>;
 
+/// Maps coordinator task ids → the wake-up id that originated them. Set
+/// by [`crate::wakeup_sink::CoordinatorWakeupSink`] alongside
+/// [`TaskArcMap`]; read by the dispatch loop so it can fetch the full
+/// `Wakeup` row and apply per-fire restrictions (autonomy band, tool
+/// allowlists, contact allowlists). `None` for sense-originated and
+/// user-driven tasks. We don't extend `Task` for this — the rule is
+/// app-layer concerns stay in side tables.
+pub type TaskWakeupMap = Arc<tokio::sync::RwLock<HashMap<Uuid, Uuid>>>;
+
 /// Wrapper to share the router via `Arc<RwLock<Arc<...>>>` while satisfying
 /// the `LlmRouter` trait.  The `RwLock` allows the inner router to be swapped
 /// at runtime (e.g. when the user switches active provider).
@@ -254,6 +263,11 @@ pub struct AppState {
     /// when it dispatches an autonomous task; consumed by the dispatch
     /// loop to persist replies into the right arc.
     pub task_arc_map: TaskArcMap,
+    /// Maps task ids → the wake-up id that fired them. Populated by
+    /// `CoordinatorWakeupSink`; consumed by the dispatch loop so the
+    /// executor can apply per-fire restrictions (autonomy band, tool /
+    /// contact allowlists). See [`TaskWakeupMap`].
+    pub task_wakeup_map: TaskWakeupMap,
     /// Maps task ids → the IMAP UID/folder to flag `\Seen` once the
     /// agent successfully acts on the originating email. Populated by
     /// the sense router for any decision that could lead to an
@@ -412,6 +426,7 @@ impl AppState {
             telegram_outbound_hint: std::sync::Arc::new(std::sync::Mutex::new(None)),
             inflight_approvals: Arc::new(Mutex::new(HashSet::new())),
             task_arc_map: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            task_wakeup_map: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             pending_email_marks: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             dispatch_signal: Arc::new(tokio::sync::Notify::new()),
             dispatch_loop_shutdown: None,
@@ -668,6 +683,28 @@ impl AppState {
         let escalation_secs = config.notifications.escalation_timeout_secs.max(15);
         router = router.with_escalation_after(std::time::Duration::from_secs(escalation_secs));
 
+        // Mirror the user's notifier preference into the approval router
+        // so approval prompts go to the same channel as completion pings
+        // (Telegram-first when configured). Without this, the user
+        // would see the completion message land on Telegram but the
+        // approval-needed prompt arrive only in-app.
+        let preferred: Vec<athen_core::approval::ReplyChannelKind> = config
+            .notifications
+            .preferred_channels
+            .iter()
+            .map(|k| match k {
+                athen_core::config::NotificationChannelKind::InApp => {
+                    athen_core::approval::ReplyChannelKind::InApp
+                }
+                athen_core::config::NotificationChannelKind::Telegram => {
+                    athen_core::approval::ReplyChannelKind::Telegram
+                }
+            })
+            .collect();
+        if !preferred.is_empty() {
+            router = router.with_preferred_channels(preferred);
+        }
+
         self.approval_router = Some(Arc::new(router));
         self.inapp_approval_sink = Some(inapp);
         self.telegram_approval_sink = telegram_sink;
@@ -808,7 +845,7 @@ impl AppState {
     /// store isn't wired or the loop is already running. Calls
     /// `arm_unscheduled(now)` first so freshly-created rows that lack a
     /// `next_fire_at` get armed before the first tick.
-    pub fn start_wakeup_scheduler(&mut self) {
+    pub fn start_wakeup_scheduler(&mut self, app_handle: tauri::AppHandle) {
         let Some(store) = self.wakeup_store.clone() else {
             tracing::debug!("No wake-up store wired; skipping scheduler");
             return;
@@ -827,7 +864,9 @@ impl AppState {
                 Arc::clone(&self.coordinator),
                 arc_store,
                 Arc::clone(&self.task_arc_map),
+                Arc::clone(&self.task_wakeup_map),
                 Arc::clone(&self.dispatch_signal),
+                Some(app_handle),
             ));
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         self.wakeup_scheduler_shutdown = Some(tx);
@@ -1196,6 +1235,8 @@ impl AppState {
         let coordinator = Arc::clone(&self.coordinator);
         let dispatch_signal = Arc::clone(&self.dispatch_signal);
         let task_arc_map = Arc::clone(&self.task_arc_map);
+        let task_wakeup_map = Arc::clone(&self.task_wakeup_map);
+        let wakeup_store = self.wakeup_store.clone();
         let pending_email_marks = Arc::clone(&self.pending_email_marks);
         let router = Arc::clone(&self.router);
         let arc_store = self._database.as_ref().map(|db| db.arc_store());
@@ -1283,6 +1324,30 @@ impl AppState {
                     };
 
                     let task_id = task.id;
+                    // Was this task fired by a wake-up? If so, fetch the
+                    // full row so the executor can apply the declared
+                    // autonomy band + (Phase 3c2) tool/contact allowlists.
+                    // Look-up failures fall through to "no wake-up" — the
+                    // task still runs, just without restrictions.
+                    let wakeup_id_opt = task_wakeup_map.read().await.get(&task.id).cloned();
+                    let wakeup_for_ctx = if let (Some(id), Some(store)) =
+                        (wakeup_id_opt, wakeup_store.as_ref())
+                    {
+                        use athen_core::traits::wakeup::WakeupStore;
+                        match store.get(id).await {
+                            Ok(Some(w)) => Some(w),
+                            Ok(None) => {
+                                tracing::debug!(wakeup_id = %id, "wake-up row missing at dispatch");
+                                None
+                            }
+                            Err(e) => {
+                                warn!(wakeup_id = %id, error = %e, "wake-up lookup failed");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     // Resolve compaction budget per task. Re-reading the
                     // config TOML each dispatch is cheap (small file, only
                     // fires on user-driven sense events) and lets the user
@@ -1328,6 +1393,7 @@ impl AppState {
                         compaction_trigger_tokens,
                         compaction_target_tokens,
                         sampling_temperature,
+                        wakeup: wakeup_for_ctx,
                         // Sense-originated tasks don't carry composer
                         // uploads; the surfacing path uses the original
                         // event_id stamped on the email/Telegram arc
@@ -1336,6 +1402,7 @@ impl AppState {
                     };
 
                     let task_arc_map_clone = Arc::clone(&task_arc_map);
+                    let task_wakeup_map_clone = Arc::clone(&task_wakeup_map);
                     let pending_email_marks_clone = Arc::clone(&pending_email_marks);
                     tauri::async_runtime::spawn(async move {
                         let outcome =
@@ -1370,6 +1437,7 @@ impl AppState {
                         // Always remove the mapping entry so the table
                         // doesn't leak even on failure.
                         task_arc_map_clone.write().await.remove(&task_id);
+                        task_wakeup_map_clone.write().await.remove(&task_id);
 
                         // Drain the pending-email-mark entry too. On
                         // success: spawn a fire-and-forget IMAP STORE

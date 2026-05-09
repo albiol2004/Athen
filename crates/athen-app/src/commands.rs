@@ -242,6 +242,9 @@ fn spawn_router_approval(
             // an upload event_id to thread through. Same rationale as
             // `message_override` above.
             upload_event_id: None,
+            // Bg approval path is for user-driven HumanConfirm flows, not
+            // wake-up fires — the autonomy directive doesn't apply.
+            wakeup: None,
         };
 
         let outcome = match execute_approved_task(task_id, ctx).await {
@@ -2037,6 +2040,8 @@ pub async fn approve_task(
         compaction_target_tokens,
         sampling_temperature,
         upload_event_id,
+        // User-driven approved-task path; wake-up directives don't apply.
+        wakeup: None,
     };
 
     let outcome = match execute_approved_task(task_uuid, ctx).await {
@@ -2177,6 +2182,12 @@ pub(crate) struct ApprovedTaskCtx {
     /// trip. `None` for sense-originated tasks and for approved turns
     /// with no composer attachments.
     pub upload_event_id: Option<uuid::Uuid>,
+    /// The wake-up that fired this task, if any. Set by the dispatch
+    /// loop after looking up `state.task_wakeup_map`. `None` for sense-
+    /// originated and user-driven tasks. The executor uses it to
+    /// prepend an autonomy directive to the system suffix and (Phase
+    /// 3c2) to apply tool / contact allowlists.
+    pub wakeup: Option<athen_core::wakeup::Wakeup>,
 }
 
 /// Drive a risk-flagged task all the way through approval, dispatch,
@@ -2438,6 +2449,50 @@ pub(crate) async fn execute_approved_task(
             }
             surfaced_images = surfacing.images;
         }
+    }
+
+    // Wake-up autonomy directive. Last block in `system_suffix` so the
+    // LLM reads it after compaction summary, memory, and surfaced
+    // attachments. Soft enforcement (the LLM must self-restrict) — the
+    // hard layer (tool/contact allowlists at registry level) ships in
+    // Phase 3c2. Today this is what tells a 3am scheduled job "you are
+    // running unattended; be conservative" and makes `NotifyOnly`
+    // visible to the model.
+    if let Some(ref w) = ctx.wakeup {
+        use athen_core::wakeup::AutonomyBand;
+        let band_directive = match w.autonomy {
+            AutonomyBand::Auto => {
+                "AUTONOMY: auto. Run anything below `Critical` risk without \
+                 prompting. Pause only on Critical actions and write a clear \
+                 stop note to the arc."
+            }
+            AutonomyBand::SafeOnly => {
+                "AUTONOMY: safe_only (default). Execute below-threshold \
+                 actions without prompting. For anything Caution or above, \
+                 stop and write a stop note to the arc — the user will see it \
+                 next time they open Athen."
+            }
+            AutonomyBand::NotifyOnly => {
+                "AUTONOMY: notify_only. You may read, summarize, and write to \
+                 this arc. You MUST NOT send any outbound message (email, \
+                 Telegram, etc.), call any contact, or trigger any external \
+                 side effect. If the instruction implies an outbound action, \
+                 stop, write what you would have sent into the arc, and exit."
+            }
+        };
+        let header = format!(
+            "[Wake-up trigger — id {}, fired by scheduler at {}]\n\
+             You were not invoked by a live user; this run is unattended. \
+             Output destination is governed by the instruction itself \
+             (write to file / send / append). The user will review the arc \
+             when they next open Athen.\n\n{band_directive}\n\n",
+            w.id,
+            chrono::Utc::now().to_rfc3339()
+        );
+        if !system_suffix.is_empty() && !system_suffix.ends_with("\n\n") {
+            system_suffix.push_str("\n\n");
+        }
+        system_suffix.push_str(&header);
     }
 
     // Build the tool registry, mirroring AppState::build_tool_registry —

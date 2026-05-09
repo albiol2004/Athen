@@ -431,13 +431,66 @@ function registerTauriEventListeners() {
     // ApprovalRouter::ask -> InAppApprovalSink, with a question_id +
     // explicit choice list. Resolved via submit_approval.
     window.__TAURI__.event.listen('approval-question', (event) => {
-        addApprovalQuestionDialog(event.payload);
+        const q = event.payload || {};
+        // Approval-question events fire from background flows like
+        // wake-ups and sense-driven autonomous tasks. Their `arc_id`
+        // may differ from the one the user is currently viewing —
+        // appending the card straight into the chat list would put it
+        // in the wrong arc and the user would never see it (the chat
+        // view might even be hidden behind Settings / Scheduled). When
+        // the question targets a different arc, surface a toast that
+        // jumps the user to that arc; the card renders the moment they
+        // arrive (loadHistory replays approval-question state via a
+        // pending queue — see `pendingApprovalQuestionsByArc`).
+        if (q.arc_id && q.arc_id !== activeArcId) {
+            stashApprovalQuestionForArc(q);
+            showSenseNotification(
+                'approval',
+                'Athen',
+                q.prompt || 'Approval needed',
+                q.description || '',
+                'high',
+                'Athen needs your approval to continue',
+                'urgent',
+                q.arc_id,
+                false,
+            );
+            return;
+        }
+        addApprovalQuestionDialog(q);
     });
     window.__TAURI__.event.listen('approval-cancel', (event) => {
         const id = event.payload;
         if (!id) return;
         const card = document.getElementById(`approval-q-${id}`);
         if (card) card.remove();
+    });
+
+    // Wake-up fired: a scheduled trigger just produced a Task and (likely)
+    // dispatched it. Refresh the arc list so the freshly-created wake-up
+    // arc appears in the sidebar, and surface a sense-event-style toast
+    // so the user knows their wake-up actually ran.
+    window.__TAURI__.event.listen('wakeup-fired', (event) => {
+        const p = event.payload || {};
+        loadArcs();
+        const decisionLabel = ({
+            silent_approve: 'running',
+            notify_and_proceed: 'running',
+            human_confirm: 'awaiting approval',
+            hard_block: 'blocked',
+            no_decision: 'no decision',
+        })[p.decision] || p.decision || '';
+        showSenseNotification(
+            'wake-up',
+            'Scheduled',
+            (p.instruction || '').slice(0, 80),
+            decisionLabel,
+            'medium',
+            `Autonomy ${p.autonomy || 'safe_only'} — ${decisionLabel}`,
+            'read',
+            p.arc_id,
+            p.decision === 'silent_approve' || p.decision === 'notify_and_proceed',
+        );
     });
 
     // Listen for sense events (email, calendar, messaging, etc.)
@@ -2601,6 +2654,28 @@ function addSummaryEntry(content, metadataRaw) {
     messagesEl.appendChild(row);
 }
 
+// Per-arc queue of approval-question payloads that arrived while the
+// user was viewing a different arc. Drained when they switch to that
+// arc — keeps the card from getting lost in the wrong chat view.
+const pendingApprovalQuestionsByArc = new Map();
+
+function stashApprovalQuestionForArc(q) {
+    if (!q || !q.id || !q.arc_id) return;
+    const list = pendingApprovalQuestionsByArc.get(q.arc_id) || [];
+    if (!list.some(existing => existing.id === q.id)) {
+        list.push(q);
+        pendingApprovalQuestionsByArc.set(q.arc_id, list);
+    }
+}
+
+function drainPendingApprovalQuestionsForActiveArc() {
+    if (!activeArcId) return;
+    const list = pendingApprovalQuestionsByArc.get(activeArcId);
+    if (!list || list.length === 0) return;
+    pendingApprovalQuestionsByArc.delete(activeArcId);
+    for (const q of list) addApprovalQuestionDialog(q);
+}
+
 async function loadHistory() {
     if (!invoke) return;
     try {
@@ -2632,6 +2707,7 @@ async function loadHistory() {
     } catch (err) {
         console.error('Failed to load history:', err);
     }
+    drainPendingApprovalQuestionsForActiveArc();
 }
 
 function addEmailEntry(content, meta) {
@@ -7810,6 +7886,7 @@ const wakeupCronTzEl = document.getElementById('wakeup-cron-tz');
 const wakeupIntervalSecsEl = document.getElementById('wakeup-interval-secs');
 const wakeupInstructionEl = document.getElementById('wakeup-instruction');
 const wakeupArcSelectEl = document.getElementById('wakeup-arc');
+const wakeupAutonomyEl = document.getElementById('wakeup-autonomy');
 
 function showWakeups() {
     if (!wakeupsView) return;
@@ -7900,6 +7977,10 @@ function openWakeupForm(existing) {
     renderWakeupCalendar();
     refreshWakeupDatetimePreview();
 
+    if (wakeupAutonomyEl) {
+        wakeupAutonomyEl.value = (existing && existing.autonomy) || 'safe_only';
+    }
+
     if (existing) {
         wakeupInstructionEl.value = existing.instruction || '';
         const kind = existing.schedule_kind || 'one_shot';
@@ -7935,14 +8016,32 @@ function openWakeupForm(existing) {
 
 async function populateWakeupArcOptions(preferredArcId) {
     if (!wakeupArcSelectEl || !invoke) return;
-    // Reset to just the "New arc" option, then append live arcs.
+    // Reset to just the "New arc" option PLUS — synchronously — a
+    // placeholder entry for the preferred arc when given, so a fast-
+    // clicking user who hits Save before list_arcs returns still
+    // submits the right arc_id. The placeholder gets replaced by the
+    // real label below if the arc shows up in `list_arcs`.
     wakeupArcSelectEl.innerHTML = '<option value="">New arc (created on fire)</option>';
+    if (preferredArcId) {
+        const placeholder = document.createElement('option');
+        placeholder.value = preferredArcId;
+        const cached = arcMetaById.get(preferredArcId);
+        placeholder.textContent = cached?.name || preferredArcId;
+        wakeupArcSelectEl.appendChild(placeholder);
+        wakeupArcSelectEl.value = preferredArcId;
+    }
     try {
         const arcs = await invoke('list_arcs');
         if (!Array.isArray(arcs)) return;
         // Drop completed arcs to keep the dropdown short and avoid
         // pointing at a stale arc.
         const live = arcs.filter(a => a && a.id && a.status !== 'completed');
+        // Capture the user's current selection (the placeholder we
+        // synchronously inserted above, OR a deliberate change made
+        // while list_arcs was in flight) so the live-list rebuild
+        // doesn't clobber it.
+        const currentSelection = wakeupArcSelectEl.value;
+        wakeupArcSelectEl.innerHTML = '<option value="">New arc (created on fire)</option>';
         // Active arc first if it's in the list, then the rest by recency.
         live.sort((a, b) => {
             if (a.id === activeArcId) return -1;
@@ -7958,12 +8057,25 @@ async function populateWakeupArcOptions(preferredArcId) {
             opt.textContent = arc.id === activeArcId ? `${label} (current)` : label;
             wakeupArcSelectEl.appendChild(opt);
         }
-        // Resolution order: explicit preferred (the wake-up's existing
-        // arc_id when editing) > current arc > none.
-        if (preferredArcId && live.some(a => a.id === preferredArcId)) {
+        // Resolution order: user already moved the dropdown > preferred
+        // (existing wake-up's arc_id) > current arc > none.
+        if (currentSelection && live.some(a => a.id === currentSelection)) {
+            wakeupArcSelectEl.value = currentSelection;
+        } else if (preferredArcId && live.some(a => a.id === preferredArcId)) {
             wakeupArcSelectEl.value = preferredArcId;
         } else if (!preferredArcId && activeArcId && live.some(a => a.id === activeArcId)) {
             wakeupArcSelectEl.value = activeArcId;
+        } else if (preferredArcId && !live.some(a => a.id === preferredArcId)) {
+            // Preferred arc isn't in the live list (deleted? completed?).
+            // Keep the placeholder we synchronously inserted at the top
+            // of this function so the wake-up still points at it on
+            // submit — resolve_target_arc will create a fresh arc on
+            // fire if the arc really is gone.
+            const placeholder = document.createElement('option');
+            placeholder.value = preferredArcId;
+            placeholder.textContent = `${preferredArcId} (not in active list)`;
+            wakeupArcSelectEl.appendChild(placeholder);
+            wakeupArcSelectEl.value = preferredArcId;
         }
     } catch (e) {
         console.warn('Failed to load arcs for wake-up picker:', e);
@@ -8065,6 +8177,7 @@ function refreshWakeupDatetimePreview() {
 function closeWakeupForm() {
     wakeupsForm?.classList.add('hidden');
     wakeupFormError?.classList.add('hidden');
+    wakeupEditingId = null;
 }
 
 function buildSchedulePayload() {
@@ -8108,22 +8221,35 @@ async function submitWakeup(ev) {
         return;
     }
     const arcId = (wakeupArcSelectEl?.value || '').trim();
+    const autonomy = (wakeupAutonomyEl?.value || 'safe_only').trim();
     const reqPayload = {
         instruction,
         schedule,
+        autonomy,
         ...(arcId ? { arc_id: arcId } : {}),
     };
     try {
+        console.log('[wakeup] submit', { editing: wakeupEditingId, payload: reqPayload });
         if (wakeupEditingId) {
             await invoke('update_wakeup', { id: wakeupEditingId, req: reqPayload });
         } else {
             await invoke('create_wakeup', { req: reqPayload });
         }
+        console.log('[wakeup] saved, closing form and reloading list');
         closeWakeupForm();
-        await loadWakeups();
     } catch (e) {
+        console.error('[wakeup] save failed:', e);
         wakeupFormError.textContent = String(e);
         wakeupFormError.classList.remove('hidden');
+        return;
+    }
+    // Reload outside the try so a render exception in loadWakeups doesn't
+    // get swallowed as a "save failed" — they're separate concerns.
+    try {
+        await loadWakeups();
+        console.log('[wakeup] list reloaded');
+    } catch (e) {
+        console.error('[wakeup] list reload failed:', e);
     }
 }
 
@@ -8157,9 +8283,17 @@ function renderWakeupRow(w) {
     nextSpan.textContent = w.next_fire_at ? `Next: ${fmtWakeupTime(w.next_fire_at)}` : 'Done';
     const lastSpan = document.createElement('span');
     lastSpan.textContent = w.last_fired_at ? `Last fired: ${fmtWakeupTime(w.last_fired_at)}` : 'Never fired';
+    const autonomySpan = document.createElement('span');
+    const autonomyLabel = ({
+        auto: 'Auto',
+        safe_only: 'Safe-only',
+        notify_only: 'Notify-only',
+    })[w.autonomy] || w.autonomy;
+    autonomySpan.textContent = `Autonomy: ${autonomyLabel}`;
     meta.appendChild(scheduleSpan);
     meta.appendChild(nextSpan);
     meta.appendChild(lastSpan);
+    meta.appendChild(autonomySpan);
     main.appendChild(instr);
     main.appendChild(meta);
 

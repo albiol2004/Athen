@@ -424,6 +424,14 @@ pub struct ApprovalRouter {
     /// How long to wait on the primary channel before also asking the
     /// escalation channel. The first answer wins; the other is cancelled.
     escalation_after: Duration,
+    /// User's preferred notification channel order, mirrored from
+    /// `config.notifications.preferred_channels`. Used as the fallback in
+    /// `pick_primary` when the arc itself has no explicit
+    /// `primary_reply_channel` — without this the approval router would
+    /// default to InApp regardless of the user's preferences, even
+    /// though the notifier orchestrator already routes completion pings
+    /// to Telegram per the same config.
+    preferred_channels: Vec<ReplyChannelKind>,
 }
 
 impl ApprovalRouter {
@@ -432,6 +440,7 @@ impl ApprovalRouter {
             sinks,
             arc_store: None,
             escalation_after: Duration::from_secs(120),
+            preferred_channels: Vec::new(),
         }
     }
 
@@ -445,6 +454,14 @@ impl ApprovalRouter {
         self
     }
 
+    /// Set the user's preferred channel order. Channels are tried in
+    /// listed order; the first one that has a matching sink and isn't
+    /// blocked by a per-arc override wins. Pass an empty vec to disable.
+    pub fn with_preferred_channels(mut self, kinds: Vec<ReplyChannelKind>) -> Self {
+        self.preferred_channels = kinds;
+        self
+    }
+
     fn find(&self, kind: ReplyChannelKind) -> Option<Arc<dyn ApprovalSink>> {
         self.sinks
             .iter()
@@ -453,26 +470,47 @@ impl ApprovalRouter {
     }
 
     /// Pick the channel to ask first, given the arc this question
-    /// belongs to. Honours an explicit `primary_reply_channel` set on
-    /// the arc; otherwise falls back to a default derived from the arc
-    /// source (Messaging → Telegram, everything else → InApp).
+    /// belongs to.
+    ///
+    /// Resolution order:
+    /// 1. Arc's explicit `primary_reply_channel` (set when the arc was
+    ///    spawned from Telegram, etc.) — strongest signal, always wins.
+    /// 2. User's `preferred_channels` from notification settings — the
+    ///    same order the notifier orchestrator already honors. Without
+    ///    this, the user would get completion pings via Telegram per
+    ///    their preference but approval prompts always in-app, which is
+    ///    surprising.
+    /// 3. Arc source heuristic (Messaging → Telegram, else InApp) as a
+    ///    last-resort default for installs with no preference set.
+    ///
+    /// Step 2/3 fall back further to InApp if a preferred channel isn't
+    /// wired (e.g. user picked Telegram but the bot isn't configured).
     pub async fn pick_primary(&self, arc_id: Option<&str>) -> ReplyChannelKind {
-        let Some(arc_id) = arc_id else {
-            return ReplyChannelKind::InApp;
+        let arc_meta = match (arc_id, &self.arc_store) {
+            (Some(id), Some(store)) => store.get_arc(id).await.ok().flatten(),
+            _ => None,
         };
-        let Some(store) = &self.arc_store else {
-            return ReplyChannelKind::InApp;
-        };
-        let Ok(Some(meta)) = store.get_arc(arc_id).await else {
-            return ReplyChannelKind::InApp;
-        };
-        if let Some(s) = meta.primary_reply_channel.as_deref() {
-            if let Some(kind) = ReplyChannelKind::from_str(s) {
+
+        // Step 1: explicit per-arc override.
+        if let Some(ref meta) = arc_meta {
+            if let Some(s) = meta.primary_reply_channel.as_deref() {
+                if let Some(kind) = ReplyChannelKind::from_str(s) {
+                    return kind;
+                }
+            }
+        }
+
+        // Step 2: user's preferred channel order. Pick the first one
+        // that has a sink wired in.
+        for &kind in &self.preferred_channels {
+            if self.find(kind).is_some() {
                 return kind;
             }
         }
-        match meta.source {
-            ArcSource::Messaging => ReplyChannelKind::Telegram,
+
+        // Step 3: arc-source heuristic, finally InApp.
+        match arc_meta.map(|m| m.source) {
+            Some(ArcSource::Messaging) => ReplyChannelKind::Telegram,
             _ => ReplyChannelKind::InApp,
         }
     }
