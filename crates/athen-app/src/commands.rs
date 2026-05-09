@@ -126,6 +126,10 @@ fn spawn_router_approval(
         compaction_trigger_tokens,
         compaction_target_tokens,
         sampling_temperature,
+        wakeup_store: state
+            .wakeup_store
+            .clone()
+            .map(|s| s as Arc<dyn athen_core::traits::wakeup::WakeupStore>),
     };
 
     tauri::async_runtime::spawn(async move {
@@ -245,6 +249,7 @@ fn spawn_router_approval(
             // Bg approval path is for user-driven HumanConfirm flows, not
             // wake-up fires — the autonomy directive doesn't apply.
             wakeup: None,
+            wakeup_store: bg_ctx.wakeup_store,
         };
 
         let outcome = match execute_approved_task(task_id, ctx).await {
@@ -330,6 +335,9 @@ struct ApprovedTaskBgCtx {
     /// construction so a mid-task settings change can't move the
     /// goalposts.
     sampling_temperature: Option<f32>,
+    /// Wake-up store, threaded into `ApprovedTaskCtx` so the executor
+    /// path can compose `create_wakeup` for the agent (Phase 5).
+    wakeup_store: Option<Arc<dyn athen_core::traits::wakeup::WakeupStore>>,
 }
 
 /// Resolve the agent profile that should drive execution for a given arc.
@@ -2042,6 +2050,10 @@ pub async fn approve_task(
         upload_event_id,
         // User-driven approved-task path; wake-up directives don't apply.
         wakeup: None,
+        wakeup_store: state
+            .wakeup_store
+            .clone()
+            .map(|s| s as Arc<dyn athen_core::traits::wakeup::WakeupStore>),
     };
 
     let outcome = match execute_approved_task(task_uuid, ctx).await {
@@ -2188,6 +2200,11 @@ pub(crate) struct ApprovedTaskCtx {
     /// prepend an autonomy directive to the system suffix and (Phase
     /// 3c2) to apply tool / contact allowlists.
     pub wakeup: Option<athen_core::wakeup::Wakeup>,
+    /// Wake-up persistence handle. When `Some`, the registry composition
+    /// adds the agent-authored `create_wakeup` tool so the agent can
+    /// schedule its own follow-ups (Phase 5). `None` in CLI / test
+    /// builds — the tool is then hidden from the agent.
+    pub wakeup_store: Option<Arc<dyn athen_core::traits::wakeup::WakeupStore>>,
 }
 
 /// Drive a risk-flagged task all the way through approval, dispatch,
@@ -2611,6 +2628,24 @@ pub(crate) async fn execute_approved_task(
         } else {
             Box::new(crate::delegation::ArcRegistryAdapter(base_registry))
         };
+
+    // Wake-up authoring layer — adds `create_wakeup` so the agent can
+    // schedule its own follow-ups. Sits between delegation and the
+    // wake-up restriction wrapper so a locked-down wake-up's
+    // tool_allowlist can still hide create_wakeup if the user wants.
+    let registry: Box<dyn athen_core::traits::tool::ToolRegistry> = match ctx.wakeup_store.clone() {
+        Some(store) => {
+            let wctx = crate::wakeup_tool::WakeupToolContext {
+                wakeup_store: store,
+                approval_router: ctx.approval_router.clone(),
+                parent_arc_id: ctx.active_arc_id.clone(),
+            };
+            Box::new(crate::wakeup_tool::WakeupAuthoringRegistry::new(
+                registry, wctx,
+            ))
+        }
+        None => registry,
+    };
 
     // Wake-up tool/contact allowlist — sits outermost so it can hide
     // tools that any inner layer (delegation, app tools, MCP) exposes.
@@ -3507,6 +3542,21 @@ pub(crate) async fn execute_dispatched_task(
         } else {
             Box::new(crate::delegation::ArcRegistryAdapter(base_registry))
         };
+
+    // Wake-up authoring layer — adds `create_wakeup`. See execute_approved_task.
+    let registry: Box<dyn athen_core::traits::tool::ToolRegistry> = match ctx.wakeup_store.clone() {
+        Some(store) => {
+            let wctx = crate::wakeup_tool::WakeupToolContext {
+                wakeup_store: store,
+                approval_router: ctx.approval_router.clone(),
+                parent_arc_id: arc_id.clone(),
+            };
+            Box::new(crate::wakeup_tool::WakeupAuthoringRegistry::new(
+                registry, wctx,
+            ))
+        }
+        None => registry,
+    };
 
     // Wake-up tool/contact allowlist — outermost. See execute_approved_task.
     let registry: Box<dyn athen_core::traits::tool::ToolRegistry> = match wakeup_restrictions {

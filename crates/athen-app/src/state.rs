@@ -567,27 +567,50 @@ impl AppState {
         // receive the bare AppToolRegistry — no delegate_to_agent — which
         // is how depth=1 is enforced.
         let base: Arc<dyn athen_core::traits::tool::ToolRegistry> = Arc::new(registry);
-        if let (Some(profile_store), Some(arc_store)) = (
-            self.profile_store.clone(),
-            self._database.as_ref().map(|db| db.arc_store()),
-        ) {
-            let ctx = crate::delegation::DelegationContext {
-                profile_store,
-                identity_store: self.identity_store.clone(),
-                arc_store,
-                llm_router: Arc::clone(&self.router),
-                parent_arc_id: arc_id.to_string(),
-                tool_doc_dir: self.tool_doc_dir.clone(),
-                app_handle: delegation_app_handle,
-                // build_tool_registry is the generic registry builder
-                // (sense events, manual chat, wake-up tool inventory). The
-                // wake-up firing path constructs its own DelegationContext
-                // with restrictions in commands.rs; this one runs without.
-                wakeup_restrictions: None,
+        let with_delegation: Box<dyn athen_core::traits::tool::ToolRegistry> =
+            if let (Some(profile_store), Some(arc_store)) = (
+                self.profile_store.clone(),
+                self._database.as_ref().map(|db| db.arc_store()),
+            ) {
+                let ctx = crate::delegation::DelegationContext {
+                    profile_store,
+                    identity_store: self.identity_store.clone(),
+                    arc_store,
+                    llm_router: Arc::clone(&self.router),
+                    parent_arc_id: arc_id.to_string(),
+                    tool_doc_dir: self.tool_doc_dir.clone(),
+                    app_handle: delegation_app_handle,
+                    // build_tool_registry is the generic registry builder
+                    // (sense events, manual chat, wake-up tool inventory). The
+                    // wake-up firing path constructs its own DelegationContext
+                    // with restrictions in commands.rs; this one runs without.
+                    wakeup_restrictions: None,
+                };
+                Box::new(crate::delegation::DelegationToolRegistry::new(base, ctx))
+            } else {
+                Box::new(crate::delegation::ArcRegistryAdapter(base))
             };
-            Box::new(crate::delegation::DelegationToolRegistry::new(base, ctx))
+
+        // Wrap with the wake-up authoring layer so the agent can call
+        // `create_wakeup` to schedule its own follow-ups. Sits OUTSIDE
+        // delegation so a wake-up declaring `delegate_to_agent` in its
+        // allowlist still works; sits INSIDE the wake-up restriction
+        // wrapper (which the firing path adds in commands.rs) so a
+        // locked-down wake-up's tool_allowlist can hide create_wakeup.
+        // Skipped when no wakeup_store is wired (CLI / test builds).
+        if let Some(store) = self.wakeup_store.clone() {
+            let store: Arc<dyn athen_core::traits::wakeup::WakeupStore> = store;
+            let ctx = crate::wakeup_tool::WakeupToolContext {
+                wakeup_store: store,
+                approval_router: self.approval_router.clone(),
+                parent_arc_id: arc_id.to_string(),
+            };
+            Box::new(crate::wakeup_tool::WakeupAuthoringRegistry::new(
+                with_delegation,
+                ctx,
+            ))
         } else {
-            Box::new(crate::delegation::ArcRegistryAdapter(base))
+            with_delegation
         }
     }
 
@@ -1404,6 +1427,9 @@ impl AppState {
                         // event_id stamped on the email/Telegram arc
                         // entry, not on the user-message entry.
                         upload_event_id: None,
+                        wakeup_store: wakeup_store
+                            .clone()
+                            .map(|s| s as Arc<dyn athen_core::traits::wakeup::WakeupStore>),
                     };
 
                     let task_arc_map_clone = Arc::clone(&task_arc_map);

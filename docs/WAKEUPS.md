@@ -1,7 +1,11 @@
-# Wake-ups (Design Doc)
+# Wake-ups
 
-**Status:** Design only — not yet implemented. Tracked as a roadmap
-item under "Athen wakes itself up at the right time."
+**Status:** Implemented (2026-05-09). All planned phases shipped:
+core types + scheduler, real coordinator dispatch, autonomy directive,
+tool/contact allowlist enforcement, UI panel, sub-agent inheritance,
+agent-authored `create_wakeup`. See `docs/IMPLEMENTATION.md` for the
+phase-by-phase wiring summary; this doc remains the conceptual
+reference for *why* it works the way it does.
 
 Athen is proactive on two axes. **Senses** cover *something happened*
 (email arrived, calendar invite, Telegram message). **Wake-ups** cover

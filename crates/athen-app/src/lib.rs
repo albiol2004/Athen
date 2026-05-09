@@ -22,6 +22,7 @@ pub(crate) mod telegram_progress;
 mod wakeup_commands;
 pub(crate) mod wakeup_registry;
 pub(crate) mod wakeup_sink;
+pub(crate) mod wakeup_tool;
 
 use state::AppState;
 
