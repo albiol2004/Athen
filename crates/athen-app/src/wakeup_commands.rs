@@ -200,6 +200,79 @@ pub async fn create_wakeup(
     Ok(WakeupView::from(&w))
 }
 
+/// Patch an existing wake-up. Same shape as `CreateWakeupReq` — every
+/// editable field gets replaced. `next_fire_at` is recomputed from the
+/// (possibly new) schedule, `last_fired_at` is preserved, `enabled` is
+/// preserved (toggle via `set_wakeup_enabled`).
+#[tauri::command]
+pub async fn update_wakeup(
+    id: String,
+    req: CreateWakeupReq,
+    state: State<'_, AppState>,
+) -> std::result::Result<WakeupView, String> {
+    let store = state
+        .wakeup_store
+        .clone()
+        .ok_or_else(|| "Wake-up store not initialized".to_string())?;
+
+    let id = Uuid::parse_str(&id).map_err(|e| format!("Invalid id: {e}"))?;
+    let existing = store
+        .get(id)
+        .await
+        .map_err(|e| format!("Lookup wakeup: {e}"))?
+        .ok_or_else(|| format!("Wake-up {id} not found"))?;
+
+    let now = Utc::now();
+    let schedule = req.schedule.into_schedule(now)?;
+    let next_fire_at = athen_scheduler::compute_next_fire(&schedule, now);
+    if next_fire_at.is_none() {
+        return Err(
+            "Schedule produced no next fire time (one-shot in the past or invalid cron)"
+                .to_string(),
+        );
+    }
+
+    let preferred_channel = match req.preferred_channel.as_deref() {
+        Some(s) => Some(parse_channel(s)?),
+        None => None,
+    };
+    let autonomy = req
+        .autonomy
+        .as_deref()
+        .map(AutonomyBand::from_str_lossy)
+        .unwrap_or(existing.autonomy);
+
+    let instruction = req.instruction.trim().to_string();
+    if instruction.is_empty() {
+        return Err("Instruction cannot be empty".into());
+    }
+
+    // Preserve identity, origin, created_at, last_fired_at, enabled.
+    // Allowlists aren't yet authorable from the form, so they survive
+    // a round-trip from whatever they were on creation.
+    let updated = Wakeup {
+        id: existing.id,
+        schedule,
+        instruction,
+        autonomy,
+        preferred_channel,
+        tool_allowlist: existing.tool_allowlist,
+        contact_allowlist: existing.contact_allowlist,
+        profile: req.profile.unwrap_or(existing.profile),
+        arc_id: req.arc_id,
+        origin: existing.origin,
+        created_at: existing.created_at,
+        last_fired_at: existing.last_fired_at,
+        next_fire_at,
+        enabled: existing.enabled,
+    };
+    store
+        .update(&updated)
+        .await
+        .map_err(|e| format!("Update wakeup: {e}"))?;
+    Ok(WakeupView::from(&updated))
+}
+
 #[tauri::command]
 pub async fn list_wakeups(
     state: State<'_, AppState>,

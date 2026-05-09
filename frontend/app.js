@@ -7869,35 +7869,79 @@ function sameDay(a, b) {
         && a.getDate() === b.getDate();
 }
 
-function openWakeupForm() {
+// Tracks which existing wake-up the form is currently editing.
+// `null` means "create a new one" (the default).
+let wakeupEditingId = null;
+
+function openWakeupForm(existing) {
     if (!wakeupsForm) return;
-    // Default the picker to "in 5 minutes" — a sane fast-fire for smoke
-    // tests and reminders authored in the moment.
-    const start = new Date(Date.now() + 5 * 60_000);
-    wakeupSelectedDate = midnight(start);
+    wakeupEditingId = existing ? existing.id : null;
+
+    // Seed the picker. For edits we pull from the existing schedule;
+    // for new ones we default to "in 5 minutes" so smoke tests fire fast.
+    let seedDate;
+    if (existing && existing.next_fire_at) {
+        seedDate = new Date(existing.next_fire_at);
+    } else if (existing && existing.schedule_kind === 'one_shot' && existing.schedule_summary) {
+        // Fallback: schedule_summary is "Once at <RFC3339>" — try to parse it.
+        const match = existing.schedule_summary.match(/Once at (.+)$/);
+        const parsed = match ? new Date(match[1]) : null;
+        seedDate = parsed && !Number.isNaN(parsed.getTime())
+            ? parsed
+            : new Date(Date.now() + 5 * 60_000);
+    } else {
+        seedDate = new Date(Date.now() + 5 * 60_000);
+    }
+    wakeupSelectedDate = midnight(seedDate);
     wakeupViewedMonth = new Date(wakeupSelectedDate.getFullYear(), wakeupSelectedDate.getMonth(), 1);
-    if (wakeupHourEl) wakeupHourEl.value = String(start.getHours());
-    if (wakeupMinuteEl) wakeupMinuteEl.value = String(start.getMinutes()).padStart(2, '0');
+    if (wakeupHourEl) wakeupHourEl.value = String(seedDate.getHours());
+    if (wakeupMinuteEl) wakeupMinuteEl.value = String(seedDate.getMinutes()).padStart(2, '0');
+
     renderWakeupCalendar();
     refreshWakeupDatetimePreview();
-    wakeupInstructionEl.value = '';
-    wakeupScheduleKindEl.value = 'one_shot';
-    setWakeupScheduleKind('one_shot');
-    populateWakeupArcOptions();
+
+    if (existing) {
+        wakeupInstructionEl.value = existing.instruction || '';
+        const kind = existing.schedule_kind || 'one_shot';
+        wakeupScheduleKindEl.value = kind;
+        setWakeupScheduleKind(kind);
+        // Cron / interval fields are best-effort: parse the summary text.
+        if (kind === 'cron') {
+            const m = (existing.schedule_summary || '').match(/Cron `([^`]+)` \(([^)]+)\)/);
+            if (m) {
+                if (wakeupCronExprEl) wakeupCronExprEl.value = m[1];
+                if (wakeupCronTzEl) wakeupCronTzEl.value = m[2];
+            }
+        } else if (kind === 'interval') {
+            const m = (existing.schedule_summary || '').match(/Every (\d+)s/);
+            if (m && wakeupIntervalSecsEl) wakeupIntervalSecsEl.value = m[1];
+        }
+    } else {
+        wakeupInstructionEl.value = '';
+        wakeupScheduleKindEl.value = 'one_shot';
+        setWakeupScheduleKind('one_shot');
+    }
+
+    populateWakeupArcOptions(existing ? existing.arc_id : null);
+
+    // Reflect mode in the submit button so the user knows what they're about to do.
+    const saveBtn = document.getElementById('wakeup-form-save');
+    if (saveBtn) saveBtn.textContent = existing ? 'Save changes' : 'Create wake-up';
+
     wakeupFormError?.classList.add('hidden');
     wakeupsForm.classList.remove('hidden');
     wakeupInstructionEl.focus();
 }
 
-async function populateWakeupArcOptions() {
+async function populateWakeupArcOptions(preferredArcId) {
     if (!wakeupArcSelectEl || !invoke) return;
     // Reset to just the "New arc" option, then append live arcs.
     wakeupArcSelectEl.innerHTML = '<option value="">New arc (created on fire)</option>';
     try {
         const arcs = await invoke('list_arcs');
         if (!Array.isArray(arcs)) return;
-        // Drop System / completed arcs from prior wake-up runs to keep
-        // the dropdown short and avoid the user picking a stale arc.
+        // Drop completed arcs to keep the dropdown short and avoid
+        // pointing at a stale arc.
         const live = arcs.filter(a => a && a.id && a.status !== 'completed');
         // Active arc first if it's in the list, then the rest by recency.
         live.sort((a, b) => {
@@ -7914,9 +7958,11 @@ async function populateWakeupArcOptions() {
             opt.textContent = arc.id === activeArcId ? `${label} (current)` : label;
             wakeupArcSelectEl.appendChild(opt);
         }
-        // Default to the current arc when present — most "remind me about
-        // THIS" flows want continuity with the arc the user is in.
-        if (activeArcId && live.some(a => a.id === activeArcId)) {
+        // Resolution order: explicit preferred (the wake-up's existing
+        // arc_id when editing) > current arc > none.
+        if (preferredArcId && live.some(a => a.id === preferredArcId)) {
+            wakeupArcSelectEl.value = preferredArcId;
+        } else if (!preferredArcId && activeArcId && live.some(a => a.id === activeArcId)) {
             wakeupArcSelectEl.value = activeArcId;
         }
     } catch (e) {
@@ -8062,14 +8108,17 @@ async function submitWakeup(ev) {
         return;
     }
     const arcId = (wakeupArcSelectEl?.value || '').trim();
+    const reqPayload = {
+        instruction,
+        schedule,
+        ...(arcId ? { arc_id: arcId } : {}),
+    };
     try {
-        await invoke('create_wakeup', {
-            req: {
-                instruction,
-                schedule,
-                ...(arcId ? { arc_id: arcId } : {}),
-            },
-        });
+        if (wakeupEditingId) {
+            await invoke('update_wakeup', { id: wakeupEditingId, req: reqPayload });
+        } else {
+            await invoke('create_wakeup', { req: reqPayload });
+        }
         closeWakeupForm();
         await loadWakeups();
     } catch (e) {
@@ -8117,6 +8166,12 @@ function renderWakeupRow(w) {
     const actions = document.createElement('div');
     actions.className = 'wakeup-row-actions';
 
+    const editBtn = document.createElement('button');
+    editBtn.className = 'btn-secondary wakeup-edit-btn';
+    editBtn.type = 'button';
+    editBtn.textContent = 'Edit';
+    editBtn.addEventListener('click', () => openWakeupForm(w));
+
     const enableBtn = document.createElement('button');
     enableBtn.className = 'btn-secondary wakeup-toggle-btn';
     enableBtn.type = 'button';
@@ -8144,6 +8199,7 @@ function renderWakeupRow(w) {
         }
     });
 
+    actions.appendChild(editBtn);
     actions.appendChild(enableBtn);
     actions.appendChild(deleteBtn);
 
@@ -8182,7 +8238,7 @@ async function loadWakeups() {
 
 if (wakeupsBtn) wakeupsBtn.addEventListener('click', showWakeups);
 if (wakeupsBack) wakeupsBack.addEventListener('click', hideWakeups);
-if (wakeupsNewBtn) wakeupsNewBtn.addEventListener('click', openWakeupForm);
+if (wakeupsNewBtn) wakeupsNewBtn.addEventListener('click', () => openWakeupForm(null));
 if (wakeupFormCancel) wakeupFormCancel.addEventListener('click', closeWakeupForm);
 if (wakeupsForm) wakeupsForm.addEventListener('submit', submitWakeup);
 if (wakeupScheduleKindEl) {

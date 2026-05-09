@@ -160,6 +160,7 @@ pub fn run() {
             commands::get_runtime_status,
             commands::install_runtime,
             wakeup_commands::create_wakeup,
+            wakeup_commands::update_wakeup,
             wakeup_commands::list_wakeups,
             wakeup_commands::delete_wakeup,
             wakeup_commands::set_wakeup_enabled,
