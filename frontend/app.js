@@ -2573,16 +2573,36 @@ function renderToolError(msg) {
     return div;
 }
 
+// Detect language from a file path, deferring to the small offline
+// highlighter loaded in syntax.js. Always-safe wrapper: if the
+// highlighter didn't load (e.g. broken bundle), we fall back to plain
+// escaped text instead of crashing the card render.
+function _hl(content, lang) {
+    if (window.AthenSyntax && typeof window.AthenSyntax.highlightCode === 'function') {
+        return window.AthenSyntax.highlightCode(content, lang);
+    }
+    return escapeHtml(content);
+}
+function _detectLang(path) {
+    if (window.AthenSyntax && typeof window.AthenSyntax.detectLanguage === 'function') {
+        return window.AthenSyntax.detectLanguage(path);
+    }
+    return null;
+}
+
 // Naive line diff: split old_string / new_string by '\n' and render
 // each as a coloured row. For exact-string Edits this matches what the
 // user actually swapped — no LCS needed because the change is already
-// minimised by definition.
+// minimised by definition. Each row gets per-language token colouring
+// on top of the red/green band so structural code highlights stay
+// visible inside the diff.
 function renderEditDiff(args, _result) {
     const oldStr = typeof args.old_string === 'string' ? args.old_string : '';
     const newStr = typeof args.new_string === 'string' ? args.new_string : '';
     if (!oldStr && !newStr) return null;
 
     const path = typeof args.path === 'string' ? args.path : '';
+    const lang = _detectLang(path);
     const wrap = document.createElement('div');
     wrap.className = 'tool-body-diff';
     if (path) {
@@ -2594,20 +2614,17 @@ function renderEditDiff(args, _result) {
 
     const block = document.createElement('pre');
     block.className = 'tool-body-diff-block';
-    const oldLines = oldStr.split('\n');
-    const newLines = newStr.split('\n');
-    for (const line of oldLines) {
-        const row = document.createElement('div');
-        row.className = 'diff-row diff-old';
-        row.textContent = '- ' + line;
-        block.appendChild(row);
-    }
-    for (const line of newLines) {
-        const row = document.createElement('div');
-        row.className = 'diff-row diff-new';
-        row.textContent = '+ ' + line;
-        block.appendChild(row);
-    }
+    const pushRows = (text, kindClass, prefix) => {
+        for (const line of text.split('\n')) {
+            const row = document.createElement('div');
+            row.className = 'diff-row ' + kindClass;
+            row.innerHTML = '<span class="diff-marker">' + prefix + '</span>' +
+                            _hl(line, lang);
+            block.appendChild(row);
+        }
+    };
+    pushRows(oldStr, 'diff-old', '- ');
+    pushRows(newStr, 'diff-new', '+ ');
     wrap.appendChild(block);
     return wrap;
 }
@@ -2629,7 +2646,7 @@ function renderReadContent(args, result) {
     }
     const pre = document.createElement('pre');
     pre.className = 'tool-body-code';
-    pre.textContent = content;
+    pre.innerHTML = _hl(content, _detectLang(path));
     wrap.appendChild(pre);
     return wrap;
 }
@@ -2648,10 +2665,17 @@ function renderWriteContent(args, result) {
     }
     const pre = document.createElement('pre');
     pre.className = 'tool-body-code';
-    pre.textContent = content;
+    pre.innerHTML = _hl(content, _detectLang(path));
     wrap.appendChild(pre);
     return wrap;
 }
+
+// Inline icons for list_directory entries. Folders get a brand-tinted
+// folder glyph so the eye sorts them out fast; files get a neutral
+// file-text icon; symlinks an arrow chip.
+const _LIST_ICON_FOLDER  = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>';
+const _LIST_ICON_FILE    = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>';
+const _LIST_ICON_SYMLINK = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/></svg>';
 
 function renderListDirectory(args, result) {
     const entries = Array.isArray(result.entries) ? result.entries : null;
@@ -2663,13 +2687,30 @@ function renderListDirectory(args, result) {
     head.textContent = `${path} (${entries.length})`;
     wrap.appendChild(head);
 
+    // Sort: directories first, then files, then symlinks; alpha within
+    // each group. Mirrors how every file manager presents the same
+    // data — far more scannable than insertion order.
+    const sorted = entries.slice().sort((a, b) => {
+        const rank = (e) => e && e.type === 'directory' ? 0 : (e && e.type === 'symlink' ? 2 : 1);
+        const dr = rank(a) - rank(b);
+        if (dr !== 0) return dr;
+        return String(a && a.name || '').localeCompare(String(b && b.name || ''));
+    });
+
     const list = document.createElement('ul');
     list.className = 'tool-body-list';
-    for (const e of entries) {
+    for (const e of sorted) {
         const li = document.createElement('li');
-        const isDir = e && e.type === 'directory';
-        li.className = isDir ? 'list-entry dir' : 'list-entry file';
-        li.textContent = isDir ? `${e.name || ''}/` : (e ? (e.name || '') : '');
+        const t = e && e.type;
+        const isDir = t === 'directory';
+        const isSym = t === 'symlink';
+        li.className = 'list-entry ' + (isDir ? 'dir' : (isSym ? 'sym' : 'file'));
+        const icon = isDir ? _LIST_ICON_FOLDER
+                   : isSym ? _LIST_ICON_SYMLINK
+                   : _LIST_ICON_FILE;
+        const name = (e && e.name) || '';
+        li.innerHTML = '<span class="list-icon">' + icon + '</span>' +
+                       '<span class="list-name">' + escapeHtml(isDir ? name + '/' : name) + '</span>';
         list.appendChild(li);
     }
     wrap.appendChild(list);
@@ -2686,9 +2727,25 @@ function renderGrep(args, result) {
     head.className = 'tool-body-path';
     head.textContent = pattern ? `"${pattern}" in ${path}` : path;
     wrap.appendChild(head);
+
     const pre = document.createElement('pre');
     pre.className = 'tool-body-code';
-    pre.textContent = matches;
+    // Highlight the matched substring inside each line so the eye
+    // jumps to it. We escape-then-mark to keep the output safe even
+    // if the pattern contains HTML metacharacters in the file.
+    if (pattern) {
+        const escaped = escapeHtml(matches);
+        // Build a literal-pattern regex that ignores ripgrep's own
+        // colour codes (we don't ship --color anyway, but stay safe).
+        try {
+            const rx = new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g');
+            pre.innerHTML = escaped.replace(rx, (m) => '<mark class="grep-match">' + m + '</mark>');
+        } catch {
+            pre.textContent = matches;
+        }
+    } else {
+        pre.textContent = matches;
+    }
     wrap.appendChild(pre);
     return wrap;
 }
@@ -2707,23 +2764,31 @@ function renderShell(args, result) {
         head.textContent = '$ ' + cmd + (exit != null ? ` → ${exit}` : '');
         wrap.appendChild(head);
     }
-    if (stdout) {
-        const pre = document.createElement('pre');
-        pre.className = 'tool-body-code';
-        pre.textContent = stdout;
-        wrap.appendChild(pre);
-    }
+    if (stdout) wrap.appendChild(_shellPre(stdout, 'tool-body-code ansi'));
     if (stderr) {
         const label = document.createElement('div');
         label.className = 'tool-body-sublabel';
         label.textContent = 'stderr';
         wrap.appendChild(label);
-        const pre = document.createElement('pre');
-        pre.className = 'tool-body-code stderr';
-        pre.textContent = stderr;
-        wrap.appendChild(pre);
+        wrap.appendChild(_shellPre(stderr, 'tool-body-code ansi stderr'));
     }
     return wrap;
+}
+
+// Render a chunk of shell output. Branches on whether the text
+// actually contains ANSI escapes — plain output (most short commands)
+// goes through `textContent` to avoid spinning up the regex parser
+// for nothing; coloured output (cargo, ls, npm, git) gets the small
+// AthenAnsi pass.
+function _shellPre(text, className) {
+    const pre = document.createElement('pre');
+    pre.className = className;
+    if (window.AthenAnsi && window.AthenAnsi.hasAnsi(text)) {
+        pre.innerHTML = window.AthenAnsi.toHtml(text);
+    } else {
+        pre.textContent = text;
+    }
+    return pre;
 }
 
 function renderWebFetch(args, result) {
@@ -2732,17 +2797,39 @@ function renderWebFetch(args, result) {
                 (typeof args.url === 'string' ? args.url : '');
     const title = typeof result.title === 'string' ? result.title : '';
     if (!content) return null;
+
     const wrap = document.createElement('div');
     if (url || title) {
         const head = document.createElement('div');
-        head.className = 'tool-body-path';
-        head.textContent = title ? `${title} — ${url}` : url;
+        head.className = 'tool-body-path web-fetch-head';
+        if (title) {
+            const t = document.createElement('span');
+            t.className = 'web-fetch-title';
+            t.textContent = title;
+            head.appendChild(t);
+        }
+        if (url) {
+            // "Open original ↗" — explicit link out instead of an
+            // iframe, avoiding the prompt-injection / tracker pile-up
+            // that comes with rendering arbitrary HTML in-window.
+            const a = document.createElement('a');
+            a.href = url;
+            a.target = '_blank';
+            a.rel = 'noopener noreferrer';
+            a.className = 'web-fetch-link';
+            a.textContent = url + ' ↗';
+            head.appendChild(a);
+        }
         wrap.appendChild(head);
     }
-    const pre = document.createElement('pre');
-    pre.className = 'tool-body-code wrap';
-    pre.textContent = content;
-    wrap.appendChild(pre);
+    // The page reader returns cleaned readability-mode markdown.
+    // Pipe it through the same renderer the assistant message bubble
+    // uses so links are clickable, headings get type, lists indent,
+    // and embedded images render — exactly what the agent saw.
+    const body = document.createElement('div');
+    body.className = 'tool-body-prose';
+    body.innerHTML = renderMarkdown(content);
+    wrap.appendChild(body);
     return wrap;
 }
 
