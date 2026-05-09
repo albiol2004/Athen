@@ -950,12 +950,11 @@ pub(crate) fn summarize_tool_call(
     args: Option<&serde_json::Value>,
     result: Option<&serde_json::Value>,
 ) -> Option<String> {
-    let s_str =
-        |v: Option<&serde_json::Value>, k: &str| -> Option<String> {
-            v.and_then(|v| v.get(k))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        };
+    let s_str = |v: Option<&serde_json::Value>, k: &str| -> Option<String> {
+        v.and_then(|v| v.get(k))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    };
     let s_u64 = |v: Option<&serde_json::Value>, k: &str| -> Option<u64> {
         v.and_then(|v| v.get(k)).and_then(|v| v.as_u64())
     };
@@ -1105,7 +1104,11 @@ fn format_wakeup_when(schedule: &serde_json::Value) -> String {
             }
             if let Some(at) = schedule.get("at").and_then(|v| v.as_str()) {
                 let pretty = chrono::DateTime::parse_from_rfc3339(at)
-                    .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
+                    .map(|d| {
+                        d.with_timezone(&chrono::Local)
+                            .format("%Y-%m-%d %H:%M")
+                            .to_string()
+                    })
                     .unwrap_or_else(|_| at.to_string());
                 return format!("at {pretty}");
             }
@@ -1116,10 +1119,7 @@ fn format_wakeup_when(schedule: &serde_json::Value) -> String {
             None => "interval".to_string(),
         },
         "cron" => {
-            let expr = schedule
-                .get("expr")
-                .and_then(|v| v.as_str())
-                .unwrap_or("?");
+            let expr = schedule.get("expr").and_then(|v| v.as_str()).unwrap_or("?");
             format!("cron: {expr}")
         }
         other => other.to_string(),
@@ -6312,9 +6312,17 @@ mod summary_tests {
 
     #[test]
     fn list_directory_uses_args_path_and_count() {
-        let out = s("list_directory", json!({ "path": "/tmp" }), json!({ "count": 3 }));
+        let out = s(
+            "list_directory",
+            json!({ "path": "/tmp" }),
+            json!({ "count": 3 }),
+        );
         assert_eq!(out.as_deref(), Some("/tmp (3 entries)"));
-        let out_one = s("list_directory", json!({ "path": "/tmp" }), json!({ "count": 1 }));
+        let out_one = s(
+            "list_directory",
+            json!({ "path": "/tmp" }),
+            json!({ "count": 1 }),
+        );
         assert_eq!(out_one.as_deref(), Some("/tmp (1 entry)"));
     }
 

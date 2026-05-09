@@ -2481,47 +2481,284 @@ function renderToolGroup(toolCalls) {
 // Build a single tool-call card. For `delegate_to_agent`, wraps the card
 // with a nested expandable view that lazily fetches the sub-arc's tool
 // calls and renders them inline (Claude-Code-style sub-agent activity).
+// For other built-in tools, wraps the card in a <details> whose body
+// shows the actual content that was read/written/fetched/edited — using
+// the args+result already persisted on the entry, so the expansion is
+// instant and stays consistent with what the agent actually saw.
 function buildToolCardBlock(meta) {
     const toolName = meta.tool || '';
     const card = buildToolCard(meta);
 
-    if (toolName !== 'delegate_to_agent') return card;
+    if (toolName === 'delegate_to_agent') {
+        const result = meta.result && typeof meta.result === 'object' ? meta.result : null;
+        const subArcId = result ? result.sub_arc_id : null;
+        if (!subArcId) return card;
 
-    const result = meta.result && typeof meta.result === 'object' ? meta.result : null;
-    const subArcId = result ? result.sub_arc_id : null;
-    if (!subArcId) return card;
+        const wrapper = document.createElement('div');
+        wrapper.className = 'tool-card-block delegate-block';
 
-    const wrapper = document.createElement('div');
-    wrapper.className = 'tool-card-block delegate-block';
+        const details = document.createElement('details');
+        details.className = 'sub-agent-steps';
+
+        const summary = document.createElement('summary');
+        summary.className = 'sub-agent-steps-summary';
+        summary.textContent = '⤷ specialist steps';
+        details.appendChild(summary);
+
+        const body = document.createElement('div');
+        body.className = 'sub-agent-steps-body';
+        body.textContent = 'Loading...';
+        details.appendChild(body);
+
+        let loaded = false;
+        details.addEventListener('toggle', async () => {
+            if (!details.open || loaded) return;
+            loaded = true;
+            try {
+                const entries = await invoke('get_arc_entries', { arcId: subArcId });
+                renderSubAgentSteps(body, entries || []);
+            } catch (e) {
+                body.textContent = `Could not load specialist steps: ${e}`;
+            }
+        });
+
+        wrapper.appendChild(card);
+        wrapper.appendChild(details);
+        return wrapper;
+    }
+
+    // Per-tool expanded body. Returns a DOM node when the tool has a
+    // recognised renderer; otherwise the card stays a flat strip.
+    const body = renderToolBody(meta);
+    if (!body) return card;
 
     const details = document.createElement('details');
-    details.className = 'sub-agent-steps';
-
+    details.className = 'tool-card-expand';
     const summary = document.createElement('summary');
-    summary.className = 'sub-agent-steps-summary';
-    summary.textContent = '⤷ specialist steps';
+    summary.className = 'tool-card-expand-summary';
+    summary.appendChild(card);
     details.appendChild(summary);
+    const bodyWrap = document.createElement('div');
+    bodyWrap.className = 'tool-card-expand-body';
+    bodyWrap.appendChild(body);
+    details.appendChild(bodyWrap);
+    return details;
+}
 
-    const body = document.createElement('div');
-    body.className = 'sub-agent-steps-body';
-    body.textContent = 'Loading...';
-    details.appendChild(body);
+// Map a tool-call's persisted metadata to a DOM body that renders what
+// happened. Returns null when no specialised renderer exists — the
+// caller falls back to a flat card with no expansion.
+function renderToolBody(meta) {
+    const tool = meta.tool || '';
+    const args = (meta.args && typeof meta.args === 'object') ? meta.args : {};
+    const result = (meta.result && typeof meta.result === 'object') ? meta.result : {};
+    const error = typeof meta.error === 'string' ? meta.error : null;
 
-    let loaded = false;
-    details.addEventListener('toggle', async () => {
-        if (!details.open || loaded) return;
-        loaded = true;
-        try {
-            const entries = await invoke('get_arc_entries', { arcId: subArcId });
-            renderSubAgentSteps(body, entries || []);
-        } catch (e) {
-            body.textContent = `Could not load specialist steps: ${e}`;
-        }
-    });
+    // Surface tool errors above any body — the user wants to see the
+    // failure mode before the (often empty) result blob.
+    const errorNode = error ? renderToolError(error) : null;
+    let main = null;
 
-    wrapper.appendChild(card);
-    wrapper.appendChild(details);
-    return wrapper;
+    switch (tool) {
+        case 'edit':            main = renderEditDiff(args, result); break;
+        case 'read':            main = renderReadContent(args, result); break;
+        case 'write':           main = renderWriteContent(args, result); break;
+        case 'list_directory':  main = renderListDirectory(args, result); break;
+        case 'grep':            main = renderGrep(args, result); break;
+        case 'web_fetch':       main = renderWebFetch(args, result); break;
+        case 'shell_execute':
+        case 'shell_spawn':     main = renderShell(args, result); break;
+        default: break;
+    }
+
+    if (!main && !errorNode) return null;
+    if (errorNode && !main) return errorNode;
+    if (main && !errorNode) return main;
+
+    const frag = document.createElement('div');
+    frag.appendChild(errorNode);
+    frag.appendChild(main);
+    return frag;
+}
+
+function renderToolError(msg) {
+    const div = document.createElement('div');
+    div.className = 'tool-body-error';
+    div.textContent = msg;
+    return div;
+}
+
+// Naive line diff: split old_string / new_string by '\n' and render
+// each as a coloured row. For exact-string Edits this matches what the
+// user actually swapped — no LCS needed because the change is already
+// minimised by definition.
+function renderEditDiff(args, _result) {
+    const oldStr = typeof args.old_string === 'string' ? args.old_string : '';
+    const newStr = typeof args.new_string === 'string' ? args.new_string : '';
+    if (!oldStr && !newStr) return null;
+
+    const path = typeof args.path === 'string' ? args.path : '';
+    const wrap = document.createElement('div');
+    wrap.className = 'tool-body-diff';
+    if (path) {
+        const head = document.createElement('div');
+        head.className = 'tool-body-path';
+        head.textContent = path;
+        wrap.appendChild(head);
+    }
+
+    const block = document.createElement('pre');
+    block.className = 'tool-body-diff-block';
+    const oldLines = oldStr.split('\n');
+    const newLines = newStr.split('\n');
+    for (const line of oldLines) {
+        const row = document.createElement('div');
+        row.className = 'diff-row diff-old';
+        row.textContent = '- ' + line;
+        block.appendChild(row);
+    }
+    for (const line of newLines) {
+        const row = document.createElement('div');
+        row.className = 'diff-row diff-new';
+        row.textContent = '+ ' + line;
+        block.appendChild(row);
+    }
+    wrap.appendChild(block);
+    return wrap;
+}
+
+function renderReadContent(args, result) {
+    const content = typeof result.content === 'string' ? result.content : '';
+    const path = typeof args.path === 'string' ? args.path : '';
+    if (!content) return null;
+    const wrap = document.createElement('div');
+    if (path) {
+        const head = document.createElement('div');
+        head.className = 'tool-body-path';
+        const totalLines = typeof result.total_lines === 'number' ? result.total_lines : null;
+        const returned = typeof result.lines_returned === 'number' ? result.lines_returned : null;
+        head.textContent = totalLines && returned && returned < totalLines
+            ? `${path} — showing ${returned} of ${totalLines} lines`
+            : path;
+        wrap.appendChild(head);
+    }
+    const pre = document.createElement('pre');
+    pre.className = 'tool-body-code';
+    pre.textContent = content;
+    wrap.appendChild(pre);
+    return wrap;
+}
+
+function renderWriteContent(args, result) {
+    const content = typeof args.content === 'string' ? args.content : '';
+    const path = typeof args.path === 'string' ? args.path : '';
+    if (!content) return null;
+    const wrap = document.createElement('div');
+    if (path) {
+        const head = document.createElement('div');
+        head.className = 'tool-body-path';
+        const bytes = typeof result.bytes_written === 'number' ? result.bytes_written : null;
+        head.textContent = bytes != null ? `${path} (${bytes} bytes)` : path;
+        wrap.appendChild(head);
+    }
+    const pre = document.createElement('pre');
+    pre.className = 'tool-body-code';
+    pre.textContent = content;
+    wrap.appendChild(pre);
+    return wrap;
+}
+
+function renderListDirectory(args, result) {
+    const entries = Array.isArray(result.entries) ? result.entries : null;
+    if (!entries) return null;
+    const path = typeof args.path === 'string' ? args.path : '.';
+    const wrap = document.createElement('div');
+    const head = document.createElement('div');
+    head.className = 'tool-body-path';
+    head.textContent = `${path} (${entries.length})`;
+    wrap.appendChild(head);
+
+    const list = document.createElement('ul');
+    list.className = 'tool-body-list';
+    for (const e of entries) {
+        const li = document.createElement('li');
+        const isDir = e && e.type === 'directory';
+        li.className = isDir ? 'list-entry dir' : 'list-entry file';
+        li.textContent = isDir ? `${e.name || ''}/` : (e ? (e.name || '') : '');
+        list.appendChild(li);
+    }
+    wrap.appendChild(list);
+    return wrap;
+}
+
+function renderGrep(args, result) {
+    const matches = typeof result.matches === 'string' ? result.matches : '';
+    if (!matches) return null;
+    const pattern = typeof args.pattern === 'string' ? args.pattern : '';
+    const path = typeof args.path === 'string' ? args.path : '.';
+    const wrap = document.createElement('div');
+    const head = document.createElement('div');
+    head.className = 'tool-body-path';
+    head.textContent = pattern ? `"${pattern}" in ${path}` : path;
+    wrap.appendChild(head);
+    const pre = document.createElement('pre');
+    pre.className = 'tool-body-code';
+    pre.textContent = matches;
+    wrap.appendChild(pre);
+    return wrap;
+}
+
+function renderShell(args, result) {
+    const cmd = typeof args.command === 'string' ? args.command : '';
+    const stdout = typeof result.stdout === 'string' ? result.stdout : '';
+    const stderr = typeof result.stderr === 'string' ? result.stderr : '';
+    const exit = (typeof result.exit_code === 'number') ? result.exit_code : null;
+    if (!cmd && !stdout && !stderr) return null;
+
+    const wrap = document.createElement('div');
+    if (cmd) {
+        const head = document.createElement('div');
+        head.className = 'tool-body-path mono';
+        head.textContent = '$ ' + cmd + (exit != null ? ` → ${exit}` : '');
+        wrap.appendChild(head);
+    }
+    if (stdout) {
+        const pre = document.createElement('pre');
+        pre.className = 'tool-body-code';
+        pre.textContent = stdout;
+        wrap.appendChild(pre);
+    }
+    if (stderr) {
+        const label = document.createElement('div');
+        label.className = 'tool-body-sublabel';
+        label.textContent = 'stderr';
+        wrap.appendChild(label);
+        const pre = document.createElement('pre');
+        pre.className = 'tool-body-code stderr';
+        pre.textContent = stderr;
+        wrap.appendChild(pre);
+    }
+    return wrap;
+}
+
+function renderWebFetch(args, result) {
+    const content = typeof result.content === 'string' ? result.content : '';
+    const url = (typeof result.url === 'string' && result.url) ||
+                (typeof args.url === 'string' ? args.url : '');
+    const title = typeof result.title === 'string' ? result.title : '';
+    if (!content) return null;
+    const wrap = document.createElement('div');
+    if (url || title) {
+        const head = document.createElement('div');
+        head.className = 'tool-body-path';
+        head.textContent = title ? `${title} — ${url}` : url;
+        wrap.appendChild(head);
+    }
+    const pre = document.createElement('pre');
+    pre.className = 'tool-body-code wrap';
+    pre.textContent = content;
+    wrap.appendChild(pre);
+    return wrap;
 }
 
 // Build the inner card element only — no wrappers, no nested rendering.

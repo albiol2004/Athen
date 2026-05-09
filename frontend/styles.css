@@ -1327,6 +1327,114 @@ header h1 {
     margin: 0;
 }
 
+/* ─── Per-tool expanded body (Read content, Edit diff, Fetch page, …) ─── */
+/* Each tool card becomes a <details> when a per-tool body renderer
+   exists. The card stays the <summary>, so the tooling layout above
+   doesn't change; clicking it reveals a code-block-style body that
+   shows what the agent actually saw or wrote. */
+.tool-card-expand {
+    display: block;
+}
+.tool-card-expand > summary.tool-card-expand-summary {
+    list-style: none;
+    cursor: pointer;
+    user-select: none;
+}
+.tool-card-expand > summary.tool-card-expand-summary::-webkit-details-marker { display: none; }
+.tool-card-expand > summary.tool-card-expand-summary > .tool-execution-card {
+    /* Subtle hover indicates clickability without competing with the
+       card's own status colours. */
+    transition: background 100ms var(--ease);
+}
+.tool-card-expand > summary.tool-card-expand-summary:hover > .tool-execution-card {
+    background: rgba(255, 255, 255, 0.025);
+}
+.tool-card-expand[open] > summary.tool-card-expand-summary > .tool-execution-card {
+    border-bottom-left-radius: 0;
+    border-bottom-right-radius: 0;
+}
+.tool-card-expand-body {
+    border: 1px solid var(--border);
+    border-top: none;
+    border-bottom-left-radius: var(--r-md);
+    border-bottom-right-radius: var(--r-md);
+    background: var(--surface-2);
+    padding: 8px 10px;
+    overflow: hidden;
+}
+.tool-body-path {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--text-3);
+    margin-bottom: 6px;
+    word-break: break-all;
+}
+.tool-body-path.mono { color: var(--text-2); }
+.tool-body-sublabel {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-3);
+    margin: 6px 0 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+.tool-body-code {
+    margin: 0;
+    padding: 8px 10px;
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm, 4px);
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--text-2);
+    max-height: 360px;
+    overflow: auto;
+    white-space: pre;
+}
+.tool-body-code.wrap { white-space: pre-wrap; word-break: break-word; }
+.tool-body-code.stderr { color: var(--danger); opacity: 0.85; }
+.tool-body-error {
+    margin-bottom: 8px;
+    padding: 6px 10px;
+    background: rgba(229, 72, 77, 0.08);
+    border: 1px solid rgba(229, 72, 77, 0.22);
+    border-radius: var(--r-sm, 4px);
+    color: var(--danger);
+    font-size: 12px;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+.tool-body-list {
+    list-style: none;
+    padding: 4px 0;
+    margin: 0;
+    max-height: 360px;
+    overflow: auto;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--text-2);
+}
+.list-entry { padding: 1px 4px; }
+.list-entry.dir { color: var(--brand-warm, var(--brand-solid)); }
+.tool-body-diff { /* container */ }
+.tool-body-diff-block {
+    margin: 0;
+    padding: 6px 0;
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm, 4px);
+    font-family: var(--mono);
+    font-size: 11.5px;
+    max-height: 360px;
+    overflow: auto;
+}
+.diff-row {
+    padding: 1px 10px;
+    white-space: pre;
+}
+.diff-row.diff-old { background: rgba(229, 72, 77, 0.08);  color: #e88a8a; }
+.diff-row.diff-new { background: rgba(123, 201, 122, 0.10); color: #8acf8a; }
+
 /* ─── delegate_to_agent inline sub-agent activity ─── */
 .tool-card-block.delegate-block {
     display: flex;
