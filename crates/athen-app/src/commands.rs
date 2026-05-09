@@ -828,6 +828,15 @@ pub(crate) struct AgentProgress {
     /// Tool arguments or result summary (truncated to ~200 chars).
     pub detail: Option<String>,
     pub arc_id: String,
+    /// Full tool arguments + result, included so the live UI can build
+    /// the same expandable body (Edit diff, Read content, Fetch page, …)
+    /// without waiting for an arc reload. `None` on non-tool steps.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub args: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Shared list of tool names that completed successfully during a turn.
@@ -1187,6 +1196,23 @@ impl StepAuditor for TauriAuditor {
         });
 
         if self.emit_progress {
+            // Ship args+result+error along with the progress event so the
+            // live UI can build the same expandable body the persisted
+            // path uses. We deliberately keep these as raw JSON Values
+            // (no truncation) — the renderer enforces its own max-height
+            // scroll. Pulling them straight from `step.output` avoids
+            // re-cloning paths and keeps the event payload aligned with
+            // what the auditor will later persist.
+            let (args, result, err) = match step.output.as_ref() {
+                Some(o) => (
+                    o.get("args").cloned(),
+                    o.get("result").cloned(),
+                    o.get("error")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                ),
+                None => (None, None, None),
+            };
             let _ = self.app_handle.emit(
                 "agent-progress",
                 AgentProgress {
@@ -1195,6 +1221,9 @@ impl StepAuditor for TauriAuditor {
                     status: format!("{:?}", step.status),
                     detail: detail.clone(),
                     arc_id: self.arc_id.clone(),
+                    args,
+                    result,
+                    error: err,
                 },
             );
         }
@@ -1602,6 +1631,9 @@ pub async fn send_message(
             status: "InProgress".to_string(),
             detail: None,
             arc_id: active_arc.clone(),
+            args: None,
+            result: None,
+            error: None,
         },
     );
 

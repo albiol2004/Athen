@@ -165,7 +165,7 @@ function registerTauriEventListeners() {
     if (!(window.__TAURI__.event && window.__TAURI__.event.listen)) return;
 
     window.__TAURI__.event.listen('agent-progress', (event) => {
-        const { step, tool_name, status, detail, arc_id } = event.payload;
+        const { step, tool_name, status, detail, arc_id, args, result, error } = event.payload;
 
         // Drop progress for arcs the user isn't currently viewing — otherwise
         // a Telegram-driven background arc renders its tool cards into
@@ -195,35 +195,20 @@ function registerTauriEventListeners() {
             }
         }
 
-        // Build the tool execution card.
-        const card = document.createElement('div');
-        const statusClass = status === 'Completed' ? 'completed' :
-                            status === 'Failed' ? 'failed' : 'in-progress';
-        const builtinIcon = builtinToolIcon(tool_name);
-        const builtinClass = builtinIcon ? ' builtin' : '';
-        card.className = `tool-execution-card ${statusClass}${builtinClass}`;
-        card.setAttribute('title', tool_name);
-
-        const statusIcon = status === 'Completed' ? '&#10003;' :
-                           status === 'Failed' ? '&#10007;' : '&#9679;';
-
-        let detailHtml = '';
-        if (detail) {
-            const truncated = detail.length > 80 ? detail.substring(0, 80) + '...' : detail;
-            detailHtml = `<span class="tool-detail">${escapeHtml(truncated)}</span>`;
-        }
-
-        const labelText = builtinIcon ? builtinToolLabel(tool_name) : tool_name;
-        const iconMarkup = builtinIcon
-            ? `<span class="tool-builtin-icon">${builtinIcon}</span>`
-            : '';
-
-        card.innerHTML =
-            `<span class="tool-status-icon">${statusIcon}</span>` +
-            iconMarkup +
-            `<span class="tool-name">${escapeHtml(labelText)}</span>` +
-            detailHtml;
-
+        // Build the live card. Reuse the same DOM constructor the
+        // rehydrated path uses, so click-to-expand bodies (Edit diff,
+        // Read content, Fetch page, …) work for the active turn too.
+        // The auditor enriches terminal events with full args+result;
+        // InProgress events stay flat (nothing to expand yet).
+        const meta = {
+            tool: tool_name,
+            status,
+            summary: detail || '',
+            args: args || null,
+            result: result || null,
+            error: error || null,
+        };
+        const card = buildToolCardBlock(meta);
         currentToolContainer.appendChild(card);
 
         // Scroll to keep latest card visible.

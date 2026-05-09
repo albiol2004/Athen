@@ -1989,6 +1989,9 @@ async fn execute_owner_telegram_message(
                 status: "InProgress".to_string(),
                 detail: Some(text.chars().take(200).collect()),
                 arc_id: arc_id.clone(),
+                args: None,
+                result: None,
+                error: None,
             },
         );
     }
