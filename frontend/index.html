@@ -897,8 +897,28 @@
                         </select>
                     </div>
                     <div class="wakeups-form-row" id="wakeup-oneshot-fields">
-                        <label for="wakeup-at">When</label>
-                        <input type="datetime-local" id="wakeup-at">
+                        <label>When</label>
+                        <div class="wakeup-datetime-picker">
+                            <div class="wakeup-quick-dates" id="wakeup-quick-dates">
+                                <button type="button" class="wakeup-preset" data-day-offset="0">Today</button>
+                                <button type="button" class="wakeup-preset" data-day-offset="1">Tomorrow</button>
+                                <button type="button" class="wakeup-preset" data-day-offset="2">+2 days</button>
+                                <button type="button" class="wakeup-preset" data-day-offset="7">+1 week</button>
+                            </div>
+                            <div class="wakeup-cal-header">
+                                <button type="button" id="wakeup-cal-prev" class="wakeup-cal-nav" aria-label="Previous month">‹</button>
+                                <span id="wakeup-cal-month-label" class="wakeup-cal-month-label"></span>
+                                <button type="button" id="wakeup-cal-next" class="wakeup-cal-nav" aria-label="Next month">›</button>
+                            </div>
+                            <div class="wakeup-cal-grid" id="wakeup-cal-grid"></div>
+                            <div class="wakeup-time-row">
+                                <label class="wakeup-sub-label">at</label>
+                                <input type="number" id="wakeup-hour" min="0" max="23" step="1" value="9" class="wakeup-time-input">
+                                <span class="wakeup-time-sep">:</span>
+                                <input type="number" id="wakeup-minute" min="0" max="59" step="1" value="0" class="wakeup-time-input">
+                                <span id="wakeup-datetime-preview" class="wakeup-relative-preview"></span>
+                            </div>
+                        </div>
                     </div>
                     <div class="wakeups-form-row hidden" id="wakeup-cron-fields">
                         <label for="wakeup-cron-expr">Cron expression</label>

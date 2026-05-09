@@ -39,6 +39,12 @@ impl NativeShell {
         command: &str,
         opts: ShellOptions<'_>,
     ) -> Result<SandboxOutput> {
+        // Same drain-gate semantics as nushell: refuse to spawn while an
+        // update is in progress so the installer can swap binaries.
+        let _permit = crate::drain::global_gate().enter().ok_or_else(|| {
+            AthenError::Other("shell unavailable: update in progress".to_string())
+        })?;
+
         debug!(command, "executing native shell command");
 
         let start = Instant::now();

@@ -4,6 +4,7 @@
 //! Fallback: native platform shell (sh/bash on Unix, cmd on Windows) for
 //! platform-specific tools.
 
+pub mod drain;
 pub mod native;
 pub mod nushell;
 

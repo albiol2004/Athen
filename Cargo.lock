@@ -297,6 +297,7 @@ dependencies = [
  "athen-risk",
  "athen-scheduler",
  "athen-sentidos",
+ "athen-shell",
  "athen-web",
  "base64 0.22.1",
  "chrono",

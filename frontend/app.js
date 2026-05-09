@@ -7797,7 +7797,14 @@ const wakeupScheduleKindEl = document.getElementById('wakeup-schedule-kind');
 const wakeupOneshotFields = document.getElementById('wakeup-oneshot-fields');
 const wakeupCronFields = document.getElementById('wakeup-cron-fields');
 const wakeupIntervalFields = document.getElementById('wakeup-interval-fields');
-const wakeupAtEl = document.getElementById('wakeup-at');
+const wakeupCalGridEl = document.getElementById('wakeup-cal-grid');
+const wakeupCalMonthLabelEl = document.getElementById('wakeup-cal-month-label');
+const wakeupCalPrevBtn = document.getElementById('wakeup-cal-prev');
+const wakeupCalNextBtn = document.getElementById('wakeup-cal-next');
+const wakeupQuickDatesEl = document.getElementById('wakeup-quick-dates');
+const wakeupHourEl = document.getElementById('wakeup-hour');
+const wakeupMinuteEl = document.getElementById('wakeup-minute');
+const wakeupDatetimePreviewEl = document.getElementById('wakeup-datetime-preview');
 const wakeupCronExprEl = document.getElementById('wakeup-cron-expr');
 const wakeupCronTzEl = document.getElementById('wakeup-cron-tz');
 const wakeupIntervalSecsEl = document.getElementById('wakeup-interval-secs');
@@ -7836,22 +7843,140 @@ function setWakeupScheduleKind(kind) {
     wakeupIntervalFields?.classList.toggle('hidden', kind !== 'interval');
 }
 
+// Inline custom datetime picker for one-shot wake-ups. Native
+// <input type="datetime-local"> freezes the WebKitGTK window — see
+// memory feedback_native_datepicker_webkitgtk.md. Everything below is
+// rendered inline in the form so there's no popup focus to fight.
+let wakeupSelectedDate = null;   // Date at midnight local — the chosen day
+let wakeupViewedMonth = null;    // Date at the 1st of the month being shown
+
+const WAKEUP_MONTH_NAMES = [
+    'January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December',
+];
+const WAKEUP_DOW_NAMES = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
+function midnight(date) {
+    const d = new Date(date);
+    d.setHours(0, 0, 0, 0);
+    return d;
+}
+
+function sameDay(a, b) {
+    return a && b && a.getFullYear() === b.getFullYear()
+        && a.getMonth() === b.getMonth()
+        && a.getDate() === b.getDate();
+}
+
 function openWakeupForm() {
     if (!wakeupsForm) return;
-    // Default the one-shot picker to "now + 1 minute" so the user can fire
-    // it almost immediately for a smoke test.
-    if (wakeupAtEl) {
-        const dt = new Date(Date.now() + 60_000);
-        // datetime-local needs YYYY-MM-DDTHH:MM in *local* time.
-        const pad = (n) => String(n).padStart(2, '0');
-        wakeupAtEl.value = `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}T${pad(dt.getHours())}:${pad(dt.getMinutes())}`;
-    }
+    // Default the picker to "in 5 minutes" — a sane fast-fire for smoke
+    // tests and reminders authored in the moment.
+    const start = new Date(Date.now() + 5 * 60_000);
+    wakeupSelectedDate = midnight(start);
+    wakeupViewedMonth = new Date(wakeupSelectedDate.getFullYear(), wakeupSelectedDate.getMonth(), 1);
+    if (wakeupHourEl) wakeupHourEl.value = String(start.getHours());
+    if (wakeupMinuteEl) wakeupMinuteEl.value = String(start.getMinutes()).padStart(2, '0');
+    renderWakeupCalendar();
+    refreshWakeupDatetimePreview();
     wakeupInstructionEl.value = '';
     wakeupScheduleKindEl.value = 'one_shot';
     setWakeupScheduleKind('one_shot');
     wakeupFormError?.classList.add('hidden');
     wakeupsForm.classList.remove('hidden');
     wakeupInstructionEl.focus();
+}
+
+function renderWakeupCalendar() {
+    if (!wakeupCalGridEl || !wakeupViewedMonth) return;
+    const monthStart = new Date(wakeupViewedMonth);
+    if (wakeupCalMonthLabelEl) {
+        wakeupCalMonthLabelEl.textContent =
+            `${WAKEUP_MONTH_NAMES[monthStart.getMonth()]} ${monthStart.getFullYear()}`;
+    }
+    wakeupCalGridEl.innerHTML = '';
+
+    // DOW header row (Mon–Sun).
+    for (const name of WAKEUP_DOW_NAMES) {
+        const h = document.createElement('div');
+        h.className = 'wakeup-cal-dow';
+        h.textContent = name;
+        wakeupCalGridEl.appendChild(h);
+    }
+
+    // First cell: the Monday on or before the 1st of the viewed month.
+    const firstOfMonth = new Date(monthStart);
+    const dow = firstOfMonth.getDay(); // 0=Sun..6=Sat
+    const offset = (dow === 0 ? 6 : dow - 1); // distance back to Monday
+    const cursor = new Date(firstOfMonth);
+    cursor.setDate(cursor.getDate() - offset);
+
+    const today = midnight(new Date());
+    // 6 weeks always — keeps grid height stable across short months.
+    for (let i = 0; i < 42; i++) {
+        const cell = document.createElement('button');
+        cell.type = 'button';
+        cell.className = 'wakeup-cal-cell';
+        cell.textContent = String(cursor.getDate());
+        const cellDate = midnight(cursor);
+        if (cellDate.getMonth() !== monthStart.getMonth()) {
+            cell.classList.add('wakeup-cal-cell-other-month');
+        }
+        if (sameDay(cellDate, today)) {
+            cell.classList.add('wakeup-cal-cell-today');
+        }
+        if (sameDay(cellDate, wakeupSelectedDate)) {
+            cell.classList.add('wakeup-cal-cell-selected');
+        }
+        const captured = new Date(cellDate);
+        cell.addEventListener('click', (ev) => {
+            ev.preventDefault();
+            wakeupSelectedDate = captured;
+            // If user clicked into prev/next-month overflow, follow them.
+            wakeupViewedMonth = new Date(captured.getFullYear(), captured.getMonth(), 1);
+            renderWakeupCalendar();
+            refreshWakeupDatetimePreview();
+        });
+        wakeupCalGridEl.appendChild(cell);
+        cursor.setDate(cursor.getDate() + 1);
+    }
+}
+
+function buildOneShotDate() {
+    if (!wakeupSelectedDate) return null;
+    const hh = parseInt(wakeupHourEl?.value, 10);
+    const mm = parseInt(wakeupMinuteEl?.value, 10);
+    if (!Number.isFinite(hh) || hh < 0 || hh > 23) return null;
+    if (!Number.isFinite(mm) || mm < 0 || mm > 59) return null;
+    const d = new Date(wakeupSelectedDate);
+    d.setHours(hh, mm, 0, 0);
+    return d;
+}
+
+function refreshWakeupDatetimePreview() {
+    if (!wakeupDatetimePreviewEl) return;
+    const d = buildOneShotDate();
+    if (!d) {
+        wakeupDatetimePreviewEl.textContent = '';
+        wakeupDatetimePreviewEl.classList.remove('wakeup-preview-error');
+        return;
+    }
+    const ms = d.getTime() - Date.now();
+    if (ms <= 0) {
+        wakeupDatetimePreviewEl.textContent = `${d.toLocaleString()}  (in the past)`;
+        wakeupDatetimePreviewEl.classList.add('wakeup-preview-error');
+        return;
+    }
+    wakeupDatetimePreviewEl.classList.remove('wakeup-preview-error');
+    const totalMin = Math.round(ms / 60_000);
+    const days = Math.floor(totalMin / 1440);
+    const hrs = Math.floor((totalMin % 1440) / 60);
+    const mins = totalMin % 60;
+    const parts = [];
+    if (days) parts.push(`${days}d`);
+    if (hrs) parts.push(`${hrs}h`);
+    if (mins || (!days && !hrs)) parts.push(`${mins}m`);
+    wakeupDatetimePreviewEl.textContent = `${d.toLocaleString()}  (in ${parts.join(' ')})`;
 }
 
 function closeWakeupForm() {
@@ -7862,13 +7987,10 @@ function closeWakeupForm() {
 function buildSchedulePayload() {
     const kind = wakeupScheduleKindEl.value;
     if (kind === 'one_shot') {
-        const v = wakeupAtEl.value;
-        if (!v) throw new Error('Pick a date and time');
-        // datetime-local has no timezone; treat as local, convert to UTC ISO.
-        const local = new Date(v);
-        if (Number.isNaN(local.getTime())) throw new Error('Invalid date');
-        if (local.getTime() <= Date.now()) throw new Error('Time must be in the future');
-        return { kind: 'one_shot', at: local.toISOString() };
+        const at = buildOneShotDate();
+        if (!at) throw new Error('Pick a date and a valid time');
+        if (at.getTime() <= Date.now()) throw new Error('Time must be in the future');
+        return { kind: 'one_shot', at: at.toISOString() };
     }
     if (kind === 'cron') {
         const expr = (wakeupCronExprEl.value || '').trim();
@@ -8024,6 +8146,37 @@ if (wakeupsForm) wakeupsForm.addEventListener('submit', submitWakeup);
 if (wakeupScheduleKindEl) {
     wakeupScheduleKindEl.addEventListener('change', () => {
         setWakeupScheduleKind(wakeupScheduleKindEl.value);
+    });
+}
+if (wakeupHourEl) wakeupHourEl.addEventListener('input', refreshWakeupDatetimePreview);
+if (wakeupMinuteEl) wakeupMinuteEl.addEventListener('input', refreshWakeupDatetimePreview);
+if (wakeupCalPrevBtn) {
+    wakeupCalPrevBtn.addEventListener('click', () => {
+        if (!wakeupViewedMonth) return;
+        wakeupViewedMonth = new Date(wakeupViewedMonth.getFullYear(), wakeupViewedMonth.getMonth() - 1, 1);
+        renderWakeupCalendar();
+    });
+}
+if (wakeupCalNextBtn) {
+    wakeupCalNextBtn.addEventListener('click', () => {
+        if (!wakeupViewedMonth) return;
+        wakeupViewedMonth = new Date(wakeupViewedMonth.getFullYear(), wakeupViewedMonth.getMonth() + 1, 1);
+        renderWakeupCalendar();
+    });
+}
+if (wakeupQuickDatesEl) {
+    wakeupQuickDatesEl.addEventListener('click', (ev) => {
+        const btn = ev.target.closest('.wakeup-preset');
+        if (!btn) return;
+        ev.preventDefault();
+        const offset = parseInt(btn.dataset.dayOffset, 10);
+        if (!Number.isFinite(offset)) return;
+        const d = midnight(new Date());
+        d.setDate(d.getDate() + offset);
+        wakeupSelectedDate = d;
+        wakeupViewedMonth = new Date(d.getFullYear(), d.getMonth(), 1);
+        renderWakeupCalendar();
+        refreshWakeupDatetimePreview();
     });
 }
 

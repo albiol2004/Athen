@@ -112,12 +112,24 @@ impl NushellShell {
             .as_ref()
             .expect("run_nushell called without nushell available");
 
+        // Hold a drain permit for the lifetime of the spawn. If the
+        // updater has begun draining in-flight shell calls, refuse to
+        // start a new one — letting it run would re-lock `nu.exe` while
+        // the installer is trying to overwrite it.
+        let _permit = crate::drain::global_gate().enter().ok_or_else(|| {
+            AthenError::Other("shell unavailable: update in progress".to_string())
+        })?;
+
         debug!(command, "executing via nushell");
 
         let start = Instant::now();
 
         let mut cmd = Command::new(nu_path);
         cmd.arg("-c").arg(command);
+        // Kill the child if the future is cancelled (timeout, drain): the
+        // bundled `nu.exe` would otherwise outlive us and keep the binary
+        // locked, defeating the very drain we're trying to do.
+        cmd.kill_on_drop(true);
         // Suppress the console window flash on Windows GUI parents.
         #[cfg(windows)]
         cmd.creation_flags(0x0800_0000);

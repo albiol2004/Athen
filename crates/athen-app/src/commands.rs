@@ -4858,10 +4858,43 @@ pub async fn install_update(app: AppHandle) -> std::result::Result<(), String> {
         .map_err(|e| format!("update check failed: {}", e))?
         .ok_or_else(|| "no update available".to_string())?;
 
-    update
-        .download_and_install(|_chunk_len, _content_len| {}, || {})
-        .await
-        .map_err(|e| format!("download/install failed: {}", e))?;
+    // Close the shell drain gate and wait for in-flight commands to
+    // finish. On Windows the installer can't overwrite the bundled
+    // `nu.exe` sidecar while it's still running — symptom is the
+    // "Error opening nu.exe to write" failure users hit on the v0.1.3
+    // → v0.1.4 update. After this returns the gate stays closed; new
+    // shell calls fail fast until the app restarts.
+    let drained = athen_shell::drain::drain_for_update(Duration::from_secs(10)).await;
+    if !drained {
+        tracing::warn!("Shell drain timed out before update; install may still hit a sidecar lock");
+    }
+
+    // Retry install on transient failures. On Windows an antivirus
+    // scanner can hold a brief handle on the sidecar even after the
+    // child exits, so a one-or-two second pause often clears it.
+    let mut last_err: Option<String> = None;
+    for attempt in 0..3 {
+        match update
+            .download_and_install(|_chunk_len, _content_len| {}, || {})
+            .await
+        {
+            Ok(()) => {
+                last_err = None;
+                break;
+            }
+            Err(e) => {
+                let msg = format!("download/install failed: {}", e);
+                tracing::warn!("update attempt {} failed: {}", attempt + 1, msg);
+                last_err = Some(msg);
+                if attempt < 2 {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+        }
+    }
+    if let Some(err) = last_err {
+        return Err(err);
+    }
 
     // Restart so the freshly installed binary takes over. On Windows the
     // installer already replaces the running .exe and `restart()` will
