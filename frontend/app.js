@@ -2264,6 +2264,27 @@ formEl.addEventListener('submit', async (e) => {
             // Re-acquire the bubble reference for finalization.
             streamingBubble = streamedRow.querySelector('.message-bubble');
             finalizeStreamingMessage(meta);
+            // Rescue path for Qwen-class models on llama.cpp `--jinja`:
+            // when the model's entire reply is wrapped in <think>...</think>,
+            // the parser routes everything to reasoning_content and the
+            // content stream stays empty — so no bubble was created above
+            // the thinking block. The non-streaming fallback in the
+            // executor still returns the promoted reasoning as
+            // `response.content`, so render it now to avoid a silent
+            // turn that visibly stops at "Thinking...".
+            if (!streamingBubble && response.content) {
+                const wrap = streamedRow.querySelector('.message-content-wrap');
+                if (wrap) {
+                    const bubble = document.createElement('div');
+                    bubble.className = 'message-bubble';
+                    bubble.innerHTML = renderMarkdown(response.content);
+                    // Sit above the meta row finalize() just appended,
+                    // so the order stays: thinking → reply → time.
+                    const metaRow = wrap.querySelector('.message-meta');
+                    if (metaRow) wrap.insertBefore(bubble, metaRow);
+                    else wrap.appendChild(bubble);
+                }
+            }
         } else {
             // No streaming happened -- render the full response at once.
             addMessage('assistant', response.content || '', meta);
