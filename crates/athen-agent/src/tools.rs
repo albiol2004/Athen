@@ -135,6 +135,51 @@ pub struct SpawnedProcess {
 /// kill in turn N a process it spawned in turn N-1.
 pub type SpawnedProcessMap = Arc<Mutex<HashMap<u32, SpawnedProcess>>>;
 
+/// Force-kill every process tracked in `map` and clear the map. Used by
+/// the auto-updater right before it overwrites the install dir: any
+/// `shell_spawn`'d watcher that's chained into `nu.exe` (cmd /C nu -c …)
+/// would otherwise hold the bundled sidecar locked. Post-update those
+/// processes would be unmanageable orphans anyway — the in-memory PID
+/// map is gone — so killing them is the right semantic.
+pub async fn kill_all_spawned(map: &SpawnedProcessMap) -> usize {
+    // Snapshot + clear under the lock so concurrent shell_spawn calls
+    // can't slip a new entry in while we iterate.
+    let pids: Vec<u32> = {
+        let mut guard = map.lock().await;
+        let pids = guard.keys().copied().collect();
+        guard.clear();
+        pids
+    };
+    if pids.is_empty() {
+        return 0;
+    }
+    tracing::info!(count = pids.len(), "killing spawned processes for update");
+    for pid in &pids {
+        kill_spawned_pid(*pid).await;
+    }
+    pids.len()
+}
+
+#[cfg(unix)]
+async fn kill_spawned_pid(pid: u32) {
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+    // Same pattern as do_shell_kill's force path: hit the process group
+    // first (children of `sh -c`), then the bare PID as a fallback.
+    let pgid = Pid::from_raw(-(pid as i32));
+    let direct = Pid::from_raw(pid as i32);
+    let _ = kill(pgid, Signal::SIGKILL);
+    let _ = kill(direct, Signal::SIGKILL);
+}
+
+#[cfg(windows)]
+async fn kill_spawned_pid(pid: u32) {
+    let mut cmd = tokio::process::Command::new("taskkill");
+    hide_console_tokio(&mut cmd);
+    cmd.arg("/PID").arg(pid.to_string()).arg("/T").arg("/F");
+    let _ = cmd.output().await;
+}
+
 /// A [`ToolRegistry`] that provides built-in tools for shell execution,
 /// filesystem operations, and in-session key-value memory,
 /// backed by [`athen_shell::Shell`].

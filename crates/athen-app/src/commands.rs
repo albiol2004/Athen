@@ -4981,7 +4981,10 @@ pub async fn open_external_url(url: String) -> std::result::Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn install_update(app: AppHandle) -> std::result::Result<(), String> {
+pub async fn install_update(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
     use tauri_plugin_updater::UpdaterExt;
 
     if detect_installer_kind() == "system" {
@@ -4999,6 +5002,17 @@ pub async fn install_update(app: AppHandle) -> std::result::Result<(), String> {
         .await
         .map_err(|e| format!("update check failed: {}", e))?
         .ok_or_else(|| "no update available".to_string())?;
+
+    // Force-kill every `shell_spawn`'d watcher before the installer
+    // starts. The agent's prompt funnels "monitor X" into shell_spawn,
+    // and on Windows the model has been observed to chain `cmd /C nu …`
+    // when raw cmd syntax fails — that nu grandchild then locks the
+    // bundled sidecar. Tracking is in-memory anyway, so anything we
+    // don't kill becomes an unmanageable orphan after restart.
+    let killed = athen_agent::kill_all_spawned(&state.spawned_processes).await;
+    if killed > 0 {
+        tracing::info!(count = killed, "killed spawned processes before update");
+    }
 
     // Close the shell drain gate and wait for in-flight commands to
     // finish. On Windows the installer can't overwrite the bundled
