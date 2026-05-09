@@ -1040,10 +1040,12 @@ pub(crate) fn summarize_tool_call(
             }
         }
         "memory_store" => s_str(args, "key"),
-        "memory_recall" => s_str(args, "query"),
+        "memory_recall" => s_str(args, "key").or_else(|| s_str(args, "query")),
         "calendar_create" => {
             let title = s_str(args, "title").unwrap_or_default();
-            let start = s_str(args, "start").unwrap_or_default();
+            let start = s_str(args, "start_time")
+                .or_else(|| s_str(args, "start"))
+                .unwrap_or_default();
             match (title.is_empty(), start.is_empty()) {
                 (true, true) => None,
                 (true, false) => Some(start),
@@ -1052,8 +1054,8 @@ pub(crate) fn summarize_tool_call(
             }
         }
         "calendar_list" => {
-            let start = s_str(args, "start_date");
-            let end = s_str(args, "end_date");
+            let start = s_str(args, "start").or_else(|| s_str(args, "start_date"));
+            let end = s_str(args, "end").or_else(|| s_str(args, "end_date"));
             match (start, end) {
                 (Some(s), Some(e)) => Some(format!("{s} → {e}")),
                 (Some(s), None) => Some(s),

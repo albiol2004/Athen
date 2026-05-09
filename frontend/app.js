@@ -2551,9 +2551,33 @@ function renderToolBody(meta) {
         case 'list_directory':  main = renderListDirectory(args, result); break;
         case 'grep':            main = renderGrep(args, result); break;
         case 'web_fetch':       main = renderWebFetch(args, result); break;
+        case 'web_search':      main = renderWebSearch(args, result); break;
         case 'shell_execute':
         case 'shell_spawn':     main = renderShell(args, result); break;
-        default: break;
+        case 'shell_kill':
+        case 'shell_logs':      main = renderShellMeta(args, result); break;
+        case 'email_send':      main = renderEmailSend(args, result); break;
+        case 'memory_store':    main = renderMemoryStore(args, result); break;
+        case 'memory_recall':   main = renderMemoryRecall(args, result); break;
+        case 'calendar_list':   main = renderCalendarList(args, result); break;
+        case 'calendar_create': main = renderCalendarCreate(args, result); break;
+        case 'calendar_update': main = renderCalendarUpdate(args, result); break;
+        case 'calendar_delete': main = renderCalendarDelete(args, result); break;
+        case 'contacts_list':   main = renderContactsList(args, result); break;
+        case 'contacts_search': main = renderContactsSearch(args, result); break;
+        case 'contacts_create': main = renderContactsCreate(args, result); break;
+        case 'contacts_update': main = renderContactsUpdate(args, result); break;
+        case 'contacts_delete': main = renderContactsDelete(args, result); break;
+        case 'install_package':       main = renderInstallPackage(args, result); break;
+        case 'uninstall_package':     main = renderUninstallPackage(args, result); break;
+        case 'list_installed_packages': main = renderListInstalledPackages(args, result); break;
+        case 'create_wakeup':   main = renderCreateWakeup(args, result); break;
+        default:
+            // No bespoke layout — fall back to a labelled-fields dump
+            // so the user still gets a structured view instead of the
+            // card showing nothing on click.
+            main = renderGenericFields(tool, args, result);
+            break;
     }
 
     if (!main && !errorNode) return null;
@@ -2831,6 +2855,498 @@ function renderWebFetch(args, result) {
     body.innerHTML = renderMarkdown(content);
     wrap.appendChild(body);
     return wrap;
+}
+
+// ─── Shared layout helpers for the labeled-fields renderer style ───
+// The vast majority of tools have the shape "small set of named values".
+// Emit each as a `Label: value` row so the user reads the content the
+// same way they would in any settings dialog.
+
+// Render an array of [label, value, opts?] tuples as a labelled-fields
+// grid. `value` may be: string | string[] | DOM Node | null. Opts:
+//   { block: true } — value spans the full row instead of sitting next
+//                     to the label (use for body text, descriptions).
+//   { mono:  true } — value rendered in monospace.
+//   { html:  true } — value is treated as already-safe HTML.
+function renderFields(rows) {
+    const wrap = document.createElement('div');
+    wrap.className = 'tool-body-fields';
+    for (const r of rows) {
+        if (!r) continue;
+        const [label, value, opts] = r;
+        const o = opts || {};
+        const isEmpty = value == null || value === '' ||
+                        (Array.isArray(value) && value.length === 0);
+        if (isEmpty) continue;
+
+        const labelEl = document.createElement('div');
+        labelEl.className = 'tool-field-label';
+        labelEl.textContent = label;
+        const valueEl = document.createElement('div');
+        valueEl.className = 'tool-field-value' +
+            (o.mono ? ' mono' : '') +
+            (o.block ? ' block' : '');
+
+        if (value instanceof Node) {
+            valueEl.appendChild(value);
+        } else if (Array.isArray(value)) {
+            // Render array values as small chips so the eye can count
+            // recipients / tags without parsing commas.
+            for (const item of value) {
+                const chip = document.createElement('span');
+                chip.className = 'tool-field-chip';
+                chip.textContent = String(item);
+                valueEl.appendChild(chip);
+            }
+        } else if (o.html) {
+            valueEl.innerHTML = String(value);
+        } else {
+            valueEl.textContent = String(value);
+        }
+
+        if (o.block) {
+            // Block rows take their own line under the label.
+            const blockWrap = document.createElement('div');
+            blockWrap.className = 'tool-field-row block';
+            blockWrap.appendChild(labelEl);
+            blockWrap.appendChild(valueEl);
+            wrap.appendChild(blockWrap);
+        } else {
+            wrap.appendChild(labelEl);
+            wrap.appendChild(valueEl);
+        }
+    }
+    return wrap.children.length ? wrap : null;
+}
+
+// Render a coloured pill — used for trust levels, autonomy bands,
+// statuses ("created", "deleted") so they stand out from neutral text.
+function renderPill(text, kind) {
+    const span = document.createElement('span');
+    span.className = 'tool-pill' + (kind ? ' tool-pill-' + kind : '');
+    span.textContent = text;
+    return span;
+}
+
+// Convenience: arrange a vertical list of cards (events, contacts,
+// search hits) inside a scrollable panel.
+function renderRowsList(rows) {
+    const wrap = document.createElement('div');
+    wrap.className = 'tool-body-rows';
+    for (const r of rows) wrap.appendChild(r);
+    return wrap;
+}
+
+// Format an ISO/RFC3339 string in local time. Returns the input
+// unchanged if parsing fails — better than swallowing the value.
+function fmtDateTime(s) {
+    if (!s) return '';
+    const d = new Date(s);
+    if (isNaN(d.getTime())) return s;
+    const opts = { year: 'numeric', month: 'short', day: '2-digit',
+                   hour: '2-digit', minute: '2-digit' };
+    try { return d.toLocaleString(undefined, opts); }
+    catch { return s; }
+}
+
+// ─── Per-tool renderers ───
+
+function renderEmailSend(args, result) {
+    const to      = Array.isArray(args.to)  ? args.to  : (args.to ? [args.to] : []);
+    const cc      = Array.isArray(args.cc)  ? args.cc  : [];
+    const bcc     = Array.isArray(args.bcc) ? args.bcc : [];
+    const subject = typeof args.subject === 'string' ? args.subject : '';
+    const bodyText = typeof args.body_text === 'string' ? args.body_text : '';
+    const bodyHtml = typeof args.body_html === 'string' ? args.body_html : '';
+    const inReplyTo = typeof args.in_reply_to === 'string' ? args.in_reply_to : '';
+    const messageId = typeof result.message_id === 'string' ? result.message_id : '';
+
+    const bodyEl = document.createElement('div');
+    bodyEl.className = 'tool-body-prose email-body';
+    if (bodyText) bodyEl.innerHTML = renderMarkdown(bodyText);
+    else if (bodyHtml) bodyEl.textContent = bodyHtml;
+
+    return renderFields([
+        ['Sent To',  to],
+        cc.length  ? ['Cc',  cc]  : null,
+        bcc.length ? ['Bcc', bcc] : null,
+        ['Subject',  subject],
+        bodyEl.children.length || bodyEl.textContent ? ['Body', bodyEl, { block: true }] : null,
+        inReplyTo  ? ['In Reply To', inReplyTo, { mono: true }] : null,
+        messageId  ? ['Message ID',  messageId, { mono: true }] : null,
+    ]);
+}
+
+function renderWebSearch(args, result) {
+    const query = typeof args.query === 'string' ? args.query : '';
+    const provider = typeof result.answered_by === 'string' ? result.answered_by
+                  : (typeof result.provider === 'string' ? result.provider : '');
+    const results = Array.isArray(result.results) ? result.results : [];
+
+    const head = renderFields([
+        ['Query', query],
+        provider ? ['Provider', provider, { mono: true }] : null,
+        ['Results', String(results.length)],
+    ]);
+    const wrap = document.createElement('div');
+    if (head) wrap.appendChild(head);
+    if (results.length) {
+        const list = document.createElement('div');
+        list.className = 'tool-body-rows search-hits';
+        for (const r of results) {
+            const row = document.createElement('div');
+            row.className = 'search-hit';
+            const title = document.createElement('a');
+            title.className = 'search-hit-title';
+            title.href = r.url || '#';
+            title.target = '_blank';
+            title.rel = 'noopener noreferrer';
+            title.textContent = r.title || r.url || '(untitled)';
+            row.appendChild(title);
+            if (r.url) {
+                const u = document.createElement('div');
+                u.className = 'search-hit-url';
+                u.textContent = r.url;
+                row.appendChild(u);
+            }
+            if (r.snippet) {
+                const s = document.createElement('div');
+                s.className = 'search-hit-snippet';
+                s.textContent = r.snippet;
+                row.appendChild(s);
+            }
+            list.appendChild(row);
+        }
+        wrap.appendChild(list);
+    }
+    return wrap.children.length ? wrap : null;
+}
+
+function renderMemoryStore(args, _result) {
+    const key   = typeof args.key   === 'string' ? args.key   : '';
+    const value = typeof args.value === 'string' ? args.value : '';
+    return renderFields([
+        ['Key',   key,   { mono: true }],
+        ['Value', value, { block: true }],
+    ]);
+}
+
+function renderMemoryRecall(args, result) {
+    const key = typeof args.key === 'string' ? args.key : '';
+    if (Array.isArray(result.keys)) {
+        return renderFields([
+            ['Stored keys', result.keys.length ? result.keys : ['(none)']],
+        ]);
+    }
+    if (result.found === false) {
+        return renderFields([
+            ['Key',    key, { mono: true }],
+            ['Result', '(not found)'],
+        ]);
+    }
+    const value = typeof result.value === 'string' ? result.value : '';
+    return renderFields([
+        ['Key',   key,   { mono: true }],
+        ['Value', value, { block: true }],
+    ]);
+}
+
+function renderCalendarList(args, result) {
+    const start = typeof args.start === 'string' ? args.start : '';
+    const end   = typeof args.end   === 'string' ? args.end   : '';
+    const events = Array.isArray(result.events) ? result.events : [];
+
+    const head = renderFields([
+        ['Range', `${fmtDateTime(start)} → ${fmtDateTime(end)}`],
+        ['Found', String(events.length)],
+    ]);
+    const wrap = document.createElement('div');
+    if (head) wrap.appendChild(head);
+    if (events.length) {
+        const list = document.createElement('div');
+        list.className = 'tool-body-rows event-list';
+        for (const e of events) {
+            const row = document.createElement('div');
+            row.className = 'event-row';
+            const title = document.createElement('div');
+            title.className = 'event-title';
+            title.textContent = e.title || '(untitled)';
+            row.appendChild(title);
+            const meta = document.createElement('div');
+            meta.className = 'event-meta';
+            const when = e.all_day
+                ? `${fmtDateTime(e.start_time)} (all day)`
+                : `${fmtDateTime(e.start_time)} → ${fmtDateTime(e.end_time)}`;
+            meta.textContent = when;
+            row.appendChild(meta);
+            if (e.location) {
+                const loc = document.createElement('div');
+                loc.className = 'event-location';
+                loc.textContent = '📍 ' + e.location;
+                row.appendChild(loc);
+            }
+            if (e.category) {
+                row.appendChild(renderPill(e.category, 'neutral'));
+            }
+            list.appendChild(row);
+        }
+        wrap.appendChild(list);
+    }
+    return wrap.children.length ? wrap : null;
+}
+
+function renderCalendarCreate(args, result) {
+    const reminders = Array.isArray(args.reminder_minutes) ? args.reminder_minutes : [];
+    return renderFields([
+        ['Title',       args.title || result.title],
+        ['Start',       fmtDateTime(args.start_time || result.start_time)],
+        ['End',         fmtDateTime(args.end_time   || result.end_time)],
+        args.all_day ? ['All Day', 'yes'] : null,
+        ['Location',    args.location],
+        ['Category',    args.category],
+        ['Recurrence',  args.recurrence],
+        reminders.length ? ['Reminders', reminders.map(m => `${m} min`)] : null,
+        args.description ? ['Description', args.description, { block: true }] : null,
+        ['Event ID',    result.id, { mono: true }],
+    ]);
+}
+
+function renderCalendarUpdate(args, _result) {
+    // Show only the fields the agent actually changed, plus the id.
+    const rows = [['Event ID', args.id, { mono: true }]];
+    const optional = [
+        ['Title',       args.title],
+        ['Start',       args.start_time ? fmtDateTime(args.start_time) : null],
+        ['End',         args.end_time   ? fmtDateTime(args.end_time)   : null],
+        ['All Day',     typeof args.all_day === 'boolean' ? (args.all_day ? 'yes' : 'no') : null],
+        ['Location',    args.location],
+        ['Category',    args.category],
+        ['Color',       args.color, { mono: true }],
+        ['Recurrence',  args.recurrence],
+        ['Reminders',   Array.isArray(args.reminder_minutes) ? args.reminder_minutes.map(m => `${m} min`) : null],
+        ['Description', args.description, { block: true }],
+    ];
+    for (const r of optional) {
+        const v = r[1];
+        if (v != null && v !== '' && !(Array.isArray(v) && v.length === 0)) rows.push(r);
+    }
+    return renderFields(rows);
+}
+
+function renderCalendarDelete(args, _result) {
+    return renderFields([
+        ['Event ID', args.id, { mono: true }],
+        ['Status', renderPill('deleted', 'danger')],
+    ]);
+}
+
+// Helper used by all contact rows. Identifiers come back as
+// [{ value, kind }] — render each as `kind: value`.
+function _contactRow(c) {
+    if (!c) return document.createTextNode('');
+    const row = document.createElement('div');
+    row.className = 'contact-row';
+    const head = document.createElement('div');
+    head.className = 'contact-head';
+    const name = document.createElement('span');
+    name.className = 'contact-name';
+    name.textContent = c.name || '(unnamed)';
+    head.appendChild(name);
+    if (c.trust_level) {
+        const trust = String(c.trust_level).toLowerCase();
+        const kind = trust === 'trusted' ? 'good'
+                  : trust === 'known'    ? 'info'
+                  : trust === 'blocked'  ? 'danger'
+                  : 'neutral';
+        head.appendChild(renderPill(c.trust_level, kind));
+    }
+    if (c.blocked) head.appendChild(renderPill('blocked', 'danger'));
+    row.appendChild(head);
+    const ids = Array.isArray(c.identifiers) ? c.identifiers : [];
+    if (ids.length) {
+        const ul = document.createElement('ul');
+        ul.className = 'contact-ids';
+        for (const i of ids) {
+            const li = document.createElement('li');
+            li.innerHTML = '<span class="contact-id-kind">' + escapeHtml(String(i.kind || '')) +
+                           '</span><span class="contact-id-value">' + escapeHtml(String(i.value || '')) + '</span>';
+            ul.appendChild(li);
+        }
+        row.appendChild(ul);
+    }
+    return row;
+}
+
+function renderContactsList(_args, result) {
+    const contacts = Array.isArray(result.contacts) ? result.contacts : [];
+    const head = renderFields([['Total', String(contacts.length)]]);
+    const wrap = document.createElement('div');
+    if (head) wrap.appendChild(head);
+    if (contacts.length) {
+        const list = document.createElement('div');
+        list.className = 'tool-body-rows';
+        for (const c of contacts) list.appendChild(_contactRow(c));
+        wrap.appendChild(list);
+    }
+    return wrap.children.length ? wrap : null;
+}
+
+function renderContactsSearch(args, result) {
+    const contacts = Array.isArray(result.contacts) ? result.contacts : [];
+    const head = renderFields([
+        ['Query', args.query],
+        ['Found', String(contacts.length)],
+    ]);
+    const wrap = document.createElement('div');
+    if (head) wrap.appendChild(head);
+    if (contacts.length) {
+        const list = document.createElement('div');
+        list.className = 'tool-body-rows';
+        for (const c of contacts) list.appendChild(_contactRow(c));
+        wrap.appendChild(list);
+    }
+    return wrap.children.length ? wrap : null;
+}
+
+function renderContactsCreate(args, result) {
+    const ids = Array.isArray(args.identifiers) ? args.identifiers : [];
+    const idChips = ids.map(i => `${i.kind || '?'}: ${i.value || ''}`);
+    return renderFields([
+        ['Name',        args.name],
+        ['Trust Level', args.trust_level || 'Neutral'],
+        ['Identifiers', idChips],
+        ['Contact ID',  (result && result.id) || (result && result.contact && result.contact.id), { mono: true }],
+    ]);
+}
+
+function renderContactsUpdate(args, _result) {
+    const ids = Array.isArray(args.identifiers)
+        ? args.identifiers.map(i => `${i.kind || '?'}: ${i.value || ''}`)
+        : null;
+    const rows = [['Contact ID', args.id, { mono: true }]];
+    if (args.name) rows.push(['Name', args.name]);
+    if (args.trust_level) rows.push(['Trust Level', args.trust_level]);
+    if (ids) rows.push(['Identifiers', ids]);
+    return renderFields(rows);
+}
+
+function renderContactsDelete(args, _result) {
+    return renderFields([
+        ['Contact ID', args.id, { mono: true }],
+        ['Status', renderPill('deleted', 'danger')],
+    ]);
+}
+
+function renderInstallPackage(args, result) {
+    return renderFields([
+        ['Runtime', args.runtime],
+        ['Package', args.package, { mono: true }],
+        ['Reason',  args.reason, { block: true }],
+        result.installed_version ? ['Installed', result.installed_version, { mono: true }] : null,
+    ]);
+}
+
+function renderUninstallPackage(args, _result) {
+    return renderFields([
+        ['Runtime', args.runtime],
+        ['Package', args.package, { mono: true }],
+    ]);
+}
+
+function renderListInstalledPackages(_args, result) {
+    // Result shape varies by version of the toolbox manifest reader;
+    // be defensive and surface whatever we find.
+    const py   = Array.isArray(result.python) ? result.python
+              : (result.runtimes && Array.isArray(result.runtimes.python) ? result.runtimes.python : []);
+    const node = Array.isArray(result.node)   ? result.node
+              : (result.runtimes && Array.isArray(result.runtimes.node)   ? result.runtimes.node   : []);
+    const fmt = (arr) => arr.map(p => typeof p === 'string' ? p : (p.name + (p.version ? `@${p.version}` : '')));
+    return renderFields([
+        py.length   ? ['Python (pip)', fmt(py)]   : null,
+        node.length ? ['Node (npm)',   fmt(node)] : null,
+        (!py.length && !node.length) ? ['Installed', '(none)'] : null,
+    ]);
+}
+
+function renderCreateWakeup(args, result) {
+    const sched = args.schedule || {};
+    let when = '';
+    if (sched.kind === 'one_shot') {
+        when = sched.in ? `in ${sched.in}` : `at ${fmtDateTime(sched.at)}`;
+    } else if (sched.kind === 'interval') {
+        when = `every ${sched.every_seconds}s`;
+    } else if (sched.kind === 'cron') {
+        when = `cron: ${sched.expr}`;
+    }
+    const tools = Array.isArray(args.tool_allowlist) ? args.tool_allowlist : [];
+    const contacts = Array.isArray(args.contact_allowlist) ? args.contact_allowlist : [];
+    const autonomy = args.autonomy || (result && result.autonomy) || 'safe_only';
+    const autonomyKind = autonomy === 'auto' ? 'warning'
+                       : autonomy === 'notify_only' ? 'info' : 'good';
+    return renderFields([
+        ['When',         when],
+        ['Instruction',  args.instruction, { block: true }],
+        ['Profile',      args.profile || 'assistant'],
+        ['Autonomy',     renderPill(autonomy, autonomyKind)],
+        tools.length    ? ['Tools',    tools]    : null,
+        contacts.length ? ['Contacts', contacts] : null,
+        args.preferred_channel ? ['Notify Via', args.preferred_channel] : null,
+        result.wakeup_id    ? ['Wake-up ID',  result.wakeup_id, { mono: true }] : null,
+        result.next_fire_at ? ['Next Fire',   fmtDateTime(result.next_fire_at)] : null,
+        result.computed_impact ? ['Computed Risk', renderPill(result.computed_impact, 'neutral')] : null,
+    ]);
+}
+
+function renderShellMeta(args, result) {
+    return renderFields([
+        ['PID',     args.pid, { mono: true }],
+        result.stdout ? ['Output', result.stdout, { block: true, mono: true }] : null,
+        result.signal ? ['Signal', result.signal] : null,
+    ]);
+}
+
+// Last-resort renderer for any tool we don't have a bespoke layout
+// for. Strips noise (timestamps, internal ids, raw blobs) and shows
+// remaining args + result entries as labelled fields. Better than the
+// card showing nothing on click; trivial to upgrade later by adding a
+// dedicated case to `renderToolBody`'s switch.
+function renderGenericFields(_tool, args, result) {
+    const NOISE = new Set([
+        'execution_time_ms', 'message', 'success',
+    ]);
+    const rows = [];
+    const pushRows = (obj, prefix) => {
+        if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return;
+        for (const [k, v] of Object.entries(obj)) {
+            if (NOISE.has(k)) continue;
+            if (v == null || v === '') continue;
+            const label = (prefix ? prefix + ' ' : '') + _humanizeKey(k);
+            if (Array.isArray(v)) {
+                if (v.length === 0) continue;
+                if (v.every(x => typeof x === 'string' || typeof x === 'number')) {
+                    rows.push([label, v.map(String)]);
+                } else {
+                    // Compact JSON for arrays of objects.
+                    rows.push([label, JSON.stringify(v), { mono: true, block: true }]);
+                }
+            } else if (typeof v === 'object') {
+                rows.push([label, JSON.stringify(v), { mono: true, block: true }]);
+            } else if (typeof v === 'string' && v.length > 80) {
+                rows.push([label, v, { block: true }]);
+            } else {
+                rows.push([label, String(v)]);
+            }
+        }
+    };
+    pushRows(args, '');
+    pushRows(result, '→');
+    return renderFields(rows);
+}
+
+function _humanizeKey(k) {
+    return String(k)
+        .replace(/[_-]+/g, ' ')
+        .replace(/\b\w/g, c => c.toUpperCase());
 }
 
 // Build the inner card element only — no wrappers, no nested rendering.
