@@ -112,6 +112,27 @@ Sub-quirks for `SeparateField` and `InlineThinkTags`:
   block from content before showing to user. Don't try to be clever
   with nested or partial tags — emit as-is when malformed.
 
+**Streaming caveat (frontend rescue path).** llama.cpp's
+`--jinja --reasoning-format` routes the entire `<think>...</think>`
+envelope into the streaming `reasoning_content` field. For Qwen-class
+models that wrap a *complete* reply (final answer + chain-of-thought)
+in one `<think>` block, the SSE stream contains only
+`is_thinking: true` chunks and the executor's `try_streaming_call`
+returns `result.content = ""`. The executor then issues a non-streaming
+fallback call where `apply_to_response`'s promotion rule above kicks in
+correctly — but the FE's "finalize streaming bubble" branch had
+already run, leaving the user with a "Thinking..." block and no answer
+bubble. The FE response handler now patches a bubble from
+`response.content` whenever the streamed row exists but contains no
+`.message-bubble`. This is a UI symptom of the empty-content streaming
+case; the backend promotion rule is unchanged. Cost: one wasted LLM
+roundtrip per all-thinking turn — a future optimization in
+`try_streaming_call` could promote `thinking → content` at end-of-stream
+so the fallback isn't needed, but doing so would either duplicate the
+text in the UI (bubble + already-streamed thinking) or require deleting
+the thinking deltas mid-render; neither is obviously better than the
+current rescue.
+
 ### Axis 3 — `TemplateStrictness`
 
 Constraint the chat template enforces. Only matters for local
