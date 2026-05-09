@@ -64,49 +64,89 @@ pub struct WakeupRestrictedRegistry {
     autonomy: AutonomyBand,
 }
 
-impl WakeupRestrictedRegistry {
-    /// Build a wrapper. `contact_store` is consulted up-front to expand
-    /// `contact_allowlist` (UUIDs) into the concrete identifier strings
-    /// the outbound tools actually receive.
-    pub async fn new(
-        inner: Box<dyn ToolRegistry>,
-        tool_allowlist: Option<Vec<String>>,
-        contact_allowlist: Option<Vec<ContactId>>,
-        autonomy: AutonomyBand,
-        contact_store: Option<Arc<dyn ContactStore>>,
-    ) -> Self {
-        let tool_allowlist = tool_allowlist
-            .filter(|v| !v.is_empty())
-            .map(|v| v.into_iter().collect::<HashSet<_>>());
+/// Sync, cloneable snapshot of a wake-up's restrictions with contacts
+/// already resolved to identifier strings. Plumbed through
+/// `DelegationContext` so `delegate_to_agent` can re-wrap the sub-agent's
+/// registry with the *same* WakeupRestrictedRegistry the parent saw —
+/// no second async contact-store lookup, no risk of drift between
+/// parent + child views of the allowlist.
+#[derive(Clone)]
+pub struct WakeupSubagentRestrictions {
+    pub tool_allowlist: Option<HashSet<String>>,
+    pub allowed_identifiers: Option<HashSet<String>>,
+    pub autonomy: AutonomyBand,
+}
 
-        let allowed_identifiers = match (&contact_allowlist, &contact_store) {
-            (Some(ids), Some(store)) if !ids.is_empty() => {
-                let mut out = HashSet::new();
-                for id in ids {
-                    match store.load(*id).await {
-                        Ok(Some(c)) => {
-                            for ident in &c.identifiers {
-                                out.insert(ident.value.trim().to_ascii_lowercase());
-                            }
-                        }
-                        _ => {
-                            tracing::warn!(
-                                contact = %id,
-                                "Wake-up contact_allowlist references unknown contact; entry skipped"
-                            );
+/// Pre-resolve a wake-up's `contact_allowlist` UUIDs into the lower-cased
+/// identifier strings outbound tools compare against. `None` when the
+/// allowlist is unset; `Some(empty)` when configured but no contact
+/// resolved (callers must treat that as fail-closed). Shared by the
+/// async `new` constructor and the commands.rs setup that builds a
+/// `WakeupSubagentRestrictions` for the delegation tool.
+pub async fn resolve_contact_identifiers(
+    contact_allowlist: Option<&[ContactId]>,
+    contact_store: Option<&Arc<dyn ContactStore>>,
+) -> Option<HashSet<String>> {
+    match (contact_allowlist, contact_store) {
+        (Some(ids), Some(store)) if !ids.is_empty() => {
+            let mut out = HashSet::new();
+            for id in ids {
+                match store.load(*id).await {
+                    Ok(Some(c)) => {
+                        for ident in &c.identifiers {
+                            out.insert(ident.value.trim().to_ascii_lowercase());
                         }
                     }
+                    _ => {
+                        tracing::warn!(
+                            contact = %id,
+                            "Wake-up contact_allowlist references unknown contact; entry skipped"
+                        );
+                    }
                 }
-                Some(out)
             }
-            _ => None,
-        };
+            Some(out)
+        }
+        _ => None,
+    }
+}
 
+/// Build a `WakeupSubagentRestrictions` from a wake-up's raw fields.
+/// Async because contact ids resolve through the contact store. Used by
+/// commands.rs once per wake-up firing — the resulting snapshot is then
+/// cloned into both the parent's wrapper and the delegation sub-agent's
+/// wrapper without a second store lookup.
+pub async fn resolve_wakeup_restrictions(
+    tool_allowlist: Option<Vec<String>>,
+    contact_allowlist: Option<&[ContactId]>,
+    autonomy: AutonomyBand,
+    contact_store: Option<&Arc<dyn ContactStore>>,
+) -> WakeupSubagentRestrictions {
+    let tool_allowlist = tool_allowlist
+        .filter(|v| !v.is_empty())
+        .map(|v| v.into_iter().collect::<HashSet<_>>());
+    let allowed_identifiers = resolve_contact_identifiers(contact_allowlist, contact_store).await;
+    WakeupSubagentRestrictions {
+        tool_allowlist,
+        allowed_identifiers,
+        autonomy,
+    }
+}
+
+impl WakeupRestrictedRegistry {
+    /// Wrap `inner` with a pre-resolved restriction set. The parent path
+    /// (commands.rs) and the delegation path (delegation.rs) both go
+    /// through here so they share the same allowlist semantics — no
+    /// "looks the same but resolves differently" drift.
+    pub fn new_with_resolved(
+        inner: Box<dyn ToolRegistry>,
+        restrictions: WakeupSubagentRestrictions,
+    ) -> Self {
         Self {
             inner,
-            tool_allowlist,
-            allowed_identifiers,
-            autonomy,
+            tool_allowlist: restrictions.tool_allowlist,
+            allowed_identifiers: restrictions.allowed_identifiers,
+            autonomy: restrictions.autonomy,
         }
     }
 
@@ -267,17 +307,20 @@ mod tests {
         }
     }
 
+    async fn mk_restrictions(
+        tool_allowlist: Option<Vec<String>>,
+        autonomy: AutonomyBand,
+    ) -> WakeupSubagentRestrictions {
+        resolve_wakeup_restrictions(tool_allowlist, None, autonomy, None).await
+    }
+
     #[tokio::test]
     async fn allowlist_filters_list_and_blocks_call() {
         let inner: Box<dyn ToolRegistry> = Box::new(FakeRegistry::default());
-        let r = WakeupRestrictedRegistry::new(
+        let r = WakeupRestrictedRegistry::new_with_resolved(
             inner,
-            Some(vec!["read".into()]),
-            None,
-            AutonomyBand::SafeOnly,
-            None,
-        )
-        .await;
+            mk_restrictions(Some(vec!["read".into()]), AutonomyBand::SafeOnly).await,
+        );
         let listed = r.list_tools().await.unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].name, "read");
@@ -292,8 +335,10 @@ mod tests {
     #[tokio::test]
     async fn notify_only_strips_outbound_tools() {
         let inner: Box<dyn ToolRegistry> = Box::new(FakeRegistry::default());
-        let r =
-            WakeupRestrictedRegistry::new(inner, None, None, AutonomyBand::NotifyOnly, None).await;
+        let r = WakeupRestrictedRegistry::new_with_resolved(
+            inner,
+            mk_restrictions(None, AutonomyBand::NotifyOnly).await,
+        );
         let listed = r.list_tools().await.unwrap();
         assert!(listed.iter().any(|t| t.name == "read"));
         assert!(!listed.iter().any(|t| t.name == "email_send"));
@@ -323,11 +368,7 @@ mod tests {
                     base_risk: BaseImpact::WritePersist,
                 }])
             }
-            async fn call_tool(
-                &self,
-                _name: &str,
-                _args: serde_json::Value,
-            ) -> Result<ToolResult> {
+            async fn call_tool(&self, _name: &str, _args: serde_json::Value) -> Result<ToolResult> {
                 Ok(ToolResult {
                     success: true,
                     output: json!({}),
@@ -337,26 +378,18 @@ mod tests {
             }
         }
         // No allowlist + no opt-in → delegate is hidden and rejected.
-        let r = WakeupRestrictedRegistry::new(
+        let r = WakeupRestrictedRegistry::new_with_resolved(
             Box::new(DelegRegistry),
-            None,
-            None,
-            AutonomyBand::Auto,
-            None,
-        )
-        .await;
+            mk_restrictions(None, AutonomyBand::Auto).await,
+        );
         assert!(r.list_tools().await.unwrap().is_empty());
         assert!(r.call_tool("delegate_to_agent", json!({})).await.is_err());
 
         // Opt-in via allowlist → delegate becomes available again.
-        let r2 = WakeupRestrictedRegistry::new(
+        let r2 = WakeupRestrictedRegistry::new_with_resolved(
             Box::new(DelegRegistry),
-            Some(vec!["delegate_to_agent".into()]),
-            None,
-            AutonomyBand::Auto,
-            None,
-        )
-        .await;
+            mk_restrictions(Some(vec!["delegate_to_agent".into()]), AutonomyBand::Auto).await,
+        );
         assert_eq!(r2.list_tools().await.unwrap().len(), 1);
         assert!(r2.call_tool("delegate_to_agent", json!({})).await.is_ok());
     }
@@ -364,7 +397,10 @@ mod tests {
     #[tokio::test]
     async fn no_allowlists_passes_through() {
         let inner: Box<dyn ToolRegistry> = Box::new(FakeRegistry::default());
-        let r = WakeupRestrictedRegistry::new(inner, None, None, AutonomyBand::Auto, None).await;
+        let r = WakeupRestrictedRegistry::new_with_resolved(
+            inner,
+            mk_restrictions(None, AutonomyBand::Auto).await,
+        );
         let listed = r.list_tools().await.unwrap();
         assert_eq!(listed.len(), 2);
         let res = r
@@ -372,5 +408,30 @@ mod tests {
             .await
             .unwrap();
         assert!(res.success);
+    }
+
+    /// The new shared resolver path produces the same restriction shape
+    /// the delegation tool gets. Locks in: tool_allowlist hashset is
+    /// `Some(non_empty)` when the input list is non-empty, `None`
+    /// otherwise; `allowed_identifiers` is `None` when no contact_store
+    /// is supplied (i.e. CLI / test paths).
+    #[tokio::test]
+    async fn resolve_wakeup_restrictions_normalizes_inputs() {
+        let r = resolve_wakeup_restrictions(Some(vec![]), None, AutonomyBand::SafeOnly, None).await;
+        assert!(r.tool_allowlist.is_none());
+        assert!(r.allowed_identifiers.is_none());
+        assert_eq!(r.autonomy, AutonomyBand::SafeOnly);
+
+        let r2 = resolve_wakeup_restrictions(
+            Some(vec!["read".into(), "write".into()]),
+            None,
+            AutonomyBand::Auto,
+            None,
+        )
+        .await;
+        let set = r2.tool_allowlist.expect("non-empty list yields Some");
+        assert_eq!(set.len(), 2);
+        assert!(set.contains("read"));
+        assert!(set.contains("write"));
     }
 }

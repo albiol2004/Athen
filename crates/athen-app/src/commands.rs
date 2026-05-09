@@ -2546,6 +2546,45 @@ pub(crate) async fn execute_approved_task(
         registry = registry.with_file_gate(Arc::new(gate));
     }
 
+    // Pre-resolve wake-up restrictions once so we can share the same
+    // snapshot between the parent's WakeupRestrictedRegistry wrapper and
+    // any sub-agent the delegation tool spawns under
+    // `inherit_restrictions = true`. Resolution lives here (not inside
+    // delegation.rs) because the contact_store lives on AppState — the
+    // delegation crate stays free of state plumbing.
+    let wakeup_restrictions: Option<crate::wakeup_registry::WakeupSubagentRestrictions> =
+        if let Some(ref w) = ctx.wakeup {
+            let contact_store_dyn: Option<Arc<dyn athen_contacts::ContactStore>> = ctx
+                .contact_store
+                .as_ref()
+                .map(|s| Arc::new(s.clone()) as Arc<dyn athen_contacts::ContactStore>);
+            Some(
+                crate::wakeup_registry::resolve_wakeup_restrictions(
+                    w.tool_allowlist.clone(),
+                    w.contact_allowlist.as_deref(),
+                    w.autonomy,
+                    contact_store_dyn.as_ref(),
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+    // Sub-agent inheritance: only propagate when the wake-up opted in.
+    // `inherit_restrictions = false` lets a delegated specialist run with
+    // its profile's natural tool surface (e.g. coder needing Tier 2 tools
+    // beyond what the wake-up itself declared).
+    let subagent_inherit = ctx
+        .wakeup
+        .as_ref()
+        .map(|w| w.inherit_restrictions)
+        .unwrap_or(false);
+    let subagent_restrictions = if subagent_inherit {
+        wakeup_restrictions.clone()
+    } else {
+        None
+    };
+
     // Wrap in DelegationToolRegistry so the agent can spawn specialists.
     // Sub-agents receive the bare AppToolRegistry — depth=1 by composition.
     let base_registry: Arc<dyn athen_core::traits::tool::ToolRegistry> = Arc::new(registry);
@@ -2560,6 +2599,7 @@ pub(crate) async fn execute_approved_task(
                     parent_arc_id: ctx.active_arc_id.clone(),
                     tool_doc_dir: ctx.tool_doc_dir.clone(),
                     app_handle: Some(ctx.app_handle.clone()),
+                    wakeup_restrictions: subagent_restrictions,
                 };
                 Box::new(crate::delegation::DelegationToolRegistry::new(
                     base_registry,
@@ -2576,24 +2616,14 @@ pub(crate) async fn execute_approved_task(
     // tools that any inner layer (delegation, app tools, MCP) exposes.
     // No-op when the task isn't a wake-up fire or when no allowlists
     // are declared and autonomy is permissive. See `wakeup_registry`.
-    let registry: Box<dyn athen_core::traits::tool::ToolRegistry> = if let Some(ref w) = ctx.wakeup
-    {
-        let contact_store_dyn: Option<Arc<dyn athen_contacts::ContactStore>> = ctx
-            .contact_store
-            .as_ref()
-            .map(|s| Arc::new(s.clone()) as Arc<dyn athen_contacts::ContactStore>);
-        Box::new(
-            crate::wakeup_registry::WakeupRestrictedRegistry::new(
+    let registry: Box<dyn athen_core::traits::tool::ToolRegistry> = match wakeup_restrictions {
+        Some(restrictions) => Box::new(
+            crate::wakeup_registry::WakeupRestrictedRegistry::new_with_resolved(
                 registry,
-                w.tool_allowlist.clone(),
-                w.contact_allowlist.clone(),
-                w.autonomy,
-                contact_store_dyn,
-            )
-            .await,
-        )
-    } else {
-        registry
+                restrictions,
+            ),
+        ),
+        None => registry,
     };
 
     let exec_router: Box<dyn LlmRouter> = Box::new(SharedRouter(Arc::clone(&ctx.router)));
@@ -3422,6 +3452,37 @@ pub(crate) async fn execute_dispatched_task(
         registry = registry.with_file_gate(Arc::new(gate));
     }
 
+    // Pre-resolve wake-up restrictions; same shape as execute_approved_task.
+    // See that function for the full design rationale.
+    let wakeup_restrictions: Option<crate::wakeup_registry::WakeupSubagentRestrictions> =
+        if let Some(ref w) = ctx.wakeup {
+            let contact_store_dyn: Option<Arc<dyn athen_contacts::ContactStore>> = ctx
+                .contact_store
+                .as_ref()
+                .map(|s| Arc::new(s.clone()) as Arc<dyn athen_contacts::ContactStore>);
+            Some(
+                crate::wakeup_registry::resolve_wakeup_restrictions(
+                    w.tool_allowlist.clone(),
+                    w.contact_allowlist.as_deref(),
+                    w.autonomy,
+                    contact_store_dyn.as_ref(),
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+    let subagent_inherit = ctx
+        .wakeup
+        .as_ref()
+        .map(|w| w.inherit_restrictions)
+        .unwrap_or(false);
+    let subagent_restrictions = if subagent_inherit {
+        wakeup_restrictions.clone()
+    } else {
+        None
+    };
+
     let base_registry: Arc<dyn athen_core::traits::tool::ToolRegistry> = Arc::new(registry);
     let registry: Box<dyn athen_core::traits::tool::ToolRegistry> =
         if let Some(profile_store) = ctx.profile_store.clone() {
@@ -3434,6 +3495,7 @@ pub(crate) async fn execute_dispatched_task(
                     parent_arc_id: arc_id.clone(),
                     tool_doc_dir: ctx.tool_doc_dir.clone(),
                     app_handle: Some(ctx.app_handle.clone()),
+                    wakeup_restrictions: subagent_restrictions,
                 };
                 Box::new(crate::delegation::DelegationToolRegistry::new(
                     base_registry,
@@ -3447,24 +3509,14 @@ pub(crate) async fn execute_dispatched_task(
         };
 
     // Wake-up tool/contact allowlist — outermost. See execute_approved_task.
-    let registry: Box<dyn athen_core::traits::tool::ToolRegistry> = if let Some(ref w) = ctx.wakeup
-    {
-        let contact_store_dyn: Option<Arc<dyn athen_contacts::ContactStore>> = ctx
-            .contact_store
-            .as_ref()
-            .map(|s| Arc::new(s.clone()) as Arc<dyn athen_contacts::ContactStore>);
-        Box::new(
-            crate::wakeup_registry::WakeupRestrictedRegistry::new(
+    let registry: Box<dyn athen_core::traits::tool::ToolRegistry> = match wakeup_restrictions {
+        Some(restrictions) => Box::new(
+            crate::wakeup_registry::WakeupRestrictedRegistry::new_with_resolved(
                 registry,
-                w.tool_allowlist.clone(),
-                w.contact_allowlist.clone(),
-                w.autonomy,
-                contact_store_dyn,
-            )
-            .await,
-        )
-    } else {
-        registry
+                restrictions,
+            ),
+        ),
+        None => registry,
     };
 
     let exec_router: Box<dyn LlmRouter> = Box::new(SharedRouter(Arc::clone(&ctx.router)));

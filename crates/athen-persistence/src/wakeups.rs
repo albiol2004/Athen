@@ -34,16 +34,24 @@ CREATE TABLE IF NOT EXISTS wakeups (
     created_at TEXT NOT NULL,
     last_fired_at TEXT,
     next_fire_at TEXT,
-    enabled INTEGER NOT NULL DEFAULT 1
+    enabled INTEGER NOT NULL DEFAULT 1,
+    inherit_restrictions INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE INDEX IF NOT EXISTS idx_wakeups_next_fire
     ON wakeups(next_fire_at) WHERE enabled = 1 AND next_fire_at IS NOT NULL;
 "#;
 
+/// Idempotent ALTER for existing DBs that pre-date the
+/// `inherit_restrictions` column. SQLite returns "duplicate column" if
+/// the column is already there — we swallow that exact error and
+/// surface anything else.
+const WAKEUPS_ADD_INHERIT_SQL: &str =
+    "ALTER TABLE wakeups ADD COLUMN inherit_restrictions INTEGER NOT NULL DEFAULT 1";
+
 const WAKEUP_COLS: &str = "id, schedule_json, instruction, autonomy, preferred_channel_json, \
      tool_allowlist_json, contact_allowlist_json, profile, arc_id, \
-     origin_json, created_at, last_fired_at, next_fire_at, enabled";
+     origin_json, created_at, last_fired_at, next_fire_at, enabled, inherit_restrictions";
 
 /// SQLite-backed wake-up store.
 #[derive(Clone)]
@@ -62,6 +70,16 @@ impl SqliteWakeupStore {
             let conn = conn.blocking_lock();
             conn.execute_batch(WAKEUPS_SCHEMA_SQL)
                 .map_err(|e| AthenError::Other(format!("Init wakeups schema: {e}")))?;
+            // Migrate older DBs that don't have inherit_restrictions yet.
+            // Duplicate-column errors mean the migration already ran.
+            if let Err(e) = conn.execute(WAKEUPS_ADD_INHERIT_SQL, []) {
+                let msg = e.to_string();
+                if !msg.contains("duplicate column name") {
+                    return Err(AthenError::Other(format!(
+                        "Migrate wakeups.inherit_restrictions: {e}"
+                    )));
+                }
+            }
             Ok(())
         })
         .await
@@ -94,6 +112,7 @@ fn read_wakeup_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Wakeup> {
     let last_fired_at_str: Option<String> = row.get(11)?;
     let next_fire_at_str: Option<String> = row.get(12)?;
     let enabled_int: i64 = row.get(13)?;
+    let inherit_restrictions_int: i64 = row.get(14)?;
 
     let parse_err = |i: usize, e: serde_json::Error| {
         rusqlite::Error::FromSqlConversionFailure(i, rusqlite::types::Type::Text, Box::new(e))
@@ -150,6 +169,7 @@ fn read_wakeup_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Wakeup> {
         preferred_channel,
         tool_allowlist,
         contact_allowlist,
+        inherit_restrictions: inherit_restrictions_int != 0,
         profile,
         arc_id,
         origin,
@@ -345,8 +365,9 @@ fn insert_or_replace(conn: &Connection, w: &Wakeup) -> Result<()> {
         "INSERT OR REPLACE INTO wakeups \
          (id, schedule_json, instruction, autonomy, preferred_channel_json, \
           tool_allowlist_json, contact_allowlist_json, profile, arc_id, \
-          origin_json, created_at, last_fired_at, next_fire_at, enabled) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+          origin_json, created_at, last_fired_at, next_fire_at, enabled, \
+          inherit_restrictions) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
         params![
             w.id.to_string(),
             schedule_json,
@@ -362,6 +383,7 @@ fn insert_or_replace(conn: &Connection, w: &Wakeup) -> Result<()> {
             w.last_fired_at.map(datetime_to_str),
             w.next_fire_at.map(datetime_to_str),
             w.enabled as i64,
+            w.inherit_restrictions as i64,
         ],
     )
     .map_err(|e| AthenError::Other(format!("Insert wakeup: {e}")))?;
@@ -395,6 +417,7 @@ mod tests {
             preferred_channel: Some(NotificationChannelKind::InApp),
             tool_allowlist: None,
             contact_allowlist: None,
+            inherit_restrictions: true,
             profile: "assistant".into(),
             arc_id: None,
             origin: WakeupOrigin::User,
@@ -423,6 +446,7 @@ mod tests {
             preferred_channel: Some(NotificationChannelKind::Telegram),
             tool_allowlist: Some(vec!["web_search".into(), "read_page".into()]),
             contact_allowlist: Some(vec![contact_id]),
+            inherit_restrictions: false,
             profile: "assistant".into(),
             arc_id: Some(arc_id.clone()),
             origin: WakeupOrigin::Agent { authoring_arc_id },
@@ -441,6 +465,7 @@ mod tests {
         assert_eq!(loaded.preferred_channel, w.preferred_channel);
         assert_eq!(loaded.tool_allowlist, w.tool_allowlist);
         assert_eq!(loaded.contact_allowlist, w.contact_allowlist);
+        assert_eq!(loaded.inherit_restrictions, w.inherit_restrictions);
         assert_eq!(loaded.profile, w.profile);
         assert_eq!(loaded.arc_id, w.arc_id);
         assert_eq!(loaded.origin, w.origin);

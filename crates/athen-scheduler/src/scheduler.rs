@@ -278,6 +278,7 @@ mod tests {
             preferred_channel: Some(NotificationChannelKind::InApp),
             tool_allowlist: None,
             contact_allowlist: None,
+            inherit_restrictions: true,
             profile: "assistant".into(),
             arc_id: None,
             origin: WakeupOrigin::User,

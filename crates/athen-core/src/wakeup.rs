@@ -38,6 +38,13 @@ pub struct Wakeup {
     /// `None` = profile defaults; `Some(list)` = outbound contact strict
     /// allowlist (Telegram chat ids, email recipients, etc.).
     pub contact_allowlist: Option<Vec<ContactId>>,
+    /// When `true` (default), sub-agents spawned via `delegate_to_agent`
+    /// inherit this wake-up's tool/contact allowlist + autonomy band. When
+    /// `false`, sub-agents run with their profile's natural tool surface
+    /// — useful when a delegated specialist genuinely needs broader tools
+    /// than the wake-up itself declares (e.g. a coder profile that must
+    /// reach Tier 2 utilities). Inheritance is the safer default.
+    pub inherit_restrictions: bool,
     /// Which agent profile runs the work.
     pub profile: String,
     /// If set, the wake-up appends to that arc. If `None`, a fresh arc is

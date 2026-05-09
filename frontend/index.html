@@ -956,6 +956,13 @@
                         <span class="wakeup-sub-label wakeup-arc-hint">When set, outbound tools (e.g. <code>email_send</code>) only accept recipients matching one of these contacts' identifiers. Leave empty to keep the default — every recipient your profile permits.</span>
                         <div id="wakeup-contact-list" class="wakeup-allowlist"></div>
                     </div>
+                    <div class="wakeups-form-row wakeup-inherit-row">
+                        <label class="wakeup-inherit-label">
+                            <input type="checkbox" id="wakeup-inherit-restrictions" checked>
+                            <span>Sub-agents inherit these restrictions</span>
+                        </label>
+                        <span class="wakeup-sub-label wakeup-arc-hint">When checked, any specialist agent spawned via <code>delegate_to_agent</code> uses the same tool/contact allowlist + autonomy band as this wake-up. Uncheck to let the specialist run with its profile's natural tool surface — useful when the delegate genuinely needs broader tools than the wake-up itself declares.</span>
+                    </div>
                     <div class="wakeups-form-actions">
                         <button type="button" id="wakeup-form-cancel" class="btn-secondary">Cancel</button>
                         <button type="submit" id="wakeup-form-save" class="btn-primary">Create wake-up</button>

@@ -38,6 +38,9 @@ pub struct WakeupView {
     pub tool_allowlist: Option<Vec<String>>,
     /// Contact UUIDs (as strings) allowed as outbound recipients.
     pub contact_allowlist: Option<Vec<String>>,
+    /// When `true`, sub-agents spawned via `delegate_to_agent` inherit
+    /// the wake-up's restrictions. Default for new wake-ups.
+    pub inherit_restrictions: bool,
 }
 
 impl From<&Wakeup> for WakeupView {
@@ -78,6 +81,7 @@ impl From<&Wakeup> for WakeupView {
                 .contact_allowlist
                 .as_ref()
                 .map(|v| v.iter().map(|c| c.to_string()).collect()),
+            inherit_restrictions: w.inherit_restrictions,
         }
     }
 }
@@ -103,6 +107,11 @@ pub struct CreateWakeupReq {
     /// When `Some(non_empty)`, outbound tools (today: `email_send`) only
     /// accept recipients whose identifiers belong to one of these contacts.
     pub contact_allowlist: Option<Vec<String>>,
+    /// When `true` (default), sub-agents spawned via `delegate_to_agent`
+    /// inherit this wake-up's tool/contact allowlist + autonomy band.
+    /// `None` from the frontend = use the existing value (on update) or
+    /// `true` (on create).
+    pub inherit_restrictions: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -194,6 +203,10 @@ pub async fn create_wakeup(
 
     let tool_allowlist = sanitize_tool_allowlist(req.tool_allowlist);
     let contact_allowlist = parse_contact_allowlist(req.contact_allowlist)?;
+    // Default true: sub-agents inherit the wake-up's tool/contact
+    // allowlist + autonomy band. Users opt out per wake-up when a
+    // delegated specialist needs broader tools.
+    let inherit_restrictions = req.inherit_restrictions.unwrap_or(true);
 
     let w = Wakeup {
         id: Uuid::new_v4(),
@@ -203,6 +216,7 @@ pub async fn create_wakeup(
         preferred_channel,
         tool_allowlist,
         contact_allowlist,
+        inherit_restrictions,
         profile: req.profile.unwrap_or_else(|| "assistant".to_string()),
         arc_id: req.arc_id,
         origin: WakeupOrigin::User,
@@ -270,6 +284,9 @@ pub async fn update_wakeup(
 
     let tool_allowlist = sanitize_tool_allowlist(req.tool_allowlist);
     let contact_allowlist = parse_contact_allowlist(req.contact_allowlist)?;
+    let inherit_restrictions = req
+        .inherit_restrictions
+        .unwrap_or(existing.inherit_restrictions);
 
     // Preserve identity, origin, created_at, last_fired_at, enabled.
     let updated = Wakeup {
@@ -280,6 +297,7 @@ pub async fn update_wakeup(
         preferred_channel,
         tool_allowlist,
         contact_allowlist,
+        inherit_restrictions,
         profile: req.profile.unwrap_or(existing.profile),
         arc_id: req.arc_id,
         origin: existing.origin,

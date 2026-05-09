@@ -234,10 +234,7 @@ impl FileGate {
     /// Returns true when this tool name is a file-touching operation the
     /// gate must intercept.
     pub fn is_file_tool(name: &str) -> bool {
-        matches!(
-            name,
-            "read" | "edit" | "write" | "grep" | "list_directory"
-        )
+        matches!(name, "read" | "edit" | "write" | "grep" | "list_directory")
     }
 
     /// Map a tool name to the access kind it needs, for risk classification.

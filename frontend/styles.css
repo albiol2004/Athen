@@ -4934,6 +4934,30 @@ option:hover {
     margin-top: 8px;
 }
 
+.wakeup-inherit-row {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+}
+
+.wakeup-inherit-label {
+    display: flex !important;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px !important;
+    color: var(--text-1) !important;
+    cursor: pointer;
+    font-weight: 500 !important;
+}
+
+.wakeup-inherit-label input[type="checkbox"] {
+    width: auto !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    cursor: pointer;
+}
+
 .wakeups-form-row textarea,
 .wakeups-form-row input,
 .wakeups-form-row select {

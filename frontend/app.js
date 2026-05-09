@@ -8002,6 +8002,13 @@ function openWakeupForm(existing) {
     populateWakeupArcOptions(existing ? existing.arc_id : null);
     populateWakeupToolAllowlist(existing ? existing.tool_allowlist : null);
     populateWakeupContactAllowlist(existing ? existing.contact_allowlist : null);
+    const inheritEl = document.getElementById('wakeup-inherit-restrictions');
+    if (inheritEl) {
+        // Default true on create; respect saved value on edit.
+        inheritEl.checked = existing
+            ? (existing.inherit_restrictions !== false)
+            : true;
+    }
 
     // Reflect mode in the submit button so the user knows what they're about to do.
     const saveBtn = document.getElementById('wakeup-form-save');
@@ -8352,10 +8359,13 @@ async function submitWakeup(ev) {
     const autonomy = (wakeupAutonomyEl?.value || 'safe_only').trim();
     const toolAllowlist = readWakeupAllowlist(wakeupToolListEl, 'tool');
     const contactAllowlist = readWakeupAllowlist(wakeupContactListEl, 'contact');
+    const inheritEl = document.getElementById('wakeup-inherit-restrictions');
+    const inheritRestrictions = inheritEl ? !!inheritEl.checked : true;
     const reqPayload = {
         instruction,
         schedule,
         autonomy,
+        inherit_restrictions: inheritRestrictions,
         ...(arcId ? { arc_id: arcId } : {}),
         ...(toolAllowlist ? { tool_allowlist: toolAllowlist } : {}),
         ...(contactAllowlist ? { contact_allowlist: contactAllowlist } : {}),

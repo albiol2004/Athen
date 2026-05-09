@@ -64,6 +64,13 @@ pub struct DelegationContext {
     /// means "no UI handle available" — sub-agent runs without persistence
     /// (CLI / test paths).
     pub app_handle: Option<tauri::AppHandle>,
+    /// When `Some`, the spawned sub-agent's tool registry is wrapped with
+    /// a `WakeupRestrictedRegistry` carrying these restrictions — i.e. the
+    /// wake-up's tool/contact allowlist + autonomy band propagate to the
+    /// child. `None` means the sub-agent runs with its profile's natural
+    /// surface (either we're not inside a wake-up firing, or the wake-up
+    /// opted out of inheritance via `Wakeup::inherit_restrictions = false`).
+    pub wakeup_restrictions: Option<crate::wakeup_registry::WakeupSubagentRestrictions>,
 }
 
 /// Wraps a base tool registry and exposes `delegate_to_agent` as an
@@ -304,9 +311,24 @@ async fn run_delegation(
     // 3. Build the sub-executor. The sub-agent's tool registry is the
     //    *bare* base — no DelegationToolRegistry wrap — so it has every
     //    other tool but cannot itself delegate. Depth=1 by composition.
+    //
+    //    When the parent is a wake-up firing with `inherit_restrictions =
+    //    true`, we re-wrap the sub-agent's registry with the same
+    //    `WakeupRestrictedRegistry` the parent used so the wake-up's
+    //    tool/contact allowlist + autonomy band propagate down. The
+    //    restrictions snapshot was pre-resolved on the parent side, so
+    //    no second contact-store lookup is needed.
     let exec_router: Box<dyn LlmRouter> =
         Box::new(crate::state::SharedRouter(Arc::clone(&ctx.llm_router)));
-    let sub_registry: Box<dyn ToolRegistry> = Box::new(ArcRegistryAdapter(base));
+    let sub_registry: Box<dyn ToolRegistry> = match &ctx.wakeup_restrictions {
+        Some(restrictions) => Box::new(
+            crate::wakeup_registry::WakeupRestrictedRegistry::new_with_resolved(
+                Box::new(ArcRegistryAdapter(base)),
+                restrictions.clone(),
+            ),
+        ),
+        None => Box::new(ArcRegistryAdapter(base)),
+    };
 
     // Sub-agent inherits the parent's router (and therefore the parent's
     // provider), so the temperature override comes from the same active

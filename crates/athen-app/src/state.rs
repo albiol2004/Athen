@@ -579,6 +579,11 @@ impl AppState {
                 parent_arc_id: arc_id.to_string(),
                 tool_doc_dir: self.tool_doc_dir.clone(),
                 app_handle: delegation_app_handle,
+                // build_tool_registry is the generic registry builder
+                // (sense events, manual chat, wake-up tool inventory). The
+                // wake-up firing path constructs its own DelegationContext
+                // with restrictions in commands.rs; this one runs without.
+                wakeup_restrictions: None,
             };
             Box::new(crate::delegation::DelegationToolRegistry::new(base, ctx))
         } else {
