@@ -85,6 +85,7 @@ mod tests {
             body: body.into(),
             applies_to: tags,
             pinned: false,
+            proposed_by_agent: false,
             created_at: now,
             updated_at: now,
         }

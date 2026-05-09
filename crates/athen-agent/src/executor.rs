@@ -665,6 +665,10 @@ impl DefaultExecutor {
         };
         format!(
             "--- IDENTITY (who Athen is, across every agent) ---\n\
+             The facts below are already loaded from the user's identity \
+             store. Treat them as known — don't call identity_add or \
+             memory_store to record anything already covered here. Only \
+             persist genuinely new facts the user shares.\n\n\
              {body}\n\
              --- END IDENTITY ---\n\n"
         )

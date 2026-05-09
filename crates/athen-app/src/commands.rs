@@ -1757,36 +1757,19 @@ pub async fn send_message(
             // system message via `AgentBuilder::external_system_suffix`.
             let mut system_suffix = String::new();
 
-            // Auto-inject relevant memories into context.
-            // Search with the full message AND with individual key terms
-            // to catch indirect references (e.g., "mi novia" → finds "Nadia es mi novia").
+            // Auto-inject relevant memories into context. Single full-message
+            // recall against the global min_relevance threshold; the prior
+            // per-key-term fan-out flooded context with low-confidence hits.
             if let Some(ref memory) = state.memory {
                 let mut all_items = Vec::new();
                 let mut seen_ids = std::collections::HashSet::new();
-
-                // 1. Full message search.
-                if let Ok(items) = memory.recall(&message, 5).await {
+                if let Ok(items) = memory.recall(&message, 3).await {
                     for item in items {
                         if seen_ids.insert(item.id.clone()) {
                             all_items.push(item);
                         }
                     }
                 }
-
-                // 2. Extract key terms and search each one for broader coverage.
-                let key_terms = extract_key_terms(&message);
-                for term in &key_terms {
-                    if let Ok(items) = memory.recall(term, 3).await {
-                        for item in items {
-                            if seen_ids.insert(item.id.clone()) {
-                                all_items.push(item);
-                            }
-                        }
-                    }
-                }
-
-                // Limit to top 5 total.
-                all_items.truncate(5);
 
                 if !all_items.is_empty() {
                     tracing::info!(
@@ -2569,24 +2552,13 @@ pub(crate) async fn execute_approved_task(
     if let Some(ref memory) = ctx.memory {
         let mut all_items = Vec::new();
         let mut seen_ids = std::collections::HashSet::new();
-        if let Ok(items) = memory.recall(&message, 5).await {
+        if let Ok(items) = memory.recall(&message, 3).await {
             for item in items {
                 if seen_ids.insert(item.id.clone()) {
                     all_items.push(item);
                 }
             }
         }
-        let key_terms = extract_key_terms(&message);
-        for term in &key_terms {
-            if let Ok(items) = memory.recall(term, 3).await {
-                for item in items {
-                    if seen_ids.insert(item.id.clone()) {
-                        all_items.push(item);
-                    }
-                }
-            }
-        }
-        all_items.truncate(5);
 
         if !all_items.is_empty() {
             tracing::info!(
@@ -3517,24 +3489,13 @@ pub(crate) async fn execute_dispatched_task(
     if let Some(ref memory) = ctx.memory {
         let mut all_items = Vec::new();
         let mut seen_ids = std::collections::HashSet::new();
-        if let Ok(items) = memory.recall(&message, 5).await {
+        if let Ok(items) = memory.recall(&message, 3).await {
             for item in items {
                 if seen_ids.insert(item.id.clone()) {
                     all_items.push(item);
                 }
             }
         }
-        let key_terms = extract_key_terms(&message);
-        for term in &key_terms {
-            if let Ok(items) = memory.recall(term, 3).await {
-                for item in items {
-                    if seen_ids.insert(item.id.clone()) {
-                        all_items.push(item);
-                    }
-                }
-            }
-        }
-        all_items.truncate(5);
 
         if !all_items.is_empty() {
             tracing::info!(
@@ -5663,8 +5624,9 @@ pub async fn upsert_identity_entry(
         body: input.body,
         applies_to: input.applies_to,
         pinned: input.pinned,
-        // upsert_entry preserves created_at on replace and stamps
-        // updated_at, so these "now" values are the create-path defaults.
+        // User-driven path always lands as `false`; only `identity_add`
+        // (the agent tool) sets this true.
+        proposed_by_agent: false,
         created_at: now,
         updated_at: now,
     };
@@ -5683,6 +5645,22 @@ pub async fn upsert_identity_entry(
 /// Delete an entry by id.
 #[tauri::command]
 pub async fn delete_identity_entry(
+    id: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    use athen_core::traits::identity::IdentityStore;
+    let Some(store) = state.identity_store.as_ref() else {
+        return Err("Identity store not available".into());
+    };
+    let uuid = uuid::Uuid::parse_str(&id).map_err(|e| format!("Invalid entry id: {e}"))?;
+    store.delete_entry(uuid).await.map_err(|e| e.to_string())
+}
+
+/// Dismiss an agent-proposed identity entry. Same delete path as
+/// `delete_identity_entry`; the distinct command name lets the UI surface a
+/// "remove suggestion" action and keeps the audit log readable.
+#[tauri::command]
+pub async fn dismiss_identity_entry(
     id: String,
     state: State<'_, AppState>,
 ) -> std::result::Result<(), String> {

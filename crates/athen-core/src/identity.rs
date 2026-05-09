@@ -34,6 +34,11 @@ pub struct IdentityEntry {
     /// auto-truncate, but the flag is here so future budget code can prefer
     /// pinned entries when it has to drop something.
     pub pinned: bool,
+    /// True when the agent (not the user) added this entry via the
+    /// `identity_add` tool. The Settings UI shows a dismissible chip on
+    /// these so the user can clear anything wrong with one click.
+    #[serde(default)]
+    pub proposed_by_agent: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

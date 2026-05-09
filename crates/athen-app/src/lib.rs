@@ -153,6 +153,7 @@ pub fn run() {
             commands::list_identity_entries,
             commands::upsert_identity_entry,
             commands::delete_identity_entry,
+            commands::dismiss_identity_entry,
             commands::list_attachments_for_event,
             commands::check_for_update,
             commands::install_update,

@@ -93,6 +93,8 @@ const ICON_DELEGATE    = toolSvg('<circle cx="6" cy="8" r="3"/><path d="M2 21v-2
 const ICON_MAIL        = toolSvg('<path d="M4 4h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z"/><polyline points="22,6 12,13 2,6"/>');
 // Alarm clock with two ear-bells: communicates "scheduled wake-up".
 const ICON_ALARM       = toolSvg('<circle cx="12" cy="13" r="8"/><polyline points="12 9 12 13 14.5 15"/><line x1="5" y1="3" x2="2" y2="6"/><line x1="22" y1="6" x2="19" y2="3"/>');
+// Person with id-card aura: communicates "identity entry".
+const ICON_IDENTITY    = toolSvg('<circle cx="12" cy="8" r="4"/><path d="M4 21v-1a8 8 0 0 1 16 0v1"/><line x1="9" y1="13" x2="15" y2="13"/>');
 
 const BUILTIN_TOOL_ICONS = {
     'read': ICON_FILE_TEXT, 'list_directory': ICON_FOLDER, 'grep': ICON_FILE_SEARCH,
@@ -115,6 +117,8 @@ const BUILTIN_TOOL_ICONS = {
     'list_installed_packages': ICON_BOOKMARK,
     // wake-ups (agent-authored scheduled follow-ups)
     'create_wakeup': ICON_ALARM,
+    // identity (agent-authored entries to the user-maintained identity store)
+    'identity_add': ICON_IDENTITY,
 };
 
 const BUILTIN_TOOL_LABELS = {
@@ -135,6 +139,7 @@ const BUILTIN_TOOL_LABELS = {
     'uninstall_package': 'Uninstall package',
     'list_installed_packages': 'List packages',
     'create_wakeup': 'Schedule wake-up',
+    'identity_add': 'Note about you',
 };
 
 // MCP-prefixed tools (e.g. `slack__post_message`) — strip prefix and try common
@@ -2572,6 +2577,7 @@ function renderToolBody(meta) {
         case 'uninstall_package':     main = renderUninstallPackage(args, result); break;
         case 'list_installed_packages': main = renderListInstalledPackages(args, result); break;
         case 'create_wakeup':   main = renderCreateWakeup(args, result); break;
+        case 'identity_add':    main = renderIdentityAdd(args, result); break;
         default:
             // No bespoke layout — fall back to a labelled-fields dump
             // so the user still gets a structured view instead of the
@@ -3294,6 +3300,26 @@ function renderCreateWakeup(args, result) {
         result.wakeup_id    ? ['Wake-up ID',  result.wakeup_id, { mono: true }] : null,
         result.next_fire_at ? ['Next Fire',   fmtDateTime(result.next_fire_at)] : null,
         result.computed_impact ? ['Computed Risk', renderPill(result.computed_impact, 'neutral')] : null,
+    ]);
+}
+
+function renderIdentityAdd(args, result) {
+    const category = (args.category || result.category || '').toString();
+    const body = (args.body || result.body || '').toString();
+    const applies = Array.isArray(args.applies_to) && args.applies_to.length
+        ? args.applies_to.map(String)
+        : (Array.isArray(result.applies_to) && result.applies_to.length
+            ? result.applies_to.map(String)
+            : ['Always']);
+    const isRule = category === 'rules';
+    const categoryNode = isRule
+        ? renderPill(category + ' (review)', 'warning')
+        : renderPill(category, 'neutral');
+    return renderFields([
+        ['Category',   categoryNode],
+        ['Body',       body, { block: true }],
+        ['Applies to', applies],
+        result.id ? ['Entry ID', result.id, { mono: true }] : null,
     ]);
 }
 
@@ -4341,6 +4367,32 @@ function renderIdentityDetail() {
 function buildIdentityEntryCard(entry, cat) {
     const card = document.createElement('div');
     card.className = 'identity-entry-card';
+
+    if (entry.proposed_by_agent) {
+        const isRule = cat.name === 'rules';
+        const chip = document.createElement('span');
+        chip.className = 'identity-proposed-chip' + (isRule ? ' rules' : '');
+        const label = document.createElement('span');
+        label.className = 'identity-proposed-chip-label';
+        label.textContent = isRule ? 'New rule — review' : 'added by agent';
+        chip.appendChild(label);
+        const dismiss = document.createElement('button');
+        dismiss.type = 'button';
+        dismiss.className = 'identity-proposed-chip-dismiss';
+        dismiss.title = 'Dismiss this suggestion';
+        dismiss.setAttribute('aria-label', 'Dismiss this suggestion');
+        dismiss.textContent = '×';
+        dismiss.addEventListener('click', async () => {
+            try {
+                await invoke('dismiss_identity_entry', { id: entry.id });
+                await loadIdentityManager();
+            } catch (err) {
+                showToast('Dismiss failed: ' + err, 'error');
+            }
+        });
+        chip.appendChild(dismiss);
+        card.appendChild(chip);
+    }
 
     const body = document.createElement('textarea');
     body.className = 'identity-entry-body';

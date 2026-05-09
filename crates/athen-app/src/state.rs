@@ -486,6 +486,9 @@ impl AppState {
         if let Some(astore) = self.attachment_store() {
             registry = registry.with_attachments(astore);
         }
+        if let Some(istore) = self.identity_store.clone() {
+            registry = registry.with_identity(istore);
+        }
         let tools = athen_core::traits::tool::ToolRegistry::list_tools(&registry).await?;
         let written = athen_agent::tools_doc::write_per_group(&dir, &tools).map_err(|e| {
             athen_core::error::AthenError::Other(format!(
@@ -544,6 +547,9 @@ impl AppState {
         .with_mcp(self.mcp.clone() as Arc<dyn athen_core::traits::mcp::McpClient>);
         if let Some(astore) = self.attachment_store() {
             registry = registry.with_attachments(astore);
+        }
+        if let Some(istore) = self.identity_store.clone() {
+            registry = registry.with_identity(istore);
         }
         if let Some(grants) = self.grant_store.clone() {
             let mut gate = crate::file_gate::FileGate::new(
@@ -1029,6 +1035,7 @@ impl AppState {
         let profile_embedding_cache_ref = Arc::clone(&self.profile_embedding_cache);
         let calendar_store_ref = self.calendar_store.clone();
         let contact_store_ref = self.contact_store.clone();
+        let identity_store_ref = self.identity_store.clone();
         let memory_ref = self.memory.clone();
         let mcp_ref = self.mcp.clone();
         let tool_doc_dir_ref = self.tool_doc_dir.clone();
@@ -1110,6 +1117,7 @@ impl AppState {
                                     let attachment_store_c = attachment_store_ref.clone();
                                     let calendar_store_c = calendar_store_ref.clone();
                                     let contact_store_c = contact_store_ref.clone();
+                                    let identity_store_c = identity_store_ref.clone();
                                     let memory_c = memory_ref.clone();
                                     let mcp_c = Arc::clone(&mcp_ref);
                                     let tool_doc_dir_c = tool_doc_dir_ref.clone();
@@ -1142,6 +1150,7 @@ impl AppState {
                                             attachment_store_c.as_ref(),
                                             &calendar_store_c,
                                             &contact_store_c,
+                                            &identity_store_c,
                                             &memory_c,
                                             &mcp_c,
                                             tool_doc_dir_c.as_deref(),
@@ -1545,6 +1554,7 @@ async fn execute_owner_telegram_message(
     attachment_store: Option<&athen_persistence::attachments::AttachmentStore>,
     calendar_store: &Option<CalendarStore>,
     contact_store: &Option<SqliteContactStore>,
+    identity_store: &Option<Arc<athen_persistence::identity::SqliteIdentityStore>>,
     memory: &Option<Arc<Memory>>,
     mcp: &Arc<McpRegistry>,
     tool_doc_dir: Option<&std::path::Path>,
@@ -1882,6 +1892,9 @@ async fn execute_owner_telegram_message(
     .with_mcp(mcp.clone() as Arc<dyn athen_core::traits::mcp::McpClient>);
     if let Some(astore) = attachment_store {
         registry = registry.with_attachments(astore.clone());
+    }
+    if let Some(istore) = identity_store.clone() {
+        registry = registry.with_identity(istore);
     }
     if let (Some(store), Some(arc_id_str)) = (grant_store, target_arc_id.as_ref()) {
         let mut gate = crate::file_gate::FileGate::new(
@@ -2758,7 +2771,8 @@ async fn build_memory(router: &Arc<RwLock<Arc<DefaultLlmRouter>>>) -> Option<Arc
 
     let memory = Memory::new(Box::new(vector), Box::new(graph))
         .with_embedder(Box::new(embedding_router))
-        .with_extractor(Box::new(extractor));
+        .with_extractor(Box::new(extractor))
+        .with_min_score(0.6);
 
     info!("Memory system initialized with SQLite persistence");
     Some(Arc::new(memory))

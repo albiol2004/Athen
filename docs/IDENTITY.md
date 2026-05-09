@@ -1,6 +1,6 @@
 # Identity (Design Doc)
 
-**Status:** Design only — not yet implemented. Tracked as a future task.
+**Status:** Shipped (storage, UI, prompt injection, agent-write tool, 2026-05-09).
 
 Athen needs a place for the user to write down, by hand, who Athen is and
 what it knows: personality, rules, facts about the user and their team,
@@ -80,7 +80,8 @@ ships are:
 |---|---|---|
 | `personality` | Voice, warmth, refusal style, humor level | `[Always]` (often refined to specific profiles) |
 | `rules` | Hard constraints — "never X", "always Y" | `[Always]` |
-| `knowledge` | Facts about the user, family, recurring contexts | `[Always]` |
+| `knowledge` | General facts and recurring contexts — projects, tools, places, anything that's not specifically about you as a person | `[Always]` |
+| `user` | Personal facts about you — relationships, family, preferences, hobbies, dietary, location. The agent adds entries here as it learns about you | `[Always]` |
 | `team` | Org chart, business identity, escalation chain | `[Profile("personal_assistant"), Profile("outreach")]` |
 
 The user can rename them, delete them, add new ones, reorder them.
@@ -119,6 +120,22 @@ CREATE INDEX idx_identity_entries_category ON identity_entries(category);
 `applies_to` as JSON keeps the schema simple while preserving
 queryability — the prompt builder reads everything for a given profile
 in one query. Alternative (junction table) is over-engineered for v1.
+
+## Agent-write
+
+The agent can add identity entries via the `identity_add` tool
+(`crates/athen-app/src/app_tools.rs`). It accepts `category`, `body`,
+and an optional `applies_to` (default `["Always"]`). New entries are
+persisted with `proposed_by_agent: true` and become live in the prompt
+prefix immediately — the same arc that learned a fact about the user
+can use it on the very next turn. The chat tool-call card serves as
+the notification: there is no approval prompt, no risk gate, no
+deferred review queue. Settings → Identity surfaces a small
+"added by agent" chip on each `proposed_by_agent` entry with a
+one-click dismiss; for the `rules` category the chip is louder
+("New rule — review") because adding a rule has cross-arc blast radius.
+The agent never edits or deletes existing entries — only adds — so the
+user retains full ownership.
 
 ## Where it plugs into the prompt
 
@@ -261,16 +278,19 @@ not the other way around.
   arc itself (open actions, decisions made there) or — eventually
   — in standing instructions
   (see `MULTI_INTENT_ROUTING.md#adjacent-idea-coordinator-as-agent-with-standing-instructions`).
-- **Not agent-mutable.** The agent reads identity; it does not write
-  to it. User-only territory. (Future: a "suggest an identity entry"
-  tool that proposes diffs requiring user approval — out of scope
-  for v1.)
+- **Not agent-editable or agent-deletable.** The agent CAN add entries
+  via the `identity_add` tool (see "Agent-write" below), but never
+  edits or deletes existing ones. Agent-added entries land with
+  `proposed_by_agent: true` and the chat tool-call card IS the
+  notification — there is no approval flow. The user reviews and
+  dismisses anything wrong from Settings → Identity with one click.
 
 ## v1 scope explicitly excludes
 
 - **Per-arc identity overrides.** Could be useful ("for this work
   arc, prefer formal English"); v2.
-- **Agent-mutable identity.** As above.
+- **Agent edit / delete.** The agent can ADD via `identity_add`
+  (shipped); editing or deleting existing entries stays user-only.
 - **Sharing/import.** A community library of identity templates
   ("startup CTO", "indie hacker", "PhD researcher") would be neat
   but is post-v1.

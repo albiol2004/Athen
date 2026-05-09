@@ -16,8 +16,10 @@ use athen_contacts::ContactStore;
 use athen_core::contact::{Contact, ContactIdentifier, IdentifierKind, TrustLevel};
 use athen_core::error::{AthenError, Result};
 use athen_core::event::AttachmentId;
+use athen_core::identity::{IdentityEntry, ProfileTag};
 use athen_core::risk::BaseImpact;
 use athen_core::tool::{ToolBackend, ToolDefinition, ToolResult};
+use athen_core::traits::identity::IdentityStore;
 use athen_core::traits::mcp::McpClient;
 use athen_core::traits::memory::{MemoryItem, MemoryStore};
 use athen_core::traits::tool::ToolRegistry;
@@ -25,6 +27,7 @@ use athen_memory::Memory;
 use athen_persistence::attachments::AttachmentStore;
 use athen_persistence::calendar::{CalendarEvent, CalendarStore, EventCreator};
 use athen_persistence::contacts::SqliteContactStore;
+use athen_persistence::identity::SqliteIdentityStore;
 
 use crate::file_gate::FileGate;
 
@@ -41,6 +44,7 @@ pub struct AppToolRegistry {
     mcp: Option<Arc<dyn McpClient>>,
     file_gate: Option<Arc<FileGate>>,
     attachments: Option<AttachmentStore>,
+    identity: Option<Arc<SqliteIdentityStore>>,
 }
 
 impl AppToolRegistry {
@@ -59,7 +63,17 @@ impl AppToolRegistry {
             mcp: None,
             file_gate: None,
             attachments: None,
+            identity: None,
         }
+    }
+
+    /// Attach the identity store so the agent can call `identity_add` to
+    /// persist new personality / rules / knowledge / user / team statements
+    /// into the user-editable identity prefix. Without this, the tool
+    /// refuses with a clear error.
+    pub fn with_identity(mut self, identity: Arc<SqliteIdentityStore>) -> Self {
+        self.identity = Some(identity);
+        self
     }
 
     /// Attach an MCP client. Tools exposed by enabled MCP servers will appear
@@ -1212,6 +1226,116 @@ impl AppToolRegistry {
             execution_time_ms: elapsed_ms,
         })
     }
+
+    fn identity_add_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "category": {
+                    "type": "string",
+                    "description": "Which identity category to file the entry under. Standard categories: 'user' (personal facts about the user — relationships, family, preferences, hobbies; PREFER THIS for personal facts), 'personality' (voice, refusal style), 'rules' (hard constraints, 'never X'/'always Y'), 'knowledge' (general facts and recurring contexts — projects, places), 'team' (org chart, business identity). Custom user-created categories are also accepted.",
+                },
+                "body": {
+                    "type": "string",
+                    "description": "The identity statement, plain markdown. Keep it 1–3 sentences. Example: 'The user's girlfriend is Sara.'",
+                },
+                "applies_to": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Which agent profiles see this entry. Default ['Always'] makes it visible to every profile. Use a profile id (e.g. 'coder') to scope, or '!coder' to exclude one profile.",
+                },
+            },
+            "required": ["category", "body"]
+        })
+    }
+
+    async fn do_identity_add(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let Some(store) = self.identity.as_ref() else {
+            return Err(AthenError::Other(
+                "identity_add: identity store is not wired into this agent".to_string(),
+            ));
+        };
+
+        let category = args
+            .get("category")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| AthenError::Other("identity_add: 'category' is required".to_string()))?
+            .to_string();
+
+        let body = args
+            .get("body")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| AthenError::Other("identity_add: 'body' is required".to_string()))?
+            .to_string();
+
+        let applies_to: Vec<ProfileTag> = match args.get("applies_to") {
+            Some(serde_json::Value::Array(items)) if !items.is_empty() => items
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(parse_applies_to_token)
+                .collect(),
+            _ => vec![ProfileTag::Always],
+        };
+        let applies_to = if applies_to.is_empty() {
+            vec![ProfileTag::Always]
+        } else {
+            applies_to
+        };
+
+        let now = chrono::Utc::now();
+        let entry = IdentityEntry {
+            id: uuid::Uuid::new_v4(),
+            category: category.clone(),
+            body: body.clone(),
+            applies_to: applies_to.clone(),
+            pinned: false,
+            proposed_by_agent: true,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let start = Instant::now();
+        store.upsert_entry(&entry).await?;
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+
+        let applies_to_strs: Vec<String> = applies_to.iter().map(format_applies_to_tag).collect();
+
+        Ok(ToolResult {
+            success: true,
+            output: json!({
+                "id": entry.id.to_string(),
+                "category": category,
+                "body": body,
+                "applies_to": applies_to_strs,
+                "proposed_by_agent": true,
+            }),
+            error: None,
+            execution_time_ms: elapsed_ms,
+        })
+    }
+}
+
+fn parse_applies_to_token(tok: &str) -> ProfileTag {
+    let trimmed = tok.trim();
+    if trimmed.eq_ignore_ascii_case("always") {
+        ProfileTag::Always
+    } else if let Some(rest) = trimmed.strip_prefix('!') {
+        ProfileTag::NotProfile(rest.trim().to_string())
+    } else {
+        ProfileTag::Profile(trimmed.to_string())
+    }
+}
+
+fn format_applies_to_tag(tag: &ProfileTag) -> String {
+    match tag {
+        ProfileTag::Always => "Always".to_string(),
+        ProfileTag::Profile(p) => p.clone(),
+        ProfileTag::NotProfile(p) => format!("!{p}"),
+    }
 }
 
 #[async_trait]
@@ -1310,6 +1434,19 @@ impl ToolRegistry for AppToolRegistry {
                     native: false,
                 },
                 base_risk: BaseImpact::Read,
+            });
+        }
+
+        if self.identity.is_some() {
+            tools.push(ToolDefinition {
+                name: "identity_add".to_string(),
+                description: "Add an identity entry to the user's hand-maintained identity store. Use this when the user shares a personal fact ('I have a girlfriend named Sara'), a hard rule ('never email my boss without checking with me'), or recurring context worth remembering across every conversation. Prefer category='user' for personal facts. The entry is immediately live in every future agent prefix and is shown in Settings → Identity with an 'added by agent' chip the user can dismiss. No approval flow — be selective and only add facts the user clearly wants persisted.".to_string(),
+                parameters: Self::identity_add_schema(),
+                backend: ToolBackend::Shell {
+                    command: String::new(),
+                    native: false,
+                },
+                base_risk: BaseImpact::WritePersist,
             });
         }
 
@@ -1428,6 +1565,7 @@ impl ToolRegistry for AppToolRegistry {
             "contacts_delete" => self.do_contacts_delete(&args).await,
             "read_attachment_full" => self.do_read_attachment_full(&args).await,
             "fetch_attachment" => self.do_fetch_attachment(&args).await,
+            "identity_add" => self.do_identity_add(&args).await,
             _ => self.inner.call_tool(name, args).await,
         }
     }
@@ -2135,6 +2273,109 @@ mod tests {
         let id = uuid::Uuid::parse_str(id_str).unwrap();
         let loaded = contact_store.load(id).await.unwrap().unwrap();
         assert_eq!(loaded.trust_level, TrustLevel::Trusted);
+    }
+
+    // ── Identity tool tests ─────────────────────────────────────────
+
+    mod identity_tools {
+        use super::*;
+        use athen_core::traits::identity::IdentityStore as _IdStore;
+
+        async fn setup_with_identity() -> (Database, AppToolRegistry) {
+            let db = Database::in_memory().await.unwrap();
+            let store = Arc::new(db.identity_store());
+            store.init_schema().await.unwrap();
+            store.seed_categories_if_empty().await.unwrap();
+            let shell = ShellToolRegistry::new().await;
+            let registry = AppToolRegistry::new(shell, None, None, None).with_identity(store);
+            (db, registry)
+        }
+
+        #[tokio::test]
+        async fn list_tools_includes_identity_add_when_store_present() {
+            let (_db, registry) = setup_with_identity().await;
+            let tools = registry.list_tools().await.unwrap();
+            let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+            assert!(names.contains(&"identity_add"));
+        }
+
+        #[tokio::test]
+        async fn list_tools_omits_identity_add_without_store() {
+            let shell = ShellToolRegistry::new().await;
+            let registry = AppToolRegistry::new(shell, None, None, None);
+            let tools = registry.list_tools().await.unwrap();
+            let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+            assert!(!names.contains(&"identity_add"));
+        }
+
+        #[tokio::test]
+        async fn identity_add_persists_with_proposed_by_agent_true() {
+            let (db, registry) = setup_with_identity().await;
+            let store = Arc::new(db.identity_store());
+
+            let result = registry
+                .call_tool(
+                    "identity_add",
+                    json!({
+                        "category": "user",
+                        "body": "The user's girlfriend is Sara.",
+                    }),
+                )
+                .await
+                .unwrap();
+            assert!(result.success);
+            assert_eq!(result.output["category"].as_str().unwrap(), "user");
+            assert!(result.output["proposed_by_agent"].as_bool().unwrap());
+
+            let id_str = result.output["id"].as_str().unwrap();
+            let id = uuid::Uuid::parse_str(id_str).unwrap();
+            let loaded = store.get_entry(id).await.unwrap().unwrap();
+            assert_eq!(loaded.body, "The user's girlfriend is Sara.");
+            assert!(loaded.proposed_by_agent);
+            assert!(matches!(loaded.applies_to.as_slice(), [ProfileTag::Always]));
+        }
+
+        #[tokio::test]
+        async fn identity_add_resolves_applies_to_strings() {
+            let (_db, registry) = setup_with_identity().await;
+            let result = registry
+                .call_tool(
+                    "identity_add",
+                    json!({
+                        "category": "rules",
+                        "body": "Never email legal@ on Fridays.",
+                        "applies_to": ["coder", "!outreach"],
+                    }),
+                )
+                .await
+                .unwrap();
+            assert!(result.success);
+            let scopes = result.output["applies_to"].as_array().unwrap();
+            let strs: Vec<&str> = scopes.iter().map(|v| v.as_str().unwrap()).collect();
+            assert!(strs.contains(&"coder"));
+            assert!(strs.contains(&"!outreach"));
+        }
+
+        #[tokio::test]
+        async fn identity_add_rejects_empty_body() {
+            let (_db, registry) = setup_with_identity().await;
+            let err = registry
+                .call_tool("identity_add", json!({"category": "user", "body": "  "}))
+                .await
+                .unwrap_err();
+            assert!(format!("{err}").contains("'body' is required"));
+        }
+
+        #[tokio::test]
+        async fn identity_add_without_store_errors() {
+            let shell = ShellToolRegistry::new().await;
+            let registry = AppToolRegistry::new(shell, None, None, None);
+            let err = registry
+                .call_tool("identity_add", json!({"category": "user", "body": "hi"}))
+                .await
+                .unwrap_err();
+            assert!(format!("{err}").contains("identity store is not wired"));
+        }
     }
 
     // ── Attachment tool tests ───────────────────────────────────────

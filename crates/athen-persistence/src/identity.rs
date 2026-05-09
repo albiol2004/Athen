@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS identity_entries (
     body TEXT NOT NULL,
     applies_to_json TEXT NOT NULL,
     pinned INTEGER NOT NULL DEFAULT 0,
+    proposed_by_agent INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -63,6 +64,21 @@ impl SqliteIdentityStore {
                 .map_err(|e| AthenError::Other(format!("Enable FK: {e}")))?;
             conn.execute_batch(IDENTITY_SCHEMA_SQL)
                 .map_err(|e| AthenError::Other(format!("Init identity schema: {e}")))?;
+            // Additive migration for installs that pre-date the
+            // proposed_by_agent column. ADD COLUMN errors with "duplicate
+            // column name" once the column exists; treat that one error as
+            // success so the path stays idempotent.
+            if let Err(e) = conn.execute(
+                "ALTER TABLE identity_entries ADD COLUMN proposed_by_agent INTEGER NOT NULL DEFAULT 0",
+                [],
+            ) {
+                let msg = e.to_string();
+                if !msg.contains("duplicate column name") {
+                    return Err(AthenError::Other(format!(
+                        "Migrate identity_entries.proposed_by_agent: {e}"
+                    )));
+                }
+            }
             Ok(())
         })
         .await
@@ -136,9 +152,16 @@ fn seed_categories() -> Vec<IdentityCategory> {
         },
         IdentityCategory {
             name: "knowledge".into(),
-            description: "Facts about the user, family, recurring contexts.".into(),
+            description: "General facts and recurring contexts — projects, tools, places, anything that's not specifically about you as a person.".into(),
             default_applies_to: vec![ProfileTag::Always],
             sort_order: 30,
+            is_seed: true,
+        },
+        IdentityCategory {
+            name: "user".into(),
+            description: "Personal facts about you — relationships, family, preferences, hobbies, dietary, location. The agent adds entries here as it learns about you.".into(),
+            default_applies_to: vec![ProfileTag::Always],
+            sort_order: 35,
             is_seed: true,
         },
         IdentityCategory {
@@ -155,7 +178,8 @@ fn seed_categories() -> Vec<IdentityCategory> {
 }
 
 const CATEGORY_COLS: &str = "name, description, default_applies_to_json, sort_order, is_seed";
-const ENTRY_COLS: &str = "id, category, body, applies_to_json, pinned, created_at, updated_at";
+const ENTRY_COLS: &str =
+    "id, category, body, applies_to_json, pinned, proposed_by_agent, created_at, updated_at";
 
 fn read_category_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IdentityCategory> {
     let name: String = row.get(0)?;
@@ -182,8 +206,9 @@ fn read_entry_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(IdentityEntry, (
     let body: String = row.get(2)?;
     let applies_to_json: String = row.get(3)?;
     let pinned: i64 = row.get(4)?;
-    let created_at: String = row.get(5)?;
-    let updated_at: String = row.get(6)?;
+    let proposed_by_agent: i64 = row.get(5)?;
+    let created_at: String = row.get(6)?;
+    let updated_at: String = row.get(7)?;
 
     let id = Uuid::parse_str(&id_str).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
@@ -193,12 +218,12 @@ fn read_entry_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(IdentityEntry, (
     })?;
     let created_at = chrono::DateTime::parse_from_rfc3339(&created_at)
         .map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e))
+            rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(e))
         })?
         .with_timezone(&chrono::Utc);
     let updated_at = chrono::DateTime::parse_from_rfc3339(&updated_at)
         .map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(e))
+            rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(e))
         })?
         .with_timezone(&chrono::Utc);
 
@@ -209,6 +234,7 @@ fn read_entry_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(IdentityEntry, (
             body,
             applies_to,
             pinned: pinned != 0,
+            proposed_by_agent: proposed_by_agent != 0,
             created_at,
             updated_at,
         },
@@ -397,14 +423,15 @@ impl IdentityStore for SqliteIdentityStore {
                 serde_json::to_string(&e.applies_to).map_err(AthenError::Serialization)?;
             conn.execute(
                 "INSERT OR REPLACE INTO identity_entries \
-                 (id, category, body, applies_to_json, pinned, created_at, updated_at) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                 (id, category, body, applies_to_json, pinned, proposed_by_agent, created_at, updated_at) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                 params![
                     e.id.to_string(),
                     e.category,
                     e.body,
                     applies_to_json,
                     e.pinned as i64,
+                    e.proposed_by_agent as i64,
                     e.created_at.to_rfc3339(),
                     e.updated_at.to_rfc3339(),
                 ],
@@ -477,17 +504,21 @@ mod tests {
             body: body.into(),
             applies_to,
             pinned: false,
+            proposed_by_agent: false,
             created_at: now,
             updated_at: now,
         }
     }
 
     #[tokio::test]
-    async fn seeds_four_canonical_categories() {
+    async fn seeds_canonical_categories() {
         let store = setup_store().await;
         let cats = store.list_categories().await.unwrap();
         let names: Vec<&str> = cats.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, vec!["personality", "rules", "knowledge", "team"]);
+        assert_eq!(
+            names,
+            vec!["personality", "rules", "knowledge", "user", "team"]
+        );
         assert!(cats.iter().all(|c| c.is_seed));
     }
 
@@ -654,6 +685,74 @@ mod tests {
         assert_eq!(loaded.body, "v2");
         assert_eq!(loaded.created_at, original_created);
         assert!(loaded.updated_at > original_created);
+    }
+
+    #[tokio::test]
+    async fn proposed_by_agent_round_trips() {
+        let store = setup_store().await;
+        let mut e = mk_entry("personality", "agent says hi", vec![ProfileTag::Always]);
+        e.proposed_by_agent = true;
+        store.upsert_entry(&e).await.unwrap();
+        let loaded = store.get_entry(e.id).await.unwrap().unwrap();
+        assert!(loaded.proposed_by_agent);
+    }
+
+    #[tokio::test]
+    async fn migration_backfills_proposed_by_agent_to_false() {
+        // Simulate a pre-migration install by creating the table without
+        // the new column, inserting a row, then running init_schema (which
+        // includes the additive migration) and confirming the legacy row
+        // round-trips with proposed_by_agent = false.
+        let conn = Connection::open_in_memory().unwrap();
+        {
+            let c = &conn;
+            c.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+            c.execute_batch(
+                r#"
+                CREATE TABLE identity_categories (
+                    name TEXT PRIMARY KEY,
+                    description TEXT NOT NULL DEFAULT '',
+                    default_applies_to_json TEXT NOT NULL,
+                    sort_order INTEGER NOT NULL,
+                    is_seed INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE identity_entries (
+                    id TEXT PRIMARY KEY,
+                    category TEXT NOT NULL REFERENCES identity_categories(name) ON DELETE CASCADE,
+                    body TEXT NOT NULL,
+                    applies_to_json TEXT NOT NULL,
+                    pinned INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                "#,
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO identity_categories \
+                 (name, description, default_applies_to_json, sort_order, is_seed) \
+                 VALUES ('personality', '', '[\"Always\"]', 10, 1)",
+                [],
+            )
+            .unwrap();
+            let id = Uuid::new_v4();
+            let now = Utc::now().to_rfc3339();
+            c.execute(
+                "INSERT INTO identity_entries \
+                 (id, category, body, applies_to_json, pinned, created_at, updated_at) \
+                 VALUES (?1, 'personality', 'legacy body', '[\"Always\"]', 0, ?2, ?2)",
+                params![id.to_string(), now],
+            )
+            .unwrap();
+        }
+
+        let store = SqliteIdentityStore::new(Arc::new(Mutex::new(conn)));
+        store.init_schema().await.unwrap();
+
+        let entries = store.list_entries(Some("personality")).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].body, "legacy body");
+        assert!(!entries[0].proposed_by_agent);
     }
 
     #[tokio::test]
