@@ -4955,12 +4955,50 @@ option:hover {
     display: flex;
     flex-direction: column;
     gap: 4px;
-    max-height: 200px;
+    max-height: 280px;
     overflow-y: auto;
     border: 1px solid var(--border);
     border-radius: 6px;
     padding: 8px;
     background: var(--bg);
+}
+
+.wakeup-allowlist-group {
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 4px;
+    margin-bottom: 2px;
+}
+
+.wakeup-allowlist-group:last-child {
+    border-bottom: none;
+}
+
+.wakeup-allowlist-group-summary {
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-2);
+    padding: 6px 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    list-style: none;
+    user-select: none;
+}
+
+.wakeup-allowlist-group-summary::-webkit-details-marker {
+    display: none;
+}
+
+.wakeup-allowlist-group-summary::before {
+    content: '▸';
+    display: inline-block;
+    margin-right: 6px;
+    font-size: 10px;
+    transition: transform 0.1s ease;
+}
+
+.wakeup-allowlist-group[open] > .wakeup-allowlist-group-summary::before {
+    transform: rotate(90deg);
 }
 
 .wakeup-allowlist-row {

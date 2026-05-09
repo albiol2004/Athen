@@ -8105,30 +8105,55 @@ async function populateWakeupToolAllowlist(selectedNames) {
             wakeupToolListEl.innerHTML = '<div class="wakeup-allowlist-empty">No tools available.</div>';
             return;
         }
+        // Group by category (backend already sorted by category then label).
+        const groups = new Map();
         for (const t of tools) {
-            const row = document.createElement('label');
-            row.className = 'wakeup-allowlist-row';
-            const cb = document.createElement('input');
-            cb.type = 'checkbox';
-            cb.value = t.name;
-            cb.dataset.kind = 'tool';
-            cb.checked = selected.has(t.name);
-            const head = document.createElement('span');
-            head.className = 'wakeup-allowlist-head';
-            head.textContent = t.name;
-            if (t.outbound) {
-                const badge = document.createElement('span');
-                badge.className = 'wakeup-allowlist-badge';
-                badge.textContent = 'sends';
-                head.appendChild(badge);
+            const cat = t.category || 'Other';
+            if (!groups.has(cat)) groups.set(cat, []);
+            groups.get(cat).push(t);
+        }
+        // Render each group as a collapsible <details> so the picker
+        // doesn't dump 30+ rows on the user. Pre-expand groups that
+        // contain anything pre-selected so edits land already-open.
+        for (const [cat, items] of groups) {
+            const details = document.createElement('details');
+            details.className = 'wakeup-allowlist-group';
+            const anySelected = items.some(t => selected.has(t.name));
+            if (anySelected) details.open = true;
+            const summary = document.createElement('summary');
+            summary.className = 'wakeup-allowlist-group-summary';
+            const selCount = items.filter(t => selected.has(t.name)).length;
+            summary.textContent = selCount > 0
+                ? `${cat}  (${selCount}/${items.length})`
+                : `${cat}  (${items.length})`;
+            details.appendChild(summary);
+            for (const t of items) {
+                const row = document.createElement('label');
+                row.className = 'wakeup-allowlist-row';
+                row.title = t.name; // raw id available on hover
+                const cb = document.createElement('input');
+                cb.type = 'checkbox';
+                cb.value = t.name;
+                cb.dataset.kind = 'tool';
+                cb.checked = selected.has(t.name);
+                const head = document.createElement('span');
+                head.className = 'wakeup-allowlist-head';
+                head.textContent = t.display_name || t.name;
+                if (t.outbound) {
+                    const badge = document.createElement('span');
+                    badge.className = 'wakeup-allowlist-badge';
+                    badge.textContent = 'sends';
+                    head.appendChild(badge);
+                }
+                const desc = document.createElement('span');
+                desc.className = 'wakeup-allowlist-desc';
+                desc.textContent = t.description || '';
+                row.appendChild(cb);
+                row.appendChild(head);
+                row.appendChild(desc);
+                details.appendChild(row);
             }
-            const desc = document.createElement('span');
-            desc.className = 'wakeup-allowlist-desc';
-            desc.textContent = t.description || '';
-            row.appendChild(cb);
-            row.appendChild(head);
-            row.appendChild(desc);
-            wakeupToolListEl.appendChild(row);
+            wakeupToolListEl.appendChild(details);
         }
     } catch (e) {
         console.warn('Failed to load tool inventory:', e);

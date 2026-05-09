@@ -369,11 +369,83 @@ fn parse_contact_allowlist(
 /// One entry in the tool inventory the wake-up form renders.
 #[derive(Debug, Serialize)]
 pub struct ToolInventoryItem {
+    /// Internal tool id — what `tool_allowlist` actually stores. The UI
+    /// posts this back; humans never see it directly.
     pub name: String,
+    /// Human-friendly label for the row ("Read file", "Send email").
+    /// Falls back to a tidied form of `name` for tools we don't know
+    /// about yet (e.g. third-party MCPs).
+    pub display_name: String,
+    /// Coarse category for grouping ("Filesystem", "Shell", "Web", etc.).
+    /// MCP tools default to "MCP: <server-id>" so each external server
+    /// gets its own collapsible section.
+    pub category: String,
     pub description: String,
     /// Hint for the UI: outbound tools get a small "sends" badge so the
     /// user knows which ones are actually network-/world-affecting.
     pub outbound: bool,
+}
+
+/// Friendly label + category for the well-known built-in tools. The
+/// wake-up form groups by category and shows the label instead of the
+/// raw id so a non-technical user can pick `Send email` rather than
+/// `email_send`. Tools missing from this table fall through to a
+/// best-effort tidy of the underlying name.
+fn tool_metadata(name: &str) -> Option<(&'static str, &'static str)> {
+    Some(match name {
+        // Filesystem (built-in, gated by FileGate)
+        "read" => ("Read file", "Filesystem"),
+        "edit" => ("Edit file", "Filesystem"),
+        "write" => ("Write file", "Filesystem"),
+        "grep" => ("Search file contents", "Filesystem"),
+        "list_directory" => ("List directory", "Filesystem"),
+        // Shell
+        "shell_execute" => ("Run shell command", "Shell"),
+        "shell_spawn" => ("Spawn long-running process", "Shell"),
+        "shell_kill" => ("Kill spawned process", "Shell"),
+        "shell_logs" => ("Read process logs", "Shell"),
+        // Memory
+        "memory_store" => ("Save to memory", "Memory"),
+        "memory_recall" => ("Recall from memory", "Memory"),
+        // Web
+        "web_search" => ("Search the web", "Web"),
+        "web_fetch" => ("Fetch a web page", "Web"),
+        // Email
+        "email_send" => ("Send email", "Email"),
+        // Calendar
+        "calendar_list" => ("List calendar events", "Calendar"),
+        "calendar_create" => ("Create calendar event", "Calendar"),
+        "calendar_update" => ("Update calendar event", "Calendar"),
+        "calendar_delete" => ("Delete calendar event", "Calendar"),
+        // Contacts
+        "contacts_list" => ("List contacts", "Contacts"),
+        "contacts_search" => ("Search contacts", "Contacts"),
+        "contacts_create" => ("Create contact", "Contacts"),
+        "contacts_update" => ("Update contact", "Contacts"),
+        "contacts_delete" => ("Delete contact", "Contacts"),
+        // Attachments
+        "read_attachment_full" => ("Read attachment text", "Attachments"),
+        "fetch_attachment" => ("Fetch attachment bytes", "Attachments"),
+        // Toolbox / packages
+        "install_package" => ("Install package", "Toolbox"),
+        "list_installed_packages" => ("List installed packages", "Toolbox"),
+        "uninstall_package" => ("Uninstall package", "Toolbox"),
+        // Delegation
+        "delegate_to_agent" => ("Delegate to specialist agent", "Delegation"),
+        _ => return None,
+    })
+}
+
+/// Default-prettify an unknown tool id into a display label. Replaces
+/// underscores with spaces, capitalizes the first letter — readable
+/// enough for MCP-provided tools without forcing a full mapping.
+fn humanize(name: &str) -> String {
+    let cleaned = name.replace('_', " ");
+    let mut chars = cleaned.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+    }
 }
 
 /// Snapshot of the tools available to a wake-up at *create* time. Built
@@ -383,6 +455,14 @@ pub struct ToolInventoryItem {
 /// we use the active arc when there is one (so MCP/file gates resolve)
 /// and a placeholder otherwise. Outbound is a name-based heuristic that
 /// matches the list in `wakeup_registry::OUTBOUND_TOOL_NAMES`.
+///
+/// Each entry carries a human-readable `display_name` + `category` so
+/// the UI can render grouped collapsible sections instead of a flat
+/// alphabetical wall of internal tool ids. The MCP filesystem tools
+/// (`<mcp>__read_file`, `__write_file`, `__list_dir`, etc.) are dropped
+/// from this list because the gated built-ins (`read`/`write`/`edit`/
+/// `grep`/`list_directory`) cover the same ground and run through the
+/// permission gate; exposing both would just bloat the picker.
 #[tauri::command]
 pub async fn list_available_tools(
     state: State<'_, AppState>,
@@ -395,15 +475,65 @@ pub async fn list_available_tools(
         .await
         .map_err(|e| format!("List tools: {e}"))?;
     let outbound: std::collections::HashSet<&str> = ["email_send"].into_iter().collect();
+
+    // The filesystem MCP exposes `<mcp_id>__read_file`, `__write_file`,
+    // `__list_dir`, `__create_dir`, `__delete`, etc. Built-ins cover the
+    // same ground and route through the file-permission gate, so listing
+    // both confuses the picker. Hide the MCP duplicates here; users who
+    // genuinely need a non-default MCP filesystem can still allow the
+    // server-prefixed name by typing it (future: an "advanced" toggle).
+    const MCP_FILE_DUPLICATES: &[&str] = &[
+        "read_file",
+        "write_file",
+        "append_file",
+        "list_dir",
+        "list_directory",
+        "create_dir",
+        "create_directory",
+        "delete",
+        "delete_file",
+        "remove",
+        "remove_file",
+        "stat",
+        "exists",
+    ];
+
     let mut out: Vec<ToolInventoryItem> = tools
         .into_iter()
-        .map(|t| ToolInventoryItem {
-            outbound: outbound.contains(t.name.as_str()),
-            name: t.name,
-            description: t.description,
+        .filter(|t| {
+            // Drop filesystem MCP duplicates — keep MCPs that bring new
+            // capability (Slack, Notion, etc.).
+            if let Some((_, suffix)) = t.name.split_once("__") {
+                if MCP_FILE_DUPLICATES.contains(&suffix) {
+                    return false;
+                }
+            }
+            true
+        })
+        .map(|t| {
+            let (display_name, category) = match tool_metadata(&t.name) {
+                Some((label, cat)) => (label.to_string(), cat.to_string()),
+                None => match t.name.split_once("__") {
+                    Some((mcp_id, suffix)) => (humanize(suffix), format!("MCP: {mcp_id}")),
+                    None => (humanize(&t.name), "Other".to_string()),
+                },
+            };
+            ToolInventoryItem {
+                outbound: outbound.contains(t.name.as_str()),
+                name: t.name,
+                display_name,
+                category,
+                description: t.description,
+            }
         })
         .collect();
-    out.sort_by(|a, b| a.name.cmp(&b.name));
+    // Sort by category then display_name so the JS can group adjacent
+    // entries without re-sorting.
+    out.sort_by(|a, b| {
+        a.category
+            .cmp(&b.category)
+            .then_with(|| a.display_name.cmp(&b.display_name))
+    });
     Ok(out)
 }
 
