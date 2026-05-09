@@ -818,8 +818,17 @@ impl AppState {
             return;
         }
         let arc_store = self.arc_store.clone();
+        // Phase 3b: coordinator-backed sink. Each fire becomes a synthetic
+        // sense event the coordinator can risk-evaluate and queue, with
+        // the resulting task registered for the dispatch loop. Phase 3c
+        // will layer AutonomyBand + tool/contact allowlists on top.
         let sink: Arc<dyn athen_core::traits::wakeup::WakeupFireSink> =
-            Arc::new(crate::wakeup_sink::LoggingWakeupSink::new(arc_store));
+            Arc::new(crate::wakeup_sink::CoordinatorWakeupSink::new(
+                Arc::clone(&self.coordinator),
+                arc_store,
+                Arc::clone(&self.task_arc_map),
+                Arc::clone(&self.dispatch_signal),
+            ));
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         self.wakeup_scheduler_shutdown = Some(tx);
 

@@ -889,6 +889,13 @@
                         <textarea id="wakeup-instruction" rows="3" placeholder="e.g. Summarize today's tech news, post to Telegram"></textarea>
                     </div>
                     <div class="wakeups-form-row">
+                        <label for="wakeup-arc">Where to log the result</label>
+                        <select id="wakeup-arc">
+                            <option value="">New arc (created on fire)</option>
+                        </select>
+                        <span class="wakeup-sub-label wakeup-arc-hint">Pick an existing arc to continue a thread, or leave on "New arc" so each fire spawns its own.</span>
+                    </div>
+                    <div class="wakeups-form-row">
                         <label for="wakeup-schedule-kind">Schedule</label>
                         <select id="wakeup-schedule-kind">
                             <option value="one_shot">One-time</option>

@@ -7809,6 +7809,7 @@ const wakeupCronExprEl = document.getElementById('wakeup-cron-expr');
 const wakeupCronTzEl = document.getElementById('wakeup-cron-tz');
 const wakeupIntervalSecsEl = document.getElementById('wakeup-interval-secs');
 const wakeupInstructionEl = document.getElementById('wakeup-instruction');
+const wakeupArcSelectEl = document.getElementById('wakeup-arc');
 
 function showWakeups() {
     if (!wakeupsView) return;
@@ -7882,9 +7883,45 @@ function openWakeupForm() {
     wakeupInstructionEl.value = '';
     wakeupScheduleKindEl.value = 'one_shot';
     setWakeupScheduleKind('one_shot');
+    populateWakeupArcOptions();
     wakeupFormError?.classList.add('hidden');
     wakeupsForm.classList.remove('hidden');
     wakeupInstructionEl.focus();
+}
+
+async function populateWakeupArcOptions() {
+    if (!wakeupArcSelectEl || !invoke) return;
+    // Reset to just the "New arc" option, then append live arcs.
+    wakeupArcSelectEl.innerHTML = '<option value="">New arc (created on fire)</option>';
+    try {
+        const arcs = await invoke('list_arcs');
+        if (!Array.isArray(arcs)) return;
+        // Drop System / completed arcs from prior wake-up runs to keep
+        // the dropdown short and avoid the user picking a stale arc.
+        const live = arcs.filter(a => a && a.id && a.status !== 'completed');
+        // Active arc first if it's in the list, then the rest by recency.
+        live.sort((a, b) => {
+            if (a.id === activeArcId) return -1;
+            if (b.id === activeArcId) return 1;
+            const at = a.updated_at || a.created_at || '';
+            const bt = b.updated_at || b.created_at || '';
+            return bt.localeCompare(at);
+        });
+        for (const arc of live) {
+            const opt = document.createElement('option');
+            opt.value = arc.id;
+            const label = arc.name || arc.id;
+            opt.textContent = arc.id === activeArcId ? `${label} (current)` : label;
+            wakeupArcSelectEl.appendChild(opt);
+        }
+        // Default to the current arc when present — most "remind me about
+        // THIS" flows want continuity with the arc the user is in.
+        if (activeArcId && live.some(a => a.id === activeArcId)) {
+            wakeupArcSelectEl.value = activeArcId;
+        }
+    } catch (e) {
+        console.warn('Failed to load arcs for wake-up picker:', e);
+    }
 }
 
 function renderWakeupCalendar() {
@@ -8024,9 +8061,14 @@ async function submitWakeup(ev) {
         wakeupFormError.classList.remove('hidden');
         return;
     }
+    const arcId = (wakeupArcSelectEl?.value || '').trim();
     try {
         await invoke('create_wakeup', {
-            req: { instruction, schedule },
+            req: {
+                instruction,
+                schedule,
+                ...(arcId ? { arc_id: arcId } : {}),
+            },
         });
         closeWakeupForm();
         await loadWakeups();
