@@ -2572,6 +2572,30 @@ pub(crate) async fn execute_approved_task(
             Box::new(crate::delegation::ArcRegistryAdapter(base_registry))
         };
 
+    // Wake-up tool/contact allowlist — sits outermost so it can hide
+    // tools that any inner layer (delegation, app tools, MCP) exposes.
+    // No-op when the task isn't a wake-up fire or when no allowlists
+    // are declared and autonomy is permissive. See `wakeup_registry`.
+    let registry: Box<dyn athen_core::traits::tool::ToolRegistry> = if let Some(ref w) = ctx.wakeup
+    {
+        let contact_store_dyn: Option<Arc<dyn athen_contacts::ContactStore>> = ctx
+            .contact_store
+            .as_ref()
+            .map(|s| Arc::new(s.clone()) as Arc<dyn athen_contacts::ContactStore>);
+        Box::new(
+            crate::wakeup_registry::WakeupRestrictedRegistry::new(
+                registry,
+                w.tool_allowlist.clone(),
+                w.contact_allowlist.clone(),
+                w.autonomy,
+                contact_store_dyn,
+            )
+            .await,
+        )
+    } else {
+        registry
+    };
+
     let exec_router: Box<dyn LlmRouter> = Box::new(SharedRouter(Arc::clone(&ctx.router)));
     let tool_log = new_tool_log();
     let auditor = TauriAuditor::new(
@@ -3306,6 +3330,48 @@ pub(crate) async fn execute_dispatched_task(
         surfaced_images = surfacing.images;
     }
 
+    // Wake-up autonomy directive — same shape as execute_approved_task.
+    // The dispatch path is the *normal* wake-up route (SilentApprove /
+    // NotifyAndProceed), so this is where the directive matters most.
+    // Soft enforcement (the LLM must self-restrict); the hard layer
+    // (tool/contact allowlists) wraps the registry below.
+    if let Some(ref w) = ctx.wakeup {
+        use athen_core::wakeup::AutonomyBand;
+        let band_directive = match w.autonomy {
+            AutonomyBand::Auto => {
+                "AUTONOMY: auto. Run anything below `Critical` risk without \
+                 prompting. Pause only on Critical actions and write a clear \
+                 stop note to the arc."
+            }
+            AutonomyBand::SafeOnly => {
+                "AUTONOMY: safe_only (default). Execute below-threshold \
+                 actions without prompting. For anything Caution or above, \
+                 stop and write a stop note to the arc — the user will see it \
+                 next time they open Athen."
+            }
+            AutonomyBand::NotifyOnly => {
+                "AUTONOMY: notify_only. You may read, summarize, and write to \
+                 this arc. You MUST NOT send any outbound message (email, \
+                 Telegram, etc.), call any contact, or trigger any external \
+                 side effect. If the instruction implies an outbound action, \
+                 stop, write what you would have sent into the arc, and exit."
+            }
+        };
+        let header = format!(
+            "[Wake-up trigger — id {}, fired by scheduler at {}]\n\
+             You were not invoked by a live user; this run is unattended. \
+             Output destination is governed by the instruction itself \
+             (write to file / send / append). The user will review the arc \
+             when they next open Athen.\n\n{band_directive}\n\n",
+            w.id,
+            chrono::Utc::now().to_rfc3339()
+        );
+        if !system_suffix.is_empty() && !system_suffix.ends_with("\n\n") {
+            system_suffix.push_str("\n\n");
+        }
+        system_suffix.push_str(&header);
+    }
+
     // Build the tool registry, mirroring execute_approved_task.
     let mut shell_registry = athen_agent::ShellToolRegistry::new()
         .await
@@ -3379,6 +3445,27 @@ pub(crate) async fn execute_dispatched_task(
         } else {
             Box::new(crate::delegation::ArcRegistryAdapter(base_registry))
         };
+
+    // Wake-up tool/contact allowlist — outermost. See execute_approved_task.
+    let registry: Box<dyn athen_core::traits::tool::ToolRegistry> = if let Some(ref w) = ctx.wakeup
+    {
+        let contact_store_dyn: Option<Arc<dyn athen_contacts::ContactStore>> = ctx
+            .contact_store
+            .as_ref()
+            .map(|s| Arc::new(s.clone()) as Arc<dyn athen_contacts::ContactStore>);
+        Box::new(
+            crate::wakeup_registry::WakeupRestrictedRegistry::new(
+                registry,
+                w.tool_allowlist.clone(),
+                w.contact_allowlist.clone(),
+                w.autonomy,
+                contact_store_dyn,
+            )
+            .await,
+        )
+    } else {
+        registry
+    };
 
     let exec_router: Box<dyn LlmRouter> = Box::new(SharedRouter(Arc::clone(&ctx.router)));
     let tool_log = new_tool_log();

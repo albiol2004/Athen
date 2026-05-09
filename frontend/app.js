@@ -7887,6 +7887,8 @@ const wakeupIntervalSecsEl = document.getElementById('wakeup-interval-secs');
 const wakeupInstructionEl = document.getElementById('wakeup-instruction');
 const wakeupArcSelectEl = document.getElementById('wakeup-arc');
 const wakeupAutonomyEl = document.getElementById('wakeup-autonomy');
+const wakeupToolListEl = document.getElementById('wakeup-tool-list');
+const wakeupContactListEl = document.getElementById('wakeup-contact-list');
 
 function showWakeups() {
     if (!wakeupsView) return;
@@ -8004,6 +8006,8 @@ function openWakeupForm(existing) {
     }
 
     populateWakeupArcOptions(existing ? existing.arc_id : null);
+    populateWakeupToolAllowlist(existing ? existing.tool_allowlist : null);
+    populateWakeupContactAllowlist(existing ? existing.contact_allowlist : null);
 
     // Reflect mode in the submit button so the user knows what they're about to do.
     const saveBtn = document.getElementById('wakeup-form-save');
@@ -8080,6 +8084,104 @@ async function populateWakeupArcOptions(preferredArcId) {
     } catch (e) {
         console.warn('Failed to load arcs for wake-up picker:', e);
     }
+}
+
+// Cached so opening / re-opening the form doesn't re-hit the backend.
+// Cleared once the user actually leaves the wake-ups view.
+let wakeupToolInventoryCache = null;
+let wakeupContactInventoryCache = null;
+
+async function populateWakeupToolAllowlist(selectedNames) {
+    if (!wakeupToolListEl || !invoke) return;
+    const selected = new Set(Array.isArray(selectedNames) ? selectedNames : []);
+    wakeupToolListEl.innerHTML = '<div class="wakeup-allowlist-loading">Loading tools…</div>';
+    try {
+        if (!wakeupToolInventoryCache) {
+            wakeupToolInventoryCache = await invoke('list_available_tools');
+        }
+        const tools = Array.isArray(wakeupToolInventoryCache) ? wakeupToolInventoryCache : [];
+        wakeupToolListEl.innerHTML = '';
+        if (tools.length === 0) {
+            wakeupToolListEl.innerHTML = '<div class="wakeup-allowlist-empty">No tools available.</div>';
+            return;
+        }
+        for (const t of tools) {
+            const row = document.createElement('label');
+            row.className = 'wakeup-allowlist-row';
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.value = t.name;
+            cb.dataset.kind = 'tool';
+            cb.checked = selected.has(t.name);
+            const head = document.createElement('span');
+            head.className = 'wakeup-allowlist-head';
+            head.textContent = t.name;
+            if (t.outbound) {
+                const badge = document.createElement('span');
+                badge.className = 'wakeup-allowlist-badge';
+                badge.textContent = 'sends';
+                head.appendChild(badge);
+            }
+            const desc = document.createElement('span');
+            desc.className = 'wakeup-allowlist-desc';
+            desc.textContent = t.description || '';
+            row.appendChild(cb);
+            row.appendChild(head);
+            row.appendChild(desc);
+            wakeupToolListEl.appendChild(row);
+        }
+    } catch (e) {
+        console.warn('Failed to load tool inventory:', e);
+        wakeupToolListEl.innerHTML = `<div class="wakeup-allowlist-error">Failed to load tools: ${e}</div>`;
+    }
+}
+
+async function populateWakeupContactAllowlist(selectedIds) {
+    if (!wakeupContactListEl || !invoke) return;
+    const selected = new Set(Array.isArray(selectedIds) ? selectedIds : []);
+    wakeupContactListEl.innerHTML = '<div class="wakeup-allowlist-loading">Loading contacts…</div>';
+    try {
+        if (!wakeupContactInventoryCache) {
+            wakeupContactInventoryCache = await invoke('list_contacts');
+        }
+        const contacts = Array.isArray(wakeupContactInventoryCache) ? wakeupContactInventoryCache : [];
+        wakeupContactListEl.innerHTML = '';
+        if (contacts.length === 0) {
+            wakeupContactListEl.innerHTML = '<div class="wakeup-allowlist-empty">No contacts yet — add some in the Contacts view to allowlist them here.</div>';
+            return;
+        }
+        for (const c of contacts) {
+            const row = document.createElement('label');
+            row.className = 'wakeup-allowlist-row';
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.value = c.id;
+            cb.dataset.kind = 'contact';
+            cb.checked = selected.has(c.id);
+            const head = document.createElement('span');
+            head.className = 'wakeup-allowlist-head';
+            head.textContent = c.name || c.id;
+            const ids = Array.isArray(c.identifiers) ? c.identifiers : [];
+            const idText = ids.map(i => i.value || '').filter(Boolean).join(', ');
+            const desc = document.createElement('span');
+            desc.className = 'wakeup-allowlist-desc';
+            desc.textContent = idText || '(no identifiers)';
+            row.appendChild(cb);
+            row.appendChild(head);
+            row.appendChild(desc);
+            wakeupContactListEl.appendChild(row);
+        }
+    } catch (e) {
+        console.warn('Failed to load contacts for wake-up picker:', e);
+        wakeupContactListEl.innerHTML = `<div class="wakeup-allowlist-error">Failed to load contacts: ${e}</div>`;
+    }
+}
+
+function readWakeupAllowlist(container, kind) {
+    if (!container) return null;
+    const checked = container.querySelectorAll(`input[type="checkbox"][data-kind="${kind}"]:checked`);
+    const out = Array.from(checked).map(c => c.value).filter(Boolean);
+    return out.length === 0 ? null : out;
 }
 
 function renderWakeupCalendar() {
@@ -8222,11 +8324,15 @@ async function submitWakeup(ev) {
     }
     const arcId = (wakeupArcSelectEl?.value || '').trim();
     const autonomy = (wakeupAutonomyEl?.value || 'safe_only').trim();
+    const toolAllowlist = readWakeupAllowlist(wakeupToolListEl, 'tool');
+    const contactAllowlist = readWakeupAllowlist(wakeupContactListEl, 'contact');
     const reqPayload = {
         instruction,
         schedule,
         autonomy,
         ...(arcId ? { arc_id: arcId } : {}),
+        ...(toolAllowlist ? { tool_allowlist: toolAllowlist } : {}),
+        ...(contactAllowlist ? { contact_allowlist: contactAllowlist } : {}),
     };
     try {
         console.log('[wakeup] submit', { editing: wakeupEditingId, payload: reqPayload });

@@ -946,6 +946,16 @@
                         <label for="wakeup-interval-secs">Every (seconds)</label>
                         <input type="number" id="wakeup-interval-secs" min="60" step="60" value="3600">
                     </div>
+                    <div class="wakeups-form-row">
+                        <label>Tool allowlist <span class="wakeup-sub-label">(optional)</span></label>
+                        <span class="wakeup-sub-label wakeup-arc-hint">Limit which tools the agent can use when this wake-up fires. Leave all unchecked to allow the profile defaults. Outbound tools are tagged "sends" — the wake-up cannot reach the world without one.</span>
+                        <div id="wakeup-tool-list" class="wakeup-allowlist"></div>
+                    </div>
+                    <div class="wakeups-form-row">
+                        <label>Contact allowlist <span class="wakeup-sub-label">(optional)</span></label>
+                        <span class="wakeup-sub-label wakeup-arc-hint">When set, outbound tools (e.g. <code>email_send</code>) only accept recipients matching one of these contacts' identifiers. Leave empty to keep the default — every recipient your profile permits.</span>
+                        <div id="wakeup-contact-list" class="wakeup-allowlist"></div>
+                    </div>
                     <div class="wakeups-form-actions">
                         <button type="button" id="wakeup-form-cancel" class="btn-secondary">Cancel</button>
                         <button type="submit" id="wakeup-form-save" class="btn-primary">Create wake-up</button>

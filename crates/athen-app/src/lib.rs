@@ -20,6 +20,7 @@ mod settings;
 pub(crate) mod state;
 pub(crate) mod telegram_progress;
 mod wakeup_commands;
+pub(crate) mod wakeup_registry;
 pub(crate) mod wakeup_sink;
 
 use state::AppState;
@@ -164,6 +165,7 @@ pub fn run() {
             wakeup_commands::list_wakeups,
             wakeup_commands::delete_wakeup,
             wakeup_commands::set_wakeup_enabled,
+            wakeup_commands::list_available_tools,
         ])
         .setup(|app| {
             use tauri::Manager;

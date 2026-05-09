@@ -11,6 +11,7 @@ use tauri::State;
 use uuid::Uuid;
 
 use athen_core::config::NotificationChannelKind;
+use athen_core::contact::ContactId;
 use athen_core::traits::wakeup::WakeupStore;
 use athen_core::wakeup::{AutonomyBand, Schedule, Wakeup, WakeupOrigin};
 
@@ -33,6 +34,10 @@ pub struct WakeupView {
     pub arc_id: Option<String>,
     pub profile: String,
     pub preferred_channel: Option<String>,
+    /// Tool names the wake-up may invoke. `null` = use profile defaults.
+    pub tool_allowlist: Option<Vec<String>>,
+    /// Contact UUIDs (as strings) allowed as outbound recipients.
+    pub contact_allowlist: Option<Vec<String>>,
 }
 
 impl From<&Wakeup> for WakeupView {
@@ -68,6 +73,11 @@ impl From<&Wakeup> for WakeupView {
                 NotificationChannelKind::InApp => "in_app".to_string(),
                 NotificationChannelKind::Telegram => "telegram".to_string(),
             }),
+            tool_allowlist: w.tool_allowlist.clone(),
+            contact_allowlist: w
+                .contact_allowlist
+                .as_ref()
+                .map(|v| v.iter().map(|c| c.to_string()).collect()),
         }
     }
 }
@@ -85,6 +95,14 @@ pub struct CreateWakeupReq {
     pub arc_id: Option<String>,
     /// "in_app" | "telegram"; null = use system default at notify time.
     pub preferred_channel: Option<String>,
+    /// Optional tool name allowlist. `None` / empty = profile defaults.
+    /// When `Some(non_empty)`, the wake-up registry hides every other tool
+    /// from the agent's surface and refuses calls outside the list.
+    pub tool_allowlist: Option<Vec<String>>,
+    /// Optional contact id allowlist. `None` / empty = profile defaults.
+    /// When `Some(non_empty)`, outbound tools (today: `email_send`) only
+    /// accept recipients whose identifiers belong to one of these contacts.
+    pub contact_allowlist: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,14 +192,17 @@ pub async fn create_wakeup(
         .map(AutonomyBand::from_str_lossy)
         .unwrap_or(AutonomyBand::SafeOnly);
 
+    let tool_allowlist = sanitize_tool_allowlist(req.tool_allowlist);
+    let contact_allowlist = parse_contact_allowlist(req.contact_allowlist)?;
+
     let w = Wakeup {
         id: Uuid::new_v4(),
         schedule,
         instruction: req.instruction.trim().to_string(),
         autonomy,
         preferred_channel,
-        tool_allowlist: None,
-        contact_allowlist: None,
+        tool_allowlist,
+        contact_allowlist,
         profile: req.profile.unwrap_or_else(|| "assistant".to_string()),
         arc_id: req.arc_id,
         origin: WakeupOrigin::User,
@@ -247,17 +268,18 @@ pub async fn update_wakeup(
         return Err("Instruction cannot be empty".into());
     }
 
+    let tool_allowlist = sanitize_tool_allowlist(req.tool_allowlist);
+    let contact_allowlist = parse_contact_allowlist(req.contact_allowlist)?;
+
     // Preserve identity, origin, created_at, last_fired_at, enabled.
-    // Allowlists aren't yet authorable from the form, so they survive
-    // a round-trip from whatever they were on creation.
     let updated = Wakeup {
         id: existing.id,
         schedule,
         instruction,
         autonomy,
         preferred_channel,
-        tool_allowlist: existing.tool_allowlist,
-        contact_allowlist: existing.contact_allowlist,
+        tool_allowlist,
+        contact_allowlist,
         profile: req.profile.unwrap_or(existing.profile),
         arc_id: req.arc_id,
         origin: existing.origin,
@@ -302,6 +324,87 @@ pub async fn delete_wakeup(
         .delete(id)
         .await
         .map_err(|e| format!("Delete wakeup: {e}"))
+}
+
+/// Treat empty / whitespace-only entries as "no allowlist". The frontend
+/// posts `[]` when the user clears the multiselect — that should mean
+/// "use profile defaults," not "block every tool."
+fn sanitize_tool_allowlist(v: Option<Vec<String>>) -> Option<Vec<String>> {
+    let cleaned: Vec<String> = v
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+fn parse_contact_allowlist(
+    v: Option<Vec<String>>,
+) -> std::result::Result<Option<Vec<ContactId>>, String> {
+    let raw = v.unwrap_or_default();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let mut out = Vec::with_capacity(raw.len());
+    for s in raw {
+        let s = s.trim();
+        if s.is_empty() {
+            continue;
+        }
+        let id = Uuid::parse_str(s).map_err(|e| format!("Invalid contact id '{s}': {e}"))?;
+        out.push(id);
+    }
+    if out.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(out))
+    }
+}
+
+/// One entry in the tool inventory the wake-up form renders.
+#[derive(Debug, Serialize)]
+pub struct ToolInventoryItem {
+    pub name: String,
+    pub description: String,
+    /// Hint for the UI: outbound tools get a small "sends" badge so the
+    /// user knows which ones are actually network-/world-affecting.
+    pub outbound: bool,
+}
+
+/// Snapshot of the tools available to a wake-up at *create* time. Built
+/// against the same registry composition the executor uses, so what the
+/// user sees in the multi-select matches what the agent can actually
+/// invoke at fire time. Wake-ups don't have an arc id at create time —
+/// we use the active arc when there is one (so MCP/file gates resolve)
+/// and a placeholder otherwise. Outbound is a name-based heuristic that
+/// matches the list in `wakeup_registry::OUTBOUND_TOOL_NAMES`.
+#[tauri::command]
+pub async fn list_available_tools(
+    state: State<'_, AppState>,
+) -> std::result::Result<Vec<ToolInventoryItem>, String> {
+    let arc_id_opt = state.active_arc_id.try_lock().map(|g| g.clone()).ok();
+    let arc_id = arc_id_opt.unwrap_or_else(|| "wakeup-tool-inventory".to_string());
+    let registry = state.build_tool_registry(&arc_id, None).await;
+    let tools = registry
+        .list_tools()
+        .await
+        .map_err(|e| format!("List tools: {e}"))?;
+    let outbound: std::collections::HashSet<&str> = ["email_send"].into_iter().collect();
+    let mut out: Vec<ToolInventoryItem> = tools
+        .into_iter()
+        .map(|t| ToolInventoryItem {
+            outbound: outbound.contains(t.name.as_str()),
+            name: t.name,
+            description: t.description,
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
 }
 
 #[tauri::command]
