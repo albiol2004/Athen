@@ -9880,6 +9880,23 @@ let agentRunsCache = [];
 let activeAgentsRefreshing = false;
 let agentRunsRefreshing = false;
 let agentControlTickHandle = null;
+let agentHistoryFilter = 'all';
+// Tracks which task_ids are currently expanded in the active list, so a
+// full re-render (driven by the `agents-changed` push event) can restore
+// the expansion state instead of collapsing everything.
+const expandedActiveTaskIds = new Set();
+// Same for the history pane, keyed by task_id.
+const expandedHistoryTaskIds = new Set();
+// Per-task in-memory cache of step-card DOM nodes — the second click on
+// an already-loaded card is instant and survives re-renders. History
+// only: active cards re-fetch on every `agents-changed` to surface
+// freshly-streamed steps without an explicit collapse-and-expand cycle.
+const agentStepsLoaded = new Set();
+// Tracks the most recently rendered step_count per active task so we can
+// detect increments and trigger a one-off bump animation on the count
+// badge. Wiped when a task drops out of the active list (registry
+// finalize). Cheap; only holds Number entries keyed by task_id.
+const lastActiveStepCount = new Map();
 
 const agentControlView = document.getElementById('agent-control-view');
 const agentControlBtn = document.getElementById('agent-control-btn');
@@ -9997,73 +10014,451 @@ function renderActiveAgentsPill() {
 
 function renderAgentControlRunningCount() {
     const el = document.getElementById('agent-control-running-count');
-    if (!el) return;
     const count = activeAgentsCache.length;
-    el.textContent = `${count} running`;
+    if (el) el.textContent = `${count} running`;
+    // Mirror into the Active sub-tab badge so the count is visible even
+    // when the user is on the History tab.
+    const badge = document.getElementById('agent-tab-active-count');
+    if (badge) {
+        badge.textContent = String(count);
+        badge.classList.toggle('hidden', count === 0);
+    }
+}
+
+// Inline chevron used by both expandable cards and history rows.
+function agentChevronSvg() {
+    return '<svg viewBox="0 0 12 12" aria-hidden="true" focusable="false">'
+        + '<path d="M4 2.5L8 6L4 9.5" fill="none" stroke="currentColor" '
+        + 'stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+}
+
+// Lazily load the per-turn tool_call rows for a run and render them via
+// the existing buildToolCardBlock so the expanded view matches the chat
+// transcript visually. Falls back gracefully when arc_id or turn_id are
+// missing (older runs from before the migration).
+//
+// `silent`: when true, fetch first and only swap DOM in one pass (no
+// "Loading…" placeholder). Used by active-card live refreshes so the
+// already-rendered steps don't blink during background re-fetch.
+// Per-container request-seq guard. Pulse N+1 may complete before pulse
+// N (DeepSeek bursts 3–5 tool calls/s, get_arc_entries latency varies).
+// Without this guard, an older fetch can overwrite the latest snapshot
+// with stale data. We bump a seq on each call and drop late results.
+const stepsRequestSeq = new WeakMap();
+
+async function loadAgentSteps(container, arcId, turnId, silent = false) {
+    if (!container) return;
+    if (!arcId || !turnId) {
+        container.innerHTML = '<div class="agent-card-steps-empty">'
+            + 'No step data — open the arc to see the transcript.</div>';
+        return;
+    }
+    const seq = (stepsRequestSeq.get(container) || 0) + 1;
+    stepsRequestSeq.set(container, seq);
+    if (!silent) {
+        container.innerHTML = '<div class="agent-card-steps-empty muted">Loading steps…</div>';
+    }
+    try {
+        const entries = await invoke('get_arc_entries', { arcId });
+        // Drop stale: another fetch superseded us before this one
+        // returned. Rendering would revert the DOM to an older snapshot.
+        if (stepsRequestSeq.get(container) !== seq) return;
+        const toolCalls = (entries || []).filter(
+            (e) => e && e.entry_type === 'tool_call' && e.turn_id === turnId,
+        );
+        if (toolCalls.length === 0) {
+            container.innerHTML = '<div class="agent-card-steps-empty">'
+                + 'This run finished without any tool calls.</div>';
+            // Reset the previous-count tracker so a later first card
+            // doesn't get flagged as "fresh" on the very next render.
+            delete container.dataset.lastStepCount;
+            return;
+        }
+        // Build into a fragment then swap in one pass — keeps the
+        // existing cards visible until the new ones arrive (no flicker).
+        const frag = document.createDocumentFragment();
+        for (const tc of toolCalls) {
+            const meta = parseEntryMetadata(tc.metadata) || {};
+            frag.appendChild(buildToolCardBlock(meta));
+        }
+        // Detect newly-arrived rows: if the count grew since the last
+        // render of this container, mark every card past the previous
+        // index as `.fresh` for a brief left-edge highlight. Skip on
+        // the first render (when there's no prior count to compare).
+        const prevCountStr = container.dataset.lastStepCount;
+        const prevCount = prevCountStr === undefined ? -1 : parseInt(prevCountStr, 10);
+        container.dataset.lastStepCount = String(toolCalls.length);
+        if (prevCount >= 0 && toolCalls.length > prevCount) {
+            const newCards = Array.from(frag.children).slice(prevCount);
+            for (const node of newCards) {
+                node.classList.add('fresh');
+                setTimeout(() => node.classList.remove('fresh'), 700);
+            }
+        }
+        container.replaceChildren(frag);
+    } catch (err) {
+        if (stepsRequestSeq.get(container) !== seq) return;
+        if (!silent) {
+            container.innerHTML = '<div class="agent-card-steps-empty">'
+                + `Could not load steps: ${escapeHtml(String(err))}</div>`;
+        }
+        // On silent refresh failure, leave the previous content in place
+        // — the next `agents-changed` will retry.
+    }
+}
+
+// Toggle expansion on an active agent card. Always loads (no cache):
+// active runs stream new tool_call rows, so the user expects to see
+// fresh content on every expand. Skips clicks inside the "Jump to arc"
+// or per-card Stop buttons (those run their own handlers).
+async function toggleAgentCardExpand(card) {
+    const taskId = card.getAttribute('data-task-id');
+    if (!taskId) return;
+    // Direct-child div only — the footer also has `.agent-card-steps`
+    // on its count badge (a span), and a plain querySelector would
+    // match that first in document order.
+    const stepsEl = card.querySelector(':scope > :scope > div.agent-card-steps');
+    if (!stepsEl) return;
+    const wasExpanded = card.classList.contains('expanded');
+    if (wasExpanded) {
+        card.classList.remove('expanded');
+        stepsEl.hidden = true;
+        expandedActiveTaskIds.delete(taskId);
+        return;
+    }
+    card.classList.add('expanded');
+    stepsEl.hidden = false;
+    expandedActiveTaskIds.add(taskId);
+    const arcId = card.getAttribute('data-arc-id') || '';
+    const turnId = card.getAttribute('data-turn-id') || '';
+    // Non-silent (show "Loading…") on user-driven expand; the auto
+    // refresh path uses silent=true to avoid flashing the placeholder
+    // every time the registry pulses.
+    await loadAgentSteps(stepsEl, arcId, turnId);
+}
+
+// Same as above for a history row item (the wrapping <div.agent-history-item>).
+async function toggleAgentHistoryExpand(item) {
+    const taskId = item.getAttribute('data-task-id');
+    if (!taskId) return;
+    const row = item.querySelector('.agent-history-row');
+    const stepsEl = item.querySelector('.agent-history-steps');
+    if (!row || !stepsEl) return;
+    const wasExpanded = row.classList.contains('expanded');
+    if (wasExpanded) {
+        row.classList.remove('expanded');
+        stepsEl.hidden = true;
+        expandedHistoryTaskIds.delete(taskId);
+        return;
+    }
+    row.classList.add('expanded');
+    stepsEl.hidden = false;
+    expandedHistoryTaskIds.add(taskId);
+    if (!agentStepsLoaded.has(taskId)) {
+        agentStepsLoaded.add(taskId);
+        const arcId = item.getAttribute('data-arc-id') || '';
+        const turnId = item.getAttribute('data-turn-id') || '';
+        await loadAgentSteps(stepsEl, arcId, turnId);
+    }
+}
+
+// Build a single active-agent card from scratch. Returns a real DOM node
+// (not an HTML string) so the diff path in renderAgentControlActive can
+// append/insert it directly. Wires its own click + button handlers — the
+// outer render function no longer re-binds on every pulse.
+function buildActiveAgentCard(agent) {
+    const sourceKey = agentSourceKey(agent.source);
+    const icon = agentSourceIcon(agent.source);
+    const title = escapeHtml(agent.title || '(untitled)');
+    const elapsed = escapeHtml(formatAgentElapsed(agent.started_at));
+    const stepCount = Number.isFinite(agent.step_count) ? agent.step_count : 0;
+    const tool = agent.current_tool ? escapeHtml(agent.current_tool) : '';
+    const action = agent.current_action ? escapeHtml(agent.current_action) : '';
+    const arcId = agent.arc_id ? escapeHtml(agent.arc_id) : '';
+    const taskId = escapeHtml(agent.task_id);
+    const turnId = agent.turn_id ? escapeHtml(agent.turn_id) : '';
+    // Hide the chip entirely when there's no current_tool — "—" dashes
+    // feel like missing data; absence is cleaner.
+    const toolChip = tool ? `<span class="agent-card-tool-chip">${tool}</span>` : '';
+    const actionInner = action || '<span class="muted">starting…</span>';
+    const jumpBtn = arcId
+        ? `<button class="agent-card-jump" type="button" data-jump-arc="${arcId}">Jump to arc</button>`
+        : '';
+    const stopBtn = `<button class="agent-card-stop" type="button" title="Stop agent" aria-label="Stop agent" data-stop-task="${taskId}">
+        <svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+    </button>`;
+    const card = document.createElement('article');
+    card.className = 'agent-card';
+    card.setAttribute('data-source', sourceKey);
+    card.setAttribute('data-task-id', taskId);
+    card.setAttribute('data-arc-id', arcId);
+    card.setAttribute('data-turn-id', turnId);
+    card.innerHTML = `
+    <header class="agent-card-head">
+        <span class="agent-card-icon" aria-hidden="true">${icon}</span>
+        <span class="agent-card-title" title="${title}">${title}</span>
+        <span class="agent-card-elapsed" data-elapsed-for="${taskId}">${elapsed}</span>
+        <span class="agent-card-chevron" aria-hidden="true">${agentChevronSvg()}</span>
+    </header>
+    <div class="agent-card-body">
+        ${toolChip}<span class="agent-card-action">${actionInner}</span>
+    </div>
+    <footer class="agent-card-foot">
+        <span class="agent-card-steps" data-steps-for="${taskId}">${stepCount} step${stepCount === 1 ? '' : 's'}</span>
+        <span class="agent-card-foot-actions">${jumpBtn}${stopBtn}</span>
+    </footer>
+    <div class="agent-card-steps" hidden></div>`;
+
+    // Wire interactions once at construction. The diff path keeps this
+    // node alive across pulses so handlers attach exactly one time per
+    // task — no leak, no double-fire.
+    const jumpEl = card.querySelector('[data-jump-arc]');
+    if (jumpEl) {
+        jumpEl.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            const aid = jumpEl.getAttribute('data-jump-arc');
+            if (aid && typeof handleSwitchArc === 'function') {
+                handleSwitchArc(aid);
+            }
+        });
+    }
+    const stopEl = card.querySelector('[data-stop-task]');
+    if (stopEl) {
+        stopEl.addEventListener('click', async (ev) => {
+            ev.stopPropagation();
+            const tid = stopEl.getAttribute('data-stop-task');
+            if (!tid) return;
+            card.classList.add('cancelling');
+            const actionEl = card.querySelector('.agent-card-action');
+            if (actionEl) actionEl.innerHTML = '<span class="muted">Stopping…</span>';
+            stopEl.disabled = true;
+            try {
+                await invoke('cancel_agent', { taskId: tid });
+            } catch (err) {
+                console.warn('[athen] cancel_agent failed:', err);
+                card.classList.remove('cancelling');
+                stopEl.disabled = false;
+            }
+        });
+    }
+    card.addEventListener('click', (ev) => {
+        if (ev.target.closest('.agent-card-jump')) return;
+        if (ev.target.closest('.agent-card-stop')) return;
+        if (ev.target.closest('button')) return;
+        toggleAgentCardExpand(card);
+    });
+    return card;
+}
+
+// Patch a live card's mutable fields in place (elapsed, step count,
+// current_tool chip, current_action). Title rarely changes but we
+// refresh it for free since the cost is a single textContent write.
+// Skips DOM if the value already matches — keeps style recalcs minimal.
+function patchActiveCardInPlace(card, agent) {
+    const taskId = agent.task_id;
+    // Elapsed.
+    const elapsedEl = card.querySelector(`[data-elapsed-for="${CSS.escape(taskId)}"]`);
+    if (elapsedEl) {
+        const next = formatAgentElapsed(agent.started_at);
+        if (elapsedEl.textContent !== next) elapsedEl.textContent = next;
+    }
+    // Step count badge in the footer.
+    const stepCount = Number.isFinite(agent.step_count) ? agent.step_count : 0;
+    const stepsBadge = card.querySelector(`[data-steps-for="${CSS.escape(taskId)}"]`);
+    if (stepsBadge) {
+        const nextText = `${stepCount} step${stepCount === 1 ? '' : 's'}`;
+        if (stepsBadge.textContent !== nextText) {
+            stepsBadge.textContent = nextText;
+            // Bump animation on growth — applies on the next frame so
+            // the browser registers the class flip as an animation
+            // start rather than a same-frame style flush.
+            const prev = parseInt(card.dataset.lastFooterCount || '-1', 10);
+            if (prev >= 0 && stepCount > prev) {
+                requestAnimationFrame(() => {
+                    stepsBadge.classList.add('bumped');
+                    setTimeout(() => stepsBadge.classList.remove('bumped'), 420);
+                });
+            }
+        }
+        card.dataset.lastFooterCount = String(stepCount);
+    }
+    // Source + arc/turn ids — almost never change, but keep the
+    // attributes truthful so jump/stop buttons keep targeting the
+    // right thing if the backend ever rotates them.
+    const nextSource = agentSourceKey(agent.source);
+    if (card.getAttribute('data-source') !== nextSource) {
+        card.setAttribute('data-source', nextSource);
+    }
+    const nextArc = agent.arc_id ? agent.arc_id : '';
+    if (card.getAttribute('data-arc-id') !== nextArc) {
+        card.setAttribute('data-arc-id', nextArc);
+    }
+    const nextTurn = agent.turn_id ? agent.turn_id : '';
+    if (card.getAttribute('data-turn-id') !== nextTurn) {
+        card.setAttribute('data-turn-id', nextTurn);
+    }
+    // Current tool + action row. Cancelling state owns the action row
+    // until the registry actually drops the card, so don't overwrite it.
+    if (!card.classList.contains('cancelling')) {
+        const bodyEl = card.querySelector('.agent-card-body');
+        if (bodyEl) {
+            const tool = agent.current_tool ? escapeHtml(agent.current_tool) : '';
+            const action = agent.current_action ? escapeHtml(agent.current_action) : '';
+            const toolChip = tool ? `<span class="agent-card-tool-chip">${tool}</span>` : '';
+            const actionInner = action || '<span class="muted">starting…</span>';
+            const nextHtml = `${toolChip}<span class="agent-card-action">${actionInner}</span>`;
+            if (bodyEl.innerHTML !== nextHtml) bodyEl.innerHTML = nextHtml;
+        }
+    }
 }
 
 function renderAgentControlActive() {
     const container = document.getElementById('agent-control-active');
     if (!container) return;
     if (activeAgentsCache.length === 0) {
-        container.innerHTML = '<div class="agent-cards-empty">No agents currently running.</div>';
+        container.innerHTML = '<div class="agent-cards-empty">'
+            + 'No agents are running right now.'
+            + '<span class="empty-sub">Tasks you start show up here in real time.</span>'
+            + '</div>';
+        lastActiveStepCount.clear();
         return;
     }
 
-    const cards = activeAgentsCache.map((agent) => {
-        const sourceKey = agentSourceKey(agent.source);
-        const icon = agentSourceIcon(agent.source);
-        const title = escapeHtml(agent.title || '(untitled)');
-        const elapsed = escapeHtml(formatAgentElapsed(agent.started_at));
-        const stepCount = Number.isFinite(agent.step_count) ? agent.step_count : 0;
-        const tool = agent.current_tool ? escapeHtml(agent.current_tool) : '';
-        const action = agent.current_action ? escapeHtml(agent.current_action) : '';
-        const arcId = agent.arc_id ? escapeHtml(agent.arc_id) : '';
-        const taskId = escapeHtml(agent.task_id);
-        const bodyInner = tool || action
-            ? `${tool ? `<span class="agent-card-tool-chip">${tool}</span>` : ''}<span class="agent-card-action">${action || ''}</span>`
-            : '<span class="agent-card-action muted">starting…</span>';
-        const jumpBtn = arcId
-            ? `<button class="agent-card-jump" type="button" data-jump-arc="${arcId}">Jump to arc</button>`
-            : '<span></span>';
-        return `
-<article class="agent-card" data-source="${sourceKey}" data-task-id="${taskId}" data-arc-id="${arcId}">
-    <header class="agent-card-head">
-        <span class="agent-card-icon" aria-hidden="true">${icon}</span>
-        <span class="agent-card-title" title="${title}">${title}</span>
-        <span class="agent-card-elapsed">${elapsed}</span>
-    </header>
-    <div class="agent-card-body">${bodyInner}</div>
-    <footer class="agent-card-foot">
-        <span class="agent-card-steps">${stepCount} step${stepCount === 1 ? '' : 's'}</span>
-        ${jumpBtn}
-    </footer>
-</article>`;
-    }).join('');
+    // If the previous render was the empty-state placeholder (or first
+    // render of the panel), wipe it before diffing — there are no
+    // existing card nodes to reuse.
+    const placeholder = container.querySelector('.agent-cards-empty');
+    if (placeholder) container.innerHTML = '';
 
-    container.innerHTML = cards;
-    container.querySelectorAll('[data-jump-arc]').forEach((btn) => {
-        btn.addEventListener('click', (ev) => {
-            ev.stopPropagation();
-            const arcId = btn.getAttribute('data-jump-arc');
-            if (arcId && typeof handleSwitchArc === 'function') {
-                handleSwitchArc(arcId);
+    // Build a lookup of existing card nodes keyed by task_id.
+    const existing = new Map();
+    for (const node of Array.from(container.children)) {
+        if (node.classList && node.classList.contains('agent-card')) {
+            const tid = node.getAttribute('data-task-id') || '';
+            if (tid) existing.set(tid, node);
+        }
+    }
+
+    const liveTaskIds = new Set();
+    const orderedNodes = [];
+
+    // For each agent in the snapshot: reuse the existing card (in-place
+    // patch) or build a fresh one. Preserves CSS transitions, focus, and
+    // the expanded steps DOM across pulses.
+    for (const agent of activeAgentsCache) {
+        const tid = agent.task_id;
+        liveTaskIds.add(tid);
+        let card = existing.get(tid);
+        if (card) {
+            patchActiveCardInPlace(card, agent);
+        } else {
+            card = buildActiveAgentCard(agent);
+            // Seed the in-place footer-count tracker so the very first
+            // patch after construction doesn't fire the bump animation.
+            const initial = Number.isFinite(agent.step_count) ? agent.step_count : 0;
+            card.dataset.lastFooterCount = String(initial);
+            // Restore expansion if the user had this card open before.
+            if (expandedActiveTaskIds.has(tid)) {
+                card.classList.add('expanded');
+                const stepsEl = card.querySelector(':scope > div.agent-card-steps');
+                if (stepsEl) {
+                    stepsEl.hidden = false;
+                    const arcId = card.getAttribute('data-arc-id') || '';
+                    const turnId = card.getAttribute('data-turn-id') || '';
+                    loadAgentSteps(stepsEl, arcId, turnId, true);
+                }
             }
-        });
-    });
+        }
+        orderedNodes.push(card);
+    }
+
+    // Fade out + remove cards whose tasks have left the snapshot.
+    for (const [tid, node] of existing) {
+        if (liveTaskIds.has(tid)) continue;
+        if (node.classList.contains('removing')) continue;
+        node.classList.add('removing');
+        const drop = () => { if (node.parentNode === container) node.remove(); };
+        let removed = false;
+        const onEnd = () => { if (!removed) { removed = true; drop(); } };
+        node.addEventListener('transitionend', onEnd, { once: true });
+        // Fallback: if no transition fires (display:none, reduced motion,
+        // class collision), force the removal after the same window.
+        setTimeout(onEnd, 240);
+    }
+
+    // Reorder to match snapshot order. appendChild on an already-attached
+    // node moves it without rebuilding — cheaper than insertBefore in a
+    // loop and preserves all DOM state.
+    for (const node of orderedNodes) {
+        container.appendChild(node);
+    }
+
+    // Refresh the live expanded-steps fetch for any card the user has
+    // open — `agents-changed` is the heartbeat that streams new tool
+    // rows into the visible body. Silent mode swaps in one pass.
+    for (const node of orderedNodes) {
+        const tid = node.getAttribute('data-task-id') || '';
+        if (!tid || !expandedActiveTaskIds.has(tid)) continue;
+        const stepsEl = node.querySelector(':scope > div.agent-card-steps');
+        if (!stepsEl) continue;
+        const arcId = node.getAttribute('data-arc-id') || '';
+        const turnId = node.getAttribute('data-turn-id') || '';
+        loadAgentSteps(stepsEl, arcId, turnId, true);
+    }
+
+    // Drop entries for tasks that have left the active list — keeps the
+    // map bounded and prevents stale "first render" hits.
+    for (const id of Array.from(lastActiveStepCount.keys())) {
+        if (!liveTaskIds.has(id)) lastActiveStepCount.delete(id);
+    }
+}
+
+// Lightweight in-place tick used by the 1s interval. Only updates
+// elapsed times, step counts, and the current-tool chip — does NOT
+// rebuild the card list, so expanded panes stay open and the step
+// timeline below them isn't disturbed.
+function tickAgentControlElapsed() {
+    if (activeAgentsCache.length === 0) return;
+    for (const agent of activeAgentsCache) {
+        const elapsedEl = document.querySelector(
+            `[data-elapsed-for="${CSS.escape(agent.task_id)}"]`,
+        );
+        if (elapsedEl) elapsedEl.textContent = formatAgentElapsed(agent.started_at);
+        const stepsEl = document.querySelector(
+            `[data-steps-for="${CSS.escape(agent.task_id)}"]`,
+        );
+        if (stepsEl) {
+            const n = Number.isFinite(agent.step_count) ? agent.step_count : 0;
+            stepsEl.textContent = `${n} step${n === 1 ? '' : 's'}`;
+        }
+    }
 }
 
 function renderAgentControlHistory() {
     const container = document.getElementById('agent-control-history');
     if (!container) return;
     // Skip rows that are still running — those are surfaced in the
-    // active-cards section above.
-    const finalized = (agentRunsCache || []).filter((r) => r.status && r.status !== 'running');
-    if (finalized.length === 0) {
-        container.innerHTML = '<div class="agent-history-empty">No agent runs yet.</div>';
+    // Active sub-tab.
+    const finalized = (agentRunsCache || []).filter(
+        (r) => r.status && r.status !== 'running',
+    );
+    const filtered = agentHistoryFilter === 'all'
+        ? finalized
+        : finalized.filter((r) => agentSourceKey(r.source) === agentHistoryFilter);
+    if (filtered.length === 0) {
+        const msg = finalized.length === 0
+            ? 'No agent runs yet.'
+            : 'No runs match this filter.';
+        const sub = finalized.length === 0
+            ? 'Past runs will live here for 30 days.'
+            : 'Try a different source.';
+        container.innerHTML = `<div class="agent-history-empty">${msg}`
+            + `<span class="empty-sub">${sub}</span></div>`;
+        container.classList.remove('agent-history-list-wrap');
         return;
     }
-    const rows = finalized.map((run) => {
+    container.classList.add('agent-history-list-wrap');
+    const items = filtered.map((run) => {
         const sourceKey = agentSourceKey(run.source);
         const icon = agentSourceIcon(run.source);
         const title = escapeHtml(run.title || '(untitled)');
@@ -10071,25 +10466,105 @@ function renderAgentControlHistory() {
         const duration = escapeHtml(formatAgentDuration(run.started_at, run.finished_at));
         const status = String(run.status || 'completed').toLowerCase();
         const arcId = run.arc_id ? escapeHtml(run.arc_id) : '';
-        const clickable = arcId ? 'clickable' : '';
+        const taskId = escapeHtml(run.task_id || '');
+        const turnId = run.turn_id ? escapeHtml(run.turn_id) : '';
+        const jumpBtn = arcId
+            ? `<button class="agent-history-jump" type="button" title="Open arc" aria-label="Open arc">
+                   <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17 17 7"/><path d="M8 7h9v9"/></svg>
+               </button>`
+            : '';
         return `
-<div class="agent-history-row ${clickable}" data-source="${sourceKey}" data-arc-id="${arcId}">
-    <span class="agent-history-icon" aria-hidden="true">${icon}</span>
-    <span class="agent-history-title" title="${title}">${title}</span>
-    <span class="agent-history-meta">${started}</span>
-    <span class="agent-history-duration">${duration}</span>
-    <span class="agent-history-status" data-status="${escapeHtml(status)}">${escapeHtml(status)}</span>
+<div class="agent-history-item" data-source="${sourceKey}" data-task-id="${taskId}" data-arc-id="${arcId}" data-turn-id="${turnId}">
+    <div class="agent-history-row" data-source="${sourceKey}" data-arc-id="${arcId}">
+        <span class="agent-history-icon" aria-hidden="true">${icon}</span>
+        <span class="agent-history-title" title="${title}">${title}</span>
+        <span class="agent-history-meta">${started}</span>
+        <span class="agent-history-duration">${duration}</span>
+        <span class="agent-history-status" data-status="${escapeHtml(status)}">${escapeHtml(status)}</span>
+        ${jumpBtn}
+        <span class="agent-history-chevron" aria-hidden="true">${agentChevronSvg()}</span>
+    </div>
+    <div class="agent-history-steps" hidden></div>
 </div>`;
     }).join('');
-    container.innerHTML = rows;
-    container.querySelectorAll('.agent-history-row.clickable').forEach((row) => {
-        row.addEventListener('click', () => {
-            const arcId = row.getAttribute('data-arc-id');
-            if (arcId && typeof handleSwitchArc === 'function') {
-                handleSwitchArc(arcId);
-            }
+    container.innerHTML = items;
+    container.querySelectorAll('.agent-history-item').forEach((item) => {
+        const row = item.querySelector('.agent-history-row');
+        if (!row) return;
+        const jump = row.querySelector('.agent-history-jump');
+        if (jump) {
+            jump.addEventListener('click', (ev) => {
+                ev.stopPropagation();
+                const arcId = item.getAttribute('data-arc-id');
+                if (arcId && typeof handleSwitchArc === 'function') {
+                    handleSwitchArc(arcId);
+                }
+            });
+        }
+        row.addEventListener('click', (ev) => {
+            if (ev.target.closest('.agent-history-jump')) return;
+            toggleAgentHistoryExpand(item);
         });
+        const taskId = item.getAttribute('data-task-id');
+        if (taskId && expandedHistoryTaskIds.has(taskId)) {
+            const stepsEl = item.querySelector('.agent-history-steps');
+            row.classList.add('expanded');
+            if (stepsEl) {
+                stepsEl.hidden = false;
+                if (agentStepsLoaded.has(taskId)) {
+                    const arcId = item.getAttribute('data-arc-id') || '';
+                    const turnId = item.getAttribute('data-turn-id') || '';
+                    loadAgentSteps(stepsEl, arcId, turnId);
+                }
+            }
+        }
     });
+}
+
+// Wires the sub-tab buttons + filter chips. Idempotent — runs once at
+// app init time. The active-tab state is restored from localStorage and
+// applied via a synthetic .click() so the same code path that handles
+// user clicks also handles initial state.
+function setupAgentControlTabs() {
+    const tabs = document.querySelectorAll('.agent-control-tab');
+    const panes = document.querySelectorAll('.agent-control-tab-pane');
+    if (tabs.length) {
+        tabs.forEach((btn) => {
+            btn.addEventListener('click', () => {
+                const which = btn.dataset.agentTab;
+                tabs.forEach((t) => {
+                    const on = t === btn;
+                    t.classList.toggle('active', on);
+                    t.setAttribute('aria-selected', on ? 'true' : 'false');
+                });
+                panes.forEach((p) => p.classList.toggle('active', p.dataset.agentPane === which));
+                try { localStorage.setItem('agentControlTab', which); } catch (_) { /* ignore */ }
+            });
+        });
+        let stored = null;
+        try { stored = localStorage.getItem('agentControlTab'); } catch (_) { /* ignore */ }
+        if (stored) {
+            const target = document.querySelector(`.agent-control-tab[data-agent-tab="${stored}"]`);
+            if (target) target.click();
+        }
+    }
+
+    const chips = document.querySelectorAll('.agent-filter-chip');
+    if (chips.length) {
+        let storedFilter = null;
+        try { storedFilter = localStorage.getItem('agentHistoryFilter'); } catch (_) { /* ignore */ }
+        if (storedFilter) agentHistoryFilter = storedFilter;
+        chips.forEach((chip) => {
+            const which = chip.dataset.sourceFilter || 'all';
+            chip.classList.toggle('active', which === agentHistoryFilter);
+            chip.addEventListener('click', () => {
+                agentHistoryFilter = which;
+                chips.forEach((c) => c.classList.toggle('active', c === chip));
+                try { localStorage.setItem('agentHistoryFilter', agentHistoryFilter); } catch (_) { /* ignore */ }
+                renderAgentControlHistory();
+            });
+        });
+    }
 }
 
 function showAgentControl() {
@@ -10113,9 +10588,10 @@ function showAgentControl() {
     refreshAgentRuns();
     if (agentControlTickHandle) clearInterval(agentControlTickHandle);
     // 1s tick keeps the elapsed badges honest while the view is open.
+    // Only patches in-place so expanded step panes don't snap shut.
     agentControlTickHandle = setInterval(() => {
         if (agentControlView.classList.contains('hidden')) return;
-        renderAgentControlActive();
+        tickAgentControlElapsed();
     }, 1000);
 }
 
@@ -10134,12 +10610,25 @@ function wireActiveAgentsPanel() {
     if (agentControlBtn) agentControlBtn.addEventListener('click', showAgentControl);
     if (agentControlBack) agentControlBack.addEventListener('click', hideAgentControl);
 
-    // Backend pulse — registry mutations + finalized runs.
+    // Sub-tabs + filter chips. Idempotent — wired once at init time;
+    // showAgentControl just refreshes data afterwards.
+    setupAgentControlTabs();
+
+    // Backend pulse — registry mutations + finalized runs. Coalesce
+    // bursts (DeepSeek streams 3–5 tool calls/s; without debounce every
+    // pulse triggers a rebuild that destroys in-flight transitions and
+    // forces redundant get_arc_entries fetches). 80ms feels live but
+    // absorbs the burst.
+    let agentsChangedTimer = null;
     if (window.__TAURI__?.event?.listen) {
         window.__TAURI__.event.listen('agents-changed', () => {
-            refreshActiveAgents();
-            // Newly-finalized runs land in the history feed.
-            refreshAgentRuns();
+            if (agentsChangedTimer) return;
+            agentsChangedTimer = setTimeout(() => {
+                agentsChangedTimer = null;
+                refreshActiveAgents();
+                // Newly-finalized runs land in the history feed.
+                refreshAgentRuns();
+            }, 80);
         }).catch((err) => {
             console.warn('[athen] agents-changed listen failed:', err);
         });

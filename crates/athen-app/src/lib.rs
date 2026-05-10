@@ -72,6 +72,7 @@ pub fn run() {
             commands::approve_task,
             commands::submit_approval,
             commands::cancel_task,
+            commands::cancel_agent,
             commands::new_arc,
             commands::get_arc_history,
             commands::get_arc_entries,

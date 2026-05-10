@@ -66,6 +66,10 @@ pub struct ActiveAgent {
     pub step_count: u32,
     pub profile_id: Option<String>,
     pub model: Option<String>,
+    /// Conversation-turn id this run belongs to. Surfaced to the FE so
+    /// the Agent Control "expand a card" view can look up the per-turn
+    /// `tool_call` arc entries that make up this run's step timeline.
+    pub turn_id: Option<String>,
 }
 
 /// Terminal status for a finalized run.
@@ -86,12 +90,21 @@ impl FinishStatus {
     }
 }
 
+/// Internal map entry pairing the public [`ActiveAgent`] snapshot with
+/// the per-run cancellation flag. The flag is intentionally NOT on
+/// `ActiveAgent` (which is `Serialize` / shipped to the frontend) — it
+/// stays Rust-side and is handed to the executor via `AgentBuilder`.
+struct AgentEntry {
+    agent: ActiveAgent,
+    cancel_flag: Arc<AtomicBool>,
+}
+
 /// Live registry. Constructed once during app startup with an
 /// [`AppHandle`] for emitting change events and an optional store for
 /// persisting historical runs.
 pub struct AgentRegistry {
     app: AppHandle,
-    inner: RwLock<HashMap<Uuid, ActiveAgent>>,
+    inner: RwLock<HashMap<Uuid, AgentEntry>>,
     store: Option<Arc<SqliteAgentRunStore>>,
 }
 
@@ -108,6 +121,11 @@ impl AgentRegistry {
     /// the store (best-effort), and return a guard that finalizes on
     /// `complete()` / `fail()` or — failing those — on Drop as
     /// `Cancelled`. Caller must parse `agent.task_id` from a Uuid.
+    ///
+    /// The returned [`RegistrationGuard`] also exposes the freshly-minted
+    /// per-run cancel flag via [`RegistrationGuard::cancel_flag`], which
+    /// must be passed to `AgentBuilder::cancel_flag(...)` so the
+    /// executor checks it between steps. The flag starts `false`.
     pub async fn register(self: &Arc<Self>, agent: ActiveAgent) -> RegistrationGuard {
         let task_id_uuid = Uuid::parse_str(&agent.task_id).unwrap_or_else(|_| Uuid::new_v4());
 
@@ -124,15 +142,24 @@ impl AgentRegistry {
                 profile_id: agent.profile_id.clone(),
                 model: agent.model.clone(),
                 error: None,
+                turn_id: agent.turn_id.clone(),
             };
             if let Err(e) = store.start(&record).await {
                 tracing::warn!(task_id = %agent.task_id, error = %e, "agent_runs.start failed");
             }
         }
 
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+
         {
             let mut map = self.inner.write().await;
-            map.insert(task_id_uuid, agent);
+            map.insert(
+                task_id_uuid,
+                AgentEntry {
+                    agent,
+                    cancel_flag: Arc::clone(&cancel_flag),
+                },
+            );
         }
         self.emit_changed();
 
@@ -140,6 +167,7 @@ impl AgentRegistry {
             reg: Arc::clone(self),
             task_id: task_id_uuid,
             finalized: AtomicBool::new(false),
+            cancel_flag,
         }
     }
 
@@ -149,7 +177,8 @@ impl AgentRegistry {
     pub async fn record_step(&self, task_id: Uuid, tool: Option<&str>, summary: Option<String>) {
         let new_count = {
             let mut map = self.inner.write().await;
-            if let Some(agent) = map.get_mut(&task_id) {
+            if let Some(entry) = map.get_mut(&task_id) {
+                let agent = &mut entry.agent;
                 agent.step_count = agent.step_count.saturating_add(1);
                 agent.last_step_at = Utc::now();
                 if tool.is_some() {
@@ -180,7 +209,32 @@ impl AgentRegistry {
     /// the `list_active_agents` command sorts by `started_at` DESC.
     pub async fn snapshot(&self) -> Vec<ActiveAgent> {
         let map = self.inner.read().await;
-        map.values().cloned().collect()
+        map.values().map(|e| e.agent.clone()).collect()
+    }
+
+    /// Flip the per-run cancel flag for a specific task. Returns `true`
+    /// if the task was found in the registry. The executor checks the
+    /// flag between steps and short-circuits with a Cancelled outcome.
+    pub async fn cancel(&self, task_id: Uuid) -> bool {
+        let map = self.inner.read().await;
+        if let Some(entry) = map.get(&task_id) {
+            entry.cancel_flag.store(true, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Flip every per-run cancel flag in the registry. Returns the count
+    /// of flags flipped. Backs the global `cancel_task` Tauri command.
+    pub async fn cancel_all(&self) -> usize {
+        let map = self.inner.read().await;
+        let mut n = 0usize;
+        for entry in map.values() {
+            entry.cancel_flag.store(true, Ordering::Relaxed);
+            n += 1;
+        }
+        n
     }
 
     async fn finalize(&self, task_id: Uuid, status: FinishStatus, error: Option<String>) {
@@ -215,6 +269,7 @@ pub struct RegistrationGuard {
     reg: Arc<AgentRegistry>,
     task_id: Uuid,
     finalized: AtomicBool,
+    cancel_flag: Arc<AtomicBool>,
 }
 
 impl RegistrationGuard {
@@ -223,6 +278,14 @@ impl RegistrationGuard {
     #[allow(dead_code)]
     pub fn task_id(&self) -> Uuid {
         self.task_id
+    }
+
+    /// Per-run cancel flag, freshly minted by [`AgentRegistry::register`].
+    /// Hand this to `AgentBuilder::cancel_flag(...)` so the executor
+    /// honors per-agent stop requests. Independently flippable from the
+    /// registry's [`AgentRegistry::cancel`] / `cancel_all` methods.
+    pub fn cancel_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancel_flag)
     }
 
     pub async fn complete(self) {

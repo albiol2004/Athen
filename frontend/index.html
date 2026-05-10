@@ -1016,14 +1016,31 @@
                 </div>
             </header>
             <div class="agent-control-body">
-                <section class="agent-control-section">
-                    <h3>Active</h3>
+                <nav class="agent-control-tabs" role="tablist">
+                    <button class="agent-control-tab active" data-agent-tab="active" role="tab" aria-selected="true" type="button">
+                        Active <span id="agent-tab-active-count" class="tab-count hidden">0</span>
+                    </button>
+                    <button class="agent-control-tab" data-agent-tab="history" role="tab" aria-selected="false" type="button">
+                        History
+                    </button>
+                </nav>
+
+                <div class="agent-control-tab-pane active" data-agent-pane="active">
                     <div id="agent-control-active" class="agent-cards"></div>
-                </section>
-                <section class="agent-control-section">
-                    <h3>Recent runs <span class="muted">(last 30 days)</span></h3>
+                </div>
+
+                <div class="agent-control-tab-pane" data-agent-pane="history">
+                    <div class="agent-history-toolbar">
+                        <div class="agent-filter-chips" role="group" aria-label="Filter by source">
+                            <button class="agent-filter-chip active" data-source-filter="all" type="button">All</button>
+                            <button class="agent-filter-chip" data-source-filter="user_chat" type="button">Chat</button>
+                            <button class="agent-filter-chip" data-source-filter="telegram" type="button">Telegram</button>
+                            <button class="agent-filter-chip" data-source-filter="email" type="button">Email</button>
+                            <button class="agent-filter-chip" data-source-filter="wakeup" type="button">Wake-ups</button>
+                        </div>
+                    </div>
                     <div id="agent-control-history" class="agent-history"></div>
-                </section>
+                </div>
             </div>
         </div>
 

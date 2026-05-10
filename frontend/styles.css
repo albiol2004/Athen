@@ -6029,24 +6029,134 @@ option:hover {
     padding: 20px 24px 32px;
     display: flex;
     flex-direction: column;
-    gap: 24px;
+    gap: 16px;
+    max-width: 980px;
+    width: 100%;
+    margin: 0 auto;
 }
 
-.agent-control-section h3 {
-    margin: 0 0 10px;
-    font-size: 11px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: var(--text-2);
+/* ── Sub-tab strip (mirrors .settings-tabs) ── */
+.agent-control-tabs {
+    display: flex;
+    gap: 4px;
+    padding: 4px;
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
+    box-shadow: var(--shadow-card);
+    position: sticky;
+    top: 0;
+    z-index: 5;
 }
-.agent-control-section h3 .muted {
-    color: var(--text-3);
+
+.agent-control-tab {
+    flex: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 9px 14px;
+    background: transparent;
+    border: none;
+    border-radius: var(--r-sm);
+    color: var(--text-2);
+    font-size: 13px;
     font-weight: 500;
-    text-transform: none;
-    letter-spacing: 0;
-    margin-left: 6px;
+    letter-spacing: -0.005em;
+    cursor: pointer;
+    transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+
+.agent-control-tab:hover {
+    background: rgba(255, 255, 255, 0.04);
+    color: var(--text);
+}
+
+.agent-control-tab.active {
+    background: var(--accent);
+    color: #fff;
+}
+
+.agent-control-tab .tab-count {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 5px;
+    border-radius: 999px;
+    font-size: 10px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    background: var(--brand-grad-soft);
+    color: var(--brand-warm);
+    border: 1px solid var(--border-strong);
+}
+
+.agent-control-tab.active .tab-count {
+    background: rgba(255, 255, 255, 0.18);
+    color: #fff;
+    border-color: transparent;
+}
+
+.agent-control-tab .tab-count.hidden {
+    display: none;
+}
+
+.agent-control-tab-pane {
+    display: none;
+    animation: agentTabFade var(--dur) var(--ease);
+}
+
+.agent-control-tab-pane.active {
+    display: block;
+}
+
+@keyframes agentTabFade {
+    from { opacity: 0; transform: translateY(2px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ── History toolbar + filter chips ── */
+.agent-history-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 12px;
+}
+
+.agent-filter-chips {
+    display: inline-flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.agent-filter-chip {
+    height: 26px;
+    padding: 0 10px;
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    color: var(--text-2);
     font-size: 11px;
+    font-weight: 500;
+    letter-spacing: -0.005em;
+    cursor: pointer;
+    transition: background var(--dur) var(--ease),
+                color var(--dur) var(--ease),
+                border-color var(--dur) var(--ease);
+}
+
+.agent-filter-chip:hover {
+    background: rgba(255, 255, 255, 0.04);
+    color: var(--text);
+}
+
+.agent-filter-chip.active {
+    background: var(--brand-grad-soft);
+    color: var(--brand-warm);
+    border-color: var(--brand-warm);
 }
 
 /* ── Active agent cards ── */
@@ -6072,10 +6182,13 @@ option:hover {
     background: var(--surface-1);
     border: 1px solid var(--border);
     border-left: 3px solid var(--agent-src-other);
-    border-radius: var(--r-md);
+    border-radius: var(--r-lg);
+    box-shadow: var(--shadow-card);
+    cursor: pointer;
     transition: transform var(--dur) var(--ease),
                 border-color var(--dur) var(--ease),
-                box-shadow var(--dur) var(--ease);
+                box-shadow var(--dur) var(--ease),
+                opacity 200ms var(--ease);
     overflow: hidden;
 }
 .agent-card::before {
@@ -6085,12 +6198,21 @@ option:hover {
     pointer-events: none;
     border-radius: inherit;
     box-shadow: inset 3px 0 0 0 var(--agent-src-other);
-    opacity: 0;
-    animation: agents-pulse 2.4s ease-out infinite;
+    opacity: 0.6;
+    animation: agent-card-pulse 3s ease-in-out infinite;
 }
 .agent-card:hover {
     transform: translateY(-1px);
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18);
+    border-color: var(--border-strong);
+    box-shadow: 0 6px 14px rgba(0, 0, 0, 0.22);
+}
+.agent-card.expanded {
+    cursor: default;
+}
+
+@keyframes agent-card-pulse {
+    0%, 100% { opacity: 0.6; }
+    50%      { opacity: 1.0; }
 }
 .agent-card[data-source="telegram"]  { border-left-color: var(--agent-src-telegram); }
 .agent-card[data-source="telegram"]::before { box-shadow: inset 3px 0 0 0 var(--agent-src-telegram); }
@@ -6201,6 +6323,68 @@ option:hover {
     background: var(--surface-3);
     color: var(--text);
 }
+.agent-card-foot-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+/* Per-card Stop button — square, brand-tinted on hover. Sits next to
+   the Jump pill in the card footer; the icon is a small filled square
+   to read as a hard-stop, distinct from a play/pause/cancel "x". */
+.agent-card-stop {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    background: var(--surface-2);
+    color: var(--text-3);
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    cursor: pointer;
+    transition:
+        background var(--dur) var(--ease),
+        color var(--dur) var(--ease),
+        border-color var(--dur) var(--ease);
+}
+.agent-card-stop:hover {
+    background: var(--brand-glow);
+    color: var(--brand-warm);
+    border-color: var(--brand-glow-strong);
+}
+.agent-card-stop:disabled {
+    cursor: progress;
+    opacity: 0.5;
+}
+.agent-card-stop:disabled:hover {
+    background: var(--surface-2);
+    color: var(--text-3);
+    border-color: var(--border);
+}
+/* Cancelling-state: the agent has been asked to stop and we're waiting
+   for the next agents-changed pulse to drop the card. Subtle dim only;
+   the brand-tinted "Stopping…" text in the action row carries the
+   message so we don't fight it visually here. */
+.agent-card.cancelling {
+    opacity: 0.65;
+    pointer-events: none;
+}
+/* Step-count bump: brief pop on the count badge when step_count grows.
+   Single-tone deep coral tint matches the design direction (no glass,
+   no rainbow, no glow). 420ms total — visible without being noisy. */
+@keyframes agentStepBump {
+    0%   { transform: scale(1);    background: transparent; color: var(--text-3); }
+    35%  { transform: scale(1.12); background: var(--brand-glow); color: var(--brand-warm); }
+    100% { transform: scale(1);    background: transparent; color: var(--text-3); }
+}
+.agent-card-steps.bumped {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: var(--r-sm);
+    transform-origin: center;
+    animation: agentStepBump 420ms var(--ease) both;
+}
 
 /* ── History rows ── */
 .agent-history {
@@ -6307,4 +6491,197 @@ option:hover {
     background: var(--brand-grad-soft);
     color: var(--brand-warm);
     border-color: var(--brand-warm);
+}
+
+/* ── Expandable chevron + step pane (shared by cards + rows) ── */
+.agent-card-chevron,
+.agent-history-jump {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    color: var(--text-3);
+    cursor: pointer;
+    transition: background var(--dur) var(--ease), color var(--dur) var(--ease), border-color var(--dur) var(--ease);
+}
+.agent-history-jump:hover {
+    background: var(--surface-2);
+    color: var(--text);
+    border-color: var(--border-bright);
+}
+
+.agent-history-chevron {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    color: var(--text-3);
+    transition: transform var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+.agent-card-chevron svg,
+.agent-history-chevron svg {
+    width: 12px;
+    height: 12px;
+}
+.agent-card.expanded .agent-card-chevron,
+.agent-history-row.expanded .agent-history-chevron {
+    transform: rotate(90deg);
+    color: var(--text);
+}
+
+.agent-card-steps,
+.agent-history-steps {
+    margin-top: 4px;
+    padding-top: 12px;
+    border-top: 1px dashed var(--border);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    animation: agentTabFade var(--dur) var(--ease);
+}
+.agent-card-steps[hidden],
+.agent-history-steps[hidden] {
+    display: none;
+}
+.agent-card-steps-empty,
+.agent-history-steps-empty {
+    padding: 12px 4px;
+    color: var(--text-3);
+    font-size: 11px;
+    text-align: center;
+}
+
+/* ─── Agent Control: normalize step row visual weight ─────────────────
+   In chat the mixed `<details class="tool-card-expand">` (taller, with
+   chevron, hover) vs bare `.tool-execution-card` distinction is fine —
+   chat has vertical room. In the cramped Active/History step lists it
+   reads as inconsistency ("first row is full, the next is small"). The
+   selectors below are scoped to the agent step containers and never
+   touch chat-view rendering. */
+.agent-card-steps > details.tool-card-expand,
+.agent-history-steps > details.tool-card-expand,
+.agent-card-steps > .tool-execution-card,
+.agent-history-steps > .tool-execution-card {
+    border-radius: var(--r-md);
+    background: var(--surface-1);
+    transition:
+        background var(--dur) var(--ease),
+        border-color var(--dur) var(--ease),
+        box-shadow var(--dur) var(--ease);
+}
+/* The summary's inner .tool-execution-card already carries the border,
+   padding and 12.5px text. Strip the bare strip's animation here so
+   neither flavour pops in on every refresh. */
+.agent-card-steps > .tool-execution-card,
+.agent-history-steps > .tool-execution-card {
+    animation: none;
+    min-height: 38px;
+    padding: 9px 12px;
+}
+/* Wrapped <details>: the inner .tool-execution-card carries the border
+   already. Make sure nothing inside the details wrapper introduces an
+   extra outer border that would visually duplicate the strip. */
+.agent-card-steps > details.tool-card-expand,
+.agent-history-steps > details.tool-card-expand {
+    border: none;
+    background: transparent;
+}
+.agent-card-steps > details.tool-card-expand > summary.tool-card-expand-summary > .tool-execution-card,
+.agent-history-steps > details.tool-card-expand > summary.tool-card-expand-summary > .tool-execution-card {
+    min-height: 38px;
+    padding: 9px 12px;
+}
+/* Subtle "new step landed" highlight — a brief left-edge brand-coral
+   bar that fades out. Applied for ~700ms by loadAgentSteps when the
+   step count grows compared to the container's previous render. No
+   first-render hits (loadAgentSteps gates on prior count). */
+@keyframes agentStepFresh {
+    0%   { box-shadow: inset 3px 0 0 0 var(--brand-warm, var(--brand-solid)); background: var(--brand-glow); }
+    100% { box-shadow: inset 3px 0 0 0 transparent; background: var(--surface-1); }
+}
+.agent-card-steps > .fresh,
+.agent-history-steps > .fresh {
+    animation: agentStepFresh 600ms var(--ease) both;
+}
+.agent-card-steps > details.tool-card-expand.fresh,
+.agent-history-steps > details.tool-card-expand.fresh {
+    animation: agentStepFresh 600ms var(--ease) both;
+    border-radius: var(--r-md);
+}
+
+/* Diff-based active-card removal: short fade so disappearing cards
+   don't snap out of the list. renderAgentControlActive flips this on
+   and removes the node on transitionend (with a 240ms fallback). The
+   opacity transition itself lives on .agent-card up top. */
+.agent-card.removing {
+    opacity: 0;
+    pointer-events: none;
+}
+
+/* Expandable history rows: switch to flex so we can stack steps below
+   the row's metadata strip without breaking the existing grid layout. */
+.agent-history-row {
+    cursor: pointer;
+}
+.agent-history-row.expanded {
+    background: var(--surface-2);
+}
+
+.agent-history-list-wrap > .agent-history-item + .agent-history-item {
+    border-top: 1px solid var(--border);
+}
+.agent-history-item {
+    display: flex;
+    flex-direction: column;
+    border-left: 3px solid var(--agent-src-other);
+    transition: background var(--dur) var(--ease);
+}
+.agent-history-item[data-source="telegram"]  { border-left-color: var(--agent-src-telegram); }
+.agent-history-item[data-source="email"]     { border-left-color: var(--agent-src-email); }
+.agent-history-item[data-source="calendar"]  { border-left-color: var(--agent-src-calendar); }
+.agent-history-item[data-source="wakeup"]    { border-left-color: var(--agent-src-wakeup); }
+.agent-history-item[data-source="user_chat"] { border-left-color: var(--agent-src-user_chat); }
+.agent-history-item[data-source="subagent"]  { border-left-color: var(--agent-src-subagent); }
+
+.agent-history-item .agent-history-row {
+    border-left: none;
+    display: grid;
+    grid-template-columns: 28px minmax(0, 1.5fr) minmax(120px, 1fr) 90px 90px 18px;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 14px;
+}
+.agent-history-item .agent-history-steps {
+    margin: 0;
+    padding: 12px 14px 14px 14px;
+    border-top: 1px dashed var(--border);
+    background: var(--surface-1);
+}
+
+/* Empty-state polish — large muted hint plus a quiet secondary line. */
+.agent-cards-empty,
+.agent-history-empty {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 36px 16px;
+    text-align: center;
+    color: var(--text-2);
+    font-size: 13px;
+    border: 1px dashed var(--border);
+    border-radius: var(--r-md);
+    background: var(--surface-1);
+}
+.agent-cards-empty .empty-sub,
+.agent-history-empty .empty-sub {
+    font-size: 11px;
+    color: var(--text-3);
 }

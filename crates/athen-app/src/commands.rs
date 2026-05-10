@@ -2016,6 +2016,7 @@ pub async fn send_message(
                         step_count: 0,
                         profile_id: active_profile_id_for_run,
                         model: Some(model_for_run),
+                        turn_id: Some(turn_id.clone()),
                     })
                     .await,
                 )
@@ -2039,9 +2040,13 @@ pub async fn send_message(
             let current_arc = state.active_arc_id.lock().await.clone();
             let stream_tx = spawn_stream_forwarder(&app_handle, Some(current_arc.clone()));
 
-            // Reset and wire the cancellation flag.
-            let cancel_flag = Arc::clone(&state.cancel_flag);
-            cancel_flag.store(false, Ordering::Relaxed);
+            // Per-run cancel flag freshly minted by the registry guard.
+            // Each agent has its own — the global `cancel_task` flips
+            // every flag in the registry; per-agent Stop flips just one.
+            let cancel_flag = agent_guard
+                .as_ref()
+                .map(|g| g.cancel_flag())
+                .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
 
             // Snapshot context for post-response reinforcement.
             let context_snapshot = context.clone();
@@ -3039,6 +3044,7 @@ pub(crate) async fn execute_approved_task(
                 step_count: 0,
                 profile_id: active_profile_id_for_run,
                 model: None,
+                turn_id: Some(ctx.turn_id.clone()),
             })
             .await,
         )
@@ -3058,7 +3064,14 @@ pub(crate) async fn execute_approved_task(
     }
     let stream_tx = spawn_stream_forwarder(&ctx.app_handle, Some(ctx.active_arc_id.clone()));
 
-    ctx.cancel_flag.store(false, Ordering::Relaxed);
+    // Per-run cancel flag from the registry guard. The legacy
+    // `ctx.cancel_flag` (still threaded in for backwards compat) is no
+    // longer the canonical knob — it's a no-op safety net flipped by
+    // `cancel_task`. The registry-driven cancel covers the live executor.
+    let cancel_flag = agent_guard
+        .as_ref()
+        .map(|g| g.cancel_flag())
+        .unwrap_or_else(|| Arc::clone(&ctx.cancel_flag));
 
     let context_snapshot = context.clone();
 
@@ -3087,7 +3100,7 @@ pub(crate) async fn execute_approved_task(
         .timeout(Duration::from_secs(300))
         .context_messages(context)
         .stream_sender(stream_tx)
-        .cancel_flag(ctx.cancel_flag.clone())
+        .cancel_flag(cancel_flag)
         .external_system_suffix(Some(system_suffix))
         .identity_block(identity_block)
         .default_temperature(ctx.sampling_temperature);
@@ -4014,6 +4027,7 @@ pub(crate) async fn execute_dispatched_task(
                 step_count: 0,
                 profile_id: active_profile_id_for_run,
                 model: None,
+                turn_id: Some(ctx.turn_id.clone()),
             })
             .await,
         )
@@ -4033,7 +4047,12 @@ pub(crate) async fn execute_dispatched_task(
     }
     let stream_tx = spawn_stream_forwarder(&ctx.app_handle, Some(arc_id.clone()));
 
-    ctx.cancel_flag.store(false, Ordering::Relaxed);
+    // Per-run cancel flag from the registry guard (see execute_approved_task
+    // for the full rationale on legacy ctx.cancel_flag fallback).
+    let cancel_flag = agent_guard
+        .as_ref()
+        .map(|g| g.cancel_flag())
+        .unwrap_or_else(|| Arc::clone(&ctx.cancel_flag));
 
     let context_snapshot = context.clone();
 
@@ -4058,7 +4077,7 @@ pub(crate) async fn execute_dispatched_task(
         .timeout(Duration::from_secs(300))
         .context_messages(context)
         .stream_sender(stream_tx)
-        .cancel_flag(ctx.cancel_flag.clone())
+        .cancel_flag(cancel_flag)
         .external_system_suffix(Some(system_suffix))
         .autonomous_mode(true)
         .identity_block(identity_block)
@@ -4306,15 +4325,40 @@ pub(crate) async fn execute_dispatched_task(
     }))
 }
 
-/// Cancel the currently running agent task.
+/// Cancel every currently-running agent task.
 ///
-/// Sets the shared cancellation flag to `true`, which the executor checks
-/// at the top of each loop iteration and between tool calls. The executor
-/// will return a "cancelled" result on its next check.
+/// Iterates the live agent registry and flips each per-run cancel flag.
+/// Also flips the legacy `state.cancel_flag` as a belt-and-braces no-op
+/// safety net — no executor reads it now that every register-site uses
+/// the registry-minted flag, but keeping it pinned avoids surprising
+/// behaviour for any future caller that still hands it to the builder.
 #[tauri::command]
 pub async fn cancel_task(state: State<'_, AppState>) -> std::result::Result<(), String> {
     state.cancel_flag.store(true, Ordering::Relaxed);
+    if let Some(reg) = state.agent_registry.as_ref() {
+        let n = reg.cancel_all().await;
+        tracing::info!("cancel_task: flipped {n} per-agent cancel flag(s)");
+    }
     Ok(())
+}
+
+/// Cancel a single running agent by task id.
+///
+/// Returns `true` if the task was found in the live registry and its
+/// cancel flag was flipped, `false` if the registry doesn't know that
+/// id (already finished, never registered, or wrong id). The frontend
+/// uses this for the per-card Stop button on the Agent Control view.
+#[tauri::command]
+pub async fn cancel_agent(
+    state: State<'_, AppState>,
+    task_id: String,
+) -> std::result::Result<bool, String> {
+    let reg = state
+        .agent_registry
+        .as_ref()
+        .ok_or("agent registry not initialized")?;
+    let uuid = Uuid::parse_str(&task_id).map_err(|e| format!("bad task_id: {e}"))?;
+    Ok(reg.cancel(uuid).await)
 }
 
 /// Dev-only smoke test for the credential vault wired into AppState.

@@ -2239,6 +2239,7 @@ async fn execute_owner_telegram_message(
                 step_count: 0,
                 profile_id: None,
                 model: None,
+                turn_id: Some(turn_id.clone()),
             })
             .await,
         )
@@ -2258,7 +2259,14 @@ async fn execute_owner_telegram_message(
         auditor = auditor.with_agent_tracking(Arc::clone(reg), task_id_for_run);
     }
     let stream_tx = spawn_stream_forwarder(app_handle, target_arc_id.clone());
-    let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Per-run cancel flag: prefer the one minted by the registry guard
+    // so a Telegram-driven run can also be stopped from the desktop
+    // Agent Control panel. Falls back to a freshly-allocated flag when
+    // the registry isn't wired (early startup).
+    let cancel_flag = agent_guard
+        .as_ref()
+        .map(|g| g.cancel_flag())
+        .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
 
     // Resolve sampling-temperature override for the active provider here
     // — this Telegram path doesn't carry an `ApprovedTaskCtx`, so the

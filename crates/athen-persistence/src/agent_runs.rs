@@ -29,15 +29,22 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     step_count INTEGER NOT NULL DEFAULT 0,
     profile_id TEXT,
     model TEXT,
-    error TEXT
+    error TEXT,
+    turn_id TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_agent_runs_started ON agent_runs(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_agent_runs_arc ON agent_runs(arc_id);
 "#;
 
+/// Idempotent ALTER for existing DBs that pre-date the `turn_id` column.
+/// Mirrors the migration pattern in `wakeups.rs::WAKEUPS_ADD_INHERIT_SQL`.
+/// SQLite returns "duplicate column" if the column already exists — that
+/// exact error is swallowed; everything else surfaces.
+const AGENT_RUNS_ADD_TURN_ID_SQL: &str = "ALTER TABLE agent_runs ADD COLUMN turn_id TEXT";
+
 const COLS: &str = "task_id, arc_id, source, title, started_at, finished_at, \
-                    status, step_count, profile_id, model, error";
+                    status, step_count, profile_id, model, error, turn_id";
 
 /// Durable record of an agent run. `started_at` / `finished_at` are
 /// stored as RFC3339 strings, matching the rest of the persistence layer
@@ -55,6 +62,9 @@ pub struct AgentRunRecord {
     pub profile_id: Option<String>,
     pub model: Option<String>,
     pub error: Option<String>,
+    /// Conversation-turn id this run belongs to. Lets the UI fetch the
+    /// per-turn `tool_call` arc entries for this run's step timeline.
+    pub turn_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -76,6 +86,16 @@ impl SqliteAgentRunStore {
             let conn = conn.blocking_lock();
             conn.execute_batch(SCHEMA_SQL)
                 .map_err(|e| AthenError::Other(format!("Init agent_runs schema: {e}")))?;
+            // Migrate older DBs that don't have turn_id yet.
+            // Duplicate-column errors mean the migration already ran.
+            if let Err(e) = conn.execute(AGENT_RUNS_ADD_TURN_ID_SQL, []) {
+                let msg = e.to_string();
+                if !msg.contains("duplicate column name") {
+                    return Err(AthenError::Other(format!(
+                        "Migrate agent_runs.turn_id: {e}"
+                    )));
+                }
+            }
             Ok(())
         })
         .await
@@ -92,8 +112,8 @@ impl SqliteAgentRunStore {
             conn.execute(
                 "INSERT OR REPLACE INTO agent_runs \
                  (task_id, arc_id, source, title, started_at, finished_at, \
-                  status, step_count, profile_id, model, error) \
-                 VALUES (?1,?2,?3,?4,?5,NULL,'running',?6,?7,?8,NULL)",
+                  status, step_count, profile_id, model, error, turn_id) \
+                 VALUES (?1,?2,?3,?4,?5,NULL,'running',?6,?7,?8,NULL,?9)",
                 params![
                     r.task_id,
                     r.arc_id,
@@ -103,6 +123,7 @@ impl SqliteAgentRunStore {
                     r.step_count as i64,
                     r.profile_id,
                     r.model,
+                    r.turn_id,
                 ],
             )
             .map_err(|e| AthenError::Other(format!("Insert agent_run: {e}")))?;
@@ -239,6 +260,7 @@ fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRunRecord> {
     let profile_id: Option<String> = row.get(8)?;
     let model: Option<String> = row.get(9)?;
     let error: Option<String> = row.get(10)?;
+    let turn_id: Option<String> = row.get(11)?;
 
     let chrono_err = |i: usize, e: chrono::ParseError| {
         rusqlite::Error::FromSqlConversionFailure(i, rusqlite::types::Type::Text, Box::new(e))
@@ -262,6 +284,7 @@ fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRunRecord> {
         profile_id,
         model,
         error,
+        turn_id,
     })
 }
 
@@ -290,6 +313,7 @@ mod tests {
             profile_id: Some("default".to_string()),
             model: Some("deepseek-chat".to_string()),
             error: None,
+            turn_id: Some("turn-abc-123".to_string()),
         }
     }
 
@@ -405,5 +429,53 @@ mod tests {
     async fn get_returns_none_for_missing() {
         let store = setup().await;
         assert!(store.get("does-not-exist").await.unwrap().is_none());
+    }
+
+    /// turn_id must round-trip through both `start` and `list_recent` so the
+    /// UI can use it to fetch per-turn tool_call rows for the step timeline.
+    #[tokio::test]
+    async fn turn_id_round_trips_through_start_get_list() {
+        let store = setup().await;
+        let run = mk_run("44444444-4444-4444-4444-444444444444");
+        store.start(&run).await.unwrap();
+        let got = store.get(&run.task_id).await.unwrap().unwrap();
+        assert_eq!(got.turn_id.as_deref(), Some("turn-abc-123"));
+        let listed = store.list_recent(10).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].turn_id.as_deref(), Some("turn-abc-123"));
+    }
+
+    /// `init_schema` runs the ALTER migration on legacy DBs that pre-date
+    /// the `turn_id` column. Mirrors `wakeups::tests::test_inherit_…` style.
+    #[tokio::test]
+    async fn init_schema_migrates_legacy_db_without_turn_id() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Old schema — no turn_id column.
+        conn.execute_batch(
+            "CREATE TABLE agent_runs (
+                task_id TEXT PRIMARY KEY,
+                arc_id TEXT,
+                source TEXT NOT NULL,
+                title TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                status TEXT NOT NULL,
+                step_count INTEGER NOT NULL DEFAULT 0,
+                profile_id TEXT,
+                model TEXT,
+                error TEXT
+            );",
+        )
+        .unwrap();
+        let store = SqliteAgentRunStore::from_conn(Arc::new(Mutex::new(conn)));
+        // First call adds the column.
+        store.init_schema().await.unwrap();
+        // Idempotent: a second call must be a no-op (duplicate column swallowed).
+        store.init_schema().await.unwrap();
+        // Now we can insert + read with turn_id populated.
+        let run = mk_run("55555555-5555-5555-5555-555555555555");
+        store.start(&run).await.unwrap();
+        let got = store.get(&run.task_id).await.unwrap().unwrap();
+        assert_eq!(got.turn_id.as_deref(), Some("turn-abc-123"));
     }
 }
