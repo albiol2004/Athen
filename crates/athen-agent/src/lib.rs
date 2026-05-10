@@ -5,6 +5,7 @@
 //! timeout guards, and resource monitoring.
 
 pub mod auditor;
+pub mod estimator;
 pub mod executor;
 pub mod resource;
 pub mod runtimes;

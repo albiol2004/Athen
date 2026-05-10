@@ -4056,6 +4056,77 @@ async function loadProfileManager() {
     }
 }
 
+// Per-profile static-prefix token estimates, fetched lazily from
+// `estimate_profile_tokens`. Cached for 60 seconds because the underlying
+// inputs (identity, endpoints, tool registry) only change on user edits;
+// invalidate explicitly via `invalidateProfileTokenCache()` whenever one of
+// those panels saves.
+const profileTokenEstimates = new Map(); // profile_id -> { estimate, fetchedAt }
+const PROFILE_TOKEN_CACHE_TTL_MS = 60_000;
+
+function invalidateProfileTokenCache() {
+    profileTokenEstimates.clear();
+}
+
+function formatTokenCount(tokens) {
+    if (!tokens || tokens < 0) return '0';
+    if (tokens < 1000) return String(tokens);
+    return (tokens / 1000).toFixed(1).replace(/\.0$/, '') + 'k';
+}
+
+async function fetchProfileTokenEstimate(profileId) {
+    if (!invoke) return null;
+    const cached = profileTokenEstimates.get(profileId);
+    if (cached && Date.now() - cached.fetchedAt < PROFILE_TOKEN_CACHE_TTL_MS) {
+        return cached.estimate;
+    }
+    try {
+        const estimate = await invoke('estimate_profile_tokens', { profileId });
+        profileTokenEstimates.set(profileId, { estimate, fetchedAt: Date.now() });
+        return estimate;
+    } catch (err) {
+        console.warn('estimate_profile_tokens failed for', profileId, err);
+        return null;
+    }
+}
+
+function buildEstimateTooltip(est) {
+    if (!est) return 'Token estimate unavailable.';
+    const t = (chars) => Math.round(chars / 3.7);
+    return [
+        `System ~${t(est.system_prompt_chars).toLocaleString()} tok`,
+        `+ Tools ~${t(est.tools_array_chars).toLocaleString()} tok`,
+        `+ Identity ~${t(est.identity_chars).toLocaleString()} tok`,
+        `+ Endpoints ~${t(est.endpoints_chars).toLocaleString()} tok`,
+        `≈ ${est.approx_tokens.toLocaleString()} tokens`,
+        '(heuristic — actual varies by tokenizer).',
+    ].join(' ');
+}
+
+async function paintProfileChip(chipEl, profileId) {
+    if (!chipEl) return;
+    chipEl.classList.add('loading');
+    chipEl.textContent = '…';
+    chipEl.title = 'Calculating fresh-start token cost…';
+    const est = await fetchProfileTokenEstimate(profileId);
+    chipEl.classList.remove('loading');
+    if (!est || !est.approx_tokens) {
+        chipEl.textContent = '— tok';
+        chipEl.title = 'Token estimate unavailable.';
+        return;
+    }
+    chipEl.textContent = `≈ ${formatTokenCount(est.approx_tokens)} tok`;
+    chipEl.title = buildEstimateTooltip(est);
+}
+
+async function paintAllProfileChips() {
+    const chips = document.querySelectorAll('.profile-token-chip[data-profile-id]');
+    if (!chips.length) return;
+    await Promise.all(
+        Array.from(chips).map((c) => paintProfileChip(c, c.dataset.profileId)),
+    );
+}
+
 function renderProfileList() {
     const listEl = document.getElementById('profile-list');
     if (!listEl) return;
@@ -4067,6 +4138,12 @@ function renderProfileList() {
     for (const p of agentProfiles) {
         listEl.appendChild(buildProfileCard(p));
     }
+    // Fire all estimate calls in parallel so the chips fill in within ~1s
+    // of paint instead of one-at-a-time. Errors degrade per-chip; never
+    // throw out of here or the whole list disappears.
+    paintAllProfileChips().catch((err) =>
+        console.warn('paintAllProfileChips:', err),
+    );
 }
 
 function buildProfileCard(p) {
@@ -4086,7 +4163,10 @@ function buildProfileCard(p) {
         : '<button data-action="delete" class="btn-danger">Delete</button>';
     card.innerHTML = `
         <div class="profile-card-main">
-            <div class="profile-card-name">${escapeHtml(p.display_name)} ${badge}</div>
+            <div class="profile-card-name">
+                ${escapeHtml(p.display_name)} ${badge}
+                <span class="profile-token-chip loading" data-profile-id="${escapeHtml(p.id)}" title="Calculating fresh-start token cost…">…</span>
+            </div>
             ${desc}
         </div>
         <div class="profile-card-actions">
@@ -4183,6 +4263,67 @@ function openProfileEditor(mode, source) {
 
     overlay.classList.remove('hidden');
     displayEl.focus();
+
+    // Show the token-budget panel only for existing profiles — there's
+    // nothing to estimate for an unsaved create-flow draft. The chip on
+    // the card already reflects the post-save number.
+    const editingExisting = mode === 'edit' && source;
+    renderProfileTokenBudget(editingExisting ? source.id : null);
+}
+
+function renderProfileTokenBudget(profileId) {
+    const wrap = document.getElementById('profile-token-budget');
+    const body = document.getElementById('profile-token-budget-body');
+    if (!wrap || !body) return;
+    if (!profileId) {
+        wrap.classList.add('hidden');
+        body.innerHTML = '';
+        return;
+    }
+    wrap.classList.remove('hidden');
+    body.innerHTML = '<div class="profile-token-budget-loading">Calculating…</div>';
+    fetchProfileTokenEstimate(profileId).then((est) => {
+        if (!est) {
+            body.innerHTML = '<div class="profile-token-budget-loading">Estimate unavailable.</div>';
+            return;
+        }
+        const t = (chars) => Math.round(chars / 3.7);
+        const max = Math.max(
+            est.system_prompt_chars,
+            est.tools_array_chars,
+            est.identity_chars,
+            est.endpoints_chars,
+            1,
+        );
+        const row = (label, chars) => {
+            const tokens = t(chars);
+            const pct = Math.round((chars / max) * 100);
+            return `
+                <div class="profile-token-row">
+                    <div class="profile-token-row-label">${escapeHtml(label)}</div>
+                    <div class="profile-token-row-value">~${tokens.toLocaleString()} tok</div>
+                    <div class="profile-token-row-bar"><span style="width: ${pct}%"></span></div>
+                </div>
+            `;
+        };
+        body.innerHTML = `
+            ${row('System prompt', est.system_prompt_chars)}
+            ${row('Tool schemas', est.tools_array_chars)}
+            ${row('Identity', est.identity_chars)}
+            ${row('Endpoints', est.endpoints_chars)}
+            <div class="profile-token-row total">
+                <div class="profile-token-row-label">Total</div>
+                <div class="profile-token-row-value">~${est.approx_tokens.toLocaleString()} tok</div>
+                <div class="profile-token-row-bar"></div>
+            </div>
+            <div class="profile-token-budget-meta">
+                ${est.tool_count_revealed} tool${est.tool_count_revealed === 1 ? '' : 's'} with inline schemas
+                · ${est.tool_count_available} available
+                · ${est.identity_entry_count} identity entr${est.identity_entry_count === 1 ? 'y' : 'ies'}
+                · ${est.endpoint_count} endpoint${est.endpoint_count === 1 ? '' : 's'}
+            </div>
+        `;
+    });
 }
 
 function renderProfileChips(expertise) {
@@ -4293,6 +4434,9 @@ async function saveProfileFromEditor() {
         } else {
             await invoke('create_agent_profile', { input: serdeInput });
         }
+        // Cost may have shifted (tool_selection, persona length) — drop
+        // the cache so the chip refetches when the list re-renders.
+        invalidateProfileTokenCache();
         closeProfileEditor();
         await loadProfileManager();
     } catch (err) {
@@ -4329,6 +4473,9 @@ async function loadIdentityManager() {
         ]);
         identityCategories = cats || [];
         identityEntries = entries || [];
+        // Identity content feeds every profile's static prefix; drop
+        // cached profile estimates so the chips refetch on next render.
+        invalidateProfileTokenCache();
         // Preserve selection across reloads when possible; otherwise pick
         // the first category so users always see something.
         if (
@@ -4626,17 +4773,26 @@ async function deleteIdentityCategory(cat) {
     }
 }
 
-function updateIdentityTokenFooter() {
+async function updateIdentityTokenFooter() {
     const countEl = document.getElementById('identity-token-count');
     const pctEl = document.getElementById('identity-token-pct');
     const warnEl = document.getElementById('identity-token-warning');
     if (!countEl || !pctEl || !warnEl) return;
-    let chars = 0;
-    for (const e of identityEntries) {
-        chars += (e.body || '').length;
-        chars += (e.category || '').length + 4; // approximate "## name\n"
+    // Prefer the backend estimator (matches the executor's renderer
+    // exactly); fall back to a quick FE-only sum if the call fails so
+    // the footer still shows something useful.
+    let tokens;
+    try {
+        const total = await invoke('estimate_identity_total');
+        tokens = total?.approx_tokens ?? 0;
+    } catch (err) {
+        let chars = 0;
+        for (const e of identityEntries) {
+            chars += (e.body || '').length;
+            chars += (e.category || '').length + 4; // approximate "## name\n"
+        }
+        tokens = Math.ceil(chars / 4);
     }
-    const tokens = Math.ceil(chars / 4);
     // Reference window: assume 8K. We don't know the user's smallest model
     // here; this is a rough indicator. Settings could later populate the
     // real value once we wire model context windows into the frontend.
@@ -9539,6 +9695,9 @@ async function loadCloudApis() {
         cloudApiEndpoints = endpoints || [];
         cloudApiPresets = presets || [];
         renderCloudApisList();
+        // Endpoint changes show up in every profile's `http_request`
+        // section — drop the cached estimates so chips refetch.
+        invalidateProfileTokenCache();
     } catch (err) {
         console.error('Failed to load cloud APIs:', err);
         list.innerHTML = `<p class="setting-hint">Failed to load endpoints: ${escapeHtml(String(err))}</p>`;

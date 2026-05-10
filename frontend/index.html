@@ -1120,6 +1120,12 @@
                     <label for="profile-model-hint">Model hint <span class="permissions-subnote">(optional — defaults to your active model)</span></label>
                     <input type="text" id="profile-model-hint" class="settings-input" placeholder="e.g. Smart">
                 </div>
+                <div class="cal-field profile-token-budget" id="profile-token-budget">
+                    <label>Token budget at fresh start <span class="permissions-subnote">(heuristic — actual varies by tokenizer)</span></label>
+                    <div id="profile-token-budget-body" class="profile-token-budget-body">
+                        <div class="profile-token-budget-loading">Calculating…</div>
+                    </div>
+                </div>
                 <p id="profile-modal-error" class="profile-modal-error hidden"></p>
             </div>
             <div class="profile-modal-actions">

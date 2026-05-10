@@ -153,6 +153,8 @@ pub fn run() {
             commands::update_agent_profile,
             commands::delete_agent_profile,
             commands::restore_agent_profile,
+            commands::estimate_profile_tokens,
+            commands::estimate_identity_total,
             commands::list_identity_categories,
             commands::upsert_identity_category,
             commands::delete_identity_category,

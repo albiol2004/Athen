@@ -5390,6 +5390,240 @@ pub async fn restore_agent_profile(
 }
 
 // ---------------------------------------------------------------------------
+// Static-prefix token estimation (issue #204)
+// ---------------------------------------------------------------------------
+
+/// Per-profile static-prompt size estimate, surfaced in the UI as a
+/// "this profile costs ~X tokens at fresh start" chip. Numbers come
+/// from the same `build_system_prompt_with_mode` builder the executor
+/// uses, so they cannot drift from runtime cost. Identity and endpoint
+/// counts are reported separately so the editor can show a breakdown.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProfileTokenEstimate {
+    pub profile_id: String,
+    pub system_prompt_chars: usize,
+    pub tools_array_chars: usize,
+    pub identity_chars: usize,
+    pub endpoints_chars: usize,
+    pub total_chars: usize,
+    pub approx_tokens: usize,
+    /// Tools available to this profile after `tool_selection` filtering.
+    pub tool_count_available: usize,
+    /// Always-revealed subset of `tool_count_available` — these tools'
+    /// full schemas ship inline in every request.
+    pub tool_count_revealed: usize,
+    pub identity_entry_count: usize,
+    pub endpoint_count: usize,
+}
+
+/// Estimate the static-prefix size for `profile_id` at fresh start.
+///
+/// Failures degrade to zeroed fields rather than errors — this is a UI
+/// hint, not a precondition. The frontend reads `total_chars` /
+/// `approx_tokens` for the chip and the per-component breakdown for the
+/// expanded view in the profile editor.
+#[tauri::command]
+pub async fn estimate_profile_tokens(
+    state: State<'_, AppState>,
+    app_handle: AppHandle,
+    profile_id: String,
+) -> std::result::Result<ProfileTokenEstimate, String> {
+    use athen_core::traits::profile::ProfileStore;
+
+    let empty = |id: String| ProfileTokenEstimate {
+        profile_id: id,
+        system_prompt_chars: 0,
+        tools_array_chars: 0,
+        identity_chars: 0,
+        endpoints_chars: 0,
+        total_chars: 0,
+        approx_tokens: 0,
+        tool_count_available: 0,
+        tool_count_revealed: 0,
+        identity_entry_count: 0,
+        endpoint_count: 0,
+    };
+
+    // 1. Resolve the profile (and its persona templates). Missing
+    //    store / unknown id → return zeros so the UI shows "—".
+    let Some(pstore) = state.profile_store.as_ref() else {
+        return Ok(empty(profile_id));
+    };
+    let profile = match pstore.get_profile(&profile_id).await {
+        Ok(Some(p)) => p,
+        _ => return Ok(empty(profile_id)),
+    };
+    let templates = pstore
+        .resolve_templates(&profile.persona_template_ids)
+        .await
+        .unwrap_or_default();
+    let resolved = athen_core::agent_profile::ResolvedAgentProfile {
+        profile,
+        persona_templates: templates,
+    };
+
+    // 2. Render the identity block for THIS profile. Same path the
+    //    executor uses, so the chip reflects per-profile filtering.
+    let identity_block =
+        crate::identity_render::render_identity_block(state.identity_store.as_ref(), &profile_id)
+            .await;
+    let identity_chars = identity_block.as_deref().map(|s| s.len()).unwrap_or(0);
+
+    // 3. Render the endpoints block. Note the executor's
+    //    `build_endpoints_section` *gates* on `http_request` being in
+    //    the tool slice, so absent tools yield zero contribution even
+    //    when a block is present. That gate is reproduced inside
+    //    `estimate_static_prompt_chars`; we still report the raw block
+    //    chars so the editor's breakdown labels the cost source.
+    let endpoints_block =
+        crate::endpoints_render::render_endpoints_block(state.http_endpoint_store.as_ref()).await;
+    let endpoints_chars = endpoints_block.as_deref().map(|s| s.len()).unwrap_or(0);
+
+    // 4. Build the tool registry and list its tools. Use the active arc
+    //    id when available (matches dispatch); fall back to a synthetic
+    //    one when no arc is selected (e.g. settings page on first run).
+    //    Per-arc differences are permission-shaped, not tool-shaped, so
+    //    the listed names + schemas are the same either way.
+    let arc_id = state.active_arc_id.lock().await.clone();
+    let registry = state
+        .build_tool_registry(&arc_id, Some(app_handle.clone()))
+        .await;
+    let tools = registry.list_tools().await.unwrap_or_default();
+
+    // 5. Run the estimator with the same shell + toolbox info the
+    //    runtime uses. Tool-doc dir matches what the executor sees.
+    let toolbox_info = athen_agent::toolbox::ToolboxPromptInfo::load().await;
+    let shell_kind = athen_agent::detect_shell_kind().await;
+    let breakdown = athen_agent::estimator::estimate_static_prompt_chars(
+        &tools,
+        Some(&resolved),
+        identity_block.as_deref(),
+        endpoints_block.as_deref(),
+        Some(&toolbox_info),
+        Some(shell_kind),
+        state.tool_doc_dir.as_deref(),
+        false,
+        false,
+    );
+
+    // 6. Counts for the breakdown labels.
+    let available =
+        athen_agent::executor::apply_tool_selection(&tools, &resolved.profile.tool_selection);
+    let tool_count_available = available.len();
+    let tool_count_revealed = available
+        .iter()
+        .filter(|t| athen_agent::tool_grouping::is_always_revealed(&t.name))
+        .count();
+
+    let identity_entry_count = match state.identity_store.as_ref() {
+        Some(store) => {
+            use athen_core::traits::identity::IdentityStore;
+            match store.entries_for_profile(&profile_id).await {
+                Ok(grouped) => grouped.iter().map(|(_, es)| es.len()).sum(),
+                Err(_) => 0,
+            }
+        }
+        None => 0,
+    };
+
+    let endpoint_count = match state.http_endpoint_store.as_ref() {
+        Some(store) => {
+            use athen_core::traits::http_endpoint::HttpEndpointStore;
+            match store.list().await {
+                Ok(eps) => eps.iter().filter(|e| e.enabled).count(),
+                Err(_) => 0,
+            }
+        }
+        None => 0,
+    };
+
+    Ok(ProfileTokenEstimate {
+        profile_id,
+        system_prompt_chars: breakdown.system_prompt,
+        tools_array_chars: breakdown.tools_array,
+        identity_chars,
+        endpoints_chars,
+        total_chars: breakdown.total,
+        approx_tokens: athen_agent::estimator::approx_tokens(breakdown.total),
+        tool_count_available,
+        tool_count_revealed,
+        identity_entry_count,
+        endpoint_count,
+    })
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct IdentityCategoryEstimate {
+    pub category_id: String,
+    pub category_name: String,
+    pub entry_count: usize,
+    pub chars: usize,
+    pub tokens: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct IdentityTotalEstimate {
+    pub entry_count: usize,
+    pub total_chars: usize,
+    pub approx_tokens: usize,
+    pub by_category: Vec<IdentityCategoryEstimate>,
+}
+
+/// Sum identity content across all entries (regardless of `applies_to`).
+/// This is the maximum cost — any single profile pays at most this much
+/// for the identity block. The per-category breakdown helps the user
+/// see what's bloating it.
+#[tauri::command]
+pub async fn estimate_identity_total(
+    state: State<'_, AppState>,
+) -> std::result::Result<IdentityTotalEstimate, String> {
+    use athen_core::traits::identity::IdentityStore;
+    let zero = IdentityTotalEstimate {
+        entry_count: 0,
+        total_chars: 0,
+        approx_tokens: 0,
+        by_category: Vec::new(),
+    };
+    let Some(store) = state.identity_store.as_ref() else {
+        return Ok(zero);
+    };
+    let categories = store.list_categories().await.unwrap_or_default();
+    let entries = store.list_entries(None).await.unwrap_or_default();
+
+    let mut by_category: Vec<IdentityCategoryEstimate> = categories
+        .iter()
+        .map(|cat| {
+            let in_cat: Vec<&athen_core::identity::IdentityEntry> =
+                entries.iter().filter(|e| e.category == cat.name).collect();
+            // Approximate the per-category contribution: header line
+            // ("## name\n") + each entry body + a trailing newline.
+            let mut chars = 0usize;
+            chars += "## ".len() + cat.name.len() + 1;
+            for e in &in_cat {
+                chars += e.body.len() + 1;
+            }
+            IdentityCategoryEstimate {
+                category_id: cat.name.clone(),
+                category_name: cat.name.clone(),
+                entry_count: in_cat.len(),
+                chars,
+                tokens: athen_agent::estimator::approx_tokens(chars),
+            }
+        })
+        .collect();
+    // Drop empty categories — they don't show up in the rendered block.
+    by_category.retain(|c| c.entry_count > 0);
+
+    let total_chars: usize = by_category.iter().map(|c| c.chars).sum();
+    Ok(IdentityTotalEstimate {
+        entry_count: entries.len(),
+        total_chars,
+        approx_tokens: athen_agent::estimator::approx_tokens(total_chars),
+        by_category,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Calendar commands
 // ---------------------------------------------------------------------------
 

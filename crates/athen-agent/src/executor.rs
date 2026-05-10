@@ -447,8 +447,13 @@ impl DefaultExecutor {
     /// warning that there is no live user, and the persona rules slot
     /// swaps the "take initiative, don't ask" rule for one that steers
     /// uncertain actions through the approval system instead.
+    ///
+    /// `pub` so the static-prefix estimator (see [`crate::estimator`])
+    /// can call the same builder the runtime uses — this is the only
+    /// way to guarantee the UI's per-profile token chips don't drift
+    /// from what the executor actually ships.
     #[allow(clippy::too_many_arguments)]
-    fn build_system_prompt_with_mode(
+    pub fn build_system_prompt_with_mode(
         tools: &[athen_core::tool::ToolDefinition],
         revealed: &HashSet<String>,
         has_context: bool,

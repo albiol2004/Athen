@@ -4956,6 +4956,93 @@ option:hover {
     border-color: rgba(247, 118, 142, 0.4);
 }
 
+/* Per-profile static-prefix token-cost chip (issue #204). Sits in the
+ * profile card name row; tooltip exposes the full per-section breakdown. */
+.profile-token-chip {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 8px;
+    margin-left: 4px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--surface-2);
+    color: var(--text-2);
+    font-size: 11px;
+    font-family: var(--mono);
+    font-variant-numeric: tabular-nums;
+    font-weight: 500;
+    cursor: help;
+    line-height: 1.4;
+}
+.profile-token-chip:hover {
+    color: var(--text);
+    border-color: var(--border-bright);
+}
+.profile-token-chip.loading {
+    color: var(--text-3);
+    opacity: 0.7;
+}
+
+/* Token-budget breakdown panel inside the profile editor. */
+.profile-token-budget.hidden { display: none; }
+.profile-token-budget-body {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 10px 12px;
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
+    font-family: var(--mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 12px;
+}
+.profile-token-budget-loading {
+    color: var(--text-3);
+    font-style: italic;
+}
+.profile-token-row {
+    display: grid;
+    grid-template-columns: 130px 90px 1fr;
+    align-items: center;
+    gap: 10px;
+}
+.profile-token-row-label {
+    color: var(--text-2);
+}
+.profile-token-row-value {
+    color: var(--text);
+    text-align: right;
+}
+.profile-token-row-bar {
+    height: 6px;
+    background: var(--surface-2);
+    border-radius: 3px;
+    overflow: hidden;
+}
+.profile-token-row-bar > span {
+    display: block;
+    height: 100%;
+    background: var(--info, #7aa2f7);
+    opacity: 0.7;
+}
+.profile-token-row.total {
+    margin-top: 4px;
+    padding-top: 6px;
+    border-top: 1px solid var(--border);
+    font-weight: 600;
+}
+.profile-token-row.total .profile-token-row-label,
+.profile-token-row.total .profile-token-row-value {
+    color: var(--text);
+}
+.profile-token-budget-meta {
+    margin-top: 4px;
+    color: var(--text-3);
+    font-size: 11px;
+    font-family: var(--font-sans);
+}
+
 .profile-modal-overlay {
     position: fixed;
     inset: 0;
