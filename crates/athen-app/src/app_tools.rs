@@ -1412,7 +1412,21 @@ impl AppToolRegistry {
                     "description": "Query-string parameters. Merged with any defaults configured on the endpoint."
                 },
                 "body": {
-                    "description": "Request body (JSON). Only for POST/PUT/PATCH; ignored on GET/DELETE."
+                    "description": "Request body (JSON). Only for POST/PUT/PATCH; ignored on GET/DELETE. Mutually exclusive with `files`/`form` — use those for multipart uploads."
+                },
+                "form": {
+                    "type": "object",
+                    "additionalProperties": { "type": "string" },
+                    "description": "Multipart text fields (string→string). Only meaningful when `files` is also set, or when the API expects multipart even with no file. If `files` is empty and `body` is unset, this is sent as application/x-www-form-urlencoded instead."
+                },
+                "files": {
+                    "type": "object",
+                    "additionalProperties": { "type": "string" },
+                    "description": "Multipart file fields: `{field_name: \"/abs/path/to/file\"}`. When set, the request becomes multipart/form-data. Use this for Whisper STT (`{file: \"/path/to/voice.ogg\"}`) and similar uploads. The path must already exist; pull voice notes/photos from the attachment_view tool first."
+                },
+                "save_to": {
+                    "type": "string",
+                    "description": "Absolute path to write the response BODY to (binary-safe). When set, the JSON response replaces `body` with `{saved_to, body_bytes, content_type}` — no base64, no UTF-8 lossy decode. Use this for ElevenLabs TTS (audio/mpeg) and any other binary download."
                 },
                 "headers": {
                     "type": "object",
@@ -1604,17 +1618,86 @@ impl AppToolRegistry {
             builder = builder.basic_auth(u, Some(p));
         }
         // Body is only meaningful on write methods; reqwest will happily
-        // attach a body to GET, but most APIs ignore or reject it.
+        // attach a body to GET, but most APIs ignore or reject it. Three
+        // mutually-exclusive shapes are supported:
+        //   1. `files` (and optionally `form`)  → multipart/form-data
+        //   2. `form` alone                     → application/x-www-form-urlencoded
+        //   3. `body`                           → application/json
+        // Caller is responsible for not mixing — if they do, multipart wins,
+        // form is folded in, json body is silently ignored.
         if matches!(
             method,
             reqwest::Method::POST | reqwest::Method::PUT | reqwest::Method::PATCH
         ) {
-            if let Some(body) = args.get("body") {
+            let files_obj = args.get("files").and_then(|v| v.as_object());
+            let form_obj = args.get("form").and_then(|v| v.as_object());
+
+            if let Some(files) = files_obj.filter(|m| !m.is_empty()) {
+                let mut multipart = reqwest::multipart::Form::new();
+                if let Some(form) = form_obj {
+                    for (k, v) in form {
+                        if let Some(s) = v.as_str() {
+                            multipart = multipart.text(k.clone(), s.to_string());
+                        }
+                    }
+                }
+                for (field, path_v) in files {
+                    let Some(p) = path_v.as_str() else { continue };
+                    let path = std::path::Path::new(p);
+                    let bytes = match tokio::fs::read(path).await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            return Ok(ToolResult {
+                                success: false,
+                                output: json!({
+                                    "error": "file_read_failed",
+                                    "endpoint": endpoint.name,
+                                    "path": p,
+                                    "detail": e.to_string(),
+                                }),
+                                error: Some(format!(
+                                    "http_request: cannot read file '{p}' for field '{field}': {e}"
+                                )),
+                                execution_time_ms: 0,
+                            });
+                        }
+                    };
+                    let file_name = path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("upload")
+                        .to_string();
+                    let mime = guess_mime_for_path(path);
+                    let part = reqwest::multipart::Part::bytes(bytes)
+                        .file_name(file_name)
+                        .mime_str(&mime)
+                        .map_err(|e| {
+                            AthenError::Other(format!(
+                                "http_request: bad mime '{mime}' for field '{field}': {e}"
+                            ))
+                        })?;
+                    multipart = multipart.part(field.clone(), part);
+                }
+                builder = builder.multipart(multipart);
+            } else if let Some(form) = form_obj.filter(|m| !m.is_empty()) {
+                let pairs: Vec<(String, String)> = form
+                    .iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect();
+                builder = builder.form(&pairs);
+            } else if let Some(body) = args.get("body") {
                 if !body.is_null() {
                     builder = builder.json(body);
                 }
             }
         }
+
+        let save_to: Option<String> = args
+            .get("save_to")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
 
         let started = Instant::now();
         let send_result = builder.send().await;
@@ -1676,9 +1759,52 @@ impl AppToolRegistry {
             }
         };
         let body_bytes = bytes.len();
-        let raw_text = String::from_utf8_lossy(&bytes).into_owned();
 
-        let body_value: serde_json::Value =
+        // If the caller asked to save the body, write it and report the
+        // path — never try to decode the bytes (could be audio, image, PDF).
+        let body_value: serde_json::Value = if let Some(out_path) = save_to.as_deref() {
+            let path = std::path::Path::new(out_path);
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: json!({
+                                "error": "save_to_mkdir_failed",
+                                "endpoint": endpoint.name,
+                                "path": out_path,
+                                "detail": e.to_string(),
+                            }),
+                            error: Some(format!(
+                                "http_request: cannot create parent dir for '{out_path}': {e}"
+                            )),
+                            execution_time_ms: started.elapsed().as_millis() as u64,
+                        });
+                    }
+                }
+            }
+            if let Err(e) = tokio::fs::write(path, &bytes).await {
+                return Ok(ToolResult {
+                    success: false,
+                    output: json!({
+                        "error": "save_to_write_failed",
+                        "endpoint": endpoint.name,
+                        "path": out_path,
+                        "detail": e.to_string(),
+                    }),
+                    error: Some(format!(
+                        "http_request: cannot write response to '{out_path}': {e}"
+                    )),
+                    execution_time_ms: started.elapsed().as_millis() as u64,
+                });
+            }
+            json!({
+                "saved_to": out_path,
+                "body_bytes": body_bytes,
+                "content_type": content_type,
+            })
+        } else {
+            let raw_text = String::from_utf8_lossy(&bytes).into_owned();
             if content_type.contains("application/json") && !raw_text.is_empty() {
                 match serde_json::from_str::<serde_json::Value>(&raw_text) {
                     Ok(v) => v,
@@ -1689,7 +1815,8 @@ impl AppToolRegistry {
                 }
             } else {
                 json!({ "raw_text": raw_text })
-            };
+            }
+        };
 
         let elapsed_ms = started.elapsed().as_millis() as u64;
         // Bump the persistent counter — best-effort; a counter blip is
@@ -1726,6 +1853,39 @@ fn join_base_and_path(base: &str, path: &str) -> Result<reqwest::Url> {
     parsed
         .join(path)
         .map_err(|e| AthenError::Other(format!("http_request: invalid path '{path}': {e}")))
+}
+
+/// Best-effort MIME guess from file extension. Used to set the Content-Type
+/// of a multipart file part — Whisper STT and most upload APIs accept the
+/// generic `application/octet-stream` fallback, but signal-rich types like
+/// `audio/ogg` and `image/png` improve compatibility with stricter servers.
+fn guess_mime_for_path(path: &std::path::Path) -> String {
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "ogg" | "oga" | "opus" => "audio/ogg",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "m4a" | "aac" => "audio/mp4",
+        "flac" => "audio/flac",
+        "webm" => "audio/webm",
+        "mp4" => "video/mp4",
+        "mov" => "video/quicktime",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "pdf" => "application/pdf",
+        "json" => "application/json",
+        "txt" | "log" => "text/plain",
+        "csv" => "text/csv",
+        "html" | "htm" => "text/html",
+        _ => "application/octet-stream",
+    }
+    .to_string()
 }
 
 fn insert_header(map: &mut reqwest::header::HeaderMap, name: &str, value: &str) -> Result<()> {
