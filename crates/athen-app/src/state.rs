@@ -303,6 +303,15 @@ pub struct AppState {
     /// populated. `None` means the `email_send` tool will refuse with a
     /// "not configured" error until the user wires SMTP via Settings.
     pub email_sender: Option<Arc<dyn athen_core::traits::email_sender::EmailSender>>,
+    /// Encrypted credential vault. Backs registered HTTP endpoints,
+    /// IMAP/SMTP credentials, OAuth tokens, and any other at-rest secret.
+    /// Always `Some` whenever a data directory is available; falls back
+    /// from the OS keychain to an encrypted file if the keychain is
+    /// unreachable. `None` only on test/CLI builds without a data dir.
+    // first real consumer is task #184 (http_request + registered endpoints).
+    // Until then the only reader is `vault_smoke_test` in commands.rs, which
+    // is enough to keep dead_code happy.
+    pub vault: Option<Arc<dyn athen_core::traits::vault::Vault>>,
 }
 
 impl AppState {
@@ -387,6 +396,17 @@ impl AppState {
         let email_sender: Option<Arc<dyn athen_core::traits::email_sender::EmailSender>> =
             build_email_sender(&config.email);
 
+        let vault: Option<Arc<dyn athen_core::traits::vault::Vault>> = match ensure_data_dir() {
+            Some(dir) => match athen_vault::open_vault(&dir, "athen").await {
+                Ok(v) => Some(Arc::from(v)),
+                Err(e) => {
+                    warn!("Vault unavailable: {e} — credential-backed tools will fail until fixed");
+                    None
+                }
+            },
+            None => None,
+        };
+
         let state = Self {
             coordinator: Arc::new(coordinator),
             router,
@@ -433,6 +453,7 @@ impl AppState {
             compactor,
             web_search,
             email_sender,
+            vault,
         };
 
         if let Err(e) = state.refresh_tools_doc().await {

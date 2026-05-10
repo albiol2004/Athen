@@ -17,6 +17,7 @@ members = [
     "crates/athen-app",
     "crates/athen-mcp",
     "crates/athen-scheduler",
+    "crates/athen-vault",
     "crates/athen-cli",
 ]
 
@@ -37,6 +38,7 @@ athen-agent = { path = "crates/athen-agent" }
 athen-mcp = { path = "crates/athen-mcp" }
 athen-web = { path = "crates/athen-web" }
 athen-scheduler = { path = "crates/athen-scheduler" }
+athen-vault = { path = "crates/athen-vault" }
 
 # External
 tokio = { version = "1", features = ["full"] }

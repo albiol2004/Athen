@@ -50,6 +50,7 @@ athen/
 │   ├── athen-contacts/           # Contact trust model + risk multipliers
 │   ├── athen-sandbox/            # OS-native + container sandboxing
 │   ├── athen-shell/              # Nushell embedding + native shell fallback
+│   ├── athen-vault/              # Encrypted credential vault (OS keychain + encrypted-file fallback)
 │   ├── athen-cli/                # CLI runner (REPL)
 │   └── athen-app/                # Tauri desktop app (composition root)
 ```
@@ -130,4 +131,8 @@ Read the relevant doc BEFORE working on a feature area:
 - [Prompt Caching](docs/PROMPT_CACHING.md) — Read when: touching any LLM provider request/response path, the `TokenUsage` struct, or cost estimation. Per-provider audit (Anthropic/OpenAI/DeepSeek/Google) of how prompt caching works on the wire and where Athen currently leaves money on the table. Design doc; not yet implemented. Anthropic gap is severe (zero `cache_control` markers + missing `tools` field), DeepSeek gap is observability-only (cache fires but cost UI lies).
 - [Memory](docs/MEMORY.md) — Read when: touching auto-recall injection, the post-turn `judge_worth_remembering` flow, the `memory_store` / `memory_recall` agent tools, or the relevance threshold. Memory is the episodic auto-recall store; distinct from Identity (always-on, in the static prefix). Covers dedup at all three layers (auto-judge sees existing memories, `memory_store` skips duplicates, recall threshold raised to 0.6).
 - [Tool Expansion Menu](docs/TOOL_EXPANSION.md) — Read when: picking the next agent tool to wrap, or when an existing tool category needs a refresh. 10-category survey (browser, docs, OCR, GitHub, audio/video, db, social, outreach, scraping, jobs) with top pick + footprint + wrap shape + risk + fit per category. Picking menu, not a build plan; per-category implementation docs land when each category is shipped.
-- [Cloud APIs Expansion](docs/CLOUD_APIS.md) — Read when: working on the `http_request` agent tool or the Registered HTTP Endpoints store. Architecture sketch + 15 preset endpoints (Jina, Firecrawl, Hunter, Apollo, PDL, DeepL, NewsAPI, Adzuna, Brave Search, OpenCage, Open-Meteo, Frankfurter, ElevenLabs, Cal.com, OpenRouter, Groq, Wikipedia). One ship unlocks ~15 APIs; #1 in updated ship order. Depends on a credential-at-rest crypto module that doesn't exist yet.
+- [Cloud APIs Expansion](docs/CLOUD_APIS.md) — Read when: working on the `http_request` agent tool or the Registered HTTP Endpoints store. Architecture sketch + 15 preset endpoints (Jina, Firecrawl, Hunter, Apollo, PDL, DeepL, NewsAPI, Adzuna, Brave Search, OpenCage, Open-Meteo, Frankfurter, ElevenLabs, Cal.com, OpenRouter, Groq, Wikipedia). One ship unlocks ~15 APIs; #1 in updated ship order. Vault prereq is now shipped — see `athen-vault`.
+
+### Crate-level docs (read source, not a separate file)
+
+- `athen-vault` — Encrypted credential vault. Two backends sharing the `Vault` trait from `athen-core::traits::vault`: `KeyringVault` (OS keychain via the `keyring` crate, with a SQLite index for `list`) and `EncryptedFileVault` (chacha20poly1305, random 32-byte master key at `<data_dir>/vault.key` mode 0600, AAD bound to `(scope, key)` so row-swap attacks fail). Use `athen_vault::open_vault(data_dir, "athen")` — it tries the keychain, self-checks with a sentinel round-trip, falls back to encrypted file on failure. Wired into `AppState::vault` in `athen-app`. Backs `http_request` registered endpoints (#184), future IMAP/SMTP credentials, and OAuth tokens. Single source of truth for at-rest secrets — never roll your own.

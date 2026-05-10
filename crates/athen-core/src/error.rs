@@ -32,6 +32,9 @@ pub enum AthenError {
     #[error("Configuration error: {0}")]
     Config(String),
 
+    #[error("Vault error: {0}")]
+    Vault(String),
+
     #[error("{0}")]
     Other(String),
 }

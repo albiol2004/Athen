@@ -168,6 +168,7 @@ pub fn run() {
             wakeup_commands::delete_wakeup,
             wakeup_commands::set_wakeup_enabled,
             wakeup_commands::list_available_tools,
+            commands::vault_smoke_test,
         ])
         .setup(|app| {
             use tauri::Manager;

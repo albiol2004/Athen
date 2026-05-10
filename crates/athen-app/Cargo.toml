@@ -18,6 +18,7 @@ athen-mcp = { workspace = true }
 athen-web = { workspace = true }
 athen-shell = { workspace = true }
 athen-scheduler = { workspace = true }
+athen-vault = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

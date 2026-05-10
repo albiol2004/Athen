@@ -15,4 +15,5 @@ pub mod sandbox;
 pub mod sense;
 pub mod shell;
 pub mod tool;
+pub mod vault;
 pub mod wakeup;

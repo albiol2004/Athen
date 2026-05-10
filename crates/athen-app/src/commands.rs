@@ -4055,6 +4055,56 @@ pub async fn cancel_task(state: State<'_, AppState>) -> std::result::Result<(), 
     Ok(())
 }
 
+/// Dev-only smoke test for the credential vault wired into AppState.
+///
+/// Round-trips a sentinel value through the active vault backend so you
+/// can verify from DevTools (`__TAURI__.core.invoke('vault_smoke_test')`)
+/// that `set` / `get` / `list` / `delete` all work end-to-end against the
+/// real composition root. Returns a JSON object with which backend was
+/// chosen and the round-trip outcome. Leaves no residue (deletes the
+/// sentinel before returning).
+#[tauri::command]
+pub async fn vault_smoke_test(
+    state: State<'_, AppState>,
+) -> std::result::Result<serde_json::Value, String> {
+    use serde_json::json;
+    let Some(vault) = state.vault.clone() else {
+        return Ok(json!({
+            "ok": false,
+            "reason": "vault_not_initialised — no data dir or open_vault failed (check startup logs)"
+        }));
+    };
+    let scope = "__smoke_test__";
+    let key = "ping";
+    let value = "pong";
+    vault
+        .set(scope, key, value)
+        .await
+        .map_err(|e| format!("set: {e}"))?;
+    let got = vault
+        .get(scope, key)
+        .await
+        .map_err(|e| format!("get: {e}"))?;
+    let listed = vault
+        .list(scope)
+        .await
+        .map_err(|e| format!("list: {e}"))?;
+    vault
+        .delete(scope, key)
+        .await
+        .map_err(|e| format!("delete: {e}"))?;
+    let after_delete = vault
+        .get(scope, key)
+        .await
+        .map_err(|e| format!("get after delete: {e}"))?;
+    Ok(json!({
+        "ok": got.as_deref() == Some(value) && listed == vec![key.to_string()] && after_delete.is_none(),
+        "round_trip": got,
+        "listed_keys": listed,
+        "after_delete_is_none": after_delete.is_none(),
+    }))
+}
+
 /// Resolve a pending [`ApprovalQuestion`] from the in-app UI.
 ///
 /// Used by the new approval router flow: when the frontend renders an
