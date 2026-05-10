@@ -308,9 +308,12 @@ pub struct AppState {
     /// Always `Some` whenever a data directory is available; falls back
     /// from the OS keychain to an encrypted file if the keychain is
     /// unreachable. `None` only on test/CLI builds without a data dir.
-    // first real consumer is task #184 (http_request + registered endpoints).
-    // Until then the only reader is `vault_smoke_test` in commands.rs, which
-    // is enough to keep dead_code happy.
+    /// Encrypted credential vault — primary store for secrets going
+    /// forward. Hydrates `config` at startup (see `vault_creds::
+    /// hydrate_secrets_from_vault`) so the existing build paths are
+    /// unchanged. Save commands write here and blank the corresponding
+    /// `config.toml` field, so secrets stop appearing on disk in
+    /// plaintext after the next save.
     pub vault: Option<Arc<dyn athen_core::traits::vault::Vault>>,
 }
 
@@ -329,7 +332,23 @@ impl AppState {
     ///
     /// `DEEPSEEK_API_KEY` env var always takes precedence over config file values.
     pub async fn new() -> Self {
-        let config = load_config();
+        let mut config = load_config();
+
+        // Open the credential vault FIRST so secrets stored there can hydrate
+        // the in-memory config before any consumer (router, email, web search,
+        // telegram, …) reads it. Failure is non-fatal — we log and fall back
+        // to the legacy plaintext fields in config.toml.
+        let vault: Option<Arc<dyn athen_core::traits::vault::Vault>> = match ensure_data_dir() {
+            Some(dir) => match athen_vault::open_vault(&dir, "athen").await {
+                Ok(v) => Some(Arc::from(v)),
+                Err(e) => {
+                    warn!("Vault unavailable: {e} — credential-backed tools will fail until fixed");
+                    None
+                }
+            },
+            None => None,
+        };
+        crate::vault_creds::hydrate_secrets_from_vault(vault.as_ref(), &mut config).await;
 
         // Determine which provider to activate on startup.
         let active_id = resolve_active_provider(&config);
@@ -396,17 +415,6 @@ impl AppState {
         let email_sender: Option<Arc<dyn athen_core::traits::email_sender::EmailSender>> =
             build_email_sender(&config.email);
 
-        let vault: Option<Arc<dyn athen_core::traits::vault::Vault>> = match ensure_data_dir() {
-            Some(dir) => match athen_vault::open_vault(&dir, "athen").await {
-                Ok(v) => Some(Arc::from(v)),
-                Err(e) => {
-                    warn!("Vault unavailable: {e} — credential-backed tools will fail until fixed");
-                    None
-                }
-            },
-            None => None,
-        };
-
         let state = Self {
             coordinator: Arc::new(coordinator),
             router,
@@ -470,6 +478,29 @@ impl AppState {
     /// freely into background tasks.
     pub fn attachment_store(&self) -> Option<athen_persistence::attachments::AttachmentStore> {
         self._database.as_ref().map(|db| db.attachment_store())
+    }
+
+    /// Load `config.toml` and overlay any vault-stored secrets on top.
+    /// Use this anywhere that currently calls `load_config()` and then
+    /// reads a credential field — IMAP password, SMTP password,
+    /// Telegram bot token, web-search keys, provider api_keys. Pure
+    /// non-credential reads can keep using bare `load_config()`.
+    ///
+    /// `load_hydrated_config_sync` is the sync-context companion for
+    /// the Tauri startup hooks that aren't async; prefer this async
+    /// one wherever possible.
+    pub fn load_hydrated_config_sync(&self) -> AthenConfig {
+        let mut config = load_config();
+        if let Some(vault) = self.vault.as_ref() {
+            let vault = vault.clone();
+            let cfg = std::mem::take(&mut config);
+            config = tauri::async_runtime::block_on(async move {
+                let mut c = cfg;
+                crate::vault_creds::hydrate_secrets_from_vault(Some(&vault), &mut c).await;
+                c
+            });
+        }
+        config
     }
 
     /// Generate per-group markdown schema files into `tool_doc_dir`. Called
@@ -648,7 +679,7 @@ impl AppState {
     /// Channels are built from the current config: InApp is always added,
     /// Telegram is added only if the bot is configured with an owner.
     pub fn init_notifier(&mut self, app_handle: tauri::AppHandle) {
-        let config = load_config();
+        let config = self.load_hydrated_config_sync();
         let mut channels: Vec<Box<dyn NotificationChannel>> = Vec::new();
 
         // InApp is always available.
@@ -709,7 +740,7 @@ impl AppState {
         use crate::approval::{ApprovalRouter, InAppApprovalSink, TelegramApprovalSink};
         use athen_core::traits::approval::ApprovalSink;
 
-        let config = load_config();
+        let config = self.load_hydrated_config_sync();
 
         let inapp = Arc::new(InAppApprovalSink::new(app_handle));
         let mut sinks: Vec<Arc<dyn ApprovalSink>> = vec![inapp.clone() as Arc<dyn ApprovalSink>];
@@ -784,7 +815,7 @@ impl AppState {
         use athen_core::traits::sense::SenseMonitor;
         use athen_sentidos::email::EmailMonitor;
 
-        let config = load_config();
+        let config = self.load_hydrated_config_sync();
         if !config.email.enabled {
             info!("Email monitor disabled in config, skipping startup");
             return;
@@ -1031,7 +1062,7 @@ impl AppState {
         use athen_core::traits::sense::SenseMonitor;
         use athen_sentidos::telegram::TelegramMonitor;
 
-        let config = load_config();
+        let config = self.load_hydrated_config_sync();
         if !config.telegram.enabled {
             info!("Telegram monitor disabled in config, skipping startup");
             return;
@@ -1314,6 +1345,10 @@ impl AppState {
         let compactor = self.compactor.clone();
         let web_search = Arc::clone(&self.web_search);
         let email_sender = self.email_sender.clone();
+        // Snapshot the vault so the per-task IMAP mark-seen flow can
+        // hydrate the IMAP password from it (the password lives in the
+        // vault for installs that have re-saved their email settings).
+        let vault_snapshot = self.vault.clone();
         // Snapshot the active provider id so the dispatch loop can resolve
         // the per-arc compaction budget on each iteration. A mid-session
         // provider switch won't propagate into already-spawned dispatch
@@ -1465,6 +1500,7 @@ impl AppState {
                     let task_arc_map_clone = Arc::clone(&task_arc_map);
                     let task_wakeup_map_clone = Arc::clone(&task_wakeup_map);
                     let pending_email_marks_clone = Arc::clone(&pending_email_marks);
+                    let vault_snapshot = vault_snapshot.clone();
                     tauri::async_runtime::spawn(async move {
                         let outcome =
                             crate::commands::execute_dispatched_task(task, arc_id.clone(), ctx)
@@ -1509,7 +1545,12 @@ impl AppState {
                         let mark_info = pending_email_marks_clone.write().await.remove(&task_id);
                         if let Some(info) = mark_info {
                             if succeeded {
-                                let config = load_config();
+                                let mut config = load_config();
+                                crate::vault_creds::hydrate_secrets_from_vault(
+                                    vault_snapshot.as_ref(),
+                                    &mut config,
+                                )
+                                .await;
                                 let email_config = config.email.clone();
                                 tokio::spawn(async move {
                                     match athen_sentidos::email::mark_uid_seen(

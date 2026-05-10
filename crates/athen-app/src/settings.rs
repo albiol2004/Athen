@@ -4,6 +4,7 @@
 //! and general application settings through the UI.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde::Serialize;
 use tauri::State;
@@ -761,10 +762,96 @@ pub async fn save_provider(
     let mut models = load_models_config();
 
     let existing = models.providers.get(&id);
-    let auth = match api_key {
-        Some(key) if key.is_empty() => AuthType::None,
-        Some(key) => AuthType::ApiKey(key),
-        None => existing.map(|p| p.auth.clone()).unwrap_or(AuthType::None),
+    // Decide what to do with the api_key first, *then* derive the
+    // AuthType to write into models.toml. The vault-backed path stores
+    // the key out of band and writes `AuthType::None` on disk, so a
+    // leaked models.toml carries no secret. The legacy path (no vault
+    // wired — test/CLI builds) keeps the old behaviour of storing the
+    // plaintext key under `AuthType::ApiKey`.
+    //
+    // `effective_key` is the value we'll use to (re)build the live
+    // router below — vault-stored or in-flight — so a hot-reload after
+    // save still has the credential available.
+    let (auth, effective_key): (AuthType, Option<String>) = match (api_key, state.vault.as_ref()) {
+        (Some(key), _) if key.is_empty() => {
+            // User cleared the key: drop it from both the vault and the
+            // existing AuthType. Failure to delete from the vault is
+            // non-fatal (it might never have been written there).
+            if let Some(vault) = state.vault.as_ref() {
+                let _ = vault
+                    .delete(
+                        &crate::vault_creds::provider_scope(&id),
+                        crate::vault_creds::KEY_API_KEY,
+                    )
+                    .await;
+            }
+            (AuthType::None, None)
+        }
+        (Some(key), Some(vault)) => {
+            vault
+                .set(
+                    &crate::vault_creds::provider_scope(&id),
+                    crate::vault_creds::KEY_API_KEY,
+                    &key,
+                )
+                .await
+                .map_err(|e| format!("Vault store provider api_key: {e}"))?;
+            (AuthType::None, Some(key))
+        }
+        (Some(key), None) => (AuthType::ApiKey(key.clone()), Some(key)),
+        (None, _) => {
+            // No new key from the caller — preserve whatever was already
+            // set. ALSO opportunistically migrate: if the existing
+            // AuthType holds a plaintext ApiKey AND the vault doesn't
+            // yet have one for this provider, move it across now and
+            // write `AuthType::None` to disk. Lazy migration kicks in
+            // on the very first Save the user performs through the
+            // new code — they don't have to manually retype the key.
+            let existing_auth = existing.map(|p| p.auth.clone()).unwrap_or(AuthType::None);
+            let plaintext_legacy = match &existing_auth {
+                AuthType::ApiKey(k) if !k.is_empty() && !k.starts_with("${") => Some(k.clone()),
+                _ => None,
+            };
+            let vault_held = if let Some(vault) = state.vault.as_ref() {
+                vault
+                    .get(
+                        &crate::vault_creds::provider_scope(&id),
+                        crate::vault_creds::KEY_API_KEY,
+                    )
+                    .await
+                    .ok()
+                    .flatten()
+                    .filter(|s| !s.is_empty())
+            } else {
+                None
+            };
+            match (state.vault.as_ref(), &plaintext_legacy, &vault_held) {
+                (Some(vault), Some(legacy), None) => {
+                    // Migrate plaintext → vault; flip the on-disk auth
+                    // to None so models.toml stops carrying the secret.
+                    vault
+                        .set(
+                            &crate::vault_creds::provider_scope(&id),
+                            crate::vault_creds::KEY_API_KEY,
+                            legacy,
+                        )
+                        .await
+                        .map_err(|e| format!("Vault migrate provider api_key: {e}"))?;
+                    (AuthType::None, Some(legacy.clone()))
+                }
+                (Some(_), _, Some(v)) => {
+                    // Vault already has a value — make sure on-disk auth
+                    // doesn't lie about a stale plaintext.
+                    let on_disk = if matches!(&existing_auth, AuthType::ApiKey(_)) {
+                        AuthType::None
+                    } else {
+                        existing_auth
+                    };
+                    (on_disk, Some(v.clone()))
+                }
+                _ => (existing_auth, plaintext_legacy),
+            }
+        }
     };
 
     let resolved_base_url = if base_url.is_empty() {
@@ -849,14 +936,13 @@ pub async fn save_provider(
     // Hot-reload if saving the currently active provider.
     let active_id = state.active_provider_id.lock().await.clone();
     if id == active_id {
-        // Resolve the API key: saved key takes priority over env var.
-        let router_api_key = match &auth {
-            AuthType::ApiKey(key) if !key.is_empty() && !key.starts_with("${") => Some(key.clone()),
-            _ => {
-                let env_var = format!("{}_API_KEY", id.to_uppercase());
-                std::env::var(&env_var).ok().filter(|k| !k.is_empty())
-            }
-        };
+        // Resolve the API key for the live router rebuild. `effective_key`
+        // already reflects vault + in-flight + existing AuthType; only
+        // fall back to the env var when none of those held a value.
+        let router_api_key = effective_key.clone().or_else(|| {
+            let env_var = format!("{}_API_KEY", id.to_uppercase());
+            std::env::var(&env_var).ok().filter(|k| !k.is_empty())
+        });
 
         let supports_vision = models.providers.get(&id).is_some_and(|c| c.supports_vision);
         let supports_documents = models
@@ -1165,6 +1251,7 @@ pub async fn save_email_settings(
     folders: String,
     poll_interval_secs: u64,
     lookback_hours: u32,
+    state: State<'_, AppState>,
 ) -> std::result::Result<String, String> {
     let mut config = load_main_config();
 
@@ -1174,7 +1261,48 @@ pub async fn save_email_settings(
     config.email.username = username;
     if let Some(pw) = password {
         if !pw.is_empty() {
-            config.email.password = pw;
+            // Vault path: store the password and blank it on disk so a
+            // leaked config.toml carries no secret. Falls back to the
+            // legacy plaintext write when no vault is wired (test/CLI).
+            if let Some(vault) = state.vault.as_ref() {
+                vault
+                    .set(
+                        crate::vault_creds::SCOPE_EMAIL_IMAP,
+                        crate::vault_creds::KEY_PASSWORD,
+                        &pw,
+                    )
+                    .await
+                    .map_err(|e| format!("Vault store IMAP password: {e}"))?;
+                config.email.password = String::new();
+            } else {
+                config.email.password = pw;
+            }
+        }
+    } else if let Some(vault) = state.vault.as_ref() {
+        // Caller didn't supply a new password. Opportunistic migration:
+        // if a plaintext value still lives in config.toml AND the vault
+        // doesn't yet have one, move it across now and blank the disk.
+        if !config.email.password.is_empty() {
+            let already = vault
+                .get(
+                    crate::vault_creds::SCOPE_EMAIL_IMAP,
+                    crate::vault_creds::KEY_PASSWORD,
+                )
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|s| !s.is_empty());
+            if !already {
+                vault
+                    .set(
+                        crate::vault_creds::SCOPE_EMAIL_IMAP,
+                        crate::vault_creds::KEY_PASSWORD,
+                        &config.email.password,
+                    )
+                    .await
+                    .map_err(|e| format!("Vault migrate IMAP password: {e}"))?;
+            }
+            config.email.password = String::new();
         }
     }
     config.email.use_tls = use_tls;
@@ -1285,6 +1413,7 @@ pub async fn save_smtp_settings(
     smtp_password: Option<String>,
     smtp_use_tls: bool,
     from_address: String,
+    state: State<'_, AppState>,
 ) -> std::result::Result<String, String> {
     let mut config = load_main_config();
     config.email.smtp_server = smtp_server;
@@ -1292,7 +1421,42 @@ pub async fn save_smtp_settings(
     config.email.smtp_username = smtp_username;
     if let Some(pw) = smtp_password {
         if !pw.is_empty() {
-            config.email.smtp_password = pw;
+            if let Some(vault) = state.vault.as_ref() {
+                vault
+                    .set(
+                        crate::vault_creds::SCOPE_EMAIL_SMTP,
+                        crate::vault_creds::KEY_PASSWORD,
+                        &pw,
+                    )
+                    .await
+                    .map_err(|e| format!("Vault store SMTP password: {e}"))?;
+                config.email.smtp_password = String::new();
+            } else {
+                config.email.smtp_password = pw;
+            }
+        }
+    } else if let Some(vault) = state.vault.as_ref() {
+        if !config.email.smtp_password.is_empty() {
+            let already = vault
+                .get(
+                    crate::vault_creds::SCOPE_EMAIL_SMTP,
+                    crate::vault_creds::KEY_PASSWORD,
+                )
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|s| !s.is_empty());
+            if !already {
+                vault
+                    .set(
+                        crate::vault_creds::SCOPE_EMAIL_SMTP,
+                        crate::vault_creds::KEY_PASSWORD,
+                        &config.email.smtp_password,
+                    )
+                    .await
+                    .map_err(|e| format!("Vault migrate SMTP password: {e}"))?;
+            }
+            config.email.smtp_password = String::new();
         }
     }
     config.email.smtp_use_tls = smtp_use_tls;
@@ -1369,13 +1533,49 @@ pub async fn save_telegram_settings(
     owner_user_id: Option<i64>,
     allowed_chat_ids: Vec<i64>,
     poll_interval_secs: Option<u64>,
+    state: State<'_, AppState>,
 ) -> std::result::Result<String, String> {
     let mut config = load_main_config();
 
     config.telegram.enabled = enabled;
     if let Some(token) = bot_token {
         if !token.is_empty() {
-            config.telegram.bot_token = token;
+            if let Some(vault) = state.vault.as_ref() {
+                vault
+                    .set(
+                        crate::vault_creds::SCOPE_TELEGRAM,
+                        crate::vault_creds::KEY_BOT_TOKEN,
+                        &token,
+                    )
+                    .await
+                    .map_err(|e| format!("Vault store Telegram bot token: {e}"))?;
+                config.telegram.bot_token = String::new();
+            } else {
+                config.telegram.bot_token = token;
+            }
+        }
+    } else if let Some(vault) = state.vault.as_ref() {
+        if !config.telegram.bot_token.is_empty() {
+            let already = vault
+                .get(
+                    crate::vault_creds::SCOPE_TELEGRAM,
+                    crate::vault_creds::KEY_BOT_TOKEN,
+                )
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|s| !s.is_empty());
+            if !already {
+                vault
+                    .set(
+                        crate::vault_creds::SCOPE_TELEGRAM,
+                        crate::vault_creds::KEY_BOT_TOKEN,
+                        &config.telegram.bot_token,
+                    )
+                    .await
+                    .map_err(|e| format!("Vault migrate Telegram bot token: {e}"))?;
+            }
+            config.telegram.bot_token = String::new();
         }
     }
     config.telegram.owner_user_id = owner_user_id;
@@ -1469,18 +1669,84 @@ pub async fn test_telegram_connection(
 pub async fn save_web_search_settings(
     brave_api_key: Option<String>,
     tavily_api_key: Option<String>,
+    state: State<'_, AppState>,
 ) -> std::result::Result<String, String> {
     let mut config = load_main_config();
 
-    if let Some(key) = brave_api_key {
-        config.web_search.brave_api_key = key;
-    }
-    if let Some(key) = tavily_api_key {
-        config.web_search.tavily_api_key = key;
-    }
+    migrate_websearch_key(
+        state.vault.as_ref(),
+        crate::vault_creds::SCOPE_WEBSEARCH_BRAVE,
+        brave_api_key,
+        &mut config.web_search.brave_api_key,
+        "Brave",
+    )
+    .await?;
+    migrate_websearch_key(
+        state.vault.as_ref(),
+        crate::vault_creds::SCOPE_WEBSEARCH_TAVILY,
+        tavily_api_key,
+        &mut config.web_search.tavily_api_key,
+        "Tavily",
+    )
+    .await?;
 
     save_main_config(&config)?;
     Ok("Web search settings saved. Restart to apply.".to_string())
+}
+
+/// Shared logic for `save_web_search_settings`. Treats:
+/// - `Some(non-empty)` → write to vault (or to `cfg_field` if no vault),
+///   blank `cfg_field` on disk.
+/// - `Some("")` → delete from vault, blank `cfg_field`.
+/// - `None` with a non-empty plaintext still in `cfg_field` → migrate
+///   it to the vault if the vault doesn't already hold one. Lazy
+///   migration that doesn't require the user to retype.
+/// - `None` with empty `cfg_field` → no-op.
+async fn migrate_websearch_key(
+    vault: Option<&Arc<dyn athen_core::traits::vault::Vault>>,
+    scope: &str,
+    incoming: Option<String>,
+    cfg_field: &mut String,
+    label: &str,
+) -> std::result::Result<(), String> {
+    use crate::vault_creds::KEY_API_KEY;
+    match incoming {
+        Some(key) if key.is_empty() => {
+            if let Some(v) = vault {
+                let _ = v.delete(scope, KEY_API_KEY).await;
+            }
+            *cfg_field = String::new();
+        }
+        Some(key) => {
+            if let Some(v) = vault {
+                v.set(scope, KEY_API_KEY, &key)
+                    .await
+                    .map_err(|e| format!("Vault store {label} API key: {e}"))?;
+                *cfg_field = String::new();
+            } else {
+                *cfg_field = key;
+            }
+        }
+        None => {
+            if let Some(v) = vault {
+                if !cfg_field.is_empty() {
+                    let already = v
+                        .get(scope, KEY_API_KEY)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some_and(|s| !s.is_empty());
+                    if !already {
+                        v.set(scope, KEY_API_KEY, cfg_field)
+                            .await
+                            .map_err(|e| format!("Vault migrate {label} API key: {e}"))?;
+                    }
+                    *cfg_field = String::new();
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Frontend-shaped view of the attachment policy. Sizes go to/from the

@@ -44,13 +44,19 @@ pub async fn open_vault(data_dir: &Path, service: &str) -> Result<Box<dyn Vault>
                 "Vault: keyring opened but self-check failed; falling back to encrypted file"
             );
             let v = EncryptedFileVault::open(data_dir).await?;
-            tracing::info!(backend = "encrypted_file", "Vault: opened encrypted-file fallback");
+            tracing::info!(
+                backend = "encrypted_file",
+                "Vault: opened encrypted-file fallback"
+            );
             Ok(Box::new(v))
         }
         Err(e) => {
             tracing::warn!(error = %e, "Vault: keyring unavailable; using encrypted file");
             let v = EncryptedFileVault::open(data_dir).await?;
-            tracing::info!(backend = "encrypted_file", "Vault: opened encrypted-file fallback");
+            tracing::info!(
+                backend = "encrypted_file",
+                "Vault: opened encrypted-file fallback"
+            );
             Ok(Box::new(v))
         }
     }

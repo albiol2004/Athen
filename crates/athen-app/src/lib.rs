@@ -19,6 +19,7 @@ pub(crate) mod sense_router;
 mod settings;
 pub(crate) mod state;
 pub(crate) mod telegram_progress;
+pub(crate) mod vault_creds;
 mod wakeup_commands;
 pub(crate) mod wakeup_registry;
 pub(crate) mod wakeup_sink;

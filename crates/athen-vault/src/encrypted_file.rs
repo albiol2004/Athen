@@ -89,8 +89,8 @@ impl EncryptedFileVault {
 
 fn load_or_create_master_key(path: &PathBuf) -> Result<[u8; MASTER_KEY_BYTES]> {
     if path.exists() {
-        let bytes = std::fs::read(path)
-            .map_err(|e| AthenError::Vault(format!("Read master key: {e}")))?;
+        let bytes =
+            std::fs::read(path).map_err(|e| AthenError::Vault(format!("Read master key: {e}")))?;
         if bytes.len() != MASTER_KEY_BYTES {
             return Err(AthenError::Vault(format!(
                 "Master key file has wrong length: {} (expected {})",
@@ -128,8 +128,7 @@ fn write_master_key(path: &PathBuf, bytes: &[u8]) -> Result<()> {
 fn write_master_key(path: &PathBuf, bytes: &[u8]) -> Result<()> {
     // On Windows the user data dir already lives under the user profile;
     // additional ACL hardening is left for a follow-up.
-    std::fs::write(path, bytes)
-        .map_err(|e| AthenError::Vault(format!("Write master key: {e}")))?;
+    std::fs::write(path, bytes).map_err(|e| AthenError::Vault(format!("Write master key: {e}")))?;
     Ok(())
 }
 

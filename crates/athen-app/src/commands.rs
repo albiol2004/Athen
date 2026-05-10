@@ -4085,10 +4085,7 @@ pub async fn vault_smoke_test(
         .get(scope, key)
         .await
         .map_err(|e| format!("get: {e}"))?;
-    let listed = vault
-        .list(scope)
-        .await
-        .map_err(|e| format!("list: {e}"))?;
+    let listed = vault.list(scope).await.map_err(|e| format!("list: {e}"))?;
     vault
         .delete(scope, key)
         .await
