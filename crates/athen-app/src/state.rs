@@ -790,6 +790,7 @@ impl AppState {
                 let ctx = crate::delegation::DelegationContext {
                     profile_store,
                     identity_store: self.identity_store.clone(),
+                    http_endpoint_store: self.http_endpoint_store.clone(),
                     arc_store,
                     llm_router: Arc::clone(&self.router),
                     parent_arc_id: arc_id.to_string(),
@@ -1551,6 +1552,7 @@ impl AppState {
         let tool_doc_dir = self.tool_doc_dir.clone();
         let profile_store = self.profile_store.clone();
         let identity_store = self.identity_store.clone();
+        let http_endpoint_store_dispatch = self.http_endpoint_store.clone();
         let grant_store = self.grant_store.clone();
         let pending_grants = self.pending_grants.clone();
         let spawned_processes = self.spawned_processes.clone();
@@ -1683,6 +1685,7 @@ impl AppState {
                         grant_store: grant_store.clone(),
                         profile_store: profile_store.clone(),
                         identity_store: identity_store.clone(),
+                        http_endpoint_store: http_endpoint_store_dispatch.clone(),
                         pending_grants: pending_grants.clone(),
                         spawned_processes: spawned_processes.clone(),
                         telegram_approval_sink: telegram_approval_sink.clone(),
@@ -2280,6 +2283,14 @@ async fn execute_owner_telegram_message(
         crate::compaction::resolve_provider_temperature(&cfg, &active_id)
     };
 
+    // Pin the user's enabled HTTP endpoints into the static prefix so
+    // the Telegram path's agent ALSO knows what's pre-configured (the
+    // ElevenLabs failure was on this exact path). Identity isn't wired
+    // here yet — the Telegram path predates the identity store
+    // composition — so we only ship endpoints through.
+    let endpoints_block =
+        crate::endpoints_render::render_endpoints_block(http_endpoint_store).await;
+
     let mut builder = AgentBuilder::new()
         .llm_router(exec_router)
         .tool_registry(Box::new(registry))
@@ -2289,6 +2300,7 @@ async fn execute_owner_telegram_message(
         .context_messages(context)
         .stream_sender(stream_tx)
         .cancel_flag(cancel_flag)
+        .endpoints_block(endpoints_block)
         .default_temperature(sampling_temperature);
     if let Some(p) = tool_doc_dir {
         builder = builder.tool_doc_dir(p.to_path_buf());

@@ -52,6 +52,13 @@ pub struct DelegationContext {
     /// / rules / knowledge / team block into the sub-agent's system prefix.
     /// Optional because pre-identity tests may build a context without it.
     pub identity_store: Option<Arc<athen_persistence::identity::SqliteIdentityStore>>,
+    /// Registered HTTP endpoints store. Used to render the
+    /// "REGISTERED CLOUD APIs" block into the sub-agent's static prefix
+    /// so the delegated specialist also sees ElevenLabs / Jina / etc.
+    /// as already-configured and skips SDK-install rabbit holes.
+    /// Optional for the same backwards-compat reason as `identity_store`.
+    pub http_endpoint_store:
+        Option<Arc<athen_persistence::http_endpoints::SqliteHttpEndpointStore>>,
     pub arc_store: athen_persistence::arcs::ArcStore,
     pub llm_router: Arc<tokio::sync::RwLock<Arc<athen_llm::router::DefaultLlmRouter>>>,
     /// The arc the *parent* agent is running under. Each delegation creates
@@ -350,6 +357,12 @@ async fn run_delegation(
         &resolved.profile.id,
     )
     .await;
+    // Endpoints block is install-wide, not profile-specific (any profile
+    // that has http_request can call any registered endpoint). The
+    // executor still gates on http_request being in the sub-agent's
+    // tool slice, so a profile without it pays zero bytes.
+    let endpoints_block =
+        crate::endpoints_render::render_endpoints_block(ctx.http_endpoint_store.as_ref()).await;
 
     let mut builder = AgentBuilder::new()
         .llm_router(exec_router)
@@ -358,6 +371,7 @@ async fn run_delegation(
         .timeout(Duration::from_secs(180))
         .active_profile(resolved)
         .identity_block(identity_block)
+        .endpoints_block(endpoints_block)
         .default_temperature(sampling_temperature);
     if let Some(ref dir) = ctx.tool_doc_dir {
         builder = builder.tool_doc_dir(dir.clone());

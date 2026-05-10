@@ -55,6 +55,7 @@ pub struct AgentBuilder {
     external_system_suffix: Option<String>,
     default_temperature: Option<f32>,
     identity_block: Option<String>,
+    endpoints_block: Option<String>,
 }
 
 impl AgentBuilder {
@@ -83,6 +84,7 @@ impl AgentBuilder {
             external_system_suffix: None,
             default_temperature: None,
             identity_block: None,
+            endpoints_block: None,
         }
     }
 
@@ -93,6 +95,24 @@ impl AgentBuilder {
     /// system header. Empty / `None` reproduces today's prompt byte-for-byte.
     pub fn identity_block(mut self, block: Option<String>) -> Self {
         self.identity_block = block.filter(|s| !s.trim().is_empty());
+        self
+    }
+
+    /// Inject a pre-rendered registered-HTTP-endpoints block — the
+    /// user's enabled cloud APIs (ElevenLabs, Jina, Firecrawl, …),
+    /// formatted as one line per endpoint with name, base URL, and a
+    /// short blurb. Pinned in the static prefix so the agent always
+    /// knows which APIs are pre-configured (with credentials), instead
+    /// of reflexively trying to install Python SDKs and shell-out.
+    ///
+    /// The host (athen-app) reads the endpoint store, matches against
+    /// the preset library to derive the blurb, and ships the rendered
+    /// markdown in. Empty / `None` reproduces today's prompt
+    /// byte-for-byte. The executor itself gates the section on
+    /// `http_request` being in the agent's tool surface — profiles
+    /// without that tool get zero bytes here regardless.
+    pub fn endpoints_block(mut self, block: Option<String>) -> Self {
+        self.endpoints_block = block.filter(|s| !s.trim().is_empty());
         self
     }
 
@@ -297,6 +317,10 @@ impl AgentBuilder {
 
         if self.identity_block.is_some() {
             executor.set_identity_block(self.identity_block);
+        }
+
+        if self.endpoints_block.is_some() {
+            executor.set_endpoints_block(self.endpoints_block);
         }
 
         Ok(executor)

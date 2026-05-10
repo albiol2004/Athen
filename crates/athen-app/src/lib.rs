@@ -12,6 +12,7 @@ pub(crate) mod compaction;
 mod contacts;
 pub(crate) mod delegation;
 pub(crate) mod email_gate;
+pub(crate) mod endpoints_render;
 pub(crate) mod file_gate;
 pub(crate) mod http_presets;
 pub(crate) mod http_rate_limiter;

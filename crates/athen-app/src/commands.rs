@@ -111,6 +111,7 @@ fn spawn_router_approval(
         grant_store: state.grant_store.clone(),
         profile_store: state.profile_store.clone(),
         identity_store: state.identity_store.clone(),
+        http_endpoint_store: state.http_endpoint_store.clone(),
         pending_grants: state.pending_grants.clone(),
         spawned_processes: state.spawned_processes.clone(),
         telegram_sink: telegram_sink.clone(),
@@ -215,6 +216,7 @@ fn spawn_router_approval(
             grant_store: bg_ctx.grant_store,
             profile_store: bg_ctx.profile_store,
             identity_store: bg_ctx.identity_store,
+            http_endpoint_store: bg_ctx.http_endpoint_store,
             pending_grants: bg_ctx.pending_grants,
             spawned_processes: bg_ctx.spawned_processes,
             telegram_approval_sink: Some(bg_ctx.telegram_sink.clone()),
@@ -317,6 +319,7 @@ struct ApprovedTaskBgCtx {
     grant_store: Option<Arc<athen_persistence::grants::GrantStore>>,
     profile_store: Option<Arc<athen_persistence::profiles::SqliteProfileStore>>,
     identity_store: Option<Arc<athen_persistence::identity::SqliteIdentityStore>>,
+    http_endpoint_store: Option<Arc<athen_persistence::http_endpoints::SqliteHttpEndpointStore>>,
     pending_grants: crate::file_gate::PendingGrants,
     spawned_processes: athen_agent::SpawnedProcessMap,
     telegram_sink: Arc<crate::approval::TelegramApprovalSink>,
@@ -2070,6 +2073,9 @@ pub async fn send_message(
                 &identity_profile_id,
             )
             .await;
+            let endpoints_block =
+                crate::endpoints_render::render_endpoints_block(state.http_endpoint_store.as_ref())
+                    .await;
 
             let sampling_temperature = crate::compaction::resolve_provider_temperature(
                 &crate::state::load_config(),
@@ -2086,6 +2092,7 @@ pub async fn send_message(
                 .cancel_flag(cancel_flag)
                 .external_system_suffix(Some(system_suffix))
                 .identity_block(identity_block)
+                .endpoints_block(endpoints_block)
                 .default_temperature(sampling_temperature);
             if let Some(p) = state.tool_doc_dir.clone() {
                 builder = builder.tool_doc_dir(p);
@@ -2379,6 +2386,7 @@ pub async fn approve_task(
         grant_store: state.grant_store.clone(),
         profile_store: state.profile_store.clone(),
         identity_store: state.identity_store.clone(),
+        http_endpoint_store: state.http_endpoint_store.clone(),
         pending_grants: state.pending_grants.clone(),
         spawned_processes: state.spawned_processes.clone(),
         telegram_approval_sink: state.telegram_approval_sink.clone(),
@@ -2488,6 +2496,8 @@ pub(crate) struct ApprovedTaskCtx {
     pub grant_store: Option<Arc<athen_persistence::grants::GrantStore>>,
     pub profile_store: Option<Arc<athen_persistence::profiles::SqliteProfileStore>>,
     pub identity_store: Option<Arc<athen_persistence::identity::SqliteIdentityStore>>,
+    pub http_endpoint_store:
+        Option<Arc<athen_persistence::http_endpoints::SqliteHttpEndpointStore>>,
     pub pending_grants: crate::file_gate::PendingGrants,
     pub spawned_processes: athen_agent::SpawnedProcessMap,
     pub telegram_approval_sink: Option<Arc<crate::approval::TelegramApprovalSink>>,
@@ -2961,6 +2971,7 @@ pub(crate) async fn execute_approved_task(
                 let dctx = crate::delegation::DelegationContext {
                     profile_store,
                     identity_store: ctx.identity_store.clone(),
+                    http_endpoint_store: ctx.http_endpoint_store.clone(),
                     arc_store,
                     llm_router: Arc::clone(&ctx.router),
                     parent_arc_id: ctx.active_arc_id.clone(),
@@ -3091,6 +3102,8 @@ pub(crate) async fn execute_approved_task(
         &identity_profile_id,
     )
     .await;
+    let endpoints_block =
+        crate::endpoints_render::render_endpoints_block(ctx.http_endpoint_store.as_ref()).await;
 
     let mut builder = AgentBuilder::new()
         .llm_router(exec_router)
@@ -3103,6 +3116,7 @@ pub(crate) async fn execute_approved_task(
         .cancel_flag(cancel_flag)
         .external_system_suffix(Some(system_suffix))
         .identity_block(identity_block)
+        .endpoints_block(endpoints_block)
         .default_temperature(ctx.sampling_temperature);
     if let Some(p) = ctx.tool_doc_dir.clone() {
         builder = builder.tool_doc_dir(p);
@@ -3926,6 +3940,7 @@ pub(crate) async fn execute_dispatched_task(
                 let dctx = crate::delegation::DelegationContext {
                     profile_store,
                     identity_store: ctx.identity_store.clone(),
+                    http_endpoint_store: ctx.http_endpoint_store.clone(),
                     arc_store,
                     llm_router: Arc::clone(&ctx.router),
                     parent_arc_id: arc_id.clone(),
@@ -4068,6 +4083,8 @@ pub(crate) async fn execute_dispatched_task(
         &identity_profile_id,
     )
     .await;
+    let endpoints_block =
+        crate::endpoints_render::render_endpoints_block(ctx.http_endpoint_store.as_ref()).await;
 
     let mut builder = AgentBuilder::new()
         .llm_router(exec_router)
@@ -4081,6 +4098,7 @@ pub(crate) async fn execute_dispatched_task(
         .external_system_suffix(Some(system_suffix))
         .autonomous_mode(true)
         .identity_block(identity_block)
+        .endpoints_block(endpoints_block)
         .default_temperature(ctx.sampling_temperature);
     if let Some(p) = ctx.tool_doc_dir.clone() {
         builder = builder.tool_doc_dir(p);

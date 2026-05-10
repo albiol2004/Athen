@@ -244,6 +244,18 @@ pub struct DefaultExecutor {
     /// between persona header and workspace rules so the cache only
     /// invalidates when the user edits identity, not per-request.
     identity_block: Option<String>,
+    /// Pre-rendered registered-HTTP-endpoints block — one line per
+    /// enabled endpoint (name, base URL, short blurb, auth shape). The
+    /// host (athen-app) reads SQLite + matches each endpoint to its
+    /// preset to compose this; the executor only frames it.
+    ///
+    /// Pinned in the static prefix between toolbox section and tool
+    /// index so the cacheable prefix only invalidates when the user
+    /// adds/removes/edits an endpoint. The framing call also gates on
+    /// `http_request` being in the tool slice — profiles without that
+    /// tool get zero bytes regardless of the block contents. `None`
+    /// reproduces today's prompt byte-for-byte.
+    endpoints_block: Option<String>,
 }
 
 impl DefaultExecutor {
@@ -274,6 +286,7 @@ impl DefaultExecutor {
             external_system_suffix: None,
             default_temperature: None,
             identity_block: None,
+            endpoints_block: None,
         }
     }
 
@@ -292,6 +305,19 @@ impl DefaultExecutor {
     /// installs with no identity entries get today's prompt byte-for-byte.
     pub fn set_identity_block(&mut self, block: Option<String>) {
         self.identity_block = block.filter(|s| !s.trim().is_empty());
+    }
+
+    /// Inject a pre-rendered registered-HTTP-endpoints block into the
+    /// static system header.
+    ///
+    /// The block must already list only enabled endpoints, formatted
+    /// for direct splicing. The framing helper additionally gates the
+    /// section on `http_request` being present in the agent's tool
+    /// surface, so a profile that doesn't have `http_request` emits
+    /// nothing here even if the block is non-empty. Empty /
+    /// whitespace-only / `None` clears the section entirely.
+    pub fn set_endpoints_block(&mut self, block: Option<String>) {
+        self.endpoints_block = block.filter(|s| !s.trim().is_empty());
     }
 
     /// Inject host-supplied volatile content (e.g. memory recall,
@@ -412,6 +438,7 @@ impl DefaultExecutor {
             shell_kind,
             false,
             None,
+            None,
         )
     }
 
@@ -431,6 +458,7 @@ impl DefaultExecutor {
         shell_kind: Option<&'static str>,
         autonomous: bool,
         identity_block: Option<&str>,
+        endpoints_block: Option<&str>,
     ) -> String {
         let mut prompt = String::new();
         if autonomous {
@@ -450,6 +478,7 @@ impl DefaultExecutor {
         prompt.push_str(&Self::build_workspace_rules(has_context));
         prompt.push_str(&Self::build_shell_env_section(shell_kind));
         prompt.push_str(&Self::build_toolbox_section(toolbox_info));
+        prompt.push_str(&Self::build_endpoints_section(endpoints_block, tools));
         prompt.push_str(&Self::build_tool_index(tools, tool_doc_dir));
         prompt.push_str(&Self::build_persona_rules(autonomous));
         // Append-only block: revealed-tool schemas grow as the agent
@@ -671,6 +700,44 @@ impl DefaultExecutor {
              persist genuinely new facts the user shares.\n\n\
              {body}\n\
              --- END IDENTITY ---\n\n"
+        )
+    }
+
+    /// Slot 2.55: registered HTTP endpoints. Pinned in the static
+    /// prefix so the agent always knows what cloud APIs are
+    /// pre-configured (with credentials in the vault) — without this,
+    /// agents reflexively try to install Python SDKs and shell-out for
+    /// things `http_request` could do in one call (real failure
+    /// observed: 11 wasted shell turns trying to install
+    /// `elevenlabs`, then giving up, despite an enabled ElevenLabs
+    /// endpoint).
+    ///
+    /// Sits between `build_toolbox_section` and `build_tool_index` so
+    /// adding/removing/editing an endpoint only invalidates the
+    /// prefix from this section forward (tool_index, persona_rules,
+    /// revealed schemas re-encode but they're small and prefix-cache
+    /// friendly).
+    ///
+    /// Gated on `http_request` being in the tool slice: agents that
+    /// don't have `http_request` (e.g. specialised profiles) get zero
+    /// bytes here regardless of the block contents.
+    fn build_endpoints_section(
+        block: Option<&str>,
+        tools: &[athen_core::tool::ToolDefinition],
+    ) -> String {
+        let body = match block {
+            Some(b) if !b.trim().is_empty() => b.trim(),
+            _ => return String::new(),
+        };
+        let has_http_request = tools.iter().any(|t| t.name == "http_request");
+        if !has_http_request {
+            return String::new();
+        }
+        format!(
+            "REGISTERED CLOUD APIs (call via `http_request` with the `endpoint` arg \
+             set to the endpoint name shown below — credentials are already loaded \
+             from the vault, do NOT install SDKs or shell-out for these):\n\
+             {body}\n\n"
         )
     }
 
@@ -1243,6 +1310,7 @@ impl AgentExecutor for DefaultExecutor {
                 self.shell_kind,
                 self.autonomous_mode,
                 self.identity_block.as_deref(),
+                self.endpoints_block.as_deref(),
             );
             // Volatile content (current time, host memory recall,
             // attachment summaries, compaction state) used to be appended
@@ -2403,10 +2471,10 @@ mod tests {
         let tools = vec![tool_def("memory_store", "store a memory")];
         let revealed = HashSet::new();
         let interactive = DefaultExecutor::build_system_prompt_with_mode(
-            &tools, &revealed, false, None, None, None, None, false, None,
+            &tools, &revealed, false, None, None, None, None, false, None, None,
         );
         let autonomous = DefaultExecutor::build_system_prompt_with_mode(
-            &tools, &revealed, false, None, None, None, None, true, None,
+            &tools, &revealed, false, None, None, None, None, true, None, None,
         );
 
         assert_ne!(
@@ -2531,7 +2599,7 @@ mod tests {
         let tools = vec![tool_def("memory_store", "store a memory")];
         let revealed = HashSet::new();
         let with_none = DefaultExecutor::build_system_prompt_with_mode(
-            &tools, &revealed, false, None, None, None, None, false, None,
+            &tools, &revealed, false, None, None, None, None, false, None, None,
         );
         let with_empty = DefaultExecutor::build_system_prompt_with_mode(
             &tools,
@@ -2543,6 +2611,7 @@ mod tests {
             None,
             false,
             Some("   \n\n  "),
+            None,
         );
         // Whitespace-only block must be treated as no-block.
         assert_eq!(with_none, with_empty);
@@ -2568,6 +2637,7 @@ mod tests {
             None,
             false,
             Some(block),
+            None,
         );
         assert!(prompt.contains("--- IDENTITY (who Athen is, across every agent) ---"));
         assert!(prompt.contains("--- END IDENTITY ---"));
@@ -2586,6 +2656,77 @@ mod tests {
             .find("AVAILABLE TOOL GROUPS")
             .expect("tool index present");
         assert!(identity_idx < tools_idx);
+    }
+
+    /// `build_endpoints_section` only fires when the agent actually has
+    /// `http_request` in its tool surface. Without it, even a populated
+    /// block produces zero bytes — a profile that can't call cloud APIs
+    /// shouldn't pay tokens learning about them.
+    #[test]
+    fn endpoints_section_gated_on_http_request_presence() {
+        let block = "- **ElevenLabs** (https://api.elevenlabs.io/v1/) — TTS endpoint.";
+
+        // No http_request → empty.
+        let tools_no_http = vec![tool_def("memory_store", "store a memory")];
+        let out_no_http = DefaultExecutor::build_endpoints_section(Some(block), &tools_no_http);
+        assert!(
+            out_no_http.is_empty(),
+            "section must be empty when http_request is not present"
+        );
+
+        // With http_request → block is rendered with framing.
+        let tools_with_http = vec![
+            tool_def("memory_store", "store a memory"),
+            tool_def("http_request", "call a registered HTTP endpoint"),
+        ];
+        let out = DefaultExecutor::build_endpoints_section(Some(block), &tools_with_http);
+        assert!(out.contains("REGISTERED CLOUD APIs"));
+        assert!(out.contains("ElevenLabs"));
+        assert!(out.contains("`http_request`"));
+        assert!(out.contains("`endpoint`"));
+    }
+
+    /// Empty / whitespace-only block emits zero bytes regardless of the
+    /// tool slice, so installs without any registered endpoints get
+    /// today's prompt byte-for-byte.
+    #[test]
+    fn endpoints_section_empty_block_produces_no_bytes() {
+        let tools = vec![tool_def("http_request", "call a registered HTTP endpoint")];
+        assert!(DefaultExecutor::build_endpoints_section(None, &tools).is_empty());
+        assert!(DefaultExecutor::build_endpoints_section(Some("   \n  "), &tools).is_empty());
+    }
+
+    /// Position check: the endpoints section sits between the toolbox
+    /// summary and the available-tool-groups index. Stable position is
+    /// what makes the LCP-cacheable static prefix safe.
+    #[test]
+    fn endpoints_section_position_between_toolbox_and_tool_index() {
+        let tools = vec![tool_def("http_request", "call a registered HTTP endpoint")];
+        let revealed = HashSet::new();
+        let block = "- **Jina** (https://r.jina.ai/) — fetches pages as markdown.";
+        let prompt = DefaultExecutor::build_system_prompt_with_mode(
+            &tools,
+            &revealed,
+            false,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            Some(block),
+        );
+        let endpoints_idx = prompt
+            .find("REGISTERED CLOUD APIs")
+            .expect("endpoints section present");
+        let tool_groups_idx = prompt
+            .find("AVAILABLE TOOL GROUPS")
+            .expect("tool index present");
+        assert!(
+            endpoints_idx < tool_groups_idx,
+            "endpoints section must precede the tool groups index"
+        );
+        assert!(prompt.contains("Jina"));
     }
 
     /// A profile with custom persona templates must replace the hardcoded
