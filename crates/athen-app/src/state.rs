@@ -3249,9 +3249,16 @@ fn render_endpoint_detail(
             out.push_str("\n```\n\n");
         }
     }
+    if let Some(p) = preset {
+        if !p.usage_hints.is_empty() {
+            out.push_str("## Usage hints\n\n");
+            out.push_str(p.usage_hints);
+            out.push_str("\n\n");
+        }
+    }
     if let Some(notes) = &ep.notes {
         if !notes.is_empty() {
-            out.push_str("## Notes\n\n");
+            out.push_str("## Notes (user-provided)\n\n");
             out.push_str(notes);
             out.push_str("\n\n");
         }

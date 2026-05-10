@@ -119,6 +119,8 @@ const BUILTIN_TOOL_ICONS = {
     'create_wakeup': ICON_ALARM,
     // identity (agent-authored entries to the user-maintained identity store)
     'identity_add': ICON_IDENTITY,
+    // generic cloud HTTP API call (registered endpoint via Settings → Cloud APIs)
+    'http_request': ICON_GLOBE,
 };
 
 const BUILTIN_TOOL_LABELS = {
@@ -140,6 +142,7 @@ const BUILTIN_TOOL_LABELS = {
     'list_installed_packages': 'List packages',
     'create_wakeup': 'Schedule wake-up',
     'identity_add': 'Note about you',
+    'http_request': 'Cloud API',
 };
 
 // MCP-prefixed tools (e.g. `slack__post_message`) — strip prefix and try common
@@ -2280,7 +2283,11 @@ formEl.addEventListener('submit', async (e) => {
                 const summary = escapeHtml(tc.summary || '');
                 const builtinIcon = builtinToolIcon(rawName);
                 if (builtinIcon) {
-                    const label = escapeHtml(builtinToolLabel(rawName));
+                    let labelRaw = builtinToolLabel(rawName);
+                    if (rawName === 'http_request' && tc.args && tc.args.endpoint) {
+                        labelRaw = `Cloud API: ${tc.args.endpoint}`;
+                    }
+                    const label = escapeHtml(labelRaw);
                     const titleAttr = escapeHtml(rawName);
                     toolsHtml += `<div class="tool-call builtin" title="${titleAttr}">
                         <span class="tool-call-icon">${builtinIcon}</span>
@@ -2578,6 +2585,7 @@ function renderToolBody(meta) {
         case 'list_installed_packages': main = renderListInstalledPackages(args, result); break;
         case 'create_wakeup':   main = renderCreateWakeup(args, result); break;
         case 'identity_add':    main = renderIdentityAdd(args, result); break;
+        case 'http_request':    main = renderHttpRequest(args, result); break;
         default:
             // No bespoke layout — fall back to a labelled-fields dump
             // so the user still gets a structured view instead of the
@@ -3323,6 +3331,56 @@ function renderIdentityAdd(args, result) {
     ]);
 }
 
+function renderHttpRequest(args, result) {
+    const endpoint = String(args.endpoint || result.endpoint || '');
+    const method = String(args.method || 'GET').toUpperCase();
+    const path = String(args.path || '');
+    const status = result.status;
+    const latency = result.latency_ms;
+    const bytes = result.body_bytes;
+    const contentType = result.content_type || '';
+
+    const ok = typeof status === 'number' && status >= 200 && status < 300;
+    const statusNode = (status !== undefined)
+        ? renderPill(`${status}${ok ? ' OK' : ''}`, ok ? 'success' : 'warning')
+        : null;
+
+    // Body lands as either parsed JSON (object) or {raw_text: '...'} for
+    // non-JSON responses. Render JSON pretty-printed; raw_text inline.
+    let bodyDisplay = '';
+    let bodyMono = true;
+    let bodyBlock = true;
+    if (result.body && typeof result.body === 'object') {
+        if (typeof result.body.raw_text === 'string') {
+            bodyDisplay = result.body.raw_text;
+        } else if (typeof result.body.parse_error === 'string') {
+            bodyDisplay = `Parse error: ${result.body.parse_error}\n\n${result.body.raw_text || ''}`;
+        } else {
+            try {
+                bodyDisplay = JSON.stringify(result.body, null, 2);
+            } catch (_) {
+                bodyDisplay = String(result.body);
+            }
+        }
+    }
+    // Cap to 4k chars in the UI — full body is in the agent's context anyway.
+    if (bodyDisplay.length > 4000) {
+        bodyDisplay = bodyDisplay.slice(0, 4000) + '\n… (truncated)';
+    }
+
+    const fields = [
+        ['Endpoint',     endpoint],
+        ['Method',       renderPill(method, method === 'GET' ? 'neutral' : 'warning')],
+        ['Path',         path, { mono: true }],
+        statusNode ? ['Status', statusNode] : null,
+        (typeof latency === 'number') ? ['Latency', `${latency} ms`] : null,
+        (typeof bytes === 'number')  ? ['Bytes',   bytes.toLocaleString()] : null,
+        contentType ? ['Content-Type', contentType, { mono: true }] : null,
+        bodyDisplay ? ['Response',     bodyDisplay, { block: bodyBlock, mono: bodyMono }] : null,
+    ];
+    return renderFields(fields);
+}
+
 function renderShellMeta(args, result) {
     return renderFields([
         ['PID',     args.pid, { mono: true }],
@@ -3391,7 +3449,14 @@ function buildToolCard(meta) {
 
     const statusIcon = status === 'Completed' ? '&#10003;'
                      : status === 'Failed' ? '&#10007;' : '&#9679;';
-    const labelText = icon ? builtinToolLabel(toolName) : toolName;
+    let labelText = icon ? builtinToolLabel(toolName) : toolName;
+    // http_request reads as "Cloud API" by default; promote to
+    // "Cloud API: <endpoint>" so the user can tell which API the
+    // agent hit at a glance, without expanding the card.
+    if (toolName === 'http_request') {
+        const ep = (meta.args && meta.args.endpoint) || '';
+        if (ep) labelText = `Cloud API: ${ep}`;
+    }
     const iconMarkup = icon ? `<span class="tool-builtin-icon">${icon}</span>` : '';
     let detailHtml = '';
     if (summaryText) {
