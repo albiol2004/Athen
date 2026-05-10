@@ -67,6 +67,12 @@
                     </span>
                     <span>Scheduled</span>
                 </button>
+                <button id="agent-control-btn" class="sidebar-footer-btn" title="Agent Control">
+                    <span class="agent-control-icon" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="5" width="14" height="14" rx="2"/><rect x="9" y="9" width="6" height="6" rx="1"/><line x1="9" y1="2" x2="9" y2="5"/><line x1="15" y1="2" x2="15" y2="5"/><line x1="9" y1="19" x2="9" y2="22"/><line x1="15" y1="19" x2="15" y2="22"/><line x1="2" y1="9" x2="5" y2="9"/><line x1="2" y1="15" x2="5" y2="15"/><line x1="19" y1="9" x2="22" y2="9"/><line x1="19" y1="15" x2="22" y2="15"/></svg>
+                    </span>
+                    <span>Agent Control</span>
+                </button>
                 <button id="memory-btn" class="sidebar-footer-btn" title="Memory">
                     <span class="memory-icon" aria-hidden="true">
                         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.5 4.5L18 9l-4.5 1.5L12 15l-1.5-4.5L6 9l4.5-1.5z"/><path d="M5.2 17l.6 1.8L7.6 19.4 5.8 20l-.6 1.8L4.6 20 2.8 19.4 4.6 18.8z"/></svg>
@@ -97,6 +103,11 @@
                     </div>
                 </div>
                 <div class="header-right">
+                    <button id="active-agents-pill" class="agents-pill hidden" type="button" aria-label="Active agents" title="Open Agent Control">
+                        <span class="agents-pulse" aria-hidden="true"></span>
+                        <span class="agents-count">0</span>
+                        <span class="agents-label">working</span>
+                    </button>
                     <label class="profile-picker-wrap" title="Choose the specialist that handles this arc">
                         <span class="profile-picker-label">Agent:</span>
                         <select id="arc-profile-picker" class="profile-picker"></select>
@@ -989,6 +1000,30 @@
                 </div>
 
                 <div id="wakeups-list" class="wakeups-list"></div>
+            </div>
+        </div>
+
+        <div id="agent-control-view" class="agent-control-view hidden">
+            <header class="agent-control-header">
+                <div class="header-left">
+                    <button id="agent-control-back" class="settings-back-btn" type="button" title="Back">
+                        <span>&#8592;</span> Back
+                    </button>
+                </div>
+                <h2>Agent Control</h2>
+                <div class="header-right">
+                    <span id="agent-control-running-count" class="agents-running-pill">0 running</span>
+                </div>
+            </header>
+            <div class="agent-control-body">
+                <section class="agent-control-section">
+                    <h3>Active</h3>
+                    <div id="agent-control-active" class="agent-cards"></div>
+                </section>
+                <section class="agent-control-section">
+                    <h3>Recent runs <span class="muted">(last 30 days)</span></h3>
+                    <div id="agent-control-history" class="agent-history"></div>
+                </section>
             </div>
         </div>
 

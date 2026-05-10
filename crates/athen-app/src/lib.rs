@@ -3,6 +3,7 @@
 //! This crate wires all Athen components together and exposes them
 //! to the frontend through Tauri IPC commands.
 
+pub(crate) mod agent_registry;
 pub(crate) mod app_tools;
 pub(crate) mod approval;
 pub(crate) mod attachment_purger;
@@ -178,6 +179,8 @@ pub fn run() {
             commands::set_http_endpoint_enabled,
             commands::test_http_endpoint,
             commands::list_http_endpoint_presets,
+            commands::list_active_agents,
+            commands::list_recent_agent_runs,
         ])
         .setup(|app| {
             use tauri::Manager;
@@ -197,6 +200,12 @@ pub fn run() {
 
             // Initialize the notification orchestrator (needs AppHandle for InApp channel).
             state.init_notifier(app.handle().clone());
+
+            // Initialize the live agent registry. Needs AppHandle for the
+            // `agents-changed` event the FE listens to. Wired here (between
+            // notifier and approval_router) so every executor entry point
+            // sees a Some(registry) on the AppState by the time it runs.
+            state.init_agent_registry(app.handle().clone());
 
             // Initialize the approval router (InApp + Telegram sinks). Must
             // come before start_telegram_monitor so the poll loop can pick
@@ -224,6 +233,10 @@ pub fn run() {
             // 3b will swap in a coordinator-backed sink that turns fires
             // into Tasks.
             state.start_wakeup_scheduler(app.handle().clone());
+
+            // Sweep finalized agent_runs older than 30 days. Cheap; runs
+            // once at startup and then every 6 hours.
+            state.start_agent_run_pruner();
 
             app.manage(state);
 

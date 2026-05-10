@@ -130,6 +130,7 @@ fn spawn_router_approval(
             .wakeup_store
             .clone()
             .map(|s| s as Arc<dyn athen_core::traits::wakeup::WakeupStore>),
+        agent_registry: state.agent_registry.clone(),
     };
 
     tauri::async_runtime::spawn(async move {
@@ -250,6 +251,7 @@ fn spawn_router_approval(
             // wake-up fires — the autonomy directive doesn't apply.
             wakeup: None,
             wakeup_store: bg_ctx.wakeup_store,
+            agent_registry: bg_ctx.agent_registry.clone(),
         };
 
         let outcome = match execute_approved_task(task_id, ctx).await {
@@ -338,6 +340,9 @@ struct ApprovedTaskBgCtx {
     /// Wake-up store, threaded into `ApprovedTaskCtx` so the executor
     /// path can compose `create_wakeup` for the agent (Phase 5).
     wakeup_store: Option<Arc<dyn athen_core::traits::wakeup::WakeupStore>>,
+    /// Live agent registry handle, ferried into `ApprovedTaskCtx` so the
+    /// bg approval flow can register the run and stream step updates.
+    agent_registry: Option<Arc<crate::agent_registry::AgentRegistry>>,
 }
 
 /// Resolve the agent profile that should drive execution for a given arc.
@@ -854,6 +859,47 @@ pub(crate) struct AgentProgress {
     pub error: Option<String>,
 }
 
+/// Truncate a title down to `max_chars` graphemes-ish (we use char_indices)
+/// for the "watch the agents work" panel. Newlines are flattened to spaces
+/// so the panel stays one line per row.
+pub(crate) fn truncate_title(s: &str, max_chars: usize) -> String {
+    let flat: String = s.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
+    let trimmed = flat.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let end: usize = trimmed
+        .char_indices()
+        .nth(max_chars.saturating_sub(1))
+        .map(|(i, _)| i)
+        .unwrap_or(trimmed.len());
+    format!("{}…", &trimmed[..end])
+}
+
+/// Look up the active profile id for an arc, falling back to the seeded
+/// default. Returns `None` only when the profile store is unwired (CLI /
+/// test builds). Used by the agent registry to stamp "which persona is
+/// running this".
+pub(crate) async fn active_profile_id_for_arc(
+    profile_store: Option<&Arc<athen_persistence::profiles::SqliteProfileStore>>,
+    arc_store: Option<&athen_persistence::arcs::ArcStore>,
+    arc_id: &str,
+) -> Option<String> {
+    let astore = arc_store?;
+    let pstore = profile_store?;
+    let arc_meta = astore.get_arc(arc_id).await.ok().flatten()?;
+    if let Some(id) = arc_meta.active_profile_id {
+        return Some(id);
+    }
+    use athen_core::traits::profile::ProfileStore;
+    pstore
+        .get_or_default(None)
+        .await
+        .ok()
+        .map(|p| p.id)
+        .or_else(|| Some(athen_core::agent_profile::AgentProfile::DEFAULT_ID.to_string()))
+}
+
 /// Shared list of tool names that completed successfully during a turn.
 ///
 /// The `TauriAuditor` appends to it as steps finish; callers that need a
@@ -888,6 +934,13 @@ pub(crate) struct TauriAuditor {
     /// so the user isn't watching dead air on a long task. `None` for
     /// in-app turns (the frontend already renders progress directly).
     telegram_progress: Option<Arc<crate::telegram_progress::TelegramProgressReporter>>,
+    /// Live agent-registry hook. When wired, every terminal step pushes
+    /// the current tool + summary into the registry so the "watch the
+    /// agents work" panel sees what each agent is doing right now.
+    agent_registry: Option<Arc<crate::agent_registry::AgentRegistry>>,
+    /// Task-id used to address `agent_registry`. Set in tandem with
+    /// `agent_registry`; both are populated by `with_agent_tracking`.
+    agent_task_id: Option<Uuid>,
 }
 
 impl TauriAuditor {
@@ -907,6 +960,8 @@ impl TauriAuditor {
             tool_log,
             emit_progress: true,
             telegram_progress: None,
+            agent_registry: None,
+            agent_task_id: None,
         }
     }
 
@@ -930,7 +985,23 @@ impl TauriAuditor {
             tool_log,
             emit_progress: false,
             telegram_progress: None,
+            agent_registry: None,
+            agent_task_id: None,
         }
+    }
+
+    /// Wire this auditor to the live agent registry. Each terminal step
+    /// pushes the current tool + summary into the registry so the
+    /// "active agents" panel updates in real time. No-op for sub-agents
+    /// (we keep them off the panel for v1).
+    pub(crate) fn with_agent_tracking(
+        mut self,
+        registry: Arc<crate::agent_registry::AgentRegistry>,
+        task_id: Uuid,
+    ) -> Self {
+        self.agent_registry = Some(registry);
+        self.agent_task_id = Some(task_id);
+        self
     }
 
     /// Attach a live Telegram progress reporter. When set, the auditor
@@ -1286,6 +1357,20 @@ impl StepAuditor for TauriAuditor {
                     tokio::spawn(async move {
                         reporter.report_tool(&tool).await;
                     });
+                }
+            }
+
+            // Push live step into the agent registry so the "watch the
+            // agents work" panel reflects the current tool + summary.
+            // Done before persistence so the FE pulse doesn't wait on a
+            // SQLite write. Sub-agent auditors leave registry=None.
+            if let (Some(reg), Some(task_id), Some(output)) = (
+                self.agent_registry.as_ref(),
+                self.agent_task_id,
+                step.output.as_ref(),
+            ) {
+                if let Some(tool) = output.get("tool").and_then(|t| t.as_str()) {
+                    reg.record_step(task_id, Some(tool), detail.clone()).await;
                 }
             }
 
@@ -1898,13 +1983,56 @@ pub async fn send_message(
                 .await;
 
             let auditor_arc_id = state.active_arc_id.lock().await.clone();
-            let auditor = TauriAuditor::new(
+
+            // Pre-allocate the task id so we can register it with the
+            // live agent registry BEFORE the executor starts. The Task
+            // struct is constructed below with this same id.
+            let task_id_for_run = Uuid::new_v4();
+
+            // Register this run with the live agent registry. Held for
+            // the duration of executor.execute(); finalized explicitly
+            // on Ok / Err below, with the Drop impl as a Cancelled
+            // safety net.
+            let model_for_run = state.model_name.lock().await.clone();
+            let active_profile_id_for_run = active_profile_id_for_arc(
+                state.profile_store.as_ref(),
+                state.arc_store.as_ref(),
+                &auditor_arc_id,
+            )
+            .await;
+            let agent_guard = if let Some(reg) = state.agent_registry.as_ref() {
+                let now = Utc::now();
+                let title = truncate_title(&message, 200);
+                Some(
+                    reg.register(crate::agent_registry::ActiveAgent {
+                        task_id: task_id_for_run.to_string(),
+                        arc_id: Some(auditor_arc_id.clone()),
+                        source: crate::agent_registry::AgentSource::UserChat,
+                        title,
+                        started_at: now,
+                        last_step_at: now,
+                        current_tool: None,
+                        current_action: None,
+                        step_count: 0,
+                        profile_id: active_profile_id_for_run,
+                        model: Some(model_for_run),
+                    })
+                    .await,
+                )
+            } else {
+                None
+            };
+
+            let mut auditor = TauriAuditor::new(
                 app_handle.clone(),
                 state.arc_store.clone(),
                 auditor_arc_id,
                 turn_id.clone(),
                 new_tool_log(),
             );
+            if let Some(reg) = state.agent_registry.as_ref() {
+                auditor = auditor.with_agent_tracking(Arc::clone(reg), task_id_for_run);
+            }
 
             // Set up streaming: forward LLM text chunks to the frontend
             // in real time via Tauri events, tagged with the active arc.
@@ -1985,7 +2113,7 @@ pub async fn send_message(
             // wrote the bare `message` above, so the surfacing only travels
             // to the LLM, not to the user-visible history.
             let task = Task {
-                id: Uuid::new_v4(),
+                id: task_id_for_run,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
                 source_event: None,
@@ -2004,6 +2132,9 @@ pub async fn send_message(
             let result = match executor.execute(task).await {
                 Ok(r) => r,
                 Err(e) => {
+                    if let Some(g) = agent_guard {
+                        g.fail(e.to_string()).await;
+                    }
                     let _ = state.coordinator.complete_task(task_id).await;
                     let raw = e.to_string();
                     tracing::error!("Agent execution failed: {raw}");
@@ -2029,6 +2160,9 @@ pub async fn send_message(
                     });
                 }
             };
+            if let Some(g) = agent_guard {
+                g.complete().await;
+            }
 
             // Extract response content from the executor output.
             let content = if !result.success {
@@ -2270,6 +2404,7 @@ pub async fn approve_task(
             .wakeup_store
             .clone()
             .map(|s| s as Arc<dyn athen_core::traits::wakeup::WakeupStore>),
+        agent_registry: state.agent_registry.clone(),
     };
 
     let outcome = match execute_approved_task(task_uuid, ctx).await {
@@ -2421,6 +2556,11 @@ pub(crate) struct ApprovedTaskCtx {
     /// schedule its own follow-ups (Phase 5). `None` in CLI / test
     /// builds — the tool is then hidden from the agent.
     pub wakeup_store: Option<Arc<dyn athen_core::traits::wakeup::WakeupStore>>,
+    /// Live agent registry. When wired, the executor path registers a
+    /// `RegistrationGuard` for the duration of the run and the auditor
+    /// pushes step updates so the FE "watch the agents work" panel
+    /// reflects this task in real time.
+    pub agent_registry: Option<Arc<crate::agent_registry::AgentRegistry>>,
 }
 
 /// Drive a risk-flagged task all the way through approval, dispatch,
@@ -2868,13 +3008,54 @@ pub(crate) async fn execute_approved_task(
 
     let exec_router: Box<dyn LlmRouter> = Box::new(SharedRouter(Arc::clone(&ctx.router)));
     let tool_log = new_tool_log();
-    let auditor = TauriAuditor::new(
+
+    // Pre-allocate the executor task id so the live agent registry can
+    // address it BEFORE execute() begins. The Task struct below uses
+    // this same id.
+    let task_id_for_run = Uuid::new_v4();
+
+    // Register with the live agent registry (if wired). Source is
+    // UserChat for the standard approval path; we don't reach this code
+    // for sense-originated runs (those go through execute_dispatched_task).
+    let active_profile_id_for_run = active_profile_id_for_arc(
+        ctx.profile_store.as_ref(),
+        ctx.arc_store.as_ref(),
+        &ctx.active_arc_id,
+    )
+    .await;
+    let agent_guard = if let Some(reg) = ctx.agent_registry.as_ref() {
+        let now = chrono::Utc::now();
+        let title = truncate_title(&message, 200);
+        Some(
+            reg.register(crate::agent_registry::ActiveAgent {
+                task_id: task_id_for_run.to_string(),
+                arc_id: Some(ctx.active_arc_id.clone()),
+                source: crate::agent_registry::AgentSource::UserChat,
+                title,
+                started_at: now,
+                last_step_at: now,
+                current_tool: None,
+                current_action: None,
+                step_count: 0,
+                profile_id: active_profile_id_for_run,
+                model: None,
+            })
+            .await,
+        )
+    } else {
+        None
+    };
+
+    let mut auditor = TauriAuditor::new(
         ctx.app_handle.clone(),
         ctx.arc_store.clone(),
         ctx.active_arc_id.clone(),
         ctx.turn_id.clone(),
         tool_log.clone(),
     );
+    if let Some(reg) = ctx.agent_registry.as_ref() {
+        auditor = auditor.with_agent_tracking(Arc::clone(reg), task_id_for_run);
+    }
     let stream_tx = spawn_stream_forwarder(&ctx.app_handle, Some(ctx.active_arc_id.clone()));
 
     ctx.cancel_flag.store(false, Ordering::Relaxed);
@@ -2934,7 +3115,7 @@ pub(crate) async fn execute_approved_task(
     })?;
 
     let task = Task {
-        id: Uuid::new_v4(),
+        id: task_id_for_run,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         source_event: None,
@@ -2953,6 +3134,9 @@ pub(crate) async fn execute_approved_task(
     let result = match executor.execute(task).await {
         Ok(r) => r,
         Err(e) => {
+            if let Some(g) = agent_guard {
+                g.fail(e.to_string()).await;
+            }
             let _ = ctx.coordinator.complete_task(coord_task_id).await;
             let raw = e.to_string();
             tracing::error!("Agent execution failed after approval: {raw}");
@@ -2987,6 +3171,9 @@ pub(crate) async fn execute_approved_task(
             }));
         }
     };
+    if let Some(g) = agent_guard {
+        g.complete().await;
+    }
 
     let content = if !result.success {
         let reason = result
@@ -3772,13 +3959,78 @@ pub(crate) async fn execute_dispatched_task(
 
     let exec_router: Box<dyn LlmRouter> = Box::new(SharedRouter(Arc::clone(&ctx.router)));
     let tool_log = new_tool_log();
-    let auditor = TauriAuditor::new(
+
+    // Pre-allocate executor task id so the registry binds to the same id
+    // the Task carries below.
+    let task_id_for_run = Uuid::new_v4();
+
+    // Derive `source` for the live agent panel:
+    //   - `wakeup` when this dispatch was fired by the wake-up scheduler
+    //   - otherwise from the arc's source (Email / Calendar / Messaging /
+    //     UserInput / System)
+    let derived_source = if ctx.wakeup.is_some() {
+        crate::agent_registry::AgentSource::Wakeup
+    } else if let Some(astore) = ctx.arc_store.as_ref() {
+        match astore.get_arc(&arc_id).await {
+            Ok(Some(meta)) => match meta.source {
+                athen_persistence::arcs::ArcSource::Email => {
+                    crate::agent_registry::AgentSource::Email
+                }
+                athen_persistence::arcs::ArcSource::Calendar => {
+                    crate::agent_registry::AgentSource::Calendar
+                }
+                athen_persistence::arcs::ArcSource::Messaging => {
+                    crate::agent_registry::AgentSource::Telegram
+                }
+                athen_persistence::arcs::ArcSource::UserInput => {
+                    crate::agent_registry::AgentSource::UserChat
+                }
+                athen_persistence::arcs::ArcSource::System => {
+                    crate::agent_registry::AgentSource::Other
+                }
+            },
+            _ => crate::agent_registry::AgentSource::Other,
+        }
+    } else {
+        crate::agent_registry::AgentSource::Other
+    };
+
+    let active_profile_id_for_run =
+        active_profile_id_for_arc(ctx.profile_store.as_ref(), ctx.arc_store.as_ref(), &arc_id)
+            .await;
+    let agent_guard = if let Some(reg) = ctx.agent_registry.as_ref() {
+        let now = chrono::Utc::now();
+        let title = truncate_title(&message, 200);
+        Some(
+            reg.register(crate::agent_registry::ActiveAgent {
+                task_id: task_id_for_run.to_string(),
+                arc_id: Some(arc_id.clone()),
+                source: derived_source,
+                title,
+                started_at: now,
+                last_step_at: now,
+                current_tool: None,
+                current_action: None,
+                step_count: 0,
+                profile_id: active_profile_id_for_run,
+                model: None,
+            })
+            .await,
+        )
+    } else {
+        None
+    };
+
+    let mut auditor = TauriAuditor::new(
         ctx.app_handle.clone(),
         ctx.arc_store.clone(),
         arc_id.clone(),
         ctx.turn_id.clone(),
         tool_log.clone(),
     );
+    if let Some(reg) = ctx.agent_registry.as_ref() {
+        auditor = auditor.with_agent_tracking(Arc::clone(reg), task_id_for_run);
+    }
     let stream_tx = spawn_stream_forwarder(&ctx.app_handle, Some(arc_id.clone()));
 
     ctx.cancel_flag.store(false, Ordering::Relaxed);
@@ -3831,7 +4083,7 @@ pub(crate) async fn execute_dispatched_task(
     // domain, priority, and risk fields the coordinator already filled
     // in — we just need a fresh inner id for executor bookkeeping.
     let exec_task = Task {
-        id: Uuid::new_v4(),
+        id: task_id_for_run,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         source_event: task.source_event,
@@ -3850,6 +4102,9 @@ pub(crate) async fn execute_dispatched_task(
     let result = match executor.execute(exec_task).await {
         Ok(r) => r,
         Err(e) => {
+            if let Some(g) = agent_guard {
+                g.fail(e.to_string()).await;
+            }
             let _ = ctx.coordinator.complete_task(coord_task_id).await;
             let raw = e.to_string();
             tracing::error!("Agent execution failed for dispatched task: {raw}");
@@ -3884,6 +4139,13 @@ pub(crate) async fn execute_dispatched_task(
             }));
         }
     };
+    if let Some(g) = agent_guard {
+        if result.success {
+            g.complete().await;
+        } else {
+            g.fail("agent stopped before finishing").await;
+        }
+    }
 
     let content = if !result.success {
         let reason = result
@@ -4475,6 +4737,39 @@ pub async fn test_http_endpoint(
 pub async fn list_http_endpoint_presets(
 ) -> std::result::Result<Vec<crate::http_presets::EndpointPreset>, String> {
     Ok(crate::http_presets::presets())
+}
+
+/// Snapshot of every agent currently executing. The "watch the agents
+/// work" topbar pill polls this on the `agents-changed` event and once
+/// per second while the popover is open (to refresh elapsed times).
+/// Sorted newest-first by `started_at`.
+#[tauri::command]
+pub async fn list_active_agents(
+    state: State<'_, AppState>,
+) -> std::result::Result<Vec<crate::agent_registry::ActiveAgent>, String> {
+    let reg = state
+        .agent_registry
+        .as_ref()
+        .ok_or_else(|| "agent registry not initialized".to_string())?;
+    let mut snap = reg.snapshot().await;
+    snap.sort_by_key(|a| std::cmp::Reverse(a.started_at));
+    Ok(snap)
+}
+
+/// Most recent finalized agent runs, newest-first. Backs the "history"
+/// view in the agents panel. `limit` is clamped to [1, 500] with a
+/// default of 50.
+#[tauri::command]
+pub async fn list_recent_agent_runs(
+    state: State<'_, AppState>,
+    limit: Option<u32>,
+) -> std::result::Result<Vec<athen_persistence::agent_runs::AgentRunRecord>, String> {
+    let store = state
+        .agent_run_store
+        .as_ref()
+        .ok_or_else(|| "agent run store not initialized".to_string())?;
+    let limit = limit.unwrap_or(50).clamp(1, 500);
+    store.list_recent(limit).await.map_err(|e| e.to_string())
 }
 
 /// Resolve a pending [`ApprovalQuestion`] from the in-app UI.

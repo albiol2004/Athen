@@ -554,6 +554,12 @@ function startInitialDataLoads() {
     // Non-critical: defer to idle slices so they can't contend with first paint.
     scheduleIdle(() => updateNotifBadge());
     scheduleIdle(() => recoverPendingGrants());
+    // First fetch for the active-agents pill — the backend pulse will
+    // drive subsequent refreshes via the `agents-changed` event listener
+    // wired in `wireActiveAgentsPanel`. Seed the history feed too so the
+    // Agent Control tab is non-empty on first open.
+    scheduleIdle(() => refreshActiveAgents());
+    scheduleIdle(() => refreshAgentRuns());
     // Initial composer-attach gate sync — loadSettings updates it later
     // whenever the user opens Settings, but on cold start we need to
     // run once so the paperclip's tooltip/state matches reality.
@@ -3802,6 +3808,7 @@ function showSettings() {
     timelineView?.classList.add('hidden');
     calendarView?.classList.add('hidden');
     document.getElementById('wakeups-view')?.classList.add('hidden');
+    document.getElementById('agent-control-view')?.classList.add('hidden');
     contactsView?.classList.add('hidden');
     notificationsView?.classList.add('hidden');
     document.getElementById('memory-view')?.classList.add('hidden');
@@ -3817,6 +3824,7 @@ function showChat() {
     timelineView?.classList.add('hidden');
     calendarView?.classList.add('hidden');
     document.getElementById('wakeups-view')?.classList.add('hidden');
+    document.getElementById('agent-control-view')?.classList.add('hidden');
     contactsView?.classList.add('hidden');
     notificationsView?.classList.add('hidden');
     document.getElementById('memory-view')?.classList.add('hidden');
@@ -3829,7 +3837,8 @@ function showChat() {
 // Returns true if any non-chat top-level view is currently visible.
 function isOnSubView() {
     const ids = ['settings-view', 'timeline-view', 'calendar-view',
-                 'contacts-view', 'notifications-view', 'memory-view'];
+                 'contacts-view', 'notifications-view', 'memory-view',
+                 'wakeups-view', 'agent-control-view'];
     return ids.some((id) => {
         const el = document.getElementById(id);
         return el && !el.classList.contains('hidden');
@@ -6332,6 +6341,7 @@ function showTimeline() {
     settingsView.classList.add('hidden');
     calendarView?.classList.add('hidden');
     document.getElementById('wakeups-view')?.classList.add('hidden');
+    document.getElementById('agent-control-view')?.classList.add('hidden');
     contactsView?.classList.add('hidden');
     notificationsView?.classList.add('hidden');
     document.getElementById('memory-view')?.classList.add('hidden');
@@ -6620,6 +6630,8 @@ function showCalendar() {
     contactsView?.classList.add('hidden');
     notificationsView?.classList.add('hidden');
     document.getElementById('memory-view')?.classList.add('hidden');
+    document.getElementById('wakeups-view')?.classList.add('hidden');
+    document.getElementById('agent-control-view')?.classList.add('hidden');
     document.getElementById('sidebar').style.display = '';
     if (timelineRefreshInterval) { clearInterval(timelineRefreshInterval); timelineRefreshInterval = null; }
     calendarView.classList.remove('hidden');
@@ -7228,6 +7240,7 @@ function showNotifications() {
     timelineView?.classList.add('hidden');
     calendarView?.classList.add('hidden');
     document.getElementById('wakeups-view')?.classList.add('hidden');
+    document.getElementById('agent-control-view')?.classList.add('hidden');
     contactsView?.classList.add('hidden');
     document.getElementById('memory-view')?.classList.add('hidden');
     document.getElementById('sidebar').style.display = '';
@@ -7409,6 +7422,7 @@ function showContacts() {
     timelineView?.classList.add('hidden');
     calendarView?.classList.add('hidden');
     document.getElementById('wakeups-view')?.classList.add('hidden');
+    document.getElementById('agent-control-view')?.classList.add('hidden');
     notificationsView?.classList.add('hidden');
     document.getElementById('memory-view')?.classList.add('hidden');
     document.getElementById('sidebar').style.display = '';
@@ -7775,6 +7789,7 @@ function showMemory() {
     timelineView?.classList.add('hidden');
     calendarView?.classList.add('hidden');
     document.getElementById('wakeups-view')?.classList.add('hidden');
+    document.getElementById('agent-control-view')?.classList.add('hidden');
     notificationsView?.classList.add('hidden');
     contactsView?.classList.add('hidden');
     document.getElementById('sidebar').style.display = '';
@@ -8839,6 +8854,7 @@ function showWakeups() {
     timelineView?.classList.add('hidden');
     calendarView?.classList.add('hidden');
     document.getElementById('wakeups-view')?.classList.add('hidden');
+    document.getElementById('agent-control-view')?.classList.add('hidden');
     notificationsView?.classList.add('hidden');
     contactsView?.classList.add('hidden');
     memoryView?.classList.add('hidden');
@@ -9850,9 +9866,290 @@ function wireCloudApisModal() {
     });
 }
 
+// ─── Active agents pill + Agent Control view ─────────────────────────
+//
+// Live "watch the agents work" indicator wired against the
+// `list_active_agents` and `list_recent_agent_runs` Tauri commands and
+// the `agents-changed` push event. The topbar pill (count + pulse) is
+// a from-anywhere indicator; clicking it navigates to the dedicated
+// Agent Control view, which surfaces both the live cards and the
+// recent-history table.
+
+let activeAgentsCache = [];
+let agentRunsCache = [];
+let activeAgentsRefreshing = false;
+let agentRunsRefreshing = false;
+let agentControlTickHandle = null;
+
+const agentControlView = document.getElementById('agent-control-view');
+const agentControlBtn = document.getElementById('agent-control-btn');
+const agentControlBack = document.getElementById('agent-control-back');
+
+const AGENT_SOURCE_ICONS = {
+    user_chat: '\u{1F464}',
+    telegram: '\u{1F4AC}',
+    email: '\u{2709}\u{FE0F}',
+    calendar: '\u{1F4C5}',
+    wakeup: '\u{23F0}',
+    subagent: '\u{1FAA8}',
+    other: '\u{2022}',
+};
+
+function activeAgentsPillEl() {
+    return document.getElementById('active-agents-pill');
+}
+function agentSourceKey(source) {
+    if (!source) return 'other';
+    const s = String(source).toLowerCase();
+    return AGENT_SOURCE_ICONS[s] ? s : 'other';
+}
+function agentSourceIcon(source) {
+    return AGENT_SOURCE_ICONS[agentSourceKey(source)];
+}
+
+function formatAgentElapsed(startedAt) {
+    if (!startedAt) return '';
+    const start = new Date(startedAt).getTime();
+    if (!Number.isFinite(start)) return '';
+    let diffSec = Math.max(0, Math.floor((Date.now() - start) / 1000));
+    if (diffSec < 60) return `${diffSec}s`;
+    const m = Math.floor(diffSec / 60);
+    const s = diffSec % 60;
+    if (m < 60) return s ? `${m}m ${s}s` : `${m}m`;
+    const h = Math.floor(m / 60);
+    const mm = m % 60;
+    return mm ? `${h}h ${mm}m` : `${h}h`;
+}
+
+function formatAgentDuration(startedAt, finishedAt) {
+    if (!startedAt || !finishedAt) return '—';
+    const start = new Date(startedAt).getTime();
+    const end = new Date(finishedAt).getTime();
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return '—';
+    const diffSec = Math.max(0, Math.floor((end - start) / 1000));
+    if (diffSec < 60) return `${diffSec}s`;
+    const m = Math.floor(diffSec / 60);
+    const s = diffSec % 60;
+    if (m < 60) return s ? `${m}m ${s}s` : `${m}m`;
+    const h = Math.floor(m / 60);
+    const mm = m % 60;
+    return mm ? `${h}h ${mm}m` : `${h}h`;
+}
+
+function formatAgentRelative(ts) {
+    if (!ts) return '';
+    const t = new Date(ts).getTime();
+    if (!Number.isFinite(t)) return '';
+    const diffSec = Math.max(0, Math.floor((Date.now() - t) / 1000));
+    if (diffSec < 60) return `${diffSec}s ago`;
+    const m = Math.floor(diffSec / 60);
+    if (m < 60) return `${m}m ago`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h}h ago`;
+    const d = Math.floor(h / 24);
+    if (d < 30) return `${d}d ago`;
+    try { return new Date(ts).toLocaleDateString(); } catch (_) { return ''; }
+}
+
+async function refreshActiveAgents() {
+    if (!invoke || activeAgentsRefreshing) return;
+    activeAgentsRefreshing = true;
+    try {
+        activeAgentsCache = await invoke('list_active_agents');
+        if (!Array.isArray(activeAgentsCache)) activeAgentsCache = [];
+    } catch (err) {
+        // Registry not initialized yet (early startup race), or backend
+        // is rebuilding; treat as "no agents" rather than spamming logs.
+        activeAgentsCache = [];
+    } finally {
+        activeAgentsRefreshing = false;
+    }
+    renderActiveAgentsPill();
+    renderAgentControlActive();
+    renderAgentControlRunningCount();
+}
+
+async function refreshAgentRuns() {
+    if (!invoke || agentRunsRefreshing) return;
+    agentRunsRefreshing = true;
+    try {
+        agentRunsCache = await invoke('list_recent_agent_runs', { limit: 100 });
+        if (!Array.isArray(agentRunsCache)) agentRunsCache = [];
+    } catch (err) {
+        // Store not initialized yet — treat as empty.
+        agentRunsCache = [];
+    } finally {
+        agentRunsRefreshing = false;
+    }
+    renderAgentControlHistory();
+}
+
+function renderActiveAgentsPill() {
+    const pill = activeAgentsPillEl();
+    if (!pill) return;
+    const count = activeAgentsCache.length;
+    const countEl = pill.querySelector('.agents-count');
+    const labelEl = pill.querySelector('.agents-label');
+    if (countEl) countEl.textContent = String(count);
+    if (labelEl) labelEl.textContent = count === 1 ? 'working' : 'working';
+    pill.classList.toggle('hidden', count === 0);
+}
+
+function renderAgentControlRunningCount() {
+    const el = document.getElementById('agent-control-running-count');
+    if (!el) return;
+    const count = activeAgentsCache.length;
+    el.textContent = `${count} running`;
+}
+
+function renderAgentControlActive() {
+    const container = document.getElementById('agent-control-active');
+    if (!container) return;
+    if (activeAgentsCache.length === 0) {
+        container.innerHTML = '<div class="agent-cards-empty">No agents currently running.</div>';
+        return;
+    }
+
+    const cards = activeAgentsCache.map((agent) => {
+        const sourceKey = agentSourceKey(agent.source);
+        const icon = agentSourceIcon(agent.source);
+        const title = escapeHtml(agent.title || '(untitled)');
+        const elapsed = escapeHtml(formatAgentElapsed(agent.started_at));
+        const stepCount = Number.isFinite(agent.step_count) ? agent.step_count : 0;
+        const tool = agent.current_tool ? escapeHtml(agent.current_tool) : '';
+        const action = agent.current_action ? escapeHtml(agent.current_action) : '';
+        const arcId = agent.arc_id ? escapeHtml(agent.arc_id) : '';
+        const taskId = escapeHtml(agent.task_id);
+        const bodyInner = tool || action
+            ? `${tool ? `<span class="agent-card-tool-chip">${tool}</span>` : ''}<span class="agent-card-action">${action || ''}</span>`
+            : '<span class="agent-card-action muted">starting…</span>';
+        const jumpBtn = arcId
+            ? `<button class="agent-card-jump" type="button" data-jump-arc="${arcId}">Jump to arc</button>`
+            : '<span></span>';
+        return `
+<article class="agent-card" data-source="${sourceKey}" data-task-id="${taskId}" data-arc-id="${arcId}">
+    <header class="agent-card-head">
+        <span class="agent-card-icon" aria-hidden="true">${icon}</span>
+        <span class="agent-card-title" title="${title}">${title}</span>
+        <span class="agent-card-elapsed">${elapsed}</span>
+    </header>
+    <div class="agent-card-body">${bodyInner}</div>
+    <footer class="agent-card-foot">
+        <span class="agent-card-steps">${stepCount} step${stepCount === 1 ? '' : 's'}</span>
+        ${jumpBtn}
+    </footer>
+</article>`;
+    }).join('');
+
+    container.innerHTML = cards;
+    container.querySelectorAll('[data-jump-arc]').forEach((btn) => {
+        btn.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            const arcId = btn.getAttribute('data-jump-arc');
+            if (arcId && typeof handleSwitchArc === 'function') {
+                handleSwitchArc(arcId);
+            }
+        });
+    });
+}
+
+function renderAgentControlHistory() {
+    const container = document.getElementById('agent-control-history');
+    if (!container) return;
+    // Skip rows that are still running — those are surfaced in the
+    // active-cards section above.
+    const finalized = (agentRunsCache || []).filter((r) => r.status && r.status !== 'running');
+    if (finalized.length === 0) {
+        container.innerHTML = '<div class="agent-history-empty">No agent runs yet.</div>';
+        return;
+    }
+    const rows = finalized.map((run) => {
+        const sourceKey = agentSourceKey(run.source);
+        const icon = agentSourceIcon(run.source);
+        const title = escapeHtml(run.title || '(untitled)');
+        const started = escapeHtml(formatAgentRelative(run.started_at));
+        const duration = escapeHtml(formatAgentDuration(run.started_at, run.finished_at));
+        const status = String(run.status || 'completed').toLowerCase();
+        const arcId = run.arc_id ? escapeHtml(run.arc_id) : '';
+        const clickable = arcId ? 'clickable' : '';
+        return `
+<div class="agent-history-row ${clickable}" data-source="${sourceKey}" data-arc-id="${arcId}">
+    <span class="agent-history-icon" aria-hidden="true">${icon}</span>
+    <span class="agent-history-title" title="${title}">${title}</span>
+    <span class="agent-history-meta">${started}</span>
+    <span class="agent-history-duration">${duration}</span>
+    <span class="agent-history-status" data-status="${escapeHtml(status)}">${escapeHtml(status)}</span>
+</div>`;
+    }).join('');
+    container.innerHTML = rows;
+    container.querySelectorAll('.agent-history-row.clickable').forEach((row) => {
+        row.addEventListener('click', () => {
+            const arcId = row.getAttribute('data-arc-id');
+            if (arcId && typeof handleSwitchArc === 'function') {
+                handleSwitchArc(arcId);
+            }
+        });
+    });
+}
+
+function showAgentControl() {
+    if (!agentControlView) return;
+    if (typeof appView !== 'undefined' && appView) appView.style.display = 'none';
+    settingsView?.classList.add('hidden');
+    timelineView?.classList.add('hidden');
+    calendarView?.classList.add('hidden');
+    document.getElementById('wakeups-view')?.classList.add('hidden');
+    notificationsView?.classList.add('hidden');
+    contactsView?.classList.add('hidden');
+    memoryView?.classList.add('hidden');
+    document.getElementById('sidebar').style.display = '';
+    if (typeof timelineRefreshInterval !== 'undefined' && timelineRefreshInterval) {
+        clearInterval(timelineRefreshInterval);
+        timelineRefreshInterval = null;
+    }
+    agentControlView.classList.remove('hidden');
+    closeSidebar();
+    refreshActiveAgents();
+    refreshAgentRuns();
+    if (agentControlTickHandle) clearInterval(agentControlTickHandle);
+    // 1s tick keeps the elapsed badges honest while the view is open.
+    agentControlTickHandle = setInterval(() => {
+        if (agentControlView.classList.contains('hidden')) return;
+        renderAgentControlActive();
+    }, 1000);
+}
+
+function hideAgentControl() {
+    agentControlView?.classList.add('hidden');
+    if (agentControlTickHandle) {
+        clearInterval(agentControlTickHandle);
+        agentControlTickHandle = null;
+    }
+    showChat();
+}
+
+function wireActiveAgentsPanel() {
+    const pill = activeAgentsPillEl();
+    if (pill) pill.addEventListener('click', showAgentControl);
+    if (agentControlBtn) agentControlBtn.addEventListener('click', showAgentControl);
+    if (agentControlBack) agentControlBack.addEventListener('click', hideAgentControl);
+
+    // Backend pulse — registry mutations + finalized runs.
+    if (window.__TAURI__?.event?.listen) {
+        window.__TAURI__.event.listen('agents-changed', () => {
+            refreshActiveAgents();
+            // Newly-finalized runs land in the history feed.
+            refreshAgentRuns();
+        }).catch((err) => {
+            console.warn('[athen] agents-changed listen failed:', err);
+        });
+    }
+}
+
 // ─── Initialize ───
 
 inputEl.focus();
 wireOnboardingButtons();
 wireCloudApisModal();
+wireActiveAgentsPanel();
 initTauri();

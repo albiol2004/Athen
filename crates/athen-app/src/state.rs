@@ -335,6 +335,17 @@ pub struct AppState {
     /// the agent doesn't try blindly. Refreshed at startup and after
     /// every endpoint mutation.
     pub cloud_apis_doc_path: Option<std::path::PathBuf>,
+    /// Durable record of every agent execution. Backs the "watch the
+    /// agents work" panel's recent-runs view and is pruned to a 30-day
+    /// window by [`AppState::start_agent_run_pruner`]. `None` only on
+    /// CLI/test builds without a data dir.
+    pub agent_run_store: Option<Arc<athen_persistence::agent_runs::SqliteAgentRunStore>>,
+    /// Live in-memory view of agents currently executing. Wired after
+    /// startup via [`AppState::init_agent_registry`] (needs an
+    /// `AppHandle` to emit the `agents-changed` event). Read by every
+    /// executor entry point so it can register/finalize and by the
+    /// `list_active_agents` Tauri command.
+    pub agent_registry: Option<Arc<crate::agent_registry::AgentRegistry>>,
 }
 
 impl AppState {
@@ -412,6 +423,7 @@ impl AppState {
         let http_endpoint_store = database
             .as_ref()
             .map(|db| Arc::new(db.http_endpoint_store()));
+        let agent_run_store = database.as_ref().map(|db| Arc::new(db.agent_run_store()));
         let http_rate_limiter = Arc::new(crate::http_rate_limiter::HttpRateLimiter::new());
         // Single reqwest client reused across every per-arc registry —
         // avoids per-call connection setup cost. Defaults are fine; the
@@ -501,6 +513,8 @@ impl AppState {
             http_rate_limiter,
             http_client,
             cloud_apis_doc_path,
+            agent_run_store,
+            agent_registry: None,
         };
 
         if let Err(e) = state.refresh_tools_doc().await {
@@ -944,6 +958,46 @@ impl AppState {
         );
     }
 
+    /// Initialize the live agent registry. Must run after `AppState::new()`
+    /// but before `app.manage()` because it needs an `AppHandle` to emit
+    /// `agents-changed` events. Idempotent — re-init replaces the previous
+    /// registry, which is fine since live state is also empty at startup.
+    pub fn init_agent_registry(&mut self, app_handle: tauri::AppHandle) {
+        let registry =
+            crate::agent_registry::AgentRegistry::new(app_handle, self.agent_run_store.clone());
+        self.agent_registry = Some(registry);
+    }
+
+    /// Spawn a background loop that prunes finalized agent_runs rows
+    /// older than 30 days. Runs once at startup, then every 6 hours.
+    /// No-op when `agent_run_store` is unwired (CLI / test builds).
+    pub fn start_agent_run_pruner(&self) {
+        let Some(store) = self.agent_run_store.clone() else {
+            tracing::debug!("No agent_run_store wired; skipping pruner");
+            return;
+        };
+        tauri::async_runtime::spawn(async move {
+            let interval = std::time::Duration::from_secs(6 * 60 * 60);
+            let mut ticker = tokio::time::interval(interval);
+            // First tick fires immediately, kicking off the startup sweep.
+            loop {
+                ticker.tick().await;
+                let cutoff = chrono::Utc::now() - chrono::Duration::days(30);
+                match store.prune_older_than(cutoff).await {
+                    Ok(0) => {
+                        tracing::debug!("agent_runs pruner: nothing to prune");
+                    }
+                    Ok(n) => {
+                        tracing::info!("agent_runs pruner: removed {n} stale row(s)");
+                    }
+                    Err(e) => {
+                        tracing::warn!("agent_runs pruner failed: {e}");
+                    }
+                }
+            }
+        });
+    }
+
     /// Start the email monitor background polling task.
     ///
     /// This must be called after the `AppState` is constructed but before it
@@ -1252,6 +1306,7 @@ impl AppState {
         let http_rate_limiter_ref = self.http_rate_limiter.clone();
         let http_client_ref = self.http_client.clone();
         let cloud_apis_doc_path_ref = self.cloud_apis_doc_path.clone();
+        let agent_registry_ref = self.agent_registry.clone();
 
         tauri::async_runtime::spawn(async move {
             if let Err(e) = monitor.init(&telegram_config).await {
@@ -1339,6 +1394,7 @@ impl AppState {
                                     let http_rate_limiter_c = Arc::clone(&http_rate_limiter_ref);
                                     let http_client_c = http_client_ref.clone();
                                     let cloud_apis_doc_path_c = cloud_apis_doc_path_ref.clone();
+                                    let agent_registry_c = agent_registry_ref.clone();
                                     let telegram_outbound_hint_c =
                                         telegram_outbound_hint_ref.clone();
                                     let event_id = event.id;
@@ -1377,6 +1433,7 @@ impl AppState {
                                             &http_rate_limiter_c,
                                             &http_client_c,
                                             cloud_apis_doc_path_c.as_ref(),
+                                            agent_registry_c.as_ref(),
                                         )
                                         .await;
                                     });
@@ -1519,6 +1576,7 @@ impl AppState {
             .unwrap_or_default();
         let attachment_store_loop = self.attachment_store();
         let inflight = Arc::clone(&self.inflight_approvals);
+        let agent_registry_loop = self.agent_registry.clone();
 
         tauri::async_runtime::spawn(async move {
             use athen_core::traits::coordinator::TaskQueue;
@@ -1653,6 +1711,7 @@ impl AppState {
                         wakeup_store: wakeup_store
                             .clone()
                             .map(|s| s as Arc<dyn athen_core::traits::wakeup::WakeupStore>),
+                        agent_registry: agent_registry_loop.clone(),
                     };
 
                     let task_arc_map_clone = Arc::clone(&task_arc_map);
@@ -1796,6 +1855,7 @@ async fn execute_owner_telegram_message(
     http_rate_limiter: &Arc<crate::http_rate_limiter::HttpRateLimiter>,
     http_client: &reqwest::Client,
     cloud_apis_doc_path: Option<&std::path::PathBuf>,
+    agent_registry: Option<&Arc<crate::agent_registry::AgentRegistry>>,
 ) {
     use std::time::Duration;
 
@@ -2157,7 +2217,36 @@ async fn execute_owner_telegram_message(
     ));
     progress.start().await;
 
-    let auditor = TauriAuditor::new(
+    // Pre-allocate executor task id so the live agent registry can
+    // address it BEFORE execute() begins.
+    let task_id_for_run = uuid::Uuid::new_v4();
+
+    // Register with the live agent registry so the desktop "watch the
+    // agents work" panel sees this Telegram-driven run too.
+    let agent_guard = if let Some(reg) = agent_registry {
+        let now = chrono::Utc::now();
+        let title = crate::commands::truncate_title(text, 200);
+        Some(
+            reg.register(crate::agent_registry::ActiveAgent {
+                task_id: task_id_for_run.to_string(),
+                arc_id: target_arc_id.clone(),
+                source: crate::agent_registry::AgentSource::Telegram,
+                title,
+                started_at: now,
+                last_step_at: now,
+                current_tool: None,
+                current_action: None,
+                step_count: 0,
+                profile_id: None,
+                model: None,
+            })
+            .await,
+        )
+    } else {
+        None
+    };
+
+    let mut auditor = TauriAuditor::new(
         app_handle.clone(),
         arc_store.clone(),
         target_arc_id.clone().unwrap_or_default(),
@@ -2165,6 +2254,9 @@ async fn execute_owner_telegram_message(
         tool_log.clone(),
     )
     .with_telegram_progress(Arc::clone(&progress));
+    if let Some(reg) = agent_registry {
+        auditor = auditor.with_agent_tracking(Arc::clone(reg), task_id_for_run);
+    }
     let stream_tx = spawn_stream_forwarder(app_handle, target_arc_id.clone());
     let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -2208,7 +2300,7 @@ async fn execute_owner_telegram_message(
     };
 
     let task = Task {
-        id: uuid::Uuid::new_v4(),
+        id: task_id_for_run,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         source_event: Some(event_id),
@@ -2264,6 +2356,9 @@ async fn execute_owner_telegram_message(
     let result = match executor.execute(task).await {
         Ok(r) => r,
         Err(e) => {
+            if let Some(g) = agent_guard {
+                g.fail(e.to_string()).await;
+            }
             let raw = e.to_string();
             tracing::error!("Agent execution failed for owner Telegram message: {raw}");
 
@@ -2307,6 +2402,13 @@ async fn execute_owner_telegram_message(
             return;
         }
     };
+    if let Some(g) = agent_guard {
+        if result.success {
+            g.complete().await;
+        } else {
+            g.fail("agent stopped before finishing").await;
+        }
+    }
 
     // Extract the response text (same logic as send_message).
     let content = if !result.success {

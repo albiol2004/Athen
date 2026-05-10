@@ -2,6 +2,7 @@
 //!
 //! Tasks, checkpoints, pending messages, chat history, arcs, and operational state.
 
+pub mod agent_runs;
 pub mod arcs;
 pub mod attachments;
 pub mod calendar;
@@ -25,6 +26,7 @@ use tokio::sync::Mutex;
 
 use athen_core::error::{AthenError, Result};
 
+use crate::agent_runs::SqliteAgentRunStore;
 use crate::arcs::ArcStore;
 use crate::attachments::AttachmentStore;
 use crate::calendar::CalendarStore;
@@ -102,6 +104,8 @@ impl Database {
         wakeups.init_schema().await?;
         let endpoints = self.http_endpoint_store();
         endpoints.init_schema().await?;
+        let agent_runs = self.agent_run_store();
+        agent_runs.init_schema().await?;
         profiles.seed_builtins_if_empty().await
     }
 
@@ -168,6 +172,11 @@ impl Database {
     /// Create a `SqliteHttpEndpointStore` backed by this database's connection.
     pub fn http_endpoint_store(&self) -> SqliteHttpEndpointStore {
         SqliteHttpEndpointStore::new(self.conn.clone())
+    }
+
+    /// Create a `SqliteAgentRunStore` backed by this database's connection.
+    pub fn agent_run_store(&self) -> SqliteAgentRunStore {
+        SqliteAgentRunStore::from_conn(self.conn.clone())
     }
 }
 
