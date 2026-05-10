@@ -4102,6 +4102,376 @@ pub async fn vault_smoke_test(
     }))
 }
 
+/// Wire-shape for an HTTP endpoint as exposed to the frontend.
+///
+/// `has_credential` is computed (vault-key present?) so the UI can render
+/// a "Key set / not set" badge without ever shipping the secret across
+/// IPC. `auth_method` lands as the `AuthMethod` enum on the wire — the
+/// enum variants tell the UI which form fields to show.
+#[derive(serde::Serialize, Debug)]
+pub struct EndpointWire {
+    pub id: String,
+    pub name: String,
+    pub provider: String,
+    pub base_url: String,
+    pub enabled: bool,
+    pub auth_method: athen_core::http_endpoint::AuthMethod,
+    pub default_headers: Vec<(String, String)>,
+    pub default_query_params: Vec<(String, String)>,
+    pub rate_limit_per_minute: u32,
+    pub risk_override: Option<String>,
+    pub notes: Option<String>,
+    pub last_used: Option<String>,
+    pub call_count_30d: u32,
+    pub created_at: String,
+    pub has_credential: bool,
+}
+
+fn endpoint_to_wire(
+    e: athen_core::http_endpoint::RegisteredEndpoint,
+    has_credential: bool,
+) -> EndpointWire {
+    EndpointWire {
+        id: e.id.to_string(),
+        name: e.name,
+        provider: e.provider,
+        base_url: e.base_url,
+        enabled: e.enabled,
+        auth_method: e.auth_method,
+        default_headers: e.default_headers,
+        default_query_params: e.default_query_params,
+        rate_limit_per_minute: e.rate_limit.map(|r| r.requests_per_minute).unwrap_or(0),
+        risk_override: e.risk_override.map(|r| match r {
+            athen_core::http_endpoint::EndpointRisk::Low => "low".to_string(),
+            athen_core::http_endpoint::EndpointRisk::Medium => "medium".to_string(),
+            athen_core::http_endpoint::EndpointRisk::High => "high".to_string(),
+        }),
+        notes: e.notes,
+        last_used: e.last_used.map(|t| t.to_rfc3339()),
+        call_count_30d: e.call_count_30d,
+        created_at: e.created_at.to_rfc3339(),
+        has_credential,
+    }
+}
+
+async fn endpoint_has_credential(
+    vault: &std::sync::Arc<dyn athen_core::traits::vault::Vault>,
+    endpoint: &athen_core::http_endpoint::RegisteredEndpoint,
+) -> bool {
+    let Some(key) = endpoint.auth_method.vault_key() else {
+        return true; // no auth needed → "credential present" by definition
+    };
+    let scope = crate::vault_creds::endpoint_scope(endpoint.id);
+    matches!(vault.get(&scope, key).await, Ok(Some(s)) if !s.is_empty())
+}
+
+/// List every registered HTTP endpoint, sorted by name. The credential
+/// itself never leaves the vault — the wire shape exposes a boolean
+/// `has_credential` flag so the UI can render a "Key set" badge.
+#[tauri::command]
+pub async fn list_http_endpoints(
+    state: State<'_, AppState>,
+) -> std::result::Result<Vec<EndpointWire>, String> {
+    use athen_core::traits::http_endpoint::HttpEndpointStore;
+    let Some(store) = state.http_endpoint_store.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let endpoints = store.list().await.map_err(|e| e.to_string())?;
+    let mut out = Vec::with_capacity(endpoints.len());
+    for ep in endpoints {
+        let has_cred = if let Some(v) = state.vault.as_ref() {
+            endpoint_has_credential(v, &ep).await
+        } else {
+            false
+        };
+        out.push(endpoint_to_wire(ep, has_cred));
+    }
+    Ok(out)
+}
+
+/// Input shape for upsert. `id` empty → create new. `credential` empty →
+/// keep existing (matching the "Key is set, leave blank to keep" UX used
+/// for SMTP/IMAP). `credential` non-empty → write the new value into the
+/// vault under `endpoint:<id>` using the [`AuthMethod`] vault key.
+#[derive(serde::Deserialize, Debug)]
+pub struct EndpointInput {
+    #[serde(default)]
+    pub id: Option<String>,
+    pub name: String,
+    #[serde(default)]
+    pub provider: String,
+    pub base_url: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub auth_method: athen_core::http_endpoint::AuthMethod,
+    #[serde(default)]
+    pub default_headers: Vec<(String, String)>,
+    #[serde(default)]
+    pub default_query_params: Vec<(String, String)>,
+    #[serde(default)]
+    pub rate_limit_per_minute: u32,
+    #[serde(default)]
+    pub risk_override: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+    /// New credential value to write into the vault. `None` (or empty
+    /// string) preserves any existing credential. Sending an explicit
+    /// empty string is treated the same as `None` so the
+    /// "leave-blank-to-keep" form pattern works.
+    #[serde(default)]
+    pub credential: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Insert or update a registered endpoint. Writes the credential to the
+/// vault when one was provided; the row in SQLite never carries the
+/// secret. Returns the persisted wire-shape.
+#[tauri::command]
+pub async fn upsert_http_endpoint(
+    input: EndpointInput,
+    state: State<'_, AppState>,
+) -> std::result::Result<EndpointWire, String> {
+    use athen_core::http_endpoint::{EndpointRisk, RateLimit, RegisteredEndpoint};
+    use athen_core::traits::http_endpoint::HttpEndpointStore;
+
+    let Some(store) = state.http_endpoint_store.as_ref() else {
+        return Err("HTTP endpoint store not available".into());
+    };
+    let Some(vault) = state.vault.as_ref() else {
+        return Err("Vault not available — cannot store endpoint credential".into());
+    };
+
+    let id = match input.id.as_deref().filter(|s| !s.is_empty()) {
+        Some(s) => uuid::Uuid::parse_str(s).map_err(|e| format!("Invalid endpoint id: {e}"))?,
+        None => uuid::Uuid::new_v4(),
+    };
+
+    let risk_override = match input.risk_override.as_deref() {
+        Some("low") => Some(EndpointRisk::Low),
+        Some("medium") => Some(EndpointRisk::Medium),
+        Some("high") => Some(EndpointRisk::High),
+        Some(other) => return Err(format!("Unknown risk_override '{other}'")),
+        None => None,
+    };
+
+    let endpoint = RegisteredEndpoint {
+        id,
+        name: input.name.trim().to_string(),
+        provider: input.provider,
+        base_url: input.base_url,
+        enabled: input.enabled,
+        auth_method: input.auth_method.clone(),
+        default_headers: input.default_headers,
+        default_query_params: input.default_query_params,
+        rate_limit: if input.rate_limit_per_minute > 0 {
+            Some(RateLimit {
+                requests_per_minute: input.rate_limit_per_minute,
+            })
+        } else {
+            None
+        },
+        risk_override,
+        notes: input.notes,
+        last_used: None,
+        call_count_30d: 0,
+        created_at: chrono::Utc::now(),
+    };
+
+    store.upsert(&endpoint).await.map_err(|e| e.to_string())?;
+
+    // Credential write happens AFTER the row is persisted so a vault
+    // failure leaves no orphan secret. Empty / None leaves the vault
+    // untouched (legacy creds keep working).
+    let new_cred = input.credential.as_deref().filter(|s| !s.is_empty());
+    if let (Some(cred), Some(key)) = (new_cred, endpoint.auth_method.vault_key()) {
+        let scope = crate::vault_creds::endpoint_scope(endpoint.id);
+        vault
+            .set(&scope, key, cred)
+            .await
+            .map_err(|e| format!("Vault write: {e}"))?;
+    }
+    // If the new auth_method has no vault key (e.g. switched to None),
+    // nuke any old credential the previous auth shape might have written.
+    if endpoint.auth_method.vault_key().is_none() {
+        let scope = crate::vault_creds::endpoint_scope(endpoint.id);
+        for key in &["token", "value", "password"] {
+            let _ = vault.delete(&scope, key).await;
+        }
+    }
+
+    let loaded = store
+        .get(endpoint.id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Endpoint missing after save".to_string())?;
+    let has_cred = endpoint_has_credential(vault, &loaded).await;
+    Ok(endpoint_to_wire(loaded, has_cred))
+}
+
+/// Delete a registered endpoint and its vault-stored credential. Vault
+/// key removal is best-effort — a missing entry is fine, a failure is
+/// logged but not surfaced because the row is gone either way.
+#[tauri::command]
+pub async fn delete_http_endpoint(
+    id: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    use athen_core::traits::http_endpoint::HttpEndpointStore;
+    let Some(store) = state.http_endpoint_store.as_ref() else {
+        return Err("HTTP endpoint store not available".into());
+    };
+    let uuid = uuid::Uuid::parse_str(&id).map_err(|e| format!("Invalid endpoint id: {e}"))?;
+    // Vault cleanup before the row vanishes so we still know the scope.
+    if let Some(vault) = state.vault.as_ref() {
+        let scope = crate::vault_creds::endpoint_scope(uuid);
+        for key in &["token", "value", "password"] {
+            if let Err(e) = vault.delete(&scope, key).await {
+                tracing::warn!(endpoint = %uuid, key, error = %e, "vault delete failed");
+            }
+        }
+    }
+    store.delete(uuid).await.map_err(|e| e.to_string())
+}
+
+/// Toggle the enabled flag without re-sending the whole row.
+#[tauri::command]
+pub async fn set_http_endpoint_enabled(
+    id: String,
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    use athen_core::traits::http_endpoint::HttpEndpointStore;
+    let Some(store) = state.http_endpoint_store.as_ref() else {
+        return Err("HTTP endpoint store not available".into());
+    };
+    let uuid = uuid::Uuid::parse_str(&id).map_err(|e| format!("Invalid endpoint id: {e}"))?;
+    store
+        .set_enabled(uuid, enabled)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Smoke-test a registered endpoint by issuing a GET against the
+/// optional `path` (default empty → just the base URL). Returns the
+/// status code and a snippet of the response body so the user can verify
+/// from Settings before relying on it.
+#[tauri::command]
+pub async fn test_http_endpoint(
+    id: String,
+    path: Option<String>,
+    state: State<'_, AppState>,
+) -> std::result::Result<serde_json::Value, String> {
+    use athen_core::http_endpoint::AuthMethod;
+    use athen_core::traits::http_endpoint::HttpEndpointStore;
+    use serde_json::json;
+
+    let Some(store) = state.http_endpoint_store.as_ref() else {
+        return Err("HTTP endpoint store not available".into());
+    };
+    let Some(vault) = state.vault.as_ref() else {
+        return Err("Vault not available".into());
+    };
+    let uuid = uuid::Uuid::parse_str(&id).map_err(|e| format!("Invalid endpoint id: {e}"))?;
+    let endpoint = store
+        .get(uuid)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Endpoint not found: {id}"))?;
+
+    let path = path.unwrap_or_default();
+    let url = reqwest::Url::parse(&endpoint.base_url)
+        .map_err(|e| format!("Invalid base_url: {e}"))?
+        .join(&path)
+        .map_err(|e| format!("Invalid path: {e}"))?;
+
+    let mut builder = state.http_client.get(url);
+    let scope = crate::vault_creds::endpoint_scope(endpoint.id);
+
+    // Replicate the http_request auth injection — keep this in sync with
+    // do_http_request; if test_connection passes but the agent fails,
+    // the divergence is a bug.
+    for (k, v) in &endpoint.default_headers {
+        builder = builder.header(k.as_str(), v.as_str());
+    }
+    let mut query: Vec<(String, String)> = endpoint.default_query_params.clone();
+    match &endpoint.auth_method {
+        AuthMethod::None => {}
+        AuthMethod::BearerToken => {
+            if let Some(t) = vault
+                .get(&scope, "token")
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                builder = builder.bearer_auth(t);
+            } else {
+                return Err("No bearer token set in vault for this endpoint".into());
+            }
+        }
+        AuthMethod::Header { name } => {
+            if let Some(v) = vault
+                .get(&scope, "value")
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                builder = builder.header(name.as_str(), v);
+            } else {
+                return Err("No header credential set in vault for this endpoint".into());
+            }
+        }
+        AuthMethod::QueryParam { name } => {
+            if let Some(v) = vault
+                .get(&scope, "value")
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                query.push((name.clone(), v));
+            } else {
+                return Err("No query-param credential set in vault for this endpoint".into());
+            }
+        }
+        AuthMethod::BasicAuth { user } => {
+            if let Some(p) = vault
+                .get(&scope, "password")
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                builder = builder.basic_auth(user, Some(p));
+            } else {
+                return Err("No basic-auth password set in vault for this endpoint".into());
+            }
+        }
+    }
+    if !query.is_empty() {
+        builder = builder.query(&query);
+    }
+
+    let started = std::time::Instant::now();
+    let res = builder
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {e}"))?;
+    let status = res.status();
+    let body = res.text().await.unwrap_or_default();
+    let snippet: String = body.chars().take(500).collect();
+    Ok(json!({
+        "status": status.as_u16(),
+        "ok": status.is_success(),
+        "latency_ms": started.elapsed().as_millis() as u64,
+        "body_snippet": snippet,
+    }))
+}
+
+/// Return the static preset library used by the "+ Add Endpoint" modal.
+/// The frontend renders these in a dropdown that pre-fills the form.
+#[tauri::command]
+pub async fn list_http_endpoint_presets(
+) -> std::result::Result<Vec<crate::http_presets::EndpointPreset>, String> {
+    Ok(crate::http_presets::presets())
+}
+
 /// Resolve a pending [`ApprovalQuestion`] from the in-app UI.
 ///
 /// Used by the new approval router flow: when the frontend renders an

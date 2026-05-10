@@ -12,6 +12,8 @@ mod contacts;
 pub(crate) mod delegation;
 pub(crate) mod email_gate;
 pub(crate) mod file_gate;
+pub(crate) mod http_presets;
+pub(crate) mod http_rate_limiter;
 pub(crate) mod identity_render;
 pub(crate) mod notifier;
 pub(crate) mod process;
@@ -170,6 +172,12 @@ pub fn run() {
             wakeup_commands::set_wakeup_enabled,
             wakeup_commands::list_available_tools,
             commands::vault_smoke_test,
+            commands::list_http_endpoints,
+            commands::upsert_http_endpoint,
+            commands::delete_http_endpoint,
+            commands::set_http_endpoint_enabled,
+            commands::test_http_endpoint,
+            commands::list_http_endpoint_presets,
         ])
         .setup(|app| {
             use tauri::Manager;

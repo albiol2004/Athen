@@ -5823,3 +5823,85 @@ option:hover {
 .wakeup-preview-error {
     color: #f7768e;
 }
+
+/* ─── Cloud APIs (registered HTTP endpoints) ─────────────────── */
+
+.cloud-apis-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    margin-bottom: 16px;
+}
+
+.cloud-api-row {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    grid-template-areas: "main actions" "result result";
+    gap: 8px 16px;
+    padding: 12px 16px;
+    border: 1px solid var(--border-color, #2a2a2a);
+    border-radius: 8px;
+    background: var(--bg-elevated, #1a1a1a);
+}
+
+.cloud-api-row-main { grid-area: main; min-width: 0; }
+.cloud-api-row-actions {
+    grid-area: actions;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+}
+.cloud-api-row-test-result {
+    grid-area: result;
+    font-family: monospace;
+    font-size: 12px;
+    padding: 8px 10px;
+    border-radius: 4px;
+    background: rgba(255,255,255,0.04);
+    word-break: break-word;
+}
+.cloud-api-row-test-ok { background: rgba(34, 197, 94, 0.12); color: #4ade80; }
+.cloud-api-row-test-fail { background: rgba(239, 68, 68, 0.12); color: #fca5a5; }
+
+.cloud-api-row-name {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 4px;
+}
+.cloud-api-row-provider {
+    color: var(--text-muted, #888);
+    font-size: 13px;
+}
+.cloud-api-row-meta {
+    display: flex;
+    gap: 16px;
+    font-size: 12px;
+    color: var(--text-muted, #888);
+    margin-bottom: 2px;
+    flex-wrap: wrap;
+}
+.cloud-api-row-url {
+    font-family: monospace;
+    font-size: 12px;
+    color: var(--text-muted, #aaa);
+    word-break: break-all;
+}
+
+.cloud-api-badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 500;
+}
+.cloud-api-badge-ok { background: rgba(34, 197, 94, 0.15); color: #4ade80; }
+.cloud-api-badge-warn { background: rgba(234, 179, 8, 0.15); color: #fbbf24; }
+.cloud-api-badge-muted { background: rgba(148, 163, 184, 0.15); color: #94a3b8; }
+
+.cloud-api-modal {
+    max-width: 540px;
+}

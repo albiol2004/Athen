@@ -474,6 +474,19 @@
             </section>
 
             <section class="settings-section">
+                <h2>Cloud APIs</h2>
+                <p class="settings-description">
+                    Register cloud HTTP endpoints (Hunter, Brave Search, Open-Meteo, …) the agent can call via the generic <code>http_request</code> tool. Pick a preset, paste your key, and click Save — the credential goes straight into the encrypted vault, never into <code>config.toml</code>. Bespoke tools (web_fetch, email_send, calendar) take precedence when one already exists for a given API.
+                </p>
+                <div id="cloud-apis-list" class="cloud-apis-list">
+                    <p class="setting-hint">No endpoints registered yet.</p>
+                </div>
+                <div class="setting-actions">
+                    <button id="cloud-apis-add-btn" class="btn-primary" type="button">+ Add Endpoint</button>
+                </div>
+            </section>
+
+            <section class="settings-section">
                 <h2>Attachments</h2>
                 <p class="settings-description">
                     Controls how Athen handles attachments arriving via email, Telegram, or the chat composer.
@@ -1089,6 +1102,85 @@
             <div class="profile-modal-actions">
                 <button id="identity-category-modal-cancel" class="btn-secondary" type="button">Cancel</button>
                 <button id="identity-category-modal-save" class="btn-primary" type="button">Save</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="cloud-api-modal-overlay" class="profile-modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="cloud-api-modal-title">
+        <div class="profile-modal cloud-api-modal">
+            <div class="profile-modal-header">
+                <h2 id="cloud-api-modal-title">New endpoint</h2>
+                <button id="cloud-api-modal-close" class="cal-modal-close-btn" type="button">&times;</button>
+            </div>
+            <div class="profile-modal-body">
+                <div class="cal-field">
+                    <label for="cloud-api-preset">Preset</label>
+                    <select id="cloud-api-preset" class="settings-input"></select>
+                    <p class="setting-hint" id="cloud-api-signup-hint"></p>
+                </div>
+                <div class="cal-field">
+                    <label for="cloud-api-name">Name <span class="permissions-subnote">(case-insensitive, used by the agent)</span></label>
+                    <input type="text" id="cloud-api-name" class="settings-input" placeholder="e.g. Hunter">
+                </div>
+                <div class="cal-field">
+                    <label for="cloud-api-provider">Provider</label>
+                    <input type="text" id="cloud-api-provider" class="settings-input" placeholder="Hunter.io">
+                </div>
+                <div class="cal-field">
+                    <label for="cloud-api-base-url">Base URL</label>
+                    <input type="text" id="cloud-api-base-url" class="settings-input" placeholder="https://api.example.com/v1/">
+                </div>
+                <div class="cal-field">
+                    <label for="cloud-api-auth-kind">Auth method</label>
+                    <select id="cloud-api-auth-kind" class="settings-input">
+                        <option value="None">None (public)</option>
+                        <option value="BearerToken">Bearer token</option>
+                        <option value="Header">Header (X-Api-Key, etc.)</option>
+                        <option value="QueryParam">Query parameter</option>
+                        <option value="BasicAuth">Basic auth</option>
+                    </select>
+                </div>
+                <div class="cal-field hidden" id="cloud-api-auth-param-row">
+                    <label for="cloud-api-auth-param">Header / param name</label>
+                    <input type="text" id="cloud-api-auth-param" class="settings-input" placeholder="X-Api-Key">
+                </div>
+                <div class="cal-field hidden" id="cloud-api-auth-user-row">
+                    <label for="cloud-api-auth-user">Username (basic auth)</label>
+                    <input type="text" id="cloud-api-auth-user" class="settings-input" placeholder="user">
+                </div>
+                <div class="cal-field" id="cloud-api-credential-row">
+                    <label for="cloud-api-credential">API key / token</label>
+                    <input type="password" id="cloud-api-credential" class="settings-input" placeholder="Paste API key" autocomplete="off">
+                    <p class="setting-hint">Stored encrypted in the OS keychain (or encrypted-file fallback). Never written to <code>config.toml</code>.</p>
+                </div>
+                <div class="cal-field">
+                    <label for="cloud-api-rate-limit">Rate limit (req/min, 0 = none)</label>
+                    <input type="number" id="cloud-api-rate-limit" class="settings-input" min="0" max="10000" value="0">
+                </div>
+                <div class="cal-field">
+                    <label for="cloud-api-risk">Risk override</label>
+                    <select id="cloud-api-risk" class="settings-input">
+                        <option value="">— Use HTTP-method default —</option>
+                        <option value="low">Low (auto-approve)</option>
+                        <option value="medium">Medium (notify and proceed)</option>
+                        <option value="high">High (require approval)</option>
+                    </select>
+                </div>
+                <div class="cal-field">
+                    <label for="cloud-api-notes">Notes (optional)</label>
+                    <input type="text" id="cloud-api-notes" class="settings-input" placeholder="What is this for?">
+                </div>
+                <div class="cal-field">
+                    <label class="toggle-label">
+                        <input type="checkbox" id="cloud-api-enabled" checked>
+                        <span>Enabled</span>
+                    </label>
+                </div>
+                <p id="cloud-api-modal-error" class="profile-modal-error hidden"></p>
+            </div>
+            <div class="profile-modal-actions">
+                <button id="cloud-api-modal-cancel" class="btn-secondary" type="button">Cancel</button>
+                <button id="cloud-api-modal-save" class="btn-primary" type="button">Save</button>
             </div>
         </div>
     </div>

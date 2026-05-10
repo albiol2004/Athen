@@ -9,6 +9,7 @@ pub mod chat;
 pub mod checkpoint;
 pub mod contacts;
 pub mod grants;
+pub mod http_endpoints;
 pub mod identity;
 pub mod mcp;
 pub mod notifications;
@@ -30,6 +31,7 @@ use crate::calendar::CalendarStore;
 use crate::chat::ChatStore;
 use crate::contacts::SqliteContactStore;
 use crate::grants::GrantStore;
+use crate::http_endpoints::SqliteHttpEndpointStore;
 use crate::identity::SqliteIdentityStore;
 use crate::mcp::McpStore;
 use crate::notifications::NotificationStore;
@@ -98,6 +100,8 @@ impl Database {
         identity.seed_categories_if_empty().await?;
         let wakeups = self.wakeup_store();
         wakeups.init_schema().await?;
+        let endpoints = self.http_endpoint_store();
+        endpoints.init_schema().await?;
         profiles.seed_builtins_if_empty().await
     }
 
@@ -159,6 +163,11 @@ impl Database {
     /// Create a `SqliteWakeupStore` backed by this database's connection.
     pub fn wakeup_store(&self) -> SqliteWakeupStore {
         SqliteWakeupStore::new(self.conn.clone())
+    }
+
+    /// Create a `SqliteHttpEndpointStore` backed by this database's connection.
+    pub fn http_endpoint_store(&self) -> SqliteHttpEndpointStore {
+        SqliteHttpEndpointStore::new(self.conn.clone())
     }
 }
 

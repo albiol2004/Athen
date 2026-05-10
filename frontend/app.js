@@ -3911,6 +3911,7 @@ async function loadSettings() {
         await loadGrants();
         await loadProfileManager();
         await loadIdentityManager();
+        await loadCloudApis();
         await loadAttachmentPolicySettings();
     } catch (err) {
         console.error('Failed to load settings:', err);
@@ -9436,8 +9437,357 @@ if (wakeupQuickDatesEl) {
     });
 }
 
+// ─── Cloud APIs (registered HTTP endpoints) ─────────────────────────
+//
+// Each row is a `RegisteredEndpoint` projected through `EndpointWire` —
+// the secret stays in the vault, the UI only sees `has_credential` for
+// the badge. Adding an endpoint pops a modal that prefills from a
+// preset so onboarding is "pick provider, paste key, click save".
+
+let cloudApiEndpoints = [];
+let cloudApiPresets = [];
+
+async function loadCloudApis() {
+    const list = document.getElementById('cloud-apis-list');
+    if (!list) return;
+    try {
+        const [endpoints, presets] = await Promise.all([
+            invoke('list_http_endpoints'),
+            invoke('list_http_endpoint_presets'),
+        ]);
+        cloudApiEndpoints = endpoints || [];
+        cloudApiPresets = presets || [];
+        renderCloudApisList();
+    } catch (err) {
+        console.error('Failed to load cloud APIs:', err);
+        list.innerHTML = `<p class="setting-hint">Failed to load endpoints: ${escapeHtml(String(err))}</p>`;
+    }
+}
+
+function renderCloudApisList() {
+    const list = document.getElementById('cloud-apis-list');
+    if (!list) return;
+    if (!cloudApiEndpoints.length) {
+        list.innerHTML = '<p class="setting-hint">No endpoints registered yet. Click <strong>+ Add Endpoint</strong> below — pick a preset (Brave, Hunter, Open-Meteo, …), paste your key, save.</p>';
+        return;
+    }
+    list.innerHTML = cloudApiEndpoints.map((e) => {
+        const credBadge = e.has_credential
+            ? '<span class="cloud-api-badge cloud-api-badge-ok">Key set</span>'
+            : '<span class="cloud-api-badge cloud-api-badge-warn">No key</span>';
+        const enabledBadge = e.enabled
+            ? ''
+            : '<span class="cloud-api-badge cloud-api-badge-muted">Disabled</span>';
+        const lastUsed = e.last_used
+            ? new Date(e.last_used).toLocaleDateString()
+            : 'never';
+        const authLabel = describeAuthMethod(e.auth_method);
+        return `
+            <div class="cloud-api-row" data-endpoint-id="${escapeHtml(e.id)}">
+                <div class="cloud-api-row-main">
+                    <div class="cloud-api-row-name">
+                        <strong>${escapeHtml(e.name)}</strong>
+                        <span class="cloud-api-row-provider">${escapeHtml(e.provider || '')}</span>
+                        ${credBadge}
+                        ${enabledBadge}
+                    </div>
+                    <div class="cloud-api-row-meta">
+                        <span title="Auth method">${escapeHtml(authLabel)}</span>
+                        <span title="30-day call count">${e.call_count_30d} calls / 30d</span>
+                        <span title="Last call">last: ${escapeHtml(lastUsed)}</span>
+                    </div>
+                    <div class="cloud-api-row-url">${escapeHtml(e.base_url)}</div>
+                </div>
+                <div class="cloud-api-row-actions">
+                    <label class="toggle-label">
+                        <input type="checkbox" class="cloud-api-enabled" ${e.enabled ? 'checked' : ''} data-endpoint-id="${escapeHtml(e.id)}">
+                        <span>Enabled</span>
+                    </label>
+                    <button class="btn-secondary cloud-api-test-btn" data-endpoint-id="${escapeHtml(e.id)}" type="button">Test</button>
+                    <button class="btn-secondary cloud-api-edit-btn" data-endpoint-id="${escapeHtml(e.id)}" type="button">Edit</button>
+                    <button class="btn-secondary cloud-api-delete-btn" data-endpoint-id="${escapeHtml(e.id)}" type="button">Delete</button>
+                </div>
+                <div class="cloud-api-row-test-result hidden" data-endpoint-id="${escapeHtml(e.id)}"></div>
+            </div>
+        `;
+    }).join('');
+
+    list.querySelectorAll('.cloud-api-enabled').forEach((cb) => {
+        cb.addEventListener('change', async (ev) => {
+            const id = ev.target.dataset.endpointId;
+            try {
+                await invoke('set_http_endpoint_enabled', { id, enabled: ev.target.checked });
+            } catch (err) {
+                showToast('Failed to toggle: ' + err, 'error');
+                ev.target.checked = !ev.target.checked;
+            }
+        });
+    });
+    list.querySelectorAll('.cloud-api-test-btn').forEach((b) => {
+        b.addEventListener('click', () => testCloudApi(b.dataset.endpointId));
+    });
+    list.querySelectorAll('.cloud-api-edit-btn').forEach((b) => {
+        b.addEventListener('click', () => openCloudApiModal(b.dataset.endpointId));
+    });
+    list.querySelectorAll('.cloud-api-delete-btn').forEach((b) => {
+        b.addEventListener('click', () => deleteCloudApi(b.dataset.endpointId));
+    });
+}
+
+function describeAuthMethod(am) {
+    if (!am || am === 'None') return 'no auth';
+    if (am === 'BearerToken') return 'Bearer token';
+    if (am.Header) return `Header: ${am.Header.name}`;
+    if (am.QueryParam) return `?${am.QueryParam.name}=…`;
+    if (am.BasicAuth) return `Basic (${am.BasicAuth.user})`;
+    return 'unknown';
+}
+
+async function testCloudApi(id) {
+    const ep = cloudApiEndpoints.find((e) => e.id === id);
+    if (!ep) return;
+    // Pull the preset's test_path when the endpoint matches a preset by
+    // base_url. Many APIs (Open-Meteo, NewsAPI, …) 404 on the base URL
+    // alone; the preset knows a known-safe sample path to hit instead.
+    const matchingPreset = cloudApiPresets.find(
+        (p) => p.base_url === ep.base_url || p.label === ep.name || p.provider === ep.provider,
+    );
+    const defaultPath = matchingPreset?.test_path || '';
+    const path = window.prompt(
+        `Test path for "${ep.name}" (joined to ${ep.base_url}). Leave blank to hit the base URL.`,
+        defaultPath,
+    );
+    // null = user cancelled.
+    if (path === null) return;
+
+    const resultEl = document.querySelector(`.cloud-api-row-test-result[data-endpoint-id="${id}"]`);
+    if (resultEl) {
+        resultEl.classList.remove('hidden');
+        resultEl.textContent = 'Testing…';
+        resultEl.className = 'cloud-api-row-test-result';
+    }
+    try {
+        const res = await invoke('test_http_endpoint', { id, path });
+        if (resultEl) {
+            resultEl.classList.toggle('cloud-api-row-test-ok', !!res.ok);
+            resultEl.classList.toggle('cloud-api-row-test-fail', !res.ok);
+            resultEl.textContent = `HTTP ${res.status} · ${res.latency_ms}ms — ${(res.body_snippet || '').slice(0, 200)}`;
+        }
+    } catch (err) {
+        if (resultEl) {
+            resultEl.classList.add('cloud-api-row-test-fail');
+            resultEl.textContent = `Failed: ${err}`;
+        }
+    }
+}
+
+async function deleteCloudApi(id) {
+    const ep = cloudApiEndpoints.find((e) => e.id === id);
+    if (!ep) return;
+    if (!confirm(`Delete endpoint "${ep.name}"? Its credential will also be removed from the vault.`)) return;
+    try {
+        await invoke('delete_http_endpoint', { id });
+        await loadCloudApis();
+    } catch (err) {
+        showToast('Delete failed: ' + err, 'error');
+    }
+}
+
+// Modal state. `cloudApiEditingId === null` means "create"; otherwise
+// the form is editing an existing row and the credential field's blank
+// value preserves the vault entry.
+let cloudApiEditingId = null;
+
+function openCloudApiModal(id = null) {
+    cloudApiEditingId = id;
+    const overlay = document.getElementById('cloud-api-modal-overlay');
+    if (!overlay) return;
+    const presetSelect = document.getElementById('cloud-api-preset');
+    presetSelect.innerHTML = '<option value="">— Custom (no preset) —</option>'
+        + cloudApiPresets.map((p) =>
+            `<option value="${escapeHtml(p.slug)}">${escapeHtml(p.label)} — ${escapeHtml(p.free_tier_blurb)}</option>`).join('');
+    presetSelect.value = '';
+
+    const form = {
+        name: document.getElementById('cloud-api-name'),
+        provider: document.getElementById('cloud-api-provider'),
+        baseUrl: document.getElementById('cloud-api-base-url'),
+        authKind: document.getElementById('cloud-api-auth-kind'),
+        authParam: document.getElementById('cloud-api-auth-param'),
+        authUser: document.getElementById('cloud-api-auth-user'),
+        credential: document.getElementById('cloud-api-credential'),
+        rateLimit: document.getElementById('cloud-api-rate-limit'),
+        risk: document.getElementById('cloud-api-risk'),
+        notes: document.getElementById('cloud-api-notes'),
+        enabled: document.getElementById('cloud-api-enabled'),
+        title: document.getElementById('cloud-api-modal-title'),
+        signupHint: document.getElementById('cloud-api-signup-hint'),
+        error: document.getElementById('cloud-api-modal-error'),
+    };
+
+    if (id) {
+        const ep = cloudApiEndpoints.find((e) => e.id === id);
+        if (!ep) return;
+        form.title.textContent = `Edit "${ep.name}"`;
+        form.name.value = ep.name;
+        form.provider.value = ep.provider || '';
+        form.baseUrl.value = ep.base_url;
+        applyAuthMethodToForm(form, ep.auth_method);
+        form.credential.value = '';
+        form.credential.placeholder = ep.has_credential
+            ? 'Leave blank to keep existing key'
+            : 'Paste API key';
+        form.rateLimit.value = ep.rate_limit_per_minute || '';
+        form.risk.value = ep.risk_override || '';
+        form.notes.value = ep.notes || '';
+        form.enabled.checked = ep.enabled;
+        form.signupHint.innerHTML = '';
+    } else {
+        form.title.textContent = 'New endpoint';
+        form.name.value = '';
+        form.provider.value = '';
+        form.baseUrl.value = '';
+        applyAuthMethodToForm(form, 'None');
+        form.credential.value = '';
+        form.credential.placeholder = 'Paste API key';
+        form.rateLimit.value = '';
+        form.risk.value = '';
+        form.notes.value = '';
+        form.enabled.checked = true;
+        form.signupHint.innerHTML = '';
+    }
+    form.error.classList.add('hidden');
+    overlay.classList.remove('hidden');
+    setTimeout(() => form.name.focus(), 50);
+}
+
+function closeCloudApiModal() {
+    const overlay = document.getElementById('cloud-api-modal-overlay');
+    if (overlay) overlay.classList.add('hidden');
+    cloudApiEditingId = null;
+}
+
+function applyAuthMethodToForm(form, am) {
+    let kind = 'None';
+    let paramName = '';
+    let user = '';
+    if (am === 'BearerToken') kind = 'BearerToken';
+    else if (am && am.Header) { kind = 'Header'; paramName = am.Header.name; }
+    else if (am && am.QueryParam) { kind = 'QueryParam'; paramName = am.QueryParam.name; }
+    else if (am && am.BasicAuth) { kind = 'BasicAuth'; user = am.BasicAuth.user; }
+    form.authKind.value = kind;
+    form.authParam.value = paramName;
+    form.authUser.value = user;
+    refreshCloudApiAuthFields();
+}
+
+function readAuthMethodFromForm() {
+    const kind = document.getElementById('cloud-api-auth-kind').value;
+    const paramName = document.getElementById('cloud-api-auth-param').value.trim();
+    const user = document.getElementById('cloud-api-auth-user').value.trim();
+    switch (kind) {
+        case 'None': return 'None';
+        case 'BearerToken': return 'BearerToken';
+        case 'Header': return { Header: { name: paramName || 'X-Api-Key' } };
+        case 'QueryParam': return { QueryParam: { name: paramName || 'api_key' } };
+        case 'BasicAuth': return { BasicAuth: { user: user } };
+        default: return 'None';
+    }
+}
+
+function refreshCloudApiAuthFields() {
+    const kind = document.getElementById('cloud-api-auth-kind').value;
+    document.getElementById('cloud-api-auth-param-row').classList.toggle('hidden',
+        kind !== 'Header' && kind !== 'QueryParam');
+    document.getElementById('cloud-api-auth-user-row').classList.toggle('hidden',
+        kind !== 'BasicAuth');
+    document.getElementById('cloud-api-credential-row').classList.toggle('hidden',
+        kind === 'None');
+    const param = document.getElementById('cloud-api-auth-param');
+    if (kind === 'Header') param.placeholder = 'X-Api-Key';
+    else if (kind === 'QueryParam') param.placeholder = 'api_key';
+}
+
+function applyPresetToModal(slug) {
+    const p = cloudApiPresets.find((x) => x.slug === slug);
+    if (!p) return;
+    const form = {
+        name: document.getElementById('cloud-api-name'),
+        provider: document.getElementById('cloud-api-provider'),
+        baseUrl: document.getElementById('cloud-api-base-url'),
+        authKind: document.getElementById('cloud-api-auth-kind'),
+        authParam: document.getElementById('cloud-api-auth-param'),
+        authUser: document.getElementById('cloud-api-auth-user'),
+        rateLimit: document.getElementById('cloud-api-rate-limit'),
+        risk: document.getElementById('cloud-api-risk'),
+        signupHint: document.getElementById('cloud-api-signup-hint'),
+    };
+    if (!form.name.value) form.name.value = p.label;
+    form.provider.value = p.provider;
+    form.baseUrl.value = p.base_url;
+    applyAuthMethodToForm({
+        authKind: form.authKind, authParam: form.authParam, authUser: form.authUser,
+    }, p.auth_method);
+    if (p.default_rate_limit_per_minute) form.rateLimit.value = p.default_rate_limit_per_minute;
+    if (p.suggested_risk) form.risk.value = p.suggested_risk;
+    form.signupHint.innerHTML = `Free tier: ${escapeHtml(p.free_tier_blurb)}. Get a key at <a href="${escapeHtml(p.signup_url)}" target="_blank" rel="noopener">${escapeHtml(p.signup_url)}</a>.`;
+}
+
+async function saveCloudApiModal() {
+    const errorEl = document.getElementById('cloud-api-modal-error');
+    errorEl.classList.add('hidden');
+    const name = document.getElementById('cloud-api-name').value.trim();
+    const baseUrl = document.getElementById('cloud-api-base-url').value.trim();
+    if (!name) { errorEl.textContent = 'Name is required'; errorEl.classList.remove('hidden'); return; }
+    if (!baseUrl) { errorEl.textContent = 'Base URL is required'; errorEl.classList.remove('hidden'); return; }
+
+    const input = {
+        id: cloudApiEditingId || null,
+        name,
+        provider: document.getElementById('cloud-api-provider').value.trim(),
+        base_url: baseUrl,
+        enabled: document.getElementById('cloud-api-enabled').checked,
+        auth_method: readAuthMethodFromForm(),
+        default_headers: [],
+        default_query_params: [],
+        rate_limit_per_minute: parseInt(document.getElementById('cloud-api-rate-limit').value, 10) || 0,
+        risk_override: document.getElementById('cloud-api-risk').value || null,
+        notes: document.getElementById('cloud-api-notes').value.trim() || null,
+        credential: document.getElementById('cloud-api-credential').value || null,
+    };
+    try {
+        await invoke('upsert_http_endpoint', { input });
+        closeCloudApiModal();
+        await loadCloudApis();
+        showToast(cloudApiEditingId ? 'Endpoint updated' : 'Endpoint added', 'success');
+    } catch (err) {
+        errorEl.textContent = String(err);
+        errorEl.classList.remove('hidden');
+    }
+}
+
+function wireCloudApisModal() {
+    const addBtn = document.getElementById('cloud-apis-add-btn');
+    if (addBtn) addBtn.addEventListener('click', () => openCloudApiModal(null));
+    const closeBtn = document.getElementById('cloud-api-modal-close');
+    if (closeBtn) closeBtn.addEventListener('click', closeCloudApiModal);
+    const cancelBtn = document.getElementById('cloud-api-modal-cancel');
+    if (cancelBtn) cancelBtn.addEventListener('click', closeCloudApiModal);
+    const saveBtn = document.getElementById('cloud-api-modal-save');
+    if (saveBtn) saveBtn.addEventListener('click', saveCloudApiModal);
+    const presetSelect = document.getElementById('cloud-api-preset');
+    if (presetSelect) presetSelect.addEventListener('change', (ev) => applyPresetToModal(ev.target.value));
+    const authKind = document.getElementById('cloud-api-auth-kind');
+    if (authKind) authKind.addEventListener('change', refreshCloudApiAuthFields);
+    const overlay = document.getElementById('cloud-api-modal-overlay');
+    if (overlay) overlay.addEventListener('click', (ev) => {
+        if (ev.target === overlay) closeCloudApiModal();
+    });
+}
+
 // ─── Initialize ───
 
 inputEl.focus();
 wireOnboardingButtons();
+wireCloudApisModal();
 initTauri();

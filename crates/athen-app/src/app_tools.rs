@@ -16,20 +16,26 @@ use athen_contacts::ContactStore;
 use athen_core::contact::{Contact, ContactIdentifier, IdentifierKind, TrustLevel};
 use athen_core::error::{AthenError, Result};
 use athen_core::event::AttachmentId;
+use athen_core::http_endpoint::{AuthMethod, RegisteredEndpoint};
 use athen_core::identity::{IdentityEntry, ProfileTag};
 use athen_core::risk::BaseImpact;
 use athen_core::tool::{ToolBackend, ToolDefinition, ToolResult};
+use athen_core::traits::http_endpoint::HttpEndpointStore;
 use athen_core::traits::identity::IdentityStore;
 use athen_core::traits::mcp::McpClient;
 use athen_core::traits::memory::{MemoryItem, MemoryStore};
 use athen_core::traits::tool::ToolRegistry;
+use athen_core::traits::vault::Vault;
 use athen_memory::Memory;
 use athen_persistence::attachments::AttachmentStore;
 use athen_persistence::calendar::{CalendarEvent, CalendarStore, EventCreator};
 use athen_persistence::contacts::SqliteContactStore;
+use athen_persistence::http_endpoints::SqliteHttpEndpointStore;
 use athen_persistence::identity::SqliteIdentityStore;
 
 use crate::file_gate::FileGate;
+use crate::http_rate_limiter::{HttpRateLimiter, RateCheck};
+use crate::vault_creds::endpoint_scope;
 
 /// Prefix MCP-routed tools use to avoid name collisions with built-in tools.
 /// `slack__post_message` resolves to mcp_id="slack", tool="post_message".
@@ -45,6 +51,10 @@ pub struct AppToolRegistry {
     file_gate: Option<Arc<FileGate>>,
     attachments: Option<AttachmentStore>,
     identity: Option<Arc<SqliteIdentityStore>>,
+    http_endpoints: Option<Arc<SqliteHttpEndpointStore>>,
+    vault: Option<Arc<dyn Vault>>,
+    http_rate_limiter: Option<Arc<HttpRateLimiter>>,
+    http_client: Option<reqwest::Client>,
 }
 
 impl AppToolRegistry {
@@ -64,7 +74,29 @@ impl AppToolRegistry {
             file_gate: None,
             attachments: None,
             identity: None,
+            http_endpoints: None,
+            vault: None,
+            http_rate_limiter: None,
+            http_client: None,
         }
+    }
+
+    /// Attach the registered-endpoint store + vault + rate limiter so the
+    /// agent can call `http_request` against any endpoint the user has
+    /// registered. Without all three, the tool refuses with a clear
+    /// error and is not advertised in `list_tools`.
+    pub fn with_http_endpoints(
+        mut self,
+        store: Arc<SqliteHttpEndpointStore>,
+        vault: Arc<dyn Vault>,
+        rate_limiter: Arc<HttpRateLimiter>,
+        client: reqwest::Client,
+    ) -> Self {
+        self.http_endpoints = Some(store);
+        self.vault = Some(vault);
+        self.http_rate_limiter = Some(rate_limiter);
+        self.http_client = Some(client);
+        self
     }
 
     /// Attach the identity store so the agent can call `identity_add` to
@@ -1347,6 +1379,344 @@ impl AppToolRegistry {
             execution_time_ms: elapsed_ms,
         })
     }
+
+    // ── http_request ────────────────────────────────────────────────
+
+    fn http_request_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "endpoint": {
+                    "type": "string",
+                    "description": "Registered endpoint name (case-insensitive). The user manages these in Settings → Cloud APIs."
+                },
+                "method": {
+                    "type": "string",
+                    "enum": ["GET", "POST", "PUT", "DELETE", "PATCH"],
+                    "description": "HTTP method. Defaults to GET. POST/PUT/PATCH/DELETE require user approval by default."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "URL path joined to the endpoint's base_url. May start with '/' or not. May include query string; prefer the structured 'query' object for clarity."
+                },
+                "query": {
+                    "type": "object",
+                    "additionalProperties": { "type": "string" },
+                    "description": "Query-string parameters. Merged with any defaults configured on the endpoint."
+                },
+                "body": {
+                    "description": "Request body (JSON). Only for POST/PUT/PATCH; ignored on GET/DELETE."
+                },
+                "headers": {
+                    "type": "object",
+                    "additionalProperties": { "type": "string" },
+                    "description": "Extra request headers. Merged on top of any defaults configured on the endpoint."
+                }
+            },
+            "required": ["endpoint", "path"]
+        })
+    }
+
+    async fn do_http_request(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let Some(store) = self.http_endpoints.as_ref() else {
+            return Err(AthenError::Other(
+                "http_request: registered-endpoint store is not wired into this agent".to_string(),
+            ));
+        };
+        let Some(vault) = self.vault.as_ref() else {
+            return Err(AthenError::Other(
+                "http_request: vault is not wired into this agent".to_string(),
+            ));
+        };
+        let Some(client) = self.http_client.as_ref() else {
+            return Err(AthenError::Other(
+                "http_request: HTTP client is not wired into this agent".to_string(),
+            ));
+        };
+        let Some(rl) = self.http_rate_limiter.as_ref() else {
+            return Err(AthenError::Other(
+                "http_request: rate limiter is not wired into this agent".to_string(),
+            ));
+        };
+
+        let endpoint_name = args
+            .get("endpoint")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| AthenError::Other("http_request: 'endpoint' is required".to_string()))?;
+
+        let path = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AthenError::Other("http_request: 'path' is required".to_string()))?;
+
+        let method_str = args
+            .get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or("GET")
+            .to_uppercase();
+        let method = reqwest::Method::from_bytes(method_str.as_bytes()).map_err(|_| {
+            AthenError::Other(format!("http_request: invalid method '{method_str}'"))
+        })?;
+
+        let endpoint = store.get_by_name(endpoint_name).await?.ok_or_else(|| {
+            AthenError::Other(format!(
+                "http_request: no registered endpoint named '{endpoint_name}'. \
+                     Ask the user to add one in Settings → Cloud APIs, or list known endpoints."
+            ))
+        })?;
+
+        if !endpoint.enabled {
+            return Err(AthenError::Other(format!(
+                "http_request: endpoint '{}' is disabled",
+                endpoint.name
+            )));
+        }
+
+        // Rate-limit pre-check: refuse before opening a socket if the
+        // configured per-minute cap is exhausted.
+        if let Some(rate) = endpoint.rate_limit {
+            if let RateCheck::Exceeded {
+                recent_calls,
+                limit_per_minute,
+                retry_in_secs,
+            } = rl.check(endpoint.id, rate.requests_per_minute)
+            {
+                return Ok(ToolResult {
+                    success: false,
+                    output: json!({
+                        "error": "rate_limited",
+                        "endpoint": endpoint.name,
+                        "limit_per_minute": limit_per_minute,
+                        "recent_calls": recent_calls,
+                        "retry_in_secs": retry_in_secs,
+                    }),
+                    error: Some(format!(
+                        "Rate limit {limit_per_minute}/min exceeded ({recent_calls} calls in past 60s). \
+                         Try again in {retry_in_secs}s."
+                    )),
+                    execution_time_ms: 0,
+                });
+            }
+        }
+
+        let url = join_base_and_path(&endpoint.base_url, path)?;
+
+        // Start with the endpoint's default headers, then layer per-call
+        // overrides on top so callers can squelch a default by re-setting.
+        let mut header_map = reqwest::header::HeaderMap::new();
+        for (k, v) in &endpoint.default_headers {
+            insert_header(&mut header_map, k, v)?;
+        }
+        if let Some(extra) = args.get("headers").and_then(|v| v.as_object()) {
+            for (k, v) in extra {
+                if let Some(s) = v.as_str() {
+                    insert_header(&mut header_map, k, s)?;
+                }
+            }
+        }
+
+        // Build the full query: defaults + overrides.
+        let mut query: Vec<(String, String)> = endpoint.default_query_params.clone();
+        if let Some(extra) = args.get("query").and_then(|v| v.as_object()) {
+            for (k, v) in extra {
+                if let Some(s) = v.as_str() {
+                    query.push((k.clone(), s.to_string()));
+                }
+            }
+        }
+
+        // Resolve credentials from the vault and inject them into the
+        // appropriate slot (header / query / basic-auth). On failure we
+        // surface a precise message so the user can re-save the key.
+        let scope = endpoint_scope(endpoint.id);
+        let mut basic_auth: Option<(String, String)> = None;
+        match &endpoint.auth_method {
+            AuthMethod::None => {}
+            AuthMethod::BearerToken => {
+                let token = vault
+                    .get(&scope, "token")
+                    .await?
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        AthenError::Other(format!(
+                            "http_request: endpoint '{}' has no bearer token in the vault. \
+                             Open Settings → Cloud APIs to set it.",
+                            endpoint.name
+                        ))
+                    })?;
+                insert_header(&mut header_map, "Authorization", &format!("Bearer {token}"))?;
+            }
+            AuthMethod::Header { name } => {
+                let value = vault
+                    .get(&scope, "value")
+                    .await?
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        AthenError::Other(format!(
+                            "http_request: endpoint '{}' has no header credential in the vault.",
+                            endpoint.name
+                        ))
+                    })?;
+                insert_header(&mut header_map, name, &value)?;
+            }
+            AuthMethod::QueryParam { name } => {
+                let value = vault
+                    .get(&scope, "value")
+                    .await?
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        AthenError::Other(format!(
+                            "http_request: endpoint '{}' has no query-param credential in the vault.",
+                            endpoint.name
+                        ))
+                    })?;
+                query.push((name.clone(), value));
+            }
+            AuthMethod::BasicAuth { user } => {
+                let pass = vault
+                    .get(&scope, "password")
+                    .await?
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        AthenError::Other(format!(
+                            "http_request: endpoint '{}' has no basic-auth password in the vault.",
+                            endpoint.name
+                        ))
+                    })?;
+                basic_auth = Some((user.clone(), pass));
+            }
+        }
+
+        let mut builder = client.request(method.clone(), url).headers(header_map);
+        if !query.is_empty() {
+            builder = builder.query(&query);
+        }
+        if let Some((u, p)) = basic_auth {
+            builder = builder.basic_auth(u, Some(p));
+        }
+        // Body is only meaningful on write methods; reqwest will happily
+        // attach a body to GET, but most APIs ignore or reject it.
+        if matches!(
+            method,
+            reqwest::Method::POST | reqwest::Method::PUT | reqwest::Method::PATCH
+        ) {
+            if let Some(body) = args.get("body") {
+                if !body.is_null() {
+                    builder = builder.json(body);
+                }
+            }
+        }
+
+        let started = Instant::now();
+        let send_result = builder.send().await;
+        // Record the call attempt for the rate limiter regardless of
+        // outcome — quota reflects pressure on the upstream, including
+        // failed attempts.
+        rl.record(endpoint.id);
+
+        let response = match send_result {
+            Ok(r) => r,
+            Err(e) => {
+                let scrubbed = scrub_secret_text(&e.to_string(), &endpoint, vault, &scope).await;
+                return Ok(ToolResult {
+                    success: false,
+                    output: json!({
+                        "error": "request_failed",
+                        "endpoint": endpoint.name,
+                        "detail": scrubbed,
+                    }),
+                    error: Some(scrubbed),
+                    execution_time_ms: started.elapsed().as_millis() as u64,
+                });
+            }
+        };
+
+        let status = response.status();
+        let header_pairs: Vec<(String, String)> = response
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let raw_text = response.text().await.unwrap_or_default();
+
+        let body_value: serde_json::Value = if content_type.contains("application/json") {
+            serde_json::from_str(&raw_text)
+                .unwrap_or_else(|_| json!({ "raw_text": raw_text.clone() }))
+        } else {
+            json!({ "raw_text": raw_text })
+        };
+
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        // Bump the persistent counter — best-effort; a counter blip is
+        // never worth failing a successful HTTP call.
+        if let Err(e) = store.record_call(endpoint.id).await {
+            tracing::warn!(endpoint = %endpoint.name, error = %e, "record_call failed");
+        }
+
+        let success = status.is_success();
+        Ok(ToolResult {
+            success,
+            output: json!({
+                "endpoint": endpoint.name,
+                "status": status.as_u16(),
+                "headers": header_pairs,
+                "body": body_value,
+                "latency_ms": elapsed_ms,
+            }),
+            error: if success {
+                None
+            } else {
+                Some(format!("HTTP {} from '{}'", status.as_u16(), endpoint.name))
+            },
+            execution_time_ms: elapsed_ms,
+        })
+    }
+}
+
+fn join_base_and_path(base: &str, path: &str) -> Result<reqwest::Url> {
+    let parsed = reqwest::Url::parse(base)
+        .map_err(|e| AthenError::Other(format!("http_request: invalid base_url '{base}': {e}")))?;
+    parsed
+        .join(path)
+        .map_err(|e| AthenError::Other(format!("http_request: invalid path '{path}': {e}")))
+}
+
+fn insert_header(map: &mut reqwest::header::HeaderMap, name: &str, value: &str) -> Result<()> {
+    let header_name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+        .map_err(|e| AthenError::Other(format!("http_request: bad header name '{name}': {e}")))?;
+    let header_value = reqwest::header::HeaderValue::from_str(value).map_err(|e| {
+        AthenError::Other(format!("http_request: bad header value for '{name}': {e}"))
+    })?;
+    map.insert(header_name, header_value);
+    Ok(())
+}
+
+/// Replace the stored credential string with `[REDACTED]` anywhere it
+/// appears in `text`. Reads the credential lazily via the vault so this
+/// path is only paid on error. Best-effort: a missing vault entry just
+/// returns the original text.
+async fn scrub_secret_text(
+    text: &str,
+    endpoint: &RegisteredEndpoint,
+    vault: &Arc<dyn Vault>,
+    scope: &str,
+) -> String {
+    let key_opt = endpoint.auth_method.vault_key();
+    let Some(key) = key_opt else {
+        return text.to_string();
+    };
+    match vault.get(scope, key).await {
+        Ok(Some(secret)) if !secret.is_empty() => text.replace(&secret, "[REDACTED]"),
+        _ => text.to_string(),
+    }
 }
 
 fn parse_applies_to_token(tok: &str) -> ProfileTag {
@@ -1464,6 +1834,27 @@ impl ToolRegistry for AppToolRegistry {
                     native: false,
                 },
                 base_risk: BaseImpact::Read,
+            });
+        }
+
+        if self.http_endpoints.is_some()
+            && self.vault.is_some()
+            && self.http_client.is_some()
+            && self.http_rate_limiter.is_some()
+        {
+            tools.push(ToolDefinition {
+                name: "http_request".to_string(),
+                description: "Call a registered cloud HTTP API by name. Prefer bespoke tools (web_fetch, email_send, calendar_*, contacts_*) when one exists — they have richer schemas. Use http_request for less-common APIs the user has registered in Settings → Cloud APIs (Hunter, Brave Search, Open-Meteo, etc.). Returns {endpoint, status, headers, body, latency_ms}. Body is parsed JSON when Content-Type is application/json, else {raw_text: '...'}.".to_string(),
+                parameters: Self::http_request_schema(),
+                backend: ToolBackend::Shell {
+                    command: String::new(),
+                    native: false,
+                },
+                // Per-call risk is derived from method + endpoint at dispatch
+                // time via `endpoint_base_risk`; the registry-level entry
+                // declares a conservative default so risk never under-counts
+                // before the per-call evaluator runs.
+                base_risk: BaseImpact::WritePersist,
             });
         }
 
@@ -1596,6 +1987,7 @@ impl ToolRegistry for AppToolRegistry {
             "read_attachment_full" => self.do_read_attachment_full(&args).await,
             "fetch_attachment" => self.do_fetch_attachment(&args).await,
             "identity_add" => self.do_identity_add(&args).await,
+            "http_request" => self.do_http_request(&args).await,
             _ => self.inner.call_tool(name, args).await,
         }
     }

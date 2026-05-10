@@ -315,6 +315,18 @@ pub struct AppState {
     /// `config.toml` field, so secrets stop appearing on disk in
     /// plaintext after the next save.
     pub vault: Option<Arc<dyn athen_core::traits::vault::Vault>>,
+    /// Registered HTTP endpoints store. Backs the `http_request` agent
+    /// tool and the Settings → Cloud APIs panel. `None` only on test/CLI
+    /// builds without a data dir.
+    pub http_endpoint_store:
+        Option<Arc<athen_persistence::http_endpoints::SqliteHttpEndpointStore>>,
+    /// Process-wide rate limiter for `http_request`. Shared across every
+    /// per-arc registry so per-endpoint per-minute caps are honoured even
+    /// when multiple arcs run concurrently.
+    pub http_rate_limiter: Arc<crate::http_rate_limiter::HttpRateLimiter>,
+    /// Long-lived `reqwest` client used by `http_request` so connection
+    /// pooling survives across arcs and tool calls.
+    pub http_client: reqwest::Client,
 }
 
 impl AppState {
@@ -389,6 +401,17 @@ impl AppState {
         let profile_store = database.as_ref().map(|db| Arc::new(db.profile_store()));
         let identity_store = database.as_ref().map(|db| Arc::new(db.identity_store()));
         let wakeup_store = database.as_ref().map(|db| Arc::new(db.wakeup_store()));
+        let http_endpoint_store = database
+            .as_ref()
+            .map(|db| Arc::new(db.http_endpoint_store()));
+        let http_rate_limiter = Arc::new(crate::http_rate_limiter::HttpRateLimiter::new());
+        // Single reqwest client reused across every per-arc registry —
+        // avoids per-call connection setup cost. Defaults are fine; the
+        // workspace already pins gzip/brotli/deflate + rustls.
+        let http_client = reqwest::Client::builder()
+            .user_agent(concat!("Athen/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         // Build an embedding router for profile routing. Same shape as the
         // memory subsystem's embedder: real providers can be wired later
         // from settings; until then it falls back to keyword embeddings,
@@ -462,6 +485,9 @@ impl AppState {
             web_search,
             email_sender,
             vault,
+            http_endpoint_store,
+            http_rate_limiter,
+            http_client,
         };
 
         if let Err(e) = state.refresh_tools_doc().await {
@@ -541,6 +567,15 @@ impl AppState {
         if let Some(istore) = self.identity_store.clone() {
             registry = registry.with_identity(istore);
         }
+        if let (Some(estore), Some(vault)) = (self.http_endpoint_store.clone(), self.vault.clone())
+        {
+            registry = registry.with_http_endpoints(
+                estore,
+                vault,
+                self.http_rate_limiter.clone(),
+                self.http_client.clone(),
+            );
+        }
         let tools = athen_core::traits::tool::ToolRegistry::list_tools(&registry).await?;
         let written = athen_agent::tools_doc::write_per_group(&dir, &tools).map_err(|e| {
             athen_core::error::AthenError::Other(format!(
@@ -602,6 +637,15 @@ impl AppState {
         }
         if let Some(istore) = self.identity_store.clone() {
             registry = registry.with_identity(istore);
+        }
+        if let (Some(estore), Some(vault)) = (self.http_endpoint_store.clone(), self.vault.clone())
+        {
+            registry = registry.with_http_endpoints(
+                estore,
+                vault,
+                self.http_rate_limiter.clone(),
+                self.http_client.clone(),
+            );
         }
         if let Some(grants) = self.grant_store.clone() {
             let mut gate = crate::file_gate::FileGate::new(
@@ -1104,6 +1148,10 @@ impl AppState {
         let web_search_ref = Arc::clone(&self.web_search);
         let email_sender_ref = self.email_sender.clone();
         let telegram_outbound_hint_ref = self.telegram_outbound_hint.clone();
+        let http_endpoint_store_ref = self.http_endpoint_store.clone();
+        let vault_ref = self.vault.clone();
+        let http_rate_limiter_ref = self.http_rate_limiter.clone();
+        let http_client_ref = self.http_client.clone();
 
         tauri::async_runtime::spawn(async move {
             if let Err(e) = monitor.init(&telegram_config).await {
@@ -1186,6 +1234,10 @@ impl AppState {
                                     let approval_router_c = approval_router_ref.clone();
                                     let web_search_c = Arc::clone(&web_search_ref);
                                     let email_sender_c = email_sender_ref.clone();
+                                    let http_endpoint_store_c = http_endpoint_store_ref.clone();
+                                    let vault_c = vault_ref.clone();
+                                    let http_rate_limiter_c = Arc::clone(&http_rate_limiter_ref);
+                                    let http_client_c = http_client_ref.clone();
                                     let telegram_outbound_hint_c =
                                         telegram_outbound_hint_ref.clone();
                                     let event_id = event.id;
@@ -1219,6 +1271,10 @@ impl AppState {
                                             &web_search_c,
                                             &email_sender_c,
                                             &telegram_outbound_hint_c,
+                                            http_endpoint_store_c.as_ref(),
+                                            vault_c.as_ref(),
+                                            &http_rate_limiter_c,
+                                            &http_client_c,
                                         )
                                         .await;
                                     });
@@ -1633,6 +1689,10 @@ async fn execute_owner_telegram_message(
     web_search: &Arc<dyn WebSearchProvider>,
     email_sender: &Option<Arc<dyn athen_core::traits::email_sender::EmailSender>>,
     telegram_outbound_hint: &crate::notifier::TelegramOutboundHint,
+    http_endpoint_store: Option<&Arc<athen_persistence::http_endpoints::SqliteHttpEndpointStore>>,
+    vault: Option<&Arc<dyn athen_core::traits::vault::Vault>>,
+    http_rate_limiter: &Arc<crate::http_rate_limiter::HttpRateLimiter>,
+    http_client: &reqwest::Client,
 ) {
     use std::time::Duration;
 
@@ -1957,6 +2017,14 @@ async fn execute_owner_telegram_message(
     }
     if let Some(istore) = identity_store.clone() {
         registry = registry.with_identity(istore);
+    }
+    if let (Some(estore), Some(v)) = (http_endpoint_store, vault) {
+        registry = registry.with_http_endpoints(
+            estore.clone(),
+            v.clone(),
+            http_rate_limiter.clone(),
+            http_client.clone(),
+        );
     }
     if let (Some(store), Some(arc_id_str)) = (grant_store, target_arc_id.as_ref()) {
         let mut gate = crate::file_gate::FileGate::new(

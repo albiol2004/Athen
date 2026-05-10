@@ -34,6 +34,13 @@ pub fn provider_scope(provider_id: &str) -> String {
     format!("{SCOPE_PROVIDER}:{provider_id}")
 }
 
+/// Per-registered-HTTP-endpoint scope used by the `http_request` tool:
+/// `endpoint:<uuid>`. The UUID (not the human name) is the stable key so
+/// renaming an endpoint in the UI doesn't strand its credential.
+pub fn endpoint_scope(endpoint_id: uuid::Uuid) -> String {
+    format!("endpoint:{endpoint_id}")
+}
+
 /// Patch every credential field in `config` from the vault.
 ///
 /// For each known secret, if the vault holds a non-empty value it

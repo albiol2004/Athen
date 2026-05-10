@@ -4,6 +4,7 @@ pub mod compaction;
 pub mod coordinator;
 pub mod email_sender;
 pub mod embedding;
+pub mod http_endpoint;
 pub mod identity;
 pub mod llm;
 pub mod mcp;
