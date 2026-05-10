@@ -327,6 +327,14 @@ pub struct AppState {
     /// Long-lived `reqwest` client used by `http_request` so connection
     /// pooling survives across arcs and tool calls.
     pub http_client: reqwest::Client,
+    /// Path to the auto-generated `cloud_apis.md` catalogue. Rendered
+    /// from the registered-endpoint store + preset library so the agent
+    /// can `read` it on demand to discover what endpoints exist, what
+    /// auth shape each takes, and a sample path. The `http_request`
+    /// tool description carries a one-line pointer at this file so
+    /// the agent doesn't try blindly. Refreshed at startup and after
+    /// every endpoint mutation.
+    pub cloud_apis_doc_path: Option<std::path::PathBuf>,
 }
 
 impl AppState {
@@ -412,6 +420,10 @@ impl AppState {
             .user_agent(concat!("Athen/", env!("CARGO_PKG_VERSION")))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
+        // Sit alongside `tools/`, NOT inside it — `write_per_group`
+        // sweeps stray .md files out of the tools dir on every refresh,
+        // which would nuke a sibling endpoint catalogue.
+        let cloud_apis_doc_path = ensure_data_dir().map(|d| d.join("cloud_apis.md"));
         // Build an embedding router for profile routing. Same shape as the
         // memory subsystem's embedder: real providers can be wired later
         // from settings; until then it falls back to keyword embeddings,
@@ -488,10 +500,14 @@ impl AppState {
             http_endpoint_store,
             http_rate_limiter,
             http_client,
+            cloud_apis_doc_path,
         };
 
         if let Err(e) = state.refresh_tools_doc().await {
             warn!("Failed to write initial per-group tool docs: {e}");
+        }
+        if let Err(e) = state.refresh_cloud_apis_doc().await {
+            warn!("Failed to write initial cloud_apis catalogue: {e}");
         }
 
         state
@@ -574,6 +590,7 @@ impl AppState {
                 vault,
                 self.http_rate_limiter.clone(),
                 self.http_client.clone(),
+                self.cloud_apis_doc_path.clone(),
             );
         }
         let tools = athen_core::traits::tool::ToolRegistry::list_tools(&registry).await?;
@@ -588,6 +605,87 @@ impl AppState {
             written.len(),
             dir.display()
         );
+        Ok(())
+    }
+
+    /// Refresh the registered-endpoint reference docs.
+    ///
+    /// Two-tier shape — same idea as `tools/<group>.md`:
+    /// - `<data_dir>/cloud_apis.md` is a small INDEX. One line per
+    ///   endpoint with name + one-liner + path to its detail file.
+    /// - `<data_dir>/cloud_apis/<slug>.md` is the per-endpoint DETAIL
+    ///   (auth shape, sample paths, free-tier blurb, notes). The agent
+    ///   reads only the file it needs.
+    ///
+    /// Stale detail files (whose endpoint was deleted) are swept on
+    /// every call so renames don't leave orphans.
+    pub async fn refresh_cloud_apis_doc(&self) -> athen_core::error::Result<()> {
+        use athen_core::traits::http_endpoint::HttpEndpointStore;
+        let Some(index_path) = self.cloud_apis_doc_path.clone() else {
+            return Ok(());
+        };
+        let Some(store) = self.http_endpoint_store.clone() else {
+            return Ok(());
+        };
+        let endpoints = store.list().await?;
+        let presets = crate::http_presets::presets();
+        let detail_dir = match index_path.parent() {
+            Some(p) => p.join("cloud_apis"),
+            None => return Ok(()),
+        };
+        if let Err(e) = std::fs::create_dir_all(&detail_dir) {
+            warn!(
+                "Failed to create cloud_apis detail dir {}: {e}",
+                detail_dir.display()
+            );
+            return Ok(());
+        }
+
+        // Detail files keyed by sanitized endpoint name. Track which we
+        // wrote this run so stale ones can be removed.
+        let mut current_files: std::collections::HashSet<std::path::PathBuf> =
+            std::collections::HashSet::new();
+        let mut index_rows: Vec<(String, String, std::path::PathBuf)> =
+            Vec::with_capacity(endpoints.len());
+        for ep in &endpoints {
+            let slug = sanitize_endpoint_filename(&ep.name);
+            let detail_path = detail_dir.join(format!("{slug}.md"));
+            let preset = presets
+                .iter()
+                .find(|p| p.base_url == ep.base_url || p.label == ep.name);
+            let detail = render_endpoint_detail(ep, preset);
+            if let Err(e) = std::fs::write(&detail_path, detail) {
+                warn!(
+                    "Failed to write {} detail to {}: {e}",
+                    ep.name,
+                    detail_path.display()
+                );
+                continue;
+            }
+            current_files.insert(detail_path.clone());
+            let one_liner = endpoint_one_liner(ep, preset);
+            index_rows.push((ep.name.clone(), one_liner, detail_path));
+        }
+
+        // Sweep stray detail files (renamed / deleted endpoints).
+        if let Ok(entries) = std::fs::read_dir(&detail_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().and_then(|s| s.to_str()) == Some("md")
+                    && !current_files.contains(&p)
+                {
+                    let _ = std::fs::remove_file(p);
+                }
+            }
+        }
+
+        let index = render_cloud_apis_index(&index_rows);
+        if let Err(e) = std::fs::write(&index_path, index) {
+            warn!(
+                "Failed to write cloud_apis index to {}: {e}",
+                index_path.display()
+            );
+        }
         Ok(())
     }
 
@@ -645,6 +743,7 @@ impl AppState {
                 vault,
                 self.http_rate_limiter.clone(),
                 self.http_client.clone(),
+                self.cloud_apis_doc_path.clone(),
             );
         }
         if let Some(grants) = self.grant_store.clone() {
@@ -1152,6 +1251,7 @@ impl AppState {
         let vault_ref = self.vault.clone();
         let http_rate_limiter_ref = self.http_rate_limiter.clone();
         let http_client_ref = self.http_client.clone();
+        let cloud_apis_doc_path_ref = self.cloud_apis_doc_path.clone();
 
         tauri::async_runtime::spawn(async move {
             if let Err(e) = monitor.init(&telegram_config).await {
@@ -1238,6 +1338,7 @@ impl AppState {
                                     let vault_c = vault_ref.clone();
                                     let http_rate_limiter_c = Arc::clone(&http_rate_limiter_ref);
                                     let http_client_c = http_client_ref.clone();
+                                    let cloud_apis_doc_path_c = cloud_apis_doc_path_ref.clone();
                                     let telegram_outbound_hint_c =
                                         telegram_outbound_hint_ref.clone();
                                     let event_id = event.id;
@@ -1275,6 +1376,7 @@ impl AppState {
                                             vault_c.as_ref(),
                                             &http_rate_limiter_c,
                                             &http_client_c,
+                                            cloud_apis_doc_path_c.as_ref(),
                                         )
                                         .await;
                                     });
@@ -1693,6 +1795,7 @@ async fn execute_owner_telegram_message(
     vault: Option<&Arc<dyn athen_core::traits::vault::Vault>>,
     http_rate_limiter: &Arc<crate::http_rate_limiter::HttpRateLimiter>,
     http_client: &reqwest::Client,
+    cloud_apis_doc_path: Option<&std::path::PathBuf>,
 ) {
     use std::time::Duration;
 
@@ -2024,6 +2127,7 @@ async fn execute_owner_telegram_message(
             v.clone(),
             http_rate_limiter.clone(),
             http_client.clone(),
+            cloud_apis_doc_path.cloned(),
         );
     }
     if let (Some(store), Some(arc_id_str)) = (grant_store, target_arc_id.as_ref()) {
@@ -3029,6 +3133,152 @@ async fn build_memory(
 
     info!("Memory system initialized with SQLite persistence");
     Some(Arc::new(memory))
+}
+
+/// Sanitize an endpoint name for use as a filename. Lowercase, ASCII
+/// alphanumerics + `_`. Empty result falls back to `endpoint` so we
+/// never write an unnamed file.
+fn sanitize_endpoint_filename(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    let trimmed = out.trim_matches('_').to_string();
+    if trimmed.is_empty() {
+        "endpoint".to_string()
+    } else {
+        trimmed
+    }
+}
+
+fn auth_method_short(am: &athen_core::http_endpoint::AuthMethod) -> String {
+    use athen_core::http_endpoint::AuthMethod as A;
+    match am {
+        A::None => "no auth".to_string(),
+        A::BearerToken => "Bearer token".to_string(),
+        A::Header { name } => format!("header `{name}`"),
+        A::QueryParam { name } => format!("query param `{name}`"),
+        A::BasicAuth { user } => format!("basic auth (user `{user}`)"),
+    }
+}
+
+/// One-line summary used in the index. Pulls the preset's blurb when
+/// available so the agent gets a shape hint without reading the detail.
+fn endpoint_one_liner(
+    ep: &athen_core::http_endpoint::RegisteredEndpoint,
+    preset: Option<&crate::http_presets::EndpointPreset>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(auth_method_short(&ep.auth_method));
+    if let Some(p) = preset {
+        parts.push(p.free_tier_blurb.to_string());
+    }
+    if let Some(notes) = &ep.notes {
+        if !notes.is_empty() {
+            parts.push(notes.clone());
+        }
+    }
+    if !ep.enabled {
+        parts.push("DISABLED".to_string());
+    }
+    parts.join(" — ")
+}
+
+fn render_cloud_apis_index(rows: &[(String, String, std::path::PathBuf)]) -> String {
+    let mut out = String::new();
+    out.push_str("# Registered HTTP endpoints (`http_request`)\n\n");
+    if rows.is_empty() {
+        out.push_str(
+            "No endpoints registered. The user manages this list in \
+             Settings → Cloud APIs. Until at least one is registered, \
+             the `http_request` tool has nothing to call.\n",
+        );
+        return out;
+    }
+    out.push_str(
+        "Index of every endpoint Athen can reach via `http_request`. \
+         For the full per-endpoint usage (sample paths, auth specifics, \
+         free-tier limits), `read` the linked detail file — they are \
+         tiny so reads stay cheap.\n\n",
+    );
+    for (name, blurb, path) in rows {
+        out.push_str(&format!(
+            "- **{name}** — {blurb}\n  Detail: `{}`\n",
+            path.display()
+        ));
+    }
+    out.push('\n');
+    out.push_str(
+        "Call shape: `http_request(endpoint=\"<name>\", path=\"<rest>\", \
+         method=\"GET\"|\"POST\"|...)`. The path is joined onto the \
+         endpoint's base_url; query parameters can ride in `path` or \
+         in a structured `query` object.\n",
+    );
+    out
+}
+
+fn render_endpoint_detail(
+    ep: &athen_core::http_endpoint::RegisteredEndpoint,
+    preset: Option<&crate::http_presets::EndpointPreset>,
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("# {}\n\n", ep.name));
+    out.push_str(&format!("Provider: {}\n\n", ep.provider));
+    out.push_str(&format!("Base URL: `{}`\n\n", ep.base_url));
+    out.push_str(&format!("Auth: {}\n\n", auth_method_short(&ep.auth_method)));
+    if !ep.enabled {
+        out.push_str("⚠ Endpoint is currently DISABLED — calls will refuse.\n\n");
+    }
+    if let Some(p) = preset {
+        out.push_str(&format!("Free tier: {}\n\n", p.free_tier_blurb));
+        out.push_str(&format!("Sign-up / docs: {}\n\n", p.signup_url));
+        if !p.test_path.is_empty() {
+            out.push_str("## Sample call\n\n```json\n");
+            out.push_str(
+                &serde_json::to_string_pretty(&serde_json::json!({
+                    "endpoint": ep.name,
+                    "method": "GET",
+                    "path": p.test_path,
+                }))
+                .unwrap_or_default(),
+            );
+            out.push_str("\n```\n\n");
+        }
+    }
+    if let Some(notes) = &ep.notes {
+        if !notes.is_empty() {
+            out.push_str("## Notes\n\n");
+            out.push_str(notes);
+            out.push_str("\n\n");
+        }
+    }
+    if !ep.default_headers.is_empty() {
+        out.push_str("## Default headers (sent on every call)\n\n");
+        for (k, v) in &ep.default_headers {
+            out.push_str(&format!("- `{k}: {v}`\n"));
+        }
+        out.push('\n');
+    }
+    if !ep.default_query_params.is_empty() {
+        out.push_str("## Default query params (sent on every call)\n\n");
+        for (k, v) in &ep.default_query_params {
+            out.push_str(&format!("- `{k}={v}`\n"));
+        }
+        out.push('\n');
+    }
+    if let Some(rl) = ep.rate_limit {
+        if rl.requests_per_minute > 0 {
+            out.push_str(&format!(
+                "Rate limit: {} req/min (in-process; exceeding returns a structured `rate_limited` error).\n\n",
+                rl.requests_per_minute
+            ));
+        }
+    }
+    out
 }
 
 #[cfg(test)]

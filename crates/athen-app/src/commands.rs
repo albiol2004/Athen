@@ -4308,6 +4308,7 @@ pub async fn upsert_http_endpoint(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "Endpoint missing after save".to_string())?;
     let has_cred = endpoint_has_credential(vault, &loaded).await;
+    let _ = state.refresh_cloud_apis_doc().await;
     Ok(endpoint_to_wire(loaded, has_cred))
 }
 
@@ -4333,7 +4334,9 @@ pub async fn delete_http_endpoint(
             }
         }
     }
-    store.delete(uuid).await.map_err(|e| e.to_string())
+    store.delete(uuid).await.map_err(|e| e.to_string())?;
+    let _ = state.refresh_cloud_apis_doc().await;
+    Ok(())
 }
 
 /// Toggle the enabled flag without re-sending the whole row.
@@ -4351,7 +4354,9 @@ pub async fn set_http_endpoint_enabled(
     store
         .set_enabled(uuid, enabled)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    let _ = state.refresh_cloud_apis_doc().await;
+    Ok(())
 }
 
 /// Smoke-test a registered endpoint by issuing a GET against the

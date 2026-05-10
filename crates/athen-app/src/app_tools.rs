@@ -55,6 +55,10 @@ pub struct AppToolRegistry {
     vault: Option<Arc<dyn Vault>>,
     http_rate_limiter: Option<Arc<HttpRateLimiter>>,
     http_client: Option<reqwest::Client>,
+    /// Path to the auto-generated `cloud_apis.md` index. When present,
+    /// the `http_request` tool description points the agent at it so
+    /// they can read the endpoint catalogue on demand.
+    cloud_apis_doc_path: Option<std::path::PathBuf>,
 }
 
 impl AppToolRegistry {
@@ -78,6 +82,7 @@ impl AppToolRegistry {
             vault: None,
             http_rate_limiter: None,
             http_client: None,
+            cloud_apis_doc_path: None,
         }
     }
 
@@ -91,11 +96,13 @@ impl AppToolRegistry {
         vault: Arc<dyn Vault>,
         rate_limiter: Arc<HttpRateLimiter>,
         client: reqwest::Client,
+        cloud_apis_doc_path: Option<std::path::PathBuf>,
     ) -> Self {
         self.http_endpoints = Some(store);
         self.vault = Some(vault);
         self.http_rate_limiter = Some(rate_limiter);
         self.http_client = Some(client);
+        self.cloud_apis_doc_path = cloud_apis_doc_path;
         self
     }
 
@@ -1645,14 +1652,44 @@ impl AppToolRegistry {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let raw_text = response.text().await.unwrap_or_default();
-
-        let body_value: serde_json::Value = if content_type.contains("application/json") {
-            serde_json::from_str(&raw_text)
-                .unwrap_or_else(|_| json!({ "raw_text": raw_text.clone() }))
-        } else {
-            json!({ "raw_text": raw_text })
+        // Pull bytes first so we always have a length, then decode UTF-8
+        // with replacement so a single bad sequence doesn't blank the
+        // body. The previous `.text().unwrap_or_default()` was the source
+        // of empty-body reports — a decompression error or invalid UTF-8
+        // silently coerced to "".
+        let bytes = match response.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                let msg = format!("Body read failed: {e}");
+                let scrubbed = scrub_secret_text(&msg, &endpoint, vault, &scope).await;
+                return Ok(ToolResult {
+                    success: false,
+                    output: json!({
+                        "error": "body_read_failed",
+                        "endpoint": endpoint.name,
+                        "status": status.as_u16(),
+                        "detail": scrubbed,
+                    }),
+                    error: Some(scrubbed),
+                    execution_time_ms: started.elapsed().as_millis() as u64,
+                });
+            }
         };
+        let body_bytes = bytes.len();
+        let raw_text = String::from_utf8_lossy(&bytes).into_owned();
+
+        let body_value: serde_json::Value =
+            if content_type.contains("application/json") && !raw_text.is_empty() {
+                match serde_json::from_str::<serde_json::Value>(&raw_text) {
+                    Ok(v) => v,
+                    Err(e) => json!({
+                        "parse_error": e.to_string(),
+                        "raw_text": raw_text.clone(),
+                    }),
+                }
+            } else {
+                json!({ "raw_text": raw_text })
+            };
 
         let elapsed_ms = started.elapsed().as_millis() as u64;
         // Bump the persistent counter — best-effort; a counter blip is
@@ -1669,6 +1706,8 @@ impl AppToolRegistry {
                 "status": status.as_u16(),
                 "headers": header_pairs,
                 "body": body_value,
+                "body_bytes": body_bytes,
+                "content_type": content_type,
                 "latency_ms": elapsed_ms,
             }),
             error: if success {
@@ -1842,18 +1881,32 @@ impl ToolRegistry for AppToolRegistry {
             && self.http_client.is_some()
             && self.http_rate_limiter.is_some()
         {
+            // Bake the doc path into the description so the agent can
+            // discover endpoints on demand without flooding the prompt.
+            // Tier-2 chain: this description (in `tools/http.md`) →
+            // index at `cloud_apis.md` → per-endpoint detail under
+            // `cloud_apis/<name>.md`.
+            let doc_pointer = match &self.cloud_apis_doc_path {
+                Some(p) => format!(
+                    " To discover what endpoints are registered (and the per-endpoint sample paths, auth specifics, free-tier limits, notes), `read` the index at `{}` first — it lists every endpoint with a one-liner and a path to its tiny per-endpoint detail file. Read ONE detail file when you actually need to call that endpoint, not all of them.",
+                    p.display()
+                ),
+                None => String::new(),
+            };
             tools.push(ToolDefinition {
                 name: "http_request".to_string(),
-                description: "Call a registered cloud HTTP API by name. Prefer bespoke tools (web_fetch, email_send, calendar_*, contacts_*) when one exists — they have richer schemas. Use http_request for less-common APIs the user has registered in Settings → Cloud APIs (Hunter, Brave Search, Open-Meteo, etc.). Returns {endpoint, status, headers, body, latency_ms}. Body is parsed JSON when Content-Type is application/json, else {raw_text: '...'}.".to_string(),
+                description: format!(
+                    "Call a registered cloud HTTP API by name. Prefer bespoke tools (web_fetch, email_send, calendar_*, contacts_*) when one exists — they have richer schemas. Use http_request for less-common APIs the user has registered in Settings → Cloud APIs (Hunter, Brave Search, Open-Meteo, etc.). Returns {{endpoint, status, headers, body, body_bytes, content_type, latency_ms}}. Body is parsed JSON when Content-Type is application/json, else {{raw_text: '...'}}.{doc_pointer}"
+                ),
                 parameters: Self::http_request_schema(),
                 backend: ToolBackend::Shell {
                     command: String::new(),
                     native: false,
                 },
-                // Per-call risk is derived from method + endpoint at dispatch
-                // time via `endpoint_base_risk`; the registry-level entry
-                // declares a conservative default so risk never under-counts
-                // before the per-call evaluator runs.
+                // Per-call risk derivation by HTTP method + endpoint
+                // risk_override is a follow-up. Today every http_request
+                // call gets the same conservative WritePersist budget so
+                // risk never under-counts.
                 base_risk: BaseImpact::WritePersist,
             });
         }
