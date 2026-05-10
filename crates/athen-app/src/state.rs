@@ -372,7 +372,7 @@ impl AppState {
         let (active_arc_id, history) = restore_or_create_arc(&arc_store).await;
 
         // Build persistent memory (vector search + knowledge graph).
-        let memory = build_memory(&router).await;
+        let memory = build_memory(&router, &config.embeddings).await;
 
         // Build the MCP registry and load persisted enabled state.
         let mcp = Arc::new(McpRegistry::new());
@@ -394,7 +394,7 @@ impl AppState {
         // from settings; until then it falls back to keyword embeddings,
         // which still produce a usable cosine signal across short strings.
         let profile_embedder: Arc<dyn athen_core::traits::embedding::EmbeddingProvider> =
-            Arc::new(athen_llm::embeddings::router::EmbeddingRouter::new(vec![]));
+            Arc::new(build_embedding_router(&config.embeddings));
         let profile_embedding_cache = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         let pending_grants = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let spawned_processes: athen_agent::SpawnedProcessMap =
@@ -2513,6 +2513,125 @@ fn build_router_for_provider_from_config(
     (router, model)
 }
 
+/// Build an `EmbeddingRouter` from `config.embeddings`.
+///
+/// Mode behaviour:
+/// - `Off` → empty router, keyword fallback only.
+/// - `LocalOnly` → Ollama provider (default model `nomic-embed-text`,
+///   default host `http://localhost:11434`).
+/// - `Cloud` → OpenAI-compatible provider with the configured api_key,
+///   defaulting to OpenAI's endpoint and `text-embedding-3-small` if
+///   the user didn't override `base_url` / `model`.
+/// - `Specific` → uses `cfg.provider` to pick (`"ollama"` →
+///   OllamaEmbedding, anything else → OpenAiEmbedding::compatible).
+/// - `Automatic` → opportunistic: build providers from any populated
+///   field, with Ollama probed first via `is_available`. If nothing
+///   configured, falls through to keyword.
+fn build_embedding_router(
+    cfg: &athen_core::config::EmbeddingConfig,
+) -> athen_llm::embeddings::router::EmbeddingRouter {
+    use athen_core::config::EmbeddingMode;
+    use athen_core::traits::embedding::EmbeddingProvider;
+    use athen_llm::embeddings::ollama::OllamaEmbedding;
+    use athen_llm::embeddings::openai::OpenAiEmbedding;
+    use athen_llm::embeddings::router::EmbeddingRouter;
+
+    let mut providers: Vec<Box<dyn EmbeddingProvider>> = Vec::new();
+
+    let model_or = |default: &str| -> String {
+        cfg.model
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| default.to_string())
+    };
+
+    match cfg.mode {
+        EmbeddingMode::Off => {
+            info!("Embeddings: mode=Off, keyword fallback only");
+        }
+        EmbeddingMode::LocalOnly => {
+            let model = model_or("nomic-embed-text");
+            let mut p = OllamaEmbedding::new(&model);
+            if let Some(url) = cfg.base_url.as_deref().filter(|s| !s.is_empty()) {
+                p = p.with_base_url(url);
+            }
+            info!(model = %model, "Embeddings: LocalOnly via Ollama");
+            providers.push(Box::new(p));
+        }
+        EmbeddingMode::Cloud => {
+            let key = cfg.api_key.as_deref().unwrap_or("");
+            if key.is_empty() {
+                warn!("Embeddings: Cloud mode but no api_key set; falling back to keyword");
+            } else {
+                let mut p = match cfg.base_url.as_deref().filter(|s| !s.is_empty()) {
+                    Some(url) => OpenAiEmbedding::compatible(url).with_api_key(key),
+                    None => OpenAiEmbedding::openai(key),
+                };
+                if let Some(m) = cfg.model.as_deref().filter(|s| !s.is_empty()) {
+                    p = p.with_model(m);
+                }
+                info!("Embeddings: Cloud via OpenAI-compatible");
+                providers.push(Box::new(p));
+            }
+        }
+        EmbeddingMode::Specific => match cfg.provider.as_deref() {
+            Some("ollama") => {
+                let model = model_or("nomic-embed-text");
+                let mut p = OllamaEmbedding::new(&model);
+                if let Some(url) = cfg.base_url.as_deref().filter(|s| !s.is_empty()) {
+                    p = p.with_base_url(url);
+                }
+                info!(model = %model, "Embeddings: Specific=ollama");
+                providers.push(Box::new(p));
+            }
+            Some(other) => {
+                let url = cfg
+                    .base_url
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("http://localhost:8080");
+                let mut p = OpenAiEmbedding::compatible(url).with_provider_id(other);
+                if let Some(m) = cfg.model.as_deref().filter(|s| !s.is_empty()) {
+                    p = p.with_model(m);
+                }
+                if let Some(k) = cfg.api_key.as_deref().filter(|s| !s.is_empty()) {
+                    p = p.with_api_key(k);
+                }
+                info!(provider = %other, base_url = %url, "Embeddings: Specific OpenAI-compatible");
+                providers.push(Box::new(p));
+            }
+            None => {
+                warn!("Embeddings: Specific mode but no provider id; falling back to keyword");
+            }
+        },
+        EmbeddingMode::Automatic => {
+            // Try Ollama at the default endpoint first. is_available()
+            // pings /api/tags and returns false fast when nothing's
+            // listening, so this is cheap. Cloud requires explicit
+            // api_key so we don't surprise users with outbound calls.
+            let model = model_or("nomic-embed-text");
+            let ollama = OllamaEmbedding::new(&model);
+            providers.push(Box::new(ollama));
+            if let Some(key) = cfg.api_key.as_deref().filter(|s| !s.is_empty()) {
+                let mut p = match cfg.base_url.as_deref().filter(|s| !s.is_empty()) {
+                    Some(url) => OpenAiEmbedding::compatible(url).with_api_key(key),
+                    None => OpenAiEmbedding::openai(key),
+                };
+                if let Some(m) = cfg.model.as_deref().filter(|s| !s.is_empty()) {
+                    p = p.with_model(m);
+                }
+                providers.push(Box::new(p));
+            }
+            info!(
+                provider_count = providers.len(),
+                "Embeddings: Automatic — Ollama first then keyword"
+            );
+        }
+    }
+
+    EmbeddingRouter::new(providers)
+}
+
 /// Default base URL for known provider IDs.
 fn default_base_url_for(id: &str) -> &str {
     match id {
@@ -2781,8 +2900,10 @@ async fn restore_enabled_mcps(registry: &Arc<McpRegistry>, store: &McpStore) -> 
 /// Uses keyword embeddings as fallback (always available, near-instant)
 /// and an LLM entity extractor for automatic knowledge graph population.
 /// Returns `None` if the data directory or database cannot be opened.
-async fn build_memory(router: &Arc<RwLock<Arc<DefaultLlmRouter>>>) -> Option<Arc<Memory>> {
-    use athen_llm::embeddings::router::EmbeddingRouter;
+async fn build_memory(
+    router: &Arc<RwLock<Arc<DefaultLlmRouter>>>,
+    embeddings: &athen_core::config::EmbeddingConfig,
+) -> Option<Arc<Memory>> {
     use athen_memory::extractor::LlmEntityExtractor;
     use athen_memory::sqlite::{SqliteGraph, SqliteVectorIndex};
 
@@ -2825,8 +2946,10 @@ async fn build_memory(router: &Arc<RwLock<Arc<DefaultLlmRouter>>>) -> Option<Arc
         }
     };
 
-    // Use keyword embeddings as the default fallback (always available).
-    let embedding_router = EmbeddingRouter::new(vec![]);
+    // Build the embedding router from config — when no neural provider
+    // is configured this collapses to the keyword fallback inside
+    // `EmbeddingRouter::resolve`.
+    let embedding_router = build_embedding_router(embeddings);
     // LLM entity extractor for automatic knowledge graph population.
     let extractor_router: Box<dyn LlmRouter> = Box::new(SharedRouter(Arc::clone(router)));
     let extractor = LlmEntityExtractor::new(extractor_router);

@@ -21,6 +21,7 @@ pub const SCOPE_EMAIL_SMTP: &str = "email:smtp";
 pub const SCOPE_TELEGRAM: &str = "telegram";
 pub const SCOPE_WEBSEARCH_BRAVE: &str = "websearch:brave";
 pub const SCOPE_WEBSEARCH_TAVILY: &str = "websearch:tavily";
+pub const SCOPE_EMBEDDING: &str = "embedding";
 
 pub const KEY_API_KEY: &str = "api_key";
 pub const KEY_PASSWORD: &str = "password";
@@ -82,6 +83,12 @@ pub async fn hydrate_secrets_from_vault(
     if let Ok(Some(key)) = v.get(SCOPE_WEBSEARCH_TAVILY, KEY_API_KEY).await {
         if !key.is_empty() {
             config.web_search.tavily_api_key = key;
+        }
+    }
+    // Embedding api_key (cloud-mode OpenAI-compatible provider).
+    if let Ok(Some(key)) = v.get(SCOPE_EMBEDDING, KEY_API_KEY).await {
+        if !key.is_empty() {
+            config.embeddings.api_key = Some(key);
         }
     }
     // Per-provider api_keys. Walk every provider in models.providers and

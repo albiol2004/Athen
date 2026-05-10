@@ -2143,13 +2143,14 @@ pub async fn save_notification_settings(
 /// Save embedding / memory provider settings.
 #[tauri::command]
 pub async fn save_embedding_settings(
-    _state: State<'_, AppState>,
+    state: State<'_, AppState>,
     mode: String,
     provider: Option<String>,
     model: Option<String>,
     base_url: Option<String>,
     api_key: Option<String>,
 ) -> std::result::Result<String, String> {
+    use crate::vault_creds::{KEY_API_KEY, SCOPE_EMBEDDING};
     let mut config = load_main_config();
 
     config.embeddings.mode = match mode.as_str() {
@@ -2164,16 +2165,47 @@ pub async fn save_embedding_settings(
     config.embeddings.model = model.filter(|s| !s.is_empty());
     config.embeddings.base_url = base_url.filter(|s| !s.is_empty());
 
-    // API key handling: None preserves existing, Some("") removes, Some("sk-...") updates.
-    match api_key {
-        Some(key) if key.is_empty() => {
+    // API key handling: vault-backed when wired, plaintext fallback
+    // otherwise. Same migrate-on-Save discipline as the other secrets:
+    // an explicit value writes to vault and blanks the disk; an empty
+    // string deletes; absent + lingering plaintext triggers an
+    // opportunistic migration so the user doesn't have to retype.
+    match (api_key, state.vault.as_ref()) {
+        (Some(key), _) if key.is_empty() => {
+            if let Some(v) = state.vault.as_ref() {
+                let _ = v.delete(SCOPE_EMBEDDING, KEY_API_KEY).await;
+            }
             config.embeddings.api_key = None;
         }
-        Some(key) => {
+        (Some(key), Some(vault)) => {
+            vault
+                .set(SCOPE_EMBEDDING, KEY_API_KEY, &key)
+                .await
+                .map_err(|e| format!("Vault store embedding api_key: {e}"))?;
+            config.embeddings.api_key = None;
+        }
+        (Some(key), None) => {
             config.embeddings.api_key = Some(key);
         }
-        None => {
-            // Preserve existing key.
+        (None, Some(vault)) => {
+            if let Some(plaintext) = config.embeddings.api_key.clone().filter(|s| !s.is_empty()) {
+                let already = vault
+                    .get(SCOPE_EMBEDDING, KEY_API_KEY)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|s| !s.is_empty());
+                if !already {
+                    vault
+                        .set(SCOPE_EMBEDDING, KEY_API_KEY, &plaintext)
+                        .await
+                        .map_err(|e| format!("Vault migrate embedding api_key: {e}"))?;
+                }
+                config.embeddings.api_key = None;
+            }
+        }
+        (None, None) => {
+            // No vault, no caller value — preserve existing.
         }
     }
 
