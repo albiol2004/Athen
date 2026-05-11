@@ -137,17 +137,27 @@ pub trait TelegramSendApprovalGate: Send + Sync {
     async fn confirm_send(&self, summary: &TelegramSendSummary) -> bool;
 }
 
+/// Summary of one outbound Telegram send, handed to
+/// [`TelegramOutboundRecorder::record`]. Carries enough context for the
+/// composition root to (a) stamp the cross-channel arc-routing hint and
+/// (b) append a row to the per-`chat_id` transcript log for future
+/// system-context injection.
+pub struct OutboundTelegramSummary<'a> {
+    pub chat_id: i64,
+    /// `None` when the message was attachments-only.
+    pub text: Option<&'a str>,
+    pub attachment_count: usize,
+}
+
 /// Notified after `send_telegram` successfully delivers, so the
 /// composition root can record "the last outbound Telegram message
-/// belongs to arc X". When the owner replies on Telegram a few seconds
-/// later, the owner-Telegram handler reads that record and routes the
-/// reply to arc X instead of re-triaging it as a fresh first-message.
-///
-/// Implementations should fail silently — recorder errors must never
-/// surface as send failures.
+/// belongs to arc X" (cross-channel arc routing) and append the
+/// outbound bubble to the per-chat transcript (context injection on the
+/// next inbound). Implementations should fail silently — recorder
+/// errors must never surface as send failures.
 #[async_trait]
 pub trait TelegramOutboundRecorder: Send + Sync {
-    async fn record(&self, chat_id: i64);
+    async fn record(&self, summary: OutboundTelegramSummary<'_>);
 }
 
 /// Permission gate consulted before `email_send` hands a message to
@@ -3092,11 +3102,18 @@ impl ShellToolRegistry {
 
         match sender.send(&outbound).await {
             Ok(sent) => {
-                // Stamp the cross-channel routing hint so the owner's
-                // reply (if it comes within the hint window) lands back
-                // in this arc instead of re-triaging into a new one.
+                // Stamp the cross-channel routing hint AND append to
+                // the per-chat transcript so the owner's next Telegram
+                // reply lands back in this arc and the agent has
+                // recent-context continuity even when arc routing fails.
                 if let Some(rec) = self.telegram_outbound_recorder.as_ref() {
-                    rec.record(sent.chat_id).await;
+                    let outbound_text_for_log = outbound.text.as_deref();
+                    rec.record(OutboundTelegramSummary {
+                        chat_id: sent.chat_id,
+                        text: outbound_text_for_log,
+                        attachment_count: outbound.attachments.len(),
+                    })
+                    .await;
                 }
                 Ok(ToolResult {
                     success: true,

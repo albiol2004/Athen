@@ -278,6 +278,17 @@ pub struct AppState {
     /// short follow-ups that arrive right after a notification fires.
     /// See `docs/MULTI_INTENT_ROUTING.md` for the multi-arc extension.
     pub telegram_outbound_hint: crate::notifier::TelegramOutboundHint,
+    /// Per-`chat_id` Telegram transcript store. Records inbound +
+    /// outbound messages independently of arc routing, so when a new
+    /// owner-Telegram message arrives we can prepend the last 4 turns
+    /// as system context — giving the agent continuity even when arc
+    /// routing picks the wrong arc (or creates a fresh one).
+    ///
+    /// `None` only on test/CLI builds without a data dir. Future:
+    /// gate injection behind small-vs-large model size modes so tight
+    /// context-window models don't pay the ~500-token cost.
+    pub telegram_chat_log:
+        Option<std::sync::Arc<athen_persistence::telegram_chat_log::TelegramChatLogStore>>,
     /// Approvals currently being executed. See [`InflightApprovals`].
     pub inflight_approvals: InflightApprovals,
     /// Maps coordinator task ids to the arc the originating sense
@@ -453,6 +464,9 @@ impl AppState {
             .as_ref()
             .map(|db| Arc::new(db.http_endpoint_store()));
         let agent_run_store = database.as_ref().map(|db| Arc::new(db.agent_run_store()));
+        let telegram_chat_log = database
+            .as_ref()
+            .map(|db| Arc::new(db.telegram_chat_log_store()));
         let http_rate_limiter = Arc::new(crate::http_rate_limiter::HttpRateLimiter::new());
         // Single reqwest client reused across every per-arc registry —
         // avoids per-call connection setup cost. Defaults are fine; the
@@ -547,6 +561,7 @@ impl AppState {
             spawn_persistence,
             pidfile_path,
             telegram_outbound_hint: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            telegram_chat_log,
             inflight_approvals: Arc::new(Mutex::new(HashSet::new())),
             task_arc_map: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             task_wakeup_map: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
@@ -785,6 +800,7 @@ impl AppState {
             Arc::new(crate::email_gate::ArcAwareTelegramOutboundRecorder::new(
                 self.telegram_outbound_hint.clone(),
                 None,
+                self.telegram_chat_log.clone(),
             ));
         shell_registry = shell_registry.with_telegram_outbound_recorder(recorder);
         let mut registry = crate::app_tools::AppToolRegistry::new(
@@ -958,6 +974,7 @@ impl AppState {
             Arc::new(crate::email_gate::ArcAwareTelegramOutboundRecorder::new(
                 self.telegram_outbound_hint.clone(),
                 Some(arc_id.to_string()),
+                self.telegram_chat_log.clone(),
             ));
         shell = shell.with_telegram_outbound_recorder(tg_recorder);
         let mut registry = crate::app_tools::AppToolRegistry::new(
@@ -1300,6 +1317,7 @@ impl AppState {
                                 Some(&pending_email_marks_ref),
                                 attachment_store_ref.as_ref(),
                                 contact_store_ref.as_ref(),
+                                None,
                             )
                             .await;
                         }
@@ -1486,6 +1504,7 @@ impl AppState {
                                 Some(&pending_email_marks_ref),
                                 attachment_store_ref.as_ref(),
                                 contact_store_ref.as_ref(),
+                                None,
                             )
                             .await;
                         }
@@ -1562,6 +1581,7 @@ impl AppState {
         let web_search_ref = Arc::clone(&self.web_search);
         let email_sender_ref = self.email_sender.clone();
         let telegram_sender_ref = self.telegram_sender.clone();
+        let telegram_chat_log_ref = self.telegram_chat_log.clone();
         let owner_check_ref = self.owner_destination_check();
         let telegram_outbound_hint_ref = self.telegram_outbound_hint.clone();
         let http_endpoint_store_ref = self.http_endpoint_store.clone();
@@ -1654,6 +1674,7 @@ impl AppState {
                                     let web_search_c = Arc::clone(&web_search_ref);
                                     let email_sender_c = email_sender_ref.clone();
                                     let telegram_sender_c = telegram_sender_ref.clone();
+                                    let telegram_chat_log_c = telegram_chat_log_ref.clone();
                                     let owner_check_c = owner_check_ref.clone();
                                     let http_endpoint_store_c = http_endpoint_store_ref.clone();
                                     let vault_c = vault_ref.clone();
@@ -1697,6 +1718,7 @@ impl AppState {
                                             &telegram_sender_c,
                                             owner_check_c.as_ref(),
                                             &telegram_outbound_hint_c,
+                                            telegram_chat_log_c.as_ref(),
                                             http_endpoint_store_c.as_ref(),
                                             vault_c.as_ref(),
                                             &http_rate_limiter_c,
@@ -1728,6 +1750,7 @@ impl AppState {
                                     Some(&pending_email_marks_ref),
                                     attachment_store_ref.as_ref(),
                                     contact_store_ref.as_ref(),
+                                    telegram_chat_log_ref.as_ref(),
                                 )
                                 .await;
                             }
@@ -2129,6 +2152,7 @@ async fn execute_owner_telegram_message(
     telegram_sender: &Option<Arc<dyn athen_core::traits::telegram_sender::TelegramSender>>,
     owner_check: Option<&Arc<dyn athen_agent::OwnerDestinationCheck>>,
     telegram_outbound_hint: &crate::notifier::TelegramOutboundHint,
+    telegram_chat_log: Option<&Arc<athen_persistence::telegram_chat_log::TelegramChatLogStore>>,
     http_endpoint_store: Option<&Arc<athen_persistence::http_endpoints::SqliteHttpEndpointStore>>,
     vault: Option<&Arc<dyn athen_core::traits::vault::Vault>>,
     http_rate_limiter: &Arc<crate::http_rate_limiter::HttpRateLimiter>,
@@ -2253,7 +2277,44 @@ async fn execute_owner_telegram_message(
                         .map(|a| a.id.clone())
                 };
 
-                if let Some(id) = tier3 {
+                // Tier 3.5 (LLM): when tiers 3 *and* 4 produce different
+                // candidates (or only tier 4 fires — i.e. a Messaging arc
+                // exists but it wasn't a Telegram reply thread), use an
+                // LLM with the per-chat transcript to decide whether
+                // this new turn continues one of the candidates or
+                // starts something new. Skipped on /newarc and when no
+                // candidate exists.
+                let llm_pick: Option<String> = if force_new_arc {
+                    None
+                } else {
+                    let candidates: Vec<athen_persistence::arcs::ArcMeta> = arcs
+                        .iter()
+                        .filter(|a| {
+                            a.status == athen_persistence::arcs::ArcStatus::Active
+                                && (a.source == athen_persistence::arcs::ArcSource::Messaging
+                                    || a.primary_reply_channel.as_deref() == Some("telegram"))
+                        })
+                        .filter(|a| within_window(a, 1800))
+                        .take(6)
+                        .cloned()
+                        .collect();
+                    if candidates.is_empty() {
+                        None
+                    } else {
+                        let chat_history = match telegram_chat_log {
+                            Some(s) => s.recent(chat_id, 4).await.unwrap_or_default(),
+                            None => Vec::new(),
+                        };
+                        pick_arc_with_llm(router, text, &candidates, &chat_history, store).await
+                    }
+                };
+
+                if let Some(id) = llm_pick {
+                    info!(arc = %id, "Routing owner Telegram message via LLM arc-pick");
+                    arc_match_reason = Some("llm_pick");
+                    arc_was_reused = true;
+                    Some(id)
+                } else if let Some(id) = tier3 {
                     info!(arc = %id, "Routing owner Telegram message via primary_reply_channel hint");
                     arc_match_reason = Some("primary_reply_channel");
                     arc_was_reused = true;
@@ -2387,6 +2448,73 @@ async fn execute_owner_telegram_message(
         }
     }
 
+    // Chat-history context injection (safety net for arc-routing
+    // failures). For a freshly-created arc, the agent has zero history
+    // to lean on — pull the last 4 messages from the per-`chat_id`
+    // transcript and inject them as a System bubble so the conversation
+    // stays coherent across arc boundaries. Reused arcs already loaded
+    // their own history into `context` above, so we skip injection
+    // there to avoid duplicating tokens on every turn.
+    //
+    // TODO: when prompt-size modes ship (Compact/Balanced/Full), gate
+    // this on Balanced+ so small-context-window models don't pay.
+    if !arc_was_reused {
+        if let Some(store) = telegram_chat_log {
+            match store.recent(chat_id, 4).await {
+                Ok(rows) if !rows.is_empty() => {
+                    let mut buf = String::from(
+                        "<CONTEXT type=\"telegram-chat-history\">\n\
+                         Recent messages with this Telegram chat (newest last). \
+                         Use for conversational continuity — the user may be \
+                         referring back to one of these.\n",
+                    );
+                    for row in &rows {
+                        let who = match row.direction {
+                            athen_persistence::telegram_chat_log::TelegramLogDirection::Inbound => "user",
+                            athen_persistence::telegram_chat_log::TelegramLogDirection::Outbound => "assistant",
+                        };
+                        buf.push_str(&format!(
+                            "[{ts}] {who}: {body}\n",
+                            ts = row.ts,
+                            who = who,
+                            body = row.text
+                        ));
+                    }
+                    buf.push_str("</CONTEXT>");
+                    context.push(athen_core::llm::ChatMessage {
+                        role: athen_core::llm::Role::System,
+                        content: athen_core::llm::MessageContent::Text(buf),
+                    });
+                    tracing::info!(
+                        chat_id,
+                        injected = rows.len(),
+                        "Injected Telegram chat-history context (fresh arc)"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, chat_id, "telegram_chat_log recent failed");
+                }
+            }
+        }
+    }
+    // Log this inbound turn AFTER fetching the context window above, so
+    // the injection contains the *prior* exchange, not the message
+    // we're about to feed to the agent.
+    if let Some(store) = telegram_chat_log {
+        if let Err(e) = store
+            .append(
+                chat_id,
+                athen_persistence::telegram_chat_log::TelegramLogDirection::Inbound,
+                text,
+                !attachments.is_empty(),
+            )
+            .await
+        {
+            tracing::warn!(error = %e, chat_id, "telegram_chat_log append (inbound) failed");
+        }
+    }
+
     // Surface attachments into the executor's first turn — images go to
     // the multimodal user content (when the active provider has vision)
     // and PDF text sidecars get inlined as a System turn. This is the
@@ -2462,6 +2590,7 @@ async fn execute_owner_telegram_message(
         Arc::new(crate::email_gate::ArcAwareTelegramOutboundRecorder::new(
             telegram_outbound_hint.clone(),
             target_arc_id.clone(),
+            telegram_chat_log.cloned(),
         ));
     shell_registry = shell_registry.with_telegram_outbound_recorder(tg_recorder);
     let mut registry = AppToolRegistry::new(
@@ -2924,6 +3053,132 @@ pub(crate) async fn send_telegram_reply(
 /// `load_config_dir` then loads each file independently — a user who has
 /// only configured an LLM provider via Settings (writing `models.toml`
 /// but never `config.toml`) must still have their provider keys loaded.
+/// LLM arc-picker for the owner-Telegram routing fallback. Fires only
+/// after tiers 1 (`/newarc`) and 2 (outbound hint) miss but there *are*
+/// candidate arcs — handing the model the cross-chat transcript +
+/// each candidate's last entry so it can decide whether the new turn
+/// continues one of them or starts fresh.
+///
+/// Returns `Some(arc_id)` only when the LLM picks one of the supplied
+/// candidates AND the id round-trips against the store; any other
+/// outcome (parse fail, timeout, unknown id, "new") returns `None` so
+/// the caller falls through to the existing tier-3/4/create-new logic.
+async fn pick_arc_with_llm(
+    router: &Arc<RwLock<Arc<DefaultLlmRouter>>>,
+    text: &str,
+    candidates: &[athen_persistence::arcs::ArcMeta],
+    chat_history: &[athen_persistence::telegram_chat_log::TelegramLogEntry],
+    store: &ArcStore,
+) -> Option<String> {
+    use athen_core::llm::{
+        ChatMessage as LlmChatMessage, LlmRequest, MessageContent as LlmContent, ModelProfile,
+        Role as LlmRole,
+    };
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // Render history block.
+    let mut history_block = String::new();
+    if !chat_history.is_empty() {
+        history_block.push_str("\nRecent exchange with this Telegram chat (newest last):\n");
+        for entry in chat_history {
+            let who = match entry.direction {
+                athen_persistence::telegram_chat_log::TelegramLogDirection::Inbound => "them",
+                athen_persistence::telegram_chat_log::TelegramLogDirection::Outbound => "us",
+            };
+            history_block.push_str(&format!("  [{}] {}: {}\n", entry.ts, who, entry.text));
+        }
+    }
+
+    // Render candidate arcs with their last user/assistant entry (best-effort).
+    let mut arcs_block = String::from("\nCandidate arcs to consider:\n");
+    for arc in candidates {
+        let snippet: String = match store.load_entries(&arc.id).await {
+            Ok(entries) => entries
+                .into_iter()
+                .rev()
+                .find(|e| e.entry_type == athen_persistence::arcs::EntryType::Message)
+                .map(|e| {
+                    let body = e.content;
+                    let cap = body.chars().take(200).collect::<String>();
+                    cap
+                })
+                .unwrap_or_default(),
+            Err(_) => String::new(),
+        };
+        arcs_block.push_str(&format!(
+            "- id: \"{}\" | name: \"{}\" | last: \"{}\"\n",
+            arc.id, arc.name, snippet
+        ));
+    }
+
+    let prompt = format!(
+        r#"You route incoming Telegram messages to the right ongoing conversation thread (arc).
+
+New incoming message from the user:
+"{text}"
+{history_block}{arcs_block}
+Decide whether this new message continues one of the candidate arcs or starts something new. Use the recent exchange to judge continuity — if the user's last reply to us was "yes", "ok", "do it", or a one-word follow-up, they're almost certainly continuing whatever we last said. Otherwise lean on topic match.
+
+Respond with ONLY one of:
+- The arc id (just the id, exactly as shown above) if it continues one of them
+- The literal word NEW if it's a different topic
+
+No explanation. No markdown."#
+    );
+
+    let request = LlmRequest {
+        messages: vec![LlmChatMessage {
+            role: LlmRole::User,
+            content: LlmContent::Text(prompt),
+        }],
+        profile: ModelProfile::Cheap,
+        max_tokens: Some(40),
+        temperature: Some(0.1),
+        tools: None,
+        system_prompt: None,
+    };
+
+    let llm_router = router.read().await.clone();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        llm_router.route(&request),
+    )
+    .await;
+    let raw = match result {
+        Ok(Ok(resp)) => resp.content.trim().to_string(),
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "LLM arc-pick failed; falling through to heuristics");
+            return None;
+        }
+        Err(_) => {
+            tracing::warn!("LLM arc-pick timed out; falling through to heuristics");
+            return None;
+        }
+    };
+
+    // Models sometimes wrap the answer in quotes or backticks.
+    let stripped = raw
+        .trim_matches(|c: char| c == '"' || c == '`' || c == '\'' || c.is_whitespace())
+        .to_string();
+    if stripped.eq_ignore_ascii_case("new") || stripped.is_empty() {
+        return None;
+    }
+    // Only accept ids that are actually in the candidate set — defense
+    // against the model inventing or mangling an id.
+    if candidates.iter().any(|c| c.id == stripped) {
+        Some(stripped)
+    } else {
+        tracing::warn!(
+            llm_response = %stripped,
+            "LLM arc-pick returned id not in candidate set; falling through"
+        );
+        None
+    }
+}
+
 fn find_config_dir() -> Option<PathBuf> {
     if let Some(data_dir) = athen_core::paths::athen_data_dir() {
         if data_dir.exists() {

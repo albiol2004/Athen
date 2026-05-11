@@ -13,11 +13,12 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use athen_agent::tools::{
-    EmailSendApprovalGate, EmailSendSummary, TelegramOutboundRecorder, TelegramSendApprovalGate,
-    TelegramSendSummary,
+    EmailSendApprovalGate, EmailSendSummary, OutboundTelegramSummary, TelegramOutboundRecorder,
+    TelegramSendApprovalGate, TelegramSendSummary,
 };
 use athen_agent::OwnerDestinationCheck;
 use athen_contacts::OwnerLookup;
+use athen_persistence::telegram_chat_log::{TelegramChatLogStore, TelegramLogDirection};
 
 pub struct RouterEmailApprovalGate {
     router: Arc<crate::approval::ApprovalRouter>,
@@ -163,39 +164,73 @@ impl TelegramSendApprovalGate for RouterTelegramApprovalGate {
     }
 }
 
-/// Production [`TelegramOutboundRecorder`]: stamps the in-process
-/// `telegram_outbound_hint` slot with the registry's arc id after every
-/// successful agent-driven Telegram send. The owner-Telegram handler
-/// reads that slot when picking which arc the user's next Telegram
-/// reply belongs to, so a UI-driven arc that asked Athen to "reply on
-/// Telegram" stays sticky even though Telegram is technically a
-/// different channel.
+/// Production [`TelegramOutboundRecorder`] that does two things after
+/// every successful agent-driven `send_telegram`:
 ///
-/// When `arc_id` is `None` (e.g. registry built outside of an arc
-/// context like `refresh_tools_doc`), `record` is a no-op — there's
-/// nothing meaningful to stamp.
+/// 1. Stamps the in-process `telegram_outbound_hint` slot with the
+///    registry's `arc_id` so the user's next Telegram reply gets
+///    routed back to this arc instead of being re-triaged. When
+///    `arc_id` is `None`, this step is skipped.
+/// 2. Appends an outbound row to the per-`chat_id` transcript store
+///    (`telegram_chat_log`) so the owner-Telegram handler can prepend
+///    recent turns as system context on the next inbound — giving the
+///    agent continuity even when arc routing picks the wrong arc.
 pub struct ArcAwareTelegramOutboundRecorder {
     hint: crate::notifier::TelegramOutboundHint,
     arc_id: Option<String>,
+    chat_log: Option<Arc<TelegramChatLogStore>>,
 }
 
 impl ArcAwareTelegramOutboundRecorder {
-    pub fn new(hint: crate::notifier::TelegramOutboundHint, arc_id: Option<String>) -> Self {
-        Self { hint, arc_id }
+    pub fn new(
+        hint: crate::notifier::TelegramOutboundHint,
+        arc_id: Option<String>,
+        chat_log: Option<Arc<TelegramChatLogStore>>,
+    ) -> Self {
+        Self {
+            hint,
+            arc_id,
+            chat_log,
+        }
     }
 }
 
 #[async_trait]
 impl TelegramOutboundRecorder for ArcAwareTelegramOutboundRecorder {
-    async fn record(&self, _chat_id: i64) {
-        let Some(arc_id) = self.arc_id.as_deref() else {
-            return;
-        };
-        crate::notifier::stamp_outbound_hint(&self.hint, arc_id);
-        tracing::info!(
-            arc = %arc_id,
-            "Stamped Telegram outbound hint from send_telegram tool"
-        );
+    async fn record(&self, summary: OutboundTelegramSummary<'_>) {
+        if let Some(arc_id) = self.arc_id.as_deref() {
+            crate::notifier::stamp_outbound_hint(&self.hint, arc_id);
+            tracing::info!(
+                arc = %arc_id,
+                chat_id = summary.chat_id,
+                "Stamped Telegram outbound hint from send_telegram tool"
+            );
+        }
+        if let Some(store) = self.chat_log.as_ref() {
+            let body = match (summary.text, summary.attachment_count) {
+                (Some(t), 0) => t.to_string(),
+                (Some(t), n) => format!("{t}\n[+{n} attachment(s)]"),
+                (None, n) if n > 0 => format!("[{n} attachment(s)]"),
+                _ => String::new(),
+            };
+            if !body.is_empty() {
+                if let Err(e) = store
+                    .append(
+                        summary.chat_id,
+                        TelegramLogDirection::Outbound,
+                        &body,
+                        summary.attachment_count > 0,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        chat_id = summary.chat_id,
+                        "telegram_chat_log append (outbound) failed"
+                    );
+                }
+            }
+        }
     }
 }
 

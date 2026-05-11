@@ -73,6 +73,7 @@ pub async fn process_sense_event(
     pending_email_marks: Option<&crate::state::PendingEmailMarks>,
     attachment_store: Option<&AttachmentStore>,
     contact_store: Option<&SqliteContactStore>,
+    telegram_chat_log: Option<&Arc<athen_persistence::telegram_chat_log::TelegramChatLogStore>>,
 ) -> bool {
     let source_name = source_display_name(&event.source);
     let summary = event.content.summary.as_deref().unwrap_or("(no subject)");
@@ -164,6 +165,37 @@ pub async fn process_sense_event(
         recent_arcs_with_snippets.push((arc.clone(), snippet));
     }
 
+    // Cross-arc chat history for messaging events — gives the triage
+    // LLM continuity beyond what any single arc's snippet shows. Only
+    // fetched for Messaging source (other sources have no chat_id).
+    let messaging_chat_id: Option<i64> = if event.source == EventSource::Messaging {
+        event.content.body.get("chat_id").and_then(|v| v.as_i64())
+    } else {
+        None
+    };
+    let chat_history: Vec<athen_persistence::telegram_chat_log::TelegramLogEntry> =
+        match (telegram_chat_log, messaging_chat_id) {
+            (Some(store), Some(cid)) => store.recent(cid, 4).await.unwrap_or_default(),
+            _ => Vec::new(),
+        };
+    // Log this inbound *after* the fetch so the current message
+    // doesn't appear in its own context window. Done here (not just in
+    // the owner-Telegram path) so non-owner chats also accumulate a
+    // transcript the next triage can lean on.
+    if let (Some(store), Some(cid)) = (telegram_chat_log, messaging_chat_id) {
+        if let Err(e) = store
+            .append(
+                cid,
+                athen_persistence::telegram_chat_log::TelegramLogDirection::Inbound,
+                &body_text,
+                !event.content.attachments.is_empty(),
+            )
+            .await
+        {
+            tracing::warn!(error = %e, chat_id = cid, "telegram_chat_log append (non-owner inbound) failed");
+        }
+    }
+
     // Step 1: Triage via LLM (with arc context for matching).
     let triage = triage_event(
         router,
@@ -172,6 +204,7 @@ pub async fn process_sense_event(
         summary,
         &body_for_triage,
         &recent_arcs_with_snippets,
+        &chat_history,
     )
     .await;
 
@@ -1296,6 +1329,12 @@ pub(crate) fn format_entry_content(sender: &str, subject: &str, body: &str) -> S
 ///
 /// When `recent_arcs` is non-empty, the LLM is also asked whether the event
 /// belongs to an existing arc (by ID) or requires a new one.
+///
+/// `chat_history`, when non-empty, is rendered as a "Recent exchange with
+/// this chat:" block above the new message. Used for `EventSource::Messaging`
+/// where the cross-chat transcript helps decide arc continuity even when
+/// per-arc snippets are misleading (e.g. the right arc lives in a *different*
+/// arc than the most-recently-updated one).
 async fn triage_event(
     router: &Arc<RwLock<Arc<DefaultLlmRouter>>>,
     source: &EventSource,
@@ -1303,6 +1342,7 @@ async fn triage_event(
     subject: &str,
     body: &str,
     recent_arcs: &[(ArcMeta, String)],
+    chat_history: &[athen_persistence::telegram_chat_log::TelegramLogEntry],
 ) -> SenseTriage {
     let source_name = source_display_name(source);
 
@@ -1328,6 +1368,25 @@ async fn triage_event(
         ctx
     };
 
+    // Cross-arc chat transcript for messaging events — gives the LLM
+    // continuity beyond what any single arc's `Recent:` snippet shows.
+    let history_context = if chat_history.is_empty() {
+        String::new()
+    } else {
+        let mut ctx = String::from("\n\nRecent exchange with this chat (newest last):\n");
+        for entry in chat_history {
+            let who = match entry.direction {
+                athen_persistence::telegram_chat_log::TelegramLogDirection::Inbound => "them",
+                athen_persistence::telegram_chat_log::TelegramLogDirection::Outbound => "us",
+            };
+            ctx.push_str(&format!("  [{}] {}: {}\n", entry.ts, who, entry.text));
+        }
+        ctx.push_str(
+            "Use this to judge whether the new message is a continuation of an existing arc.\n",
+        );
+        ctx
+    };
+
     let arc_matching_instruction = if recent_arcs.is_empty() {
         r#"For "arc_name": give a short, descriptive name summarizing the topic (max 40 chars, e.g. "Meeting with John", "Server alert")."#.to_string()
     } else {
@@ -1346,7 +1405,7 @@ Set EITHER "existing_arc_id" OR "arc_name", never both."#.to_string()
 From: {sender}
 Subject: {subject}
 Body:
-{body}{arcs_context}
+{body}{history_context}{arcs_context}
 Respond with ONLY a JSON object (no markdown, no explanation):
 {{
   "relevance": "ignore|low|medium|high",

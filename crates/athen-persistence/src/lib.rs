@@ -16,6 +16,7 @@ pub mod mcp;
 pub mod notifications;
 pub mod profiles;
 pub mod store;
+pub mod telegram_chat_log;
 pub mod wakeups;
 
 use std::path::Path;
@@ -106,6 +107,8 @@ impl Database {
         endpoints.init_schema().await?;
         let agent_runs = self.agent_run_store();
         agent_runs.init_schema().await?;
+        let tg_log = self.telegram_chat_log_store();
+        tg_log.init_schema().await?;
         profiles.seed_builtins_if_empty().await
     }
 
@@ -177,6 +180,13 @@ impl Database {
     /// Create a `SqliteAgentRunStore` backed by this database's connection.
     pub fn agent_run_store(&self) -> SqliteAgentRunStore {
         SqliteAgentRunStore::from_conn(self.conn.clone())
+    }
+
+    /// Create a `TelegramChatLogStore` backed by this database's
+    /// connection. Records per-`chat_id` Telegram transcripts for the
+    /// owner-Telegram handler to prepend as system context.
+    pub fn telegram_chat_log_store(&self) -> crate::telegram_chat_log::TelegramChatLogStore {
+        crate::telegram_chat_log::TelegramChatLogStore::new(self.conn.clone())
     }
 
     /// Force-checkpoint the WAL and truncate it. Called from the graceful
