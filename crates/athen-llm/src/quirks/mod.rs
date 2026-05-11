@@ -530,6 +530,7 @@ mod tests {
             id: "x".into(),
             name: "shell".into(),
             arguments: serde_json::json!({"cmd": "ls\u{0001}-la"}),
+            thought_signature: None,
         }];
         apply_to_response(&v4_quirks, &mut resp);
         assert_eq!(resp.tool_calls[0].arguments["cmd"], "ls -la");

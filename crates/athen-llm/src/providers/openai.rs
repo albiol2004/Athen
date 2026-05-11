@@ -362,6 +362,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
                         name: tc.function.name.clone(),
                         arguments: serde_json::from_str(&tc.function.arguments)
                             .unwrap_or(serde_json::Value::String(tc.function.arguments.clone())),
+                        thought_signature: None,
                     })
                     .collect()
             })
@@ -903,6 +904,7 @@ impl ToolCallAccumulator {
                     id,
                     name,
                     arguments,
+                    thought_signature: None,
                 })
             })
             .collect()

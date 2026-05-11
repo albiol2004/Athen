@@ -79,6 +79,7 @@ fn parse_hermes_json_body(body: &str) -> Option<ToolCall> {
         id: synth_call_id(),
         name,
         arguments: args,
+        thought_signature: None,
     })
 }
 
@@ -131,6 +132,7 @@ fn parse_qwen_xml_body(body: &str) -> Option<ToolCall> {
         id: synth_call_id(),
         name,
         arguments: Value::Object(args_map),
+        thought_signature: None,
     })
 }
 

@@ -104,6 +104,7 @@ async fn test_agent_executes_shell_tool_and_completes() {
         id: "call_1".to_string(),
         name: "shell_execute".to_string(),
         arguments: json!({"command": "echo hello_from_agent"}),
+        thought_signature: None,
     };
 
     let responses = vec![
@@ -147,6 +148,7 @@ async fn test_agent_reads_file_via_tool() {
         id: "call_read".to_string(),
         name: "read".to_string(),
         arguments: json!({"path": file_path.to_str().unwrap()}),
+        thought_signature: None,
     };
 
     let responses = vec![
@@ -181,12 +183,14 @@ async fn test_agent_multi_step_tool_usage() {
         id: "call_list".to_string(),
         name: "list_directory".to_string(),
         arguments: json!({"path": dir.path().to_str().unwrap()}),
+        thought_signature: None,
     };
 
     let read_call = ToolCall {
         id: "call_read".to_string(),
         name: "read".to_string(),
         arguments: json!({"path": dir.path().join("readme.md").to_str().unwrap()}),
+        thought_signature: None,
     };
 
     let responses = vec![

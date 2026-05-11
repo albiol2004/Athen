@@ -88,6 +88,15 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: serde_json::Value,
+    /// Opaque, provider-specific signature returned alongside the tool
+    /// call that we must echo back unchanged when replaying this turn in
+    /// history. Today only Gemini 3 / thinking-mode 2.5 populate this
+    /// (the `thoughtSignature` field on `functionCall` parts) — passing
+    /// it back is mandatory or the API rejects the next turn with HTTP
+    /// 400. Other providers leave this `None` and the field is omitted
+    /// from the wire JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

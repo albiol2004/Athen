@@ -201,6 +201,7 @@ impl LlmProvider for AnthropicProvider {
                 id: block.id.clone().unwrap_or_default(),
                 name: block.name.clone().unwrap_or_default(),
                 arguments: block.input.clone().unwrap_or(serde_json::Value::Null),
+                thought_signature: None,
             })
             .collect();
 

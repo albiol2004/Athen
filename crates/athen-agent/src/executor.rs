@@ -2159,6 +2159,7 @@ mod tests {
             id: "call_1".to_string(),
             name: "search".to_string(),
             arguments: serde_json::json!({"query": "test"}),
+            thought_signature: None,
         };
 
         let responses = vec![
@@ -2199,6 +2200,7 @@ mod tests {
             id: "call_loop".to_string(),
             name: "noop".to_string(),
             arguments: serde_json::json!({}),
+            thought_signature: None,
         };
 
         let responses: Vec<LlmResponse> = (0..10)
@@ -2228,6 +2230,7 @@ mod tests {
             id: "call_1".to_string(),
             name: "slow_tool".to_string(),
             arguments: serde_json::json!({}),
+            thought_signature: None,
         };
 
         let responses = vec![MockLlmRouter::make_response(
@@ -2264,6 +2267,7 @@ mod tests {
             id: "call_1".to_string(),
             name: "test_tool".to_string(),
             arguments: serde_json::json!({}),
+            thought_signature: None,
         };
 
         let responses = vec![
@@ -2316,6 +2320,7 @@ mod tests {
             id: "call_loop".to_string(),
             name: "noop".to_string(),
             arguments: serde_json::json!({}),
+            thought_signature: None,
         };
 
         let responses: Vec<LlmResponse> = (0..10)
@@ -2356,11 +2361,13 @@ mod tests {
             id: "call_1".to_string(),
             name: "tool_a".to_string(),
             arguments: serde_json::json!({}),
+            thought_signature: None,
         };
         let tool_call_2 = ToolCall {
             id: "call_2".to_string(),
             name: "tool_b".to_string(),
             arguments: serde_json::json!({}),
+            thought_signature: None,
         };
 
         let responses = vec![MockLlmRouter::make_response(
@@ -3084,16 +3091,19 @@ mod tests {
                 id: "1".into(),
                 name: "a".into(),
                 arguments: serde_json::json!({}),
+                thought_signature: None,
             },
             ToolCall {
                 id: "2".into(),
                 name: "b".into(),
                 arguments: serde_json::json!({}),
+                thought_signature: None,
             },
             ToolCall {
                 id: "3".into(),
                 name: "c".into(),
                 arguments: serde_json::json!({}),
+                thought_signature: None,
             },
         ];
         let responses = vec![
@@ -3144,6 +3154,7 @@ mod tests {
             id: "1".into(),
             name: "calendar_create".into(),
             arguments: serde_json::json!({}),
+            thought_signature: None,
         }];
         let responses = vec![
             MockLlmRouter::make_response("Creating event.", calls),
@@ -3184,6 +3195,7 @@ mod tests {
             id: "x".to_string(),
             name: "calendar_list".to_string(),
             arguments: serde_json::json!({"start": "a", "end": "b"}),
+            thought_signature: None,
         };
         let responses = vec![
             MockLlmRouter::make_response("1", vec![make_call()]),
@@ -3250,11 +3262,13 @@ mod tests {
             id: "a".to_string(),
             name: "calendar_list".to_string(),
             arguments: serde_json::json!({"start": "a", "end": "b"}),
+            thought_signature: None,
         };
         let two = ToolCall {
             id: "b".to_string(),
             name: "calendar_list".to_string(),
             arguments: serde_json::json!({"start": "a", "end": "b"}),
+            thought_signature: None,
         };
         let responses = vec![
             MockLlmRouter::make_response("listing twice", vec![one, two]),

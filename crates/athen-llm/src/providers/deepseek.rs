@@ -285,6 +285,7 @@ impl LlmProvider for DeepSeekProvider {
                         id: tc.id.clone(),
                         name: tc.function.name.clone(),
                         arguments: parse_tool_arguments(&tc.function.arguments),
+                        thought_signature: None,
                     })
                     .collect()
             })

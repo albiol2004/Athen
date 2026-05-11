@@ -189,7 +189,16 @@ impl GoogleProvider {
                                 .get("arguments")
                                 .cloned()
                                 .unwrap_or(serde_json::Value::Null);
-                            out.push(GeminiPart::function_call(name, id, args));
+                            // Gemini 3 + thinking-mode 2.5 require us to echo
+                            // back the original `thoughtSignature` for any
+                            // functionCall part we reproduce from history.
+                            // The executor stashes it on `ToolCall`, which
+                            // serialises as `thought_signature` here.
+                            let sig = c
+                                .get("thought_signature")
+                                .and_then(|s| s.as_str())
+                                .map(|s| s.to_string());
+                            out.push(GeminiPart::function_call(name, id, args, sig));
                         }
                     }
                     out
@@ -341,6 +350,9 @@ impl GoogleProvider {
                             .unwrap_or_else(|| Uuid::new_v4().to_string()),
                         name: call.name,
                         arguments: call.args.unwrap_or(serde_json::Value::Null),
+                        // Carry Gemini's thoughtSignature through the
+                        // round-trip so the next request can replay it.
+                        thought_signature: part.thought_signature,
                     });
                 }
             }
@@ -630,6 +642,7 @@ fn parse_sse_chunks(text: &str) -> Vec<Result<LlmChunk>> {
                                 .unwrap_or_else(|| Uuid::new_v4().to_string()),
                             name: call.name,
                             arguments: call.args.unwrap_or(serde_json::Value::Null),
+                            thought_signature: part.thought_signature,
                         }],
                     }));
                 }
@@ -717,6 +730,20 @@ struct GeminiPart {
     /// chain of thought. We never send `thought` on outbound parts.
     #[serde(skip_serializing_if = "Option::is_none")]
     thought: Option<bool>,
+    /// Opaque, base64-encoded signature returned by Gemini 3 / thinking-mode
+    /// 2.5 on parts that participated in chain-of-thought reasoning — most
+    /// importantly on `functionCall` parts. The API REQUIRES that we echo
+    /// this back unchanged when replaying the same part in subsequent turns
+    /// (HTTP 400 "Function call is missing a thought_signature" otherwise).
+    /// We never set this on outbound parts ourselves; it only rides back
+    /// when we serialise the model's prior tool call from conversation
+    /// history.
+    #[serde(
+        rename = "thoughtSignature",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    thought_signature: Option<String>,
     #[serde(
         rename = "inlineData",
         skip_serializing_if = "Option::is_none",
@@ -752,8 +779,14 @@ impl GeminiPart {
         }
     }
 
-    fn function_call(name: String, id: Option<String>, args: serde_json::Value) -> Self {
+    fn function_call(
+        name: String,
+        id: Option<String>,
+        args: serde_json::Value,
+        thought_signature: Option<String>,
+    ) -> Self {
         Self {
+            thought_signature,
             function_call: Some(GeminiFunctionCall {
                 name,
                 id,
@@ -1284,6 +1317,123 @@ mod tests {
         let decl = &tools[0].function_declarations[0];
         assert_eq!(decl.name, "search");
         assert_eq!(decl.parameters["required"][0], "q");
+    }
+
+    #[test]
+    fn parse_response_captures_thought_signature_on_function_call() {
+        // Gemini 3 / thinking-mode responses tag the functionCall part with
+        // an opaque thoughtSignature blob. We must lift it onto the ToolCall
+        // or the very next request will be rejected as "missing thought_signature".
+        let provider = provider_with_family(ModelFamily::Gemini3Pro);
+        let raw = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{
+                        "functionCall": { "name": "web_search", "args": { "q": "x" } },
+                        "thoughtSignature": "AAAA-opaque-blob-zzzz"
+                    }]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let api: GeminiResponse = serde_json::from_value(raw).unwrap();
+        let resp = provider.parse_response_value(api).unwrap();
+        assert_eq!(resp.tool_calls.len(), 1);
+        assert_eq!(
+            resp.tool_calls[0].thought_signature.as_deref(),
+            Some("AAAA-opaque-blob-zzzz")
+        );
+    }
+
+    #[test]
+    fn assistant_history_round_trips_thought_signature() {
+        // When the executor replays a prior assistant tool-call turn, the
+        // builder must serialise the signature back onto the functionCall
+        // part — otherwise Gemini 3 rejects the turn.
+        let provider = provider_with_family(ModelFamily::Gemini3Pro);
+        let req = LlmRequest {
+            profile: ModelProfile::Powerful,
+            messages: vec![
+                user_text("hi"),
+                ChatMessage {
+                    role: Role::Assistant,
+                    content: MessageContent::Structured(serde_json::json!({
+                        "text": "",
+                        "tool_calls": [{
+                            "id": "call_abc",
+                            "name": "web_search",
+                            "arguments": { "q": "x" },
+                            "thought_signature": "SIGN-XYZ"
+                        }]
+                    })),
+                },
+                ChatMessage {
+                    role: Role::Tool,
+                    content: MessageContent::Structured(serde_json::json!({
+                        "name": "web_search",
+                        "id": "call_abc",
+                        "response": { "result": "ok" }
+                    })),
+                },
+            ],
+            max_tokens: None,
+            temperature: None,
+            tools: None,
+            system_prompt: None,
+        };
+        let body = provider.build_request_body(&req);
+        let json = serde_json::to_value(&body).unwrap();
+        // Find the model turn's functionCall part and check it carries the
+        // signature at the part level (Gemini wire format).
+        let model_turn = json["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["role"] == "model")
+            .expect("model turn present");
+        let part = &model_turn["parts"][0];
+        assert_eq!(part["functionCall"]["name"], "web_search");
+        assert_eq!(part["thoughtSignature"], "SIGN-XYZ");
+    }
+
+    #[test]
+    fn assistant_history_without_signature_does_not_emit_field() {
+        // Outbound parts should never carry a signature when the upstream
+        // ToolCall didn't supply one — Gemini 2.5 non-thinking responses
+        // omit it, and round-tripping `null` would be wrong.
+        let provider = provider_with_family(ModelFamily::Default);
+        let req = LlmRequest {
+            profile: ModelProfile::Powerful,
+            messages: vec![
+                user_text("hi"),
+                ChatMessage {
+                    role: Role::Assistant,
+                    content: MessageContent::Structured(serde_json::json!({
+                        "text": "",
+                        "tool_calls": [{
+                            "id": "call_abc",
+                            "name": "web_search",
+                            "arguments": { "q": "x" }
+                        }]
+                    })),
+                },
+            ],
+            max_tokens: None,
+            temperature: None,
+            tools: None,
+            system_prompt: None,
+        };
+        let body = provider.build_request_body(&req);
+        let json = serde_json::to_value(&body).unwrap();
+        let model_turn = json["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["role"] == "model")
+            .expect("model turn present");
+        let part = &model_turn["parts"][0];
+        assert!(part.get("thoughtSignature").is_none());
     }
 
     #[test]
