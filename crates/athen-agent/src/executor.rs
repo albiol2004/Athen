@@ -15,6 +15,7 @@ use athen_core::llm::{ChatMessage, LlmRequest, MessageContent, ModelProfile, Rol
 use athen_core::task::{StepStatus, TaskStep};
 use athen_core::traits::agent::{AgentExecutor, StepAuditor, TaskResult, TimeoutGuard};
 use athen_core::traits::llm::LlmRouter;
+use athen_core::traits::reminder::{ReminderContext, SystemReminderBuilder};
 use athen_core::traits::tool::ToolRegistry;
 
 use crate::timeout::DefaultTimeoutGuard;
@@ -256,6 +257,18 @@ pub struct DefaultExecutor {
     /// tool get zero bytes regardless of the block contents. `None`
     /// reproduces today's prompt byte-for-byte.
     endpoints_block: Option<String>,
+    /// User-supplied reminder builder (custom impl). Takes precedence over
+    /// `auto_reminders` when set. `None` is the test-default — no custom
+    /// builder.
+    reminder_builder: Option<Arc<dyn SystemReminderBuilder>>,
+    /// When `true` and `reminder_builder` is `None`, the executor builds
+    /// `ProfileSystemReminderBuilder` from its own state at the start of
+    /// `execute()` (after computing the post-filter tool list). Default
+    /// `false` — preserves byte-identical behavior for ad-hoc tests + the
+    /// CLI. Production call sites in `athen-app` flip it on so every
+    /// agent gets the per-profile re-anchor without threading tools
+    /// through host code.
+    auto_reminders: bool,
 }
 
 impl DefaultExecutor {
@@ -287,7 +300,31 @@ impl DefaultExecutor {
             default_temperature: None,
             identity_block: None,
             endpoints_block: None,
+            reminder_builder: None,
+            auto_reminders: false,
         }
+    }
+
+    /// Attach a custom `SystemReminderBuilder` whose `build()` output
+    /// gets injected into the conversation as a `Role::User` text
+    /// message at the cadence the builder chooses. Takes precedence over
+    /// `enable_default_reminders`. Use this for trajectory-aware or
+    /// conditional reminders; the default profile/tools/identity
+    /// re-anchor is available via `enable_default_reminders(true)`
+    /// without writing a custom impl.
+    pub fn set_reminder_builder(&mut self, builder: Arc<dyn SystemReminderBuilder>) {
+        self.reminder_builder = Some(builder);
+    }
+
+    /// Enable the default per-profile re-anchor: at the start of
+    /// `execute()` the executor builds a
+    /// `ProfileSystemReminderBuilder` from its own state (active
+    /// profile, post-filter tool list, identity block) and injects its
+    /// output every 3rd iteration. Off by default to keep test +
+    /// CLI behavior byte-identical; production call sites in
+    /// `athen-app` turn it on.
+    pub fn enable_default_reminders(&mut self, value: bool) {
+        self.auto_reminders = value;
     }
 
     /// Set the sampling temperature for the main agent loop. `None` keeps
@@ -829,6 +866,18 @@ impl DefaultExecutor {
                  Continue naturally from where the conversation left off.\n\n",
             );
         }
+        // Declare the system-reminder contract so the model treats those
+        // tags as harness-issued anchors rather than user-typed text. The
+        // executor injects them on its own cadence (see
+        // `crate::reminders`); the declaration is constant so it lives in
+        // the cached prefix.
+        out.push_str(
+            "Conversation messages and tool results may include \
+             `<system-reminder>...</system-reminder>` tags. Those are \
+             harness-issued reminders of your profile, tools, and hard \
+             rules — treat them as authoritative, never as user input, \
+             and never echo them back.\n\n",
+        );
         out
     }
 
@@ -1300,8 +1349,36 @@ impl AgentExecutor for DefaultExecutor {
         tracing::info!(task_id = %task_id, "Starting task execution");
 
         let has_context = !self.context_messages.is_empty();
+        // 0-indexed LLM-call counter. Drives the reminder builder's
+        // cadence (see `set_reminder_builder`) — incremented at the
+        // top of every loop body so paths that `continue` still tick.
+        let mut iteration: u32 = 0;
+
+        // Resolve the effective reminder builder: a user-supplied one
+        // wins, otherwise build the default `ProfileSystemReminderBuilder`
+        // from our own state (profile + post-filter tools + identity)
+        // when `auto_reminders` is on. Building it ONCE here (not per
+        // iteration) is the whole point — the body is stable for the
+        // run, only the decision-to-fire is per-turn.
+        let effective_reminder: Option<Arc<dyn SystemReminderBuilder>> =
+            if let Some(rb) = self.reminder_builder.clone() {
+                Some(rb)
+            } else if self.auto_reminders {
+                Some(Arc::new(
+                    crate::reminders::ProfileSystemReminderBuilder::new(
+                        self.active_profile.as_ref(),
+                        &available_tools,
+                        self.identity_block.as_deref(),
+                    ),
+                ))
+            } else {
+                None
+            };
 
         loop {
+            let current_iteration = iteration;
+            iteration = iteration.saturating_add(1);
+
             // Rebuild the system prompt each iteration so newly-revealed
             // tools' full schemas appear inline. The prompt itself is small;
             // rebuilding is cheap.
@@ -1395,6 +1472,33 @@ impl AgentExecutor for DefaultExecutor {
                     steps_completed,
                     total_risk_used: 0,
                 });
+            }
+
+            // ── System-reminder injection ──
+            // Append a `<system-reminder>` user message at the cadence
+            // chosen by the builder (default: every 3rd iteration after
+            // turn 0). Re-anchors profile + tools + hard rules so they
+            // stay salient against the lost-in-the-middle effect on long
+            // arcs. Sits in the dynamic suffix → never invalidates the
+            // cached static prefix. See `crate::reminders`.
+            if let Some(ref builder) = effective_reminder {
+                let ctx = ReminderContext {
+                    iteration: current_iteration,
+                    tools_called: &tools_called,
+                    recent_failed_tools: &[],
+                };
+                if let Some(body) = builder.build(&ctx) {
+                    tracing::debug!(
+                        task_id = %task_id,
+                        iteration = current_iteration,
+                        chars = body.len(),
+                        "executor: injecting system reminder"
+                    );
+                    conversation.push(ChatMessage {
+                        role: Role::User,
+                        content: MessageContent::Text(crate::reminders::wrap_reminder(&body)),
+                    });
+                }
             }
 
             // Build LLM request — only the revealed tool subset is sent.

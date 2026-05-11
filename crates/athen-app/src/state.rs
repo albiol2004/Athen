@@ -2723,6 +2723,7 @@ async fn execute_owner_telegram_message(
         .stream_sender(stream_tx)
         .cancel_flag(cancel_flag)
         .endpoints_block(endpoints_block)
+        .enable_default_reminders(true)
         .default_temperature(sampling_temperature);
     if let Some(p) = tool_doc_dir {
         builder = builder.tool_doc_dir(p.to_path_buf());

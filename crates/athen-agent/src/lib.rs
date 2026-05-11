@@ -7,6 +7,7 @@
 pub mod auditor;
 pub mod estimator;
 pub mod executor;
+pub mod reminders;
 pub mod resource;
 pub mod runtimes;
 pub mod timeout;
@@ -36,6 +37,7 @@ use athen_core::error::{AthenError, Result};
 use athen_core::llm::ChatMessage;
 use athen_core::traits::agent::StepAuditor;
 use athen_core::traits::llm::LlmRouter;
+use athen_core::traits::reminder::SystemReminderBuilder;
 use athen_core::traits::tool::ToolRegistry;
 
 /// Builder for constructing a [`DefaultExecutor`] with sensible defaults.
@@ -58,6 +60,8 @@ pub struct AgentBuilder {
     default_temperature: Option<f32>,
     identity_block: Option<String>,
     endpoints_block: Option<String>,
+    reminder_builder: Option<Arc<dyn SystemReminderBuilder>>,
+    auto_reminders: bool,
 }
 
 impl AgentBuilder {
@@ -87,7 +91,30 @@ impl AgentBuilder {
             default_temperature: None,
             identity_block: None,
             endpoints_block: None,
+            reminder_builder: None,
+            auto_reminders: false,
         }
+    }
+
+    /// Attach a custom `SystemReminderBuilder` (trajectory-aware /
+    /// conditional reminders). Takes precedence over
+    /// `enable_default_reminders`. For the standard per-profile
+    /// re-anchor, prefer `enable_default_reminders(true)` so the
+    /// executor builds the default impl from its own state.
+    pub fn reminder_builder(mut self, builder: Arc<dyn SystemReminderBuilder>) -> Self {
+        self.reminder_builder = Some(builder);
+        self
+    }
+
+    /// Turn on the default per-profile reminder. The executor builds a
+    /// `ProfileSystemReminderBuilder` lazily at the start of `execute()`
+    /// from the active profile + post-filter tool list + identity
+    /// block, and injects its output every 3rd iteration. Off by
+    /// default to preserve byte-identical behavior for tests; production
+    /// call sites should flip it on.
+    pub fn enable_default_reminders(mut self, value: bool) -> Self {
+        self.auto_reminders = value;
+        self
     }
 
     /// Inject a pre-rendered identity block (the user's hand-maintained
@@ -323,6 +350,14 @@ impl AgentBuilder {
 
         if self.endpoints_block.is_some() {
             executor.set_endpoints_block(self.endpoints_block);
+        }
+
+        if let Some(rb) = self.reminder_builder {
+            executor.set_reminder_builder(rb);
+        }
+
+        if self.auto_reminders {
+            executor.enable_default_reminders(true);
         }
 
         Ok(executor)

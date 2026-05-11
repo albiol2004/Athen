@@ -2100,6 +2100,7 @@ pub async fn send_message(
                 .external_system_suffix(Some(system_suffix))
                 .identity_block(identity_block)
                 .endpoints_block(endpoints_block)
+                .enable_default_reminders(true)
                 .default_temperature(sampling_temperature);
             if let Some(p) = state.tool_doc_dir.clone() {
                 builder = builder.tool_doc_dir(p);
@@ -3138,6 +3139,7 @@ pub(crate) async fn execute_approved_task(
         .external_system_suffix(Some(system_suffix))
         .identity_block(identity_block)
         .endpoints_block(endpoints_block)
+        .enable_default_reminders(true)
         .default_temperature(ctx.sampling_temperature);
     if let Some(p) = ctx.tool_doc_dir.clone() {
         builder = builder.tool_doc_dir(p);
@@ -4122,6 +4124,7 @@ pub(crate) async fn execute_dispatched_task(
         .autonomous_mode(true)
         .identity_block(identity_block)
         .endpoints_block(endpoints_block)
+        .enable_default_reminders(true)
         .default_temperature(ctx.sampling_temperature);
     if let Some(p) = ctx.tool_doc_dir.clone() {
         builder = builder.tool_doc_dir(p);

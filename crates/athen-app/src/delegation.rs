@@ -372,6 +372,7 @@ async fn run_delegation(
         .active_profile(resolved)
         .identity_block(identity_block)
         .endpoints_block(endpoints_block)
+        .enable_default_reminders(true)
         .default_temperature(sampling_temperature);
     if let Some(ref dir) = ctx.tool_doc_dir {
         builder = builder.tool_doc_dir(dir.clone());
