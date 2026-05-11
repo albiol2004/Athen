@@ -2,7 +2,10 @@
 //!
 //! Trust levels, risk multiplier calculation, contact resolution.
 
+pub mod owner;
 pub mod trust;
+
+pub use owner::{assert_disjoint_from_owner, OwnerLookup};
 
 use async_trait::async_trait;
 use athen_core::contact::{Contact, ContactId};
@@ -20,6 +23,19 @@ pub trait ContactStore: Send + Sync {
     async fn find_by_identifier(&self, identifier: &str) -> Result<Option<Contact>>;
     async fn list_all(&self) -> Result<Vec<Contact>>;
     async fn delete(&self, id: ContactId) -> Result<()>;
+
+    /// Return the single contact marked `is_owner = true`, if any.
+    ///
+    /// The owner contact represents Athen's user across every channel:
+    /// inbound events whose sender identifier matches one of this
+    /// contact's attached identifiers are treated as
+    /// `TrustLevel::AuthUser`.
+    async fn find_owner(&self) -> Result<Option<Contact>>;
+
+    /// Mark `contact_id` as the owner, clearing the flag on every other
+    /// contact in the same store. Single-row invariant: at most one
+    /// owner exists at any time.
+    async fn set_owner(&self, contact_id: &ContactId) -> Result<()>;
 }
 
 /// In-memory contact store for testing purposes.
@@ -74,6 +90,19 @@ impl ContactStore for InMemoryContactStore {
     async fn delete(&self, id: ContactId) -> Result<()> {
         let mut contacts = self.contacts.write().await;
         contacts.retain(|c| c.id != id);
+        Ok(())
+    }
+
+    async fn find_owner(&self) -> Result<Option<Contact>> {
+        let contacts = self.contacts.read().await;
+        Ok(contacts.iter().find(|c| c.is_owner).cloned())
+    }
+
+    async fn set_owner(&self, contact_id: &ContactId) -> Result<()> {
+        let mut contacts = self.contacts.write().await;
+        for c in contacts.iter_mut() {
+            c.is_owner = c.id == *contact_id;
+        }
         Ok(())
     }
 }

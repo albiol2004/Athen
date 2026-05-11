@@ -540,6 +540,7 @@ name = "athen-sentidos"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "athen-contacts",
  "athen-core",
  "athen-ipc",
  "chrono",

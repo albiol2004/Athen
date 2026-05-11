@@ -281,6 +281,7 @@ pub async fn create_contact(
         last_interaction: None,
         notes: None,
         blocked: false,
+        is_owner: false,
     };
 
     store

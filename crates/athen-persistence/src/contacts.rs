@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS contacts (
     last_interaction TEXT,
     notes TEXT,
     blocked INTEGER NOT NULL DEFAULT 0,
+    is_owner INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -36,6 +37,26 @@ CREATE TABLE IF NOT EXISTS contact_identifiers (
     UNIQUE(identifier, kind)
 );
 ";
+
+/// Add `is_owner` to legacy DBs created before the owner-identity
+/// unification (#???). SQLite has no `ADD COLUMN IF NOT EXISTS`; we
+/// probe `PRAGMA table_info` first and only run the ALTER when the
+/// column is missing. Idempotent.
+fn migrate_add_is_owner(conn: &Connection) -> std::result::Result<(), rusqlite::Error> {
+    let mut stmt = conn.prepare("PRAGMA table_info(contacts)")?;
+    let has_col = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .any(|name| name == "is_owner");
+    drop(stmt);
+    if !has_col {
+        conn.execute(
+            "ALTER TABLE contacts ADD COLUMN is_owner INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
+}
 
 /// SQLite-backed contact storage.
 #[derive(Clone)]
@@ -59,6 +80,11 @@ impl SqliteContactStore {
                 .map_err(|e| AthenError::Other(format!("Enable foreign keys: {e}")))?;
             conn.execute_batch(CONTACTS_SCHEMA_SQL)
                 .map_err(|e| AthenError::Other(format!("Failed to init contacts schema: {e}")))?;
+            // Legacy DB compatibility: add `is_owner` to pre-existing
+            // contacts tables that lack it. No-op on fresh installs
+            // because CONTACTS_SCHEMA_SQL already declares the column.
+            migrate_add_is_owner(&conn)
+                .map_err(|e| AthenError::Other(format!("Migrate is_owner column: {e}")))?;
             Ok(())
         })
         .await
@@ -151,6 +177,7 @@ fn row_to_contact(row: &rusqlite::Row<'_>) -> rusqlite::Result<Contact> {
     let interaction_count: u32 = row.get::<_, i64>(4)? as u32;
     let last_interaction_str: Option<String> = row.get(5)?;
     let blocked_int: i32 = row.get(7)?;
+    let is_owner_int: i32 = row.get(8)?;
 
     let last_interaction = last_interaction_str.and_then(|s| {
         chrono::DateTime::parse_from_rfc3339(&s)
@@ -168,13 +195,26 @@ fn row_to_contact(row: &rusqlite::Row<'_>) -> rusqlite::Result<Contact> {
         last_interaction,
         notes: row.get(6)?,
         blocked: blocked_int != 0,
+        is_owner: is_owner_int != 0,
     })
 }
 
 const SELECT_CONTACTS: &str = "\
     SELECT id, name, trust_level, trust_manual_override, interaction_count, \
-           last_interaction, notes, blocked, created_at, updated_at \
+           last_interaction, notes, blocked, is_owner, created_at, updated_at \
     FROM contacts";
+
+/// Normalize an identifier value before persisting it. Email
+/// identifiers are lowercased so case-only differences don't fork a
+/// contact across rows (e.g. `Alex@x.com` vs `alex@x.com`); every other
+/// kind is stored verbatim. Mirrors the normalization in
+/// `athen_contacts::owner` so cross-channel owner matching works.
+fn normalize_identifier_value(kind: IdentifierKind, value: &str) -> String {
+    match kind {
+        IdentifierKind::Email => value.to_ascii_lowercase(),
+        _ => value.to_string(),
+    }
+}
 
 #[async_trait]
 impl ContactStore for SqliteContactStore {
@@ -198,8 +238,8 @@ impl ContactStore for SqliteContactStore {
             tx.execute(
                 "INSERT INTO contacts \
                  (id, name, trust_level, trust_manual_override, interaction_count, \
-                  last_interaction, notes, blocked, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+                  last_interaction, notes, blocked, is_owner, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
                  ON CONFLICT(id) DO UPDATE SET \
                   name = excluded.name, \
                   trust_level = excluded.trust_level, \
@@ -208,6 +248,7 @@ impl ContactStore for SqliteContactStore {
                   last_interaction = excluded.last_interaction, \
                   notes = excluded.notes, \
                   blocked = excluded.blocked, \
+                  is_owner = excluded.is_owner, \
                   updated_at = excluded.updated_at",
                 params![
                     id_str,
@@ -218,13 +259,16 @@ impl ContactStore for SqliteContactStore {
                     last_interaction_str,
                     contact.notes,
                     contact.blocked as i32,
+                    contact.is_owner as i32,
                     now,
                     now,
                 ],
             )
             .map_err(|e| AthenError::Other(format!("Upsert contact: {e}")))?;
 
-            // Replace identifiers: delete old, insert new.
+            // Replace identifiers: delete old, insert new. Email values
+            // are lowercased on the way in so the unique index can't
+            // fork on case alone.
             tx.execute(
                 "DELETE FROM contact_identifiers WHERE contact_id = ?1",
                 params![id_str],
@@ -232,10 +276,11 @@ impl ContactStore for SqliteContactStore {
             .map_err(|e| AthenError::Other(format!("Delete old identifiers: {e}")))?;
 
             for ident in &contact.identifiers {
+                let value = normalize_identifier_value(ident.kind, &ident.value);
                 tx.execute(
                     "INSERT INTO contact_identifiers (contact_id, identifier, kind) \
                      VALUES (?1, ?2, ?3)",
-                    params![id_str, ident.value, identifier_kind_to_str(ident.kind),],
+                    params![id_str, value, identifier_kind_to_str(ident.kind),],
                 )
                 .map_err(|e| AthenError::Other(format!("Insert identifier: {e}")))?;
             }
@@ -281,6 +326,14 @@ impl ContactStore for SqliteContactStore {
         let identifier = identifier.to_string();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
+            // Mirror the insert-side normalization: emails contain `@`
+            // and are stored lowercased, so the lookup must too. Other
+            // schemes pass through unchanged.
+            let needle = if identifier.contains('@') {
+                identifier.to_ascii_lowercase()
+            } else {
+                identifier.clone()
+            };
             let sql = format!(
                 "{SELECT_CONTACTS} WHERE id IN \
                  (SELECT contact_id FROM contact_identifiers WHERE identifier = ?1) \
@@ -291,7 +344,7 @@ impl ContactStore for SqliteContactStore {
                 .map_err(|e| AthenError::Other(format!("Prepare find by identifier: {e}")))?;
 
             let mut rows = stmt
-                .query_map(params![identifier], row_to_contact)
+                .query_map(params![needle], row_to_contact)
                 .map_err(|e| AthenError::Other(format!("Query find by identifier: {e}")))?;
 
             match rows.next() {
@@ -332,6 +385,66 @@ impl ContactStore for SqliteContactStore {
                 contacts.push(contact);
             }
             Ok(contacts)
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
+    async fn find_owner(&self) -> Result<Option<Contact>> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let sql = format!("{SELECT_CONTACTS} WHERE is_owner = 1 LIMIT 1");
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| AthenError::Other(format!("Prepare find owner: {e}")))?;
+
+            let mut rows = stmt
+                .query_map([], row_to_contact)
+                .map_err(|e| AthenError::Other(format!("Query find owner: {e}")))?;
+
+            match rows.next() {
+                Some(Ok(mut contact)) => {
+                    let id_str = contact.id.to_string();
+                    contact.identifiers = load_identifiers(&conn, &id_str)
+                        .map_err(|e| AthenError::Other(format!("Load identifiers: {e}")))?;
+                    Ok(Some(contact))
+                }
+                Some(Err(e)) => Err(AthenError::Other(format!("Read owner row: {e}"))),
+                None => Ok(None),
+            }
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
+    async fn set_owner(&self, contact_id: &ContactId) -> Result<()> {
+        let conn = self.conn.clone();
+        let target = *contact_id;
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|e| AthenError::Other(format!("Begin set_owner tx: {e}")))?;
+
+            // Clear the flag on every other row, then set it on the
+            // target. Two statements keep the invariant atomic even if
+            // the target row didn't exist (in which case we still leave
+            // the table with zero owners — caller's bug, not ours).
+            tx.execute(
+                "UPDATE contacts SET is_owner = 0 WHERE id != ?1",
+                params![target.to_string()],
+            )
+            .map_err(|e| AthenError::Other(format!("Clear previous owner: {e}")))?;
+            tx.execute(
+                "UPDATE contacts SET is_owner = 1 WHERE id = ?1",
+                params![target.to_string()],
+            )
+            .map_err(|e| AthenError::Other(format!("Set owner: {e}")))?;
+
+            tx.commit()
+                .map_err(|e| AthenError::Other(format!("Commit set_owner tx: {e}")))?;
+            Ok(())
         })
         .await
         .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
@@ -384,6 +497,7 @@ mod tests {
             last_interaction: None,
             notes: None,
             blocked: false,
+            is_owner: false,
         }
     }
 
@@ -574,6 +688,7 @@ mod tests {
                     last_interaction: None,
                     notes: None,
                     blocked: false,
+                    is_owner: false,
                 };
                 s.save(&contact).await.unwrap();
             }));
@@ -627,5 +742,101 @@ mod tests {
         let store = setup().await;
         let loaded = store.load(Uuid::new_v4()).await.unwrap();
         assert!(loaded.is_none());
+    }
+
+    // ----- Owner-contact tests (Phase 1 of the unified-owner work) -----
+
+    #[tokio::test]
+    async fn find_owner_returns_none_when_unset() {
+        let store = setup().await;
+        let contact = make_contact("Alice", vec![("a@x.com", IdentifierKind::Email)]);
+        store.save(&contact).await.unwrap();
+        assert!(store.find_owner().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn set_owner_marks_single_row_and_clears_previous() {
+        let store = setup().await;
+        let mut a = make_contact("Alice", vec![("a@x.com", IdentifierKind::Email)]);
+        let mut b = make_contact("Bob", vec![("b@x.com", IdentifierKind::Email)]);
+        a.is_owner = true;
+        b.is_owner = false;
+        let a_id = a.id;
+        let b_id = b.id;
+        store.save(&a).await.unwrap();
+        store.save(&b).await.unwrap();
+
+        store.set_owner(&a_id).await.unwrap();
+        let owner = store.find_owner().await.unwrap().unwrap();
+        assert_eq!(owner.id, a_id);
+        assert!(owner.is_owner);
+        // Identifiers are populated by find_owner.
+        assert_eq!(owner.identifiers.len(), 1);
+        assert_eq!(owner.identifiers[0].value, "a@x.com");
+
+        // Switching the owner clears the prior owner's flag.
+        store.set_owner(&b_id).await.unwrap();
+        let owner = store.find_owner().await.unwrap().unwrap();
+        assert_eq!(owner.id, b_id);
+        let reloaded_a = store.load(a_id).await.unwrap().unwrap();
+        assert!(!reloaded_a.is_owner);
+    }
+
+    #[tokio::test]
+    async fn email_identifiers_normalized_to_lowercase_on_save() {
+        let store = setup().await;
+        let contact = make_contact("Mixed", vec![("Alex@Example.com", IdentifierKind::Email)]);
+        let id = contact.id;
+        store.save(&contact).await.unwrap();
+
+        // Lookup by either casing resolves the same contact.
+        let lo = store.find_by_identifier("alex@example.com").await.unwrap();
+        let mixed = store.find_by_identifier("ALEX@Example.com").await.unwrap();
+        assert!(lo.is_some());
+        assert!(mixed.is_some());
+        assert_eq!(lo.as_ref().unwrap().id, id);
+        assert_eq!(mixed.as_ref().unwrap().id, id);
+        // Stored value is the lowercased form.
+        let loaded = store.load(id).await.unwrap().unwrap();
+        assert_eq!(loaded.identifiers[0].value, "alex@example.com");
+    }
+
+    #[tokio::test]
+    async fn migrate_add_is_owner_is_idempotent_on_legacy_table() {
+        // Hand-roll a contacts table without `is_owner` to simulate a
+        // DB created before the migration shipped. init_schema should
+        // happily add the column; running it twice must remain a no-op.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE contacts (\
+                 id TEXT PRIMARY KEY, name TEXT NOT NULL, \
+                 trust_level TEXT NOT NULL DEFAULT 'Unknown', \
+                 trust_manual_override INTEGER NOT NULL DEFAULT 0, \
+                 interaction_count INTEGER NOT NULL DEFAULT 0, \
+                 last_interaction TEXT, notes TEXT, \
+                 blocked INTEGER NOT NULL DEFAULT 0, \
+                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL \
+             );\
+             CREATE TABLE contact_identifiers (\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                 contact_id TEXT NOT NULL REFERENCES contacts(id) ON DELETE CASCADE, \
+                 identifier TEXT NOT NULL, kind TEXT NOT NULL, \
+                 UNIQUE(identifier, kind) \
+             );",
+        )
+        .unwrap();
+
+        let conn = Arc::new(Mutex::new(conn));
+        let store = SqliteContactStore::new(conn);
+        store.init_schema().await.unwrap();
+        // Run again — must not fail.
+        store.init_schema().await.unwrap();
+
+        // Round-trip a contact and verify is_owner defaults to false.
+        let contact = make_contact("Pre-migration", vec![]);
+        let id = contact.id;
+        store.save(&contact).await.unwrap();
+        let loaded = store.load(id).await.unwrap().unwrap();
+        assert!(!loaded.is_owner);
     }
 }

@@ -792,6 +792,7 @@ impl AppToolRegistry {
             last_interaction: None,
             notes: None,
             blocked: false,
+            is_owner: false,
         };
 
         tracing::info!(tool = "contacts_create", name, "Creating contact");

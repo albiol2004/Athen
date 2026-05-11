@@ -18,6 +18,7 @@ pub(crate) mod http_presets;
 pub(crate) mod http_rate_limiter;
 pub(crate) mod identity_render;
 pub(crate) mod notifier;
+pub(crate) mod owner_migration;
 pub(crate) mod process;
 pub(crate) mod sense_router;
 mod settings;
@@ -235,6 +236,24 @@ pub fn run() {
             // come before start_telegram_monitor so the poll loop can pick
             // up the Telegram sink for callback resolution.
             state.init_approval_router(app.handle().clone());
+
+            // Migrate the legacy TelegramConfig::owner_user_id into the
+            // unified contact store BEFORE any sense monitor starts —
+            // sense monitors snapshot the owner identifier set per
+            // poll, and we want the first poll to already see the
+            // migrated contact instead of falling back to the legacy
+            // config path. Idempotent across restarts.
+            if let Some(ref store) = state.contact_store {
+                let cfg = crate::settings::load_main_config_public();
+                let store = store.clone();
+                tauri::async_runtime::block_on(async move {
+                    crate::owner_migration::migrate_telegram_owner_to_contacts(
+                        &store,
+                        &cfg.telegram,
+                    )
+                    .await
+                });
+            }
 
             // Start background monitor tasks before managing state.
             state.start_email_monitor(app.handle().clone());

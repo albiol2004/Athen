@@ -15,6 +15,15 @@ pub struct Contact {
     pub last_interaction: Option<DateTime<Utc>>,
     pub notes: Option<String>,
     pub blocked: bool,
+    /// Marks the single contact representing Athen's owner (the user
+    /// running this instance). Inbound events from any identifier
+    /// attached to this contact bypass risk gating via the existing
+    /// `TrustLevel::AuthUser` fast-pass.
+    ///
+    /// Exactly one contact should be flagged at a time; the
+    /// `ContactStore::set_owner` method enforces that invariant.
+    #[serde(default)]
+    pub is_owner: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

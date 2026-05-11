@@ -693,6 +693,16 @@ impl AppState {
         self._database.as_ref().map(|db| db.attachment_store())
     }
 
+    /// Build an `OwnerLookup` from the shared contact store. Returns
+    /// `None` when no store is wired (CLI / test builds without a DB).
+    /// Cheap to call repeatedly — the underlying store is cloneable and
+    /// the lookup wraps it in an `Arc<dyn ContactStore>`.
+    pub fn owner_lookup(&self) -> Option<Arc<athen_contacts::OwnerLookup>> {
+        let store = self.contact_store.as_ref()?;
+        let arc: Arc<dyn athen_contacts::ContactStore> = Arc::new(store.clone());
+        Some(Arc::new(athen_contacts::OwnerLookup::new(arc)))
+    }
+
     /// Load `config.toml` and overlay any vault-stored secrets on top.
     /// Use this anywhere that currently calls `load_config()` and then
     /// reads a credential field — IMAP password, SMTP password,
@@ -1187,6 +1197,9 @@ impl AppState {
         self.email_shutdown = Some(shutdown_tx);
 
         let mut monitor = EmailMonitor::new();
+        if let Some(lookup) = self.owner_lookup() {
+            monitor = monitor.with_owner_lookup(lookup);
+        }
         let email_config = config.clone();
         let router = Arc::clone(&self.router);
         let arc_store_ref = self._database.as_ref().map(|db| db.arc_store());
@@ -1460,6 +1473,9 @@ impl AppState {
         self.telegram_shutdown = Some(shutdown_tx);
 
         let mut monitor = TelegramMonitor::new(config.telegram.clone());
+        if let Some(lookup) = self.owner_lookup() {
+            monitor = monitor.with_owner_lookup(lookup);
+        }
         let bot_token = config.telegram.bot_token.clone();
         let telegram_config = config.clone();
         let router = Arc::clone(&self.router);

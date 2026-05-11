@@ -6,7 +6,7 @@
 //! avoid processing the same message twice.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -14,6 +14,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use serde::Deserialize;
 use uuid::Uuid;
 
+use athen_contacts::OwnerLookup;
 use athen_core::config::{AthenConfig, TelegramConfig};
 use athen_core::error::{AthenError, Result};
 use athen_core::event::{
@@ -180,6 +181,12 @@ pub struct TelegramMonitor {
     /// Callback-query events collected during `process_updates` and
     /// drained by callers via [`TelegramMonitor::take_callbacks`].
     callbacks: Mutex<Vec<TelegramCallbackEvent>>,
+    /// Optional cross-channel owner resolver. When wired, the per-poll
+    /// flow fetches the owner's identifier set via async lookup and
+    /// passes it into the sync `process_updates`. Falls back to the
+    /// legacy `TelegramConfig::owner_user_id` for first-boot / when no
+    /// store is available.
+    owner_lookup: Option<Arc<OwnerLookup>>,
 }
 
 impl TelegramMonitor {
@@ -190,7 +197,39 @@ impl TelegramMonitor {
             client: reqwest::Client::new(),
             last_update_id: Mutex::new(None),
             callbacks: Mutex::new(Vec::new()),
+            owner_lookup: None,
         }
+    }
+
+    /// Attach an `OwnerLookup` so inbound messages can be cross-checked
+    /// against the unified owner contact instead of (or in addition to)
+    /// the legacy `TelegramConfig::owner_user_id`.
+    pub fn with_owner_lookup(mut self, lookup: Arc<OwnerLookup>) -> Self {
+        self.owner_lookup = Some(lookup);
+        self
+    }
+
+    /// Resolve the owner's Telegram user ids (as strings) for the
+    /// current poll tick. Returns the cached snapshot from
+    /// `OwnerLookup`, augmented with `config.owner_user_id` if present —
+    /// the legacy fallback is intentional so first-boot before the
+    /// migration runs still treats the user as owner.
+    async fn current_owner_telegram_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = Vec::new();
+        if let Some(ref lookup) = self.owner_lookup {
+            for (scheme, value) in lookup.owner_identifiers().await {
+                if scheme == "telegram_user" {
+                    ids.push(value);
+                }
+            }
+        }
+        if let Some(legacy) = self.config.owner_user_id {
+            let s = legacy.to_string();
+            if !ids.contains(&s) {
+                ids.push(s);
+            }
+        }
+        ids
     }
 
     /// Drain accumulated callback-query events. Called by the host after
@@ -212,8 +251,15 @@ impl TelegramMonitor {
     /// Convert a list of Telegram updates into [`SenseEvent`]s.
     ///
     /// This method is public so it can be tested in isolation without
-    /// making HTTP calls.
-    pub fn process_updates(&self, updates: Vec<TelegramUpdate>) -> Vec<SenseEvent> {
+    /// making HTTP calls. `owner_telegram_ids` is the snapshot of
+    /// Telegram user ids that should be treated as the owner for this
+    /// batch — `poll` builds it via [`OwnerLookup`] + the legacy config
+    /// fallback before calling in; tests pass the set directly.
+    pub fn process_updates_with_owner(
+        &self,
+        updates: Vec<TelegramUpdate>,
+        owner_telegram_ids: &[String],
+    ) -> Vec<SenseEvent> {
         let mut events = Vec::new();
         let mut max_id: Option<i64> = None;
 
@@ -284,7 +330,32 @@ impl TelegramMonitor {
                 continue;
             }
 
-            // Build sender info.
+            // Determine risk based on sender vs owner. Cross-channel
+            // owner identity lives in the contact store: we match by
+            // numeric user_id (the canonical Telegram identifier), with
+            // a legacy fallback to `TelegramConfig::owner_user_id` so
+            // first-boot before the migration runs still resolves the
+            // owner correctly.
+            let is_owner_msg = message
+                .from
+                .as_ref()
+                .map(|user| {
+                    let uid = user.id.to_string();
+                    owner_telegram_ids.iter().any(|o| o == &uid)
+                })
+                .unwrap_or(false);
+
+            let source_risk = if is_owner_msg {
+                RiskLevel::Safe // L1
+            } else {
+                RiskLevel::Caution // L2
+            };
+
+            // Build sender info. We always use the numeric user_id as
+            // the canonical identifier so the contact-store lookup in
+            // the coordinator picks up the unified owner contact (whose
+            // attached identifier is the user_id). The display name
+            // still carries the friendlier name/@username.
             let sender = message.from.as_ref().map(|user| {
                 let display = if let Some(ref uname) = user.username {
                     format!("{} (@{})", user.first_name, uname)
@@ -292,18 +363,11 @@ impl TelegramMonitor {
                     user.first_name.clone()
                 };
                 SenderInfo {
-                    identifier: user.username.clone().unwrap_or_else(|| user.id.to_string()),
+                    identifier: user.id.to_string(),
                     contact_id: None,
                     display_name: Some(display),
                 }
             });
-
-            // Determine risk based on sender vs owner.
-            let source_risk = if self.is_owner(&message) {
-                RiskLevel::Safe // L1
-            } else {
-                RiskLevel::Caution // L2
-            };
 
             let timestamp: DateTime<Utc> = Utc
                 .timestamp_opt(message.date, 0)
@@ -363,12 +427,18 @@ impl TelegramMonitor {
         events
     }
 
-    /// Return `true` if the message sender matches the configured owner.
-    fn is_owner(&self, message: &TelegramMessage) -> bool {
-        match (self.config.owner_user_id, &message.from) {
-            (Some(owner_id), Some(user)) => user.id == owner_id,
-            _ => false,
-        }
+    /// Back-compat wrapper that derives the owner id list from the
+    /// legacy `TelegramConfig::owner_user_id` only. New code should
+    /// build a snapshot via [`OwnerLookup`] and call
+    /// [`process_updates_with_owner`] directly — kept here so existing
+    /// tests and call sites compile without churn.
+    pub fn process_updates(&self, updates: Vec<TelegramUpdate>) -> Vec<SenseEvent> {
+        let owner_ids: Vec<String> = self
+            .config
+            .owner_user_id
+            .map(|id| vec![id.to_string()])
+            .unwrap_or_default();
+        self.process_updates_with_owner(updates, &owner_ids)
     }
 
     /// Walk every attachment on `events` whose source is Telegram and
@@ -864,7 +934,12 @@ impl SenseMonitor for TelegramMonitor {
             }
         }
 
-        let mut events = self.process_updates(updates);
+        // Snapshot the owner's Telegram identifiers once per poll so we
+        // don't hit the store per message. Falls back to the legacy
+        // config when no lookup is wired (CLI tests, first-boot before
+        // migration).
+        let owner_telegram_ids = self.current_owner_telegram_ids().await;
+        let mut events = self.process_updates_with_owner(updates, &owner_telegram_ids);
         // Second pass: pull the bytes for every Telegram-sourced
         // attachment. Failures are logged but don't fail the poll —
         // the agent still gets the metadata.
@@ -1390,7 +1465,10 @@ mod tests {
         assert_eq!(event.content.body["chat_id"], 99);
 
         let sender = event.sender.as_ref().unwrap();
-        assert_eq!(sender.identifier, "bob123");
+        // Identifier is the canonical numeric user_id (99) so the
+        // contact-store owner lookup matches across Telegram clients
+        // that may or may not have a username set.
+        assert_eq!(sender.identifier, "99");
         assert_eq!(sender.display_name.as_deref(), Some("Bob (@bob123)"));
     }
 
@@ -1448,6 +1526,106 @@ mod tests {
         let events = monitor.process_updates(updates);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].source_risk, RiskLevel::Safe); // L1
+    }
+
+    #[tokio::test]
+    async fn process_updates_with_owner_via_lookup_marks_safe() {
+        use athen_contacts::{ContactStore, InMemoryContactStore};
+        use athen_core::contact::{Contact, ContactIdentifier, IdentifierKind, TrustLevel};
+
+        let store: std::sync::Arc<dyn ContactStore> =
+            std::sync::Arc::new(InMemoryContactStore::new());
+        let owner = Contact {
+            id: Uuid::new_v4(),
+            name: "Owner".into(),
+            trust_level: TrustLevel::AuthUser,
+            trust_manual_override: true,
+            identifiers: vec![ContactIdentifier {
+                kind: IdentifierKind::Telegram,
+                value: "777".into(),
+            }],
+            interaction_count: 0,
+            last_interaction: None,
+            notes: None,
+            blocked: false,
+            is_owner: true,
+        };
+        let id = owner.id;
+        store.save(&owner).await.unwrap();
+        store.set_owner(&id).await.unwrap();
+
+        // No legacy fallback in this config — owner must resolve via
+        // the lookup alone.
+        let mut config = test_config();
+        config.owner_user_id = None;
+        let monitor = TelegramMonitor::new(config)
+            .with_owner_lookup(std::sync::Arc::new(OwnerLookup::new(store)));
+
+        let owner_ids = monitor.current_owner_telegram_ids().await;
+        assert_eq!(owner_ids, vec!["777".to_string()]);
+
+        let updates = vec![make_text_update(
+            100,
+            1,
+            777,
+            "Owner",
+            Some("ownerdev"),
+            777,
+            "hi me",
+        )];
+        let events = monitor.process_updates_with_owner(updates, &owner_ids);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source_risk, RiskLevel::Safe);
+    }
+
+    #[tokio::test]
+    async fn process_updates_with_owner_lookup_negative_case() {
+        use athen_contacts::{ContactStore, InMemoryContactStore};
+        use athen_core::contact::{Contact, ContactIdentifier, IdentifierKind, TrustLevel};
+
+        let store: std::sync::Arc<dyn ContactStore> =
+            std::sync::Arc::new(InMemoryContactStore::new());
+        let owner = Contact {
+            id: Uuid::new_v4(),
+            name: "Owner".into(),
+            trust_level: TrustLevel::AuthUser,
+            trust_manual_override: true,
+            identifiers: vec![ContactIdentifier {
+                kind: IdentifierKind::Telegram,
+                value: "777".into(),
+            }],
+            interaction_count: 0,
+            last_interaction: None,
+            notes: None,
+            blocked: false,
+            is_owner: true,
+        };
+        let id = owner.id;
+        store.save(&owner).await.unwrap();
+        store.set_owner(&id).await.unwrap();
+
+        let mut config = test_config();
+        config.owner_user_id = None;
+        let monitor = TelegramMonitor::new(config)
+            .with_owner_lookup(std::sync::Arc::new(OwnerLookup::new(store)));
+
+        let owner_ids = monitor.current_owner_telegram_ids().await;
+        let updates = vec![make_text_update(100, 1, 999, "Stranger", None, 999, "spam")];
+        let events = monitor.process_updates_with_owner(updates, &owner_ids);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source_risk, RiskLevel::Caution);
+    }
+
+    #[tokio::test]
+    async fn current_owner_telegram_ids_falls_back_to_legacy_config() {
+        // No lookup wired; only the legacy `owner_user_id` provides the
+        // owner. Confirms first-boot path still works before the
+        // app-level migration runs.
+        let mut config = test_config();
+        config.owner_user_id = Some(123);
+        let monitor = TelegramMonitor::new(config);
+        let ids = monitor.current_owner_telegram_ids().await;
+        assert_eq!(ids, vec!["123".to_string()]);
     }
 
     #[test]

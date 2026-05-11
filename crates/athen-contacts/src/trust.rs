@@ -44,6 +44,7 @@ impl TrustManager {
             last_interaction: None,
             notes: None,
             blocked: false,
+            is_owner: false,
         };
         self.store.save(&contact).await?;
         Ok(contact)
@@ -215,6 +216,7 @@ mod tests {
             last_interaction: None,
             notes: None,
             blocked: true,
+            is_owner: false,
         };
         // Blocked contacts always get the Unknown (highest) multiplier.
         assert!((manager.risk_multiplier(&contact) - 5.0).abs() < f64::EPSILON);

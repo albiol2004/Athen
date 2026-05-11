@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use uuid::Uuid;
 
+use athen_contacts::OwnerLookup;
 use athen_core::config::{AthenConfig, EmailConfig};
 use athen_core::error::{AthenError, Result};
 use athen_core::event::{
@@ -49,6 +50,10 @@ pub struct EmailMonitor {
     config: Arc<Mutex<Option<EmailConfig>>>,
     last_seen_uid: Arc<Mutex<Option<u32>>>,
     poll_interval: Duration,
+    /// Cross-channel owner resolver. When set and the From address
+    /// matches one of the owner contact's email identifiers, the event
+    /// is tagged `RiskLevel::Safe` instead of the default `Caution`.
+    owner_lookup: Option<Arc<OwnerLookup>>,
 }
 
 impl EmailMonitor {
@@ -58,6 +63,7 @@ impl EmailMonitor {
             config: Arc::new(Mutex::new(None)),
             last_seen_uid: Arc::new(Mutex::new(None)),
             poll_interval: Duration::from_secs(60),
+            owner_lookup: None,
         }
     }
 
@@ -67,7 +73,17 @@ impl EmailMonitor {
             config: Arc::new(Mutex::new(None)),
             last_seen_uid: Arc::new(Mutex::new(None)),
             poll_interval,
+            owner_lookup: None,
         }
+    }
+
+    /// Attach an `OwnerLookup` so inbound mail from the owner's
+    /// configured email identifiers is marked `RiskLevel::Safe`
+    /// (matching Telegram's owner treatment). Without a lookup the
+    /// monitor keeps the legacy "everything is Caution" behaviour.
+    pub fn with_owner_lookup(mut self, lookup: Arc<OwnerLookup>) -> Self {
+        self.owner_lookup = Some(lookup);
+        self
     }
 
     /// The risk level assigned to events from this source.
@@ -382,13 +398,17 @@ fn extract_subject(parsed: &mailparse::ParsedMail<'_>) -> Option<String> {
 ///
 /// `folder` is preserved in the event body so downstream consumers (e.g. the
 /// sense router) know where to mark the message `\Seen` after a successful
-/// agent run.
+/// agent run. `owner_emails` is the (already-lowercased) set of email
+/// identifiers attached to the owner contact for this poll tick — when
+/// the From address matches, the event is upgraded to `RiskLevel::Safe`
+/// so it lands in the same fast-path that owner Telegram messages take.
 fn message_to_event(
     uid: u32,
     uid_validity: u32,
     folder: &str,
     raw_body: &[u8],
     save_root: Option<&Path>,
+    owner_emails: &[String],
 ) -> Result<SenseEvent> {
     let parsed = mailparse::parse_mail(raw_body)
         .map_err(|e| AthenError::Other(format!("Failed to parse email UID {uid}: {e}")))?;
@@ -404,10 +424,25 @@ fn message_to_event(
         .as_ref()
         .map(|s| s.identifier.clone())
         .unwrap_or_default();
+    let from_lc = from_str.to_ascii_lowercase();
+
+    let source_risk = if !from_lc.is_empty() && owner_emails.iter().any(|o| o == &from_lc) {
+        RiskLevel::Safe
+    } else {
+        RiskLevel::Caution
+    };
+
+    // Normalise the sender identifier so contact-store lookups in the
+    // coordinator (case-insensitive emails) succeed regardless of how
+    // the From header is cased.
+    let sender = sender.map(|mut s| {
+        s.identifier = s.identifier.to_ascii_lowercase();
+        s
+    });
 
     let body = serde_json::json!({
         "subject": subject.as_deref().unwrap_or(""),
-        "from": from_str,
+        "from": from_lc,
         "text": text,
         "html": html,
         "folder": folder,
@@ -425,7 +460,7 @@ fn message_to_event(
             body,
             attachments,
         },
-        source_risk: RiskLevel::Caution,
+        source_risk,
         raw_id: Some(uid.to_string()),
     })
 }
@@ -436,12 +471,13 @@ fn poll_all_folders<S: std::io::Read + std::io::Write>(
     folders: &[String],
     current_last: Option<u32>,
     save_root: Option<&Path>,
+    owner_emails: &[String],
 ) -> Result<(Vec<SenseEvent>, Option<u32>)> {
     let mut all_events = Vec::new();
     let mut global_max_uid = current_last;
 
     for folder in folders {
-        match fetch_folder(session, folder, current_last, save_root) {
+        match fetch_folder(session, folder, current_last, save_root, owner_emails) {
             Ok((events, max_uid)) => {
                 all_events.extend(events);
                 if let Some(mu) = max_uid {
@@ -465,6 +501,7 @@ fn fetch_folder<S: std::io::Read + std::io::Write>(
     folder: &str,
     min_uid: Option<u32>,
     save_root: Option<&Path>,
+    owner_emails: &[String],
 ) -> Result<(Vec<SenseEvent>, Option<u32>)> {
     let mailbox = session
         .select(folder)
@@ -519,7 +556,7 @@ fn fetch_folder<S: std::io::Read + std::io::Write>(
             }
         };
 
-        match message_to_event(uid, uid_validity, folder, body, save_root) {
+        match message_to_event(uid, uid_validity, folder, body, save_root, owner_emails) {
             Ok(event) => events.push(event),
             Err(e) => {
                 tracing::warn!("Failed to parse email UID {uid} in '{folder}': {e}");
@@ -562,6 +599,20 @@ impl SenseMonitor for EmailMonitor {
         // tests, just degrades to metadata-only attachments.
         let save_root = athen_core::paths::athen_attachments_dir();
 
+        // Snapshot the owner's email identifiers once per poll so the
+        // sync inner loop can match without hitting the store per
+        // message. Lowercased pairs already; owner_lookup normalises.
+        let owner_emails: Vec<String> = match self.owner_lookup.as_ref() {
+            Some(lookup) => lookup
+                .owner_identifiers()
+                .await
+                .into_iter()
+                .filter(|(s, _)| s == "email")
+                .map(|(_, v)| v)
+                .collect(),
+            None => Vec::new(),
+        };
+
         let result = tokio::task::spawn_blocking(move || -> Result<Vec<SenseEvent>> {
             let current_last = *last_seen.lock().unwrap();
             let save_root = save_root.as_deref();
@@ -586,8 +637,13 @@ impl SenseMonitor for EmailMonitor {
                     .login(&config.username, &config.password)
                     .map_err(|(e, _)| AthenError::Other(format!("IMAP login: {e}")))?;
 
-                let result =
-                    poll_all_folders(&mut session, &config.folders, current_last, save_root);
+                let result = poll_all_folders(
+                    &mut session,
+                    &config.folders,
+                    current_last,
+                    save_root,
+                    &owner_emails,
+                );
                 if let Err(e) = session.logout() {
                     tracing::warn!("IMAP logout error: {e}");
                 }
@@ -602,8 +658,13 @@ impl SenseMonitor for EmailMonitor {
                     .login(&config.username, &config.password)
                     .map_err(|(e, _)| AthenError::Other(format!("IMAP login: {e}")))?;
 
-                let result =
-                    poll_all_folders(&mut session, &config.folders, current_last, save_root);
+                let result = poll_all_folders(
+                    &mut session,
+                    &config.folders,
+                    current_last,
+                    save_root,
+                    &owner_emails,
+                );
                 if let Err(e) = session.logout() {
                     tracing::warn!("IMAP logout error: {e}");
                 }
@@ -918,7 +979,7 @@ Content-Type: text/plain; charset=utf-8\r\n\
 \r\n\
 This is the body.";
 
-        let event = message_to_event(42, 1, "INBOX", raw, None).unwrap();
+        let event = message_to_event(42, 1, "INBOX", raw, None, &[]).unwrap();
         assert_eq!(event.source, EventSource::Email);
         assert!(matches!(event.kind, EventKind::NewMessage));
         assert_eq!(event.source_risk, RiskLevel::Caution);
@@ -1039,7 +1100,7 @@ Content-Type: text/plain\r\n\
 \r\n\
 Just a body, no subject";
 
-        let event = message_to_event(99, 1, "INBOX", raw, None).unwrap();
+        let event = message_to_event(99, 1, "INBOX", raw, None, &[]).unwrap();
         assert!(event.content.summary.is_none());
         assert_eq!(event.raw_id.as_deref(), Some("99"));
         assert!(event.content.body["text"]
@@ -1055,7 +1116,7 @@ Content-Type: text/plain\r\n\
 \r\n\
 Body without sender";
 
-        let event = message_to_event(100, 1, "Archive", raw, None).unwrap();
+        let event = message_to_event(100, 1, "Archive", raw, None, &[]).unwrap();
         assert!(event.sender.is_none());
         assert_eq!(event.content.summary.as_deref(), Some("No From"));
         assert_eq!(event.content.body["folder"], "Archive");
@@ -1331,5 +1392,51 @@ PDF-BYTES\r\n\
         assert_eq!(sanitize_filename("invoice<>.pdf"), "invoice__.pdf");
         assert_eq!(sanitize_filename(""), "file");
         assert_eq!(sanitize_filename("..."), "file");
+    }
+
+    // ---------------------------------------------------------------
+    // Owner-resolution tests (Phase 1 unified-owner work)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn message_to_event_marks_safe_when_from_matches_owner() {
+        let raw = b"From: \"Alex\" <alex@example.com>\r\n\
+Subject: Self-note\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\
+\r\n\
+remember the milk";
+        let owner_emails = vec!["alex@example.com".to_string()];
+        let event = message_to_event(7, 1, "INBOX", raw, None, &owner_emails).unwrap();
+        assert_eq!(event.source_risk, RiskLevel::Safe);
+        let sender = event.sender.unwrap();
+        // Lowercased identifier.
+        assert_eq!(sender.identifier, "alex@example.com");
+    }
+
+    #[test]
+    fn message_to_event_matches_owner_case_insensitively() {
+        // From header has mixed case; owner_emails are already
+        // lowercased by the OwnerLookup snapshot — match must still
+        // succeed because the comparison lowercases on the message side.
+        let raw = b"From: ALEX@Example.com\r\n\
+Subject: caps\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+body";
+        let owner_emails = vec!["alex@example.com".to_string()];
+        let event = message_to_event(8, 1, "INBOX", raw, None, &owner_emails).unwrap();
+        assert_eq!(event.source_risk, RiskLevel::Safe);
+    }
+
+    #[test]
+    fn message_to_event_keeps_caution_for_non_owner_sender() {
+        let raw = b"From: stranger@somewhere.test\r\n\
+Subject: hi\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+body";
+        let owner_emails = vec!["alex@example.com".to_string()];
+        let event = message_to_event(9, 1, "INBOX", raw, None, &owner_emails).unwrap();
+        assert_eq!(event.source_risk, RiskLevel::Caution);
     }
 }
