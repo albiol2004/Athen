@@ -1,6 +1,11 @@
 //! Production EmailSendApprovalGate — routes the question through the
 //! cross-channel ApprovalRouter so the user can answer in-app or via
 //! Telegram (with escalation). Fails closed on any non-approve outcome.
+//!
+//! Also hosts the [`OwnerLookupAdapter`] that bridges
+//! `athen_contacts::OwnerLookup` to the agent-side
+//! [`athen_agent::OwnerDestinationCheck`] trait — keeps the dep graph
+//! clean (the agent crate never has to depend on athen-contacts).
 
 use std::sync::Arc;
 
@@ -8,6 +13,8 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use athen_agent::tools::{EmailSendApprovalGate, EmailSendSummary};
+use athen_agent::OwnerDestinationCheck;
+use athen_contacts::OwnerLookup;
 
 pub struct RouterEmailApprovalGate {
     router: Arc<crate::approval::ApprovalRouter>,
@@ -63,5 +70,28 @@ impl EmailSendApprovalGate for RouterEmailApprovalGate {
                 false
             }
         }
+    }
+}
+
+/// Adapter that lets the agent crate's `OwnerDestinationCheck`
+/// trait be satisfied by an `Arc<OwnerLookup>` from athen-contacts.
+/// Lives here rather than in athen-agent so the agent crate stays
+/// free of an athen-contacts dependency.
+pub struct OwnerLookupAdapter {
+    lookup: Arc<OwnerLookup>,
+}
+
+impl OwnerLookupAdapter {
+    pub fn new(lookup: Arc<OwnerLookup>) -> Self {
+        Self { lookup }
+    }
+}
+
+#[async_trait]
+impl OwnerDestinationCheck for OwnerLookupAdapter {
+    async fn is_owner_email(&self, email: &str) -> bool {
+        // The OwnerLookup normalizes scheme="email" values to lowercase,
+        // so passing the caller-lowercased value through is correct.
+        self.lookup.is_owner_identifier("email", email).await
     }
 }

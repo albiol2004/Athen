@@ -124,6 +124,7 @@ fn spawn_router_approval(
         compactor: state.compactor.clone(),
         web_search: Arc::clone(&state.web_search),
         email_sender: state.email_sender.clone(),
+        owner_check: state.owner_destination_check(),
         attachment_store: state.attachment_store(),
         compaction_trigger_tokens,
         compaction_target_tokens,
@@ -241,6 +242,7 @@ fn spawn_router_approval(
             compactor: bg_ctx.compactor.clone(),
             web_search: bg_ctx.web_search.clone(),
             email_sender: bg_ctx.email_sender.clone(),
+            owner_check: bg_ctx.owner_check.clone(),
             initial_user_images: Vec::new(),
             attachment_store: bg_ctx.attachment_store.clone(),
             compaction_trigger_tokens: bg_ctx.compaction_trigger_tokens,
@@ -335,6 +337,8 @@ struct ApprovedTaskBgCtx {
     compactor: Option<Arc<dyn athen_core::traits::compaction::ArcCompactor>>,
     web_search: Arc<dyn athen_web::WebSearchProvider>,
     email_sender: Option<Arc<dyn athen_core::traits::email_sender::EmailSender>>,
+    /// See [`ApprovedTaskCtx::owner_check`].
+    owner_check: Option<Arc<dyn athen_agent::OwnerDestinationCheck>>,
     attachment_store: Option<athen_persistence::attachments::AttachmentStore>,
     compaction_trigger_tokens: u32,
     compaction_target_tokens: u32,
@@ -2406,6 +2410,7 @@ pub async fn approve_task(
         compactor: state.compactor.clone(),
         web_search: Arc::clone(&state.web_search),
         email_sender: state.email_sender.clone(),
+        owner_check: state.owner_destination_check(),
         // Approved-via-card path: original images aren't restashed yet
         // (Phase 2 will mirror `pending_message` for images). For now,
         // images flow through the direct-execution path in `send_message`,
@@ -2541,6 +2546,11 @@ pub(crate) struct ApprovedTaskCtx {
     /// Outbound SMTP transport for the `email_send` tool. `None` when
     /// SMTP isn't configured — the tool then refuses with a clear error.
     pub email_sender: Option<Arc<dyn athen_core::traits::email_sender::EmailSender>>,
+    /// Owner-destination check fed into `ShellToolRegistry::with_owner_check_opt`
+    /// so `email_send` can auto-approve owner-self-send turns without
+    /// firing the approval gate. `None` when no contact store / no owner
+    /// is configured — `email_send` falls back to gate-every-send.
+    pub owner_check: Option<Arc<dyn athen_agent::OwnerDestinationCheck>>,
     /// Images attached to this turn's user message. Empty in the
     /// background/Telegram path; the in-app composer populates this when
     /// the user pastes or drops an image. Forwarded into the executor so
@@ -2889,7 +2899,8 @@ pub(crate) async fn execute_approved_task(
         .with_spawned_processes(ctx.spawned_processes.clone())
         .with_spawn_persistence_hook_opt(ctx.spawn_persistence.clone())
         .with_web_search(Arc::clone(&ctx.web_search))
-        .with_email_sender_opt(ctx.email_sender.clone());
+        .with_email_sender_opt(ctx.email_sender.clone())
+        .with_owner_check_opt(ctx.owner_check.clone());
     if let Some(ref store) = ctx.grant_store {
         let provider = Arc::new(crate::file_gate::ArcWritableProvider {
             arc_id: crate::file_gate::arc_uuid(&ctx.active_arc_id),
@@ -3869,7 +3880,8 @@ pub(crate) async fn execute_dispatched_task(
         .with_spawned_processes(ctx.spawned_processes.clone())
         .with_spawn_persistence_hook_opt(ctx.spawn_persistence.clone())
         .with_web_search(Arc::clone(&ctx.web_search))
-        .with_email_sender_opt(ctx.email_sender.clone());
+        .with_email_sender_opt(ctx.email_sender.clone())
+        .with_owner_check_opt(ctx.owner_check.clone());
     if let Some(ref store) = ctx.grant_store {
         let provider = Arc::new(crate::file_gate::ArcWritableProvider {
             arc_id: crate::file_gate::arc_uuid(&arc_id),

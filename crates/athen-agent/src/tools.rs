@@ -118,6 +118,29 @@ pub trait EmailSendApprovalGate: Send + Sync {
     async fn confirm_send(&self, summary: &EmailSendSummary) -> bool;
 }
 
+/// Lightweight check the `email_send` path consults before invoking
+/// the approval gate: is this destination email address one of the
+/// owner's own identifiers?
+///
+/// Lives in `athen-agent` (rather than depending on `athen-contacts`)
+/// to keep the hexagonal dep graph clean. The composition root in
+/// `athen-app` implements this trait for `athen_contacts::OwnerLookup`
+/// and injects it via [`ShellToolRegistry::with_owner_check`].
+///
+/// Semantics: when `email_send` finds the destination set is
+/// *non-empty* and *every* address matches the owner, the approval
+/// gate is bypassed (the user can't meaningfully "approve sending an
+/// email to themselves"). A single non-owner address still routes
+/// through the gate — BCC'ing an external while CC'ing the owner does
+/// **not** bypass.
+#[async_trait]
+pub trait OwnerDestinationCheck: Send + Sync {
+    /// Compare `email` (already lowercased by the caller) against the
+    /// owner contact's email identifiers. Returns `false` when no
+    /// owner is configured.
+    async fn is_owner_email(&self, email: &str) -> bool;
+}
+
 /// Metadata for a process started via `shell_spawn`. Kept in
 /// [`ShellToolRegistry::spawned`] so subsequent `shell_logs`/`shell_kill`
 /// calls can find the log file and validate the PID is one we own.
@@ -253,6 +276,11 @@ pub struct ShellToolRegistry {
     /// no gate is wired — the tool refuses to send so emails can never
     /// leave without user consent.
     email_approval: Option<Arc<dyn EmailSendApprovalGate>>,
+    /// Optional owner-destination check. When wired, `email_send`
+    /// bypasses the approval gate iff *every* recipient resolves to
+    /// the owner's own email identifiers. Unwired (or no owner set) →
+    /// behaviour is unchanged: the gate runs unconditionally.
+    owner_check: Option<Arc<dyn OwnerDestinationCheck>>,
     /// Optional sink notified every time the spawned-process map mutates.
     /// Wired by the app layer to a JSON pidfile under `<data_dir>/`. Tests
     /// and CLI builds leave it `None` and the registry behaves as before.
@@ -579,6 +607,7 @@ impl ShellToolRegistry {
             toolbox_approval: None,
             email_sender: None,
             email_approval: None,
+            owner_check: None,
             spawn_persistence: None,
         }
     }
@@ -620,6 +649,24 @@ impl ShellToolRegistry {
     pub fn with_email_approval_opt(self, gate: Option<Arc<dyn EmailSendApprovalGate>>) -> Self {
         match gate {
             Some(g) => self.with_email_approval(g),
+            None => self,
+        }
+    }
+
+    /// Inject the owner-destination check so `email_send` can skip the
+    /// approval gate when the user is mailing themselves. Without this,
+    /// every send goes through the gate — preserving today's behaviour.
+    pub fn with_owner_check(mut self, check: Arc<dyn OwnerDestinationCheck>) -> Self {
+        self.owner_check = Some(check);
+        self
+    }
+
+    /// `Option`-flavoured variant — see [`Self::with_email_sender_opt`].
+    /// Lets the composition root pass `state.owner_destination_check_opt()`
+    /// without a manual `if let Some`.
+    pub fn with_owner_check_opt(self, check: Option<Arc<dyn OwnerDestinationCheck>>) -> Self {
+        match check {
+            Some(c) => self.with_owner_check(c),
             None => self,
         }
     }
@@ -2643,7 +2690,39 @@ impl ShellToolRegistry {
             "sending email"
         );
 
-        if !gate.confirm_send(&summary).await {
+        // Owner-self-send bypass: if every destination address (to + cc +
+        // bcc) matches one of the owner contact's email identifiers, the
+        // approval gate is meaningless ("approve sending mail to
+        // yourself?") — skip it. Any non-owner destination falls through
+        // to the gate, even if other destinations are owner. The check
+        // also requires a non-empty destination set, but `to` is already
+        // validated above so this branch is guaranteed to evaluate at
+        // least one address.
+        let mut auto_approved = false;
+        if let Some(check) = self.owner_check.as_ref() {
+            let mut all_owner = true;
+            'outer: for slot in [&to, &cc, &bcc] {
+                for addr in slot.iter() {
+                    let lc = addr.trim().to_ascii_lowercase();
+                    if lc.is_empty() {
+                        continue;
+                    }
+                    if !check.is_owner_email(&lc).await {
+                        all_owner = false;
+                        break 'outer;
+                    }
+                }
+            }
+            if all_owner {
+                tracing::info!(
+                    tool = "email_send",
+                    "all destinations are owner — auto-approved (bypassing gate)"
+                );
+                auto_approved = true;
+            }
+        }
+
+        if !auto_approved && !gate.confirm_send(&summary).await {
             let msg = "User declined the send".to_string();
             return Ok(ToolResult {
                 success: false,
@@ -4334,6 +4413,130 @@ mod tests {
         assert!(err.contains("smtp transport boom"), "got: {err}");
         // Sender was reached (so the gate approved), but the transport
         // error propagated as a structured failure rather than a panic.
+        assert_eq!(sent.lock().await.len(), 1);
+    }
+
+    // ---- Owner self-send bypass ----
+
+    /// Mock owner-destination check. Returns `true` for any address in
+    /// `owner_emails` (compared lowercased), `false` otherwise.
+    struct MockOwnerCheck {
+        owner_emails: Vec<String>,
+    }
+
+    #[async_trait]
+    impl OwnerDestinationCheck for MockOwnerCheck {
+        async fn is_owner_email(&self, email: &str) -> bool {
+            let lc = email.to_ascii_lowercase();
+            self.owner_emails.iter().any(|o| o == &lc)
+        }
+    }
+
+    #[tokio::test]
+    async fn email_send_auto_approves_when_all_destinations_are_owner() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sender = Arc::new(MockEmailSender {
+            sent: sent.clone(),
+            should_fail: false,
+            message_id: "<self@athen>".into(),
+        });
+        // Gate would deny if asked — so observing a successful send
+        // proves the gate was bypassed.
+        let gate = Arc::new(MockEmailApprovalGate {
+            answer: false,
+            calls: calls.clone(),
+        });
+        let owner = Arc::new(MockOwnerCheck {
+            owner_emails: vec!["me@example.com".into(), "alias@example.com".into()],
+        });
+        let registry = ShellToolRegistry::new()
+            .await
+            .with_email_sender(sender as Arc<dyn EmailSender>)
+            .with_email_approval(gate as Arc<dyn EmailSendApprovalGate>)
+            .with_owner_check(owner as Arc<dyn OwnerDestinationCheck>);
+
+        let args = json!({
+            "to": ["ME@example.com"], // case-insensitive
+            "cc": ["alias@example.com"],
+            "subject": "note to self",
+            "body_text": "remember the milk",
+        });
+        let result = registry.call_tool("email_send", args).await.unwrap();
+        assert!(result.success, "expected success, got {result:?}");
+        // Gate must NOT have been consulted.
+        assert!(
+            calls.lock().await.is_empty(),
+            "approval gate was consulted on owner self-send"
+        );
+        // Send did happen.
+        assert_eq!(sent.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn email_send_routes_through_gate_when_any_destination_is_non_owner() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sender = Arc::new(MockEmailSender {
+            sent: sent.clone(),
+            should_fail: false,
+            message_id: "<mixed@athen>".into(),
+        });
+        let gate = Arc::new(MockEmailApprovalGate {
+            answer: true,
+            calls: calls.clone(),
+        });
+        let owner = Arc::new(MockOwnerCheck {
+            owner_emails: vec!["me@example.com".into()],
+        });
+        let registry = ShellToolRegistry::new()
+            .await
+            .with_email_sender(sender as Arc<dyn EmailSender>)
+            .with_email_approval(gate as Arc<dyn EmailSendApprovalGate>)
+            .with_owner_check(owner as Arc<dyn OwnerDestinationCheck>);
+
+        // Owner in to:, stranger in bcc:. Mixed destinations must go
+        // through the gate — BCC'ing an external while CC'ing the
+        // owner is exactly the case the spec rejects.
+        let args = json!({
+            "to": ["me@example.com"],
+            "bcc": ["stranger@example.com"],
+            "subject": "leaky",
+            "body_text": "...",
+        });
+        let result = registry.call_tool("email_send", args).await.unwrap();
+        assert!(result.success);
+        // Gate WAS consulted.
+        assert_eq!(calls.lock().await.len(), 1);
+        assert_eq!(sent.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn email_send_routes_through_gate_when_owner_not_configured() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sender = Arc::new(MockEmailSender {
+            sent: sent.clone(),
+            should_fail: false,
+            message_id: "<no-owner@athen>".into(),
+        });
+        let gate = Arc::new(MockEmailApprovalGate {
+            answer: true,
+            calls: calls.clone(),
+        });
+        // No owner check wired at all — should be identical to today's
+        // behaviour: every send hits the gate.
+        let registry = ShellToolRegistry::new()
+            .await
+            .with_email_sender(sender as Arc<dyn EmailSender>)
+            .with_email_approval(gate as Arc<dyn EmailSendApprovalGate>);
+
+        let result = registry
+            .call_tool("email_send", well_formed_email_args())
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert_eq!(calls.lock().await.len(), 1);
         assert_eq!(sent.lock().await.len(), 1);
     }
 

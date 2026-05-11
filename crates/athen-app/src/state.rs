@@ -703,6 +703,16 @@ impl AppState {
         Some(Arc::new(athen_contacts::OwnerLookup::new(arc)))
     }
 
+    /// Build an `OwnerDestinationCheck` adapter around `owner_lookup()`,
+    /// ready to feed into `ShellToolRegistry::with_owner_check_opt`. Same
+    /// `None` semantics — when the lookup is unavailable, the agent-side
+    /// owner self-send bypass simply doesn't fire and `email_send`
+    /// preserves today's gate-every-send behaviour.
+    pub fn owner_destination_check(&self) -> Option<Arc<dyn athen_agent::OwnerDestinationCheck>> {
+        let lookup = self.owner_lookup()?;
+        Some(Arc::new(crate::email_gate::OwnerLookupAdapter::new(lookup)))
+    }
+
     /// Load `config.toml` and overlay any vault-stored secrets on top.
     /// Use this anywhere that currently calls `load_config()` and then
     /// reads a credential field — IMAP password, SMTP password,
@@ -742,7 +752,8 @@ impl AppState {
             .with_spawned_processes(self.spawned_processes.clone())
             .with_spawn_persistence_hook_opt(self.spawn_persistence.clone())
             .with_web_search(self.web_search.clone())
-            .with_email_sender_opt(self.email_sender.clone());
+            .with_email_sender_opt(self.email_sender.clone())
+            .with_owner_check_opt(self.owner_destination_check());
         if let Some(router) = self.approval_router.clone() {
             shell_registry = shell_registry.with_toolbox_approval(Arc::new(
                 crate::file_gate::RouterToolboxApprovalGate::new(router.clone(), None),
@@ -886,7 +897,8 @@ impl AppState {
             .with_spawned_processes(self.spawned_processes.clone())
             .with_spawn_persistence_hook_opt(self.spawn_persistence.clone())
             .with_web_search(self.web_search.clone())
-            .with_email_sender_opt(self.email_sender.clone());
+            .with_email_sender_opt(self.email_sender.clone())
+            .with_owner_check_opt(self.owner_destination_check());
         if let Some(store) = self.grant_store.clone() {
             let provider = Arc::new(crate::file_gate::ArcWritableProvider {
                 arc_id: crate::file_gate::arc_uuid(arc_id),
@@ -1503,6 +1515,7 @@ impl AppState {
         let dispatch_signal_ref = Arc::clone(&self.dispatch_signal);
         let web_search_ref = Arc::clone(&self.web_search);
         let email_sender_ref = self.email_sender.clone();
+        let owner_check_ref = self.owner_destination_check();
         let telegram_outbound_hint_ref = self.telegram_outbound_hint.clone();
         let http_endpoint_store_ref = self.http_endpoint_store.clone();
         let vault_ref = self.vault.clone();
@@ -1593,6 +1606,7 @@ impl AppState {
                                     let approval_router_c = approval_router_ref.clone();
                                     let web_search_c = Arc::clone(&web_search_ref);
                                     let email_sender_c = email_sender_ref.clone();
+                                    let owner_check_c = owner_check_ref.clone();
                                     let http_endpoint_store_c = http_endpoint_store_ref.clone();
                                     let vault_c = vault_ref.clone();
                                     let http_rate_limiter_c = Arc::clone(&http_rate_limiter_ref);
@@ -1632,6 +1646,7 @@ impl AppState {
                                             approval_router_c.as_ref(),
                                             &web_search_c,
                                             &email_sender_c,
+                                            owner_check_c.as_ref(),
                                             &telegram_outbound_hint_c,
                                             http_endpoint_store_c.as_ref(),
                                             vault_c.as_ref(),
@@ -1767,6 +1782,7 @@ impl AppState {
         let compactor = self.compactor.clone();
         let web_search = Arc::clone(&self.web_search);
         let email_sender = self.email_sender.clone();
+        let owner_check_dispatch = self.owner_destination_check();
         // Snapshot the vault so the per-task IMAP mark-seen flow can
         // hydrate the IMAP password from it (the password lives in the
         // vault for installs that have re-saved their email settings).
@@ -1906,6 +1922,7 @@ impl AppState {
                         compactor: compactor.clone(),
                         web_search: Arc::clone(&web_search),
                         email_sender: email_sender.clone(),
+                        owner_check: owner_check_dispatch.clone(),
                         initial_user_images: Vec::new(),
                         attachment_store: attachment_store_loop.clone(),
                         compaction_trigger_tokens,
@@ -2059,6 +2076,7 @@ async fn execute_owner_telegram_message(
     approval_router: Option<&Arc<crate::approval::ApprovalRouter>>,
     web_search: &Arc<dyn WebSearchProvider>,
     email_sender: &Option<Arc<dyn athen_core::traits::email_sender::EmailSender>>,
+    owner_check: Option<&Arc<dyn athen_agent::OwnerDestinationCheck>>,
     telegram_outbound_hint: &crate::notifier::TelegramOutboundHint,
     http_endpoint_store: Option<&Arc<athen_persistence::http_endpoints::SqliteHttpEndpointStore>>,
     vault: Option<&Arc<dyn athen_core::traits::vault::Vault>>,
@@ -2357,7 +2375,8 @@ async fn execute_owner_telegram_message(
         .with_spawned_processes(spawned_processes.clone())
         .with_spawn_persistence_hook_opt(spawn_persistence.cloned())
         .with_web_search(web_search.clone())
-        .with_email_sender_opt(email_sender.clone());
+        .with_email_sender_opt(email_sender.clone())
+        .with_owner_check_opt(owner_check.cloned());
     if let (Some(store), Some(arc_id_str)) = (grant_store, target_arc_id.as_ref()) {
         let provider = Arc::new(crate::file_gate::ArcWritableProvider {
             arc_id: crate::file_gate::arc_uuid(arc_id_str),

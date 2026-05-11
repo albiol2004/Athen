@@ -19,6 +19,59 @@ use athen_core::config_loader;
 use crate::state::{build_router_for_provider, AppState};
 
 // ---------------------------------------------------------------------------
+// Owner-identifier disjointness helpers
+// ---------------------------------------------------------------------------
+
+/// Snapshot the owner contact's identifiers and check that none of the
+/// `candidates` (scheme, value) pairs overlap. Returns a human-friendly
+/// error string the frontend renders verbatim under the form when a
+/// conflict is found.
+///
+/// Used by the email + Telegram settings-save commands to prevent the
+/// user from assigning an identifier that the owner contact already
+/// owns — which would let an unauthenticated sender masquerade as the
+/// owner (Phase 3 of the owner-identity unification).
+///
+/// When the owner contact has no identifiers (no owner configured yet
+/// in a fresh install), this is a trivial `Ok(())` — there's nothing
+/// to conflict with.
+async fn validate_disjoint_from_owner(
+    owner_lookup: &athen_contacts::OwnerLookup,
+    candidates: &[(String, String)],
+) -> std::result::Result<(), String> {
+    let owner_idents = owner_lookup.owner_identifiers().await;
+    if owner_idents.is_empty() || candidates.is_empty() {
+        return Ok(());
+    }
+    match athen_contacts::assert_disjoint_from_owner(&owner_idents, candidates) {
+        Ok(()) => Ok(()),
+        Err(conflicts) => {
+            // Render every conflict so the user fixes them all at once
+            // rather than discovering them one at a time on resubmit.
+            let parts: Vec<String> = conflicts
+                .into_iter()
+                .map(|(scheme, value)| format!("{scheme}={value}"))
+                .collect();
+            Err(format!(
+                "Conflicts with owner contact: {} (cannot be both you and Athen's identity)",
+                parts.join(", ")
+            ))
+        }
+    }
+}
+
+/// Extract the bot's own numeric Telegram user id from a bot token of
+/// the form `<digits>:<base64ish>`. Used to catch the rare misconfig
+/// where the user pastes a bot token whose prefix matches the owner's
+/// own Telegram id. Returns `None` for malformed tokens — the caller
+/// then just skips the bot-id leg of the validation.
+pub(crate) fn bot_user_id_from_token(token: &str) -> Option<String> {
+    let (prefix, _) = token.split_once(':')?;
+    let n: i64 = prefix.parse().ok()?;
+    Some(n.to_string())
+}
+
+// ---------------------------------------------------------------------------
 // Response types
 // ---------------------------------------------------------------------------
 
@@ -1314,6 +1367,18 @@ pub async fn save_email_settings(
     config.email.poll_interval_secs = poll_interval_secs;
     config.email.lookback_hours = lookback_hours;
 
+    // Disjointness: refuse to save if the IMAP `username` is the
+    // owner's own email — that would let an unauthenticated sender
+    // masquerade as the owner over inbound mail.
+    if let Some(lookup) = state.owner_lookup() {
+        let mut candidates: Vec<(String, String)> = Vec::new();
+        let uname = config.email.username.trim();
+        if uname.contains('@') {
+            candidates.push(("email".into(), uname.to_ascii_lowercase()));
+        }
+        validate_disjoint_from_owner(&lookup, &candidates).await?;
+    }
+
     save_main_config(&config)?;
     Ok("Email settings saved. Restart to apply.".to_string())
 }
@@ -1461,6 +1526,23 @@ pub async fn save_smtp_settings(
     }
     config.email.smtp_use_tls = smtp_use_tls;
     config.email.from_address = from_address;
+
+    // Disjointness: refuse to save when SMTP `from_address` or an
+    // email-shaped `smtp_username` matches one of the owner contact's
+    // identifiers. Same rationale as the IMAP path above.
+    if let Some(lookup) = state.owner_lookup() {
+        let mut candidates: Vec<(String, String)> = Vec::new();
+        let from = config.email.from_address.trim();
+        if !from.is_empty() {
+            candidates.push(("email".into(), from.to_ascii_lowercase()));
+        }
+        let sun = config.email.smtp_username.trim();
+        if sun.contains('@') {
+            candidates.push(("email".into(), sun.to_ascii_lowercase()));
+        }
+        validate_disjoint_from_owner(&lookup, &candidates).await?;
+    }
+
     save_main_config(&config)?;
     Ok("SMTP settings saved. Restart to apply.".to_string())
 }
@@ -1582,6 +1664,33 @@ pub async fn save_telegram_settings(
     config.telegram.allowed_chat_ids = allowed_chat_ids;
     if let Some(interval) = poll_interval_secs {
         config.telegram.poll_interval_secs = interval;
+    }
+
+    // Disjointness: catch the rare misconfig where the bot token's
+    // numeric prefix (== bot's own user id) collides with the owner
+    // contact's Telegram identifier. We pull the token from config,
+    // which may have just been emptied above when the value was
+    // routed into the vault — try the vault-backed value first.
+    if let Some(lookup) = state.owner_lookup() {
+        let mut maybe_token = config.telegram.bot_token.clone();
+        if maybe_token.is_empty() {
+            if let Some(vault) = state.vault.as_ref() {
+                if let Ok(Some(t)) = vault
+                    .get(
+                        crate::vault_creds::SCOPE_TELEGRAM,
+                        crate::vault_creds::KEY_BOT_TOKEN,
+                    )
+                    .await
+                {
+                    maybe_token = t;
+                }
+            }
+        }
+        let mut candidates: Vec<(String, String)> = Vec::new();
+        if let Some(bot_id) = bot_user_id_from_token(&maybe_token) {
+            candidates.push(("telegram_user".into(), bot_id));
+        }
+        validate_disjoint_from_owner(&lookup, &candidates).await?;
     }
 
     save_main_config(&config)?;
@@ -2752,5 +2861,105 @@ mod attachment_policy_settings_tests {
             cfg.attachment_policy.max_attachment_bytes,
             default.max_attachment_bytes
         );
+    }
+}
+
+#[cfg(test)]
+mod owner_disjointness_tests {
+    use super::*;
+    use athen_contacts::{ContactStore, InMemoryContactStore, OwnerLookup};
+    use athen_core::contact::{Contact, ContactIdentifier, IdentifierKind, TrustLevel};
+    use uuid::Uuid;
+
+    async fn make_owner_store_with(idents: Vec<(&str, IdentifierKind)>) -> Arc<dyn ContactStore> {
+        let store: Arc<dyn ContactStore> = Arc::new(InMemoryContactStore::new());
+        let mut owner = Contact {
+            id: Uuid::new_v4(),
+            name: "Alex".into(),
+            trust_level: TrustLevel::AuthUser,
+            trust_manual_override: true,
+            identifiers: idents
+                .into_iter()
+                .map(|(v, k)| ContactIdentifier {
+                    value: v.to_string(),
+                    kind: k,
+                })
+                .collect(),
+            interaction_count: 0,
+            last_interaction: None,
+            notes: None,
+            blocked: false,
+            is_owner: true,
+        };
+        let id = owner.id;
+        owner.is_owner = true;
+        store.save(&owner).await.unwrap();
+        store.set_owner(&id).await.unwrap();
+        store
+    }
+
+    #[tokio::test]
+    async fn validate_disjoint_returns_human_error_on_email_conflict() {
+        let store = make_owner_store_with(vec![("alex@example.com", IdentifierKind::Email)]).await;
+        let lookup = OwnerLookup::new(store);
+        let candidates = vec![("email".to_string(), "ALEX@example.com".to_string())];
+        let err = validate_disjoint_from_owner(&lookup, &candidates)
+            .await
+            .unwrap_err();
+        assert!(err.contains("Conflicts with owner contact"), "got: {err}");
+        assert!(err.contains("alex@example.com"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn validate_disjoint_passes_when_no_overlap() {
+        let store = make_owner_store_with(vec![("alex@example.com", IdentifierKind::Email)]).await;
+        let lookup = OwnerLookup::new(store);
+        let candidates = vec![("email".to_string(), "athen-bot@example.com".to_string())];
+        assert!(validate_disjoint_from_owner(&lookup, &candidates)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn validate_disjoint_passes_when_no_owner_set() {
+        // Empty store → no owner identifiers → no possible conflict,
+        // even when candidates would otherwise overlap if the owner
+        // existed. This is the "first-run" defensive case.
+        let store: Arc<dyn ContactStore> = Arc::new(InMemoryContactStore::new());
+        let lookup = OwnerLookup::new(store);
+        let candidates = vec![("email".to_string(), "anybody@example.com".to_string())];
+        assert!(validate_disjoint_from_owner(&lookup, &candidates)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn validate_disjoint_telegram_user_conflict() {
+        let store = make_owner_store_with(vec![("987654321", IdentifierKind::Telegram)]).await;
+        let lookup = OwnerLookup::new(store);
+        let candidates = vec![("telegram_user".to_string(), "987654321".to_string())];
+        let err = validate_disjoint_from_owner(&lookup, &candidates)
+            .await
+            .unwrap_err();
+        assert!(err.contains("telegram_user=987654321"), "got: {err}");
+    }
+
+    #[test]
+    fn bot_user_id_parses_valid_token() {
+        let id = bot_user_id_from_token("123456789:ABCDEF-some-base64ish_payload");
+        assert_eq!(id.as_deref(), Some("123456789"));
+    }
+
+    #[test]
+    fn bot_user_id_rejects_malformed_token() {
+        // No colon at all.
+        assert!(bot_user_id_from_token("not-a-token").is_none());
+        // Non-numeric prefix.
+        assert!(bot_user_id_from_token("abc:def").is_none());
+    }
+
+    #[test]
+    fn bot_user_id_rejects_empty_string() {
+        assert!(bot_user_id_from_token("").is_none());
     }
 }
