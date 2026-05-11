@@ -356,6 +356,12 @@ fn save_bytes(root: &Path, event_id: Uuid, name: &str, bytes: &[u8]) -> Option<P
 }
 
 /// Extract the sender (From header) from a parsed email.
+///
+/// Uses `mailparse::addrparse_header` so we honour RFC 5322 grammar including
+/// MIME-encoded display names (`=?UTF-8?B?...?= <user@example.com>`), folded
+/// headers, quoted local-parts, and `display-name <email>` variants. Falls
+/// back to a naive `<...>` split only as a defensive last resort if the
+/// proper parser fails or returns no usable address.
 fn extract_sender(parsed: &mailparse::ParsedMail<'_>) -> Option<SenderInfo> {
     let from_header = parsed
         .headers
@@ -363,11 +369,32 @@ fn extract_sender(parsed: &mailparse::ParsedMail<'_>) -> Option<SenderInfo> {
         .find(|h| h.get_key().eq_ignore_ascii_case("From"))?;
     let from = from_header.get_value();
 
-    if from.is_empty() {
+    if from.trim().is_empty() {
         return None;
     }
 
-    // Try to split "Display Name <email@example.com>" format.
+    // Primary path: RFC-compliant address parsing via mailparse.
+    if let Ok(list) = mailparse::addrparse_header(from_header) {
+        if let Some(single) = first_single(&list) {
+            let display_name = single
+                .display_name
+                .as_ref()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let identifier = single.addr.trim().to_string();
+            if !identifier.is_empty() {
+                return Some(SenderInfo {
+                    identifier,
+                    contact_id: None,
+                    display_name,
+                });
+            }
+        }
+    }
+
+    // Defensive fallback: naive split. Reached only when addrparse fails
+    // (malformed header) or yields no single address — e.g. display-name
+    // without any email portion.
     let (display_name, identifier) = if let Some(start) = from.find('<') {
         let name = from[..start].trim().trim_matches('"').to_string();
         let email = from[start + 1..].trim_end_matches('>').trim().to_string();
@@ -382,6 +409,23 @@ fn extract_sender(parsed: &mailparse::ParsedMail<'_>) -> Option<SenderInfo> {
         contact_id: None,
         display_name,
     })
+}
+
+/// Pull the first `SingleInfo` out of a `MailAddrList`, descending into the
+/// first `Group` if the top-level entry is a group construct
+/// (`undisclosed-recipients:;` style).
+fn first_single(list: &mailparse::MailAddrList) -> Option<mailparse::SingleInfo> {
+    for addr in list.iter() {
+        match addr {
+            mailparse::MailAddr::Single(s) => return Some(s.clone()),
+            mailparse::MailAddr::Group(g) => {
+                if let Some(s) = g.addrs.first() {
+                    return Some(s.clone());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Extract the Subject header from a parsed email.
@@ -996,6 +1040,36 @@ This is the body.";
         assert!(body["text"].as_str().unwrap().contains("This is the body"));
         assert!(body["html"].is_null());
         assert_eq!(body["folder"], "INBOX");
+    }
+
+    #[test]
+    fn extract_sender_mime_encoded_display_name() {
+        // RFC 2047 encoded display name (UTF-8 base64 of "Alex Garcia").
+        let raw = b"From: =?UTF-8?B?QWxleCBHYXJjaWE=?= <alex@example.com>\r\n\
+Subject: Test\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+Body";
+        let parsed = mailparse::parse_mail(raw).unwrap();
+        let sender = extract_sender(&parsed).unwrap();
+        assert_eq!(sender.identifier, "alex@example.com");
+        assert_eq!(sender.display_name.as_deref(), Some("Alex Garcia"));
+    }
+
+    #[test]
+    fn extract_sender_display_name_only_falls_back() {
+        // No angle-bracketed email; addrparse may not yield a SingleInfo
+        // with a usable addr. We document the fallback returns the raw
+        // string as the identifier (best-effort — there is no email to
+        // match against contacts in this case).
+        let raw = b"From: Alex Garcia\r\n\
+Subject: Test\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+Body";
+        let parsed = mailparse::parse_mail(raw).unwrap();
+        let sender = extract_sender(&parsed).unwrap();
+        assert_eq!(sender.identifier, "Alex Garcia");
     }
 
     #[test]

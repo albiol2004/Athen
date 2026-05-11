@@ -729,14 +729,27 @@ impl AppToolRegistry {
 
         let t = Instant::now();
         let contacts = store.list_all().await?;
-        let query_lower = query.to_lowercase();
+        // Tokenize the query on whitespace and require ALL tokens to appear
+        // as substrings in the per-contact haystack (name + every identifier
+        // value, lowercased, joined). This makes "Alex Garcia" match a
+        // contact whose name is "Alex" and whose email is "alex.garcia@...".
+        let query_tokens: Vec<String> = query
+            .to_lowercase()
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect();
         let matches: Vec<serde_json::Value> = contacts
             .iter()
             .filter(|c| {
-                c.name.to_lowercase().contains(&query_lower)
-                    || c.identifiers
-                        .iter()
-                        .any(|i| i.value.to_lowercase().contains(&query_lower))
+                if query_tokens.is_empty() {
+                    return true;
+                }
+                let mut haystack = c.name.to_lowercase();
+                for ident in &c.identifiers {
+                    haystack.push(' ');
+                    haystack.push_str(&ident.value.to_lowercase());
+                }
+                query_tokens.iter().all(|tok| haystack.contains(tok))
             })
             .map(Self::contact_to_json)
             .collect();
@@ -2791,6 +2804,81 @@ mod tests {
 
         let result = registry
             .call_tool("contacts_search", json!({ "query": "alice@test" }))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert_eq!(result.output["count"].as_u64().unwrap(), 1);
+    }
+
+    // 21b. contacts_search multi-token: tokens must match across the
+    // name + identifier haystack. "Alex Garcia" should resolve a contact
+    // named "Alex" whose email is "alex.garcia@x.com".
+    #[tokio::test]
+    async fn contacts_search_multi_token_across_name_and_identifier() {
+        let (_db, registry) = setup_with_contacts().await;
+
+        registry
+            .call_tool(
+                "contacts_create",
+                json!({
+                    "name": "Alex",
+                    "identifiers": [{ "value": "alex.garcia@x.com", "kind": "Email" }]
+                }),
+            )
+            .await
+            .unwrap();
+        registry
+            .call_tool("contacts_create", json!({ "name": "Bob" }))
+            .await
+            .unwrap();
+
+        // Both tokens present (one in name, one in identifier).
+        let result = registry
+            .call_tool("contacts_search", json!({ "query": "Alex Garcia" }))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert_eq!(result.output["count"].as_u64().unwrap(), 1);
+        assert_eq!(
+            result.output["contacts"][0]["name"].as_str().unwrap(),
+            "Alex"
+        );
+
+        // Single token in identifier only.
+        let result = registry
+            .call_tool("contacts_search", json!({ "query": "Garcia" }))
+            .await
+            .unwrap();
+        assert_eq!(result.output["count"].as_u64().unwrap(), 1);
+
+        // No-match query.
+        let result = registry
+            .call_tool("contacts_search", json!({ "query": "Carol" }))
+            .await
+            .unwrap();
+        assert_eq!(result.output["count"].as_u64().unwrap(), 0);
+
+        // Empty query returns all contacts.
+        let result = registry
+            .call_tool("contacts_search", json!({ "query": "" }))
+            .await
+            .unwrap();
+        assert_eq!(result.output["count"].as_u64().unwrap(), 2);
+    }
+
+    // 21c. contacts_search substring within token: "Alex" against name
+    // "Alexandra" still matches (token is a substring, not a full word).
+    #[tokio::test]
+    async fn contacts_search_token_is_substring() {
+        let (_db, registry) = setup_with_contacts().await;
+
+        registry
+            .call_tool("contacts_create", json!({ "name": "Alexandra" }))
+            .await
+            .unwrap();
+
+        let result = registry
+            .call_tool("contacts_search", json!({ "query": "Alex" }))
             .await
             .unwrap();
         assert!(result.success);

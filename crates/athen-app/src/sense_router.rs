@@ -272,6 +272,11 @@ pub async fn process_sense_event(
 
         // Also add a system message so the agent has context when the user
         // opens this Arc and starts chatting.
+        // `source_risk == Safe` is set upstream (e.g. EmailMonitor matches
+        // From against the owner's known addresses; Telegram monitor flags
+        // the owner chat) — propagate it so the agent prompt addresses the
+        // user directly rather than asking it to triage a stranger.
+        let from_owner = matches!(event.source_risk, athen_core::risk::RiskLevel::Safe);
         let context_msg = build_context_message(
             &event.source,
             sender,
@@ -279,6 +284,7 @@ pub async fn process_sense_event(
             &body_text,
             &event.content.body,
             &triage,
+            from_owner,
         );
         if let Err(e) = store
             .add_entry(
@@ -803,6 +809,7 @@ fn build_context_message(
     body_text: &str,
     body_json: &serde_json::Value,
     triage: &SenseTriage,
+    from_owner: bool,
 ) -> String {
     let source_name = source_display_name(source);
     let mut msg = format!(
@@ -819,37 +826,55 @@ fn build_context_message(
             );
         }
         EventSource::Email => {
-            msg.push_str(&format!(
-                "Email from {sender}\nSubject: {subject}\n\n{body_text}"
-            ));
-            msg.push_str(&format!(
-                "\n\nSender identifier: {sender} (type: Email)\n\
-                 The user may ask you to summarize, reply, or take action on this email.\n\
-                 If you have contacts tools, check if this sender exists in contacts — \
-                 if not, consider creating a contact or asking the user if they match an existing one."
-            ));
+            if from_owner {
+                msg.push_str(&format!(
+                    "Email from you (the owner)\nSubject: {subject}\n\n{body_text}"
+                ));
+                msg.push_str(
+                    "\n\nThis email arrived in your own inbox — Athen recognizes it as \
+                     coming from you. Act on it as you would on a direct request from the user.",
+                );
+            } else {
+                msg.push_str(&format!(
+                    "Email from {sender}\nSubject: {subject}\n\n{body_text}"
+                ));
+                msg.push_str(&format!(
+                    "\n\nSender identifier: {sender} (type: Email)\n\
+                     The user may ask you to summarize, reply, or take action on this email.\n\
+                     If you have contacts tools, check if this sender exists in contacts — \
+                     if not, consider creating a contact or asking the user if they match an existing one."
+                ));
+            }
         }
         EventSource::Messaging => {
-            msg.push_str(&format!("Message from {sender}\n\n{body_text}"));
-            // Extract Telegram-specific sender details from the body JSON.
-            let tg_user_id = body_json.get("sender_user_id").and_then(|v| v.as_i64());
-            let tg_username = body_json.get("sender_username").and_then(|v| v.as_str());
-            let tg_name = body_json.get("sender_first_name").and_then(|v| v.as_str());
-            let mut sender_details = format!("\n\nSender: {sender}");
-            if let Some(uid) = tg_user_id {
-                sender_details.push_str(&format!(" | Telegram user ID: {uid}"));
+            if from_owner {
+                msg.push_str(&format!("Message from you (owner)\n\n{body_text}"));
+                msg.push_str(
+                    "\n\nMessage from you (owner) — Athen recognizes you across channels. \
+                     Act on it as you would on a direct request from the user.",
+                );
+            } else {
+                msg.push_str(&format!("Message from {sender}\n\n{body_text}"));
+                // Extract Telegram-specific sender details from the body JSON.
+                let tg_user_id = body_json.get("sender_user_id").and_then(|v| v.as_i64());
+                let tg_username = body_json.get("sender_username").and_then(|v| v.as_str());
+                let tg_name = body_json.get("sender_first_name").and_then(|v| v.as_str());
+                let mut sender_details = format!("\n\nSender: {sender}");
+                if let Some(uid) = tg_user_id {
+                    sender_details.push_str(&format!(" | Telegram user ID: {uid}"));
+                }
+                if let Some(uname) = tg_username {
+                    sender_details.push_str(&format!(" | Telegram username: @{uname}"));
+                }
+                if let Some(name) = tg_name {
+                    sender_details.push_str(&format!(" | Name: {name}"));
+                }
+                msg.push_str(&sender_details);
+                msg.push_str(
+                    "\n\nIf you have contacts tools, check if this sender exists in contacts — \
+                     if not, consider creating a contact or asking the user if they match an existing one."
+                );
             }
-            if let Some(uname) = tg_username {
-                sender_details.push_str(&format!(" | Telegram username: @{uname}"));
-            }
-            if let Some(name) = tg_name {
-                sender_details.push_str(&format!(" | Name: {name}"));
-            }
-            msg.push_str(&sender_details);
-            msg.push_str(
-                "\n\nIf you have contacts tools, check if this sender exists in contacts — \
-                 if not, consider creating a contact or asking the user if they match an existing one."
-            );
         }
         _ => {
             msg.push_str(&format!(
