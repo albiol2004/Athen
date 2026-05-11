@@ -12,6 +12,7 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use athen_contacts::ContactStore;
 use athen_core::event::{EventSource, SenseEvent};
 use athen_core::llm::{
     ChatMessage as LlmChatMessage, LlmRequest, MessageContent as LlmContent, ModelProfile,
@@ -22,6 +23,7 @@ use athen_core::traits::llm::LlmRouter;
 use athen_llm::router::DefaultLlmRouter;
 use athen_persistence::arcs::{ArcEntry, ArcMeta, ArcSource, ArcStatus, ArcStore, EntryType};
 use athen_persistence::attachments::AttachmentStore;
+use athen_persistence::contacts::SqliteContactStore;
 
 use crate::notifier::NotificationOrchestrator;
 
@@ -70,6 +72,7 @@ pub async fn process_sense_event(
     approval_router: Option<&Arc<crate::approval::ApprovalRouter>>,
     pending_email_marks: Option<&crate::state::PendingEmailMarks>,
     attachment_store: Option<&AttachmentStore>,
+    contact_store: Option<&SqliteContactStore>,
 ) -> bool {
     let source_name = source_display_name(&event.source);
     let summary = event.content.summary.as_deref().unwrap_or("(no subject)");
@@ -277,6 +280,20 @@ pub async fn process_sense_event(
         // the owner chat) — propagate it so the agent prompt addresses the
         // user directly rather than asking it to triage a stranger.
         let from_owner = matches!(event.source_risk, athen_core::risk::RiskLevel::Safe);
+
+        // Pre-resolve the sender's contact so the agent prompt names the
+        // person instead of pushing the raw email/Telegram-user-id into the
+        // model and asking it to re-derive what we already know. Best-effort:
+        // any error / unknown identifier just falls back to the legacy
+        // "Sender identifier: ..." instructions in build_context_message.
+        let resolved_contact_name: Option<String> = resolve_sender_contact_name(
+            contact_store,
+            &event.source,
+            event.sender.as_ref(),
+            &event.content.body,
+        )
+        .await;
+
         let context_msg = build_context_message(
             &event.source,
             sender,
@@ -285,6 +302,7 @@ pub async fn process_sense_event(
             &event.content.body,
             &triage,
             from_owner,
+            resolved_contact_name.as_deref(),
         );
         if let Err(e) = store
             .add_entry(
@@ -800,8 +818,77 @@ fn format_calendar_body(body: &serde_json::Value) -> String {
     }
 }
 
+/// Resolve the sender's contact via the contact store, returning the
+/// contact's display name (`Contact::name`) if found.
+///
+/// Returns `None` when:
+/// - The contact store isn't wired (CLI / tests).
+/// - The event has no sender (Calendar, System).
+/// - `find_by_identifier` returns Ok(None) — sender isn't in contacts.
+/// - `find_by_identifier` returns Err — logged at debug, treated as miss.
+///
+/// For Telegram, prefers `body.sender_user_id` (the canonical numeric id)
+/// over `sender.identifier`. The Telegram monitor populates both with the
+/// same value today, but reading from `body` makes the contract explicit
+/// — that's the field that names the canonical identifier.
+async fn resolve_sender_contact_name(
+    contact_store: Option<&SqliteContactStore>,
+    source: &EventSource,
+    sender_info: Option<&athen_core::event::SenderInfo>,
+    body_json: &serde_json::Value,
+) -> Option<String> {
+    let store = contact_store?;
+
+    // Pick the identifier value to look up. Email is straightforward
+    // (already lowercased upstream). Telegram canonicalises on the numeric
+    // user id; prefer body.sender_user_id since that's the documented
+    // source of truth and falls back to sender.identifier.
+    let identifier: String = match source {
+        EventSource::Email => sender_info?.identifier.clone(),
+        EventSource::Messaging => body_json
+            .get("sender_user_id")
+            .and_then(|v| v.as_i64())
+            .map(|i| i.to_string())
+            .or_else(|| sender_info.map(|s| s.identifier.clone()))?,
+        // Calendar / UserInput / System have no human sender to resolve.
+        _ => return None,
+    };
+
+    if identifier.is_empty() {
+        return None;
+    }
+
+    match store.find_by_identifier(&identifier).await {
+        Ok(Some(contact)) => {
+            let name = contact.name.trim();
+            if name.is_empty() {
+                None
+            } else {
+                Some(name.to_string())
+            }
+        }
+        Ok(None) => None,
+        Err(e) => {
+            tracing::debug!(
+                identifier = %identifier,
+                error = %e,
+                "Sender contact lookup failed; falling back to raw identifier"
+            );
+            None
+        }
+    }
+}
+
 /// Build a system context message that gives the agent full awareness of
 /// the sense event when the user opens this Arc.
+///
+/// `resolved_contact_name` is the contact-store-resolved display name for
+/// the sender, when known. When `Some`, the prompt names the contact and
+/// drops the "check if this sender exists in contacts" instructions —
+/// we already know who they are, so the agent doesn't need to re-derive
+/// it via `contacts_search`. When `None`, the prompt falls back to the
+/// raw `Sender identifier:` block + contact-search hint.
+#[allow(clippy::too_many_arguments)]
 fn build_context_message(
     source: &EventSource,
     sender: &str,
@@ -810,6 +897,7 @@ fn build_context_message(
     body_json: &serde_json::Value,
     triage: &SenseTriage,
     from_owner: bool,
+    resolved_contact_name: Option<&str>,
 ) -> String {
     let source_name = source_display_name(source);
     let mut msg = format!(
@@ -827,13 +915,31 @@ fn build_context_message(
         }
         EventSource::Email => {
             if from_owner {
+                if let Some(name) = resolved_contact_name {
+                    msg.push_str(&format!(
+                        "Email from {name} (you)\nSubject: {subject}\n\n{body_text}"
+                    ));
+                    msg.push_str(
+                        "\n\nThis email arrived in your own inbox — Athen recognizes it as \
+                         coming from you. Act on it as you would on a direct request from the user.",
+                    );
+                } else {
+                    msg.push_str(&format!(
+                        "Email from you (the owner)\nSubject: {subject}\n\n{body_text}"
+                    ));
+                    msg.push_str(
+                        "\n\nThis email arrived in your own inbox — Athen recognizes it as \
+                         coming from you. Act on it as you would on a direct request from the user.",
+                    );
+                }
+            } else if let Some(name) = resolved_contact_name {
                 msg.push_str(&format!(
-                    "Email from you (the owner)\nSubject: {subject}\n\n{body_text}"
+                    "Email from {name} <{sender}>\nSubject: {subject}\n\n{body_text}"
                 ));
-                msg.push_str(
-                    "\n\nThis email arrived in your own inbox — Athen recognizes it as \
-                     coming from you. Act on it as you would on a direct request from the user.",
-                );
+                msg.push_str(&format!(
+                    "\n\nThis sender is in your contacts as \"{name}\". \
+                     The user may ask you to summarize, reply, or take action on this email."
+                ));
             } else {
                 msg.push_str(&format!(
                     "Email from {sender}\nSubject: {subject}\n\n{body_text}"
@@ -848,11 +954,41 @@ fn build_context_message(
         }
         EventSource::Messaging => {
             if from_owner {
-                msg.push_str(&format!("Message from you (owner)\n\n{body_text}"));
-                msg.push_str(
-                    "\n\nMessage from you (owner) — Athen recognizes you across channels. \
-                     Act on it as you would on a direct request from the user.",
-                );
+                if let Some(name) = resolved_contact_name {
+                    msg.push_str(&format!("Message from {name} (you)\n\n{body_text}"));
+                    msg.push_str(
+                        "\n\nMessage from you (owner) — Athen recognizes you across channels. \
+                         Act on it as you would on a direct request from the user.",
+                    );
+                } else {
+                    msg.push_str(&format!("Message from you (owner)\n\n{body_text}"));
+                    msg.push_str(
+                        "\n\nMessage from you (owner) — Athen recognizes you across channels. \
+                         Act on it as you would on a direct request from the user.",
+                    );
+                }
+            } else if let Some(name) = resolved_contact_name {
+                msg.push_str(&format!("Message from {name}\n\n{body_text}"));
+                // Keep the Telegram-specific identifier breakdown — username,
+                // first_name — useful for the agent even when we know the
+                // contact (e.g. the agent may want to @-mention them).
+                let tg_user_id = body_json.get("sender_user_id").and_then(|v| v.as_i64());
+                let tg_username = body_json.get("sender_username").and_then(|v| v.as_str());
+                let tg_name = body_json.get("sender_first_name").and_then(|v| v.as_str());
+                let mut sender_details = format!("\n\nSender: {name}");
+                if let Some(uid) = tg_user_id {
+                    sender_details.push_str(&format!(" | Telegram user ID: {uid}"));
+                }
+                if let Some(uname) = tg_username {
+                    sender_details.push_str(&format!(" | Telegram username: @{uname}"));
+                }
+                if let Some(tg) = tg_name {
+                    sender_details.push_str(&format!(" | Name: {tg}"));
+                }
+                msg.push_str(&sender_details);
+                msg.push_str(&format!(
+                    "\n\nThis sender is in your contacts as \"{name}\"."
+                ));
             } else {
                 msg.push_str(&format!("Message from {sender}\n\n{body_text}"));
                 // Extract Telegram-specific sender details from the body JSON.
@@ -1751,6 +1887,196 @@ mod tests {
         let snippet = build_arc_snippet(&entries);
         assert!(!snippet.contains('\n'));
         assert!(!snippet.contains('"'));
+    }
+
+    fn dummy_triage() -> SenseTriage {
+        SenseTriage {
+            relevance: "medium".into(),
+            reason: "test reason".into(),
+            suggested_action: "reply".into(),
+            target_arc: TriageTarget::NewArc { name: "t".into() },
+        }
+    }
+
+    // ---------- build_context_message: contact-resolution branches ----------
+
+    #[test]
+    fn ctx_email_owner_with_resolved_name_says_from_self() {
+        let triage = dummy_triage();
+        let body = serde_json::json!({});
+        let msg = build_context_message(
+            &EventSource::Email,
+            "alex@example.com",
+            "Hello",
+            "body text",
+            &body,
+            &triage,
+            true,
+            Some("Alex Albiol"),
+        );
+        assert!(
+            msg.contains("Email from Alex Albiol (you)"),
+            "missing owner-with-name greeting: {msg}"
+        );
+        // Owner-from-name path must NOT use the generic "(the owner)" template.
+        assert!(
+            !msg.contains("Email from you (the owner)"),
+            "fell back to legacy owner template: {msg}"
+        );
+        // No contact-search instruction when sender is known.
+        assert!(
+            !msg.contains("check if this sender exists in contacts"),
+            "leaked contact-search hint: {msg}"
+        );
+    }
+
+    #[test]
+    fn ctx_email_owner_unresolved_falls_back_to_legacy() {
+        let triage = dummy_triage();
+        let body = serde_json::json!({});
+        let msg = build_context_message(
+            &EventSource::Email,
+            "alex@example.com",
+            "Hello",
+            "body text",
+            &body,
+            &triage,
+            true,
+            None,
+        );
+        assert!(msg.contains("Email from you (the owner)"), "{msg}");
+    }
+
+    #[test]
+    fn ctx_email_non_owner_with_resolved_name_names_contact() {
+        let triage = dummy_triage();
+        let body = serde_json::json!({});
+        let msg = build_context_message(
+            &EventSource::Email,
+            "bob@example.com",
+            "Project update",
+            "Hi there",
+            &body,
+            &triage,
+            false,
+            Some("Bob Smith"),
+        );
+        assert!(
+            msg.contains("Email from Bob Smith <bob@example.com>"),
+            "missing name+email header: {msg}"
+        );
+        assert!(
+            msg.contains("This sender is in your contacts as \"Bob Smith\""),
+            "missing known-sender note: {msg}"
+        );
+        assert!(
+            !msg.contains("check if this sender exists in contacts"),
+            "leaked contact-search hint: {msg}"
+        );
+        assert!(
+            !msg.contains("Sender identifier:"),
+            "leaked raw identifier line: {msg}"
+        );
+    }
+
+    #[test]
+    fn ctx_email_non_owner_unresolved_keeps_legacy_instructions() {
+        let triage = dummy_triage();
+        let body = serde_json::json!({});
+        let msg = build_context_message(
+            &EventSource::Email,
+            "stranger@example.com",
+            "Hello",
+            "body",
+            &body,
+            &triage,
+            false,
+            None,
+        );
+        assert!(msg.contains("Email from stranger@example.com"), "{msg}");
+        assert!(
+            msg.contains("Sender identifier: stranger@example.com (type: Email)"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("check if this sender exists in contacts"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn ctx_messaging_owner_with_resolved_name_says_from_self() {
+        let triage = dummy_triage();
+        let body = serde_json::json!({});
+        let msg = build_context_message(
+            &EventSource::Messaging,
+            "12345",
+            "(no subject)",
+            "Yo",
+            &body,
+            &triage,
+            true,
+            Some("Alex Albiol"),
+        );
+        assert!(msg.contains("Message from Alex Albiol (you)"), "{msg}");
+        assert!(!msg.contains("Message from you (owner)\n\n"), "{msg}");
+    }
+
+    #[test]
+    fn ctx_messaging_non_owner_with_resolved_name_names_contact() {
+        let triage = dummy_triage();
+        let body = serde_json::json!({
+            "sender_user_id": 98765i64,
+            "sender_username": "bobsmith",
+            "sender_first_name": "Bob",
+        });
+        let msg = build_context_message(
+            &EventSource::Messaging,
+            "98765",
+            "(no subject)",
+            "Hey",
+            &body,
+            &triage,
+            false,
+            Some("Bob Smith"),
+        );
+        assert!(msg.contains("Message from Bob Smith"), "{msg}");
+        // Keeps the Telegram identifier breakdown.
+        assert!(msg.contains("Telegram user ID: 98765"), "{msg}");
+        assert!(msg.contains("Telegram username: @bobsmith"), "{msg}");
+        // Names the contact, drops the search hint.
+        assert!(
+            msg.contains("This sender is in your contacts as \"Bob Smith\""),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("check if this sender exists in contacts"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn ctx_messaging_non_owner_unresolved_keeps_legacy_instructions() {
+        let triage = dummy_triage();
+        let body = serde_json::json!({
+            "sender_user_id": 11111i64,
+        });
+        let msg = build_context_message(
+            &EventSource::Messaging,
+            "11111",
+            "(no subject)",
+            "Hey",
+            &body,
+            &triage,
+            false,
+            None,
+        );
+        assert!(msg.contains("Message from 11111"), "{msg}");
+        assert!(msg.contains("Telegram user ID: 11111"), "{msg}");
+        assert!(
+            msg.contains("check if this sender exists in contacts"),
+            "{msg}"
+        );
     }
 
     #[test]

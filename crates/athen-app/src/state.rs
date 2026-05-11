@@ -1216,6 +1216,7 @@ impl AppState {
         let router = Arc::clone(&self.router);
         let arc_store_ref = self._database.as_ref().map(|db| db.arc_store());
         let attachment_store_ref = self._database.as_ref().map(|db| db.attachment_store());
+        let contact_store_ref = self.contact_store.clone();
         let profile_store_ref = self.profile_store.clone();
         let profile_embedder_ref = Arc::clone(&self.profile_embedder);
         let profile_embedding_cache_ref = Arc::clone(&self.profile_embedding_cache);
@@ -1256,6 +1257,7 @@ impl AppState {
                                 approval_router_ref.as_ref(),
                                 Some(&pending_email_marks_ref),
                                 attachment_store_ref.as_ref(),
+                                contact_store_ref.as_ref(),
                             )
                             .await;
                         }
@@ -1383,6 +1385,7 @@ impl AppState {
         let router = Arc::clone(&self.router);
         let arc_store_ref = self._database.as_ref().map(|db| db.arc_store());
         let attachment_store_ref = self._database.as_ref().map(|db| db.attachment_store());
+        let contact_store_ref = self.contact_store.clone();
         let profile_store_ref = self.profile_store.clone();
         let profile_embedder_ref = Arc::clone(&self.profile_embedder);
         let profile_embedding_cache_ref = Arc::clone(&self.profile_embedding_cache);
@@ -1440,6 +1443,7 @@ impl AppState {
                                 approval_router_ref.as_ref(),
                                 Some(&pending_email_marks_ref),
                                 attachment_store_ref.as_ref(),
+                                contact_store_ref.as_ref(),
                             )
                             .await;
                         }
@@ -1678,6 +1682,7 @@ impl AppState {
                                     approval_router_ref.as_ref(),
                                     Some(&pending_email_marks_ref),
                                     attachment_store_ref.as_ref(),
+                                    contact_store_ref.as_ref(),
                                 )
                                 .await;
                             }
