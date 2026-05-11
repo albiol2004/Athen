@@ -449,12 +449,6 @@
                         <p class="setting-hint" id="telegram-token-hint"></p>
                     </div>
                     <div class="setting-row">
-                        <label for="telegram-owner-id">Your Telegram User ID</label>
-                        <input type="number" id="telegram-owner-id" class="settings-input" placeholder="Optional">
-                        <p class="setting-hint">Messages from this ID get lowest risk. Send /start to <a href="https://t.me/userinfobot" target="_blank">@userinfobot</a> to find yours.</p>
-                        <p class="setting-hint">Deprecated. Set your Telegram user ID in <b>My Contact Info</b> above. This field will be removed in a future release.</p>
-                    </div>
-                    <div class="setting-row">
                         <label for="telegram-chat-ids">Allowed Chat IDs</label>
                         <input type="text" id="telegram-chat-ids" class="settings-input" placeholder="Comma-separated, empty = all">
                         <p class="setting-hint">Only process messages from these chats. Leave empty to accept all.</p>
@@ -1306,7 +1300,8 @@
                 <span class="onb-progress-step" data-step="memory">2. Memory</span>
                 <span class="onb-progress-step" data-step="search">3. Search</span>
                 <span class="onb-progress-step" data-step="runtimes">4. Runtimes</span>
-                <span class="onb-progress-step" data-step="done">5. Ready</span>
+                <span class="onb-progress-step" data-step="identity">5. You</span>
+                <span class="onb-progress-step" data-step="done">6. Ready</span>
             </div>
 
             <div class="onboarding-step" data-step="welcome">
@@ -1492,6 +1487,30 @@
                 <div class="onboarding-buttons">
                     <button id="onb-runtimes-skip" class="btn-secondary">Skip for now</button>
                     <button id="onb-runtimes-continue" class="btn-primary">Continue</button>
+                </div>
+            </div>
+
+            <div class="onboarding-step" data-step="identity" style="display: none;">
+                <h1>Who are you?</h1>
+                <p class="onboarding-hint">
+                    Athen distinguishes messages from you vs. anyone else to handle risk correctly — your own messages get auto-trusted, everyone else's go through the approval flow. Tell Athen how to recognize you across channels.
+                </p>
+                <div class="setting-row">
+                    <label for="onb-owner-name">Name</label>
+                    <input type="text" id="onb-owner-name" class="settings-input" placeholder="Your name" />
+                </div>
+                <div id="onb-owner-identifiers-list"></div>
+                <div class="setting-actions">
+                    <button class="btn-secondary" id="onb-owner-add-identifier-btn">+ Add identifier</button>
+                </div>
+                <p class="onboarding-hint" style="margin-top: 1.5em; opacity: 0.7;">
+                    Athen runs entirely on your machine. No telemetry, no analytics, nothing leaves your computer — this info is stored locally in your encrypted Athen database and used only to recognize you.
+                </p>
+                <div id="onb-owner-error" class="setting-hint" style="display:none; color: var(--color-error, #c33);"></div>
+                <div class="onboarding-buttons">
+                    <button id="onb-back-identity" class="btn-secondary">Back</button>
+                    <button id="onb-skip-identity" class="btn-secondary">Skip for now</button>
+                    <button id="onb-next-identity" class="btn-primary">Continue</button>
                 </div>
             </div>
 

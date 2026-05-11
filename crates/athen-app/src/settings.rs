@@ -133,7 +133,6 @@ pub struct TelegramSettingsInfo {
     pub bot_token_hint: String,
     /// The actual bot token so the frontend can re-populate the field.
     pub bot_token: String,
-    pub owner_user_id: Option<i64>,
     pub allowed_chat_ids: Vec<i64>,
     pub poll_interval_secs: u64,
 }
@@ -704,7 +703,6 @@ pub async fn get_settings(
             mask_api_key(&main_config.telegram.bot_token)
         },
         bot_token: main_config.telegram.bot_token.clone(),
-        owner_user_id: main_config.telegram.owner_user_id,
         allowed_chat_ids: main_config.telegram.allowed_chat_ids.clone(),
         poll_interval_secs: main_config.telegram.poll_interval_secs,
     };
@@ -1612,7 +1610,6 @@ pub async fn test_smtp_connection(
 pub async fn save_telegram_settings(
     enabled: bool,
     bot_token: Option<String>,
-    owner_user_id: Option<i64>,
     allowed_chat_ids: Vec<i64>,
     poll_interval_secs: Option<u64>,
     state: State<'_, AppState>,
@@ -1660,7 +1657,6 @@ pub async fn save_telegram_settings(
             config.telegram.bot_token = String::new();
         }
     }
-    config.telegram.owner_user_id = owner_user_id;
     config.telegram.allowed_chat_ids = allowed_chat_ids;
     if let Some(interval) = poll_interval_secs {
         config.telegram.poll_interval_secs = interval;

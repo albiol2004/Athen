@@ -3891,12 +3891,6 @@ async function loadSettings() {
         // Populate telegram settings
         if (settings.telegram) {
             document.getElementById('telegram-enabled').checked = settings.telegram.enabled;
-            const ownerIdEl = document.getElementById('telegram-owner-id');
-            if (settings.telegram.owner_user_id) {
-                ownerIdEl.value = settings.telegram.owner_user_id;
-            } else {
-                ownerIdEl.value = '';
-            }
             const chatIdsEl = document.getElementById('telegram-chat-ids');
             chatIdsEl.value = settings.telegram.allowed_chat_ids.length > 0
                 ? settings.telegram.allowed_chat_ids.join(', ')
@@ -6105,7 +6099,6 @@ document.getElementById('telegram-token-toggle')?.addEventListener('click', func
 
 document.getElementById('save-telegram-btn')?.addEventListener('click', async function() {
     const token = document.getElementById('telegram-bot-token').value;
-    const ownerIdStr = document.getElementById('telegram-owner-id').value;
     const chatIdsStr = document.getElementById('telegram-chat-ids').value;
     const pollInterval = parseInt(document.getElementById('telegram-poll-interval').value);
 
@@ -6117,7 +6110,6 @@ document.getElementById('save-telegram-btn')?.addEventListener('click', async fu
         const result = await window.__TAURI__.core.invoke('save_telegram_settings', {
             enabled: document.getElementById('telegram-enabled').checked,
             botToken: token || null,
-            ownerUserId: ownerIdStr ? parseInt(ownerIdStr) : null,
             allowedChatIds: allowedChatIds,
             pollIntervalSecs: !isNaN(pollInterval) ? pollInterval : null,
         });
@@ -8601,6 +8593,7 @@ const ONB_PROGRESS_FOR_STEP = {
     memory: 'memory',
     search: 'search',
     runtimes: 'runtimes',
+    identity: 'identity',
     done: 'done',
 };
 
@@ -8755,6 +8748,7 @@ function wireOnboardingButtons() {
     wireMemoryStep();
     wireSearchStep();
     wireRuntimesStep();
+    wireIdentityStep();
 
     document.getElementById('onb-finish')?.addEventListener('click', finishOnboarding);
 }
@@ -9080,10 +9074,109 @@ function wireRuntimesStep() {
     });
 
     document.getElementById('onb-runtimes-skip')?.addEventListener('click', () => {
-        showOnboardingStep('done');
+        enterIdentityStep();
     });
     document.getElementById('onb-runtimes-continue')?.addEventListener('click', () => {
+        enterIdentityStep();
+    });
+}
+
+// ─── Identity ("Who are you?") step ─────────────────────────────────
+//
+// Final substantive step before `done`. Reuses the owner-contact module
+// (`OWNER_IDENTIFIER_KINDS`, `renderOwnerIdentifierRow`) so the wizard
+// shares the validation surface with Settings → Connections → My
+// Contact Info. The step is optional: skipping or submitting empty just
+// advances to `done` without calling `save_owner_contact`.
+
+function appendOnbOwnerIdentifierRow(kind, value) {
+    const listEl = document.getElementById('onb-owner-identifiers-list');
+    if (!listEl) return;
+    listEl.appendChild(renderOwnerIdentifierRow(kind || 'email', value || ''));
+}
+
+function clearOnbOwnerError() {
+    const errEl = document.getElementById('onb-owner-error');
+    if (!errEl) return;
+    errEl.style.display = 'none';
+    errEl.textContent = '';
+}
+
+function showOnbOwnerError(msg) {
+    const errEl = document.getElementById('onb-owner-error');
+    if (!errEl) return;
+    errEl.textContent = msg;
+    errEl.style.display = 'block';
+}
+
+async function enterIdentityStep() {
+    showOnboardingStep('identity');
+    clearOnbOwnerError();
+    // Seed an empty identifier row so the user sees the shape of the
+    // input without having to click + first. Only do this once per
+    // visit — re-entering after a back/forward should keep what they
+    // typed.
+    const listEl = document.getElementById('onb-owner-identifiers-list');
+    if (listEl && !listEl.dataset.seeded) {
+        appendOnbOwnerIdentifierRow('email', '');
+        listEl.dataset.seeded = '1';
+    }
+}
+
+function wireIdentityStep() {
+    document.getElementById('onb-owner-add-identifier-btn')?.addEventListener('click', () => {
+        appendOnbOwnerIdentifierRow('email', '');
+    });
+
+    document.getElementById('onb-back-identity')?.addEventListener('click', () => {
+        showOnboardingStep('runtimes');
+    });
+
+    document.getElementById('onb-skip-identity')?.addEventListener('click', () => {
         showOnboardingStep('done');
+    });
+
+    document.getElementById('onb-next-identity')?.addEventListener('click', async () => {
+        clearOnbOwnerError();
+        const nameEl = document.getElementById('onb-owner-name');
+        const listEl = document.getElementById('onb-owner-identifiers-list');
+        if (!nameEl || !listEl) {
+            showOnboardingStep('done');
+            return;
+        }
+        const name = (nameEl.value || '').trim();
+        const rows = listEl.querySelectorAll('.owner-identifier-row');
+        const identifiers = [];
+        for (const row of rows) {
+            const kindEl = row.querySelector('.owner-identifier-kind');
+            const valueEl = row.querySelector('.owner-identifier-value');
+            if (!kindEl || !valueEl) continue;
+            const value = (valueEl.value || '').trim();
+            if (!value) continue;
+            identifiers.push({ kind: kindEl.value, value });
+        }
+        // Empty → treat as Skip. Don't bother the backend; identity is
+        // optional and Athen still works without owner trust.
+        if (!name && identifiers.length === 0) {
+            showOnboardingStep('done');
+            return;
+        }
+        const btn = document.getElementById('onb-next-identity');
+        if (btn) {
+            btn.disabled = true;
+            btn.textContent = 'Saving…';
+        }
+        try {
+            await invoke('save_owner_contact', { name, identifiers });
+            showOnboardingStep('done');
+        } catch (err) {
+            showOnbOwnerError(err && err.toString ? err.toString() : String(err));
+        } finally {
+            if (btn) {
+                btn.disabled = false;
+                btn.textContent = 'Continue';
+            }
+        }
     });
 }
 
