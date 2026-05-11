@@ -259,6 +259,34 @@ fn load_main_config() -> AthenConfig {
     AthenConfig::default()
 }
 
+/// Load the main config and hydrate every credential field from the vault.
+///
+/// Use this in Tauri commands that consume credentials AFTER startup —
+/// `load_main_config()` returns the raw on-disk view, in which migrated
+/// secrets sit as empty strings. The startup-time hydrate in
+/// `AppState::new` only repopulates the in-memory config used to build
+/// the background senders; later disk reloads need this helper to see
+/// the real values.
+pub(crate) async fn load_main_config_hydrated(
+    vault: Option<&std::sync::Arc<dyn athen_core::traits::vault::Vault>>,
+) -> AthenConfig {
+    let mut config = load_main_config();
+    crate::vault_creds::hydrate_secrets_from_vault(vault, &mut config).await;
+    config
+}
+
+/// Load `models.toml` and hydrate each provider's api_key from the vault.
+///
+/// Same rationale as [`load_main_config_hydrated`], scoped to the
+/// per-provider api_keys that `save_provider` blanks on disk.
+pub(crate) async fn load_models_config_hydrated(
+    vault: Option<&std::sync::Arc<dyn athen_core::traits::vault::Vault>>,
+) -> ModelsConfig {
+    let mut models = load_models_config();
+    crate::vault_creds::hydrate_models_from_vault(vault, &mut models).await;
+    models
+}
+
 /// Save the main config to `~/.athen/config.toml`.
 fn save_main_config(config: &AthenConfig) -> Result<(), String> {
     let dir = ensure_athen_dir()?;
@@ -658,8 +686,8 @@ pub async fn list_model_families() -> std::result::Result<Vec<ModelFamilyEntry>,
 pub async fn get_settings(
     state: State<'_, AppState>,
 ) -> std::result::Result<SettingsResponse, String> {
-    let models = load_models_config();
-    let main_config = load_main_config();
+    let models = load_models_config_hydrated(state.vault.as_ref()).await;
+    let main_config = load_main_config_hydrated(state.vault.as_ref()).await;
 
     // Read the active provider from runtime state.
     let active = state.active_provider_id.lock().await.clone();
@@ -1055,6 +1083,21 @@ pub async fn delete_provider(
 
     save_models_config(&models)?;
 
+    // Drop the deleted provider's vault entry so we don't leak it for the
+    // lifetime of the OS keychain. Best-effort: a NoEntry is fine.
+    if let Some(vault) = state.vault.as_ref() {
+        let _ = vault
+            .delete(
+                &crate::vault_creds::provider_scope(&id),
+                crate::vault_creds::KEY_API_KEY,
+            )
+            .await;
+    }
+
+    // Hydrate AFTER the save so disk stays clean (AuthType::None) but the
+    // fallback router below sees the real api_key from the vault.
+    crate::vault_creds::hydrate_models_from_vault(state.vault.as_ref(), &mut models).await;
+
     // If deleting the active provider, switch to a fallback.
     let active_id = state.active_provider_id.lock().await.clone();
     if id == active_id {
@@ -1131,6 +1174,7 @@ pub async fn test_provider(
     base_url: String,
     model: String,
     api_key: Option<String>,
+    state: State<'_, AppState>,
 ) -> std::result::Result<TestResult, String> {
     // For local providers, just check if the endpoint responds.
     let url = if base_url.is_empty() {
@@ -1145,22 +1189,23 @@ pub async fn test_provider(
         model
     };
 
-    // Resolve the API key: use provided, or fall back to env var, or config.
-    let key = api_key.unwrap_or_else(|| {
-        if id == "deepseek" {
-            std::env::var("DEEPSEEK_API_KEY").unwrap_or_default()
-        } else {
-            let models = load_models_config();
-            models
-                .providers
-                .get(&id)
-                .and_then(|p| match &p.auth {
-                    AuthType::ApiKey(k) if !k.is_empty() && !k.starts_with("${") => Some(k.clone()),
-                    _ => None,
-                })
-                .unwrap_or_default()
-        }
-    });
+    // Resolve the API key: caller-provided first, then the hydrated
+    // models.toml entry (vault-backed), then the per-provider env var.
+    let key = if let Some(k) = api_key.filter(|k| !k.is_empty()) {
+        k
+    } else {
+        let models = load_models_config_hydrated(state.vault.as_ref()).await;
+        let from_config = models.providers.get(&id).and_then(|p| match &p.auth {
+            AuthType::ApiKey(k) if !k.is_empty() && !k.starts_with("${") => Some(k.clone()),
+            _ => None,
+        });
+        from_config
+            .or_else(|| {
+                let env_var = format!("{}_API_KEY", id.to_uppercase());
+                std::env::var(&env_var).ok().filter(|k| !k.is_empty())
+            })
+            .unwrap_or_default()
+    };
 
     // Build a minimal test request based on the provider type.
     let client = reqwest::Client::builder()
@@ -1198,7 +1243,7 @@ pub async fn set_active_provider(
     id: String,
     state: State<'_, AppState>,
 ) -> std::result::Result<String, String> {
-    let models = load_models_config();
+    let models = load_models_config_hydrated(state.vault.as_ref()).await;
     let provider_cfg = models.providers.get(&id);
 
     let base_url = provider_cfg

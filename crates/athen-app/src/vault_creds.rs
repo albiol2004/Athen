@@ -98,14 +98,33 @@ pub async fn hydrate_secrets_from_vault(
             config.embeddings.api_key = Some(key);
         }
     }
-    // Per-provider api_keys. Walk every provider in models.providers and
-    // promote the vault value into AuthType::ApiKey when present.
-    let provider_ids: Vec<String> = config.models.providers.keys().cloned().collect();
+    // Per-provider api_keys. Delegate to the models-only helper so post-
+    // startup reads (Tauri commands that reload `models.toml` from disk)
+    // can call it on a freshly loaded `ModelsConfig` without rebuilding
+    // the full `AthenConfig`.
+    hydrate_models_from_vault(Some(v), &mut config.models).await;
+}
+
+/// Patch each provider's api_key from the vault.
+///
+/// Equivalent to the provider loop in [`hydrate_secrets_from_vault`] but
+/// scoped to `ModelsConfig`. Tauri commands that re-read `models.toml`
+/// from disk after startup must call this before consuming `auth` — the
+/// on-disk copy is intentionally blanked to `AuthType::None` post-
+/// migration; the live secret only exists in the vault.
+pub async fn hydrate_models_from_vault(
+    vault: Option<&Arc<dyn Vault>>,
+    models: &mut athen_core::config::ModelsConfig,
+) {
+    let Some(v) = vault else {
+        return;
+    };
+    let provider_ids: Vec<String> = models.providers.keys().cloned().collect();
     for id in provider_ids {
         let scope = provider_scope(&id);
         if let Ok(Some(key)) = v.get(&scope, KEY_API_KEY).await {
             if !key.is_empty() {
-                if let Some(p) = config.models.providers.get_mut(&id) {
+                if let Some(p) = models.providers.get_mut(&id) {
                     p.auth = athen_core::config::AuthType::ApiKey(key);
                 }
             }
