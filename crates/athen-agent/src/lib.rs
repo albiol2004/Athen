@@ -11,6 +11,7 @@ pub mod reminders;
 pub mod resource;
 pub mod runtimes;
 pub mod timeout;
+pub mod tool_error_hints;
 pub mod tool_grouping;
 pub mod tool_truncation;
 pub mod toolbox;

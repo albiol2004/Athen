@@ -1957,16 +1957,34 @@ impl AgentExecutor for DefaultExecutor {
                 // by `tool_truncation::policy_for` so an oversized tool
                 // output (build logs, fetched pages) can't blow the context
                 // window for the next turn.
+                //
+                // On failure the body is wrapped with a `<system-reminder>`
+                // carrying the tool's common-misuse policy — episodic
+                // anchoring so the model sees the error + the rule in the
+                // same context (Cursor-style). See `tool_error_hints`.
                 let tool_response_content = match &tool_result {
                     Ok(result) => {
                         let raw = serde_json::to_string(&result.output)
                             .unwrap_or_else(|_| "{}".to_string());
-                        crate::tool_truncation::apply(
+                        let truncated = crate::tool_truncation::apply(
                             crate::tool_truncation::policy_for(&tool_call.name),
                             raw,
-                        )
+                        );
+                        if result.success {
+                            truncated
+                        } else {
+                            crate::tool_error_hints::maybe_append_hint(
+                                &truncated,
+                                &tool_call.name,
+                                result.error.as_deref(),
+                            )
+                        }
                     }
-                    Err(e) => format!("Error: {}", e),
+                    Err(e) => crate::tool_error_hints::maybe_append_hint(
+                        &format!("Error: {}", e),
+                        &tool_call.name,
+                        None,
+                    ),
                 };
 
                 conversation.push(ChatMessage {
