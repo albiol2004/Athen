@@ -21,8 +21,12 @@ pub fn default_slug_for_family(family: ModelFamily) -> &'static str {
         ModelFamily::ClaudeHaiku45 => "claude-haiku-4-5",
         ModelFamily::Gpt5 => "gpt-5.5",
         ModelFamily::OpenAiO3 => "o4-mini",
-        ModelFamily::Gemini3Pro => "gemini-3.1-pro",
-        ModelFamily::Gemini3Flash => "gemini-3-flash",
+        // Gemini 3 family is preview-only on the Generative Language API
+        // as of May 2026 — the `-preview` suffix is mandatory or the API
+        // 404s the model. Pro is at 3.1 (older 3.0 Pro Preview was shut
+        // down 2026-03-09); Flash is still on the 3.0 lineage.
+        ModelFamily::Gemini3Pro => "gemini-3.1-pro-preview",
+        ModelFamily::Gemini3Flash => "gemini-3-flash-preview",
         // `deepseek-chat` is a backward-compatible alias still accepted by
         // DeepSeek's API; the new canonical (2026) is `deepseek-v4-flash`.
         ModelFamily::DeepSeekV4Chat => "deepseek-v4-flash",

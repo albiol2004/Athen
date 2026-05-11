@@ -499,7 +499,9 @@ fn default_model(id: &str) -> &str {
         "deepseek" => "deepseek-chat",
         "openai" => "gpt-4o",
         "anthropic" => "claude-sonnet-4-20250514",
-        "google" => "gemini-2.5-flash",
+        // Gemini 3 Flash is the newest cheap default. The `-preview` suffix
+        // is mandatory on Gemini 3 — without it the API 404s the model.
+        "google" => "gemini-3-flash-preview",
         "mistral" => "mistral-large-latest",
         "openrouter" => "openai/gpt-4o-mini",
         "ollama" => "llama3",
@@ -528,6 +530,25 @@ fn provider_type(id: &str) -> &str {
     match id {
         "ollama" | "llamacpp" => "local",
         _ => "cloud",
+    }
+}
+
+/// Default ModelFamily wire id for a provider. The frontend uses this to
+/// pre-select the family dropdown when the user adds a fresh provider via
+/// the "+ Add Provider" chip — and the family's change handler then auto-
+/// fills the model slug, giving a one-click "matches the default model"
+/// UX. Empty string falls through to `Default` (the safety-net family).
+///
+/// Local providers (Ollama / llama.cpp) and OpenRouter intentionally
+/// stay on `Default` — the user picks the actual model post-add.
+fn default_family(id: &str) -> &str {
+    match id {
+        "deepseek" => "DeepSeekV4Chat",
+        "openai" => "Gpt5",
+        "anthropic" => "ClaudeSonnet46",
+        "google" => "Gemini3Flash",
+        "mistral" => "MistralLarge3",
+        _ => "Default",
     }
 }
 
@@ -568,6 +589,11 @@ pub struct ProviderCatalogEntry {
     pub provider_type: &'static str,
     pub default_base_url: &'static str,
     pub default_model: &'static str,
+    /// `ModelFamily::wire_id()` value to pre-select in the family dropdown
+    /// when this provider is added via the "+ Add Provider" chip. Empty
+    /// string means "leave on Default" — used for OpenRouter and local
+    /// providers where the user picks the actual model afterwards.
+    pub default_family: &'static str,
     /// Placeholder text for the API key input. Empty for local providers.
     pub api_key_hint: &'static str,
 }
@@ -584,6 +610,7 @@ pub async fn list_provider_catalog() -> std::result::Result<Vec<ProviderCatalogE
             provider_type: provider_type(id),
             default_base_url: default_base_url(id),
             default_model: default_model(id),
+            default_family: default_family(id),
             api_key_hint: api_key_hint(id),
         })
         .collect())

@@ -3826,6 +3826,7 @@ const PROVIDER_DEFAULTS = new Proxy({}, {
             name: entry.name,
             base_url: entry.default_base_url,
             model: entry.default_model,
+            family: entry.default_family,
             type: entry.provider_type,
         };
     },
@@ -5723,6 +5724,12 @@ if (providerTemplates) {
             provider_type: defaults.type,
             base_url: defaults.base_url,
             model: defaults.model,
+            // Pre-select the matching family in the dropdown so the user
+            // doesn't have to manually flip it after adding the chip. The
+            // family-change listener fires on createProviderCard only for
+            // user interactions; the initial value comes straight from
+            // `provider.family` via the `selected` attribute.
+            family: defaults.family || 'Default',
             has_api_key: false,
             api_key_hint: '',
             is_active: false,

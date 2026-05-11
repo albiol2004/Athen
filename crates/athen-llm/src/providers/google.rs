@@ -668,19 +668,20 @@ fn parse_sse_chunks(text: &str) -> Vec<Result<LlmChunk>> {
 /// with the published pay-as-you-go list pricing — caller is responsible for
 /// updating these alongside model launches.
 fn estimate_google_cost(model: &str, input_tokens: u32, output_tokens: u32) -> f64 {
-    let (input_per_m, output_per_m) = if model.contains("2.5-pro") || model.contains("3-pro") {
-        (1.25, 10.0)
-    } else if model.contains("2.5-flash-lite") {
-        (0.10, 0.40)
-    } else if model.contains("2.5-flash") || model.contains("flash") {
-        (0.30, 2.50)
-    } else if model.contains("embedding") {
-        (0.15, 0.0)
-    } else {
-        // Default to flash pricing — closer to the free-tier-friendly model
-        // we ship as the default than to Pro.
-        (0.30, 2.50)
-    };
+    let (input_per_m, output_per_m) =
+        if model.contains("2.5-pro") || model.contains("3-pro") || model.contains("3.1-pro") {
+            (1.25, 10.0)
+        } else if model.contains("2.5-flash-lite") {
+            (0.10, 0.40)
+        } else if model.contains("2.5-flash") || model.contains("flash") {
+            (0.30, 2.50)
+        } else if model.contains("embedding") {
+            (0.15, 0.0)
+        } else {
+            // Default to flash pricing — closer to the free-tier-friendly model
+            // we ship as the default than to Pro.
+            (0.30, 2.50)
+        };
     let input_cost = (input_tokens as f64 / 1_000_000.0) * input_per_m;
     let output_cost = (output_tokens as f64 / 1_000_000.0) * output_per_m;
     input_cost + output_cost
