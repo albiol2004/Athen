@@ -114,6 +114,7 @@ fn spawn_router_approval(
         http_endpoint_store: state.http_endpoint_store.clone(),
         pending_grants: state.pending_grants.clone(),
         spawned_processes: state.spawned_processes.clone(),
+        spawn_persistence: state.spawn_persistence.clone(),
         telegram_sink: telegram_sink.clone(),
         cancel_flag: Arc::clone(&state.cancel_flag),
         active_arc_id: arc_id.clone().unwrap_or_default(),
@@ -219,6 +220,7 @@ fn spawn_router_approval(
             http_endpoint_store: bg_ctx.http_endpoint_store,
             pending_grants: bg_ctx.pending_grants,
             spawned_processes: bg_ctx.spawned_processes,
+            spawn_persistence: bg_ctx.spawn_persistence.clone(),
             telegram_approval_sink: Some(bg_ctx.telegram_sink.clone()),
             cancel_flag: bg_ctx.cancel_flag,
             active_arc_id: bg_ctx.active_arc_id,
@@ -322,6 +324,8 @@ struct ApprovedTaskBgCtx {
     http_endpoint_store: Option<Arc<athen_persistence::http_endpoints::SqliteHttpEndpointStore>>,
     pending_grants: crate::file_gate::PendingGrants,
     spawned_processes: athen_agent::SpawnedProcessMap,
+    /// See [`ApprovedTaskCtx::spawn_persistence`].
+    spawn_persistence: Option<Arc<dyn athen_agent::SpawnPersistenceHook>>,
     telegram_sink: Arc<crate::approval::TelegramApprovalSink>,
     cancel_flag: Arc<std::sync::atomic::AtomicBool>,
     active_arc_id: String,
@@ -2389,6 +2393,7 @@ pub async fn approve_task(
         http_endpoint_store: state.http_endpoint_store.clone(),
         pending_grants: state.pending_grants.clone(),
         spawned_processes: state.spawned_processes.clone(),
+        spawn_persistence: state.spawn_persistence.clone(),
         telegram_approval_sink: state.telegram_approval_sink.clone(),
         cancel_flag: Arc::clone(&state.cancel_flag),
         active_arc_id: active_arc,
@@ -2500,6 +2505,11 @@ pub(crate) struct ApprovedTaskCtx {
         Option<Arc<athen_persistence::http_endpoints::SqliteHttpEndpointStore>>,
     pub pending_grants: crate::file_gate::PendingGrants,
     pub spawned_processes: athen_agent::SpawnedProcessMap,
+    /// Persistence hook for the spawned-process pidfile. When `Some`, every
+    /// per-arc registry built from this context fires the hook on every
+    /// `shell_spawn` / `shell_kill` so a crash leaves a recoverable record
+    /// of orphans. `None` in CLI/test contexts without a data dir.
+    pub spawn_persistence: Option<Arc<dyn athen_agent::SpawnPersistenceHook>>,
     pub telegram_approval_sink: Option<Arc<crate::approval::TelegramApprovalSink>>,
     pub cancel_flag: Arc<std::sync::atomic::AtomicBool>,
     pub active_arc_id: String,
@@ -2877,6 +2887,7 @@ pub(crate) async fn execute_approved_task(
     let mut shell_registry = athen_agent::ShellToolRegistry::new()
         .await
         .with_spawned_processes(ctx.spawned_processes.clone())
+        .with_spawn_persistence_hook_opt(ctx.spawn_persistence.clone())
         .with_web_search(Arc::clone(&ctx.web_search))
         .with_email_sender_opt(ctx.email_sender.clone());
     if let Some(ref store) = ctx.grant_store {
@@ -3856,6 +3867,7 @@ pub(crate) async fn execute_dispatched_task(
     let mut shell_registry = athen_agent::ShellToolRegistry::new()
         .await
         .with_spawned_processes(ctx.spawned_processes.clone())
+        .with_spawn_persistence_hook_opt(ctx.spawn_persistence.clone())
         .with_web_search(Arc::clone(&ctx.web_search))
         .with_email_sender_opt(ctx.email_sender.clone());
     if let Some(ref store) = ctx.grant_store {
@@ -6332,7 +6344,9 @@ pub async fn install_update(
     // when raw cmd syntax fails — that nu grandchild then locks the
     // bundled sidecar. Tracking is in-memory anyway, so anything we
     // don't kill becomes an unmanageable orphan after restart.
-    let killed = athen_agent::kill_all_spawned(&state.spawned_processes).await;
+    let killed =
+        athen_agent::kill_all_spawned(&state.spawned_processes, state.spawn_persistence.as_ref())
+            .await;
     if killed > 0 {
         tracing::info!(count = killed, "killed spawned processes before update");
     }

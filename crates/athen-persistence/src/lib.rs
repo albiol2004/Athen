@@ -178,6 +178,34 @@ impl Database {
     pub fn agent_run_store(&self) -> SqliteAgentRunStore {
         SqliteAgentRunStore::from_conn(self.conn.clone())
     }
+
+    /// Force-checkpoint the WAL and truncate it. Called from the graceful
+    /// shutdown coordinator so an abrupt power loss right after exit
+    /// doesn't lose committed-but-WAL'd writes. Best-effort: the pragma
+    /// can fail (busy, IO error) and we just log without propagating.
+    ///
+    /// Uses `tokio::task::spawn_blocking` because the rusqlite call is
+    /// synchronous and we don't want to stall the async reactor under the
+    /// `tokio::sync::Mutex`.
+    pub async fn checkpoint_wal(&self) {
+        let conn = self.conn.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            let guard = conn.blocking_lock();
+            guard.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        })
+        .await;
+        match res {
+            Ok(Ok(())) => {
+                tracing::debug!("WAL checkpoint completed");
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "WAL checkpoint failed");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "WAL checkpoint task panicked");
+            }
+        }
+    }
 }
 
 #[cfg(test)]

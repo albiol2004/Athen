@@ -22,8 +22,9 @@ pub use resource::DefaultResourceMonitor;
 pub use timeout::DefaultTimeoutGuard;
 pub use toolbox::{InstalledPackage, Runtime as ToolboxRuntime, RuntimeProbe, ToolboxManifest};
 pub use tools::{
-    detect_shell_kind, kill_all_spawned, EmailSendApprovalGate, EmailSendSummary,
-    ShellToolRegistry, SpawnedProcess, SpawnedProcessMap, ToolboxApprovalGate,
+    detect_shell_kind, kill_all_spawned, kill_spawned_pid, EmailSendApprovalGate, EmailSendSummary,
+    ShellToolRegistry, SpawnPersistenceHook, SpawnedProcess, SpawnedProcessMap,
+    ToolboxApprovalGate,
 };
 
 use std::path::PathBuf;

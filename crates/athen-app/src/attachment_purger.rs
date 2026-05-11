@@ -84,16 +84,22 @@ pub async fn sweep_once(
 /// Spawn the forever-loop. The task wakes every `interval`, computes
 /// `cutoff = now - ttl_days`, runs `sweep_once`, then sleeps. Owned by
 /// `AppState` via the spawned join handle (not awaited — runs until
-/// the process exits).
+/// the process exits or the shutdown signal fires).
 ///
 /// Uses `tauri::async_runtime::spawn` rather than `tokio::spawn` so the
 /// purger can be started from `setup()` (synchronous Tauri callback,
 /// no enclosing runtime). The Tauri runtime is itself tokio-backed, so
 /// this is the same as `tokio::spawn` from a runtime-aware context.
+///
+/// The `shutdown` receiver is consumed by the graceful shutdown
+/// coordinator: a `send(())` on the matching sender makes the loop exit
+/// at the next select boundary (immediately if we're sleeping, or after
+/// the current sweep finishes).
 pub fn spawn_loop(
     store: AttachmentStore,
     ttl_days: u32,
     interval: Duration,
+    mut shutdown: tokio::sync::broadcast::Receiver<()>,
 ) -> tauri::async_runtime::JoinHandle<()> {
     tauri::async_runtime::spawn(async move {
         tracing::info!(
@@ -106,7 +112,13 @@ pub fn spawn_loop(
             if let Err(e) = sweep_once(&store, cutoff).await {
                 tracing::warn!(error = %e, "Attachment TTL sweep failed");
             }
-            tokio::time::sleep(interval).await;
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                _ = shutdown.recv() => {
+                    tracing::info!("Attachment TTL purger shutdown signal received");
+                    break;
+                }
+            }
         }
     })
 }

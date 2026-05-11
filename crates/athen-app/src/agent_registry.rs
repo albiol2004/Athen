@@ -237,6 +237,29 @@ impl AgentRegistry {
         n
     }
 
+    /// Drain every live entry and finalize each as `Cancelled` with the
+    /// given reason recorded in the error column. Used by the graceful
+    /// shutdown coordinator: setting `cancel_flag = true` (via
+    /// [`Self::cancel_all`]) only reaches the executor at its next
+    /// between-steps poll, but on exit we want the persistent record to
+    /// reflect immediately that these runs didn't complete naturally.
+    /// Returns the count of entries finalized.
+    pub async fn finalize_all_as_cancelled(&self, reason: &str) -> usize {
+        // Snapshot the task ids under the read lock so `finalize` can
+        // re-acquire the write lock to remove each entry without
+        // deadlocking ourselves.
+        let task_ids: Vec<Uuid> = {
+            let map = self.inner.read().await;
+            map.keys().copied().collect()
+        };
+        let count = task_ids.len();
+        for id in task_ids {
+            self.finalize(id, FinishStatus::Cancelled, Some(reason.to_string()))
+                .await;
+        }
+        count
+    }
+
     async fn finalize(&self, task_id: Uuid, status: FinishStatus, error: Option<String>) {
         {
             let mut map = self.inner.write().await;

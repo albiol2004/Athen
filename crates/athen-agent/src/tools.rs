@@ -135,13 +135,43 @@ pub struct SpawnedProcess {
 /// kill in turn N a process it spawned in turn N-1.
 pub type SpawnedProcessMap = Arc<Mutex<HashMap<u32, SpawnedProcess>>>;
 
+/// Optional sink notified every time the spawned-process map mutates.
+/// The app layer wires this to a JSON pidfile (`spawned_pids.json`) so a
+/// crash/power-loss leaves a recoverable record — on next start the
+/// reconciler best-effort kills any orphans before fresh wake-ups can
+/// re-spawn watchers on top of them.
+///
+/// Implementations should atomically rewrite their store and swallow IO
+/// errors (log, don't panic). The snapshot is the current full map in no
+/// particular order — receivers should treat it as the truth, not as a
+/// delta.
+#[async_trait]
+pub trait SpawnPersistenceHook: Send + Sync {
+    async fn on_change(&self, snapshot: Vec<SpawnedProcess>);
+}
+
+/// Snapshot the map's values without the surrounding lock. Used by the
+/// hook firing path so we don't hold the spawned-map lock across an
+/// async fs write (which would also need to grab it on the next
+/// shell_spawn).
+async fn snapshot_spawned(map: &SpawnedProcessMap) -> Vec<SpawnedProcess> {
+    map.lock().await.values().cloned().collect()
+}
+
 /// Force-kill every process tracked in `map` and clear the map. Used by
-/// the auto-updater right before it overwrites the install dir: any
-/// `shell_spawn`'d watcher that's chained into `nu.exe` (cmd /C nu -c …)
-/// would otherwise hold the bundled sidecar locked. Post-update those
-/// processes would be unmanageable orphans anyway — the in-memory PID
-/// map is gone — so killing them is the right semantic.
-pub async fn kill_all_spawned(map: &SpawnedProcessMap) -> usize {
+/// the auto-updater right before it overwrites the install dir and by
+/// the graceful-shutdown coordinator at app exit: any `shell_spawn`'d
+/// watcher that's chained into `nu.exe` (cmd /C nu -c …) would
+/// otherwise hold the bundled sidecar locked. Post-update / post-exit
+/// those processes would be unmanageable orphans anyway — the in-memory
+/// PID map is gone — so killing them is the right semantic.
+///
+/// When `hook` is provided, fires a single final `on_change` with the
+/// (empty) snapshot after the clear so the pidfile reflects truth.
+pub async fn kill_all_spawned(
+    map: &SpawnedProcessMap,
+    hook: Option<&Arc<dyn SpawnPersistenceHook>>,
+) -> usize {
     // Snapshot + clear under the lock so concurrent shell_spawn calls
     // can't slip a new entry in while we iterate.
     let pids: Vec<u32> = {
@@ -150,18 +180,24 @@ pub async fn kill_all_spawned(map: &SpawnedProcessMap) -> usize {
         guard.clear();
         pids
     };
+    if let Some(h) = hook {
+        h.on_change(Vec::new()).await;
+    }
     if pids.is_empty() {
         return 0;
     }
-    tracing::info!(count = pids.len(), "killing spawned processes for update");
+    tracing::info!(count = pids.len(), "killing spawned processes");
     for pid in &pids {
         kill_spawned_pid(*pid).await;
     }
     pids.len()
 }
 
+/// Best-effort SIGKILL / taskkill for a single PID. Public so the pidfile
+/// reconciler can call it on app startup without needing the in-memory
+/// `SpawnedProcessMap` (which is, by definition, empty in a fresh process).
 #[cfg(unix)]
-async fn kill_spawned_pid(pid: u32) {
+pub async fn kill_spawned_pid(pid: u32) {
     use nix::sys::signal::{kill, Signal};
     use nix::unistd::Pid;
     // Same pattern as do_shell_kill's force path: hit the process group
@@ -173,7 +209,7 @@ async fn kill_spawned_pid(pid: u32) {
 }
 
 #[cfg(windows)]
-async fn kill_spawned_pid(pid: u32) {
+pub async fn kill_spawned_pid(pid: u32) {
     let mut cmd = tokio::process::Command::new("taskkill");
     hide_console_tokio(&mut cmd);
     cmd.arg("/PID").arg(pid.to_string()).arg("/T").arg("/F");
@@ -217,6 +253,10 @@ pub struct ShellToolRegistry {
     /// no gate is wired — the tool refuses to send so emails can never
     /// leave without user consent.
     email_approval: Option<Arc<dyn EmailSendApprovalGate>>,
+    /// Optional sink notified every time the spawned-process map mutates.
+    /// Wired by the app layer to a JSON pidfile under `<data_dir>/`. Tests
+    /// and CLI builds leave it `None` and the registry behaves as before.
+    spawn_persistence: Option<Arc<dyn SpawnPersistenceHook>>,
 }
 
 /// Defense-in-depth: tolerate args delivered as a JSON-encoded string
@@ -539,6 +579,7 @@ impl ShellToolRegistry {
             toolbox_approval: None,
             email_sender: None,
             email_approval: None,
+            spawn_persistence: None,
         }
     }
 
@@ -610,6 +651,37 @@ impl ShellToolRegistry {
     pub fn with_spawned_processes(mut self, spawned: SpawnedProcessMap) -> Self {
         self.spawned = spawned;
         self
+    }
+
+    /// Attach a persistence hook fired every time the spawned-process map
+    /// mutates (insert / remove / bulk-clear). The app layer wires this to
+    /// a JSON pidfile so a crash leaves behind a recoverable record of
+    /// orphans for the next startup to reap.
+    pub fn with_spawn_persistence_hook(mut self, hook: Arc<dyn SpawnPersistenceHook>) -> Self {
+        self.spawn_persistence = Some(hook);
+        self
+    }
+
+    /// `Option`-flavoured variant — see [`Self::with_email_sender_opt`].
+    /// Lets the composition root pass `state.spawn_persistence.clone()`
+    /// without a manual `if let Some`.
+    pub fn with_spawn_persistence_hook_opt(
+        self,
+        hook: Option<Arc<dyn SpawnPersistenceHook>>,
+    ) -> Self {
+        match hook {
+            Some(h) => self.with_spawn_persistence_hook(h),
+            None => self,
+        }
+    }
+
+    /// Fire the persistence hook with the current map snapshot. Called
+    /// after every `self.spawned` mutation. No-op when no hook is wired.
+    async fn fire_spawn_persistence(&self) {
+        if let Some(hook) = self.spawn_persistence.as_ref() {
+            let snap = snapshot_spawned(&self.spawned).await;
+            hook.on_change(snap).await;
+        }
     }
 
     /// Build the JSON Schema for the `shell_execute` tool parameters.
@@ -2019,6 +2091,7 @@ impl ShellToolRegistry {
             started_at: chrono::Utc::now(),
         };
         self.spawned.lock().await.insert(pid, entry);
+        self.fire_spawn_persistence().await;
 
         let elapsed_ms = start.elapsed().as_millis() as u64;
         Ok(ToolResult {
@@ -2112,6 +2185,7 @@ impl ShellToolRegistry {
         };
 
         self.spawned.lock().await.remove(&pid);
+        self.fire_spawn_persistence().await;
 
         let elapsed_ms = start.elapsed().as_millis() as u64;
         Ok(ToolResult {

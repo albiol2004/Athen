@@ -173,6 +173,12 @@ pub struct AppState {
     pub email_shutdown: Option<tokio::sync::broadcast::Sender<()>>,
     /// Shutdown sender for the Telegram monitor background task.
     pub telegram_shutdown: Option<tokio::sync::broadcast::Sender<()>>,
+    /// Shutdown sender for the calendar monitor background task. Set by
+    /// [`Self::start_calendar_monitor`]; consumed by [`Self::shutdown_all`].
+    pub calendar_shutdown: Option<tokio::sync::broadcast::Sender<()>>,
+    /// Shutdown sender for the attachment TTL purger loop. Set by
+    /// [`Self::start_attachment_purger`]; consumed by [`Self::shutdown_all`].
+    pub attachment_purger_shutdown: Option<tokio::sync::broadcast::Sender<()>>,
     /// Notification orchestrator for delivering notifications through the
     /// best available channel (in-app, Telegram, etc.) with quiet-hours
     /// support and escalation.  Initialized after setup via `init_notifier`.
@@ -224,7 +230,11 @@ pub struct AppState {
     /// Shutdown signal for the wake-up scheduler loop. `None` until
     /// `start_wakeup_scheduler` has been called. Sending on this channel
     /// causes the scheduler to exit at the next select boundary.
-    pub wakeup_scheduler_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Wrapped in `std::sync::Mutex` so `shutdown_all` (which takes `&self`)
+    /// can `take()` and `send` without needing `&mut self`. The
+    /// oneshot sender isn't Clone, so unlike the broadcast channels we
+    /// can't just clone-and-send.
+    pub wakeup_scheduler_shutdown: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     /// Embedding provider used for semantic profile routing. Always wired
     /// to a router that falls back to keyword embeddings when no neural
     /// provider is available, so the per-call code path can assume `Some`.
@@ -245,11 +255,22 @@ pub struct AppState {
     /// would be lost between messages — the model could spawn a server in
     /// turn N but be unable to kill or inspect it in turn N+1.
     ///
-    // TODO: kill spawned on shutdown — Tauri exposes only a sync window
-    // event hook here, not an async one suitable for awaiting our locks.
-    // Workaround: process group leadership + parent-death signal would be
-    // a cleaner OS-level fix than wiring a custom Drop.
+    /// Cleared on graceful shutdown via [`Self::shutdown_all`] →
+    /// [`athen_agent::kill_all_spawned`], and persisted continuously to
+    /// [`Self::pidfile_path`] via [`Self::spawn_persistence`] so a crash
+    /// leaves a recoverable record for next startup's
+    /// [`crate::spawn_pidfile::reconcile_orphans`] sweep.
     pub spawned_processes: athen_agent::SpawnedProcessMap,
+    /// Persistence hook fired on every `spawned_processes` mutation. Wired
+    /// to a JSON pidfile under `<data_dir>/spawned_pids.json` so a
+    /// crash/power-loss leaves behind a recoverable record of orphans.
+    /// `None` only in CLI/test contexts with no data dir.
+    pub spawn_persistence: Option<Arc<dyn athen_agent::SpawnPersistenceHook>>,
+    /// Resolved path to the persistent spawn pidfile. Stored alongside
+    /// `spawn_persistence` so [`Self::shutdown_all`] can write the empty
+    /// snapshot one last time after `kill_all_spawned` returns. `None`
+    /// when no data dir is configured.
+    pub pidfile_path: Option<PathBuf>,
     /// Single-slot hint recording the most recent outbound Telegram
     /// notification's arc + timestamp. Written by `TelegramChannel::send`,
     /// read by `execute_owner_telegram_message` to bias arc matching for
@@ -447,6 +468,19 @@ impl AppState {
         let spawned_processes: athen_agent::SpawnedProcessMap =
             Arc::new(Mutex::new(HashMap::new()));
 
+        // Persistent pidfile for `shell_spawn`'d processes. The hook fires
+        // on every map mutation so a crash leaves a recoverable record.
+        // `reconcile_orphans` is called from `lib.rs` setup() AFTER state
+        // is built but BEFORE any monitor can start spawning new shells.
+        let pidfile_path: Option<PathBuf> =
+            ensure_data_dir().map(|d| crate::spawn_pidfile::pidfile_path(&d));
+        let spawn_persistence: Option<Arc<dyn athen_agent::SpawnPersistenceHook>> =
+            pidfile_path.clone().map(|p| {
+                let hook: Arc<dyn athen_agent::SpawnPersistenceHook> =
+                    crate::spawn_pidfile::PidFilePersistence::new(p);
+                hook
+            });
+
         // Wire the compactor whenever an arc store exists. The router
         // shares the same RwLock the executor uses so a provider switch
         // is reflected here too.
@@ -481,6 +515,8 @@ impl AppState {
             cancel_flag: Arc::new(AtomicBool::new(false)),
             email_shutdown: None,
             telegram_shutdown: None,
+            calendar_shutdown: None,
+            attachment_purger_shutdown: None,
             notifier: None,
             approval_router: None,
             inapp_approval_sink: None,
@@ -493,11 +529,13 @@ impl AppState {
             profile_store,
             identity_store,
             wakeup_store,
-            wakeup_scheduler_shutdown: None,
+            wakeup_scheduler_shutdown: std::sync::Mutex::new(None),
             profile_embedder,
             profile_embedding_cache,
             pending_grants,
             spawned_processes,
+            spawn_persistence,
+            pidfile_path,
             telegram_outbound_hint: std::sync::Arc::new(std::sync::Mutex::new(None)),
             inflight_approvals: Arc::new(Mutex::new(HashSet::new())),
             task_arc_map: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
@@ -525,6 +563,125 @@ impl AppState {
         }
 
         state
+    }
+
+    /// Graceful shutdown coordinator. Called from the tray-menu Quit
+    /// path, the auto-updater restart path, and on SIGTERM. Each step
+    /// is bounded by a short timeout so a wedged subsystem can't trap
+    /// the user — total budget is roughly 5 seconds.
+    ///
+    /// Order matters:
+    /// 1. Signal every monitor loop to exit (broadcast, fire-and-forget).
+    /// 2. Mark every live agent in the registry as `Cancelled` so the
+    ///    SQLite history doesn't lie about runs that never completed.
+    /// 3. SIGKILL / taskkill every `shell_spawn`'d process so wake-ups
+    ///    can't keep watchers alive past the app's lifetime.
+    /// 4. Force-write the pidfile to `[]` — defensive, also fires the
+    ///    persistence hook once during kill_all_spawned but the explicit
+    ///    write here is idempotent and covers the no-hook case.
+    /// 5. `PRAGMA wal_checkpoint(TRUNCATE)` so a power loss right after
+    ///    exit doesn't lose committed-but-WAL'd writes.
+    ///
+    /// Individual step failures are logged but never propagate — the
+    /// goal is to make exit as clean as possible, not to guarantee it.
+    pub async fn shutdown_all(&self) {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        tracing::info!("graceful shutdown: starting");
+
+        // 1. Fire-and-forget the broadcast / oneshot signals. The
+        // receivers may already be gone (loop exited early on its own,
+        // CLI build that never started them) — that's fine, we just
+        // care that any live receiver flips out of its sleep / poll.
+        macro_rules! pulse {
+            ($sender:expr, $label:literal) => {
+                if let Some(tx) = $sender {
+                    if tx.send(()).is_err() {
+                        tracing::debug!(concat!($label, " shutdown signal had no listeners"));
+                    }
+                }
+            };
+        }
+        // We take() conceptually but only have &self here, so just clone
+        // the inner Sender — broadcast senders are cheap to clone and
+        // can be dropped freely after the send.
+        pulse!(self.email_shutdown.as_ref().cloned(), "email monitor");
+        pulse!(self.telegram_shutdown.as_ref().cloned(), "telegram monitor");
+        pulse!(self.calendar_shutdown.as_ref().cloned(), "calendar monitor");
+        pulse!(
+            self.attachment_purger_shutdown.as_ref().cloned(),
+            "attachment purger"
+        );
+        pulse!(
+            self.dispatch_loop_shutdown.as_ref().cloned(),
+            "dispatch loop"
+        );
+        // Wake-up scheduler uses a oneshot — take() the inner via the
+        // wrapping `std::sync::Mutex` so we can move-send it. Dropping
+        // the sender on a take() also fires the rx side, so both paths
+        // (explicit send + Drop) wake the scheduler.
+        if let Ok(mut guard) = self.wakeup_scheduler_shutdown.lock() {
+            if let Some(tx) = guard.take() {
+                if tx.send(()).is_err() {
+                    tracing::debug!("wakeup scheduler shutdown signal had no listener");
+                }
+            }
+        }
+
+        // 2. Mark live agent runs as Cancelled with reason "app_shutdown".
+        if let Some(reg) = self.agent_registry.as_ref() {
+            let reg = Arc::clone(reg);
+            let res = timeout(Duration::from_millis(1000), async move {
+                let n = reg.finalize_all_as_cancelled("app_shutdown").await;
+                if n > 0 {
+                    tracing::info!(count = n, "finalized live agents as Cancelled");
+                }
+            })
+            .await;
+            if res.is_err() {
+                tracing::warn!("graceful shutdown: agent finalize step timed out");
+            }
+        }
+
+        // 3. Kill every `shell_spawn`'d process. Passing the persistence
+        // hook means kill_all_spawned itself fires a final empty
+        // snapshot — step 4 below is defense in depth.
+        let map = self.spawned_processes.clone();
+        let hook = self.spawn_persistence.clone();
+        let res = timeout(Duration::from_millis(2000), async move {
+            athen_agent::kill_all_spawned(&map, hook.as_ref()).await
+        })
+        .await;
+        match res {
+            Ok(n) if n > 0 => tracing::info!(count = n, "killed spawned processes on shutdown"),
+            Ok(_) => {}
+            Err(_) => tracing::warn!("graceful shutdown: kill_all_spawned timed out"),
+        }
+
+        // 4. Explicitly truncate the pidfile. Idempotent — same target
+        // state as the hook-fired write above.
+        if let Some(path) = self.pidfile_path.as_ref() {
+            let path = path.clone();
+            let res = timeout(Duration::from_millis(500), async move {
+                crate::spawn_pidfile::write_pidfile(&path, &[]).await
+            })
+            .await;
+            if res.is_err() {
+                tracing::warn!("graceful shutdown: pidfile truncate timed out");
+            }
+        }
+
+        // 5. WAL checkpoint so a power-loss right after exit doesn't
+        // strand committed writes in the WAL.
+        if let Some(db) = self._database.as_ref() {
+            let res = timeout(Duration::from_millis(2000), db.checkpoint_wal()).await;
+            if res.is_err() {
+                tracing::warn!("graceful shutdown: WAL checkpoint timed out");
+            }
+        }
+
+        tracing::info!("graceful shutdown: done");
     }
 
     /// Borrow the attachment-ref store backed by the same SQLite
@@ -573,6 +730,7 @@ impl AppState {
         let mut shell_registry = athen_agent::ShellToolRegistry::new()
             .await
             .with_spawned_processes(self.spawned_processes.clone())
+            .with_spawn_persistence_hook_opt(self.spawn_persistence.clone())
             .with_web_search(self.web_search.clone())
             .with_email_sender_opt(self.email_sender.clone());
         if let Some(router) = self.approval_router.clone() {
@@ -716,6 +874,7 @@ impl AppState {
         let mut shell = athen_agent::ShellToolRegistry::new()
             .await
             .with_spawned_processes(self.spawned_processes.clone())
+            .with_spawn_persistence_hook_opt(self.spawn_persistence.clone())
             .with_web_search(self.web_search.clone())
             .with_email_sender_opt(self.email_sender.clone());
         if let Some(store) = self.grant_store.clone() {
@@ -1109,19 +1268,23 @@ impl AppState {
     /// `AttachmentPolicy` so user changes in Settings take effect on
     /// restart; falls back to the policy default if the config can't be
     /// loaded (fresh install, parse error).
-    pub fn start_attachment_purger(&self) {
+    pub fn start_attachment_purger(&mut self) {
         let Some(store) = self.attachment_store() else {
             tracing::debug!("No attachment store wired; skipping TTL purger");
             return;
         };
         let cfg = crate::settings::load_main_config_public();
         let ttl_days = cfg.attachment_policy.byte_ttl_days;
-        // JoinHandle deliberately dropped — the loop runs until the
-        // process exits, same as the calendar/email/telegram monitors.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+        self.attachment_purger_shutdown = Some(shutdown_tx);
+        // JoinHandle deliberately dropped — the loop runs until either the
+        // process exits or the graceful-shutdown coordinator fires the
+        // shutdown signal, same as the calendar/email/telegram monitors.
         drop(crate::attachment_purger::spawn_loop(
             store,
             ttl_days,
             crate::attachment_purger::DEFAULT_SWEEP_INTERVAL,
+            shutdown_rx,
         ));
     }
 
@@ -1134,7 +1297,13 @@ impl AppState {
             tracing::debug!("No wake-up store wired; skipping scheduler");
             return;
         };
-        if self.wakeup_scheduler_shutdown.is_some() {
+        if self
+            .wakeup_scheduler_shutdown
+            .lock()
+            .ok()
+            .map(|g| g.is_some())
+            .unwrap_or(false)
+        {
             tracing::debug!("Wake-up scheduler already running");
             return;
         }
@@ -1153,7 +1322,9 @@ impl AppState {
                 Some(app_handle),
             ));
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        self.wakeup_scheduler_shutdown = Some(tx);
+        if let Ok(mut guard) = self.wakeup_scheduler_shutdown.lock() {
+            *guard = Some(tx);
+        }
 
         // Tick every 5 seconds. Fast enough that "remind me in 30 seconds"
         // feels prompt; slow enough that an idle laptop burns no real CPU.
@@ -1197,6 +1368,9 @@ impl AppState {
         let dispatch_signal_ref = Arc::clone(&self.dispatch_signal);
         let approval_router_ref = self.approval_router.clone();
 
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+        self.calendar_shutdown = Some(shutdown_tx);
+
         tauri::async_runtime::spawn(async move {
             if let Err(e) = monitor.init(&config).await {
                 tracing::error!("Failed to initialize calendar monitor: {e}");
@@ -1209,7 +1383,19 @@ impl AppState {
                 poll_interval
             );
 
+            let mut shutdown = shutdown_rx;
             loop {
+                // Select the sleep so a shutdown signal during the sleep
+                // unblocks immediately. The poll itself isn't interruptible
+                // here — if it ever became slow we'd want to wrap it too.
+                tokio::select! {
+                    _ = shutdown.recv() => {
+                        info!("Calendar monitor shutdown signal received");
+                        break;
+                    }
+                    _ = tokio::time::sleep(poll_interval) => {}
+                }
+
                 match monitor.poll().await {
                     Ok(events) if !events.is_empty() => {
                         info!("Calendar monitor: {} reminder(s)", events.len());
@@ -1238,9 +1424,8 @@ impl AppState {
                         warn!("Calendar poll error: {e}");
                     }
                 }
-
-                tokio::time::sleep(poll_interval).await;
             }
+            info!("Calendar monitor stopped");
         });
     }
 
@@ -1293,6 +1478,7 @@ impl AppState {
         let grant_store_ref = self.grant_store.clone();
         let pending_grants_ref = self.pending_grants.clone();
         let spawned_processes_ref = self.spawned_processes.clone();
+        let spawn_persistence_ref = self.spawn_persistence.clone();
         let telegram_approval_sink = self.telegram_approval_sink.clone();
         let approval_router_ref = self.approval_router.clone();
         let coordinator_ref = Arc::clone(&self.coordinator);
@@ -1382,6 +1568,7 @@ impl AppState {
                                     let grant_store_c = grant_store_ref.clone();
                                     let pending_grants_c = pending_grants_ref.clone();
                                     let spawned_processes_c = spawned_processes_ref.clone();
+                                    let spawn_persistence_c = spawn_persistence_ref.clone();
                                     let telegram_approval_sink_c = telegram_approval_sink.clone();
                                     let profile_store_c = profile_store_ref.clone();
                                     let profile_embedder_c = Arc::clone(&profile_embedder_ref);
@@ -1421,6 +1608,7 @@ impl AppState {
                                             grant_store_c.as_ref(),
                                             &pending_grants_c,
                                             &spawned_processes_c,
+                                            spawn_persistence_c.as_ref(),
                                             telegram_approval_sink_c.as_ref(),
                                             &profile_store_c,
                                             &profile_embedder_c,
@@ -1556,6 +1744,7 @@ impl AppState {
         let grant_store = self.grant_store.clone();
         let pending_grants = self.pending_grants.clone();
         let spawned_processes = self.spawned_processes.clone();
+        let spawn_persistence = self.spawn_persistence.clone();
         let telegram_approval_sink = self.telegram_approval_sink.clone();
         let approval_router = self.approval_router.clone();
         let notifier = self.notifier.clone();
@@ -1688,6 +1877,7 @@ impl AppState {
                         http_endpoint_store: http_endpoint_store_dispatch.clone(),
                         pending_grants: pending_grants.clone(),
                         spawned_processes: spawned_processes.clone(),
+                        spawn_persistence: spawn_persistence.clone(),
                         telegram_approval_sink: telegram_approval_sink.clone(),
                         cancel_flag: Arc::new(AtomicBool::new(false)),
                         active_arc_id: arc_id.clone(),
@@ -1845,6 +2035,7 @@ async fn execute_owner_telegram_message(
     grant_store: Option<&Arc<GrantStore>>,
     pending_grants: &PendingGrants,
     spawned_processes: &athen_agent::SpawnedProcessMap,
+    spawn_persistence: Option<&Arc<dyn athen_agent::SpawnPersistenceHook>>,
     telegram_approval_sink: Option<&Arc<crate::approval::TelegramApprovalSink>>,
     profile_store: &Option<Arc<athen_persistence::profiles::SqliteProfileStore>>,
     profile_embedder: &Arc<dyn athen_core::traits::embedding::EmbeddingProvider>,
@@ -2148,6 +2339,7 @@ async fn execute_owner_telegram_message(
     let mut shell_registry = ShellToolRegistry::new()
         .await
         .with_spawned_processes(spawned_processes.clone())
+        .with_spawn_persistence_hook_opt(spawn_persistence.cloned())
         .with_web_search(web_search.clone())
         .with_email_sender_opt(email_sender.clone());
     if let (Some(store), Some(arc_id_str)) = (grant_store, target_arc_id.as_ref()) {

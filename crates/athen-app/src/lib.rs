@@ -21,6 +21,7 @@ pub(crate) mod notifier;
 pub(crate) mod process;
 pub(crate) mod sense_router;
 mod settings;
+pub(crate) mod spawn_pidfile;
 pub(crate) mod state;
 pub(crate) mod telegram_progress;
 pub(crate) mod vault_creds;
@@ -52,7 +53,7 @@ pub fn run() {
     // "pip" / "npm" resolves to the portable copy without per-call
     // plumbing.
     athen_agent::runtimes::init_portable_path();
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         // Single-instance must be registered first: when a second launch
         // happens (app runner, desktop file, CLI), the plugin's lock
         // bounces it and runs this callback in the original process so
@@ -192,6 +193,25 @@ pub fn run() {
             // Build the application state asynchronously (loads config, opens database).
             let mut state = tauri::async_runtime::block_on(AppState::new());
 
+            // Reap orphaned `shell_spawn`'d processes from a previous run
+            // BEFORE any monitor can start firing new wake-ups (which can
+            // themselves shell_spawn). The pidfile is the only durable
+            // record of these — the in-memory map is, by definition, empty
+            // in a fresh process. Acceptable false-positive: PID reuse
+            // means we might briefly nuke an unrelated process; better
+            // that than a leaked watcher pinning the bundled nu.exe.
+            if let Some(pidfile) = state.pidfile_path.clone() {
+                tauri::async_runtime::block_on(async move {
+                    let killed = crate::spawn_pidfile::reconcile_orphans(&pidfile).await;
+                    if killed > 0 {
+                        tracing::info!(
+                            count = killed,
+                            "Reconciled orphaned spawned processes from previous run"
+                        );
+                    }
+                });
+            }
+
             // Register an agent so tasks can be dispatched.
             let agent_id = uuid::Uuid::new_v4();
             tauri::async_runtime::block_on(async {
@@ -327,6 +347,41 @@ pub fn run() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running Athen");
+        .build(tauri::generate_context!())
+        .expect("error while building Athen");
+
+    // Intercept ExitRequested so we can run the async shutdown coordinator
+    // before the process dies. The window-close path is already wired to
+    // hide-to-tray (above) — Quit via tray menu / auto-updater restart /
+    // OS signal (SIGTERM) is what funnels through here.
+    //
+    // The flow is: ExitRequested fires once → we `api.prevent_exit()`,
+    // spawn the async `shutdown_all()`, then call `handle.exit(code)`
+    // from inside the spawned future. That re-enters this callback;
+    // a static `AtomicBool` guard lets the second pass through.
+    app.run(|app_handle, event| {
+        if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+            if SHUTTING_DOWN.swap(true, Ordering::SeqCst) {
+                // Re-entry from our own handle.exit() at the end of the
+                // async block — let it through.
+                return;
+            }
+            api.prevent_exit();
+            let handle = app_handle.clone();
+            let exit_code = code.unwrap_or(0);
+            tauri::async_runtime::spawn(async move {
+                use tauri::Manager;
+                let state: tauri::State<AppState> = handle.state();
+                // Cap total shutdown at 5s so a wedged step can't trap
+                // the user. shutdown_all has its own per-step timeouts
+                // for finer-grained protection.
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), state.shutdown_all())
+                        .await;
+                handle.exit(exit_code);
+            });
+        }
+    });
 }
