@@ -456,6 +456,7 @@ fn default_base_url(id: &str) -> &str {
         "deepseek" => "https://api.deepseek.com",
         "openai" => "https://api.openai.com",
         "anthropic" => "https://api.anthropic.com",
+        "google" => "https://generativelanguage.googleapis.com",
         "mistral" => "https://api.mistral.ai",
         "openrouter" => "https://openrouter.ai/api",
         "ollama" => "http://localhost:11434",
@@ -470,6 +471,7 @@ fn default_model(id: &str) -> &str {
         "deepseek" => "deepseek-chat",
         "openai" => "gpt-4o",
         "anthropic" => "claude-sonnet-4-20250514",
+        "google" => "gemini-2.5-flash",
         "mistral" => "mistral-large-latest",
         "openrouter" => "openai/gpt-4o-mini",
         "ollama" => "llama3",
@@ -484,6 +486,7 @@ fn display_name(id: &str) -> &str {
         "deepseek" => "DeepSeek",
         "openai" => "OpenAI",
         "anthropic" => "Anthropic",
+        "google" => "Google (Gemini)",
         "mistral" => "Mistral",
         "openrouter" => "OpenRouter",
         "ollama" => "Ollama",
@@ -506,6 +509,7 @@ fn api_key_hint(id: &str) -> &str {
     match id {
         "anthropic" => "sk-ant-...",
         "openrouter" => "sk-or-...",
+        "google" => "AIza...",
         "deepseek" | "openai" | "mistral" => "sk-...",
         _ => "",
     }
@@ -519,6 +523,7 @@ fn api_key_hint(id: &str) -> &str {
 const PROVIDER_IDS: &[&str] = &[
     "deepseek",
     "anthropic",
+    "google",
     "openai",
     "mistral",
     "openrouter",
@@ -1167,6 +1172,7 @@ pub async fn test_provider(
         "ollama" => test_ollama(&client, &url).await,
         "llamacpp" => test_llamacpp(&client, &url).await,
         "anthropic" => test_anthropic(&client, &url, &key, &model).await,
+        "google" => test_google(&client, &url, &key, &model).await,
         _ => test_openai_compatible(&client, &url, &key, &model).await,
     };
 
@@ -2481,6 +2487,58 @@ async fn test_anthropic(
         .post(&url)
         .header("x-api-key", api_key)
         .header("anthropic-version", "2023-06-01")
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Connection failed: {e}"))?;
+
+    if resp.status().is_success() {
+        Ok(format!("Connected to {} successfully.", model))
+    } else {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        let detail = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| {
+                v.get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| text.chars().take(200).collect());
+        Err(format!("HTTP {}: {}", status, detail))
+    }
+}
+
+/// Test a Google (Gemini) endpoint with a minimal `generateContent` call.
+async fn test_google(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+) -> Result<String, String> {
+    if api_key.is_empty() {
+        return Err("API key is required.".to_string());
+    }
+
+    let url = format!(
+        "{}/v1beta/models/{}:generateContent",
+        base_url.trim_end_matches('/'),
+        model
+    );
+
+    let body = serde_json::json!({
+        "contents": [{
+            "role": "user",
+            "parts": [{ "text": "hi" }]
+        }],
+        "generationConfig": { "maxOutputTokens": 10 }
+    });
+
+    let resp = client
+        .post(&url)
+        .header("x-goog-api-key", api_key)
         .header("Content-Type", "application/json")
         .json(&body)
         .send()

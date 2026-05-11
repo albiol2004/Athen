@@ -1623,13 +1623,12 @@ pub async fn send_message(
             .is_some_and(|c| c.supports_vision);
         // Adapters that hard-reject multimodal regardless of the user's
         // toggle: DeepSeek's standard chat API and the bare local OpenAI-
-        // compat wrappers (Ollama, llama.cpp). Google is a stub. The
-        // generic `OpenAiCompatibleProvider` (any other id) *does*
-        // serialise images and trusts the supports_vision flag.
-        let adapter_can_carry_vision = !matches!(
-            active_id.as_str(),
-            "deepseek" | "ollama" | "llamacpp" | "google"
-        );
+        // compat wrappers (Ollama, llama.cpp). Google (Gemini) carries
+        // images natively through `inlineData`. The generic
+        // `OpenAiCompatibleProvider` (any other id) *does* serialise
+        // images and trusts the supports_vision flag.
+        let adapter_can_carry_vision =
+            !matches!(active_id.as_str(), "deepseek" | "ollama" | "llamacpp");
         if !(active_supports_vision && adapter_can_carry_vision) {
             return Ok(ChatResponse {
                 content: format!(

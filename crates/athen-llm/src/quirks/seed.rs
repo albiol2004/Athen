@@ -22,6 +22,7 @@ pub fn default_slug_for_family(family: ModelFamily) -> &'static str {
         ModelFamily::Gpt5 => "gpt-5.5",
         ModelFamily::OpenAiO3 => "o4-mini",
         ModelFamily::Gemini3Pro => "gemini-3.1-pro",
+        ModelFamily::Gemini3Flash => "gemini-3-flash",
         // `deepseek-chat` is a backward-compatible alias still accepted by
         // DeepSeek's API; the new canonical (2026) is `deepseek-v4-flash`.
         ModelFamily::DeepSeekV4Chat => "deepseek-v4-flash",
@@ -72,8 +73,10 @@ pub fn quirks_for_family(family: ModelFamily) -> ModelQuirks {
             ..ModelQuirks::default()
         },
 
-        // Gemini: native `part.thought:true` content blocks.
-        ModelFamily::Gemini3Pro => ModelQuirks {
+        // Gemini: native `part.thought:true` content blocks. Pro and Flash
+        // share the same wire format — the family split is for the UI slug
+        // dropdown and (eventually) per-tier cost estimation.
+        ModelFamily::Gemini3Pro | ModelFamily::Gemini3Flash => ModelQuirks {
             reasoning_surface: ReasoningSurface::NativeContentBlock,
             ..ModelQuirks::default()
         },

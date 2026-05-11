@@ -2163,9 +2163,10 @@ function consumeComposerAttachmentsForSend() {
 
 // Provider IDs whose adapters never accept multimodal regardless of the
 // `supports_vision` toggle (DeepSeek standard chat, plain Ollama and
-// llama.cpp wrappers, Google stub). Mirrors the backend gate in
-// commands.rs::send_message.
-const NON_VISION_ADAPTER_IDS = new Set(['deepseek', 'ollama', 'llamacpp', 'google']);
+// llama.cpp wrappers). Mirrors the backend gate in commands.rs::send_message.
+// Google (Gemini) carries images natively through `inlineData` so it's
+// excluded — the user still needs to tick "Vision-capable model" though.
+const NON_VISION_ADAPTER_IDS = new Set(['deepseek', 'ollama', 'llamacpp']);
 
 function updateComposerVisionGate(providers) {
     if (!composerAttachBtn) return;

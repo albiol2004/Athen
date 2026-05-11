@@ -33,6 +33,7 @@ use athen_core::traits::llm::{LlmProvider, LlmRouter};
 use athen_llm::budget::BudgetTracker;
 use athen_llm::providers::anthropic::AnthropicProvider;
 use athen_llm::providers::deepseek::DeepSeekProvider;
+use athen_llm::providers::google::GoogleProvider;
 use athen_llm::providers::llamacpp::LlamaCppProvider;
 use athen_llm::providers::ollama::OllamaProvider;
 use athen_llm::providers::openai::OpenAiCompatibleProvider;
@@ -3241,6 +3242,17 @@ pub(crate) fn build_router_for_provider(
                 .with_vision(supports_vision)
                 .with_documents(supports_documents);
             if base_url != "https://api.anthropic.com" && !base_url.is_empty() {
+                p = p.with_base_url(base_url.to_string());
+            }
+            Box::new(p)
+        }
+        "google" => {
+            let key = api_key.unwrap_or_default().to_string();
+            let mut p = GoogleProvider::new(key, model.to_string())
+                .with_family(family)
+                .with_vision(supports_vision)
+                .with_documents(supports_documents);
+            if base_url != "https://generativelanguage.googleapis.com" && !base_url.is_empty() {
                 p = p.with_base_url(base_url.to_string());
             }
             Box::new(p)
