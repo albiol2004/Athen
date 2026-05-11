@@ -307,6 +307,26 @@
             </div>
 
             <div class="settings-tab-pane" data-settings-pane="connections">
+            <section class="settings-section" id="owner-contact-section">
+                <h2>My Contact Info</h2>
+                <p class="settings-description">
+                    Athen uses this to recognize when a message is from you (auto-trust) and to skip approval when sending to your own address. Athen's own credentials (IMAP, SMTP, Telegram bot) cannot overlap with these.
+                </p>
+                <div class="setting-row">
+                    <label for="owner-name">Name</label>
+                    <input type="text" id="owner-name" class="settings-input" placeholder="Your name">
+                </div>
+                <div id="owner-identifiers-list"></div>
+                <div class="setting-actions">
+                    <button class="btn-secondary" id="owner-add-identifier-btn">+ Add identifier</button>
+                </div>
+                <div class="setting-actions">
+                    <button class="btn-primary" id="save-owner-contact-btn">Save</button>
+                    <button class="btn-secondary" id="clear-owner-contact-btn">Remove</button>
+                </div>
+                <div id="owner-contact-error" class="setting-hint" style="display:none; color: var(--color-error, #c33);"></div>
+            </section>
+
             <section class="settings-section">
                 <h2>Email Monitor</h2>
                 <p class="settings-description">Connect your email to let Athen monitor and act on incoming messages.</p>
@@ -432,6 +452,7 @@
                         <label for="telegram-owner-id">Your Telegram User ID</label>
                         <input type="number" id="telegram-owner-id" class="settings-input" placeholder="Optional">
                         <p class="setting-hint">Messages from this ID get lowest risk. Send /start to <a href="https://t.me/userinfobot" target="_blank">@userinfobot</a> to find yours.</p>
+                        <p class="setting-hint">Deprecated. Set your Telegram user ID in <b>My Contact Info</b> above. This field will be removed in a future release.</p>
                     </div>
                     <div class="setting-row">
                         <label for="telegram-chat-ids">Allowed Chat IDs</label>

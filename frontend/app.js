@@ -3987,6 +3987,7 @@ async function loadSettings() {
         await loadIdentityManager();
         await loadCloudApis();
         await loadAttachmentPolicySettings();
+        await loadOwnerContact();
     } catch (err) {
         console.error('Failed to load settings:', err);
         showToast('Failed to load settings: ' + err, 'error');
@@ -6151,6 +6152,149 @@ function showTelegramTestResult(success, message) {
     el.classList.remove('hidden');
     setTimeout(() => el.classList.add('hidden'), 5000);
 }
+
+// ─── Owner Contact ("My Contact Info") ───
+
+// IdentifierKind variants the backend understands. Values match the
+// snake_case scheme form (`identifier_kind_scheme` on the Rust side) so
+// the round-trip through `save_owner_contact` is stable.
+const OWNER_IDENTIFIER_KINDS = [
+    { value: 'email', label: 'Email' },
+    { value: 'telegram_user', label: 'Telegram user ID' },
+    { value: 'phone', label: 'Phone' },
+    { value: 'whatsapp', label: 'WhatsApp' },
+    { value: 'signal', label: 'Signal' },
+    { value: 'username', label: 'Username' },
+    { value: 'other', label: 'Other' },
+];
+
+function renderOwnerIdentifierRow(kind, value) {
+    const row = document.createElement('div');
+    row.className = 'setting-row owner-identifier-row';
+    const select = document.createElement('select');
+    select.className = 'settings-select owner-identifier-kind';
+    for (const k of OWNER_IDENTIFIER_KINDS) {
+        const opt = document.createElement('option');
+        opt.value = k.value;
+        opt.textContent = k.label;
+        if (k.value === kind) opt.selected = true;
+        select.appendChild(opt);
+    }
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'settings-input owner-identifier-value';
+    input.placeholder = 'e.g. you@example.com or 123456789';
+    if (value) input.value = value;
+    const remove = document.createElement('button');
+    remove.className = 'btn-secondary owner-identifier-remove';
+    remove.title = 'Remove';
+    remove.type = 'button';
+    remove.textContent = '×';
+    remove.addEventListener('click', () => row.remove());
+    row.appendChild(select);
+    row.appendChild(input);
+    row.appendChild(remove);
+    return row;
+}
+
+function clearOwnerContactError() {
+    const errEl = document.getElementById('owner-contact-error');
+    if (!errEl) return;
+    errEl.style.display = 'none';
+    errEl.textContent = '';
+}
+
+function showOwnerContactError(msg) {
+    const errEl = document.getElementById('owner-contact-error');
+    if (!errEl) return;
+    errEl.textContent = msg;
+    errEl.style.display = 'block';
+}
+
+function renderOwnerContact(view) {
+    const nameEl = document.getElementById('owner-name');
+    const listEl = document.getElementById('owner-identifiers-list');
+    if (!nameEl || !listEl) return;
+    nameEl.value = view ? (view.name || '') : '';
+    listEl.innerHTML = '';
+    if (view && Array.isArray(view.identifiers) && view.identifiers.length > 0) {
+        for (const id of view.identifiers) {
+            listEl.appendChild(renderOwnerIdentifierRow(id.kind, id.value));
+        }
+    }
+}
+
+async function loadOwnerContact() {
+    if (!invoke) return;
+    clearOwnerContactError();
+    try {
+        const view = await invoke('get_owner_contact');
+        renderOwnerContact(view);
+    } catch (err) {
+        console.error('Failed to load owner contact:', err);
+        showOwnerContactError('Failed to load: ' + (err && err.toString ? err.toString() : err));
+    }
+}
+
+document.getElementById('owner-add-identifier-btn')?.addEventListener('click', function () {
+    const listEl = document.getElementById('owner-identifiers-list');
+    if (!listEl) return;
+    listEl.appendChild(renderOwnerIdentifierRow('email', ''));
+});
+
+document.getElementById('save-owner-contact-btn')?.addEventListener('click', async function () {
+    clearOwnerContactError();
+    const nameEl = document.getElementById('owner-name');
+    const listEl = document.getElementById('owner-identifiers-list');
+    if (!nameEl || !listEl) return;
+    const name = (nameEl.value || '').trim();
+    const rows = listEl.querySelectorAll('.owner-identifier-row');
+    const identifiers = [];
+    for (const row of rows) {
+        const kindEl = row.querySelector('.owner-identifier-kind');
+        const valueEl = row.querySelector('.owner-identifier-value');
+        if (!kindEl || !valueEl) continue;
+        const value = (valueEl.value || '').trim();
+        if (!value) continue;
+        identifiers.push({ kind: kindEl.value, value });
+    }
+    const btn = this;
+    btn.disabled = true;
+    const origText = btn.textContent;
+    btn.textContent = 'Saving…';
+    try {
+        const view = await invoke('save_owner_contact', { name, identifiers });
+        renderOwnerContact(view);
+        showToast('Contact info saved.', 'success');
+    } catch (err) {
+        showOwnerContactError(err && err.toString ? err.toString() : String(err));
+    } finally {
+        btn.disabled = false;
+        btn.textContent = origText;
+    }
+});
+
+document.getElementById('clear-owner-contact-btn')?.addEventListener('click', async function () {
+    clearOwnerContactError();
+    const ok = window.confirm(
+        'Remove your contact info? Athen will no longer recognize messages as coming from you.'
+    );
+    if (!ok) return;
+    const btn = this;
+    btn.disabled = true;
+    const origText = btn.textContent;
+    btn.textContent = 'Removing…';
+    try {
+        await invoke('clear_owner_contact');
+        renderOwnerContact(null);
+        showToast('Contact info removed.', 'success');
+    } catch (err) {
+        showOwnerContactError(err && err.toString ? err.toString() : String(err));
+    } finally {
+        btn.disabled = false;
+        btn.textContent = origText;
+    }
+});
 
 // ─── Web Search Settings ───
 
