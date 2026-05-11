@@ -3,9 +3,14 @@
 > **An open, native AI agent that runs on your laptop, not someone's server.**
 
 [![CI](https://github.com/albiol2004/Athen/actions/workflows/ci.yml/badge.svg)](https://github.com/albiol2004/Athen/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/albiol2004/Athen?include_prereleases&sort=semver)](https://github.com/albiol2004/Athen/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Built with Rust](https://img.shields.io/badge/built_with-Rust-orange.svg)](https://www.rust-lang.org)
 [![Tauri 2](https://img.shields.io/badge/Tauri-2-24C8DB.svg)](https://tauri.app)
+
+> 🚀 **Athen is live on Product Hunt today.** If you've used it and have
+> opinions — kind or otherwise — that's the place to drop them. Every
+> upvote and comment is read by the human who built this.
 
 Athen watches your inbox, calendar, and messages, decides what needs doing,
 and does it — autonomously, with a risk system that knows when to act
@@ -18,12 +23,11 @@ a single native binary you double-click, with a tray icon and a clean
 window — but underneath, a hexagonal Rust core, a real risk model, MCP
 support, and a tool surface you can extend.
 
-> ⚠️ **Status: alpha (v0.1.0) — very early.** This is the first public
-> release. Core agent loop, tools, risk system, and infrastructure are
-> working and well-tested, but the surface is intentionally small. The UI
-> is functional and being polished. Pre-built binaries are **unsigned**
-> for v0.1.0 — see [Install](#install) for the one-line workaround on
-> each OS.
+> ⚠️ **Status: alpha (v0.1.7) — early but moving fast.** Core agent loop,
+> tools, risk system, senses, MCP runtime, and infrastructure are working
+> and well-tested. The surface is small on purpose and the UI is being
+> polished release by release. Pre-built binaries are **unsigned** today —
+> see [Install](#install) for the one-line workaround on each OS.
 >
 > 🙏 **Feedback shapes the roadmap.** Athen ships with a small,
 > deliberately focused feature set. **What gets built next is driven by
@@ -84,7 +88,11 @@ Chromium fork, no Node runtime, no React-on-Windows quirks.
 | **LLM provider routing** — failover, circuit breakers, budget tracker | ✅ |
 | **Auto-update** — minisign-signed in-app updates from GitHub Releases | ✅ |
 | **Onboarding wizard** — first-launch provider/key setup (local vs. cloud, memory backend) | ✅ |
-| **Vision (image input)** | ❌ planned |
+| **Vision (image + PDF input)** — native multimodal via Anthropic & Gemini providers | ✅ |
+| **Reasoning / thinking mode** — Claude extended thinking, DeepSeek-R1, Gemini thinkingConfig surfaced as `reasoning_content` | ✅ |
+| **Wake-ups / proactive scheduling** — one-shot + recurring agent-triggered or user-scheduled actions, with autonomy-band controls | ✅ |
+| **Generic HTTP tool + 15 cloud API presets** — Jina, Firecrawl, Brave, SerpAPI, DeepL, ElevenLabs, OpenRouter, Groq, ... | ✅ |
+| **Encrypted credential vault** — OS keychain backend + ChaCha20-Poly1305 file fallback | ✅ |
 | **Voice (STT/TTS)** | ❌ planned |
 | **Headless server mode** — daemon binary for always-on hosts | ❌ planned for v0.2 |
 
@@ -92,9 +100,9 @@ Chromium fork, no Node runtime, no React-on-Windows quirks.
 
 ## Install
 
-> **v0.1.0 binaries are unsigned.** Each OS will warn you the first time.
-> Below is the one-line workaround per platform — sorry, code-signing
-> certificates are coming in v0.1.1.
+> **Pre-built binaries are unsigned today.** Each OS will warn you the
+> first time you launch. Below is the one-line workaround per platform —
+> code-signing certificates are next on the post-launch list.
 
 Grab the latest release from
 **[github.com/albiol2004/Athen/releases](https://github.com/albiol2004/Athen/releases/latest)**.
@@ -127,7 +135,7 @@ new Athen versions like any other system package.
 
 ### macOS (Apple Silicon)
 - Download `Athen_<version>_aarch64.dmg`.
-- v0.1.0 ships **Apple Silicon only**. Intel Mac builds will return in a later release once code signing is in place.
+- macOS builds are **Apple Silicon only** today. Intel Mac builds will return once code signing is in place.
 - After dragging into Applications, the first launch will say *"Athen is damaged and can't be opened"*. **It isn't.** Run once:
   ```bash
   xattr -d com.apple.quarantine /Applications/Athen.app
@@ -163,11 +171,12 @@ a frontier model on hard work and a tiny local model on the easy stuff.
 
 | Provider | Mode | Notes |
 |---|---|---|
-| **Anthropic** | Cloud | Claude Opus / Sonnet / Haiku |
-| **DeepSeek** | Cloud | Cheap and capable, OpenAI-compatible |
-| **OpenAI-compatible** | Cloud or local | Works with OpenAI, Together, Groq, OpenRouter, ... |
+| **Anthropic** | Cloud | Claude Opus / Sonnet / Haiku, native vision + PDF input |
+| **Google (Gemini)** | Cloud | Gemini 2.5 / 3 Pro / Flash / Flash-Lite, native vision + PDF, generous free tier |
+| **DeepSeek** | Cloud | Cheap and capable, R1 reasoning surfaced as `reasoning_content` |
+| **OpenAI-compatible** | Cloud or local | Works with OpenAI, Mistral, Together, Groq, OpenRouter, ... |
 | **Ollama** | **Local** | Talks to `localhost:11434` |
-| **llama.cpp** | **Local** | Talks to `localhost:8080`. Pair with a Qwen/Llama/Mistral GGUF |
+| **llama.cpp** | **Local** | Talks to `localhost:8080`. Pair with a Qwen / Llama / Mistral GGUF |
 
 The local-only path means **zero data leaves your machine.** No API key,
 no third party, no telemetry.
@@ -176,13 +185,19 @@ no third party, no telemetry.
 
 ## Tools the agent has
 
-13 built-in tools, plus anything you expose through MCP.
+A built-in tool surface that covers shell, files, memory, web, calendar,
+contacts, email, scheduling, and arbitrary HTTP — plus anything you expose
+through MCP.
 
-- **Shell & files:** `shell_execute`, `shell_spawn/kill/logs`, `read`, `edit`, `write`, `grep`, `list_directory`
-- **Memory:** `memory_store`, `memory_recall` (semantic, persistent)
-- **Web:** `web_search`, `web_fetch` (static → Jina → Wayback fallback)
-- **Calendar:** `calendar_list/create/update/delete`
-- **Contacts:** `contacts_list/search/create/update/delete`
+- **Shell & files:** `shell_execute`, `shell_spawn` / `kill` / `logs`, `read`, `edit`, `write`, `grep`, `list_directory`
+- **Memory:** `memory_store`, `memory_recall` (semantic, persistent; dedup at recall + store)
+- **Identity:** `identity_add` — agent can write to your personality / rules / knowledge / team store
+- **Web:** `web_search`, `web_fetch` (static → Jina Reader → Wayback fallback chain)
+- **Calendar:** `calendar_list` / `create` / `update` / `delete`
+- **Contacts:** `contacts_list` / `search` / `create` / `update` / `delete`
+- **Email:** `send_email` (auto-approves when recipient is the owner; risk-gated otherwise)
+- **Cloud APIs:** `http_request` against any endpoint you register — 15 presets out of the box (Jina, Firecrawl, Brave, SerpAPI, Hunter, Apollo, PDL, DeepL, NewsAPI, Open-Meteo, Frankfurter, OpenCage, ElevenLabs, OpenRouter, Groq); vault-backed credentials, per-endpoint rate limiting
+- **Wake-ups:** `create_wakeup` — agent can schedule one-shot or recurring proactive triggers (reminders, follow-ups, digests), each with its own autonomy band and tool allowlist
 - **MCP:** any tool from any spawned MCP server, namespaced `<mcp_id>__<tool>`
 
 Full reference in [`docs/TOOLS_AND_SENSES.md`](docs/TOOLS_AND_SENSES.md).
@@ -276,11 +291,13 @@ For a deeper read see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 **v0.1.x (post-launch polish):**
 - Code signing (macOS notarization, Windows Trusted Signing)
-- Vision (image input + screenshot tool)
+- Screenshot tool + screen-capture sense
+- Prompt-cache wiring across providers (Anthropic `cache_control`, Gemini implicit cache, DeepSeek cost UI)
+- Per-task model selection driven by complexity (auto-route hard problems to a stronger model, cheap stuff to a smaller one)
 
 **v0.2:**
 - `athend` headless server mode (systemd unit, Docker image)
-- Voice (STT/TTS)
+- Voice (STT / TTS)
 - More senses (Slack, Discord, RSS, generic webhook)
 
 **Bigger picture:**
