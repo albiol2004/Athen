@@ -91,6 +91,7 @@ const ICON_CHECK       = toolSvg('<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
 // "Hand off to a specialist": two figures with an arrow between them.
 const ICON_DELEGATE    = toolSvg('<circle cx="6" cy="8" r="3"/><path d="M2 21v-2a4 4 0 0 1 4-4h0"/><circle cx="18" cy="8" r="3"/><path d="M14 21v-2a4 4 0 0 1 4-4h0"/><line x1="9" y1="12" x2="15" y2="12"/><polyline points="13 10 15 12 13 14"/>');
 const ICON_MAIL        = toolSvg('<path d="M4 4h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z"/><polyline points="22,6 12,13 2,6"/>');
+const ICON_PAPER_PLANE = toolSvg('<line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>');
 // Alarm clock with two ear-bells: communicates "scheduled wake-up".
 const ICON_ALARM       = toolSvg('<circle cx="12" cy="13" r="8"/><polyline points="12 9 12 13 14.5 15"/><line x1="5" y1="3" x2="2" y2="6"/><line x1="22" y1="6" x2="19" y2="3"/>');
 // Person with id-card aura: communicates "identity entry".
@@ -103,6 +104,7 @@ const BUILTIN_TOOL_ICONS = {
     'shell_kill': ICON_STOP, 'shell_logs': ICON_LOGS,
     'web_search': ICON_SEARCH, 'web_fetch': ICON_GLOBE,
     'email_send': ICON_MAIL,
+    'send_telegram': ICON_PAPER_PLANE,
     'memory_store': ICON_BOOKMARK, 'memory_recall': ICON_SPARKLES,
     'calendar_list': ICON_CALENDAR, 'calendar_create': ICON_CAL_PLUS,
     'calendar_update': ICON_CALENDAR, 'calendar_delete': ICON_TRASH,
@@ -130,6 +132,7 @@ const BUILTIN_TOOL_LABELS = {
     'shell_kill': 'Stop', 'shell_logs': 'Logs',
     'web_search': 'Search web', 'web_fetch': 'Fetch',
     'email_send': 'Send email',
+    'send_telegram': 'Send Telegram',
     'memory_store': 'Save', 'memory_recall': 'Recall',
     'calendar_list': 'Events', 'calendar_create': 'Create event',
     'calendar_update': 'Update event', 'calendar_delete': 'Delete event',
@@ -2576,6 +2579,7 @@ function renderToolBody(meta) {
         case 'shell_kill':
         case 'shell_logs':      main = renderShellMeta(args, result); break;
         case 'email_send':      main = renderEmailSend(args, result); break;
+        case 'send_telegram':   main = renderSendTelegram(args, result); break;
         case 'memory_store':    main = renderMemoryStore(args, result); break;
         case 'memory_recall':   main = renderMemoryRecall(args, result); break;
         case 'calendar_list':   main = renderCalendarList(args, result); break;
@@ -2995,6 +2999,59 @@ function renderEmailSend(args, result) {
         bodyEl.children.length || bodyEl.textContent ? ['Body', bodyEl, { block: true }] : null,
         inReplyTo  ? ['In Reply To', inReplyTo, { mono: true }] : null,
         messageId  ? ['Message ID',  messageId, { mono: true }] : null,
+    ]);
+}
+
+function renderSendTelegram(args, result) {
+    const chatIdArg = args.chat_id;
+    const text = typeof args.text === 'string' ? args.text : '';
+    const replyTo = args.reply_to_message_id;
+    const atts = Array.isArray(args.attachments) ? args.attachments : [];
+    const chatIdResult = result.chat_id;
+    const messageIds = Array.isArray(result.message_ids) ? result.message_ids : [];
+    const toOwner = result.to_owner === true;
+
+    const bodyEl = document.createElement('div');
+    bodyEl.className = 'tool-body-prose';
+    if (text) bodyEl.innerHTML = renderMarkdown(text);
+
+    let attsEl = null;
+    if (atts.length) {
+        attsEl = document.createElement('div');
+        attsEl.className = 'tool-body-rows';
+        for (const a of atts) {
+            const path = typeof a.path === 'string' ? a.path : '';
+            const kind = typeof a.kind === 'string' ? a.kind : 'auto';
+            const caption = typeof a.caption === 'string' ? a.caption : '';
+            const row = document.createElement('div');
+            row.className = 'tool-row';
+            const lhs = document.createElement('span');
+            lhs.className = 'mono';
+            lhs.textContent = path;
+            const rhs = document.createElement('span');
+            rhs.className = 'tool-tag';
+            rhs.textContent = kind;
+            row.appendChild(lhs);
+            row.appendChild(rhs);
+            if (caption) {
+                const cap = document.createElement('div');
+                cap.className = 'tool-row-sub';
+                cap.textContent = caption;
+                row.appendChild(cap);
+            }
+            attsEl.appendChild(row);
+        }
+    }
+
+    const chatLabel = chatIdResult != null ? String(chatIdResult)
+                    : (chatIdArg != null ? String(chatIdArg) : '(owner default)');
+
+    return renderFields([
+        ['Chat', chatLabel + (toOwner ? ' (owner)' : ''), { mono: true }],
+        replyTo != null ? ['Reply to', String(replyTo), { mono: true }] : null,
+        bodyEl.children.length || bodyEl.textContent ? ['Text', bodyEl, { block: true }] : null,
+        atts.length ? ['Attachments', attsEl, { block: true }] : null,
+        messageIds.length ? ['Message IDs', messageIds.join(', '), { mono: true }] : null,
     ]);
 }
 

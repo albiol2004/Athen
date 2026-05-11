@@ -17,6 +17,9 @@ use athen_core::sandbox::{SandboxLevel, SandboxProfile};
 use athen_core::tool::{ToolBackend, ToolDefinition, ToolResult};
 use athen_core::traits::email_sender::{EmailSender, OutboundEmail};
 use athen_core::traits::shell::{ShellExecutor, ShellOptions};
+use athen_core::traits::telegram_sender::{
+    OutboundTelegramMessage, TelegramAttachment, TelegramAttachmentKind, TelegramSender,
+};
 use athen_core::traits::tool::ToolRegistry;
 use athen_risk::rules::RuleEngine;
 use athen_sandbox::UnifiedSandbox;
@@ -102,6 +105,49 @@ pub struct EmailSendSummary {
     pub body_preview: String,
     /// Set when the agent is replying to an existing thread.
     pub in_reply_to: Option<String>,
+}
+
+/// Summary handed to the Telegram approval gate. Carries the
+/// information the user needs to decide: destination chat (resolved),
+/// message text preview, and attachment metadata (paths + kinds).
+#[derive(Debug, Clone)]
+pub struct TelegramSendSummary {
+    /// Resolved destination chat (after the default-owner-chat fallback).
+    pub chat_id: i64,
+    /// `true` when the destination is the bot's configured owner chat.
+    /// The agent layer auto-approves when this is set.
+    pub to_owner: bool,
+    /// First ~200 chars of `text`. Empty when the message is
+    /// attachments-only.
+    pub text_preview: String,
+    /// Absolute paths of each attachment, in send order.
+    pub attachment_paths: Vec<PathBuf>,
+    /// `Photo` / `Document` / `Auto` per attachment, parallel to
+    /// `attachment_paths`.
+    pub attachment_kinds: Vec<TelegramAttachmentKind>,
+}
+
+/// Permission gate consulted before `send_telegram` hands a message to
+/// the Bot API. Mirrors [`EmailSendApprovalGate`].
+#[async_trait]
+pub trait TelegramSendApprovalGate: Send + Sync {
+    /// Returns `true` only when the user approves. Any other outcome
+    /// (deny, timeout, transport error) returns `false` so sends fail
+    /// closed.
+    async fn confirm_send(&self, summary: &TelegramSendSummary) -> bool;
+}
+
+/// Notified after `send_telegram` successfully delivers, so the
+/// composition root can record "the last outbound Telegram message
+/// belongs to arc X". When the owner replies on Telegram a few seconds
+/// later, the owner-Telegram handler reads that record and routes the
+/// reply to arc X instead of re-triaging it as a fresh first-message.
+///
+/// Implementations should fail silently — recorder errors must never
+/// surface as send failures.
+#[async_trait]
+pub trait TelegramOutboundRecorder: Send + Sync {
+    async fn record(&self, chat_id: i64);
 }
 
 /// Permission gate consulted before `email_send` hands a message to
@@ -281,6 +327,20 @@ pub struct ShellToolRegistry {
     /// the owner's own email identifiers. Unwired (or no owner set) →
     /// behaviour is unchanged: the gate runs unconditionally.
     owner_check: Option<Arc<dyn OwnerDestinationCheck>>,
+    /// Outbound Telegram transport for the `send_telegram` tool.
+    /// `None` means the bot isn't configured; the tool refuses with a
+    /// clear "not configured" error rather than dropping the message.
+    telegram_sender: Option<Arc<dyn TelegramSender>>,
+    /// Approval gate consulted before every non-owner `send_telegram`.
+    /// `None` means no gate is wired and the tool refuses non-owner
+    /// sends. Sends to the bot's owner chat bypass the gate (the user
+    /// is messaging themselves).
+    telegram_approval: Option<Arc<dyn TelegramSendApprovalGate>>,
+    /// Best-effort post-send recorder. Fires after every successful
+    /// `send_telegram` so the composition root can stamp the outbound
+    /// hint — letting the user's next Telegram reply route back to this
+    /// arc instead of getting re-triaged.
+    telegram_outbound_recorder: Option<Arc<dyn TelegramOutboundRecorder>>,
     /// Optional sink notified every time the spawned-process map mutates.
     /// Wired by the app layer to a JSON pidfile under `<data_dir>/`. Tests
     /// and CLI builds leave it `None` and the registry behaves as before.
@@ -608,6 +668,9 @@ impl ShellToolRegistry {
             email_sender: None,
             email_approval: None,
             owner_check: None,
+            telegram_sender: None,
+            telegram_approval: None,
+            telegram_outbound_recorder: None,
             spawn_persistence: None,
         }
     }
@@ -667,6 +730,61 @@ impl ShellToolRegistry {
     pub fn with_owner_check_opt(self, check: Option<Arc<dyn OwnerDestinationCheck>>) -> Self {
         match check {
             Some(c) => self.with_owner_check(c),
+            None => self,
+        }
+    }
+
+    /// Inject the Telegram outbound sender for the `send_telegram`
+    /// tool. Without it, the tool refuses with a "not configured" error.
+    pub fn with_telegram_sender(mut self, sender: Arc<dyn TelegramSender>) -> Self {
+        self.telegram_sender = Some(sender);
+        self
+    }
+
+    /// `Option`-flavoured variant — see [`Self::with_telegram_sender`].
+    pub fn with_telegram_sender_opt(self, sender: Option<Arc<dyn TelegramSender>>) -> Self {
+        match sender {
+            Some(s) => self.with_telegram_sender(s),
+            None => self,
+        }
+    }
+
+    /// Inject the Telegram approval gate so non-owner sends ask the
+    /// user first. Sends to the configured owner chat bypass the gate.
+    pub fn with_telegram_approval(mut self, gate: Arc<dyn TelegramSendApprovalGate>) -> Self {
+        self.telegram_approval = Some(gate);
+        self
+    }
+
+    /// `Option`-flavoured variant — see [`Self::with_telegram_approval`].
+    pub fn with_telegram_approval_opt(
+        self,
+        gate: Option<Arc<dyn TelegramSendApprovalGate>>,
+    ) -> Self {
+        match gate {
+            Some(g) => self.with_telegram_approval(g),
+            None => self,
+        }
+    }
+
+    /// Inject a post-send recorder that gets notified after every
+    /// successful `send_telegram`. Used by the composition root to stamp
+    /// the cross-channel arc-routing hint with the registry's arc id.
+    pub fn with_telegram_outbound_recorder(
+        mut self,
+        recorder: Arc<dyn TelegramOutboundRecorder>,
+    ) -> Self {
+        self.telegram_outbound_recorder = Some(recorder);
+        self
+    }
+
+    /// `Option`-flavoured variant — see [`Self::with_telegram_outbound_recorder`].
+    pub fn with_telegram_outbound_recorder_opt(
+        self,
+        recorder: Option<Arc<dyn TelegramOutboundRecorder>>,
+    ) -> Self {
+        match recorder {
+            Some(r) => self.with_telegram_outbound_recorder(r),
             None => self,
         }
     }
@@ -939,6 +1057,51 @@ impl ShellToolRegistry {
                 }
             },
             "required": ["to", "subject", "body_text"]
+        })
+    }
+
+    /// JSON Schema for the `send_telegram` tool. At least one of
+    /// `text` / `attachments` must be present.
+    fn send_telegram_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "chat_id": {
+                    "type": "integer",
+                    "description": "Destination Telegram chat ID. Omit to send to the bot's configured owner chat (the typical case — that's the user you talk to over Telegram). Non-owner chats trigger an approval prompt."
+                },
+                "text": {
+                    "type": "string",
+                    "description": "Plain-text message body. Optional only when `attachments` is non-empty. Telegram caps text at 4096 chars; longer messages are auto-split at line/word boundaries."
+                },
+                "attachments": {
+                    "type": "array",
+                    "description": "Files to attach. Each entry is an object with: `path` (absolute path to the file, required), `kind` (`photo`|`document`|`auto`, default `auto` — `photo` re-compresses, `document` preserves bytes), and optional `caption` (per-attachment caption, max 1024 chars).",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Absolute path to the file to upload."
+                            },
+                            "kind": {
+                                "type": "string",
+                                "enum": ["photo", "document", "auto"],
+                                "description": "How Telegram should render this file. `photo` for images you're OK losing compression on; `document` for anything that must arrive byte-identical (PDFs, archives, code); `auto` picks by extension."
+                            },
+                            "caption": {
+                                "type": "string",
+                                "description": "Optional per-attachment caption (max 1024 chars in the Telegram client)."
+                            }
+                        },
+                        "required": ["path"]
+                    }
+                },
+                "reply_to_message_id": {
+                    "type": "integer",
+                    "description": "Optional Telegram message_id to thread this message as a reply to. Useful when the user just messaged you and you want the reply to attach to their message."
+                }
+            }
         })
     }
 
@@ -2774,6 +2937,189 @@ impl ShellToolRegistry {
             }
         }
     }
+
+    /// Implementation of `send_telegram`. Validates that at least one
+    /// of text/attachments is present, asks the approval gate (unless
+    /// the destination is the bot's owner chat), and forwards to the
+    /// `TelegramSender` adapter which handles Bot API multipart uploads
+    /// and text chunking.
+    async fn do_send_telegram(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let mut owned = serde_json::Value::Null;
+        let args = coerce_args(args, &mut owned);
+        let start = Instant::now();
+
+        let Some(sender) = self.telegram_sender.clone() else {
+            let msg =
+                "Telegram bot not configured. Set the bot token in Settings → Telegram first."
+                    .to_string();
+            return Ok(ToolResult {
+                success: false,
+                output: json!({ "error": msg }),
+                error: Some(msg),
+                execution_time_ms: start.elapsed().as_millis() as u64,
+            });
+        };
+
+        // Parse args.
+        let chat_id_arg = args.get("chat_id").and_then(|v| v.as_i64());
+        let text = args
+            .get("text")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty());
+        let reply_to = args.get("reply_to_message_id").and_then(|v| v.as_i64());
+
+        let mut attachments: Vec<TelegramAttachment> = Vec::new();
+        if let Some(arr) = args.get("attachments").and_then(|v| v.as_array()) {
+            for entry in arr {
+                let Some(path) = entry.get("path").and_then(|v| v.as_str()) else {
+                    let msg = "each attachment must include `path` (absolute path to the file)"
+                        .to_string();
+                    return Ok(ToolResult {
+                        success: false,
+                        output: json!({ "error": msg }),
+                        error: Some(msg),
+                        execution_time_ms: start.elapsed().as_millis() as u64,
+                    });
+                };
+                let kind = match entry.get("kind").and_then(|v| v.as_str()) {
+                    Some("photo") => TelegramAttachmentKind::Photo,
+                    Some("document") => TelegramAttachmentKind::Document,
+                    None | Some("auto") => TelegramAttachmentKind::Auto,
+                    Some(other) => {
+                        let msg =
+                            format!("attachment kind '{other}' is not one of photo/document/auto");
+                        return Ok(ToolResult {
+                            success: false,
+                            output: json!({ "error": msg }),
+                            error: Some(msg),
+                            execution_time_ms: start.elapsed().as_millis() as u64,
+                        });
+                    }
+                };
+                let caption = entry
+                    .get("caption")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                attachments.push(TelegramAttachment {
+                    path: PathBuf::from(path),
+                    kind,
+                    caption,
+                });
+            }
+        }
+
+        if text.is_none() && attachments.is_empty() {
+            let msg = "send_telegram needs at least one of `text` or `attachments`".to_string();
+            return Ok(ToolResult {
+                success: false,
+                output: json!({ "error": msg }),
+                error: Some(msg),
+                execution_time_ms: start.elapsed().as_millis() as u64,
+            });
+        }
+
+        // Resolve the destination chat for the approval prompt.
+        let resolved_chat = match chat_id_arg.or_else(|| sender.default_chat_id()) {
+            Some(c) => c,
+            None => {
+                let msg =
+                    "no chat_id given and no owner default configured — set Telegram owner in Settings"
+                        .to_string();
+                return Ok(ToolResult {
+                    success: false,
+                    output: json!({ "error": msg }),
+                    error: Some(msg),
+                    execution_time_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+        };
+        let to_owner = sender
+            .default_chat_id()
+            .map(|d| d == resolved_chat)
+            .unwrap_or(false);
+
+        let text_preview: String = text
+            .as_deref()
+            .map(|t| t.chars().take(200).collect())
+            .unwrap_or_default();
+        let summary = TelegramSendSummary {
+            chat_id: resolved_chat,
+            to_owner,
+            text_preview,
+            attachment_paths: attachments.iter().map(|a| a.path.clone()).collect(),
+            attachment_kinds: attachments.iter().map(|a| a.kind).collect(),
+        };
+
+        tracing::info!(
+            tool = "send_telegram",
+            chat_id = resolved_chat,
+            to_owner,
+            attachments = attachments.len(),
+            text_chars = text.as_deref().map(|t| t.chars().count()).unwrap_or(0),
+            "sending telegram message"
+        );
+
+        // Owner-chat auto-approve: messaging yourself doesn't need a prompt.
+        if !to_owner {
+            let Some(gate) = self.telegram_approval.clone() else {
+                let msg = "Telegram approval gate not wired; refusing to send to non-owner chat"
+                    .to_string();
+                return Ok(ToolResult {
+                    success: false,
+                    output: json!({ "error": msg }),
+                    error: Some(msg),
+                    execution_time_ms: start.elapsed().as_millis() as u64,
+                });
+            };
+            if !gate.confirm_send(&summary).await {
+                let msg = "User declined the send".to_string();
+                return Ok(ToolResult {
+                    success: false,
+                    output: json!({ "error": msg }),
+                    error: Some(msg),
+                    execution_time_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+        }
+
+        let outbound = OutboundTelegramMessage {
+            chat_id: Some(resolved_chat),
+            text,
+            attachments,
+            reply_to_message_id: reply_to,
+        };
+
+        match sender.send(&outbound).await {
+            Ok(sent) => {
+                // Stamp the cross-channel routing hint so the owner's
+                // reply (if it comes within the hint window) lands back
+                // in this arc instead of re-triaging into a new one.
+                if let Some(rec) = self.telegram_outbound_recorder.as_ref() {
+                    rec.record(sent.chat_id).await;
+                }
+                Ok(ToolResult {
+                    success: true,
+                    output: json!({
+                        "chat_id": sent.chat_id,
+                        "message_ids": sent.message_ids,
+                        "to_owner": to_owner,
+                    }),
+                    error: None,
+                    execution_time_ms: start.elapsed().as_millis() as u64,
+                })
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                Ok(ToolResult {
+                    success: false,
+                    output: json!({ "error": msg }),
+                    error: Some(msg),
+                    execution_time_ms: start.elapsed().as_millis() as u64,
+                })
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -2921,6 +3267,16 @@ impl ToolRegistry for ShellToolRegistry {
                 base_risk: BaseImpact::WritePersist,
             },
             ToolDefinition {
+                name: "send_telegram".to_string(),
+                description: "Send a Telegram message via the user's configured bot — text and/or file attachments. Omit `chat_id` to message the bot's owner (the typical case — that's the user); non-owner chats trigger an approval prompt. `attachments` is an array of `{path, kind?, caption?}` where `kind` is `photo`|`document`|`auto` (default `auto` — `.png`/`.jpg`/`.webp`/`.gif` go as photo, everything else as document). When a single attachment ships with text ≤ 1024 chars, the text is sent as the file caption (one bubble); otherwise text leads and files follow. Long text auto-splits at the 4096-char limit on line/word boundaries. Common uses: ping the user with a status update, send a generated PDF/screenshot, forward a file from your workspace.".to_string(),
+                parameters: Self::send_telegram_schema(),
+                backend: ToolBackend::Shell {
+                    command: String::new(),
+                    native: false,
+                },
+                base_risk: BaseImpact::WritePersist,
+            },
+            ToolDefinition {
                 name: "install_package".to_string(),
                 description: "Install a Python package (via pip --target) or Node package (via npm --prefix) into Athen's persistent toolbox at ~/.athen/toolbox. PYTHONPATH and PATH are automatically configured so subsequent shell_execute calls can import/run them. The user will be asked for permission, so write a clear `reason` explaining what the package is for and why you need it.".to_string(),
                 parameters: Self::install_package_schema(),
@@ -2969,6 +3325,7 @@ impl ToolRegistry for ShellToolRegistry {
             "web_search" => self.do_web_search(&args).await,
             "web_fetch" => self.do_web_fetch(&args).await,
             "email_send" => self.do_email_send(&args).await,
+            "send_telegram" => self.do_send_telegram(&args).await,
             "install_package" => self.do_install_package(&args).await,
             "list_installed_packages" => self.do_list_installed_packages(&args).await,
             "uninstall_package" => self.do_uninstall_package(&args).await,
@@ -3144,9 +3501,9 @@ mod tests {
 
         // shell_execute, shell_spawn, shell_kill, shell_logs, read, edit,
         // write, grep, list_directory, memory_store, memory_recall,
-        // web_search, web_fetch, email_send, install_package,
-        // list_installed_packages, uninstall_package
-        assert_eq!(tools.len(), 17);
+        // web_search, web_fetch, email_send, send_telegram,
+        // install_package, list_installed_packages, uninstall_package
+        assert_eq!(tools.len(), 18);
 
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"shell_execute"));
@@ -3162,6 +3519,8 @@ mod tests {
         assert!(names.contains(&"memory_recall"));
         assert!(names.contains(&"web_search"));
         assert!(names.contains(&"web_fetch"));
+        assert!(names.contains(&"email_send"));
+        assert!(names.contains(&"send_telegram"));
         assert!(names.contains(&"install_package"));
         assert!(names.contains(&"list_installed_packages"));
         assert!(names.contains(&"uninstall_package"));

@@ -10,6 +10,7 @@ pub mod email_send;
 pub mod messaging;
 pub mod pdf_extract;
 pub mod telegram;
+pub mod telegram_send;
 pub mod user_input;
 
 use athen_core::error::{AthenError, Result};

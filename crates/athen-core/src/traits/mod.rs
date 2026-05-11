@@ -15,6 +15,7 @@ pub mod profile;
 pub mod sandbox;
 pub mod sense;
 pub mod shell;
+pub mod telegram_sender;
 pub mod tool;
 pub mod vault;
 pub mod wakeup;

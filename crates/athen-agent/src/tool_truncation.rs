@@ -56,6 +56,7 @@ pub fn policy_for(name: &str) -> TruncationPolicy {
 
         "memory_store" | "memory_recall" => TruncationPolicy::None,
         "email_send" => TruncationPolicy::None,
+        "send_telegram" => TruncationPolicy::None,
         "install_package" | "uninstall_package" | "list_installed_packages" => {
             TruncationPolicy::Chars { max: 8_000 }
         }

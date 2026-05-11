@@ -132,6 +132,7 @@ pub fn is_always_revealed(name: &str) -> bool {
             | "web_search"
             | "web_fetch"
             | "email_send"
+            | "send_telegram"
     )
 }
 

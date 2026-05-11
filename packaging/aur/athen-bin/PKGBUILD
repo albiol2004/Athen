@@ -30,7 +30,7 @@ source=(
     "LICENSE-$pkgver::$url/raw/v$pkgver/LICENSE"
 )
 sha256sums=(
-    'c5df77c52b0c0d2f05f208225a0823ddc746f639f46d9c3f6de71f6a94a683ea'
+    '37aa023d58b46382f71f192b87ef794b4a219e152a601d0a63e547bc0377db49'
     '63a6a7e9ff02a7d4782645d17fb75d5d918dc35c834a64dab5db485da85feb47'
 )
 

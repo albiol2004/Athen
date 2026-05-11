@@ -325,6 +325,13 @@ pub struct AppState {
     /// populated. `None` means the `email_send` tool will refuse with a
     /// "not configured" error until the user wires SMTP via Settings.
     pub email_sender: Option<Arc<dyn athen_core::traits::email_sender::EmailSender>>,
+    /// Outbound Telegram. Built from `config.telegram` when the bot
+    /// token is populated. The bot's owner chat (from `owner_user_id`)
+    /// is the default destination — `send_telegram` calls without an
+    /// explicit `chat_id` go there and skip the approval gate.
+    /// `None` means the `send_telegram` tool will refuse with a "not
+    /// configured" error until the user wires the bot via Settings.
+    pub telegram_sender: Option<Arc<dyn athen_core::traits::telegram_sender::TelegramSender>>,
     /// Encrypted credential vault. Backs registered HTTP endpoints,
     /// IMAP/SMTP credentials, OAuth tokens, and any other at-rest secret.
     /// Always `Some` whenever a data directory is available; falls back
@@ -496,6 +503,8 @@ impl AppState {
         let web_search = build_web_search_provider(&config.web_search);
         let email_sender: Option<Arc<dyn athen_core::traits::email_sender::EmailSender>> =
             build_email_sender(&config.email);
+        let telegram_sender: Option<Arc<dyn athen_core::traits::telegram_sender::TelegramSender>> =
+            build_telegram_sender(&config.telegram);
 
         let state = Self {
             coordinator: Arc::new(coordinator),
@@ -547,6 +556,7 @@ impl AppState {
             compactor,
             web_search,
             email_sender,
+            telegram_sender,
             vault,
             http_endpoint_store,
             http_rate_limiter,
@@ -754,16 +764,29 @@ impl AppState {
             .with_spawn_persistence_hook_opt(self.spawn_persistence.clone())
             .with_web_search(self.web_search.clone())
             .with_email_sender_opt(self.email_sender.clone())
+            .with_telegram_sender_opt(self.telegram_sender.clone())
             .with_owner_check_opt(self.owner_destination_check());
         if let Some(router) = self.approval_router.clone() {
             shell_registry = shell_registry.with_toolbox_approval(Arc::new(
                 crate::file_gate::RouterToolboxApprovalGate::new(router.clone(), None),
             ));
             let gate: Arc<dyn athen_agent::EmailSendApprovalGate> = Arc::new(
-                crate::email_gate::RouterEmailApprovalGate::new(router, None),
+                crate::email_gate::RouterEmailApprovalGate::new(router.clone(), None),
             );
             shell_registry = shell_registry.with_email_approval(gate);
+            let tg_gate: Arc<dyn athen_agent::tools::TelegramSendApprovalGate> = Arc::new(
+                crate::email_gate::RouterTelegramApprovalGate::new(router, None),
+            );
+            shell_registry = shell_registry.with_telegram_approval(tg_gate);
         }
+        // No arc context here (`refresh_tools_doc` is a global tool
+        // listing), so the recorder is a no-op stamp. Wired for parity.
+        let recorder: Arc<dyn athen_agent::tools::TelegramOutboundRecorder> =
+            Arc::new(crate::email_gate::ArcAwareTelegramOutboundRecorder::new(
+                self.telegram_outbound_hint.clone(),
+                None,
+            ));
+        shell_registry = shell_registry.with_telegram_outbound_recorder(recorder);
         let mut registry = crate::app_tools::AppToolRegistry::new(
             shell_registry,
             self.calendar_store.clone(),
@@ -899,6 +922,7 @@ impl AppState {
             .with_spawn_persistence_hook_opt(self.spawn_persistence.clone())
             .with_web_search(self.web_search.clone())
             .with_email_sender_opt(self.email_sender.clone())
+            .with_telegram_sender_opt(self.telegram_sender.clone())
             .with_owner_check_opt(self.owner_destination_check());
         if let Some(store) = self.grant_store.clone() {
             let provider = Arc::new(crate::file_gate::ArcWritableProvider {
@@ -914,11 +938,28 @@ impl AppState {
                     Some(arc_id.to_string()),
                 ),
             ));
-            let gate: Arc<dyn athen_agent::EmailSendApprovalGate> = Arc::new(
-                crate::email_gate::RouterEmailApprovalGate::new(router, Some(arc_id.to_string())),
-            );
+            let gate: Arc<dyn athen_agent::EmailSendApprovalGate> =
+                Arc::new(crate::email_gate::RouterEmailApprovalGate::new(
+                    router.clone(),
+                    Some(arc_id.to_string()),
+                ));
             shell = shell.with_email_approval(gate);
+            let tg_gate: Arc<dyn athen_agent::tools::TelegramSendApprovalGate> =
+                Arc::new(crate::email_gate::RouterTelegramApprovalGate::new(
+                    router,
+                    Some(arc_id.to_string()),
+                ));
+            shell = shell.with_telegram_approval(tg_gate);
         }
+        // Cross-channel arc routing: stamp the outbound hint after a
+        // successful send_telegram so the user's Telegram reply lands
+        // back in this arc instead of being re-triaged as fresh.
+        let tg_recorder: Arc<dyn athen_agent::tools::TelegramOutboundRecorder> =
+            Arc::new(crate::email_gate::ArcAwareTelegramOutboundRecorder::new(
+                self.telegram_outbound_hint.clone(),
+                Some(arc_id.to_string()),
+            ));
+        shell = shell.with_telegram_outbound_recorder(tg_recorder);
         let mut registry = crate::app_tools::AppToolRegistry::new(
             shell,
             self.calendar_store.clone(),
@@ -1520,6 +1561,7 @@ impl AppState {
         let dispatch_signal_ref = Arc::clone(&self.dispatch_signal);
         let web_search_ref = Arc::clone(&self.web_search);
         let email_sender_ref = self.email_sender.clone();
+        let telegram_sender_ref = self.telegram_sender.clone();
         let owner_check_ref = self.owner_destination_check();
         let telegram_outbound_hint_ref = self.telegram_outbound_hint.clone();
         let http_endpoint_store_ref = self.http_endpoint_store.clone();
@@ -1611,6 +1653,7 @@ impl AppState {
                                     let approval_router_c = approval_router_ref.clone();
                                     let web_search_c = Arc::clone(&web_search_ref);
                                     let email_sender_c = email_sender_ref.clone();
+                                    let telegram_sender_c = telegram_sender_ref.clone();
                                     let owner_check_c = owner_check_ref.clone();
                                     let http_endpoint_store_c = http_endpoint_store_ref.clone();
                                     let vault_c = vault_ref.clone();
@@ -1651,6 +1694,7 @@ impl AppState {
                                             approval_router_c.as_ref(),
                                             &web_search_c,
                                             &email_sender_c,
+                                            &telegram_sender_c,
                                             owner_check_c.as_ref(),
                                             &telegram_outbound_hint_c,
                                             http_endpoint_store_c.as_ref(),
@@ -2082,6 +2126,7 @@ async fn execute_owner_telegram_message(
     approval_router: Option<&Arc<crate::approval::ApprovalRouter>>,
     web_search: &Arc<dyn WebSearchProvider>,
     email_sender: &Option<Arc<dyn athen_core::traits::email_sender::EmailSender>>,
+    telegram_sender: &Option<Arc<dyn athen_core::traits::telegram_sender::TelegramSender>>,
     owner_check: Option<&Arc<dyn athen_agent::OwnerDestinationCheck>>,
     telegram_outbound_hint: &crate::notifier::TelegramOutboundHint,
     http_endpoint_store: Option<&Arc<athen_persistence::http_endpoints::SqliteHttpEndpointStore>>,
@@ -2382,6 +2427,7 @@ async fn execute_owner_telegram_message(
         .with_spawn_persistence_hook_opt(spawn_persistence.cloned())
         .with_web_search(web_search.clone())
         .with_email_sender_opt(email_sender.clone())
+        .with_telegram_sender_opt(telegram_sender.clone())
         .with_owner_check_opt(owner_check.cloned());
     if let (Some(store), Some(arc_id_str)) = (grant_store, target_arc_id.as_ref()) {
         let provider = Arc::new(crate::file_gate::ArcWritableProvider {
@@ -2403,7 +2449,21 @@ async fn execute_owner_telegram_message(
                 target_arc_id.clone(),
             ));
         shell_registry = shell_registry.with_email_approval(gate);
+        let tg_gate: Arc<dyn athen_agent::tools::TelegramSendApprovalGate> =
+            Arc::new(crate::email_gate::RouterTelegramApprovalGate::new(
+                Arc::clone(router),
+                target_arc_id.clone(),
+            ));
+        shell_registry = shell_registry.with_telegram_approval(tg_gate);
     }
+    // Cross-channel arc routing: stamp outbound hint after each
+    // successful send_telegram so the next reply lands here too.
+    let tg_recorder: Arc<dyn athen_agent::tools::TelegramOutboundRecorder> =
+        Arc::new(crate::email_gate::ArcAwareTelegramOutboundRecorder::new(
+            telegram_outbound_hint.clone(),
+            target_arc_id.clone(),
+        ));
+    shell_registry = shell_registry.with_telegram_outbound_recorder(tg_recorder);
     let mut registry = AppToolRegistry::new(
         shell_registry,
         calendar_store.clone(),
@@ -2912,6 +2972,35 @@ fn build_web_search_provider(
         !tavily_key.is_empty()
     );
     Arc::new(MultiSearchProvider::new(slots))
+}
+
+/// Build the Telegram outbound sender from `config.telegram`. Returns
+/// `None` when the bot token is empty. The owner's chat (from
+/// `owner_user_id`) is wired as the default destination — for private
+/// 1-on-1 chats Telegram's chat_id equals the user's id.
+fn build_telegram_sender(
+    cfg: &athen_core::config::TelegramConfig,
+) -> Option<Arc<dyn athen_core::traits::telegram_sender::TelegramSender>> {
+    if !cfg.enabled || cfg.bot_token.trim().is_empty() {
+        tracing::info!("Telegram sender not configured; send_telegram tool will refuse");
+        return None;
+    }
+    match athen_sentidos::telegram_send::BotApiTelegramSender::new(
+        cfg.bot_token.clone(),
+        cfg.owner_user_id,
+    ) {
+        Ok(sender) => {
+            tracing::info!(
+                owner_default_chat = ?cfg.owner_user_id,
+                "Telegram sender configured"
+            );
+            Some(Arc::new(sender))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to build Telegram sender; send_telegram disabled");
+            None
+        }
+    }
 }
 
 /// Build the SMTP outbound sender from `config.email`. Returns `None`
