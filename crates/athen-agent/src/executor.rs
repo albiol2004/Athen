@@ -1065,10 +1065,21 @@ struct StreamResult {
 }
 
 impl DefaultExecutor {
-    /// Ask a cheap LLM whether the agent actually completed the user's task.
+    /// Ask a cheap LLM whether the agent falsely claimed completion.
     ///
-    /// Returns `true` if the agent should CONTINUE (task is NOT done),
-    /// `false` if the task is genuinely complete.
+    /// Returns `true` if the agent should CONTINUE (the reply claims an
+    /// action that wasn't actually taken), `false` if the reply is
+    /// internally consistent — either a genuine completion, an honest
+    /// status report, a refusal, or a clarifying question.
+    ///
+    /// The previous shape of this judge fired CONTINUE whenever the user
+    /// used an action verb and the agent didn't call a write tool. That
+    /// pushed the agent to act even when the correct response was to do
+    /// nothing — "delete it" when nothing exists, "kill it" when no
+    /// process is running, "make a calendar event" when the agent needs
+    /// clarification first. The reframe: fire only on claim/action
+    /// mismatch (the agent says "done" without doing it), not on
+    /// action/tool mismatch.
     async fn judge_completion(
         &self,
         user_request: &str,
@@ -1082,24 +1093,29 @@ impl DefaultExecutor {
         };
 
         let prompt = format!(
-            "You are a strict task completion judge. Determine if the AI agent ACTUALLY \
-             completed the user's request by using tools, or if it just talked about it.\n\n\
+            "You are a completion judge. Decide whether the agent's reply is internally \
+             consistent with the tools it actually called, or whether the reply FALSELY CLAIMS \
+             an action that did not happen.\n\n\
              User's request: \"{user_request}\"\n\
              Agent's response: \"{agent_response}\"\n\
              Tools actually called: [{tools_str}]\n\n\
-             Rules:\n\
-             - If the user asked for an ACTION (create, update, delete, modify, move, write, \
-               execute) and the agent did NOT call the appropriate write tool \
-               (calendar_update, calendar_create, calendar_delete, write, edit, shell_execute), \
-               answer CONTINUE.\n\
-             - If the agent only used read tools (calendar_list, read, grep, list_directory, \
-               memory_recall) but the user wanted a write action, answer CONTINUE.\n\
-             - If the agent just narrated what it would do without calling tools, answer CONTINUE.\n\
-             - If the user asked a question or for information and the agent answered it \
-               (with or without tools), answer DONE.\n\
-             - If the agent genuinely completed the action using the right tools, answer DONE.\n\
-             - If the user is just chatting (greeting, joke, conversation), answer DONE.\n\n\
-             Reply with ONLY one word: DONE or CONTINUE"
+             Answer CONTINUE only when there is a CLAIM/ACTION MISMATCH:\n\
+             - The reply states or implies that the requested action was performed \
+               (\"I deleted it\", \"created the event\", \"done\", \"the file is written\") \
+               but no appropriate write tool was called.\n\
+             - The reply announces an action it is about to perform (\"Let me write that now\") \
+               without then calling the tool.\n\n\
+             Answer DONE in EVERY other case. Specifically DONE for:\n\
+             - Honest status reports (\"no server is running\", \"the file does not exist\", \
+               \"nothing to delete\") — the agent correctly determined no action was needed.\n\
+             - Refusals or explanations of why the agent cannot act.\n\
+             - Clarifying questions back to the user.\n\
+             - Information / question answers (with or without tools).\n\
+             - Genuine completion using the right tools.\n\
+             - Greetings, jokes, small talk.\n\n\
+             Trust the agent's stated reasoning. If the reply does not claim an action \
+             happened, the absence of tools is NOT a failure — it's a choice. \
+             Reply with ONLY one word: DONE or CONTINUE."
         );
 
         let request = LlmRequest {
@@ -1682,9 +1698,10 @@ impl AgentExecutor for DefaultExecutor {
                         conversation.push(ChatMessage {
                             role: Role::User,
                             content: MessageContent::Text(
-                                "You have NOT completed the task. You MUST call the appropriate \
-                                 tools to actually perform the action. Do it NOW — no narration, \
-                                 no announcements, just tool calls."
+                                "Your reply claims an action that you did not actually perform \
+                                 with a tool. Either call the tool now to make the claim true, \
+                                 OR rewrite your reply to honestly describe what happened (or \
+                                 didn't). Do not announce an action without doing it."
                                     .to_string(),
                             ),
                         });

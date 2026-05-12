@@ -96,9 +96,13 @@ pub fn resolve_provider_temperature(
 ///
 /// Returns `(messages, system_suffix)`:
 /// - `messages` — verbatim tail history with `source → role` mapping.
-///   Non-message tail entries (tool_call rows, system_event, etc.) are
-///   dropped because the executor's `context_messages` is a chat history,
-///   not a raw audit log.
+///   Includes prior `tool_call` rows, rendered as one-line assistant
+///   audit prose (see [`to_context_entry`]) at their chronological
+///   position. Without this, a provider failover or any mid-arc error
+///   left the next provider with prose-only history — the agent denied
+///   its own actions, re-ran finished work, and confabulated when asked
+///   to recall. Other non-message entries (system_event, etc.) are
+///   still dropped.
 /// - `system_suffix` — compaction summary and most-recent-tool-result
 ///   cache, packaged as text intended to be appended to the leading
 ///   system message (via `AgentBuilder::external_system_suffix`). These
@@ -126,14 +130,15 @@ pub fn view_to_messages(view: &ArcContextView) -> (Vec<ChatMessage>, String) {
 
     let mut tail = Vec::new();
     for e in &view.tail {
-        if e.entry_type != "message" {
-            continue;
-        }
-        let role = match e.source.as_str() {
-            "user" => Role::User,
-            "assistant" => Role::Assistant,
-            "system" => Role::System,
-            "tool" => Role::Tool,
+        let role = match (e.entry_type.as_str(), e.source.as_str()) {
+            ("message", "user") => Role::User,
+            ("message", "assistant") => Role::Assistant,
+            ("message", "system") => Role::System,
+            ("message", "tool") => Role::Tool,
+            // Persisted tool_call rows replay as assistant-side audit
+            // prose at their chronological position. The content was
+            // already flattened in `to_context_entry` so we just push it.
+            ("tool_call", _) => Role::Assistant,
             _ => continue,
         };
         tail.push(ChatMessage {
@@ -156,11 +161,89 @@ fn entry_token_estimate(e: &ArcEntry) -> u32 {
 }
 
 fn to_context_entry(e: &ArcEntry) -> ContextEntry {
+    // `tool_call` rows are persisted with only the tool name in `content`
+    // and the rich `{tool, args, result, error, status}` payload in
+    // `metadata`. `ContextEntry` has no metadata field (it's intentionally
+    // lean — athen-core stays decoupled from the persistence enum), so
+    // when we convert tool_call rows for downstream consumption we flatten
+    // the metadata into the content string here. That way every caller —
+    // the rebuilt chat history, the tool_cache rendering, anyone else —
+    // sees a single readable line instead of a bare tool name.
+    let content = if e.entry_type == EntryType::ToolCall {
+        render_tool_call_audit(e)
+    } else {
+        e.content.clone()
+    };
     ContextEntry {
         id: e.id,
         source: e.source.clone(),
-        content: e.content.clone(),
+        content,
         entry_type: e.entry_type.as_str().to_string(),
+    }
+}
+
+/// Render a persisted `tool_call` ArcEntry as a single line of audit
+/// prose. Long results are truncated so replay doesn't balloon the prompt
+/// (a 50 KB shell stdout has no business living in `context_messages`
+/// turn after turn). The previously-correct tool/args/result is the
+/// minimum needed for the next turn — for the full text the agent can
+/// re-run the tool or read the arc UI.
+fn render_tool_call_audit(e: &ArcEntry) -> String {
+    let Some(meta) = e.metadata.as_ref() else {
+        return format!("[tool={} (no metadata)]", e.content);
+    };
+    let tool = meta
+        .get("tool")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&e.content);
+    let status = meta.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+
+    let args = meta
+        .get("args")
+        .map(|v| one_line(v, 240))
+        .unwrap_or_default();
+    let result = meta
+        .get("result")
+        .map(|v| one_line(v, 600))
+        .unwrap_or_default();
+    let error = meta
+        .get("error")
+        .map(|v| one_line(v, 400))
+        .unwrap_or_default();
+
+    let mut out = format!("[tool={tool} status={status}");
+    if !args.is_empty() {
+        out.push_str(" args=");
+        out.push_str(&args);
+    }
+    if !result.is_empty() {
+        out.push_str(" → result=");
+        out.push_str(&result);
+    }
+    if !error.is_empty() {
+        out.push_str(" → error=");
+        out.push_str(&error);
+    }
+    out.push(']');
+    out
+}
+
+/// Stringify a JSON value into a single line capped at `limit` chars.
+/// Null returns empty so callers can skip empty fields cleanly.
+fn one_line(v: &serde_json::Value, limit: usize) -> String {
+    let s = match v {
+        serde_json::Value::Null => return String::new(),
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    let s = s.replace('\n', " ");
+    let s = s.trim();
+    if s.chars().count() > limit {
+        let mut t: String = s.chars().take(limit).collect();
+        t.push_str(" …(truncated)");
+        t
+    } else {
+        s.to_string()
     }
 }
 
@@ -566,6 +649,113 @@ mod tests {
         assert!(view.summary.is_none());
         assert_eq!(view.tail.len(), 3);
         assert!(view.tool_cache.is_empty());
+    }
+
+    /// Regression: a Gemini→DeepSeek failover left the new provider with
+    /// prose-only history because `view_to_messages` dropped every entry
+    /// that wasn't `entry_type == "message"`. Tool calls are persisted to
+    /// the arc with full metadata, but rebuilding `context_messages` for
+    /// the next turn (or the next provider) discarded them. The agent
+    /// then redid finished work, denied its own actions, and confabulated
+    /// when asked to recall. This test confirms tool_call rows now ride
+    /// through rehydration as assistant-role audit prose.
+    #[tokio::test]
+    async fn view_to_messages_preserves_tool_calls_across_rehydration() {
+        let store = empty_store().await;
+        store
+            .create_arc("a", "A", athen_persistence::arcs::ArcSource::UserInput)
+            .await
+            .unwrap();
+        store
+            .add_entry(
+                "a",
+                EntryType::Message,
+                "user",
+                "Write an HTML page and host it on port 7681",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        // Tool call burst from the prior (failed-over) turn.
+        store
+            .add_entry(
+                "a",
+                EntryType::ToolCall,
+                "assistant",
+                "write",
+                Some(serde_json::json!({
+                    "tool": "write",
+                    "args": {"path": "/tmp/x/index.html", "size_bytes": 900},
+                    "result": "wrote 900B",
+                    "error": null,
+                    "status": "Completed",
+                })),
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .add_entry(
+                "a",
+                EntryType::ToolCall,
+                "assistant",
+                "shell_spawn",
+                Some(serde_json::json!({
+                    "tool": "shell_spawn",
+                    "args": {"command": "python3 -m http.server 7681"},
+                    "result": {"pid": 12345, "alive": true},
+                    "error": null,
+                    "status": "Completed",
+                })),
+                None,
+            )
+            .await
+            .unwrap();
+        // Final assistant reply that was overwritten with the rate-limit
+        // error when the LLM call failed mid-iteration.
+        store
+            .add_entry(
+                "a",
+                EntryType::Message,
+                "assistant",
+                "Something went wrong: rate limited.",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let router = athen_llm::router::DefaultLlmRouter::new(
+            Default::default(),
+            Default::default(),
+            athen_llm::budget::BudgetTracker::new(None),
+        );
+        let router = StdArc::new(tokio::sync::RwLock::new(StdArc::new(router)));
+        let compactor = LlmArcCompactor::new(store.clone(), router);
+
+        let view = compactor.load_context_view("a").await.unwrap();
+        let (messages, _suffix) = view_to_messages(&view);
+
+        // 1 user + 2 tool_call (replayed as assistant) + 1 assistant reply.
+        assert_eq!(messages.len(), 4, "messages: {messages:#?}");
+        assert!(matches!(messages[0].role, Role::User));
+        assert!(matches!(messages[1].role, Role::Assistant));
+        assert!(matches!(messages[2].role, Role::Assistant));
+        assert!(matches!(messages[3].role, Role::Assistant));
+        // Tool-call audit prose must surface the tool name + result so the
+        // next provider can see what already happened.
+        let MessageContent::Text(ref m1) = messages[1].content else {
+            panic!("expected text");
+        };
+        assert!(m1.contains("tool=write"), "got: {m1}");
+        assert!(m1.contains("status=Completed"), "got: {m1}");
+        let MessageContent::Text(ref m2) = messages[2].content else {
+            panic!("expected text");
+        };
+        assert!(m2.contains("tool=shell_spawn"), "got: {m2}");
+        assert!(m2.contains("python3"), "got: {m2}");
+        assert!(m2.contains("\"alive\":true"), "got: {m2}");
     }
 
     #[tokio::test]
