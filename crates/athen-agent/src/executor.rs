@@ -19,7 +19,7 @@ use athen_core::traits::reminder::{ReminderContext, SystemReminderBuilder};
 use athen_core::traits::tool::ToolRegistry;
 
 use crate::timeout::DefaultTimeoutGuard;
-use crate::tool_grouping::{group_for, is_always_revealed, summarize_groups};
+use crate::tool_grouping::{group_for, is_always_revealed_for_profile, summarize_groups};
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -521,7 +521,10 @@ impl DefaultExecutor {
         prompt.push_str(&Self::build_shell_env_section(shell_kind));
         prompt.push_str(&Self::build_toolbox_section(toolbox_info));
         prompt.push_str(&Self::build_endpoints_section(endpoints_block, tools));
-        prompt.push_str(&Self::build_tool_index(tools, tool_doc_dir));
+        let primary_groups: &[String] = profile
+            .map(|p| p.profile.primary_groups.as_slice())
+            .unwrap_or(&[]);
+        prompt.push_str(&Self::build_tool_index(tools, tool_doc_dir, primary_groups));
         prompt.push_str(&Self::build_persona_rules(autonomous));
         // Append-only block: revealed-tool schemas grow as the agent
         // discovers tools. Placed AFTER the static sections so adding a
@@ -891,18 +894,29 @@ impl DefaultExecutor {
     fn build_tool_index(
         tools: &[athen_core::tool::ToolDefinition],
         tool_doc_dir: Option<&std::path::Path>,
+        primary_groups: &[String],
     ) -> String {
         let mut out = String::new();
         let tz_offset = chrono::Local::now().format("%:z");
 
-        // Categorize tools for smarter guidance.
-        let has_calendar = tools.iter().any(|t| t.name.starts_with("calendar_"));
-        let has_shell = tools.iter().any(|t| t.name == "shell_execute");
-        let has_contacts = tools.iter().any(|t| t.name.starts_with("contacts_"));
-        let has_memory = tools.iter().any(|t| t.name == "memory_store");
+        // Whether a tier-2 capability section ("CALENDAR:", "SHELL & FILES:",
+        // etc.) appears. Two gates: the tool must exist at all (otherwise the
+        // block describes nothing), AND when the profile declares a tier-1
+        // primary set, the group has to be in it. Empty primary_groups = use
+        // tool presence alone (today's behavior, the `default` profile path).
+        let is_primary = |group: &str| -> bool {
+            primary_groups.is_empty() || primary_groups.iter().any(|g| g == group)
+        };
+        let has_calendar =
+            tools.iter().any(|t| t.name.starts_with("calendar_")) && is_primary("calendar");
+        let has_shell = tools.iter().any(|t| t.name == "shell_execute") && is_primary("shell");
+        let has_contacts =
+            tools.iter().any(|t| t.name.starts_with("contacts_")) && is_primary("contacts");
+        let has_memory = tools.iter().any(|t| t.name == "memory_store") && is_primary("memory");
         let has_web = tools
             .iter()
-            .any(|t| t.name == "web_search" || t.name == "web_fetch");
+            .any(|t| t.name == "web_search" || t.name == "web_fetch")
+            && is_primary("web");
 
         // ── Tier 1: capability index (always shown, one line per group) ──
         if !tools.is_empty() {
@@ -1220,12 +1234,19 @@ impl AgentExecutor for DefaultExecutor {
         };
 
         // Two-tier surfacing: only the "revealed" subset has its full schema
-        // sent to the LLM each turn. Memory tools are revealed by default;
-        // others enter the set on first dispatch (tolerant dispatch).
+        // sent to the LLM each turn. The active profile's `primary_groups`
+        // shape this initial set — tier-1 groups get their schemas always-
+        // revealed, everything else enters the set on first dispatch
+        // (tolerant dispatch). Empty `primary_groups` = global default.
+        let primary_groups_for_reveal: &[String] = self
+            .active_profile
+            .as_ref()
+            .map(|p| p.profile.primary_groups.as_slice())
+            .unwrap_or(&[]);
         let mut revealed_tools: HashSet<String> = available_tools
             .iter()
             .map(|t| t.name.clone())
-            .filter(|name| is_always_revealed(name))
+            .filter(|name| is_always_revealed_for_profile(name, primary_groups_for_reveal))
             .collect();
 
         // Prepend context messages (prior conversation history) before the
@@ -2559,6 +2580,7 @@ mod tests {
                 persona_template_ids: vec![],
                 custom_persona_addendum: None,
                 tool_selection: ToolSelection::All,
+                primary_groups: vec![],
                 expertise: ExpertiseDeclaration::default(),
                 model_profile_hint: None,
                 builtin: true,
@@ -2796,6 +2818,7 @@ mod tests {
                 persona_template_ids: vec!["voice".into()],
                 custom_persona_addendum: Some("Personalize first lines.".into()),
                 tool_selection: ToolSelection::All,
+                primary_groups: vec![],
                 expertise: ExpertiseDeclaration::default(),
                 model_profile_hint: None,
                 builtin: false,

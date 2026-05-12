@@ -783,6 +783,7 @@ mod tests {
             persona_template_ids: vec![],
             custom_persona_addendum: None,
             tool_selection: ToolSelection::All,
+            primary_groups: vec![],
             expertise: ExpertiseDeclaration {
                 domains,
                 task_kinds,
@@ -805,6 +806,7 @@ mod tests {
             persona_template_ids: vec![],
             custom_persona_addendum: None,
             tool_selection: ToolSelection::All,
+            primary_groups: vec![],
             expertise: ExpertiseDeclaration::default(),
             model_profile_hint: None,
             builtin: true,

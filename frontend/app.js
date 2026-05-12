@@ -1153,7 +1153,25 @@ function parseTableRow(line) {
         .map((c) => c.trim());
 }
 function parseTableSeparator(line) {
-    if (!/^\s*\|?[\s:|-]+\|[\s:|-]+\|?\s*$/.test(line)) return null;
+    // Fast linear pre-check. The previous regex `[\s:|-]+\|[\s:|-]+`
+    // had two greedy classes that both included `|`, so a separator
+    // line of N pipe/dash chars meant N choices for "which `|` is the
+    // divider" — exponential backtracking in JavaScriptCore. A
+    // base64-image-in-a-markdown-table page reader output (e.g. PHP
+    // info) hit this and pegged the WebProcess long enough for
+    // WebKit's 10s IPC watchdog to abort it.
+    let hasPipe = false, hasDash = false;
+    for (let i = 0; i < line.length; i++) {
+        const c = line.charCodeAt(i);
+        // tab, space, '-', ':', '|'
+        if (c === 9 || c === 32 || c === 45 || c === 58 || c === 124) {
+            if (c === 124) hasPipe = true;
+            else if (c === 45) hasDash = true;
+        } else {
+            return null;
+        }
+    }
+    if (!hasPipe || !hasDash) return null;
     const cells = parseTableRow(line);
     if (cells.length === 0) return null;
     const aligns = [];

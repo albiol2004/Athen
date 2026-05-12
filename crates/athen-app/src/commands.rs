@@ -5440,6 +5440,11 @@ pub struct AgentProfileInput {
     pub custom_persona_addendum: Option<String>,
     #[serde(default)]
     pub tool_selection: Option<athen_core::agent_profile::ToolSelection>,
+    /// Canonical group ids for tier-1 schema prominence. Empty = use the
+    /// global default reveal set. Never doubles as a hard restriction;
+    /// see `feedback_tool_selection_is_tiering_not_restriction`.
+    #[serde(default)]
+    pub primary_groups: Vec<String>,
     #[serde(default)]
     pub expertise: athen_core::agent_profile::ExpertiseDeclaration,
     #[serde(default)]
@@ -5459,6 +5464,7 @@ fn input_to_profile(
         persona_template_ids: vec![],
         custom_persona_addendum: input.custom_persona_addendum,
         tool_selection: input.tool_selection.unwrap_or(ToolSelection::All),
+        primary_groups: input.primary_groups,
         expertise: input.expertise,
         model_profile_hint: input.model_profile_hint,
         builtin: false,

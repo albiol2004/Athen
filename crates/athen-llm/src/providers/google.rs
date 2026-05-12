@@ -14,9 +14,16 @@
 //! - URL-source images. Gemini doesn't accept arbitrary URLs through
 //!   `inlineData`; we warn and skip rather than silently dropping them. The
 //!   Gemini `fileData` path is a future feature.
-//! - Cross-chunk SSE buffering. We match Anthropic's per-`bytes_stream` chunk
-//!   parsing; a single SSE event split across TCP chunks is a known
-//!   pre-existing limitation shared with the Anthropic adapter.
+//! ## SSE buffering
+//!
+//! Gemini's streaming endpoint emits one SSE event per content chunk and a
+//! single `functionCall` part carries the WHOLE argument blob inline. A
+//! `write` call with a long HTML payload routinely overflows a single TCP
+//! segment, so `bytes_stream` hands us the event in two pieces. We accumulate
+//! bytes across chunks in a `scan`-style buffer and only feed complete events
+//! (terminated by `\n\n`) into the per-event parser. Without this every long
+//! tool call silently drops, taking its `thoughtSignature` with it and
+//! breaking the next turn with HTTP 400.
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -484,15 +491,18 @@ impl LlmProvider for GoogleProvider {
 
         let byte_stream = http_response.bytes_stream();
         let chunk_stream = byte_stream
-            .map(|result| match result {
-                Ok(bytes) => {
-                    let text = String::from_utf8_lossy(&bytes).to_string();
-                    parse_sse_chunks(&text)
-                }
-                Err(e) => vec![Err(AthenError::LlmProvider {
-                    provider: "google".into(),
-                    message: format!("stream error: {}", e),
-                })],
+            .scan(Vec::<u8>::new(), |buffer, result| {
+                let emitted: Vec<Result<LlmChunk>> = match result {
+                    Ok(bytes) => {
+                        buffer.extend_from_slice(&bytes);
+                        drain_complete_events(buffer)
+                    }
+                    Err(e) => vec![Err(AthenError::LlmProvider {
+                        provider: "google".into(),
+                        message: format!("stream error: {}", e),
+                    })],
+                };
+                futures::future::ready(Some(emitted))
             })
             .flat_map(futures::stream::iter);
 
@@ -568,60 +578,88 @@ fn map_finish_reason(raw: Option<&str>) -> FinishReason {
     }
 }
 
-/// Parse SSE text into `LlmChunk` results. Gemini's stream is one
-/// `data: <json>` line per event with no `[DONE]` sentinel; the final event
-/// is the one whose candidate carries a `finishReason`.
-fn parse_sse_chunks(text: &str) -> Vec<Result<LlmChunk>> {
+/// Drain every complete SSE event from `buffer` (events are separated by a
+/// blank line — the two-byte sequence `\n\n`). Leaves any trailing partial
+/// event in the buffer for the next byte chunk to complete.
+///
+/// Gemini's JSON payloads never contain raw LF bytes (newlines inside string
+/// values arrive as the two characters `\` `n`), so searching the raw buffer
+/// for `\n\n` is unambiguous. UTF-8 decoding is deferred until we have a full
+/// event so we don't corrupt multi-byte characters split across TCP segments.
+fn drain_complete_events(buffer: &mut Vec<u8>) -> Vec<Result<LlmChunk>> {
+    let mut out = Vec::new();
+    while let Some(end) = buffer.windows(2).position(|w| w == b"\n\n") {
+        let event_bytes: Vec<u8> = buffer.drain(..end).collect();
+        // Drop the `\n\n` terminator itself.
+        buffer.drain(..2);
+        let event_text = String::from_utf8_lossy(&event_bytes);
+        out.extend(parse_sse_event(&event_text));
+    }
+    out
+}
+
+/// Parse one complete SSE event (the text between two `\n\n` separators) into
+/// `LlmChunk` results. An event may contain multiple `data:` lines, which by
+/// SSE convention are concatenated; Gemini's stream uses one per event.
+fn parse_sse_event(event_text: &str) -> Vec<Result<LlmChunk>> {
+    let mut data = String::new();
+    for line in event_text.lines() {
+        if let Some(rest) = line.strip_prefix("data:") {
+            // Per SSE: a single leading space after the colon is part of the
+            // protocol, not the payload.
+            data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+        }
+    }
+    if data.is_empty() {
+        return Vec::new();
+    }
+
+    let event: GeminiResponse = match serde_json::from_str(&data) {
+        Ok(e) => e,
+        Err(err) => {
+            // A complete `data:` line that still fails JSON parse means
+            // genuinely malformed payload, not a chunk-split (that case is
+            // prevented by the caller buffering until `\n\n`). Surface it
+            // loudly — silently dropping tool calls is what got us here.
+            warn!(
+                error = %err,
+                data_len = data.len(),
+                "google: failed to parse SSE event data"
+            );
+            return Vec::new();
+        }
+    };
+
     let mut chunks = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        let data = match line.strip_prefix("data: ") {
-            Some(d) => d,
-            None => continue,
-        };
-        if data.is_empty() {
-            continue;
-        }
-        let event: GeminiResponse = match serde_json::from_str(data) {
-            Ok(e) => e,
-            Err(_) => {
-                warn!(data = data, "google: failed to parse SSE event data");
-                continue;
-            }
-        };
 
-        // Safety block surfaced mid-stream — emit a single error chunk so the
-        // consumer sees the reason rather than a silent end-of-stream.
-        if event.candidates.is_empty() {
-            let reason = event
-                .prompt_feedback
-                .as_ref()
-                .and_then(|f| f.block_reason.as_deref())
-                .unwrap_or("unknown");
-            chunks.push(Err(AthenError::LlmProvider {
-                provider: "google".into(),
-                message: format!("content blocked: {}", reason),
-            }));
-            continue;
-        }
-
-        let candidate = match event.candidates.into_iter().next() {
-            Some(c) => c,
-            None => continue,
-        };
-        let finish_reason_raw = candidate.finish_reason.clone();
-        let has_finish = finish_reason_raw
+    // Safety block surfaced mid-stream — emit a single error chunk so the
+    // consumer sees the reason rather than a silent end-of-stream.
+    if event.candidates.is_empty() {
+        let reason = event
+            .prompt_feedback
             .as_ref()
-            .map(|s| !s.is_empty())
-            .unwrap_or(false);
+            .and_then(|f| f.block_reason.as_deref())
+            .unwrap_or("unknown");
+        chunks.push(Err(AthenError::LlmProvider {
+            provider: "google".into(),
+            message: format!("content blocked: {}", reason),
+        }));
+        return chunks;
+    }
 
-        let mut emitted_tool_call = false;
-        if let Some(content) = candidate.content {
-            for part in content.parts {
-                if let Some(text) = part.text {
-                    if text.is_empty() {
-                        continue;
-                    }
+    let Some(candidate) = event.candidates.into_iter().next() else {
+        return chunks;
+    };
+    let has_finish = candidate
+        .finish_reason
+        .as_ref()
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+
+    if let Some(content) = candidate.content {
+        for part in content.parts {
+            if let Some(text) = part.text {
+                if !text.is_empty() {
                     chunks.push(Ok(LlmChunk {
                         delta: text,
                         is_final: false,
@@ -629,37 +667,49 @@ fn parse_sse_chunks(text: &str) -> Vec<Result<LlmChunk>> {
                         tool_calls: vec![],
                     }));
                 }
-                if let Some(call) = part.function_call {
-                    emitted_tool_call = true;
-                    chunks.push(Ok(LlmChunk {
-                        delta: String::new(),
-                        is_final: false,
-                        is_thinking: false,
-                        tool_calls: vec![ToolCall {
-                            id: call
-                                .id
-                                .filter(|s| !s.is_empty())
-                                .unwrap_or_else(|| Uuid::new_v4().to_string()),
-                            name: call.name,
-                            arguments: call.args.unwrap_or(serde_json::Value::Null),
-                            thought_signature: part.thought_signature,
-                        }],
-                    }));
-                }
+            }
+            if let Some(call) = part.function_call {
+                chunks.push(Ok(LlmChunk {
+                    delta: String::new(),
+                    is_final: false,
+                    is_thinking: false,
+                    tool_calls: vec![ToolCall {
+                        id: call
+                            .id
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| Uuid::new_v4().to_string()),
+                        name: call.name,
+                        arguments: call.args.unwrap_or(serde_json::Value::Null),
+                        thought_signature: part.thought_signature,
+                    }],
+                }));
             }
         }
+    }
 
-        if has_finish {
-            chunks.push(Ok(LlmChunk {
-                delta: String::new(),
-                is_final: true,
-                is_thinking: false,
-                tool_calls: vec![],
-            }));
-            // Suppress the (unused) emitted-tool-call signal — the executor
-            // already saw the tool_calls chunk before this terminal one.
-            let _ = emitted_tool_call;
+    if has_finish {
+        chunks.push(Ok(LlmChunk {
+            delta: String::new(),
+            is_final: true,
+            is_thinking: false,
+            tool_calls: vec![],
+        }));
+    }
+
+    chunks
+}
+
+/// Parse a buffer that already contains one or more complete SSE events
+/// (each terminated by `\n\n`). Kept around as a test-friendly wrapper —
+/// production streaming uses [`drain_complete_events`] directly.
+#[cfg(test)]
+fn parse_sse_chunks(text: &str) -> Vec<Result<LlmChunk>> {
+    let mut chunks = Vec::new();
+    for event in text.split("\n\n") {
+        if event.is_empty() {
+            continue;
         }
+        chunks.extend(parse_sse_event(event));
     }
     chunks
 }
@@ -1318,6 +1368,83 @@ mod tests {
         let decl = &tools[0].function_declarations[0];
         assert_eq!(decl.name, "search");
         assert_eq!(decl.parameters["required"][0], "q");
+    }
+
+    #[test]
+    fn drain_complete_events_recovers_function_call_split_across_two_chunks() {
+        // Regression: a `write` functionCall part with a large args payload
+        // overflows a single TCP segment. Old per-chunk parser warn-dropped
+        // the half it couldn't parse, losing both the tool call and its
+        // thoughtSignature (the latter then crashed the next turn with
+        // HTTP 400 "missing thought_signature").
+        let event_json = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{
+                        "functionCall": {
+                            "name": "write",
+                            "args": {
+                                "path": "/tmp/x.html",
+                                "content": "<!DOCTYPE html>\n<html>\n<body>\n<p>hello</p>\n</body>\n</html>"
+                            }
+                        },
+                        "thoughtSignature": "SIG-CHUNK-SPLIT"
+                    }]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let event = format!("data: {}\n\n", serde_json::to_string(&event_json).unwrap());
+        let bytes = event.as_bytes();
+        // Slice at an arbitrary mid-payload offset (inside the JSON string body).
+        let split = bytes.len() / 2;
+
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&bytes[..split]);
+        let first_pass = drain_complete_events(&mut buf);
+        // The terminator `\n\n` hasn't arrived yet — nothing should be drained.
+        assert!(
+            first_pass.is_empty(),
+            "expected zero chunks before terminator, got {first_pass:?}"
+        );
+        // Buffer still holds the partial event for the next chunk.
+        assert!(!buf.is_empty());
+
+        buf.extend_from_slice(&bytes[split..]);
+        let second_pass = drain_complete_events(&mut buf);
+        let oks: Vec<_> = second_pass.into_iter().filter_map(|c| c.ok()).collect();
+        // Expect: one tool_call chunk + one final marker.
+        assert_eq!(oks.len(), 2, "unexpected chunk count: {oks:?}");
+        assert_eq!(oks[0].tool_calls.len(), 1);
+        assert_eq!(oks[0].tool_calls[0].name, "write");
+        assert_eq!(
+            oks[0].tool_calls[0].thought_signature.as_deref(),
+            Some("SIG-CHUNK-SPLIT"),
+            "thoughtSignature must survive cross-chunk reassembly"
+        );
+        assert!(oks[1].is_final);
+        // Buffer fully drained.
+        assert!(buf.is_empty(), "expected empty buffer, got {buf:?}");
+    }
+
+    #[test]
+    fn drain_complete_events_handles_two_events_in_one_chunk() {
+        let event_a = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}]}\n\n";
+        let event_b = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"there\"}]},\"finishReason\":\"STOP\"}]}\n\n";
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(event_a.as_bytes());
+        buf.extend_from_slice(event_b.as_bytes());
+        let oks: Vec<_> = drain_complete_events(&mut buf)
+            .into_iter()
+            .filter_map(|c| c.ok())
+            .collect();
+        // hi + there + final marker.
+        assert_eq!(oks.len(), 3);
+        assert_eq!(oks[0].delta, "hi");
+        assert_eq!(oks[1].delta, "there");
+        assert!(oks[2].is_final);
+        assert!(buf.is_empty());
     }
 
     #[test]

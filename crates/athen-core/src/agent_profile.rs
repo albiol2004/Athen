@@ -157,6 +157,27 @@ pub struct AgentProfile {
     /// purely template-driven profiles.
     pub custom_persona_addendum: Option<String>,
     pub tool_selection: ToolSelection,
+    /// Canonical group ids (matching `tool_grouping::group_for`) whose
+    /// tools get full JSON schemas in the static system prefix. Tools
+    /// outside these groups are tier-2 — they remain fully callable and
+    /// auto-reveal their schema on first call, but they don't eat
+    /// prompt budget upfront. The profile-level tier-2 capability
+    /// sections (CALENDAR / SHELL / WEB / CONTACTS / MEMORY) in the
+    /// system prompt are also gated by this list.
+    ///
+    /// Empty = fall back to the global default reveal set
+    /// (`tool_grouping::is_always_revealed`). This is the seeded value
+    /// for the `default` profile and for profiles like `assistant` /
+    /// `devops` that legitimately exercise the full surface; the empty
+    /// case preserves byte-identical behavior for callers that have
+    /// not opted into per-profile tiering.
+    ///
+    /// NEVER doubles as a hard restriction — see the feedback memory
+    /// `tool-selection-is-tiering-not-restriction`. Hard filtering of
+    /// the callable surface lives on `tool_selection`; this field only
+    /// reshapes prompt prominence.
+    #[serde(default)]
+    pub primary_groups: Vec<String>,
     pub expertise: ExpertiseDeclaration,
     /// Optional override of the LLM model profile name (matched against
     /// `athen_core::llm::ModelProfile`). When `None`, the default model
@@ -218,6 +239,7 @@ mod tests {
             persona_template_ids: vec!["concise_voice".into(), "outreach_mission".into()],
             custom_persona_addendum: Some("Always personalize first lines.".into()),
             tool_selection: ToolSelection::Groups(vec!["email".into(), "contacts".into()]),
+            primary_groups: vec![],
             expertise: ExpertiseDeclaration {
                 domains: vec![DomainTag::Outreach, DomainTag::Email],
                 task_kinds: vec![TaskKindTag::Drafting, TaskKindTag::Outreach],

@@ -270,6 +270,7 @@ mod tests {
                 persona_template_ids: templates.iter().map(|t| t.id.clone()).collect(),
                 custom_persona_addendum: None,
                 tool_selection: ToolSelection::All,
+                primary_groups: vec![],
                 expertise: ExpertiseDeclaration::default(),
                 model_profile_hint: None,
                 builtin: false,

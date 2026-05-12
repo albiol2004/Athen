@@ -125,23 +125,48 @@ fn group_one_liner(id: &str, tools: &[&ToolDefinition]) -> String {
 /// short / pronoun-y messages and act on stale entries as if they were
 /// instructions.
 pub fn is_always_revealed(name: &str) -> bool {
-    matches!(
-        name,
-        "memory_store"
-            | "shell_execute"
-            | "shell_spawn"
-            | "shell_kill"
-            | "shell_logs"
-            | "read"
-            | "edit"
-            | "write"
-            | "grep"
-            | "list_directory"
-            | "web_search"
-            | "web_fetch"
-            | "email_send"
-            | "send_telegram"
-    )
+    is_always_revealed_for_profile(name, &[])
+}
+
+/// Per-profile variant. When `primary_groups` is non-empty, *only* tools
+/// whose group is in that list (plus a small universal core that every
+/// profile reaches for) get full schemas in the static prefix. Tools
+/// outside primary_groups remain fully callable — the executor auto-
+/// reveals their schema on first invocation, see
+/// `executor::DefaultExecutor::execute` reveal-on-call path.
+///
+/// When `primary_groups` is empty, falls back to the global default —
+/// the historic always-revealed list, preserving today's behavior for
+/// the `default` / `assistant` / `devops` / `technical_support` profiles.
+pub fn is_always_revealed_for_profile(name: &str, primary_groups: &[String]) -> bool {
+    // Universal core: memory_store is referenced by every "should I remember
+    // this" reflex even on profiles that aren't memory-heavy. email_send and
+    // send_telegram are kept always-revealed because they're the inbound-
+    // reply channels for autonomous dispatch (sense events) — a profile
+    // that's never expected to reply via email STILL receives email sense
+    // events and must be able to draft one back. If a profile genuinely
+    // doesn't want them prominent it can edit its `primary_groups`.
+    if matches!(name, "memory_store" | "email_send" | "send_telegram") {
+        return true;
+    }
+    if primary_groups.is_empty() {
+        return matches!(
+            name,
+            "shell_execute"
+                | "shell_spawn"
+                | "shell_kill"
+                | "shell_logs"
+                | "read"
+                | "edit"
+                | "write"
+                | "grep"
+                | "list_directory"
+                | "web_search"
+                | "web_fetch"
+        );
+    }
+    let group = group_for(name);
+    primary_groups.iter().any(|g| g == group)
 }
 
 #[cfg(test)]
@@ -187,6 +212,34 @@ mod tests {
         assert_eq!(group_for("write"), "files");
         assert_eq!(group_for("grep"), "files");
         assert_eq!(group_for("list_directory"), "files");
+    }
+
+    #[test]
+    fn profile_aware_reveal_respects_primary_groups() {
+        use super::is_always_revealed_for_profile;
+        let lawyerish = vec!["web".to_string(), "files".to_string(), "memory".to_string()];
+        // Tools in primary_groups are revealed.
+        assert!(is_always_revealed_for_profile("web_search", &lawyerish));
+        assert!(is_always_revealed_for_profile("web_fetch", &lawyerish));
+        assert!(is_always_revealed_for_profile("read", &lawyerish));
+        assert!(is_always_revealed_for_profile("memory_store", &lawyerish));
+        // Tools outside primary_groups stay tier-2 — agents can still
+        // reach them via auto-reveal-on-call.
+        assert!(!is_always_revealed_for_profile("shell_execute", &lawyerish));
+        assert!(!is_always_revealed_for_profile(
+            "calendar_create",
+            &lawyerish
+        ));
+        // Universal core: memory_store / email_send / send_telegram are
+        // always tier-1 regardless of the profile's primary_groups.
+        let narrow = vec!["web".to_string()];
+        assert!(is_always_revealed_for_profile("memory_store", &narrow));
+        assert!(is_always_revealed_for_profile("email_send", &narrow));
+        assert!(is_always_revealed_for_profile("send_telegram", &narrow));
+        // Empty primary_groups falls back to the global default.
+        assert!(is_always_revealed_for_profile("shell_execute", &[]));
+        assert!(is_always_revealed_for_profile("web_search", &[]));
+        assert!(!is_always_revealed_for_profile("calendar_create", &[]));
     }
 
     #[test]

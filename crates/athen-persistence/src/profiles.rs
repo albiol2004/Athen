@@ -44,7 +44,8 @@ CREATE TABLE IF NOT EXISTS agent_profiles (
     model_profile_hint TEXT,
     builtin INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    primary_groups_json TEXT NOT NULL DEFAULT '[]'
 );
 
 CREATE TABLE IF NOT EXISTS persona_templates (
@@ -73,6 +74,20 @@ impl SqliteProfileStore {
             let conn = conn.blocking_lock();
             conn.execute_batch(PROFILES_SCHEMA_SQL)
                 .map_err(|e| AthenError::Other(format!("Init profiles schema: {e}")))?;
+            // Idempotent ALTER for installs predating the primary_groups
+            // field. SQLite errors on duplicate column name — swallow that
+            // specifically; any other error is real.
+            if let Err(e) = conn.execute(
+                "ALTER TABLE agent_profiles ADD COLUMN primary_groups_json TEXT NOT NULL DEFAULT '[]'",
+                [],
+            ) {
+                let msg = e.to_string();
+                if !msg.contains("duplicate column name") {
+                    return Err(AthenError::Other(format!(
+                        "Add primary_groups_json column: {e}"
+                    )));
+                }
+            }
             Ok(())
         })
         .await
@@ -90,6 +105,86 @@ impl SqliteProfileStore {
             if self.get_profile(&profile.id).await?.is_none() {
                 self.save_profile_raw(&profile).await?;
             }
+        }
+        self.upgrade_legacy_builtin_tool_selections().await?;
+        self.upgrade_empty_primary_groups_from_canonical().await?;
+        Ok(())
+    }
+
+    /// Fill in `primary_groups` for builtin profiles whose row was seeded
+    /// before the schema-tiering work landed (the column was added later
+    /// with default '[]'). Only triggers when the stored value is empty
+    /// AND the canonical seed is non-empty — i.e. "uninitialized," not
+    /// "user explicitly cleared." Customizations survive because once the
+    /// user sets any non-empty value the predicate stops matching.
+    ///
+    /// Unlike `tool_selection` (which is a hard-restriction surface),
+    /// `primary_groups` only reshapes prompt prominence — no callable
+    /// surface changes, so auto-upgrade is safe.
+    async fn upgrade_empty_primary_groups_from_canonical(&self) -> Result<()> {
+        let now = Utc::now();
+        for canonical in builtin_profiles(now) {
+            if canonical.primary_groups.is_empty() {
+                continue;
+            }
+            let Some(existing) = self.get_profile(&canonical.id).await? else {
+                continue;
+            };
+            if !existing.primary_groups.is_empty() {
+                continue;
+            }
+            let mut to_save = existing.clone();
+            to_save.primary_groups = canonical.primary_groups.clone();
+            to_save.updated_at = Utc::now();
+            self.save_profile_raw(&to_save).await?;
+            tracing::info!(
+                profile_id = %canonical.id,
+                groups = ?canonical.primary_groups,
+                "Auto-populated empty primary_groups from canonical seed"
+            );
+        }
+        Ok(())
+    }
+
+    /// Re-seed builtins whose stored `tool_selection` matches a known
+    /// pre-release shape that we now know was broken or stale.
+    ///
+    /// Currently scoped to the **coder** profile: the prior seed listed
+    /// `read/edit/write/grep/list` as group names, but `group_for("read")`
+    /// returns `"files"` — so the filter silently rejected every file
+    /// primitive. Any install still carrying that exact shape is broken
+    /// and definitely hasn't been customized, so re-seeding is safe.
+    ///
+    /// Per `feedback_tool_selection_is_tiering_not_restriction`, NEW
+    /// hard-restrict shapes for other builtin profiles do NOT belong
+    /// here — that work has to land as schema-tiering instead.
+    async fn upgrade_legacy_builtin_tool_selections(&self) -> Result<()> {
+        let legacy: &[(&str, &[&str])] = &[
+            (
+                "coder",
+                &["{\"Groups\":[\"shell\",\"read\",\"edit\",\"write\",\"grep\",\"list\",\"memory\",\"install\",\"uninstall\"]}"],
+            ),
+        ];
+        for (id, legacy_shapes) in legacy {
+            let Some(existing) = self.get_profile(id).await? else {
+                continue;
+            };
+            let stored_shape = serde_json::to_string(&existing.tool_selection)
+                .map_err(AthenError::Serialization)?;
+            if !legacy_shapes.contains(&stored_shape.as_str()) {
+                continue;
+            }
+            let Some(canonical) = canonical_builtin_profile(id) else {
+                continue;
+            };
+            let mut to_save = existing.clone();
+            to_save.tool_selection = canonical.tool_selection;
+            to_save.updated_at = Utc::now();
+            self.save_profile_raw(&to_save).await?;
+            tracing::info!(
+                profile_id = %id,
+                "Upgraded builtin profile tool_selection from legacy shape to current canonical"
+            );
         }
         Ok(())
     }
@@ -139,12 +234,15 @@ impl SqliteProfileStore {
                 serde_json::to_string(&p.tool_selection).map_err(AthenError::Serialization)?;
             let expertise_json =
                 serde_json::to_string(&p.expertise).map_err(AthenError::Serialization)?;
+            let primary_groups_json =
+                serde_json::to_string(&p.primary_groups).map_err(AthenError::Serialization)?;
             conn.execute(
                 "INSERT OR REPLACE INTO agent_profiles \
                  (id, display_name, description, persona_template_ids_json, \
                   custom_persona_addendum, tool_selection_json, expertise_json, \
-                  model_profile_hint, builtin, created_at, updated_at) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                  model_profile_hint, builtin, created_at, updated_at, \
+                  primary_groups_json) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
                 params![
                     p.id,
                     p.display_name,
@@ -157,6 +255,7 @@ impl SqliteProfileStore {
                     p.builtin as i64,
                     p.created_at.to_rfc3339(),
                     p.updated_at.to_rfc3339(),
+                    primary_groups_json,
                 ],
             )
             .map_err(|e| AthenError::Other(format!("Insert profile: {e}")))?;
@@ -191,7 +290,8 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
               task_kinds: Vec<TaskKindTag>,
               strengths: Vec<&str>,
               avoid: Vec<TaskKindTag>,
-              tool_selection: ToolSelection|
+              tool_selection: ToolSelection,
+              primary_groups: Vec<&str>|
      -> AgentProfile {
         AgentProfile {
             id: id.to_string(),
@@ -200,6 +300,7 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
             persona_template_ids: vec![],
             custom_persona_addendum: addendum.map(|s| s.to_string()),
             tool_selection,
+            primary_groups: primary_groups.into_iter().map(String::from).collect(),
             expertise: ExpertiseDeclaration {
                 domains,
                 task_kinds,
@@ -225,6 +326,7 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
             persona_template_ids: vec![],
             custom_persona_addendum: None,
             tool_selection: ToolSelection::All,
+            primary_groups: vec![],
             expertise: ExpertiseDeclaration::default(),
             model_profile_hint: None,
             builtin: true,
@@ -256,6 +358,7 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
             vec!["calendar triage", "inbox zero", "follow-up tracking"],
             vec![],
             ToolSelection::All,
+            vec![],
         ),
         mk(
             "coder",
@@ -289,17 +392,24 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
             // shell access, scratch memory, and package management — every
             // group needed to land code, none that aren't. Users can edit
             // this via the profile UI; "Restore default" reseeds it.
+            //
+            // NOTE on group names: `group_for("read"/"edit"/"write"/"grep"/
+            // "list_directory")` returns `"files"` — listing those tool names
+            // individually as groups would silently match nothing. Use the
+            // canonical group ids from `tool_grouping::group_for`.
             ToolSelection::Groups(vec![
+                "files".into(),
                 "shell".into(),
-                "read".into(),
-                "edit".into(),
-                "write".into(),
-                "grep".into(),
-                "list".into(),
                 "memory".into(),
                 "install".into(),
                 "uninstall".into(),
+                "identity".into(),
+                "http".into(),
+                "fetch".into(),
+                "create".into(),
             ]),
+            // Tier-1 schema set mirrors the callable surface.
+            vec!["files", "shell", "memory", "install", "uninstall"],
         ),
         mk(
             "devops",
@@ -326,6 +436,7 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
             ],
             vec![],
             ToolSelection::All,
+            vec!["files", "shell", "memory", "install", "uninstall"],
         ),
         mk(
             "systems_architect",
@@ -348,7 +459,11 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
                 "failure modes",
             ],
             vec![],
+            // ToolSelection::All deliberately — see feedback memory
+            // `tool-selection-is-tiering-not-restriction`. Narrowing
+            // belongs in the per-profile schema-tiering work, not here.
             ToolSelection::All,
+            vec!["files", "web", "memory"],
         ),
         mk(
             "technical_support",
@@ -372,6 +487,7 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
             ],
             vec![],
             ToolSelection::All,
+            vec![],
         ),
         mk(
             "researcher",
@@ -388,6 +504,7 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
             vec!["source triangulation", "literature review", "fact-checking"],
             vec![],
             ToolSelection::All,
+            vec!["web", "files", "memory"],
         ),
         mk(
             "marketing",
@@ -413,6 +530,7 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
             ],
             vec![TaskKindTag::Coding, TaskKindTag::Debugging],
             ToolSelection::All,
+            vec!["web", "email", "send", "files", "memory", "contacts"],
         ),
         mk(
             "social_media",
@@ -442,6 +560,7 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
             ],
             vec![TaskKindTag::Coding, TaskKindTag::Debugging],
             ToolSelection::All,
+            vec!["web", "send", "files", "memory"],
         ),
         mk(
             "outreach",
@@ -464,6 +583,7 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
             ],
             vec![TaskKindTag::Coding, TaskKindTag::Debugging],
             ToolSelection::All,
+            vec!["web", "email", "send", "files", "memory", "contacts"],
         ),
         mk(
             "lawyer",
@@ -490,6 +610,7 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
             ],
             vec![],
             ToolSelection::All,
+            vec!["web", "files", "memory"],
         ),
         mk(
             "doctor",
@@ -516,6 +637,7 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
             ],
             vec![],
             ToolSelection::All,
+            vec!["web", "files", "memory"],
         ),
     ]
 }
@@ -559,6 +681,7 @@ struct ProfileRow {
     builtin: i64,
     created_at: String,
     updated_at: String,
+    primary_groups_json: String,
 }
 
 fn row_to_profile(row: ProfileRow) -> Result<AgentProfile> {
@@ -566,6 +689,8 @@ fn row_to_profile(row: ProfileRow) -> Result<AgentProfile> {
         serde_json::from_str(&row.persona_template_ids_json).map_err(AthenError::Serialization)?;
     let tool_selection: ToolSelection =
         serde_json::from_str(&row.tool_selection_json).map_err(AthenError::Serialization)?;
+    let primary_groups: Vec<String> =
+        serde_json::from_str(&row.primary_groups_json).map_err(AthenError::Serialization)?;
     let expertise: ExpertiseDeclaration =
         serde_json::from_str(&row.expertise_json).map_err(AthenError::Serialization)?;
     Ok(AgentProfile {
@@ -575,6 +700,7 @@ fn row_to_profile(row: ProfileRow) -> Result<AgentProfile> {
         persona_template_ids,
         custom_persona_addendum: row.custom_persona_addendum,
         tool_selection,
+        primary_groups,
         expertise,
         model_profile_hint: row.model_profile_hint,
         builtin: row.builtin != 0,
@@ -585,7 +711,7 @@ fn row_to_profile(row: ProfileRow) -> Result<AgentProfile> {
 
 const PROFILE_COLS: &str = "id, display_name, description, persona_template_ids_json, \
      custom_persona_addendum, tool_selection_json, expertise_json, \
-     model_profile_hint, builtin, created_at, updated_at";
+     model_profile_hint, builtin, created_at, updated_at, primary_groups_json";
 
 fn read_profile_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProfileRow> {
     Ok(ProfileRow {
@@ -600,6 +726,7 @@ fn read_profile_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProfileRow> {
         builtin: row.get(8)?,
         created_at: row.get(9)?,
         updated_at: row.get(10)?,
+        primary_groups_json: row.get(11)?,
     })
 }
 
@@ -936,17 +1063,11 @@ mod tests {
             .expect("coder profile seeded");
         match &coder.tool_selection {
             ToolSelection::Groups(groups) => {
-                for required in [
-                    "shell",
-                    "read",
-                    "edit",
-                    "write",
-                    "grep",
-                    "list",
-                    "memory",
-                    "install",
-                    "uninstall",
-                ] {
+                // Canonical group ids from `tool_grouping::group_for`. Note
+                // `read`/`edit`/`write`/`grep`/`list_directory` all collapse
+                // to the "files" group — listing them individually would
+                // silently match nothing.
+                for required in ["files", "shell", "memory", "install", "uninstall"] {
                     assert!(
                         groups.iter().any(|g| g == required),
                         "coder profile missing required group `{required}`"
@@ -996,6 +1117,7 @@ mod tests {
             persona_template_ids: vec!["concise_voice".into()],
             custom_persona_addendum: Some("Optimize for conversions.".into()),
             tool_selection: ToolSelection::Groups(vec!["web".into(), "email".into()]),
+            primary_groups: vec![],
             expertise: ExpertiseDeclaration {
                 domains: vec![athen_core::agent_profile::DomainTag::Marketing],
                 ..Default::default()
@@ -1102,6 +1224,7 @@ mod tests {
             persona_template_ids: vec![],
             custom_persona_addendum: None,
             tool_selection: ToolSelection::All,
+            primary_groups: vec![],
             expertise: ExpertiseDeclaration::default(),
             model_profile_hint: None,
             builtin: false,
