@@ -6575,10 +6575,15 @@ pub async fn mcp_test_spawn(
 }
 
 /// Tool descriptor wire shape for the expanded UI row.
+///
+/// `base_risk` is the *stamped* risk for the tool — the registry has
+/// already folded in the per-server default + per-tool overrides — so
+/// the UI can render the current effective level without re-deriving it.
 #[derive(Serialize)]
 pub struct McpToolView {
     pub name: String,
     pub description: Option<String>,
+    pub base_risk: athen_core::risk::BaseImpact,
 }
 
 #[tauri::command]
@@ -6596,8 +6601,68 @@ pub async fn mcp_list_tools_for(
         .map(|t| McpToolView {
             name: t.name,
             description: t.description,
+            base_risk: t.base_risk,
         })
         .collect())
+}
+
+/// Update per-server default risk + per-tool risk overrides for a
+/// custom (BYO) MCP. Persists the change to `mcp_custom_entries` and
+/// updates the live registry in place (no respawn — the child process
+/// keeps running, only the in-memory risk metadata changes).
+///
+/// `tool_overrides` should only contain entries that differ from
+/// `default_risk` — the UI is expected to filter pass-throughs before
+/// calling. Sending the full set still works, just wastes JSON.
+///
+/// Returns an error if the id is not in `mcp_custom_entries` — bundled
+/// catalog entries aren't user-editable through this path (they have
+/// no UI affordance today and the bundled catalog is empty).
+#[tauri::command]
+pub async fn mcp_set_risks(
+    id: String,
+    default_risk: athen_core::risk::BaseImpact,
+    tool_overrides: std::collections::HashMap<String, athen_core::risk::BaseImpact>,
+    state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    let Some(store) = &state.mcp_store else {
+        return Err("MCP persistence not available".into());
+    };
+
+    // Resolve the existing definition. Risk overrides for the bundled
+    // catalog (none exist today) are out of scope — only custom entries
+    // are addressable here.
+    let mut entry = store
+        .get_custom(&id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Unknown custom MCP id: {id}"))?;
+
+    entry.base_risk = default_risk;
+    entry.tool_risks = tool_overrides.clone();
+
+    // Persist BEFORE mutating the live registry so a SQLite failure
+    // doesn't leave the live + persisted views out of sync.
+    store.add_custom(&entry).await.map_err(|e| e.to_string())?;
+
+    // Best-effort live update. The server might not be currently
+    // enabled (the user disabled it from the same panel); in that case
+    // there's nothing to update and the persisted change is enough —
+    // the next `enable` will pick up the new risks.
+    if let Err(e) = state
+        .mcp
+        .update_risks(&id, default_risk, tool_overrides)
+        .await
+    {
+        // Log but don't fail — persistence is the source of truth.
+        tracing::info!(
+            mcp = %id,
+            error = %e,
+            "live registry update skipped (probably not enabled)"
+        );
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

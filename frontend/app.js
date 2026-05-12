@@ -11242,29 +11242,215 @@ function mcpServerCommandLine(entry) {
 function toggleMcpServerExpand(id) {
     if (mcpServersExpanded.has(id)) {
         mcpServersExpanded.delete(id);
+        // Drop any in-flight edit state so a re-expand re-reads the
+        // canonical persisted view (no stale dirty flag carrying over).
+        mcpServersRiskState.delete(id);
     } else {
         mcpServersExpanded.add(id);
     }
     renderMcpServersList();
 }
 
+// Risk vocabulary used in the per-server / per-tool picker. The keys
+// MUST match the `BaseImpact` Rust enum variants exactly — the Tauri
+// command deserializes them straight into `BaseImpact`. The labels are
+// the user-facing human strings (matched against existing risk-level
+// rendering conventions in the rest of the UI).
+const MCP_RISK_LEVELS = [
+    { value: 'Read',         label: 'Read (silent)' },
+    { value: 'WriteTemp',    label: 'Notify (fire and notify)' },
+    { value: 'WritePersist', label: 'Write (ask if untrusted)' },
+    { value: 'System',       label: 'System (always ask)' },
+];
+
+function mcpRiskOptionsHtml(selected) {
+    return MCP_RISK_LEVELS
+        .map((r) => `<option value="${r.value}"${r.value === selected ? ' selected' : ''}>${escapeHtml(r.label)}</option>`)
+        .join('');
+}
+
+// Per-expanded-pane edit state, keyed by mcp id. Cleared when the user
+// hits Save (or the pane is collapsed). Holds:
+//   defaultRisk : current value of the per-server default dropdown
+//   toolRisks   : Map<toolName, currentRiskValue> (every tool, not just dirty ones)
+//   savedDefault: the value persisted on the backend (for dirty detection)
+//   savedTools  : Map<toolName, persistedRiskValue> (ditto)
+const mcpServersRiskState = new Map();
+
 async function loadMcpServerTools(id) {
     const pane = document.querySelector(`[data-mcp-expand="${cssEscape(id)}"]`);
     if (!pane) return;
+
+    // Find the persisted server default. `mcpServersCustom` is the
+    // hydrated McpCatalogEntry list, which now carries `base_risk` +
+    // `tool_risks` (added in this change). Old persisted entries (pre
+    // serde defaults) might be missing the field — fall back to the
+    // conservative `WritePersist`.
+    const entry = mcpServersCustom.find((e) => e.id === id);
+    const persistedDefault = (entry && entry.base_risk) ? entry.base_risk : 'WritePersist';
+    const persistedTools = (entry && entry.tool_risks) ? entry.tool_risks : {};
+
     try {
         const tools = await invoke('mcp_list_tools_for', { id });
         if (!tools || tools.length === 0) {
             pane.innerHTML = '<p class="setting-hint">This server advertised no tools.</p>';
             return;
         }
-        pane.innerHTML = `<ul class="mcp-server-tool-list">${tools.map((t) => `
-            <li>
-                <code>${escapeHtml(t.name)}</code>
-                ${t.description ? `<span class="mcp-server-tool-desc">${escapeHtml(t.description)}</span>` : ''}
-            </li>
-        `).join('')}</ul>`;
+
+        // Seed local edit state from the registry-stamped risk on each
+        // tool. The stamped value already reflects per-tool overrides
+        // when present, so this is the right starting point.
+        const toolRisks = new Map();
+        const savedTools = new Map();
+        for (const t of tools) {
+            const stamped = t.base_risk || persistedDefault;
+            toolRisks.set(t.name, stamped);
+            // For dirty detection we compare against the stored per-tool
+            // override (if any) — falling back to the persisted server
+            // default. This matches the "only send overrides that differ
+            // from the default" contract.
+            const persistedOverride = Object.prototype.hasOwnProperty.call(persistedTools, t.name)
+                ? persistedTools[t.name]
+                : persistedDefault;
+            savedTools.set(t.name, persistedOverride);
+        }
+        mcpServersRiskState.set(id, {
+            defaultRisk: persistedDefault,
+            toolRisks,
+            savedDefault: persistedDefault,
+            savedTools,
+        });
+
+        const escapedId = escapeHtml(id);
+        pane.innerHTML = `
+            <div class="mcp-server-risk-default">
+                <label for="mcp-server-default-risk-${escapedId}">Default risk for tools from this server</label>
+                <select id="mcp-server-default-risk-${escapedId}" class="settings-input mcp-server-default-risk-select" data-mcp-id="${escapedId}">
+                    ${mcpRiskOptionsHtml(persistedDefault)}
+                </select>
+                <p class="setting-hint">Sets the risk level applied to every tool from this server unless you override it per tool below.</p>
+            </div>
+            <ul class="mcp-server-tool-list mcp-server-tool-list-risk">
+                ${tools.map((t) => `
+                    <li class="mcp-server-tool-row" data-tool-name="${escapeHtml(t.name)}">
+                        <div class="mcp-server-tool-info">
+                            <code>${escapeHtml(t.name)}</code>
+                            ${t.description ? `<span class="mcp-server-tool-desc">${escapeHtml(t.description)}</span>` : ''}
+                        </div>
+                        <select class="settings-input mcp-server-tool-risk-select" data-mcp-id="${escapedId}" data-tool-name="${escapeHtml(t.name)}">
+                            ${mcpRiskOptionsHtml(toolRisks.get(t.name))}
+                        </select>
+                    </li>
+                `).join('')}
+            </ul>
+            <div class="mcp-server-risk-actions">
+                <button class="btn-primary mcp-server-risk-save-btn" data-mcp-id="${escapedId}" type="button" disabled>Save risk levels</button>
+                <span class="mcp-server-risk-status" data-mcp-id="${escapedId}"></span>
+            </div>
+        `;
+
+        // Wire the dropdowns to update local state + recompute dirty.
+        const defaultSel = pane.querySelector('.mcp-server-default-risk-select');
+        if (defaultSel) {
+            defaultSel.addEventListener('change', (ev) => {
+                const s = mcpServersRiskState.get(id);
+                if (!s) return;
+                s.defaultRisk = ev.target.value;
+                refreshMcpRiskDirty(id);
+            });
+        }
+        pane.querySelectorAll('.mcp-server-tool-risk-select').forEach((sel) => {
+            sel.addEventListener('change', (ev) => {
+                const s = mcpServersRiskState.get(id);
+                if (!s) return;
+                s.toolRisks.set(ev.target.dataset.toolName, ev.target.value);
+                refreshMcpRiskDirty(id);
+            });
+        });
+        const saveBtn = pane.querySelector('.mcp-server-risk-save-btn');
+        if (saveBtn) {
+            saveBtn.addEventListener('click', () => saveMcpServerRisks(id));
+        }
     } catch (err) {
         pane.innerHTML = `<p class="setting-hint" style="color:#fca5a5;">Failed to list tools: ${escapeHtml(String(err))}</p>`;
+    }
+}
+
+function refreshMcpRiskDirty(id) {
+    const s = mcpServersRiskState.get(id);
+    if (!s) return;
+    let dirty = s.defaultRisk !== s.savedDefault;
+    if (!dirty) {
+        for (const [tool, risk] of s.toolRisks.entries()) {
+            // The "saved" view collapses pass-throughs (where the
+            // stored override equals the server default) into the
+            // default. So an effective change is anything where the
+            // current dropdown value differs from the recorded saved
+            // override (which is also resolved against the default).
+            const saved = s.savedTools.get(tool);
+            if (saved !== risk) { dirty = true; break; }
+        }
+    }
+    const escapedId = cssEscape(id);
+    const btn = document.querySelector(`.mcp-server-risk-save-btn[data-mcp-id="${escapedId}"]`);
+    if (btn) btn.disabled = !dirty;
+}
+
+async function saveMcpServerRisks(id) {
+    const s = mcpServersRiskState.get(id);
+    if (!s) return;
+    const escapedId = cssEscape(id);
+    const btn = document.querySelector(`.mcp-server-risk-save-btn[data-mcp-id="${escapedId}"]`);
+    const statusEl = document.querySelector(`.mcp-server-risk-status[data-mcp-id="${escapedId}"]`);
+    if (btn) btn.disabled = true;
+    if (statusEl) {
+        statusEl.className = 'mcp-server-risk-status mcp-server-risk-status-pending';
+        statusEl.textContent = 'Saving…';
+    }
+
+    // Only send overrides that DIFFER from the chosen default — the
+    // backend default applies everywhere else and keeps the persisted
+    // overrides map small.
+    const tool_overrides = {};
+    for (const [tool, risk] of s.toolRisks.entries()) {
+        if (risk !== s.defaultRisk) {
+            tool_overrides[tool] = risk;
+        }
+    }
+
+    try {
+        await invoke('mcp_set_risks', {
+            id,
+            defaultRisk: s.defaultRisk,
+            toolOverrides: tool_overrides,
+        });
+        // Recompute saved baseline from the just-saved values.
+        s.savedDefault = s.defaultRisk;
+        s.savedTools = new Map(s.toolRisks);
+        // Also refresh `mcpServersCustom` so a later collapse/expand
+        // cycle uses the new persisted shape.
+        const entry = mcpServersCustom.find((e) => e.id === id);
+        if (entry) {
+            entry.base_risk = s.defaultRisk;
+            entry.tool_risks = { ...tool_overrides };
+        }
+        if (statusEl) {
+            statusEl.className = 'mcp-server-risk-status mcp-server-risk-status-ok';
+            statusEl.textContent = 'Saved';
+            setTimeout(() => {
+                if (statusEl.textContent === 'Saved') {
+                    statusEl.textContent = '';
+                    statusEl.className = 'mcp-server-risk-status';
+                }
+            }, 2000);
+        }
+        refreshMcpRiskDirty(id);
+    } catch (err) {
+        if (statusEl) {
+            statusEl.className = 'mcp-server-risk-status mcp-server-risk-status-fail';
+            statusEl.textContent = `Failed: ${String(err)}`;
+        }
+        if (btn) btn.disabled = false;
     }
 }
 

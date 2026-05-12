@@ -276,6 +276,7 @@ mod tests {
                 working_dir: None,
             },
             base_risk: BaseImpact::WritePersist,
+            tool_risks: std::collections::HashMap::new(),
         };
 
         store.add_custom(&entry).await.unwrap();
@@ -318,10 +319,99 @@ mod tests {
                 working_dir: None,
             },
             base_risk: BaseImpact::Read,
+            tool_risks: std::collections::HashMap::new(),
         };
         store.add_custom(&entry).await.unwrap();
         // No `enable()` call — the custom definition exists but no live instance.
         assert!(store.list_enabled().await.unwrap().is_empty());
         assert_eq!(store.list_custom().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn custom_entry_preserves_tool_risks_across_roundtrip() {
+        use athen_core::risk::BaseImpact;
+        use athen_core::traits::mcp::{McpCatalogEntry, McpSource};
+
+        let db = Database::in_memory().await.unwrap();
+        let store = db.mcp_store();
+
+        let mut tool_risks = std::collections::HashMap::new();
+        tool_risks.insert("delete_file".to_string(), BaseImpact::System);
+        tool_risks.insert("read_file".to_string(), BaseImpact::Read);
+
+        let entry = McpCatalogEntry {
+            id: "fs".into(),
+            display_name: "Files".into(),
+            description: String::new(),
+            icon: None,
+            config_schema: serde_json::json!({}),
+            source: McpSource::Process {
+                command: "/bin/true".into(),
+                args: vec![],
+                env: vec![],
+                working_dir: None,
+            },
+            base_risk: BaseImpact::WriteTemp,
+            tool_risks,
+        };
+        store.add_custom(&entry).await.unwrap();
+
+        let fetched = store.get_custom("fs").await.unwrap().unwrap();
+        assert_eq!(fetched.base_risk, BaseImpact::WriteTemp);
+        assert_eq!(
+            fetched.tool_risks.get("delete_file").copied(),
+            Some(BaseImpact::System)
+        );
+        assert_eq!(
+            fetched.tool_risks.get("read_file").copied(),
+            Some(BaseImpact::Read)
+        );
+        assert!(!fetched.tool_risks.contains_key("write_file"));
+    }
+
+    #[tokio::test]
+    async fn loads_phase1_shape_without_tool_risks() {
+        // Hand-craft a row matching the Phase-1 persisted JSON shape (no
+        // `tool_risks` field). Inserting via raw SQL so we don't rely on
+        // serde to round-trip a missing field. Verifies that existing
+        // user data continues to load cleanly with default risk fields.
+        use athen_core::traits::mcp::McpCatalogEntry;
+
+        let db = Database::in_memory().await.unwrap();
+        let store = db.mcp_store();
+
+        // Old-shape JSON: pre-#TASK, no `tool_risks`. `base_risk` is also
+        // omitted (the field existed but #[serde(default)] keeps even
+        // pre-base_risk shapes loading).
+        let old_json = r#"{
+            "id": "legacy",
+            "display_name": "Legacy",
+            "description": "Old row",
+            "icon": null,
+            "config_schema": {},
+            "source": {
+                "kind": "process",
+                "command": "/bin/true",
+                "args": [],
+                "env": [],
+                "working_dir": null
+            }
+        }"#;
+
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO mcp_custom_entries (id, definition, enabled_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params!["legacy", old_json, chrono::Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+        }
+
+        let listed = store.list_custom().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        let entry: &McpCatalogEntry = &listed[0];
+        // Both new fields take their defaults from serde.
+        assert!(entry.tool_risks.is_empty());
+        assert_eq!(entry.base_risk, athen_core::risk::BaseImpact::WritePersist);
     }
 }

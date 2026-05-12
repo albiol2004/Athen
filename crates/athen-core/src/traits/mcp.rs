@@ -6,11 +6,21 @@
 //! which entries the user has enabled and lazily spawns the underlying
 //! processes on demand.
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 use crate::risk::BaseImpact;
+
+/// Default for `McpCatalogEntry::base_risk` when deserializing an older
+/// persisted shape that pre-dates the per-server risk field. Conservative
+/// by design — anything sketchier than `WritePersist` would be a regression
+/// for users who already had MCPs configured.
+fn default_mcp_base_risk() -> BaseImpact {
+    BaseImpact::WritePersist
+}
 
 /// One catalog entry — a "branded" MCP available for the user to enable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,8 +39,16 @@ pub struct McpCatalogEntry {
     /// How the MCP is delivered. Bundled binaries ship with Athen; downloads
     /// are fetched on first enable (not yet implemented).
     pub source: McpSource,
-    /// Default base risk for tool calls coming from this MCP.
+    /// Default base risk for tool calls coming from this MCP. Used as a
+    /// per-server fallback when a tool isn't keyed in `tool_risks`.
+    /// `serde(default)` keeps old persisted entries (Phase 1 shape) loading.
+    #[serde(default = "default_mcp_base_risk")]
     pub base_risk: BaseImpact,
+    /// Per-tool risk overrides. If a tool isn't keyed here, `base_risk`
+    /// (the per-server default) applies. Keys are bare tool names as the
+    /// MCP server advertises them (no `<mcp_id>__` prefix).
+    #[serde(default)]
+    pub tool_risks: HashMap<String, BaseImpact>,
 }
 
 /// Where the MCP server binary comes from.
@@ -93,6 +111,12 @@ pub struct McpToolDescriptor {
     pub description: Option<String>,
     /// JSON Schema for the tool's input.
     pub input_schema: serde_json::Value,
+    /// Effective risk level for this tool, computed by the registry as
+    /// `tool_risks.get(name).unwrap_or(catalog_entry.base_risk)`. Callers
+    /// stamp this onto `ToolDefinition.base_risk` without needing to know
+    /// about the catalog wiring. `serde(default)` keeps old shapes loading.
+    #[serde(default = "default_mcp_base_risk")]
+    pub base_risk: BaseImpact,
 }
 
 /// Result of an MCP tool call.
@@ -158,6 +182,7 @@ mod tests {
                 working_dir: None,
             },
             base_risk: BaseImpact::WritePersist,
+            tool_risks: HashMap::new(),
         };
 
         let json = serde_json::to_value(&entry).unwrap();
@@ -210,5 +235,85 @@ mod tests {
         let json = serde_json::to_value(&src).unwrap();
         assert_eq!(json["kind"], "bundled");
         assert_eq!(json["binary_name"], "athen-mcp-files");
+    }
+
+    #[test]
+    fn tool_risks_roundtrip_with_default_fallthrough() {
+        // Lock the JSON shape: an entry with one tool keyed at `System`,
+        // a second tool falling through to the per-server `WritePersist`
+        // default. The serialized shape must keep `tool_risks` as a map
+        // and `base_risk` as a string variant.
+        let mut tool_risks = HashMap::new();
+        tool_risks.insert("delete_file".to_string(), BaseImpact::System);
+
+        let entry = McpCatalogEntry {
+            id: "files".into(),
+            display_name: "Files".into(),
+            description: "Filesystem MCP".into(),
+            icon: None,
+            config_schema: serde_json::json!({}),
+            source: McpSource::Bundled {
+                binary_name: "athen-mcp-files".into(),
+            },
+            base_risk: BaseImpact::WritePersist,
+            tool_risks,
+        };
+
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["base_risk"], "WritePersist");
+        assert_eq!(json["tool_risks"]["delete_file"], "System");
+        // `read_file` is NOT in tool_risks — falls through to base_risk
+        // at lookup time. Schema should reflect that absence.
+        assert!(json["tool_risks"].get("read_file").is_none());
+
+        let back: McpCatalogEntry = serde_json::from_value(json).unwrap();
+        assert_eq!(back.base_risk, BaseImpact::WritePersist);
+        assert_eq!(
+            back.tool_risks.get("delete_file").copied(),
+            Some(BaseImpact::System)
+        );
+        assert!(!back.tool_risks.contains_key("read_file"));
+    }
+
+    #[test]
+    fn old_shape_without_tool_risks_still_loads() {
+        // Phase-1 persisted JSON shape — no `tool_risks` field, no
+        // `base_risk` field (the latter was already present in #184 but
+        // we double-test the `serde(default)` annotations together so
+        // migrations stay safe). Must deserialize cleanly with defaults.
+        let json = serde_json::json!({
+            "id": "byo-github",
+            "display_name": "GitHub (BYO)",
+            "description": "User-installed GitHub MCP",
+            "icon": null,
+            "config_schema": {},
+            "source": {
+                "kind": "process",
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-github"],
+                "env": [],
+                "working_dir": null
+            }
+        });
+        let entry: McpCatalogEntry = serde_json::from_value(json).unwrap();
+        assert_eq!(entry.id, "byo-github");
+        // base_risk defaults to WritePersist (the conservative fallback).
+        assert_eq!(entry.base_risk, BaseImpact::WritePersist);
+        // tool_risks defaults to an empty map.
+        assert!(entry.tool_risks.is_empty());
+    }
+
+    #[test]
+    fn tool_descriptor_default_risk_for_old_shape() {
+        // `McpToolDescriptor` also gained `base_risk`. Existing serialized
+        // descriptors (if any leak into persistence) must round-trip.
+        let json = serde_json::json!({
+            "mcp_id": "files",
+            "name": "read_file",
+            "description": "Read a file",
+            "input_schema": {}
+        });
+        let desc: McpToolDescriptor = serde_json::from_value(json).unwrap();
+        assert_eq!(desc.base_risk, BaseImpact::WritePersist);
     }
 }

@@ -2017,7 +2017,9 @@ impl ToolRegistry for AppToolRegistry {
                                 command: String::new(),
                                 native: false,
                             },
-                            base_risk: BaseImpact::WritePersist,
+                            // Stamped by the registry from per-server default
+                            // + per-tool overrides on `McpCatalogEntry`.
+                            base_risk: t.base_risk,
                         });
                     }
                 }
@@ -3308,6 +3310,91 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(format!("{err}").contains("Attachment store not available"));
+        }
+    }
+
+    // ── MCP risk-stamping tests ─────────────────────────────────────
+    //
+    // Verifies the per-tool risk plumbed by the registry flows through
+    // `AppToolRegistry::list_tools()` into each `ToolDefinition.base_risk`.
+
+    mod mcp_risk {
+        use super::*;
+        use athen_core::traits::mcp::{McpCallOutcome, McpClient, McpToolDescriptor};
+        use std::sync::Arc;
+
+        /// Hand-crafted McpClient that hands back a fixed list of
+        /// descriptors with mixed risk levels. The risk values we set here
+        /// are what we expect to see on the corresponding ToolDefinitions
+        /// after `list_tools()`.
+        struct FixedRiskMcp;
+
+        #[async_trait::async_trait]
+        impl McpClient for FixedRiskMcp {
+            async fn list_tools(&self) -> Result<Vec<McpToolDescriptor>> {
+                Ok(vec![
+                    McpToolDescriptor {
+                        mcp_id: "fs".into(),
+                        name: "read_file".into(),
+                        description: Some("Read a file".into()),
+                        input_schema: serde_json::json!({}),
+                        base_risk: BaseImpact::Read,
+                    },
+                    McpToolDescriptor {
+                        mcp_id: "fs".into(),
+                        name: "delete_file".into(),
+                        description: Some("Delete a file".into()),
+                        input_schema: serde_json::json!({}),
+                        base_risk: BaseImpact::System,
+                    },
+                    McpToolDescriptor {
+                        mcp_id: "fs".into(),
+                        name: "write_file".into(),
+                        description: None,
+                        input_schema: serde_json::json!({}),
+                        base_risk: BaseImpact::WritePersist,
+                    },
+                ])
+            }
+
+            async fn call_tool(
+                &self,
+                _mcp_id: &str,
+                _tool: &str,
+                _args: serde_json::Value,
+            ) -> Result<McpCallOutcome> {
+                Ok(McpCallOutcome {
+                    success: true,
+                    text: String::new(),
+                    raw: serde_json::json!([]),
+                })
+            }
+        }
+
+        #[tokio::test]
+        async fn list_tools_stamps_per_tool_risk_from_descriptor() {
+            let shell = ShellToolRegistry::new().await;
+            let registry =
+                AppToolRegistry::new(shell, None, None, None).with_mcp(Arc::new(FixedRiskMcp));
+            let tools = registry.list_tools().await.unwrap();
+
+            // MCP tools get a prefixed name (`<mcp_id>__<tool>`).
+            let by_name: std::collections::HashMap<&str, BaseImpact> = tools
+                .iter()
+                .map(|t| (t.name.as_str(), t.base_risk))
+                .collect();
+            assert_eq!(
+                by_name.get("fs__read_file").copied(),
+                Some(BaseImpact::Read)
+            );
+            assert_eq!(
+                by_name.get("fs__delete_file").copied(),
+                Some(BaseImpact::System)
+            );
+            assert_eq!(
+                by_name.get("fs__write_file").copied(),
+                Some(BaseImpact::WritePersist)
+            );
         }
     }
 }

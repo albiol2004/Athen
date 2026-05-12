@@ -180,12 +180,22 @@ impl McpRegistry {
             .map_err(|e| AthenError::Other(format!("MCP '{mcp_id}' list_tools: {e}")))?;
         let descriptors = tools
             .into_iter()
-            .map(|t| McpToolDescriptor {
-                mcp_id: mcp_id.clone(),
-                name: t.name.to_string(),
-                description: t.description.map(|c| c.to_string()),
-                input_schema: serde_json::to_value(&t.input_schema)
-                    .unwrap_or(serde_json::json!({})),
+            .map(|t| {
+                let name = t.name.to_string();
+                let base_risk = enabled
+                    .entry
+                    .tool_risks
+                    .get(&name)
+                    .copied()
+                    .unwrap_or(enabled.entry.base_risk);
+                McpToolDescriptor {
+                    mcp_id: mcp_id.clone(),
+                    name,
+                    description: t.description.map(|c| c.to_string()),
+                    input_schema: serde_json::to_value(&t.input_schema)
+                        .unwrap_or(serde_json::json!({})),
+                    base_risk,
+                }
             })
             .collect();
         // `live` drops here → child process is killed.
@@ -204,16 +214,55 @@ impl McpRegistry {
             .list_all_tools()
             .await
             .map_err(|e| AthenError::Other(format!("MCP '{mcp_id}' list_tools: {e}")))?;
+        // Snapshot the entry's risk shape so the stamping below doesn't
+        // hold the enabled lock across the per-tool loop.
+        let (default_risk, overrides) = {
+            let enabled = self.enabled.lock().await;
+            match enabled.get(mcp_id) {
+                Some(ee) => (ee.entry.base_risk, ee.entry.tool_risks.clone()),
+                None => {
+                    // Race: spawned but the entry vanished. Treat as the
+                    // conservative default — we still want to surface the
+                    // tools so the UI doesn't strand them.
+                    (athen_core::risk::BaseImpact::WritePersist, HashMap::new())
+                }
+            }
+        };
         Ok(tools
             .into_iter()
-            .map(|t| McpToolDescriptor {
-                mcp_id: mcp_id.to_string(),
-                name: t.name.to_string(),
-                description: t.description.map(|c| c.to_string()),
-                input_schema: serde_json::to_value(&t.input_schema)
-                    .unwrap_or(serde_json::json!({})),
+            .map(|t| {
+                let name = t.name.to_string();
+                let base_risk = overrides.get(&name).copied().unwrap_or(default_risk);
+                McpToolDescriptor {
+                    mcp_id: mcp_id.to_string(),
+                    name,
+                    description: t.description.map(|c| c.to_string()),
+                    input_schema: serde_json::to_value(&t.input_schema)
+                        .unwrap_or(serde_json::json!({})),
+                    base_risk,
+                }
             })
             .collect())
+    }
+
+    /// Replace the per-server default risk + per-tool overrides for an
+    /// already-enabled MCP. The live child process is left running — only
+    /// the in-memory descriptor metadata changes, so the next
+    /// `list_tools` / `list_tools_for` call sees the new risk levels.
+    /// Errors when the id is not currently enabled.
+    pub async fn update_risks(
+        &self,
+        mcp_id: &str,
+        default_risk: athen_core::risk::BaseImpact,
+        overrides: HashMap<String, athen_core::risk::BaseImpact>,
+    ) -> Result<()> {
+        let mut enabled = self.enabled.lock().await;
+        let ee = enabled
+            .get_mut(mcp_id)
+            .ok_or_else(|| AthenError::Other(format!("MCP '{mcp_id}' is not enabled")))?;
+        ee.entry.base_risk = default_risk;
+        ee.entry.tool_risks = overrides;
+        Ok(())
     }
 
     /// Lazily acquire (or spawn) the live client for a given mcp id.
@@ -359,16 +408,29 @@ impl McpClient for McpRegistry {
         let ids = self.enabled_ids().await;
         let mut out = Vec::new();
         for id in ids {
+            // Snapshot the risk shape once per server so we don't reacquire
+            // the lock for every tool. If the entry vanished between the
+            // enabled_ids() call and here we just skip it.
+            let (default_risk, overrides) = {
+                let enabled = self.enabled.lock().await;
+                match enabled.get(&id) {
+                    Some(ee) => (ee.entry.base_risk, ee.entry.tool_risks.clone()),
+                    None => continue,
+                }
+            };
             match self.get_or_spawn(&id).await {
                 Ok(client) => match client.service.peer().list_all_tools().await {
                     Ok(tools) => {
                         for t in tools {
+                            let name = t.name.to_string();
+                            let base_risk = overrides.get(&name).copied().unwrap_or(default_risk);
                             out.push(McpToolDescriptor {
                                 mcp_id: id.clone(),
-                                name: t.name.to_string(),
+                                name,
                                 description: t.description.map(|c| c.to_string()),
                                 input_schema: serde_json::to_value(&t.input_schema)
                                     .unwrap_or(serde_json::json!({})),
+                                base_risk,
                             });
                         }
                     }
@@ -517,6 +579,7 @@ mod tests {
                 working_dir: None,
             },
             base_risk: BaseImpact::WritePersist,
+            tool_risks: std::collections::HashMap::new(),
         }
     }
 
@@ -626,6 +689,86 @@ mod tests {
                 // bug we're guarding against is a panic.
             }
         }
+    }
+
+    #[tokio::test]
+    async fn update_risks_unknown_id_errors() {
+        let reg = McpRegistry::new();
+        let res = reg
+            .update_risks("nope", BaseImpact::Read, std::collections::HashMap::new())
+            .await;
+        assert!(res.is_err(), "update_risks on unknown id should error");
+    }
+
+    #[tokio::test]
+    async fn update_risks_mutates_entry_without_respawn() {
+        // Hand-insert an EnabledEntry directly so we don't need a real
+        // child process for the metadata-only test. update_risks should
+        // ONLY change the entry's risk fields — clients map must remain
+        // untouched (preserving live PID handles in the production path).
+        let reg = McpRegistry::new();
+        let entry = process_entry("test", "/bin/true", vec![]);
+        let ee = EnabledEntry {
+            entry,
+            config: serde_json::json!({}),
+        };
+        reg.enabled.lock().await.insert("test".into(), ee);
+
+        let clients_before = reg.clients.lock().await.len();
+
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("delete_file".to_string(), BaseImpact::System);
+        overrides.insert("read_file".to_string(), BaseImpact::Read);
+        reg.update_risks("test", BaseImpact::WriteTemp, overrides.clone())
+            .await
+            .unwrap();
+
+        let enabled = reg.enabled.lock().await;
+        let updated = enabled.get("test").unwrap();
+        assert_eq!(updated.entry.base_risk, BaseImpact::WriteTemp);
+        assert_eq!(
+            updated.entry.tool_risks.get("delete_file").copied(),
+            Some(BaseImpact::System)
+        );
+        assert_eq!(
+            updated.entry.tool_risks.get("read_file").copied(),
+            Some(BaseImpact::Read)
+        );
+
+        // No new clients were spawned and no existing ones were dropped.
+        assert_eq!(reg.clients.lock().await.len(), clients_before);
+    }
+
+    #[tokio::test]
+    async fn update_risks_replaces_overrides_wholesale() {
+        // Spec says we replace, not merge. A second call with a smaller
+        // map drops the previously-set overrides.
+        let reg = McpRegistry::new();
+        let mut entry = process_entry("test", "/bin/true", vec![]);
+        let mut initial = std::collections::HashMap::new();
+        initial.insert("delete_file".to_string(), BaseImpact::System);
+        initial.insert("read_file".to_string(), BaseImpact::Read);
+        entry.tool_risks = initial;
+        reg.enabled.lock().await.insert(
+            "test".into(),
+            EnabledEntry {
+                entry,
+                config: serde_json::json!({}),
+            },
+        );
+
+        // Replace with a single-key map.
+        let mut next = std::collections::HashMap::new();
+        next.insert("delete_file".to_string(), BaseImpact::WritePersist);
+        reg.update_risks("test", BaseImpact::WritePersist, next)
+            .await
+            .unwrap();
+
+        let enabled = reg.enabled.lock().await;
+        let updated = enabled.get("test").unwrap();
+        assert_eq!(updated.entry.tool_risks.len(), 1);
+        assert!(updated.entry.tool_risks.contains_key("delete_file"));
+        assert!(!updated.entry.tool_risks.contains_key("read_file"));
     }
 
     #[tokio::test]
