@@ -9,11 +9,17 @@ use rusqlite::{params, Connection};
 use tokio::sync::Mutex;
 
 use athen_core::error::{AthenError, Result};
+use athen_core::traits::mcp::McpCatalogEntry;
 
 const MCP_SCHEMA_SQL: &str = "\
 CREATE TABLE IF NOT EXISTS mcp_enabled (
     mcp_id TEXT PRIMARY KEY,
     config TEXT NOT NULL DEFAULT '{}',
+    enabled_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mcp_custom_entries (
+    id TEXT PRIMARY KEY,
+    definition TEXT NOT NULL,
     enabled_at TEXT NOT NULL
 );
 ";
@@ -83,6 +89,88 @@ impl McpStore {
         conn.execute("DELETE FROM mcp_enabled WHERE mcp_id = ?1", params![mcp_id])
             .map_err(|e| AthenError::Other(format!("delete mcp_enabled: {e}")))?;
         Ok(())
+    }
+
+    /// Persist a user-supplied custom catalog entry (BYO MCP).
+    ///
+    /// The full `McpCatalogEntry` is serialized into the `definition`
+    /// column so it can be re-hydrated at startup without a catalog
+    /// lookup. The companion `mcp_enabled` row (with the per-instance
+    /// config blob) is still required to actually run the server — call
+    /// `enable(id, config)` after `add_custom`.
+    pub async fn add_custom(&self, entry: &McpCatalogEntry) -> Result<()> {
+        let conn = self.conn.lock().await;
+        let now = chrono::Utc::now().to_rfc3339();
+        let def = serde_json::to_string(entry)
+            .map_err(|e| AthenError::Other(format!("serialize custom mcp: {e}")))?;
+        conn.execute(
+            "INSERT INTO mcp_custom_entries (id, definition, enabled_at) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(id) DO UPDATE SET definition = excluded.definition",
+            params![entry.id, def, now],
+        )
+        .map_err(|e| AthenError::Other(format!("insert mcp_custom_entries: {e}")))?;
+        Ok(())
+    }
+
+    /// Remove a custom catalog entry. Does NOT touch `mcp_enabled` — the
+    /// caller should also call `disable(id)` to drop the running instance.
+    pub async fn remove_custom(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute("DELETE FROM mcp_custom_entries WHERE id = ?1", params![id])
+            .map_err(|e| AthenError::Other(format!("delete mcp_custom_entries: {e}")))?;
+        Ok(())
+    }
+
+    /// List every user-supplied custom catalog entry, regardless of
+    /// whether it is currently enabled.
+    pub async fn list_custom(&self) -> Result<Vec<McpCatalogEntry>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare("SELECT definition FROM mcp_custom_entries ORDER BY enabled_at ASC")
+            .map_err(|e| AthenError::Other(format!("prepare list_custom: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let def: String = row.get(0)?;
+                Ok(def)
+            })
+            .map_err(|e| AthenError::Other(format!("query list_custom: {e}")))?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            let def = r.map_err(|e| AthenError::Other(format!("row: {e}")))?;
+            match serde_json::from_str::<McpCatalogEntry>(&def) {
+                Ok(entry) => out.push(entry),
+                Err(e) => {
+                    tracing::warn!(error = %e, "skipping corrupt custom MCP definition");
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Fetch a single custom catalog entry by id.
+    pub async fn get_custom(&self, id: &str) -> Result<Option<McpCatalogEntry>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn
+            .prepare("SELECT definition FROM mcp_custom_entries WHERE id = ?1")
+            .map_err(|e| AthenError::Other(format!("prepare get_custom: {e}")))?;
+        let mut rows = stmt
+            .query(params![id])
+            .map_err(|e| AthenError::Other(format!("query get_custom: {e}")))?;
+        match rows
+            .next()
+            .map_err(|e| AthenError::Other(format!("row: {e}")))?
+        {
+            Some(row) => {
+                let def: String = row
+                    .get(0)
+                    .map_err(|e| AthenError::Other(format!("col 0: {e}")))?;
+                let entry = serde_json::from_str::<McpCatalogEntry>(&def)
+                    .map_err(|e| AthenError::Other(format!("parse custom mcp: {e}")))?;
+                Ok(Some(entry))
+            }
+            None => Ok(None),
+        }
     }
 
     pub async fn get(&self, mcp_id: &str) -> Result<Option<EnabledMcp>> {
@@ -160,5 +248,80 @@ mod tests {
         let db = Database::in_memory().await.unwrap();
         let store = db.mcp_store();
         assert!(store.get("slack").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn custom_entry_roundtrip() {
+        use athen_core::risk::BaseImpact;
+        use athen_core::traits::mcp::{EnvBinding, EnvValue, McpCatalogEntry, McpSource};
+
+        let db = Database::in_memory().await.unwrap();
+        let store = db.mcp_store();
+        let entry = McpCatalogEntry {
+            id: "byo-github".into(),
+            display_name: "GitHub (BYO)".into(),
+            description: "User-installed GitHub MCP".into(),
+            icon: None,
+            config_schema: serde_json::json!({}),
+            source: McpSource::Process {
+                command: "npx".into(),
+                args: vec!["-y".into(), "@modelcontextprotocol/server-github".into()],
+                env: vec![EnvBinding {
+                    key: "GITHUB_TOKEN".into(),
+                    value: EnvValue::Vault {
+                        scope: "mcp:byo-github".into(),
+                        key: "token".into(),
+                    },
+                }],
+                working_dir: None,
+            },
+            base_risk: BaseImpact::WritePersist,
+        };
+
+        store.add_custom(&entry).await.unwrap();
+        let listed = store.list_custom().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "byo-github");
+        assert_eq!(listed[0].display_name, "GitHub (BYO)");
+
+        let fetched = store.get_custom("byo-github").await.unwrap().unwrap();
+        match fetched.source {
+            McpSource::Process { command, args, .. } => {
+                assert_eq!(command, "npx");
+                assert_eq!(args.len(), 2);
+            }
+            _ => panic!("expected Process"),
+        }
+
+        store.remove_custom("byo-github").await.unwrap();
+        assert!(store.list_custom().await.unwrap().is_empty());
+        assert!(store.get_custom("byo-github").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn custom_and_enabled_are_independent_tables() {
+        use athen_core::risk::BaseImpact;
+        use athen_core::traits::mcp::{McpCatalogEntry, McpSource};
+
+        let db = Database::in_memory().await.unwrap();
+        let store = db.mcp_store();
+        let entry = McpCatalogEntry {
+            id: "byo".into(),
+            display_name: "BYO".into(),
+            description: String::new(),
+            icon: None,
+            config_schema: serde_json::json!({}),
+            source: McpSource::Process {
+                command: "/bin/true".into(),
+                args: vec![],
+                env: vec![],
+                working_dir: None,
+            },
+            base_risk: BaseImpact::Read,
+        };
+        store.add_custom(&entry).await.unwrap();
+        // No `enable()` call — the custom definition exists but no live instance.
+        assert!(store.list_enabled().await.unwrap().is_empty());
+        assert_eq!(store.list_custom().await.unwrap().len(), 1);
     }
 }

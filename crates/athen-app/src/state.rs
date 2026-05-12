@@ -446,7 +446,12 @@ impl AppState {
         let memory = build_memory(&router, &config.embeddings).await;
 
         // Build the MCP registry and load persisted enabled state.
-        let mcp = Arc::new(McpRegistry::new());
+        // Pass the vault through so BYO `Process` MCPs can resolve
+        // `EnvValue::Vault` bindings at spawn time.
+        let mcp = Arc::new(match vault.clone() {
+            Some(v) => McpRegistry::new_with_vault(v),
+            None => McpRegistry::new(),
+        });
         let mcp_store = database.as_ref().map(|db| db.mcp_store());
         if let Some(ref store) = mcp_store {
             if let Err(e) = restore_enabled_mcps(&mcp, store).await {
@@ -3754,23 +3759,42 @@ async fn build_coordinator_with_persistence(
 }
 
 /// Restore the set of enabled MCPs from the SQLite store into the registry.
+/// Bundled entries are matched against the in-code catalog; BYO entries
+/// deserialize their full `McpCatalogEntry` from the `mcp_custom_entries`
+/// table.
 async fn restore_enabled_mcps(registry: &Arc<McpRegistry>, store: &McpStore) -> Result<()> {
+    // Build a lookup of custom definitions so we can resolve enabled rows
+    // that have no bundled-catalog counterpart.
+    let custom_defs: std::collections::HashMap<String, athen_core::traits::mcp::McpCatalogEntry> =
+        store
+            .list_custom()
+            .await
+            .unwrap_or_else(|e| {
+                warn!("Failed to load custom MCP definitions: {e}");
+                Vec::new()
+            })
+            .into_iter()
+            .map(|e| (e.id.clone(), e))
+            .collect();
+
     let rows = store.list_enabled().await?;
     let mut entries = Vec::new();
     for row in rows {
-        match athen_mcp::lookup(&row.mcp_id) {
-            Some(entry) => {
-                entries.push(athen_mcp::EnabledEntry {
-                    entry,
-                    config: row.config,
-                });
-            }
-            None => {
-                warn!(
-                    "Persisted MCP id '{}' not found in catalog; skipping",
-                    row.mcp_id
-                );
-            }
+        if let Some(entry) = athen_mcp::lookup(&row.mcp_id) {
+            entries.push(athen_mcp::EnabledEntry {
+                entry,
+                config: row.config,
+            });
+        } else if let Some(entry) = custom_defs.get(&row.mcp_id).cloned() {
+            entries.push(athen_mcp::EnabledEntry {
+                entry,
+                config: row.config,
+            });
+        } else {
+            warn!(
+                "Persisted MCP id '{}' not found in catalog or custom registry; skipping",
+                row.mcp_id
+            );
         }
     }
     let count = entries.len();

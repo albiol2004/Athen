@@ -6269,6 +6269,338 @@ pub async fn disable_mcp(
 }
 
 // ---------------------------------------------------------------------------
+// BYO custom MCP servers (Phase 1)
+// ---------------------------------------------------------------------------
+//
+// The catalog above ships a curated set of bundled MCPs. These commands
+// power the Settings → MCP Servers panel where the user can paste a
+// Claude-Desktop-style `command + args + env` block (`McpSource::Process`)
+// and have Athen spawn it as a sandboxed subprocess. Secret env values
+// route through the vault (`mcp:<id>` scope) so they never land in
+// `mcp_custom_entries.definition`.
+
+/// Wire-shape for a single enabled server in the UI list. Status is
+/// derived on the fly from the registry; tool count comes from the live
+/// `list_tools_for` call (lazy spawn).
+#[derive(Serialize)]
+pub struct EnabledMcpView {
+    pub id: String,
+    pub display_name: String,
+    pub source_kind: String,
+    pub tool_count: Option<usize>,
+    pub status: String,
+}
+
+#[tauri::command]
+pub async fn mcp_list_custom(
+    state: State<'_, AppState>,
+) -> std::result::Result<Vec<athen_core::traits::mcp::McpCatalogEntry>, String> {
+    let Some(store) = &state.mcp_store else {
+        return Ok(Vec::new());
+    };
+    store.list_custom().await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn mcp_list_enabled(
+    state: State<'_, AppState>,
+) -> std::result::Result<Vec<EnabledMcpView>, String> {
+    let entries = state.mcp.enabled_entries().await;
+    let mut out = Vec::with_capacity(entries.len());
+    for ee in entries {
+        let id = ee.entry.id.clone();
+        let source_kind = match &ee.entry.source {
+            athen_core::traits::mcp::McpSource::Bundled { .. } => "bundled",
+            athen_core::traits::mcp::McpSource::Download { .. } => "download",
+            athen_core::traits::mcp::McpSource::Process { .. } => "process",
+        }
+        .to_string();
+        // list_tools_for triggers (or reuses) the lazy spawn. If it fails
+        // we surface the error in `status` instead of dropping the row —
+        // the UI needs to show "error: <msg>" for misconfigured servers.
+        let (tool_count, status) = match state.mcp.list_tools_for(&id).await {
+            Ok(tools) => (Some(tools.len()), "ok".to_string()),
+            Err(e) => (None, format!("error: {e}")),
+        };
+        out.push(EnabledMcpView {
+            id,
+            display_name: ee.entry.display_name,
+            source_kind,
+            tool_count,
+            status,
+        });
+    }
+    Ok(out)
+}
+
+/// Persist a BYO MCP definition + (optionally) enable it now.
+///
+/// `env_secrets` maps an env-var KEY to the secret value the user typed
+/// in the modal. The corresponding `EnvBinding` in `entry.source` should
+/// already declare that env as `EnvValue::Vault { scope, key }` — this
+/// command writes the secret to the vault at that location BEFORE
+/// persisting the definition row, so a vault failure leaves no orphan
+/// definition pointing at a missing secret.
+#[tauri::command]
+pub async fn mcp_add_custom(
+    entry: athen_core::traits::mcp::McpCatalogEntry,
+    env_secrets: std::collections::HashMap<String, String>,
+    enable_now: bool,
+    state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    let Some(store) = &state.mcp_store else {
+        return Err("MCP persistence not available".into());
+    };
+
+    // Write every secret first; persist after. Vault writes are
+    // idempotent (upsert), so re-saving an existing entry overwrites the
+    // old secret cleanly.
+    if let athen_core::traits::mcp::McpSource::Process { env, .. } = &entry.source {
+        if let Some(vault) = state.vault.as_ref() {
+            for binding in env {
+                if let athen_core::traits::mcp::EnvValue::Vault { scope, key } = &binding.value {
+                    if let Some(value) = env_secrets.get(&binding.key) {
+                        if value.is_empty() {
+                            // Empty → don't overwrite an existing secret
+                            // (matches the "leave blank to keep" pattern).
+                            continue;
+                        }
+                        vault
+                            .set(scope, key, value)
+                            .await
+                            .map_err(|e| format!("Vault write for {}: {e}", binding.key))?;
+                    }
+                }
+            }
+        } else if env
+            .iter()
+            .any(|b| matches!(b.value, athen_core::traits::mcp::EnvValue::Vault { .. }))
+        {
+            return Err("Vault not available — cannot store MCP secrets".into());
+        }
+    }
+
+    store.add_custom(&entry).await.map_err(|e| e.to_string())?;
+
+    if enable_now {
+        let cfg = serde_json::json!({});
+        state
+            .mcp
+            .enable_custom(entry.clone(), cfg.clone())
+            .await
+            .map_err(|e| e.to_string())?;
+        store
+            .enable(&entry.id, &cfg)
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Err(e) = state.refresh_tools_doc().await {
+            tracing::warn!("Failed to refresh TOOLS.md after mcp_add_custom: {e}");
+        }
+    }
+    Ok(())
+}
+
+/// Remove a BYO MCP entry. Disables in registry, drops persistence,
+/// best-effort cleans up vault entries (failure logged, not surfaced —
+/// the definition is gone either way and the UI must succeed).
+#[tauri::command]
+pub async fn mcp_remove_custom(
+    id: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    let Some(store) = &state.mcp_store else {
+        return Err("MCP persistence not available".into());
+    };
+
+    // Vault cleanup BEFORE the definition row vanishes so we still know
+    // which scope/key pairs to delete.
+    if let Some(vault) = state.vault.as_ref() {
+        if let Ok(Some(entry)) = store.get_custom(&id).await {
+            if let athen_core::traits::mcp::McpSource::Process { env, .. } = &entry.source {
+                for binding in env {
+                    if let athen_core::traits::mcp::EnvValue::Vault { scope, key } = &binding.value
+                    {
+                        if let Err(e) = vault.delete(scope, key).await {
+                            tracing::warn!(
+                                mcp = %id,
+                                env_key = %binding.key,
+                                error = %e,
+                                "vault delete for custom MCP failed (best effort)"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    state.mcp.disable(&id).await;
+    store.disable(&id).await.map_err(|e| e.to_string())?;
+    store.remove_custom(&id).await.map_err(|e| e.to_string())?;
+    if let Err(e) = state.refresh_tools_doc().await {
+        tracing::warn!("Failed to refresh TOOLS.md after mcp_remove_custom: {e}");
+    }
+    Ok(())
+}
+
+/// Toggle a server on/off without dropping its definition. Works for
+/// both bundled (catalog) ids and custom ids (`mcp_custom_entries`).
+#[tauri::command]
+pub async fn mcp_set_enabled(
+    id: String,
+    enable: bool,
+    state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    let Some(store) = &state.mcp_store else {
+        return Err("MCP persistence not available".into());
+    };
+    if enable {
+        // Prefer the bundled catalog (matches behaviour for stable ids);
+        // fall back to the custom registry for BYO entries.
+        let cfg = match store.get(&id).await.map_err(|e| e.to_string())? {
+            Some(row) => row.config,
+            None => serde_json::json!({}),
+        };
+        if let Some(entry) = athen_mcp::lookup(&id) {
+            state
+                .mcp
+                .enable_custom(entry, cfg.clone())
+                .await
+                .map_err(|e| e.to_string())?;
+        } else if let Some(entry) = store.get_custom(&id).await.map_err(|e| e.to_string())? {
+            state
+                .mcp
+                .enable_custom(entry, cfg.clone())
+                .await
+                .map_err(|e| e.to_string())?;
+        } else {
+            return Err(format!("Unknown MCP id: {id}"));
+        }
+        store.enable(&id, &cfg).await.map_err(|e| e.to_string())?;
+    } else {
+        state.mcp.disable(&id).await;
+        store.disable(&id).await.map_err(|e| e.to_string())?;
+    }
+    if let Err(e) = state.refresh_tools_doc().await {
+        tracing::warn!("Failed to refresh TOOLS.md after mcp_set_enabled: {e}");
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+pub struct McpTestSpawnResult {
+    pub tool_count: usize,
+    pub tool_names: Vec<String>,
+}
+
+/// Dry-run an MCP definition before saving: spawn → handshake →
+/// list_tools → drop. `env_secrets` is plumbed through the vault so the
+/// test sees exactly what `mcp_add_custom` would persist. Nothing is
+/// written to SQLite or to the live registry. A temporary vault scope
+/// (`mcp:test-spawn:<uuid>`) is used so the dry-run secrets don't
+/// collide with any persisted entry.
+#[tauri::command]
+pub async fn mcp_test_spawn(
+    entry: athen_core::traits::mcp::McpCatalogEntry,
+    env_secrets: std::collections::HashMap<String, String>,
+    state: State<'_, AppState>,
+) -> std::result::Result<McpTestSpawnResult, String> {
+    use athen_core::traits::mcp::{EnvBinding, EnvValue, McpSource};
+
+    // Rewrite vault-bound env into a scratch scope, then write the
+    // provided secrets there. This isolates the dry-run from any real
+    // saved entry that shares the same id.
+    let mut entry = entry;
+    let scratch_scope = format!("mcp:test-spawn:{}", uuid::Uuid::new_v4());
+    let mut scratch_keys: Vec<String> = Vec::new();
+
+    if let McpSource::Process { env, .. } = &mut entry.source {
+        let mut new_env: Vec<EnvBinding> = Vec::with_capacity(env.len());
+        for binding in env.drain(..) {
+            match binding.value {
+                EnvValue::Vault { key, .. } => {
+                    if let Some(value) = env_secrets.get(&binding.key) {
+                        if let Some(vault) = state.vault.as_ref() {
+                            vault
+                                .set(&scratch_scope, &key, value)
+                                .await
+                                .map_err(|e| format!("Vault scratch write: {e}"))?;
+                            scratch_keys.push(key.clone());
+                        } else {
+                            return Err(
+                                "Vault not available — cannot test a server that uses vault secrets"
+                                    .into(),
+                            );
+                        }
+                    }
+                    new_env.push(EnvBinding {
+                        key: binding.key,
+                        value: EnvValue::Vault {
+                            scope: scratch_scope.clone(),
+                            key,
+                        },
+                    });
+                }
+                EnvValue::Plain { value } => {
+                    new_env.push(EnvBinding {
+                        key: binding.key,
+                        value: EnvValue::Plain { value },
+                    });
+                }
+            }
+        }
+        *env = new_env;
+    }
+
+    let result =
+        athen_mcp::McpRegistry::test_spawn(entry, serde_json::json!({}), state.vault.as_ref())
+            .await;
+
+    // Best-effort: clear scratch secrets either way. Failure to clean up
+    // doesn't change the dry-run outcome, but a leak across many tests
+    // would otherwise grow the vault index unboundedly.
+    if let Some(vault) = state.vault.as_ref() {
+        for key in &scratch_keys {
+            let _ = vault.delete(&scratch_scope, key).await;
+        }
+    }
+
+    match result {
+        Ok(tools) => Ok(McpTestSpawnResult {
+            tool_count: tools.len(),
+            tool_names: tools.into_iter().map(|t| t.name).collect(),
+        }),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Tool descriptor wire shape for the expanded UI row.
+#[derive(Serialize)]
+pub struct McpToolView {
+    pub name: String,
+    pub description: Option<String>,
+}
+
+#[tauri::command]
+pub async fn mcp_list_tools_for(
+    id: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<Vec<McpToolView>, String> {
+    let tools = state
+        .mcp
+        .list_tools_for(&id)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(tools
+        .into_iter()
+        .map(|t| McpToolView {
+            name: t.name,
+            description: t.description,
+        })
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
 // Path-grant approval flow + grant management
 // ---------------------------------------------------------------------------
 

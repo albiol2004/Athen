@@ -42,6 +42,44 @@ pub enum McpSource {
     Bundled { binary_name: String },
     /// Reserved for future use — fetch a binary from a URL on first enable.
     Download { url: String, binary_name: String },
+    /// User-supplied stdio MCP launched from an arbitrary command line
+    /// (BYO custom MCP, schema-compatible with Claude Desktop / Cursor
+    /// `mcpServers` entries).
+    Process {
+        /// Executable name resolved against PATH, or an absolute path.
+        command: String,
+        /// CLI arguments passed verbatim to the child process.
+        #[serde(default)]
+        args: Vec<String>,
+        /// Environment variables exposed to the child. Each binding is
+        /// resolved at spawn time; vault-backed values never appear in
+        /// persisted config.
+        #[serde(default)]
+        env: Vec<EnvBinding>,
+        /// Optional working directory for the child process.
+        #[serde(default)]
+        working_dir: Option<String>,
+    },
+}
+
+/// A single environment-variable binding for a `Process` MCP source.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnvBinding {
+    /// Variable name exposed inside the child process (e.g. `GITHUB_TOKEN`).
+    pub key: String,
+    /// How the value is resolved at spawn time.
+    pub value: EnvValue,
+}
+
+/// Resolution strategy for an env-binding value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EnvValue {
+    /// Inline literal value. Persisted in plaintext — caller is responsible
+    /// for routing secrets through `Vault` instead.
+    Plain { value: String },
+    /// Read at spawn time from the credential vault.
+    Vault { scope: String, key: String },
 }
 
 /// Tool exposed by an MCP server, exactly as advertised by the server.
@@ -84,4 +122,93 @@ pub trait McpClient: Send + Sync {
         tool: &str,
         args: serde_json::Value,
     ) -> Result<McpCallOutcome>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::risk::BaseImpact;
+
+    #[test]
+    fn process_source_roundtrip_with_vault_env() {
+        let entry = McpCatalogEntry {
+            id: "github".into(),
+            display_name: "GitHub".into(),
+            description: "BYO GitHub MCP".into(),
+            icon: None,
+            config_schema: serde_json::json!({}),
+            source: McpSource::Process {
+                command: "npx".into(),
+                args: vec!["-y".into(), "@modelcontextprotocol/server-github".into()],
+                env: vec![
+                    EnvBinding {
+                        key: "GITHUB_TOKEN".into(),
+                        value: EnvValue::Vault {
+                            scope: "mcp:github".into(),
+                            key: "token".into(),
+                        },
+                    },
+                    EnvBinding {
+                        key: "GITHUB_HOST".into(),
+                        value: EnvValue::Plain {
+                            value: "github.com".into(),
+                        },
+                    },
+                ],
+                working_dir: None,
+            },
+            base_risk: BaseImpact::WritePersist,
+        };
+
+        let json = serde_json::to_value(&entry).unwrap();
+        // Schema lock so we don't accidentally diverge from Claude Desktop's
+        // `mcpServers` shape — `kind: "process"` + `command` + `args` + `env`
+        // are load-bearing.
+        assert_eq!(json["source"]["kind"], "process");
+        assert_eq!(json["source"]["command"], "npx");
+        assert_eq!(json["source"]["args"][0], "-y");
+        assert_eq!(json["source"]["env"][0]["key"], "GITHUB_TOKEN");
+        assert_eq!(json["source"]["env"][0]["value"]["kind"], "vault");
+        assert_eq!(json["source"]["env"][0]["value"]["scope"], "mcp:github");
+        assert_eq!(json["source"]["env"][1]["value"]["kind"], "plain");
+        assert_eq!(json["source"]["env"][1]["value"]["value"], "github.com");
+
+        let back: McpCatalogEntry = serde_json::from_value(json).unwrap();
+        match back.source {
+            McpSource::Process {
+                command,
+                args,
+                env,
+                working_dir,
+            } => {
+                assert_eq!(command, "npx");
+                assert_eq!(args.len(), 2);
+                assert_eq!(env.len(), 2);
+                assert_eq!(env[0].key, "GITHUB_TOKEN");
+                assert!(working_dir.is_none());
+                match &env[0].value {
+                    EnvValue::Vault { scope, key } => {
+                        assert_eq!(scope, "mcp:github");
+                        assert_eq!(key, "token");
+                    }
+                    EnvValue::Plain { .. } => panic!("expected vault"),
+                }
+                match &env[1].value {
+                    EnvValue::Plain { value } => assert_eq!(value, "github.com"),
+                    EnvValue::Vault { .. } => panic!("expected plain"),
+                }
+            }
+            _ => panic!("expected Process source"),
+        }
+    }
+
+    #[test]
+    fn bundled_source_still_serializes_unchanged() {
+        let src = McpSource::Bundled {
+            binary_name: "athen-mcp-files".into(),
+        };
+        let json = serde_json::to_value(&src).unwrap();
+        assert_eq!(json["kind"], "bundled");
+        assert_eq!(json["binary_name"], "athen-mcp-files");
+    }
 }

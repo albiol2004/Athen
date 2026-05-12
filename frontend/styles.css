@@ -6772,3 +6772,162 @@ option:hover {
     font-size: 11px;
     color: var(--text-3);
 }
+
+/* ─── MCP Servers (BYO custom MCP) ─────────────────────────────── */
+
+.mcp-servers-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    margin-bottom: 16px;
+}
+
+.mcp-server-row {
+    border: 1px solid var(--border-color, #2a2a2a);
+    border-radius: 8px;
+    background: var(--bg-elevated, #1a1a1a);
+    overflow: hidden;
+}
+
+.mcp-server-row-main {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 8px 16px;
+    padding: 12px 16px;
+}
+
+.mcp-server-row-info { min-width: 0; }
+
+.mcp-server-row-name {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 4px;
+}
+
+.mcp-server-row-name strong {
+    font-size: 14px;
+}
+
+.mcp-server-row-command {
+    font-family: monospace;
+    font-size: 12px;
+    color: var(--text-muted, #aaa);
+    word-break: break-all;
+}
+
+.mcp-server-row-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+}
+
+.mcp-server-badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 500;
+}
+.mcp-server-badge-ok { background: rgba(34, 197, 94, 0.15); color: #4ade80; }
+.mcp-server-badge-error { background: rgba(239, 68, 68, 0.15); color: #fca5a5; }
+.mcp-server-badge-muted { background: rgba(148, 163, 184, 0.15); color: #94a3b8; }
+.mcp-server-badge-info { background: rgba(96, 165, 250, 0.15); color: #93c5fd; }
+
+.mcp-server-row-error {
+    padding: 8px 16px 12px;
+    font-family: monospace;
+    font-size: 12px;
+    color: #fca5a5;
+    background: rgba(239, 68, 68, 0.06);
+    border-top: 1px solid var(--border-color, #2a2a2a);
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.mcp-server-row-expanded {
+    padding: 12px 16px;
+    border-top: 1px solid var(--border-color, #2a2a2a);
+    background: rgba(255, 255, 255, 0.02);
+}
+
+.mcp-server-tool-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin: 0 0 12px;
+    padding: 0;
+    list-style: none;
+}
+
+.mcp-server-tool-list li {
+    font-family: monospace;
+    font-size: 12px;
+    color: var(--text-2, #ccc);
+}
+
+.mcp-server-tool-list li .mcp-server-tool-desc {
+    display: block;
+    font-family: inherit;
+    font-size: 11px;
+    color: var(--text-muted, #888);
+    margin-top: 2px;
+}
+
+.mcp-server-modal {
+    max-width: 600px;
+}
+
+.mcp-server-env-rows {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 6px;
+}
+
+.mcp-server-env-row {
+    display: grid;
+    grid-template-columns: minmax(120px, 1fr) minmax(160px, 2fr) auto auto;
+    gap: 6px;
+    align-items: center;
+}
+
+.mcp-server-env-row input[type="text"],
+.mcp-server-env-row input[type="password"] {
+    width: 100%;
+}
+
+.mcp-server-env-row .mcp-server-env-secret {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 12px;
+    color: var(--text-muted, #aaa);
+    white-space: nowrap;
+}
+
+.mcp-server-env-row .mcp-server-env-remove {
+    padding: 4px 8px;
+    font-size: 12px;
+}
+
+.mcp-server-env-add-btn {
+    align-self: flex-start;
+}
+
+.mcp-server-test-result {
+    margin-top: 8px;
+    font-family: monospace;
+    font-size: 12px;
+    padding: 8px 10px;
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.04);
+    word-break: break-word;
+    white-space: pre-wrap;
+}
+.mcp-server-test-result.mcp-server-test-ok { background: rgba(34, 197, 94, 0.12); color: #4ade80; }
+.mcp-server-test-result.mcp-server-test-fail { background: rgba(239, 68, 68, 0.12); color: #fca5a5; }
+.mcp-server-test-result.mcp-server-test-pending { background: rgba(96, 165, 250, 0.12); color: #93c5fd; }

@@ -297,6 +297,19 @@
             </section>
 
             <section class="settings-section">
+                <h2>MCP Servers</h2>
+                <p class="settings-description">
+                    Connect tools from Slack, Notion, GitHub, and more by adding a Model Context Protocol server. Each one runs as a sandboxed subprocess on your machine. <a href="https://modelcontextprotocol.io/" target="_blank" rel="noopener">Where do MCP servers come from?</a>
+                </p>
+                <div id="mcp-servers-list" class="mcp-servers-list">
+                    <p class="setting-hint">No MCP servers yet. Click <strong>+ Add Server</strong> below to wire up <code>npx</code>, <code>uvx</code>, or any local stdio MCP binary.</p>
+                </div>
+                <div class="setting-actions">
+                    <button id="mcp-servers-add-btn" class="btn-primary" type="button">+ Add Server</button>
+                </div>
+            </section>
+
+            <section class="settings-section">
                 <h2>Shell Toolbox</h2>
                 <p class="settings-description">Persistent Python and Node packages the agent installed for itself under <code>~/.athen/toolbox</code>. PYTHONPATH and PATH are auto-injected into every shell command, so anything listed here is importable/runnable without further configuration. The agent asks for permission before installing.</p>
                 <div id="toolbox-list" class="toolbox-list"></div>
@@ -1254,6 +1267,51 @@
             <div class="profile-modal-actions">
                 <button id="cloud-api-modal-cancel" class="btn-secondary" type="button">Cancel</button>
                 <button id="cloud-api-modal-save" class="btn-primary" type="button">Save</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="mcp-server-modal-overlay" class="profile-modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="mcp-server-modal-title">
+        <div class="profile-modal mcp-server-modal">
+            <div class="profile-modal-header">
+                <h2 id="mcp-server-modal-title">New MCP server</h2>
+                <button id="mcp-server-modal-close" class="cal-modal-close-btn" type="button">&times;</button>
+            </div>
+            <div class="profile-modal-body">
+                <div class="cal-field">
+                    <label for="mcp-server-name">Name</label>
+                    <input type="text" id="mcp-server-name" class="settings-input" placeholder="e.g. GitHub, Slack, Postgres">
+                    <p class="setting-hint">Becomes the display name. An id is derived automatically (kebab-case).</p>
+                </div>
+                <div class="cal-field">
+                    <label for="mcp-server-command">Command</label>
+                    <input type="text" id="mcp-server-command" class="settings-input" placeholder="npx" autocomplete="off" spellcheck="false">
+                    <p class="setting-hint">Executable name on PATH (<code>npx</code>, <code>uvx</code>, <code>python</code>, <code>node</code>) or an absolute path.</p>
+                </div>
+                <div class="cal-field">
+                    <label for="mcp-server-args">Arguments</label>
+                    <input type="text" id="mcp-server-args" class="settings-input" placeholder="-y @modelcontextprotocol/server-github" autocomplete="off" spellcheck="false">
+                    <p class="setting-hint">Space-separated, passed verbatim to the child. Quote tokens with spaces using double quotes.</p>
+                </div>
+                <div class="cal-field">
+                    <label>Environment variables</label>
+                    <div id="mcp-server-env-rows" class="mcp-server-env-rows"></div>
+                    <button id="mcp-server-env-add-btn" class="btn-secondary mcp-server-env-add-btn" type="button">+ Add env var</button>
+                    <p class="setting-hint">Check <strong>Secret</strong> to route the value through the encrypted vault. Plain values are persisted in the definition row.</p>
+                </div>
+                <div class="cal-field">
+                    <label for="mcp-server-working-dir">Working directory (optional)</label>
+                    <input type="text" id="mcp-server-working-dir" class="settings-input" placeholder="/absolute/path or leave blank">
+                </div>
+                <div class="cal-field">
+                    <button id="mcp-server-test-btn" class="btn-secondary" type="button">Test connection</button>
+                    <div id="mcp-server-test-result" class="mcp-server-test-result hidden"></div>
+                </div>
+                <p id="mcp-server-modal-error" class="profile-modal-error hidden"></p>
+            </div>
+            <div class="profile-modal-actions">
+                <button id="mcp-server-modal-cancel" class="btn-secondary" type="button">Cancel</button>
+                <button id="mcp-server-modal-save" class="btn-primary" type="button" disabled>Save</button>
             </div>
         </div>
     </div>

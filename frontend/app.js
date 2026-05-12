@@ -4052,6 +4052,7 @@ async function loadSettings() {
         }
 
         await loadMcpCatalog();
+        await loadMcpServers();
         await loadToolboxPackages();
         await loadGrants();
         await loadProfileManager();
@@ -11114,10 +11115,438 @@ function wireActiveAgentsPanel() {
     }
 }
 
+// ─── MCP Servers (BYO custom MCP) ──────────────────────────────────
+//
+// Two SQLite tables back this panel:
+//   - mcp_custom_entries: the user-supplied McpCatalogEntry definitions
+//   - mcp_enabled       : which ids are currently spawned
+// The Tauri commands (mcp_list_custom / mcp_list_enabled / mcp_*) hide
+// the join — the UI just renders rows and forwards toggles.
+//
+// Secrets never reach the FE. The modal collects them in
+// `env_secrets[KEY] = value` and ships them to mcp_add_custom /
+// mcp_test_spawn, which writes them straight into the vault under
+// `mcp:<id>` (or a scratch scope for the dry-run path).
+
+let mcpServersCustom = [];   // McpCatalogEntry definitions
+let mcpServersEnabled = [];  // EnabledMcpView rows (status + tool_count)
+let mcpServersExpanded = new Set();  // ids the user clicked open
+
+async function loadMcpServers() {
+    const list = document.getElementById('mcp-servers-list');
+    if (!list) return;
+    try {
+        const [custom, enabled] = await Promise.all([
+            invoke('mcp_list_custom'),
+            invoke('mcp_list_enabled'),
+        ]);
+        mcpServersCustom = custom || [];
+        mcpServersEnabled = enabled || [];
+        renderMcpServersList();
+    } catch (err) {
+        console.error('Failed to load MCP servers:', err);
+        list.innerHTML = `<p class="setting-hint">Failed to load: ${escapeHtml(String(err))}</p>`;
+    }
+}
+
+function renderMcpServersList() {
+    const list = document.getElementById('mcp-servers-list');
+    if (!list) return;
+    if (!mcpServersCustom.length) {
+        list.innerHTML = '<p class="setting-hint">No MCP servers yet. Connect tools from Slack, Notion, GitHub, and more by adding an MCP server below. Each one runs as a sandboxed subprocess on your machine.</p>';
+        return;
+    }
+    const enabledById = new Map(mcpServersEnabled.map((e) => [e.id, e]));
+    list.innerHTML = mcpServersCustom.map((entry) => {
+        const live = enabledById.get(entry.id);
+        const isEnabled = !!live;
+        const status = live ? live.status : 'disabled';
+        const isError = status.startsWith('error:');
+        let badge;
+        if (!isEnabled) {
+            badge = '<span class="mcp-server-badge mcp-server-badge-muted">Disabled</span>';
+        } else if (isError) {
+            badge = '<span class="mcp-server-badge mcp-server-badge-error">Error</span>';
+        } else {
+            badge = '<span class="mcp-server-badge mcp-server-badge-ok">Running</span>';
+        }
+        const toolBadge = live && live.tool_count !== null && live.tool_count !== undefined
+            ? `<span class="mcp-server-badge mcp-server-badge-info">${live.tool_count} tool${live.tool_count === 1 ? '' : 's'}</span>`
+            : '';
+        const cmdLine = mcpServerCommandLine(entry);
+        const expanded = mcpServersExpanded.has(entry.id);
+        const errorBlock = isEnabled && isError
+            ? `<div class="mcp-server-row-error">${escapeHtml(status.replace(/^error:\s*/, ''))}</div>`
+            : '';
+        return `
+            <div class="mcp-server-row" data-mcp-id="${escapeHtml(entry.id)}">
+                <div class="mcp-server-row-main">
+                    <div class="mcp-server-row-info">
+                        <div class="mcp-server-row-name">
+                            <strong>${escapeHtml(entry.display_name || entry.id)}</strong>
+                            ${badge}
+                            ${toolBadge}
+                        </div>
+                        <div class="mcp-server-row-command">${escapeHtml(cmdLine)}</div>
+                    </div>
+                    <div class="mcp-server-row-actions">
+                        <label class="toggle-label">
+                            <input type="checkbox" class="mcp-server-enabled" ${isEnabled ? 'checked' : ''} data-mcp-id="${escapeHtml(entry.id)}">
+                            <span>Enabled</span>
+                        </label>
+                        <button class="btn-secondary mcp-server-expand-btn" data-mcp-id="${escapeHtml(entry.id)}" type="button">${expanded ? 'Hide' : 'Tools'}</button>
+                        <button class="btn-secondary mcp-server-delete-btn" data-mcp-id="${escapeHtml(entry.id)}" type="button">Delete</button>
+                    </div>
+                </div>
+                ${errorBlock}
+                ${expanded ? `<div class="mcp-server-row-expanded" data-mcp-expand="${escapeHtml(entry.id)}"><p class="setting-hint">Loading tools…</p></div>` : ''}
+            </div>
+        `;
+    }).join('');
+
+    list.querySelectorAll('.mcp-server-enabled').forEach((cb) => {
+        cb.addEventListener('change', async (ev) => {
+            const id = ev.target.dataset.mcpId;
+            const enable = ev.target.checked;
+            try {
+                await invoke('mcp_set_enabled', { id, enable });
+                await loadMcpServers();
+            } catch (err) {
+                showToast(`Failed to ${enable ? 'enable' : 'disable'}: ${err}`, 'error');
+                ev.target.checked = !enable;
+            }
+        });
+    });
+    list.querySelectorAll('.mcp-server-expand-btn').forEach((b) => {
+        b.addEventListener('click', () => toggleMcpServerExpand(b.dataset.mcpId));
+    });
+    list.querySelectorAll('.mcp-server-delete-btn').forEach((b) => {
+        b.addEventListener('click', () => deleteMcpServer(b.dataset.mcpId));
+    });
+
+    // Lazy-fetch the tool list for any pane that's already expanded.
+    for (const id of mcpServersExpanded) {
+        loadMcpServerTools(id);
+    }
+}
+
+function mcpServerCommandLine(entry) {
+    const src = entry.source;
+    if (!src || src.kind !== 'process') {
+        return `[${src && src.kind ? src.kind : 'unknown'}]`;
+    }
+    const args = (src.args || []).join(' ');
+    return args ? `${src.command} ${args}` : src.command;
+}
+
+function toggleMcpServerExpand(id) {
+    if (mcpServersExpanded.has(id)) {
+        mcpServersExpanded.delete(id);
+    } else {
+        mcpServersExpanded.add(id);
+    }
+    renderMcpServersList();
+}
+
+async function loadMcpServerTools(id) {
+    const pane = document.querySelector(`[data-mcp-expand="${cssEscape(id)}"]`);
+    if (!pane) return;
+    try {
+        const tools = await invoke('mcp_list_tools_for', { id });
+        if (!tools || tools.length === 0) {
+            pane.innerHTML = '<p class="setting-hint">This server advertised no tools.</p>';
+            return;
+        }
+        pane.innerHTML = `<ul class="mcp-server-tool-list">${tools.map((t) => `
+            <li>
+                <code>${escapeHtml(t.name)}</code>
+                ${t.description ? `<span class="mcp-server-tool-desc">${escapeHtml(t.description)}</span>` : ''}
+            </li>
+        `).join('')}</ul>`;
+    } catch (err) {
+        pane.innerHTML = `<p class="setting-hint" style="color:#fca5a5;">Failed to list tools: ${escapeHtml(String(err))}</p>`;
+    }
+}
+
+// CSS.escape isn't on every WebKitGTK version; fall back to a tame
+// allowlist for the id slugs we generate (kebab-case ASCII).
+function cssEscape(s) {
+    if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') return CSS.escape(s);
+    return String(s).replace(/[^a-zA-Z0-9_-]/g, (c) => `\\${c}`);
+}
+
+async function deleteMcpServer(id) {
+    const entry = mcpServersCustom.find((e) => e.id === id);
+    if (!entry) return;
+    if (!confirm(`Delete MCP server "${entry.display_name || id}"? Any secrets it uses will be removed from the vault.`)) return;
+    try {
+        await invoke('mcp_remove_custom', { id });
+        mcpServersExpanded.delete(id);
+        await loadMcpServers();
+        showToast('MCP server deleted', 'success');
+    } catch (err) {
+        showToast(`Delete failed: ${err}`, 'error');
+    }
+}
+
+// ─── MCP Server modal ──
+
+function slugifyMcpId(name) {
+    return String(name || '')
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 48) || 'custom-mcp';
+}
+
+// Quote-aware split: splits on whitespace but preserves "double quoted"
+// tokens so users can pass args with spaces.
+function parseMcpArgs(raw) {
+    const out = [];
+    const re = /"([^"]*)"|(\S+)/g;
+    let m;
+    while ((m = re.exec(raw)) !== null) {
+        out.push(m[1] !== undefined ? m[1] : m[2]);
+    }
+    return out;
+}
+
+function addMcpEnvRow(initial = { key: '', value: '', secret: false }) {
+    const wrap = document.getElementById('mcp-server-env-rows');
+    if (!wrap) return;
+    const row = document.createElement('div');
+    row.className = 'mcp-server-env-row';
+    row.innerHTML = `
+        <input type="text" class="settings-input mcp-server-env-key" placeholder="KEY" autocomplete="off" spellcheck="false">
+        <input type="${initial.secret ? 'password' : 'text'}" class="settings-input mcp-server-env-value" placeholder="${initial.secret ? 'Secret value' : 'value'}" autocomplete="off" spellcheck="false">
+        <label class="mcp-server-env-secret">
+            <input type="checkbox" class="mcp-server-env-secret-cb">
+            <span>Secret</span>
+        </label>
+        <button class="btn-secondary mcp-server-env-remove" type="button">×</button>
+    `;
+    row.querySelector('.mcp-server-env-key').value = initial.key || '';
+    row.querySelector('.mcp-server-env-value').value = initial.value || '';
+    const secretCb = row.querySelector('.mcp-server-env-secret-cb');
+    secretCb.checked = !!initial.secret;
+    secretCb.addEventListener('change', () => {
+        const val = row.querySelector('.mcp-server-env-value');
+        val.type = secretCb.checked ? 'password' : 'text';
+        val.placeholder = secretCb.checked ? 'Secret value' : 'value';
+        invalidateMcpServerTest();
+    });
+    row.querySelector('.mcp-server-env-remove').addEventListener('click', () => {
+        row.remove();
+        invalidateMcpServerTest();
+    });
+    [row.querySelector('.mcp-server-env-key'), row.querySelector('.mcp-server-env-value')]
+        .forEach((el) => el.addEventListener('input', invalidateMcpServerTest));
+    wrap.appendChild(row);
+}
+
+function readMcpEnvRows() {
+    const rows = document.querySelectorAll('#mcp-server-env-rows .mcp-server-env-row');
+    const bindings = [];      // entries to write into McpCatalogEntry.source.env
+    const env_secrets = {};   // KEY → raw value, for the vault
+    for (const row of rows) {
+        const key = row.querySelector('.mcp-server-env-key').value.trim();
+        const value = row.querySelector('.mcp-server-env-value').value;
+        const secret = row.querySelector('.mcp-server-env-secret-cb').checked;
+        if (!key) continue;
+        if (secret) {
+            // McpRegistry expects an EnvValue::Vault pointing at the scope
+            // we use for this MCP. The backend overwrites scope for the
+            // dry-run path; we still send a sensible "mcp:<id>" so the
+            // persisted shape matches what the spec requires.
+            bindings.push({ key, value: { kind: 'vault', scope: '', key: key } });
+            env_secrets[key] = value;
+        } else {
+            bindings.push({ key, value: { kind: 'plain', value } });
+        }
+    }
+    return { bindings, env_secrets };
+}
+
+// Save is gated on a successful test connection (or an existing saved
+// entry being re-saved without changes). Any edit clears the test result
+// and disables Save again.
+function invalidateMcpServerTest() {
+    const resultEl = document.getElementById('mcp-server-test-result');
+    if (resultEl) {
+        resultEl.classList.add('hidden');
+        resultEl.className = 'mcp-server-test-result hidden';
+        resultEl.textContent = '';
+    }
+    const saveBtn = document.getElementById('mcp-server-modal-save');
+    if (saveBtn) saveBtn.disabled = true;
+}
+
+function openMcpServerModal() {
+    const overlay = document.getElementById('mcp-server-modal-overlay');
+    if (!overlay) return;
+    document.getElementById('mcp-server-name').value = '';
+    document.getElementById('mcp-server-command').value = '';
+    document.getElementById('mcp-server-args').value = '';
+    document.getElementById('mcp-server-working-dir').value = '';
+    const envWrap = document.getElementById('mcp-server-env-rows');
+    if (envWrap) envWrap.innerHTML = '';
+    const errorEl = document.getElementById('mcp-server-modal-error');
+    if (errorEl) errorEl.classList.add('hidden');
+    invalidateMcpServerTest();
+    overlay.classList.remove('hidden');
+    setTimeout(() => document.getElementById('mcp-server-name').focus(), 50);
+}
+
+function closeMcpServerModal() {
+    const overlay = document.getElementById('mcp-server-modal-overlay');
+    if (overlay) overlay.classList.add('hidden');
+}
+
+function buildMcpEntryFromForm() {
+    const displayName = document.getElementById('mcp-server-name').value.trim();
+    const command = document.getElementById('mcp-server-command').value.trim();
+    const argsRaw = document.getElementById('mcp-server-args').value;
+    const workingDir = document.getElementById('mcp-server-working-dir').value.trim() || null;
+    if (!displayName) throw new Error('Name is required');
+    if (!command) throw new Error('Command is required');
+    const id = slugifyMcpId(displayName);
+    const { bindings, env_secrets } = readMcpEnvRows();
+    // Now that we have the id, rewrite the per-binding scope so the
+    // persisted EnvValue::Vault points at the right vault location.
+    for (const b of bindings) {
+        if (b.value && b.value.kind === 'vault') {
+            b.value.scope = `mcp:${id}`;
+        }
+    }
+    const entry = {
+        id,
+        display_name: displayName,
+        description: '',
+        icon: null,
+        config_schema: {},
+        source: {
+            kind: 'process',
+            command,
+            args: parseMcpArgs(argsRaw),
+            env: bindings,
+            working_dir: workingDir,
+        },
+        // BYO MCPs default to WritePersist — same baseline as
+        // mcp_custom_entries roundtrip test. The per-call risk gate is
+        // still the real authority.
+        base_risk: 'WritePersist',
+    };
+    return { entry, env_secrets };
+}
+
+async function testMcpServerConnection() {
+    const resultEl = document.getElementById('mcp-server-test-result');
+    const saveBtn = document.getElementById('mcp-server-modal-save');
+    const errorEl = document.getElementById('mcp-server-modal-error');
+    if (errorEl) errorEl.classList.add('hidden');
+    if (saveBtn) saveBtn.disabled = true;
+    if (!resultEl) return;
+    resultEl.classList.remove('hidden');
+    resultEl.className = 'mcp-server-test-result mcp-server-test-pending';
+    resultEl.textContent = 'Spawning server and running MCP handshake…';
+
+    let payload;
+    try {
+        payload = buildMcpEntryFromForm();
+    } catch (err) {
+        resultEl.className = 'mcp-server-test-result mcp-server-test-fail';
+        resultEl.textContent = String(err.message || err);
+        return;
+    }
+
+    try {
+        const res = await invoke('mcp_test_spawn', {
+            entry: payload.entry,
+            envSecrets: payload.env_secrets,
+        });
+        resultEl.className = 'mcp-server-test-result mcp-server-test-ok';
+        const preview = (res.tool_names || []).slice(0, 8).join(', ');
+        const more = res.tool_count > 8 ? `, +${res.tool_count - 8} more` : '';
+        resultEl.textContent = `Connected — found ${res.tool_count} tool${res.tool_count === 1 ? '' : 's'}${preview ? `: ${preview}${more}` : ''}`;
+        if (saveBtn) saveBtn.disabled = false;
+    } catch (err) {
+        resultEl.className = 'mcp-server-test-result mcp-server-test-fail';
+        resultEl.textContent = `Error: ${String(err)}`;
+    }
+}
+
+async function saveMcpServerFromModal() {
+    const errorEl = document.getElementById('mcp-server-modal-error');
+    if (errorEl) errorEl.classList.add('hidden');
+    let payload;
+    try {
+        payload = buildMcpEntryFromForm();
+    } catch (err) {
+        if (errorEl) {
+            errorEl.textContent = String(err.message || err);
+            errorEl.classList.remove('hidden');
+        }
+        return;
+    }
+    // Reject collisions against the bundled catalog (the user can still
+    // toggle bundled entries through the "Tools (MCP)" panel above).
+    if (mcpServersCustom.some((e) => e.id === payload.entry.id)) {
+        if (errorEl) {
+            errorEl.textContent = `An MCP server with id "${payload.entry.id}" already exists. Pick a different name.`;
+            errorEl.classList.remove('hidden');
+        }
+        return;
+    }
+    try {
+        await invoke('mcp_add_custom', {
+            entry: payload.entry,
+            envSecrets: payload.env_secrets,
+            enableNow: true,
+        });
+        closeMcpServerModal();
+        await loadMcpServers();
+        showToast('MCP server added', 'success');
+    } catch (err) {
+        if (errorEl) {
+            errorEl.textContent = String(err);
+            errorEl.classList.remove('hidden');
+        }
+    }
+}
+
+function wireMcpServersPanel() {
+    const addBtn = document.getElementById('mcp-servers-add-btn');
+    if (addBtn) addBtn.addEventListener('click', openMcpServerModal);
+    const closeBtn = document.getElementById('mcp-server-modal-close');
+    if (closeBtn) closeBtn.addEventListener('click', closeMcpServerModal);
+    const cancelBtn = document.getElementById('mcp-server-modal-cancel');
+    if (cancelBtn) cancelBtn.addEventListener('click', closeMcpServerModal);
+    const saveBtn = document.getElementById('mcp-server-modal-save');
+    if (saveBtn) saveBtn.addEventListener('click', saveMcpServerFromModal);
+    const testBtn = document.getElementById('mcp-server-test-btn');
+    if (testBtn) testBtn.addEventListener('click', testMcpServerConnection);
+    const envAddBtn = document.getElementById('mcp-server-env-add-btn');
+    if (envAddBtn) envAddBtn.addEventListener('click', () => {
+        addMcpEnvRow();
+        invalidateMcpServerTest();
+    });
+    // Re-run "test required" gating when basic fields change.
+    ['mcp-server-name', 'mcp-server-command', 'mcp-server-args', 'mcp-server-working-dir']
+        .forEach((id) => {
+            const el = document.getElementById(id);
+            if (el) el.addEventListener('input', invalidateMcpServerTest);
+        });
+    const overlay = document.getElementById('mcp-server-modal-overlay');
+    if (overlay) overlay.addEventListener('click', (ev) => {
+        if (ev.target === overlay) closeMcpServerModal();
+    });
+}
+
 // ─── Initialize ───
 
 inputEl.focus();
 wireOnboardingButtons();
 wireCloudApisModal();
+wireMcpServersPanel();
 wireActiveAgentsPanel();
 initTauri();

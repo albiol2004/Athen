@@ -17,8 +17,9 @@ use tokio::sync::Mutex;
 
 use athen_core::error::{AthenError, Result};
 use athen_core::traits::mcp::{
-    McpCallOutcome, McpCatalogEntry, McpClient, McpSource, McpToolDescriptor,
+    EnvValue, McpCallOutcome, McpCatalogEntry, McpClient, McpSource, McpToolDescriptor,
 };
+use athen_core::traits::vault::Vault;
 
 use crate::catalog;
 
@@ -64,6 +65,10 @@ fn resolve_bundled_binary(binary_name: &str) -> PathBuf {
 pub struct McpRegistry {
     enabled: Mutex<HashMap<String, EnabledEntry>>,
     clients: Mutex<HashMap<String, Arc<LiveClient>>>,
+    /// Resolves `EnvValue::Vault` bindings for `Process` sources. `None`
+    /// when the vault is unavailable — `Process` MCPs that depend on
+    /// vault-backed env vars will fail to spawn with a clear error.
+    vault: Option<Arc<dyn Vault>>,
 }
 
 impl McpRegistry {
@@ -71,6 +76,17 @@ impl McpRegistry {
         Self {
             enabled: Mutex::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),
+            vault: None,
+        }
+    }
+
+    /// Build a registry wired to a vault so `Process` MCPs can resolve
+    /// `EnvValue::Vault` bindings at spawn time.
+    pub fn new_with_vault(vault: Arc<dyn Vault>) -> Self {
+        Self {
+            enabled: Mutex::new(HashMap::new()),
+            clients: Mutex::new(HashMap::new()),
+            vault: Some(vault),
         }
     }
 
@@ -100,19 +116,28 @@ impl McpRegistry {
     pub async fn enable(&self, mcp_id: &str, config: serde_json::Value) -> Result<()> {
         let entry = catalog::lookup(mcp_id)
             .ok_or_else(|| AthenError::Other(format!("unknown MCP id: {mcp_id}")))?;
+        self.enable_entry(entry, config).await
+    }
+
+    /// Enable a BYO catalog entry that doesn't live in the bundled catalog.
+    /// The caller (typically the persistence layer) owns the entry definition.
+    pub async fn enable_custom(
+        &self,
+        entry: McpCatalogEntry,
+        config: serde_json::Value,
+    ) -> Result<()> {
+        self.enable_entry(entry, config).await
+    }
+
+    async fn enable_entry(&self, entry: McpCatalogEntry, config: serde_json::Value) -> Result<()> {
+        let mcp_id = entry.id.clone();
         let enabled_entry = EnabledEntry { entry, config };
-        // Verify by spawning before we commit to the enabled set. If this
-        // fails we leave state untouched so the UI toggle can revert.
-        let live = spawn_client(&enabled_entry).await?;
+        let live = spawn_client(&enabled_entry, self.vault.as_ref()).await?;
         self.enabled
             .lock()
             .await
-            .insert(mcp_id.to_string(), enabled_entry);
-        // Replace any pre-existing client with the freshly spawned one.
-        self.clients
-            .lock()
-            .await
-            .insert(mcp_id.to_string(), Arc::new(live));
+            .insert(mcp_id.clone(), enabled_entry);
+        self.clients.lock().await.insert(mcp_id, Arc::new(live));
         Ok(())
     }
 
@@ -130,6 +155,67 @@ impl McpRegistry {
         self.enabled.lock().await.values().cloned().collect()
     }
 
+    /// Dry-run a `Process` (or `Bundled`) MCP source: spawn the child,
+    /// complete the rmcp handshake, list every tool the server advertises,
+    /// then drop the connection (which kills the process via the
+    /// transport's `Drop`).
+    ///
+    /// Used by the Settings UI's "Test connection" button before the user
+    /// saves a custom MCP. Does NOT mutate any persisted state and does
+    /// NOT touch `self.enabled` / `self.clients` — the caller can run it
+    /// against a throwaway registry or the live one without side effects.
+    pub async fn test_spawn(
+        entry: McpCatalogEntry,
+        config: serde_json::Value,
+        vault: Option<&Arc<dyn Vault>>,
+    ) -> Result<Vec<McpToolDescriptor>> {
+        let mcp_id = entry.id.clone();
+        let enabled = EnabledEntry { entry, config };
+        let live = spawn_client(&enabled, vault).await?;
+        let tools = live
+            .service
+            .peer()
+            .list_all_tools()
+            .await
+            .map_err(|e| AthenError::Other(format!("MCP '{mcp_id}' list_tools: {e}")))?;
+        let descriptors = tools
+            .into_iter()
+            .map(|t| McpToolDescriptor {
+                mcp_id: mcp_id.clone(),
+                name: t.name.to_string(),
+                description: t.description.map(|c| c.to_string()),
+                input_schema: serde_json::to_value(&t.input_schema)
+                    .unwrap_or(serde_json::json!({})),
+            })
+            .collect();
+        // `live` drops here → child process is killed.
+        Ok(descriptors)
+    }
+
+    /// List every tool advertised by a single already-enabled MCP, by id.
+    /// Used by the Settings UI to populate the expanded row without
+    /// re-spawning the process — the lazy `get_or_spawn` is reused so the
+    /// existing live client (if any) answers the request.
+    pub async fn list_tools_for(&self, mcp_id: &str) -> Result<Vec<McpToolDescriptor>> {
+        let client = self.get_or_spawn(mcp_id).await?;
+        let tools = client
+            .service
+            .peer()
+            .list_all_tools()
+            .await
+            .map_err(|e| AthenError::Other(format!("MCP '{mcp_id}' list_tools: {e}")))?;
+        Ok(tools
+            .into_iter()
+            .map(|t| McpToolDescriptor {
+                mcp_id: mcp_id.to_string(),
+                name: t.name.to_string(),
+                description: t.description.map(|c| c.to_string()),
+                input_schema: serde_json::to_value(&t.input_schema)
+                    .unwrap_or(serde_json::json!({})),
+            })
+            .collect())
+    }
+
     /// Lazily acquire (or spawn) the live client for a given mcp id.
     async fn get_or_spawn(&self, mcp_id: &str) -> Result<Arc<LiveClient>> {
         if let Some(c) = self.clients.lock().await.get(mcp_id).cloned() {
@@ -145,7 +231,7 @@ impl McpRegistry {
             .cloned()
             .ok_or_else(|| AthenError::Other(format!("MCP '{mcp_id}' is not enabled")))?;
 
-        let live = Arc::new(spawn_client(&entry).await?);
+        let live = Arc::new(spawn_client(&entry, self.vault.as_ref()).await?);
         self.clients
             .lock()
             .await
@@ -162,44 +248,109 @@ impl Default for McpRegistry {
 
 /// Build the `Command` line for an enabled entry, then spawn it as an MCP
 /// child process and complete the rmcp handshake.
-async fn spawn_client(enabled: &EnabledEntry) -> Result<LiveClient> {
-    let binary_name = match &enabled.entry.source {
-        McpSource::Bundled { binary_name } => binary_name.clone(),
+async fn spawn_client(
+    enabled: &EnabledEntry,
+    vault: Option<&Arc<dyn Vault>>,
+) -> Result<LiveClient> {
+    let mcp_id = enabled.entry.id.as_str();
+
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut cmd = match &enabled.entry.source {
+        McpSource::Bundled { binary_name } => {
+            let path = resolve_bundled_binary(binary_name);
+            tracing::info!(
+                mcp = mcp_id,
+                binary = %path.display(),
+                "spawning bundled MCP server"
+            );
+            Command::new(path)
+        }
         McpSource::Download { .. } => {
             return Err(AthenError::Other(
                 "MCP download source not yet supported".into(),
             ));
         }
+        McpSource::Process {
+            command,
+            args,
+            env,
+            working_dir,
+        } => {
+            let resolved_env = resolve_env(mcp_id, env, vault).await?;
+            tracing::info!(
+                mcp = mcp_id,
+                command = %command,
+                args = ?args,
+                "spawning process MCP server"
+            );
+            let mut c = Command::new(command);
+            c.args(args);
+            // Minimal inherited env: keep PATH so portable Node/Python (and
+            // anything wired up by the runtime wizard) still resolve, but
+            // drop the rest of the parent environment to avoid leaking the
+            // user's shell variables into a third-party process.
+            c.env_clear();
+            if let Ok(path_val) = std::env::var("PATH") {
+                c.env("PATH", path_val);
+            }
+            for (k, v) in resolved_env {
+                c.env(k, v);
+            }
+            if let Some(dir) = working_dir.as_deref() {
+                c.current_dir(dir);
+            }
+            c
+        }
     };
-    let path = resolve_bundled_binary(&binary_name);
 
-    #[cfg_attr(not(windows), allow(unused_mut))]
-    let mut cmd = Command::new(&path);
     // MCP sidecars are headless JSON-RPC servers; suppress the cmd-window flash
     // Windows would otherwise attach to GUI parents.
     #[cfg(windows)]
     cmd.creation_flags(0x0800_0000);
 
-    tracing::info!(
-        mcp = enabled.entry.id,
-        binary = %path.display(),
-        "spawning MCP server"
-    );
-
-    let transport = TokioChildProcess::new(cmd).map_err(|e| {
-        AthenError::Other(format!(
-            "spawn MCP '{}' ({}): {e}",
-            enabled.entry.id,
-            path.display()
-        ))
-    })?;
+    let transport = TokioChildProcess::new(cmd)
+        .map_err(|e| AthenError::Other(format!("spawn MCP '{mcp_id}': {e}")))?;
 
     let service = ()
         .serve(transport)
         .await
-        .map_err(|e| AthenError::Other(format!("MCP '{}' handshake: {e}", enabled.entry.id)))?;
+        .map_err(|e| AthenError::Other(format!("MCP '{mcp_id}' handshake: {e}")))?;
 
     Ok(LiveClient { service })
+}
+
+/// Resolve every `EnvBinding` into a flat `(key, value)` list, pulling
+/// `Vault` values from the credential store. Missing vault entries become
+/// hard errors with a user-actionable message — the alternative (spawn
+/// with an empty token) silently breaks the MCP downstream.
+async fn resolve_env(
+    mcp_id: &str,
+    bindings: &[athen_core::traits::mcp::EnvBinding],
+    vault: Option<&Arc<dyn Vault>>,
+) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::with_capacity(bindings.len());
+    for b in bindings {
+        match &b.value {
+            EnvValue::Plain { value } => out.push((b.key.clone(), value.clone())),
+            EnvValue::Vault { scope, key } => {
+                let vault = vault.ok_or_else(|| {
+                    AthenError::Other(format!(
+                        "MCP '{mcp_id}' env var '{}' needs vault but no vault is configured",
+                        b.key
+                    ))
+                })?;
+                let val = vault.get(scope, key).await?.ok_or_else(|| {
+                    AthenError::Other(format!(
+                        "MCP '{mcp_id}' env var '{}' not set in vault — \
+                         please configure it in Settings (scope '{scope}', key '{key}')",
+                        b.key
+                    ))
+                })?;
+                out.push((b.key.clone(), val));
+            }
+        }
+    }
+    Ok(out)
 }
 
 #[async_trait]
@@ -277,6 +428,10 @@ impl McpClient for McpRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use athen_core::risk::BaseImpact;
+    use athen_core::traits::mcp::{EnvBinding, EnvValue};
+    use std::collections::HashMap as StdHashMap;
+    use tokio::sync::Mutex as TokioMutex;
 
     #[tokio::test]
     async fn unknown_id_rejected() {
@@ -298,5 +453,196 @@ mod tests {
         let reg = McpRegistry::new();
         let tools = reg.list_tools().await.unwrap();
         assert!(tools.is_empty());
+    }
+
+    struct FakeVault {
+        data: TokioMutex<StdHashMap<(String, String), String>>,
+    }
+
+    impl FakeVault {
+        fn new() -> Self {
+            Self {
+                data: TokioMutex::new(StdHashMap::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Vault for FakeVault {
+        async fn set(&self, scope: &str, key: &str, value: &str) -> Result<()> {
+            self.data
+                .lock()
+                .await
+                .insert((scope.to_string(), key.to_string()), value.to_string());
+            Ok(())
+        }
+        async fn get(&self, scope: &str, key: &str) -> Result<Option<String>> {
+            Ok(self
+                .data
+                .lock()
+                .await
+                .get(&(scope.to_string(), key.to_string()))
+                .cloned())
+        }
+        async fn delete(&self, scope: &str, key: &str) -> Result<()> {
+            self.data
+                .lock()
+                .await
+                .remove(&(scope.to_string(), key.to_string()));
+            Ok(())
+        }
+        async fn list(&self, scope: &str) -> Result<Vec<String>> {
+            Ok(self
+                .data
+                .lock()
+                .await
+                .keys()
+                .filter(|(s, _)| s == scope)
+                .map(|(_, k)| k.clone())
+                .collect())
+        }
+    }
+
+    fn process_entry(id: &str, command: &str, env: Vec<EnvBinding>) -> McpCatalogEntry {
+        McpCatalogEntry {
+            id: id.into(),
+            display_name: id.into(),
+            description: String::new(),
+            icon: None,
+            config_schema: serde_json::json!({}),
+            source: McpSource::Process {
+                command: command.into(),
+                args: vec![],
+                env,
+                working_dir: None,
+            },
+            base_risk: BaseImpact::WritePersist,
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_env_plain_value_passes_through() {
+        let bindings = vec![EnvBinding {
+            key: "FOO".into(),
+            value: EnvValue::Plain {
+                value: "bar".into(),
+            },
+        }];
+        let resolved = resolve_env("test", &bindings, None).await.unwrap();
+        assert_eq!(resolved, vec![("FOO".into(), "bar".into())]);
+    }
+
+    #[tokio::test]
+    async fn resolve_env_vault_value_resolves() {
+        let vault: Arc<dyn Vault> = Arc::new(FakeVault::new());
+        vault
+            .set("mcp:github", "token", "ghp_secret")
+            .await
+            .unwrap();
+
+        let bindings = vec![EnvBinding {
+            key: "GITHUB_TOKEN".into(),
+            value: EnvValue::Vault {
+                scope: "mcp:github".into(),
+                key: "token".into(),
+            },
+        }];
+        let resolved = resolve_env("test", &bindings, Some(&vault)).await.unwrap();
+        assert_eq!(resolved, vec![("GITHUB_TOKEN".into(), "ghp_secret".into())]);
+    }
+
+    #[tokio::test]
+    async fn resolve_env_missing_vault_entry_returns_clear_error() {
+        let vault: Arc<dyn Vault> = Arc::new(FakeVault::new());
+        let bindings = vec![EnvBinding {
+            key: "GITHUB_TOKEN".into(),
+            value: EnvValue::Vault {
+                scope: "mcp:github".into(),
+                key: "token".into(),
+            },
+        }];
+        let err = resolve_env("byo-github", &bindings, Some(&vault))
+            .await
+            .expect_err("missing vault entry should error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not set in vault"),
+            "error message missing user hint: {msg}"
+        );
+        assert!(msg.contains("GITHUB_TOKEN"));
+        assert!(msg.contains("byo-github"));
+    }
+
+    #[tokio::test]
+    async fn resolve_env_vault_binding_without_vault_errors() {
+        let bindings = vec![EnvBinding {
+            key: "GITHUB_TOKEN".into(),
+            value: EnvValue::Vault {
+                scope: "mcp:github".into(),
+                key: "token".into(),
+            },
+        }];
+        let err = resolve_env("byo-github", &bindings, None)
+            .await
+            .expect_err("no vault should error");
+        let msg = format!("{err}");
+        assert!(msg.contains("no vault is configured"), "msg: {msg}");
+    }
+
+    #[tokio::test]
+    async fn test_spawn_with_bogus_command_returns_error() {
+        // Bogus path → TokioChildProcess::new fails fast with a clear
+        // error. test_spawn must propagate that without panicking and
+        // without leaving anything behind.
+        let entry = process_entry(
+            "bogus-test",
+            "/definitely/not/a/real/binary/athen-mcp-test",
+            vec![],
+        );
+        let res = McpRegistry::test_spawn(entry, serde_json::json!({}), None).await;
+        assert!(res.is_err(), "expected spawn failure, got {res:?}");
+    }
+
+    #[tokio::test]
+    async fn test_spawn_against_cat_fails_handshake_gracefully() {
+        // /bin/cat (or printf) reads stdin forever but never speaks JSON-RPC.
+        // The rmcp handshake should time out / error rather than spawn-erroring
+        // — we just want a clean error message, not a panic or hang.
+        let entry = process_entry("cat-fake", "/bin/cat", vec![]);
+        // Wrap in a 5s timeout so a stuck handshake can't hang the test suite.
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            McpRegistry::test_spawn(entry, serde_json::json!({}), None),
+        )
+        .await;
+        // Either the rmcp handshake errored (preferred) or the test timed out.
+        // Both prove we don't crash. The handshake-error path is the one the
+        // UI will actually surface, so warn if we hit the timeout instead.
+        match res {
+            Ok(Ok(_)) => panic!("cat should NOT successfully complete an MCP handshake"),
+            Ok(Err(_)) => { /* expected: clean error from handshake */ }
+            Err(_) => {
+                // Timed out — also acceptable for this smoke test; the real
+                // bug we're guarding against is a panic.
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn enable_custom_with_bogus_command_returns_error_not_panic() {
+        // Pointing at a clearly nonexistent path so TokioChildProcess::new
+        // fails fast. The goal is to exercise the enable_custom registration
+        // path without depending on a real MCP server being installed.
+        let reg = McpRegistry::new();
+        let entry = process_entry(
+            "bogus",
+            "/definitely/not/a/real/binary/athen-mcp-test",
+            vec![],
+        );
+        let res = reg.enable_custom(entry, serde_json::json!({})).await;
+        assert!(res.is_err(), "expected spawn failure, got {res:?}");
+        // State must remain clean — failed enable should NOT have left
+        // the entry in the enabled map.
+        assert!(reg.enabled_ids().await.is_empty());
     }
 }
