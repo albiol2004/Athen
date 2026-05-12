@@ -107,19 +107,27 @@ fn group_one_liner(id: &str, tools: &[&ToolDefinition]) -> String {
 }
 
 /// True if the tool should always be revealed (full schema in every request).
-/// Always-revealed tools are the universally-used core: memory (referenced on
-/// every turn) plus the shell + file primitives (the bread-and-butter coding
-/// tools). Without their schemas, small models fall back to whatever IS
-/// schema-visible and loop. `email_send` is included because it's a
-/// user-facing action tool gated behind explicit approval — keeping its
-/// schema inline prevents the agent from grepping config files or
-/// reaching for `shell_execute` / smtplib when it could just call the
-/// tool. Domain-specific tools (calendar, contacts, MCP) stay tier-2.
+/// Always-revealed tools are the universally-used core: the write side of
+/// memory (only used on explicit user request) plus the shell + file
+/// primitives (the bread-and-butter coding tools). Without their schemas,
+/// small models fall back to whatever IS schema-visible and loop.
+/// `email_send` is included because it's a user-facing action tool gated
+/// behind explicit approval — keeping its schema inline prevents the
+/// agent from grepping config files or reaching for `shell_execute` /
+/// smtplib when it could just call the tool. Domain-specific tools
+/// (calendar, contacts, MCP) stay tier-2.
+///
+/// `memory_recall` is DELIBERATELY tier-2 (revealed on first call) — the
+/// host already injects relevant memories into the leading system message
+/// via the `BACKGROUND RECALL` block when the user message is substantive,
+/// so the agent rarely needs to call recall directly. Surfacing its full
+/// schema in every prompt biased small models to over-recall on
+/// short / pronoun-y messages and act on stale entries as if they were
+/// instructions.
 pub fn is_always_revealed(name: &str) -> bool {
     matches!(
         name,
         "memory_store"
-            | "memory_recall"
             | "shell_execute"
             | "shell_spawn"
             | "shell_kill"
@@ -184,7 +192,10 @@ mod tests {
     #[test]
     fn always_revealed_covers_core_tools() {
         assert!(is_always_revealed("memory_store"));
-        assert!(is_always_revealed("memory_recall"));
+        // memory_recall is DELIBERATELY tier-2: the host already injects
+        // relevant memories into the leading system message via the
+        // BACKGROUND RECALL block when the user message is substantive.
+        assert!(!is_always_revealed("memory_recall"));
         assert!(is_always_revealed("shell_execute"));
         assert!(is_always_revealed("shell_spawn"));
         assert!(is_always_revealed("read"));
