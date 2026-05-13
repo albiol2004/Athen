@@ -341,7 +341,10 @@
             </section>
 
             <section class="settings-section">
-                <h2>Email Monitor</h2>
+                <div class="email-section-heading">
+                    <h2>Email Monitor</h2>
+                    <span id="email-connected-pill" class="email-status-pill" style="display:none;"></span>
+                </div>
                 <p class="settings-description">Connect your email to let Athen monitor and act on incoming messages.</p>
 
                 <div class="setting-row">
@@ -353,28 +356,33 @@
 
                 <div id="email-settings-fields">
                     <div class="setting-row">
-                        <label for="email-imap-server">IMAP Server</label>
-                        <input type="text" id="email-imap-server" class="settings-input" placeholder="imap.gmail.com">
+                        <label for="email-username">Email address</label>
+                        <input type="text" id="email-username" class="settings-input" placeholder="you@gmail.com" autocomplete="email">
                     </div>
-                    <div class="setting-row">
-                        <label for="email-imap-port">Port</label>
-                        <input type="number" id="email-imap-port" class="settings-input" value="993" min="1" max="65535">
-                    </div>
-                    <div class="setting-row">
-                        <label for="email-username">Email / Username</label>
-                        <input type="text" id="email-username" class="settings-input" placeholder="you@gmail.com">
-                    </div>
+
+                    <div id="email-provider-hint" class="email-provider-hint" style="display:none;"></div>
+
                     <div class="setting-row">
                         <label for="email-password">Password / App Password</label>
                         <input type="password" id="email-password" class="settings-input" placeholder="Enter app password">
-                        <p class="setting-hint">For Gmail, use an <a href="https://myaccount.google.com/apppasswords" target="_blank">App Password</a>. Your regular password won't work with 2FA.</p>
+                        <p class="setting-hint" id="email-password-hint">Most providers need an app-specific password, not your regular login password.</p>
                     </div>
+
                     <div class="setting-row">
-                        <label class="toggle-label">
-                            <input type="checkbox" id="email-use-tls" checked>
-                            <span>Use TLS (recommended)</span>
-                        </label>
+                        <label for="email-smtp-password">SMTP Password</label>
+                        <div class="api-key-wrapper">
+                            <input type="password" id="email-smtp-password" class="settings-input" placeholder="App password (same as above on most providers)" autocomplete="off">
+                            <button class="api-key-toggle" id="email-smtp-password-toggle" title="Show/hide password" type="button">&#128065;</button>
+                        </div>
+                        <p class="setting-hint">Same app password works for both IMAP and SMTP on most providers.</p>
                     </div>
+
+                    <div class="setting-row">
+                        <label for="email-from-address">From Address</label>
+                        <input type="text" id="email-from-address" class="settings-input" placeholder="Alex &lt;alex@example.com&gt;">
+                        <p class="setting-hint">What recipients see. Plain "alex@example.com" or "Alex &lt;alex@example.com&gt;" both work.</p>
+                    </div>
+
                     <div class="setting-row">
                         <label for="email-folders">Folders to Monitor</label>
                         <input type="text" id="email-folders" class="settings-input" value="INBOX" placeholder="INBOX, Important">
@@ -389,54 +397,60 @@
                         <input type="number" id="email-lookback" class="settings-input" value="24" min="1" max="168">
                         <p class="setting-hint">Only process emails newer than this.</p>
                     </div>
-                </div>
 
-                <h3 class="settings-subhead">Outbound (SMTP) — Sending Email</h3>
-                <p class="settings-description">Configure the same account for sending. Athen always asks before sending each email.</p>
+                    <details id="email-advanced-details" class="email-advanced">
+                        <summary>Advanced (server settings)</summary>
+                        <div class="email-advanced-body">
+                            <h4 class="settings-subhead settings-subhead-tight">Incoming (IMAP)</h4>
+                            <div class="setting-row">
+                                <label for="email-imap-server">IMAP Server</label>
+                                <input type="text" id="email-imap-server" class="settings-input" placeholder="imap.gmail.com">
+                            </div>
+                            <div class="setting-row">
+                                <label for="email-imap-port">Port</label>
+                                <input type="number" id="email-imap-port" class="settings-input" value="993" min="1" max="65535">
+                            </div>
+                            <div class="setting-row">
+                                <label class="toggle-label">
+                                    <input type="checkbox" id="email-use-tls" checked>
+                                    <span>Use TLS (recommended)</span>
+                                </label>
+                            </div>
 
-                <div id="smtp-settings-fields">
-                    <div class="setting-row">
-                        <label for="email-smtp-server">SMTP Server</label>
-                        <input type="text" id="email-smtp-server" class="settings-input" placeholder="smtp.gmail.com">
-                    </div>
-                    <div class="setting-row">
-                        <label for="email-smtp-port">Port</label>
-                        <input type="number" id="email-smtp-port" class="settings-input" value="587" min="1" max="65535">
-                        <p class="setting-hint">587 for STARTTLS (default), 465 for implicit TLS.</p>
-                    </div>
-                    <div class="setting-row">
-                        <label for="email-smtp-username">SMTP Username</label>
-                        <input type="text" id="email-smtp-username" class="settings-input" placeholder="you@gmail.com">
-                        <p class="setting-hint">Usually the same as your email address.</p>
-                    </div>
-                    <div class="setting-row">
-                        <label for="email-smtp-password">SMTP Password</label>
-                        <div class="api-key-wrapper">
-                            <input type="password" id="email-smtp-password" class="settings-input" placeholder="App password" autocomplete="off">
-                            <button class="api-key-toggle" id="email-smtp-password-toggle" title="Show/hide password" type="button">&#128065;</button>
+                            <h4 class="settings-subhead settings-subhead-tight">Outgoing (SMTP)</h4>
+                            <div class="setting-row">
+                                <label for="email-smtp-server">SMTP Server</label>
+                                <input type="text" id="email-smtp-server" class="settings-input" placeholder="smtp.gmail.com">
+                            </div>
+                            <div class="setting-row">
+                                <label for="email-smtp-port">Port</label>
+                                <input type="number" id="email-smtp-port" class="settings-input" value="587" min="1" max="65535">
+                                <p class="setting-hint">587 for STARTTLS (default), 465 for implicit TLS.</p>
+                            </div>
+                            <div class="setting-row">
+                                <label for="email-smtp-username">SMTP Username</label>
+                                <input type="text" id="email-smtp-username" class="settings-input" placeholder="you@gmail.com">
+                                <p class="setting-hint">Usually the same as your email address.</p>
+                            </div>
+                            <div class="setting-row">
+                                <label class="toggle-label">
+                                    <input type="checkbox" id="email-smtp-use-tls">
+                                    <span>Implicit TLS (port 465 only)</span>
+                                </label>
+                                <p class="setting-hint">Leave unchecked for STARTTLS on port 587.</p>
+                            </div>
                         </div>
-                        <p class="setting-hint">Same app password works for both IMAP and SMTP on most providers.</p>
-                    </div>
-                    <div class="setting-row">
-                        <label class="toggle-label">
-                            <input type="checkbox" id="email-smtp-use-tls">
-                            <span>Implicit TLS (port 465 only)</span>
-                        </label>
-                        <p class="setting-hint">Leave unchecked for STARTTLS on port 587.</p>
-                    </div>
-                    <div class="setting-row">
-                        <label for="email-from-address">From Address</label>
-                        <input type="text" id="email-from-address" class="settings-input" placeholder="Alex &lt;alex@example.com&gt;">
-                        <p class="setting-hint">What recipients see. Plain "alex@example.com" or "Alex &lt;alex@example.com&gt;" both work.</p>
-                    </div>
+                    </details>
                 </div>
 
-                <div class="setting-actions">
+                <div class="setting-actions email-actions">
+                    <button id="test-and-save-btn" class="btn-primary">Test &amp; Save</button>
                     <button id="test-email-btn" class="btn-secondary">Test IMAP</button>
-                    <button id="save-email-btn" class="btn-primary">Save IMAP</button>
+                    <button id="save-email-btn" class="btn-secondary">Save IMAP</button>
                     <button id="test-smtp-btn" class="btn-secondary">Test SMTP</button>
-                    <button id="save-smtp-btn" class="btn-primary">Save SMTP</button>
+                    <button id="save-smtp-btn" class="btn-secondary">Save SMTP</button>
                 </div>
+                <div id="email-combined-result" class="test-result hidden"></div>
                 <div id="email-test-result" class="test-result hidden"></div>
                 <div id="smtp-test-result" class="test-result hidden"></div>
             </section>

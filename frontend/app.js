@@ -4060,6 +4060,12 @@ async function loadSettings() {
         await loadCloudApis();
         await loadAttachmentPolicySettings();
         await loadOwnerContact();
+
+        // Let opt-in listeners (e.g. the email setup wizard's connected-pill
+        // + advanced-auto-open logic) react after every settings field is in
+        // the DOM. Keep this as the last step so listeners can rely on the
+        // form being fully populated.
+        window.dispatchEvent(new CustomEvent('athen:settings-loaded'));
     } catch (err) {
         console.error('Failed to load settings:', err);
         showToast('Failed to load settings: ' + err, 'error');
@@ -6159,6 +6165,458 @@ function showSmtpTestResult(success, message) {
     el.classList.remove('hidden');
     setTimeout(() => el.classList.add('hidden'), 5000);
 }
+
+// ─── Email setup wizard (Phase 2) ───
+//
+// Provider autodetect, combined Test & Save, translated error banners,
+// connected-state pill. Wraps the existing split-button flow with a
+// guided one-click path; the four split buttons remain for power users
+// who want to test or save only one half.
+//
+// Tauri JSON casing (verified 2026-05-13):
+//  - command argument names: camelCase (Tauri auto-converts from Rust snake_case args)
+//  - struct fields in returned values: snake_case (serde uses field names as-is,
+//    no `rename_all` on ProviderHint / TestResult / TranslatedError).
+// So we invoke with { smtpPassword: "..." } but read result.imap.ok and
+// hint.app_password_url.
+
+const EMAIL_DETECT_DEBOUNCE_MS = 600;
+let _emailDetectTimer = null;
+let _lastDetectedEmail = null;
+let _lastProviderHint = null;
+let _emailDetectAbortToken = 0;
+
+function emailDomain(addr) {
+    if (!addr) return null;
+    const at = addr.indexOf('@');
+    if (at < 0 || at === addr.length - 1) return null;
+    return addr.slice(at + 1).trim().toLowerCase();
+}
+
+function looksLikeFullEmail(addr) {
+    if (!addr) return false;
+    const m = addr.trim().match(/^[^\s@]+@([^\s@]+\.[^\s@]+)$/);
+    return !!m;
+}
+
+function securityToTls(security) {
+    // For incoming IMAP: 993 SSL or 143 STARTTLS both want TLS on; "none" => off.
+    return security === 'ssl' || security === 'start_tls';
+}
+
+function smtpSecurityToImplicitTls(security) {
+    // Our `email-smtp-use-tls` checkbox means "implicit SSL/TLS on 465".
+    // STARTTLS on 587 -> unchecked. None -> unchecked.
+    return security === 'ssl';
+}
+
+function setIfEmpty(id, value) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (el.type === 'checkbox') {
+        // For checkboxes we don't have a clean "empty" notion; only set if
+        // the user hasn't interacted (dataset.userTouched not set).
+        if (!el.dataset.userTouched) {
+            el.checked = !!value;
+        }
+        return;
+    }
+    if (!el.value || el.value.trim() === '') {
+        el.value = value == null ? '' : String(value);
+    }
+}
+
+// Mark a checkbox as user-touched so autodetect won't clobber it.
+document.querySelectorAll('#email-use-tls, #email-smtp-use-tls').forEach((cb) => {
+    cb.addEventListener('change', () => { cb.dataset.userTouched = '1'; });
+});
+
+function applyProviderHint(hint) {
+    _lastProviderHint = hint;
+    const detailsEl = document.getElementById('email-advanced-details');
+
+    if (!hint) {
+        renderProviderHintEmpty();
+        // Open advanced if we have a full email but no match — user needs
+        // to fill server settings manually.
+        const username = document.getElementById('email-username')?.value.trim() || '';
+        if (detailsEl && looksLikeFullEmail(username)) {
+            detailsEl.open = true;
+        }
+        return;
+    }
+
+    // Pre-fill IMAP fields.
+    setIfEmpty('email-imap-server', hint.incoming?.host);
+    setIfEmpty('email-imap-port', hint.incoming?.port);
+    const imapTlsEl = document.getElementById('email-use-tls');
+    if (imapTlsEl && !imapTlsEl.dataset.userTouched && hint.incoming) {
+        imapTlsEl.checked = securityToTls(hint.incoming.security);
+    }
+
+    // Pre-fill SMTP fields.
+    setIfEmpty('email-smtp-server', hint.outgoing?.host);
+    setIfEmpty('email-smtp-port', hint.outgoing?.port);
+    const smtpTlsEl = document.getElementById('email-smtp-use-tls');
+    if (smtpTlsEl && !smtpTlsEl.dataset.userTouched && hint.outgoing) {
+        smtpTlsEl.checked = smtpSecurityToImplicitTls(hint.outgoing.security);
+    }
+
+    // Mirror email address into SMTP username + From if those are empty.
+    const username = document.getElementById('email-username')?.value.trim() || '';
+    if (username) {
+        setIfEmpty('email-smtp-username', username);
+        setIfEmpty('email-from-address', username);
+    }
+
+    renderProviderHint(hint);
+}
+
+function renderProviderHintEmpty() {
+    const box = document.getElementById('email-provider-hint');
+    if (!box) return;
+    const username = document.getElementById('email-username')?.value.trim() || '';
+    if (looksLikeFullEmail(username)) {
+        const domain = emailDomain(username);
+        box.className = 'email-provider-hint';
+        box.style.display = '';
+        box.innerHTML = `
+            <p class="email-provider-hint-title">No match for ${escapeHtml(domain || '')}</p>
+            <p class="email-provider-hint-body">We don't recognise this provider — fill in the server settings under Advanced below, or hit Test &amp; Save to try common defaults.</p>
+        `;
+    } else {
+        box.style.display = 'none';
+        box.innerHTML = '';
+    }
+}
+
+function renderProviderHint(hint) {
+    const box = document.getElementById('email-provider-hint');
+    if (!box) return;
+    const isBridge = hint.auth_kind === 'bridge_required';
+    box.className = 'email-provider-hint' + (isBridge ? ' email-provider-hint-warning' : '');
+    box.style.display = '';
+
+    const parts = [];
+    parts.push(`<p class="email-provider-hint-title">Detected: <span class="email-provider-hint-name">${escapeHtml(hint.display_name)}</span></p>`);
+
+    if (hint.notes) {
+        parts.push(`<p class="email-provider-hint-notes">${escapeHtml(hint.notes)}</p>`);
+    }
+
+    const actions = [];
+    if (hint.auth_kind === 'app_password' && hint.app_password_url) {
+        actions.push(`<a class="email-provider-hint-link" href="${escapeHtml(hint.app_password_url)}" target="_blank" rel="noopener">Open ${escapeHtml(hint.display_name)} app passwords &rarr;</a>`);
+    }
+    if (isBridge) {
+        actions.push(`<a class="email-provider-hint-link" href="https://proton.me/mail/bridge" target="_blank" rel="noopener">Open Proton Bridge docs &rarr;</a>`);
+    }
+    if (hint.auth_kind === 'o_auth2') {
+        // OAuth2 will land in Move #3 of the integrations push.
+        parts.push(`<p class="email-provider-hint-notes">${escapeHtml(hint.display_name)} prefers OAuth login. App password support is still available on most accounts — open the link to generate one.</p>`);
+    }
+    if (actions.length) {
+        parts.push(`<div class="email-provider-hint-actions">${actions.join('')}</div>`);
+    }
+
+    box.innerHTML = parts.join('');
+}
+
+async function runEmailDetect(email) {
+    if (!invoke) return;
+    if (!looksLikeFullEmail(email)) {
+        _lastDetectedEmail = null;
+        applyProviderHint(null);
+        return;
+    }
+    if (_lastDetectedEmail === email) return;
+    _lastDetectedEmail = email;
+
+    const token = ++_emailDetectAbortToken;
+    try {
+        const hint = await invoke('email_detect', { email });
+        if (token !== _emailDetectAbortToken) return; // superseded
+        applyProviderHint(hint || null);
+    } catch (e) {
+        if (token !== _emailDetectAbortToken) return;
+        console.warn('email_detect failed:', e);
+        applyProviderHint(null);
+    }
+}
+
+document.getElementById('email-username')?.addEventListener('input', function() {
+    const email = this.value.trim();
+    if (_emailDetectTimer) clearTimeout(_emailDetectTimer);
+    _emailDetectTimer = setTimeout(() => runEmailDetect(email), EMAIL_DETECT_DEBOUNCE_MS);
+});
+document.getElementById('email-username')?.addEventListener('blur', function() {
+    if (_emailDetectTimer) { clearTimeout(_emailDetectTimer); _emailDetectTimer = null; }
+    runEmailDetect(this.value.trim());
+});
+
+// Well-known ports override the checkbox, custom ports fall back to it.
+// This prevents the most common misconfiguration (SSL checkbox + STARTTLS
+// port 587 -> rustls "InvalidContentType" against a plaintext banner)
+// from reaching the backend. The checkbox is intentionally kept as a hint
+// for non-standard ports so the legacy save_email_settings /
+// save_smtp_settings payload shapes (which take the boolean directly) are
+// unaffected.
+function inferImapSecurity(port, checkboxChecked) {
+    if (port === 993) return 'ssl';
+    if (port === 143) return checkboxChecked ? 'start_tls' : 'none';
+    return checkboxChecked ? 'ssl' : 'none';
+}
+
+function inferSmtpSecurity(port, checkboxChecked) {
+    if (port === 465) return 'ssl';
+    if (port === 587 || port === 25) return 'start_tls';
+    return checkboxChecked ? 'ssl' : 'start_tls';
+}
+
+function readEmailTestConfig() {
+    const imapPort = parseInt(document.getElementById('email-imap-port').value, 10) || 993;
+    const smtpPort = parseInt(document.getElementById('email-smtp-port').value, 10) || 587;
+    return {
+        imap_host: document.getElementById('email-imap-server').value.trim(),
+        imap_port: imapPort,
+        imap_security: inferImapSecurity(imapPort, document.getElementById('email-use-tls').checked),
+        imap_username: document.getElementById('email-username').value.trim(),
+
+        smtp_host: document.getElementById('email-smtp-server').value.trim(),
+        smtp_port: smtpPort,
+        smtp_security: inferSmtpSecurity(smtpPort, document.getElementById('email-smtp-use-tls').checked),
+        smtp_username: (document.getElementById('email-smtp-username').value.trim()
+            || document.getElementById('email-username').value.trim()),
+    };
+}
+
+function setEmailButtonsDisabled(disabled) {
+    [
+        'test-and-save-btn',
+        'test-email-btn',
+        'save-email-btn',
+        'test-smtp-btn',
+        'save-smtp-btn',
+    ].forEach((id) => {
+        const b = document.getElementById(id);
+        if (b) b.disabled = disabled;
+    });
+}
+
+function showCombinedResultSuccess(message, note) {
+    const el = document.getElementById('email-combined-result');
+    if (!el) return;
+    el.className = 'test-result success test-result-rich';
+    const noteHtml = note
+        ? `<p class="test-result-body" style="margin-top:0.5em;opacity:0.85;">${escapeHtml(note)}</p>`
+        : '';
+    el.innerHTML = `
+        <p class="test-result-title">Connected</p>
+        <p class="test-result-body">${escapeHtml(message)}</p>
+        ${noteHtml}
+    `;
+    el.classList.remove('hidden');
+}
+
+function showCombinedResultError(translated, rawError, stageLabel) {
+    const el = document.getElementById('email-combined-result');
+    if (!el) return;
+    el.className = 'test-result error test-result-rich';
+
+    if (translated) {
+        const actionHtml = (translated.action_label && translated.action_url)
+            ? `<a class="test-result-action" href="${escapeHtml(translated.action_url)}" target="_blank" rel="noopener">${escapeHtml(translated.action_label)} &rarr;</a>`
+            : '';
+        const detailsHtml = rawError
+            ? `<details class="test-result-details"><summary>Technical details</summary><pre>${escapeHtml(rawError)}</pre></details>`
+            : '';
+        el.innerHTML = `
+            <p class="test-result-title">${escapeHtml(translated.title)}</p>
+            <p class="test-result-body">${escapeHtml(translated.body)}</p>
+            ${actionHtml}
+            ${detailsHtml}
+        `;
+    } else {
+        const prefix = stageLabel ? `${stageLabel}: ` : '';
+        el.innerHTML = `
+            <p class="test-result-title">Connection failed</p>
+            <p class="test-result-body">${escapeHtml(prefix + (rawError || 'Unknown error'))}</p>
+        `;
+    }
+    el.classList.remove('hidden');
+}
+
+function hideCombinedResult() {
+    const el = document.getElementById('email-combined-result');
+    if (el) {
+        el.classList.add('hidden');
+        el.innerHTML = '';
+    }
+}
+
+async function saveImapHalf() {
+    const password = document.getElementById('email-password').value;
+    await invoke('save_email_settings', {
+        enabled: document.getElementById('email-enabled').checked,
+        imapServer: document.getElementById('email-imap-server').value,
+        imapPort: parseInt(document.getElementById('email-imap-port').value, 10) || 993,
+        username: document.getElementById('email-username').value,
+        password: password || null,
+        useTls: document.getElementById('email-use-tls').checked,
+        folders: document.getElementById('email-folders').value,
+        pollIntervalSecs: parseInt(document.getElementById('email-poll-interval').value, 10) || 60,
+        lookbackHours: parseInt(document.getElementById('email-lookback').value, 10) || 24,
+    });
+}
+
+async function saveSmtpHalf(fallbackPassword) {
+    // If the user only filled the IMAP password and left SMTP blank (most
+    // providers accept the same credential for both), persist the IMAP
+    // password under SMTP too so the backend doesn't silently re-use a
+    // stale saved value or refuse to send.
+    const own = document.getElementById('email-smtp-password').value;
+    const password = own || fallbackPassword || null;
+    await invoke('save_smtp_settings', {
+        smtpServer: document.getElementById('email-smtp-server').value,
+        smtpPort: parseInt(document.getElementById('email-smtp-port').value, 10) || 587,
+        smtpUsername: document.getElementById('email-smtp-username').value,
+        smtpPassword: password,
+        smtpUseTls: document.getElementById('email-smtp-use-tls').checked,
+        fromAddress: document.getElementById('email-from-address').value,
+    });
+}
+
+document.getElementById('test-and-save-btn')?.addEventListener('click', async function() {
+    if (!invoke) return;
+    hideCombinedResult();
+
+    const username = document.getElementById('email-username').value.trim();
+    const password = document.getElementById('email-password').value;
+    const smtpPassword = document.getElementById('email-smtp-password').value || password;
+
+    if (!username || !password) {
+        showCombinedResultError(
+            { title: 'Missing details', body: 'Enter your email address and password before testing.', action_label: null, action_url: null },
+            null, null,
+        );
+        return;
+    }
+
+    const originalLabel = this.textContent;
+    this.textContent = 'Testing…';
+    setEmailButtonsDisabled(true);
+
+    let result;
+    try {
+        const config = readEmailTestConfig();
+        result = await invoke('email_test_connection', {
+            config,
+            password,
+            smtpPassword,
+        });
+    } catch (e) {
+        const raw = (e && e.toString) ? e.toString() : String(e);
+        await renderCombinedFailure(raw, null, username);
+        this.textContent = originalLabel;
+        setEmailButtonsDisabled(false);
+        return;
+    }
+
+    const imapOk = result?.imap?.ok;
+    const smtpOk = result?.smtp?.ok;
+
+    if (imapOk && smtpOk) {
+        try {
+            // If the backend auto-corrected SSL/STARTTLS to match the
+            // port (synthetic stage `auto_corrected_security`), flip the
+            // checkbox before persisting so the saved config reflects
+            // what actually works on the wire.
+            let autoCorrectNote = null;
+            if (result?.smtp?.stage === 'auto_corrected_security') {
+                const smtpPort = parseInt(document.getElementById('email-smtp-port').value, 10) || 587;
+                const corrected = inferSmtpSecurity(smtpPort, false);
+                const useTlsCheckbox = document.getElementById('email-smtp-use-tls');
+                if (useTlsCheckbox) useTlsCheckbox.checked = (corrected === 'ssl');
+                autoCorrectNote = `We adjusted the SSL/STARTTLS setting to match port ${smtpPort}. Click Save to keep the corrected setting.`;
+            }
+            await saveImapHalf();
+            await saveSmtpHalf(password);
+            const providerName = _lastProviderHint?.display_name || 'your email';
+            showCombinedResultSuccess(`Connected to ${providerName} as ${username}.`, autoCorrectNote);
+            refreshConnectedPill(true, username);
+        } catch (e) {
+            const raw = (e && e.toString) ? e.toString() : String(e);
+            showCombinedResultError(
+                { title: 'Saved settings failed', body: raw, action_label: null, action_url: null },
+                raw, null,
+            );
+        }
+    } else {
+        // Pick the failed half (IMAP first if both failed).
+        const failedHalf = !imapOk ? result.imap : result.smtp;
+        const stageLabel = !imapOk ? `IMAP / ${failedHalf?.stage || 'connect'}` : `SMTP / ${failedHalf?.stage || 'connect'}`;
+        const raw = failedHalf?.error || 'Connection failed.';
+        await renderCombinedFailure(raw, stageLabel, username);
+    }
+
+    this.textContent = originalLabel;
+    setEmailButtonsDisabled(false);
+});
+
+async function renderCombinedFailure(rawError, stageLabel, username) {
+    let translated = null;
+    try {
+        translated = await invoke('email_translate_error', {
+            rawError,
+            domain: emailDomain(username),
+        });
+    } catch (e) {
+        console.warn('email_translate_error failed:', e);
+    }
+    showCombinedResultError(translated, rawError, stageLabel);
+}
+
+// ─── Connected-state pill ───
+
+function refreshConnectedPill(enabled, username) {
+    const pill = document.getElementById('email-connected-pill');
+    if (!pill) return;
+    if (enabled && username && username.trim() !== '') {
+        pill.textContent = `Connected as ${username.trim()}`;
+        pill.style.display = '';
+    } else {
+        pill.style.display = 'none';
+        pill.textContent = '';
+    }
+}
+
+document.getElementById('email-enabled')?.addEventListener('change', function() {
+    refreshConnectedPill(this.checked, document.getElementById('email-username')?.value || '');
+});
+
+// On settings panel load, evaluate the pill + auto-open Advanced for
+// returning users who have any IMAP/SMTP server already set. Hooks into
+// the existing loadSettings flow by waiting one tick after the DOM is
+// populated — loadSettings runs synchronously inside the fetch await,
+// so we listen for a 'settings-loaded' event if one exists, otherwise
+// piggy-back on the next animation frame.
+window.addEventListener('athen:settings-loaded', () => {
+    const enabled = document.getElementById('email-enabled')?.checked || false;
+    const username = document.getElementById('email-username')?.value || '';
+    refreshConnectedPill(enabled, username);
+
+    const detailsEl = document.getElementById('email-advanced-details');
+    const imapServer = document.getElementById('email-imap-server')?.value || '';
+    const smtpServer = document.getElementById('email-smtp-server')?.value || '';
+    if (detailsEl && (imapServer || smtpServer)) {
+        detailsEl.open = true;
+    }
+    // Trigger a passive detect for the saved address — refreshes the
+    // hint card without clobbering anything (setIfEmpty guards values).
+    if (looksLikeFullEmail(username)) {
+        runEmailDetect(username);
+    }
+});
 
 // ─── Telegram Settings ───
 

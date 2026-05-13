@@ -2858,6 +2858,201 @@ option:hover {
 .test-success { color: var(--success); }
 .test-error { color: var(--danger); }
 
+/* ─── Email setup wizard (Phase 2) ─── */
+.email-section-heading {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 6px;
+}
+.email-section-heading h2 { margin: 0; }
+
+.email-status-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 10px;
+    font-size: 11.5px;
+    font-weight: 500;
+    color: var(--success);
+    background: var(--success-soft);
+    border: 1px solid rgba(123, 201, 122, 0.25);
+    border-radius: var(--r-pill);
+    letter-spacing: 0.01em;
+}
+.email-status-pill::before {
+    content: "";
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--success);
+}
+
+.email-provider-hint {
+    margin: 0 0 16px;
+    padding: 12px 14px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface-2);
+    font-size: 12.5px;
+    line-height: 1.5;
+    color: var(--text-2);
+}
+.email-provider-hint.email-provider-hint-warning {
+    border-color: rgba(224, 175, 104, 0.45);
+    background: var(--warning-soft);
+}
+.email-provider-hint-title {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-3);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin: 0 0 4px;
+}
+.email-provider-hint-name {
+    color: var(--brand-warm);
+    font-weight: 600;
+}
+.email-provider-hint-notes {
+    margin: 6px 0 0;
+    color: var(--text-3);
+    font-size: 11.5px;
+}
+.email-provider-hint-actions {
+    margin-top: 10px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+.email-provider-hint-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 6px 12px;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--brand-warm);
+    background: transparent;
+    border: 1px solid var(--border-strong, var(--border));
+    border-radius: 6px;
+    text-decoration: none;
+    transition: border-color var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+.email-provider-hint-link:hover {
+    color: var(--brand-amber);
+    border-color: var(--brand-warm);
+}
+
+.email-advanced {
+    margin-top: 4px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface-2);
+    overflow: hidden;
+}
+.email-advanced > summary {
+    padding: 10px 14px;
+    cursor: pointer;
+    font-size: 12.5px;
+    font-weight: 500;
+    color: var(--text-2);
+    list-style: none;
+    user-select: none;
+    transition: background var(--dur) var(--ease);
+}
+.email-advanced > summary::-webkit-details-marker { display: none; }
+.email-advanced > summary::before {
+    content: "▸";
+    display: inline-block;
+    margin-right: 8px;
+    color: var(--text-3);
+    transition: transform var(--dur) var(--ease);
+}
+.email-advanced[open] > summary::before {
+    transform: rotate(90deg);
+}
+.email-advanced > summary:hover { background: var(--surface-3, var(--surface-2)); }
+.email-advanced-body {
+    padding: 8px 14px 4px;
+    border-top: 1px solid var(--border);
+}
+.settings-subhead-tight {
+    margin: 12px 0 8px;
+    padding-top: 0;
+    border-top: none;
+    font-size: 12px;
+    color: var(--text-3);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+.email-advanced-body .settings-subhead-tight:first-child { margin-top: 4px; }
+
+.email-actions {
+    flex-wrap: wrap;
+}
+
+.test-result.test-result-rich {
+    display: block;
+}
+.test-result-title {
+    font-weight: 600;
+    margin: 0 0 4px;
+    font-size: 13px;
+}
+.test-result-body {
+    margin: 0;
+    font-size: 12.5px;
+    line-height: 1.5;
+}
+.test-result-action {
+    display: inline-block;
+    margin-top: 8px;
+    padding: 5px 10px;
+    font-size: 12px;
+    color: var(--brand-warm);
+    border: 1px solid var(--border-strong, var(--border));
+    border-radius: 6px;
+    text-decoration: none;
+}
+.test-result-action:hover {
+    color: var(--brand-amber);
+    border-color: var(--brand-warm);
+}
+.test-result-details {
+    margin-top: 8px;
+    font-size: 11.5px;
+    color: var(--text-3);
+}
+.test-result-details > summary {
+    cursor: pointer;
+    user-select: none;
+    list-style: none;
+    color: var(--text-3);
+}
+.test-result-details > summary::-webkit-details-marker { display: none; }
+.test-result-details > summary::before {
+    content: "▸";
+    display: inline-block;
+    margin-right: 6px;
+    transition: transform var(--dur) var(--ease);
+}
+.test-result-details[open] > summary::before {
+    transform: rotate(90deg);
+}
+.test-result-details pre {
+    margin: 6px 0 0;
+    padding: 8px 10px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-family: var(--mono);
+    font-size: 11px;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
 /* ─── Provider cards ─── */
 .provider-card {
     background: var(--surface-2);

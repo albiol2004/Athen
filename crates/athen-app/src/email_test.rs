@@ -6,10 +6,17 @@
 //! half runs in `spawn_blocking` because the crate is sync.
 //!
 //! Each stage captures *which* stage failed (`tcp` / `tls` / `login` /
-//! `list` / `logout` for IMAP; `ehlo` / `auth` / `rset` / `quit` for
-//! SMTP — `lettre`'s `test_connection()` rolls EHLO+AUTH+RSET+QUIT into a
-//! single call, so we report `auth` on its failure since 90% of failures
-//! at that step are credential issues).
+//! `list` / `logout` for IMAP — note that `list` is reserved for backward
+//! compat in the catalog but is no longer exercised: LOGIN ack is the
+//! proof point and some servers reject `LIST "" ""` as "Invalid pattern";
+//! `ehlo` / `auth` / `rset` / `quit` for SMTP — `lettre`'s
+//! `test_connection()` rolls EHLO+AUTH+RSET+QUIT into a single call, so
+//! we report `auth` on its failure since 90% of failures at that step are
+//! credential issues). The SMTP half also emits a synthetic
+//! `auto_corrected_security` stage on success when the user-supplied
+//! Security disagreed with the port and we silently retried with the
+//! port-implied choice — the FE uses this to flip the checkbox before
+//! persisting.
 
 use std::net::TcpStream;
 use std::time::Duration;
@@ -172,20 +179,19 @@ fn imap_blocking_finish<S>(client: imap::Client<S>, username: &str, password: &s
 where
     S: std::io::Read + std::io::Write,
 {
-    // Stage 2: LOGIN.
+    // Stage 2: LOGIN — the ack is itself proof the credentials passed.
+    // We used to follow up with `LIST "" ""` for paranoia, but that's
+    // RFC 3501's special "return the hierarchy delimiter" form and some
+    // servers (Dovecot configurations in the wild) reject it with
+    // "Invalid pattern" even after a successful LOGIN, producing a false
+    // negative. The legacy `test_email_connection` command never ran
+    // LIST either, so dropping it restores parity.
     let mut session = match client.login(username, password) {
         Ok(s) => s,
         Err((e, _)) => return StageResult::fail("login", e.to_string()),
     };
 
-    // Stage 3: LIST "" "" — proves we actually pass auth, not just LOGIN
-    // ack. Some providers accept LOGIN but reject everything after.
-    if let Err(e) = session.list(Some(""), Some("")) {
-        let _ = session.logout();
-        return StageResult::fail("list", e.to_string());
-    }
-
-    // Stage 4: LOGOUT. Failure here is cosmetic — the credentials worked.
+    // Stage 3: LOGOUT. Failure here is cosmetic — the credentials worked.
     if let Err(e) = session.logout() {
         return StageResult::fail("logout", e.to_string());
     }
@@ -194,9 +200,66 @@ where
 }
 
 async fn test_smtp(config: &EmailTestConfig, password: &str) -> StageResult {
+    // The FE derives `smtp_security` from a checkbox that can disagree
+    // with the port (e.g. SSL + 587). Rather than fail the user with a
+    // cryptic rustls "received corrupt message of type InvalidContentType"
+    // — which is what happens when we TLS-handshake against a plaintext
+    // SMTP banner — try the user's choice first, then fall back to the
+    // port-implied choice if the failure smells like a TLS-record
+    // mismatch. Auth / DNS / refused-connection errors are NOT retried.
+    let port_implied_security = match config.smtp_port {
+        465 => Security::Ssl,
+        587 | 25 => Security::StartTls,
+        _ => config.smtp_security,
+    };
+
+    let primary = run_smtp_attempt(config, password, config.smtp_security).await;
+    if primary.ok {
+        return primary;
+    }
+
+    let looks_like_tls_mismatch = primary
+        .error
+        .as_deref()
+        .map(|e| {
+            let e = e.to_ascii_lowercase();
+            e.contains("invalidcontenttype")
+                || e.contains("corrupt message")
+                || e.contains("alert received")
+                || e.contains("unexpected eof")
+        })
+        .unwrap_or(false);
+
+    if looks_like_tls_mismatch && port_implied_security != config.smtp_security {
+        let retry = run_smtp_attempt(config, password, port_implied_security).await;
+        if retry.ok {
+            // Surface a synthetic stage so the FE can flip the checkbox
+            // before persisting — see frontend/app.js's test-and-save
+            // handler.
+            return StageResult {
+                ok: true,
+                error: None,
+                stage: Some("auto_corrected_security".to_string()),
+            };
+        }
+        return retry;
+    }
+
+    primary
+}
+
+/// One end-to-end SMTP attempt with a specific `Security`. Same port,
+/// creds, timeout — only the relay/starttls/dangerous choice differs.
+/// Factored out so `test_smtp` can retry with a different Security
+/// without duplicating the builder plumbing.
+async fn run_smtp_attempt(
+    config: &EmailTestConfig,
+    password: &str,
+    security: Security,
+) -> StageResult {
     let creds = Credentials::new(config.smtp_username.clone(), password.to_string());
 
-    let builder = match config.smtp_security {
+    let builder = match security {
         Security::Ssl => AsyncSmtpTransport::<Tokio1Executor>::relay(&config.smtp_host),
         Security::StartTls => {
             AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&config.smtp_host)

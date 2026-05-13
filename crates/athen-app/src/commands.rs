@@ -7089,20 +7089,35 @@ pub async fn email_test_connection(
     Ok(crate::email_test::test_connection(&config, &password, &smtp_password).await)
 }
 
-/// Translate a raw IMAP / SMTP error into a human-friendly banner. Tier 1
-/// of the translator (static catalog); returns `None` for errors the
-/// catalog doesn't cover — Phase 3 will plug an LLM fallback in behind
-/// the same shape. The optional `domain` argument narrows the
-/// `AUTHENTICATIONFAILED` family to the right provider's app-password URL.
+/// Translate a raw IMAP / SMTP error into a human-friendly banner.
+///
+/// Two-tier translator (per `docs/EMAIL_SETUP.md`):
+/// 1. Static catalog — hand-written copy for ~13 well-known shapes.
+///    Returns immediately on hit; no I/O.
+/// 2. LLM fallback — when the catalog misses AND a domain is supplied,
+///    ask the cheap LLM profile for a one-shot JSON translation.
+///    Cached in-memory for the session keyed on
+///    `hash(raw_error + "|" + domain)` so retries are free.
+///
+/// Returns `None` if both tiers fail — the FE renders the raw error as
+/// a fallback in that case.
 #[tauri::command]
 pub async fn email_translate_error(
+    state: State<'_, AppState>,
     raw_error: String,
     domain: Option<String>,
 ) -> std::result::Result<Option<crate::email_errors::TranslatedError>, String> {
-    Ok(crate::email_errors::translate(
-        &raw_error,
-        domain.as_deref(),
-    ))
+    // Tier 1 first — synchronous, no allocs beyond the lowercased copy.
+    if let Some(hit) = crate::email_errors::translate(&raw_error, domain.as_deref()) {
+        return Ok(Some(hit));
+    }
+
+    // Tier 2: LLM fallback. Wrap the live router in `SharedRouter` so the
+    // call sees provider swaps, same as every other LLM caller in this
+    // crate. `translate_with_llm` handles the domain-empty guard, the
+    // cache, the timeout, and the parse failure modes.
+    let router = SharedRouter(state.router.clone());
+    Ok(crate::email_errors::translate_with_llm(&raw_error, domain.as_deref(), &router).await)
 }
 
 #[cfg(test)]
