@@ -107,6 +107,17 @@ pub struct ArcMeta {
     /// for this arc. `None` means the arc has never been compacted; the
     /// executor's context view falls through to raw entries.
     pub summarized_through_entry_id: Option<i64>,
+    /// Provider this arc is currently locked to for in-flight protection.
+    /// Set on the first LLM call of a task (snapshotting the active
+    /// provider at task start), cleared when the arc transitions back to
+    /// idle. `None` means "follow the global active provider." See
+    /// `docs/PROVIDER_PINNING.md`.
+    pub pinned_provider_id: Option<String>,
+    /// `ModelProfile` (wire form: `"Powerful"` / `"Fast"` / `"Code"` /
+    /// `"Cheap"` / `"Local"`) the task started on. Stored alongside
+    /// `pinned_provider_id` for future per-tier honouring; today the
+    /// column is captured but routing only consults `pinned_provider_id`.
+    pub pinned_tier: Option<String>,
 }
 
 /// The type of an entry within an Arc.
@@ -288,6 +299,31 @@ impl ArcStore {
                 .map_err(|e| AthenError::Other(format!("Add summarized_through_entry_id: {e}")))?;
             }
 
+            // Column-level migration: `pinned_provider_id` + `pinned_tier`
+            // were added so an arc can lock onto the provider that started
+            // its in-flight task — preventing mid-task provider switches
+            // from rehydrating provider-A's messages onto provider B. NULL
+            // means "follow the global active provider."
+            let cols: std::collections::HashSet<String> = conn
+                .prepare("PRAGMA table_info(arcs)")
+                .and_then(|mut stmt| {
+                    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+                    let mut set = std::collections::HashSet::new();
+                    for r in rows {
+                        set.insert(r?);
+                    }
+                    Ok(set)
+                })
+                .map_err(|e| AthenError::Other(format!("Inspect arcs cols (pinning): {e}")))?;
+            if !cols.contains("pinned_provider_id") {
+                conn.execute("ALTER TABLE arcs ADD COLUMN pinned_provider_id TEXT", [])
+                    .map_err(|e| AthenError::Other(format!("Add pinned_provider_id: {e}")))?;
+            }
+            if !cols.contains("pinned_tier") {
+                conn.execute("ALTER TABLE arcs ADD COLUMN pinned_tier TEXT", [])
+                    .map_err(|e| AthenError::Other(format!("Add pinned_tier: {e}")))?;
+            }
+
             Ok(())
         })
         .await
@@ -355,7 +391,8 @@ impl ArcStore {
                             a.merged_into_arc_id, a.created_at, a.updated_at, \
                             COALESCE(e.cnt, 0) AS entry_count, \
                             a.primary_reply_channel, a.active_profile_id, \
-                            a.summarized_through_entry_id \
+                            a.summarized_through_entry_id, \
+                            a.pinned_provider_id, a.pinned_tier \
                      FROM arcs a \
                      LEFT JOIN ( \
                          SELECT arc_id, COUNT(*) AS cnt \
@@ -380,6 +417,8 @@ impl ArcStore {
                         primary_reply_channel: row.get(9)?,
                         active_profile_id: row.get(10)?,
                         summarized_through_entry_id: row.get(11)?,
+                        pinned_provider_id: row.get(12)?,
+                        pinned_tier: row.get(13)?,
                     })
                 })
                 .map_err(|e| AthenError::Other(format!("Query get arc: {e}")))?;
@@ -425,7 +464,8 @@ impl ArcStore {
                         a.merged_into_arc_id, a.created_at, a.updated_at, \
                         COALESCE(e.cnt, 0) AS entry_count, \
                         a.primary_reply_channel, a.active_profile_id, \
-                        a.summarized_through_entry_id \
+                        a.summarized_through_entry_id, \
+                        a.pinned_provider_id, a.pinned_tier \
                  FROM arcs a \
                  LEFT JOIN ( \
                      SELECT arc_id, COUNT(*) AS cnt \
@@ -453,6 +493,8 @@ impl ArcStore {
                         primary_reply_channel: row.get(9)?,
                         active_profile_id: row.get(10)?,
                         summarized_through_entry_id: row.get(11)?,
+                        pinned_provider_id: row.get(12)?,
+                        pinned_tier: row.get(13)?,
                     })
                 })
                 .map_err(|e| AthenError::Other(format!("Query list arcs: {e}")))?;
@@ -574,6 +616,56 @@ impl ArcStore {
                 params![profile_id, id],
             )
             .map_err(|e| AthenError::Other(format!("Set active_profile_id: {e}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
+    /// Atomically pin this arc to `(provider_id, tier)` if it currently
+    /// has no pin. Returns `true` if the pin was written, `false` if a
+    /// pin was already in place. First-call-wins semantics: callers race
+    /// the very first LLM call of a task; only the first one to land
+    /// records the pin, every later iteration reads the same value.
+    pub async fn set_pinned_provider_if_unset(
+        &self,
+        id: &str,
+        provider_id: &str,
+        tier: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.clone();
+        let id = id.to_string();
+        let provider_id = provider_id.to_string();
+        let tier = tier.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let affected = conn
+                .execute(
+                    "UPDATE arcs SET pinned_provider_id = ?1, pinned_tier = ?2 \
+                     WHERE id = ?3 AND pinned_provider_id IS NULL",
+                    params![provider_id, tier, id],
+                )
+                .map_err(|e| AthenError::Other(format!("Set pinned provider: {e}")))?;
+            Ok(affected > 0)
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
+    /// Clear the provider pin (both `pinned_provider_id` and
+    /// `pinned_tier`). Called when the arc transitions back to idle so
+    /// the next task can re-pin against whatever active provider is in
+    /// effect at that point.
+    pub async fn clear_pinned_provider(&self, id: &str) -> Result<()> {
+        let conn = self.conn.clone();
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE arcs SET pinned_provider_id = NULL, pinned_tier = NULL WHERE id = ?1",
+                params![id],
+            )
+            .map_err(|e| AthenError::Other(format!("Clear pinned provider: {e}")))?;
             Ok(())
         })
         .await
@@ -1030,7 +1122,9 @@ CREATE TABLE IF NOT EXISTS arcs (
     updated_at TEXT NOT NULL,
     primary_reply_channel TEXT,
     active_profile_id TEXT,
-    summarized_through_entry_id INTEGER
+    summarized_through_entry_id INTEGER,
+    pinned_provider_id TEXT,
+    pinned_tier TEXT
 );
 
 CREATE TABLE IF NOT EXISTS arc_entries (
@@ -2217,6 +2311,117 @@ mod tests {
         // Sanity: pointing past the last id returns empty.
         let none = store.load_entries_after("arc_t", ids[3]).await.unwrap();
         assert!(none.is_empty());
+    }
+
+    /// Pin lifecycle: new arcs default to None on both columns; the
+    /// first set wins; subsequent sets are no-ops; clear restores None;
+    /// re-pin after clear is allowed.
+    #[tokio::test]
+    async fn test_pinned_provider_lifecycle() {
+        let store = setup_arc_store().await;
+        store
+            .create_arc("arc_p", "Pin arc", ArcSource::UserInput)
+            .await
+            .unwrap();
+
+        let meta = store.get_arc("arc_p").await.unwrap().expect("arc present");
+        assert_eq!(meta.pinned_provider_id, None);
+        assert_eq!(meta.pinned_tier, None);
+
+        let wrote = store
+            .set_pinned_provider_if_unset("arc_p", "deepseek", "Powerful")
+            .await
+            .unwrap();
+        assert!(wrote, "first set must write");
+        let meta = store.get_arc("arc_p").await.unwrap().expect("arc present");
+        assert_eq!(meta.pinned_provider_id.as_deref(), Some("deepseek"));
+        assert_eq!(meta.pinned_tier.as_deref(), Some("Powerful"));
+
+        let wrote = store
+            .set_pinned_provider_if_unset("arc_p", "anthropic", "Fast")
+            .await
+            .unwrap();
+        assert!(!wrote, "second set must be a no-op (first-call-wins)");
+        let meta = store.get_arc("arc_p").await.unwrap().expect("arc present");
+        assert_eq!(meta.pinned_provider_id.as_deref(), Some("deepseek"));
+        assert_eq!(meta.pinned_tier.as_deref(), Some("Powerful"));
+
+        store.clear_pinned_provider("arc_p").await.unwrap();
+        let meta = store.get_arc("arc_p").await.unwrap().expect("arc present");
+        assert_eq!(meta.pinned_provider_id, None);
+        assert_eq!(meta.pinned_tier, None);
+
+        let wrote = store
+            .set_pinned_provider_if_unset("arc_p", "anthropic", "Fast")
+            .await
+            .unwrap();
+        assert!(wrote, "re-pin after clear must succeed");
+        let listed = store.list_arcs().await.unwrap();
+        let row = listed.iter().find(|a| a.id == "arc_p").unwrap();
+        assert_eq!(row.pinned_provider_id.as_deref(), Some("anthropic"));
+        assert_eq!(row.pinned_tier.as_deref(), Some("Fast"));
+    }
+
+    /// `init_schema` must add `pinned_provider_id` + `pinned_tier` to a
+    /// pre-existing database created before the columns existed.
+    #[tokio::test]
+    async fn test_pinned_provider_migration_on_legacy_db() {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        let conn = Arc::new(Mutex::new(conn));
+
+        let conn_clone = conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let c = conn_clone.blocking_lock();
+            c.execute_batch(
+                "CREATE TABLE arcs (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'user_input',
+                    status TEXT NOT NULL DEFAULT 'active',
+                    parent_arc_id TEXT,
+                    merged_into_arc_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    primary_reply_channel TEXT,
+                    active_profile_id TEXT,
+                    summarized_through_entry_id INTEGER
+                );
+                CREATE TABLE arc_entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    arc_id TEXT NOT NULL,
+                    entry_type TEXT NOT NULL DEFAULT 'message',
+                    source TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    metadata TEXT,
+                    created_at TEXT NOT NULL,
+                    turn_id TEXT
+                );
+                INSERT INTO arcs (id, name, source, status, created_at, updated_at)
+                  VALUES ('legacy', 'Legacy', 'user_input', 'active',
+                          '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z');",
+            )
+            .expect("seed legacy schema");
+        })
+        .await
+        .unwrap();
+
+        let store = ArcStore::new(conn);
+        store.init_schema().await.expect("migrates legacy db");
+
+        let meta = store.get_arc("legacy").await.unwrap().expect("arc present");
+        assert_eq!(meta.pinned_provider_id, None);
+        assert_eq!(meta.pinned_tier, None);
+
+        let wrote = store
+            .set_pinned_provider_if_unset("legacy", "openai", "Code")
+            .await
+            .unwrap();
+        assert!(wrote);
+        let meta = store.get_arc("legacy").await.unwrap().expect("arc present");
+        assert_eq!(meta.pinned_provider_id.as_deref(), Some("openai"));
+        assert_eq!(meta.pinned_tier.as_deref(), Some("Code"));
+
+        store.init_schema().await.expect("idempotent re-init");
     }
 
     #[tokio::test]

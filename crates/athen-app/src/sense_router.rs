@@ -2158,6 +2158,8 @@ mod tests {
                 primary_reply_channel: None,
                 active_profile_id: None,
                 summarized_through_entry_id: None,
+                pinned_provider_id: None,
+                pinned_tier: None,
             },
             ArcMeta {
                 id: "arc_recent".into(),
@@ -2172,6 +2174,8 @@ mod tests {
                 primary_reply_channel: None,
                 active_profile_id: None,
                 summarized_through_entry_id: None,
+                pinned_provider_id: None,
+                pinned_tier: None,
             },
         ];
 

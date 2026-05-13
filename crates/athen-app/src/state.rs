@@ -1865,16 +1865,10 @@ impl AppState {
         // hydrate the IMAP password from it (the password lives in the
         // vault for installs that have re-saved their email settings).
         let vault_snapshot = self.vault.clone();
-        // Snapshot the active provider id so the dispatch loop can resolve
-        // the per-arc compaction budget on each iteration. A mid-session
-        // provider switch won't propagate into already-spawned dispatch
-        // loops — acceptable, and clearly bounded scope. TODO: switch to
-        // an Arc<Mutex<String>> on AppState if we ever need live reloads.
-        let active_provider_id_snapshot = self
-            .active_provider_id
-            .try_lock()
-            .map(|g| g.clone())
-            .unwrap_or_default();
+        // Re-read the active provider id off `load_config()` per dispatched
+        // task instead of cloning a one-shot snapshot here. New tasks see
+        // a mid-session active-provider switch; in-flight arcs ride their
+        // existing pin (see `docs/PROVIDER_PINNING.md`).
         let attachment_store_loop = self.attachment_store();
         let inflight = Arc::clone(&self.inflight_approvals);
         let agent_registry_loop = self.agent_registry.clone();
@@ -1963,14 +1957,22 @@ impl AppState {
                     // fires on user-driven sense events) and lets the user
                     // tune compaction without restarting the loop.
                     let cfg_for_resolvers = crate::state::load_config();
+                    let active_id_now = crate::state::resolve_active_provider(&cfg_for_resolvers);
+                    let effective_provider_id = crate::state::resolve_effective_provider_for_arc(
+                        arc_store.as_ref(),
+                        &arc_id,
+                        &active_id_now,
+                        athen_core::llm::ModelProfile::Powerful,
+                    )
+                    .await;
                     let (compaction_trigger_tokens, compaction_target_tokens) =
                         crate::compaction::resolve_compaction_budget(
                             &cfg_for_resolvers,
-                            &active_provider_id_snapshot,
+                            &effective_provider_id,
                         );
                     let sampling_temperature = crate::compaction::resolve_provider_temperature(
                         &cfg_for_resolvers,
-                        &active_provider_id_snapshot,
+                        &effective_provider_id,
                     );
                     let ctx = crate::commands::ApprovedTaskCtx {
                         coordinator: Arc::clone(&coordinator),
@@ -3334,6 +3336,68 @@ fn ensure_data_dir() -> Option<PathBuf> {
         return None;
     }
     Some(data_dir)
+}
+
+/// Resolve the effective provider id for an arc-scoped LLM call,
+/// honouring an existing pin or installing one if none is present.
+///
+/// First-call-wins semantics: when the arc has no pin yet, the current
+/// active provider id is snapshotted onto the arc row. Subsequent calls
+/// against the same arc read that pinned value back, isolating the
+/// arc's in-flight task from a mid-flight active-provider switch (see
+/// `docs/PROVIDER_PINNING.md`).
+///
+/// If the pinned provider has been removed from config the function
+/// logs a warning and returns the current active id — recoverability
+/// over purity.
+pub(crate) async fn resolve_effective_provider_for_arc(
+    arc_store: Option<&ArcStore>,
+    arc_id: &str,
+    active_provider_id: &str,
+    tier: ModelProfile,
+) -> String {
+    let Some(store) = arc_store else {
+        return active_provider_id.to_string();
+    };
+    let arc = match store.get_arc(arc_id).await {
+        Ok(Some(arc)) => arc,
+        Ok(None) => return active_provider_id.to_string(),
+        Err(e) => {
+            warn!(arc_id = %arc_id, error = %e, "pin lookup failed; using active provider");
+            return active_provider_id.to_string();
+        }
+    };
+    if let Some(pinned) = arc.pinned_provider_id.as_deref() {
+        let cfg = load_config();
+        if cfg.models.providers.contains_key(pinned) {
+            return pinned.to_string();
+        }
+        warn!(
+            arc_id = %arc_id,
+            pinned_provider_id = %pinned,
+            "pinned provider missing from config; falling back to active"
+        );
+        return active_provider_id.to_string();
+    }
+    let tier_str = format!("{:?}", tier);
+    if let Err(e) = store
+        .set_pinned_provider_if_unset(arc_id, active_provider_id, &tier_str)
+        .await
+    {
+        warn!(arc_id = %arc_id, error = %e, "failed to install provider pin");
+    }
+    active_provider_id.to_string()
+}
+
+/// Clear an arc's provider pin. Best-effort: logs and swallows errors
+/// since pin clearing is a hygiene step, not load-bearing for the task
+/// that just finished.
+pub(crate) async fn clear_provider_pin_for_arc(arc_store: Option<&ArcStore>, arc_id: &str) {
+    if let Some(store) = arc_store {
+        if let Err(e) = store.clear_pinned_provider(arc_id).await {
+            warn!(arc_id = %arc_id, error = %e, "failed to clear provider pin");
+        }
+    }
 }
 
 /// Determine the active provider ID from config, falling back to "deepseek".

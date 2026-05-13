@@ -77,25 +77,15 @@ fn spawn_router_approval(
     let arc_id = state.active_arc_id.try_lock().map(|g| g.clone()).ok();
     let app_handle = app_handle.clone();
 
-    // Resolve per-arc compaction budget from the active provider's
-    // `context_window_tokens` × `compaction_trigger_pct` /
-    // `compaction_target_pct` once at construction. Snapshot semantics
-    // means a mid-task provider switch can't move the goalposts.
+    // Snapshot the active provider id; the effective provider (honouring
+    // any existing arc pin) is resolved later inside the spawned async
+    // block — `spawn_router_approval` itself is sync, so we can't await
+    // the arc-store pin lookup here. See `docs/PROVIDER_PINNING.md`.
     let active_provider_id_snapshot = state
         .active_provider_id
         .try_lock()
         .map(|g| g.clone())
         .unwrap_or_default();
-    let cfg_for_resolvers = crate::state::load_config();
-    let (compaction_trigger_tokens, compaction_target_tokens) =
-        crate::compaction::resolve_compaction_budget(
-            &cfg_for_resolvers,
-            &active_provider_id_snapshot,
-        );
-    let sampling_temperature = crate::compaction::resolve_provider_temperature(
-        &cfg_for_resolvers,
-        &active_provider_id_snapshot,
-    );
 
     // Clone every AppState bit the helper would need, so the bg task can
     // drive execution without borrowing `&AppState`.
@@ -126,9 +116,7 @@ fn spawn_router_approval(
         email_sender: state.email_sender.clone(),
         owner_check: state.owner_destination_check(),
         attachment_store: state.attachment_store(),
-        compaction_trigger_tokens,
-        compaction_target_tokens,
-        sampling_temperature,
+        active_provider_id_snapshot: active_provider_id_snapshot.clone(),
         wakeup_store: state
             .wakeup_store
             .clone()
@@ -206,6 +194,25 @@ fn spawn_router_approval(
         // execute_approved_task ensures we no-op cleanly if the in-app
         // IPC `approve_task` already started this task.
         let turn_id = Uuid::new_v4().to_string();
+
+        let effective_provider_id = crate::state::resolve_effective_provider_for_arc(
+            bg_ctx.arc_store.as_ref(),
+            &bg_ctx.active_arc_id,
+            &bg_ctx.active_provider_id_snapshot,
+            athen_core::llm::ModelProfile::Powerful,
+        )
+        .await;
+        let cfg_for_resolvers = crate::state::load_config();
+        let (compaction_trigger_tokens, compaction_target_tokens) =
+            crate::compaction::resolve_compaction_budget(
+                &cfg_for_resolvers,
+                &effective_provider_id,
+            );
+        let sampling_temperature = crate::compaction::resolve_provider_temperature(
+            &cfg_for_resolvers,
+            &effective_provider_id,
+        );
+
         let ctx = ApprovedTaskCtx {
             coordinator: bg_ctx.coordinator,
             router: bg_ctx.router_arc,
@@ -245,9 +252,9 @@ fn spawn_router_approval(
             owner_check: bg_ctx.owner_check.clone(),
             initial_user_images: Vec::new(),
             attachment_store: bg_ctx.attachment_store.clone(),
-            compaction_trigger_tokens: bg_ctx.compaction_trigger_tokens,
-            compaction_target_tokens: bg_ctx.compaction_target_tokens,
-            sampling_temperature: bg_ctx.sampling_temperature,
+            compaction_trigger_tokens,
+            compaction_target_tokens,
+            sampling_temperature,
             // Bg path drives Telegram-originated approvals; composer
             // uploads live on the desktop side, so this turn never has
             // an upload event_id to thread through. Same rationale as
@@ -340,14 +347,11 @@ struct ApprovedTaskBgCtx {
     /// See [`ApprovedTaskCtx::owner_check`].
     owner_check: Option<Arc<dyn athen_agent::OwnerDestinationCheck>>,
     attachment_store: Option<athen_persistence::attachments::AttachmentStore>,
-    compaction_trigger_tokens: u32,
-    compaction_target_tokens: u32,
-    /// Active provider's sampling-temperature override. `None` means
-    /// "let the provider adapter pick its baked-in default" (currently
-    /// 0.7 across OpenAI-compat / DeepSeek). Snapshotted at ctx
-    /// construction so a mid-task settings change can't move the
-    /// goalposts.
-    sampling_temperature: Option<f32>,
+    /// Active provider id at the moment `spawn_router_approval` was called.
+    /// Used inside the spawned async block to resolve the effective
+    /// (pin-honouring) provider for compaction/temperature, since the
+    /// sync surface here can't await the arc-store pin lookup.
+    active_provider_id_snapshot: String,
     /// Wake-up store, threaded into `ApprovedTaskCtx` so the executor
     /// path can compose `create_wakeup` for the agent (Phase 5).
     wakeup_store: Option<Arc<dyn athen_core::traits::wakeup::WakeupStore>>,
@@ -2229,9 +2233,17 @@ pub async fn send_message(
                 crate::endpoints_render::render_endpoints_block(state.http_endpoint_store.as_ref())
                     .await;
 
+            let active_id_now = state.active_provider_id.lock().await.clone();
+            let effective_provider_id = crate::state::resolve_effective_provider_for_arc(
+                state.arc_store.as_ref(),
+                &current_arc,
+                &active_id_now,
+                athen_core::llm::ModelProfile::Powerful,
+            )
+            .await;
             let sampling_temperature = crate::compaction::resolve_provider_temperature(
                 &crate::state::load_config(),
-                &state.active_provider_id.lock().await.clone(),
+                &effective_provider_id,
             );
             let mut builder = AgentBuilder::new()
                 .llm_router(exec_router)
@@ -2301,6 +2313,11 @@ pub async fn send_message(
                         g.fail(e.to_string()).await;
                     }
                     let _ = state.coordinator.complete_task(task_id).await;
+                    crate::state::clear_provider_pin_for_arc(
+                        state.arc_store.as_ref(),
+                        &current_arc,
+                    )
+                    .await;
                     let raw = e.to_string();
                     tracing::error!("Agent execution failed: {raw}");
                     let msg = format_user_error(&raw);
@@ -2435,6 +2452,7 @@ pub async fn send_message(
 
             // Mark coordinator task as completed.
             let _ = state.coordinator.complete_task(task_id).await;
+            crate::state::clear_provider_pin_for_arc(state.arc_store.as_ref(), &current_arc).await;
 
             Ok(ChatResponse {
                 content,
@@ -2516,16 +2534,18 @@ pub async fn approve_task(
 
     let active_arc = state.active_arc_id.lock().await.clone();
     let active_provider_id_snapshot = state.active_provider_id.lock().await.clone();
+    let effective_provider_id = crate::state::resolve_effective_provider_for_arc(
+        state.arc_store.as_ref(),
+        &active_arc,
+        &active_provider_id_snapshot,
+        athen_core::llm::ModelProfile::Powerful,
+    )
+    .await;
     let cfg_for_resolvers = crate::state::load_config();
     let (compaction_trigger_tokens, compaction_target_tokens) =
-        crate::compaction::resolve_compaction_budget(
-            &cfg_for_resolvers,
-            &active_provider_id_snapshot,
-        );
-    let sampling_temperature = crate::compaction::resolve_provider_temperature(
-        &cfg_for_resolvers,
-        &active_provider_id_snapshot,
-    );
+        crate::compaction::resolve_compaction_budget(&cfg_for_resolvers, &effective_provider_id);
+    let sampling_temperature =
+        crate::compaction::resolve_provider_temperature(&cfg_for_resolvers, &effective_provider_id);
 
     let ctx = ApprovedTaskCtx {
         coordinator: Arc::clone(&state.coordinator),
@@ -3338,6 +3358,8 @@ pub(crate) async fn execute_approved_task(
                 g.fail(e.to_string()).await;
             }
             let _ = ctx.coordinator.complete_task(coord_task_id).await;
+            crate::state::clear_provider_pin_for_arc(ctx.arc_store.as_ref(), &ctx.active_arc_id)
+                .await;
             let raw = e.to_string();
             tracing::error!("Agent execution failed after approval: {raw}");
             let msg = format_user_error(&raw);
@@ -3473,6 +3495,7 @@ pub(crate) async fn execute_approved_task(
     }
 
     let _ = ctx.coordinator.complete_task(coord_task_id).await;
+    crate::state::clear_provider_pin_for_arc(ctx.arc_store.as_ref(), &ctx.active_arc_id).await;
 
     // Notify the frontend so the sidebar refreshes (mirrors the Telegram
     // owner-message handler — relevant when the bg path drives this).
@@ -4328,6 +4351,7 @@ pub(crate) async fn execute_dispatched_task(
                 g.fail(e.to_string()).await;
             }
             let _ = ctx.coordinator.complete_task(coord_task_id).await;
+            crate::state::clear_provider_pin_for_arc(ctx.arc_store.as_ref(), &arc_id).await;
             let raw = e.to_string();
             tracing::error!("Agent execution failed for dispatched task: {raw}");
             let msg = format_user_error(&raw);
@@ -4467,6 +4491,7 @@ pub(crate) async fn execute_dispatched_task(
     }
 
     let _ = ctx.coordinator.complete_task(coord_task_id).await;
+    crate::state::clear_provider_pin_for_arc(ctx.arc_store.as_ref(), &arc_id).await;
 
     let _ = ctx
         .app_handle
