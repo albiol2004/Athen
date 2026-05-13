@@ -42,6 +42,8 @@ futures = { workspace = true }
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 base64 = { workspace = true }
 url = { workspace = true }
+quick-xml = { workspace = true }
+lettre = { workspace = true }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

@@ -7057,6 +7057,54 @@ pub async fn install_runtime(
         .map_err(|e| e.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Email setup wizard — autodetect + test-connection (Phase 1).
+//
+// Backs the Settings → Email panel. `email_detect` runs the hardcoded
+// provider table + Thunderbird autoconfig chain; `email_test_connection`
+// proves the supplied credentials work without sending mail. The UI
+// composes them: detect → pre-fill form → user pastes app password →
+// test → save. See docs/EMAIL_SETUP.md for the full design.
+// ---------------------------------------------------------------------------
+
+/// Autodetect provider settings for an email address. Tries the hardcoded
+/// table first, falls back to Thunderbird autoconfig. Returns `None` if
+/// nothing matched — the FE drops the user into the Advanced disclosure.
+#[tauri::command]
+pub async fn email_detect(
+    email: String,
+) -> std::result::Result<Option<athen_core::email_provider::ProviderHint>, String> {
+    Ok(crate::email_autodetect::detect(&email).await)
+}
+
+/// Test IMAP login + SMTP auth using the supplied credentials. Both halves
+/// always run; the result reports them independently so the FE can show
+/// one passed and the other failed. Never sends an email.
+#[tauri::command]
+pub async fn email_test_connection(
+    config: crate::email_test::EmailTestConfig,
+    password: String,
+    smtp_password: String,
+) -> std::result::Result<crate::email_test::TestResult, String> {
+    Ok(crate::email_test::test_connection(&config, &password, &smtp_password).await)
+}
+
+/// Translate a raw IMAP / SMTP error into a human-friendly banner. Tier 1
+/// of the translator (static catalog); returns `None` for errors the
+/// catalog doesn't cover — Phase 3 will plug an LLM fallback in behind
+/// the same shape. The optional `domain` argument narrows the
+/// `AUTHENTICATIONFAILED` family to the right provider's app-password URL.
+#[tauri::command]
+pub async fn email_translate_error(
+    raw_error: String,
+    domain: Option<String>,
+) -> std::result::Result<Option<crate::email_errors::TranslatedError>, String> {
+    Ok(crate::email_errors::translate(
+        &raw_error,
+        domain.as_deref(),
+    ))
+}
+
 #[cfg(test)]
 mod key_term_tests {
     use super::extract_key_terms;

@@ -11,7 +11,10 @@ mod commands;
 pub(crate) mod compaction;
 mod contacts;
 pub(crate) mod delegation;
+pub(crate) mod email_autodetect;
+pub(crate) mod email_errors;
 pub(crate) mod email_gate;
+pub(crate) mod email_test;
 pub(crate) mod endpoints_render;
 pub(crate) mod file_gate;
 pub(crate) mod http_presets;
@@ -198,6 +201,9 @@ pub fn run() {
             commands::list_http_endpoint_presets,
             commands::list_active_agents,
             commands::list_recent_agent_runs,
+            commands::email_detect,
+            commands::email_test_connection,
+            commands::email_translate_error,
         ])
         .setup(|app| {
             use tauri::Manager;

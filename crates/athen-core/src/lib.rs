@@ -4,6 +4,7 @@ pub mod attachment_policy;
 pub mod config;
 pub mod config_loader;
 pub mod contact;
+pub mod email_provider;
 pub mod error;
 pub mod event;
 pub mod http_endpoint;
