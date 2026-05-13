@@ -112,6 +112,18 @@
                         <span class="profile-picker-label">Agent:</span>
                         <select id="arc-profile-picker" class="profile-picker"></select>
                     </label>
+                    <label class="profile-picker-wrap" title="How hard the model should think on this arc. Default = provider's own default.">
+                        <span class="profile-picker-label">Think:</span>
+                        <select id="arc-reasoning-picker" class="profile-picker">
+                            <option value="default">Default</option>
+                            <option value="off">Off</option>
+                            <option value="minimal">Minimal</option>
+                            <option value="low">Low</option>
+                            <option value="medium">Medium</option>
+                            <option value="high">High</option>
+                            <option value="max">Max</option>
+                        </select>
+                    </label>
                     <button id="new-chat-btn" title="Start a new conversation">New Arc</button>
                 </div>
             </header>

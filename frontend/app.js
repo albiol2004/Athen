@@ -626,6 +626,7 @@ async function loadArcs() {
         }
         renderArcList(arcs || []);
         renderProfilePicker();
+        renderReasoningPicker();
     } catch (err) {
         console.error('Failed to load arcs:', err);
     }
@@ -642,6 +643,7 @@ async function loadAgentProfiles() {
     try {
         agentProfiles = await invoke('list_agent_profiles');
         renderProfilePicker();
+        renderReasoningPicker();
     } catch (err) {
         console.error('Failed to load agent profiles:', err);
         agentProfiles = [];
@@ -680,6 +682,29 @@ async function onProfileChange(ev) {
         console.error('set_arc_profile failed:', err);
         // Roll the dropdown back to whatever the arc actually has.
         renderProfilePicker();
+        renderReasoningPicker();
+    }
+}
+
+function renderReasoningPicker() {
+    const sel = document.getElementById('arc-reasoning-picker');
+    if (!sel) return;
+    sel.disabled = !activeArcId;
+    const meta = activeArcId ? arcMetaById.get(activeArcId) : null;
+    sel.value = (meta && meta.reasoning_effort_override) || 'default';
+}
+
+async function onReasoningChange(ev) {
+    if (!invoke || !activeArcId) return;
+    const chosen = ev.target.value;
+    const effort = chosen === 'default' ? null : chosen;
+    try {
+        await invoke('set_arc_reasoning_effort', { arcId: activeArcId, effort });
+        const meta = arcMetaById.get(activeArcId);
+        if (meta) meta.reasoning_effort_override = effort;
+    } catch (err) {
+        console.error('set_arc_reasoning_effort failed:', err);
+        renderReasoningPicker();
     }
 }
 
@@ -999,6 +1024,7 @@ async function handleSwitchArc(arcId) {
         const entries = await invoke('switch_arc', { arcId });
         activeArcId = arcId;
         renderProfilePicker();
+        renderReasoningPicker();
 
         // Clear notification dot for this arc.
         arcsWithNotifications.delete(arcId);
@@ -3793,6 +3819,11 @@ if (arcProfilePicker) {
     arcProfilePicker.addEventListener('change', onProfileChange);
 }
 
+const arcReasoningPicker = document.getElementById('arc-reasoning-picker');
+if (arcReasoningPicker) {
+    arcReasoningPicker.addEventListener('change', onReasoningChange);
+}
+
 const newProfileBtn = document.getElementById('new-profile-btn');
 if (newProfileBtn) {
     newProfileBtn.addEventListener('click', () => openProfileEditor('create', null));
@@ -4150,6 +4181,7 @@ async function loadProfileManager() {
         // Push the freshly loaded list back to the per-arc dropdown so the
         // two views never disagree.
         renderProfilePicker();
+        renderReasoningPicker();
     } catch (err) {
         console.error('Failed to load profiles:', err);
         listEl.innerHTML = '<p class="setting-hint">Failed to load profiles.</p>';

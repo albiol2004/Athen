@@ -5474,6 +5474,33 @@ pub async fn set_arc_profile(
         .map_err(|e| e.to_string())
 }
 
+/// Set the reasoning-effort override for an arc. `None` (or `"default"`)
+/// clears the override so the arc falls back to provider defaults. Other
+/// values map onto `ReasoningEffort` via its `FromStr`.
+#[tauri::command]
+pub async fn set_arc_reasoning_effort(
+    arc_id: String,
+    effort: Option<String>,
+    state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    let Some(arc_store) = state.arc_store.as_ref() else {
+        return Err("Arc store not available".into());
+    };
+    let normalized: Option<String> = match effort.as_deref() {
+        None | Some("") | Some("default") => None,
+        Some(s) => {
+            let parsed: athen_core::llm::ReasoningEffort = s
+                .parse()
+                .map_err(|_| format!("unknown reasoning_effort value: {s:?}"))?;
+            Some(parsed.to_wire_str().to_string())
+        }
+    };
+    arc_store
+        .set_reasoning_effort_override(&arc_id, normalized.as_deref())
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Inputs the manager UI sends when creating or updating a user-authored
 /// profile. Mirrors `AgentProfile` minus the server-managed fields
 /// (`builtin`, `created_at`, `updated_at`) and the unused-yet

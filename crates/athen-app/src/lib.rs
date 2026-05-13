@@ -166,6 +166,7 @@ pub fn run() {
             commands::revoke_global_grant,
             commands::list_agent_profiles,
             commands::set_arc_profile,
+            commands::set_arc_reasoning_effort,
             commands::create_agent_profile,
             commands::update_agent_profile,
             commands::delete_agent_profile,
