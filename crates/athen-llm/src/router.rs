@@ -476,6 +476,7 @@ mod tests {
             temperature: None,
             tools: None,
             system_prompt: None,
+            reasoning_effort: athen_core::llm::ReasoningEffort::default(),
         }
     }
 

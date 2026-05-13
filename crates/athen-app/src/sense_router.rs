@@ -1438,6 +1438,7 @@ If the body is followed by an "[Attachments on this message ...]" block, those f
         temperature: Some(0.1),
         tools: None,
         system_prompt: None,
+        reasoning_effort: athen_core::llm::ReasoningEffort::default(),
     };
 
     let llm_router = router.read().await.clone();
@@ -2159,7 +2160,8 @@ mod tests {
                 active_profile_id: None,
                 summarized_through_entry_id: None,
                 pinned_provider_id: None,
-                pinned_tier: None,
+                pinned_slug: None,
+                reasoning_effort_override: None,
             },
             ArcMeta {
                 id: "arc_recent".into(),
@@ -2175,7 +2177,8 @@ mod tests {
                 active_profile_id: None,
                 summarized_through_entry_id: None,
                 pinned_provider_id: None,
-                pinned_tier: None,
+                pinned_slug: None,
+                reasoning_effort_override: None,
             },
         ];
 

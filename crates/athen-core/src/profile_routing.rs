@@ -728,6 +728,7 @@ fn build_llm_classifier_request(description: &str, profiles: &[&AgentProfile]) -
         temperature: Some(0.0),
         tools: None,
         system_prompt: Some(system_prompt),
+        reasoning_effort: crate::llm::ReasoningEffort::default(),
     }
 }
 

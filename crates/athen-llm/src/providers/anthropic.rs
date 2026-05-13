@@ -28,6 +28,12 @@ pub struct AnthropicProvider {
     /// a no-op for Claude families — kept for consistency with the other
     /// providers.
     quirks: ModelQuirks,
+    /// Family selection drives reasoning-effort mapping: Opus 4.7 takes
+    /// `{ type: "adaptive" }` and rejects `type: "enabled"`; Haiku 4.5
+    /// takes only `type: "enabled"`; Sonnet 4.6 accepts either. Default
+    /// keeps reproductive byte-for-byte behaviour with the pre-feature
+    /// adapter for unprofiled configs.
+    family: ModelFamily,
 }
 
 impl AnthropicProvider {
@@ -43,6 +49,7 @@ impl AnthropicProvider {
             // Default quirks; callers pick a Claude family via with_family
             // for symmetry — the values don't affect Claude parsing today.
             quirks: ModelQuirks::default(),
+            family: ModelFamily::Default,
         }
     }
 
@@ -51,6 +58,7 @@ impl AnthropicProvider {
     /// keeps the construction surface uniform across providers.
     pub fn with_family(mut self, family: ModelFamily) -> Self {
         self.quirks = seed::quirks_for_family(family);
+        self.family = family;
         self
     }
 
@@ -113,6 +121,7 @@ impl AnthropicProvider {
             temperature: request.temperature,
             system: request.system_prompt.clone(),
             stream: false,
+            thinking: map_reasoning_effort(self.family, request.reasoning_effort),
         }
     }
 
@@ -417,6 +426,74 @@ struct AnthropicRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<String>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<AnthropicThinking>,
+}
+
+/// Anthropic's `thinking` knob. Sonnet/Haiku take `{ type: "enabled",
+/// budget_tokens }`, Opus 4.7 takes `{ type: "adaptive" }` (no budget)
+/// and rejects `type: "enabled"`. Wire shape is `{ type, ...rest }`
+/// (no neighbouring discriminator field), so we hand-roll Serialize
+/// rather than relying on `#[serde(tag = "type")]` which can't omit
+/// the `budget_tokens` field on the adaptive variant cleanly.
+#[derive(Debug)]
+enum AnthropicThinking {
+    Enabled { budget_tokens: u32 },
+    Adaptive,
+}
+
+impl Serialize for AnthropicThinking {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        match self {
+            AnthropicThinking::Enabled { budget_tokens } => {
+                let mut m = ser.serialize_map(Some(2))?;
+                m.serialize_entry("type", "enabled")?;
+                m.serialize_entry("budget_tokens", budget_tokens)?;
+                m.end()
+            }
+            AnthropicThinking::Adaptive => {
+                let mut m = ser.serialize_map(Some(1))?;
+                m.serialize_entry("type", "adaptive")?;
+                m.end()
+            }
+        }
+    }
+}
+
+/// Map our cross-provider `ReasoningEffort` to Anthropic's `thinking`
+/// shape. Per `docs/REASONING_EFFORT.md`:
+/// - Default / Off → omit the field (Off "best-effort" on Opus, see below)
+/// - Opus 4.7 → `{ type: "adaptive" }` for Minimal..Max (the model is
+///   always-thinking and rejects `type: "enabled"`)
+/// - Haiku 4.5 + Sonnet 4.6 → `{ type: "enabled", budget_tokens: N }`
+///   with N clamped to 64k upstream of the API
+fn map_reasoning_effort(family: ModelFamily, effort: ReasoningEffort) -> Option<AnthropicThinking> {
+    match (family, effort) {
+        // Default and Off: omit. Opus is always-thinking so Off is
+        // best-effort — sending nothing lets the model run its built-in
+        // adaptive policy.
+        (_, ReasoningEffort::Default | ReasoningEffort::Off) => None,
+        // Opus 4.7 rejects `type: "enabled"` — only adaptive is valid.
+        (ModelFamily::ClaudeOpus47, _) => Some(AnthropicThinking::Adaptive),
+        // Sonnet 4.6 + Haiku 4.5 (and any other claude family) take a
+        // token budget. Levels per the design doc; cap at 64k.
+        (_, ReasoningEffort::Minimal) => Some(AnthropicThinking::Enabled {
+            budget_tokens: 1024,
+        }),
+        (_, ReasoningEffort::Low) => Some(AnthropicThinking::Enabled {
+            budget_tokens: 4096,
+        }),
+        (_, ReasoningEffort::Medium) => Some(AnthropicThinking::Enabled {
+            budget_tokens: 16384,
+        }),
+        (_, ReasoningEffort::High) => Some(AnthropicThinking::Enabled {
+            budget_tokens: 32768,
+        }),
+        (_, ReasoningEffort::Max) => Some(AnthropicThinking::Enabled {
+            budget_tokens: 65536,
+        }),
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -522,6 +599,7 @@ mod tests {
             temperature: None,
             tools: None,
             system_prompt: None,
+            reasoning_effort: ReasoningEffort::default(),
         };
         let body = provider.build_request_body(&req);
         assert_eq!(body.messages.len(), 1);
@@ -530,5 +608,86 @@ mod tests {
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0]["type"], "text");
         assert_eq!(blocks[1]["type"], "image");
+    }
+
+    /// Helper: build a minimal request and serialise the result.
+    fn serialize_body_with(family: ModelFamily, effort: ReasoningEffort) -> serde_json::Value {
+        let provider = AnthropicProvider::new("k".into(), "claude-x".into()).with_family(family);
+        let req = LlmRequest {
+            profile: ModelProfile::Powerful,
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: MessageContent::Text("hi".into()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            tools: None,
+            system_prompt: None,
+            reasoning_effort: effort,
+        };
+        serde_json::to_value(provider.build_request_body(&req)).expect("serializes")
+    }
+
+    #[test]
+    fn anthropic_default_omits_thinking_field() {
+        let body = serialize_body_with(ModelFamily::ClaudeSonnet46, ReasoningEffort::Default);
+        assert!(
+            body.get("thinking").is_none(),
+            "Default must not emit `thinking`: {body}"
+        );
+    }
+
+    #[test]
+    fn anthropic_off_omits_thinking_field() {
+        let body = serialize_body_with(ModelFamily::ClaudeSonnet46, ReasoningEffort::Off);
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn anthropic_sonnet_low_emits_enabled_with_budget() {
+        let body = serialize_body_with(ModelFamily::ClaudeSonnet46, ReasoningEffort::Low);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 4096);
+    }
+
+    #[test]
+    fn anthropic_sonnet_max_clamps_at_64k() {
+        let body = serialize_body_with(ModelFamily::ClaudeSonnet46, ReasoningEffort::Max);
+        assert_eq!(body["thinking"]["budget_tokens"], 65536);
+    }
+
+    #[test]
+    fn anthropic_haiku_uses_enabled_shape() {
+        let body = serialize_body_with(ModelFamily::ClaudeHaiku45, ReasoningEffort::Medium);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 16384);
+    }
+
+    #[test]
+    fn anthropic_opus_uses_adaptive_for_any_active_level() {
+        // Opus 4.7 rejects `type: "enabled"`, so we send adaptive for
+        // every Minimal..Max level — the model runs its own policy.
+        for eff in [
+            ReasoningEffort::Minimal,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::Max,
+        ] {
+            let body = serialize_body_with(ModelFamily::ClaudeOpus47, eff);
+            assert_eq!(body["thinking"]["type"], "adaptive", "for {eff:?}");
+            assert!(
+                body["thinking"].get("budget_tokens").is_none(),
+                "adaptive must not carry budget_tokens for {eff:?}: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_opus_default_and_off_still_omit() {
+        for eff in [ReasoningEffort::Default, ReasoningEffort::Off] {
+            let body = serialize_body_with(ModelFamily::ClaudeOpus47, eff);
+            assert!(body.get("thinking").is_none(), "for {eff:?}: {body}");
+        }
     }
 }

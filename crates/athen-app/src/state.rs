@@ -1974,6 +1974,9 @@ impl AppState {
                         &cfg_for_resolvers,
                         &effective_provider_id,
                     );
+                    let reasoning_effort =
+                        crate::state::resolve_reasoning_effort_for_arc(arc_store.as_ref(), &arc_id)
+                            .await;
                     let ctx = crate::commands::ApprovedTaskCtx {
                         coordinator: Arc::clone(&coordinator),
                         router: Arc::clone(&router),
@@ -2008,6 +2011,7 @@ impl AppState {
                         compaction_trigger_tokens,
                         compaction_target_tokens,
                         sampling_temperature,
+                        reasoning_effort,
                         wakeup: wakeup_for_ctx,
                         // Sense-originated tasks don't carry composer
                         // uploads; the surfacing path uses the original
@@ -3147,6 +3151,7 @@ No explanation. No markdown."#
         temperature: Some(0.1),
         tools: None,
         system_prompt: None,
+        reasoning_effort: athen_core::llm::ReasoningEffort::default(),
     };
 
     let llm_router = router.read().await.clone();
@@ -3367,8 +3372,8 @@ pub(crate) async fn resolve_effective_provider_for_arc(
             return active_provider_id.to_string();
         }
     };
+    let cfg = load_config();
     if let Some(pinned) = arc.pinned_provider_id.as_deref() {
-        let cfg = load_config();
         if cfg.models.providers.contains_key(pinned) {
             return pinned.to_string();
         }
@@ -3379,9 +3384,20 @@ pub(crate) async fn resolve_effective_provider_for_arc(
         );
         return active_provider_id.to_string();
     }
-    let tier_str = format!("{:?}", tier);
+    let slug = cfg
+        .models
+        .providers
+        .get(active_provider_id)
+        .map(|p| {
+            p.tier_models
+                .get(&tier)
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .unwrap_or_else(|| p.default_model.clone())
+        })
+        .unwrap_or_default();
     if let Err(e) = store
-        .set_pinned_provider_if_unset(arc_id, active_provider_id, &tier_str)
+        .set_pinned_provider_if_unset(arc_id, active_provider_id, &slug)
         .await
     {
         warn!(arc_id = %arc_id, error = %e, "failed to install provider pin");
@@ -3397,6 +3413,34 @@ pub(crate) async fn clear_provider_pin_for_arc(arc_store: Option<&ArcStore>, arc
         if let Err(e) = store.clear_pinned_provider(arc_id).await {
             warn!(arc_id = %arc_id, error = %e, "failed to clear provider pin");
         }
+    }
+}
+
+/// Resolve the effective `ReasoningEffort` for an arc-scoped LLM call.
+///
+/// Reads the arc's `reasoning_effort_override` column (a user-set
+/// durable preference) and parses it. Missing arc, missing override,
+/// parse failure, or store error all fall through to
+/// `ReasoningEffort::Default` — which providers map to "omit the field
+/// on the wire" so behaviour matches today's call paths for any arc
+/// that hasn't opted in. Per-tier defaults from Settings are a
+/// follow-up; not consulted here.
+pub(crate) async fn resolve_reasoning_effort_for_arc(
+    arc_store: Option<&ArcStore>,
+    arc_id: &str,
+) -> athen_core::llm::ReasoningEffort {
+    use athen_core::llm::ReasoningEffort;
+    use std::str::FromStr;
+    let Some(store) = arc_store else {
+        return ReasoningEffort::Default;
+    };
+    match store.get_arc(arc_id).await {
+        Ok(Some(arc)) => arc
+            .reasoning_effort_override
+            .as_deref()
+            .and_then(|s| ReasoningEffort::from_str(s).ok())
+            .unwrap_or(ReasoningEffort::Default),
+        _ => ReasoningEffort::Default,
     }
 }
 

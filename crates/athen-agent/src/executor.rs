@@ -269,6 +269,13 @@ pub struct DefaultExecutor {
     /// agent gets the per-profile re-anchor without threading tools
     /// through host code.
     auto_reminders: bool,
+    /// Cross-provider "think harder / think less" knob applied to the
+    /// main loop's `LlmRequest`. `Default` (the default) omits the field
+    /// on the wire so providers apply their own defaults. The cheap
+    /// completion-judge and summarisation helpers intentionally stay at
+    /// `Default` — burning reasoning tokens on a one-word verdict is
+    /// pure waste regardless of the user's preference.
+    default_reasoning_effort: athen_core::llm::ReasoningEffort,
 }
 
 impl DefaultExecutor {
@@ -302,6 +309,7 @@ impl DefaultExecutor {
             endpoints_block: None,
             reminder_builder: None,
             auto_reminders: false,
+            default_reasoning_effort: athen_core::llm::ReasoningEffort::Default,
         }
     }
 
@@ -332,6 +340,14 @@ impl DefaultExecutor {
     /// provider so users see whatever error the backend raises for OOR.
     pub fn set_default_temperature(&mut self, t: Option<f32>) {
         self.default_temperature = t;
+    }
+
+    /// Set the cross-provider reasoning-effort knob the main loop will
+    /// stamp on every `LlmRequest`. `Default` omits the field on the
+    /// wire so providers fall back to their built-in defaults; see
+    /// `docs/REASONING_EFFORT.md` for the mapping table.
+    pub fn set_default_reasoning_effort(&mut self, effort: athen_core::llm::ReasoningEffort) {
+        self.default_reasoning_effort = effort;
     }
 
     /// Inject a pre-rendered identity block into the static system header.
@@ -1128,6 +1144,7 @@ impl DefaultExecutor {
             temperature: Some(0.0),
             tools: None,
             system_prompt: None,
+            reasoning_effort: athen_core::llm::ReasoningEffort::default(),
         };
 
         match tokio::time::timeout(
@@ -1408,6 +1425,7 @@ impl AgentExecutor for DefaultExecutor {
                     temperature: Some(0.5),
                     tools: None, // no tools — just summarise
                     system_prompt: Some(system_prompt),
+                    reasoning_effort: athen_core::llm::ReasoningEffort::default(),
                 };
                 let summary = match self.llm_router.route(&summary_request).await {
                     Ok(resp) => resp.content,
@@ -1471,6 +1489,7 @@ impl AgentExecutor for DefaultExecutor {
                     Some(revealed_tool_defs.clone())
                 },
                 system_prompt: Some(system_prompt),
+                reasoning_effort: self.default_reasoning_effort,
             };
 
             // Call the LLM — use streaming when a stream sender is available.

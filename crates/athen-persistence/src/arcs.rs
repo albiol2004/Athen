@@ -113,11 +113,23 @@ pub struct ArcMeta {
     /// idle. `None` means "follow the global active provider." See
     /// `docs/PROVIDER_PINNING.md`.
     pub pinned_provider_id: Option<String>,
-    /// `ModelProfile` (wire form: `"Powerful"` / `"Fast"` / `"Code"` /
-    /// `"Cheap"` / `"Local"`) the task started on. Stored alongside
-    /// `pinned_provider_id` for future per-tier honouring; today the
-    /// column is captured but routing only consults `pinned_provider_id`.
-    pub pinned_tier: Option<String>,
+    /// Concrete model slug that resolved on the first LLM call of the
+    /// task (e.g. `"deepseek-v4-pro"`, `"claude-sonnet-4-6"`). Stored
+    /// alongside `pinned_provider_id` for a future "warn on slug drift"
+    /// path: if the user edits `tier_models` mid-task and the same
+    /// `(provider, tier)` pair now resolves to a different slug, we'll
+    /// log + surface the divergence. Today the column is captured but
+    /// routing only consults `pinned_provider_id`.
+    pub pinned_slug: Option<String>,
+    /// User-set per-arc reasoning-effort override. Stored as the wire
+    /// string (`"default"` / `"off"` / `"minimal"` / `"low"` / `"medium"`
+    /// / `"high"` / `"max"`) so adding levels later doesn't require a
+    /// type migration. `None` falls through to `ReasoningEffort::Default`
+    /// — see `docs/REASONING_EFFORT.md` for the resolution chain.
+    /// Last-write-wins: distinct from the first-call-wins `pinned_*`
+    /// columns because this is a durable user preference, not an
+    /// in-flight snapshot.
+    pub reasoning_effort_override: Option<String>,
 }
 
 /// The type of an entry within an Arc.
@@ -299,11 +311,14 @@ impl ArcStore {
                 .map_err(|e| AthenError::Other(format!("Add summarized_through_entry_id: {e}")))?;
             }
 
-            // Column-level migration: `pinned_provider_id` + `pinned_tier`
+            // Column-level migration: `pinned_provider_id` + `pinned_slug`
             // were added so an arc can lock onto the provider that started
             // its in-flight task — preventing mid-task provider switches
             // from rehydrating provider-A's messages onto provider B. NULL
-            // means "follow the global active provider."
+            // means "follow the global active provider." An earlier
+            // landing of this feature used `pinned_tier`; that column is
+            // dropped here since the semantic was wrong (different call
+            // sites legitimately use different tiers within one task).
             let cols: std::collections::HashSet<String> = conn
                 .prepare("PRAGMA table_info(arcs)")
                 .and_then(|mut stmt| {
@@ -319,9 +334,27 @@ impl ArcStore {
                 conn.execute("ALTER TABLE arcs ADD COLUMN pinned_provider_id TEXT", [])
                     .map_err(|e| AthenError::Other(format!("Add pinned_provider_id: {e}")))?;
             }
-            if !cols.contains("pinned_tier") {
-                conn.execute("ALTER TABLE arcs ADD COLUMN pinned_tier TEXT", [])
-                    .map_err(|e| AthenError::Other(format!("Add pinned_tier: {e}")))?;
+            if !cols.contains("pinned_slug") {
+                conn.execute("ALTER TABLE arcs ADD COLUMN pinned_slug TEXT", [])
+                    .map_err(|e| AthenError::Other(format!("Add pinned_slug: {e}")))?;
+            }
+            if cols.contains("pinned_tier") {
+                // SQLite 3.35+ supports DROP COLUMN. If the runtime is
+                // older, the column lingers harmlessly — readers don't
+                // reference it.
+                let _ = conn.execute("ALTER TABLE arcs DROP COLUMN pinned_tier", []);
+            }
+
+            // Column-level migration: `reasoning_effort_override` lets a
+            // user dial reasoning effort per-arc. Stored as the wire
+            // string so adding levels later (e.g. `xhigh`) is a no-op
+            // for the schema.
+            if !cols.contains("reasoning_effort_override") {
+                conn.execute(
+                    "ALTER TABLE arcs ADD COLUMN reasoning_effort_override TEXT",
+                    [],
+                )
+                .map_err(|e| AthenError::Other(format!("Add reasoning_effort_override: {e}")))?;
             }
 
             Ok(())
@@ -392,7 +425,8 @@ impl ArcStore {
                             COALESCE(e.cnt, 0) AS entry_count, \
                             a.primary_reply_channel, a.active_profile_id, \
                             a.summarized_through_entry_id, \
-                            a.pinned_provider_id, a.pinned_tier \
+                            a.pinned_provider_id, a.pinned_slug, \
+                            a.reasoning_effort_override \
                      FROM arcs a \
                      LEFT JOIN ( \
                          SELECT arc_id, COUNT(*) AS cnt \
@@ -418,7 +452,8 @@ impl ArcStore {
                         active_profile_id: row.get(10)?,
                         summarized_through_entry_id: row.get(11)?,
                         pinned_provider_id: row.get(12)?,
-                        pinned_tier: row.get(13)?,
+                        pinned_slug: row.get(13)?,
+                        reasoning_effort_override: row.get(14)?,
                     })
                 })
                 .map_err(|e| AthenError::Other(format!("Query get arc: {e}")))?;
@@ -465,7 +500,8 @@ impl ArcStore {
                         COALESCE(e.cnt, 0) AS entry_count, \
                         a.primary_reply_channel, a.active_profile_id, \
                         a.summarized_through_entry_id, \
-                        a.pinned_provider_id, a.pinned_tier \
+                        a.pinned_provider_id, a.pinned_slug, \
+                        a.reasoning_effort_override \
                  FROM arcs a \
                  LEFT JOIN ( \
                      SELECT arc_id, COUNT(*) AS cnt \
@@ -494,7 +530,8 @@ impl ArcStore {
                         active_profile_id: row.get(10)?,
                         summarized_through_entry_id: row.get(11)?,
                         pinned_provider_id: row.get(12)?,
-                        pinned_tier: row.get(13)?,
+                        pinned_slug: row.get(13)?,
+                        reasoning_effort_override: row.get(14)?,
                     })
                 })
                 .map_err(|e| AthenError::Other(format!("Query list arcs: {e}")))?;
@@ -622,7 +659,7 @@ impl ArcStore {
         .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
     }
 
-    /// Atomically pin this arc to `(provider_id, tier)` if it currently
+    /// Atomically pin this arc to `(provider_id, slug)` if it currently
     /// has no pin. Returns `true` if the pin was written, `false` if a
     /// pin was already in place. First-call-wins semantics: callers race
     /// the very first LLM call of a task; only the first one to land
@@ -631,19 +668,19 @@ impl ArcStore {
         &self,
         id: &str,
         provider_id: &str,
-        tier: &str,
+        slug: &str,
     ) -> Result<bool> {
         let conn = self.conn.clone();
         let id = id.to_string();
         let provider_id = provider_id.to_string();
-        let tier = tier.to_string();
+        let slug = slug.to_string();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             let affected = conn
                 .execute(
-                    "UPDATE arcs SET pinned_provider_id = ?1, pinned_tier = ?2 \
+                    "UPDATE arcs SET pinned_provider_id = ?1, pinned_slug = ?2 \
                      WHERE id = ?3 AND pinned_provider_id IS NULL",
-                    params![provider_id, tier, id],
+                    params![provider_id, slug, id],
                 )
                 .map_err(|e| AthenError::Other(format!("Set pinned provider: {e}")))?;
             Ok(affected > 0)
@@ -653,7 +690,7 @@ impl ArcStore {
     }
 
     /// Clear the provider pin (both `pinned_provider_id` and
-    /// `pinned_tier`). Called when the arc transitions back to idle so
+    /// `pinned_slug`). Called when the arc transitions back to idle so
     /// the next task can re-pin against whatever active provider is in
     /// effect at that point.
     pub async fn clear_pinned_provider(&self, id: &str) -> Result<()> {
@@ -662,10 +699,32 @@ impl ArcStore {
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             conn.execute(
-                "UPDATE arcs SET pinned_provider_id = NULL, pinned_tier = NULL WHERE id = ?1",
+                "UPDATE arcs SET pinned_provider_id = NULL, pinned_slug = NULL WHERE id = ?1",
                 params![id],
             )
             .map_err(|e| AthenError::Other(format!("Clear pinned provider: {e}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
+    /// Set (or clear) the per-arc reasoning-effort override. Last-write-wins:
+    /// a user toggling effort mid-task takes effect on the next LLM call.
+    /// Pass `None` to clear; pass `Some(wire_str)` where `wire_str` is the
+    /// `ReasoningEffort::to_wire_str()` form (`"default"`, `"off"`,
+    /// `"minimal"`, `"low"`, `"medium"`, `"high"`, `"max"`).
+    pub async fn set_reasoning_effort_override(&self, id: &str, value: Option<&str>) -> Result<()> {
+        let conn = self.conn.clone();
+        let id = id.to_string();
+        let value = value.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE arcs SET reasoning_effort_override = ?1 WHERE id = ?2",
+                params![value, id],
+            )
+            .map_err(|e| AthenError::Other(format!("Set reasoning_effort_override: {e}")))?;
             Ok(())
         })
         .await
@@ -1124,7 +1183,8 @@ CREATE TABLE IF NOT EXISTS arcs (
     active_profile_id TEXT,
     summarized_through_entry_id INTEGER,
     pinned_provider_id TEXT,
-    pinned_tier TEXT
+    pinned_slug TEXT,
+    reasoning_effort_override TEXT
 );
 
 CREATE TABLE IF NOT EXISTS arc_entries (
@@ -2326,43 +2386,43 @@ mod tests {
 
         let meta = store.get_arc("arc_p").await.unwrap().expect("arc present");
         assert_eq!(meta.pinned_provider_id, None);
-        assert_eq!(meta.pinned_tier, None);
+        assert_eq!(meta.pinned_slug, None);
 
         let wrote = store
-            .set_pinned_provider_if_unset("arc_p", "deepseek", "Powerful")
+            .set_pinned_provider_if_unset("arc_p", "deepseek", "deepseek-v4-pro")
             .await
             .unwrap();
         assert!(wrote, "first set must write");
         let meta = store.get_arc("arc_p").await.unwrap().expect("arc present");
         assert_eq!(meta.pinned_provider_id.as_deref(), Some("deepseek"));
-        assert_eq!(meta.pinned_tier.as_deref(), Some("Powerful"));
+        assert_eq!(meta.pinned_slug.as_deref(), Some("deepseek-v4-pro"));
 
         let wrote = store
-            .set_pinned_provider_if_unset("arc_p", "anthropic", "Fast")
+            .set_pinned_provider_if_unset("arc_p", "anthropic", "claude-sonnet-4-6")
             .await
             .unwrap();
         assert!(!wrote, "second set must be a no-op (first-call-wins)");
         let meta = store.get_arc("arc_p").await.unwrap().expect("arc present");
         assert_eq!(meta.pinned_provider_id.as_deref(), Some("deepseek"));
-        assert_eq!(meta.pinned_tier.as_deref(), Some("Powerful"));
+        assert_eq!(meta.pinned_slug.as_deref(), Some("deepseek-v4-pro"));
 
         store.clear_pinned_provider("arc_p").await.unwrap();
         let meta = store.get_arc("arc_p").await.unwrap().expect("arc present");
         assert_eq!(meta.pinned_provider_id, None);
-        assert_eq!(meta.pinned_tier, None);
+        assert_eq!(meta.pinned_slug, None);
 
         let wrote = store
-            .set_pinned_provider_if_unset("arc_p", "anthropic", "Fast")
+            .set_pinned_provider_if_unset("arc_p", "anthropic", "claude-sonnet-4-6")
             .await
             .unwrap();
         assert!(wrote, "re-pin after clear must succeed");
         let listed = store.list_arcs().await.unwrap();
         let row = listed.iter().find(|a| a.id == "arc_p").unwrap();
         assert_eq!(row.pinned_provider_id.as_deref(), Some("anthropic"));
-        assert_eq!(row.pinned_tier.as_deref(), Some("Fast"));
+        assert_eq!(row.pinned_slug.as_deref(), Some("claude-sonnet-4-6"));
     }
 
-    /// `init_schema` must add `pinned_provider_id` + `pinned_tier` to a
+    /// `init_schema` must add `pinned_provider_id` + `pinned_slug` to a
     /// pre-existing database created before the columns existed.
     #[tokio::test]
     async fn test_pinned_provider_migration_on_legacy_db() {
@@ -2410,16 +2470,16 @@ mod tests {
 
         let meta = store.get_arc("legacy").await.unwrap().expect("arc present");
         assert_eq!(meta.pinned_provider_id, None);
-        assert_eq!(meta.pinned_tier, None);
+        assert_eq!(meta.pinned_slug, None);
 
         let wrote = store
-            .set_pinned_provider_if_unset("legacy", "openai", "Code")
+            .set_pinned_provider_if_unset("legacy", "openai", "gpt-5.5")
             .await
             .unwrap();
         assert!(wrote);
         let meta = store.get_arc("legacy").await.unwrap().expect("arc present");
         assert_eq!(meta.pinned_provider_id.as_deref(), Some("openai"));
-        assert_eq!(meta.pinned_tier.as_deref(), Some("Code"));
+        assert_eq!(meta.pinned_slug.as_deref(), Some("gpt-5.5"));
 
         store.init_schema().await.expect("idempotent re-init");
     }
@@ -2469,5 +2529,48 @@ mod tests {
         // Pointer reflects the most recent compaction.
         let meta = store.get_arc("arc_m").await.unwrap().expect("arc");
         assert_eq!(meta.summarized_through_entry_id, Some(last_id));
+    }
+
+    /// Per-arc reasoning-effort override: defaults to None, last-write-wins
+    /// (distinct from the first-call-wins pin), and round-trips through
+    /// both `get_arc` and `list_arcs`.
+    #[tokio::test]
+    async fn test_reasoning_effort_override_set_get_clear() {
+        let store = setup_arc_store().await;
+        store
+            .create_arc("arc_r", "Reasoning arc", ArcSource::UserInput)
+            .await
+            .unwrap();
+
+        let meta = store.get_arc("arc_r").await.unwrap().expect("arc present");
+        assert_eq!(meta.reasoning_effort_override, None);
+
+        store
+            .set_reasoning_effort_override("arc_r", Some("high"))
+            .await
+            .unwrap();
+        let meta = store.get_arc("arc_r").await.unwrap().expect("arc present");
+        assert_eq!(meta.reasoning_effort_override.as_deref(), Some("high"));
+
+        // Last-write-wins: overwrite freely.
+        store
+            .set_reasoning_effort_override("arc_r", Some("off"))
+            .await
+            .unwrap();
+        let meta = store.get_arc("arc_r").await.unwrap().expect("arc present");
+        assert_eq!(meta.reasoning_effort_override.as_deref(), Some("off"));
+
+        // list_arcs surfaces the same value.
+        let listed = store.list_arcs().await.unwrap();
+        let row = listed.iter().find(|a| a.id == "arc_r").unwrap();
+        assert_eq!(row.reasoning_effort_override.as_deref(), Some("off"));
+
+        // Clear restores None.
+        store
+            .set_reasoning_effort_override("arc_r", None)
+            .await
+            .unwrap();
+        let meta = store.get_arc("arc_r").await.unwrap().expect("arc present");
+        assert_eq!(meta.reasoning_effort_override, None);
     }
 }

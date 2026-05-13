@@ -22,6 +22,66 @@ pub struct LlmRequest {
     pub temperature: Option<f32>,
     pub tools: Option<Vec<ToolDefinition>>,
     pub system_prompt: Option<String>,
+    /// Cross-provider "think harder / think less" knob. `Default` (the
+    /// default) omits any reasoning field from the wire request so each
+    /// provider applies its built-in default — opt-in behaviour, see
+    /// `docs/REASONING_EFFORT.md` for the per-provider mapping table.
+    #[serde(default)]
+    pub reasoning_effort: ReasoningEffort,
+}
+
+/// Unifying knob for provider-specific reasoning controls. Each adapter
+/// maps these variants to its wire shape (OpenAI `reasoning.effort`,
+/// Anthropic `thinking.budget_tokens`, Gemini `thinkingLevel` /
+/// `thinkingBudget`, DeepSeek `reasoning_effort`, local
+/// `chat_template_kwargs.enable_thinking` or Ollama `think`). See
+/// `docs/REASONING_EFFORT.md` §"Per-provider mapping table" for the full
+/// spec. `Default` and `Off` are distinct: `Default` omits the field
+/// entirely so the provider applies its built-in default, `Off`
+/// explicitly disables reasoning where the provider supports it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    #[default]
+    Default,
+    Off,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Max,
+}
+
+impl ReasoningEffort {
+    /// Stable wire identifier — round-trips through arc-meta storage and
+    /// the `delegate_to_agent` tool param.
+    pub fn to_wire_str(self) -> &'static str {
+        match self {
+            ReasoningEffort::Default => "default",
+            ReasoningEffort::Off => "off",
+            ReasoningEffort::Minimal => "minimal",
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+            ReasoningEffort::Max => "max",
+        }
+    }
+}
+
+impl std::str::FromStr for ReasoningEffort {
+    type Err = ();
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "" | "default" => Ok(ReasoningEffort::Default),
+            "off" | "none" | "disabled" => Ok(ReasoningEffort::Off),
+            "minimal" => Ok(ReasoningEffort::Minimal),
+            "low" => Ok(ReasoningEffort::Low),
+            "medium" | "med" => Ok(ReasoningEffort::Medium),
+            "high" => Ok(ReasoningEffort::High),
+            "max" | "xhigh" => Ok(ReasoningEffort::Max),
+            _ => Err(()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -329,5 +389,75 @@ mod model_family_tests {
         assert_eq!(ModelFamily::from_wire_id("nope"), None);
         // case-sensitive — wire ids match enum variant names exactly
         assert_eq!(ModelFamily::from_wire_id("default"), None);
+    }
+}
+
+#[cfg(test)]
+mod reasoning_effort_tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn default_is_the_omit_variant() {
+        assert_eq!(ReasoningEffort::default(), ReasoningEffort::Default);
+    }
+
+    #[test]
+    fn wire_str_round_trips_for_every_variant() {
+        for v in [
+            ReasoningEffort::Default,
+            ReasoningEffort::Off,
+            ReasoningEffort::Minimal,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::Max,
+        ] {
+            assert_eq!(ReasoningEffort::from_str(v.to_wire_str()).unwrap(), v);
+        }
+    }
+
+    #[test]
+    fn from_str_accepts_synonyms_and_blank() {
+        assert_eq!(
+            ReasoningEffort::from_str("").unwrap(),
+            ReasoningEffort::Default
+        );
+        assert_eq!(
+            ReasoningEffort::from_str("None").unwrap(),
+            ReasoningEffort::Off
+        );
+        assert_eq!(
+            ReasoningEffort::from_str(" MED ").unwrap(),
+            ReasoningEffort::Medium
+        );
+        assert_eq!(
+            ReasoningEffort::from_str("xhigh").unwrap(),
+            ReasoningEffort::Max
+        );
+        assert!(ReasoningEffort::from_str("bogus").is_err());
+    }
+
+    #[test]
+    fn serde_uses_lowercase_wire_names() {
+        let json = serde_json::to_string(&ReasoningEffort::Medium).unwrap();
+        assert_eq!(json, "\"medium\"");
+        let back: ReasoningEffort = serde_json::from_str("\"high\"").unwrap();
+        assert_eq!(back, ReasoningEffort::High);
+    }
+
+    #[test]
+    fn llm_request_defaults_serialize_to_default_variant() {
+        let req = LlmRequest {
+            profile: ModelProfile::Powerful,
+            messages: vec![],
+            max_tokens: None,
+            temperature: None,
+            tools: None,
+            system_prompt: None,
+            reasoning_effort: ReasoningEffort::default(),
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["reasoning_effort"], "default");
     }
 }

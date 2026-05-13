@@ -109,6 +109,11 @@ impl DelegationToolRegistry {
                 "brief": {
                     "type": "string",
                     "description": "SPECIFICATION (not deliverable) for the specialist, under ~2000 characters. Describe what they should produce: goals, constraints, sections/structure, success criteria. Do NOT paste the deliverable itself — the specialist writes it. The specialist sees only this brief, not your conversation history, so make it self-contained but tight."
+                },
+                "reasoning_effort": {
+                    "type": "string",
+                    "enum": ["default", "off", "minimal", "low", "medium", "high", "max"],
+                    "description": "Optional cross-provider reasoning-effort override for the specialist's LLM calls. Use 'max' or 'high' when the brief is genuinely hard (complex code, multi-step planning) — reasoning tokens are billed at the output rate so cranking this on a chatty task wastes money. Omit or use 'default' to inherit the provider's built-in default."
                 }
             },
             "required": ["target_profile_id", "brief"]
@@ -150,6 +155,12 @@ impl DelegationToolRegistry {
 struct DelegateArgs {
     target_profile_id: String,
     brief: String,
+    /// Optional per-call reasoning-effort override for the sub-agent.
+    /// Stored as the wire string (`"default"`/`"off"`/`"minimal"`/`"low"`/
+    /// `"medium"`/`"high"`/`"max"`) and written onto the sub-arc so the
+    /// sub-executor picks it up through the standard resolver chain.
+    #[serde(default)]
+    reasoning_effort: Option<String>,
 }
 
 #[async_trait]
@@ -314,6 +325,31 @@ async fn run_delegation(
     {
         tracing::warn!("delegation: set_active_profile_id on sub-arc failed: {e}");
     }
+    // Per-call reasoning_effort: write onto the sub-arc so the standard
+    // resolver chain (state::resolve_reasoning_effort_for_arc) picks it
+    // up when the sub-executor builds its LlmRequest. Validated via
+    // ReasoningEffort::from_str so a bogus value silently falls back to
+    // the parent's default rather than corrupting persisted state.
+    if let Some(ref raw) = args.reasoning_effort {
+        use std::str::FromStr;
+        match athen_core::llm::ReasoningEffort::from_str(raw) {
+            Ok(eff) => {
+                if let Err(e) = ctx
+                    .arc_store
+                    .set_reasoning_effort_override(&sub_arc_id, Some(eff.to_wire_str()))
+                    .await
+                {
+                    tracing::warn!("delegation: set_reasoning_effort_override failed: {e}");
+                }
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "delegate_to_agent: ignoring unknown reasoning_effort={raw:?}; \
+                     accepted: default|off|minimal|low|medium|high|max"
+                );
+            }
+        }
+    }
 
     // 3. Build the sub-executor. The sub-agent's tool registry is the
     //    *bare* base — no DelegationToolRegistry wrap — so it has every
@@ -364,6 +400,13 @@ async fn run_delegation(
     let endpoints_block =
         crate::endpoints_render::render_endpoints_block(ctx.http_endpoint_store.as_ref()).await;
 
+    // Sub-executor's reasoning effort: resolved from the sub-arc, which
+    // we may have just written above (per-call delegate param) or which
+    // inherits the parent's setting via a previous user gesture. The
+    // standard resolver covers both cases uniformly.
+    let sub_reasoning_effort =
+        crate::state::resolve_reasoning_effort_for_arc(Some(&ctx.arc_store), &sub_arc_id).await;
+
     let mut builder = AgentBuilder::new()
         .llm_router(exec_router)
         .tool_registry(sub_registry)
@@ -373,7 +416,8 @@ async fn run_delegation(
         .identity_block(identity_block)
         .endpoints_block(endpoints_block)
         .enable_default_reminders(true)
-        .default_temperature(sampling_temperature);
+        .default_temperature(sampling_temperature)
+        .default_reasoning_effort(sub_reasoning_effort);
     if let Some(ref dir) = ctx.tool_doc_dir {
         builder = builder.tool_doc_dir(dir.clone());
     }
@@ -516,6 +560,8 @@ fn salvage_delegate_args_from_raw(value: &serde_json::Value) -> Option<DelegateA
     Some(DelegateArgs {
         target_profile_id,
         brief,
+        // Salvage path: optional field is not worth a regex.
+        reasoning_effort: None,
     })
 }
 

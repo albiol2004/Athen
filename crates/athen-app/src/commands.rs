@@ -212,6 +212,11 @@ fn spawn_router_approval(
             &cfg_for_resolvers,
             &effective_provider_id,
         );
+        let reasoning_effort = crate::state::resolve_reasoning_effort_for_arc(
+            bg_ctx.arc_store.as_ref(),
+            &bg_ctx.active_arc_id,
+        )
+        .await;
 
         let ctx = ApprovedTaskCtx {
             coordinator: bg_ctx.coordinator,
@@ -255,6 +260,7 @@ fn spawn_router_approval(
             compaction_trigger_tokens,
             compaction_target_tokens,
             sampling_temperature,
+            reasoning_effort,
             // Bg path drives Telegram-originated approvals; composer
             // uploads live on the desktop side, so this turn never has
             // an upload event_id to thread through. Same rationale as
@@ -857,6 +863,7 @@ async fn judge_worth_remembering(
         temperature: Some(0.0),
         tools: None,
         system_prompt: None,
+        reasoning_effort: athen_core::llm::ReasoningEffort::default(),
     };
 
     let response = match tokio::time::timeout(
@@ -2245,6 +2252,11 @@ pub async fn send_message(
                 &crate::state::load_config(),
                 &effective_provider_id,
             );
+            let reasoning_effort = crate::state::resolve_reasoning_effort_for_arc(
+                state.arc_store.as_ref(),
+                &current_arc,
+            )
+            .await;
             let mut builder = AgentBuilder::new()
                 .llm_router(exec_router)
                 .tool_registry(registry)
@@ -2258,7 +2270,8 @@ pub async fn send_message(
                 .identity_block(identity_block)
                 .endpoints_block(endpoints_block)
                 .enable_default_reminders(true)
-                .default_temperature(sampling_temperature);
+                .default_temperature(sampling_temperature)
+                .default_reasoning_effort(reasoning_effort);
             if let Some(p) = state.tool_doc_dir.clone() {
                 builder = builder.tool_doc_dir(p);
             }
@@ -2546,6 +2559,8 @@ pub async fn approve_task(
         crate::compaction::resolve_compaction_budget(&cfg_for_resolvers, &effective_provider_id);
     let sampling_temperature =
         crate::compaction::resolve_provider_temperature(&cfg_for_resolvers, &effective_provider_id);
+    let reasoning_effort =
+        crate::state::resolve_reasoning_effort_for_arc(state.arc_store.as_ref(), &active_arc).await;
 
     let ctx = ApprovedTaskCtx {
         coordinator: Arc::clone(&state.coordinator),
@@ -2585,6 +2600,7 @@ pub async fn approve_task(
         compaction_trigger_tokens,
         compaction_target_tokens,
         sampling_temperature,
+        reasoning_effort,
         upload_event_id,
         // User-driven approved-task path; wake-up directives don't apply.
         wakeup: None,
@@ -2739,6 +2755,11 @@ pub(crate) struct ApprovedTaskCtx {
     /// default". Same snapshot semantics as the compaction budget so a
     /// mid-task settings tweak doesn't change behavior inside one run.
     pub sampling_temperature: Option<f32>,
+    /// Per-arc reasoning-effort override resolved alongside
+    /// `sampling_temperature`. `ReasoningEffort::Default` means "omit on
+    /// the wire" — providers apply their built-in defaults. See
+    /// `crate::state::resolve_reasoning_effort_for_arc`.
+    pub reasoning_effort: athen_core::llm::ReasoningEffort,
     /// Synthesized `event_id` for composer uploads carried into this
     /// approved-task turn. Stamped onto the user-message arc entry so
     /// reload-time thumbnail hydration works after an approval round-
@@ -3310,7 +3331,8 @@ pub(crate) async fn execute_approved_task(
         .identity_block(identity_block)
         .endpoints_block(endpoints_block)
         .enable_default_reminders(true)
-        .default_temperature(ctx.sampling_temperature);
+        .default_temperature(ctx.sampling_temperature)
+        .default_reasoning_effort(ctx.reasoning_effort);
     if let Some(p) = ctx.tool_doc_dir.clone() {
         builder = builder.tool_doc_dir(p);
     }
@@ -4307,7 +4329,8 @@ pub(crate) async fn execute_dispatched_task(
         .identity_block(identity_block)
         .endpoints_block(endpoints_block)
         .enable_default_reminders(true)
-        .default_temperature(ctx.sampling_temperature);
+        .default_temperature(ctx.sampling_temperature)
+        .default_reasoning_effort(ctx.reasoning_effort);
     if let Some(p) = ctx.tool_doc_dir.clone() {
         builder = builder.tool_doc_dir(p);
     }

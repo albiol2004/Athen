@@ -382,6 +382,7 @@ impl ArcCompactor for LlmArcCompactor {
             temperature: Some(0.0),
             tools: None,
             system_prompt: Some(Self::summary_system_prompt().to_string()),
+            reasoning_effort: athen_core::llm::ReasoningEffort::default(),
         };
 
         let router = self.router.read().await.clone();

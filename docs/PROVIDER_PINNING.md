@@ -47,9 +47,12 @@ pub struct ArcRow {
     /// completes. Distinct from a user-set per-arc override (which would be
     /// a separate, durable field on `ArcSettings`).
     pub pinned_provider_id: Option<String>,
-    /// Tier the task started on. Pinned alongside the provider so per-tier
-    /// slug changes in Settings don't flip the model mid-task either.
-    pub pinned_tier: Option<ModelProfile>,
+    /// Concrete model slug that resolved on the first LLM call. Captured
+    /// so a future "warn on slug drift" path can flag the case where the
+    /// user edits `tier_models` mid-task and the same `(provider, tier)`
+    /// pair now resolves to a different slug. Today the column is stored
+    /// but routing only consults `pinned_provider_id`.
+    pub pinned_slug: Option<String>,
 }
 ```
 
@@ -119,12 +122,40 @@ even if a different provider was active at task start.
   compaction runs on the pinned provider, no issue. If a future tier-routing
   change makes compaction route elsewhere, audit then.
 
+## Why `pinned_slug` and not `pinned_tier`
+
+An earlier landing of this feature stored `pinned_tier` (the `ModelProfile`
+label of the first call: `Cheap` / `Fast` / `Code` / `Powerful`). That was
+the wrong primitive for two reasons:
+
+1. **Different call sites within one task legitimately use different
+   tiers**. The executor turn labels itself `Code`; the completion judge
+   labels itself `Cheap`; the memory extractor labels itself `Cheap`.
+   Pinning the tier at task start and forcing every subsequent call onto
+   that tier would 3× the bill for no benefit.
+2. **The thing that breaks rehydration is the slug change, not the tier
+   change**. If Settings has Code → `deepseek-v4-pro` at task start and
+   the user edits it to Code → `qwen3-coder-next` mid-task, the next
+   "Code" call lands on a different family with different quirks (think
+   tags, tool-call extraction) and rehydration of prior turns breaks.
+
+So the right pin is the *resolved slug*, captured on first call. Today
+it's diagnostic-only (routing still flows through current `tier_models`);
+the warn-on-drift path is the natural follow-up — when `(provider, tier)`
+re-resolves to a slug ≠ `pinned_slug`, log + surface in UI but don't
+silently downgrade.
+
 ## Migration
 
-`pinned_provider_id` and `pinned_tier` start `NULL` on every existing arc.
+`pinned_provider_id` and `pinned_slug` start `NULL` on every existing arc.
 Pinning takes effect on the next task each arc starts; existing in-flight
 arcs at deploy time get pinned at their next iteration (already on whatever
 provider is active). No backfill needed.
+
+Dev DBs that ran the earlier `pinned_tier`-bearing migration get the column
+dropped via `ALTER TABLE ... DROP COLUMN pinned_tier` (SQLite 3.35+). On
+older SQLite runtimes the drop silently no-ops and the dead column lingers
+— readers don't reference it, so it's harmless.
 
 ## Implementation footprint
 

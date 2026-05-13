@@ -63,6 +63,7 @@ pub struct AgentBuilder {
     endpoints_block: Option<String>,
     reminder_builder: Option<Arc<dyn SystemReminderBuilder>>,
     auto_reminders: bool,
+    default_reasoning_effort: athen_core::llm::ReasoningEffort,
 }
 
 impl AgentBuilder {
@@ -94,6 +95,7 @@ impl AgentBuilder {
             endpoints_block: None,
             reminder_builder: None,
             auto_reminders: false,
+            default_reasoning_effort: athen_core::llm::ReasoningEffort::Default,
         }
     }
 
@@ -152,6 +154,17 @@ impl AgentBuilder {
     /// hardcoded settings so determinism guarantees there don't drift.
     pub fn default_temperature(mut self, t: Option<f32>) -> Self {
         self.default_temperature = t;
+        self
+    }
+
+    /// Cross-provider reasoning-effort knob applied to the main agent
+    /// loop's LLM requests. `Default` (the default) omits the field on
+    /// the wire so the provider applies its built-in default. The cheap
+    /// helpers (completion-judge, summarisation) deliberately stay at
+    /// `Default` — burning reasoning tokens on a one-word verdict is
+    /// pure waste.
+    pub fn default_reasoning_effort(mut self, effort: athen_core::llm::ReasoningEffort) -> Self {
+        self.default_reasoning_effort = effort;
         self
     }
 
@@ -360,6 +373,8 @@ impl AgentBuilder {
         if self.auto_reminders {
             executor.enable_default_reminders(true);
         }
+
+        executor.set_default_reasoning_effort(self.default_reasoning_effort);
 
         Ok(executor)
     }

@@ -201,6 +201,7 @@ impl DeepSeekProvider {
             temperature: request.temperature.unwrap_or(0.7),
             tools,
             stream: false,
+            reasoning_effort: map_deepseek_reasoning_effort(request.reasoning_effort),
         }
     }
 
@@ -521,6 +522,29 @@ struct OpenAiRequestOut {
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<OpenAiTool>>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'static str>,
+}
+
+/// DeepSeek V4 chat exposes `reasoning_effort` with only two valid
+/// values: `"high"` and `"max"`. Omission disables reasoning entirely.
+/// Per the design doc:
+/// - Default / Off → omit (DeepSeek defaults to reasoning off)
+/// - Minimal / Low / Medium / High → `"high"` (the lowest-on value)
+/// - Max → `"max"`
+///
+/// Models with reasoning baked in (DeepSeek-R1) silently ignore the
+/// field on the wire, so this mapping is safe to apply per-request
+/// without family branching.
+fn map_deepseek_reasoning_effort(effort: ReasoningEffort) -> Option<&'static str> {
+    match effort {
+        ReasoningEffort::Default | ReasoningEffort::Off => None,
+        ReasoningEffort::Minimal
+        | ReasoningEffort::Low
+        | ReasoningEffort::Medium
+        | ReasoningEffort::High => Some("high"),
+        ReasoningEffort::Max => Some("max"),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -672,6 +696,7 @@ mod arg_parse_tests {
             temperature: None,
             tools: None,
             system_prompt: None,
+            reasoning_effort: ReasoningEffort::default(),
         };
         let err = provider.complete(&req).await.unwrap_err();
         let msg = err.to_string();
@@ -679,5 +704,55 @@ mod arg_parse_tests {
             msg.to_lowercase().contains("does not support image"),
             "expected vision rejection error, got: {msg}"
         );
+    }
+
+    fn deepseek_body_with(effort: ReasoningEffort) -> serde_json::Value {
+        let provider = DeepSeekProvider::new("k".into());
+        let req = LlmRequest {
+            profile: ModelProfile::Powerful,
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: MessageContent::Text("hi".into()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            tools: None,
+            system_prompt: None,
+            reasoning_effort: effort,
+        };
+        serde_json::to_value(provider.build_request_body(&req)).expect("serializes")
+    }
+
+    #[test]
+    fn deepseek_default_omits_reasoning_effort_field() {
+        let body = deepseek_body_with(ReasoningEffort::Default);
+        assert!(body.get("reasoning_effort").is_none(), "{body}");
+    }
+
+    #[test]
+    fn deepseek_off_also_omits_field() {
+        // DeepSeek interprets omission as "off"; sending an explicit
+        // value would be wrong since `"off"` isn't a valid enum value.
+        let body = deepseek_body_with(ReasoningEffort::Off);
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn deepseek_low_medium_high_all_map_to_high() {
+        for eff in [
+            ReasoningEffort::Minimal,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+        ] {
+            let body = deepseek_body_with(eff);
+            assert_eq!(body["reasoning_effort"], "high", "for {eff:?}");
+        }
+    }
+
+    #[test]
+    fn deepseek_max_maps_to_max() {
+        let body = deepseek_body_with(ReasoningEffort::Max);
+        assert_eq!(body["reasoning_effort"], "max");
     }
 }

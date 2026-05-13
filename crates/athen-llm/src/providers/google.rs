@@ -266,17 +266,15 @@ impl GoogleProvider {
             ReasoningSurface::NativeContentBlock
         ) && (self.default_model.contains("2.5")
             || self.default_model.contains("-3"));
+        let thinking_config = if thinking_eligible {
+            map_gemini_thinking_config(&self.default_model, request.reasoning_effort)
+        } else {
+            None
+        };
         GeminiGenerationConfig {
             temperature: request.temperature,
             max_output_tokens: request.max_tokens,
-            thinking_config: if thinking_eligible {
-                Some(GeminiThinkingConfig {
-                    thinking_budget: Some(-1),
-                    include_thoughts: Some(true),
-                })
-            } else {
-                None
-            },
+            thinking_config,
         }
     }
 
@@ -920,10 +918,69 @@ struct GeminiGenerationConfig {
 
 #[derive(Debug, Serialize)]
 struct GeminiThinkingConfig {
+    /// Gemini 2.5 surface: numeric token budget. `-1` means dynamic
+    /// (the previous always-on default before the cross-provider knob
+    /// landed). Mutually exclusive with `thinking_level` on the wire —
+    /// only one is set per request.
     #[serde(rename = "thinkingBudget", skip_serializing_if = "Option::is_none")]
     thinking_budget: Option<i32>,
+    /// Gemini 3.x surface: enum (`minimal`, `low`, `medium`, `high`).
+    /// Replaces `thinkingBudget` on 3.x models — Google deprecates
+    /// budgets there in favour of named levels.
+    #[serde(rename = "thinkingLevel", skip_serializing_if = "Option::is_none")]
+    thinking_level: Option<&'static str>,
     #[serde(rename = "includeThoughts", skip_serializing_if = "Option::is_none")]
     include_thoughts: Option<bool>,
+}
+
+/// Map our cross-provider `ReasoningEffort` to Gemini's `thinkingConfig`.
+/// Gemini 3.x prefers the `thinkingLevel` enum; Gemini 2.5 keeps the
+/// older `thinkingBudget` (token count). `Default` returns `None` so
+/// neither field is emitted — provider picks its own default.
+///
+/// `model_slug` is consulted as a coarse 3.x / 2.5 detector. The earlier
+/// `default_model.contains("-3")` / `"2.5"` test already gated entry to
+/// this helper; here we just pick between the two wire shapes.
+fn map_gemini_thinking_config(
+    model_slug: &str,
+    effort: ReasoningEffort,
+) -> Option<GeminiThinkingConfig> {
+    if matches!(effort, ReasoningEffort::Default) {
+        return None;
+    }
+    let is_3x = model_slug.contains("-3");
+    if is_3x {
+        let level = match effort {
+            ReasoningEffort::Off => "minimal",
+            ReasoningEffort::Minimal => "minimal",
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            // Gemini 3 caps at `high`; we collapse Max → high rather
+            // than 400ing on a value the model doesn't accept.
+            ReasoningEffort::High | ReasoningEffort::Max => "high",
+            ReasoningEffort::Default => unreachable!(),
+        };
+        Some(GeminiThinkingConfig {
+            thinking_budget: None,
+            thinking_level: Some(level),
+            include_thoughts: Some(true),
+        })
+    } else {
+        // Gemini 2.5 family: token budgets per the design doc table.
+        let budget: i32 = match effort {
+            ReasoningEffort::Off => 0,
+            ReasoningEffort::Minimal => 1024,
+            ReasoningEffort::Low => 4096,
+            ReasoningEffort::Medium => 12_288,
+            ReasoningEffort::High | ReasoningEffort::Max => 24_576,
+            ReasoningEffort::Default => unreachable!(),
+        };
+        Some(GeminiThinkingConfig {
+            thinking_budget: Some(budget),
+            thinking_level: None,
+            include_thoughts: Some(true),
+        })
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1056,6 +1113,7 @@ mod tests {
             temperature: None,
             tools: None,
             system_prompt: None,
+            reasoning_effort: ReasoningEffort::default(),
         };
         let (_sys, contents) = provider.build_contents(&req);
         // Both messages map to `user` and merge into one turn with two parts.
@@ -1090,6 +1148,7 @@ mod tests {
             temperature: None,
             tools: None,
             system_prompt: None,
+            reasoning_effort: ReasoningEffort::default(),
         };
         let (_sys, contents) = provider.build_contents(&req);
         let fr = contents[0].parts[1]
@@ -1119,6 +1178,7 @@ mod tests {
             temperature: None,
             tools: None,
             system_prompt: None,
+            reasoning_effort: ReasoningEffort::default(),
         };
         let (sys, contents) = provider.build_contents(&req);
         let sys = sys.expect("system instruction populated");
@@ -1142,6 +1202,7 @@ mod tests {
             temperature: None,
             tools: None,
             system_prompt: None,
+            reasoning_effort: ReasoningEffort::default(),
         };
         let (sys, _contents) = provider.build_contents(&req);
         assert!(sys.is_none());
@@ -1168,6 +1229,7 @@ mod tests {
             temperature: None,
             tools: None,
             system_prompt: None,
+            reasoning_effort: ReasoningEffort::default(),
         };
         let (_sys, contents) = provider.build_contents(&req);
         // Two consecutive user messages → one merged user turn, then one model turn.
@@ -1187,13 +1249,18 @@ mod tests {
             temperature: None,
             tools: None,
             system_prompt: None,
+            reasoning_effort: ReasoningEffort::default(),
         };
         let cfg = provider.build_generation_config(&req);
         assert!(cfg.thinking_config.is_none());
     }
 
     #[test]
-    fn thinking_config_present_for_gemini3pro_family() {
+    fn thinking_config_omitted_when_effort_is_default() {
+        // Per the cross-provider design: `Default` means "send nothing,
+        // let the provider apply its built-in default". This replaces
+        // the old always-on `thinking_budget: -1` behaviour — the user
+        // now opts in via the per-arc reasoning_effort override.
         let provider = GoogleProvider::new("k".into(), "gemini-3.1-pro".into())
             .with_family(ModelFamily::Gemini3Pro);
         let req = LlmRequest {
@@ -1203,11 +1270,48 @@ mod tests {
             temperature: None,
             tools: None,
             system_prompt: None,
+            reasoning_effort: ReasoningEffort::default(),
         };
         let cfg = provider.build_generation_config(&req);
-        let tc = cfg.thinking_config.expect("thinking config present");
-        assert_eq!(tc.thinking_budget, Some(-1));
+        assert!(cfg.thinking_config.is_none(), "Default must omit");
+    }
+
+    #[test]
+    fn gemini3_uses_thinking_level_enum() {
+        let provider = GoogleProvider::new("k".into(), "gemini-3.1-pro".into())
+            .with_family(ModelFamily::Gemini3Pro);
+        let req = LlmRequest {
+            profile: ModelProfile::Powerful,
+            messages: vec![user_text("hi")],
+            max_tokens: None,
+            temperature: None,
+            tools: None,
+            system_prompt: None,
+            reasoning_effort: ReasoningEffort::High,
+        };
+        let cfg = provider.build_generation_config(&req);
+        let tc = cfg.thinking_config.expect("present");
+        assert_eq!(tc.thinking_level, Some("high"));
+        assert_eq!(tc.thinking_budget, None);
         assert_eq!(tc.include_thoughts, Some(true));
+    }
+
+    #[test]
+    fn gemini3_max_clamps_to_high_on_wire() {
+        // Gemini 3 enum has no `xhigh`; we collapse Max → high.
+        let provider = GoogleProvider::new("k".into(), "gemini-3.1-pro".into())
+            .with_family(ModelFamily::Gemini3Pro);
+        let req = LlmRequest {
+            profile: ModelProfile::Powerful,
+            messages: vec![user_text("hi")],
+            max_tokens: None,
+            temperature: None,
+            tools: None,
+            system_prompt: None,
+            reasoning_effort: ReasoningEffort::Max,
+        };
+        let cfg = provider.build_generation_config(&req);
+        assert_eq!(cfg.thinking_config.unwrap().thinking_level, Some("high"));
     }
 
     #[test]
@@ -1361,6 +1465,7 @@ mod tests {
                 base_risk: athen_core::risk::BaseImpact::Read,
             }]),
             system_prompt: None,
+            reasoning_effort: ReasoningEffort::default(),
         };
         let tools = provider.build_tools(&req).expect("tools populated");
         assert_eq!(tools.len(), 1);
@@ -1509,6 +1614,7 @@ mod tests {
             temperature: None,
             tools: None,
             system_prompt: None,
+            reasoning_effort: ReasoningEffort::default(),
         };
         let body = provider.build_request_body(&req);
         let json = serde_json::to_value(&body).unwrap();
@@ -1551,6 +1657,7 @@ mod tests {
             temperature: None,
             tools: None,
             system_prompt: None,
+            reasoning_effort: ReasoningEffort::default(),
         };
         let body = provider.build_request_body(&req);
         let json = serde_json::to_value(&body).unwrap();

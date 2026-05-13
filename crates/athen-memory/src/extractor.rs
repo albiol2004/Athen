@@ -37,6 +37,7 @@ impl EntityExtractor for LlmEntityExtractor {
             temperature: Some(0.0),
             tools: None,
             system_prompt: None,
+            reasoning_effort: athen_core::llm::ReasoningEffort::default(),
         };
 
         // 30-second timeout — local models can be slow.

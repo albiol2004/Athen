@@ -542,6 +542,7 @@ impl NotificationOrchestrator {
             temperature: Some(0.7),
             tools: None,
             system_prompt: None,
+            reasoning_effort: athen_core::llm::ReasoningEffort::default(),
         };
 
         match tokio::time::timeout(Duration::from_secs(30), router.route(&request)).await {

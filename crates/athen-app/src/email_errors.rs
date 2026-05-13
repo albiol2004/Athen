@@ -373,6 +373,7 @@ pub async fn translate_with_llm(
         temperature: Some(0.0),
         tools: None,
         system_prompt: Some(LLM_SYSTEM_PROMPT.to_string()),
+        reasoning_effort: athen_core::llm::ReasoningEffort::default(),
     };
 
     let started = std::time::Instant::now();

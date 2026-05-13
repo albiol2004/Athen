@@ -57,6 +57,10 @@ pub struct OpenAiCompatibleProvider {
     /// the OpenAI-baseline `ModelQuirks::default()` — every code path becomes
     /// a no-op and behavior is byte-identical to the pre-quirks executor.
     quirks: ModelQuirks,
+    /// Family stored separately from `quirks` so the reasoning-effort
+    /// mapper can tell GPT-5 vs gpt-5.4-mini vs o4-mini apart — each has
+    /// different clamping rules (see `map_reasoning_effort`).
+    family: ModelFamily,
 }
 
 impl OpenAiCompatibleProvider {
@@ -75,6 +79,7 @@ impl OpenAiCompatibleProvider {
             supports_vision: false,
             supports_documents: false,
             quirks: ModelQuirks::default(),
+            family: ModelFamily::Default,
         }
     }
 
@@ -138,6 +143,7 @@ impl OpenAiCompatibleProvider {
     /// any unprofiled model.
     pub fn with_family(mut self, family: ModelFamily) -> Self {
         self.quirks = seed::quirks_for_family(family);
+        self.family = family;
         self
     }
 
@@ -262,7 +268,7 @@ impl OpenAiCompatibleProvider {
             temperature: request.temperature.unwrap_or(0.7),
             tools,
             stream: false,
-            extra: None,
+            extra: map_reasoning_effort(&self.provider_id, self.family, request.reasoning_effort),
         }
     }
 
@@ -1079,6 +1085,93 @@ impl CostEstimator for OpenAiCostEstimator {
     }
 }
 
+/// Map our cross-provider `ReasoningEffort` to the JSON fragment merged
+/// into the request body via `OpenAiRequestOut.extra`. Three shapes
+/// share this code path because all three providers route through the
+/// shared OpenAI-compatible body builder:
+///
+/// - **OpenAI proper**: `{ "reasoning": { "effort": "..." } }`. Five
+///   levels (`none|low|medium|high|xhigh`). Per-family clamping:
+///   `gpt-5.4-mini` ceiling is `high` (no `xhigh`); `o4-mini` family
+///   has no `none` and no `xhigh` (clamp to `low` / `high`).
+/// - **llama.cpp**: `{ "chat_template_kwargs": { "enable_thinking": bool } }`.
+///   Llama 3.x / 4 families have no reasoning support — silently
+///   dropped to keep the request body identical to today's.
+/// - **Ollama**: `{ "think": bool }` at the top level.
+///
+/// Default → omit the field entirely (provider built-in default
+/// applies). Off → either `"none"` (OpenAI gpt-5.x) or
+/// `enable_thinking: false` / `think: false` (local).
+pub(crate) fn map_reasoning_effort(
+    provider_id: &str,
+    family: ModelFamily,
+    effort: ReasoningEffort,
+) -> Option<serde_json::Value> {
+    if matches!(effort, ReasoningEffort::Default) {
+        return None;
+    }
+    match provider_id {
+        "ollama" => map_local_thinking_for_ollama(family, effort),
+        "llamacpp" => map_local_thinking_for_llamacpp(family, effort),
+        // Default branch covers "openai" and any future OpenAI-compatible
+        // cloud provider (Groq, OpenRouter, xAI, Mistral via openai-compat).
+        _ => map_openai_reasoning(family, effort),
+    }
+}
+
+fn map_openai_reasoning(family: ModelFamily, effort: ReasoningEffort) -> Option<serde_json::Value> {
+    // o4-mini family lacks `none` and `xhigh` — clamp at the edges.
+    let is_o4_mini = matches!(family, ModelFamily::OpenAiO3);
+    // gpt-5.4-mini ceiling is `high` (no `xhigh`). The dedicated mini
+    // family isn't in the enum yet; today every Gpt5 config takes
+    // `xhigh` for Max — when a `-mini` family lands here, extend this
+    // match arm.
+    let level = match (effort, is_o4_mini) {
+        (ReasoningEffort::Off, true) => "low",
+        (ReasoningEffort::Off, false) => "none",
+        (ReasoningEffort::Minimal, _) => "low",
+        (ReasoningEffort::Low, _) => "low",
+        (ReasoningEffort::Medium, _) => "medium",
+        (ReasoningEffort::High, _) => "high",
+        (ReasoningEffort::Max, true) => "high",
+        (ReasoningEffort::Max, false) => "xhigh",
+        (ReasoningEffort::Default, _) => return None,
+    };
+    Some(serde_json::json!({ "reasoning": { "effort": level } }))
+}
+
+fn map_local_thinking_for_llamacpp(
+    family: ModelFamily,
+    effort: ReasoningEffort,
+) -> Option<serde_json::Value> {
+    // Llama 3.x / 4 don't support thinking — silently drop so the
+    // request body stays byte-identical to pre-feature behaviour.
+    if matches!(
+        family,
+        ModelFamily::Llama32Instruct | ModelFamily::Llama33Instruct | ModelFamily::Llama4Instruct
+    ) {
+        return None;
+    }
+    let enable = !matches!(effort, ReasoningEffort::Off | ReasoningEffort::Default);
+    Some(serde_json::json!({
+        "chat_template_kwargs": { "enable_thinking": enable }
+    }))
+}
+
+fn map_local_thinking_for_ollama(
+    family: ModelFamily,
+    effort: ReasoningEffort,
+) -> Option<serde_json::Value> {
+    if matches!(
+        family,
+        ModelFamily::Llama32Instruct | ModelFamily::Llama33Instruct | ModelFamily::Llama4Instruct
+    ) {
+        return None;
+    }
+    let think = !matches!(effort, ReasoningEffort::Off | ReasoningEffort::Default);
+    Some(serde_json::json!({ "think": think }))
+}
+
 /// Zero-cost estimator for local providers (Ollama, llama.cpp, etc.).
 pub struct ZeroCostEstimator;
 
@@ -1281,6 +1374,7 @@ mod tests {
             temperature: Some(0.5),
             tools: None,
             system_prompt: None,
+            reasoning_effort: ReasoningEffort::default(),
         }
     }
 
@@ -1354,6 +1448,7 @@ mod tests {
             temperature: None,
             tools: None,
             system_prompt: None,
+            reasoning_effort: ReasoningEffort::default(),
         };
         let body = provider.build_request_body(&request);
 
@@ -1377,6 +1472,7 @@ mod tests {
             temperature: None,
             tools: None,
             system_prompt: None,
+            reasoning_effort: ReasoningEffort::default(),
         };
         let body = provider.build_request_body(&request);
 
@@ -1406,6 +1502,7 @@ mod tests {
             temperature: None,
             tools: None,
             system_prompt: None,
+            reasoning_effort: ReasoningEffort::default(),
         };
         let body = provider.build_request_body(&request);
 
@@ -1870,6 +1967,7 @@ data: [DONE]
             temperature: None,
             tools: None,
             system_prompt: None,
+            reasoning_effort: ReasoningEffort::default(),
         };
         let body = provider.build_request_body(&request);
         let content = body.messages[0].content.as_ref().expect("content set");
@@ -1885,5 +1983,106 @@ data: [DONE]
         assert!(!p.supports_vision());
         let p = p.with_vision(true);
         assert!(p.supports_vision());
+    }
+
+    fn body_with(
+        provider_id: &str,
+        family: ModelFamily,
+        effort: ReasoningEffort,
+    ) -> serde_json::Value {
+        let provider = OpenAiCompatibleProvider::new("http://x".to_string())
+            .with_provider_id(provider_id.to_string())
+            .with_model("m".to_string())
+            .with_family(family);
+        let req = LlmRequest {
+            profile: ModelProfile::Powerful,
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: MessageContent::Text("hi".into()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            tools: None,
+            system_prompt: None,
+            reasoning_effort: effort,
+        };
+        serde_json::to_value(provider.build_request_body(&req)).expect("serializes")
+    }
+
+    #[test]
+    fn openai_default_omits_reasoning_field() {
+        let body = body_with("openai", ModelFamily::Gpt5, ReasoningEffort::Default);
+        assert!(body.get("reasoning").is_none(), "{body}");
+    }
+
+    #[test]
+    fn openai_off_maps_to_none_on_gpt5() {
+        let body = body_with("openai", ModelFamily::Gpt5, ReasoningEffort::Off);
+        assert_eq!(body["reasoning"]["effort"], "none");
+    }
+
+    #[test]
+    fn openai_max_maps_to_xhigh_on_gpt5_full() {
+        let body = body_with("openai", ModelFamily::Gpt5, ReasoningEffort::Max);
+        assert_eq!(body["reasoning"]["effort"], "xhigh");
+    }
+
+    #[test]
+    fn openai_o3_family_clamps_off_to_low_and_max_to_high() {
+        // o3/o4-mini family lacks `none` and `xhigh`; we clamp at the
+        // edges so the API doesn't 400 on a configured user override.
+        let body = body_with("openai", ModelFamily::OpenAiO3, ReasoningEffort::Off);
+        assert_eq!(body["reasoning"]["effort"], "low");
+        let body = body_with("openai", ModelFamily::OpenAiO3, ReasoningEffort::Max);
+        assert_eq!(body["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn llamacpp_default_omits_thinking_kwargs() {
+        let body = body_with(
+            "llamacpp",
+            ModelFamily::Qwen35Local,
+            ReasoningEffort::Default,
+        );
+        assert!(body.get("chat_template_kwargs").is_none(), "{body}");
+    }
+
+    #[test]
+    fn llamacpp_off_sends_enable_thinking_false() {
+        let body = body_with("llamacpp", ModelFamily::Qwen36Local, ReasoningEffort::Off);
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+    }
+
+    #[test]
+    fn llamacpp_high_sends_enable_thinking_true() {
+        let body = body_with("llamacpp", ModelFamily::Qwen36Local, ReasoningEffort::High);
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
+    }
+
+    #[test]
+    fn llamacpp_llama4_drops_thinking_silently() {
+        // Llama 4 has no reasoning support — both Default and Off omit
+        // the field entirely so the request body matches pre-feature.
+        for eff in [
+            ReasoningEffort::Default,
+            ReasoningEffort::Off,
+            ReasoningEffort::Max,
+        ] {
+            let body = body_with("llamacpp", ModelFamily::Llama4Instruct, eff);
+            assert!(
+                body.get("chat_template_kwargs").is_none(),
+                "Llama4 must not get thinking kwargs for {eff:?}: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn ollama_uses_think_boolean() {
+        let body = body_with("ollama", ModelFamily::Qwen36Local, ReasoningEffort::Medium);
+        assert_eq!(body["think"], true);
+        let body = body_with("ollama", ModelFamily::Qwen36Local, ReasoningEffort::Off);
+        assert_eq!(body["think"], false);
+        let body = body_with("ollama", ModelFamily::Qwen36Local, ReasoningEffort::Default);
+        assert!(body.get("think").is_none(), "{body}");
     }
 }
