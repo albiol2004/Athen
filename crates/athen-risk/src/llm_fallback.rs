@@ -5,7 +5,9 @@
 
 use athen_core::contact::TrustLevel;
 use athen_core::llm::{ChatMessage, LlmRequest, LlmResponse, MessageContent, ModelProfile, Role};
-use athen_core::risk::{BaseImpact, DataSensitivity, EvaluationMethod, RiskContext, RiskScore};
+use athen_core::risk::{
+    BaseImpact, ComplexityTag, DataSensitivity, EvaluationMethod, RiskContext, RiskScore,
+};
 use athen_core::traits::llm::LlmRouter;
 
 use crate::scorer::RiskScorer;
@@ -57,7 +59,7 @@ impl LlmRiskEvaluator {
             }
         };
 
-        let (impact, sensitivity, confidence) = match self.parse_response(&response) {
+        let (impact, sensitivity, confidence, complexity) = match self.parse_response(&response) {
             Some(parsed) => parsed,
             None => {
                 tracing::warn!(
@@ -79,9 +81,11 @@ impl LlmRiskEvaluator {
             accumulated_risk: context.accumulated_risk,
         };
 
-        Ok(self
-            .scorer
-            .compute(impact, &effective_context, EvaluationMethod::LlmAssisted))
+        let mut score =
+            self.scorer
+                .compute(impact, &effective_context, EvaluationMethod::LlmAssisted);
+        score.complexity = complexity;
+        Ok(score)
     }
 
     /// Return a conservative risk score when the LLM call fails or returns
@@ -128,7 +132,12 @@ impl LlmRiskEvaluator {
             "- \"impact\": one of \"read\", \"write_temp\", \"write_persist\", \"system\"\n",
             "- \"sensitivity\": one of \"plain\", \"personal_info\", \"secrets\"\n",
             "- \"confidence\": a float between 0.0 and 1.0 indicating your confidence\n",
+            "- \"complexity\": one of \"low\", \"medium\", \"high\" — how hard the task is for the agent (NOT how risky)\n",
             "- \"reasoning\": a brief explanation\n\n",
+            "Complexity levels (judge difficulty, not danger — a one-line `rm -rf /` is HIGH risk but LOW complexity):\n",
+            "- low: single-shot trivial — read one file, look up a fact, summarize a short message, send a one-line reply\n",
+            "- medium: multi-step but standard — write a small script, edit a few files, send a structured reply, look up + summarize\n",
+            "- high: open-ended / requires reasoning across many constraints — design a system, debug across modules, write substantial code, plan a multi-day workflow\n\n",
             "Impact levels:\n",
             "- read: Read-only, no side effects (listing files, reading, searching)\n",
             "- write_temp: Creates temporary/reversible changes (writing to /tmp)\n",
@@ -169,7 +178,10 @@ impl LlmRiskEvaluator {
     /// trust-weighted conservative fallback on `None` — embedding a fixed
     /// "assume the worst" tuple here used to silently HardBlock trusted
     /// contacts on any local-model JSON wobble.
-    fn parse_response(&self, response: &LlmResponse) -> Option<(BaseImpact, DataSensitivity, f64)> {
+    fn parse_response(
+        &self,
+        response: &LlmResponse,
+    ) -> Option<(BaseImpact, DataSensitivity, f64, Option<ComplexityTag>)> {
         let content = &response.content;
         let v: serde_json::Value = serde_json::from_str(content).ok()?;
 
@@ -194,7 +206,19 @@ impl LlmRiskEvaluator {
             .unwrap_or(0.5)
             .clamp(0.0, 1.0);
 
-        Some((impact, sensitivity, confidence))
+        // Complexity is best-effort: a missing or off-vocabulary tag falls
+        // through to the static call-site tier rather than aborting the
+        // whole risk parse over a routing hint.
+        let complexity = v.get("complexity").and_then(|c| c.as_str()).and_then(|s| {
+            match s.trim().to_ascii_lowercase().as_str() {
+                "low" => Some(ComplexityTag::Low),
+                "medium" | "med" => Some(ComplexityTag::Medium),
+                "high" => Some(ComplexityTag::High),
+                _ => None,
+            }
+        });
+
+        Some((impact, sensitivity, confidence, complexity))
     }
 }
 
@@ -374,6 +398,62 @@ mod tests {
         let score = evaluator.evaluate("something", &ctx).await.unwrap();
         // WritePersist(40) * Neutral(2) * PersonalInfo(2) + 49 = 209
         assert!(score.total > 50.0, "got {}", score.total);
+    }
+
+    #[tokio::test]
+    async fn parses_complexity_when_present() {
+        let json = r#"{"impact":"read","sensitivity":"plain","confidence":1.0,"complexity":"high","reasoning":"hard"}"#;
+        let router = MockRouter::new(json);
+        let evaluator = LlmRiskEvaluator::new(Box::new(router));
+        let score = evaluator
+            .evaluate("design a system", &default_ctx())
+            .await
+            .unwrap();
+        assert_eq!(
+            score.complexity,
+            Some(athen_core::risk::ComplexityTag::High)
+        );
+    }
+
+    #[tokio::test]
+    async fn complexity_missing_falls_through_to_none() {
+        // Older / smaller models that ignore the new rubric must not break
+        // the score; complexity stays None and the executor falls back to
+        // the static call-site tier.
+        let json = r#"{"impact":"read","sensitivity":"plain","confidence":1.0}"#;
+        let router = MockRouter::new(json);
+        let evaluator = LlmRiskEvaluator::new(Box::new(router));
+        let score = evaluator
+            .evaluate("read a file", &default_ctx())
+            .await
+            .unwrap();
+        assert!(score.complexity.is_none());
+    }
+
+    #[tokio::test]
+    async fn complexity_off_vocabulary_is_ignored() {
+        let json = r#"{"impact":"read","sensitivity":"plain","confidence":1.0,"complexity":"galaxy-brain"}"#;
+        let router = MockRouter::new(json);
+        let evaluator = LlmRiskEvaluator::new(Box::new(router));
+        let score = evaluator
+            .evaluate("anything", &default_ctx())
+            .await
+            .unwrap();
+        assert!(score.complexity.is_none());
+    }
+
+    #[test]
+    fn regex_scorer_emits_no_complexity() {
+        // Regex can't classify hardness; the path must always emit None so
+        // the executor falls through to the static tier rather than
+        // routing on a guess.
+        let scorer = RiskScorer::new();
+        let score = scorer.compute(
+            BaseImpact::Read,
+            &default_ctx(),
+            EvaluationMethod::RuleBased,
+        );
+        assert!(score.complexity.is_none());
     }
 
     #[tokio::test]

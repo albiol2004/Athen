@@ -276,6 +276,15 @@ pub struct DefaultExecutor {
     /// `Default` — burning reasoning tokens on a one-word verdict is
     /// pure waste regardless of the user's preference.
     default_reasoning_effort: athen_core::llm::ReasoningEffort,
+    /// `ModelProfile` stamped on the main-loop `LlmRequest`. The host
+    /// (athen-app) resolves this *before* building the executor — via
+    /// `state::resolve_effective_tier_for_arc`, which honours the arc's
+    /// `tier_override` and the task's `risk_score.complexity` on top of
+    /// the static `Fast` call-site label. The completion-judge,
+    /// max-step-summary, and other helpers keep their own hardcoded
+    /// tiers (Cheap / Fast) regardless of this field — they're cheap by
+    /// design.
+    default_tier: athen_core::llm::ModelProfile,
 }
 
 impl DefaultExecutor {
@@ -310,6 +319,7 @@ impl DefaultExecutor {
             reminder_builder: None,
             auto_reminders: false,
             default_reasoning_effort: athen_core::llm::ReasoningEffort::Default,
+            default_tier: athen_core::llm::ModelProfile::Fast,
         }
     }
 
@@ -348,6 +358,14 @@ impl DefaultExecutor {
     /// `docs/REASONING_EFFORT.md` for the mapping table.
     pub fn set_default_reasoning_effort(&mut self, effort: athen_core::llm::ReasoningEffort) {
         self.default_reasoning_effort = effort;
+    }
+
+    /// Set the `ModelProfile` the main loop stamps on its `LlmRequest`.
+    /// The host (athen-app) computes this from the per-arc resolver
+    /// before constructing the executor. Helpers (judge / summary) keep
+    /// their own hardcoded tiers and aren't affected.
+    pub fn set_default_tier(&mut self, tier: athen_core::llm::ModelProfile) {
+        self.default_tier = tier;
     }
 
     /// Inject a pre-rendered identity block into the static system header.
@@ -1419,7 +1437,7 @@ impl AgentExecutor for DefaultExecutor {
                     ),
                 });
                 let summary_request = LlmRequest {
-                    profile: ModelProfile::Fast,
+                    profile: self.default_tier,
                     messages: conversation.clone(),
                     max_tokens: Some(2048),
                     temperature: Some(0.5),
@@ -1479,7 +1497,7 @@ impl AgentExecutor for DefaultExecutor {
             // honors a smaller cap we'll still see the truncation abort
             // guard kick in cleanly downstream — no tight-loop risk.
             let request = LlmRequest {
-                profile: ModelProfile::Fast,
+                profile: self.default_tier,
                 messages: conversation.clone(),
                 max_tokens: Some(32_768),
                 temperature: Some(self.default_temperature.unwrap_or(0.7)),

@@ -130,6 +130,15 @@ pub struct ArcMeta {
     /// columns because this is a durable user preference, not an
     /// in-flight snapshot.
     pub reasoning_effort_override: Option<String>,
+    /// User-set per-arc tier override. Stored as the serialized
+    /// `ModelProfile` wire form (`"Cheap"` / `"Fast"` / `"Code"` /
+    /// `"Powerful"`) so adding tiers later doesn't require a type
+    /// migration. `None` means "fall through to the task's complexity
+    /// tag (if any) and otherwise to the static call-site tier". Same
+    /// last-write-wins semantics as `reasoning_effort_override` —
+    /// distinct from the first-call-wins `pinned_*` columns because this
+    /// is a durable user preference, not an in-flight snapshot.
+    pub tier_override: Option<String>,
 }
 
 /// The type of an entry within an Arc.
@@ -357,6 +366,16 @@ impl ArcStore {
                 .map_err(|e| AthenError::Other(format!("Add reasoning_effort_override: {e}")))?;
             }
 
+            // Column-level migration: `tier_override` lets a user force
+            // a specific `ModelProfile` tier for an arc, bypassing the
+            // task-complexity heuristic. Stored as the wire form (the
+            // `ModelProfile` variant name) so adding tiers later is a
+            // no-op for the schema.
+            if !cols.contains("tier_override") {
+                conn.execute("ALTER TABLE arcs ADD COLUMN tier_override TEXT", [])
+                    .map_err(|e| AthenError::Other(format!("Add tier_override: {e}")))?;
+            }
+
             Ok(())
         })
         .await
@@ -426,7 +445,8 @@ impl ArcStore {
                             a.primary_reply_channel, a.active_profile_id, \
                             a.summarized_through_entry_id, \
                             a.pinned_provider_id, a.pinned_slug, \
-                            a.reasoning_effort_override \
+                            a.reasoning_effort_override, \
+                            a.tier_override \
                      FROM arcs a \
                      LEFT JOIN ( \
                          SELECT arc_id, COUNT(*) AS cnt \
@@ -454,6 +474,7 @@ impl ArcStore {
                         pinned_provider_id: row.get(12)?,
                         pinned_slug: row.get(13)?,
                         reasoning_effort_override: row.get(14)?,
+                        tier_override: row.get(15)?,
                     })
                 })
                 .map_err(|e| AthenError::Other(format!("Query get arc: {e}")))?;
@@ -501,7 +522,8 @@ impl ArcStore {
                         a.primary_reply_channel, a.active_profile_id, \
                         a.summarized_through_entry_id, \
                         a.pinned_provider_id, a.pinned_slug, \
-                        a.reasoning_effort_override \
+                        a.reasoning_effort_override, \
+                        a.tier_override \
                  FROM arcs a \
                  LEFT JOIN ( \
                      SELECT arc_id, COUNT(*) AS cnt \
@@ -532,6 +554,7 @@ impl ArcStore {
                         pinned_provider_id: row.get(12)?,
                         pinned_slug: row.get(13)?,
                         reasoning_effort_override: row.get(14)?,
+                        tier_override: row.get(15)?,
                     })
                 })
                 .map_err(|e| AthenError::Other(format!("Query list arcs: {e}")))?;
@@ -725,6 +748,29 @@ impl ArcStore {
                 params![value, id],
             )
             .map_err(|e| AthenError::Other(format!("Set reasoning_effort_override: {e}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
+    /// Set (or clear) the per-arc tier override. Last-write-wins: a user
+    /// toggling tier mid-task takes effect on the next LLM call. Pass
+    /// `None` to clear; pass `Some(wire_str)` where `wire_str` is the
+    /// serialized `ModelProfile` variant name (`"Cheap"`, `"Fast"`,
+    /// `"Code"`, `"Powerful"`). Validation of the wire form happens
+    /// upstream in the Tauri command — this setter trusts its caller.
+    pub async fn set_tier_override(&self, id: &str, value: Option<&str>) -> Result<()> {
+        let conn = self.conn.clone();
+        let id = id.to_string();
+        let value = value.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE arcs SET tier_override = ?1 WHERE id = ?2",
+                params![value, id],
+            )
+            .map_err(|e| AthenError::Other(format!("Set tier_override: {e}")))?;
             Ok(())
         })
         .await
@@ -1184,7 +1230,8 @@ CREATE TABLE IF NOT EXISTS arcs (
     summarized_through_entry_id INTEGER,
     pinned_provider_id TEXT,
     pinned_slug TEXT,
-    reasoning_effort_override TEXT
+    reasoning_effort_override TEXT,
+    tier_override TEXT
 );
 
 CREATE TABLE IF NOT EXISTS arc_entries (
@@ -2572,5 +2619,45 @@ mod tests {
             .unwrap();
         let meta = store.get_arc("arc_r").await.unwrap().expect("arc present");
         assert_eq!(meta.reasoning_effort_override, None);
+    }
+
+    /// Per-arc tier override: defaults to None, last-write-wins, and
+    /// round-trips through both `get_arc` and `list_arcs`. Modeled on the
+    /// reasoning-effort override test since the semantics are identical.
+    #[tokio::test]
+    async fn test_tier_override_set_get_clear() {
+        let store = setup_arc_store().await;
+        store
+            .create_arc("arc_t", "Tier arc", ArcSource::UserInput)
+            .await
+            .unwrap();
+
+        let meta = store.get_arc("arc_t").await.unwrap().expect("arc present");
+        assert_eq!(meta.tier_override, None);
+
+        store
+            .set_tier_override("arc_t", Some("Powerful"))
+            .await
+            .unwrap();
+        let meta = store.get_arc("arc_t").await.unwrap().expect("arc present");
+        assert_eq!(meta.tier_override.as_deref(), Some("Powerful"));
+
+        // Last-write-wins: overwrite freely.
+        store
+            .set_tier_override("arc_t", Some("Cheap"))
+            .await
+            .unwrap();
+        let meta = store.get_arc("arc_t").await.unwrap().expect("arc present");
+        assert_eq!(meta.tier_override.as_deref(), Some("Cheap"));
+
+        // list_arcs surfaces the same value.
+        let listed = store.list_arcs().await.unwrap();
+        let row = listed.iter().find(|a| a.id == "arc_t").unwrap();
+        assert_eq!(row.tier_override.as_deref(), Some("Cheap"));
+
+        // Clear restores None.
+        store.set_tier_override("arc_t", None).await.unwrap();
+        let meta = store.get_arc("arc_t").await.unwrap().expect("arc present");
+        assert_eq!(meta.tier_override, None);
     }
 }

@@ -2257,6 +2257,16 @@ pub async fn send_message(
                 &current_arc,
             )
             .await;
+            // In-app direct turns don't go through the risk LLM, so the
+            // task carries no complexity tag — resolver collapses to
+            // `override > Fast`.
+            let default_tier = crate::state::resolve_effective_tier_for_arc(
+                state.arc_store.as_ref(),
+                &current_arc,
+                None,
+                athen_core::llm::ModelProfile::Fast,
+            )
+            .await;
             let mut builder = AgentBuilder::new()
                 .llm_router(exec_router)
                 .tool_registry(registry)
@@ -2271,7 +2281,8 @@ pub async fn send_message(
                 .endpoints_block(endpoints_block)
                 .enable_default_reminders(true)
                 .default_temperature(sampling_temperature)
-                .default_reasoning_effort(reasoning_effort);
+                .default_reasoning_effort(reasoning_effort)
+                .default_tier(default_tier);
             if let Some(p) = state.tool_doc_dir.clone() {
                 builder = builder.tool_doc_dir(p);
             }
@@ -3318,6 +3329,19 @@ pub(crate) async fn execute_approved_task(
     let endpoints_block =
         crate::endpoints_render::render_endpoints_block(ctx.http_endpoint_store.as_ref()).await;
 
+    // Tier resolution: arc override > task complexity (piggybacked on
+    // the risk LLM that already ran on this approved task) > static
+    // `Fast`. The other LLM call sites (memory extractor, completion
+    // judge, risk LLM itself) keep their static tier labels.
+    let task_complexity = approved_task.risk_score.as_ref().and_then(|r| r.complexity);
+    let default_tier = crate::state::resolve_effective_tier_for_arc(
+        ctx.arc_store.as_ref(),
+        &ctx.active_arc_id,
+        task_complexity,
+        athen_core::llm::ModelProfile::Fast,
+    )
+    .await;
+
     let mut builder = AgentBuilder::new()
         .llm_router(exec_router)
         .tool_registry(registry)
@@ -3332,7 +3356,8 @@ pub(crate) async fn execute_approved_task(
         .endpoints_block(endpoints_block)
         .enable_default_reminders(true)
         .default_temperature(ctx.sampling_temperature)
-        .default_reasoning_effort(ctx.reasoning_effort);
+        .default_reasoning_effort(ctx.reasoning_effort)
+        .default_tier(default_tier);
     if let Some(p) = ctx.tool_doc_dir.clone() {
         builder = builder.tool_doc_dir(p);
     }
@@ -4315,6 +4340,17 @@ pub(crate) async fn execute_dispatched_task(
     let endpoints_block =
         crate::endpoints_render::render_endpoints_block(ctx.http_endpoint_store.as_ref()).await;
 
+    // Tier resolution mirrors the approval path; `task` carries the
+    // risk_score the dispatch loop installed.
+    let task_complexity = task.risk_score.as_ref().and_then(|r| r.complexity);
+    let default_tier = crate::state::resolve_effective_tier_for_arc(
+        ctx.arc_store.as_ref(),
+        &arc_id,
+        task_complexity,
+        athen_core::llm::ModelProfile::Fast,
+    )
+    .await;
+
     let mut builder = AgentBuilder::new()
         .llm_router(exec_router)
         .tool_registry(registry)
@@ -4330,7 +4366,8 @@ pub(crate) async fn execute_dispatched_task(
         .endpoints_block(endpoints_block)
         .enable_default_reminders(true)
         .default_temperature(ctx.sampling_temperature)
-        .default_reasoning_effort(ctx.reasoning_effort);
+        .default_reasoning_effort(ctx.reasoning_effort)
+        .default_tier(default_tier);
     if let Some(p) = ctx.tool_doc_dir.clone() {
         builder = builder.tool_doc_dir(p);
     }
@@ -5497,6 +5534,41 @@ pub async fn set_arc_reasoning_effort(
     };
     arc_store
         .set_reasoning_effort_override(&arc_id, normalized.as_deref())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Set the per-arc tier override. `None` / `"auto"` / `""` clears it so
+/// the executor falls back to the task's complexity tag (when available)
+/// and otherwise to the static call-site label. Valid wire values are
+/// the `ModelProfile` variant names: `"Cheap"`, `"Fast"`, `"Code"`,
+/// `"Powerful"`. We parse to `ModelProfile` first for validation, then
+/// persist the canonical wire form — so a malformed value can never
+/// land in the DB and trip the resolver's warn-and-fallthrough path.
+#[tauri::command]
+pub async fn set_arc_tier(
+    arc_id: String,
+    tier: Option<String>,
+    state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    let Some(arc_store) = state.arc_store.as_ref() else {
+        return Err("Arc store not available".into());
+    };
+    let normalized: Option<String> = match tier.as_deref() {
+        None | Some("") | Some("auto") => None,
+        Some(s) => {
+            let canonical = match s.trim() {
+                "Cheap" => "Cheap",
+                "Fast" => "Fast",
+                "Code" => "Code",
+                "Powerful" => "Powerful",
+                other => return Err(format!("unknown tier value: {other:?}")),
+            };
+            Some(canonical.to_string())
+        }
+    };
+    arc_store
+        .set_tier_override(&arc_id, normalized.as_deref())
         .await
         .map_err(|e| e.to_string())
 }

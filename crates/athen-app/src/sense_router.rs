@@ -2162,6 +2162,7 @@ mod tests {
                 pinned_provider_id: None,
                 pinned_slug: None,
                 reasoning_effort_override: None,
+                tier_override: None,
             },
             ArcMeta {
                 id: "arc_recent".into(),
@@ -2179,6 +2180,7 @@ mod tests {
                 pinned_provider_id: None,
                 pinned_slug: None,
                 reasoning_effort_override: None,
+                tier_override: None,
             },
         ];
 

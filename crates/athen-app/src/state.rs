@@ -3444,6 +3444,93 @@ pub(crate) async fn resolve_reasoning_effort_for_arc(
     }
 }
 
+/// Parse the wire form (`ModelProfile` variant name) of a stored tier
+/// override into a `ModelProfile`. Returns `None` for unknown strings so
+/// the resolver can warn and fall through rather than silently
+/// substituting a wrong tier.
+fn parse_model_profile_wire(s: &str) -> Option<ModelProfile> {
+    match s.trim() {
+        "Powerful" => Some(ModelProfile::Powerful),
+        "Fast" => Some(ModelProfile::Fast),
+        "Code" => Some(ModelProfile::Code),
+        "Cheap" => Some(ModelProfile::Cheap),
+        "Local" => Some(ModelProfile::Local),
+        _ => None,
+    }
+}
+
+/// Resolve the effective `ModelProfile` for the main-executor call of a
+/// task. Resolution order (highest first):
+/// 1. Arc's `tier_override` (user said "force this tier for this arc")
+/// 2. Task's `risk_score.complexity` mapped via `complexity_to_tier`
+/// 3. Caller-supplied `default_label` (the static per-call-site tier)
+///
+/// Only the main executor should call this — the memory extractor,
+/// completion judge, and risk LLM itself keep their static tier labels
+/// (Cheap / Cheap / Fast respectively) regardless of task complexity.
+/// Logs once at info-level when the chosen tier diverges from the
+/// caller's default so users can see why their task ran on a different
+/// model.
+pub(crate) async fn resolve_effective_tier_for_arc(
+    arc_store: Option<&ArcStore>,
+    arc_id: &str,
+    task_complexity: Option<athen_core::risk::ComplexityTag>,
+    default_label: ModelProfile,
+) -> ModelProfile {
+    let (chosen, reason): (ModelProfile, &'static str) = if let Some(store) = arc_store {
+        match store.get_arc(arc_id).await {
+            Ok(Some(arc)) => match arc.tier_override.as_deref() {
+                Some(raw) => match parse_model_profile_wire(raw) {
+                    Some(t) => (t, "override"),
+                    None => {
+                        warn!(
+                            arc_id = %arc_id,
+                            tier_override = %raw,
+                            "unknown tier_override wire value; ignoring"
+                        );
+                        complexity_path(task_complexity, default_label)
+                    }
+                },
+                None => complexity_path(task_complexity, default_label),
+            },
+            _ => complexity_path(task_complexity, default_label),
+        }
+    } else {
+        complexity_path(task_complexity, default_label)
+    };
+
+    if chosen != default_label {
+        tracing::info!(
+            arc_id = %arc_id,
+            chosen = ?chosen,
+            default = ?default_label,
+            reason = %reason,
+            "executor: tier diverges from static label"
+        );
+    }
+    chosen
+}
+
+/// Sub-resolver for the complexity-then-default fallthrough. Pulled out
+/// so the override branch above stays readable — the reason string is
+/// what differs between the override path and this one.
+fn complexity_path(
+    task_complexity: Option<athen_core::risk::ComplexityTag>,
+    default_label: ModelProfile,
+) -> (ModelProfile, &'static str) {
+    match task_complexity {
+        Some(tag) => (
+            athen_core::risk::complexity_to_tier(tag),
+            match tag {
+                athen_core::risk::ComplexityTag::Low => "complexity_low",
+                athen_core::risk::ComplexityTag::Medium => "complexity_medium",
+                athen_core::risk::ComplexityTag::High => "complexity_high",
+            },
+        ),
+        None => (default_label, "default"),
+    }
+}
+
 /// Determine the active provider ID from config, falling back to "deepseek".
 ///
 /// Looks for `active_provider` in `config.models.assignments` (we reuse the
@@ -4258,5 +4345,107 @@ mod newarc_command_tests {
         let (force, rest) = parse_newarc_command("/newarc\tafter tab");
         assert!(force);
         assert_eq!(rest, "after tab");
+    }
+}
+
+#[cfg(test)]
+mod resolve_effective_tier_tests {
+    use super::resolve_effective_tier_for_arc;
+    use athen_core::llm::ModelProfile;
+    use athen_core::risk::ComplexityTag;
+    use athen_persistence::arcs::{ArcSource, ArcStore};
+    use rusqlite::Connection;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    async fn setup_store() -> ArcStore {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        let store = ArcStore::new(Arc::new(Mutex::new(conn)));
+        store.init_schema().await.expect("init arc schema");
+        store
+    }
+
+    /// Override beats both complexity and the static default — even when
+    /// the task-complexity tag would point somewhere else.
+    #[tokio::test]
+    async fn override_wins_over_complexity_and_default() {
+        let store = setup_store().await;
+        store
+            .create_arc("arc1", "t", ArcSource::UserInput)
+            .await
+            .unwrap();
+        store
+            .set_tier_override("arc1", Some("Cheap"))
+            .await
+            .unwrap();
+
+        let tier = resolve_effective_tier_for_arc(
+            Some(&store),
+            "arc1",
+            Some(ComplexityTag::High),
+            ModelProfile::Fast,
+        )
+        .await;
+        assert_eq!(tier, ModelProfile::Cheap);
+    }
+
+    /// No override but a complexity tag is present — the tag maps to a
+    /// tier and beats the static call-site default.
+    #[tokio::test]
+    async fn complexity_wins_when_no_override() {
+        let store = setup_store().await;
+        store
+            .create_arc("arc2", "t", ArcSource::UserInput)
+            .await
+            .unwrap();
+
+        let tier = resolve_effective_tier_for_arc(
+            Some(&store),
+            "arc2",
+            Some(ComplexityTag::High),
+            ModelProfile::Fast,
+        )
+        .await;
+        assert_eq!(tier, ModelProfile::Powerful);
+    }
+
+    /// No override and no complexity tag — fall through to the static
+    /// caller-supplied default (Road 1's call-site label).
+    #[tokio::test]
+    async fn default_used_when_no_override_no_complexity() {
+        let store = setup_store().await;
+        store
+            .create_arc("arc3", "t", ArcSource::UserInput)
+            .await
+            .unwrap();
+
+        let tier =
+            resolve_effective_tier_for_arc(Some(&store), "arc3", None, ModelProfile::Fast).await;
+        assert_eq!(tier, ModelProfile::Fast);
+    }
+
+    /// Unknown wire string in `tier_override` must not crash or
+    /// substitute the wrong tier — it falls through to the complexity /
+    /// default path, with a warn-level log to surface the malformed row.
+    #[tokio::test]
+    async fn unknown_override_string_falls_through() {
+        let store = setup_store().await;
+        store
+            .create_arc("arc4", "t", ArcSource::UserInput)
+            .await
+            .unwrap();
+        store
+            .set_tier_override("arc4", Some("Bogus"))
+            .await
+            .unwrap();
+
+        let tier = resolve_effective_tier_for_arc(
+            Some(&store),
+            "arc4",
+            Some(ComplexityTag::Low),
+            ModelProfile::Fast,
+        )
+        .await;
+        assert_eq!(tier, ModelProfile::Cheap);
     }
 }

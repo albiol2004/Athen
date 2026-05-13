@@ -64,6 +64,7 @@ pub struct AgentBuilder {
     reminder_builder: Option<Arc<dyn SystemReminderBuilder>>,
     auto_reminders: bool,
     default_reasoning_effort: athen_core::llm::ReasoningEffort,
+    default_tier: athen_core::llm::ModelProfile,
 }
 
 impl AgentBuilder {
@@ -96,6 +97,7 @@ impl AgentBuilder {
             reminder_builder: None,
             auto_reminders: false,
             default_reasoning_effort: athen_core::llm::ReasoningEffort::Default,
+            default_tier: athen_core::llm::ModelProfile::Fast,
         }
     }
 
@@ -165,6 +167,16 @@ impl AgentBuilder {
     /// pure waste.
     pub fn default_reasoning_effort(mut self, effort: athen_core::llm::ReasoningEffort) -> Self {
         self.default_reasoning_effort = effort;
+        self
+    }
+
+    /// Resolved `ModelProfile` for the main agent loop. The host computes
+    /// this via `state::resolve_effective_tier_for_arc` (arc override >
+    /// task complexity > static call-site label `Fast`) and threads it
+    /// through. The cheap helpers (completion judge, etc.) keep their
+    /// hardcoded tiers regardless.
+    pub fn default_tier(mut self, tier: athen_core::llm::ModelProfile) -> Self {
+        self.default_tier = tier;
         self
     }
 
@@ -375,6 +387,7 @@ impl AgentBuilder {
         }
 
         executor.set_default_reasoning_effort(self.default_reasoning_effort);
+        executor.set_default_tier(self.default_tier);
 
         Ok(executor)
     }

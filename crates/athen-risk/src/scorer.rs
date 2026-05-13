@@ -47,6 +47,9 @@ impl RiskScorer {
             uncertainty_penalty: p_incertidumbre,
             level,
             evaluation_method: method,
+            // Regex can't judge hardness — absence is the right signal,
+            // the LLM-fallback path is the only one that fills this in.
+            complexity: None,
         }
     }
 }

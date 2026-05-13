@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::contact::TrustLevel;
+use crate::llm::ModelProfile;
 
 /// The computed risk score for an action or task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -12,6 +13,36 @@ pub struct RiskScore {
     pub uncertainty_penalty: f64,
     pub level: RiskLevel,
     pub evaluation_method: EvaluationMethod,
+    /// LLM-judged task hardness, piggybacked on the risk-evaluation step
+    /// so we don't pay for a second classification round-trip. Drives the
+    /// main-executor tier selection via `complexity_to_tier`. `None` for
+    /// regex-only scored actions (regex can't classify hardness) and for
+    /// any persisted score predating this field — both fall through to
+    /// the static call-site tier.
+    #[serde(default)]
+    pub complexity: Option<ComplexityTag>,
+}
+
+/// LLM-judged hardness of a task. Mapped to a `ModelProfile` via
+/// `complexity_to_tier`. Kept tiny on purpose — three tiers is enough
+/// signal to route Cheap/Fast/Powerful without overfitting the rubric.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ComplexityTag {
+    Low,
+    Medium,
+    High,
+}
+
+/// Map a complexity tag to the model tier the main executor should use.
+/// Hardcoded today; a per-profile mapping is a future option but YAGNI
+/// while there's exactly one main-executor call site honouring this.
+pub fn complexity_to_tier(tag: ComplexityTag) -> ModelProfile {
+    match tag {
+        ComplexityTag::Low => ModelProfile::Cheap,
+        ComplexityTag::Medium => ModelProfile::Fast,
+        ComplexityTag::High => ModelProfile::Powerful,
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -80,5 +111,58 @@ impl RiskScore {
             50..90 => RiskDecision::HumanConfirm,
             _ => RiskDecision::HardBlock,
         }
+    }
+}
+
+#[cfg(test)]
+mod complexity_tests {
+    use super::*;
+
+    #[test]
+    fn complexity_to_tier_maps_expected() {
+        assert_eq!(complexity_to_tier(ComplexityTag::Low), ModelProfile::Cheap);
+        assert_eq!(
+            complexity_to_tier(ComplexityTag::Medium),
+            ModelProfile::Fast
+        );
+        assert_eq!(
+            complexity_to_tier(ComplexityTag::High),
+            ModelProfile::Powerful
+        );
+    }
+
+    #[test]
+    fn complexity_tag_serializes_to_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&ComplexityTag::Low).unwrap(),
+            "\"low\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ComplexityTag::Medium).unwrap(),
+            "\"medium\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ComplexityTag::High).unwrap(),
+            "\"high\""
+        );
+        let back: ComplexityTag = serde_json::from_str("\"high\"").unwrap();
+        assert_eq!(back, ComplexityTag::High);
+    }
+
+    #[test]
+    fn risk_score_complexity_defaults_to_none_when_missing() {
+        // Existing persisted scores without the new field should rehydrate
+        // with `complexity: None`, falling through to the static tier.
+        let raw = serde_json::json!({
+            "total": 12.5,
+            "base_impact": 1.0,
+            "origin_multiplier": 0.5,
+            "data_multiplier": 1.0,
+            "uncertainty_penalty": 0.0,
+            "level": "Safe",
+            "evaluation_method": "RuleBased"
+        });
+        let score: RiskScore = serde_json::from_value(raw).unwrap();
+        assert!(score.complexity.is_none());
     }
 }

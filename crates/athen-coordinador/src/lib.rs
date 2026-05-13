@@ -412,6 +412,7 @@ mod tests {
                     RiskLevel::Critical
                 },
                 evaluation_method: EvaluationMethod::RuleBased,
+                complexity: None,
             })
         }
 

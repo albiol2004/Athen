@@ -627,6 +627,7 @@ async function loadArcs() {
         renderArcList(arcs || []);
         renderProfilePicker();
         renderReasoningPicker();
+        renderTierPicker();
     } catch (err) {
         console.error('Failed to load arcs:', err);
     }
@@ -644,6 +645,7 @@ async function loadAgentProfiles() {
         agentProfiles = await invoke('list_agent_profiles');
         renderProfilePicker();
         renderReasoningPicker();
+        renderTierPicker();
     } catch (err) {
         console.error('Failed to load agent profiles:', err);
         agentProfiles = [];
@@ -683,6 +685,7 @@ async function onProfileChange(ev) {
         // Roll the dropdown back to whatever the arc actually has.
         renderProfilePicker();
         renderReasoningPicker();
+        renderTierPicker();
     }
 }
 
@@ -705,6 +708,29 @@ async function onReasoningChange(ev) {
     } catch (err) {
         console.error('set_arc_reasoning_effort failed:', err);
         renderReasoningPicker();
+    }
+}
+
+function renderTierPicker() {
+    const sel = document.getElementById('arc-tier-picker');
+    if (!sel) return;
+    sel.disabled = !activeArcId;
+    const meta = activeArcId ? arcMetaById.get(activeArcId) : null;
+    sel.value = (meta && meta.tier_override) || 'auto';
+}
+
+async function onTierChange(ev) {
+    if (!invoke || !activeArcId) return;
+    const chosen = ev.target.value;
+    // 'auto' is the cleared-override sentinel — backend treats it as None.
+    const tier = chosen === 'auto' ? null : chosen;
+    try {
+        await invoke('set_arc_tier', { arcId: activeArcId, tier });
+        const meta = arcMetaById.get(activeArcId);
+        if (meta) meta.tier_override = tier;
+    } catch (err) {
+        console.error('set_arc_tier failed:', err);
+        renderTierPicker();
     }
 }
 
@@ -1025,6 +1051,7 @@ async function handleSwitchArc(arcId) {
         activeArcId = arcId;
         renderProfilePicker();
         renderReasoningPicker();
+        renderTierPicker();
 
         // Clear notification dot for this arc.
         arcsWithNotifications.delete(arcId);
@@ -3824,6 +3851,11 @@ if (arcReasoningPicker) {
     arcReasoningPicker.addEventListener('change', onReasoningChange);
 }
 
+const arcTierPicker = document.getElementById('arc-tier-picker');
+if (arcTierPicker) {
+    arcTierPicker.addEventListener('change', onTierChange);
+}
+
 const newProfileBtn = document.getElementById('new-profile-btn');
 if (newProfileBtn) {
     newProfileBtn.addEventListener('click', () => openProfileEditor('create', null));
@@ -4182,6 +4214,7 @@ async function loadProfileManager() {
         // two views never disagree.
         renderProfilePicker();
         renderReasoningPicker();
+        renderTierPicker();
     } catch (err) {
         console.error('Failed to load profiles:', err);
         listEl.innerHTML = '<p class="setting-hint">Failed to load profiles.</p>';
