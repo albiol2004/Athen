@@ -497,6 +497,26 @@ function registerTauriEventListeners() {
     });
 }
 
+// Route `<a target="_blank">` and any external http(s) anchor through the
+// Tauri opener plugin so clicks actually reach the system browser. The
+// WebView doesn't honor `target="_blank"` for navigation, so without this
+// every external-link click is a silent no-op.
+function installExternalLinkOpener() {
+    document.addEventListener('click', (e) => {
+        const a = e.target.closest('a');
+        if (!a) return;
+        const href = a.getAttribute('href') || '';
+        if (!/^https?:\/\//i.test(href)) return;
+        e.preventDefault();
+        const opener = window.__TAURI__ && window.__TAURI__.opener;
+        if (opener && opener.openUrl) {
+            opener.openUrl(href).catch((err) => console.warn('openUrl failed:', err));
+        } else {
+            console.warn('opener plugin unavailable; cannot open', href);
+        }
+    });
+}
+
 function initTauri() {
     performance.mark('athen-init-start');
     if (window.__TAURI__ && window.__TAURI__.core) {
@@ -505,6 +525,7 @@ function initTauri() {
         // Synchronous, lightweight: just registers .listen() handlers.
         // Must run before any task could fire (e.g. agent-stream).
         registerTauriEventListeners();
+        installExternalLinkOpener();
 
         setStatus('idle', 'Ready');
 

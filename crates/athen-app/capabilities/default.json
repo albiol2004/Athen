@@ -12,6 +12,7 @@
         "core:window:allow-close",
         "core:window:allow-start-dragging",
         "updater:default",
-        "process:allow-restart"
+        "process:allow-restart",
+        "opener:allow-open-url"
     ]
 }
