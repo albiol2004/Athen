@@ -23,6 +23,8 @@ Synthesized 2026-05-13 from three parallel Haiku research streams (Windsurf/Curs
 | **magai.co** ($20/$40/$200/mo) | 50+ models behind one chat UI | 🟡 Legit company, direct provider relationships — but **intentionally no API** (founder published "Why Magai Will Never Have an API"). ToS forbids automated use. | Skip — there's nothing to call |
 | **aizolo.com** ($9.9/mo) | "All-in-one" Claude+GPT+Gemini subscription | 🔴 **Almost certainly account-pooling.** $9.9/mo for "Claude + GPT + Gemini" is mechanically impossible without violating Anthropic/OpenAI account-sharing ToS. BYOK mode is legit; "built-in" mode isn't. Scam Detector 36/100, near-zero Reddit traction. | Skip (user's gut was right) |
 | **Atlas Cloud** (atlascloud.ai, pay-per-token) | Multimodal aggregator (LLM + image + video) | 🟡 Legit funded company, OpenAI-compatible at `api.atlascloud.ai/v1`, **but ToS §7 explicitly bans "engage in automated use" / "access through automated or non-human means"**. Also: $0.26/M for DeepSeek vs Together's $0.14 — not price-competitive for LLM-only. | Skip — Together AI / Fireworks fill the same shape with agent-permissive ToS |
+| **OpenCode Go** ($5 first mo, then $10/mo) | Curated open-source coding models bundle — DeepSeek V4 Pro/Flash, Qwen 3.5/3.6, Kimi K2.5/K2.6, GLM-5.1, MiniMax M2.5/M2.7 — direct provider contracts, not account-pooled | 🟢 **"Use Go with any agent"** is the explicit on-site copy. OpenAI-compatible at `https://opencode.ai/zen/go/v1`. Generic ToS boilerplate about automation is CYA; the marketing surface and the supported-tools docs are the load-bearing signal (same pattern that flipped MiniMax Token Plan). Tiered per-model 5h rolling windows: 31.6K req/5h DeepSeek V4 Flash, 10K req/5h Qwen 3.5 Plus, 3.45K req/5h V4 Pro, 1.15K req/5h Kimi K2.6. | **Wire as first-class provider** via `OpenAiCompatibleProvider`. Same shape as DeepSeek wire path. Cheapest legitimate coding bundle Athen can ship today; complements MiniMax (which adds Anthropic-compat + prompt-cache at $20+). |
+| **ZenMux Pro** ($20/$100/$400/mo) | Enterprise aggregator across ~200 models (OpenAI/Anthropic/Google/DeepSeek/…) via official provider contracts | 🔴 Legitimate, but no differentiation over OpenRouter (already a Cloud APIs preset). "Insurance" upsell (latency/hallucination coverage) doesn't fit agent loops. ToS quiet on agent automation. | Skip — OpenRouter fills this niche with a smaller markup and explicit agent-loop tolerance. |
 
 **Net move:** add two presets to `athen-app/src/http_presets.rs` (Poe + self-hosted Copilot relay). No new bespoke provider in `athen-llm`. Total work: ~30 minutes.
 
@@ -104,6 +106,31 @@ The only argument for a bespoke `Provider` impl would be if we want chat-style s
 - Red flag corroboration: Scam Detector 36/100 "Questionable", only 3 Trustpilot reviews, blog posts with titles like "How to Bypass Claude 4.5 Sonnet Message Limit" and "Free AI Wrapper for OpenAI Key", no Reddit/HN discussion despite a price point that would go viral if legit, ToS conspicuously silent on how they source closed-model access without user keys.
 - **Skip.** Wiring this into Athen would put users at risk of having their aizolo account banned (and possibly any associated upstream account if they used BYOK with the same email).
 
+### 🟢 OpenCode Go ($5 first month, $10/mo ongoing) — wire as first-class provider
+
+- Direct provider contracts with the listed open-source-model labs (DeepSeek, Alibaba/Qwen, Moonshot/Kimi, Zhipu/GLM, MiniMax). Not account-pooled — these are commercial-tier API contracts that OpenCode resells through a unified gateway. Backed by Anomaly (the Charm team's company).
+- Dual-protocol like MiniMax Token Plan: most models on OpenAI Chat Completions (`https://opencode.ai/zen/go/v1/chat/completions`), MiniMax M2.5/M2.7 on Anthropic Messages (`https://opencode.ai/zen/go/v1/messages`). Standard `Authorization: Bearer sk-...` header on both.
+- **Verified model lineup (2026-05-13):**
+  - OpenAI protocol: `glm-5.1`, `glm-5`, `kimi-k2.6`, `kimi-k2.5`, `deepseek-v4-pro`, `deepseek-v4-flash`, `mimo-v2.5-pro`, `mimo-v2.5`, `qwen3.6-plus`, `qwen3.5-plus`
+  - Anthropic protocol: `minimax-m2.7`, `minimax-m2.5`
+- **Marketing copy is authoritative:** the landing page says "Yes, you can use Go with any agent. Follow the setup instructions in your preferred coding agent." That overrides the generic "no automated use" boilerplate elsewhere in ToS — same pattern as MiniMax Token Plan, same lesson from the Alibaba/Z.ai/Kimi correction sweep. When a provider explicitly markets an agent-shaped use case, the marketing copy is the contract.
+- Per-model 5h rolling windows (sized per tier, current $10 numbers):
+  - DeepSeek V4 Flash: **31.6K req/5h** — overkill for any single-user agent loop
+  - Qwen 3.5 Plus: 10K req/5h
+  - DeepSeek V4 Pro: 3.45K req/5h
+  - Kimi K2.6: 1.15K req/5h (too tight for sustained loops — reserve for one-shot harder reasoning)
+- For Athen's risk-scorer + executor + judge loop (≈3-5 req/turn), V4 Flash gives ~1.2K turns/hour of headroom. Use Flash as the default loop model, V4 Pro for higher-stakes single calls, Qwen 3.5 Plus as fallback.
+- $10/mo flat-rate vs DeepSeek direct's ~$0.14/$0.28 per M tokens: break-even is roughly at moderate daily use. For Athen-shaped workloads (proactive agent firing on every email + calendar event + manual), flat-rate wins on predictability even if not on raw $/req.
+- **At the $10 price point, this is the better pick than MiniMax Token Plan Starter** (1.5K req/5h, 1 concurrent — starves Athen's risk+exec+judge concurrency on the very first turn). MiniMax earns wiring at Plus ($20+) for its Anthropic-compat + prompt-cache angle, not at Starter for raw throughput. Different value props.
+- **Wire shape:** add a new provider configuration option in Settings → LLM Providers that constructs `OpenAiCompatibleProvider::new("https://opencode.ai/zen/go/v1")` with the user's `sk-...` key, model picker exposing the bundled lineup. No bespoke `Provider` impl needed.
+
+### 🔴 ZenMux Pro — legit but redundant with OpenRouter
+
+- Enterprise aggregator, ~200 models via stated direct provider contracts. OpenAI-compatible (`https://zenmux.ai/v1`) and Anthropic-compatible variants.
+- Subscription tiers $20/$100/$400/mo bundle insurance (latency, hallucination coverage) on top of pay-as-you-go. The insurance frame doesn't fit autonomous agent loops — Athen's risk system already gates execution; post-hoc latency/hallucination coverage is consumer-app shaped.
+- ToS quiet on agent automation (no explicit ban, no explicit permission).
+- **Skip.** OpenRouter is already wired as a Cloud APIs preset, runs ~500 models, has explicit agent-loop tolerance, and charges a ~5.5% markup that's negligible vs the switching cost. No net gain.
+
 ### 🟡 Atlas Cloud (atlascloud.ai) — legit but ToS-blocked
 
 - Real funded company (founder Jerry Tang, ex-Natixis/Neon Chain; CTO ex-Google), SOC 2 Type I/II + HIPAA certified, OpenAI-compatible API at `https://api.atlascloud.ai/v1`.
@@ -126,7 +153,8 @@ User asked the natural follow-up: "what about subscription products that subsidi
 | xAI SuperGrok $30 / Heavy $300 | ❌ Chat-only, ToS forbids programmatic use |
 | xAI **X Premium+** $40 | 🟡 Single blog claim ("hidden benefit nobody talks about"), unverified on first-party x.ai/api |
 | Perplexity Pro $20 | ❌ Used to include $5/mo Sonar credit, silently removed early 2026 |
-| MiniMax Hailuo Pro / Agent Pro / Token Plan | ❌ Three parallel product lines, none of them bundle. "Token Plan" is just prepaid API metering, not a bundle. |
+| MiniMax Hailuo Pro / Agent Pro | ❌ Video/image credits and chat-only, no API bundling |
+| **MiniMax Token Plan ($10–$50+/mo)** | ✅ **THE EXCEPTION.** Coding-plan structure (`sk-cp-` keys, dedicated `api.minimax.io/anthropic` subdomain with prompt-cache, supported-tools includes LangChain + Portkey + generic OpenAI clients). **No client whitelist, no UA enforcement, no agent-use ban in ToS** — ceiling is per-tier concurrency (1-4 concurrent agents) and request quotas (1,500-30,000 req/5h). Wireable into Athen as a regular OpenAI/Anthropic-compatible provider. |
 | Moonshot Kimi / Zhipu GLM / ByteDance Doubao / Tencent Hunyuan / Baidu ERNIE / iFlytek / SenseTime / Baichuan / 01.AI / StepFun | ❌ All same shape — consumer chat tier separate from API billing |
 | **Alibaba Cloud Coding Plan Pro ($50/mo)** | 🟡 Real product, real multi-vendor (Qwen+Kimi+GLM+MiniMax via OpenAI/Anthropic-compatible endpoints). Explicitly **supports agentic coding tools** (Claude Code, Cline, Cursor, Qwen Code, Codex, OpenClaw, Kilo Code…). $3 Lite tier discontinued 2026-03-20. **Catch:** client whitelist (see below) blocks unrecognised tools. |
 | **Z.ai GLM Coding Plan (Lite $10 / Pro $30 / Max $80)** | 🟡 Z.ai's English-brand version of the same shape. 20+ supported clients incl. Claude Code, Cline, Cursor, Continue.dev. Models: GLM-5.1, GLM-5-Turbo, GLM-4.7. **ToS:** *"If the system detects usage through unauthorized or unsupported tools (such as SDK-based access or third-party integrations), some subscription benefits may be restricted."* — Athen *is* "SDK-based access". |
@@ -136,16 +164,19 @@ User asked the natural follow-up: "what about subscription products that subsidi
 
 Earlier draft of this doc claimed "every flat-rate bundle bans autonomous agent use". That read was wrong. The actual line:
 
-**Flat-rate coding bundles explicitly *welcome* agentic tool loops** (Claude Code, Cline, Cursor are all multi-turn tool-call agents — they're the target market). **What they gate on is client identity, not behavior.** Each provider maintains a list of recognised coding tools and enforces it via User-Agent / endpoint patterns. Unrecognised clients are either:
+**Flat-rate coding bundles explicitly *welcome* agentic tool loops** (Claude Code, Cline, Cursor are all multi-turn tool-call agents — they're the target market). **Most gate on client identity, not behavior.** Each gating provider maintains a list of recognised coding tools and enforces it via User-Agent / endpoint patterns. Unrecognised clients are either:
 - **Hard-rejected** by the backend (Kimi, with explicit "no UA spoofing" clause)
 - **Soft-degraded** ("benefits may be restricted", Z.ai)
 - **Tolerated for now but ToS-restricted** (Alibaba "use only in coding tools like Claude Code")
+- **Not gated at all** — MiniMax. Token Plan docs explicitly list LangChain and Portkey alongside named tools, and the FAQ specifies concurrency-cap-per-tier as the actual enforcement. The provider chose throughput-based ceiling over identity-based gatekeeping.
 
 Why: the unit economics work because Claude Code / Cline / Cursor have natural session ceilings (a human is somewhere in the loop). What providers fear isn't agent loops — it's a third-party app pointing 24/7 traffic at a $30/mo bundle. Hence: name-based gatekeeping.
 
-**For Athen, this means none of the three coding plans are wirable as-is.** Athen identifies as "Athen", not as Claude Code. Spoofing User-Agent is suspension-triggering on Kimi and ToS-skirting elsewhere. The honest path is either:
+**For Athen, this means most of the coding plans aren't wirable as-is.** Athen identifies as "Athen", not as Claude Code. Spoofing User-Agent is suspension-triggering on Kimi and ToS-skirting elsewhere. The honest path for Kimi/Z.ai/Alibaba is either:
 - Commercial outreach — ask each provider to add Athen to their supported-tools list. Z.ai has added many community tools; worth trying.
 - Skip the bundles, use direct pay-as-you-go APIs.
+
+**MiniMax Token Plan is the exception that proves the rule:** same coding-bundle structure, but the published docs (`/token-plan/other-tools`) explicitly list LangChain + Portkey + generic OpenAI clients alongside named tools (Cherry Studio, Codex CLI, Zed, Roo Code, Kilo Code, Qwen Code, OpenHands, nanobot, Open WebUI, Pi, Droid, OpenCode, Claude Desktop, Grok CLI, Xcode). No UA whitelist, no SDK-access prohibition. The enforcement mechanism is per-tier **concurrency limits (1-4 concurrent agents)** plus request quotas, which is identity-agnostic. This makes MiniMax Token Plan the only coding-plan-shaped subscription in the market that Athen can wire as a first-class provider without commercial outreach. Two protocols available — **OpenAI-compat** (`api.minimax.io/v1`) and **Anthropic-compat** (`api.minimax.io/anthropic`, with prompt-cache). Caveat: position language *"designed for individual, interactive developer use"* in the FAQ — concurrency cap is the real ceiling, not the words; treat the cap as authoritative.
 
 This is also why Cursor Pro / Windsurf Pro / GitHub Copilot ToS are absolute (no agent loops) — they *are* the coding tool, not a backend the user brings their own tool to. Different shape from the Chinese labs' plans.
 
@@ -169,7 +200,10 @@ When a user says "can Athen use my X subscription?":
 
 1. If X has an **official paid API** (Perplexity, xAI, Mistral, OpenRouter, DeepSeek, Groq, Qwen via DashScope, GLM via Z.ai, Kimi via Moonshot, etc.) — use it. That's what `openai_compat` is for. No client gating on direct pay-as-you-go APIs.
 2. If X has an **official OpenAI-compatible endpoint tied to subscription credits** (Poe today, maybe future others) — ship as a Cloud APIs preset with a "personal use only" disclaimer.
-3. If X is a **flat-rate coding-tool bundle with a client whitelist** (Alibaba Coding Plan, Z.ai GLM Coding Plan, Kimi Coding Plan, Cursor Pro, Windsurf Pro, GitHub Copilot) — don't wire. Athen isn't on the supported-tool list; UA spoofing is suspension-triggering on Kimi and ToS-skirting elsewhere. Commercial outreach is the only honest path onto these lists, not engineering.
+3. If X is a **flat-rate coding-tool bundle with NO client whitelist** — wire as a first-class provider. The real ceiling is per-tier concurrency or quota, not client identity. Two known examples today:
+   - **MiniMax Token Plan** ($10-$50+/mo) — `sk-cp-` keys, OpenAI- and Anthropic-compatible endpoints, prompt-cache on the Anthropic side, concurrency cap 1-4 per tier.
+   - **OpenCode Go** ($5 first mo, $10 ongoing) — OpenAI-compatible at `opencode.ai/zen/go/v1`, generous per-model 5h windows (31.6K req for DeepSeek V4 Flash). "Use Go with any agent" is the explicit on-site copy.
+4. If X is a **flat-rate coding-tool bundle WITH a client whitelist** (Alibaba Coding Plan, Z.ai GLM Coding Plan, Kimi Coding Plan, Cursor Pro, Windsurf Pro, GitHub Copilot) — don't wire. Athen isn't on the supported-tool list; UA spoofing is suspension-triggering on Kimi and ToS-skirting elsewhere. Commercial outreach is the only honest path onto these lists, not engineering.
 4. If X requires a **reverse-engineered local relay** the user must run themselves (Copilot proxies, Cursor proxies) — at most ship a preset pointing at `localhost`, never bundle the relay binary, never advertise it.
 5. If X's ToS explicitly bans the path even for self-use (Cursor, Windsurf retail, ChatGPT/Claude.ai/Gemini, magai.co, Atlas Cloud) — say no.
 6. **If X claims to give the user Claude + GPT + Gemini for under ~$15/mo combined, it's account-pooling.** No exceptions. The unit economics don't exist without ToS violation. Whether the user gets banned today or in three months when the provider's detection improves is the only variable. Examples: aizolo.com, sites named "AI hub", "ChatGPT free", "GPT-4 cheap", etc. Hard skip.

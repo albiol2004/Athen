@@ -3,6 +3,7 @@
 //! Provides Tauri IPC commands for managing LLM providers, API keys,
 //! and general application settings through the UI.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -103,6 +104,11 @@ pub struct ProviderInfo {
     /// Sampling temperature override. `None` lets the provider adapter pick
     /// its baked-in default.
     pub temperature: Option<f32>,
+    /// Per-tier model slugs. Wire-string keys ("Cheap" | "Fast" | "Code" |
+    /// "Powerful"), values are model slugs. Missing keys or empty strings
+    /// mean "use `model` (the default)". The frontend renders one input
+    /// per tier so the user can edit them.
+    pub tier_models: HashMap<String, String>,
 }
 
 /// Email configuration info for the frontend.
@@ -487,6 +493,12 @@ fn default_base_url(id: &str) -> &str {
         "google" => "https://generativelanguage.googleapis.com",
         "mistral" => "https://api.mistral.ai",
         "openrouter" => "https://openrouter.ai/api",
+        "opencode_go" => "https://opencode.ai/zen/go",
+        // Same host as opencode_go — Anthropic provider appends /v1/messages
+        // which is the wire path OpenCode Go uses for MiniMax M2.5 / M2.7.
+        "opencode_go_anthropic" => "https://opencode.ai/zen/go",
+        "minimax" => "https://api.minimax.io",
+        "minimax_anthropic" => "https://api.minimax.io/anthropic",
         "ollama" => "http://localhost:11434",
         "llamacpp" => "http://localhost:8080",
         _ => "",
@@ -496,14 +508,27 @@ fn default_base_url(id: &str) -> &str {
 /// Default model for a provider ID.
 fn default_model(id: &str) -> &str {
     match id {
-        "deepseek" => "deepseek-chat",
-        "openai" => "gpt-4o",
-        "anthropic" => "claude-sonnet-4-20250514",
-        // Gemini 3 Flash is the newest cheap default. The `-preview` suffix
-        // is mandatory on Gemini 3 — without it the API 404s the model.
-        "google" => "gemini-3-flash-preview",
+        // Refreshed 2026-05-13: DeepSeek slugs migrated from `deepseek-chat`
+        // / `deepseek-reasoner` to the V4 Flash/Pro split. Anthropic Sonnet
+        // dropped the date suffix in the 4.6 generation. OpenAI rolled the
+        // GPT-5.x line. Gemini moved from `3-flash-preview` to
+        // `3.1-flash-lite-preview` / `3.1-pro-preview` as the live slugs.
+        "deepseek" => "deepseek-v4-flash",
+        "openai" => "gpt-5.4-mini",
+        "anthropic" => "claude-sonnet-4-6",
+        "google" => "gemini-3.1-flash-lite-preview",
         "mistral" => "mistral-large-latest",
-        "openrouter" => "openai/gpt-4o-mini",
+        "openrouter" => "openai/gpt-5.4-mini",
+        // OpenCode Go: V4 Flash has the most generous 5h quota (31.6K req)
+        // on the $10 tier — the right default for an agent loop. Pro/Kimi/
+        // Qwen are selectable from the model picker.
+        "opencode_go" => "deepseek-v4-flash",
+        // Anthropic-protocol slot of OpenCode Go: the bundle exposes
+        // MiniMax M2.7 / M2.5 via /v1/messages. M2.7 is the newer flagship.
+        "opencode_go_anthropic" => "minimax-m2.7",
+        // MiniMax Token Plan: M2.7 is the newest flagship; Starter tier
+        // exposes only this model, higher tiers add the full lineup.
+        "minimax" | "minimax_anthropic" => "MiniMax-M2.7",
         "ollama" => "llama3",
         "llamacpp" => "default",
         _ => "",
@@ -519,6 +544,10 @@ fn display_name(id: &str) -> &str {
         "google" => "Google (Gemini)",
         "mistral" => "Mistral",
         "openrouter" => "OpenRouter",
+        "opencode_go" => "OpenCode Go (OpenAI-compat — DeepSeek/Qwen/Kimi/GLM/MiMo)",
+        "opencode_go_anthropic" => "OpenCode Go (Anthropic-compat — MiniMax M2.x)",
+        "minimax" => "MiniMax Token Plan (OpenAI-compat)",
+        "minimax_anthropic" => "MiniMax Token Plan (Anthropic-compat + prompt cache)",
         "ollama" => "Ollama",
         "llamacpp" => "llama.cpp",
         _ => id,
@@ -543,12 +572,104 @@ fn provider_type(id: &str) -> &str {
 /// stay on `Default` — the user picks the actual model post-add.
 fn default_family(id: &str) -> &str {
     match id {
+        // Wire-id values from ModelFamily. Keep aligned with the refreshed
+        // default_model slugs above so a "+ Add Provider" autofill yields a
+        // consistent model+family pair.
         "deepseek" => "DeepSeekV4Chat",
         "openai" => "Gpt5",
         "anthropic" => "ClaudeSonnet46",
         "google" => "Gemini3Flash",
         "mistral" => "MistralLarge3",
+        // OpenCode Go's default bundle model is DeepSeek V4 Flash — same
+        // quirks profile as DeepSeek direct.
+        "opencode_go" => "DeepSeekV4Chat",
+        // OpenCode Go Anthropic-protocol slot — defaults to MiniMax M2.7
+        // so its quirks profile is the MiniMax one.
+        "opencode_go_anthropic" => "MiniMaxM25Cloud",
+        // MiniMax M2.7 — closest existing family is MiniMaxM25Cloud (same
+        // tool-call extraction shape). User can switch in the family
+        // dropdown if a more specific profile lands later.
+        "minimax" | "minimax_anthropic" => "MiniMaxM25Cloud",
         _ => "Default",
+    }
+}
+
+/// Parse a wire-string ModelProfile from the frontend ("Cheap" / "Fast" /
+/// "Code" / "Powerful"). Returns `None` for anything else so a stale or
+/// typo'd payload silently falls through to "use default_model" rather
+/// than poisoning the config.
+fn parse_model_profile(s: &str) -> Option<athen_core::llm::ModelProfile> {
+    use athen_core::llm::ModelProfile;
+    match s {
+        "Cheap" => Some(ModelProfile::Cheap),
+        "Fast" => Some(ModelProfile::Fast),
+        "Code" => Some(ModelProfile::Code),
+        "Powerful" => Some(ModelProfile::Powerful),
+        _ => None,
+    }
+}
+
+/// Seeded per-tier model slug presets surfaced in the Settings UI when
+/// the user first adds a provider. Returns (Cheap, Fast, Code, Powerful)
+/// — empty strings mean "fall back to default_model". The user edits any
+/// of these from the per-provider config card; the values land in
+/// `ProviderConfig.tier_models`. Pure metadata — no live calls happen
+/// here. Refresh whenever a provider rolls out new model generations.
+fn default_tier_slugs(id: &str) -> (&'static str, &'static str, &'static str, &'static str) {
+    match id {
+        // (Cheap, Fast, Code, Powerful)
+        "deepseek" => (
+            "deepseek-v4-flash",
+            "deepseek-v4-flash",
+            "deepseek-v4-pro",
+            "deepseek-v4-pro",
+        ),
+        "anthropic" => (
+            "claude-haiku-4-5-20251001",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-6",
+            "claude-opus-4-7",
+        ),
+        "google" => (
+            "gemini-3.1-flash-lite-preview",
+            "gemini-3.1-flash-lite-preview",
+            "gemini-3.1-pro-preview",
+            "gemini-3.1-pro-preview",
+        ),
+        "openai" => ("gpt-5.4-nano", "gpt-5.4-mini", "gpt-5.5", "gpt-5.5-pro"),
+        "mistral" => (
+            "ministral-3b-latest",
+            "mistral-small-latest",
+            "codestral-latest",
+            "mistral-large-latest",
+        ),
+        "openrouter" => (
+            "openai/gpt-5.4-mini",
+            "openai/gpt-5.5",
+            "anthropic/claude-sonnet-4-6",
+            "anthropic/claude-opus-4-7",
+        ),
+        "opencode_go" => (
+            "deepseek-v4-flash",
+            "deepseek-v4-flash",
+            "deepseek-v4-pro",
+            "deepseek-v4-pro",
+        ),
+        "opencode_go_anthropic" => (
+            "minimax-m2.5",
+            "minimax-m2.7",
+            "minimax-m2.7",
+            "minimax-m2.7",
+        ),
+        "minimax" | "minimax_anthropic" => (
+            "MiniMax-M2.7",
+            "MiniMax-M2.7",
+            "MiniMax-M2.7",
+            "MiniMax-M2.7",
+        ),
+        // Local providers leave tiers empty by default — the user only
+        // has one model loaded most of the time.
+        _ => ("", "", "", ""),
     }
 }
 
@@ -559,7 +680,10 @@ fn api_key_hint(id: &str) -> &str {
         "anthropic" => "sk-ant-...",
         "openrouter" => "sk-or-...",
         "google" => "AIza...",
-        "deepseek" | "openai" | "mistral" => "sk-...",
+        // MiniMax Token Plan issues coding-plan keys with the `sk-cp-` prefix
+        // (distinct from their standard API keys, which are JWT-shaped).
+        "minimax" | "minimax_anthropic" => "sk-cp-...",
+        "deepseek" | "openai" | "mistral" | "opencode_go" | "opencode_go_anthropic" => "sk-...",
         _ => "",
     }
 }
@@ -576,6 +700,10 @@ const PROVIDER_IDS: &[&str] = &[
     "openai",
     "mistral",
     "openrouter",
+    "opencode_go",
+    "opencode_go_anthropic",
+    "minimax",
+    "minimax_anthropic",
     "ollama",
     "llamacpp",
 ];
@@ -596,6 +724,14 @@ pub struct ProviderCatalogEntry {
     pub default_family: &'static str,
     /// Placeholder text for the API key input. Empty for local providers.
     pub api_key_hint: &'static str,
+    /// Seeded slug presets for each tier. Frontend uses these to autofill
+    /// the four per-tier inputs in the provider config card and to power
+    /// a "Reset to defaults" button. Empty strings mean "leave the input
+    /// empty — fall through to default_model at request time".
+    pub default_tier_cheap: &'static str,
+    pub default_tier_fast: &'static str,
+    pub default_tier_code: &'static str,
+    pub default_tier_powerful: &'static str,
 }
 
 /// Return the canonical list of providers the app supports. Single source
@@ -604,14 +740,21 @@ pub struct ProviderCatalogEntry {
 pub async fn list_provider_catalog() -> std::result::Result<Vec<ProviderCatalogEntry>, String> {
     Ok(PROVIDER_IDS
         .iter()
-        .map(|id| ProviderCatalogEntry {
-            id,
-            name: display_name(id),
-            provider_type: provider_type(id),
-            default_base_url: default_base_url(id),
-            default_model: default_model(id),
-            default_family: default_family(id),
-            api_key_hint: api_key_hint(id),
+        .map(|id| {
+            let (cheap, fast, code, powerful) = default_tier_slugs(id);
+            ProviderCatalogEntry {
+                id,
+                name: display_name(id),
+                provider_type: provider_type(id),
+                default_base_url: default_base_url(id),
+                default_model: default_model(id),
+                default_family: default_family(id),
+                api_key_hint: api_key_hint(id),
+                default_tier_cheap: cheap,
+                default_tier_fast: fast,
+                default_tier_code: code,
+                default_tier_powerful: powerful,
+            }
         })
         .collect())
 }
@@ -653,6 +796,23 @@ fn provider_config_to_info(id: &str, config: &ProviderConfig, active_id: &str) -
         }
     };
 
+    // Project the typed `tier_models` map onto a wire-string-keyed map for
+    // the frontend. Empty map round-trips as an empty object so the JS
+    // side can detect "no per-tier overrides set" and fall back to the
+    // catalog's presets when rendering the inputs.
+    let mut tier_models_wire: HashMap<String, String> = HashMap::new();
+    for (profile, slug) in &config.tier_models {
+        let key = match profile {
+            athen_core::llm::ModelProfile::Cheap => "Cheap",
+            athen_core::llm::ModelProfile::Fast => "Fast",
+            athen_core::llm::ModelProfile::Code => "Code",
+            athen_core::llm::ModelProfile::Powerful => "Powerful",
+            // Local profile isn't user-editable from this UI.
+            athen_core::llm::ModelProfile::Local => continue,
+        };
+        tier_models_wire.insert(key.to_string(), slug.clone());
+    }
+
     ProviderInfo {
         id: id.to_string(),
         name: display_name(id).to_string(),
@@ -673,6 +833,7 @@ fn provider_config_to_info(id: &str, config: &ProviderConfig, active_id: &str) -
         compaction_trigger_pct: config.compaction_trigger_pct,
         compaction_target_pct: config.compaction_target_pct,
         temperature: config.temperature,
+        tier_models: tier_models_wire,
     }
 }
 
@@ -868,6 +1029,11 @@ pub async fn save_provider(
     compaction_trigger_pct: Option<u8>,
     compaction_target_pct: Option<u8>,
     temperature: Option<f32>,
+    // Wire-string keys: "Cheap" | "Fast" | "Code" | "Powerful". Frontend
+    // posts a flat object; we parse each key into the typed enum. Missing
+    // keys are treated as "fall back to default_model"; empty strings are
+    // also skipped so a cleared input behaves identically.
+    tier_models: Option<HashMap<String, String>>,
     state: State<'_, AppState>,
 ) -> std::result::Result<String, String> {
     let mut models = load_models_config();
@@ -1028,6 +1194,27 @@ pub async fn save_provider(
         _ => existing.map(|p| p.family).unwrap_or_default(),
     };
 
+    // Tier models: parse the wire-string map ("Cheap" → slug, …) into the
+    // typed enum. Empty strings are dropped so a cleared input falls back
+    // to `default_model`. `None` from the caller preserves the existing
+    // map verbatim so editing other fields can't accidentally wipe per-
+    // tier slugs.
+    let tier_models_resolved = match tier_models {
+        Some(raw) => {
+            let mut parsed: HashMap<athen_core::llm::ModelProfile, String> = HashMap::new();
+            for (k, v) in raw {
+                if v.trim().is_empty() {
+                    continue;
+                }
+                if let Some(profile) = parse_model_profile(&k) {
+                    parsed.insert(profile, v);
+                }
+            }
+            parsed
+        }
+        None => existing.map(|p| p.tier_models.clone()).unwrap_or_default(),
+    };
+
     let provider = ProviderConfig {
         auth: auth.clone(),
         default_model: model,
@@ -1039,6 +1226,7 @@ pub async fn save_provider(
         supports_documents: supports_documents_resolved,
         family: family_resolved,
         temperature,
+        tier_models: tier_models_resolved,
     };
 
     models.providers.insert(id.clone(), provider);
@@ -1065,6 +1253,12 @@ pub async fn save_provider(
             .get(&id)
             .map(|c| c.family)
             .unwrap_or_default();
+        let empty_tiers = std::collections::HashMap::new();
+        let tier_models_for_router = models
+            .providers
+            .get(&id)
+            .map(|c| &c.tier_models)
+            .unwrap_or(&empty_tiers);
         let new_router = build_router_for_provider(
             &id,
             &resolved_base_url,
@@ -1073,6 +1267,7 @@ pub async fn save_provider(
             supports_vision,
             supports_documents,
             family_for_router,
+            tier_models_for_router,
         );
 
         {
@@ -1161,6 +1356,8 @@ pub async fn delete_provider(
         let supports_vision = fallback_cfg.is_some_and(|c| c.supports_vision);
         let supports_documents = fallback_cfg.is_some_and(|c| c.supports_documents);
         let family_for_router = fallback_cfg.map(|c| c.family).unwrap_or_default();
+        let empty_tiers = std::collections::HashMap::new();
+        let tier_models_for_router = fallback_cfg.map(|c| &c.tier_models).unwrap_or(&empty_tiers);
         let new_router = build_router_for_provider(
             &fallback_id,
             &base_url,
@@ -1169,6 +1366,7 @@ pub async fn delete_provider(
             supports_vision,
             supports_documents,
             family_for_router,
+            tier_models_for_router,
         );
 
         {
@@ -1309,6 +1507,8 @@ pub async fn set_active_provider(
     let supports_vision = provider_cfg.is_some_and(|c| c.supports_vision);
     let supports_documents = provider_cfg.is_some_and(|c| c.supports_documents);
     let family_for_router = provider_cfg.map(|c| c.family).unwrap_or_default();
+    let empty_tiers = std::collections::HashMap::new();
+    let tier_models_for_router = provider_cfg.map(|c| &c.tier_models).unwrap_or(&empty_tiers);
     let new_router = build_router_for_provider(
         &id,
         &base_url,
@@ -1317,6 +1517,7 @@ pub async fn set_active_provider(
         supports_vision,
         supports_documents,
         family_for_router,
+        tier_models_for_router,
     );
 
     // Swap the router atomically.

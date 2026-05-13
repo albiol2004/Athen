@@ -514,6 +514,7 @@ mod tests {
             supports_documents: false,
             family: athen_core::llm::ModelFamily::Default,
             temperature: None,
+            tier_models: std::collections::HashMap::new(),
         }
     }
 

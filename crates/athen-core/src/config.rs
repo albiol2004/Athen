@@ -191,6 +191,21 @@ pub struct ProviderConfig {
     /// determinism without it surfacing for non-technical users.
     #[serde(default)]
     pub temperature: Option<f32>,
+    /// Per-tier model slug overrides. Each call site that builds an
+    /// `LlmRequest` tags it with a `ModelProfile` (Cheap/Fast/Code/
+    /// Powerful) — risk-fallback and memory-extractor want Cheap,
+    /// the executor's main loop wants Fast, judge_completion wants
+    /// Cheap, etc. When this map is non-empty, the router builds a
+    /// per-tier provider instance and routes each profile to its
+    /// configured slug. Empty map = all tiers use `default_model`
+    /// (current single-model behaviour, preserved for backward
+    /// compatibility with serialized configs that predate the field).
+    ///
+    /// Seeded with per-provider presets on first add; the user edits
+    /// the slugs in the Settings → LLM Providers panel and can leave
+    /// any individual slot empty to fall through to `default_model`.
+    #[serde(default)]
+    pub tier_models: HashMap<ModelProfile, String>,
 }
 
 fn default_context_window_tokens() -> u32 {

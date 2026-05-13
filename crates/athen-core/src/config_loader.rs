@@ -64,6 +64,7 @@ pub fn save_default_config(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::config::{AuthType, OperationMode, ProfileConfig, ProviderConfig, SecurityMode};
+    use std::collections::HashMap;
     use tempfile::TempDir;
 
     #[test]
@@ -248,6 +249,7 @@ default_model = "deepseek-chat"
                 supports_documents: false,
                 family: crate::llm::ModelFamily::Default,
                 temperature: None,
+                tier_models: HashMap::new(),
             },
         );
         config.models.profiles.insert(

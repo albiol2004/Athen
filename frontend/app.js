@@ -5509,6 +5509,27 @@ function createProviderCard(provider) {
                 <input type="number" class="provider-temperature" min="0" max="2" step="0.05" value="${provider.temperature ?? ''}" placeholder="Adapter default (~0.7)">
                 <div class="field-hint">Lower = more deterministic. Leave blank for the provider's default (0.7 across most APIs). Try 0.0–0.3 for benchmarking, code, or strict tool-calling; 0.7+ for creative tasks.</div>
             </div>
+            <div class="provider-field provider-tier-models">
+                <label>Per-tier model slugs</label>
+                <div class="field-hint">Athen's internal tasks are tagged with a complexity tier — "Cheap" for memory judgments and error translations, "Fast" for the main agent loop, "Code" for code-heavy work, "Powerful" for high-stakes reasoning. Pick a different slug per tier to route lightweight tasks to a cheaper model while keeping the powerful one reserved for the main loop. Leave any slot empty to use the Model slug above.</div>
+                <div class="provider-tier-row">
+                    <span class="provider-tier-label">Cheap</span>
+                    <input type="text" class="provider-tier-cheap" value="${escapeHtml(provider.tier_models?.Cheap || '')}" placeholder="${escapeHtml((providerById(provider.id) || {}).default_tier_cheap || provider.model)}">
+                </div>
+                <div class="provider-tier-row">
+                    <span class="provider-tier-label">Fast</span>
+                    <input type="text" class="provider-tier-fast" value="${escapeHtml(provider.tier_models?.Fast || '')}" placeholder="${escapeHtml((providerById(provider.id) || {}).default_tier_fast || provider.model)}">
+                </div>
+                <div class="provider-tier-row">
+                    <span class="provider-tier-label">Code</span>
+                    <input type="text" class="provider-tier-code" value="${escapeHtml(provider.tier_models?.Code || '')}" placeholder="${escapeHtml((providerById(provider.id) || {}).default_tier_code || provider.model)}">
+                </div>
+                <div class="provider-tier-row">
+                    <span class="provider-tier-label">Powerful</span>
+                    <input type="text" class="provider-tier-powerful" value="${escapeHtml(provider.tier_models?.Powerful || '')}" placeholder="${escapeHtml((providerById(provider.id) || {}).default_tier_powerful || provider.model)}">
+                </div>
+                <button class="btn-tertiary provider-tier-reset" type="button">Use defaults</button>
+            </div>
         </div>
         <div class="provider-card-actions">
             <button class="btn-secondary test-btn">Test Connection</button>
@@ -5556,6 +5577,27 @@ function createProviderCard(provider) {
             } else {
                 advPane.style.display = 'none';
                 if (arrow) arrow.innerHTML = '&#9654;';
+            }
+        });
+    }
+
+    // "Use defaults" button: fill empty per-tier inputs from the catalog
+    // presets so the user gets a head start. Doesn't overwrite values the
+    // user typed — only blanks. If the user wants to wipe their edits and
+    // start over, they can clear inputs first and then click.
+    const tierResetBtn = body.querySelector('.provider-tier-reset');
+    if (tierResetBtn) {
+        tierResetBtn.addEventListener('click', () => {
+            const catalogEntry = providerById(provider.id) || {};
+            const presets = {
+                '.provider-tier-cheap': catalogEntry.default_tier_cheap,
+                '.provider-tier-fast': catalogEntry.default_tier_fast,
+                '.provider-tier-code': catalogEntry.default_tier_code,
+                '.provider-tier-powerful': catalogEntry.default_tier_powerful,
+            };
+            for (const [selector, preset] of Object.entries(presets)) {
+                const input = body.querySelector(selector);
+                if (input && preset) input.value = preset;
             }
         });
     }
@@ -5616,6 +5658,17 @@ async function handleSaveProvider(card, id) {
     const tempVal = tempInput ? tempInput.value.trim() : '';
     const temperature = tempVal === '' ? null : parseFloat(tempVal);
 
+    // Collect the four per-tier slug inputs. Empty strings are passed
+    // through verbatim — the backend treats them as "fall back to the
+    // default Model slug" rather than "preserve the existing tier_models
+    // map" (which is what passing `null` does).
+    const tierModels = {
+        Cheap: (card.querySelector('.provider-tier-cheap')?.value || '').trim(),
+        Fast: (card.querySelector('.provider-tier-fast')?.value || '').trim(),
+        Code: (card.querySelector('.provider-tier-code')?.value || '').trim(),
+        Powerful: (card.querySelector('.provider-tier-powerful')?.value || '').trim(),
+    };
+
     if (compactionTriggerPct !== null && compactionTargetPct !== null
         && compactionTriggerPct <= compactionTargetPct) {
         showToast('Compaction trigger must be greater than target — bumping trigger.', 'info');
@@ -5638,6 +5691,7 @@ async function handleSaveProvider(card, id) {
             compactionTriggerPct: compactionTriggerPct,
             compactionTargetPct: compactionTargetPct,
             temperature: temperature,
+            tierModels: tierModels,
         });
         showToast(msg, 'success');
         // Reload to reflect changes.

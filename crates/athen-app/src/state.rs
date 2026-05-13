@@ -3377,6 +3377,10 @@ fn build_router_for_provider_from_config(
     let family = provider_cfg
         .map(|c| c.family)
         .unwrap_or(athen_core::llm::ModelFamily::Default);
+    let empty_tier_models = HashMap::new();
+    let tier_models = provider_cfg
+        .map(|c| &c.tier_models)
+        .unwrap_or(&empty_tier_models);
 
     let router = build_router_for_provider(
         provider_id,
@@ -3386,6 +3390,7 @@ fn build_router_for_provider_from_config(
         supports_vision,
         supports_documents,
         family,
+        tier_models,
     );
     (router, model)
 }
@@ -3516,6 +3521,9 @@ fn default_base_url_for(id: &str) -> &str {
         "openai" => "https://api.openai.com",
         "anthropic" => "https://api.anthropic.com",
         "google" => "https://generativelanguage.googleapis.com",
+        "opencode_go" | "opencode_go_anthropic" => "https://opencode.ai/zen/go",
+        "minimax" => "https://api.minimax.io",
+        "minimax_anthropic" => "https://api.minimax.io/anthropic",
         "ollama" => "http://localhost:11434",
         "llamacpp" => "http://localhost:8080",
         _ => "http://localhost:8080",
@@ -3524,11 +3532,16 @@ fn default_base_url_for(id: &str) -> &str {
 
 /// Default model for known provider IDs.
 fn default_model_for(id: &str) -> &str {
+    // Keep aligned with `settings::default_model` — both must return the
+    // same slug or the bootstrap path will route a stale model.
     match id {
-        "deepseek" => "deepseek-chat",
-        "openai" => "gpt-4o",
-        "anthropic" => "claude-sonnet-4-20250514",
-        "google" => "gemini-3-flash-preview",
+        "deepseek" => "deepseek-v4-flash",
+        "openai" => "gpt-5.4-mini",
+        "anthropic" => "claude-sonnet-4-6",
+        "google" => "gemini-3.1-flash-lite-preview",
+        "opencode_go" => "deepseek-v4-flash",
+        "opencode_go_anthropic" => "minimax-m2.7",
+        "minimax" | "minimax_anthropic" => "MiniMax-M2.7",
         "ollama" => "llama3",
         "llamacpp" => "default",
         _ => "default",
@@ -3566,6 +3579,7 @@ fn resolve_api_key_for(
 /// the OpenAI Chat Completions shape (DeepSeek, Anthropic, Ollama, llama.cpp).
 /// Everything else (OpenAI proper, Mistral, OpenRouter, custom OpenAI-compat
 /// endpoints) goes through `OpenAiCompatibleProvider`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_router_for_provider(
     provider_id: &str,
     base_url: &str,
@@ -3574,8 +3588,85 @@ pub(crate) fn build_router_for_provider(
     supports_vision: bool,
     supports_documents: bool,
     family: athen_core::llm::ModelFamily,
+    tier_models: &HashMap<ModelProfile, String>,
 ) -> Arc<DefaultLlmRouter> {
-    let provider: Box<dyn LlmProvider> = match provider_id {
+    let mut providers: HashMap<String, Box<dyn LlmProvider>> = HashMap::new();
+    let mut profiles: HashMap<ModelProfile, ProfileConfig> = HashMap::new();
+
+    // Build a provider instance for `slug`, key it under `key`, and remember
+    // the key so duplicate slugs (e.g. Cheap and Fast both pointing at the
+    // same model) reuse one provider instance instead of constructing four
+    // independent reqwest::Clients.
+    let mut slug_to_key: HashMap<String, String> = HashMap::new();
+    let ensure_slug = |slug: &str,
+                       providers: &mut HashMap<String, Box<dyn LlmProvider>>,
+                       slug_to_key: &mut HashMap<String, String>|
+     -> String {
+        if let Some(k) = slug_to_key.get(slug) {
+            return k.clone();
+        }
+        let key = format!("{}.{}", provider_id, slug);
+        let provider = build_provider_instance(
+            provider_id,
+            base_url,
+            slug,
+            api_key,
+            supports_vision,
+            supports_documents,
+            family,
+        );
+        providers.insert(key.clone(), provider);
+        slug_to_key.insert(slug.to_string(), key.clone());
+        key
+    };
+
+    // Resolve each tier: caller-supplied slug from `tier_models`, falling
+    // back to the parent provider's `model`. Empty map ⇒ all four tiers
+    // point at one provider instance under the default slug, preserving
+    // the legacy single-model behaviour for configs that predate the
+    // per-tier field.
+    for tier in [
+        ModelProfile::Cheap,
+        ModelProfile::Fast,
+        ModelProfile::Code,
+        ModelProfile::Powerful,
+    ] {
+        let slug = tier_models
+            .get(&tier)
+            .map(|s| s.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(model);
+        let key = ensure_slug(slug, &mut providers, &mut slug_to_key);
+        profiles.insert(
+            tier,
+            ProfileConfig {
+                description: format!("{} {:?}", provider_id, tier),
+                priority: vec![key],
+                fallback: None,
+            },
+        );
+    }
+
+    Arc::new(DefaultLlmRouter::new(
+        providers,
+        profiles,
+        BudgetTracker::new(None),
+    ))
+}
+
+/// Construct a single adapter instance for `provider_id` with the given
+/// model slug. Factored out of `build_router_for_provider` so the per-tier
+/// loop can build N instances against the same credentials + base URL.
+fn build_provider_instance(
+    provider_id: &str,
+    base_url: &str,
+    model: &str,
+    api_key: Option<&str>,
+    supports_vision: bool,
+    supports_documents: bool,
+    family: athen_core::llm::ModelFamily,
+) -> Box<dyn LlmProvider> {
+    match provider_id {
         "deepseek" => {
             let key = api_key.unwrap_or_default().to_string();
             let mut p = DeepSeekProvider::new(key).with_family(family);
@@ -3587,7 +3678,13 @@ pub(crate) fn build_router_for_provider(
             }
             Box::new(p)
         }
-        "anthropic" => {
+        "anthropic" | "minimax_anthropic" | "opencode_go_anthropic" => {
+            // minimax_anthropic + opencode_go_anthropic route through
+            // AnthropicProvider for the /v1/messages wire format. MiniMax
+            // Token Plan exposes it at api.minimax.io/anthropic (with
+            // prompt-cache); OpenCode Go exposes it at opencode.ai/zen/go
+            // for its MiniMax M2.5 / M2.7 slots. Provider adapter is
+            // identical; only the base URL differs.
             let key = api_key.unwrap_or_default().to_string();
             let mut p = AnthropicProvider::new(key, model.to_string())
                 .with_family(family)
@@ -3631,28 +3728,7 @@ pub(crate) fn build_router_for_provider(
             }
             Box::new(p)
         }
-    };
-
-    let mut providers: HashMap<String, Box<dyn LlmProvider>> = HashMap::new();
-    providers.insert(provider_id.into(), provider);
-
-    let profile = ProfileConfig {
-        description: format!("{} default", provider_id),
-        priority: vec![provider_id.into()],
-        fallback: None,
-    };
-
-    let mut profiles = HashMap::new();
-    profiles.insert(ModelProfile::Powerful, profile.clone());
-    profiles.insert(ModelProfile::Fast, profile.clone());
-    profiles.insert(ModelProfile::Code, profile.clone());
-    profiles.insert(ModelProfile::Cheap, profile);
-
-    Arc::new(DefaultLlmRouter::new(
-        providers,
-        profiles,
-        BudgetTracker::new(None),
-    ))
+    }
 }
 
 /// Generate a human-readable Arc identifier: `arc_YYYYMMDD_HHMMSS`.
