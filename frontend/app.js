@@ -96,6 +96,8 @@ const ICON_PAPER_PLANE = toolSvg('<line x1="22" y1="2" x2="11" y2="13"/><polygon
 const ICON_ALARM       = toolSvg('<circle cx="12" cy="13" r="8"/><polyline points="12 9 12 13 14.5 15"/><line x1="5" y1="3" x2="2" y2="6"/><line x1="22" y1="6" x2="19" y2="3"/>');
 // Person with id-card aura: communicates "identity entry".
 const ICON_IDENTITY    = toolSvg('<circle cx="12" cy="8" r="4"/><path d="M4 21v-1a8 8 0 0 1 16 0v1"/><line x1="9" y1="13" x2="15" y2="13"/>');
+// Open book with spine: communicates "load a procedural playbook on demand".
+const ICON_SKILL       = toolSvg('<path d="M3 5a2 2 0 0 1 2-2h5a2 2 0 0 1 2 2v15"/><path d="M21 5a2 2 0 0 0-2-2h-5a2 2 0 0 0-2 2v15"/><path d="M3 5v15h8"/><path d="M21 5v15h-8"/>');
 
 const BUILTIN_TOOL_ICONS = {
     'read': ICON_FILE_TEXT, 'list_directory': ICON_FOLDER, 'grep': ICON_FILE_SEARCH,
@@ -121,6 +123,8 @@ const BUILTIN_TOOL_ICONS = {
     'create_wakeup': ICON_ALARM,
     // identity (agent-authored entries to the user-maintained identity store)
     'identity_add': ICON_IDENTITY,
+    // skills (procedural playbooks pulled on demand)
+    'load_skill': ICON_SKILL,
     // generic cloud HTTP API call (registered endpoint via Settings → Cloud APIs)
     'http_request': ICON_GLOBE,
 };
@@ -145,6 +149,7 @@ const BUILTIN_TOOL_LABELS = {
     'list_installed_packages': 'List packages',
     'create_wakeup': 'Schedule wake-up',
     'identity_add': 'Note about you',
+    'load_skill': 'Load skill',
     'http_request': 'Cloud API',
 };
 
@@ -2710,6 +2715,7 @@ function renderToolBody(meta) {
         case 'list_installed_packages': main = renderListInstalledPackages(args, result); break;
         case 'create_wakeup':   main = renderCreateWakeup(args, result); break;
         case 'identity_add':    main = renderIdentityAdd(args, result); break;
+        case 'load_skill':      main = renderLoadSkill(args, result); break;
         case 'http_request':    main = renderHttpRequest(args, result); break;
         default:
             // No bespoke layout — fall back to a labelled-fields dump
@@ -3539,6 +3545,20 @@ function renderIdentityAdd(args, result) {
     ]);
 }
 
+function renderLoadSkill(args, result) {
+    const slug = String(args.slug || result.slug || '');
+    const body = String(result.body || '');
+    // Compact-by-default: bodies can be long. Show a one-line preview on the
+    // card collapsed view; the click-to-expand sheet renders the full body.
+    const lines = body.split('\n').filter((l) => l.trim().length > 0);
+    const preview = lines.length ? lines[0].slice(0, 120) : '';
+    return renderFields([
+        ['Skill', slug, { mono: true }],
+        preview ? ['Preview', preview] : null,
+        body ? ['Body', body, { block: true }] : null,
+    ]);
+}
+
 function renderHttpRequest(args, result) {
     const endpoint = String(args.endpoint || result.endpoint || '');
     const method = String(args.method || 'GET').toUpperCase();
@@ -4193,6 +4213,7 @@ async function loadSettings() {
         await loadGrants();
         await loadProfileManager();
         await loadIdentityManager();
+        await loadSkillsManager();
         await loadCloudApis();
         await loadAttachmentPolicySettings();
         await loadOwnerContact();
@@ -5139,6 +5160,370 @@ async function saveIdentityCategoryFromModal() {
     }
     const newBtn = document.getElementById('identity-new-category-btn');
     if (newBtn) newBtn.addEventListener('click', () => openIdentityCategoryModal('create'));
+})();
+
+// ─── Skills ───────────────────────────────────────────────────────────
+//
+// User-authored procedural playbooks. Listing (slug + description) appears
+// in every agent's static prefix; the body is pulled on demand via the
+// `load_skill` tool. Source-of-truth lives on disk; SQLite is a derived
+// index reconciled at boot and via the Rescan button.
+
+let skillsList = [];
+let skillsSelectedSlug = null;
+// Pending edits keyed by slug — preserves form state while the user clicks
+// around the sidebar. `null` slug = the "+ New skill" draft.
+const skillsDrafts = new Map();
+
+async function loadSkillsManager() {
+    if (!invoke) return;
+    try {
+        skillsList = (await invoke('list_skills')) || [];
+        // Keep selection when possible; otherwise pick the first skill or
+        // fall through to the empty state.
+        if (
+            skillsSelectedSlug !== null &&
+            skillsSelectedSlug !== '__new__' &&
+            !skillsList.find((s) => s.slug === skillsSelectedSlug)
+        ) {
+            skillsSelectedSlug = skillsList.length ? skillsList[0].slug : null;
+        }
+        renderSkillsSidebar();
+        await renderSkillsDetail();
+        updateSkillsTokenFooter();
+    } catch (err) {
+        console.error('Failed to load skills:', err);
+    }
+}
+
+function renderSkillsSidebar() {
+    const listEl = document.getElementById('skills-list');
+    if (!listEl) return;
+    listEl.innerHTML = '';
+    if (skillsList.length === 0 && skillsSelectedSlug !== '__new__') {
+        const empty = document.createElement('div');
+        empty.className = 'identity-detail-empty';
+        empty.textContent = 'No skills yet.';
+        listEl.appendChild(empty);
+        return;
+    }
+    // Group by source so users can see which skills they wrote vs imported
+    // vs shipped. Bundled is intentionally last; users care most about
+    // their own.
+    const groups = { User: [], Imported: [], Bundled: [] };
+    for (const skill of skillsList) {
+        const bucket = groups[skill.source] || groups.User;
+        bucket.push(skill);
+    }
+    for (const [sourceLabel, skills] of Object.entries(groups)) {
+        if (skills.length === 0) continue;
+        const header = document.createElement('div');
+        header.className = 'identity-cat-name';
+        header.style.fontSize = '0.75rem';
+        header.style.opacity = '0.6';
+        header.style.margin = '8px 4px 2px';
+        header.textContent = sourceLabel;
+        listEl.appendChild(header);
+        for (const skill of skills) {
+            const item = document.createElement('div');
+            item.className = 'identity-category-item';
+            if (skill.slug === skillsSelectedSlug) item.classList.add('selected');
+            item.innerHTML = `
+                <span class="identity-cat-name">${escapeHtml(skill.slug)}</span>
+                <span class="identity-cat-count">${describeAppliesTo(skill.applies_to)}</span>
+            `;
+            item.addEventListener('click', async () => {
+                skillsSelectedSlug = skill.slug;
+                renderSkillsSidebar();
+                await renderSkillsDetail();
+            });
+            listEl.appendChild(item);
+        }
+    }
+    // "+ New skill" draft pseudo-row.
+    if (skillsSelectedSlug === '__new__') {
+        const item = document.createElement('div');
+        item.className = 'identity-category-item selected';
+        item.style.marginTop = '8px';
+        item.innerHTML = `<span class="identity-cat-name"><em>new skill…</em></span>`;
+        listEl.appendChild(item);
+    }
+}
+
+function describeAppliesTo(tags) {
+    if (!tags || tags.length === 0) return '';
+    if (tags.length === 1 && tags[0] === 'Always') return 'all';
+    const parts = tags.map((t) => {
+        if (t === 'Always') return 'all';
+        if (t && typeof t === 'object' && t.Profile) return t.Profile;
+        if (t && typeof t === 'object' && t.NotProfile) return '!' + t.NotProfile;
+        return '?';
+    });
+    return parts.join(', ');
+}
+
+async function renderSkillsDetail() {
+    const detail = document.getElementById('skills-detail');
+    if (!detail) return;
+    if (skillsSelectedSlug === null) {
+        detail.innerHTML =
+            '<p class="setting-hint">Pick a skill to edit, or click <strong>+ New skill</strong> to create one.</p>';
+        return;
+    }
+    let editing;
+    if (skillsSelectedSlug === '__new__') {
+        editing = skillsDrafts.get(null) || {
+            slug: '',
+            name: '',
+            description: '',
+            applies_to: ['Always'],
+            body: '',
+            isNew: true,
+        };
+    } else {
+        const cached = skillsDrafts.get(skillsSelectedSlug);
+        if (cached) {
+            editing = cached;
+        } else {
+            try {
+                const full = await invoke('get_skill', { slug: skillsSelectedSlug });
+                if (!full) {
+                    detail.innerHTML =
+                        '<p class="setting-hint">Skill not found (deleted on disk?). Click Rescan.</p>';
+                    return;
+                }
+                editing = {
+                    slug: full.slug,
+                    name: full.name,
+                    description: full.description,
+                    applies_to: full.applies_to || ['Always'],
+                    body: full.body,
+                    source: full.source,
+                    isNew: false,
+                };
+            } catch (err) {
+                detail.innerHTML = `<p class="setting-hint">Failed to load: ${escapeHtml(String(err))}</p>`;
+                return;
+            }
+        }
+    }
+
+    detail.innerHTML = '';
+    const wrap = document.createElement('div');
+    wrap.className = 'identity-entry-card';
+    wrap.style.maxWidth = '780px';
+
+    const slugRow = document.createElement('div');
+    slugRow.style.display = 'flex';
+    slugRow.style.gap = '8px';
+    slugRow.style.marginBottom = '8px';
+    const slugLabel = document.createElement('label');
+    slugLabel.style.minWidth = '90px';
+    slugLabel.style.alignSelf = 'center';
+    slugLabel.textContent = 'Slug';
+    const slugInput = document.createElement('input');
+    slugInput.className = 'settings-input';
+    slugInput.value = editing.slug;
+    slugInput.placeholder = 'e.g. cold-email-outreach';
+    slugInput.disabled = !editing.isNew;
+    slugInput.style.flex = '1';
+    slugInput.addEventListener('input', () => {
+        editing.slug = slugInput.value;
+    });
+    slugRow.appendChild(slugLabel);
+    slugRow.appendChild(slugInput);
+    wrap.appendChild(slugRow);
+
+    const nameRow = document.createElement('div');
+    nameRow.style.display = 'flex';
+    nameRow.style.gap = '8px';
+    nameRow.style.marginBottom = '8px';
+    const nameLabel = document.createElement('label');
+    nameLabel.style.minWidth = '90px';
+    nameLabel.style.alignSelf = 'center';
+    nameLabel.textContent = 'Name';
+    const nameInput = document.createElement('input');
+    nameInput.className = 'settings-input';
+    nameInput.value = editing.name;
+    nameInput.placeholder = 'Human-readable display name';
+    nameInput.style.flex = '1';
+    nameInput.addEventListener('input', () => {
+        editing.name = nameInput.value;
+    });
+    nameRow.appendChild(nameLabel);
+    nameRow.appendChild(nameInput);
+    wrap.appendChild(nameRow);
+
+    const descRow = document.createElement('div');
+    descRow.style.marginBottom = '8px';
+    const descLabel = document.createElement('div');
+    descLabel.style.marginBottom = '4px';
+    descLabel.innerHTML = 'Description <span class="permissions-subnote">(one sentence — this is what the agent sees in the prefix listing)</span>';
+    const descInput = document.createElement('textarea');
+    descInput.className = 'identity-entry-body';
+    descInput.style.minHeight = '52px';
+    descInput.value = editing.description;
+    descInput.placeholder = 'Use when … (the agent reads this on every turn — keep it tight)';
+    descInput.addEventListener('input', () => {
+        editing.description = descInput.value;
+    });
+    descRow.appendChild(descLabel);
+    descRow.appendChild(descInput);
+    wrap.appendChild(descRow);
+
+    const scopeRow = document.createElement('div');
+    scopeRow.style.marginBottom = '8px';
+    const scopeLabel = document.createElement('div');
+    scopeLabel.style.marginBottom = '4px';
+    scopeLabel.innerHTML = 'Applies to <span class="permissions-subnote">(which agent profiles see this skill in their listing)</span>';
+    scopeRow.appendChild(scopeLabel);
+    const chipRow = document.createElement('div');
+    chipRow.className = 'identity-scope-chip-row';
+    renderScopeChips(chipRow, editing.applies_to);
+    scopeRow.appendChild(chipRow);
+    wrap.appendChild(scopeRow);
+
+    const bodyRow = document.createElement('div');
+    bodyRow.style.marginBottom = '8px';
+    const bodyLabel = document.createElement('div');
+    bodyLabel.style.marginBottom = '4px';
+    bodyLabel.innerHTML = 'Body <span class="permissions-subnote">(markdown — only loaded when the agent calls <code>load_skill</code>)</span>';
+    const bodyInput = document.createElement('textarea');
+    bodyInput.className = 'identity-entry-body';
+    bodyInput.style.minHeight = '320px';
+    bodyInput.style.fontFamily = 'var(--font-mono, monospace)';
+    bodyInput.value = editing.body;
+    bodyInput.placeholder = '# Procedure\n\nStep 1 …';
+    bodyInput.addEventListener('input', () => {
+        editing.body = bodyInput.value;
+    });
+    bodyRow.appendChild(bodyLabel);
+    bodyRow.appendChild(bodyInput);
+    wrap.appendChild(bodyRow);
+
+    const actions = document.createElement('div');
+    actions.className = 'identity-entry-actions';
+    actions.style.marginTop = '4px';
+    const saveBtn = document.createElement('button');
+    saveBtn.className = 'btn-primary';
+    saveBtn.textContent = 'Save';
+    saveBtn.addEventListener('click', async () => {
+        if (!editing.slug || !editing.slug.trim()) {
+            showToast('Slug is required', 'error');
+            return;
+        }
+        if (!editing.name || !editing.name.trim()) {
+            showToast('Name is required', 'error');
+            return;
+        }
+        if (!editing.description || !editing.description.trim()) {
+            showToast('Description is required', 'error');
+            return;
+        }
+        try {
+            await invoke('upsert_skill', {
+                input: {
+                    slug: editing.slug.trim(),
+                    name: editing.name.trim(),
+                    description: editing.description.trim(),
+                    applies_to: editing.applies_to,
+                    body: editing.body || '',
+                },
+            });
+            // Drop the draft now that it's persisted; the reload pulls the
+            // canonical row from the server.
+            if (editing.isNew) {
+                skillsDrafts.delete(null);
+                skillsSelectedSlug = editing.slug.trim();
+            } else {
+                skillsDrafts.delete(editing.slug);
+            }
+            await loadSkillsManager();
+            invalidateProfileTokenCache();
+            showToast('Saved.', 'success');
+        } catch (err) {
+            showToast('Save failed: ' + err, 'error');
+        }
+    });
+    actions.appendChild(saveBtn);
+    if (!editing.isNew) {
+        const delBtn = document.createElement('button');
+        delBtn.className = 'btn-danger';
+        delBtn.textContent = 'Delete';
+        delBtn.addEventListener('click', async () => {
+            if (!confirm(`Delete skill "${editing.slug}"? This removes the folder on disk.`)) return;
+            try {
+                await invoke('delete_skill', { slug: editing.slug });
+                skillsDrafts.delete(editing.slug);
+                skillsSelectedSlug = null;
+                await loadSkillsManager();
+                invalidateProfileTokenCache();
+                showToast('Deleted.', 'success');
+            } catch (err) {
+                showToast('Delete failed: ' + err, 'error');
+            }
+        });
+        actions.appendChild(delBtn);
+    } else {
+        const cancelBtn = document.createElement('button');
+        cancelBtn.className = 'btn-secondary';
+        cancelBtn.textContent = 'Cancel';
+        cancelBtn.addEventListener('click', async () => {
+            skillsDrafts.delete(null);
+            skillsSelectedSlug = skillsList.length ? skillsList[0].slug : null;
+            renderSkillsSidebar();
+            await renderSkillsDetail();
+        });
+        actions.appendChild(cancelBtn);
+    }
+    wrap.appendChild(actions);
+
+    detail.appendChild(wrap);
+
+    // Cache the in-flight edits keyed by stable slug (or null for the
+    // draft). Lets the user click around the sidebar without losing form
+    // state — same pattern as the identity panel's textarea-as-source.
+    skillsDrafts.set(editing.isNew ? null : editing.slug, editing);
+}
+
+function updateSkillsTokenFooter() {
+    const countEl = document.getElementById('skills-listing-count');
+    const tokEl = document.getElementById('skills-listing-tokens');
+    if (!countEl || !tokEl) return;
+    countEl.textContent = String(skillsList.length);
+    // Listing format mirrors render_skills_block: "- slug: description\n"
+    let chars = 0;
+    for (const s of skillsList) {
+        chars += s.slug.length + s.description.length + 4;
+    }
+    tokEl.textContent = estimateTokens(chars).toLocaleString();
+}
+
+// One-time wiring for the "+ New skill" and Rescan buttons. The buttons
+// live in the Settings DOM at boot, so a single load is fine.
+(function wireSkillsButtons() {
+    const newBtn = document.getElementById('skills-new-btn');
+    if (newBtn) {
+        newBtn.addEventListener('click', async () => {
+            skillsSelectedSlug = '__new__';
+            renderSkillsSidebar();
+            await renderSkillsDetail();
+        });
+    }
+    const rescanBtn = document.getElementById('skills-rescan-btn');
+    if (rescanBtn) {
+        rescanBtn.addEventListener('click', async () => {
+            try {
+                const report = await invoke('sync_skills');
+                const msg = `Rescan: +${report.inserted} new · ~${report.updated} updated · -${report.deleted} removed`;
+                showToast(msg, 'success');
+                await loadSkillsManager();
+                invalidateProfileTokenCache();
+            } catch (err) {
+                showToast('Rescan failed: ' + err, 'error');
+            }
+        });
+    }
 })();
 
 // ─── Shell toolbox ────────────────────────────────────────────────────

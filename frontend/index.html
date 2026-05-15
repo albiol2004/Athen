@@ -313,6 +313,24 @@
             </section>
 
             <section class="settings-section">
+                <h2>Skills</h2>
+                <p class="settings-description">User-authored procedural playbooks the agent loads on demand. Skills live as <code>SKILL.md</code> folders on disk; their one-line descriptions appear in every agent's static prefix, and the agent calls <code>load_skill(slug)</code> to pull the full body when a task matches. Keep descriptions tight — they live in the prefix on every turn; the body is free to be long.</p>
+                <div class="identity-pane">
+                    <div class="identity-sidebar">
+                        <div id="skills-list" class="identity-category-list"></div>
+                        <button id="skills-new-btn" class="btn-secondary identity-new-category-btn" type="button">+ New skill</button>
+                        <button id="skills-rescan-btn" class="btn-secondary identity-new-category-btn" type="button" title="Re-read SKILL.md files from disk">↻ Rescan disk</button>
+                        <div class="identity-token-footer" id="skills-token-footer">
+                            <div class="identity-token-line"><span id="skills-listing-count">0</span> skills · <span id="skills-listing-tokens">0</span> listing tok</div>
+                        </div>
+                    </div>
+                    <div class="identity-detail" id="skills-detail">
+                        <p class="setting-hint">Pick a skill to edit, or click <strong>+ New skill</strong> to create one.</p>
+                    </div>
+                </div>
+            </section>
+
+            <section class="settings-section">
                 <h2>Tools (MCP)</h2>
                 <p class="settings-description">Toggle which Model Context Protocol servers Athen can use. Enabled tools become available to the agent on the next turn — no restart needed.</p>
                 <div id="mcp-list"></div>

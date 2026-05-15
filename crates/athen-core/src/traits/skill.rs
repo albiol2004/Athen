@@ -10,6 +10,7 @@
 //! boot-time reconciliation pass.
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 use crate::skill::{Skill, SkillFrontmatter};
@@ -66,7 +67,7 @@ pub trait SkillStore: Send + Sync {
 }
 
 /// Counters returned by [`SkillStore::sync`] for boot-time observability.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncReport {
     pub inserted: usize,
     pub updated: usize,

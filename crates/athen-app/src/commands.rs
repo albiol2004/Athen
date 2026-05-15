@@ -1349,6 +1349,7 @@ pub(crate) fn summarize_tool_call(
                 Some(format!("{when} — {instruction}"))
             }
         }
+        "load_skill" => s_str(args, "slug"),
         _ => None,
     }
 }
@@ -7557,6 +7558,165 @@ pub async fn dismiss_identity_entry(
     store.delete_entry(uuid).await.map_err(|e| e.to_string())
 }
 
+// ─── Skills ────────────────────────────────────────────────────────────────
+// User-authored procedural playbooks. The agent sees a slug+description
+// listing in its static prefix and pulls the body on demand via `load_skill`.
+// Filesystem (<data_dir>/skills/<slug>/SKILL.md) is the source of truth;
+// SQLite is a derived index. `upsert_skill` and `delete_skill` keep both in
+// sync; `sync_skills` is the manual reconciler the Settings panel exposes
+// after a user has edited files outside the UI.
+
+/// List every skill, regardless of profile. The UI groups them by source.
+#[tauri::command]
+pub async fn list_skills(
+    state: State<'_, AppState>,
+) -> std::result::Result<Vec<athen_core::skill::Skill>, String> {
+    use athen_core::traits::skill::SkillStore;
+    let Some(store) = state.skill_store.as_ref() else {
+        return Ok(Vec::new());
+    };
+    store.list(None).await.map_err(|e| e.to_string())
+}
+
+/// Wire shape returned by [`get_skill`] — frontmatter + body so the UI can
+/// edit both in one form. Slug + source + paths come from the index.
+#[derive(serde::Serialize)]
+pub struct SkillDetail {
+    pub slug: String,
+    pub name: String,
+    pub description: String,
+    pub applies_to: Vec<athen_core::identity::ProfileTag>,
+    pub source: String,
+    pub body: String,
+    pub hash: String,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Fetch one skill including its body. Returns `None` when the slug isn't
+/// indexed (the UI treats that as "deleted on disk while the panel was open"
+/// and refreshes).
+#[tauri::command]
+pub async fn get_skill(
+    slug: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<Option<SkillDetail>, String> {
+    use athen_core::traits::skill::SkillStore;
+    let Some(store) = state.skill_store.as_ref() else {
+        return Ok(None);
+    };
+    let Some(skill) = store.get(&slug).await.map_err(|e| e.to_string())? else {
+        return Ok(None);
+    };
+    let body = store.load_body(&slug).await.map_err(|e| e.to_string())?;
+    Ok(Some(SkillDetail {
+        slug: skill.slug,
+        name: skill.name,
+        description: skill.description,
+        applies_to: skill.applies_to,
+        source: skill.source.as_str().to_string(),
+        body,
+        hash: skill.hash,
+        updated_at: skill.updated_at,
+    }))
+}
+
+/// Input shape for create-or-replace. The slug is the folder name on disk;
+/// changing it is a delete+create, which the UI handles in two calls.
+#[derive(serde::Deserialize, Debug)]
+pub struct SkillInput {
+    pub slug: String,
+    pub name: String,
+    pub description: String,
+    #[serde(default)]
+    pub applies_to: Vec<athen_core::identity::ProfileTag>,
+    pub body: String,
+}
+
+/// Insert or replace a skill from the Settings UI. Always `source = User`;
+/// the store handles the filesystem write + index update atomically. Returns
+/// the persisted detail (with the freshly stamped hash + updated_at) so the
+/// UI can update its local state without an extra round-trip.
+#[tauri::command]
+pub async fn upsert_skill(
+    input: SkillInput,
+    state: State<'_, AppState>,
+) -> std::result::Result<SkillDetail, String> {
+    use athen_core::traits::skill::SkillStore;
+    let Some(store) = state.skill_store.as_ref() else {
+        return Err("Skill store not available".into());
+    };
+    let slug = input.slug.trim().to_string();
+    if slug.is_empty() {
+        return Err("Skill slug cannot be empty".into());
+    }
+    let name = input.name.trim().to_string();
+    if name.is_empty() {
+        return Err("Skill name cannot be empty".into());
+    }
+    let description = input.description.trim().to_string();
+    if description.is_empty() {
+        return Err("Skill description cannot be empty".into());
+    }
+    let applies_to = if input.applies_to.is_empty() {
+        athen_core::skill::SkillFrontmatter::default_applies_to()
+    } else {
+        input.applies_to
+    };
+    let frontmatter = athen_core::skill::SkillFrontmatter {
+        name,
+        description,
+        applies_to,
+    };
+    store
+        .upsert(&slug, &frontmatter, &input.body)
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(skill) = store.get(&slug).await.map_err(|e| e.to_string())? else {
+        return Err("Skill missing after save".into());
+    };
+    let body = store.load_body(&slug).await.map_err(|e| e.to_string())?;
+    Ok(SkillDetail {
+        slug: skill.slug,
+        name: skill.name,
+        description: skill.description,
+        applies_to: skill.applies_to,
+        source: skill.source.as_str().to_string(),
+        body,
+        hash: skill.hash,
+        updated_at: skill.updated_at,
+    })
+}
+
+/// Delete a skill — removes the folder and its index row. The UI confirms
+/// before calling this; we do not soft-delete because the filesystem is the
+/// source of truth and a stale row would be re-deleted on the next sync.
+#[tauri::command]
+pub async fn delete_skill(
+    slug: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    use athen_core::traits::skill::SkillStore;
+    let Some(store) = state.skill_store.as_ref() else {
+        return Err("Skill store not available".into());
+    };
+    store.delete(&slug).await.map_err(|e| e.to_string())
+}
+
+/// Re-reconcile the SQLite index against the filesystem. The Settings panel
+/// exposes a "Rescan" button so a user who edited files outside the UI (e.g.
+/// `git pull` on a skills repo) can pull changes without a restart. Returns
+/// the counters so the UI can show a "1 added, 2 updated" toast.
+#[tauri::command]
+pub async fn sync_skills(
+    state: State<'_, AppState>,
+) -> std::result::Result<athen_core::traits::skill::SyncReport, String> {
+    use athen_core::traits::skill::SkillStore;
+    let Some(store) = state.skill_store.as_ref() else {
+        return Err("Skill store not available".into());
+    };
+    store.sync().await.map_err(|e| e.to_string())
+}
+
 /// Wire shape for an attachment thumbnail returned to the frontend.
 /// Image rows ship `data_url` populated with a `data:<mime>;base64,...`
 /// payload so the UI can render them inline without a second round-trip;
@@ -8302,6 +8462,16 @@ mod summary_tests {
             json!({}),
         );
         assert_eq!(out.as_deref(), Some("cron: 0 8 * * * — Daily news"));
+    }
+
+    #[test]
+    fn load_skill_summarizes_to_slug() {
+        let out = s(
+            "load_skill",
+            json!({ "slug": "release-notes" }),
+            json!({ "slug": "release-notes", "body": "# …" }),
+        );
+        assert_eq!(out.as_deref(), Some("release-notes"));
     }
 
     #[test]
