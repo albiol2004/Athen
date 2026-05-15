@@ -1760,6 +1760,7 @@ function setStatus(state, text) {
 }
 
 function setInputEnabled(enabled) {
+    const wasDisabled = inputEl.disabled;
     inputEl.disabled = !enabled;
     isProcessing = !enabled;
     if (enabled) {
@@ -1767,6 +1768,23 @@ function setInputEnabled(enabled) {
         sendBtn.classList.remove('hidden');
         sendBtn.disabled = false;
         stopBtn.classList.add('hidden');
+        // WebKitGTK paint workaround: toggling `disabled` on a textarea
+        // that previously held a large multi-line value leaves the text
+        // layer stuck — the next typed/pasted content renders invisibly
+        // until some other state change (focus, click) wakes it. Force a
+        // full render-tree rebuild via display toggle on the re-enable
+        // edge so the layer starts fresh. Restore focus + caret.
+        if (wasDisabled) {
+            requestAnimationFrame(() => {
+                const selStart = inputEl.selectionStart;
+                const selEnd = inputEl.selectionEnd;
+                inputEl.style.display = 'none';
+                void inputEl.offsetHeight;
+                inputEl.style.display = '';
+                inputEl.focus();
+                try { inputEl.setSelectionRange(selStart, selEnd); } catch (_) {}
+            });
+        }
     } else {
         // Hide send button, show stop button.
         sendBtn.classList.add('hidden');
@@ -2213,22 +2231,10 @@ if (inputEl) {
                 if (file) addComposerFileFromFile(file);
             }
         }
-        // WebKitGTK paint workaround: pasting many lines at once can leave
-        // the textarea's text layer stale — layout grows (`autoResize`
-        // still fires on input), but glyphs never paint until the next
-        // state change (re-paste, focus toggle…) wakes the compositor.
-        // User reports this as "invisible composer text, app needs
-        // restart"; the toggleable nature points at a stuck paint state.
-        // Two rAFs after the browser commits the paste, force a
-        // synchronous layout + a transform-driven recomposite. Cheap and
-        // scoped to the paste path so typing keeps its hot path.
-        requestAnimationFrame(() => requestAnimationFrame(() => {
-            autoResize();
-            const prev = inputEl.style.transform;
-            inputEl.style.transform = 'translateZ(0)';
-            void inputEl.offsetHeight;
-            inputEl.style.transform = prev;
-        }));
+        // autoResize after paste so the textarea grows to fit the new
+        // content; the native input event also fires, but pasting fires
+        // it before the value is committed in some WebKitGTK builds.
+        requestAnimationFrame(autoResize);
     });
 }
 
