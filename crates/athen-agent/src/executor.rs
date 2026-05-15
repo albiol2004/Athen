@@ -1446,9 +1446,14 @@ impl AgentExecutor for DefaultExecutor {
             // user sent these via `queue_user_input` while we were busy;
             // surface them as regular `User` turns BEFORE the next LLM
             // call so the agent treats them as steering input on its
-            // next iteration.
+            // next iteration. Resetting `has_been_judged` lets the
+            // honesty check re-fire if the new input provokes another
+            // narration-only "done" reply.
             if let Some(ref slot) = self.pending_input {
                 if let Ok(mut queue) = slot.lock() {
+                    if !queue.is_empty() {
+                        has_been_judged = false;
+                    }
                     for text in queue.drain(..) {
                         conversation.push(ChatMessage {
                             role: Role::User,
@@ -1866,6 +1871,34 @@ impl AgentExecutor for DefaultExecutor {
                                     .to_string(),
                             ),
                         });
+                        steps_completed += 1;
+                        continue;
+                    }
+                }
+
+                // Pre-exit drain: the user may have queued a follow-up in
+                // the race window between the agent emitting "done" and
+                // the judge returning. Without this check the host would
+                // clean up the slot before the executor saw the message.
+                // If anything is pending, fold it in, reset the judge,
+                // and loop one more time instead of exiting.
+                if let Some(ref slot) = self.pending_input {
+                    let pending: Vec<String> = match slot.lock() {
+                        Ok(mut q) => q.drain(..).collect(),
+                        Err(_) => Vec::new(),
+                    };
+                    if !pending.is_empty() {
+                        conversation.push(ChatMessage {
+                            role: Role::Assistant,
+                            content: MessageContent::Text(response_content.clone()),
+                        });
+                        for text in pending {
+                            conversation.push(ChatMessage {
+                                role: Role::User,
+                                content: MessageContent::Text(text),
+                            });
+                        }
+                        has_been_judged = false;
                         steps_completed += 1;
                         continue;
                     }
