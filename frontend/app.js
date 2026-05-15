@@ -1757,6 +1757,50 @@ function addMessage(role, content, meta) {
     });
 }
 
+// Render a user bubble for a message that was queued via
+// `queue_user_input` while a task was already running. Visually identical
+// to a normal user message, plus a small "Queued" pill so it reads as
+// "pending, not yet seen by the agent". The executor will fold it in on
+// its next iteration; we don't transform the bubble after pickup.
+function appendQueuedUserBubble(text) {
+    const row = document.createElement('div');
+    row.className = 'message-row user';
+
+    const avatar = document.createElement('div');
+    avatar.className = 'message-avatar';
+    avatar.textContent = 'Y';
+
+    const wrap = document.createElement('div');
+    wrap.className = 'message-content-wrap';
+
+    const bubble = document.createElement('div');
+    bubble.className = 'message-bubble';
+    bubble.textContent = text;
+
+    const pill = document.createElement('span');
+    pill.className = 'queued-pill';
+    pill.textContent = 'Queued';
+
+    wrap.appendChild(bubble);
+    wrap.appendChild(pill);
+
+    const metaRow = document.createElement('div');
+    metaRow.className = 'message-meta';
+    metaRow.innerHTML = `<span class="message-time">${formatTime(new Date())}</span>`;
+    wrap.appendChild(metaRow);
+
+    row.appendChild(avatar);
+    row.appendChild(wrap);
+    messagesEl.appendChild(row);
+
+    requestAnimationFrame(() => {
+        messagesEl.parentElement.scrollTo({
+            top: messagesEl.parentElement.scrollHeight,
+            behavior: 'smooth',
+        });
+    });
+}
+
 /// Finalize a streaming message bubble by adding meta information
 /// (time, risk badge, domain) and removing the streaming class.
 function finalizeStreamingMessage(meta) {
@@ -1797,6 +1841,17 @@ function finalizeStreamingMessage(meta) {
 function setStatus(state, text) {
     statusDot.className = `status-dot ${state}`;
     statusText.textContent = text;
+}
+
+// Switch composer into "task running" mode without disabling the textarea
+// so the user can keep typing and queue mid-task follow-ups via
+// `queue_user_input`. Swaps Send → Stop and flips `isProcessing` so the
+// submit handler routes the next entry through the queue path.
+function setQueueMode() {
+    inputEl.disabled = false;
+    isProcessing = true;
+    sendBtn.classList.add('hidden');
+    stopBtn.classList.remove('hidden');
 }
 
 function setInputEnabled(enabled) {
@@ -2360,6 +2415,23 @@ formEl.addEventListener('submit', async (e) => {
         return;
     }
 
+    // Mid-task queueing: a task is already running for this arc — fold
+    // the message into the executor's pending-input queue instead of
+    // starting a fresh task. The executor drains the slot at the top
+    // of its next loop iteration.
+    if (isProcessing && activeArcId) {
+        try {
+            await invoke('queue_user_input', { arcId: activeArcId, text: message });
+            appendQueuedUserBubble(message);
+            inputEl.value = '';
+            inputEl.style.height = 'auto';
+            return;
+        } catch (err) {
+            console.error('queue_user_input failed', err);
+            // Fall through to normal send — better than swallowing.
+        }
+    }
+
     // Auto-name the arc from the first message.
     autoNameArc(message);
 
@@ -2396,8 +2468,10 @@ formEl.addEventListener('submit', async (e) => {
     inputEl.value = '';
     inputEl.style.height = 'auto';
 
-    // Disable input while processing
-    setInputEnabled(false);
+    // Keep input enabled while processing so the user can queue mid-task
+    // messages. The submit handler routes through `queue_user_input` while
+    // `isProcessing` is true. Escape / Stop still hard-cancels.
+    setQueueMode();
     setStatus('working', 'Thinking...');
 
     // Reset tool container and streaming state for this new request.

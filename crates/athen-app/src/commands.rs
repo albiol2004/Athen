@@ -2286,6 +2286,16 @@ pub async fn send_message(
                 athen_core::llm::ModelProfile::Fast,
             )
             .await;
+            // Per-arc pending input slot. The executor drains this at the
+            // top of each loop iteration so the user can queue follow-up
+            // messages mid-task via `queue_user_input` without cancelling.
+            let pending_slot: crate::state::PendingInputSlot =
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            {
+                let mut map = state.pending_user_inputs.write().await;
+                map.insert(current_arc.clone(), pending_slot.clone());
+            }
+
             let mut builder = AgentBuilder::new()
                 .llm_router(exec_router)
                 .tool_registry(registry)
@@ -2295,6 +2305,7 @@ pub async fn send_message(
                 .context_messages(context)
                 .stream_sender(stream_tx)
                 .cancel_flag(cancel_flag)
+                .pending_input_slot(pending_slot.clone())
                 .external_system_suffix(Some(system_suffix))
                 .identity_block(identity_block)
                 .endpoints_block(endpoints_block)
@@ -2362,6 +2373,10 @@ pub async fn send_message(
                         &current_arc,
                     )
                     .await;
+                    {
+                        let mut map = state.pending_user_inputs.write().await;
+                        map.remove(&current_arc);
+                    }
                     let raw = e.to_string();
                     tracing::error!("Agent execution failed: {raw}");
                     let msg = format_user_error(&raw);
@@ -2497,6 +2512,10 @@ pub async fn send_message(
             // Mark coordinator task as completed.
             let _ = state.coordinator.complete_task(task_id).await;
             crate::state::clear_provider_pin_for_arc(state.arc_store.as_ref(), &current_arc).await;
+            {
+                let mut map = state.pending_user_inputs.write().await;
+                map.remove(&current_arc);
+            }
 
             Ok(ChatResponse {
                 content,
@@ -4679,6 +4698,36 @@ pub async fn cancel_agent(
         .ok_or("agent registry not initialized")?;
     let uuid = Uuid::parse_str(&task_id).map_err(|e| format!("bad task_id: {e}"))?;
     Ok(reg.cancel(uuid).await)
+}
+
+/// Append a user message to the running executor's pending-input queue
+/// for the given arc. The executor drains it at the top of its next loop
+/// iteration and folds each entry in as a `Role::User` turn — the user
+/// steers mid-task instead of cancelling and restarting. Returns an
+/// error if there's no active task for the arc (caller should fall back
+/// to `send_message` to start a fresh task).
+#[tauri::command]
+pub async fn queue_user_input(
+    arc_id: String,
+    text: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err("Empty message".into());
+    }
+    let map = state.pending_user_inputs.read().await;
+    let slot = map.get(&arc_id).cloned();
+    drop(map);
+    match slot {
+        Some(s) => {
+            if let Ok(mut q) = s.lock() {
+                q.push(trimmed.to_string());
+            }
+            Ok(())
+        }
+        None => Err("No active task for this arc".into()),
+    }
 }
 
 /// Dev-only smoke test for the credential vault wired into AppState.

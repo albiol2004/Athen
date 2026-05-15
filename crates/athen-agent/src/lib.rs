@@ -51,6 +51,7 @@ pub struct AgentBuilder {
     context_messages: Vec<ChatMessage>,
     stream_sender: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     cancel_flag: Option<Arc<AtomicBool>>,
+    pending_input: Option<Arc<std::sync::Mutex<Vec<String>>>>,
     tool_doc_path: Option<PathBuf>,
     active_profile: Option<athen_core::agent_profile::ResolvedAgentProfile>,
     toolbox_info: Option<toolbox::ToolboxPromptInfo>,
@@ -85,6 +86,7 @@ impl AgentBuilder {
             context_messages: Vec::new(),
             stream_sender: None,
             cancel_flag: None,
+            pending_input: None,
             tool_doc_path: None,
             active_profile: None,
             toolbox_info: None,
@@ -312,6 +314,16 @@ impl AgentBuilder {
         self
     }
 
+    /// Shared queue of user messages the host appends while the executor
+    /// is running. The executor drains it at the top of every loop
+    /// iteration and folds each entry in as a `Role::User` turn, so the
+    /// user can steer the agent mid-task without cancelling. `None` (the
+    /// default) reproduces today's behavior.
+    pub fn pending_input_slot(mut self, slot: Arc<std::sync::Mutex<Vec<String>>>) -> Self {
+        self.pending_input = Some(slot);
+        self
+    }
+
     /// Directory containing per-group markdown references (e.g. `calendar.md`,
     /// `files.md`). When set, the system prompt instructs the agent to
     /// `read` the relevant group file for full schemas of any tool whose
@@ -352,6 +364,10 @@ impl AgentBuilder {
 
         if let Some(flag) = self.cancel_flag {
             executor.set_cancel_flag(flag);
+        }
+
+        if let Some(slot) = self.pending_input {
+            executor.set_pending_input_slot(slot);
         }
 
         if let Some(path) = self.tool_doc_path {

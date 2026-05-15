@@ -60,6 +60,12 @@ use crate::file_gate::PendingGrants;
 pub type ProfileEmbeddingCache =
     Arc<tokio::sync::RwLock<HashMap<String, (chrono::DateTime<chrono::Utc>, Vec<f32>)>>>;
 
+/// Per-arc queue of user messages submitted while a task is running.
+/// Inserted by `send_message` at task start, drained by the executor
+/// between iterations, removed on task completion. Lets the user steer
+/// the running agent mid-task without cancelling and restarting.
+pub type PendingInputSlot = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
 /// Maps coordinator task ids to the arc the originating sense event
 /// landed in. The sense_router populates this when it hands an event to
 /// the coordinator; the dispatch loop consumes it to know which arc to
@@ -170,6 +176,12 @@ pub struct AppState {
     /// Cancellation flag for the currently running agent executor.
     /// Set to `true` to cancel the in-progress task immediately.
     pub cancel_flag: Arc<AtomicBool>,
+    /// Per-arc queue of user messages submitted while a task is running.
+    /// Created on task start, drained by the executor between iterations,
+    /// removed on task completion. Lets the user steer the agent mid-task
+    /// without cancelling.
+    pub pending_user_inputs:
+        std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<String, PendingInputSlot>>>,
     /// Shutdown sender for the email monitor background task.
     pub email_shutdown: Option<tokio::sync::broadcast::Sender<()>>,
     /// Shutdown sender for the Telegram monitor background task.
@@ -557,6 +569,7 @@ impl AppState {
             contact_store,
             _database: database,
             cancel_flag: Arc::new(AtomicBool::new(false)),
+            pending_user_inputs: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             email_shutdown: None,
             telegram_shutdown: None,
             calendar_shutdown: None,

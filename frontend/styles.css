@@ -1157,6 +1157,20 @@ header h1 {
     font-weight: 500;
 }
 
+/* Mid-task queued user message — pinned under the bubble so it reads
+   as "pending, not yet seen by the agent". */
+.queued-pill {
+    display: inline-block;
+    margin-top: 4px;
+    padding: 1px 8px;
+    background: var(--surface-2);
+    color: var(--text-3);
+    border-radius: var(--r-sm);
+    font-size: 10.5px;
+    font-weight: 500;
+    letter-spacing: 0.03em;
+}
+
 /* ─── Tool calls / executions ─── */
 .tool-calls-container,
 .tool-steps-container {

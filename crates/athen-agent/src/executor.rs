@@ -185,6 +185,12 @@ pub struct DefaultExecutor {
     context_messages: Vec<ChatMessage>,
     stream_sender: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     cancel_flag: Option<Arc<AtomicBool>>,
+    /// Per-arc queue of user messages the host has appended while this
+    /// executor is running. Drained at the top of each loop iteration
+    /// and folded in as `Role::User` turns so the user can steer the
+    /// agent mid-task without cancelling. `None` (the default) means
+    /// the host hasn't wired the queue — purely additive.
+    pending_input: Option<Arc<std::sync::Mutex<Vec<String>>>>,
     /// Directory of per-group markdown references (typically
     /// `~/.athen/tools/`). When set, the system prompt instructs the agent
     /// to read the relevant `<group>.md` file for full schemas.
@@ -315,6 +321,7 @@ impl DefaultExecutor {
             context_messages,
             stream_sender: None,
             cancel_flag: None,
+            pending_input: None,
             tool_doc_dir: None,
             active_profile: None,
             toolbox_info: None,
@@ -490,6 +497,14 @@ impl DefaultExecutor {
     /// executor returns immediately with a "cancelled" result.
     pub fn set_cancel_flag(&mut self, flag: Arc<AtomicBool>) {
         self.cancel_flag = Some(flag);
+    }
+
+    /// Attach a shared queue that the executor drains at the top of every
+    /// loop iteration. Each entry is folded in as a `Role::User` turn so
+    /// the host can append mid-task user input without cancelling the
+    /// running executor.
+    pub fn set_pending_input_slot(&mut self, slot: Arc<std::sync::Mutex<Vec<String>>>) {
+        self.pending_input = Some(slot);
     }
 
     /// Build the system prompt for the agent.
@@ -1426,6 +1441,22 @@ impl AgentExecutor for DefaultExecutor {
         loop {
             let current_iteration = iteration;
             iteration = iteration.saturating_add(1);
+
+            // Drain any queued mid-task user messages from the host. The
+            // user sent these via `queue_user_input` while we were busy;
+            // surface them as regular `User` turns BEFORE the next LLM
+            // call so the agent treats them as steering input on its
+            // next iteration.
+            if let Some(ref slot) = self.pending_input {
+                if let Ok(mut queue) = slot.lock() {
+                    for text in queue.drain(..) {
+                        conversation.push(ChatMessage {
+                            role: Role::User,
+                            content: MessageContent::Text(text),
+                        });
+                    }
+                }
+            }
 
             // Rebuild the system prompt each iteration so newly-revealed
             // tools' full schemas appear inline. The prompt itself is small;
