@@ -908,6 +908,7 @@ header h1 {
 .message-row.user .message-bubble {
     color: var(--text-2);
     text-align: right;
+    white-space: pre-wrap;
 }
 
 .message-row.system .message-bubble {
