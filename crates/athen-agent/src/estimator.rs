@@ -73,6 +73,7 @@ pub fn estimate_static_prompt_chars(
     profile: Option<&ResolvedAgentProfile>,
     identity_block: Option<&str>,
     endpoints_block: Option<&str>,
+    skills_block: Option<&str>,
     toolbox_info: Option<&ToolboxPromptInfo>,
     shell_kind: Option<&'static str>,
     tool_doc_dir: Option<&Path>,
@@ -106,6 +107,7 @@ pub fn estimate_static_prompt_chars(
         autonomous,
         identity_block,
         endpoints_block,
+        skills_block,
     );
     let system_prompt_chars = system_prompt.len();
 
@@ -251,6 +253,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
             false,
         );
@@ -278,12 +281,14 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
             false,
         );
         let c = estimate_static_prompt_chars(
             &tools,
             Some(&coder),
+            None,
             None,
             None,
             None,
@@ -313,6 +318,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
             false,
         );
@@ -320,6 +326,7 @@ mod tests {
             &tools,
             Some(&profile),
             Some("## personality\nBe terse."),
+            None,
             None,
             None,
             None,
@@ -332,6 +339,7 @@ mod tests {
             &tools,
             Some(&profile),
             Some(&big_identity_str),
+            None,
             None,
             None,
             None,
@@ -360,12 +368,14 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
             false,
         );
         let without_endpoints = estimate_static_prompt_chars(
             &tools,
             Some(&profile),
+            None,
             None,
             None,
             None,
@@ -394,6 +404,7 @@ mod tests {
             Some(identity),
             Some(endpoints),
             None,
+            None,
             Some("nushell"),
             None,
             false,
@@ -404,6 +415,7 @@ mod tests {
             Some(&coder_profile()),
             Some(identity),
             Some(endpoints),
+            None,
             None,
             Some("nushell"),
             None,

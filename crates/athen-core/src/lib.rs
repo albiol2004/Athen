@@ -16,6 +16,7 @@ pub mod paths;
 pub mod profile_routing;
 pub mod risk;
 pub mod sandbox;
+pub mod skill;
 pub mod task;
 pub mod tool;
 pub mod traits;

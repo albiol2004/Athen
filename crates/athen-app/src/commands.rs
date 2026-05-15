@@ -102,6 +102,7 @@ fn spawn_router_approval(
         grant_store: state.grant_store.clone(),
         profile_store: state.profile_store.clone(),
         identity_store: state.identity_store.clone(),
+        skill_store: state.skill_store.clone(),
         http_endpoint_store: state.http_endpoint_store.clone(),
         pending_grants: state.pending_grants.clone(),
         spawned_processes: state.spawned_processes.clone(),
@@ -231,6 +232,7 @@ fn spawn_router_approval(
             grant_store: bg_ctx.grant_store,
             profile_store: bg_ctx.profile_store,
             identity_store: bg_ctx.identity_store,
+            skill_store: bg_ctx.skill_store,
             http_endpoint_store: bg_ctx.http_endpoint_store,
             pending_grants: bg_ctx.pending_grants,
             spawned_processes: bg_ctx.spawned_processes,
@@ -337,6 +339,7 @@ struct ApprovedTaskBgCtx {
     grant_store: Option<Arc<athen_persistence::grants::GrantStore>>,
     profile_store: Option<Arc<athen_persistence::profiles::SqliteProfileStore>>,
     identity_store: Option<Arc<athen_persistence::identity::SqliteIdentityStore>>,
+    skill_store: Option<Arc<athen_persistence::skills::SqliteSkillStore>>,
     http_endpoint_store: Option<Arc<athen_persistence::http_endpoints::SqliteHttpEndpointStore>>,
     pending_grants: crate::file_gate::PendingGrants,
     spawned_processes: athen_agent::SpawnedProcessMap,
@@ -2249,6 +2252,11 @@ pub async fn send_message(
             let endpoints_block =
                 crate::endpoints_render::render_endpoints_block(state.http_endpoint_store.as_ref())
                     .await;
+            let skills_block = crate::skills_render::render_skills_block(
+                state.skill_store.as_ref(),
+                &identity_profile_id,
+            )
+            .await;
 
             let active_id_now = state.active_provider_id.lock().await.clone();
             let effective_provider_id = crate::state::resolve_effective_provider_for_arc(
@@ -2289,6 +2297,7 @@ pub async fn send_message(
                 .external_system_suffix(Some(system_suffix))
                 .identity_block(identity_block)
                 .endpoints_block(endpoints_block)
+                .skills_block(skills_block)
                 .enable_default_reminders(true)
                 .default_temperature(sampling_temperature)
                 .default_reasoning_effort(reasoning_effort)
@@ -2595,6 +2604,7 @@ pub async fn approve_task(
         grant_store: state.grant_store.clone(),
         profile_store: state.profile_store.clone(),
         identity_store: state.identity_store.clone(),
+        skill_store: state.skill_store.clone(),
         http_endpoint_store: state.http_endpoint_store.clone(),
         pending_grants: state.pending_grants.clone(),
         spawned_processes: state.spawned_processes.clone(),
@@ -2708,6 +2718,7 @@ pub(crate) struct ApprovedTaskCtx {
     pub grant_store: Option<Arc<athen_persistence::grants::GrantStore>>,
     pub profile_store: Option<Arc<athen_persistence::profiles::SqliteProfileStore>>,
     pub identity_store: Option<Arc<athen_persistence::identity::SqliteIdentityStore>>,
+    pub skill_store: Option<Arc<athen_persistence::skills::SqliteSkillStore>>,
     pub http_endpoint_store:
         Option<Arc<athen_persistence::http_endpoints::SqliteHttpEndpointStore>>,
     pub pending_grants: crate::file_gate::PendingGrants,
@@ -3205,6 +3216,7 @@ pub(crate) async fn execute_approved_task(
                 let dctx = crate::delegation::DelegationContext {
                     profile_store,
                     identity_store: ctx.identity_store.clone(),
+                    skill_store: ctx.skill_store.clone(),
                     http_endpoint_store: ctx.http_endpoint_store.clone(),
                     arc_store,
                     llm_router: Arc::clone(&ctx.router),
@@ -3338,6 +3350,9 @@ pub(crate) async fn execute_approved_task(
     .await;
     let endpoints_block =
         crate::endpoints_render::render_endpoints_block(ctx.http_endpoint_store.as_ref()).await;
+    let skills_block =
+        crate::skills_render::render_skills_block(ctx.skill_store.as_ref(), &identity_profile_id)
+            .await;
 
     // Tier resolution: arc override > task complexity (piggybacked on
     // the risk LLM that already ran on this approved task) > static
@@ -3364,6 +3379,7 @@ pub(crate) async fn execute_approved_task(
         .external_system_suffix(Some(system_suffix))
         .identity_block(identity_block)
         .endpoints_block(endpoints_block)
+        .skills_block(skills_block)
         .enable_default_reminders(true)
         .default_temperature(ctx.sampling_temperature)
         .default_reasoning_effort(ctx.reasoning_effort)
@@ -4204,6 +4220,7 @@ pub(crate) async fn execute_dispatched_task(
                 let dctx = crate::delegation::DelegationContext {
                     profile_store,
                     identity_store: ctx.identity_store.clone(),
+                    skill_store: ctx.skill_store.clone(),
                     http_endpoint_store: ctx.http_endpoint_store.clone(),
                     arc_store,
                     llm_router: Arc::clone(&ctx.router),
@@ -4349,6 +4366,9 @@ pub(crate) async fn execute_dispatched_task(
     .await;
     let endpoints_block =
         crate::endpoints_render::render_endpoints_block(ctx.http_endpoint_store.as_ref()).await;
+    let skills_block =
+        crate::skills_render::render_skills_block(ctx.skill_store.as_ref(), &identity_profile_id)
+            .await;
 
     // Tier resolution mirrors the approval path; `task` carries the
     // risk_score the dispatch loop installed.
@@ -4374,6 +4394,7 @@ pub(crate) async fn execute_dispatched_task(
         .autonomous_mode(true)
         .identity_block(identity_block)
         .endpoints_block(endpoints_block)
+        .skills_block(skills_block)
         .enable_default_reminders(true)
         .default_temperature(ctx.sampling_temperature)
         .default_reasoning_effort(ctx.reasoning_effort)
@@ -5827,6 +5848,10 @@ pub async fn estimate_profile_tokens(
         crate::endpoints_render::render_endpoints_block(state.http_endpoint_store.as_ref()).await;
     let endpoints_chars = endpoints_block.as_deref().map(|s| s.len()).unwrap_or(0);
 
+    let skills_block =
+        crate::skills_render::render_skills_block(state.skill_store.as_ref(), &profile_id).await;
+    let _skills_chars = skills_block.as_deref().map(|s| s.len()).unwrap_or(0);
+
     // 4. Build the tool registry and list its tools. Use the active arc
     //    id when available (matches dispatch); fall back to a synthetic
     //    one when no arc is selected (e.g. settings page on first run).
@@ -5847,6 +5872,7 @@ pub async fn estimate_profile_tokens(
         Some(&resolved),
         identity_block.as_deref(),
         endpoints_block.as_deref(),
+        skills_block.as_deref(),
         Some(&toolbox_info),
         Some(shell_kind),
         state.tool_doc_dir.as_deref(),

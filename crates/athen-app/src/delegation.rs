@@ -52,6 +52,11 @@ pub struct DelegationContext {
     /// / rules / knowledge / team block into the sub-agent's system prefix.
     /// Optional because pre-identity tests may build a context without it.
     pub identity_store: Option<Arc<athen_persistence::identity::SqliteIdentityStore>>,
+    /// Skill store. Used to render the SKILLS listing into the sub-agent's
+    /// static prefix so a delegated specialist sees the same playbooks the
+    /// parent had access to (load_skill resolves against the same store).
+    /// Optional for the same backwards-compat reason as `identity_store`.
+    pub skill_store: Option<Arc<athen_persistence::skills::SqliteSkillStore>>,
     /// Registered HTTP endpoints store. Used to render the
     /// "REGISTERED CLOUD APIs" block into the sub-agent's static prefix
     /// so the delegated specialist also sees ElevenLabs / Jina / etc.
@@ -399,6 +404,9 @@ async fn run_delegation(
     // tool slice, so a profile without it pays zero bytes.
     let endpoints_block =
         crate::endpoints_render::render_endpoints_block(ctx.http_endpoint_store.as_ref()).await;
+    let skills_block =
+        crate::skills_render::render_skills_block(ctx.skill_store.as_ref(), &resolved.profile.id)
+            .await;
 
     // Sub-executor's reasoning effort: resolved from the sub-arc, which
     // we may have just written above (per-call delegate param) or which
@@ -415,6 +423,7 @@ async fn run_delegation(
         .active_profile(resolved)
         .identity_block(identity_block)
         .endpoints_block(endpoints_block)
+        .skills_block(skills_block)
         .enable_default_reminders(true)
         .default_temperature(sampling_temperature)
         .default_reasoning_effort(sub_reasoning_effort);

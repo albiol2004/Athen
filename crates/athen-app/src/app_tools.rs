@@ -24,6 +24,7 @@ use athen_core::traits::http_endpoint::HttpEndpointStore;
 use athen_core::traits::identity::IdentityStore;
 use athen_core::traits::mcp::McpClient;
 use athen_core::traits::memory::{MemoryItem, MemoryStore};
+use athen_core::traits::skill::SkillStore;
 use athen_core::traits::tool::ToolRegistry;
 use athen_core::traits::vault::Vault;
 use athen_memory::Memory;
@@ -32,6 +33,7 @@ use athen_persistence::calendar::{CalendarEvent, CalendarStore, EventCreator};
 use athen_persistence::contacts::SqliteContactStore;
 use athen_persistence::http_endpoints::SqliteHttpEndpointStore;
 use athen_persistence::identity::SqliteIdentityStore;
+use athen_persistence::skills::SqliteSkillStore;
 
 use crate::file_gate::FileGate;
 use crate::http_rate_limiter::{HttpRateLimiter, RateCheck};
@@ -51,6 +53,7 @@ pub struct AppToolRegistry {
     file_gate: Option<Arc<FileGate>>,
     attachments: Option<AttachmentStore>,
     identity: Option<Arc<SqliteIdentityStore>>,
+    skills: Option<Arc<SqliteSkillStore>>,
     http_endpoints: Option<Arc<SqliteHttpEndpointStore>>,
     vault: Option<Arc<dyn Vault>>,
     http_rate_limiter: Option<Arc<HttpRateLimiter>>,
@@ -78,6 +81,7 @@ impl AppToolRegistry {
             file_gate: None,
             attachments: None,
             identity: None,
+            skills: None,
             http_endpoints: None,
             vault: None,
             http_rate_limiter: None,
@@ -112,6 +116,16 @@ impl AppToolRegistry {
     /// refuses with a clear error.
     pub fn with_identity(mut self, identity: Arc<SqliteIdentityStore>) -> Self {
         self.identity = Some(identity);
+        self
+    }
+
+    /// Attach the skill store so the agent can call `load_skill` to pull
+    /// procedural-playbook bodies on demand. The static-prefix listing of
+    /// available skills is built by the composition root from the same
+    /// store; this wires the *invocation* side. Without this, the tool is
+    /// not advertised and `load_skill` calls refuse with a clear error.
+    pub fn with_skills(mut self, skills: Arc<SqliteSkillStore>) -> Self {
+        self.skills = Some(skills);
         self
     }
 
@@ -1401,6 +1415,51 @@ impl AppToolRegistry {
         })
     }
 
+    // ── load_skill ───────────────────────────────────────────────────
+
+    fn load_skill_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "slug": {
+                    "type": "string",
+                    "description": "The slug of the skill to load — the kebab-case identifier shown in the SKILLS listing in your system prefix (e.g. 'cold-email-outreach')."
+                }
+            },
+            "required": ["slug"]
+        })
+    }
+
+    async fn do_load_skill(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let Some(store) = self.skills.as_ref() else {
+            return Err(AthenError::Other(
+                "load_skill: skill store is not wired into this agent".to_string(),
+            ));
+        };
+
+        let slug = args
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| AthenError::Other("load_skill: 'slug' is required".to_string()))?
+            .to_string();
+
+        let start = Instant::now();
+        let body = store.load_body(&slug).await?;
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+
+        Ok(ToolResult {
+            success: true,
+            output: json!({
+                "slug": slug,
+                "body": body,
+            }),
+            error: None,
+            execution_time_ms: elapsed_ms,
+        })
+    }
+
     // ── http_request ────────────────────────────────────────────────
 
     fn http_request_schema() -> serde_json::Value {
@@ -2087,6 +2146,19 @@ impl ToolRegistry for AppToolRegistry {
             });
         }
 
+        if self.skills.is_some() {
+            tools.push(ToolDefinition {
+                name: "load_skill".to_string(),
+                description: "Load the full body of one of your registered skills. The static SKILLS section in your system prefix lists each skill's slug + one-line description; call this with the slug when a skill matches the task at hand (drafting an email → cold-email-outreach, formatting release notes → release-notes, etc.). Returns the skill's markdown body. Read-only; no side effects.".to_string(),
+                parameters: Self::load_skill_schema(),
+                backend: ToolBackend::Shell {
+                    command: String::new(),
+                    native: false,
+                },
+                base_risk: BaseImpact::Read,
+            });
+        }
+
         if self.identity.is_some() {
             tools.push(ToolDefinition {
                 name: "identity_add".to_string(),
@@ -2216,6 +2288,7 @@ impl ToolRegistry for AppToolRegistry {
             "read_attachment_full" => self.do_read_attachment_full(&args).await,
             "fetch_attachment" => self.do_fetch_attachment(&args).await,
             "identity_add" => self.do_identity_add(&args).await,
+            "load_skill" => self.do_load_skill(&args).await,
             "http_request" => self.do_http_request(&args).await,
             _ => self.inner.call_tool(name, args).await,
         }

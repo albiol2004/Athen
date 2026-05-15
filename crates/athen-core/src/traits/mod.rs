@@ -16,6 +16,7 @@ pub mod reminder;
 pub mod sandbox;
 pub mod sense;
 pub mod shell;
+pub mod skill;
 pub mod telegram_sender;
 pub mod tool;
 pub mod vault;

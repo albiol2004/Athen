@@ -15,6 +15,7 @@ pub mod identity;
 pub mod mcp;
 pub mod notifications;
 pub mod profiles;
+pub mod skills;
 pub mod store;
 pub mod telegram_chat_log;
 pub mod wakeups;
@@ -39,6 +40,7 @@ use crate::identity::SqliteIdentityStore;
 use crate::mcp::McpStore;
 use crate::notifications::NotificationStore;
 use crate::profiles::SqliteProfileStore;
+use crate::skills::SqliteSkillStore;
 use crate::store::SqliteStore;
 use crate::wakeups::SqliteWakeupStore;
 
@@ -101,6 +103,9 @@ impl Database {
         let identity = self.identity_store();
         identity.init_schema().await?;
         identity.seed_categories_if_empty().await?;
+        // Skills: only the index schema lives in the DB; the filesystem
+        // store is constructed at the composition root with a skills_dir.
+        crate::skills::init_schema(&self.conn).await?;
         let wakeups = self.wakeup_store();
         wakeups.init_schema().await?;
         let endpoints = self.http_endpoint_store();
@@ -165,6 +170,14 @@ impl Database {
     /// Create a `SqliteIdentityStore` backed by this database's connection.
     pub fn identity_store(&self) -> SqliteIdentityStore {
         SqliteIdentityStore::new(self.conn.clone())
+    }
+
+    /// Create a `SqliteSkillStore` backed by this database's connection and
+    /// the given filesystem root for `SKILL.md` files. Callers should run
+    /// `SkillStore::sync` once after construction so the index reflects any
+    /// hand-edits or fresh git-clones into the directory.
+    pub fn skill_store(&self, skills_dir: std::path::PathBuf) -> SqliteSkillStore {
+        SqliteSkillStore::new(self.conn.clone(), skills_dir)
     }
 
     /// Create a `SqliteWakeupStore` backed by this database's connection.

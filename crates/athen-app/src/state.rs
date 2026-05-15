@@ -223,6 +223,14 @@ pub struct AppState {
     /// categories). Read at prompt-build time and folded into the static
     /// system header so every agent shares the same "who Athen is".
     pub identity_store: Option<Arc<athen_persistence::identity::SqliteIdentityStore>>,
+    /// Filesystem + SQLite skill store. Bodies live on disk under
+    /// `<data_dir>/skills/<slug>/SKILL.md`; the index is in SQLite. Read at
+    /// prompt-build time to inject the SKILLS listing (name+description per
+    /// skill, profile-filtered) into the static prefix, and at agent-call
+    /// time when `load_skill(slug)` pulls a body. Distinct from
+    /// [`identity_store`] (always-on persona) and from `memory`
+    /// (auto-recalled episodic facts). See `docs/SKILLS.md`.
+    pub skill_store: Option<Arc<athen_persistence::skills::SqliteSkillStore>>,
     /// SQLite-backed wake-up store. Holds scheduled / recurring / one-shot
     /// proactive triggers (see `docs/WAKEUPS.md`). Read by the wake-up
     /// scheduler background task; written by Tauri commands and (Phase 5)
@@ -464,6 +472,13 @@ impl AppState {
         let grant_store = database.as_ref().map(|db| Arc::new(db.grant_store()));
         let profile_store = database.as_ref().map(|db| Arc::new(db.profile_store()));
         let identity_store = database.as_ref().map(|db| Arc::new(db.identity_store()));
+        // Skill store: bodies live under <data_dir>/skills/. Construction is
+        // gated on a known data_dir so an in-memory / data_dir-less boot
+        // still works (skills just won't be available, same as identity).
+        let skill_store = match (database.as_ref(), ensure_data_dir()) {
+            (Some(db), Some(data_dir)) => Some(Arc::new(db.skill_store(data_dir.join("skills")))),
+            _ => None,
+        };
         let wakeup_store = database.as_ref().map(|db| Arc::new(db.wakeup_store()));
         let http_endpoint_store = database
             .as_ref()
@@ -557,6 +572,7 @@ impl AppState {
             grant_store,
             profile_store,
             identity_store,
+            skill_store,
             wakeup_store,
             wakeup_scheduler_shutdown: std::sync::Mutex::new(None),
             profile_embedder,
@@ -591,6 +607,25 @@ impl AppState {
         }
         if let Err(e) = state.refresh_cloud_apis_doc().await {
             warn!("Failed to write initial cloud_apis catalogue: {e}");
+        }
+        // Reconcile the skills index against the filesystem so hand-edited
+        // or freshly git-cloned skill folders show up without restart. The
+        // sync is idempotent and cheap when nothing changed.
+        if let Some(skills) = state.skill_store.as_ref() {
+            use athen_core::traits::skill::SkillStore;
+            match skills.sync().await {
+                Ok(report) => {
+                    if report.inserted + report.updated + report.deleted > 0 {
+                        info!(
+                            inserted = report.inserted,
+                            updated = report.updated,
+                            deleted = report.deleted,
+                            "Skills index reconciled with filesystem"
+                        );
+                    }
+                }
+                Err(e) => warn!("Skills sync failed at boot: {e}"),
+            }
         }
 
         state
@@ -821,6 +856,9 @@ impl AppState {
         if let Some(istore) = self.identity_store.clone() {
             registry = registry.with_identity(istore);
         }
+        if let Some(sstore) = self.skill_store.clone() {
+            registry = registry.with_skills(sstore);
+        }
         if let (Some(estore), Some(vault)) = (self.http_endpoint_store.clone(), self.vault.clone())
         {
             registry = registry.with_http_endpoints(
@@ -995,6 +1033,9 @@ impl AppState {
         if let Some(istore) = self.identity_store.clone() {
             registry = registry.with_identity(istore);
         }
+        if let Some(sstore) = self.skill_store.clone() {
+            registry = registry.with_skills(sstore);
+        }
         if let (Some(estore), Some(vault)) = (self.http_endpoint_store.clone(), self.vault.clone())
         {
             registry = registry.with_http_endpoints(
@@ -1035,6 +1076,7 @@ impl AppState {
                 let ctx = crate::delegation::DelegationContext {
                     profile_store,
                     identity_store: self.identity_store.clone(),
+                    skill_store: self.skill_store.clone(),
                     http_endpoint_store: self.http_endpoint_store.clone(),
                     arc_store,
                     llm_router: Arc::clone(&self.router),
@@ -1569,6 +1611,7 @@ impl AppState {
         let calendar_store_ref = self.calendar_store.clone();
         let contact_store_ref = self.contact_store.clone();
         let identity_store_ref = self.identity_store.clone();
+        let skill_store_ref = self.skill_store.clone();
         let memory_ref = self.memory.clone();
         let mcp_ref = self.mcp.clone();
         let tool_doc_dir_ref = self.tool_doc_dir.clone();
@@ -1661,6 +1704,7 @@ impl AppState {
                                     let calendar_store_c = calendar_store_ref.clone();
                                     let contact_store_c = contact_store_ref.clone();
                                     let identity_store_c = identity_store_ref.clone();
+                                    let skill_store_c = skill_store_ref.clone();
                                     let memory_c = memory_ref.clone();
                                     let mcp_c = Arc::clone(&mcp_ref);
                                     let tool_doc_dir_c = tool_doc_dir_ref.clone();
@@ -1704,6 +1748,7 @@ impl AppState {
                                             &calendar_store_c,
                                             &contact_store_c,
                                             &identity_store_c,
+                                            skill_store_c.as_ref(),
                                             &memory_c,
                                             &mcp_c,
                                             tool_doc_dir_c.as_deref(),
@@ -1849,6 +1894,7 @@ impl AppState {
         let tool_doc_dir = self.tool_doc_dir.clone();
         let profile_store = self.profile_store.clone();
         let identity_store = self.identity_store.clone();
+        let skill_store_dispatch = self.skill_store.clone();
         let http_endpoint_store_dispatch = self.http_endpoint_store.clone();
         let grant_store = self.grant_store.clone();
         let pending_grants = self.pending_grants.clone();
@@ -1989,6 +2035,7 @@ impl AppState {
                         grant_store: grant_store.clone(),
                         profile_store: profile_store.clone(),
                         identity_store: identity_store.clone(),
+                        skill_store: skill_store_dispatch.clone(),
                         http_endpoint_store: http_endpoint_store_dispatch.clone(),
                         pending_grants: pending_grants.clone(),
                         spawned_processes: spawned_processes.clone(),
@@ -2144,6 +2191,7 @@ async fn execute_owner_telegram_message(
     calendar_store: &Option<CalendarStore>,
     contact_store: &Option<SqliteContactStore>,
     identity_store: &Option<Arc<athen_persistence::identity::SqliteIdentityStore>>,
+    skill_store: Option<&Arc<athen_persistence::skills::SqliteSkillStore>>,
     memory: &Option<Arc<Memory>>,
     mcp: &Arc<McpRegistry>,
     tool_doc_dir: Option<&std::path::Path>,
@@ -2616,6 +2664,9 @@ async fn execute_owner_telegram_message(
     }
     if let Some(istore) = identity_store.clone() {
         registry = registry.with_identity(istore);
+    }
+    if let Some(sstore) = skill_store {
+        registry = registry.with_skills(sstore.clone());
     }
     if let (Some(estore), Some(v)) = (http_endpoint_store, vault) {
         registry = registry.with_http_endpoints(

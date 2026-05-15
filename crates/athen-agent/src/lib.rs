@@ -60,6 +60,7 @@ pub struct AgentBuilder {
     external_system_suffix: Option<String>,
     default_temperature: Option<f32>,
     identity_block: Option<String>,
+    skills_block: Option<String>,
     endpoints_block: Option<String>,
     reminder_builder: Option<Arc<dyn SystemReminderBuilder>>,
     auto_reminders: bool,
@@ -93,6 +94,7 @@ impl AgentBuilder {
             external_system_suffix: None,
             default_temperature: None,
             identity_block: None,
+            skills_block: None,
             endpoints_block: None,
             reminder_builder: None,
             auto_reminders: false,
@@ -129,6 +131,20 @@ impl AgentBuilder {
     /// system header. Empty / `None` reproduces today's prompt byte-for-byte.
     pub fn identity_block(mut self, block: Option<String>) -> Self {
         self.identity_block = block.filter(|s| !s.trim().is_empty());
+        self
+    }
+
+    /// Inject a pre-rendered skills listing (name + one-line description
+    /// per available skill, profile-filtered upstream). The host reads
+    /// the skill store and ships the markdown in; the executor splices
+    /// it as-is into the static system header. The agent then calls
+    /// `load_skill(slug)` to pull the body of a specific skill on demand.
+    ///
+    /// Empty / `None` reproduces today's prompt byte-for-byte. The
+    /// executor gates the section on `load_skill` being in the tool
+    /// surface — profiles without that tool get zero bytes regardless.
+    pub fn skills_block(mut self, block: Option<String>) -> Self {
+        self.skills_block = block.filter(|s| !s.trim().is_empty());
         self
     }
 
@@ -372,6 +388,10 @@ impl AgentBuilder {
 
         if self.identity_block.is_some() {
             executor.set_identity_block(self.identity_block);
+        }
+
+        if self.skills_block.is_some() {
+            executor.set_skills_block(self.skills_block);
         }
 
         if self.endpoints_block.is_some() {

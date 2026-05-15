@@ -257,6 +257,15 @@ pub struct DefaultExecutor {
     /// tool get zero bytes regardless of the block contents. `None`
     /// reproduces today's prompt byte-for-byte.
     endpoints_block: Option<String>,
+    /// Pre-rendered skills listing — `- slug: description` per available
+    /// skill, profile-filtered upstream. The host (athen-app) reads the
+    /// skill store; the executor only frames it.
+    ///
+    /// Pinned in the static prefix alongside identity. Gated on
+    /// `load_skill` being in the tool slice — profiles without that tool
+    /// get zero bytes regardless. `None` reproduces today's prompt
+    /// byte-for-byte.
+    skills_block: Option<String>,
     /// User-supplied reminder builder (custom impl). Takes precedence over
     /// `auto_reminders` when set. `None` is the test-default — no custom
     /// builder.
@@ -316,6 +325,7 @@ impl DefaultExecutor {
             default_temperature: None,
             identity_block: None,
             endpoints_block: None,
+            skills_block: None,
             reminder_builder: None,
             auto_reminders: false,
             default_reasoning_effort: athen_core::llm::ReasoningEffort::Default,
@@ -389,6 +399,18 @@ impl DefaultExecutor {
     /// whitespace-only / `None` clears the section entirely.
     pub fn set_endpoints_block(&mut self, block: Option<String>) {
         self.endpoints_block = block.filter(|s| !s.trim().is_empty());
+    }
+
+    /// Inject a pre-rendered skills listing into the static system
+    /// header.
+    ///
+    /// The block must be a profile-filtered list of `- slug: description`
+    /// lines. The framing helper gates the section on `load_skill` being
+    /// present in the agent's tool surface, so a profile that doesn't
+    /// have `load_skill` emits nothing here even if the block is
+    /// non-empty. Empty / whitespace-only / `None` clears the section.
+    pub fn set_skills_block(&mut self, block: Option<String>) {
+        self.skills_block = block.filter(|s| !s.trim().is_empty());
     }
 
     /// Inject host-supplied volatile content (e.g. memory recall,
@@ -510,6 +532,7 @@ impl DefaultExecutor {
             false,
             None,
             None,
+            None,
         )
     }
 
@@ -535,6 +558,7 @@ impl DefaultExecutor {
         autonomous: bool,
         identity_block: Option<&str>,
         endpoints_block: Option<&str>,
+        skills_block: Option<&str>,
     ) -> String {
         let mut prompt = String::new();
         if autonomous {
@@ -555,6 +579,7 @@ impl DefaultExecutor {
         prompt.push_str(&Self::build_shell_env_section(shell_kind));
         prompt.push_str(&Self::build_toolbox_section(toolbox_info));
         prompt.push_str(&Self::build_endpoints_section(endpoints_block, tools));
+        prompt.push_str(&Self::build_skills_section(skills_block, tools));
         let primary_groups: &[String] = profile
             .map(|p| p.profile.primary_groups.as_slice())
             .unwrap_or(&[]);
@@ -817,6 +842,41 @@ impl DefaultExecutor {
              set to the endpoint name shown below — credentials are already loaded \
              from the vault, do NOT install SDKs or shell-out for these):\n\
              {body}\n\n"
+        )
+    }
+
+    /// Slot 2.6: SKILLS listing — the user's procedural playbooks (folder
+    /// per skill on disk, frontmatter `name` + `description` indexed
+    /// upstream). The listing names what's available; the agent invokes
+    /// `load_skill(slug)` to pull a body when the task fits the shape.
+    ///
+    /// Gated on `load_skill` being in the tool slice — profiles without
+    /// that tool emit nothing here even if the block is non-empty.
+    /// `None` / empty reproduces today's prompt byte-for-byte. See
+    /// `docs/SKILLS.md` for the design rationale.
+    fn build_skills_section(
+        block: Option<&str>,
+        tools: &[athen_core::tool::ToolDefinition],
+    ) -> String {
+        let body = match block {
+            Some(b) if !b.trim().is_empty() => b.trim(),
+            _ => return String::new(),
+        };
+        let has_load_skill = tools.iter().any(|t| t.name == "load_skill");
+        if !has_load_skill {
+            return String::new();
+        }
+        format!(
+            "--- SKILLS (procedural playbooks you can load on demand) ---\n\
+             Each line below is one available skill — slug + a one-sentence \
+             description of when it applies. When the current task matches \
+             one, call `load_skill` with that slug to pull the full body \
+             into context. You do NOT have the bodies yet; the listing is \
+             a menu, not the content. Skills are user-authored procedural \
+             knowledge; treat their guidance like a relevant playbook the \
+             user wrote for this kind of task.\n\n\
+             {body}\n\
+             --- END SKILLS ---\n\n"
         )
     }
 
@@ -1381,6 +1441,7 @@ impl AgentExecutor for DefaultExecutor {
                 self.autonomous_mode,
                 self.identity_block.as_deref(),
                 self.endpoints_block.as_deref(),
+                self.skills_block.as_deref(),
             );
             // Volatile content (current time, host memory recall,
             // attachment summaries, compaction state) used to be appended
@@ -2628,10 +2689,10 @@ mod tests {
         let tools = vec![tool_def("memory_store", "store a memory")];
         let revealed = HashSet::new();
         let interactive = DefaultExecutor::build_system_prompt_with_mode(
-            &tools, &revealed, false, None, None, None, None, false, None, None,
+            &tools, &revealed, false, None, None, None, None, false, None, None, None,
         );
         let autonomous = DefaultExecutor::build_system_prompt_with_mode(
-            &tools, &revealed, false, None, None, None, None, true, None, None,
+            &tools, &revealed, false, None, None, None, None, true, None, None, None,
         );
 
         assert_ne!(
@@ -2757,7 +2818,7 @@ mod tests {
         let tools = vec![tool_def("memory_store", "store a memory")];
         let revealed = HashSet::new();
         let with_none = DefaultExecutor::build_system_prompt_with_mode(
-            &tools, &revealed, false, None, None, None, None, false, None, None,
+            &tools, &revealed, false, None, None, None, None, false, None, None, None,
         );
         let with_empty = DefaultExecutor::build_system_prompt_with_mode(
             &tools,
@@ -2769,6 +2830,7 @@ mod tests {
             None,
             false,
             Some("   \n\n  "),
+            None,
             None,
         );
         // Whitespace-only block must be treated as no-block.
@@ -2795,6 +2857,7 @@ mod tests {
             None,
             false,
             Some(block),
+            None,
             None,
         );
         assert!(prompt.contains("--- IDENTITY (who Athen is, across every agent) ---"));
@@ -2873,6 +2936,7 @@ mod tests {
             false,
             None,
             Some(block),
+            None,
         );
         let endpoints_idx = prompt
             .find("REGISTERED CLOUD APIs")

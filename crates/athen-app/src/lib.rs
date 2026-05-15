@@ -25,6 +25,7 @@ pub(crate) mod owner_migration;
 pub(crate) mod process;
 pub(crate) mod sense_router;
 mod settings;
+pub(crate) mod skills_render;
 pub(crate) mod spawn_pidfile;
 pub(crate) mod state;
 pub(crate) mod telegram_progress;
