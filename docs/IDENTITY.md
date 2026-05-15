@@ -1,6 +1,6 @@
 # Identity (Design Doc)
 
-**Status:** Shipped (storage, UI, prompt injection, agent-write tool, 2026-05-09).
+**Status:** Shipped (storage, UI, prompt injection, agent-write tool, 2026-05-10).
 
 Athen needs a place for the user to write down, by hand, who Athen is and
 what it knows: personality, rules, facts about the user and their team,

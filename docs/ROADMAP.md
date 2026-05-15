@@ -22,13 +22,13 @@ This is why some popular integrations are in *Not planned* below. It's not lazin
 
 Things being built right now.
 
-- **Athen shows its work.** Render code, files, HTML pages, charts, and images inline rather than dumping them as text. Save artifacts to disk with one click. *In flight:* persisted thumbnails on reopened arcs, so an image or document you attached two days ago still renders inline when you scroll back to that conversation instead of degrading to a "_(1 image attached)_" placeholder.
+- **Athen shows its work.** Render code, files, HTML pages, charts, and images inline rather than dumping them as text. Save artifacts to disk with one click. Persisted thumbnails on reopened arcs are shipped — an image or document you attached two days ago renders inline when you scroll back to that conversation instead of degrading to a "_(1 image attached)_" placeholder.
+
+- **Athen wakes itself up at the right time.** Shipped (Phase 5 complete). Schedule recurring or one-shot wake-ups — "remind me to follow up if no reply in 3 days", "every Monday at 9am summarize my week", "check on this in 2 hours". Agents can author their own wake-ups via `create_wakeup`; dynamic risk bands and AutonomyBand escalation are wired.
 
 ## Next
 
 What we're planning to do after Now lands.
-
-- **Athen wakes itself up at the right time.** Schedule recurring or one-shot wake-ups — "remind me to follow up if no reply in 3 days", "every Monday at 9am summarize my week", "check on this in 2 hours". A proactive assistant without time-based triggers is missing half its identity.
 - **Athen survives crashes and reboots.** Pending actions persist so a closed laptop or a power cut never drops work mid-flight. Includes:
   - *Stale-action confirmation:* if Athen was about to send an email six hours ago, it asks "still relevant?" before acting on the resumed approval.
   - *Sense-driven invalidation:* if you reply to that email yourself in the meantime, or the calendar event was cancelled externally, Athen notices and quietly drops the obsolete task.

@@ -49,9 +49,9 @@ Despite that, none of the four cloud providers actually realise the savings. Thi
 
 **How it works.** Two mechanisms. **Implicit** caching is automatic on Gemini 2.5 / 3.x; min prefix 1024 tokens (Flash) / 4096 (Pro); ~75% discount; surfaces via `usageMetadata.cachedContentTokenCount`. **Explicit** caching: `POST /v1beta/cachedContents` (with `model`, `contents`, `systemInstruction`, `tools`, optional `ttl`) returns a `name` like `cachedContents/abc123`; pass `cached_content: "cachedContents/abc123"` on subsequent `generateContent` calls instead of re-sending the system + tools. Storage billed per-token-per-hour. Ref: <https://ai.google.dev/gemini-api/docs/caching>.
 
-**Athen state.** Provider is a stub — both `complete()` and `complete_streaming()` return "not yet implemented". No caching to audit.
+**Athen state.** Both `complete()` and `complete_streaming()` are implemented (`google.rs:422`, `google.rs:462`). Neither parses `usageMetadata.cachedContentTokenCount`, so implicit cache hits are invisible to Athen's cost estimator and the UI shows no cached-token credit.
 
-**Fix.** When the stub is filled in:
+**Fix.** Now that the provider is live:
 - Send Athen's stable system prompt via `systemInstruction` (separate from `contents`), not as a synthetic user turn.
 - Parse `usageMetadata.cachedContentTokenCount` into `TokenUsage.cached_tokens`.
 - Optional later: add a `cached_content_name: Option<String>` field on `LlmRequest` plus a `create_cached_content()` provider method for callers who want to mint an explicit cache and reuse it across many turns (e.g. for an agent profile with a giant identity block).
@@ -86,7 +86,7 @@ Every provider's response handler subtracts `cached_tokens` from `prompt_tokens`
 1. **DeepSeek observability** — smallest diff, biggest user-visible impact (cost UI stops lying). ~30 LoC.
 2. **OpenAI** — `cached_tokens` parsing + `prompt_cache_key = arc_id` request field. ~40 LoC.
 3. **Anthropic** — refactor `system` to content blocks, add `cache_control: ephemeral`, fix the missing `tools` bug, parse cache-hit + cache-write usage. ~150 LoC.
-4. **Google** — bake cache parsing into the provider when the stub lands.
+4. **Google** — bake cache parsing into the now-live provider.
 5. **UI** — surface "X cached / Y new" on the usage badge so users can see the cache working; update arc-cost roll-ups to use the cache-aware estimator output.
 
 ---

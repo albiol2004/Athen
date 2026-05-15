@@ -290,7 +290,7 @@
   - `arc_id: Mutex<String>` -- current arc identifier
   - `arc_store: Option<ArcStore>` -- persistent arc storage backed by SQLite
   - `calendar_store: Option<CalendarStore>` -- calendar event storage backed by SQLite
-  - `pending_message: Mutex<Option<String>>` -- stashes user's message for replay after approval
+  - `pending_input_slot: Arc<Mutex<Vec<String>>>` (type alias `PendingInputSlot`) -- ring-buffer slot shared with the executor for in-flight approval replay; replaces the old single-message `pending_message` field
   - `model_name: Mutex<String>` -- resolved from config, returned by `get_status`
   - `cancel_flag: Arc<AtomicBool>` -- shared cancellation flag for in-progress tasks
   - `memory: Option<Arc<Memory>>` -- persistent memory system built via `build_memory()` helper (SQLite vector index + SQLite graph + keyword embeddings + LLM entity extractor)

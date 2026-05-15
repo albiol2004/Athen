@@ -251,7 +251,8 @@ Google / DeepSeek / Qwen / Llama / Mistral docs).
 | `ClaudeHaiku45` | Claude Haiku 4.5 | `claude-haiku-4-5` | Structured | None | Lenient | — | — |
 | `Gpt5` | GPT-5 chat (5 / 5.4 / 5.5 family) | `gpt-5.5` | Structured | None | Lenient | — | — |
 | `OpenAiO3` | OpenAI o-series (o3, o4-mini) | `o4-mini` | Structured | HiddenServerSide | Lenient | — | — |
-| `Gemini3Pro` | Gemini 3 / 3.1 Pro / Deep Think | `gemini-3.1-pro` | Structured | NativeContentBlock | Lenient | — | — |
+| `Gemini3Pro` | Gemini 3 / 3.1 Pro / Deep Think | `gemini-3.1-pro-preview` | Structured | NativeContentBlock | Lenient | — | — |
+| `Gemini3Flash` | Gemini 3 Flash | `gemini-3-flash-preview` | Structured | NativeContentBlock | Lenient | — | — |
 | `DeepSeekV4Chat` | DeepSeek V4 chat (V4-Flash) | `deepseek-v4-flash` | Structured | None | Lenient | ControlCharsToUnicodeEscape | — |
 | `DeepSeekV4Pro` | DeepSeek V4 Pro | `deepseek-v4-pro` | Structured | None | Lenient | ControlCharsToUnicodeEscape | — |
 | `DeepSeekR1` | DeepSeek-R1 / V4 thinking mode | `deepseek-reasoner` | Structured | SeparateField | Lenient | ControlCharsToUnicodeEscape | echo_reasoning_on_tool_turn |
@@ -328,7 +329,7 @@ field in Settings to opt in.
 |---|---|---|---|
 | Gemini 3.1 Pro | `gemini-3.1-pro-preview` | `Gemini3Pro` | Flagship; 1–2M ctx; adaptive thinking |
 | Gemini 3.1 Deep Think | `gemini-3.1-deep-think` | `Gemini3Pro` | Early access; PhD-level math/science |
-| Gemini 3 Flash | `gemini-3-flash-preview` | `Default` | Fast tier; no thinking surface |
+| Gemini 3 Flash | `gemini-3-flash-preview` | `Gemini3Flash` | Fast tier; NativeContentBlock reasoning (same wire as 3.1 Pro) |
 | Gemini 3.1 Flash-Lite | `gemini-3.1-flash-lite` | `Default` | Ultra-low-latency; high-volume |
 | Gemini 3.1 Flash Live | `gemini-3.1-flash-live-preview` | `Default` | Real-time streaming dialogue |
 | Gemini 2.5 Pro (legacy) | `gemini-2.5-pro` | `Default` | Mature predecessor; reasoning hidden |

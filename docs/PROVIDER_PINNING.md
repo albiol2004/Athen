@@ -23,7 +23,20 @@ provider-specific ways:
 The user's intent when switching active is "from now on, new arcs use the new
 provider." Breaking in-flight arcs is collateral damage, not the goal.
 
-Design doc. Not yet implemented.
+**Status:** Shipped (columns, lifecycle methods, executor entry-pin + arc-idle clear; 2026-05-13).
+
+Live today:
+- `ArcMeta.pinned_provider_id` + `ArcMeta.pinned_slug` columns at `crates/athen-persistence/src/arcs.rs` (~lines 115/123), with `init_schema` migration that `ALTER TABLE`-adds them to legacy DBs (~lines 342-348).
+- Lifecycle methods `set_pinned_provider_if_unset` (~line 690, idempotent on first call) and `clear_pinned_provider` (~line 719).
+- Executor honours the pin at `crates/athen-app/src/state.rs` ~line 3440: reads `arc.pinned_provider_id` first, falls through to global `active_provider_id` only when `None`. Pin is written on first LLM call (~line 3464) and cleared when the arc transitions back to idle (~line 3477).
+- Unit-tested: `test_pinned_provider_lifecycle` and `test_pinned_provider_migration_on_legacy_db` in `arcs.rs`.
+
+Still pending:
+- UI surface (arc-card "pinned: X" badge, manual unpin in arc settings) — backend pin is silent today.
+- `pinned_slug` is captured but only diagnostic; the warn-on-slug-drift path described below isn't wired.
+- User-set durable `ArcSettings.preferred_provider_id` (the intent override, distinct from the protective pin) — not implemented.
+
+The design doc below remains the reference for lifecycle rules and edge-case decisions.
 
 ## Today's behaviour (the bug)
 

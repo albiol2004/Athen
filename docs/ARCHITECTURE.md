@@ -387,6 +387,128 @@ trait PersistentStore: Send + Sync {
 }
 ```
 
+### Vault (`traits/vault.rs`)
+```rust
+trait Vault: Send + Sync {
+    async fn set(&self, scope: &str, key: &str, value: &str) -> Result<()>;
+    async fn get(&self, scope: &str, key: &str) -> Result<Option<String>>;
+    async fn delete(&self, scope: &str, key: &str) -> Result<()>;
+    async fn list(&self, scope: &str) -> Result<Vec<String>>;
+}
+```
+Encrypted at-rest storage for secrets (API keys, passwords, OAuth tokens). Secrets are addressed by `(scope, key)` where scope is a logical namespace such as `endpoint:jina`, `imap:gmail`, or `oauth:google`. Two implementations in `athen-vault`: `KeyringVault` (OS keychain via the `keyring` crate, with a SQLite index for `list`) and `EncryptedFileVault` (chacha20poly1305 with AAD bound to `(scope, key)` to prevent row-swap attacks). Use `athen_vault::open_vault(data_dir, "athen")` — tries keychain first with a sentinel round-trip, falls back to encrypted file on failure.
+
+### ProfileStore (`traits/profile.rs`)
+```rust
+trait ProfileStore: Send + Sync {
+    async fn get_profile(&self, id: &str) -> Result<Option<AgentProfile>>;
+    async fn list_profiles(&self) -> Result<Vec<AgentProfile>>;
+    async fn save_profile(&self, profile: &AgentProfile) -> Result<()>;
+    async fn delete_profile(&self, id: &str) -> Result<()>;
+    async fn get_template(&self, id: &str) -> Result<Option<PersonaTemplate>>;
+    async fn list_templates(&self) -> Result<Vec<PersonaTemplate>>;
+    async fn save_template(&self, template: &PersonaTemplate) -> Result<()>;
+    async fn delete_template(&self, id: &str) -> Result<()>;
+    async fn resolve_templates(&self, ids: &[TemplateId]) -> Result<Vec<PersonaTemplate>>;
+    async fn get_or_default(&self, id: Option<&ProfileId>) -> Result<AgentProfile>;
+}
+```
+Storage for `AgentProfile` and `PersonaTemplate` rows. Implementations seed built-in rows on first use. `delete_profile` / `delete_template` refuse to remove built-ins — they are clonable but not deletable so a "Reset to default" action always has somewhere to land. Implemented in `athen-persistence`.
+
+### IdentityStore (`traits/identity.rs`)
+```rust
+trait IdentityStore: Send + Sync {
+    async fn list_categories(&self) -> Result<Vec<IdentityCategory>>;
+    async fn get_category(&self, name: &str) -> Result<Option<IdentityCategory>>;
+    async fn upsert_category(&self, category: &IdentityCategory) -> Result<()>;
+    async fn delete_category(&self, name: &str) -> Result<()>;
+    async fn list_entries(&self, category: Option<&str>) -> Result<Vec<IdentityEntry>>;
+    async fn get_entry(&self, id: Uuid) -> Result<Option<IdentityEntry>>;
+    async fn upsert_entry(&self, entry: &IdentityEntry) -> Result<()>;
+    async fn delete_entry(&self, id: Uuid) -> Result<()>;
+    async fn entries_for_profile(&self, profile_id: &str) -> Result<Vec<(IdentityCategory, Vec<IdentityEntry>)>>;
+}
+```
+Storage for user-editable identity (personality, rules, knowledge, team, and custom categories). Implementations seed the four canonical categories on first use. Listing is deterministically ordered by `sort_order` so the static prompt-cache prefix stays valid. `entries_for_profile` is the prompt-builder entry point — filters by `applies_to` tag and groups by category, omitting empty categories. Implemented in `athen-persistence`. See `docs/IDENTITY.md`.
+
+### SkillStore (`traits/skill.rs`)
+```rust
+trait SkillStore: Send + Sync {
+    async fn list(&self, profile: Option<&str>) -> Result<Vec<Skill>>;
+    async fn get(&self, slug: &str) -> Result<Option<Skill>>;
+    async fn load_body(&self, slug: &str) -> Result<String>;
+    async fn upsert(&self, slug: &str, frontmatter: &SkillFrontmatter, body: &str) -> Result<()>;
+    async fn delete(&self, slug: &str) -> Result<()>;
+    async fn sync(&self) -> Result<SyncReport>;
+}
+```
+Storage for user-authored procedural playbooks (Claude-Code-style `SKILL.md` folders). Storage is hybrid: bodies live on disk as plain `SKILL.md` files (source of truth, human-editable, git-friendly) and SQLite holds a derived index for cheap listing. Bodies are loaded lazily via `load_body` when the agent calls the `load_skill` tool. `sync` reconciles the SQLite index against the filesystem on boot. User skills shadow bundled skills with the same slug. Implemented in `athen-persistence`. See `docs/SKILLS.md`.
+
+### ArcCompactor (`traits/compaction.rs`)
+```rust
+trait ArcCompactor: Send + Sync {
+    async fn should_compact(&self, arc_id: &str, trigger_tokens: u32) -> Result<bool>;
+    async fn compact(&self, arc_id: &str, target_tokens: u32) -> Result<CompactionOutcome>;
+    async fn load_context_view(&self, arc_id: &str) -> Result<ArcContextView>;
+    // Default method:
+    async fn prepare_context(&self, arc_id: &str, trigger_tokens: u32, target_tokens: u32) -> Result<ArcContextView>;
+}
+```
+The executor's gateway into arc history — direct reads of `arc_entries` from the context-build path are forbidden; they bypass the compaction view. `prepare_context` (default impl) chains `should_compact` → optional `compact` → `load_context_view` in one call; compaction failures are swallowed (best-effort) so a stale summary degrades gracefully to "all entries verbatim" rather than blocking dispatch. `compact(arc_id, 0)` forces compaction regardless of budget. Implemented in `athen-app`. See `docs/ARC_COMPACTION.md`.
+
+### EmailSender (`traits/email_sender.rs`)
+```rust
+trait EmailSender: Send + Sync {
+    async fn send(&self, email: &OutboundEmail) -> Result<SentEmail>;
+    async fn test_connection(&self) -> Result<()>;
+    fn name(&self) -> &'static str;
+}
+```
+Outbound email port for the agent's `email_send` tool. `OutboundEmail` carries `to`/`cc`/`bcc`, subject, plain-text body, optional HTML body (sent as multipart/alternative), and optional `in_reply_to` for threading. `test_connection` is used by the Settings UI "Test SMTP" button without sending a message. Implemented in `athen-sentidos` as `LettreSmtpSender`.
+
+### TelegramSender (`traits/telegram_sender.rs`)
+```rust
+trait TelegramSender: Send + Sync {
+    async fn send(&self, msg: &OutboundTelegramMessage) -> Result<SentTelegramMessage>;
+    async fn test_connection(&self) -> Result<()>;
+    fn default_chat_id(&self) -> Option<i64>;
+    fn name(&self) -> &'static str;
+}
+```
+Outbound Telegram port for the agent's `send_telegram` tool. Supports text and file attachments (`TelegramAttachmentKind::Photo | Document | Auto`). When `chat_id` is omitted on the message the adapter uses its configured owner-chat default. `test_connection` authenticates via `getMe` without sending. Implemented in `athen-sentidos` as `BotApiTelegramSender`.
+
+### ApprovalSink (`traits/approval.rs`)
+```rust
+trait ApprovalSink: Send + Sync {
+    fn channel_kind(&self) -> ReplyChannelKind;
+    async fn ask(&self, question: ApprovalQuestion) -> Result<ApprovalAnswer>;
+    async fn cancel(&self, question_id: Uuid) -> Result<()>;  // default: no-op
+}
+```
+A single channel through which an approval question can be delivered and awaited. Multiple sinks (in-app, Telegram) race in parallel; whichever answers first wins and the router cancels the rest. In-app sink parks a oneshot keyed by `question.id`; Telegram sink sends an inline keyboard and resolves on the corresponding `callback_query`. See `docs/ARCHITECTURE.md` §IPC for the `ApprovalRequest`/`ApprovalResponse` IPC messages that feed this.
+
+### HttpEndpointStore (`traits/http_endpoint.rs`)
+```rust
+trait HttpEndpointStore: Send + Sync {
+    async fn list(&self) -> Result<Vec<RegisteredEndpoint>>;
+    async fn get(&self, id: Uuid) -> Result<Option<RegisteredEndpoint>>;
+    async fn get_by_name(&self, name: &str) -> Result<Option<RegisteredEndpoint>>;
+    async fn upsert(&self, endpoint: &RegisteredEndpoint) -> Result<()>;
+    async fn delete(&self, id: Uuid) -> Result<()>;
+    async fn record_call(&self, id: Uuid) -> Result<()>;
+    async fn set_enabled(&self, id: Uuid, enabled: bool) -> Result<()>;
+}
+```
+Storage for `RegisteredEndpoint` rows backing the `http_request` agent tool. Names are unique (case-insensitive); the UUID is the primary key for rename safety. `get_by_name` is the hot path used by the tool dispatcher. `record_call` bumps the call counter and `last_used` after a successful call (non-fatal on failure). Implemented in `athen-persistence`. See `docs/CLOUD_APIS.md`.
+
+### SystemReminderBuilder (`traits/reminder.rs`)
+```rust
+trait SystemReminderBuilder: Send + Sync {
+    fn build(&self, ctx: &ReminderContext<'_>) -> Option<String>;
+}
+```
+Builds ephemeral reminder text the executor injects into the message stream every few iterations to fight tool-selection drift on long arcs. Returning `None` skips injection for that iteration. The returned string is the body only — the executor wraps it in `<system-reminder>...</system-reminder>` tags. Implementations must be cheap: `build` runs once per loop iteration, so heavy lookups (template resolution, identity excerpts) belong in the constructor. Reminders sit in the dynamic suffix and never invalidate the cached static prefix.
+
 ### IpcTransport (`athen-ipc/src/transport.rs`)
 ```rust
 trait IpcTransport: Send + Sync {

@@ -150,7 +150,9 @@ Phase 1 limits (deliberate cuts):
 The executor (`crates/athen-agent/src/executor.rs`) keeps the system prompt small by separating tools into two tiers:
 
 - **Tier 1 — capability index** (always in prompt): one line per group listing tool names and a one-liner description. Groups are derived from tool name prefixes: `memory`, `calendar`, `shell`, `files`, `contacts`, and any MCP id (`tool_grouping.rs:16-28`).
-- **Tier 2 — revealed schemas** (inline in prompt): full description for each tool that has been called at least once this session ("tolerant dispatch") plus all `memory_*` tools which are always revealed (`tool_grouping.rs:101-105`).
+- **Tier 2 — revealed schemas** (inline in prompt): full description for each tool that has been called at least once this session ("tolerant dispatch") plus `memory_store` and `send_telegram` / `email_send` which are always revealed (`tool_grouping.rs:101-105`).
+
+`memory_recall` is deliberately kept in Tier 2 (revealed on first call, not always-on) even though `memory_store` is Tier 1. The coordinator already injects relevant memories into the leading system message via the `BACKGROUND RECALL` block when the user message is substantive, so the agent rarely needs to call recall directly. Surfacing its full schema in every prompt biased small models to over-recall on short or pronoun-heavy messages and act on stale entries as if they were instructions (`tool_grouping.rs:120-126`).
 
 When `tool_doc_dir` is set (defaults to `~/.athen/tools/`), the system prompt instructs the agent to call `read_file(path="<dir>/<group>.md")` for full schemas of any group it hasn't dispatched yet. `tools_doc.rs` generates and maintains these files: one `.md` per group, stale files removed when an MCP is disabled (`tools_doc.rs:54-88`).
 

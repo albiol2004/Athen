@@ -23,7 +23,7 @@ a single native binary you double-click, with a tray icon and a clean
 window — but underneath, a hexagonal Rust core, a real risk model, MCP
 support, and a tool surface you can extend.
 
-> ⚠️ **Status: alpha (v0.1.7) — early but moving fast.** Core agent loop,
+> ⚠️ **Status: alpha (v0.2.3) — early but moving fast.** Core agent loop,
 > tools, risk system, senses, MCP runtime, and infrastructure are working
 > and well-tested. The surface is small on purpose and the UI is being
 > polished release by release. Pre-built binaries are **unsigned** today —
@@ -94,7 +94,7 @@ Chromium fork, no Node runtime, no React-on-Windows quirks.
 | **Generic HTTP tool + 15 cloud API presets** — Jina, Firecrawl, Brave, SerpAPI, DeepL, ElevenLabs, OpenRouter, Groq, ... | ✅ |
 | **Encrypted credential vault** — OS keychain backend + ChaCha20-Poly1305 file fallback | ✅ |
 | **Voice (STT/TTS)** | ❌ planned |
-| **Headless server mode** — daemon binary for always-on hosts | ❌ planned for v0.2 |
+| **Headless server mode** — daemon binary for always-on hosts | ❌ planned |
 
 ---
 
@@ -198,6 +198,9 @@ through MCP.
 - **Email:** `send_email` (auto-approves when recipient is the owner; risk-gated otherwise)
 - **Cloud APIs:** `http_request` against any endpoint you register — 15 presets out of the box (Jina, Firecrawl, Brave, SerpAPI, Hunter, Apollo, PDL, DeepL, NewsAPI, Open-Meteo, Frankfurter, OpenCage, ElevenLabs, OpenRouter, Groq); vault-backed credentials, per-endpoint rate limiting
 - **Wake-ups:** `create_wakeup` — agent can schedule one-shot or recurring proactive triggers (reminders, follow-ups, digests), each with its own autonomy band and tool allowlist
+- **Telegram:** `send_telegram` — agent-initiated outbound messages to your Telegram chat
+- **Delegation:** `delegate_to_agent` — spawn a sub-agent with a scoped task, budget, and tool allowlist
+- **Skills:** `load_skill` — load a user-authored playbook (SKILL.md folder) on demand; listed in the static prefix at startup
 - **MCP:** any tool from any spawned MCP server, namespaced `<mcp_id>__<tool>`
 
 Full reference in [`docs/TOOLS_AND_SENSES.md`](docs/TOOLS_AND_SENSES.md).
@@ -218,8 +221,8 @@ Athen is built so you don't have to fork it to make it do new things.
   monitor runs in its own process and feeds normalized `SenseEvent`s back
   over IPC. Good for hooking up an RSS feed, a webhook, a webcam, etc.
 - **Headless mode** — `cargo run -p athen-cli --release` gives you a REPL
-  against the same agent core. A proper `athend` daemon for servers is
-  on the v0.2 roadmap.
+  against the same agent core. A proper `athend` daemon for always-on
+  server hosting is planned for a future release.
 
 ---
 
@@ -289,13 +292,12 @@ For a deeper read see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Roadmap
 
-**v0.1.x (post-launch polish):**
+**v0.2.x (current — ongoing polish):**
 - Code signing (macOS notarization, Windows Trusted Signing)
 - Screenshot tool + screen-capture sense
 - Prompt-cache wiring across providers (Anthropic `cache_control`, Gemini implicit cache, DeepSeek cost UI)
-- Per-task model selection driven by complexity (auto-route hard problems to a stronger model, cheap stuff to a smaller one)
 
-**v0.2:**
+**v0.3:**
 - `athend` headless server mode (systemd unit, Docker image)
 - Voice (STT / TTS)
 - More senses (Slack, Discord, RSS, generic webhook)

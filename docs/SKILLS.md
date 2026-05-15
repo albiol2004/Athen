@@ -1,6 +1,15 @@
 # Skills (Design Doc)
 
-**Status:** Design. Not yet implemented.
+**Status:** Shipped (2026-05-15). v0 build order steps 1-7 all landed.
+
+Live today:
+- Core types + `SkillStore` trait at `crates/athen-core/src/skill.rs` and `crates/athen-core/src/traits/skill.rs` (includes `SyncReport`).
+- Filesystem + SQLite index store at `crates/athen-persistence/src/skills.rs` (~761 lines).
+- `load_skill` agent tool at `crates/athen-app/src/app_tools.rs` (~line 1433), idempotent per arc, refuses cleanly when the store isn't wired.
+- Tauri commands at `crates/athen-app/src/commands.rs` (~lines 7620 and 7689).
+- Settings → Skills panel at `frontend/index.html` (~lines 320-327) + `frontend/app.js` (~line 5340+).
+
+The "v0 scope explicitly excludes" section below is still authoritative — `write_skill` (agent-authored skills), vector-recall discovery, sibling-file auto-bundling, bundled-skills shipping, and the marketplace are all deferred. Use the design doc as the reference for what's intentionally out of scope.
 
 Athen needs a place to drop **procedural orientation** that the agent
 can pull in on demand: how to write a good cold email, how to file an

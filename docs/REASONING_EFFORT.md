@@ -8,7 +8,20 @@ Companion to [PER_MODEL_QUIRKS.md](PER_MODEL_QUIRKS.md): that doc covers
 *response* parsing (where thinking output lands), this one covers *request*
 control (how to ask for more or less of it).
 
-Design doc. Not yet implemented.
+**Status:** Shipped (enum + `ChatRequest` wiring + per-provider mapping for OpenAI, Anthropic, Google, DeepSeek; 2026-05-13).
+
+Live today:
+- `ReasoningEffort` enum with all 7 variants at `crates/athen-core/src/llm.rs` (`Default`, `Off`, `Minimal`, `Low`, `Medium`, `High`, `Max`), serde + `FromStr` round-tripping.
+- Carried on `ChatRequest.reasoning_effort` and threaded into every cloud-provider adapter.
+- Per-provider mappers with unit tests: `anthropic.rs::map_reasoning_effort` (family-aware: Opus locked to adaptive, Sonnet/Haiku use `budget_tokens`), `openai.rs::map_reasoning_effort` (model-clamped enum), `google.rs` (`thinkingLevel` for 3.x / `thinkingBudget` for 2.5), `deepseek.rs::map_deepseek_reasoning_effort` (`high`/`max` opt-in).
+
+Still pending:
+- Local providers (`llamacpp.rs`, `ollama.rs`) ignore the field today — Qwen/Gemma `enable_thinking` template-kwarg path not wired.
+- Per-arc `ArcSettings.reasoning_effort` setting and the segmented control in the arc settings panel.
+- `delegate_to_agent` per-call `reasoning_effort` parameter.
+- Per-tier Settings UI column for power-user defaults.
+
+The design doc below remains the reference for the 7 wire shapes and the per-provider mapping table.
 
 ## The wire-format zoo
 

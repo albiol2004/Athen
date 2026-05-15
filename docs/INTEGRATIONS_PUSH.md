@@ -2,6 +2,8 @@
 
 Strategic picking menu for the "become the gods of integrations" pillar. Synthesized 2026-05-12 from four parallel Haiku research streams: MCP ecosystem audit, personal-OAuth landscape, credential-setup UX, and bespoke-vs-`http_request` criteria.
 
+**Status:** Move #2 (IMAP/SMTP autodetect wizard) shipped after 2026-05-12 — see [EMAIL_SETUP.md](EMAIL_SETUP.md) and `email_detect` / `email_test_connection` / `email_translate_error` Tauri commands. Moves #1, #3, #4 still design-only; Move #5's LLM error translator is the only piece of that cross-cutting layer that's landed today.
+
 This is a **picking menu**, not a build plan. Per-feature implementation docs land when each item is picked up. Related: [TOOL_EXPANSION.md](TOOL_EXPANSION.md) (the 10-category CLI/API menu, complementary), [CLOUD_APIS.md](CLOUD_APIS.md) (the `http_request` substrate this builds on).
 
 ## Operating constraints
@@ -13,7 +15,8 @@ This is a **picking menu**, not a build plan. Per-feature implementation docs la
 
 ## The five-move push (ship order)
 
-### 1. Custom MCP servers (BYO) — **highest leverage**
+### 1. Custom MCP servers (BYO) — **highest leverage** (status: design)
+
 
 Single biggest move. Every Claude Desktop / Cursor / Zed user has stdio MCPs configured for Slack, Notion, Linear, GitHub, filesystem, Postgres, etc. Athen reads the same config schema and gets the whole ecosystem for free.
 
@@ -38,7 +41,9 @@ Single biggest move. Every Claude Desktop / Cursor / Zed user has stdio MCPs con
 
 ---
 
-### 2. IMAP/SMTP autodetect wizard
+### 2. IMAP/SMTP autodetect wizard — **SHIPPED (post 2026-05-12)**
+
+Settings → Email panel landed. `email_detect` runs the hardcoded provider table + Thunderbird autoconfig chain, `email_test_connection` validates IMAP+SMTP credentials, `email_translate_error` pipes raw failures through the LLM error translator. Backend lives at `crates/athen-app/src/email_autodetect.rs` + `email_errors.rs`; commands at `crates/athen-app/src/commands.rs` (~line 7307+); frontend wired in the Settings → Email panel. The remaining email work (e.g. `email_search` IMAP IDLE tool, OAuth-tier upgrade) tracks under separate items, not under this move.
 
 Email is the bedrock proactive sense. Today's `email_send` is SMTP-only; inbound + search needs IMAP. **Avoid the Google OAuth verification trap by shipping app-password flow first.**
 
@@ -61,7 +66,8 @@ Email is the bedrock proactive sense. Today's `email_send` is SMTP-only; inbound
 
 ---
 
-### 3. Personal OAuth wraps: GitHub + Microsoft Graph + Notion + Slack
+### 3. Personal OAuth wraps: GitHub + Microsoft Graph + Notion + Slack (status: design)
+
 
 The "no friction" tier. All four offer free developer apps with zero verification, scope grants at consent time, standard refresh-token rotation. **Skip Google Workspace edit for now** (CASA audit $10k/yr, 3–6 weeks).
 
@@ -83,7 +89,8 @@ The "no friction" tier. All four offer free developer apps with zero verificatio
 
 ---
 
-### 4. CalDAV / CardDAV calendar + contacts sync
+### 4. CalDAV / CardDAV calendar + contacts sync (status: design)
+
 
 Apple iCloud has no OAuth — but CalDAV (calendar) and CardDAV (contacts) work with the same app-specific-password flow as iCloud Mail. Fastmail, Nextcloud, Yandex, Posteo, and on-prem Exchange all speak CalDAV/CardDAV too. **One protocol, ten providers.**
 
@@ -98,9 +105,9 @@ Apple iCloud has no OAuth — but CalDAV (calendar) and CardDAV (contacts) work 
 
 ---
 
-### 5. LLM-assisted credential setup panel (cross-cutting)
+### 5. LLM-assisted credential setup panel (cross-cutting, status: partial)
 
-Not a single integration — a UX layer that makes all of the above feel painless.
+Not a single integration — a UX layer that makes all of the above feel painless. **Partial today:** the LLM error translator landed alongside Move #2 (`email_translate_error` command) and is reusable for any future credential form. The rest of the cross-cutting tier (universal Test button state, device-code + QR flow, proactive token refresh, three-tier setup) is still design-only and lights up as Moves #1/#3/#4 land.
 
 **The pattern (Thunderbird-ish but with LLM hindsight):**
 1. **Test button on every credential form.** Spinner → ✓ green / ✗ red.

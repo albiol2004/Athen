@@ -107,24 +107,21 @@ Mirrors the Identity panel layout: list of registered endpoints with provider, l
 |---|---|---|---|---|
 | Jina Reader | `https://r.jina.ai/` | Bearer | Low | 10M tokens/mo |
 | Firecrawl | `https://api.firecrawl.dev/v2/` | Bearer | Low | 1k credits/mo |
-| Crawlbase | `https://api.crawlbase.com/` | QueryParam(token) | Low | 1k req/mo |
 | Brave Search | `https://api.search.brave.com/res/v1/` | Header(X-Subscription-Token) | Low | $5 credits/mo (~1k queries) |
-| SerpAPI | `https://serpapi.com/` | QueryParam(api_key) | Low | 250 searches/mo |
+| SerpAPI | `https://serpapi.com/` | QueryParam(api_key) | Low | 100 searches/mo |
 | Hunter.io | `https://api.hunter.io/v2/` | QueryParam(api_key) | Medium | 50/mo |
-| Snov.io | `https://api.snov.io/v1/` | OAuth Bearer | Medium | 50/mo |
 | Apollo.io | `https://api.apollo.io/api/v1/` | Header(X-Api-Key) | Medium | 100 credits/mo (gated) |
 | People Data Labs | `https://api.peopledatalabs.com/v5/` | Header(X-Api-Key) | Medium | 100 lookups/mo |
 | DeepL | `https://api-free.deepl.com/v2/` | Header(Authorization: DeepL-Auth-Key) | Low | 500k chars/mo |
 | NewsAPI | `https://newsapi.org/v2/` | QueryParam(apiKey) | Low | 100 req/day |
-| Adzuna | `https://api.adzuna.com/v1/api/` | QueryParam(app_id, app_key) | Low | Free dev tier |
 | Open-Meteo | `https://api.open-meteo.com/v1/` | None | Low | 10k req/day |
-| Frankfurter (FX) | `https://api.frankfurter.app/` | None | Low | Unlimited (ECB rates) |
+| Frankfurter (FX) | `https://api.frankfurter.dev/v1/` | None | Low | Unlimited (ECB rates) |
 | OpenCage Geocoding | `https://api.opencagedata.com/geocode/v1/` | QueryParam(key) | Low | 2.5k req/day |
 | ElevenLabs TTS | `https://api.elevenlabs.io/v1/` | Header(xi-api-key) | Medium | 10k chars/mo (non-commercial) |
-| Cal.com | `https://api.cal.com/v1/` | Bearer | High | 25 bookings/mo |
 | OpenRouter (LLM fallback) | `https://openrouter.ai/api/v1/` | Bearer | Medium | Some free models |
 | Groq (LLM + Whisper) | `https://api.groq.com/openai/v1/` | Bearer | Medium | 30 req/min, 7.2k audio-sec/hr |
-| Wikipedia | `https://en.wikipedia.org/w/api.php` | None | Low | Unlimited (polite) |
+
+Deferred / future presets (not yet in `http_presets.rs`): Crawlbase, Snov.io, Adzuna, Cal.com, Wikipedia.
 
 User picks from the list, pastes key (or leaves blank for keyless ones), enables. Never bigger than ~5 minutes of setup per endpoint.
 
