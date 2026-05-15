@@ -6,6 +6,7 @@ pub mod agent_runs;
 pub mod arcs;
 pub mod attachments;
 pub mod calendar;
+pub mod calendar_sources;
 pub mod chat;
 pub mod checkpoint;
 pub mod contacts;
@@ -32,6 +33,7 @@ use crate::agent_runs::SqliteAgentRunStore;
 use crate::arcs::ArcStore;
 use crate::attachments::AttachmentStore;
 use crate::calendar::CalendarStore;
+use crate::calendar_sources::SqliteCalendarSourceStore;
 use crate::chat::ChatStore;
 use crate::contacts::SqliteContactStore;
 use crate::grants::GrantStore;
@@ -88,6 +90,8 @@ impl Database {
         arcs.init_schema().await?;
         let calendar = self.calendar_store();
         calendar.init_schema().await?;
+        let calendar_sources = self.calendar_source_store();
+        calendar_sources.init_schema().await?;
         let contacts = self.contact_store();
         contacts.init_schema().await?;
         let notifications = self.notification_store();
@@ -135,6 +139,11 @@ impl Database {
     /// Create a `CalendarStore` backed by this database's connection.
     pub fn calendar_store(&self) -> CalendarStore {
         CalendarStore::new(self.conn.clone())
+    }
+
+    /// Create a `SqliteCalendarSourceStore` backed by this database's connection.
+    pub fn calendar_source_store(&self) -> SqliteCalendarSourceStore {
+        SqliteCalendarSourceStore::new(self.conn.clone())
     }
 
     /// Create a `SqliteContactStore` backed by this database's connection.

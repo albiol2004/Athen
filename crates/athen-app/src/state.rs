@@ -189,6 +189,9 @@ pub struct AppState {
     /// Shutdown sender for the calendar monitor background task. Set by
     /// [`Self::start_calendar_monitor`]; consumed by [`Self::shutdown_all`].
     pub calendar_shutdown: Option<tokio::sync::broadcast::Sender<()>>,
+    /// Shutdown sender for the remote-calendar sync loops. Set by
+    /// [`Self::start_calendar_sync`]; consumed by [`Self::shutdown_all`].
+    pub calendar_sync_shutdown: Option<tokio::sync::broadcast::Sender<()>>,
     /// Shutdown sender for the attachment TTL purger loop. Set by
     /// [`Self::start_attachment_purger`]; consumed by [`Self::shutdown_all`].
     pub attachment_purger_shutdown: Option<tokio::sync::broadcast::Sender<()>>,
@@ -573,6 +576,7 @@ impl AppState {
             email_shutdown: None,
             telegram_shutdown: None,
             calendar_shutdown: None,
+            calendar_sync_shutdown: None,
             attachment_purger_shutdown: None,
             notifier: None,
             approval_router: None,
@@ -688,6 +692,10 @@ impl AppState {
         pulse!(self.email_shutdown.as_ref().cloned(), "email monitor");
         pulse!(self.telegram_shutdown.as_ref().cloned(), "telegram monitor");
         pulse!(self.calendar_shutdown.as_ref().cloned(), "calendar monitor");
+        pulse!(
+            self.calendar_sync_shutdown.as_ref().cloned(),
+            "calendar sync"
+        );
         pulse!(
             self.attachment_purger_shutdown.as_ref().cloned(),
             "attachment purger"
@@ -1493,6 +1501,63 @@ impl AppState {
             }
             scheduler.run(period, rx).await;
             tracing::info!("Wake-up scheduler loop exited");
+        });
+    }
+
+    /// Spawn one background sync task per configured remote calendar source.
+    ///
+    /// Loads `calendar_sources` from SQLite, builds a `CalendarSource`
+    /// adapter for each enabled row (pulling its password from the vault),
+    /// then kicks off a per-source poll loop that reconciles `RemoteEvent`s
+    /// into the local `CalendarStore`. The local `CalendarMonitor` polls
+    /// that table independently for reminders, so the two pipelines stay
+    /// decoupled.
+    pub fn start_calendar_sync(&mut self) {
+        use std::sync::Arc as StdArc;
+
+        let Some(db) = self._database.as_ref() else {
+            tracing::debug!("Calendar sync skipped: no database");
+            return;
+        };
+        let Some(calendar_store) = self.calendar_store.clone() else {
+            tracing::debug!("Calendar sync skipped: no calendar_store");
+            return;
+        };
+        let Some(vault) = self.vault.clone() else {
+            tracing::debug!("Calendar sync skipped: no vault");
+            return;
+        };
+        let cfg_store: StdArc<
+            dyn athen_core::traits::calendar_source_config::CalendarSourceConfigStore,
+        > = StdArc::new(db.calendar_source_store());
+
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+        self.calendar_sync_shutdown = Some(shutdown_tx.clone());
+
+        let cfg_store_for_load = cfg_store.clone();
+        tauri::async_runtime::spawn(async move {
+            let sources = match cfg_store_for_load.list().await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("Calendar sync: failed to list sources: {e}");
+                    return;
+                }
+            };
+            if sources.is_empty() {
+                tracing::info!("Calendar sync: no remote sources configured");
+                return;
+            }
+            tracing::info!(
+                count = sources.len(),
+                "Calendar sync: spawning per-source loops"
+            );
+            crate::calendar_sources::spawn_sync_loops(
+                sources,
+                vault,
+                calendar_store,
+                cfg_store,
+                shutdown_tx,
+            );
         });
     }
 

@@ -7,6 +7,7 @@ pub(crate) mod agent_registry;
 pub(crate) mod app_tools;
 pub(crate) mod approval;
 pub(crate) mod attachment_purger;
+pub(crate) mod calendar_sources;
 mod commands;
 pub(crate) mod compaction;
 mod contacts;
@@ -285,6 +286,7 @@ pub fn run() {
             // Start background monitor tasks before managing state.
             state.start_email_monitor(app.handle().clone());
             state.start_calendar_monitor(app.handle().clone());
+            state.start_calendar_sync();
             state.start_telegram_monitor(app.handle().clone());
 
             // Sweep attachment bytes past the policy TTL. Cheap, runs
