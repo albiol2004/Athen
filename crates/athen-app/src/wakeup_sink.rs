@@ -7,8 +7,11 @@
 //! dispatch loop. The agent then picks the task up like any other
 //! autonomous work.
 //!
-//! Intentionally stops short of `AutonomyBand` + tool/contact
-//! allowlists — those land in Phase 3c on top of this.
+//! The wake-up's [`AutonomyBand`] is passed through
+//! `Coordinator::process_event_authorized` so that pre-approved
+//! triggers aren't hard-blocked by the coordinator's blanket gate;
+//! per-action risk gating and tool/contact allowlists still apply at
+//! execution time.
 
 use std::sync::Arc;
 
@@ -122,7 +125,11 @@ impl WakeupFireSink for CoordinatorWakeupSink {
             raw_id: None,
         };
 
-        let decisions = match self.coordinator.process_event(event).await {
+        let decisions = match self
+            .coordinator
+            .process_event_authorized(event, wakeup.autonomy)
+            .await
+        {
             Ok(d) => d,
             Err(e) => {
                 warn!(
@@ -170,7 +177,8 @@ impl WakeupFireSink for CoordinatorWakeupSink {
         // SilentApprove / NotifyAndProceed actually enqueue (and so
         // run); HumanConfirm goes to awaiting_approval and HardBlock
         // is dropped on the floor — both are surfaced via the marker
-        // above. AutonomyBand-aware behavior lands in Phase 3c.
+        // above. The coordinator already applied the wake-up's
+        // AutonomyBand to widen the decision before returning here.
         let mut any_dispatched = false;
         for (task_id, decision) in &decisions {
             match decision {

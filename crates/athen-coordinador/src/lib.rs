@@ -18,7 +18,34 @@ use athen_core::risk::{DataSensitivity, RiskContext, RiskDecision};
 use athen_core::task::{AgentId, Task, TaskId, TaskStatus};
 use athen_core::traits::coordinator::{EventRouter, RiskEvaluator, TaskQueue};
 use athen_core::traits::persistence::{PersistentStore, TaskFilter};
+use athen_core::wakeup::AutonomyBand;
 use tokio::sync::Mutex;
+
+/// Coerce a per-task risk decision according to a wake-up's pre-approval band.
+///
+/// Why: wake-ups carry user (or agent-on-behalf-of-user) intent that was
+/// authorized at creation time. The coordinator's blanket risk gate is built
+/// for *external* inputs (mail, telegram strangers) — applying it unchanged to
+/// pre-approved triggers means a noisy regex hit hard-blocks a wake-up whose
+/// every tool call would still pass the per-action gate. The band names what
+/// the user pre-approved; per-action gating still fires at execution time.
+fn coerce_for_autonomy(decision: RiskDecision, autonomy: AutonomyBand) -> RiskDecision {
+    use RiskDecision::*;
+    match (autonomy, decision) {
+        // Auto: user pre-approved this wake-up's intent in full. Let the
+        // per-action gate (and tool/contact allowlists) be the filter.
+        (AutonomyBand::Auto, HardBlock | HumanConfirm) => NotifyAndProceed,
+        // SafeOnly: low scores execute; high scores route to the user for
+        // an explicit yes/no instead of being silently cancelled.
+        (AutonomyBand::SafeOnly, HardBlock) => HumanConfirm,
+        // NotifyOnly: outbound tools are stripped at the executor surface,
+        // so a coordinator block buys nothing — let the executor run and
+        // just notify what it observed.
+        (AutonomyBand::NotifyOnly, HardBlock | HumanConfirm) => NotifyAndProceed,
+        // Everything else passes through.
+        (_, d) => d,
+    }
+}
 
 /// Infer the `IdentifierKind` from a sender identifier string.
 fn infer_identifier_kind(identifier: &str) -> IdentifierKind {
@@ -120,6 +147,26 @@ impl Coordinator {
     /// 5. Enqueue tasks that can proceed
     /// 6. Return created task IDs with their risk decisions
     pub async fn process_event(&self, event: SenseEvent) -> Result<Vec<(TaskId, RiskDecision)>> {
+        self.process_event_inner(event, None).await
+    }
+
+    /// Like [`Self::process_event`], but treats the event as a wake-up fire
+    /// whose pre-approved [`AutonomyBand`] coerces the decision after scoring.
+    /// The full risk score is still computed and recorded on the task for
+    /// transparency; only the action taken is widened.
+    pub async fn process_event_authorized(
+        &self,
+        event: SenseEvent,
+        autonomy: AutonomyBand,
+    ) -> Result<Vec<(TaskId, RiskDecision)>> {
+        self.process_event_inner(event, Some(autonomy)).await
+    }
+
+    async fn process_event_inner(
+        &self,
+        event: SenseEvent,
+        autonomy_override: Option<AutonomyBand>,
+    ) -> Result<Vec<(TaskId, RiskDecision)>> {
         // Resolve trust level from the sender, if present and not a UserInput event.
         let (trust_level, contact_id) = match (&event.sender, &event.source) {
             (Some(sender), source) if *source != EventSource::UserInput => {
@@ -142,7 +189,7 @@ impl Coordinator {
                 accumulated_risk: 0,
             };
 
-            let decision = self
+            let raw_decision = self
                 .risk_evaluator
                 .evaluate_and_decide(task, &context)
                 .await?;
@@ -150,6 +197,11 @@ impl Coordinator {
             // Also store the full risk score on the task
             let score = self.risk_evaluator.evaluate(task, &context).await?;
             task.risk_score = Some(score);
+
+            let decision = match autonomy_override {
+                Some(band) => coerce_for_autonomy(raw_decision, band),
+                None => raw_decision,
+            };
 
             match decision {
                 RiskDecision::SilentApprove | RiskDecision::NotifyAndProceed => {
@@ -461,6 +513,85 @@ mod tests {
 
     fn make_trust_manager() -> TrustManager {
         TrustManager::new(Box::new(InMemoryContactStore::new()))
+    }
+
+    #[test]
+    fn coerce_auto_downgrades_block_and_confirm() {
+        use RiskDecision::*;
+        assert_eq!(
+            coerce_for_autonomy(HardBlock, AutonomyBand::Auto),
+            NotifyAndProceed
+        );
+        assert_eq!(
+            coerce_for_autonomy(HumanConfirm, AutonomyBand::Auto),
+            NotifyAndProceed
+        );
+        assert_eq!(
+            coerce_for_autonomy(SilentApprove, AutonomyBand::Auto),
+            SilentApprove
+        );
+    }
+
+    #[test]
+    fn coerce_safe_only_routes_block_to_human() {
+        use RiskDecision::*;
+        assert_eq!(
+            coerce_for_autonomy(HardBlock, AutonomyBand::SafeOnly),
+            HumanConfirm
+        );
+        assert_eq!(
+            coerce_for_autonomy(HumanConfirm, AutonomyBand::SafeOnly),
+            HumanConfirm
+        );
+        assert_eq!(
+            coerce_for_autonomy(NotifyAndProceed, AutonomyBand::SafeOnly),
+            NotifyAndProceed
+        );
+    }
+
+    #[test]
+    fn coerce_notify_only_widens_both() {
+        use RiskDecision::*;
+        assert_eq!(
+            coerce_for_autonomy(HardBlock, AutonomyBand::NotifyOnly),
+            NotifyAndProceed
+        );
+        assert_eq!(
+            coerce_for_autonomy(HumanConfirm, AutonomyBand::NotifyOnly),
+            NotifyAndProceed
+        );
+    }
+
+    #[tokio::test]
+    async fn process_event_authorized_auto_enqueues_blocked_task() {
+        let coordinator = Coordinator::new(Box::new(MockRiskEvaluator::new(200.0)));
+        let event = make_event(EventSource::System);
+
+        let results = coordinator
+            .process_event_authorized(event, AutonomyBand::Auto)
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        // Score 200 would normally HardBlock; Auto coerces to NotifyAndProceed.
+        assert_eq!(results[0].1, RiskDecision::NotifyAndProceed);
+        assert_eq!(coordinator.queue.pending_count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn process_event_authorized_safe_only_routes_to_approval() {
+        let coordinator = Coordinator::new(Box::new(MockRiskEvaluator::new(200.0)));
+        let event = make_event(EventSource::System);
+
+        let results = coordinator
+            .process_event_authorized(event, AutonomyBand::SafeOnly)
+            .await
+            .unwrap();
+
+        assert_eq!(results[0].1, RiskDecision::HumanConfirm);
+        // Should not enqueue; should be in awaiting_approval.
+        assert_eq!(coordinator.queue.pending_count().await.unwrap(), 0);
+        assert_eq!(coordinator.awaiting_approval.lock().await.len(), 1);
     }
 
     #[tokio::test]
