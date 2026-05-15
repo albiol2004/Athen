@@ -2213,6 +2213,22 @@ if (inputEl) {
                 if (file) addComposerFileFromFile(file);
             }
         }
+        // WebKitGTK paint workaround: pasting many lines at once can leave
+        // the textarea's text layer stale — layout grows (`autoResize`
+        // still fires on input), but glyphs never paint until the next
+        // state change (re-paste, focus toggle…) wakes the compositor.
+        // User reports this as "invisible composer text, app needs
+        // restart"; the toggleable nature points at a stuck paint state.
+        // Two rAFs after the browser commits the paste, force a
+        // synchronous layout + a transform-driven recomposite. Cheap and
+        // scoped to the paste path so typing keeps its hot path.
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+            autoResize();
+            const prev = inputEl.style.transform;
+            inputEl.style.transform = 'translateZ(0)';
+            void inputEl.offsetHeight;
+            inputEl.style.transform = prev;
+        }));
     });
 }
 
