@@ -2963,15 +2963,45 @@ function renderWebFetch(args, result) {
         }
         wrap.appendChild(head);
     }
-    // The page reader returns cleaned readability-mode markdown.
-    // Pipe it through the same renderer the assistant message bubble
-    // uses so links are clickable, headings get type, lists indent,
-    // and embedded images render — exactly what the agent saw.
+    // The page reader returns cleaned readability-mode markdown — but
+    // a misbehaving site can slip raw HTML through (e.g. a WordPress
+    // page emitted four `<link rel="stylesheet">` tags that survived
+    // html2md, got injected via innerHTML below, and overrode every
+    // app style with the foreign theme). Defensive scrub: strip the
+    // tags that can pull external resources or restyle the document.
+    // The backend reader has its own strip pass; this is a belt-and-
+    // braces line so already-poisoned arc entries stay safe.
     const body = document.createElement('div');
     body.className = 'tool-body-prose';
-    body.innerHTML = renderMarkdown(content);
+    body.innerHTML = renderMarkdown(sanitizeWebContent(content));
     wrap.appendChild(body);
     return wrap;
+}
+
+// Remove every HTML tag that can pull external CSS, scripts, or
+// document-replacing content from page-reader output before it reaches
+// `innerHTML`. The match is intentionally coarse and case-insensitive;
+// false positives strip the textual representation of a tag (acceptable
+// in extracted-prose context), false negatives are caught at the next
+// layer (the renderer itself only honours markdown syntax for inline
+// markup, so raw `<div>`s flatten harmlessly).
+function sanitizeWebContent(text) {
+    if (typeof text !== 'string' || text.length === 0) return text;
+    // Paired tags: drop body too. Anchored to `</tag>` (case-insensitive).
+    const paired = ['script', 'style', 'iframe', 'object', 'embed', 'svg',
+                    'noscript', 'template', 'head'];
+    let out = text;
+    for (const tag of paired) {
+        const re = new RegExp(`<${tag}\\b[\\s\\S]*?</${tag}\\s*>`, 'gi');
+        out = out.replace(re, '');
+    }
+    // Void / head-only tags: drop the open tag alone.
+    const voidTags = ['link', 'meta', 'base'];
+    for (const tag of voidTags) {
+        const re = new RegExp(`<${tag}\\b[^>]*>`, 'gi');
+        out = out.replace(re, '');
+    }
+    return out;
 }
 
 // ─── Shared layout helpers for the labeled-fields renderer style ───

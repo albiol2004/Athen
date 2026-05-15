@@ -115,12 +115,21 @@ impl PageReader for LocalReader {
     }
 }
 
-/// Remove `<script>...</script>` and `<style>...</style>` blocks before
-/// markdown conversion. Case-insensitive, tolerant of attributes on the
-/// open tag. Imperfect on pathological/malformed HTML — that's fine, we
-/// only need to filter out the common noise sources.
+/// Remove every HTML tag that has no business in extracted prose: paired
+/// noise blocks (`<script>`, `<style>`, etc.) drop with their content, void
+/// head-only tags (`<link>`, `<meta>`, `<base>`) drop the open tag alone.
+/// html2md happily passes unknown tags through verbatim — that's how a
+/// `<link rel="stylesheet">` from a WordPress page survived all the way to
+/// `body.innerHTML` in the frontend and pulled a foreign stylesheet over
+/// the app's CSS. The strip runs before html2md so the markdown stays
+/// well-formed.
+///
+/// Case-insensitive, tolerant of attributes on the open tag. Imperfect on
+/// pathological / malformed HTML — that's fine, the front-end has its own
+/// defensive scrub.
 fn strip_noise(html: &str) -> String {
-    fn strip_tag(input: &str, tag: &str) -> String {
+    /// Paired tags: `<tag…>…</tag>` — strip everything inside too.
+    fn strip_paired(input: &str, tag: &str) -> String {
         let lower = input.to_ascii_lowercase();
         let open = format!("<{tag}");
         let close = format!("</{tag}>");
@@ -129,12 +138,10 @@ fn strip_noise(html: &str) -> String {
         while let Some(start) = lower[cursor..].find(&open) {
             let abs_start = cursor + start;
             out.push_str(&input[cursor..abs_start]);
-            // Advance past the open tag's `>`.
             let after_open = match input[abs_start..].find('>') {
                 Some(p) => abs_start + p + 1,
                 None => break,
             };
-            // Find the matching close tag.
             let after_close = match lower[after_open..].find(&close) {
                 Some(p) => after_open + p + close.len(),
                 None => break,
@@ -144,7 +151,45 @@ fn strip_noise(html: &str) -> String {
         out.push_str(&input[cursor..]);
         out
     }
-    strip_tag(&strip_tag(html, "script"), "style")
+
+    /// Void tags: `<tag…>` — strip the open tag only; no body to discard.
+    fn strip_void(input: &str, tag: &str) -> String {
+        let lower = input.to_ascii_lowercase();
+        let open = format!("<{tag}");
+        let mut out = String::with_capacity(input.len());
+        let mut cursor = 0;
+        while let Some(start) = lower[cursor..].find(&open) {
+            let abs_start = cursor + start;
+            // Match only `<tag` followed by space/`>`/`/` — avoid eating
+            // `<linker>` or other tags that share a prefix.
+            let next_byte = input.as_bytes().get(abs_start + 1 + tag.len()).copied();
+            let is_real_tag = matches!(next_byte, Some(b' ' | b'\t' | b'\n' | b'\r' | b'>' | b'/'));
+            if !is_real_tag {
+                out.push_str(&input[cursor..=abs_start]);
+                cursor = abs_start + 1;
+                continue;
+            }
+            out.push_str(&input[cursor..abs_start]);
+            cursor = match input[abs_start..].find('>') {
+                Some(p) => abs_start + p + 1,
+                None => break,
+            };
+        }
+        out.push_str(&input[cursor..]);
+        out
+    }
+
+    let cleaned = strip_paired(html, "script");
+    let cleaned = strip_paired(&cleaned, "style");
+    let cleaned = strip_paired(&cleaned, "iframe");
+    let cleaned = strip_paired(&cleaned, "object");
+    let cleaned = strip_paired(&cleaned, "embed");
+    let cleaned = strip_paired(&cleaned, "svg");
+    let cleaned = strip_paired(&cleaned, "noscript");
+    let cleaned = strip_paired(&cleaned, "template");
+    let cleaned = strip_void(&cleaned, "link");
+    let cleaned = strip_void(&cleaned, "meta");
+    strip_void(&cleaned, "base")
 }
 
 /// Pull `<title>` out of an HTML doc with a tiny regex-free scan. Cheap and
@@ -215,6 +260,48 @@ mod tests {
         let s = strip_noise(html);
         assert!(!s.contains("p{}"));
         assert!(s.contains("<p>x</p>"));
+    }
+
+    /// Regression: WordPress site (careerseeker.ai/outlier-ai-review) returned
+    /// `<link rel="stylesheet">` tags that survived html2md and reached the
+    /// frontend, where `innerHTML` injected them and the theme's CSS
+    /// overwrote Athen's. Void head-only tags must drop before conversion.
+    #[test]
+    fn strip_noise_removes_stylesheet_link_and_void_head_tags() {
+        let html = "<link rel=\"stylesheet\" href=\"https://evil.com/x.css\">\
+                    <meta name=\"foo\" content=\"bar\">\
+                    <base href=\"https://evil.com/\">\
+                    <p>real content</p>";
+        let s = strip_noise(html);
+        assert!(!s.contains("<link"), "<link> survived: {s}");
+        assert!(!s.contains("<meta"), "<meta> survived: {s}");
+        assert!(!s.contains("<base"), "<base> survived: {s}");
+        assert!(s.contains("<p>real content</p>"));
+    }
+
+    /// Void-tag strip must not eat tags that share a prefix
+    /// (e.g. don't kill `<linker>` when stripping `<link>`).
+    #[test]
+    fn strip_noise_void_strip_is_prefix_safe() {
+        let html = "<linker>keep me</linker><link rel=\"x\">";
+        let s = strip_noise(html);
+        assert!(s.contains("<linker>keep me</linker>"));
+        assert!(!s.contains("<link "));
+        assert!(!s.contains("<link>"));
+    }
+
+    /// Iframes and inline SVG carry layout / external-resource baggage —
+    /// strip them with their content.
+    #[test]
+    fn strip_noise_removes_iframes_and_svg_with_body() {
+        let html = "<iframe src=\"https://evil.com/widget\">fallback</iframe>\
+                    <svg viewBox=\"0 0 10 10\"><circle r=\"5\"/></svg>\
+                    <p>keep</p>";
+        let s = strip_noise(html);
+        assert!(!s.contains("evil.com"));
+        assert!(!s.contains("<svg"));
+        assert!(!s.contains("<circle"));
+        assert!(s.contains("<p>keep</p>"));
     }
 
     #[test]
