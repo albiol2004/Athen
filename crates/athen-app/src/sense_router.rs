@@ -20,6 +20,7 @@ use athen_core::llm::{
 };
 use athen_core::notification::{Notification, NotificationOrigin, NotificationUrgency};
 use athen_core::traits::llm::LlmRouter;
+use athen_core::wakeup::AutonomyBand;
 use athen_llm::router::DefaultLlmRouter;
 use athen_persistence::arcs::{ArcEntry, ArcMeta, ArcSource, ArcStatus, ArcStore, EntryType};
 use athen_persistence::attachments::AttachmentStore;
@@ -431,7 +432,10 @@ pub async fn process_sense_event(
 
     if let Some(coord) = coordinator {
         if will_dispatch {
-            match coord.process_event(event.clone()).await {
+            match coord
+                .process_event_authorized(event.clone(), AutonomyBand::SafeOnly)
+                .await
+            {
                 Ok(decisions) => {
                     for (task_id, decision) in &decisions {
                         info!(

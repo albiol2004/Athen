@@ -25,6 +25,7 @@ use athen_core::task::{DomainType, Task, TaskId, TaskPriority, TaskStatus, TaskS
 use athen_core::traits::agent::{AgentExecutor, StepAuditor};
 use athen_core::traits::llm::LlmRouter;
 use athen_core::traits::memory::MemoryStore;
+use athen_core::wakeup::AutonomyBand;
 use athen_persistence::arcs;
 use athen_persistence::calendar::CalendarEvent;
 
@@ -1898,11 +1899,20 @@ pub async fn send_message(
     );
 
     // Route the event through the coordinator (risk + queue).
-    let task_results = state.coordinator.process_event(event).await.map_err(|e| {
-        let raw = e.to_string();
-        tracing::error!("Coordinator process_event failed: {raw}");
-        format_user_error(&raw)
-    })?;
+    // User-typed messages go through SafeOnly autonomy: the risk system
+    // can still flag a task for approval, but it can't unilaterally cancel
+    // it — HardBlock demotes to HumanConfirm so the user always gets the
+    // final say on their own input. Third-party senses (Telegram, email)
+    // call plain `process_event` in sense_router.rs and keep HardBlock.
+    let task_results = state
+        .coordinator
+        .process_event_authorized(event, AutonomyBand::SafeOnly)
+        .await
+        .map_err(|e| {
+            let raw = e.to_string();
+            tracing::error!("Coordinator process_event failed: {raw}");
+            format_user_error(&raw)
+        })?;
 
     if task_results.is_empty() {
         return Ok(ChatResponse {
