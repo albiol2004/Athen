@@ -18,6 +18,7 @@ members = [
     "crates/athen-mcp",
     "crates/athen-scheduler",
     "crates/athen-vault",
+    "crates/athen-caldav",
     "crates/athen-cli",
 ]
 
@@ -39,6 +40,7 @@ athen-mcp = { path = "crates/athen-mcp" }
 athen-web = { path = "crates/athen-web" }
 athen-scheduler = { path = "crates/athen-scheduler" }
 athen-vault = { path = "crates/athen-vault" }
+athen-caldav = { path = "crates/athen-caldav" }
 
 # External
 tokio = { version = "1", features = ["full"] }

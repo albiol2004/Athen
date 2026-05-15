@@ -87,6 +87,20 @@ pub struct CalendarEvent {
     pub arc_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// `source_id` of the remote calendar source that owns this row, or
+    /// `None` for local-only events created via the in-app calendar UI.
+    #[serde(default)]
+    pub source_id: Option<String>,
+    /// Remote provider's primary key for this event.
+    #[serde(default)]
+    pub remote_id: Option<String>,
+    /// Server-supplied ETag for optimistic concurrency on the next update/delete.
+    #[serde(default)]
+    pub remote_etag: Option<String>,
+    /// iCalendar `UID` for cross-source dedup (same event visible via Gmail
+    /// invite *and* iCloud sync should collapse to one local row).
+    #[serde(default)]
+    pub ical_uid: Option<String>,
 }
 
 /// Tracks which reminders have already been fired.
@@ -113,8 +127,16 @@ CREATE TABLE IF NOT EXISTS calendar_events (
     created_by TEXT NOT NULL DEFAULT 'user',
     arc_id TEXT,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    source_id TEXT,
+    remote_id TEXT,
+    remote_etag TEXT,
+    ical_uid TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_calendar_events_source
+    ON calendar_events(source_id, remote_id);
+CREATE INDEX IF NOT EXISTS idx_calendar_events_ical_uid
+    ON calendar_events(ical_uid);
 CREATE TABLE IF NOT EXISTS fired_reminders (
     event_id TEXT NOT NULL,
     reminder_minutes INTEGER NOT NULL,
@@ -123,6 +145,17 @@ CREATE TABLE IF NOT EXISTS fired_reminders (
     FOREIGN KEY (event_id) REFERENCES calendar_events(id)
 );
 ";
+
+/// Additive migrations applied to existing databases that pre-date the
+/// remote-source columns. Each statement is `ALTER TABLE ... ADD COLUMN ...`;
+/// rusqlite errors out if the column already exists, so each runs in its
+/// own statement and we tolerate "duplicate column" failures.
+const CALENDAR_REMOTE_COLUMNS: &[&str] = &[
+    "ALTER TABLE calendar_events ADD COLUMN source_id TEXT",
+    "ALTER TABLE calendar_events ADD COLUMN remote_id TEXT",
+    "ALTER TABLE calendar_events ADD COLUMN remote_etag TEXT",
+    "ALTER TABLE calendar_events ADD COLUMN ical_uid TEXT",
+];
 
 /// SQLite-backed calendar event storage.
 #[derive(Clone)]
@@ -137,12 +170,25 @@ impl CalendarStore {
     }
 
     /// Create the calendar_events and fired_reminders tables if they do not exist.
+    /// Also applies additive `ALTER TABLE ADD COLUMN` migrations for the
+    /// remote-source columns so databases created before the multi-source
+    /// adapter landed pick them up without losing data.
     pub async fn init_schema(&self) -> Result<()> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             conn.execute_batch(CALENDAR_SCHEMA_SQL)
                 .map_err(|e| AthenError::Other(format!("Failed to init calendar schema: {e}")))?;
+            for stmt in CALENDAR_REMOTE_COLUMNS {
+                if let Err(e) = conn.execute(stmt, []) {
+                    let msg = e.to_string();
+                    if !msg.contains("duplicate column name") {
+                        return Err(AthenError::Other(format!(
+                            "Calendar migration `{stmt}` failed: {e}"
+                        )));
+                    }
+                }
+            }
             Ok(())
         })
         .await
@@ -168,8 +214,9 @@ impl CalendarStore {
                 "INSERT INTO calendar_events \
                  (id, title, description, start_time, end_time, all_day, location, \
                   recurrence, reminder_minutes, color, category, created_by, arc_id, \
-                  created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                  created_at, updated_at, source_id, remote_id, remote_etag, ical_uid) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
+                         ?16, ?17, ?18, ?19)",
                 params![
                     event.id,
                     event.title,
@@ -186,6 +233,10 @@ impl CalendarStore {
                     event.arc_id,
                     event.created_at,
                     event.updated_at,
+                    event.source_id,
+                    event.remote_id,
+                    event.remote_etag,
+                    event.ical_uid,
                 ],
             )
             .map_err(|e| AthenError::Other(format!("Create event: {e}")))?;
@@ -217,8 +268,9 @@ impl CalendarStore {
                      title = ?1, description = ?2, start_time = ?3, end_time = ?4, \
                      all_day = ?5, location = ?6, recurrence = ?7, reminder_minutes = ?8, \
                      color = ?9, category = ?10, created_by = ?11, arc_id = ?12, \
-                     updated_at = ?13 \
-                     WHERE id = ?14",
+                     updated_at = ?13, source_id = ?14, remote_id = ?15, \
+                     remote_etag = ?16, ical_uid = ?17 \
+                     WHERE id = ?18",
                     params![
                         event.title,
                         event.description,
@@ -233,6 +285,10 @@ impl CalendarStore {
                         event.created_by.as_str(),
                         event.arc_id,
                         now,
+                        event.source_id,
+                        event.remote_id,
+                        event.remote_etag,
+                        event.ical_uid,
                         event.id,
                     ],
                 )
@@ -275,7 +331,8 @@ impl CalendarStore {
                 .prepare(
                     "SELECT id, title, description, start_time, end_time, all_day, \
                      location, recurrence, reminder_minutes, color, category, \
-                     created_by, arc_id, created_at, updated_at \
+                     created_by, arc_id, created_at, updated_at, \
+                     source_id, remote_id, remote_etag, ical_uid \
                      FROM calendar_events WHERE id = ?1",
                 )
                 .map_err(|e| AthenError::Other(format!("Prepare get event: {e}")))?;
@@ -307,7 +364,8 @@ impl CalendarStore {
                 .prepare(
                     "SELECT id, title, description, start_time, end_time, all_day, \
                      location, recurrence, reminder_minutes, color, category, \
-                     created_by, arc_id, created_at, updated_at \
+                     created_by, arc_id, created_at, updated_at, \
+                     source_id, remote_id, remote_etag, ical_uid \
                      FROM calendar_events \
                      WHERE datetime(start_time) < datetime(?2) AND datetime(end_time) > datetime(?1) \
                      ORDER BY start_time ASC",
@@ -339,7 +397,8 @@ impl CalendarStore {
                 .prepare(
                     "SELECT id, title, description, start_time, end_time, all_day, \
                      location, recurrence, reminder_minutes, color, category, \
-                     created_by, arc_id, created_at, updated_at \
+                     created_by, arc_id, created_at, updated_at, \
+                     source_id, remote_id, remote_etag, ical_uid \
                      FROM calendar_events ORDER BY start_time ASC",
                 )
                 .map_err(|e| AthenError::Other(format!("Prepare list all events: {e}")))?;
@@ -370,7 +429,8 @@ impl CalendarStore {
                 .prepare(
                     "SELECT id, title, description, start_time, end_time, all_day, \
                      location, recurrence, reminder_minutes, color, category, \
-                     created_by, arc_id, created_at, updated_at \
+                     created_by, arc_id, created_at, updated_at, \
+                     source_id, remote_id, remote_etag, ical_uid \
                      FROM calendar_events \
                      WHERE datetime(start_time) >= datetime(?1) AND datetime(start_time) <= datetime(?2) \
                      ORDER BY start_time ASC",
@@ -403,7 +463,8 @@ impl CalendarStore {
                 .prepare(
                     "SELECT id, title, description, start_time, end_time, all_day, \
                      location, recurrence, reminder_minutes, color, category, \
-                     created_by, arc_id, created_at, updated_at \
+                     created_by, arc_id, created_at, updated_at, \
+                     source_id, remote_id, remote_etag, ical_uid \
                      FROM calendar_events WHERE category = ?1 ORDER BY start_time ASC",
                 )
                 .map_err(|e| AthenError::Other(format!("Prepare events by category: {e}")))?;
@@ -505,6 +566,10 @@ fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<CalendarEvent> {
         arc_id: row.get(12)?,
         created_at: row.get(13)?,
         updated_at: row.get(14)?,
+        source_id: row.get(15)?,
+        remote_id: row.get(16)?,
+        remote_etag: row.get(17)?,
+        ical_uid: row.get(18)?,
     })
 }
 
@@ -538,6 +603,10 @@ mod tests {
             arc_id: None,
             created_at: now.clone(),
             updated_at: now,
+            source_id: None,
+            remote_id: None,
+            remote_etag: None,
+            ical_uid: None,
         }
     }
 
@@ -900,6 +969,10 @@ mod tests {
             arc_id: Some("arc-999".to_string()),
             created_at: now.clone(),
             updated_at: now,
+            source_id: None,
+            remote_id: None,
+            remote_etag: None,
+            ical_uid: None,
         };
         store.create_event(&event).await.unwrap();
 

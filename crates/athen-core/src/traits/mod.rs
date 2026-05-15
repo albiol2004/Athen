@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod approval;
+pub mod calendar_source;
 pub mod compaction;
 pub mod coordinator;
 pub mod email_sender;

@@ -404,6 +404,10 @@ impl AppToolRegistry {
             arc_id: None,
             created_at: now.clone(),
             updated_at: now,
+            source_id: None,
+            remote_id: None,
+            remote_etag: None,
+            ical_uid: None,
         };
 
         tracing::info!(
@@ -513,6 +517,10 @@ impl AppToolRegistry {
             arc_id: existing.arc_id,
             created_at: existing.created_at,
             updated_at: now,
+            source_id: existing.source_id,
+            remote_id: existing.remote_id,
+            remote_etag: existing.remote_etag,
+            ical_uid: existing.ical_uid,
         };
 
         let t = Instant::now();
