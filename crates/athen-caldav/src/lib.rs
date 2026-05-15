@@ -1,26 +1,29 @@
 //! CalDAV adapter for Athen's [`CalendarSource`] port.
 //!
 //! One generic adapter that talks RFC 4791 (CalDAV) over HTTPS with HTTP
-//! Basic auth. The same code handles **Apple iCloud**
-//! (`https://caldav.icloud.com/`), **Google Calendar via CalDAV**
+//! Basic auth + an app-specific password. The same code handles **Apple
+//! iCloud** (`https://caldav.icloud.com/`), **Google Calendar via CalDAV**
 //! (`https://apidata.googleusercontent.com/caldav/v2/<email>/events/`),
 //! **Fastmail**, **Nextcloud**, **Yandex**, and any RFC-compliant server,
 //! because they all use the same PROPFIND/REPORT verbs and iCalendar
 //! payloads.
 //!
-//! Authentication is always an **app-specific password** (or an
-//! account password where the provider allows it). The credential is
-//! taken at construction time; the adapter does not touch the vault
-//! directly so it stays free of storage dependencies.
+//! Discovery flow on first contact:
 //!
-//! This crate currently exposes the trait-conformant [`CalDavSource`]
-//! struct but stubs the wire-protocol methods so the rest of Athen can
-//! be wired up against the trait. The PROPFIND/REPORT/PUT/DELETE bodies
-//! land in a follow-up commit (task #25).
+//! 1. PROPFIND `current-user-principal` against the user-supplied base URL.
+//! 2. PROPFIND `calendar-home-set` against the resolved principal.
+//! 3. Depth=1 PROPFIND against the home set to enumerate calendar collections.
+//!
+//! Steps 1–2 run lazily on first need and the resulting home-set URL is
+//! cached on the struct so subsequent operations skip the round-trips.
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use reqwest::header::HeaderValue;
 use reqwest::Client;
+use tokio::sync::Mutex;
 use url::Url;
 
 use athen_core::error::{AthenError, Result};
@@ -28,18 +31,22 @@ use athen_core::traits::calendar_source::{
     CalendarSource, CalendarSourceCapabilities, RemoteCalendar, RemoteEvent,
 };
 
+mod client;
+mod discovery;
+mod ical_codec;
+mod multistatus;
+
+pub use ical_codec::{emit_vcalendar, parse_vcalendar};
+
 /// One configured CalDAV account.
-///
-/// Construct via [`CalDavSource::new`]. The `base_url` is the CalDAV root
-/// for the provider — see [`presets`] for the URL each major provider
-/// expects.
 pub struct CalDavSource {
     source_id: String,
     display_name: String,
     base_url: Url,
-    username: String,
-    app_password: String,
+    auth: HeaderValue,
     http: Client,
+    /// Cached calendar-home-set URL discovered on first use.
+    home_set: Arc<Mutex<Option<Url>>>,
 }
 
 impl CalDavSource {
@@ -47,21 +54,47 @@ impl CalDavSource {
         source_id: impl Into<String>,
         display_name: impl Into<String>,
         base_url: Url,
-        username: impl Into<String>,
-        app_password: impl Into<String>,
+        username: impl AsRef<str>,
+        app_password: impl AsRef<str>,
     ) -> Result<Self> {
         let http = Client::builder()
             .user_agent(concat!("Athen/", env!("CARGO_PKG_VERSION"), " (CalDAV)"))
             .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::limited(5))
             .build()
             .map_err(|e| AthenError::Other(format!("CalDAV HTTP client build: {e}")))?;
+        let auth = client::basic_auth_header(username.as_ref(), app_password.as_ref());
         Ok(Self {
             source_id: source_id.into(),
             display_name: display_name.into(),
             base_url,
-            username: username.into(),
-            app_password: app_password.into(),
+            auth,
             http,
+            home_set: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    async fn calendar_home(&self) -> Result<Url> {
+        {
+            let guard = self.home_set.lock().await;
+            if let Some(u) = guard.as_ref() {
+                return Ok(u.clone());
+            }
+        }
+        let principal =
+            discovery::discover_principal(&self.http, &self.auth, &self.base_url).await?;
+        let home = discovery::discover_calendar_home(&self.http, &self.auth, &principal).await?;
+        let mut guard = self.home_set.lock().await;
+        *guard = Some(home.clone());
+        Ok(home)
+    }
+
+    fn parse_calendar_id(&self, calendar_id: &str) -> Result<Url> {
+        Url::parse(calendar_id).map_err(|e| {
+            AthenError::Other(format!(
+                "Invalid calendar_id `{calendar_id}` for source {}: {e}",
+                self.source_id
+            ))
         })
     }
 }
@@ -87,67 +120,100 @@ impl CalendarSource for CalDavSource {
     }
 
     async fn test_connection(&self) -> Result<()> {
-        Err(not_implemented("test_connection"))
+        // Discovery itself is the auth probe — a 401 surfaces from
+        // `propfind` as a descriptive error.
+        let _ = self.calendar_home().await?;
+        Ok(())
     }
 
     async fn list_calendars(&self) -> Result<Vec<RemoteCalendar>> {
-        Err(not_implemented("list_calendars"))
+        let home = self.calendar_home().await?;
+        discovery::list_calendar_collections(&self.http, &self.auth, &home).await
     }
 
     async fn list_events(
         &self,
-        _calendar_id: &str,
-        _start: DateTime<Utc>,
-        _end: DateTime<Utc>,
+        calendar_id: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
     ) -> Result<Vec<RemoteEvent>> {
-        Err(not_implemented("list_events"))
+        let cal_url = self.parse_calendar_id(calendar_id)?;
+        let body = client::build_calendar_query(
+            &start.format("%Y%m%dT%H%M%SZ").to_string(),
+            &end.format("%Y%m%dT%H%M%SZ").to_string(),
+        );
+        let xml = client::report(&self.http, &cal_url, &self.auth, "1", &body).await?;
+        let entries = multistatus::parse_multistatus(&xml)?;
+        let mut out = Vec::new();
+        for e in entries {
+            let Some(data) = e.calendar_data else {
+                continue;
+            };
+            let Some(href) = e.href.clone() else { continue };
+            // The remote_id is the object href (relative to the home),
+            // resolved to an absolute URL so the sync loop can PUT/DELETE
+            // against it later without re-resolving.
+            let object_url = discovery::resolve_href(&cal_url, &href)?.to_string();
+            match parse_vcalendar(&data, calendar_id, &object_url, e.etag) {
+                Ok(events) => out.extend(events),
+                Err(err) => {
+                    tracing::warn!(href, ?err, "CalDAV: skipping unparseable VEVENT");
+                }
+            }
+        }
+        Ok(out)
     }
 
     async fn create_event(
         &self,
-        _calendar_id: &str,
-        _event: &RemoteEvent,
+        calendar_id: &str,
+        event: &RemoteEvent,
     ) -> Result<(String, Option<String>)> {
-        Err(not_implemented("create_event"))
+        let cal_url = self.parse_calendar_id(calendar_id)?;
+        // Allocate a fresh object URL under the calendar collection.
+        let uid = event
+            .ical_uid
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let object_url = cal_url
+            .join(&format!("{uid}.ics"))
+            .map_err(|e| AthenError::Other(format!("Build event URL: {e}")))?;
+        let ics = emit_vcalendar(&RemoteEvent {
+            ical_uid: Some(uid.clone()),
+            ..event.clone()
+        });
+        let etag =
+            client::put_ical(&self.http, &object_url, &self.auth, &ics, None, Some("*")).await?;
+        Ok((object_url.to_string(), etag))
     }
 
     async fn update_event(
         &self,
         _calendar_id: &str,
-        _remote_id: &str,
-        _if_match_etag: Option<&str>,
-        _event: &RemoteEvent,
+        remote_id: &str,
+        if_match_etag: Option<&str>,
+        event: &RemoteEvent,
     ) -> Result<Option<String>> {
-        Err(not_implemented("update_event"))
+        let url = Url::parse(remote_id)
+            .map_err(|e| AthenError::Other(format!("Invalid remote_id `{remote_id}`: {e}")))?;
+        let ics = emit_vcalendar(event);
+        client::put_ical(&self.http, &url, &self.auth, &ics, if_match_etag, None).await
     }
 
     async fn delete_event(
         &self,
         _calendar_id: &str,
-        _remote_id: &str,
-        _if_match_etag: Option<&str>,
+        remote_id: &str,
+        if_match_etag: Option<&str>,
     ) -> Result<()> {
-        Err(not_implemented("delete_event"))
+        let url = Url::parse(remote_id)
+            .map_err(|e| AthenError::Other(format!("Invalid remote_id `{remote_id}`: {e}")))?;
+        client::delete(&self.http, &url, &self.auth, if_match_etag).await
     }
-}
-
-fn not_implemented(method: &str) -> AthenError {
-    AthenError::Other(format!(
-        "athen-caldav: {method} not yet wired (see task #25 — PROPFIND/REPORT/PUT/DELETE bodies + iCalendar parse)"
-    ))
-}
-
-/// Suppress unused-field warnings until the wire protocol lands.
-#[allow(dead_code)]
-fn _silence_unused(s: &CalDavSource) {
-    let _ = (&s.base_url, &s.username, &s.app_password, &s.http);
 }
 
 /// Provider presets so the Settings UI can pre-fill `base_url` once the
 /// user picks "iCloud" vs "Google" vs "Fastmail" vs "Custom".
-///
-/// These URLs are stable per provider but kept here (not in
-/// `athen-core`) because they are CalDAV-specific.
 pub mod presets {
     /// Apple iCloud Calendar.
     /// Username: full Apple ID email. Password: app-specific password
@@ -202,12 +268,5 @@ mod tests {
         let caps = make().capabilities();
         assert!(caps.read && caps.create && caps.update && caps.delete);
         assert!(!caps.find_meeting_times);
-    }
-
-    #[tokio::test]
-    async fn stubbed_methods_return_descriptive_error() {
-        let s = make();
-        let err = s.test_connection().await.unwrap_err().to_string();
-        assert!(err.contains("not yet wired"));
     }
 }
