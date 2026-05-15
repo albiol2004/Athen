@@ -177,6 +177,33 @@ function _normalizedToolKey(toolName) {
 function builtinToolIcon(toolName)  { const k = _normalizedToolKey(toolName); return k ? BUILTIN_TOOL_ICONS[k] : null; }
 function builtinToolLabel(toolName) { const k = _normalizedToolKey(toolName); return k ? BUILTIN_TOOL_LABELS[k] : ''; }
 
+// Detach the in-flight assistant row from the live-streaming machinery
+// so a tool group (or a fresh text segment) can land below it. Renders
+// accumulated markdown into the bubble, collapses any open thinking
+// block, drops the `streaming` class, and removes the row's id so the
+// next chunk creates a new row instead of appending here.
+function sealCurrentStreamingRow() {
+    const row = messagesEl ? messagesEl.querySelector('#streaming-message') : null;
+    if (row) row.removeAttribute('id');
+    if (streamingBubble) {
+        if (streamingText) {
+            streamingBubble.innerHTML = renderMarkdown(streamingText);
+        }
+        streamingBubble.classList.remove('streaming');
+    }
+    if (thinkingBlock) {
+        if (thinkingContent && thinkingText) {
+            thinkingContent.textContent = thinkingText;
+        }
+        thinkingBlock.open = false;
+    }
+    streamingBubble = null;
+    streamingText = '';
+    thinkingBlock = null;
+    thinkingContent = null;
+    thinkingText = '';
+}
+
 function registerTauriEventListeners() {
     if (!(window.__TAURI__.event && window.__TAURI__.event.listen)) return;
 
@@ -196,19 +223,19 @@ function registerTauriEventListeners() {
         // Skip non-tool steps (e.g. "Evaluating risk...", "Task completed").
         if (step === 0 || tool_name === 'Task completed') return;
 
-        // Create tool container if it does not exist yet. In optimistic
-        // completion mode the assistant message can stream in before any
-        // tool starts; insert the container above the streaming row so
-        // tool cards always sit above the conclusion they belong to.
+        // Create tool container if it does not exist yet. Before opening
+        // a new group, seal any in-flight streaming row so the text
+        // bubble commits *above* the tool group rather than getting
+        // jumped over. The container is a <details> matching the
+        // history-rehydrated tool-group shape: collapsed summary shows
+        // icons + count, body holds one card per invocation. Defaults
+        // to open during live execution so the user watches progress;
+        // once closed (by them or by future history rehydration) the
+        // same DOM expresses the collapsed state for free.
         if (!currentToolContainer) {
-            currentToolContainer = document.createElement('div');
-            currentToolContainer.className = 'tool-steps-container';
-            const streamingRow = messagesEl.querySelector('#streaming-message');
-            if (streamingRow) {
-                messagesEl.insertBefore(currentToolContainer, streamingRow);
-            } else {
-                messagesEl.appendChild(currentToolContainer);
-            }
+            sealCurrentStreamingRow();
+            currentToolContainer = buildLiveToolGroup();
+            messagesEl.appendChild(currentToolContainer);
         }
 
         // Build the live card. Reuse the same DOM constructor the
@@ -225,7 +252,7 @@ function registerTauriEventListeners() {
             error: error || null,
         };
         const card = buildToolCardBlock(meta);
-        currentToolContainer.appendChild(card);
+        appendLiveToolCard(currentToolContainer, card, tool_name, status, step);
 
         // Scroll to keep latest card visible.
         requestAnimationFrame(() => {
@@ -277,6 +304,14 @@ function registerTauriEventListeners() {
         if (!isActiveArc) return;
 
         didReceiveStreamChunks = true;
+
+        // A fresh text/thinking segment starting after a tool group means
+        // the previous batch has closed — null the live container ref so
+        // the next agent-progress event opens a new <details> group below
+        // this bubble instead of folding into the old one.
+        if (!streamingBubble && !thinkingBlock && currentToolContainer) {
+            currentToolContainer = null;
+        }
 
         if (is_thinking) {
             thinkingText += delta;
@@ -2602,6 +2637,72 @@ function renderToolGroup(toolCalls) {
     details.appendChild(body);
 
     messagesEl.appendChild(details);
+}
+
+// Build a fresh <details> tool group for the live agent-progress path.
+// Visually identical to the history rehydration group so a turn looks
+// the same whether you watched it run or reloaded it later. Stashes
+// refs to its mutable sub-nodes so the per-event handler can append
+// icons and bump the count without re-querying the DOM.
+function buildLiveToolGroup() {
+    const details = document.createElement('details');
+    details.className = 'tool-group-history tool-group-live';
+    details.open = true;
+
+    const summary = document.createElement('summary');
+    summary.className = 'tool-group-summary';
+
+    const icons = document.createElement('span');
+    icons.className = 'tool-group-icons';
+    summary.appendChild(icons);
+
+    const count = document.createElement('span');
+    count.className = 'tool-group-count';
+    count.textContent = '0 tools';
+    summary.appendChild(count);
+
+    details.appendChild(summary);
+
+    const body = document.createElement('div');
+    body.className = 'tool-group-body tool-steps-container';
+    details.appendChild(body);
+
+    details._iconsEl = icons;
+    details._countEl = count;
+    details._bodyEl = body;
+    details._stepSlots = new Map();
+    return details;
+}
+
+// Append a tool card to the live group, plus update its summary strip.
+// Dedupes summary icons by step index — the auditor fires InProgress
+// and Completed/Failed for the same step, so we keep one icon per step
+// and just re-style it when the status changes. The card itself is
+// appended every time (matches today's behavior; cards stack across
+// status transitions until a future dedup pass).
+function appendLiveToolCard(groupEl, card, toolName, status, stepIndex) {
+    groupEl._bodyEl.appendChild(card);
+
+    const key = (typeof stepIndex === 'number') ? String(stepIndex) : `${toolName}@${groupEl._stepSlots.size}`;
+    let slot = groupEl._stepSlots.get(key);
+    if (!slot) {
+        slot = document.createElement('span');
+        slot.className = 'tool-group-icon-slot';
+        slot.title = toolName || '';
+        const icon = builtinToolIcon(toolName);
+        if (icon) {
+            slot.innerHTML = icon;
+        } else {
+            slot.textContent = (toolName || '').slice(0, 2);
+            slot.classList.add('fallback');
+        }
+        groupEl._iconsEl.appendChild(slot);
+        groupEl._stepSlots.set(key, slot);
+
+        const n = groupEl._stepSlots.size;
+        groupEl._countEl.textContent = `${n} tool${n === 1 ? '' : 's'}`;
+    }
+    slot.classList.toggle('failed', status === 'Failed');
 }
 
 // Build a single tool-call card. For `delegate_to_agent`, wraps the card
