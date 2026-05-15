@@ -87,6 +87,7 @@ impl DeepSeekProvider {
                 content: Some(serde_json::Value::String(system.clone())),
                 tool_call_id: None,
                 tool_calls: None,
+                reasoning_content: None,
             });
         }
 
@@ -99,9 +100,16 @@ impl DeepSeekProvider {
             };
 
             match (&m.role, &m.content) {
-                // Assistant messages with embedded tool_calls metadata.
+                // Assistant messages stored as a Structured envelope —
+                // carries tool_calls and/or reasoning_content alongside the
+                // text. DeepSeek thinking-mode (V4 with reasoning_effort
+                // set, or DeepSeek-R1) returns HTTP 400 on the next call if
+                // the prior turn's reasoning_content isn't echoed back, so
+                // we round-trip it through this envelope.
                 (Role::Assistant, MessageContent::Structured(v))
-                    if v.get("tool_calls").is_some() =>
+                    if v.get("tool_calls").is_some()
+                        || v.get("reasoning_content").is_some()
+                        || v.get("text").is_some() =>
                 {
                     let text = v.get("text").and_then(|t| t.as_str()).unwrap_or_default();
                     let content = if text.is_empty() {
@@ -110,10 +118,19 @@ impl DeepSeekProvider {
                         Some(serde_json::Value::String(text.to_string()))
                     };
 
+                    let reasoning_content = v
+                        .get("reasoning_content")
+                        .and_then(|t| t.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string());
+
                     // Convert our ToolCall structs into OpenAI wire format.
+                    // Empty / missing arrays serialize to `None` so the field
+                    // is omitted entirely.
                     let tool_calls: Option<Vec<OpenAiToolCallOut>> = v
                         .get("tool_calls")
                         .and_then(|tc| serde_json::from_value::<Vec<ToolCallWire>>(tc.clone()).ok())
+                        .filter(|calls| !calls.is_empty())
                         .map(|calls| {
                             calls
                                 .into_iter()
@@ -137,6 +154,7 @@ impl DeepSeekProvider {
                         content,
                         tool_call_id: None,
                         tool_calls,
+                        reasoning_content,
                     });
                 }
                 // Tool result messages with tool_call_id.
@@ -153,6 +171,7 @@ impl DeepSeekProvider {
                         content: Some(serde_json::Value::String(content_str.to_string())),
                         tool_call_id: Some(tool_call_id),
                         tool_calls: None,
+                        reasoning_content: None,
                     });
                 }
                 // All other messages: plain text or structured. Multimodal
@@ -174,6 +193,7 @@ impl DeepSeekProvider {
                         content: Some(content_value),
                         tool_call_id: None,
                         tool_calls: None,
+                        reasoning_content: None,
                     });
                 }
             }
@@ -556,6 +576,13 @@ struct OpenAiMessageOut {
     tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<OpenAiToolCallOut>>,
+    /// Mandatory echo on the prior assistant turn when DeepSeek
+    /// thinking-mode is active — sending without it returns HTTP 400
+    /// ("The reasoning_content in the thinking mode must be passed back
+    /// to the API."). Omitted from the wire when `None` so non-thinking
+    /// turns stay byte-identical to the legacy shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -754,5 +781,95 @@ mod arg_parse_tests {
     fn deepseek_max_maps_to_max() {
         let body = deepseek_body_with(ReasoningEffort::Max);
         assert_eq!(body["reasoning_effort"], "max");
+    }
+
+    /// DeepSeek thinking-mode demands prior assistant turns' reasoning_content
+    /// be echoed back. The executor stores it inside the Structured envelope
+    /// alongside text + tool_calls; the request builder must lift it to the
+    /// message-level `reasoning_content` field.
+    #[test]
+    fn assistant_structured_envelope_round_trips_reasoning_content() {
+        let provider = DeepSeekProvider::new("k".into());
+        let req = LlmRequest {
+            profile: ModelProfile::Powerful,
+            messages: vec![
+                ChatMessage {
+                    role: Role::User,
+                    content: MessageContent::Text("fetch news".into()),
+                },
+                ChatMessage {
+                    role: Role::Assistant,
+                    content: MessageContent::Structured(serde_json::json!({
+                        "text": "Calling the web search now.",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "name": "web_search",
+                            "arguments": {"q": "ai news"}
+                        }],
+                        "reasoning_content": "The user wants a news briefing — start with AI."
+                    })),
+                },
+                ChatMessage {
+                    role: Role::Tool,
+                    content: MessageContent::Structured(serde_json::json!({
+                        "tool_call_id": "call_1",
+                        "content": "{\"results\":[]}"
+                    })),
+                },
+            ],
+            max_tokens: None,
+            temperature: None,
+            tools: None,
+            system_prompt: None,
+            reasoning_effort: ReasoningEffort::Medium,
+        };
+        let body = serde_json::to_value(provider.build_request_body(&req)).expect("serializes");
+        let messages = body["messages"].as_array().expect("messages");
+
+        let assistant = messages
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("assistant message");
+        assert_eq!(
+            assistant["reasoning_content"], "The user wants a news briefing — start with AI.",
+            "reasoning_content must round-trip on assistant tool-call turn: {assistant}"
+        );
+        assert_eq!(assistant["content"], "Calling the web search now.");
+        assert_eq!(assistant["tool_calls"][0]["id"], "call_1");
+    }
+
+    /// Assistant turns without reasoning_content must not invent a value — the
+    /// field is omitted from the wire so non-thinking turns stay byte-identical.
+    #[test]
+    fn assistant_structured_envelope_omits_reasoning_when_absent() {
+        let provider = DeepSeekProvider::new("k".into());
+        let req = LlmRequest {
+            profile: ModelProfile::Powerful,
+            messages: vec![ChatMessage {
+                role: Role::Assistant,
+                content: MessageContent::Structured(serde_json::json!({
+                    "text": "ok",
+                    "tool_calls": [{
+                        "id": "call_x",
+                        "name": "echo",
+                        "arguments": {}
+                    }]
+                })),
+            }],
+            max_tokens: None,
+            temperature: None,
+            tools: None,
+            system_prompt: None,
+            reasoning_effort: ReasoningEffort::Default,
+        };
+        let body = serde_json::to_value(provider.build_request_body(&req)).expect("serializes");
+        let assistant = body["messages"]
+            .as_array()
+            .and_then(|a| a.iter().find(|m| m["role"] == "assistant"))
+            .expect("assistant message");
+        assert!(
+            assistant.get("reasoning_content").is_none(),
+            "expected reasoning_content to be absent: {assistant}"
+        );
     }
 }

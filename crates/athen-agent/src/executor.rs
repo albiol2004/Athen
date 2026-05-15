@@ -1675,21 +1675,35 @@ impl AgentExecutor for DefaultExecutor {
             }
             let response_content_clean = stripped_content;
 
-            // Add assistant response to conversation.
-            // When the response includes tool calls, embed them in a Structured
-            // message so downstream providers can reconstruct the API format.
-            if response.tool_calls.is_empty() {
+            // Add assistant response to conversation. When the turn carries
+            // tool calls OR reasoning_content, embed them in a Structured
+            // envelope so downstream providers can reconstruct the wire
+            // format. DeepSeek thinking-mode rejects the *next* request with
+            // HTTP 400 if the prior assistant turn's reasoning_content isn't
+            // echoed back, so dropping it on tool-call turns breaks the loop.
+            let has_reasoning = response
+                .reasoning_content
+                .as_deref()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+            if response.tool_calls.is_empty() && !has_reasoning {
                 conversation.push(ChatMessage {
                     role: Role::Assistant,
                     content: MessageContent::Text(response_content_clean.clone()),
                 });
             } else {
+                let mut envelope = serde_json::json!({
+                    "text": response_content_clean,
+                    "tool_calls": response.tool_calls,
+                });
+                if has_reasoning {
+                    envelope["reasoning_content"] = serde_json::Value::String(
+                        response.reasoning_content.clone().unwrap_or_default(),
+                    );
+                }
                 conversation.push(ChatMessage {
                     role: Role::Assistant,
-                    content: MessageContent::Structured(serde_json::json!({
-                        "text": response_content_clean,
-                        "tool_calls": response.tool_calls,
-                    })),
+                    content: MessageContent::Structured(envelope),
                 });
             }
 
@@ -1699,7 +1713,10 @@ impl AgentExecutor for DefaultExecutor {
                 // empty JSON/empty strings. Fix it before proceeding.
                 let cleaned_content = clean_model_response(&response_content_clean);
 
-                // Update the conversation with the cleaned content.
+                // Update the conversation with the cleaned content. Preserve
+                // reasoning_content in a Structured envelope when present so
+                // the next request (if any — completion judge can push us
+                // back into the loop) carries the echo DeepSeek demands.
                 if cleaned_content != response_content_clean {
                     tracing::info!(
                         task_id = %task_id,
@@ -1708,10 +1725,25 @@ impl AgentExecutor for DefaultExecutor {
                         "cleaned up model response"
                     );
                     conversation.pop();
-                    conversation.push(ChatMessage {
-                        role: Role::Assistant,
-                        content: MessageContent::Text(cleaned_content.clone()),
-                    });
+                    let replacement = if has_reasoning {
+                        ChatMessage {
+                            role: Role::Assistant,
+                            content: MessageContent::Structured(serde_json::json!({
+                                "text": cleaned_content.clone(),
+                                "tool_calls": [],
+                                "reasoning_content": response
+                                    .reasoning_content
+                                    .clone()
+                                    .unwrap_or_default(),
+                            })),
+                        }
+                    } else {
+                        ChatMessage {
+                            role: Role::Assistant,
+                            content: MessageContent::Text(cleaned_content.clone()),
+                        }
+                    };
+                    conversation.push(replacement);
                 }
 
                 // Use the cleaned content from here on.
