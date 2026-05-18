@@ -143,8 +143,30 @@
                 <div id="messages">
                     <div class="welcome-message">
                         <img class="welcome-icon" src="assets/logo.svg" alt="">
-                        <p>Hello! I'm <strong>Athen</strong>, your universal AI agent. I can execute shell commands, read and write files, manage tasks, and more.</p>
-                        <p class="welcome-hint">Type a message below to get started.</p>
+                        <h2 class="welcome-headline">Hi, I'm <strong>Athen</strong>.</h2>
+                        <p class="welcome-sub">Pick a quick start, or just type below.</p>
+                        <div class="welcome-chips">
+                            <button type="button" class="welcome-chip" data-welcome-prompt="Triage my inbox and summarize what needs my attention." style="animation-delay:160ms">
+                                <span class="welcome-chip-icon" aria-hidden="true">📥</span>
+                                <span class="welcome-chip-label">Triage my inbox</span>
+                                <span class="welcome-chip-arrow" aria-hidden="true">→</span>
+                            </button>
+                            <button type="button" class="welcome-chip" data-welcome-prompt="What's on my calendar today, and what should I focus on?" style="animation-delay:220ms">
+                                <span class="welcome-chip-icon" aria-hidden="true">📅</span>
+                                <span class="welcome-chip-label">Plan my day</span>
+                                <span class="welcome-chip-arrow" aria-hidden="true">→</span>
+                            </button>
+                            <button type="button" class="welcome-chip" data-welcome-prompt="Help me draft a message: " style="animation-delay:280ms">
+                                <span class="welcome-chip-icon" aria-hidden="true">✍️</span>
+                                <span class="welcome-chip-label">Draft a message</span>
+                                <span class="welcome-chip-arrow" aria-hidden="true">→</span>
+                            </button>
+                            <button type="button" class="welcome-chip" data-welcome-prompt="Research this topic for me: " style="animation-delay:340ms">
+                                <span class="welcome-chip-icon" aria-hidden="true">🔎</span>
+                                <span class="welcome-chip-label">Research a topic</span>
+                                <span class="welcome-chip-arrow" aria-hidden="true">→</span>
+                            </button>
+                        </div>
                     </div>
                 </div>
             </main>

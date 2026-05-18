@@ -1197,19 +1197,58 @@ async function handleDeleteArc(arcId) {
     }
 }
 
+const WELCOME_SUGGESTIONS = [
+    { icon: '📥', label: 'Triage my inbox',
+      prompt: 'Triage my inbox and summarize what needs my attention.' },
+    { icon: '📅', label: 'Plan my day',
+      prompt: "What's on my calendar today, and what should I focus on?" },
+    { icon: '✍️', label: 'Draft a message',
+      prompt: 'Help me draft a message: ' },
+    { icon: '🔎', label: 'Research a topic',
+      prompt: 'Research this topic for me: ' },
+];
+
+function welcomeHTML() {
+    const chips = WELCOME_SUGGESTIONS.map((s, i) => (
+        `<button type="button" class="welcome-chip" data-welcome-prompt="${escapeAttr(s.prompt)}" style="animation-delay:${160 + i * 60}ms">`
+        + `<span class="welcome-chip-icon" aria-hidden="true">${s.icon}</span>`
+        + `<span class="welcome-chip-label">${escapeHtml(s.label)}</span>`
+        + `<span class="welcome-chip-arrow" aria-hidden="true">→</span>`
+        + `</button>`
+    )).join('');
+    return (
+        `<div class="welcome-message">`
+        + `<img class="welcome-icon" src="assets/logo.svg" alt="">`
+        + `<h2 class="welcome-headline">Hi, I'm <strong>Athen</strong>.</h2>`
+        + `<p class="welcome-sub">Pick a quick start, or just type below.</p>`
+        + `<div class="welcome-chips">${chips}</div>`
+        + `</div>`
+    );
+}
+
 function clearChatUI() {
-    messagesEl.innerHTML = `
-        <div class="welcome-message">
-            <div class="welcome-icon">A</div>
-            <p>Hello! I'm <strong>Athen</strong>, your universal AI agent. I can execute shell commands, read and write files, manage tasks, and more.</p>
-            <p class="welcome-hint">Type a message below to get started.</p>
-        </div>
-    `;
+    messagesEl.innerHTML = welcomeHTML();
     currentToolContainer = null;
     streamingBubble = null;
     streamingText = '';
     didReceiveStreamChunks = false;
 }
+
+// Delegated click handler for welcome suggestion chips. Fills the composer
+// with the chip's prompt and focuses it — does NOT auto-submit, so the user
+// can edit before sending.
+messagesEl.addEventListener('click', (e) => {
+    const chip = e.target.closest('.welcome-chip');
+    if (!chip || !messagesEl.contains(chip)) return;
+    const prompt = chip.getAttribute('data-welcome-prompt') || '';
+    if (!inputEl) return;
+    inputEl.value = prompt;
+    inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+    inputEl.focus();
+    // Park the cursor at the end so prompts ending in ": " feel like a fill-in.
+    const len = inputEl.value.length;
+    try { inputEl.setSelectionRange(len, len); } catch (_) {}
+});
 
 // ─── Sidebar Toggle (mobile) ───
 

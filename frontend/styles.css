@@ -804,26 +804,47 @@ header h1 {
     align-items: center;
     justify-content: center;
     text-align: center;
-    padding: 64px 24px 32px;
-    gap: 12px;
+    padding: 56px 24px 40px;
+    gap: 14px;
     color: var(--text-2);
+    max-width: 520px;
+    margin: 0 auto;
+    width: 100%;
 }
 
 .welcome-icon {
-    width: 96px;
-    height: 96px;
+    width: 72px;
+    height: 72px;
     display: block;
     object-fit: contain;
-    margin: 0 auto 16px;
+    margin: 0 auto 4px;
     user-select: none;
     -webkit-user-drag: none;
-    filter: drop-shadow(0 0 32px var(--brand-glow));
+    filter: drop-shadow(0 0 28px var(--brand-glow));
     animation: welcome-icon-in var(--dur-slow) var(--ease) both;
 }
 
 @keyframes welcome-icon-in {
     from { opacity: 0; transform: scale(0.92); }
     to   { opacity: 1; transform: scale(1); }
+}
+
+.welcome-headline {
+    margin: 0;
+    font-size: 19px;
+    font-weight: 500;
+    letter-spacing: -0.015em;
+    color: var(--text);
+}
+.welcome-headline strong {
+    font-weight: 600;
+    color: var(--brand-warm);
+}
+
+.welcome-sub {
+    margin: 0;
+    font-size: 13px;
+    color: var(--text-2);
 }
 
 .welcome-message p {
@@ -843,6 +864,90 @@ header h1 {
     font-size: 13px !important;
     color: var(--text-3) !important;
     margin-top: 4px !important;
+}
+
+/* Quick-start chip grid */
+.welcome-chips {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+    width: 100%;
+    margin-top: 8px;
+}
+
+@media (max-width: 540px) {
+    .welcome-chips { grid-template-columns: 1fr; }
+}
+
+.welcome-chip {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 14px;
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
+    color: var(--text);
+    font-size: 13px;
+    font-weight: 500;
+    text-align: left;
+    cursor: pointer;
+    font-family: inherit;
+    transition: background var(--dur) var(--ease),
+                border-color var(--dur) var(--ease),
+                transform var(--dur) var(--ease);
+    animation: welcome-chip-in 380ms var(--ease) both;
+}
+.welcome-chip:hover {
+    background: var(--surface-2);
+    border-color: var(--border-strong);
+    transform: translateY(-1px);
+}
+.welcome-chip:active { transform: translateY(0); }
+.welcome-chip:focus-visible {
+    outline: none;
+    border-color: var(--brand-warm);
+    box-shadow: var(--ring-focus);
+}
+
+@keyframes welcome-chip-in {
+    from { opacity: 0; transform: translateY(8px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+
+.welcome-chip-icon {
+    font-size: 17px;
+    line-height: 1;
+    flex: 0 0 auto;
+    width: 22px;
+    text-align: center;
+    filter: saturate(0.95);
+}
+.welcome-chip-label {
+    flex: 1;
+    min-width: 0;
+    color: var(--text);
+}
+.welcome-chip-arrow {
+    color: var(--text-3);
+    font-size: 13px;
+    line-height: 1;
+    opacity: 0;
+    transition: opacity var(--dur) var(--ease),
+                transform var(--dur) var(--ease),
+                color var(--dur) var(--ease);
+}
+.welcome-chip:hover .welcome-chip-arrow {
+    opacity: 1;
+    transform: translateX(2px);
+    color: var(--brand-warm);
+}
+
+.welcome-foot {
+    font-size: 11.5px;
+    color: var(--text-3);
+    margin-top: 4px;
+    letter-spacing: 0.01em;
 }
 
 /* ─── Messages ─── */
