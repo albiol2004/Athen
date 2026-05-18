@@ -130,6 +130,7 @@ pub fn run() {
             settings_calendar::list_remote_calendars,
             settings_calendar::sync_calendar_source_now,
             settings_calendar::sync_all_calendar_sources_now,
+            settings_calendar::list_writable_calendars,
             contacts::list_contacts,
             contacts::get_contact,
             contacts::set_contact_trust,

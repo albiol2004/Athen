@@ -6081,6 +6081,8 @@ pub async fn list_calendar_events(
 #[tauri::command]
 pub async fn create_calendar_event(
     event: CalendarEvent,
+    target_source_id: Option<String>,
+    target_calendar_id: Option<String>,
     state: State<'_, AppState>,
 ) -> std::result::Result<CalendarEvent, String> {
     let mut event = event;
@@ -6091,7 +6093,13 @@ pub async fn create_calendar_event(
     // Try to push to the remote first. If it succeeds we stamp the row
     // with the returned remote_id/etag BEFORE the local insert, so the
     // next sync pass recognises it as already-synced.
-    let pushed_remote = try_push_create(&event, &state).await;
+    let pushed_remote = try_push_create(
+        &event,
+        &state,
+        target_source_id.as_deref(),
+        target_calendar_id.as_deref(),
+    )
+    .await;
     if let Ok(Some((source_id, remote_id, etag, ical_uid, cal_name))) = pushed_remote.as_ref() {
         event.source_id = Some(source_id.clone());
         event.remote_id = Some(remote_id.clone());
@@ -6101,7 +6109,20 @@ pub async fn create_calendar_event(
         }
         tracing::info!(target = %cal_name, "Calendar event pushed to remote");
     } else if let Err(e) = pushed_remote.as_ref() {
-        tracing::warn!(error = %e, "Calendar event remote push failed; saving locally only");
+        tracing::warn!(error = %e, "Calendar event remote push failed");
+        // If the user explicitly picked a remote calendar (or there's
+        // exactly one source so we auto-picked), surface the failure
+        // instead of silently saving local-only — they'd assume it
+        // landed on their phone and miss the event entirely.
+        let msg = e.to_string();
+        let hint = if msg.contains("403") {
+            " — this calendar appears read-only or shared without write access. Pick a different one in 'Save to'."
+        } else if msg.contains("401") {
+            " — authentication failed. Check your CalDAV app password in Settings."
+        } else {
+            ""
+        };
+        return Err(format!("Remote save rejected: {msg}{hint}"));
     }
 
     store
@@ -6114,7 +6135,10 @@ pub async fn create_calendar_event(
 async fn try_push_create(
     event: &CalendarEvent,
     state: &AppState,
+    target_source_id: Option<&str>,
+    target_calendar_id: Option<&str>,
 ) -> std::result::Result<Option<(String, String, Option<String>, String, String)>, String> {
+    use athen_core::traits::calendar_source_config::CalendarSourceConfigStore as _;
     use std::sync::Arc as StdArc;
 
     let Some(cfg_store_concrete) = state.calendar_source_store() else {
@@ -6123,16 +6147,35 @@ async fn try_push_create(
     let Some(vault) = state.vault.clone() else {
         return Ok(None);
     };
-    let cfg_store: StdArc<
-        dyn athen_core::traits::calendar_source_config::CalendarSourceConfigStore,
-    > = StdArc::new(cfg_store_concrete);
 
-    let Some(target) = crate::calendar_sources::auto_pick_write_target(&cfg_store, &vault)
-        .await
-        .map_err(|e| e.to_string())?
-    else {
-        return Ok(None);
+    // Explicit target wins. Look up the source by id and synthesise the
+    // WriteTarget directly — no HTTP round-trip to re-discover names.
+    let target = if let (Some(src_id_str), Some(cal_id)) = (target_source_id, target_calendar_id) {
+        let src_uuid =
+            uuid::Uuid::parse_str(src_id_str).map_err(|e| format!("Bad target_source_id: {e}"))?;
+        let cfg = cfg_store_concrete
+            .get(src_uuid)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "Target source not found".to_string())?;
+        crate::calendar_sources::WriteTarget {
+            source: cfg,
+            calendar_id: cal_id.to_string(),
+            calendar_name: cal_id.to_string(),
+        }
+    } else {
+        let cfg_store: StdArc<
+            dyn athen_core::traits::calendar_source_config::CalendarSourceConfigStore,
+        > = StdArc::new(cfg_store_concrete);
+        let Some(t) = crate::calendar_sources::auto_pick_write_target(&cfg_store, &vault)
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(None);
+        };
+        t
     };
+
     let (remote_id, etag, uid) = crate::calendar_sources::push_create(&target, &vault, event)
         .await
         .map_err(|e| e.to_string())?;

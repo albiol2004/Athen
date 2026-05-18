@@ -982,11 +982,11 @@
                         <div class="cal-time-fields" id="cal-time-fields">
                             <div class="cal-field cal-field-half">
                                 <label for="cal-event-start">Start</label>
-                                <input type="time" id="cal-event-start" value="09:00">
+                                <input type="text" id="cal-event-start" value="09:00" placeholder="HH:MM" maxlength="5" inputmode="numeric" class="cal-time-input" autocomplete="off">
                             </div>
                             <div class="cal-field cal-field-half">
                                 <label for="cal-event-end">End</label>
-                                <input type="time" id="cal-event-end" value="10:00">
+                                <input type="text" id="cal-event-end" value="10:00" placeholder="HH:MM" maxlength="5" inputmode="numeric" class="cal-time-input" autocomplete="off">
                             </div>
                         </div>
                         <div class="cal-field">
@@ -1040,6 +1040,12 @@
                                 <option value="Weekly">Weekly</option>
                                 <option value="Monthly">Monthly</option>
                                 <option value="Yearly">Yearly</option>
+                            </select>
+                        </div>
+                        <div class="cal-field">
+                            <label for="cal-event-target">Save to</label>
+                            <select id="cal-event-target">
+                                <option value="local">Local only (just Athen)</option>
                             </select>
                         </div>
                     </div>

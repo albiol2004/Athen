@@ -249,6 +249,79 @@ pub async fn sync_calendar_source_now(
     }
 }
 
+/// One writable calendar entry the event-create modal can offer as a
+/// "Save to" choice. Flattens (source, calendar) pairs across all
+/// enabled sources so the FE can render a single dropdown.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WritableCalendarView {
+    pub source_id: String,
+    pub source_name: String,
+    pub calendar_id: String,
+    pub calendar_name: String,
+    pub color: Option<String>,
+    pub read_only: bool,
+}
+
+/// Enumerate every calendar across every enabled source the user could
+/// PUT a new event into. Used by the calendar event modal's "Save to"
+/// dropdown. Filters out read-only collections and the reminders-only
+/// calendars iCloud groups under "Recordatorios" / similar names.
+#[tauri::command]
+pub async fn list_writable_calendars(
+    state: State<'_, AppState>,
+) -> std::result::Result<Vec<WritableCalendarView>, String> {
+    let store_concrete = source_store(&state)?;
+    let sources = store_concrete.list().await.map_err(|e| e.to_string())?;
+    let vault = state
+        .vault
+        .clone()
+        .ok_or_else(|| "Credential vault unavailable".to_string())?;
+
+    let mut out = Vec::new();
+    for cfg in sources {
+        if !cfg.enabled {
+            continue;
+        }
+        let live = match crate::calendar_sources::build_source(&cfg, &vault).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(source = %cfg.display_name, error = %e, "list_writable_calendars: build_source failed");
+                continue;
+            }
+        };
+        let cals = match live.list_calendars().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(source = %cfg.display_name, error = %e, "list_writable_calendars: list_calendars failed");
+                continue;
+            }
+        };
+        for cal in cals {
+            if cal.read_only {
+                continue;
+            }
+            // Heuristic skip for reminders/VTODO-only collections — we
+            // PUT VEVENTs and the server will reject (or worse, silently
+            // misfile) them in a reminders calendar.
+            let lname = cal.name.to_lowercase();
+            if lname.contains("recordator") || lname.contains("reminder") || lname.contains("to-do")
+            {
+                continue;
+            }
+            out.push(WritableCalendarView {
+                source_id: cfg.id.to_string(),
+                source_name: cfg.display_name.clone(),
+                calendar_id: cal.id,
+                calendar_name: cal.name,
+                color: cal.color,
+                read_only: cal.read_only,
+            });
+        }
+    }
+    Ok(out)
+}
+
 /// Sync every enabled source in one shot. Used by the Calendar view's
 /// header "Sync" button so the user doesn't have to bounce to Settings.
 /// Returns the aggregate counts; per-source errors are folded into

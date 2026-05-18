@@ -8627,13 +8627,90 @@ function showEventModal(event, defaultDate, defaultHour) {
         }
     }
 
+    // Populate the "Save to" picker. Edits don't get to switch calendars
+    // (you'd have to delete + recreate to move the event), so we disable
+    // the dropdown in edit mode.
+    populateCalendarTargetPicker(event);
+
     modal.classList.remove('hidden');
     document.getElementById('cal-event-title').focus();
+}
+
+async function populateCalendarTargetPicker(existingEvent) {
+    const sel = document.getElementById('cal-event-target');
+    if (!sel) return;
+    // Reset to just the local placeholder while we (re)fetch.
+    sel.innerHTML = '<option value="local">Local only (just Athen)</option>';
+    if (existingEvent) {
+        // Edit mode: lock the picker. Editing routes via remote_id, not
+        // by re-picking a target.
+        if (existingEvent.source_id) {
+            const opt = document.createElement('option');
+            opt.value = 'existing';
+            opt.textContent = 'Stays on its current calendar';
+            opt.selected = true;
+            sel.appendChild(opt);
+        }
+        sel.disabled = true;
+        return;
+    }
+    sel.disabled = false;
+    if (!invoke) return;
+    try {
+        const cals = await invoke('list_writable_calendars');
+        if (!Array.isArray(cals) || cals.length === 0) return;
+        for (const c of cals) {
+            const opt = document.createElement('option');
+            opt.value = c.sourceId + '|' + c.calendarId;
+            opt.textContent = c.sourceName + ' · ' + c.calendarName;
+            sel.appendChild(opt);
+        }
+        // Default to the first remote calendar — matches the auto-pick
+        // behavior the user had before the picker existed.
+        if (cals.length > 0) {
+            sel.value = cals[0].sourceId + '|' + cals[0].calendarId;
+        }
+    } catch (err) {
+        console.warn('Failed to list writable calendars:', err);
+    }
 }
 
 function hideEventModal() {
     calModalOverlay.classList.add('hidden');
 }
+
+// Auto-insert the colon as the user types HHMM → HH:MM, and clamp the
+// hours/minutes on blur. Keeps the field a plain text input so WebKitGTK's
+// broken native time widget never appears.
+function installTimeInput(inputId) {
+    const el = document.getElementById(inputId);
+    if (!el) return;
+    el.addEventListener('input', (e) => {
+        let v = e.target.value.replace(/[^\d:]/g, '');
+        // Strip extra colons.
+        const firstColon = v.indexOf(':');
+        if (firstColon !== -1) {
+            v = v.slice(0, firstColon + 1) + v.slice(firstColon + 1).replace(/:/g, '');
+        }
+        // Auto-insert colon after 2 digits if user didn't type one.
+        const digitsOnly = v.replace(':', '');
+        if (digitsOnly.length >= 3 && !v.includes(':')) {
+            v = digitsOnly.slice(0, 2) + ':' + digitsOnly.slice(2, 4);
+        }
+        e.target.value = v.slice(0, 5);
+    });
+    el.addEventListener('blur', (e) => {
+        const v = e.target.value.trim();
+        if (!v) return;
+        const m = v.match(/^(\d{1,2}):?(\d{0,2})$/);
+        if (!m) { e.target.value = '09:00'; return; }
+        let h = Math.min(23, Math.max(0, parseInt(m[1] || '0', 10)));
+        let mm = Math.min(59, Math.max(0, parseInt(m[2] || '0', 10)));
+        e.target.value = String(h).padStart(2, '0') + ':' + String(mm).padStart(2, '0');
+    });
+}
+installTimeInput('cal-event-start');
+installTimeInput('cal-event-end');
 
 function getSelectedColor() {
     const sel = calModalOverlay.querySelector('.cal-color-dot.selected');
@@ -8663,18 +8740,21 @@ async function saveCalendarEvent() {
     const reminder = document.getElementById('cal-event-reminder').value;
     const recurrence = document.getElementById('cal-event-recurrence').value;
 
-    let start, end;
+    let startIso, endIso;
     if (allDay) {
-        start = dateStr + 'T00:00:00';
-        end = dateStr + 'T23:59:59';
+        // Anchor all-day events at NOON UTC. Naively storing local midnight
+        // converts to a UTC instant on the previous calendar day for any
+        // TZ east of UTC (Madrid +2 → 22:00Z the day before), which then
+        // emits `VALUE=DATE:` for the wrong date. Noon UTC stays on the
+        // intended date across every timezone the user can be in.
+        startIso = dateStr + 'T12:00:00.000Z';
+        endIso = dateStr + 'T12:00:00.000Z';
     } else {
-        start = dateStr + 'T' + startTime + ':00';
-        end = dateStr + 'T' + endTime + ':00';
+        const startLocal = new Date(dateStr + 'T' + startTime + ':00');
+        const endLocal = new Date(dateStr + 'T' + endTime + ':00');
+        startIso = startLocal.toISOString();
+        endIso = endLocal.toISOString();
     }
-
-    // Convert local times to ISO (with timezone offset)
-    const startDate = new Date(start);
-    const endDate = new Date(end);
 
     const now = new Date().toISOString();
     const reminderMinutes = (reminder === 'none' || !reminder) ? [] : [parseInt(reminder, 10)];
@@ -8683,8 +8763,8 @@ async function saveCalendarEvent() {
         id: id || crypto.randomUUID(),
         title,
         description: description || null,
-        start_time: startDate.toISOString(),
-        end_time: endDate.toISOString(),
+        start_time: startIso,
+        end_time: endIso,
         all_day: allDay,
         location: location || null,
         recurrence: recurrence === 'none' ? null : recurrence,
@@ -8696,6 +8776,19 @@ async function saveCalendarEvent() {
         created_at: now,
         updated_at: now,
     };
+
+    // "Save to" picker — null/empty value means "Local only".
+    const targetSel = document.getElementById('cal-event-target');
+    const targetValue = targetSel ? targetSel.value : '';
+    let targetSourceId = null;
+    let targetCalendarId = null;
+    if (targetValue && targetValue !== 'local') {
+        const sep = targetValue.indexOf('|');
+        if (sep > 0) {
+            targetSourceId = targetValue.slice(0, sep);
+            targetCalendarId = targetValue.slice(sep + 1);
+        }
+    }
 
     if (!invoke) {
         // Offline / demo mode: manage locally
@@ -8714,7 +8807,11 @@ async function saveCalendarEvent() {
             await invoke('update_calendar_event', { event: eventData });
             showToast('Event updated', 'success');
         } else {
-            const saved = await invoke('create_calendar_event', { event: eventData });
+            const saved = await invoke('create_calendar_event', {
+                event: eventData,
+                targetSourceId,
+                targetCalendarId,
+            });
             if (saved && saved.source_id) {
                 showToast('Event saved to your remote calendar', 'success');
             } else {
