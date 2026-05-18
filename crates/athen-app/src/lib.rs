@@ -26,6 +26,7 @@ pub(crate) mod owner_migration;
 pub(crate) mod process;
 pub(crate) mod sense_router;
 mod settings;
+mod settings_calendar;
 pub(crate) mod skills_render;
 pub(crate) mod spawn_pidfile;
 pub(crate) mod state;
@@ -120,6 +121,14 @@ pub fn run() {
             commands::create_calendar_event,
             commands::update_calendar_event,
             commands::delete_calendar_event,
+            settings_calendar::list_calendar_sources,
+            settings_calendar::add_caldav_source,
+            settings_calendar::delete_calendar_source,
+            settings_calendar::set_calendar_source_enabled,
+            settings_calendar::set_calendar_source_selected_calendars,
+            settings_calendar::test_calendar_source_connection,
+            settings_calendar::list_remote_calendars,
+            settings_calendar::sync_calendar_source_now,
             contacts::list_contacts,
             contacts::get_contact,
             contacts::set_contact_trust,

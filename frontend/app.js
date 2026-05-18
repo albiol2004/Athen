@@ -9279,6 +9279,8 @@ function showNewContactModal() {
     document.getElementById('contact-name').value = '';
     document.getElementById('contact-trust-modal-select').value = 'Neutral';
     document.getElementById('contact-identifiers-list').innerHTML = '';
+    const notesEl = document.getElementById('contact-notes');
+    if (notesEl) notesEl.value = '';
     document.getElementById('contact-modal-title').textContent = 'New Contact';
     addIdentifierRow();
     document.getElementById('contact-modal-overlay').style.display = '';
@@ -9287,8 +9289,19 @@ function showNewContactModal() {
 function showEditContactModal(contact) {
     document.getElementById('contact-edit-id').value = contact.id;
     document.getElementById('contact-name').value = contact.name || '';
-    document.getElementById('contact-trust-modal-select').value = contact.trust_level || 'Neutral';
+    // Trust level select carries Unknown/Neutral/Known/Trusted; AuthUser
+    // contacts (the owner) have no matching option, so leave the select
+    // unset and `saveContact` will send an empty string the backend
+    // treats as "don't change".
+    const trustSel = document.getElementById('contact-trust-modal-select');
+    if (['Unknown', 'Neutral', 'Known', 'Trusted'].includes(contact.trust_level)) {
+        trustSel.value = contact.trust_level;
+    } else {
+        trustSel.value = '';
+    }
     document.getElementById('contact-identifiers-list').innerHTML = '';
+    const notesEl = document.getElementById('contact-notes');
+    if (notesEl) notesEl.value = contact.notes || '';
     document.getElementById('contact-modal-title').textContent = 'Edit Contact';
 
     if (contact.identifiers && contact.identifiers.length > 0) {
@@ -9310,6 +9323,8 @@ async function saveContact() {
     const id = document.getElementById('contact-edit-id').value;
     const name = document.getElementById('contact-name').value.trim();
     const trustLevel = document.getElementById('contact-trust-modal-select').value;
+    const notesEl = document.getElementById('contact-notes');
+    const notes = notesEl ? notesEl.value : '';
 
     if (!name) {
         showToast('Name is required', 'error');
@@ -9335,10 +9350,10 @@ async function saveContact() {
 
     try {
         if (id) {
-            await invoke('update_contact', { id, name, trustLevel, identifiers });
+            await invoke('update_contact', { id, name, trustLevel, identifiers, notes });
             showToast('Contact updated', 'success');
         } else {
-            await invoke('create_contact', { name, trustLevel, identifiers });
+            await invoke('create_contact', { name, trustLevel, identifiers, notes });
             showToast('Contact created', 'success');
         }
         hideContactModal();
@@ -12938,6 +12953,333 @@ function wireMcpServersPanel() {
     });
 }
 
+// ===================================================================
+// Calendar Sources (Settings → Connections → Calendar Sources)
+// ===================================================================
+//
+// Defined BEFORE the `wire*` call block below. `const` declarations
+// are not hoisted (they sit in the temporal dead zone until reached);
+// referencing `CALDAV_PRESETS` from a function called before this line
+// throws `ReferenceError: Cannot access 'CALDAV_PRESETS' before
+// initialization`, which aborts `initTauri()` and breaks the whole UI.
+
+const CALDAV_PRESETS = {
+    icloud: {
+        baseUrl: 'https://caldav.icloud.com/',
+        displayHint: 'iCloud',
+        usernamePlaceholder: 'you@me.com',
+        passwordHint:
+            'Generate an app-specific password at <a href="https://appleid.apple.com" target="_blank">appleid.apple.com</a> → Sign-In and Security → App-Specific Passwords.',
+    },
+    google: {
+        baseUrl: 'https://apidata.googleusercontent.com/caldav/v2/{email}/events/',
+        displayHint: 'Google',
+        usernamePlaceholder: 'you@gmail.com',
+        passwordHint:
+            'Generate an app password at <a href="https://myaccount.google.com/apppasswords" target="_blank">myaccount.google.com/apppasswords</a>. Requires 2-step verification.',
+    },
+    fastmail: {
+        baseUrl: 'https://caldav.fastmail.com/',
+        displayHint: 'Fastmail',
+        usernamePlaceholder: 'you@fastmail.com',
+        passwordHint:
+            'Generate an app password at <a href="https://www.fastmail.com/settings/security/integrations" target="_blank">fastmail.com → Settings → Privacy & Security → Integrations</a>.',
+    },
+    yandex: {
+        baseUrl: 'https://caldav.yandex.com/',
+        displayHint: 'Yandex',
+        usernamePlaceholder: 'you@yandex.com',
+        passwordHint: 'Use an app password from your Yandex account settings.',
+    },
+    nextcloud: {
+        baseUrl: 'https://your-nextcloud.example.com/remote.php/dav/calendars/<user>/',
+        displayHint: 'Nextcloud',
+        usernamePlaceholder: 'your-nextcloud-user',
+        passwordHint:
+            'In your Nextcloud profile, create a Device password under Security. Use your full server URL — the path typically ends with <code>/remote.php/dav/calendars/&lt;user&gt;/</code>.',
+    },
+    custom: {
+        baseUrl: '',
+        displayHint: 'Custom',
+        usernamePlaceholder: 'username',
+        passwordHint: 'Use whatever credential your CalDAV server expects. App-specific passwords are recommended when supported.',
+    },
+};
+
+let calendarSourcePickerId = null;
+let calendarSourcePickerSelection = new Set();
+
+function wireCalendarSourcesPanel() {
+    const addBtn = document.getElementById('add-calendar-source-btn');
+    const cancelBtn = document.getElementById('cancel-calendar-source-btn');
+    const saveBtn = document.getElementById('save-calendar-source-btn');
+    const presetSel = document.getElementById('calendar-source-preset');
+    const pwToggle = document.getElementById('calendar-source-password-toggle');
+    const pickerCancel = document.getElementById('calendar-source-picker-cancel');
+    const pickerSave = document.getElementById('calendar-source-picker-save');
+
+    if (!addBtn || !presetSel) return;
+
+    addBtn.addEventListener('click', () => showCalendarSourceForm(true));
+    cancelBtn?.addEventListener('click', () => showCalendarSourceForm(false));
+    saveBtn?.addEventListener('click', addCalendarSource);
+    presetSel.addEventListener('change', applyCalendarSourcePreset);
+    pwToggle?.addEventListener('click', () => {
+        const f = document.getElementById('calendar-source-password');
+        f.type = f.type === 'password' ? 'text' : 'password';
+    });
+    pickerCancel?.addEventListener('click', () => hideCalendarSourcePicker());
+    pickerSave?.addEventListener('click', saveCalendarSourcePicker);
+
+    applyCalendarSourcePreset();
+    // First refresh waits for the Tauri bridge — `invoke` is `undefined`
+    // at script-load time. We poll briefly (mirrors how `initTauri`
+    // waits for `window.__TAURI__`) so the panel populates as soon as
+    // possible without throwing synchronously here.
+    scheduleFirstCalendarSourcesRefresh();
+}
+
+function scheduleFirstCalendarSourcesRefresh(retries = 50) {
+    if (typeof invoke === 'function') {
+        refreshCalendarSourcesList();
+        return;
+    }
+    if (retries <= 0) return;
+    setTimeout(() => scheduleFirstCalendarSourcesRefresh(retries - 1), 100);
+}
+
+function showCalendarSourceForm(visible) {
+    document.getElementById('calendar-source-form').style.display = visible ? '' : 'none';
+    if (!visible) {
+        document.getElementById('calendar-source-form-result').classList.add('hidden');
+    }
+}
+
+function applyCalendarSourcePreset() {
+    const presetSel = document.getElementById('calendar-source-preset');
+    const preset = CALDAV_PRESETS[presetSel.value] || CALDAV_PRESETS.custom;
+    document.getElementById('calendar-source-base-url').value = preset.baseUrl;
+    document.getElementById('calendar-source-username').placeholder = preset.usernamePlaceholder;
+    const hint = document.getElementById('calendar-source-credential-hint');
+    hint.innerHTML = preset.passwordHint;
+    hint.style.display = '';
+}
+
+async function addCalendarSource() {
+    if (typeof invoke !== 'function') {
+        alert('Tauri bridge not ready yet — try again in a moment.');
+        return;
+    }
+    const presetKey = document.getElementById('calendar-source-preset').value;
+    const username = document.getElementById('calendar-source-username').value.trim();
+    let baseUrl = document.getElementById('calendar-source-base-url').value.trim();
+    const password = document.getElementById('calendar-source-password').value;
+    let displayName = document.getElementById('calendar-source-display-name').value.trim();
+
+    const resultEl = document.getElementById('calendar-source-form-result');
+    resultEl.classList.remove('hidden');
+
+    if (!username || !password || !baseUrl) {
+        resultEl.textContent = 'Username, server URL, and password are all required.';
+        resultEl.className = 'test-result error';
+        return;
+    }
+
+    // Google CalDAV URL substitutes the email into the path.
+    if (presetKey === 'google' && baseUrl.includes('{email}')) {
+        baseUrl = baseUrl.replace('{email}', encodeURIComponent(username));
+    }
+
+    if (!displayName) {
+        const preset = CALDAV_PRESETS[presetKey] || CALDAV_PRESETS.custom;
+        displayName = `${preset.displayHint} (${username})`;
+    }
+
+    resultEl.textContent = 'Saving and testing…';
+    resultEl.className = 'test-result';
+
+    try {
+        const view = await invoke('add_caldav_source', {
+            displayName,
+            baseUrl,
+            username,
+            password,
+        });
+        // Immediately probe connectivity so a typo'd password fails fast.
+        const probe = await invoke('test_calendar_source_connection', { id: view.id });
+        if (probe.success) {
+            resultEl.textContent = `Added. ${probe.message} Pulling events…`;
+            resultEl.className = 'test-result success';
+            // Kick off a first sync pass so the user sees events without waiting.
+            invoke('sync_calendar_source_now', { id: view.id }).catch(() => {});
+        } else {
+            resultEl.textContent = `Added, but connection test failed: ${probe.message}`;
+            resultEl.className = 'test-result error';
+        }
+        // Reset form, refresh list either way.
+        document.getElementById('calendar-source-display-name').value = '';
+        document.getElementById('calendar-source-username').value = '';
+        document.getElementById('calendar-source-password').value = '';
+        refreshCalendarSourcesList();
+    } catch (e) {
+        resultEl.textContent = `Failed: ${e}`;
+        resultEl.className = 'test-result error';
+    }
+}
+
+async function refreshCalendarSourcesList() {
+    const listEl = document.getElementById('calendar-sources-list');
+    if (!listEl || typeof invoke !== 'function') return;
+    try {
+        const sources = await invoke('list_calendar_sources');
+        if (!sources || sources.length === 0) {
+            listEl.innerHTML = '<p class="calendar-sources-empty">No calendar sources configured.</p>';
+            return;
+        }
+        listEl.innerHTML = sources.map(renderCalendarSourceRow).join('');
+        // Wire per-row buttons after innerHTML replace.
+        listEl.querySelectorAll('[data-cal-action]').forEach((btn) => {
+            btn.addEventListener('click', onCalendarSourceAction);
+        });
+    } catch (e) {
+        listEl.innerHTML = `<p class="test-result error">Failed to load: ${escapeHtml(String(e))}</p>`;
+    }
+}
+
+function renderCalendarSourceRow(s) {
+    const lastSync = s.lastSyncAt
+        ? `last sync ${humanRelativeTime(s.lastSyncAt)}`
+        : 'never synced';
+    const errorBlock = s.lastSyncError
+        ? `<div class="cal-src-error">⚠ ${escapeHtml(s.lastSyncError)}</div>`
+        : '';
+    const selected = s.selectedCalendars && s.selectedCalendars.length
+        ? `${s.selectedCalendars.length} calendars`
+        : 'all calendars';
+    const enabledLabel = s.enabled ? 'Disable' : 'Enable';
+    return `
+        <div class="cal-src-row" data-cal-src-id="${escapeAttr(s.id)}">
+            <div class="cal-src-head">
+                <div class="cal-src-name">${escapeHtml(s.displayName)}</div>
+                <div class="cal-src-meta">${escapeHtml(selected)} • ${escapeHtml(lastSync)}</div>
+            </div>
+            ${errorBlock}
+            <div class="cal-src-actions">
+                <button class="btn-secondary" data-cal-action="pick" data-cal-id="${escapeAttr(s.id)}">Pick calendars</button>
+                <button class="btn-secondary" data-cal-action="sync" data-cal-id="${escapeAttr(s.id)}">Sync now</button>
+                <button class="btn-secondary" data-cal-action="toggle" data-cal-id="${escapeAttr(s.id)}" data-cal-enabled="${s.enabled}">${enabledLabel}</button>
+                <button class="btn-secondary" data-cal-action="delete" data-cal-id="${escapeAttr(s.id)}">Delete</button>
+            </div>
+        </div>`;
+}
+
+async function onCalendarSourceAction(ev) {
+    const btn = ev.currentTarget;
+    const action = btn.getAttribute('data-cal-action');
+    const id = btn.getAttribute('data-cal-id');
+    if (!id) return;
+    try {
+        if (action === 'pick') {
+            await openCalendarSourcePicker(id);
+        } else if (action === 'sync') {
+            btn.disabled = true;
+            btn.textContent = 'Syncing…';
+            const r = await invoke('sync_calendar_source_now', { id });
+            btn.textContent = r.success ? 'Synced' : 'Failed';
+            setTimeout(() => refreshCalendarSourcesList(), 800);
+        } else if (action === 'toggle') {
+            const currentlyEnabled = btn.getAttribute('data-cal-enabled') === 'true';
+            await invoke('set_calendar_source_enabled', { id, enabled: !currentlyEnabled });
+            refreshCalendarSourcesList();
+        } else if (action === 'delete') {
+            if (!confirm('Remove this calendar source? Synced events stay in the local calendar; future updates from this source will stop.')) {
+                return;
+            }
+            await invoke('delete_calendar_source', { id });
+            refreshCalendarSourcesList();
+        }
+    } catch (e) {
+        alert(`Action failed: ${e}`);
+    }
+}
+
+async function openCalendarSourcePicker(id) {
+    calendarSourcePickerId = id;
+    const sources = await invoke('list_calendar_sources');
+    const current = sources.find((s) => s.id === id);
+    calendarSourcePickerSelection = new Set(current?.selectedCalendars || []);
+
+    const listEl = document.getElementById('calendar-source-picker-list');
+    listEl.innerHTML = '<p>Loading…</p>';
+    document.getElementById('calendar-source-picker').style.display = '';
+
+    try {
+        const remote = await invoke('list_remote_calendars', { id });
+        if (!remote || remote.length === 0) {
+            listEl.innerHTML = '<p>No calendars exposed by this source.</p>';
+            return;
+        }
+        listEl.innerHTML = remote
+            .map((c) => {
+                const checked =
+                    calendarSourcePickerSelection.size === 0
+                        ? 'checked'
+                        : calendarSourcePickerSelection.has(c.id)
+                            ? 'checked'
+                            : '';
+                const ro = c.readOnly ? '<span class="cal-src-ro"> (read-only)</span>' : '';
+                return `
+                    <label class="cal-src-pick">
+                        <input type="checkbox" data-remote-cal-id="${escapeAttr(c.id)}" ${checked}>
+                        <span>${escapeHtml(c.name)}</span>${ro}
+                    </label>`;
+            })
+            .join('');
+    } catch (e) {
+        listEl.innerHTML = `<p class="test-result error">Failed: ${escapeHtml(String(e))}</p>`;
+    }
+}
+
+function hideCalendarSourcePicker() {
+    document.getElementById('calendar-source-picker').style.display = 'none';
+    calendarSourcePickerId = null;
+}
+
+async function saveCalendarSourcePicker() {
+    if (!calendarSourcePickerId) return;
+    const checked = Array.from(
+        document.querySelectorAll('#calendar-source-picker-list input[type=checkbox]:checked')
+    ).map((el) => el.getAttribute('data-remote-cal-id'));
+    const total = document.querySelectorAll('#calendar-source-picker-list input[type=checkbox]').length;
+    // Empty selection in the registry means "sync all" — match that convention
+    // when the user ticks every box.
+    const selection = checked.length === total ? [] : checked;
+    try {
+        await invoke('set_calendar_source_selected_calendars', {
+            id: calendarSourcePickerId,
+            calendarIds: selection,
+        });
+        hideCalendarSourcePicker();
+        refreshCalendarSourcesList();
+    } catch (e) {
+        alert(`Save failed: ${e}`);
+    }
+}
+
+function humanRelativeTime(rfc3339) {
+    const t = new Date(rfc3339).getTime();
+    if (Number.isNaN(t)) return rfc3339;
+    const diff = (Date.now() - t) / 1000;
+    if (diff < 60) return `${Math.round(diff)}s ago`;
+    if (diff < 3600) return `${Math.round(diff / 60)}m ago`;
+    if (diff < 86400) return `${Math.round(diff / 3600)}h ago`;
+    return `${Math.round(diff / 86400)}d ago`;
+}
+
+function escapeAttr(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
 // ─── Initialize ───
 
 inputEl.focus();
@@ -12945,4 +13287,5 @@ wireOnboardingButtons();
 wireCloudApisModal();
 wireMcpServersPanel();
 wireActiveAgentsPanel();
+wireCalendarSourcesPanel();
 initTauri();

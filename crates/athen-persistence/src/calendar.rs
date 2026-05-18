@@ -111,6 +111,11 @@ pub struct FiredReminder {
     pub fired_at: String,
 }
 
+/// Base tables only. Indexes that reference the remote-source columns
+/// are created in a separate step AFTER the ALTER TABLE migrations run,
+/// so existing databases (created before those columns existed) don't
+/// trip over `no such column: source_id` while the migration still
+/// hasn't happened.
 const CALENDAR_SCHEMA_SQL: &str = "\
 CREATE TABLE IF NOT EXISTS calendar_events (
     id TEXT PRIMARY KEY,
@@ -133,10 +138,6 @@ CREATE TABLE IF NOT EXISTS calendar_events (
     remote_etag TEXT,
     ical_uid TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_calendar_events_source
-    ON calendar_events(source_id, remote_id);
-CREATE INDEX IF NOT EXISTS idx_calendar_events_ical_uid
-    ON calendar_events(ical_uid);
 CREATE TABLE IF NOT EXISTS fired_reminders (
     event_id TEXT NOT NULL,
     reminder_minutes INTEGER NOT NULL,
@@ -144,6 +145,15 @@ CREATE TABLE IF NOT EXISTS fired_reminders (
     PRIMARY KEY (event_id, reminder_minutes),
     FOREIGN KEY (event_id) REFERENCES calendar_events(id)
 );
+";
+
+/// Indexes applied AFTER `CALENDAR_REMOTE_COLUMNS` ALTER TABLEs so they
+/// can reference columns that may have been missing in older databases.
+const CALENDAR_INDEX_SQL: &str = "\
+CREATE INDEX IF NOT EXISTS idx_calendar_events_source
+    ON calendar_events(source_id, remote_id);
+CREATE INDEX IF NOT EXISTS idx_calendar_events_ical_uid
+    ON calendar_events(ical_uid);
 ";
 
 /// Additive migrations applied to existing databases that pre-date the
@@ -177,8 +187,12 @@ impl CalendarStore {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
+            // 1. Base tables (no remote-source indexes yet).
             conn.execute_batch(CALENDAR_SCHEMA_SQL)
                 .map_err(|e| AthenError::Other(format!("Failed to init calendar schema: {e}")))?;
+            // 2. Additive ALTER TABLEs for databases that pre-date the
+            //    remote-source columns. Duplicate-column failures are
+            //    expected on fresh DBs and ignored.
             for stmt in CALENDAR_REMOTE_COLUMNS {
                 if let Err(e) = conn.execute(stmt, []) {
                     let msg = e.to_string();
@@ -189,6 +203,10 @@ impl CalendarStore {
                     }
                 }
             }
+            // 3. Indexes that depend on columns added in step 2.
+            conn.execute_batch(CALENDAR_INDEX_SQL).map_err(|e| {
+                AthenError::Other(format!("Failed to create calendar indexes: {e}"))
+            })?;
             Ok(())
         })
         .await

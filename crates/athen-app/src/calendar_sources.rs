@@ -132,10 +132,21 @@ pub fn spawn_sync_loops(
 }
 
 #[derive(Debug, Default, Clone, Copy)]
-struct SyncStats {
-    inserted: usize,
-    updated: usize,
-    deleted: usize,
+pub struct SyncStats {
+    pub inserted: usize,
+    pub updated: usize,
+    pub deleted: usize,
+}
+
+/// Public façade over `run_one_sync_pass` for the Settings panel's
+/// "Sync now" button. Same body, exposed name.
+pub async fn sync_one(
+    config: &CalendarSourceConfig,
+    vault: &Arc<dyn Vault>,
+    calendar_store: &CalendarStore,
+    config_store: &Arc<dyn CalendarSourceConfigStore>,
+) -> Result<SyncStats> {
+    run_one_sync_pass(config, vault, calendar_store, config_store).await
 }
 
 /// Run one read-side reconciliation pass against the remote.

@@ -552,8 +552,15 @@ impl AppState {
         let web_search = build_web_search_provider(&config.web_search);
         let email_sender: Option<Arc<dyn athen_core::traits::email_sender::EmailSender>> =
             build_email_sender(&config.email);
+        // Resolve the Telegram owner chat id from the unified contact
+        // store first, then fall back to the legacy
+        // `TelegramConfig::owner_user_id`. Users who set their owner via
+        // the "My Contact Info" panel never write to `owner_user_id`, so
+        // without this lookup `send_telegram` would refuse with "no
+        // chat_id given and no owner default configured".
+        let owner_chat_id_override = resolve_owner_telegram_chat_id(contact_store.as_ref()).await;
         let telegram_sender: Option<Arc<dyn athen_core::traits::telegram_sender::TelegramSender>> =
-            build_telegram_sender(&config.telegram);
+            build_telegram_sender(&config.telegram, owner_chat_id_override);
 
         let state = Self {
             coordinator: Arc::new(coordinator),
@@ -778,6 +785,14 @@ impl AppState {
     /// freely into background tasks.
     pub fn attachment_store(&self) -> Option<athen_persistence::attachments::AttachmentStore> {
         self._database.as_ref().map(|db| db.attachment_store())
+    }
+
+    /// SQLite-backed store for calendar source configurations. Returns
+    /// `None` in CLI/test builds without a database.
+    pub fn calendar_source_store(
+        &self,
+    ) -> Option<athen_persistence::calendar_sources::SqliteCalendarSourceStore> {
+        self._database.as_ref().map(|db| db.calendar_source_store())
     }
 
     /// Build an `OwnerLookup` from the shared contact store. Returns
@@ -3372,23 +3387,33 @@ fn build_web_search_provider(
 }
 
 /// Build the Telegram outbound sender from `config.telegram`. Returns
-/// `None` when the bot token is empty. The owner's chat (from
-/// `owner_user_id`) is wired as the default destination — for private
-/// 1-on-1 chats Telegram's chat_id equals the user's id.
+/// `None` when the bot token is empty. The owner's chat is wired as the
+/// default destination — the override (resolved from the unified
+/// contact store) wins over the legacy `owner_user_id` field. For
+/// private 1-on-1 chats Telegram's chat_id equals the user's id.
 fn build_telegram_sender(
     cfg: &athen_core::config::TelegramConfig,
+    owner_chat_id_override: Option<i64>,
 ) -> Option<Arc<dyn athen_core::traits::telegram_sender::TelegramSender>> {
     if !cfg.enabled || cfg.bot_token.trim().is_empty() {
         tracing::info!("Telegram sender not configured; send_telegram tool will refuse");
         return None;
     }
+    let default_chat_id = owner_chat_id_override.or(cfg.owner_user_id);
     match athen_sentidos::telegram_send::BotApiTelegramSender::new(
         cfg.bot_token.clone(),
-        cfg.owner_user_id,
+        default_chat_id,
     ) {
         Ok(sender) => {
             tracing::info!(
-                owner_default_chat = ?cfg.owner_user_id,
+                owner_default_chat = ?default_chat_id,
+                source = if owner_chat_id_override.is_some() {
+                    "contact_store"
+                } else if cfg.owner_user_id.is_some() {
+                    "legacy_config"
+                } else {
+                    "none"
+                },
                 "Telegram sender configured"
             );
             Some(Arc::new(sender))
@@ -3398,6 +3423,23 @@ fn build_telegram_sender(
             None
         }
     }
+}
+
+/// Walk the owner contact's identifiers for a Telegram user id and
+/// return it as an `i64`. The contact store stores Telegram identifiers
+/// as the numeric `user_id` string; private 1-on-1 chats use that same
+/// numeric id for `chat_id` on the Bot API side. Returns `None` when
+/// the contact store is absent, no owner is set, the owner has no
+/// Telegram identifier, or the stored value isn't a valid `i64`.
+async fn resolve_owner_telegram_chat_id(store: Option<&SqliteContactStore>) -> Option<i64> {
+    use athen_contacts::ContactStore as _;
+    let store = store?;
+    let owner = store.find_owner().await.ok().flatten()?;
+    owner
+        .identifiers
+        .iter()
+        .find(|i| i.kind == athen_core::contact::IdentifierKind::Telegram)
+        .and_then(|i| i.value.trim().parse::<i64>().ok())
 }
 
 /// Build the SMTP outbound sender from `config.email`. Returns `None`

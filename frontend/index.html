@@ -533,6 +533,80 @@
                 <div id="telegram-test-result" class="test-result hidden"></div>
             </section>
 
+            <section class="settings-section" id="calendar-sources-section">
+                <h2>Calendar Sources</h2>
+                <p class="settings-description">
+                    Sync events from iCloud, Google (via CalDAV — no OAuth verification needed),
+                    Fastmail, Nextcloud, Yandex, or any RFC 4791 server. Athen polls every 5 minutes
+                    by default and feeds events into the same reminder pipeline as the built-in calendar.
+                </p>
+
+                <div id="calendar-sources-list" class="calendar-sources-list">
+                    <p class="calendar-sources-empty">No calendar sources configured.</p>
+                </div>
+
+                <div class="setting-actions">
+                    <button id="add-calendar-source-btn" class="btn-primary">Add Calendar Source</button>
+                </div>
+
+                <div id="calendar-source-form" class="calendar-source-form" style="display:none;">
+                    <h3 class="settings-subhead">New Calendar Source</h3>
+
+                    <div class="setting-row">
+                        <label for="calendar-source-preset">Provider</label>
+                        <select id="calendar-source-preset" class="settings-input">
+                            <option value="icloud">Apple iCloud</option>
+                            <option value="google">Google Calendar (via CalDAV)</option>
+                            <option value="fastmail">Fastmail</option>
+                            <option value="yandex">Yandex</option>
+                            <option value="nextcloud">Nextcloud (custom URL)</option>
+                            <option value="custom">Custom CalDAV server</option>
+                        </select>
+                    </div>
+
+                    <div id="calendar-source-credential-hint" class="email-provider-hint"></div>
+
+                    <div class="setting-row">
+                        <label for="calendar-source-display-name">Display name</label>
+                        <input type="text" id="calendar-source-display-name" class="settings-input" placeholder="iCloud (alex@me.com)">
+                    </div>
+
+                    <div class="setting-row">
+                        <label for="calendar-source-base-url">Server URL</label>
+                        <input type="text" id="calendar-source-base-url" class="settings-input" placeholder="https://caldav.icloud.com/">
+                    </div>
+
+                    <div class="setting-row">
+                        <label for="calendar-source-username">Username (full email)</label>
+                        <input type="text" id="calendar-source-username" class="settings-input" placeholder="you@me.com" autocomplete="email">
+                    </div>
+
+                    <div class="setting-row">
+                        <label for="calendar-source-password">App-specific password</label>
+                        <div class="api-key-wrapper">
+                            <input type="password" id="calendar-source-password" class="settings-input" placeholder="xxxx-xxxx-xxxx-xxxx" autocomplete="off">
+                            <button class="api-key-toggle" id="calendar-source-password-toggle" title="Show/hide password" type="button">&#128065;</button>
+                        </div>
+                    </div>
+
+                    <div class="setting-actions">
+                        <button id="cancel-calendar-source-btn" class="btn-secondary">Cancel</button>
+                        <button id="save-calendar-source-btn" class="btn-primary">Add and Test</button>
+                    </div>
+                    <div id="calendar-source-form-result" class="test-result hidden"></div>
+                </div>
+
+                <div id="calendar-source-picker" class="calendar-source-form" style="display:none;">
+                    <h3 class="settings-subhead">Pick calendars to sync</h3>
+                    <p class="setting-hint" id="calendar-source-picker-help">Empty selection = sync every calendar this account exposes.</p>
+                    <div id="calendar-source-picker-list"></div>
+                    <div class="setting-actions">
+                        <button id="calendar-source-picker-cancel" class="btn-secondary">Cancel</button>
+                        <button id="calendar-source-picker-save" class="btn-primary">Save Selection</button>
+                    </div>
+                </div>
+            </section>
+
             <section class="settings-section">
                 <h2>Web Search</h2>
                 <p class="settings-description">
@@ -827,6 +901,10 @@
                             <div id="contact-identifiers-list">
                             </div>
                             <button class="btn-secondary" id="add-identifier-btn" onclick="addIdentifierRow()">+ Add Identifier</button>
+                        </div>
+                        <div class="cal-field">
+                            <label>Notes <span class="setting-hint" style="font-weight:normal;">(optional)</span></label>
+                            <textarea id="contact-notes" rows="3" placeholder="Anything Athen should remember about this contact"></textarea>
                         </div>
                     </div>
                     <div class="cal-modal-actions">

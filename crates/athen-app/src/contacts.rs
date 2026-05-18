@@ -25,6 +25,7 @@ pub struct ContactInfo {
     pub interaction_count: u32,
     pub last_interaction: Option<String>,
     pub blocked: bool,
+    pub notes: Option<String>,
 }
 
 /// A single contact identifier for frontend display.
@@ -138,26 +139,7 @@ pub async fn list_contacts(state: State<'_, AppState>) -> Result<Vec<ContactInfo
         .await
         .map_err(|e| format!("Failed to list contacts: {e}"))?;
 
-    Ok(contacts
-        .into_iter()
-        .map(|c| ContactInfo {
-            id: c.id.to_string(),
-            name: c.name.clone(),
-            trust_level: trust_level_str(c.trust_level).to_string(),
-            trust_manual_override: c.trust_manual_override,
-            identifiers: c
-                .identifiers
-                .iter()
-                .map(|i| IdentifierInfo {
-                    value: i.value.clone(),
-                    kind: format!("{:?}", i.kind),
-                })
-                .collect(),
-            interaction_count: c.interaction_count,
-            last_interaction: c.last_interaction.map(|t| t.to_rfc3339()),
-            blocked: c.blocked,
-        })
-        .collect())
+    Ok(contacts.into_iter().map(contact_to_info).collect())
 }
 
 /// Return a single contact by ID.
@@ -181,23 +163,31 @@ pub async fn get_contact(
     Ok(contacts
         .into_iter()
         .find(|c| c.id == uuid)
-        .map(|c| ContactInfo {
-            id: c.id.to_string(),
-            name: c.name.clone(),
-            trust_level: trust_level_str(c.trust_level).to_string(),
-            trust_manual_override: c.trust_manual_override,
-            identifiers: c
-                .identifiers
-                .iter()
-                .map(|i| IdentifierInfo {
-                    value: i.value.clone(),
-                    kind: format!("{:?}", i.kind),
-                })
-                .collect(),
-            interaction_count: c.interaction_count,
-            last_interaction: c.last_interaction.map(|t| t.to_rfc3339()),
-            blocked: c.blocked,
-        }))
+        .map(contact_to_info))
+}
+
+/// Build the FE-facing `ContactInfo` view from a stored `Contact`. Used
+/// by every command that returns a contact so the serialization shape
+/// stays in one place.
+fn contact_to_info(c: Contact) -> ContactInfo {
+    ContactInfo {
+        id: c.id.to_string(),
+        name: c.name.clone(),
+        trust_level: trust_level_str(c.trust_level).to_string(),
+        trust_manual_override: c.trust_manual_override,
+        identifiers: c
+            .identifiers
+            .iter()
+            .map(|i| IdentifierInfo {
+                value: i.value.clone(),
+                kind: format!("{:?}", i.kind),
+            })
+            .collect(),
+        interaction_count: c.interaction_count,
+        last_interaction: c.last_interaction.map(|t| t.to_rfc3339()),
+        blocked: c.blocked,
+        notes: c.notes,
+    }
 }
 
 /// Set the trust level for a contact (manual override).
@@ -290,12 +280,17 @@ pub async fn delete_contact(state: State<'_, AppState>, id: String) -> Result<()
     Ok(())
 }
 
-/// Create a new contact with a name and optional identifiers.
+/// Create a new contact with a name and optional identifiers. Trust
+/// level defaults to `Neutral` when not provided; if the caller picks a
+/// non-default level it counts as a manual override so auto-evolution
+/// won't quietly walk it back.
 #[tauri::command]
 pub async fn create_contact(
     state: State<'_, AppState>,
     name: String,
+    trust_level: Option<String>,
     identifiers: Vec<IdentifierInput>,
+    notes: Option<String>,
 ) -> Result<ContactInfo, String> {
     use athen_contacts::ContactStore as _;
 
@@ -304,22 +299,35 @@ pub async fn create_contact(
         .as_ref()
         .ok_or_else(|| "Contact store not available".to_string())?;
 
+    let level = match trust_level.as_deref() {
+        Some(s) if !s.is_empty() => parse_trust_level(s)?,
+        _ => TrustLevel::Neutral,
+    };
+    let manual_override = level != TrustLevel::Neutral;
+
     let id = uuid::Uuid::new_v4();
+    let parsed_idents: Vec<ContactIdentifier> = identifiers
+        .iter()
+        .filter(|i| !i.value.trim().is_empty())
+        .map(|i| {
+            let kind = parse_identifier_kind(&i.kind);
+            let value = match kind {
+                IdentifierKind::Email => normalize_email_address(&i.value),
+                _ => i.value.trim().to_string(),
+            };
+            ContactIdentifier { kind, value }
+        })
+        .collect();
+
     let contact = Contact {
         id,
-        name: name.clone(),
-        trust_level: TrustLevel::Neutral,
-        trust_manual_override: false,
-        identifiers: identifiers
-            .iter()
-            .map(|i| ContactIdentifier {
-                value: i.value.clone(),
-                kind: parse_identifier_kind(&i.kind),
-            })
-            .collect(),
+        name: name.trim().to_string(),
+        trust_level: level,
+        trust_manual_override: manual_override,
+        identifiers: parsed_idents,
         interaction_count: 0,
         last_interaction: None,
-        notes: None,
+        notes: notes.filter(|s| !s.trim().is_empty()),
         blocked: false,
         is_owner: false,
     };
@@ -329,31 +337,20 @@ pub async fn create_contact(
         .await
         .map_err(|e| format!("Failed to create contact: {e}"))?;
 
-    Ok(ContactInfo {
-        id: id.to_string(),
-        name,
-        trust_level: trust_level_str(TrustLevel::Neutral).to_string(),
-        trust_manual_override: false,
-        identifiers: identifiers
-            .iter()
-            .map(|i| IdentifierInfo {
-                value: i.value.clone(),
-                kind: i.kind.clone(),
-            })
-            .collect(),
-        interaction_count: 0,
-        last_interaction: None,
-        blocked: false,
-    })
+    Ok(contact_to_info(contact))
 }
 
 /// Update an existing contact. Only provided fields are changed.
+/// Passing `trust_level` flips `trust_manual_override` to true so the
+/// auto-evolution path can't drift the user's choice back.
 #[tauri::command]
 pub async fn update_contact(
     state: State<'_, AppState>,
     id: String,
     name: Option<String>,
+    trust_level: Option<String>,
     identifiers: Option<Vec<IdentifierInput>>,
+    notes: Option<String>,
 ) -> Result<ContactInfo, String> {
     use athen_contacts::ContactStore as _;
 
@@ -371,15 +368,37 @@ pub async fn update_contact(
         .ok_or_else(|| format!("Contact not found: {id}"))?;
 
     if let Some(new_name) = name {
-        contact.name = new_name;
+        contact.name = new_name.trim().to_string();
+    }
+
+    if let Some(s) = trust_level {
+        if !s.is_empty() {
+            let level = parse_trust_level(&s)?;
+            contact.trust_level = level;
+            contact.trust_manual_override = true;
+        }
+    }
+
+    if let Some(new_notes) = notes {
+        let trimmed = new_notes.trim();
+        contact.notes = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
     }
 
     if let Some(new_identifiers) = identifiers {
         contact.identifiers = new_identifiers
             .iter()
-            .map(|i| ContactIdentifier {
-                value: i.value.clone(),
-                kind: parse_identifier_kind(&i.kind),
+            .filter(|i| !i.value.trim().is_empty())
+            .map(|i| {
+                let kind = parse_identifier_kind(&i.kind);
+                let value = match kind {
+                    IdentifierKind::Email => normalize_email_address(&i.value),
+                    _ => i.value.trim().to_string(),
+                };
+                ContactIdentifier { kind, value }
             })
             .collect();
     }
@@ -389,23 +408,7 @@ pub async fn update_contact(
         .await
         .map_err(|e| format!("Failed to update contact: {e}"))?;
 
-    Ok(ContactInfo {
-        id: contact.id.to_string(),
-        name: contact.name.clone(),
-        trust_level: trust_level_str(contact.trust_level).to_string(),
-        trust_manual_override: contact.trust_manual_override,
-        identifiers: contact
-            .identifiers
-            .iter()
-            .map(|i| IdentifierInfo {
-                value: i.value.clone(),
-                kind: format!("{:?}", i.kind),
-            })
-            .collect(),
-        interaction_count: contact.interaction_count,
-        last_interaction: contact.last_interaction.map(|t| t.to_rfc3339()),
-        blocked: contact.blocked,
-    })
+    Ok(contact_to_info(contact))
 }
 
 // ---------------------------------------------------------------------------
