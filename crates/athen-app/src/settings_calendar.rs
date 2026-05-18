@@ -210,6 +210,7 @@ pub async fn list_remote_calendars(
 pub async fn sync_calendar_source_now(
     id: String,
     state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
 ) -> std::result::Result<SyncResult, String> {
     use std::sync::Arc as StdArc;
 
@@ -231,18 +232,94 @@ pub async fn sync_calendar_source_now(
     let cfg_store: StdArc<dyn CalendarSourceConfigStore> = StdArc::new(store_concrete);
 
     match crate::calendar_sources::sync_one(&cfg, &vault, &calendar_store, &cfg_store).await {
-        Ok(stats) => Ok(SyncResult {
-            success: true,
-            message: format!(
-                "Synced: +{} new, ~{} updated, -{} removed",
-                stats.inserted, stats.updated, stats.deleted
-            ),
-        }),
+        Ok(stats) => {
+            emit_sync_completed(&app_handle, &cfg.id.to_string(), &cfg.display_name, stats);
+            Ok(SyncResult {
+                success: true,
+                message: format!(
+                    "Synced: +{} new, ~{} updated, -{} removed",
+                    stats.inserted, stats.updated, stats.deleted
+                ),
+            })
+        }
         Err(e) => Ok(SyncResult {
             success: false,
             message: e.to_string(),
         }),
     }
+}
+
+/// Sync every enabled source in one shot. Used by the Calendar view's
+/// header "Sync" button so the user doesn't have to bounce to Settings.
+/// Returns the aggregate counts; per-source errors are folded into
+/// `errors` rather than aborting the whole call.
+#[tauri::command]
+pub async fn sync_all_calendar_sources_now(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> std::result::Result<SyncAllResult, String> {
+    use std::sync::Arc as StdArc;
+
+    let store_concrete = source_store(&state)?;
+    let sources = store_concrete.list().await.map_err(|e| e.to_string())?;
+    let vault = state
+        .vault
+        .clone()
+        .ok_or_else(|| "Credential vault unavailable".to_string())?;
+    let calendar_store = state
+        .calendar_store
+        .clone()
+        .ok_or_else(|| "Calendar store unavailable".to_string())?;
+    let cfg_store: StdArc<dyn CalendarSourceConfigStore> = StdArc::new(store_concrete);
+
+    let mut totals = SyncAllResult::default();
+    for cfg in sources {
+        if !cfg.enabled {
+            continue;
+        }
+        totals.sources_tried += 1;
+        match crate::calendar_sources::sync_one(&cfg, &vault, &calendar_store, &cfg_store).await {
+            Ok(stats) => {
+                totals.inserted += stats.inserted;
+                totals.updated += stats.updated;
+                totals.deleted += stats.deleted;
+                emit_sync_completed(&app_handle, &cfg.id.to_string(), &cfg.display_name, stats);
+            }
+            Err(e) => {
+                totals.errors.push(format!("{}: {}", cfg.display_name, e));
+            }
+        }
+    }
+    Ok(totals)
+}
+
+fn emit_sync_completed(
+    handle: &tauri::AppHandle,
+    source_id: &str,
+    source_name: &str,
+    stats: crate::calendar_sources::SyncStats,
+) {
+    use tauri::Emitter as _;
+    let payload = serde_json::json!({
+        "source_id": source_id,
+        "source_name": source_name,
+        "inserted": stats.inserted,
+        "updated": stats.updated,
+        "deleted": stats.deleted,
+    });
+    if let Err(e) = handle.emit("calendar-sync-completed", payload) {
+        tracing::debug!(error = %e, "Failed to emit calendar-sync-completed");
+    }
+}
+
+#[derive(Debug, Default, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncAllResult {
+    pub sources_tried: usize,
+    pub inserted: usize,
+    pub updated: usize,
+    pub deleted: usize,
+    pub errors: Vec<String>,
 }
 
 fn source_store(

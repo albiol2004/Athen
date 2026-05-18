@@ -129,6 +129,7 @@ pub fn run() {
             settings_calendar::test_calendar_source_connection,
             settings_calendar::list_remote_calendars,
             settings_calendar::sync_calendar_source_now,
+            settings_calendar::sync_all_calendar_sources_now,
             contacts::list_contacts,
             contacts::get_contact,
             contacts::set_contact_trust,
@@ -295,7 +296,7 @@ pub fn run() {
             // Start background monitor tasks before managing state.
             state.start_email_monitor(app.handle().clone());
             state.start_calendar_monitor(app.handle().clone());
-            state.start_calendar_sync();
+            state.start_calendar_sync(Some(app.handle().clone()));
             state.start_telegram_monitor(app.handle().clone());
 
             // Sweep attachment bytes past the policy TTL. Cheap, runs

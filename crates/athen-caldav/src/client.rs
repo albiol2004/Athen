@@ -211,13 +211,22 @@ pub const PROPFIND_CALENDAR_LIST: &str = r#"<?xml version="1.0" encoding="utf-8"
 
 /// Build a `calendar-query` REPORT body filtering VEVENTs by a time range.
 /// Times are UTC `YYYYMMDDTHHMMSSZ`.
+///
+/// The `<C:expand>` element inside `<C:calendar-data>` asks the server to
+/// expand RRULE occurrences inside the window and return each instance
+/// as its own VEVENT (with a `RECURRENCE-ID` property). Without it,
+/// recurring events come back as just the master VEVENT at its original
+/// DTSTART — so a yearly birthday with DTSTART=2014 only ever appears in
+/// 2014. iCloud, Google CalDAV, Fastmail and Nextcloud all honor expand.
 pub fn build_calendar_query(start_utc: &str, end_utc: &str) -> String {
     format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
 <C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
   <D:prop>
     <D:getetag/>
-    <C:calendar-data/>
+    <C:calendar-data>
+      <C:expand start="{start_utc}" end="{end_utc}"/>
+    </C:calendar-data>
   </D:prop>
   <C:filter>
     <C:comp-filter name="VCALENDAR">

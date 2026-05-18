@@ -535,6 +535,18 @@ function registerTauriEventListeners() {
         showSenseNotification(source, from, subject, body_preview,
                               relevance, reason, suggested_action, arc_id, dispatched);
     });
+
+    // Reload the calendar grid whenever a sync pass lands new/changed
+    // events while the user has the Calendar view open. Background syncs
+    // run every 5 minutes plus one shortly after startup; without this,
+    // the user would only see fresh remote events after manually
+    // navigating to another month and back.
+    window.__TAURI__.event.listen('calendar-sync-completed', () => {
+        const view = document.getElementById('calendar-view');
+        if (view && !view.classList.contains('hidden')) {
+            loadCalendarEvents();
+        }
+    });
 }
 
 // Route `<a target="_blank">` and any external http(s) anchor through the
@@ -8768,6 +8780,42 @@ document.getElementById('cal-today-btn')?.addEventListener('click', () => {
     loadCalendarEvents();
 });
 
+document.getElementById('cal-sync-btn')?.addEventListener('click', async () => {
+    const btn = document.getElementById('cal-sync-btn');
+    if (!btn || btn.disabled) return;
+    const original = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Syncing…';
+    try {
+        if (invoke) {
+            const result = await invoke('sync_all_calendar_sources_now');
+            const tried = result?.sourcesTried ?? 0;
+            const ins = result?.inserted ?? 0;
+            const upd = result?.updated ?? 0;
+            const del = result?.deleted ?? 0;
+            const errs = Array.isArray(result?.errors) ? result.errors : [];
+
+            if (tried === 0) {
+                showToast('No calendar sources configured. Add one in Settings → Connections → Calendar Sources.', 'warn');
+            } else if (errs.length > 0) {
+                console.warn('Calendar sync errors:', errs);
+                showToast('Sync errors: ' + errs.join(' · '), 'error');
+            } else if (ins === 0 && upd === 0 && del === 0) {
+                showToast(`Synced ${tried} source(s) — no new or changed events in the past year / next year window.`, 'info');
+            } else {
+                showToast(`Synced: +${ins} new, ~${upd} updated, -${del} removed`, 'success');
+            }
+        }
+        await loadCalendarEvents();
+    } catch (err) {
+        console.error('Calendar sync failed:', err);
+        showToast('Sync failed: ' + err, 'error');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = original;
+    }
+});
+
 if (calViewSelect) {
     calViewSelect.addEventListener('change', (e) => {
         calViewMode = e.target.value;
@@ -9075,7 +9123,7 @@ function renderContactList(contacts) {
             blockedBadge +
             '<span class="contact-badge ' + trustClass + '">' + escapeHtml(contact.trust_level) + '</span>' +
             '<span class="contact-interactions">' + interactionsText + '</span>' +
-            '<button class="contact-edit-btn" title="Edit contact">&#9998;</button>';
+            '<button class="contact-edit-btn" title="Edit contact"><span aria-hidden="true">&#9998;</span><span>Edit</span></button>';
 
         headerEl.querySelector('.contact-edit-btn').addEventListener('click', (e) => {
             e.stopPropagation();

@@ -27,15 +27,16 @@ use athen_core::traits::calendar_source_config::CalendarSourceConfigStore;
 use athen_core::traits::vault::Vault;
 use athen_persistence::calendar::{CalendarEvent, CalendarStore, EventCreator};
 
-/// How far ahead each pull pulls. 30 days catches the most-likely upcoming
-/// surface for reminders and avoids dragging entire historical archives
-/// across the wire on every tick.
-const PULL_WINDOW_DAYS_AHEAD: i64 = 30;
+/// How far ahead each pull pulls. One year covers everything the
+/// calendar UI is likely to surface — holidays, annual reminders,
+/// future planning — without the user having to babysit window size.
+const PULL_WINDOW_DAYS_AHEAD: i64 = 365;
 
-/// How far back each pull pulls. Catches events that crept into the
-/// "recent past" since the last sync (someone moved tomorrow's meeting
-/// to yesterday by accident, etc.) without re-syncing all history.
-const PULL_WINDOW_DAYS_BEHIND: i64 = 1;
+/// How far back each pull pulls. One year of history matches what a
+/// real calendar app exposes when the user pages backwards. The earlier
+/// 1-day window was sized for "reminders only" semantics and made every
+/// calendar look empty as soon as the user scrolled past today.
+const PULL_WINDOW_DAYS_BEHIND: i64 = 365;
 
 /// Build a `Box<dyn CalendarSource>` for a configured source. Reads the
 /// password out of the vault using the config's stored scope/key.
@@ -77,12 +78,17 @@ pub async fn build_source(
 /// `config.sync_interval_secs`. The caller-supplied `shutdown_tx`'s
 /// receivers are used for cancellation — sending one `()` on it
 /// terminates every sync loop at its next select boundary.
+///
+/// When `app_handle` is `Some`, each completed pass that changed anything
+/// emits a `calendar-sync-completed` Tauri event so the open Calendar UI
+/// can reload events without waiting for the user to navigate.
 pub fn spawn_sync_loops(
     sources: Vec<CalendarSourceConfig>,
     vault: Arc<dyn Vault>,
     calendar_store: CalendarStore,
     config_store: Arc<dyn CalendarSourceConfigStore>,
     shutdown_tx: broadcast::Sender<()>,
+    app_handle: Option<tauri::AppHandle>,
 ) {
     for cfg in sources {
         if !cfg.enabled {
@@ -95,6 +101,7 @@ pub fn spawn_sync_loops(
         let interval = Duration::from_secs(cfg.sync_interval_secs.max(60));
         let source_name = cfg.display_name.clone();
         let id = cfg.id;
+        let app_handle = app_handle.clone();
         tokio::spawn(async move {
             tracing::info!(source = %source_name, interval_secs = interval.as_secs(), "Calendar sync loop started");
             // First pass on a short delay so startup logs don't pile up
@@ -111,6 +118,9 @@ pub fn spawn_sync_loops(
                             deleted = stats.deleted,
                             "Calendar sync pass complete"
                         );
+                        if let Some(handle) = app_handle.as_ref() {
+                            emit_sync_completed(handle, id, &source_name, stats);
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(source = %source_name, error = %e, "Calendar sync pass failed");
@@ -128,6 +138,27 @@ pub fn spawn_sync_loops(
                 }
             }
         });
+    }
+}
+
+/// Emit a `calendar-sync-completed` event to the frontend. No-op if it
+/// can't serialise (it can't fail in practice for this payload).
+fn emit_sync_completed(
+    handle: &tauri::AppHandle,
+    source_id: Uuid,
+    source_name: &str,
+    stats: SyncStats,
+) {
+    use tauri::Emitter as _;
+    let payload = serde_json::json!({
+        "source_id": source_id.to_string(),
+        "source_name": source_name,
+        "inserted": stats.inserted,
+        "updated": stats.updated,
+        "deleted": stats.deleted,
+    });
+    if let Err(e) = handle.emit("calendar-sync-completed", payload) {
+        tracing::debug!(error = %e, "Failed to emit calendar-sync-completed");
     }
 }
 
@@ -167,28 +198,50 @@ async fn run_one_sync_pass(
     // Decide which calendars to sync: the user-selected list, or all
     // exposed by the source when none were picked.
     let calendars = if config.selected_calendars.is_empty() {
-        source
-            .list_calendars()
-            .await?
-            .into_iter()
-            .map(|c| c.id)
-            .collect::<Vec<_>>()
+        let discovered = source.list_calendars().await?;
+        tracing::info!(
+            source = %config.display_name,
+            discovered = discovered.len(),
+            names = ?discovered.iter().map(|c| &c.name).collect::<Vec<_>>(),
+            "Calendar sync: list_calendars returned"
+        );
+        if discovered.is_empty() {
+            tracing::warn!(
+                source = %config.display_name,
+                base_url = %config.base_url,
+                username = %config.username,
+                "Calendar sync: no calendars discovered — check credentials and home-set URL"
+            );
+        }
+        discovered.into_iter().map(|c| c.id).collect::<Vec<_>>()
     } else {
         config.selected_calendars.clone()
     };
 
     let mut stats = SyncStats::default();
     let source_id = config.id.to_string();
+    // Aggregate every remote_id we see across every calendar this pass
+    // pulls. We must NOT run reconcile_deletes per calendar — `source_id`
+    // covers the whole source, so a per-calendar delete would treat
+    // events from sibling calendars as "missing from the pull" and nuke
+    // them every pass. Build the union first, then delete once at the end.
+    let mut all_pulled_remote_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     for calendar_id in &calendars {
         let pulled = source
             .list_events(calendar_id, pull_start, pull_end)
             .await?;
-        let pulled_remote_ids: std::collections::HashSet<String> =
-            pulled.iter().map(|e| e.remote_id.clone()).collect();
+        tracing::info!(
+            source = %config.display_name,
+            calendar_id = %calendar_id,
+            pulled = pulled.len(),
+            "Calendar sync: list_events returned"
+        );
 
         // INSERT / UPDATE every pulled event.
         for remote in &pulled {
+            all_pulled_remote_ids.insert(remote.remote_id.clone());
             let result = reconcile_one(calendar_store, &source_id, remote).await?;
             match result {
                 ReconcileResult::Inserted => stats.inserted += 1,
@@ -196,20 +249,20 @@ async fn run_one_sync_pass(
                 ReconcileResult::Unchanged => {}
             }
         }
-
-        // DELETE: anything in the local DB tagged with this source_id
-        // and whose start falls inside the pull window but didn't appear
-        // in the pull — the user removed it on the remote side.
-        let deleted = reconcile_deletes(
-            calendar_store,
-            &source_id,
-            &pulled_remote_ids,
-            pull_start,
-            pull_end,
-        )
-        .await?;
-        stats.deleted += deleted;
     }
+
+    // DELETE: anything in the local DB tagged with this source_id
+    // and whose start falls inside the pull window but didn't appear
+    // in *any* calendar's pull — the user removed it on the remote side.
+    let deleted = reconcile_deletes(
+        calendar_store,
+        &source_id,
+        &all_pulled_remote_ids,
+        pull_start,
+        pull_end,
+    )
+    .await?;
+    stats.deleted += deleted;
 
     config_store.record_sync_success(config.id, now).await?;
     Ok(stats)

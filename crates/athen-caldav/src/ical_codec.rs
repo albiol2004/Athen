@@ -257,6 +257,7 @@ fn parse_vevent_lines(
     let mut start: Option<(DateTime<Utc>, bool)> = None;
     let mut end: Option<(DateTime<Utc>, bool)> = None;
     let mut rrule: Option<String> = None;
+    let mut recurrence_id: Option<String> = None;
     let mut reminders: Vec<i64> = Vec::new();
 
     let mut in_alarm = false;
@@ -293,6 +294,7 @@ fn parse_vevent_lines(
             "DTSTART" => start = Some(parse_datetime(&p)?),
             "DTEND" => end = Some(parse_datetime(&p)?),
             "RRULE" => rrule = Some(p.value),
+            "RECURRENCE-ID" => recurrence_id = Some(p.value),
             _ => {}
         }
     }
@@ -309,8 +311,18 @@ fn parse_vevent_lines(
         }
     });
 
+    // When the server expanded a recurring event with <C:expand/>, every
+    // occurrence comes back sharing the same object href (`remote_id`)
+    // but with a per-instance `RECURRENCE-ID`. Append it so each instance
+    // gets a unique key in the local store and they don't collide on
+    // INSERT — otherwise we'd only ever store one row per recurring event.
+    let remote_id_final = match recurrence_id.as_deref() {
+        Some(rid) if !rid.is_empty() => format!("{remote_id}#{rid}"),
+        _ => remote_id.to_string(),
+    };
+
     Ok(RemoteEvent {
-        remote_id: remote_id.to_string(),
+        remote_id: remote_id_final,
         calendar_id: calendar_id.to_string(),
         etag,
         ical_uid: uid,

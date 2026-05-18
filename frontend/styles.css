@@ -4121,19 +4121,22 @@ option:hover {
 }
 
 .contact-edit-btn {
-    width: 28px;
-    height: 28px;
-    display: grid;
-    place-items: center;
-    background: transparent;
-    color: var(--text-3);
-    border-radius: var(--r-xs);
-    font-size: 13px;
-    transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+    height: 30px;
+    padding: 0 12px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--surface-3);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    font-size: 12px;
+    font-weight: 500;
+    transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease);
 }
 .contact-edit-btn:hover {
-    background: rgba(255,255,255,0.06);
-    color: var(--text);
+    background: var(--surface-4);
+    border-color: var(--border-strong);
 }
 
 .identifier-row {

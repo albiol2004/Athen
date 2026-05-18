@@ -1527,7 +1527,7 @@ impl AppState {
     /// into the local `CalendarStore`. The local `CalendarMonitor` polls
     /// that table independently for reminders, so the two pipelines stay
     /// decoupled.
-    pub fn start_calendar_sync(&mut self) {
+    pub fn start_calendar_sync(&mut self, app_handle: Option<tauri::AppHandle>) {
         use std::sync::Arc as StdArc;
 
         let Some(db) = self._database.as_ref() else {
@@ -1572,6 +1572,7 @@ impl AppState {
                 calendar_store,
                 cfg_store,
                 shutdown_tx,
+                app_handle,
             );
         });
     }
