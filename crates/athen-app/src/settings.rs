@@ -2428,6 +2428,33 @@ async fn test_openai_compatible(
 }
 
 // ---------------------------------------------------------------------------
+// Calendar settings commands
+// ---------------------------------------------------------------------------
+
+/// Return the free-form calendar prompt the user wrote in Settings.
+/// Empty string when unset.
+#[tauri::command]
+pub async fn get_calendar_prompt(
+    _state: State<'_, AppState>,
+) -> std::result::Result<String, String> {
+    Ok(load_main_config().calendar.agent_prompt)
+}
+
+/// Save the free-form calendar prompt. Persisted to the main TOML config
+/// — picked up immediately by the next sense event since
+/// `build_context_message` reads it via `load_main_config_public()`.
+#[tauri::command]
+pub async fn save_calendar_prompt(
+    _state: State<'_, AppState>,
+    prompt: String,
+) -> std::result::Result<(), String> {
+    let mut config = load_main_config();
+    config.calendar.agent_prompt = prompt;
+    save_main_config(&config)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Notification settings commands
 // ---------------------------------------------------------------------------
 

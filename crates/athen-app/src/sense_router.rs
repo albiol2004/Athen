@@ -949,6 +949,18 @@ fn build_context_message(
                 "\n\nThe user may ask you about this event, want to reschedule it, \
                           or need help preparing for it.",
             );
+            // User-authored calendar instruction (Settings → Calendar →
+            // "Prompt for every event"). Empty by default; when set, this
+            // is the one place the user can steer the agent on every
+            // reminder without editing code.
+            let user_prompt = crate::settings::load_main_config_public()
+                .calendar
+                .agent_prompt;
+            let user_prompt = user_prompt.trim();
+            if !user_prompt.is_empty() {
+                msg.push_str("\n\nUser standing instruction for calendar events:\n");
+                msg.push_str(user_prompt);
+            }
         }
         EventSource::Email => {
             if from_owner {

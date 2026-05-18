@@ -8905,6 +8905,44 @@ document.getElementById('cal-today-btn')?.addEventListener('click', () => {
     loadCalendarEvents();
 });
 
+// Calendar standing-instruction prompt panel — collapsible, persisted
+// via get_calendar_prompt / save_calendar_prompt. Sent on every reminder
+// the calendar sense fires.
+document.getElementById('cal-prompt-btn')?.addEventListener('click', async () => {
+    const panel = document.getElementById('cal-prompt-panel');
+    const ta = document.getElementById('cal-prompt-textarea');
+    if (!panel || !ta) return;
+    const willOpen = panel.classList.contains('hidden');
+    if (willOpen && invoke) {
+        try {
+            const current = await invoke('get_calendar_prompt');
+            ta.value = typeof current === 'string' ? current : '';
+        } catch (err) {
+            console.warn('Failed to load calendar prompt:', err);
+        }
+    }
+    panel.classList.toggle('hidden');
+    if (willOpen) ta.focus();
+});
+
+document.getElementById('cal-prompt-cancel')?.addEventListener('click', () => {
+    document.getElementById('cal-prompt-panel')?.classList.add('hidden');
+});
+
+document.getElementById('cal-prompt-save')?.addEventListener('click', async () => {
+    if (!invoke) return;
+    const ta = document.getElementById('cal-prompt-textarea');
+    if (!ta) return;
+    try {
+        await invoke('save_calendar_prompt', { prompt: ta.value });
+        document.getElementById('cal-prompt-panel')?.classList.add('hidden');
+        showToast('Calendar prompt saved', 'success');
+    } catch (err) {
+        console.error('Failed to save calendar prompt:', err);
+        showToast('Failed to save prompt: ' + err, 'error');
+    }
+});
+
 document.getElementById('cal-sync-btn')?.addEventListener('click', async () => {
     const btn = document.getElementById('cal-sync-btn');
     if (!btn || btn.disabled) return;

@@ -3636,6 +3636,36 @@ option:hover {
 }
 .cal-today-btn:hover { background: var(--surface-3); }
 
+.cal-prompt-panel {
+    padding: 14px 24px;
+    background: var(--surface-1);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.cal-prompt-panel label {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+}
+.cal-prompt-panel textarea {
+    width: 100%;
+    padding: 10px;
+    background: var(--surface-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    font-family: inherit;
+    font-size: 13px;
+    resize: vertical;
+}
+.cal-prompt-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+}
+
 .cal-view-select {
     height: 30px;
     padding: 0 28px 0 10px;

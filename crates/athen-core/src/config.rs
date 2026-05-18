@@ -24,6 +24,20 @@ pub struct AthenConfig {
     pub web_search: WebSearchConfig,
     #[serde(default)]
     pub attachment_policy: AttachmentPolicy,
+    #[serde(default)]
+    pub calendar: CalendarConfig,
+}
+
+/// User-facing calendar settings. Currently just one free-form prompt
+/// the user writes once and that gets injected into every calendar-
+/// reminder agent prompt — lets the user tell Athen "when a Trabajo
+/// event fires, draft a 3-line prep summary" without code changes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CalendarConfig {
+    /// Free-form instruction prepended to the agent message on every
+    /// calendar-reminder sense event. Empty = no extra instruction.
+    pub agent_prompt: String,
 }
 
 impl Default for AthenConfig {
@@ -41,6 +55,7 @@ impl Default for AthenConfig {
             embeddings: EmbeddingConfig::default(),
             web_search: WebSearchConfig::default(),
             attachment_policy: AttachmentPolicy::default(),
+            calendar: CalendarConfig::default(),
         }
     }
 }

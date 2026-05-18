@@ -947,6 +947,7 @@
                     <button id="cal-next" class="cal-nav-btn" title="Next">&gt;</button>
                 </div>
                 <div class="calendar-header-actions">
+                    <button id="cal-prompt-btn" class="cal-today-btn" title="Standing instruction the agent gets on every calendar reminder">Prompt</button>
                     <button id="cal-sync-btn" class="cal-today-btn" title="Pull events from your connected calendars">Sync</button>
                     <button id="cal-today-btn" class="cal-today-btn">Today</button>
                     <select id="cal-view-select" class="cal-view-select">
@@ -955,6 +956,15 @@
                     </select>
                 </div>
             </header>
+            <div id="cal-prompt-panel" class="cal-prompt-panel hidden">
+                <label for="cal-prompt-textarea">Standing instruction for every calendar reminder</label>
+                <p class="setting-hint">Free text. Sent to the agent along with every calendar event the sense layer fires. Example: <em>"For Trabajo events, draft a 3-line prep summary from related emails. For Familia events, just notify."</em></p>
+                <textarea id="cal-prompt-textarea" rows="5" placeholder="e.g. For Trabajo events, prepare a summary. For Familia, just notify."></textarea>
+                <div class="cal-prompt-actions">
+                    <button id="cal-prompt-cancel" class="btn-secondary">Cancel</button>
+                    <button id="cal-prompt-save" class="btn-primary">Save</button>
+                </div>
+            </div>
             <div id="calendar-grid" class="calendar-grid"></div>
 
             <div id="cal-modal-overlay" class="cal-modal-overlay hidden">
