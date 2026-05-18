@@ -8712,12 +8712,17 @@ async function saveCalendarEvent() {
     try {
         if (id) {
             await invoke('update_calendar_event', { event: eventData });
+            showToast('Event updated', 'success');
         } else {
-            await invoke('create_calendar_event', { event: eventData });
+            const saved = await invoke('create_calendar_event', { event: eventData });
+            if (saved && saved.source_id) {
+                showToast('Event saved to your remote calendar', 'success');
+            } else {
+                showToast('Event saved locally (no remote calendar configured)', 'info');
+            }
         }
         hideEventModal();
         await loadCalendarEvents();
-        showToast('Event saved', 'success');
     } catch (err) {
         console.error('Failed to save event:', err);
         showToast('Failed to save event: ' + err, 'error');

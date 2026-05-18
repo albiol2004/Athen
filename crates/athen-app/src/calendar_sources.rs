@@ -180,6 +180,153 @@ pub async fn sync_one(
     run_one_sync_pass(config, vault, calendar_store, config_store).await
 }
 
+/// What the write-through path uses to address one calendar on one source.
+#[derive(Debug, Clone)]
+pub struct WriteTarget {
+    pub source: CalendarSourceConfig,
+    pub calendar_id: String,
+    pub calendar_name: String,
+}
+
+/// Auto-pick a write target. Returns `Some` only when exactly one source
+/// is enabled and we can identify one calendar to write into.
+///
+/// Picking rule:
+/// 1. Filter to enabled sources. If zero or more than one, return `None` —
+///    the user must disambiguate, and we don't have a UI for that yet.
+/// 2. If `selected_calendars` is non-empty, use the first entry.
+/// 3. Else fetch `list_calendars()` and skip calendars whose name contains
+///    a reminders keyword (we PUT VEVENTs, not VTODOs). First survivor wins.
+pub async fn auto_pick_write_target(
+    config_store: &Arc<dyn CalendarSourceConfigStore>,
+    vault: &Arc<dyn Vault>,
+) -> Result<Option<WriteTarget>> {
+    let sources = config_store.list().await?;
+    let enabled: Vec<CalendarSourceConfig> = sources.into_iter().filter(|s| s.enabled).collect();
+    if enabled.len() != 1 {
+        return Ok(None);
+    }
+    let source_cfg = enabled.into_iter().next().unwrap();
+    let live = build_source(&source_cfg, vault).await?;
+
+    let (cal_id, cal_name) = if let Some(first) = source_cfg.selected_calendars.first() {
+        // We only have the id — look up the name from list_calendars for
+        // the toast. Best-effort; fall back to a slice of the id.
+        let name = match live.list_calendars().await {
+            Ok(cals) => cals
+                .into_iter()
+                .find(|c| &c.id == first)
+                .map(|c| c.name)
+                .unwrap_or_else(|| first.clone()),
+            Err(_) => first.clone(),
+        };
+        (first.clone(), name)
+    } else {
+        let cals = live.list_calendars().await?;
+        let pick = cals
+            .into_iter()
+            .find(|c| !is_reminders_name(&c.name))
+            .ok_or_else(|| {
+                AthenError::Other(
+                    "No writable calendar found on source — every collection looks like a reminders/VTODO calendar".into(),
+                )
+            })?;
+        (pick.id, pick.name)
+    };
+
+    Ok(Some(WriteTarget {
+        source: source_cfg,
+        calendar_id: cal_id,
+        calendar_name: cal_name,
+    }))
+}
+
+fn is_reminders_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.contains("recordator") || lower.contains("reminder") || lower.contains("to-do")
+}
+
+/// Push a freshly-created local event to the remote, then return the
+/// remote_id + etag for the caller to stamp onto the local row.
+pub async fn push_create(
+    target: &WriteTarget,
+    vault: &Arc<dyn Vault>,
+    event: &CalendarEvent,
+) -> Result<(String, Option<String>, String)> {
+    let live = build_source(&target.source, vault).await?;
+    let mut remote = local_to_remote(event, &target.calendar_id)?;
+    // Ensure a UID exists; CalDAV needs it for the .ics path.
+    let uid = remote
+        .ical_uid
+        .clone()
+        .unwrap_or_else(|| format!("athen-{}@local", event.id));
+    remote.ical_uid = Some(uid.clone());
+    let (remote_id, etag) = live.create_event(&target.calendar_id, &remote).await?;
+    Ok((remote_id, etag, uid))
+}
+
+/// Push an update to the remote when the local row was previously synced.
+pub async fn push_update(
+    source_cfg: &CalendarSourceConfig,
+    vault: &Arc<dyn Vault>,
+    event: &CalendarEvent,
+) -> Result<Option<String>> {
+    let live = build_source(source_cfg, vault).await?;
+    // The CalDAV adapter ignores `calendar_id` on update (the remote_id is
+    // the full object URL already). Pass empty to keep the trait happy.
+    let calendar_id = "";
+    let remote = local_to_remote(event, calendar_id)?;
+    let remote_id = event.remote_id.as_deref().ok_or_else(|| {
+        AthenError::Other("Cannot push update: local event has no remote_id".into())
+    })?;
+    let new_etag = live
+        .update_event(
+            calendar_id,
+            remote_id,
+            event.remote_etag.as_deref(),
+            &remote,
+        )
+        .await?;
+    Ok(new_etag)
+}
+
+/// Delete the remote object for a synced local row.
+pub async fn push_delete(
+    source_cfg: &CalendarSourceConfig,
+    vault: &Arc<dyn Vault>,
+    event: &CalendarEvent,
+) -> Result<()> {
+    let live = build_source(source_cfg, vault).await?;
+    let remote_id = event.remote_id.as_deref().ok_or_else(|| {
+        AthenError::Other("Cannot push delete: local event has no remote_id".into())
+    })?;
+    live.delete_event("", remote_id, event.remote_etag.as_deref())
+        .await
+}
+
+fn local_to_remote(event: &CalendarEvent, calendar_id: &str) -> Result<RemoteEvent> {
+    let start = chrono::DateTime::parse_from_rfc3339(&event.start_time)
+        .map_err(|e| AthenError::Other(format!("Bad start_time `{}`: {e}", event.start_time)))?
+        .with_timezone(&Utc);
+    let end = chrono::DateTime::parse_from_rfc3339(&event.end_time)
+        .map_err(|e| AthenError::Other(format!("Bad end_time `{}`: {e}", event.end_time)))?
+        .with_timezone(&Utc);
+    Ok(RemoteEvent {
+        remote_id: event.remote_id.clone().unwrap_or_default(),
+        calendar_id: calendar_id.to_string(),
+        etag: event.remote_etag.clone(),
+        ical_uid: event.ical_uid.clone(),
+        title: event.title.clone(),
+        description: event.description.clone(),
+        start_time: start,
+        end_time: end,
+        all_day: event.all_day,
+        location: event.location.clone(),
+        recurrence_rrule: None,
+        reminder_minutes: event.reminder_minutes.clone(),
+    })
+}
+
 /// Run one read-side reconciliation pass against the remote.
 ///
 /// Records the result on the config row before returning so the

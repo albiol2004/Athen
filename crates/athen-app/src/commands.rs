@@ -6074,45 +6074,188 @@ pub async fn list_calendar_events(
 /// Create a new calendar event.
 ///
 /// The frontend sends a full `CalendarEvent` object (with a pre-generated id).
-/// Returns the event back on success.
+/// When exactly one remote calendar source is enabled, the event is also
+/// pushed to the remote so it appears on the user's phone / other clients.
+/// Returns the event back (with `source_id`/`remote_id`/`remote_etag`
+/// stamped when the remote write succeeded).
 #[tauri::command]
 pub async fn create_calendar_event(
     event: CalendarEvent,
     state: State<'_, AppState>,
 ) -> std::result::Result<CalendarEvent, String> {
-    if let Some(ref store) = state.calendar_store {
-        store
-            .create_event(&event)
-            .await
-            .map_err(|e| e.to_string())?;
+    let mut event = event;
+    let Some(ref store) = state.calendar_store else {
+        return Ok(event);
+    };
+
+    // Try to push to the remote first. If it succeeds we stamp the row
+    // with the returned remote_id/etag BEFORE the local insert, so the
+    // next sync pass recognises it as already-synced.
+    let pushed_remote = try_push_create(&event, &state).await;
+    if let Ok(Some((source_id, remote_id, etag, ical_uid, cal_name))) = pushed_remote.as_ref() {
+        event.source_id = Some(source_id.clone());
+        event.remote_id = Some(remote_id.clone());
+        event.remote_etag = etag.clone();
+        if event.ical_uid.is_none() {
+            event.ical_uid = Some(ical_uid.clone());
+        }
+        tracing::info!(target = %cal_name, "Calendar event pushed to remote");
+    } else if let Err(e) = pushed_remote.as_ref() {
+        tracing::warn!(error = %e, "Calendar event remote push failed; saving locally only");
     }
+
+    store
+        .create_event(&event)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(event)
 }
 
-/// Update an existing calendar event.
+async fn try_push_create(
+    event: &CalendarEvent,
+    state: &AppState,
+) -> std::result::Result<Option<(String, String, Option<String>, String, String)>, String> {
+    use std::sync::Arc as StdArc;
+
+    let Some(cfg_store_concrete) = state.calendar_source_store() else {
+        return Ok(None);
+    };
+    let Some(vault) = state.vault.clone() else {
+        return Ok(None);
+    };
+    let cfg_store: StdArc<
+        dyn athen_core::traits::calendar_source_config::CalendarSourceConfigStore,
+    > = StdArc::new(cfg_store_concrete);
+
+    let Some(target) = crate::calendar_sources::auto_pick_write_target(&cfg_store, &vault)
+        .await
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
+    };
+    let (remote_id, etag, uid) = crate::calendar_sources::push_create(&target, &vault, event)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(Some((
+        target.source.id.to_string(),
+        remote_id,
+        etag,
+        uid,
+        target.calendar_name,
+    )))
+}
+
+/// Update an existing calendar event. When the row carries a `source_id`
+/// + `remote_id` (i.e. it came from sync), the change is also pushed to
+/// the remote. Remote failures don't block the local save.
 #[tauri::command]
 pub async fn update_calendar_event(
     event: CalendarEvent,
     state: State<'_, AppState>,
 ) -> std::result::Result<(), String> {
-    if let Some(ref store) = state.calendar_store {
-        store.update_event(&event).await.map_err(|e| e.to_string())
-    } else {
-        Ok(())
+    let mut event = event;
+    let Some(ref store) = state.calendar_store else {
+        return Ok(());
+    };
+
+    if let (Some(_source_id), Some(_remote_id)) =
+        (event.source_id.as_ref(), event.remote_id.as_ref())
+    {
+        match try_push_update(&event, &state).await {
+            Ok(Some(new_etag)) => {
+                event.remote_etag = new_etag;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "Calendar event remote update failed; keeping local only");
+            }
+        }
     }
+
+    store.update_event(&event).await.map_err(|e| e.to_string())
 }
 
-/// Delete a calendar event by id.
+async fn try_push_update(
+    event: &CalendarEvent,
+    state: &AppState,
+) -> std::result::Result<Option<Option<String>>, String> {
+    use athen_core::traits::calendar_source_config::CalendarSourceConfigStore as _;
+
+    let Some(cfg_store) = state.calendar_source_store() else {
+        return Ok(None);
+    };
+    let Some(vault) = state.vault.clone() else {
+        return Ok(None);
+    };
+    let Some(source_id_str) = event.source_id.as_deref() else {
+        return Ok(None);
+    };
+    let source_uuid = uuid::Uuid::parse_str(source_id_str)
+        .map_err(|e| format!("Bad source_id `{source_id_str}`: {e}"))?;
+    let cfg = cfg_store
+        .get(source_uuid)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Source not found".to_string())?;
+
+    let new_etag = crate::calendar_sources::push_update(&cfg, &vault, event)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(Some(new_etag))
+}
+
+/// Delete a calendar event by id. When the row was synced from a remote
+/// source, the remote object is deleted first; a remote failure aborts
+/// the local delete so the row stays consistent with the remote.
 #[tauri::command]
 pub async fn delete_calendar_event(
     id: String,
     state: State<'_, AppState>,
 ) -> std::result::Result<(), String> {
-    if let Some(ref store) = state.calendar_store {
-        store.delete_event(&id).await.map_err(|e| e.to_string())
-    } else {
-        Ok(())
+    let Some(ref store) = state.calendar_store else {
+        return Ok(());
+    };
+
+    let existing = store.get_event(&id).await.map_err(|e| e.to_string())?;
+    if let Some(ev) = existing.as_ref() {
+        if ev.source_id.is_some() && ev.remote_id.is_some() {
+            if let Err(e) = try_push_delete(ev, &state).await {
+                tracing::warn!(error = %e, "Calendar event remote delete failed");
+                // Surface to the user — silently keeping a row that's
+                // still on the phone would be worse than the error.
+                return Err(e);
+            }
+        }
     }
+    store.delete_event(&id).await.map_err(|e| e.to_string())
+}
+
+async fn try_push_delete(
+    event: &CalendarEvent,
+    state: &AppState,
+) -> std::result::Result<(), String> {
+    use athen_core::traits::calendar_source_config::CalendarSourceConfigStore as _;
+
+    let Some(cfg_store) = state.calendar_source_store() else {
+        return Ok(());
+    };
+    let Some(vault) = state.vault.clone() else {
+        return Ok(());
+    };
+    let Some(source_id_str) = event.source_id.as_deref() else {
+        return Ok(());
+    };
+    let source_uuid = uuid::Uuid::parse_str(source_id_str)
+        .map_err(|e| format!("Bad source_id `{source_id_str}`: {e}"))?;
+    let cfg = cfg_store
+        .get(source_uuid)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Source not found".to_string())?;
+
+    crate::calendar_sources::push_delete(&cfg, &vault, event)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------
