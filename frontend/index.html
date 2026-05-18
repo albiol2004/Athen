@@ -960,6 +960,13 @@
                 <label for="cal-prompt-textarea">Standing instruction for every calendar reminder</label>
                 <p class="setting-hint">Free text. Sent to the agent along with every calendar event the sense layer fires. Example: <em>"For Trabajo events, draft a 3-line prep summary from related emails. For Familia events, just notify."</em></p>
                 <textarea id="cal-prompt-textarea" rows="5" placeholder="e.g. For Trabajo events, prepare a summary. For Familia, just notify."></textarea>
+
+                <label for="cal-agent-default-select" style="margin-top: 12px;">Default calendar for agent-created events</label>
+                <p class="setting-hint">When the agent creates an event without picking a specific calendar, it lands here. Leave on "Auto-pick" to let Athen choose (only works when one source is configured).</p>
+                <select id="cal-agent-default-select" class="cal-view-select" style="width: 100%;">
+                    <option value="">Auto-pick / Local-only</option>
+                </select>
+
                 <div class="cal-prompt-actions">
                     <button id="cal-prompt-cancel" class="btn-secondary">Cancel</button>
                     <button id="cal-prompt-save" class="btn-primary">Save</button>

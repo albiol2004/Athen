@@ -133,6 +133,8 @@ pub fn run() {
             settings_calendar::list_writable_calendars,
             settings::get_calendar_prompt,
             settings::save_calendar_prompt,
+            settings::get_agent_default_calendar,
+            settings::save_agent_default_calendar,
             contacts::list_contacts,
             contacts::get_contact,
             contacts::set_contact_trust,

@@ -279,6 +279,7 @@ pub async fn list_writable_calendars(
         .ok_or_else(|| "Credential vault unavailable".to_string())?;
 
     let mut out = Vec::new();
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
     for cfg in sources {
         if !cfg.enabled {
             continue;
@@ -307,6 +308,13 @@ pub async fn list_writable_calendars(
             let lname = cal.name.to_lowercase();
             if lname.contains("recordator") || lname.contains("reminder") || lname.contains("to-do")
             {
+                continue;
+            }
+            // Dedup: iCloud (and others) can expose the same collection
+            // twice via different principals/home-sets. Key on
+            // (source_id, calendar_id) so the dropdown isn't polluted.
+            let key = (cfg.id.to_string(), cal.id.clone());
+            if !seen.insert(key) {
                 continue;
             }
             out.push(WritableCalendarView {

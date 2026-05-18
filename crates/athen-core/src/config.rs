@@ -38,6 +38,16 @@ pub struct CalendarConfig {
     /// Free-form instruction prepended to the agent message on every
     /// calendar-reminder sense event. Empty = no extra instruction.
     pub agent_prompt: String,
+    /// Calendar the agent should target when it calls `calendar_create`
+    /// without an explicit `target_calendar_id`. None ⇒ fall back to
+    /// `auto_pick_write_target` (only fires with one source), else
+    /// local-only.
+    #[serde(default)]
+    pub agent_default_source_id: Option<String>,
+    #[serde(default)]
+    pub agent_default_calendar_id: Option<String>,
+    #[serde(default)]
+    pub agent_default_calendar_name: Option<String>,
 }
 
 impl Default for AthenConfig {

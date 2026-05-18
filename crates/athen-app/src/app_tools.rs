@@ -20,6 +20,7 @@ use athen_core::http_endpoint::{AuthMethod, RegisteredEndpoint};
 use athen_core::identity::{IdentityEntry, ProfileTag};
 use athen_core::risk::BaseImpact;
 use athen_core::tool::{ToolBackend, ToolDefinition, ToolResult};
+use athen_core::traits::calendar_source_config::CalendarSourceConfigStore;
 use athen_core::traits::http_endpoint::HttpEndpointStore;
 use athen_core::traits::identity::IdentityStore;
 use athen_core::traits::mcp::McpClient;
@@ -62,6 +63,11 @@ pub struct AppToolRegistry {
     /// the `http_request` tool description points the agent at it so
     /// they can read the endpoint catalogue on demand.
     cloud_apis_doc_path: Option<std::path::PathBuf>,
+    /// Calendar source config store — used by `calendar_create` to push
+    /// agent-authored events to the remote calendar (iCloud/Google/etc.)
+    /// alongside the local insert. When `None`, agent calendar writes
+    /// stay local-only.
+    calendar_source_store: Option<Arc<dyn CalendarSourceConfigStore>>,
 }
 
 impl AppToolRegistry {
@@ -87,7 +93,18 @@ impl AppToolRegistry {
             http_rate_limiter: None,
             http_client: None,
             cloud_apis_doc_path: None,
+            calendar_source_store: None,
         }
+    }
+
+    /// Attach the calendar source config store so `calendar_create` can
+    /// push agent-authored events to the user's remote calendar. The
+    /// vault attached via `with_http_endpoints` is reused for the
+    /// CalDAV credentials — both lookups go through the same `Vault`
+    /// trait object.
+    pub fn with_calendar_remote(mut self, store: Arc<dyn CalendarSourceConfigStore>) -> Self {
+        self.calendar_source_store = Some(store);
+        self
     }
 
     /// Attach the registered-endpoint store + vault + rate limiter so the
@@ -201,20 +218,16 @@ impl AppToolRegistry {
                 },
                 "category": {
                     "type": "string",
-                    "description": "Category: meeting, birthday, deadline, reminder, personal, work, other (optional)"
-                },
-                "color": {
-                    "type": "string",
-                    "description": "Hex color for the event (optional, e.g. '#7aa2f7')"
+                    "description": "Category for grouping/coloring. Prefer the user's existing calendar names when known (e.g. 'Trabajo', 'Familia', 'Casa'). Otherwise one of: meeting, birthday, deadline, reminder, personal, work, other."
                 },
                 "reminder_minutes": {
                     "type": "array",
                     "items": { "type": "integer" },
-                    "description": "Reminder lead times in minutes (e.g. [15, 60] = 15min and 1h before)"
+                    "description": "Reminder lead times in minutes (e.g. [15, 60] = 15min and 1h before). Omit for no reminder."
                 },
-                "recurrence": {
+                "target_calendar_id": {
                     "type": "string",
-                    "description": "Recurrence: Daily, Weekly, Monthly, Yearly (optional)"
+                    "description": "Specific calendar id to save into. Omit to use the user's default agent calendar (set in Settings → Calendar)."
                 }
             },
             "required": ["title", "start_time", "end_time"]
@@ -371,12 +384,12 @@ impl AppToolRegistry {
             .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
             .unwrap_or_default();
 
-        let recurrence = args
-            .get("recurrence")
+        let target_calendar_id = args
+            .get("target_calendar_id")
             .and_then(|v| v.as_str())
-            .and_then(|s| serde_json::from_value(json!(s)).ok());
+            .map(String::from);
 
-        let event = CalendarEvent {
+        let mut event = CalendarEvent {
             id: id.clone(),
             title: title.to_string(),
             description: args
@@ -393,9 +406,9 @@ impl AppToolRegistry {
                 .get("location")
                 .and_then(|v| v.as_str())
                 .map(String::from),
-            recurrence,
+            recurrence: None,
             reminder_minutes,
-            color: args.get("color").and_then(|v| v.as_str()).map(String::from),
+            color: None,
             category: args
                 .get("category")
                 .and_then(|v| v.as_str())
@@ -417,9 +430,46 @@ impl AppToolRegistry {
             "Creating calendar event"
         );
 
+        // Try to push to the remote first so the local row carries the
+        // remote_id/etag straight away (and the next sync pass treats it
+        // as already-synced, not orphaned).
+        let push_outcome = self
+            .try_push_agent_create(&event, target_calendar_id.as_deref())
+            .await;
+        let (pushed_remote, push_target_name, push_error) = match push_outcome {
+            Ok(Some((source_id, remote_id, etag, ical_uid, cal_name))) => {
+                event.source_id = Some(source_id);
+                event.remote_id = Some(remote_id);
+                event.remote_etag = etag;
+                event.ical_uid = Some(ical_uid);
+                (true, Some(cal_name), None)
+            }
+            Ok(None) => (false, None, None),
+            Err(e) => {
+                // Remote push failed (auth, network, 403…). Still create
+                // the event locally — the agent already told the user it
+                // would. Surface the error so the audit trail shows why
+                // it didn't land on the phone.
+                tracing::warn!(error = %e, "Agent calendar_create remote push failed; falling back to local-only");
+                (false, None, Some(e))
+            }
+        };
+
         let t = Instant::now();
         store.create_event(&event).await?;
         let elapsed = t.elapsed().as_millis() as u64;
+
+        let message = if pushed_remote {
+            format!(
+                "Event '{}' created and pushed to '{}'",
+                title,
+                push_target_name.as_deref().unwrap_or("remote calendar")
+            )
+        } else if let Some(ref e) = push_error {
+            format!("Event '{title}' created locally (remote push failed: {e})")
+        } else {
+            format!("Event '{title}' created locally (no remote calendar configured)")
+        };
 
         Ok(ToolResult {
             success: true,
@@ -428,11 +478,105 @@ impl AppToolRegistry {
                 "title": title,
                 "start_time": start_time,
                 "end_time": end_time,
-                "message": format!("Event '{}' created successfully", title),
+                "pushed_remote": pushed_remote,
+                "remote_target": push_target_name,
+                "push_error": push_error,
+                "message": message,
             }),
             error: None,
             execution_time_ms: elapsed,
         })
+    }
+
+    /// Resolve a write target + push the event. Priority:
+    ///   1. Explicit `target_calendar_id` arg paired with the user-default
+    ///      source (most common: user said "use my Familia calendar").
+    ///   2. Config `agent_default_source_id` + `agent_default_calendar_id`.
+    ///   3. `auto_pick_write_target` — only fires when exactly one source
+    ///      is enabled.
+    ///   4. None → local-only (`Ok(None)`).
+    async fn try_push_agent_create(
+        &self,
+        event: &CalendarEvent,
+        target_calendar_id: Option<&str>,
+    ) -> std::result::Result<Option<(String, String, Option<String>, String, String)>, String> {
+        let Some(cfg_store) = self.calendar_source_store.clone() else {
+            return Ok(None);
+        };
+        let Some(vault) = self.vault.clone() else {
+            return Ok(None);
+        };
+
+        let cfg = crate::settings::load_main_config_public();
+        let default_source = cfg.calendar.agent_default_source_id.as_deref();
+        let default_calendar = cfg.calendar.agent_default_calendar_id.as_deref();
+        let default_calendar_name = cfg.calendar.agent_default_calendar_name.as_deref();
+
+        // Resolve target.
+        let target: Option<crate::calendar_sources::WriteTarget> = if let Some(cal_id) =
+            target_calendar_id
+        {
+            // Need a source to pair with the calendar id. Prefer the
+            // configured default, otherwise auto-pick a sole source.
+            let source_id_str = default_source.map(String::from);
+            let source = if let Some(sid) = source_id_str {
+                let uuid = uuid::Uuid::parse_str(&sid)
+                    .map_err(|e| format!("Bad default source id: {e}"))?;
+                cfg_store
+                    .get(uuid)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "Configured default calendar source not found".to_string())?
+            } else {
+                let sources = cfg_store.list().await.map_err(|e| e.to_string())?;
+                let enabled: Vec<_> = sources.into_iter().filter(|s| s.enabled).collect();
+                if enabled.len() != 1 {
+                    return Err(
+                            "Agent supplied target_calendar_id but no default source is set and more than one source is enabled.".into(),
+                        );
+                }
+                enabled.into_iter().next().unwrap()
+            };
+            Some(crate::calendar_sources::WriteTarget {
+                source,
+                calendar_id: cal_id.to_string(),
+                calendar_name: cal_id.to_string(),
+            })
+        } else if let (Some(sid), Some(cid)) = (default_source, default_calendar) {
+            let uuid =
+                uuid::Uuid::parse_str(sid).map_err(|e| format!("Bad default source id: {e}"))?;
+            let source = cfg_store
+                .get(uuid)
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "Configured default calendar source not found".to_string())?;
+            Some(crate::calendar_sources::WriteTarget {
+                source,
+                calendar_id: cid.to_string(),
+                calendar_name: default_calendar_name
+                    .map(String::from)
+                    .unwrap_or_else(|| cid.to_string()),
+            })
+        } else {
+            crate::calendar_sources::auto_pick_write_target(&cfg_store, &vault)
+                .await
+                .map_err(|e| e.to_string())?
+        };
+
+        let Some(target) = target else {
+            return Ok(None);
+        };
+
+        let (remote_id, etag, uid) = crate::calendar_sources::push_create(&target, &vault, event)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Some((
+            target.source.id.to_string(),
+            remote_id,
+            etag,
+            uid,
+            target.calendar_name,
+        )))
     }
 
     async fn do_calendar_update(&self, args: &serde_json::Value) -> Result<ToolResult> {
@@ -2473,6 +2617,11 @@ mod tests {
     }
 
     // 7. calendar_create_with_all_fields
+    //
+    // `color` and `recurrence` were intentionally dropped from the agent
+    // schema (color is FE-derived from category; recurrence is the user's
+    // job on create). They stay updatable via `calendar_update`. The test
+    // asserts the kept fields round-trip and the dropped ones land None.
     #[tokio::test]
     async fn calendar_create_with_all_fields() {
         let (db, registry) = setup_with_calendar().await;
@@ -2488,9 +2637,7 @@ mod tests {
                     "description": "Plan Q2 sprint",
                     "location": "Conference Room A",
                     "category": "meeting",
-                    "color": "#7aa2f7",
-                    "reminder_minutes": [15, 60],
-                    "recurrence": "Weekly"
+                    "reminder_minutes": [15, 60]
                 }),
             )
             .await
@@ -2503,12 +2650,9 @@ mod tests {
         assert_eq!(event.description, Some("Plan Q2 sprint".to_string()));
         assert_eq!(event.location, Some("Conference Room A".to_string()));
         assert_eq!(event.category, Some("meeting".to_string()));
-        assert_eq!(event.color, Some("#7aa2f7".to_string()));
+        assert_eq!(event.color, None);
         assert_eq!(event.reminder_minutes, vec![15, 60]);
-        assert_eq!(
-            event.recurrence,
-            Some(athen_persistence::calendar::Recurrence::Weekly)
-        );
+        assert_eq!(event.recurrence, None);
     }
 
     // 8. calendar_update_partial

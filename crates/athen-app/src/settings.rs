@@ -2454,6 +2454,46 @@ pub async fn save_calendar_prompt(
     Ok(())
 }
 
+/// Default-calendar info returned to the Settings UI.
+#[derive(serde::Serialize)]
+pub struct CalendarAgentDefault {
+    pub source_id: Option<String>,
+    pub calendar_id: Option<String>,
+    pub calendar_name: Option<String>,
+}
+
+/// Return the agent's default write-target calendar (set via Settings →
+/// Calendar). When all three are `None`, the agent's `calendar_create`
+/// falls back to `auto_pick_write_target` and ultimately local-only.
+#[tauri::command]
+pub async fn get_agent_default_calendar(
+    _state: State<'_, AppState>,
+) -> std::result::Result<CalendarAgentDefault, String> {
+    let c = load_main_config().calendar;
+    Ok(CalendarAgentDefault {
+        source_id: c.agent_default_source_id,
+        calendar_id: c.agent_default_calendar_id,
+        calendar_name: c.agent_default_calendar_name,
+    })
+}
+
+/// Set the agent's default write-target calendar. Pass all three `None`
+/// to clear (reverts to auto-pick).
+#[tauri::command]
+pub async fn save_agent_default_calendar(
+    _state: State<'_, AppState>,
+    source_id: Option<String>,
+    calendar_id: Option<String>,
+    calendar_name: Option<String>,
+) -> std::result::Result<(), String> {
+    let mut config = load_main_config();
+    config.calendar.agent_default_source_id = source_id;
+    config.calendar.agent_default_calendar_id = calendar_id;
+    config.calendar.agent_default_calendar_name = calendar_name;
+    save_main_config(&config)?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Notification settings commands
 // ---------------------------------------------------------------------------

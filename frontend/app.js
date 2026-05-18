@@ -8194,6 +8194,7 @@ function getTlEntryIcon(type) {
 
 let calCurrentDate = new Date();
 let calViewMode = 'month';
+let calNowLineTimer = null;
 let calEvents = [];
 
 const calendarView = document.getElementById('calendar-view');
@@ -8321,6 +8322,7 @@ function formatDateStr(year, month, day) {
 }
 
 function renderMonthView() {
+    if (calNowLineTimer) { clearInterval(calNowLineTimer); calNowLineTimer = null; }
     const year = calCurrentDate.getFullYear();
     const month = calCurrentDate.getMonth();
     const firstDay = new Date(year, month, 1);
@@ -8405,7 +8407,7 @@ function buildDayCell(year, month, day, events, isOther, isToday) {
     for (const ev of shown) {
         const color = getEventColor(ev);
         const title = escapeHtml(ev.title || 'Untitled');
-        html += '<div class="cal-event-item" data-event-id="' + ev.id + '" style="background:' + color + '">' + title + '</div>';
+        html += '<div class="cal-event-item" data-event-id="' + ev.id + '" style="--ev-color:' + color + '">' + title + '</div>';
     }
     if (events.length > maxShow) {
         html += '<div class="cal-event-more">+' + (events.length - maxShow) + ' more</div>';
@@ -8443,7 +8445,7 @@ function renderWeekView() {
         html += '<div class="cal-week-allday-cell">';
         for (const ev of dayEvents) {
             const color = getEventColor(ev);
-            html += '<div class="cal-event-item" data-event-id="' + ev.id + '" style="background:' + color + '">' + escapeHtml(ev.title || 'Untitled') + '</div>';
+            html += '<div class="cal-event-item" data-event-id="' + ev.id + '" style="--ev-color:' + color + '">' + escapeHtml(ev.title || 'Untitled') + '</div>';
         }
         html += '</div>';
     }
@@ -8502,7 +8504,7 @@ function renderWeekView() {
         const color = getEventColor(ev);
         const block = document.createElement('div');
         block.className = 'cal-week-event';
-        block.style.background = color;
+        block.style.setProperty('--ev-color', color);
         block.style.top = topOffset + 'px';
         block.style.height = Math.max(height, 20) + 'px';
         block.dataset.eventId = ev.id;
@@ -8535,6 +8537,31 @@ function renderWeekView() {
             if (ev) showEventModal(ev);
         });
     });
+
+    // Now-line: only renders if today falls within the visible week.
+    paintCalNowLine(weekDays, dayCols);
+    if (calNowLineTimer) clearInterval(calNowLineTimer);
+    calNowLineTimer = setInterval(() => paintCalNowLine(weekDays, dayCols), 60000);
+}
+
+function paintCalNowLine(weekDays, dayCols) {
+    const now = new Date();
+    const startOfToday = new Date(now);
+    startOfToday.setHours(0, 0, 0, 0);
+    const colIdx = weekDays.findIndex(d => d.getTime() === startOfToday.getTime());
+    // Remove any prior line.
+    calGrid.querySelectorAll('.cal-now-line').forEach(n => n.remove());
+    if (colIdx < 0) return;
+    const hourRow = now.getHours();
+    const cellIdx = hourRow * 7 + colIdx;
+    const targetCell = dayCols[cellIdx];
+    if (!targetCell) return;
+    const minuteOffset = (now.getMinutes() / 60) * 48; // 48px per hour row
+    const line = document.createElement('div');
+    line.className = 'cal-now-line';
+    line.style.top = minuteOffset + 'px';
+    line.setAttribute('aria-hidden', 'true');
+    targetCell.appendChild(line);
 }
 
 // ─── Event Modal ───
@@ -8911,6 +8938,7 @@ document.getElementById('cal-today-btn')?.addEventListener('click', () => {
 document.getElementById('cal-prompt-btn')?.addEventListener('click', async () => {
     const panel = document.getElementById('cal-prompt-panel');
     const ta = document.getElementById('cal-prompt-textarea');
+    const defSel = document.getElementById('cal-agent-default-select');
     if (!panel || !ta) return;
     const willOpen = panel.classList.contains('hidden');
     if (willOpen && invoke) {
@@ -8919,6 +8947,35 @@ document.getElementById('cal-prompt-btn')?.addEventListener('click', async () =>
             ta.value = typeof current === 'string' ? current : '';
         } catch (err) {
             console.warn('Failed to load calendar prompt:', err);
+        }
+        if (defSel) {
+            // Repopulate options (writable calendars may have changed).
+            while (defSel.options.length > 1) defSel.remove(1);
+            try {
+                const cals = await invoke('list_writable_calendars');
+                if (Array.isArray(cals)) {
+                    for (const c of cals) {
+                        const opt = document.createElement('option');
+                        opt.value = c.sourceId + '|' + c.calendarId + '|' + c.calendarName;
+                        opt.textContent = c.sourceName + ' · ' + c.calendarName;
+                        defSel.appendChild(opt);
+                    }
+                }
+            } catch (err) {
+                console.warn('Failed to list writable calendars:', err);
+            }
+            try {
+                const cur = await invoke('get_agent_default_calendar');
+                if (cur && cur.sourceId && cur.calendarId) {
+                    const v = cur.sourceId + '|' + cur.calendarId + '|' + (cur.calendarName || cur.calendarId);
+                    const match = Array.from(defSel.options).find(o => o.value.startsWith(cur.sourceId + '|' + cur.calendarId + '|'));
+                    defSel.value = match ? match.value : v;
+                } else {
+                    defSel.value = '';
+                }
+            } catch (err) {
+                console.warn('Failed to load agent default calendar:', err);
+            }
         }
     }
     panel.classList.toggle('hidden');
@@ -8935,11 +8992,30 @@ document.getElementById('cal-prompt-save')?.addEventListener('click', async () =
     if (!ta) return;
     try {
         await invoke('save_calendar_prompt', { prompt: ta.value });
+        const defSel = document.getElementById('cal-agent-default-select');
+        if (defSel) {
+            const v = defSel.value || '';
+            if (v) {
+                const [sourceId, calendarId, ...rest] = v.split('|');
+                const calendarName = rest.join('|') || calendarId;
+                await invoke('save_agent_default_calendar', {
+                    sourceId,
+                    calendarId,
+                    calendarName,
+                });
+            } else {
+                await invoke('save_agent_default_calendar', {
+                    sourceId: null,
+                    calendarId: null,
+                    calendarName: null,
+                });
+            }
+        }
         document.getElementById('cal-prompt-panel')?.classList.add('hidden');
-        showToast('Calendar prompt saved', 'success');
+        showToast('Calendar settings saved', 'success');
     } catch (err) {
-        console.error('Failed to save calendar prompt:', err);
-        showToast('Failed to save prompt: ' + err, 'error');
+        console.error('Failed to save calendar settings:', err);
+        showToast('Failed to save settings: ' + err, 'error');
     }
 });
 
@@ -13359,20 +13435,39 @@ async function refreshCalendarSourcesList() {
 
 function renderCalendarSourceRow(s) {
     const lastSync = s.lastSyncAt
-        ? `last sync ${humanRelativeTime(s.lastSyncAt)}`
+        ? `synced ${humanRelativeTime(s.lastSyncAt)}`
         : 'never synced';
     const errorBlock = s.lastSyncError
-        ? `<div class="cal-src-error">⚠ ${escapeHtml(s.lastSyncError)}</div>`
+        ? `<div class="cal-src-error">${escapeHtml(s.lastSyncError)}</div>`
         : '';
     const selected = s.selectedCalendars && s.selectedCalendars.length
         ? `${s.selectedCalendars.length} calendars`
         : 'all calendars';
     const enabledLabel = s.enabled ? 'Disable' : 'Enable';
+
+    // Status pill: error wins, then disabled, then ok/idle based on last sync.
+    let statusClass, statusLabel;
+    if (!s.enabled) {
+        statusClass = 'disabled';
+        statusLabel = 'Disabled';
+    } else if (s.lastSyncError) {
+        statusClass = 'error';
+        statusLabel = 'Sync failed';
+    } else if (s.lastSyncAt) {
+        statusClass = 'ok';
+        statusLabel = lastSync;
+    } else {
+        statusClass = 'idle';
+        statusLabel = 'Pending first sync';
+    }
+
+    const rowClass = s.lastSyncError ? 'cal-src-row has-error' : 'cal-src-row';
     return `
-        <div class="cal-src-row" data-cal-src-id="${escapeAttr(s.id)}">
+        <div class="${rowClass}" data-cal-src-id="${escapeAttr(s.id)}">
             <div class="cal-src-head">
                 <div class="cal-src-name">${escapeHtml(s.displayName)}</div>
-                <div class="cal-src-meta">${escapeHtml(selected)} • ${escapeHtml(lastSync)}</div>
+                <span class="cal-src-status ${statusClass}">${escapeHtml(statusLabel)}</span>
+                <div class="cal-src-meta">${escapeHtml(selected)}</div>
             </div>
             ${errorBlock}
             <div class="cal-src-actions">

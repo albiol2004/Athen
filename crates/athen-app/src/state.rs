@@ -905,6 +905,12 @@ impl AppState {
                 self.cloud_apis_doc_path.clone(),
             );
         }
+        if let Some(cstore) = self.calendar_source_store() {
+            let cstore: Arc<
+                dyn athen_core::traits::calendar_source_config::CalendarSourceConfigStore,
+            > = Arc::new(cstore);
+            registry = registry.with_calendar_remote(cstore);
+        }
         let tools = athen_core::traits::tool::ToolRegistry::list_tools(&registry).await?;
         let written = athen_agent::tools_doc::write_per_group(&dir, &tools).map_err(|e| {
             athen_core::error::AthenError::Other(format!(
@@ -1081,6 +1087,12 @@ impl AppState {
                 self.http_client.clone(),
                 self.cloud_apis_doc_path.clone(),
             );
+        }
+        if let Some(cstore) = self.calendar_source_store() {
+            let cstore: Arc<
+                dyn athen_core::traits::calendar_source_config::CalendarSourceConfigStore,
+            > = Arc::new(cstore);
+            registry = registry.with_calendar_remote(cstore);
         }
         if let Some(grants) = self.grant_store.clone() {
             let mut gate = crate::file_gate::FileGate::new(

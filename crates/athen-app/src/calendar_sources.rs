@@ -348,12 +348,31 @@ pub async fn push_delete(
 }
 
 fn local_to_remote(event: &CalendarEvent, calendar_id: &str) -> Result<RemoteEvent> {
-    let start = chrono::DateTime::parse_from_rfc3339(&event.start_time)
-        .map_err(|e| AthenError::Other(format!("Bad start_time `{}`: {e}", event.start_time)))?
-        .with_timezone(&Utc);
-    let end = chrono::DateTime::parse_from_rfc3339(&event.end_time)
-        .map_err(|e| AthenError::Other(format!("Bad end_time `{}`: {e}", event.end_time)))?
-        .with_timezone(&Utc);
+    let start_parsed = chrono::DateTime::parse_from_rfc3339(&event.start_time)
+        .map_err(|e| AthenError::Other(format!("Bad start_time `{}`: {e}", event.start_time)))?;
+    let end_parsed = chrono::DateTime::parse_from_rfc3339(&event.end_time)
+        .map_err(|e| AthenError::Other(format!("Bad end_time `{}`: {e}", event.end_time)))?;
+
+    // For all-day events the iCal codec emits `VALUE=DATE:YYYYMMDD`
+    // using the UTC date of these datetimes. If the caller (FE or agent)
+    // happened to pick a time near local midnight, naively converting to
+    // UTC can shift the date by a day (e.g. Madrid 00:00 → 22:00 UTC the
+    // day before → DATE:20260517 instead of 20260518). Re-anchor at noon
+    // UTC of the *local* date so the wire date matches what the user sees.
+    let (start, end) = if event.all_day {
+        use chrono::{Local, NaiveTime, TimeZone};
+        let local_start_date = start_parsed.with_timezone(&Local).date_naive();
+        let local_end_date = end_parsed.with_timezone(&Local).date_naive();
+        let noon = NaiveTime::from_hms_opt(12, 0, 0).unwrap();
+        let s = Utc.from_utc_datetime(&local_start_date.and_time(noon));
+        let e = Utc.from_utc_datetime(&local_end_date.and_time(noon));
+        (s, e)
+    } else {
+        (
+            start_parsed.with_timezone(&Utc),
+            end_parsed.with_timezone(&Utc),
+        )
+    };
     Ok(RemoteEvent {
         remote_id: event.remote_id.clone().unwrap_or_default(),
         calendar_id: calendar_id.to_string(),
