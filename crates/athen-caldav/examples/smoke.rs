@@ -107,6 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         start_time: start,
         end_time: end,
         all_day: false,
+        categories: None,
         location: None,
         recurrence_rrule: None,
         reminder_minutes: vec![],
