@@ -99,6 +99,55 @@ impl CalDavSource {
     }
 }
 
+/// Reduce a UID to a CalDAV-safe object basename. Replaces every byte
+/// outside `[A-Za-z0-9_-]` with `-`. iCloud rejects PUTs to paths
+/// containing `@`, `/`, spaces, or other reserved characters with 403.
+fn sanitize_for_path(uid: &str) -> String {
+    let cleaned: String = uid
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    // Avoid leading dots and empty basenames.
+    let trimmed = cleaned.trim_matches('-').trim_matches('.');
+    if trimmed.is_empty() {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::sanitize_for_path;
+
+    #[test]
+    fn strips_at_sign_and_slash() {
+        assert_eq!(
+            sanitize_for_path("athen-abc123@local"),
+            "athen-abc123-local"
+        );
+        assert_eq!(sanitize_for_path("foo/bar"), "foo-bar");
+    }
+
+    #[test]
+    fn keeps_plain_uuid() {
+        let s = "550e8400-e29b-41d4-a716-446655440000";
+        assert_eq!(sanitize_for_path(s), s);
+    }
+
+    #[test]
+    fn empty_falls_back_to_uuid() {
+        let r = sanitize_for_path("@@@");
+        assert_eq!(r.len(), 36);
+    }
+}
+
 #[async_trait]
 impl CalendarSource for CalDavSource {
     fn source_id(&self) -> &str {
@@ -170,13 +219,19 @@ impl CalendarSource for CalDavSource {
         event: &RemoteEvent,
     ) -> Result<(String, Option<String>)> {
         let cal_url = self.parse_calendar_id(calendar_id)?;
-        // Allocate a fresh object URL under the calendar collection.
         let uid = event
             .ical_uid
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        // The UID can legally contain `@`, `/`, and other chars (RFC 5545
+        // email-style `uid@host` is common). Those bytes are NOT safe in
+        // a CalDAV object path — iCloud in particular returns 403 on a
+        // PUT to `…/foo@bar.ics`. Derive a URL-safe basename for the
+        // collection path while keeping the UID property intact inside
+        // the iCalendar body.
+        let object_basename = sanitize_for_path(&uid);
         let object_url = cal_url
-            .join(&format!("{uid}.ics"))
+            .join(&format!("{object_basename}.ics"))
             .map_err(|e| AthenError::Other(format!("Build event URL: {e}")))?;
         let ics = emit_vcalendar(&RemoteEvent {
             ical_uid: Some(uid.clone()),

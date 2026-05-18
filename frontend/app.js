@@ -8636,14 +8636,13 @@ function showEventModal(event, defaultDate, defaultHour) {
     document.getElementById('cal-event-title').focus();
 }
 
+const CALENDAR_DEFAULT_TARGET_KEY = 'athen.calendar.defaultWriteTarget';
+
 async function populateCalendarTargetPicker(existingEvent) {
     const sel = document.getElementById('cal-event-target');
     if (!sel) return;
-    // Reset to just the local placeholder while we (re)fetch.
     sel.innerHTML = '<option value="local">Local only (just Athen)</option>';
     if (existingEvent) {
-        // Edit mode: lock the picker. Editing routes via remote_id, not
-        // by re-picking a target.
         if (existingEvent.source_id) {
             const opt = document.createElement('option');
             opt.value = 'existing';
@@ -8665,15 +8664,39 @@ async function populateCalendarTargetPicker(existingEvent) {
             opt.textContent = c.sourceName + ' · ' + c.calendarName;
             sel.appendChild(opt);
         }
-        // Default to the first remote calendar — matches the auto-pick
-        // behavior the user had before the picker existed.
-        if (cals.length > 0) {
+        // Remembered default wins. Fall back to first remote calendar
+        // when no default is stored (or the stored one is gone).
+        const stored = (() => {
+            try { return localStorage.getItem(CALENDAR_DEFAULT_TARGET_KEY); }
+            catch { return null; }
+        })();
+        const storedExists = stored && Array.from(sel.options).some(o => o.value === stored);
+        if (storedExists) {
+            sel.value = stored;
+        } else if (cals.length > 0) {
             sel.value = cals[0].sourceId + '|' + cals[0].calendarId;
         }
     } catch (err) {
         console.warn('Failed to list writable calendars:', err);
     }
 }
+
+// Persist the picker's choice so the user picks once per (source, calendar)
+// they care about and stops getting routed to the wrong one. Listener is
+// attached once at startup; the picker is repopulated on every modal open
+// but the same element id persists.
+document.addEventListener('change', (e) => {
+    if (e.target && e.target.id === 'cal-event-target') {
+        const v = e.target.value;
+        try {
+            if (v && v !== 'local' && v !== 'existing') {
+                localStorage.setItem(CALENDAR_DEFAULT_TARGET_KEY, v);
+            } else if (v === 'local') {
+                localStorage.removeItem(CALENDAR_DEFAULT_TARGET_KEY);
+            }
+        } catch {}
+    }
+});
 
 function hideEventModal() {
     calModalOverlay.classList.add('hidden');
