@@ -68,6 +68,12 @@ pub struct RemoteEvent {
     pub recurrence_rrule: Option<String>,
     /// Reminder lead times in minutes before start.
     pub reminder_minutes: Vec<i64>,
+    /// iCalendar `CATEGORIES` values — comma-separated tags the user
+    /// applied on the source (e.g. ["Work", "Important"]). Empty when
+    /// the source doesn't expose categories. The sync loop picks the
+    /// first entry as the local `category` field when present.
+    #[serde(default)]
+    pub categories: Option<Vec<String>>,
 }
 
 /// What a source supports. Used by the Settings UI to grey out actions and

@@ -259,6 +259,7 @@ fn parse_vevent_lines(
     let mut rrule: Option<String> = None;
     let mut recurrence_id: Option<String> = None;
     let mut reminders: Vec<i64> = Vec::new();
+    let mut categories: Vec<String> = Vec::new();
 
     let mut in_alarm = false;
     let mut alarm_trigger: Option<String> = None;
@@ -295,6 +296,15 @@ fn parse_vevent_lines(
             "DTEND" => end = Some(parse_datetime(&p)?),
             "RRULE" => rrule = Some(p.value),
             "RECURRENCE-ID" => recurrence_id = Some(p.value),
+            "CATEGORIES" => {
+                // RFC 5545 §3.8.1.2 — comma-separated. Trim each, skip empties.
+                for c in p.value.split(',') {
+                    let t = c.trim();
+                    if !t.is_empty() {
+                        categories.push(t.to_string());
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -334,6 +344,11 @@ fn parse_vevent_lines(
         location,
         recurrence_rrule: rrule,
         reminder_minutes: reminders,
+        categories: if categories.is_empty() {
+            None
+        } else {
+            Some(categories)
+        },
     })
 }
 
@@ -372,6 +387,16 @@ pub fn emit_vcalendar(event: &RemoteEvent) -> String {
     lines.push(format!("SUMMARY:{}", escape_text(&event.title)));
     if let Some(d) = &event.description {
         lines.push(format!("DESCRIPTION:{}", escape_text(d)));
+    }
+    if let Some(cats) = &event.categories {
+        if !cats.is_empty() {
+            let joined = cats
+                .iter()
+                .map(|c| escape_text(c))
+                .collect::<Vec<_>>()
+                .join(",");
+            lines.push(format!("CATEGORIES:{joined}"));
+        }
     }
     if let Some(l) = &event.location {
         lines.push(format!("LOCATION:{}", escape_text(l)));
@@ -571,6 +596,7 @@ mod tests {
             location: Some("Joe's Diner".into()),
             recurrence_rrule: Some("FREQ=WEEKLY;BYDAY=MO".into()),
             reminder_minutes: vec![15, 60],
+            categories: Some(vec!["Work".into(), "Important".into()]),
         };
         let ics = emit_vcalendar(&original);
         let parsed = parse_vcalendar(&ics, "cal", "evt.ics", None).unwrap();

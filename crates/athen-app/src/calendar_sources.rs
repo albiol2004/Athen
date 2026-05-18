@@ -27,16 +27,44 @@ use athen_core::traits::calendar_source_config::CalendarSourceConfigStore;
 use athen_core::traits::vault::Vault;
 use athen_persistence::calendar::{CalendarEvent, CalendarStore, EventCreator};
 
-/// How far ahead each pull pulls. One year covers everything the
-/// calendar UI is likely to surface — holidays, annual reminders,
-/// future planning — without the user having to babysit window size.
-const PULL_WINDOW_DAYS_AHEAD: i64 = 365;
+/// "Wide" pull window — used on the **first sync pass after startup** and
+/// on **user-triggered manual sync**. One year each side guarantees the
+/// user sees their full history and upcoming year when they ask for a
+/// fresh sync or open the app cold.
+const WIDE_WINDOW_DAYS_AHEAD: i64 = 365;
+const WIDE_WINDOW_DAYS_BEHIND: i64 = 365;
 
-/// How far back each pull pulls. One year of history matches what a
-/// real calendar app exposes when the user pages backwards. The earlier
-/// 1-day window was sized for "reminders only" semantics and made every
-/// calendar look empty as soon as the user scrolled past today.
-const PULL_WINDOW_DAYS_BEHIND: i64 = 365;
+/// "Narrow" pull window — used on every background sync tick **after**
+/// the first one. Recent past + the upcoming month covers everything
+/// reminders care about and keeps the per-tick HTTP/parse cost cheap.
+/// Older or further-future events are still in the local DB from the
+/// last wide pass; they just don't get re-fetched every 5 min.
+const NARROW_WINDOW_DAYS_AHEAD: i64 = 30;
+const NARROW_WINDOW_DAYS_BEHIND: i64 = 7;
+
+/// Which pull window a sync pass should use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncWindow {
+    /// First-pass / manual-sync / "give me everything".
+    Wide,
+    /// Recurring background tick.
+    Narrow,
+}
+
+impl SyncWindow {
+    fn days_back(self) -> i64 {
+        match self {
+            SyncWindow::Wide => WIDE_WINDOW_DAYS_BEHIND,
+            SyncWindow::Narrow => NARROW_WINDOW_DAYS_BEHIND,
+        }
+    }
+    fn days_ahead(self) -> i64 {
+        match self {
+            SyncWindow::Wide => WIDE_WINDOW_DAYS_AHEAD,
+            SyncWindow::Narrow => NARROW_WINDOW_DAYS_AHEAD,
+        }
+    }
+}
 
 /// Build a `Box<dyn CalendarSource>` for a configured source. Reads the
 /// password out of the vault using the config's stored scope/key.
@@ -108,8 +136,12 @@ pub fn spawn_sync_loops(
             // and so we don't hit the remote at the exact same instant
             // every cold start.
             tokio::time::sleep(Duration::from_secs(5)).await;
+            // Wide window on the first (post-startup) pass — fills the
+            // ±1y view. Subsequent ticks go narrow so we don't repeatedly
+            // pull a year of events every 5 minutes.
+            let mut window = SyncWindow::Wide;
             loop {
-                match run_one_sync_pass(&cfg, &vault, &store, &cfg_store).await {
+                match run_one_sync_pass(&cfg, &vault, &store, &cfg_store, window).await {
                     Ok(stats) => {
                         tracing::info!(
                             source = %source_name,
@@ -136,6 +168,9 @@ pub fn spawn_sync_loops(
                     }
                     _ = tokio::time::sleep(interval) => {}
                 }
+                // After the first wide pass, every subsequent recurring
+                // pass goes narrow. Manual sync stays wide via sync_one.
+                window = SyncWindow::Narrow;
             }
         });
     }
@@ -170,14 +205,22 @@ pub struct SyncStats {
 }
 
 /// Public façade over `run_one_sync_pass` for the Settings panel's
-/// "Sync now" button. Same body, exposed name.
+/// "Sync now" button. User-triggered → always the wide window so
+/// pressing Sync feels comprehensive.
 pub async fn sync_one(
     config: &CalendarSourceConfig,
     vault: &Arc<dyn Vault>,
     calendar_store: &CalendarStore,
     config_store: &Arc<dyn CalendarSourceConfigStore>,
 ) -> Result<SyncStats> {
-    run_one_sync_pass(config, vault, calendar_store, config_store).await
+    run_one_sync_pass(
+        config,
+        vault,
+        calendar_store,
+        config_store,
+        SyncWindow::Wide,
+    )
+    .await
 }
 
 /// What the write-through path uses to address one calendar on one source.
@@ -321,6 +364,7 @@ fn local_to_remote(event: &CalendarEvent, calendar_id: &str) -> Result<RemoteEve
         start_time: start,
         end_time: end,
         all_day: event.all_day,
+        categories: event.category.as_ref().map(|c| vec![c.clone()]),
         location: event.location.clone(),
         recurrence_rrule: None,
         reminder_minutes: event.reminder_minutes.clone(),
@@ -336,20 +380,30 @@ async fn run_one_sync_pass(
     vault: &Arc<dyn Vault>,
     calendar_store: &CalendarStore,
     config_store: &Arc<dyn CalendarSourceConfigStore>,
+    window: SyncWindow,
 ) -> Result<SyncStats> {
     let source = build_source(config, vault).await?;
     let now = Utc::now();
-    let pull_start = now - chrono::Duration::days(PULL_WINDOW_DAYS_BEHIND);
-    let pull_end = now + chrono::Duration::days(PULL_WINDOW_DAYS_AHEAD);
+    let pull_start = now - chrono::Duration::days(window.days_back());
+    let pull_end = now + chrono::Duration::days(window.days_ahead());
+
+    // Fetch the calendar list once up front so we have id→name lookup
+    // for stamping `category` on each event. One extra HTTP per pass —
+    // cheap, and saves us guessing later.
+    let discovered = source.list_calendars().await.unwrap_or_default();
+    let name_by_id: std::collections::HashMap<String, String> = discovered
+        .iter()
+        .map(|c| (c.id.clone(), c.name.clone()))
+        .collect();
 
     // Decide which calendars to sync: the user-selected list, or all
     // exposed by the source when none were picked.
-    let calendars = if config.selected_calendars.is_empty() {
-        let discovered = source.list_calendars().await?;
+    let calendars: Vec<String> = if config.selected_calendars.is_empty() {
         tracing::info!(
             source = %config.display_name,
             discovered = discovered.len(),
             names = ?discovered.iter().map(|c| &c.name).collect::<Vec<_>>(),
+            ?window,
             "Calendar sync: list_calendars returned"
         );
         if discovered.is_empty() {
@@ -360,7 +414,7 @@ async fn run_one_sync_pass(
                 "Calendar sync: no calendars discovered — check credentials and home-set URL"
             );
         }
-        discovered.into_iter().map(|c| c.id).collect::<Vec<_>>()
+        discovered.iter().map(|c| c.id.clone()).collect()
     } else {
         config.selected_calendars.clone()
     };
@@ -386,10 +440,17 @@ async fn run_one_sync_pass(
             "Calendar sync: list_events returned"
         );
 
+        let cal_display_name = name_by_id.get(calendar_id).cloned();
         // INSERT / UPDATE every pulled event.
         for remote in &pulled {
             all_pulled_remote_ids.insert(remote.remote_id.clone());
-            let result = reconcile_one(calendar_store, &source_id, remote).await?;
+            let result = reconcile_one(
+                calendar_store,
+                &source_id,
+                remote,
+                cal_display_name.as_deref(),
+            )
+            .await?;
             match result {
                 ReconcileResult::Inserted => stats.inserted += 1,
                 ReconcileResult::Updated => stats.updated += 1,
@@ -398,18 +459,21 @@ async fn run_one_sync_pass(
         }
     }
 
-    // DELETE: anything in the local DB tagged with this source_id
-    // and whose start falls inside the pull window but didn't appear
-    // in *any* calendar's pull — the user removed it on the remote side.
-    let deleted = reconcile_deletes(
-        calendar_store,
-        &source_id,
-        &all_pulled_remote_ids,
-        pull_start,
-        pull_end,
-    )
-    .await?;
-    stats.deleted += deleted;
+    // DELETE only fires on the WIDE pass. On a narrow recurring tick the
+    // pulled set excludes events outside ±narrow days — running deletes
+    // would scope to that small window and we'd churn rows out and back
+    // in every wide pass. The wide pass's delete pass is authoritative.
+    if matches!(window, SyncWindow::Wide) {
+        let deleted = reconcile_deletes(
+            calendar_store,
+            &source_id,
+            &all_pulled_remote_ids,
+            pull_start,
+            pull_end,
+        )
+        .await?;
+        stats.deleted += deleted;
+    }
 
     config_store.record_sync_success(config.id, now).await?;
     Ok(stats)
@@ -428,10 +492,17 @@ async fn reconcile_one(
     store: &CalendarStore,
     source_id: &str,
     remote: &RemoteEvent,
+    calendar_display_name: Option<&str>,
 ) -> Result<ReconcileResult> {
     let local = find_by_remote_id(store, source_id, &remote.remote_id).await?;
     let now = Utc::now().to_rfc3339();
-    let mapped = remote_to_local_event(remote, source_id, local.as_ref(), &now);
+    let mapped = remote_to_local_event(
+        remote,
+        source_id,
+        local.as_ref(),
+        &now,
+        calendar_display_name,
+    );
 
     match local {
         None => {
@@ -473,6 +544,7 @@ fn remote_to_local_event(
     source_id: &str,
     existing: Option<&CalendarEvent>,
     now_rfc3339: &str,
+    calendar_display_name: Option<&str>,
 ) -> CalendarEvent {
     // Preserve the local UUID id on update so any other code that
     // referenced it (links from arcs, agent notes) stays valid.
@@ -482,6 +554,21 @@ fn remote_to_local_event(
     let created_at = existing
         .map(|e| e.created_at.clone())
         .unwrap_or_else(|| now_rfc3339.to_string());
+
+    // Category priority:
+    // 1. A category already set locally (user/agent edited it) — never
+    //    clobber a manual override.
+    // 2. The first iCalendar `CATEGORIES` entry — what the user
+    //    explicitly tagged on the source (works on Fastmail, Nextcloud,
+    //    Outlook). iCloud / Google CalDAV typically don't set this.
+    // 3. The remote calendar's display name — "Trabajo", "Casa",
+    //    "Familia" etc. Gives the user a natural per-calendar grouping
+    //    they can drive per-category rules off of.
+    let category = existing
+        .and_then(|e| e.category.clone())
+        .or_else(|| remote.categories.as_ref().and_then(|v| v.first().cloned()))
+        .or_else(|| calendar_display_name.map(|s| s.to_string()));
+
     CalendarEvent {
         id,
         title: remote.title.clone(),
@@ -493,7 +580,7 @@ fn remote_to_local_event(
         recurrence: None, // Athen's local `Recurrence` enum is coarser than RRULE; v1 leaves it null.
         reminder_minutes: remote.reminder_minutes.clone(),
         color: None,
-        category: existing.and_then(|e| e.category.clone()),
+        category,
         created_by: existing
             .map(|e| e.created_by.clone())
             .unwrap_or(EventCreator::User),
@@ -564,6 +651,7 @@ mod tests {
             location: None,
             recurrence_rrule: None,
             reminder_minutes: vec![],
+            categories: None,
         }
     }
 
@@ -582,12 +670,12 @@ mod tests {
         let r1 = remote_event("evt-1", "Lunch", "\"v1\"", now + chrono::Duration::hours(2));
 
         // First reconcile → insert.
-        let res = reconcile_one(&store, "src-1", &r1).await.unwrap();
+        let res = reconcile_one(&store, "src-1", &r1, None).await.unwrap();
         assert!(matches!(res, ReconcileResult::Inserted));
         assert_eq!(store.list_all_events().await.unwrap().len(), 1);
 
         // Same etag → unchanged.
-        let res = reconcile_one(&store, "src-1", &r1).await.unwrap();
+        let res = reconcile_one(&store, "src-1", &r1, None).await.unwrap();
         assert!(matches!(res, ReconcileResult::Unchanged));
 
         // Different etag → update, same row.
@@ -597,7 +685,7 @@ mod tests {
             "\"v2\"",
             now + chrono::Duration::hours(3),
         );
-        let res = reconcile_one(&store, "src-1", &r2).await.unwrap();
+        let res = reconcile_one(&store, "src-1", &r2, None).await.unwrap();
         assert!(matches!(res, ReconcileResult::Updated));
         let all = store.list_all_events().await.unwrap();
         assert_eq!(all.len(), 1);
@@ -612,8 +700,8 @@ mod tests {
         // Two events in DB from the same source, one inside the next-30d window, one 60 days out.
         let near = remote_event("near", "Near", "\"e\"", now + chrono::Duration::days(5));
         let far = remote_event("far", "Far", "\"e\"", now + chrono::Duration::days(60));
-        reconcile_one(&store, "src-1", &near).await.unwrap();
-        reconcile_one(&store, "src-1", &far).await.unwrap();
+        reconcile_one(&store, "src-1", &near, None).await.unwrap();
+        reconcile_one(&store, "src-1", &far, None).await.unwrap();
         assert_eq!(store.list_all_events().await.unwrap().len(), 2);
 
         // Now simulate a pull that returned nothing.
