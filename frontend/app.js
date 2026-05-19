@@ -6741,7 +6741,10 @@ function buildSettingsRails() {
         rail.setAttribute('aria-label', 'Settings sections');
 
         sections.forEach((section) => {
-            const h2 = section.querySelector(':scope > h2');
+            // First h2 anywhere in the section. Some headings are wrapped
+            // (e.g. Email Monitor's connected-pill row) so `:scope > h2`
+            // would miss them and orphan the section from the rail.
+            const h2 = section.querySelector('h2');
             if (!h2) return;
             if (!section.id) {
                 const slug = h2.textContent.trim().toLowerCase()
