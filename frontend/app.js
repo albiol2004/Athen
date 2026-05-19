@@ -267,13 +267,9 @@ function registerTauriEventListeners() {
             refreshChangesRail();
         }
 
-        // Scroll to keep latest card visible.
-        requestAnimationFrame(() => {
-            messagesEl.parentElement.scrollTo({
-                top: messagesEl.parentElement.scrollHeight,
-                behavior: 'smooth'
-            });
-        });
+        // Follow the new card to the bottom only if the user was
+        // already pinned there — see `scrollChatIfPinned`.
+        scrollChatIfPinned(messagesEl.parentElement);
     });
 
     // Listen for streaming text chunks from the agent executor.
@@ -410,12 +406,7 @@ function registerTauriEventListeners() {
             streamingBubble.textContent = streamingText;
         }
 
-        requestAnimationFrame(() => {
-            messagesEl.parentElement.scrollTo({
-                top: messagesEl.parentElement.scrollHeight,
-                behavior: 'auto'
-            });
-        });
+        scrollChatIfPinned(messagesEl.parentElement, 'auto');
     });
 
     // Listen for arc updates (e.g. Telegram auto-execution).
@@ -664,6 +655,25 @@ function startInitialDataLoads() {
 
 const messagesEl = document.getElementById('messages');
 const inputEl = document.getElementById('message-input');
+
+// Scroll the chat (or any vertical scroll container) to the bottom — but
+// ONLY when the user is already pinned near it. Streaming text deltas
+// and tool-card append events fire constantly and used to yank the
+// viewport every time, making it impossible to scroll up and read
+// earlier content while the agent was active. Threshold is permissive
+// (under 80px from the bottom counts as "pinned") so a casual nudge
+// off-bottom doesn't fight the auto-follow.
+function scrollChatIfPinned(scrollEl, behavior) {
+    if (!scrollEl) return;
+    const dist = scrollEl.scrollHeight - (scrollEl.scrollTop + scrollEl.clientHeight);
+    if (dist > 80) return;
+    requestAnimationFrame(() => {
+        scrollEl.scrollTo({
+            top: scrollEl.scrollHeight,
+            behavior: behavior || 'smooth',
+        });
+    });
+}
 const formEl = document.getElementById('input-form');
 const statusDot = document.getElementById('status-dot');
 const statusText = document.getElementById('status-text');
@@ -1591,12 +1601,7 @@ function showSenseNotification(source, from, subject, bodyPreview,
 
     container.appendChild(card);
 
-    requestAnimationFrame(() => {
-        container.parentElement.scrollTo({
-            top: container.parentElement.scrollHeight,
-            behavior: 'smooth'
-        });
-    });
+    scrollChatIfPinned(container.parentElement);
 
     // Refresh the arc list since a new arc may have been created.
     loadArcs();
@@ -1819,13 +1824,11 @@ function addMessage(role, content, meta) {
     row.appendChild(wrap);
     messagesEl.appendChild(row);
 
-    // Smooth scroll to bottom
-    requestAnimationFrame(() => {
-        messagesEl.parentElement.scrollTo({
-            top: messagesEl.parentElement.scrollHeight,
-            behavior: 'smooth'
-        });
-    });
+    // Auto-follow only if the user is already at the bottom — otherwise
+    // a background sense-driven message (Telegram, email) would yank
+    // them out of older content they were reading. See
+    // `scrollChatIfPinned`.
+    scrollChatIfPinned(messagesEl.parentElement);
 }
 
 // Render a user bubble for a message that was queued via
@@ -1864,12 +1867,7 @@ function appendQueuedUserBubble(text) {
     row.appendChild(wrap);
     messagesEl.appendChild(row);
 
-    requestAnimationFrame(() => {
-        messagesEl.parentElement.scrollTo({
-            top: messagesEl.parentElement.scrollHeight,
-            behavior: 'smooth',
-        });
-    });
+    scrollChatIfPinned(messagesEl.parentElement);
 }
 
 /// Finalize a streaming message bubble by adding meta information
@@ -2040,12 +2038,7 @@ function addApprovalDialog(approval) {
         handleApproval(approval.task_id, false);
     });
 
-    requestAnimationFrame(() => {
-        messagesEl.parentElement.scrollTo({
-            top: messagesEl.parentElement.scrollHeight,
-            behavior: 'smooth'
-        });
-    });
+    scrollChatIfPinned(messagesEl.parentElement);
 }
 
 // Renderer for ApprovalRouter questions (install_package gate, future
@@ -2117,12 +2110,7 @@ function addApprovalQuestionDialog(question) {
     row.appendChild(wrap);
     messagesEl.appendChild(row);
 
-    requestAnimationFrame(() => {
-        messagesEl.parentElement.scrollTo({
-            top: messagesEl.parentElement.scrollHeight,
-            behavior: 'smooth'
-        });
-    });
+    scrollChatIfPinned(messagesEl.parentElement);
 }
 
 async function handleApprovalQuestion(questionId, choiceKey, cardEl) {
@@ -2536,6 +2524,14 @@ formEl.addEventListener('submit', async (e) => {
         })),
     ];
     addMessage('user', message, liveAttachments.length ? { attachments: liveAttachments } : undefined);
+    // Submitting is an explicit "I want to talk now" intent — force a
+    // scroll to bottom even if the user had scrolled up to read older
+    // content, so the streaming response is visible. Subsequent chunks
+    // re-pin via `scrollChatIfPinned` because we're back at the bottom.
+    requestAnimationFrame(() => {
+        const sc = messagesEl.parentElement;
+        if (sc) sc.scrollTo({ top: sc.scrollHeight, behavior: 'smooth' });
+    });
     inputEl.value = '';
     inputEl.style.height = 'auto';
 
