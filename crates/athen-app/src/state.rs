@@ -2012,6 +2012,9 @@ impl AppState {
         let compactor = self.compactor.clone();
         let web_search = Arc::clone(&self.web_search);
         let email_sender = self.email_sender.clone();
+        let telegram_sender_dispatch = self.telegram_sender.clone();
+        let telegram_outbound_hint_dispatch = self.telegram_outbound_hint.clone();
+        let telegram_chat_log_dispatch = self.telegram_chat_log.clone();
         let owner_check_dispatch = self.owner_destination_check();
         // Snapshot the vault so the per-task IMAP mark-seen flow can
         // hydrate the IMAP password from it (the password lives in the
@@ -2158,6 +2161,9 @@ impl AppState {
                         compactor: compactor.clone(),
                         web_search: Arc::clone(&web_search),
                         email_sender: email_sender.clone(),
+                        telegram_sender: telegram_sender_dispatch.clone(),
+                        telegram_outbound_hint: telegram_outbound_hint_dispatch.clone(),
+                        telegram_chat_log: telegram_chat_log_dispatch.clone(),
                         owner_check: owner_check_dispatch.clone(),
                         initial_user_images: Vec::new(),
                         attachment_store: attachment_store_loop.clone(),

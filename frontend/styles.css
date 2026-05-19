@@ -82,6 +82,23 @@
     color: var(--text);
 }
 
+/* Tabular numerals everywhere numbers tick — counters, timestamps, day
+   numbers, durations — so digits don't dance when values change. */
+.session-item-count,
+.session-item-date,
+.session-item-meta,
+.message-time,
+.message-meta,
+.notif-time,
+.tab-count,
+.agent-card-elapsed,
+.cal-day-number,
+.cal-week-day-num,
+.cal-week-time-label,
+.cal-now-line {
+    font-variant-numeric: tabular-nums;
+}
+
 /* Respect users who've asked their OS to reduce motion. */
 @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after {
@@ -502,7 +519,24 @@ header h1 {
     color: var(--text-2);
     transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
     user-select: none;
+    animation: session-item-in 280ms var(--ease) both;
 }
+@keyframes session-item-in {
+    from { opacity: 0; transform: translateY(-4px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+.session-item:nth-child(1)  { animation-delay:   0ms; }
+.session-item:nth-child(2)  { animation-delay:  30ms; }
+.session-item:nth-child(3)  { animation-delay:  60ms; }
+.session-item:nth-child(4)  { animation-delay:  90ms; }
+.session-item:nth-child(5)  { animation-delay: 120ms; }
+.session-item:nth-child(6)  { animation-delay: 150ms; }
+.session-item:nth-child(7)  { animation-delay: 180ms; }
+.session-item:nth-child(8)  { animation-delay: 210ms; }
+.session-item:nth-child(9)  { animation-delay: 240ms; }
+.session-item:nth-child(10) { animation-delay: 270ms; }
+.session-item:nth-child(11) { animation-delay: 300ms; }
+.session-item:nth-child(12) { animation-delay: 330ms; }
 .session-item:hover {
     background: rgba(255, 255, 255, 0.04);
     color: var(--text);
@@ -809,6 +843,12 @@ header h1 {
     opacity: 0.07;
     pointer-events: none;
     z-index: 0;
+    transform-origin: center;
+    animation: orb-breath 14s ease-in-out infinite;
+}
+@keyframes orb-breath {
+    0%, 100% { opacity: 0.05; transform: scale(1.00); }
+    50%      { opacity: 0.09; transform: scale(1.04); }
 }
 
 #messages {
@@ -1033,6 +1073,15 @@ header h1 {
     background: var(--brand-grad);
     opacity: 0.7;
     box-shadow: 2px 0 12px var(--brand-glow);
+}
+
+/* While streaming, breathe the left gradient bar so the message feels alive. */
+.message-row.assistant .message-bubble.streaming::before {
+    animation: assistant-bar-breath 1.8s ease-in-out infinite;
+}
+@keyframes assistant-bar-breath {
+    0%, 100% { opacity: 0.5; box-shadow: 2px 0 8px var(--brand-glow); }
+    50%      { opacity: 1.0; box-shadow: 2px 0 16px var(--brand-glow-strong); }
 }
 
 /* Streaming caret — coral block that blinks at the end of the in-flight
@@ -1338,6 +1387,14 @@ header h1 {
     border-radius: var(--r-md);
     font-size: 12.5px;
     color: var(--text-2);
+    transition: background var(--dur) var(--ease),
+                border-color var(--dur) var(--ease),
+                transform var(--dur) var(--ease);
+}
+.tool-call:hover {
+    background: var(--surface-2);
+    border-color: var(--border-strong);
+    transform: translateY(-1px);
 }
 
 .tool-call-icon {

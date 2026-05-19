@@ -116,6 +116,9 @@ fn spawn_router_approval(
         compactor: state.compactor.clone(),
         web_search: Arc::clone(&state.web_search),
         email_sender: state.email_sender.clone(),
+        telegram_sender: state.telegram_sender.clone(),
+        telegram_outbound_hint: state.telegram_outbound_hint.clone(),
+        telegram_chat_log: state.telegram_chat_log.clone(),
         owner_check: state.owner_destination_check(),
         attachment_store: state.attachment_store(),
         active_provider_id_snapshot: active_provider_id_snapshot.clone(),
@@ -257,6 +260,9 @@ fn spawn_router_approval(
             compactor: bg_ctx.compactor.clone(),
             web_search: bg_ctx.web_search.clone(),
             email_sender: bg_ctx.email_sender.clone(),
+            telegram_sender: bg_ctx.telegram_sender.clone(),
+            telegram_outbound_hint: bg_ctx.telegram_outbound_hint.clone(),
+            telegram_chat_log: bg_ctx.telegram_chat_log.clone(),
             owner_check: bg_ctx.owner_check.clone(),
             initial_user_images: Vec::new(),
             attachment_store: bg_ctx.attachment_store.clone(),
@@ -354,6 +360,17 @@ struct ApprovedTaskBgCtx {
     compactor: Option<Arc<dyn athen_core::traits::compaction::ArcCompactor>>,
     web_search: Arc<dyn athen_web::WebSearchProvider>,
     email_sender: Option<Arc<dyn athen_core::traits::email_sender::EmailSender>>,
+    /// Outbound Bot API transport for `send_telegram`. `None` when no bot
+    /// token is configured — the tool then refuses with a clear error.
+    /// Mirrors `email_sender` in lifecycle (built once at `AppState::new`).
+    telegram_sender: Option<Arc<dyn athen_core::traits::telegram_sender::TelegramSender>>,
+    /// Cross-channel arc routing hint, stamped by the agent-driven
+    /// `send_telegram` recorder so the user's Telegram reply lands back
+    /// in this arc instead of being re-triaged as fresh.
+    telegram_outbound_hint: crate::notifier::TelegramOutboundHint,
+    /// Per-chat transcript store updated by the agent-driven
+    /// `send_telegram` recorder. `None` in CLI/test builds.
+    telegram_chat_log: Option<Arc<athen_persistence::telegram_chat_log::TelegramChatLogStore>>,
     /// See [`ApprovedTaskCtx::owner_check`].
     owner_check: Option<Arc<dyn athen_agent::OwnerDestinationCheck>>,
     attachment_store: Option<athen_persistence::attachments::AttachmentStore>,
@@ -2641,6 +2658,9 @@ pub async fn approve_task(
         compactor: state.compactor.clone(),
         web_search: Arc::clone(&state.web_search),
         email_sender: state.email_sender.clone(),
+        telegram_sender: state.telegram_sender.clone(),
+        telegram_outbound_hint: state.telegram_outbound_hint.clone(),
+        telegram_chat_log: state.telegram_chat_log.clone(),
         owner_check: state.owner_destination_check(),
         // Approved-via-card path: original images aren't restashed yet
         // (Phase 2 will mirror `pending_message` for images). For now,
@@ -2779,6 +2799,20 @@ pub(crate) struct ApprovedTaskCtx {
     /// Outbound SMTP transport for the `email_send` tool. `None` when
     /// SMTP isn't configured — the tool then refuses with a clear error.
     pub email_sender: Option<Arc<dyn athen_core::traits::email_sender::EmailSender>>,
+    /// Outbound Bot API transport for the `send_telegram` tool. `None`
+    /// when the Telegram bot token is unset — the tool then refuses with
+    /// a clear error. Built once at `AppState::new`, so the value is
+    /// independent of whether the inbound Telegram monitor has finished
+    /// starting up.
+    pub telegram_sender: Option<Arc<dyn athen_core::traits::telegram_sender::TelegramSender>>,
+    /// Cross-channel arc-routing hint stamped after a successful
+    /// agent-driven `send_telegram` so the user's reply lands back in
+    /// this arc instead of being re-triaged as a fresh inbound.
+    pub telegram_outbound_hint: crate::notifier::TelegramOutboundHint,
+    /// Per-chat transcript store updated by the agent-driven
+    /// `send_telegram` recorder so the next inbound poll sees the
+    /// assistant's reply. `None` in CLI/test builds.
+    pub telegram_chat_log: Option<Arc<athen_persistence::telegram_chat_log::TelegramChatLogStore>>,
     /// Owner-destination check fed into `ShellToolRegistry::with_owner_check_opt`
     /// so `email_send` can auto-approve owner-self-send turns without
     /// firing the approval gate. `None` when no contact store / no owner
@@ -3143,6 +3177,7 @@ pub(crate) async fn execute_approved_task(
         .with_spawn_persistence_hook_opt(ctx.spawn_persistence.clone())
         .with_web_search(Arc::clone(&ctx.web_search))
         .with_email_sender_opt(ctx.email_sender.clone())
+        .with_telegram_sender_opt(ctx.telegram_sender.clone())
         .with_owner_check_opt(ctx.owner_check.clone());
     if let Some(ref store) = ctx.grant_store {
         let provider = Arc::new(crate::file_gate::ArcWritableProvider {
@@ -3164,7 +3199,20 @@ pub(crate) async fn execute_approved_task(
                 Some(ctx.active_arc_id.clone()),
             ));
         shell_registry = shell_registry.with_email_approval(gate);
+        let tg_gate: Arc<dyn athen_agent::tools::TelegramSendApprovalGate> =
+            Arc::new(crate::email_gate::RouterTelegramApprovalGate::new(
+                Arc::clone(router),
+                Some(ctx.active_arc_id.clone()),
+            ));
+        shell_registry = shell_registry.with_telegram_approval(tg_gate);
     }
+    let tg_recorder: Arc<dyn athen_agent::tools::TelegramOutboundRecorder> =
+        Arc::new(crate::email_gate::ArcAwareTelegramOutboundRecorder::new(
+            ctx.telegram_outbound_hint.clone(),
+            Some(ctx.active_arc_id.clone()),
+            ctx.telegram_chat_log.clone(),
+        ));
+    shell_registry = shell_registry.with_telegram_outbound_recorder(tg_recorder);
     let mut registry = crate::app_tools::AppToolRegistry::new(
         shell_registry,
         ctx.calendar_store.clone(),
@@ -4157,6 +4205,7 @@ pub(crate) async fn execute_dispatched_task(
         .with_spawn_persistence_hook_opt(ctx.spawn_persistence.clone())
         .with_web_search(Arc::clone(&ctx.web_search))
         .with_email_sender_opt(ctx.email_sender.clone())
+        .with_telegram_sender_opt(ctx.telegram_sender.clone())
         .with_owner_check_opt(ctx.owner_check.clone());
     if let Some(ref store) = ctx.grant_store {
         let provider = Arc::new(crate::file_gate::ArcWritableProvider {
@@ -4178,7 +4227,20 @@ pub(crate) async fn execute_dispatched_task(
                 Some(arc_id.clone()),
             ));
         shell_registry = shell_registry.with_email_approval(gate);
+        let tg_gate: Arc<dyn athen_agent::tools::TelegramSendApprovalGate> =
+            Arc::new(crate::email_gate::RouterTelegramApprovalGate::new(
+                Arc::clone(router),
+                Some(arc_id.clone()),
+            ));
+        shell_registry = shell_registry.with_telegram_approval(tg_gate);
     }
+    let tg_recorder: Arc<dyn athen_agent::tools::TelegramOutboundRecorder> =
+        Arc::new(crate::email_gate::ArcAwareTelegramOutboundRecorder::new(
+            ctx.telegram_outbound_hint.clone(),
+            Some(arc_id.clone()),
+            ctx.telegram_chat_log.clone(),
+        ));
+    shell_registry = shell_registry.with_telegram_outbound_recorder(tg_recorder);
     let mut registry = crate::app_tools::AppToolRegistry::new(
         shell_registry,
         ctx.calendar_store.clone(),
