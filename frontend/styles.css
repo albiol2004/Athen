@@ -7882,10 +7882,10 @@ option:hover {
 
 .changes-rail {
     position: fixed;
-    top: 0;
+    top: var(--titlebar-h);
     right: 0;
     bottom: 0;
-    width: 340px;
+    width: 360px;
     max-width: 92vw;
     background: var(--surface-1);
     border-left: 1px solid var(--border-strong);
@@ -7936,10 +7936,7 @@ option:hover {
 .changes-rail-body {
     flex: 1;
     overflow-y: auto;
-    padding: 6px 12px 16px;
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
+    padding: 10px 14px 24px;
 }
 .changes-rail-empty {
     padding: 24px 4px;
@@ -7947,62 +7944,120 @@ option:hover {
     color: var(--text-3);
     font-size: 12px;
 }
-.changes-rail-item {
+
+/* Timeline layout: a vertical spine on the left, a node per action, and
+   the card body to the right of each node. "Revert up to this point"
+   semantics — clicking a node rolls back that action and everything
+   newer. The spine visually communicates that ordering. */
+.changes-timeline {
+    position: relative;
+    padding-left: 22px;
+}
+.changes-timeline::before {
+    content: '';
+    position: absolute;
+    left: 8px;
+    top: 6px;
+    bottom: 6px;
+    width: 2px;
+    background: var(--border);
+    border-radius: 2px;
+}
+.changes-node {
+    position: relative;
+    padding: 6px 0 14px;
+}
+.changes-node:last-child {
+    padding-bottom: 4px;
+}
+.changes-node-dot {
+    position: absolute;
+    left: -18px;
+    top: 10px;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--surface-1);
+    border: 2px solid var(--brand-warm);
+    box-shadow: 0 0 0 3px rgba(185, 81, 99, 0.10);
+}
+.changes-node.reverted .changes-node-dot {
+    border-color: var(--border-strong);
+    background: var(--surface-2);
+    box-shadow: none;
+}
+.changes-node-card {
     border: 1px solid var(--border);
     border-radius: var(--r-md);
-    padding: 9px 11px;
+    padding: 8px 10px;
     background: var(--surface-2);
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: 5px;
 }
-.changes-rail-item.reverted {
+.changes-node.reverted .changes-node-card {
     opacity: 0.55;
 }
-.changes-rail-item-row {
+.changes-node-head {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 8px;
 }
-.changes-rail-tool {
+.changes-node-tool {
     font-family: var(--mono);
     font-size: 11.5px;
     color: var(--text-1);
     font-weight: 600;
 }
-.changes-rail-time {
+.changes-node-time {
     font-size: 10.5px;
     color: var(--text-3);
     font-variant-numeric: tabular-nums;
 }
-.changes-rail-summary {
+.changes-node-summary {
     font-size: 11.5px;
     color: var(--text-2);
     word-break: break-all;
     line-height: 1.4;
 }
-.changes-rail-paths {
+.changes-node-paths {
     font-family: var(--mono);
     font-size: 10.5px;
     color: var(--text-3);
     word-break: break-all;
     line-height: 1.35;
 }
-.changes-rail-actions {
+.changes-node-actions {
     display: flex;
     align-items: center;
     gap: 8px;
     margin-top: 2px;
 }
-.changes-rail-badge {
+.changes-node-badge {
     font-size: 10.5px;
     padding: 1px 6px;
     border-radius: var(--r-sm);
-    background: rgba(123, 201, 122, 0.12);
-    color: var(--success);
-}
-.changes-rail-item.reverted .changes-rail-badge {
     background: var(--surface-3);
     color: var(--text-3);
+}
+.changes-revert-btn {
+    font-size: 11.5px;
+    font-family: inherit;
+    color: var(--text-2);
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    padding: 3px 8px;
+    cursor: pointer;
+    transition: background 100ms var(--ease), color 100ms var(--ease), border-color 100ms var(--ease);
+}
+.changes-revert-btn:hover:not(:disabled) {
+    color: var(--text-1);
+    border-color: var(--danger);
+    background: rgba(229, 72, 77, 0.08);
+}
+.changes-revert-btn:disabled {
+    opacity: 0.55;
+    cursor: default;
 }

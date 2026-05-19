@@ -49,6 +49,11 @@ pub struct RevertOutcome {
     /// directory missing and uncreatable). Non-fatal — best-effort
     /// revert proceeds with the rest.
     pub failed: Vec<(PathBuf, String)>,
+    /// Number of action records dropped from history during the
+    /// operation. `revert_action` always leaves this at 0;
+    /// `rewind_to_before` reports how many records it discarded.
+    #[serde(default)]
+    pub discarded: usize,
 }
 
 /// Hidden file-snapshot store. See module-level docs.
@@ -81,6 +86,18 @@ pub trait CheckpointStore: Send + Sync {
     /// on an already-reverted action is a no-op that still returns
     /// success with an empty `RevertOutcome`.
     async fn revert_action(&self, entry_id: &str) -> Result<RevertOutcome>;
+
+    /// Rewind the arc to just before `entry_id`'s action: restore
+    /// filesystem state to entry_id's pre-state AND drop entry_id plus
+    /// every newer action from history (tag + commit chain trimmed).
+    ///
+    /// Restoration walks newest-first through the discarded actions so
+    /// later actions don't overwrite earlier restorations. The arc
+    /// branch HEAD is reset to entry_id's parent commit (or the branch
+    /// is deleted if entry_id was the first action). Idempotent: if
+    /// `entry_id` is unknown, returns an empty outcome with
+    /// `discarded = 0`.
+    async fn rewind_to_before(&self, arc_id: &str, entry_id: &str) -> Result<RevertOutcome>;
 
     /// List action records for an arc, newest first. Returns an empty
     /// vec for arcs with no snapshotted actions.

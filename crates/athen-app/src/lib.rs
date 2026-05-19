@@ -234,6 +234,7 @@ pub fn run() {
             commands::list_recent_agent_runs,
             commands::list_arc_snapshots,
             commands::revert_snapshot,
+            commands::rewind_changes,
             commands::email_detect,
             commands::email_test_connection,
             commands::email_translate_error,

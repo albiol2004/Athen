@@ -103,6 +103,16 @@ impl CheckpointStore for GixCheckpointStore {
             .map_err(|e| AthenError::Other(format!("revert task join: {e}")))?
     }
 
+    async fn rewind_to_before(&self, arc_id: &str, entry_id: &str) -> Result<RevertOutcome> {
+        let arc_id = arc_id.to_string();
+        let entry_id = entry_id.to_string();
+        let store = self.clone();
+        let _guard = self.write_lock.lock().await;
+        tokio::task::spawn_blocking(move || store.rewind_to_before_sync(&arc_id, &entry_id))
+            .await
+            .map_err(|e| AthenError::Other(format!("rewind task join: {e}")))?
+    }
+
     async fn list_actions(&self, arc_id: &str) -> Result<Vec<ActionRecord>> {
         let arc_id = arc_id.to_string();
         let store = self.clone();
@@ -338,6 +348,108 @@ impl GixCheckpointStore {
                 Err(e) => outcome.failed.push((abs_path, format!("delete file: {e}"))),
             }
         }
+
+        Ok(outcome)
+    }
+
+    /// Walk the arc branch from HEAD backward, restoring each commit's
+    /// pre-state until (and including) the commit tagged `entry_id`.
+    /// Then reset the branch HEAD to that commit's parent (or delete
+    /// the branch if no parent) and drop the matching tags.
+    fn rewind_to_before_sync(&self, arc_id: &str, entry_id: &str) -> Result<RevertOutcome> {
+        let repo = self.repo.to_thread_local();
+        let branch = refs::arc_branch(arc_id);
+        let mut branch_ref = match repo.find_reference(&branch) {
+            Ok(r) => r,
+            Err(_) => return Ok(RevertOutcome::default()), // no branch -> nothing to do
+        };
+        let head_id = branch_ref
+            .peel_to_id_in_place()
+            .map_err(|e| AthenError::Other(format!("peel branch {branch}: {e}")))?
+            .detach();
+
+        // Collect commits newest-first from HEAD until we encounter the
+        // one whose meta.entry_id matches. We capture each commit's id,
+        // its parent (the rewind target if we land here), and its
+        // entry_id (for tag cleanup).
+        struct Stop {
+            new_head: Option<gix::ObjectId>,
+        }
+        let mut entry_ids_to_drop: Vec<String> = Vec::new();
+        let mut stop: Option<Stop> = None;
+
+        let walk = repo
+            .rev_walk([head_id])
+            .all()
+            .map_err(|e| AthenError::Other(format!("rev walk: {e}")))?;
+        for info in walk {
+            let info = info.map_err(|e| AthenError::Other(format!("walk step: {e}")))?;
+            let commit = repo
+                .find_object(info.id)
+                .map_err(|e| AthenError::Other(format!("find commit {}: {e}", info.id)))?
+                .into_commit();
+            let raw = commit
+                .message_raw()
+                .map_err(|e| AthenError::Other(format!("read message: {e}")))?;
+            let meta: CommitMeta = match serde_json::from_slice(raw) {
+                Ok(m) => m,
+                Err(_) => continue, // foreign commit — skip but keep collecting
+            };
+            entry_ids_to_drop.push(meta.entry_id.clone());
+            if meta.entry_id == entry_id {
+                // First parent (if any) is the new branch HEAD.
+                let parent = commit.parent_ids().next().map(|p| p.detach());
+                stop = Some(Stop { new_head: parent });
+                break;
+            }
+        }
+
+        let Some(Stop { new_head }) = stop else {
+            // entry_id not found on this branch -> idempotent no-op.
+            return Ok(RevertOutcome::default());
+        };
+
+        // Restore files newest-first. We replay each commit's pre-state
+        // (the snapshot tree + absent_paths list); when an older commit
+        // also covers a path written by a newer one, the older write
+        // wins, leaving the file at the pre-`entry_id` state.
+        let mut outcome = RevertOutcome::default();
+        for eid in &entry_ids_to_drop {
+            let single = self.revert_action_sync(eid)?;
+            outcome.restored.extend(single.restored);
+            outcome.recreated.extend(single.recreated);
+            outcome.deleted.extend(single.deleted);
+            outcome.failed.extend(single.failed);
+        }
+
+        // Reset the branch HEAD to entry_id's parent, or delete the
+        // branch if no parent (entry_id was the first action).
+        match new_head {
+            Some(parent_id) => {
+                repo.reference(
+                    branch.as_str(),
+                    parent_id,
+                    gix::refs::transaction::PreviousValue::Any,
+                    format!("rewind before {entry_id}"),
+                )
+                .map_err(|e| AthenError::Other(format!("reset arc branch: {e}")))?;
+            }
+            None => {
+                if let Ok(b) = repo.find_reference(&branch) {
+                    let _ = b.delete();
+                }
+            }
+        }
+
+        // Drop the action tags. Best-effort: a missing tag is fine.
+        let discarded = entry_ids_to_drop.len();
+        for eid in &entry_ids_to_drop {
+            let tag = refs::action_tag(eid);
+            if let Ok(tag_ref) = repo.find_reference(&tag) {
+                let _ = tag_ref.delete();
+            }
+        }
+        outcome.discarded = discarded;
 
         Ok(outcome)
     }
@@ -584,6 +696,139 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn rewind_restores_files_and_drops_history() {
+        let work = TempDir::new().unwrap();
+        let f = work.path().join("doc.txt");
+        std::fs::write(&f, b"v1").unwrap();
+
+        let (store, _data) = make_store();
+        // Action 1: write — pre-state = v1 (file exists).
+        store
+            .snapshot_paths(
+                "arc-r",
+                "e1",
+                None,
+                "write",
+                "write doc.txt",
+                std::slice::from_ref(&f),
+            )
+            .await
+            .unwrap();
+        std::fs::write(&f, b"v2").unwrap();
+
+        // Action 2: edit — pre-state = v2.
+        store
+            .snapshot_paths(
+                "arc-r",
+                "e2",
+                None,
+                "edit",
+                "edit doc.txt",
+                std::slice::from_ref(&f),
+            )
+            .await
+            .unwrap();
+        std::fs::write(&f, b"v3").unwrap();
+
+        // Action 3: edit again — pre-state = v3.
+        store
+            .snapshot_paths(
+                "arc-r",
+                "e3",
+                None,
+                "edit",
+                "edit doc.txt",
+                std::slice::from_ref(&f),
+            )
+            .await
+            .unwrap();
+        std::fs::write(&f, b"v4").unwrap();
+
+        assert_eq!(store.list_actions("arc-r").await.unwrap().len(), 3);
+
+        // Rewind to before e2: undo e2 + e3. File lands at e2's pre-state
+        // (= v2, what existed just before e2 ran), and only e1 stays in
+        // history.
+        let outcome = store.rewind_to_before("arc-r", "e2").await.unwrap();
+        assert_eq!(outcome.discarded, 2);
+        assert_eq!(std::fs::read(&f).unwrap(), b"v2");
+
+        let remaining = store.list_actions("arc-r").await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].entry_id, "e1");
+    }
+
+    #[tokio::test]
+    async fn rewind_to_first_action_deletes_branch() {
+        let work = TempDir::new().unwrap();
+        let f = work.path().join("only.txt");
+        // File does not exist — action will create it.
+
+        let (store, _data) = make_store();
+        store
+            .snapshot_paths(
+                "arc-q",
+                "only",
+                None,
+                "write",
+                "write only.txt",
+                std::slice::from_ref(&f),
+            )
+            .await
+            .unwrap();
+        std::fs::write(&f, b"created").unwrap();
+
+        let outcome = store.rewind_to_before("arc-q", "only").await.unwrap();
+        assert_eq!(outcome.discarded, 1);
+        assert_eq!(outcome.deleted.len(), 1);
+        assert!(!f.exists());
+        assert!(store.list_actions("arc-q").await.unwrap().is_empty());
+
+        // Branch is gone — a fresh snapshot on the same arc still works.
+        std::fs::write(&f, b"fresh").unwrap();
+        store
+            .snapshot_paths(
+                "arc-q",
+                "fresh",
+                None,
+                "write",
+                "rewrite",
+                std::slice::from_ref(&f),
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.list_actions("arc-q").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rewind_unknown_entry_id_is_noop() {
+        let work = TempDir::new().unwrap();
+        let f = work.path().join("x.txt");
+        std::fs::write(&f, b"x").unwrap();
+
+        let (store, _data) = make_store();
+        store
+            .snapshot_paths(
+                "arc-z",
+                "e1",
+                None,
+                "write",
+                "write x.txt",
+                std::slice::from_ref(&f),
+            )
+            .await
+            .unwrap();
+
+        let outcome = store
+            .rewind_to_before("arc-z", "nonexistent")
+            .await
+            .unwrap();
+        assert_eq!(outcome.discarded, 0);
+        assert!(outcome.restored.is_empty());
+        assert_eq!(store.list_actions("arc-z").await.unwrap().len(), 1);
     }
 
     #[tokio::test]

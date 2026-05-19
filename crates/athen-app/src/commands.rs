@@ -5367,8 +5367,9 @@ pub async fn list_arc_snapshots(
 
 /// Revert a single snapshotted action by its `action_id`. Idempotent —
 /// reverting an already-reverted action returns an empty outcome with no
-/// error. Phase-1 smoke surface; future phase 3 wires this to the
-/// Revert button on tool cards.
+/// error. Kept for parity with the per-action API; the UI Revert flow
+/// uses `rewind_changes` (which restores files AND drops history) so the
+/// timeline can't accumulate orphaned reverted nodes.
 #[tauri::command]
 pub async fn revert_snapshot(
     state: State<'_, AppState>,
@@ -5380,6 +5381,26 @@ pub async fn revert_snapshot(
         .ok_or_else(|| "checkpoint store not initialized".to_string())?;
     store
         .revert_action(&action_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Rewind the arc to just before a given snapshotted action: restore
+/// files to that action's pre-state AND drop the action plus every
+/// newer one from history. Atomic at the trait boundary; idempotent
+/// when `action_id` is unknown.
+#[tauri::command]
+pub async fn rewind_changes(
+    state: State<'_, AppState>,
+    arc_id: String,
+    action_id: String,
+) -> std::result::Result<athen_core::traits::checkpoint::RevertOutcome, String> {
+    let store = state
+        .checkpoint_store
+        .as_ref()
+        .ok_or_else(|| "checkpoint store not initialized".to_string())?;
+    store
+        .rewind_to_before(&arc_id, &action_id)
         .await
         .map_err(|e| e.to_string())
 }

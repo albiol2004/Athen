@@ -2938,35 +2938,46 @@ function maybeBuildRevertRow(meta) {
     btn.addEventListener('click', async (e) => {
         e.preventDefault();
         e.stopPropagation();
-        if (!invoke) return;
-        if (btn.disabled) return;
+        if (!invoke || btn.disabled || !activeArcId) return;
+        // Mirror the timeline rail: confirm scope first, then call the
+        // single backend op that restores files + drops history.
+        let cascadeCount = 1;
+        try {
+            const all = await invoke('list_arc_snapshots', { arcId: activeArcId });
+            const target = (all || []).find((a) => a.entry_id === actionId);
+            if (!target) {
+                showToast('Could not locate snapshot for this change.', 'error');
+                return;
+            }
+            const targetTime = target.created_at || '';
+            cascadeCount = (all || [])
+                .filter((a) => (a.created_at || '') >= targetTime)
+                .length;
+        } catch (lookupErr) {
+            console.warn('Snapshot lookup failed, proceeding with single-action confirm:', lookupErr);
+        }
+        const confirmMsg = cascadeCount > 1
+            ? `Revert this change and ${cascadeCount - 1} newer change${cascadeCount - 1 === 1 ? '' : 's'}?\n\n` +
+              `Files will be restored to their state just before this point. The reverted changes will be removed from the timeline and cannot be brought back.`
+            : `Revert this change?\n\nThe file will be restored to its previous state. This change will be removed from the timeline and cannot be brought back.`;
+        if (!window.confirm(confirmMsg)) return;
+
         btn.disabled = true;
         status.textContent = 'Reverting…';
         try {
-            const outcome = await invoke('revert_snapshot', { actionId });
-            const restored = (outcome && outcome.restored && outcome.restored.length) || 0;
-            const recreated = (outcome && outcome.recreated && outcome.recreated.length) || 0;
-            const deleted = (outcome && outcome.deleted && outcome.deleted.length) || 0;
-            const failed = (outcome && outcome.failed && outcome.failed.length) || 0;
-            const parts = [];
-            if (restored) parts.push(`${restored} restored`);
-            if (recreated) parts.push(`${recreated} recreated`);
-            if (deleted) parts.push(`${deleted} deleted`);
-            if (failed) parts.push(`${failed} failed`);
-            const summary = parts.length ? parts.join(', ') : 'nothing to do';
-            showToast(`Reverted: ${summary}`, failed ? 'error' : 'success');
+            const outcome = await invoke('rewind_changes', {
+                arcId: activeArcId,
+                actionId,
+            });
+            reportRewindOutcome(outcome);
             status.textContent = 'Reverted';
             row.classList.add('reverted');
-            // Refresh the arc so any subsequent reads reflect the reverted
-            // state and the row stays consistent across reload.
-            if (activeArcId) {
-                try {
-                    const entries = await invoke('get_arc_entries', { arcId: activeArcId });
-                    clearChatUI();
-                    renderEntries(entries || []);
-                } catch (refreshErr) {
-                    console.warn('Revert succeeded but arc refresh failed:', refreshErr);
-                }
+            try {
+                const entries = await invoke('get_arc_entries', { arcId: activeArcId });
+                clearChatUI();
+                renderEntries(entries || []);
+            } catch (refreshErr) {
+                console.warn('Revert succeeded but arc refresh failed:', refreshErr);
             }
         } catch (err) {
             console.error('Revert failed:', err);
@@ -4265,97 +4276,154 @@ async function refreshChangesRail() {
         changesRailBodyEl.appendChild(empty);
         return;
     }
-    // Newest first.
-    actions.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
-    for (const action of actions) {
-        changesRailBodyEl.appendChild(buildChangesRailItem(action));
-    }
+    // Oldest first — top of the timeline is the earliest change, bottom is
+    // the latest. Reads like a normal chronology. Clicking a node reverts
+    // that action *and everything newer* (point-in-time semantics), so the
+    // only valid revert anchor among un-reverted rows is the newest
+    // (bottom). Older un-reverted rows show "Revert through here".
+    actions.sort((a, b) => (a.created_at || '').localeCompare(b.created_at || ''));
+
+    const timeline = document.createElement('div');
+    timeline.className = 'changes-timeline';
+    actions.forEach((action, idx) => {
+        // Every un-reverted node is revertable. Cascading from older
+        // nodes skips already-reverted siblings (revert_action is
+        // idempotent), so there's no need to forbid mid-history reverts —
+        // the user picks a point in time and we rewind from "now" back
+        // to it, no-op'ing over anything already undone.
+        const isLatest = idx === actions.length - 1;
+        timeline.appendChild(buildChangesNode(action, isLatest, actions));
+    });
+    changesRailBodyEl.appendChild(timeline);
+
+    // Auto-scroll to the latest (bottom) so the most recent change is in
+    // view the moment the rail opens.
+    changesRailBodyEl.scrollTop = changesRailBodyEl.scrollHeight;
 }
 
-function buildChangesRailItem(action) {
+function buildChangesNode(action, isLatest, allActions) {
     const wrap = document.createElement('div');
-    wrap.className = 'changes-rail-item' + (action.reverted ? ' reverted' : '');
+    wrap.className = 'changes-node' + (action.reverted ? ' reverted' : '');
 
-    const topRow = document.createElement('div');
-    topRow.className = 'changes-rail-item-row';
+    const dot = document.createElement('span');
+    dot.className = 'changes-node-dot';
+    wrap.appendChild(dot);
+
+    const card = document.createElement('div');
+    card.className = 'changes-node-card';
+
+    const head = document.createElement('div');
+    head.className = 'changes-node-head';
     const toolEl = document.createElement('span');
-    toolEl.className = 'changes-rail-tool';
+    toolEl.className = 'changes-node-tool';
     toolEl.textContent = action.tool_name || '(unknown tool)';
     const timeEl = document.createElement('span');
-    timeEl.className = 'changes-rail-time';
+    timeEl.className = 'changes-node-time';
     timeEl.textContent = formatRelativeTime(action.created_at);
     timeEl.title = action.created_at || '';
-    topRow.appendChild(toolEl);
-    topRow.appendChild(timeEl);
-    wrap.appendChild(topRow);
+    head.appendChild(toolEl);
+    head.appendChild(timeEl);
+    card.appendChild(head);
 
     if (action.args_summary) {
         const sum = document.createElement('div');
-        sum.className = 'changes-rail-summary';
+        sum.className = 'changes-node-summary';
         sum.textContent = action.args_summary;
-        wrap.appendChild(sum);
+        card.appendChild(sum);
     }
     if (action.paths && action.paths.length) {
         const pathsEl = document.createElement('div');
-        pathsEl.className = 'changes-rail-paths';
+        pathsEl.className = 'changes-node-paths';
         pathsEl.textContent = action.paths.join('\n');
-        wrap.appendChild(pathsEl);
+        card.appendChild(pathsEl);
     }
 
     const actionsRow = document.createElement('div');
-    actionsRow.className = 'changes-rail-actions';
-
+    actionsRow.className = 'changes-node-actions';
     if (action.reverted) {
         const badge = document.createElement('span');
-        badge.className = 'changes-rail-badge';
+        badge.className = 'changes-node-badge';
         badge.textContent = 'reverted';
         actionsRow.appendChild(badge);
     } else {
         const btn = document.createElement('button');
         btn.type = 'button';
-        btn.className = 'tool-revert-btn';
-        btn.textContent = 'Revert';
-        btn.addEventListener('click', async () => {
-            if (!invoke || btn.disabled) return;
-            btn.disabled = true;
-            const prevLabel = btn.textContent;
-            btn.textContent = 'Reverting…';
-            try {
-                const outcome = await invoke('revert_snapshot', { actionId: action.entry_id });
-                const restored = (outcome && outcome.restored && outcome.restored.length) || 0;
-                const recreated = (outcome && outcome.recreated && outcome.recreated.length) || 0;
-                const deleted = (outcome && outcome.deleted && outcome.deleted.length) || 0;
-                const failed = (outcome && outcome.failed && outcome.failed.length) || 0;
-                const parts = [];
-                if (restored) parts.push(`${restored} restored`);
-                if (recreated) parts.push(`${recreated} recreated`);
-                if (deleted) parts.push(`${deleted} deleted`);
-                if (failed) parts.push(`${failed} failed`);
-                showToast(`Reverted: ${parts.length ? parts.join(', ') : 'nothing to do'}`, failed ? 'error' : 'success');
-                // Refresh the rail (action.reverted flips) and the arc body
-                // so any tool cards drop their Revert button.
-                await refreshChangesRail();
-                if (activeArcId) {
-                    try {
-                        const entries = await invoke('get_arc_entries', { arcId: activeArcId });
-                        clearChatUI();
-                        renderEntries(entries || []);
-                    } catch (e) {
-                        console.warn('Revert succeeded but arc refresh failed:', e);
-                    }
-                }
-            } catch (err) {
-                console.error('Revert failed:', err);
-                showToast('Revert failed: ' + (err && err.toString ? err.toString() : 'unknown error'), 'error');
-                btn.textContent = prevLabel;
-                btn.disabled = false;
-            }
-        });
+        btn.className = 'changes-revert-btn';
+        // Newest (bottom) is just "Revert"; older nodes phrase the
+        // cascade as a rewind to a point in time.
+        btn.textContent = isLatest ? 'Revert this change' : 'Revert up to this change';
+        btn.title = isLatest
+            ? 'Roll this action back.'
+            : 'Rewind history back to just before this action — every newer un-reverted change gets undone too.';
+        btn.addEventListener('click', () => revertThroughPoint(action, allActions, btn));
         actionsRow.appendChild(btn);
     }
+    card.appendChild(actionsRow);
 
-    wrap.appendChild(actionsRow);
+    wrap.appendChild(card);
     return wrap;
+}
+
+// "Revert up to this point" — confirms with the user, then asks the
+// backend to atomically restore files to `target`'s pre-state AND drop
+// every action from `target` onward out of history. After confirmation
+// there is no in-app undo (the snapshots are deleted), so the dialog
+// must be unambiguous about scope.
+async function revertThroughPoint(target, allActions, btn) {
+    if (!invoke || btn.disabled || !activeArcId) return;
+    const targetTime = target.created_at || '';
+    const cascadeCount = allActions
+        .filter((a) => (a.created_at || '') >= targetTime)
+        .length;
+    const confirmMsg = cascadeCount > 1
+        ? `Revert this change and ${cascadeCount - 1} newer change${cascadeCount - 1 === 1 ? '' : 's'}?\n\n` +
+          `Files will be restored to their state just before this point. The reverted changes will be removed from this timeline and cannot be brought back.`
+        : `Revert this change?\n\nThe file will be restored to its previous state. This change will be removed from the timeline and cannot be brought back.`;
+    if (!window.confirm(confirmMsg)) return;
+
+    btn.disabled = true;
+    const prevLabel = btn.textContent;
+    btn.textContent = cascadeCount > 1 ? `Reverting ${cascadeCount}…` : 'Reverting…';
+    try {
+        const outcome = await invoke('rewind_changes', {
+            arcId: activeArcId,
+            actionId: target.entry_id,
+        });
+        reportRewindOutcome(outcome);
+        await refreshChangesRail();
+        if (activeArcId) {
+            try {
+                const entries = await invoke('get_arc_entries', { arcId: activeArcId });
+                clearChatUI();
+                renderEntries(entries || []);
+            } catch (e) {
+                console.warn('Revert succeeded but arc refresh failed:', e);
+            }
+        }
+    } catch (err) {
+        console.error('Revert failed:', err);
+        showToast('Revert failed: ' + (err && err.toString ? err.toString() : 'unknown error'), 'error');
+        btn.textContent = prevLabel;
+        btn.disabled = false;
+    }
+}
+
+// Shared toast for both rail + inline revert paths. `outcome` is the
+// `RevertOutcome` returned by `rewind_changes`.
+function reportRewindOutcome(outcome) {
+    const restored  = (outcome && outcome.restored  && outcome.restored.length)  || 0;
+    const recreated = (outcome && outcome.recreated && outcome.recreated.length) || 0;
+    const deleted   = (outcome && outcome.deleted   && outcome.deleted.length)   || 0;
+    const failed    = (outcome && outcome.failed    && outcome.failed.length)    || 0;
+    const discarded = (outcome && typeof outcome.discarded === 'number') ? outcome.discarded : 0;
+    const parts = [];
+    if (restored) parts.push(`${restored} restored`);
+    if (recreated) parts.push(`${recreated} recreated`);
+    if (deleted) parts.push(`${deleted} deleted`);
+    if (failed) parts.push(`${failed} failed`);
+    const summary = parts.length ? parts.join(', ') : 'nothing to change on disk';
+    const label = discarded > 1 ? `Reverted ${discarded} changes` : 'Reverted';
+    showToast(`${label}: ${summary}`, failed ? 'error' : 'success');
 }
 
 function formatRelativeTime(iso) {
