@@ -944,22 +944,26 @@ async fn judge_worth_remembering(
 /// message + tool calls + assistant reply) so the UI can render them together.
 async fn persist_entry(
     state: &AppState,
+    arc_id: &str,
     source: &str,
     content: &str,
     entry_type: &str,
     metadata: Option<serde_json::Value>,
     turn_id: Option<&str>,
 ) {
+    // arc_id is passed in (snapshotted at command entry) rather than
+    // re-read from state.active_arc_id. If the user switches arcs
+    // mid-turn (clicking a notification that opens another arc), a
+    // fresh read here would persist into the wrong arc.
     if let Some(ref store) = state.arc_store {
-        let arc_id = state.active_arc_id.lock().await.clone();
         let et = arcs::EntryType::from_str(entry_type);
         if let Err(e) = store
-            .add_entry(&arc_id, et, source, content, metadata, turn_id)
+            .add_entry(arc_id, et, source, content, metadata, turn_id)
             .await
         {
             warn!("Failed to persist arc entry: {e}");
         }
-        if let Err(e) = store.touch_arc(&arc_id).await {
+        if let Err(e) = store.touch_arc(arc_id).await {
             warn!("Failed to touch arc: {e}");
         }
     }
@@ -1951,7 +1955,9 @@ pub async fn send_message(
     }
 
     // Notify on NotifyAndProceed decisions (medium-risk auto-executed tasks).
-    let current_arc_for_notif = state.active_arc_id.lock().await.clone();
+    // Reuse `active_arc` snapshotted at the top — re-reading would race with
+    // a concurrent `switch_arc` if the user clicked an arc-switching
+    // notification mid-turn.
     for (task_id, decision) in &task_results {
         if matches!(decision, RiskDecision::NotifyAndProceed) {
             if let Some(ref notifier) = state.notifier {
@@ -1961,7 +1967,7 @@ pub async fn send_message(
                     title: "Task auto-executed".to_string(),
                     body: "A medium-risk task was automatically executed.".to_string(),
                     origin: NotificationOrigin::RiskSystem,
-                    arc_id: Some(current_arc_for_notif.clone()),
+                    arc_id: Some(active_arc.clone()),
                     task_id: Some(*task_id),
                     created_at: chrono::Utc::now(),
                     requires_response: false,
@@ -2117,6 +2123,7 @@ pub async fn send_message(
             });
             persist_entry(
                 &state,
+                &active_arc,
                 "user",
                 &message,
                 "message",
@@ -2147,9 +2154,8 @@ pub async fn send_message(
                 if let (Some(arc_store), Some(astore)) =
                     (arc_store_opt, attachment_store_opt.as_ref())
                 {
-                    let arc_id_for_surface = state.active_arc_id.lock().await.clone();
                     if let Some(event_id) =
-                        latest_sense_event_id_in_arc(arc_store, &arc_id_for_surface).await
+                        latest_sense_event_id_in_arc(arc_store, &active_arc).await
                     {
                         let router_guard = state.router.read().await;
                         let supports_vision = router_guard.any_provider_supports_vision();
@@ -2164,7 +2170,7 @@ pub async fn send_message(
                         .await;
                         if let Some(msg) = surfacing.system_message {
                             tracing::info!(
-                                arc_id = %arc_id_for_surface,
+                                arc_id = %active_arc,
                                 event_id = %event_id,
                                 images = surfacing.images.len(),
                                 surfaced_chars = msg.len(),
@@ -2179,12 +2185,9 @@ pub async fn send_message(
 
             // Build executor with real tool execution (same as athen-cli).
             let exec_router: Box<dyn LlmRouter> = Box::new(SharedRouter(Arc::clone(&state.router)));
-            let arc_for_registry = state.active_arc_id.lock().await.clone();
             let registry = state
-                .build_tool_registry(&arc_for_registry, Some(app_handle.clone()))
+                .build_tool_registry(&active_arc, Some(app_handle.clone()))
                 .await;
-
-            let auditor_arc_id = state.active_arc_id.lock().await.clone();
 
             // Pre-allocate the task id so we can register it with the
             // live agent registry BEFORE the executor starts. The Task
@@ -2199,7 +2202,7 @@ pub async fn send_message(
             let active_profile_id_for_run = active_profile_id_for_arc(
                 state.profile_store.as_ref(),
                 state.arc_store.as_ref(),
-                &auditor_arc_id,
+                &active_arc,
             )
             .await;
             let agent_guard = if let Some(reg) = state.agent_registry.as_ref() {
@@ -2208,7 +2211,7 @@ pub async fn send_message(
                 Some(
                     reg.register(crate::agent_registry::ActiveAgent {
                         task_id: task_id_for_run.to_string(),
-                        arc_id: Some(auditor_arc_id.clone()),
+                        arc_id: Some(active_arc.clone()),
                         source: crate::agent_registry::AgentSource::UserChat,
                         title,
                         started_at: now,
@@ -2229,7 +2232,7 @@ pub async fn send_message(
             let mut auditor = TauriAuditor::new(
                 app_handle.clone(),
                 state.arc_store.clone(),
-                auditor_arc_id,
+                active_arc.clone(),
                 turn_id.clone(),
                 new_tool_log(),
             );
@@ -2238,9 +2241,10 @@ pub async fn send_message(
             }
 
             // Set up streaming: forward LLM text chunks to the frontend
-            // in real time via Tauri events, tagged with the active arc.
-            let current_arc = state.active_arc_id.lock().await.clone();
-            let stream_tx = spawn_stream_forwarder(&app_handle, Some(current_arc.clone()));
+            // in real time via Tauri events, tagged with the active arc
+            // snapshotted at command entry (re-reading would race with a
+            // concurrent `switch_arc`).
+            let stream_tx = spawn_stream_forwarder(&app_handle, Some(active_arc.clone()));
 
             // Per-run cancel flag freshly minted by the registry guard.
             // Each agent has its own — the global `cancel_task` flips
@@ -2256,7 +2260,7 @@ pub async fn send_message(
             let active_profile = resolve_active_profile(
                 state.profile_store.as_ref(),
                 state.arc_store.as_ref(),
-                &current_arc,
+                &active_arc,
             )
             .await;
 
@@ -2285,18 +2289,18 @@ pub async fn send_message(
             // event turn on the same arc still renders into the prompt
             // AND still feeds the completion judge.
             let mission_block =
-                crate::mission_render::render_mission_block(state.arc_store.as_ref(), &current_arc)
+                crate::mission_render::render_mission_block(state.arc_store.as_ref(), &active_arc)
                     .await;
             let acceptance_criteria = crate::mission_render::read_acceptance_criteria(
                 state.arc_store.as_ref(),
-                &current_arc,
+                &active_arc,
             )
             .await;
 
             let active_id_now = state.active_provider_id.lock().await.clone();
             let effective_provider_id = crate::state::resolve_effective_provider_for_arc(
                 state.arc_store.as_ref(),
-                &current_arc,
+                &active_arc,
                 &active_id_now,
                 athen_core::llm::ModelProfile::Powerful,
             )
@@ -2307,7 +2311,7 @@ pub async fn send_message(
             );
             let reasoning_effort = crate::state::resolve_reasoning_effort_for_arc(
                 state.arc_store.as_ref(),
-                &current_arc,
+                &active_arc,
             )
             .await;
             // In-app direct turns don't go through the risk LLM, so the
@@ -2315,7 +2319,7 @@ pub async fn send_message(
             // `override > Fast`.
             let default_tier = crate::state::resolve_effective_tier_for_arc(
                 state.arc_store.as_ref(),
-                &current_arc,
+                &active_arc,
                 None,
                 athen_core::llm::ModelProfile::Fast,
             )
@@ -2327,7 +2331,7 @@ pub async fn send_message(
                 std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             {
                 let mut map = state.pending_user_inputs.write().await;
-                map.insert(current_arc.clone(), pending_slot.clone());
+                map.insert(active_arc.clone(), pending_slot.clone());
             }
 
             let mut builder = AgentBuilder::new()
@@ -2404,14 +2408,11 @@ pub async fn send_message(
                         g.fail(e.to_string()).await;
                     }
                     let _ = state.coordinator.complete_task(task_id).await;
-                    crate::state::clear_provider_pin_for_arc(
-                        state.arc_store.as_ref(),
-                        &current_arc,
-                    )
-                    .await;
+                    crate::state::clear_provider_pin_for_arc(state.arc_store.as_ref(), &active_arc)
+                        .await;
                     {
                         let mut map = state.pending_user_inputs.write().await;
-                        map.remove(&current_arc);
+                        map.remove(&active_arc);
                     }
                     let raw = e.to_string();
                     tracing::error!("Agent execution failed: {raw}");
@@ -2427,7 +2428,16 @@ pub async fn send_message(
                     });
                     drop(history);
                     // User msg was already persisted before the executor ran.
-                    persist_entry(&state, "assistant", &msg, "message", None, Some(&turn_id)).await;
+                    persist_entry(
+                        &state,
+                        &active_arc,
+                        "assistant",
+                        &msg,
+                        "message",
+                        None,
+                        Some(&turn_id),
+                    )
+                    .await;
                     return Ok(ChatResponse {
                         content: msg,
                         risk_level: Some("Caution".into()),
@@ -2491,6 +2501,7 @@ pub async fn send_message(
             // User msg was already persisted before the executor ran.
             persist_entry(
                 &state,
+                &active_arc,
                 "assistant",
                 &content,
                 "message",
@@ -2508,7 +2519,7 @@ pub async fn send_message(
             // then remember only a distilled summary (not greetings, small talk, etc.).
             if let Some(ref memory) = state.memory {
                 let router = SharedRouter(Arc::clone(&state.router));
-                let arc_id = state.active_arc_id.lock().await.clone();
+                let arc_id = active_arc.clone();
                 let msg_clone = message.clone();
                 let content_clone = content.clone();
                 let memory_clone = Arc::clone(memory);
@@ -2547,10 +2558,10 @@ pub async fn send_message(
 
             // Mark coordinator task as completed.
             let _ = state.coordinator.complete_task(task_id).await;
-            crate::state::clear_provider_pin_for_arc(state.arc_store.as_ref(), &current_arc).await;
+            crate::state::clear_provider_pin_for_arc(state.arc_store.as_ref(), &active_arc).await;
             {
                 let mut map = state.pending_user_inputs.write().await;
-                map.remove(&current_arc);
+                map.remove(&active_arc);
             }
 
             Ok(ChatResponse {
