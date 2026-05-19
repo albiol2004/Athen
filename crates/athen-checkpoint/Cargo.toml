@@ -1,0 +1,19 @@
+[package]
+name = "athen-checkpoint"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+athen-core = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+gix = { version = "0.66", default-features = false, features = ["max-performance-safe", "revision"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["full", "test-util"] }

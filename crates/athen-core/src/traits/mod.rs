@@ -2,6 +2,7 @@ pub mod agent;
 pub mod approval;
 pub mod calendar_source;
 pub mod calendar_source_config;
+pub mod checkpoint;
 pub mod compaction;
 pub mod coordinator;
 pub mod email_sender;
