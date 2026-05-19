@@ -2741,7 +2741,7 @@ footer {
     flex: 1;
     overflow-y: auto;
     padding: 24px;
-    max-width: 880px;
+    max-width: 1040px;
     width: 100%;
     margin: 0 auto;
     -webkit-mask-image: linear-gradient(to bottom,
@@ -2797,7 +2797,68 @@ footer {
 }
 
 .settings-tab-pane.active {
+    display: grid;
+    grid-template-columns: 196px 1fr;
+    gap: 28px;
+    align-items: start;
+}
+
+/* Sub-section navigation rail (auto-built from each pane's h2s) */
+.settings-rail {
+    grid-column: 1;
+    grid-row: 1 / -1;
+    position: sticky;
+    top: 64px; /* below the sticky .settings-tabs bar */
+    align-self: start;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    padding: 4px 0;
+}
+
+.settings-tab-pane.active > .settings-section {
+    grid-column: 2;
+    display: none;
+}
+.settings-tab-pane.active > .settings-section.is-current {
     display: block;
+    animation: settingsTabFade var(--dur) var(--ease);
+}
+
+.settings-rail-link {
+    display: block;
+    width: 100%;
+    padding: 7px 12px;
+    border-radius: var(--r-sm);
+    background: transparent;
+    border: none;
+    color: var(--text-2);
+    font-size: 12.5px;
+    font-weight: 500;
+    text-align: left;
+    cursor: pointer;
+    letter-spacing: -0.005em;
+    font-family: inherit;
+    transition: background var(--dur) var(--ease),
+                color var(--dur) var(--ease),
+                box-shadow var(--dur) var(--ease);
+}
+.settings-rail-link:hover {
+    background: rgba(255,255,255,0.04);
+    color: var(--text);
+}
+.settings-rail-link.active {
+    background: var(--surface-2);
+    color: var(--text);
+    box-shadow: inset 2px 0 0 0 var(--brand-warm);
+}
+
+
+@media (max-width: 760px) {
+    .settings-tab-pane.active {
+        display: block;
+    }
+    .settings-rail { display: none; }
 }
 
 @keyframes settingsTabFade {

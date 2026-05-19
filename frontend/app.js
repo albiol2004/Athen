@@ -6649,6 +6649,53 @@ window.addEventListener('focus', () => document.body.classList.remove('window-bl
 // ─── Settings tabs ───
 const SETTINGS_TAB_STORAGE_KEY = 'athen.settings.activeTab';
 
+const SETTINGS_SECTION_STORAGE_KEY = 'athen.settings.activeSection';
+
+// Read the per-tab section map from localStorage. Shape: { tabId: sectionId }.
+function readSettingsSectionMap() {
+    try {
+        const raw = localStorage.getItem(SETTINGS_SECTION_STORAGE_KEY);
+        return raw ? (JSON.parse(raw) || {}) : {};
+    } catch (_) {
+        return {};
+    }
+}
+
+function writeSettingsSectionMap(tabId, sectionId) {
+    try {
+        const map = readSettingsSectionMap();
+        map[tabId] = sectionId;
+        localStorage.setItem(SETTINGS_SECTION_STORAGE_KEY, JSON.stringify(map));
+    } catch (_) {}
+}
+
+// Show exactly one .settings-section inside `pane`. If sectionId is missing
+// or doesn't match anything in the pane, falls back to the first section.
+function setSettingsSection(pane, sectionId) {
+    if (!pane) return;
+    const sections = pane.querySelectorAll(':scope > .settings-section');
+    if (sections.length === 0) return;
+
+    let resolvedId = null;
+    if (sectionId) {
+        for (const s of sections) {
+            if (s.id === sectionId) { resolvedId = sectionId; break; }
+        }
+    }
+    if (!resolvedId) resolvedId = sections[0].id;
+
+    sections.forEach((s) => s.classList.toggle('is-current', s.id === resolvedId));
+    pane.querySelectorAll('.settings-rail-link').forEach((link) => {
+        link.classList.toggle('active', link.dataset.target === resolvedId);
+    });
+
+    const tabId = pane.dataset.settingsPane;
+    if (tabId) writeSettingsSectionMap(tabId, resolvedId);
+
+    const content = document.querySelector('.settings-content');
+    if (content) content.scrollTop = 0;
+}
+
 function setSettingsTab(tabId) {
     const tabs = document.querySelectorAll('.settings-tab');
     const panes = document.querySelectorAll('.settings-tab-pane');
@@ -6664,10 +6711,59 @@ function setSettingsTab(tabId) {
     });
     if (matched) {
         try { localStorage.setItem(SETTINGS_TAB_STORAGE_KEY, tabId); } catch (_) {}
-        const content = document.querySelector('.settings-content');
-        if (content) content.scrollTop = 0;
+        const newPane = document.querySelector(`.settings-tab-pane[data-settings-pane="${tabId}"]`);
+        if (newPane) {
+            // Restore the last-viewed section in this tab, or default to first.
+            const remembered = readSettingsSectionMap()[tabId];
+            setSettingsSection(newPane, remembered);
+        }
     }
 }
+
+// ─── Settings sub-section rails (auto-generated nav) ───
+function buildSettingsRails() {
+    const panes = document.querySelectorAll('.settings-tab-pane');
+    panes.forEach((pane) => {
+        if (pane.querySelector(':scope > .settings-rail')) return;
+        const sections = pane.querySelectorAll(':scope > .settings-section');
+        if (sections.length === 0) return;
+
+        const rail = document.createElement('aside');
+        rail.className = 'settings-rail';
+        rail.setAttribute('aria-label', 'Settings sections');
+
+        sections.forEach((section) => {
+            const h2 = section.querySelector(':scope > h2');
+            if (!h2) return;
+            if (!section.id) {
+                const slug = h2.textContent.trim().toLowerCase()
+                    .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+                section.id = 'settings-section-' + (slug || 'unnamed');
+            }
+            const link = document.createElement('button');
+            link.type = 'button';
+            link.className = 'settings-rail-link';
+            link.dataset.target = section.id;
+            link.textContent = h2.textContent.trim();
+            link.addEventListener('click', () => {
+                setSettingsSection(pane, section.id);
+            });
+            rail.appendChild(link);
+        });
+
+        pane.insertBefore(rail, pane.firstChild);
+    });
+
+    // Bootstrap the default-active pane: show its last-viewed (or first) section.
+    const activePane = document.querySelector('.settings-tab-pane.active');
+    if (activePane) {
+        const tabId = activePane.dataset.settingsPane;
+        const remembered = tabId ? readSettingsSectionMap()[tabId] : null;
+        setSettingsSection(activePane, remembered);
+    }
+}
+
+buildSettingsRails();
 
 document.querySelectorAll('.settings-tab').forEach((btn) => {
     btn.addEventListener('click', () => setSettingsTab(btn.dataset.settingsTab));
