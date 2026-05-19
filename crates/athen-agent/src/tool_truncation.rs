@@ -29,6 +29,18 @@ pub enum TruncationPolicy {
     /// prologue (command being run, early errors) and the epilogue (final
     /// exit message, summary) carry signal.
     HeadTail { head: usize, tail: usize },
+    /// Like `HeadTail`, but additionally scans the elided middle for lines
+    /// that look like errors / warnings / panics / tracebacks, and keeps up
+    /// to `max_signal_lines` of them between the head and tail. The signal
+    /// block is bracketed with a clear marker so the model can tell it's
+    /// not contiguous output. Used for shell tools where the most
+    /// debug-useful line is often in the middle (compiler error, test
+    /// failure, stack trace), not at the prologue or epilogue.
+    SignalHeadTail {
+        head: usize,
+        tail: usize,
+        max_signal_lines: usize,
+    },
 }
 
 /// Default truncation policy for a built-in tool name. Unknown tools (e.g.
@@ -36,13 +48,15 @@ pub enum TruncationPolicy {
 /// reaches the model unbounded.
 pub fn policy_for(name: &str) -> TruncationPolicy {
     match name {
-        "shell_execute" => TruncationPolicy::HeadTail {
+        "shell_execute" => TruncationPolicy::SignalHeadTail {
             head: 8_000,
             tail: 4_000,
+            max_signal_lines: 20,
         },
-        "shell_logs" => TruncationPolicy::HeadTail {
+        "shell_logs" => TruncationPolicy::SignalHeadTail {
             head: 4_000,
             tail: 8_000,
+            max_signal_lines: 20,
         },
         "shell_spawn" | "shell_kill" => TruncationPolicy::None,
 
@@ -104,7 +118,89 @@ pub fn apply(policy: TruncationPolicy, s: String) -> String {
             out.push_str(&s[tail_start..]);
             out
         }
+        TruncationPolicy::SignalHeadTail {
+            head,
+            tail,
+            max_signal_lines,
+        } => {
+            if len <= head.saturating_add(tail) {
+                return s;
+            }
+            let head_end = floor_char_boundary(&s, head);
+            let tail_start = ceil_char_boundary(&s, len - tail);
+            let elided = tail_start.saturating_sub(head_end);
+            let middle = &s[head_end..tail_start];
+            let signals = collect_signal_lines(middle, max_signal_lines);
+            let mut out = String::with_capacity(head_end + (len - tail_start) + 256);
+            out.push_str(&s[..head_end]);
+            let _ = write!(
+                out,
+                "\n\n[TRUNCATED: {} bytes elided in the middle of {} total. Refine your query to see the missing region.]\n",
+                elided, len
+            );
+            if !signals.is_empty() {
+                let kept = signals.len();
+                let _ = write!(
+                    out,
+                    "\n[SIGNAL LINES from elided middle ({} kept, max {}): error/warn/fail/panic/traceback matches]\n",
+                    kept, max_signal_lines
+                );
+                for line in signals {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+                out.push_str("[END SIGNAL LINES]\n");
+            }
+            out.push('\n');
+            out.push_str(&s[tail_start..]);
+            out
+        }
     }
+}
+
+/// Scan `middle` for lines that look like errors / warnings / panics /
+/// tracebacks (case-insensitive substring match). Returns the first `max`
+/// matches in their original order; ties are broken by document order.
+/// Lines longer than 400 bytes are clipped to keep the signal block bounded.
+fn collect_signal_lines(middle: &str, max: usize) -> Vec<&str> {
+    if max == 0 {
+        return Vec::new();
+    }
+    let needles = [
+        "error",
+        "warn",
+        "fail",
+        "panic",
+        "fatal",
+        "denied",
+        "traceback",
+        "segfault",
+        "abort",
+    ];
+    let mut out: Vec<&str> = Vec::with_capacity(max);
+    for raw in middle.lines() {
+        let line = raw.trim_end_matches(['\r', '\u{0085}']);
+        if line.is_empty() {
+            continue;
+        }
+        // Case-insensitive substring match. ASCII lowercasing is fine for
+        // these English keywords; non-ASCII bytes simply won't match and
+        // are passed through.
+        let lower_check = line.to_ascii_lowercase();
+        if needles.iter().any(|n| lower_check.contains(n)) {
+            let clipped = if line.len() > 400 {
+                let cut = floor_char_boundary(line, 400);
+                &line[..cut]
+            } else {
+                line
+            };
+            out.push(clipped);
+            if out.len() >= max {
+                break;
+            }
+        }
+    }
+    out
 }
 
 fn floor_char_boundary(s: &str, idx: usize) -> usize {
@@ -198,11 +294,149 @@ mod tests {
     fn policy_for_known_tools() {
         assert!(matches!(
             policy_for("shell_execute"),
-            TruncationPolicy::HeadTail { .. }
+            TruncationPolicy::SignalHeadTail { .. }
+        ));
+        assert!(matches!(
+            policy_for("shell_logs"),
+            TruncationPolicy::SignalHeadTail { .. }
         ));
         assert!(matches!(policy_for("memory_store"), TruncationPolicy::None));
         assert!(matches!(policy_for("web_search"), TruncationPolicy::None));
         assert!(matches!(policy_for("read"), TruncationPolicy::Chars { .. }));
+    }
+
+    #[test]
+    fn signal_head_tail_surfaces_error_line_from_middle() {
+        let mut s = String::new();
+        s.push_str(&"H".repeat(8_000));
+        s.push_str("\nignored noise line one\n");
+        s.push_str("compiler error[E0382]: borrow of moved value: `x`\n");
+        s.push_str("more noise\n");
+        s.push_str("WARN: deprecated API used\n");
+        s.push_str(&"M".repeat(20_000));
+        s.push_str(&"T".repeat(4_000));
+
+        let out = apply(
+            TruncationPolicy::SignalHeadTail {
+                head: 8_000,
+                tail: 4_000,
+                max_signal_lines: 10,
+            },
+            s,
+        );
+        assert!(out.contains("[SIGNAL LINES from elided middle"));
+        assert!(out.contains("compiler error[E0382]"));
+        assert!(out.contains("WARN: deprecated API used"));
+        assert!(out.contains("[END SIGNAL LINES]"));
+        // Head and tail bracket the signal block.
+        assert!(out.starts_with(&"H".repeat(80)));
+        assert!(out.ends_with(&"T".repeat(80)));
+    }
+
+    #[test]
+    fn signal_head_tail_caps_signal_line_count() {
+        let mut s = String::new();
+        s.push_str(&"H".repeat(8_000));
+        for i in 0..50 {
+            s.push_str(&format!("\nerror #{i} in module foo\n"));
+        }
+        s.push_str(&"T".repeat(4_000));
+
+        let out = apply(
+            TruncationPolicy::SignalHeadTail {
+                head: 8_000,
+                tail: 4_000,
+                max_signal_lines: 5,
+            },
+            s,
+        );
+        // First 5 must be kept; 6th onwards dropped.
+        for i in 0..5 {
+            assert!(
+                out.contains(&format!("error #{i} ")),
+                "expected error #{i} kept"
+            );
+        }
+        assert!(!out.contains("error #5 "));
+    }
+
+    #[test]
+    fn signal_head_tail_skips_block_when_no_signal_matches() {
+        let mut s = String::new();
+        s.push_str(&"H".repeat(8_000));
+        s.push_str(&"plain output with no keywords\n".repeat(500));
+        s.push_str(&"T".repeat(4_000));
+        let out = apply(
+            TruncationPolicy::SignalHeadTail {
+                head: 8_000,
+                tail: 4_000,
+                max_signal_lines: 10,
+            },
+            s,
+        );
+        assert!(!out.contains("[SIGNAL LINES"));
+        assert!(out.contains("[TRUNCATED:"));
+    }
+
+    #[test]
+    fn signal_head_tail_under_combined_passes_through() {
+        let s = "short output with no error here\n".repeat(20);
+        let original = s.clone();
+        let out = apply(
+            TruncationPolicy::SignalHeadTail {
+                head: 8_000,
+                tail: 4_000,
+                max_signal_lines: 10,
+            },
+            s,
+        );
+        assert_eq!(out, original);
+    }
+
+    #[test]
+    fn signal_head_tail_clips_very_long_signal_lines() {
+        let mut s = String::new();
+        s.push_str(&"H".repeat(8_000));
+        s.push('\n');
+        s.push_str("error: ");
+        s.push_str(&"x".repeat(2_000));
+        s.push('\n');
+        s.push_str(&"T".repeat(4_000));
+        let out = apply(
+            TruncationPolicy::SignalHeadTail {
+                head: 8_000,
+                tail: 4_000,
+                max_signal_lines: 10,
+            },
+            s,
+        );
+        // The 2000-x line must be clipped to ~400 bytes inside the signal block.
+        let signal_block = out
+            .split("[SIGNAL LINES")
+            .nth(1)
+            .and_then(|s| s.split("[END SIGNAL LINES]").next())
+            .expect("signal block present");
+        // Find the longest line in the signal block.
+        let longest = signal_block.lines().map(|l| l.len()).max().unwrap_or(0);
+        assert!(longest <= 400, "signal line not clipped: {} bytes", longest);
+    }
+
+    #[test]
+    fn signal_head_tail_zero_max_skips_signal_block() {
+        let mut s = String::new();
+        s.push_str(&"H".repeat(8_000));
+        s.push_str("\nerror in middle\n");
+        s.push_str(&"M".repeat(5_000));
+        s.push_str(&"T".repeat(4_000));
+        let out = apply(
+            TruncationPolicy::SignalHeadTail {
+                head: 8_000,
+                tail: 4_000,
+                max_signal_lines: 0,
+            },
+            s,
+        );
+        assert!(!out.contains("[SIGNAL LINES"));
     }
 
     #[test]

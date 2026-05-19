@@ -17,11 +17,34 @@ use tokio::sync::RwLock;
 
 use athen_core::error::{AthenError, Result};
 use athen_core::llm::{ChatMessage, LlmRequest, MessageContent, ModelProfile, Role};
+use athen_core::risk::TriagePlan;
 use athen_core::traits::compaction::{
     ArcCompactor, ArcContextView, CompactionOutcome, ContextEntry,
 };
 use athen_core::traits::llm::LlmRouter;
 use athen_persistence::arcs::{ArcEntry, ArcStore, EntryType};
+
+/// Tool names whose successful invocation produces side effects the
+/// compactor MUST preserve verbatim in the summary's TOOL OUTCOMES
+/// section. A summary that silently drops "we sent an email" is worse
+/// than one that drops a noisy read result — the user can't be told a
+/// reply happened, the agent will re-send, etc. Used by
+/// `LlmArcCompactor::collect_write_provenance` to mark entries that get
+/// hoisted into a "DO NOT DROP" block in the compaction prompt.
+const WRITE_PROVENANCE_TOOLS: &[&str] = &[
+    "email_send",
+    "send_telegram",
+    "write",
+    "edit",
+    "shell_execute",
+    "http_request",
+    "memory_store",
+    "create_wakeup",
+    "calendar_event_create",
+    "calendar_event_update",
+    "calendar_event_delete",
+    "contact_upsert",
+];
 
 /// Fallback budgets used only when no provider config can be resolved
 /// (e.g. tests, broken config). 128k window with §5's 65/30 split, which
@@ -264,13 +287,55 @@ impl LlmArcCompactor {
         Self { arc_store, router }
     }
 
-    /// Build the §4 summarization prompt over `entries`. Entries are
-    /// rendered in id-ascending order with role tags so the LLM can
-    /// recover structure without us pre-grouping into bursts (the LLM is
-    /// asked to identify open actions and pending approvals from the
-    /// raw stream).
-    fn build_summary_prompt(entries: &[ArcEntry]) -> String {
-        let mut body = String::with_capacity(entries.len() * 80);
+    /// Build the §4 summarization prompt over `entries`, optionally
+    /// prefixed by a MISSION anchor (from the arc's persisted
+    /// `triage_plan`) and a WRITE-PROVENANCE block listing entries
+    /// whose tool name appears in `WRITE_PROVENANCE_TOOLS`. The anchors
+    /// are rendered with explicit "preserve verbatim" / "do not drop"
+    /// markers so the summarizer (which is told in the system prompt to
+    /// honour them) keeps them intact. Entries are rendered in
+    /// id-ascending order with role tags so the LLM can recover
+    /// structure without us pre-grouping into bursts.
+    fn build_summary_prompt(
+        entries: &[ArcEntry],
+        triage_plan: Option<&TriagePlan>,
+        write_entries: &[&ArcEntry],
+    ) -> String {
+        let mut body = String::with_capacity(entries.len() * 80 + 512);
+        if let Some(plan) = triage_plan {
+            let acceptance = plan.acceptance_criteria.trim();
+            let scope = plan.scope.trim();
+            if !acceptance.is_empty() || !scope.is_empty() {
+                body.push_str("[MISSION — preserve VERBATIM in DECISIONS or CONSTRAINTS]\n");
+                if !acceptance.is_empty() {
+                    body.push_str("ACCEPTANCE CRITERION: ");
+                    body.push_str(&acceptance.replace('\n', " "));
+                    body.push('\n');
+                }
+                if !scope.is_empty() {
+                    body.push_str("SCOPE GUARDRAIL: ");
+                    body.push_str(&scope.replace('\n', " "));
+                    body.push('\n');
+                }
+                body.push('\n');
+            }
+        }
+        if !write_entries.is_empty() {
+            body.push_str(
+                "[WRITE-PROVENANCE ENTRIES — DO NOT DROP. Each MUST be reflected in TOOL OUTCOMES with the tool name and a short description of what was sent/changed.]\n",
+            );
+            for e in write_entries {
+                let tool_name = e
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("tool"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("tool_call");
+                let trimmed = e.content.replace('\n', " ");
+                body.push_str(&format!("[WRITE/{tool_name} id={}] {trimmed}\n", e.id));
+            }
+            body.push('\n');
+        }
         for e in entries {
             let kind = e.entry_type.as_str();
             let tag = match (kind, e.source.as_str()) {
@@ -291,6 +356,37 @@ impl LlmArcCompactor {
         body
     }
 
+    /// Return references to entries whose `metadata.tool` matches one of
+    /// `WRITE_PROVENANCE_TOOLS`. Order-preserving so the prompt lists
+    /// them in chronological order. Entries with no `tool` metadata are
+    /// skipped — the compactor cannot infer write-vs-read for opaque
+    /// rows. Limited to a small cap so a pathological burst doesn't
+    /// dominate the prompt; the LLM only needs the protect-list as
+    /// guidance, not exhaustive enumeration.
+    fn collect_write_provenance<'a>(entries: &'a [ArcEntry]) -> Vec<&'a ArcEntry> {
+        const MAX_WRITE_ENTRIES: usize = 24;
+        let mut out: Vec<&ArcEntry> = Vec::new();
+        for e in entries {
+            if e.entry_type != EntryType::ToolCall {
+                continue;
+            }
+            let tool = e
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("tool"))
+                .and_then(|v| v.as_str());
+            if let Some(name) = tool {
+                if WRITE_PROVENANCE_TOOLS.iter().any(|w| *w == name) {
+                    out.push(e);
+                    if out.len() >= MAX_WRITE_ENTRIES {
+                        break;
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// The static header. Hard-coded categories per §4 — the LLM does
     /// not freelance the structure. The "do not paraphrase user-stated
     /// constraints or decisions" clause is load-bearing.
@@ -302,6 +398,18 @@ preserve them verbatim. DO NOT invent details not present in the input. \
 If failed-then-succeeded patterns exist for a tool, preserve the failure \
 mode (e.g. \"failed twice with X, succeeded after Y\").
 
+If the input contains a [MISSION] block, copy its ACCEPTANCE CRITERION verbatim \
+into DECISIONS (or CONSTRAINTS if it reads as a rule), and its SCOPE GUARDRAIL \
+verbatim into CONSTRAINTS. These define what 'done' means for the task — the \
+agent reads them next turn to decide whether to keep going.
+
+If the input contains a [WRITE-PROVENANCE ENTRIES] block, every listed entry \
+MUST be reflected in TOOL OUTCOMES with the tool name plus a one-line description \
+of what was sent or changed (recipient + subject for email, chat_id + message \
+gist for telegram, path for write/edit, endpoint + method gist for http_request). \
+A summary that silently drops a send/write event is a critical bug — the agent \
+will re-send.
+
 Output exactly these sections, in this order:
 
 ARC GOAL: <what the user/sense set this arc up to accomplish>
@@ -309,7 +417,7 @@ PARTICIPANTS: <contacts, threads, channels involved>
 DECISIONS: <non-obvious choices the agent or user committed to>
 CONSTRAINTS: <user-stated rules, verbatim>
 PENDING APPROVALS: <anything currently waiting on the user, or 'none'>
-TOOL OUTCOMES: <one line per named tool series; preserve failure→success patterns>
+TOOL OUTCOMES: <one line per named tool series; preserve failure→success patterns AND every WRITE-PROVENANCE entry>
 OPEN ACTION: <what the agent was about to do next, verbatim from the latest entries; or 'none'>"
     }
 }
@@ -364,13 +472,33 @@ impl ArcCompactor for LlmArcCompactor {
             .map(|e| e.id)
             .ok_or_else(|| AthenError::Other("empty summarize range".into()))?;
 
+        // Load the arc's persisted TriagePlan (Slice 1-3) so the
+        // summarizer keeps the acceptance criterion + scope verbatim, and
+        // identify write-bearing entries (Slice 6 protect-list) so the
+        // summarizer can't silently drop "we sent the email" / "we wrote
+        // the file" rows. Both are best-effort: a missing plan or empty
+        // provenance just means the prompt skips that block — never a
+        // hard failure on the compaction path.
+        let triage_plan = self
+            .arc_store
+            .get_arc(arc_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|m| m.triage_plan);
+        let write_entries = Self::collect_write_provenance(to_summarize);
+
         let mut prompt_body = String::new();
         if let Some(prev) = prior_summary.as_ref() {
             prompt_body.push_str("[PRIOR_SUMMARY]\n");
             prompt_body.push_str(&prev.content);
             prompt_body.push_str("\n\n[NEW ENTRIES SINCE PRIOR SUMMARY]\n");
         }
-        prompt_body.push_str(&Self::build_summary_prompt(to_summarize));
+        prompt_body.push_str(&Self::build_summary_prompt(
+            to_summarize,
+            triage_plan.as_ref(),
+            &write_entries,
+        ));
 
         let request = LlmRequest {
             profile: ModelProfile::Fast,
@@ -606,11 +734,139 @@ mod tests {
             .await
             .unwrap();
         let entries = store.load_entries("a").await.unwrap();
-        let prompt = LlmArcCompactor::build_summary_prompt(&entries);
+        let prompt = LlmArcCompactor::build_summary_prompt(&entries, None, &[]);
         assert!(prompt.contains("[USER] hello world"));
         assert!(prompt.contains("[TOOL_CALL] ran X"));
         assert!(prompt.contains("[ASSISTANT] did X"));
         assert!(prompt.contains('\n'));
+        // No plan / no provenance → no anchor blocks.
+        assert!(!prompt.contains("[MISSION"));
+        assert!(!prompt.contains("[WRITE-PROVENANCE"));
+    }
+
+    #[tokio::test]
+    async fn build_summary_prompt_prepends_mission_block_when_plan_present() {
+        let store = empty_store().await;
+        store
+            .create_arc("p", "P", athen_persistence::arcs::ArcSource::UserInput)
+            .await
+            .unwrap();
+        store
+            .add_entry("p", EntryType::Message, "user", "hi", None, None)
+            .await
+            .unwrap();
+        let entries = store.load_entries("p").await.unwrap();
+        let plan = TriagePlan {
+            acceptance_criteria: "Reply once with Q3 terms confirmed.".to_string(),
+            scope: "NOT a multi-message thread.".to_string(),
+        };
+        let prompt = LlmArcCompactor::build_summary_prompt(&entries, Some(&plan), &[]);
+        assert!(
+            prompt.contains("[MISSION — preserve VERBATIM"),
+            "missing MISSION anchor: {prompt}"
+        );
+        assert!(prompt.contains("ACCEPTANCE CRITERION: Reply once with Q3 terms confirmed."));
+        assert!(prompt.contains("SCOPE GUARDRAIL: NOT a multi-message thread."));
+        // MISSION block precedes the regular entries.
+        let mission_pos = prompt.find("[MISSION").unwrap();
+        let entry_pos = prompt.find("[USER] hi").unwrap();
+        assert!(mission_pos < entry_pos);
+    }
+
+    #[tokio::test]
+    async fn build_summary_prompt_includes_write_provenance_block() {
+        let store = empty_store().await;
+        store
+            .create_arc("w", "W", athen_persistence::arcs::ArcSource::UserInput)
+            .await
+            .unwrap();
+        store
+            .add_entry(
+                "w",
+                EntryType::ToolCall,
+                "agent",
+                "sent to user@example.com (subj: hi)",
+                Some(serde_json::json!({"tool": "email_send"})),
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .add_entry(
+                "w",
+                EntryType::ToolCall,
+                "agent",
+                "listed /tmp",
+                Some(serde_json::json!({"tool": "list_directory"})),
+                None,
+            )
+            .await
+            .unwrap();
+        let entries = store.load_entries("w").await.unwrap();
+        let writes = LlmArcCompactor::collect_write_provenance(&entries);
+        assert_eq!(writes.len(), 1, "only email_send is write-bearing");
+        let prompt = LlmArcCompactor::build_summary_prompt(&entries, None, &writes);
+        assert!(prompt.contains("[WRITE-PROVENANCE ENTRIES — DO NOT DROP."));
+        assert!(prompt.contains("[WRITE/email_send id="));
+        assert!(prompt.contains("sent to user@example.com (subj: hi)"));
+        // The list_directory tool call must NOT be in the protect-list.
+        assert!(!prompt.contains("[WRITE/list_directory"));
+    }
+
+    #[tokio::test]
+    async fn collect_write_provenance_caps_at_max_entries() {
+        let store = empty_store().await;
+        store
+            .create_arc("c", "C", athen_persistence::arcs::ArcSource::UserInput)
+            .await
+            .unwrap();
+        for i in 0..40 {
+            store
+                .add_entry(
+                    "c",
+                    EntryType::ToolCall,
+                    "agent",
+                    &format!("write #{i}"),
+                    Some(serde_json::json!({"tool": "write"})),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let entries = store.load_entries("c").await.unwrap();
+        let writes = LlmArcCompactor::collect_write_provenance(&entries);
+        assert_eq!(writes.len(), 24, "must cap at MAX_WRITE_ENTRIES = 24");
+    }
+
+    #[tokio::test]
+    async fn build_summary_prompt_skips_empty_plan_fields() {
+        let store = empty_store().await;
+        store
+            .create_arc("e", "E", athen_persistence::arcs::ArcSource::UserInput)
+            .await
+            .unwrap();
+        store
+            .add_entry("e", EntryType::Message, "user", "x", None, None)
+            .await
+            .unwrap();
+        let entries = store.load_entries("e").await.unwrap();
+        // Empty/whitespace plan → no MISSION block.
+        let plan = TriagePlan {
+            acceptance_criteria: "   ".to_string(),
+            scope: "\n".to_string(),
+        };
+        let prompt = LlmArcCompactor::build_summary_prompt(&entries, Some(&plan), &[]);
+        assert!(!prompt.contains("[MISSION"));
+    }
+
+    #[test]
+    fn system_prompt_references_mission_and_write_provenance_rules() {
+        let sys = LlmArcCompactor::summary_system_prompt();
+        assert!(sys.contains("[MISSION] block"));
+        assert!(sys.contains("[WRITE-PROVENANCE ENTRIES] block"));
+        assert!(sys.contains("ACCEPTANCE CRITERION"));
+        assert!(sys.contains("SCOPE GUARDRAIL"));
+        assert!(sys.contains("re-send"));
     }
 
     #[tokio::test]

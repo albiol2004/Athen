@@ -1465,6 +1465,19 @@ impl AgentExecutor for DefaultExecutor {
             std::collections::HashMap::new();
         const SIGNATURE_REPEAT_LIMIT: u32 = 3;
 
+        // Cross-iteration dedupe of tool results threaded back to the LLM:
+        // the FIRST real (non-synthetic) call with a given `(name, args)`
+        // signature stores its `tool_call_id` and success flag here.
+        // Subsequent identical calls (in later agent loop iterations or
+        // later positions in the same batch) get a short pointer instead
+        // of their full body in the conversation buffer — the audit trail
+        // (`TaskStep.output`) keeps the full body in both cases. This
+        // catches the bloat between call #2 and `SIGNATURE_REPEAT_LIMIT`
+        // (after which the existing loop guard fires), and reduces the
+        // educational gap between "you already saw this" and "STOP".
+        let mut prior_call_signatures: std::collections::HashMap<String, (String, bool)> =
+            std::collections::HashMap::new();
+
         // Gather available tools for the LLM, then apply the active
         // profile's `tool_selection` filter. With no profile (today's path)
         // or the seeded default profile (`ToolSelection::All`), the filter
@@ -2227,7 +2240,7 @@ impl AgentExecutor for DefaultExecutor {
                 // carrying the tool's common-misuse policy — episodic
                 // anchoring so the model sees the error + the rule in the
                 // same context (Cursor-style). See `tool_error_hints`.
-                let tool_response_content = match &tool_result {
+                let mut tool_response_content = match &tool_result {
                     Ok(result) => {
                         let raw = serde_json::to_string(&result.output)
                             .unwrap_or_else(|_| "{}".to_string());
@@ -2251,6 +2264,36 @@ impl AgentExecutor for DefaultExecutor {
                         None,
                     ),
                 };
+
+                // Cross-iteration dedupe: same-signature repeat → replace
+                // the threaded body with a short pointer at the prior
+                // result. Synthetic short-circuits (loop_guard,
+                // duplicate_in_batch) don't anchor — their bodies are
+                // already stubs and we don't want pointers chasing them.
+                let dedupe_sig = format!("{}|{}", tool_call.name, tool_call.arguments);
+                let is_synthetic_stub = matches!(
+                    &tool_result,
+                    Ok(r) if matches!(r.error.as_deref(), Some("loop_guard") | Some("duplicate_in_batch"))
+                );
+                if !is_synthetic_stub {
+                    if let Some((prev_id, prev_succeeded)) = prior_call_signatures.get(&dedupe_sig)
+                    {
+                        tool_response_content = if *prev_succeeded {
+                            format!(
+                                "[DEDUPE: identical call to `{}` with these same arguments succeeded earlier in this run (prior tool_call_id={}). The full result is in that earlier message above — re-read it instead of calling again. Calling with the same arguments will not produce new information.]",
+                                tool_call.name, prev_id
+                            )
+                        } else {
+                            format!(
+                                "[DEDUPE: identical call to `{}` with these same arguments FAILED earlier in this run (prior tool_call_id={}). Same arguments will produce the same failure — change your approach (different args, different tool, or stop and ask).]",
+                                tool_call.name, prev_id
+                            )
+                        };
+                    } else {
+                        let succeeded = matches!(&tool_result, Ok(r) if r.success);
+                        prior_call_signatures.insert(dedupe_sig, (tool_call.id.clone(), succeeded));
+                    }
+                }
 
                 conversation.push(ChatMessage {
                     role: Role::Tool,
@@ -3725,5 +3768,304 @@ mod tests {
             })
             .count();
         assert_eq!(dup_count, 1, "exactly one of the two should be deduped");
+    }
+
+    // --- Slice 5b: cross-iteration dedupe of tool results ---
+
+    /// LLM router that records every `LlmRequest.messages` it sees and
+    /// returns canned responses by index.
+    struct RecordingLlmRouter {
+        responses: Vec<LlmResponse>,
+        seen_messages: std::sync::Mutex<Vec<Vec<ChatMessage>>>,
+        call_count: AtomicUsize,
+    }
+
+    impl RecordingLlmRouter {
+        fn new(responses: Vec<LlmResponse>) -> Self {
+            Self {
+                responses,
+                seen_messages: std::sync::Mutex::new(Vec::new()),
+                call_count: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmRouter for RecordingLlmRouter {
+        async fn route(&self, request: &LlmRequest) -> Result<LlmResponse> {
+            self.seen_messages
+                .lock()
+                .unwrap()
+                .push(request.messages.clone());
+            let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
+            if idx < self.responses.len() {
+                Ok(self.responses[idx].clone())
+            } else {
+                Ok(MockLlmRouter::make_response("Done", vec![]))
+            }
+        }
+
+        async fn budget_remaining(&self) -> Result<BudgetStatus> {
+            Ok(BudgetStatus {
+                daily_limit_usd: None,
+                spent_today_usd: 0.0,
+                remaining_usd: None,
+                tokens_used_today: 0,
+            })
+        }
+    }
+
+    /// Find the Tool-role message bound to a given tool_call_id and return
+    /// the `content` string inside its Structured envelope.
+    fn tool_response_text(msgs: &[ChatMessage], tool_call_id: &str) -> Option<String> {
+        for m in msgs.iter().rev() {
+            if m.role != Role::Tool {
+                continue;
+            }
+            if let MessageContent::Structured(v) = &m.content {
+                if v.get("tool_call_id").and_then(|x| x.as_str()) == Some(tool_call_id) {
+                    return v
+                        .get("content")
+                        .and_then(|x| x.as_str())
+                        .map(|s| s.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn dedupe_repeated_signature_emits_pointer_in_threaded_body() {
+        // Iteration 1: tool call with args {"q":"x"} → succeeds, body has full payload.
+        // Iteration 2: same name+args → should be replaced with a DEDUPE pointer.
+        // Iteration 3: LLM says done.
+        let call_a = ToolCall {
+            id: "call_a".to_string(),
+            name: "search".to_string(),
+            arguments: serde_json::json!({"q": "x"}),
+            thought_signature: None,
+        };
+        let call_b = ToolCall {
+            id: "call_b".to_string(),
+            name: "search".to_string(),
+            arguments: serde_json::json!({"q": "x"}),
+            thought_signature: None,
+        };
+        let responses = vec![
+            MockLlmRouter::make_response("First call.", vec![call_a]),
+            MockLlmRouter::make_response("Same call again.", vec![call_b]),
+            MockLlmRouter::make_response("Now done.", vec![]),
+        ];
+
+        // Two real, successful registry results — both with a distinctive
+        // payload so we can detect whether the second one's payload leaked
+        // back into the conversation buffer.
+        let tool_result = CoreToolResult {
+            success: true,
+            output: serde_json::json!({"distinctive_payload_token": "MARKER_42"}),
+            error: None,
+            execution_time_ms: 1,
+        };
+
+        let router = Arc::new(RecordingLlmRouter::new(responses));
+        // Trait object wants `Box<dyn LlmRouter>` — wrap an Arc clone in a
+        // thin Box adapter via a tiny shim. Simpler: pass two clones of the
+        // results and share via a static. Just create the executor with a
+        // boxed clone of the recording router state by leaking the Arc.
+        struct ArcRouter(Arc<RecordingLlmRouter>);
+        #[async_trait]
+        impl LlmRouter for ArcRouter {
+            async fn route(&self, request: &LlmRequest) -> Result<LlmResponse> {
+                self.0.route(request).await
+            }
+            async fn budget_remaining(&self) -> Result<BudgetStatus> {
+                self.0.budget_remaining().await
+            }
+        }
+
+        let executor = DefaultExecutor::new(
+            Box::new(ArcRouter(router.clone())),
+            Box::new(MockToolRegistry::new(
+                vec![],
+                vec![tool_result.clone(), tool_result.clone()],
+            )),
+            Box::new(InMemoryAuditor::new()),
+            10,
+            Duration::from_secs(60),
+            vec![],
+        );
+
+        let task = make_task("dedupe test");
+        let _ = executor.execute(task).await.unwrap();
+
+        let seen = router.seen_messages.lock().unwrap().clone();
+        assert!(
+            seen.len() >= 3,
+            "expected ≥3 LLM round trips, got {}",
+            seen.len()
+        );
+
+        // The 3rd LLM call sees the conversation buffer with BOTH tool results.
+        let third = &seen[2];
+
+        let body_a =
+            tool_response_text(third, "call_a").expect("call_a tool response in 3rd request");
+        let body_b =
+            tool_response_text(third, "call_b").expect("call_b tool response in 3rd request");
+
+        assert!(
+            body_a.contains("MARKER_42"),
+            "first call body should keep its real payload, got: {}",
+            body_a
+        );
+        assert!(
+            body_b.contains("[DEDUPE:"),
+            "second call body should be a DEDUPE pointer, got: {}",
+            body_b
+        );
+        assert!(
+            body_b.contains("call_a"),
+            "DEDUPE pointer should reference the prior tool_call_id, got: {}",
+            body_b
+        );
+        assert!(
+            !body_b.contains("MARKER_42"),
+            "second call body must NOT contain the duplicated payload, got: {}",
+            body_b
+        );
+    }
+
+    #[tokio::test]
+    async fn dedupe_distinct_args_does_not_collapse() {
+        let call_a = ToolCall {
+            id: "call_a".to_string(),
+            name: "search".to_string(),
+            arguments: serde_json::json!({"q": "alpha"}),
+            thought_signature: None,
+        };
+        let call_b = ToolCall {
+            id: "call_b".to_string(),
+            name: "search".to_string(),
+            arguments: serde_json::json!({"q": "beta"}),
+            thought_signature: None,
+        };
+        let responses = vec![
+            MockLlmRouter::make_response("First.", vec![call_a]),
+            MockLlmRouter::make_response("Second.", vec![call_b]),
+            MockLlmRouter::make_response("Done.", vec![]),
+        ];
+        let results = vec![
+            CoreToolResult {
+                success: true,
+                output: serde_json::json!({"id": "ALPHA_BODY"}),
+                error: None,
+                execution_time_ms: 1,
+            },
+            CoreToolResult {
+                success: true,
+                output: serde_json::json!({"id": "BETA_BODY"}),
+                error: None,
+                execution_time_ms: 1,
+            },
+        ];
+
+        let router = Arc::new(RecordingLlmRouter::new(responses));
+        struct ArcRouter(Arc<RecordingLlmRouter>);
+        #[async_trait]
+        impl LlmRouter for ArcRouter {
+            async fn route(&self, request: &LlmRequest) -> Result<LlmResponse> {
+                self.0.route(request).await
+            }
+            async fn budget_remaining(&self) -> Result<BudgetStatus> {
+                self.0.budget_remaining().await
+            }
+        }
+        let executor = DefaultExecutor::new(
+            Box::new(ArcRouter(router.clone())),
+            Box::new(MockToolRegistry::new(vec![], results)),
+            Box::new(InMemoryAuditor::new()),
+            10,
+            Duration::from_secs(60),
+            vec![],
+        );
+
+        let _ = executor.execute(make_task("distinct args")).await.unwrap();
+        let seen = router.seen_messages.lock().unwrap().clone();
+        let third = &seen[2];
+        let a = tool_response_text(third, "call_a").unwrap();
+        let b = tool_response_text(third, "call_b").unwrap();
+        assert!(a.contains("ALPHA_BODY"));
+        assert!(b.contains("BETA_BODY"));
+        assert!(!a.contains("[DEDUPE:"));
+        assert!(!b.contains("[DEDUPE:"));
+    }
+
+    #[tokio::test]
+    async fn dedupe_repeated_failure_pointer_says_change_approach() {
+        let call_a = ToolCall {
+            id: "call_x".to_string(),
+            name: "flaky".to_string(),
+            arguments: serde_json::json!({}),
+            thought_signature: None,
+        };
+        let call_b = ToolCall {
+            id: "call_y".to_string(),
+            name: "flaky".to_string(),
+            arguments: serde_json::json!({}),
+            thought_signature: None,
+        };
+        let responses = vec![
+            MockLlmRouter::make_response("Try.", vec![call_a]),
+            MockLlmRouter::make_response("Try again.", vec![call_b]),
+            MockLlmRouter::make_response("Stop.", vec![]),
+        ];
+        let failing = CoreToolResult {
+            success: false,
+            output: serde_json::json!({"error": "boom"}),
+            error: Some("real_failure".to_string()),
+            execution_time_ms: 1,
+        };
+        let router = Arc::new(RecordingLlmRouter::new(responses));
+        struct ArcRouter(Arc<RecordingLlmRouter>);
+        #[async_trait]
+        impl LlmRouter for ArcRouter {
+            async fn route(&self, request: &LlmRequest) -> Result<LlmResponse> {
+                self.0.route(request).await
+            }
+            async fn budget_remaining(&self) -> Result<BudgetStatus> {
+                self.0.budget_remaining().await
+            }
+        }
+        let executor = DefaultExecutor::new(
+            Box::new(ArcRouter(router.clone())),
+            Box::new(MockToolRegistry::new(
+                vec![],
+                vec![failing.clone(), failing.clone()],
+            )),
+            Box::new(InMemoryAuditor::new()),
+            10,
+            Duration::from_secs(60),
+            vec![],
+        );
+
+        let _ = executor.execute(make_task("retry test")).await.unwrap();
+        let seen = router.seen_messages.lock().unwrap().clone();
+        let third = &seen[2];
+        let b = tool_response_text(third, "call_y").unwrap();
+        assert!(
+            b.contains("[DEDUPE:"),
+            "expected DEDUPE pointer, got: {}",
+            b
+        );
+        assert!(
+            b.contains("FAILED"),
+            "failed-prior pointer should say FAILED, got: {}",
+            b
+        );
+        assert!(
+            b.contains("change your approach"),
+            "failed-prior pointer should advise changing approach, got: {}",
+            b
+        );
     }
 }
