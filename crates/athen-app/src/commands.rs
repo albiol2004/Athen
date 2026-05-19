@@ -1571,6 +1571,15 @@ impl StepAuditor for TauriAuditor {
 
             if let (Some(store), Some(output)) = (self.arc_store.as_ref(), step.output.as_ref()) {
                 if let Some(tool) = output.get("tool").and_then(|t| t.as_str()) {
+                    // Lift the checkpoint action id (if any) out of the
+                    // tool's inner result JSON onto the entry's top-level
+                    // metadata so the UI Revert button has a stable place
+                    // to find it without re-parsing every tool family.
+                    let snapshot_action_id = output
+                        .get("result")
+                        .and_then(|r| r.get("_snapshot_action_id"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
                     let metadata = serde_json::json!({
                         "tool": tool,
                         "args": output.get("args").cloned().unwrap_or(serde_json::Value::Null),
@@ -1578,6 +1587,7 @@ impl StepAuditor for TauriAuditor {
                         "error": output.get("error").cloned().unwrap_or(serde_json::Value::Null),
                         "status": format!("{:?}", step.status),
                         "summary": detail,
+                        "snapshot_action_id": snapshot_action_id,
                     });
                     if let Err(e) = store
                         .add_entry(

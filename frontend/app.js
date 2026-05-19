@@ -2889,7 +2889,17 @@ function buildToolCardBlock(meta) {
     // Per-tool expanded body. Returns a DOM node when the tool has a
     // recognised renderer; otherwise the card stays a flat strip.
     const body = renderToolBody(meta);
-    if (!body) return card;
+    if (!body) {
+        // Even with no body renderer, we still want a Revert affordance on
+        // mutating tools that produced a snapshot.
+        const revertOnly = maybeBuildRevertRow(meta);
+        if (!revertOnly) return card;
+        const wrap = document.createElement('div');
+        wrap.className = 'tool-card-block';
+        wrap.appendChild(card);
+        wrap.appendChild(revertOnly);
+        return wrap;
+    }
 
     const details = document.createElement('details');
     details.className = 'tool-card-expand';
@@ -2900,8 +2910,75 @@ function buildToolCardBlock(meta) {
     const bodyWrap = document.createElement('div');
     bodyWrap.className = 'tool-card-expand-body';
     bodyWrap.appendChild(body);
+    const revertRow = maybeBuildRevertRow(meta);
+    if (revertRow) bodyWrap.appendChild(revertRow);
     details.appendChild(bodyWrap);
     return details;
+}
+
+// Build a Revert action row when this tool-call has an associated snapshot.
+// Returns null when nothing is revertable, so callers can leave the card alone.
+function maybeBuildRevertRow(meta) {
+    const actionId = meta && typeof meta.snapshot_action_id === 'string'
+        ? meta.snapshot_action_id
+        : null;
+    if (!actionId) return null;
+
+    const row = document.createElement('div');
+    row.className = 'tool-revert-row';
+
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'tool-revert-btn';
+    btn.textContent = 'Revert this change';
+
+    const status = document.createElement('span');
+    status.className = 'tool-revert-status';
+
+    btn.addEventListener('click', async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (!invoke) return;
+        if (btn.disabled) return;
+        btn.disabled = true;
+        status.textContent = 'Reverting…';
+        try {
+            const outcome = await invoke('revert_snapshot', { actionId });
+            const restored = (outcome && outcome.restored && outcome.restored.length) || 0;
+            const recreated = (outcome && outcome.recreated && outcome.recreated.length) || 0;
+            const deleted = (outcome && outcome.deleted && outcome.deleted.length) || 0;
+            const failed = (outcome && outcome.failed && outcome.failed.length) || 0;
+            const parts = [];
+            if (restored) parts.push(`${restored} restored`);
+            if (recreated) parts.push(`${recreated} recreated`);
+            if (deleted) parts.push(`${deleted} deleted`);
+            if (failed) parts.push(`${failed} failed`);
+            const summary = parts.length ? parts.join(', ') : 'nothing to do';
+            showToast(`Reverted: ${summary}`, failed ? 'error' : 'success');
+            status.textContent = 'Reverted';
+            row.classList.add('reverted');
+            // Refresh the arc so any subsequent reads reflect the reverted
+            // state and the row stays consistent across reload.
+            if (activeArcId) {
+                try {
+                    const entries = await invoke('get_arc_entries', { arcId: activeArcId });
+                    clearChatUI();
+                    renderEntries(entries || []);
+                } catch (refreshErr) {
+                    console.warn('Revert succeeded but arc refresh failed:', refreshErr);
+                }
+            }
+        } catch (err) {
+            console.error('Revert failed:', err);
+            showToast('Revert failed: ' + (err && err.toString ? err.toString() : 'unknown error'), 'error');
+            status.textContent = '';
+            btn.disabled = false;
+        }
+    });
+
+    row.appendChild(btn);
+    row.appendChild(status);
+    return row;
 }
 
 // Map a tool-call's persisted metadata to a DOM body that renders what
@@ -4139,6 +4216,159 @@ async function branchFromArc(parentArcId, parentName) {
 const newChatBtn = document.getElementById('new-chat-btn');
 if (newChatBtn) {
     newChatBtn.addEventListener('click', newArc);
+}
+
+// ─── Changes side rail ───
+// Slide-out panel listing file mutations Athen made in the active arc.
+// Each row carries a Revert button that calls revert_snapshot and refreshes
+// the active arc on success.
+const changesRailBtn = document.getElementById('changes-rail-btn');
+const changesRailEl = document.getElementById('changes-rail');
+const changesRailCloseBtn = document.getElementById('changes-rail-close');
+const changesRailBodyEl = document.getElementById('changes-rail-body');
+
+function openChangesRail() {
+    if (!changesRailEl) return;
+    changesRailEl.classList.remove('hidden');
+    refreshChangesRail();
+}
+function closeChangesRail() {
+    if (!changesRailEl) return;
+    changesRailEl.classList.add('hidden');
+}
+if (changesRailBtn) changesRailBtn.addEventListener('click', openChangesRail);
+if (changesRailCloseBtn) changesRailCloseBtn.addEventListener('click', closeChangesRail);
+
+async function refreshChangesRail() {
+    if (!invoke || !changesRailBodyEl) return;
+    if (!activeArcId) {
+        changesRailBodyEl.innerHTML = '<div class="changes-rail-empty">Pick an arc to see its changes.</div>';
+        return;
+    }
+    changesRailBodyEl.innerHTML = '<div class="changes-rail-empty">Loading…</div>';
+    let actions;
+    try {
+        actions = await invoke('list_arc_snapshots', { arcId: activeArcId });
+    } catch (err) {
+        changesRailBodyEl.innerHTML = '';
+        const e = document.createElement('div');
+        e.className = 'changes-rail-empty';
+        e.textContent = 'Could not load changes: ' + (err && err.toString ? err.toString() : 'unknown error');
+        changesRailBodyEl.appendChild(e);
+        return;
+    }
+    changesRailBodyEl.innerHTML = '';
+    if (!actions || actions.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'changes-rail-empty';
+        empty.textContent = 'No file changes recorded for this arc yet.';
+        changesRailBodyEl.appendChild(empty);
+        return;
+    }
+    // Newest first.
+    actions.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+    for (const action of actions) {
+        changesRailBodyEl.appendChild(buildChangesRailItem(action));
+    }
+}
+
+function buildChangesRailItem(action) {
+    const wrap = document.createElement('div');
+    wrap.className = 'changes-rail-item' + (action.reverted ? ' reverted' : '');
+
+    const topRow = document.createElement('div');
+    topRow.className = 'changes-rail-item-row';
+    const toolEl = document.createElement('span');
+    toolEl.className = 'changes-rail-tool';
+    toolEl.textContent = action.tool_name || '(unknown tool)';
+    const timeEl = document.createElement('span');
+    timeEl.className = 'changes-rail-time';
+    timeEl.textContent = formatRelativeTime(action.created_at);
+    timeEl.title = action.created_at || '';
+    topRow.appendChild(toolEl);
+    topRow.appendChild(timeEl);
+    wrap.appendChild(topRow);
+
+    if (action.args_summary) {
+        const sum = document.createElement('div');
+        sum.className = 'changes-rail-summary';
+        sum.textContent = action.args_summary;
+        wrap.appendChild(sum);
+    }
+    if (action.paths && action.paths.length) {
+        const pathsEl = document.createElement('div');
+        pathsEl.className = 'changes-rail-paths';
+        pathsEl.textContent = action.paths.join('\n');
+        wrap.appendChild(pathsEl);
+    }
+
+    const actionsRow = document.createElement('div');
+    actionsRow.className = 'changes-rail-actions';
+
+    if (action.reverted) {
+        const badge = document.createElement('span');
+        badge.className = 'changes-rail-badge';
+        badge.textContent = 'reverted';
+        actionsRow.appendChild(badge);
+    } else {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'tool-revert-btn';
+        btn.textContent = 'Revert';
+        btn.addEventListener('click', async () => {
+            if (!invoke || btn.disabled) return;
+            btn.disabled = true;
+            const prevLabel = btn.textContent;
+            btn.textContent = 'Reverting…';
+            try {
+                const outcome = await invoke('revert_snapshot', { actionId: action.entry_id });
+                const restored = (outcome && outcome.restored && outcome.restored.length) || 0;
+                const recreated = (outcome && outcome.recreated && outcome.recreated.length) || 0;
+                const deleted = (outcome && outcome.deleted && outcome.deleted.length) || 0;
+                const failed = (outcome && outcome.failed && outcome.failed.length) || 0;
+                const parts = [];
+                if (restored) parts.push(`${restored} restored`);
+                if (recreated) parts.push(`${recreated} recreated`);
+                if (deleted) parts.push(`${deleted} deleted`);
+                if (failed) parts.push(`${failed} failed`);
+                showToast(`Reverted: ${parts.length ? parts.join(', ') : 'nothing to do'}`, failed ? 'error' : 'success');
+                // Refresh the rail (action.reverted flips) and the arc body
+                // so any tool cards drop their Revert button.
+                await refreshChangesRail();
+                if (activeArcId) {
+                    try {
+                        const entries = await invoke('get_arc_entries', { arcId: activeArcId });
+                        clearChatUI();
+                        renderEntries(entries || []);
+                    } catch (e) {
+                        console.warn('Revert succeeded but arc refresh failed:', e);
+                    }
+                }
+            } catch (err) {
+                console.error('Revert failed:', err);
+                showToast('Revert failed: ' + (err && err.toString ? err.toString() : 'unknown error'), 'error');
+                btn.textContent = prevLabel;
+                btn.disabled = false;
+            }
+        });
+        actionsRow.appendChild(btn);
+    }
+
+    wrap.appendChild(actionsRow);
+    return wrap;
+}
+
+function formatRelativeTime(iso) {
+    if (!iso) return '';
+    const t = Date.parse(iso);
+    if (Number.isNaN(t)) return iso;
+    const delta = Date.now() - t;
+    if (delta < 60_000) return 'just now';
+    if (delta < 3_600_000) return `${Math.floor(delta / 60_000)}m ago`;
+    if (delta < 86_400_000) return `${Math.floor(delta / 3_600_000)}h ago`;
+    const days = Math.floor(delta / 86_400_000);
+    if (days < 7) return `${days}d ago`;
+    return new Date(t).toLocaleDateString();
 }
 
 const sidebarNewChatBtn = document.getElementById('sidebar-new-chat-btn');

@@ -108,6 +108,12 @@
                         <span class="agents-count">0</span>
                         <span class="agents-label">working</span>
                     </button>
+                    <button id="changes-rail-btn" class="changes-pill" type="button" aria-label="Changes" title="Recent agent file changes (undo)">
+                        <span class="changes-pill-icon" aria-hidden="true">
+                            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7"/><polyline points="3 4 3 10 9 10"/></svg>
+                        </span>
+                        <span class="changes-pill-label">Changes</span>
+                    </button>
                     <label class="profile-picker-wrap" title="Choose the specialist that handles this arc">
                         <span class="profile-picker-label">Agent:</span>
                         <select id="arc-profile-picker" class="profile-picker"></select>
@@ -198,6 +204,17 @@
                 </div>
             </footer>
         </div>
+
+        <aside id="changes-rail" class="changes-rail hidden" aria-label="Recent file changes">
+            <header class="changes-rail-header">
+                <h2 class="changes-rail-title">Changes</h2>
+                <button id="changes-rail-close" class="changes-rail-close" type="button" title="Close" aria-label="Close changes panel">&times;</button>
+            </header>
+            <div class="changes-rail-sub">File mutations Athen made in this arc. Click Revert to undo.</div>
+            <div id="changes-rail-body" class="changes-rail-body">
+                <div class="changes-rail-empty">No changes yet.</div>
+            </div>
+        </aside>
 
         <div id="timeline-view" class="timeline-view hidden">
             <header class="timeline-header">
