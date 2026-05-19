@@ -63,6 +63,8 @@ pub struct AgentBuilder {
     identity_block: Option<String>,
     skills_block: Option<String>,
     endpoints_block: Option<String>,
+    mission_block: Option<String>,
+    acceptance_criteria: Option<String>,
     reminder_builder: Option<Arc<dyn SystemReminderBuilder>>,
     auto_reminders: bool,
     default_reasoning_effort: athen_core::llm::ReasoningEffort,
@@ -98,6 +100,8 @@ impl AgentBuilder {
             identity_block: None,
             skills_block: None,
             endpoints_block: None,
+            mission_block: None,
+            acceptance_criteria: None,
             reminder_builder: None,
             auto_reminders: false,
             default_reasoning_effort: athen_core::llm::ReasoningEffort::Default,
@@ -165,6 +169,31 @@ impl AgentBuilder {
     /// without that tool get zero bytes here regardless.
     pub fn endpoints_block(mut self, block: Option<String>) -> Self {
         self.endpoints_block = block.filter(|s| !s.trim().is_empty());
+        self
+    }
+
+    /// Inject a pre-rendered mission block — the triage-drafted
+    /// acceptance criteria + scope captured for this arc's task. The
+    /// host (athen-app) reads `ArcMeta.triage_plan` and formats it; the
+    /// builder splices it in between identity and workspace rules.
+    /// Empty / `None` reproduces today's prompt byte-for-byte (arcs
+    /// predating the plan field, conversational turns with no
+    /// done-criterion, or regex-only risk paths that don't draft a
+    /// plan).
+    pub fn mission_block(mut self, block: Option<String>) -> Self {
+        self.mission_block = block.filter(|s| !s.trim().is_empty());
+        self
+    }
+
+    /// Forward the triage-drafted `acceptance_criteria` line to the
+    /// completion judge. The same string is also folded into
+    /// `mission_block` for the prompt; this slot exists separately
+    /// because the judge needs the raw line (no scope, no framing) to
+    /// detect "agent declared victory but the criterion was clearly
+    /// not addressed". Empty / `None` keeps the judge's historical
+    /// mismatch-only behavior — safe fallback for arcs without a plan.
+    pub fn acceptance_criteria(mut self, criterion: Option<String>) -> Self {
+        self.acceptance_criteria = criterion.filter(|s| !s.trim().is_empty());
         self
     }
 
@@ -412,6 +441,14 @@ impl AgentBuilder {
 
         if self.endpoints_block.is_some() {
             executor.set_endpoints_block(self.endpoints_block);
+        }
+
+        if self.mission_block.is_some() {
+            executor.set_mission_block(self.mission_block);
+        }
+
+        if self.acceptance_criteria.is_some() {
+            executor.set_acceptance_criteria(self.acceptance_criteria);
         }
 
         if let Some(rb) = self.reminder_builder {

@@ -272,6 +272,26 @@ pub struct DefaultExecutor {
     /// get zero bytes regardless. `None` reproduces today's prompt
     /// byte-for-byte.
     skills_block: Option<String>,
+    /// Pre-rendered mission block — the triage-drafted acceptance
+    /// criteria + scope captured for this arc's task. The host
+    /// (athen-app) reads `ArcMeta.triage_plan` and formats it; the
+    /// executor only frames it.
+    ///
+    /// Pinned between identity and workspace rules in the static prefix
+    /// so it sits high in the cache window but doesn't displace the
+    /// long-lived persona / identity sections. `None` reproduces
+    /// today's prompt byte-for-byte (arcs predating the plan field, or
+    /// triage paths that didn't draft one). Once captured, the plan is
+    /// write-once on the arc — so within a task the block stays
+    /// cache-stable.
+    mission_block: Option<String>,
+    /// Raw acceptance-criteria string (the same `TriagePlan` field that
+    /// went into `mission_block`) — fed to the completion judge so it
+    /// can flag "agent declared victory but the criterion clearly
+    /// wasn't met" alongside the existing claim/action mismatch rule.
+    /// `None` keeps the historical judge behavior (mismatch-only) which
+    /// is the right fallback for arcs without a plan.
+    acceptance_criteria: Option<String>,
     /// User-supplied reminder builder (custom impl). Takes precedence over
     /// `auto_reminders` when set. `None` is the test-default — no custom
     /// builder.
@@ -333,6 +353,8 @@ impl DefaultExecutor {
             identity_block: None,
             endpoints_block: None,
             skills_block: None,
+            mission_block: None,
+            acceptance_criteria: None,
             reminder_builder: None,
             auto_reminders: false,
             default_reasoning_effort: athen_core::llm::ReasoningEffort::Default,
@@ -418,6 +440,27 @@ impl DefaultExecutor {
     /// non-empty. Empty / whitespace-only / `None` clears the section.
     pub fn set_skills_block(&mut self, block: Option<String>) {
         self.skills_block = block.filter(|s| !s.trim().is_empty());
+    }
+
+    /// Inject a pre-rendered mission block into the static system header.
+    ///
+    /// The block describes the current task's done-criterion + scope as
+    /// drafted by the triage LLM call. Pinned between identity and
+    /// workspace rules in the prompt. Empty / whitespace-only / `None`
+    /// clears the section — arcs predating the plan, or triage paths
+    /// that didn't draft one, get today's prompt byte-for-byte.
+    pub fn set_mission_block(&mut self, block: Option<String>) {
+        self.mission_block = block.filter(|s| !s.trim().is_empty());
+    }
+
+    /// Store the raw `acceptance_criteria` for the completion judge.
+    /// The same string already flows into the prompt via `mission_block`;
+    /// this slot exists separately because the judge needs the line
+    /// without the framing markers and without the scope text. Empty /
+    /// whitespace-only / `None` keeps the judge's historical
+    /// mismatch-only behavior.
+    pub fn set_acceptance_criteria(&mut self, criterion: Option<String>) {
+        self.acceptance_criteria = criterion.filter(|s| !s.trim().is_empty());
     }
 
     /// Inject host-supplied volatile content (e.g. memory recall,
@@ -548,6 +591,7 @@ impl DefaultExecutor {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -574,6 +618,7 @@ impl DefaultExecutor {
         identity_block: Option<&str>,
         endpoints_block: Option<&str>,
         skills_block: Option<&str>,
+        mission_block: Option<&str>,
     ) -> String {
         let mut prompt = String::new();
         if autonomous {
@@ -590,6 +635,12 @@ impl DefaultExecutor {
         // changes only when the user edits identity (not per-request), so
         // its position keeps the cacheable static prefix stable.
         prompt.push_str(&Self::build_identity_section(identity_block));
+        // Mission sits between identity and workspace rules. Captured
+        // once per task via `set_triage_plan_if_absent`, so within a task
+        // the block stays cache-stable — same caching contract as
+        // identity. Profile-filtered upstream isn't needed: the plan is
+        // about THIS task, not about the agent's permanent persona.
+        prompt.push_str(&Self::build_mission_section(mission_block));
         prompt.push_str(&Self::build_workspace_rules(has_context));
         prompt.push_str(&Self::build_shell_env_section(shell_kind));
         prompt.push_str(&Self::build_toolbox_section(toolbox_info));
@@ -819,6 +870,30 @@ impl DefaultExecutor {
              persist genuinely new facts the user shares.\n\n\
              {body}\n\
              --- END IDENTITY ---\n\n"
+        )
+    }
+
+    /// Slot 2.5: MISSION — task-scoped done-criterion + scope drafted by
+    /// the LLM at triage. The block is captured once per task on the arc
+    /// (`set_triage_plan_if_absent`) so it stays cache-stable through
+    /// the task's life. The agent should treat `done when` as the
+    /// terminal condition the completion judge will check against, and
+    /// `not in scope` as a drift fence — work that drifts past it
+    /// should be deferred or flagged, not silently expanded.
+    ///
+    /// `None` / empty body reproduces today's prompt byte-for-byte —
+    /// covers arcs predating the plan field, conversational turns with
+    /// no done-criterion, and regex-only risk paths (which don't draft
+    /// plans).
+    fn build_mission_section(block: Option<&str>) -> String {
+        let body = match block {
+            Some(b) if !b.trim().is_empty() => b.trim(),
+            _ => return String::new(),
+        };
+        format!(
+            "--- MISSION (this task) ---\n\
+             {body}\n\
+             --- END MISSION ---\n\n"
         )
     }
 
@@ -1189,23 +1264,45 @@ impl DefaultExecutor {
     /// clarification first. The reframe: fire only on claim/action
     /// mismatch (the agent says "done" without doing it), not on
     /// action/tool mismatch.
-    async fn judge_completion(
-        &self,
+    /// Build the completion-judge prompt. Extracted from
+    /// `judge_completion` so the prompt's shape is testable without
+    /// needing to mock the LLM. When `acceptance_criteria` is `Some`
+    /// the prompt names the criterion explicitly and adds a third
+    /// CONTINUE rule for "agent declared victory but criterion clearly
+    /// not addressed"; when `None`, the prompt is the historical
+    /// mismatch-only shape (verbatim).
+    pub(crate) fn build_judge_prompt(
         user_request: &str,
         agent_response: &str,
         tools_called: &[String],
-    ) -> bool {
+        acceptance_criteria: Option<&str>,
+    ) -> String {
         let tools_str = if tools_called.is_empty() {
             "NONE".to_string()
         } else {
             tools_called.join(", ")
         };
-
-        let prompt = format!(
+        let criterion_section = match acceptance_criteria {
+            Some(c) if !c.trim().is_empty() => format!(
+                "Task's explicit done-criterion (drafted at triage): \"{c}\"\n\n\
+                 Use this criterion as the authoritative target when judging the agent's \
+                 reply. If the criterion is empty (\"\") or absent, fall back to the user's \
+                 request as the target.\n\n"
+            ),
+            _ => String::new(),
+        };
+        let extra_continue_rule = if !criterion_section.is_empty() {
+            "- The reply declares the task complete or implies the done-criterion is met, \
+             but the criterion is clearly NOT addressed by the reply or by any tool call.\n"
+        } else {
+            ""
+        };
+        format!(
             "You are a completion judge. Decide whether the agent's reply is internally \
              consistent with the tools it actually called, or whether the reply FALSELY CLAIMS \
              an action that did not happen.\n\n\
              User's request: \"{user_request}\"\n\
+             {criterion_section}\
              Agent's response: \"{agent_response}\"\n\
              Tools actually called: [{tools_str}]\n\n\
              Answer CONTINUE only when there is a CLAIM/ACTION MISMATCH:\n\
@@ -1213,18 +1310,37 @@ impl DefaultExecutor {
                (\"I deleted it\", \"created the event\", \"done\", \"the file is written\") \
                but no appropriate write tool was called.\n\
              - The reply announces an action it is about to perform (\"Let me write that now\") \
-               without then calling the tool.\n\n\
+               without then calling the tool.\n\
+             {extra_continue_rule}\n\
              Answer DONE in EVERY other case. Specifically DONE for:\n\
              - Honest status reports (\"no server is running\", \"the file does not exist\", \
                \"nothing to delete\") — the agent correctly determined no action was needed.\n\
-             - Refusals or explanations of why the agent cannot act.\n\
+             - Refusals or explanations of why the agent cannot act (criterion is impossible, \
+               missing info, would violate policy).\n\
              - Clarifying questions back to the user.\n\
              - Information / question answers (with or without tools).\n\
+             - Partial progress without a false claim of completion.\n\
              - Genuine completion using the right tools.\n\
              - Greetings, jokes, small talk.\n\n\
              Trust the agent's stated reasoning. If the reply does not claim an action \
-             happened, the absence of tools is NOT a failure — it's a choice. \
+             happened, the absence of tools is NOT a failure — it's a choice. The criterion \
+             is a check against false claims, not a stick to force completion when the agent \
+             honestly explains it can't proceed. \
              Reply with ONLY one word: DONE or CONTINUE."
+        )
+    }
+
+    async fn judge_completion(
+        &self,
+        user_request: &str,
+        agent_response: &str,
+        tools_called: &[String],
+    ) -> bool {
+        let prompt = Self::build_judge_prompt(
+            user_request,
+            agent_response,
+            tools_called,
+            self.acceptance_criteria.as_deref(),
         );
 
         let request = LlmRequest {
@@ -1478,6 +1594,7 @@ impl AgentExecutor for DefaultExecutor {
                 self.identity_block.as_deref(),
                 self.endpoints_block.as_deref(),
                 self.skills_block.as_deref(),
+                self.mission_block.as_deref(),
             );
             // Volatile content (current time, host memory recall,
             // attachment summaries, compaction state) used to be appended
@@ -2753,10 +2870,10 @@ mod tests {
         let tools = vec![tool_def("memory_store", "store a memory")];
         let revealed = HashSet::new();
         let interactive = DefaultExecutor::build_system_prompt_with_mode(
-            &tools, &revealed, false, None, None, None, None, false, None, None, None,
+            &tools, &revealed, false, None, None, None, None, false, None, None, None, None,
         );
         let autonomous = DefaultExecutor::build_system_prompt_with_mode(
-            &tools, &revealed, false, None, None, None, None, true, None, None, None,
+            &tools, &revealed, false, None, None, None, None, true, None, None, None, None,
         );
 
         assert_ne!(
@@ -2883,7 +3000,7 @@ mod tests {
         let tools = vec![tool_def("memory_store", "store a memory")];
         let revealed = HashSet::new();
         let with_none = DefaultExecutor::build_system_prompt_with_mode(
-            &tools, &revealed, false, None, None, None, None, false, None, None, None,
+            &tools, &revealed, false, None, None, None, None, false, None, None, None, None,
         );
         let with_empty = DefaultExecutor::build_system_prompt_with_mode(
             &tools,
@@ -2895,6 +3012,7 @@ mod tests {
             None,
             false,
             Some("   \n\n  "),
+            None,
             None,
             None,
         );
@@ -2924,6 +3042,7 @@ mod tests {
             Some(block),
             None,
             None,
+            None,
         );
         assert!(prompt.contains("--- IDENTITY (who Athen is, across every agent) ---"));
         assert!(prompt.contains("--- END IDENTITY ---"));
@@ -2942,6 +3061,126 @@ mod tests {
             .find("AVAILABLE TOOL GROUPS")
             .expect("tool index present");
         assert!(identity_idx < tools_idx);
+    }
+
+    /// Judge prompt with no acceptance criterion: reproduces today's
+    /// historical mismatch-only shape verbatim — no criterion section,
+    /// no third CONTINUE rule. Anchors the safety contract for arcs
+    /// without a plan (regex-only risk, conversational turns, etc.).
+    #[test]
+    fn judge_prompt_without_criterion_omits_criterion_section() {
+        let p = DefaultExecutor::build_judge_prompt(
+            "delete the temp file",
+            "I deleted it.",
+            &["read".to_string()],
+            None,
+        );
+        assert!(!p.contains("done-criterion"));
+        assert!(!p.contains("clearly NOT addressed"));
+        // Tools list still embeds.
+        assert!(p.contains("Tools actually called: [read]"));
+        // Existing CLAIM/ACTION rules still present.
+        assert!(p.contains("CLAIM/ACTION MISMATCH"));
+        assert!(p.contains("I deleted it"));
+    }
+
+    /// With an acceptance criterion the prompt names it as the
+    /// authoritative target AND gains the third CONTINUE rule for
+    /// "declared victory but criterion clearly not addressed".
+    #[test]
+    fn judge_prompt_with_criterion_adds_third_continue_rule() {
+        let p = DefaultExecutor::build_judge_prompt(
+            "draft a reply",
+            "I sent it.",
+            &[],
+            Some("Reply once to João confirming Q3 terms."),
+        );
+        assert!(p.contains("Reply once to João confirming Q3 terms."));
+        assert!(p.contains("done-criterion"));
+        assert!(p.contains("clearly NOT addressed"));
+        // Existing CLAIM/ACTION rules still present — the new rule is
+        // additive, not a replacement.
+        assert!(p.contains("CLAIM/ACTION MISMATCH"));
+        // Safety nets still present.
+        assert!(p.contains("Refusals"));
+        assert!(p.contains("Clarifying questions"));
+        assert!(p.contains("Partial progress without a false claim"));
+        assert!(p.contains("Tools actually called: [NONE]"));
+    }
+
+    /// Empty / whitespace-only criterion collapses to the no-criterion
+    /// shape — half-formed plans must not change the judge's behavior.
+    #[test]
+    fn judge_prompt_empty_criterion_treated_as_absent() {
+        let with_empty = DefaultExecutor::build_judge_prompt("x", "y", &[], Some("   \n\n"));
+        let with_none = DefaultExecutor::build_judge_prompt("x", "y", &[], None);
+        assert_eq!(with_empty, with_none);
+    }
+
+    /// Mission is omitted entirely when no block is provided, so arcs
+    /// predating the plan field (or in-app turns without a triage LLM)
+    /// get today's prompt byte-for-byte.
+    #[test]
+    fn system_prompt_no_mission_block_byte_identical() {
+        let tools = vec![tool_def("memory_store", "store a memory")];
+        let revealed = HashSet::new();
+        let with_none = DefaultExecutor::build_system_prompt_with_mode(
+            &tools, &revealed, false, None, None, None, None, false, None, None, None, None,
+        );
+        let with_empty = DefaultExecutor::build_system_prompt_with_mode(
+            &tools,
+            &revealed,
+            false,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            Some("   \n\n  "),
+        );
+        assert_eq!(with_none, with_empty);
+        assert!(!with_none.contains("--- MISSION"));
+    }
+
+    /// A non-empty mission block is framed and inserted between the
+    /// identity section and the workspace rules — i.e. above any tool
+    /// listing — so the LLM sees the task's done-criterion as a top-
+    /// level contract.
+    #[test]
+    fn system_prompt_mission_block_position_and_framing() {
+        let tools = vec![tool_def("memory_store", "store a memory")];
+        let revealed = HashSet::new();
+        let identity = "## personality\nBe concise.";
+        let mission = "Done when: Reply to João.\nNot in scope: NOT a thread.";
+        let prompt = DefaultExecutor::build_system_prompt_with_mode(
+            &tools,
+            &revealed,
+            false,
+            None,
+            None,
+            None,
+            None,
+            false,
+            Some(identity),
+            None,
+            None,
+            Some(mission),
+        );
+        assert!(prompt.contains("--- MISSION (this task) ---"));
+        assert!(prompt.contains("--- END MISSION ---"));
+        assert!(prompt.contains("Done when: Reply to João."));
+
+        let identity_idx = prompt.find("--- IDENTITY").expect("identity present");
+        let mission_idx = prompt.find("--- MISSION").expect("mission present");
+        let tools_idx = prompt
+            .find("AVAILABLE TOOL GROUPS")
+            .expect("tool index present");
+        // Identity sits above mission; mission sits above the tool index.
+        assert!(identity_idx < mission_idx);
+        assert!(mission_idx < tools_idx);
     }
 
     /// `build_endpoints_section` only fires when the agent actually has
@@ -3001,6 +3240,7 @@ mod tests {
             false,
             None,
             Some(block),
+            None,
             None,
         );
         let endpoints_idx = prompt

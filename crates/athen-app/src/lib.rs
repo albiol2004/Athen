@@ -22,6 +22,7 @@ pub(crate) mod github_identity;
 pub(crate) mod http_presets;
 pub(crate) mod http_rate_limiter;
 pub(crate) mod identity_render;
+pub(crate) mod mission_render;
 pub(crate) mod notifier;
 pub(crate) mod owner_migration;
 pub(crate) mod process;

@@ -2921,6 +2921,19 @@ async fn execute_owner_telegram_message(
     // composition — so we only ship endpoints through.
     let endpoints_block =
         crate::endpoints_render::render_endpoints_block(http_endpoint_store).await;
+    // Owner Telegram turns don't go through the risk LLM, so capture
+    // is a no-op — but a plan persisted earlier on the same arc still
+    // renders into the prompt AND still feeds the completion judge.
+    let mission_block = if let Some(id) = target_arc_id.as_ref() {
+        crate::mission_render::render_mission_block(arc_store.as_ref(), id).await
+    } else {
+        None
+    };
+    let acceptance_criteria = if let Some(id) = target_arc_id.as_ref() {
+        crate::mission_render::read_acceptance_criteria(arc_store.as_ref(), id).await
+    } else {
+        None
+    };
 
     let mut builder = AgentBuilder::new()
         .llm_router(exec_router)
@@ -2932,6 +2945,8 @@ async fn execute_owner_telegram_message(
         .stream_sender(stream_tx)
         .cancel_flag(cancel_flag)
         .endpoints_block(endpoints_block)
+        .mission_block(mission_block)
+        .acceptance_criteria(acceptance_criteria)
         .enable_default_reminders(true)
         .default_temperature(sampling_temperature);
     if let Some(p) = tool_doc_dir {

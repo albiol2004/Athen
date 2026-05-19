@@ -2280,6 +2280,18 @@ pub async fn send_message(
                 &identity_profile_id,
             )
             .await;
+            // In-app direct turns skip the triage LLM, so capture is a
+            // no-op here — but a plan persisted by an earlier sense-
+            // event turn on the same arc still renders into the prompt
+            // AND still feeds the completion judge.
+            let mission_block =
+                crate::mission_render::render_mission_block(state.arc_store.as_ref(), &current_arc)
+                    .await;
+            let acceptance_criteria = crate::mission_render::read_acceptance_criteria(
+                state.arc_store.as_ref(),
+                &current_arc,
+            )
+            .await;
 
             let active_id_now = state.active_provider_id.lock().await.clone();
             let effective_provider_id = crate::state::resolve_effective_provider_for_arc(
@@ -2332,6 +2344,8 @@ pub async fn send_message(
                 .identity_block(identity_block)
                 .endpoints_block(endpoints_block)
                 .skills_block(skills_block)
+                .mission_block(mission_block)
+                .acceptance_criteria(acceptance_criteria)
                 .enable_default_reminders(true)
                 .default_temperature(sampling_temperature)
                 .default_reasoning_effort(reasoning_effort)
@@ -3441,6 +3455,26 @@ pub(crate) async fn execute_approved_task(
     let skills_block =
         crate::skills_render::render_skills_block(ctx.skill_store.as_ref(), &identity_profile_id)
             .await;
+    // Capture-on-arrival: this is the first time on the arc that we
+    // have BOTH `arc_id` and `task.risk_score`. If the risk LLM drafted
+    // a plan and the arc has none yet, persist it. Errors are logged
+    // and swallowed — running without the plan is degrading not
+    // failing. `set_triage_plan_if_absent` short-circuits on `None`.
+    if let (Some(store), Some(score)) = (ctx.arc_store.as_ref(), approved_task.risk_score.as_ref())
+    {
+        if let Err(e) = store
+            .set_triage_plan_if_absent(&ctx.active_arc_id, score.plan.as_ref())
+            .await
+        {
+            warn!(arc = %ctx.active_arc_id, error = %e, "set_triage_plan_if_absent failed");
+        }
+    }
+    let mission_block =
+        crate::mission_render::render_mission_block(ctx.arc_store.as_ref(), &ctx.active_arc_id)
+            .await;
+    let acceptance_criteria =
+        crate::mission_render::read_acceptance_criteria(ctx.arc_store.as_ref(), &ctx.active_arc_id)
+            .await;
 
     // Tier resolution: arc override > task complexity (piggybacked on
     // the risk LLM that already ran on this approved task) > static
@@ -3468,6 +3502,8 @@ pub(crate) async fn execute_approved_task(
         .identity_block(identity_block)
         .endpoints_block(endpoints_block)
         .skills_block(skills_block)
+        .mission_block(mission_block)
+        .acceptance_criteria(acceptance_criteria)
         .enable_default_reminders(true)
         .default_temperature(ctx.sampling_temperature)
         .default_reasoning_effort(ctx.reasoning_effort)
@@ -4479,6 +4515,22 @@ pub(crate) async fn execute_dispatched_task(
     let skills_block =
         crate::skills_render::render_skills_block(ctx.skill_store.as_ref(), &identity_profile_id)
             .await;
+    // Capture-on-arrival: dispatch-driven sense-event path. First
+    // landing on the arc with the task's risk_score in scope —
+    // persist the triage plan if one was drafted and the arc has
+    // none yet. Error path is log+continue, same as approval flow.
+    if let (Some(store), Some(score)) = (ctx.arc_store.as_ref(), task.risk_score.as_ref()) {
+        if let Err(e) = store
+            .set_triage_plan_if_absent(&arc_id, score.plan.as_ref())
+            .await
+        {
+            warn!(arc = %arc_id, error = %e, "set_triage_plan_if_absent failed");
+        }
+    }
+    let mission_block =
+        crate::mission_render::render_mission_block(ctx.arc_store.as_ref(), &arc_id).await;
+    let acceptance_criteria =
+        crate::mission_render::read_acceptance_criteria(ctx.arc_store.as_ref(), &arc_id).await;
 
     // Tier resolution mirrors the approval path; `task` carries the
     // risk_score the dispatch loop installed.
@@ -4505,6 +4557,8 @@ pub(crate) async fn execute_dispatched_task(
         .identity_block(identity_block)
         .endpoints_block(endpoints_block)
         .skills_block(skills_block)
+        .mission_block(mission_block)
+        .acceptance_criteria(acceptance_criteria)
         .enable_default_reminders(true)
         .default_temperature(ctx.sampling_temperature)
         .default_reasoning_effort(ctx.reasoning_effort)
@@ -6019,6 +6073,11 @@ pub async fn estimate_profile_tokens(
         identity_block.as_deref(),
         endpoints_block.as_deref(),
         skills_block.as_deref(),
+        // Mission block is per-arc, not per-profile — the token-budget
+        // chip lives in Settings → Profiles and is fundamentally a
+        // "what does this profile cost on an empty arc" estimate.
+        // Counting a hypothetical plan would mislead.
+        None,
         Some(&toolbox_info),
         Some(shell_kind),
         state.tool_doc_dir.as_deref(),
