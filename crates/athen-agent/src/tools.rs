@@ -197,6 +197,34 @@ pub trait OwnerDestinationCheck: Send + Sync {
     async fn is_owner_email(&self, email: &str) -> bool;
 }
 
+/// Resolves a [`GithubIdentity`] to the env-var bundle injected into
+/// `shell_execute` invocations so git/gh commands authenticate and
+/// commit as the right account.
+///
+/// Implementations look up the user's stored PAT + commit-author name +
+/// email under `identity.vault_scope()` and return:
+/// - `GH_TOKEN` (gh + most git credential helpers pick this up)
+/// - `GITHUB_TOKEN` (alias accepted by many tools)
+/// - `GIT_AUTHOR_NAME` / `GIT_AUTHOR_EMAIL`
+/// - `GIT_COMMITTER_NAME` / `GIT_COMMITTER_EMAIL`
+/// - `GH_CONFIG_DIR` (per-identity dir so the bot's `gh` state never
+///   collides with the user's `~/.config/gh`)
+///
+/// Failing to resolve is not an error: implementations return whatever
+/// they have (possibly empty) and the agent's git/gh commands run
+/// without auth rather than refusing to run. This keeps the agent
+/// useful even when only some of the credentials are configured.
+#[async_trait]
+pub trait GithubIdentityResolver: Send + Sync {
+    /// Resolve identity → env-var bundle. Returns an empty Vec when the
+    /// identity is `None` or no values are configured. The returned
+    /// list is suitable to splice directly into a child-process env.
+    async fn resolve_env_vars(
+        &self,
+        identity: athen_core::agent_profile::GithubIdentity,
+    ) -> Vec<(String, String)>;
+}
+
 /// Metadata for a process started via `shell_spawn`. Kept in
 /// [`ShellToolRegistry::spawned`] so subsequent `shell_logs`/`shell_kill`
 /// calls can find the log file and validate the PID is one we own.
@@ -355,6 +383,15 @@ pub struct ShellToolRegistry {
     /// Wired by the app layer to a JSON pidfile under `<data_dir>/`. Tests
     /// and CLI builds leave it `None` and the registry behaves as before.
     spawn_persistence: Option<Arc<dyn SpawnPersistenceHook>>,
+    /// Which GitHub credentials (if any) `shell_execute` should inject
+    /// into git/gh commands. Set by the composition root from the
+    /// active agent profile. Defaults to `None` so unconfigured builds
+    /// (CLI, tests) behave exactly as before.
+    github_identity: athen_core::agent_profile::GithubIdentity,
+    /// Resolves the GitHub identity (above) to an env-var bundle.
+    /// Wired by `athen-app` against the vault. When `None` (CLI/tests),
+    /// no env injection happens regardless of `github_identity`.
+    github_identity_resolver: Option<Arc<dyn GithubIdentityResolver>>,
 }
 
 /// Defense-in-depth: tolerate args delivered as a JSON-encoded string
@@ -682,7 +719,62 @@ impl ShellToolRegistry {
             telegram_approval: None,
             telegram_outbound_recorder: None,
             spawn_persistence: None,
+            github_identity: athen_core::agent_profile::GithubIdentity::None,
+            github_identity_resolver: None,
         }
+    }
+
+    /// Set which GitHub identity this registry's `shell_execute`
+    /// invocations should authenticate as. Must be paired with
+    /// [`Self::with_github_identity_resolver`] for env vars to actually
+    /// land in the child process; without a resolver the identity is
+    /// captured but ignored.
+    pub fn with_github_identity(
+        mut self,
+        identity: athen_core::agent_profile::GithubIdentity,
+    ) -> Self {
+        self.github_identity = identity;
+        self
+    }
+
+    /// Inject the resolver that maps the captured `github_identity` to
+    /// an env-var bundle (PAT + author/committer names). Without it,
+    /// no env injection happens — the agent's git/gh commands run with
+    /// whatever the host shell would see.
+    pub fn with_github_identity_resolver(
+        mut self,
+        resolver: Arc<dyn GithubIdentityResolver>,
+    ) -> Self {
+        self.github_identity_resolver = Some(resolver);
+        self
+    }
+
+    /// `Option`-flavoured variant — see [`Self::with_github_identity_resolver`].
+    pub fn with_github_identity_resolver_opt(
+        self,
+        resolver: Option<Arc<dyn GithubIdentityResolver>>,
+    ) -> Self {
+        match resolver {
+            Some(r) => self.with_github_identity_resolver(r),
+            None => self,
+        }
+    }
+
+    /// Resolve the GitHub identity env vars for this registry. Empty
+    /// Vec when no identity is configured or no resolver is wired.
+    /// Called from `do_shell_execute` and `do_shell_spawn`; merging
+    /// happens at the call site.
+    async fn github_env_overrides(&self) -> Vec<(String, String)> {
+        let Some(resolver) = self.github_identity_resolver.as_ref() else {
+            return Vec::new();
+        };
+        if matches!(
+            self.github_identity,
+            athen_core::agent_profile::GithubIdentity::None
+        ) {
+            return Vec::new();
+        }
+        resolver.resolve_env_vars(self.github_identity).await
     }
 
     /// Inject the toolbox approval gate so `install_package` can ask
@@ -1165,7 +1257,13 @@ impl ShellToolRegistry {
         // unsandboxed path uses structured env+cwd via the OS process API
         // ([`build_shell_env`]) so it works on every shell on every OS.
         let wrapped_command = Self::build_shell_wrapper(command);
-        let (env_overrides, cwd) = Self::build_shell_env();
+        let (mut env_overrides, cwd) = Self::build_shell_env();
+        // Splice GitHub identity env vars (PAT + author/committer
+        // name+email) so git/gh commands authenticate as the configured
+        // bot or the user's own account — set on the agent profile,
+        // never per-command. No-op when identity is None or no resolver
+        // is wired.
+        env_overrides.extend(self.github_env_overrides().await);
 
         tracing::info!(
             tool = "shell_execute",
@@ -2261,7 +2359,8 @@ impl ShellToolRegistry {
         // Apply the same toolbox env (PYTHONPATH / PATH) and cwd as
         // `shell_execute`, but via the OS process API so the wrapper
         // works on every shell on every OS.
-        let (env_overrides, cwd) = Self::build_shell_env();
+        let (mut env_overrides, cwd) = Self::build_shell_env();
+        env_overrides.extend(self.github_env_overrides().await);
         for (k, v) in &env_overrides {
             cmd.env(k, v);
         }
@@ -3145,7 +3244,7 @@ impl ToolRegistry for ShellToolRegistry {
         Ok(vec![
             ToolDefinition {
                 name: "shell_execute".to_string(),
-                description: "Run a shell command and return its output (stdout, stderr, exit code). For fetching web pages or searching the web do NOT use curl/wget/lynx — use web_fetch and web_search, which return clean markdown/snippets.".to_string(),
+                description: "Run a shell command and return its output (stdout, stderr, exit code). For fetching web pages or searching the web do NOT use curl/wget/lynx — use web_fetch and web_search, which return clean markdown/snippets. For GitHub work, prefer `git` and `gh` here over the REST API: the active agent profile may inject a GitHub identity (PAT + commit author name/email) so commits and PRs land under the configured account automatically.".to_string(),
                 parameters: Self::shell_execute_schema(),
                 backend: ToolBackend::Shell {
                     command: String::new(),

@@ -378,6 +378,11 @@ pub struct AppState {
     /// `config.toml` field, so secrets stop appearing on disk in
     /// plaintext after the next save.
     pub vault: Option<Arc<dyn athen_core::traits::vault::Vault>>,
+    /// Resolves `AgentProfile.github_identity` → env-var bundle so the
+    /// agent's `shell_execute` git/gh commands authenticate as the
+    /// configured bot account (or as the user). Built when the vault is
+    /// available; `None` on builds with no data dir.
+    pub github_identity_resolver: Option<Arc<dyn athen_agent::tools::GithubIdentityResolver>>,
     /// Registered HTTP endpoints store. Backs the `http_request` agent
     /// tool and the Settings → Cloud APIs panel. `None` only on test/CLI
     /// builds without a data dir.
@@ -443,6 +448,21 @@ impl AppState {
             None => None,
         };
         crate::vault_creds::hydrate_secrets_from_vault(vault.as_ref(), &mut config).await;
+
+        // Resolver for AgentProfile.github_identity → env-var bundle on
+        // `shell_execute`. Per-identity `GH_CONFIG_DIR` lives under
+        // `<data_dir>/github/<bot|user>` so the bot's gh state never
+        // collides with the user's. Wired only when the vault is up;
+        // without it, profiles that opt into a github identity behave
+        // as if identity were `None` (no env injection).
+        let github_identity_resolver: Option<Arc<dyn athen_agent::tools::GithubIdentityResolver>> =
+            vault.as_ref().map(|v| {
+                let gh_base = ensure_data_dir().map(|d| d.join("github"));
+                let resolver: Arc<dyn athen_agent::tools::GithubIdentityResolver> = Arc::new(
+                    crate::github_identity::VaultGithubIdentityResolver::new(v.clone(), gh_base),
+                );
+                resolver
+            });
 
         // Determine which provider to activate on startup.
         let active_id = resolve_active_provider(&config);
@@ -618,6 +638,7 @@ impl AppState {
             email_sender,
             telegram_sender,
             vault,
+            github_identity_resolver,
             http_endpoint_store,
             http_rate_limiter,
             http_client,
@@ -1017,6 +1038,16 @@ impl AppState {
         app_handle: Option<tauri::AppHandle>,
     ) -> Box<dyn athen_core::traits::tool::ToolRegistry> {
         let delegation_app_handle = app_handle.clone();
+        // Resolve the active profile's GitHub identity once at registry
+        // build time so every shell_execute in this arc uses the same
+        // creds. Falls back to `None` whenever lookup is unavailable
+        // (CLI builds, missing profile_store, etc.) — never errors.
+        let github_identity = resolve_github_identity_for_arc(
+            self.profile_store.as_ref(),
+            self.arc_store.as_ref(),
+            arc_id,
+        )
+        .await;
         let mut shell = athen_agent::ShellToolRegistry::new()
             .await
             .with_spawned_processes(self.spawned_processes.clone())
@@ -1024,7 +1055,9 @@ impl AppState {
             .with_web_search(self.web_search.clone())
             .with_email_sender_opt(self.email_sender.clone())
             .with_telegram_sender_opt(self.telegram_sender.clone())
-            .with_owner_check_opt(self.owner_destination_check());
+            .with_owner_check_opt(self.owner_destination_check())
+            .with_github_identity(github_identity)
+            .with_github_identity_resolver_opt(self.github_identity_resolver.clone());
         if let Some(store) = self.grant_store.clone() {
             let provider = Arc::new(crate::file_gate::ArcWritableProvider {
                 arc_id: crate::file_gate::arc_uuid(arc_id),
@@ -2016,6 +2049,7 @@ impl AppState {
         let telegram_outbound_hint_dispatch = self.telegram_outbound_hint.clone();
         let telegram_chat_log_dispatch = self.telegram_chat_log.clone();
         let owner_check_dispatch = self.owner_destination_check();
+        let github_identity_resolver_dispatch = self.github_identity_resolver.clone();
         // Snapshot the vault so the per-task IMAP mark-seen flow can
         // hydrate the IMAP password from it (the password lives in the
         // vault for installs that have re-saved their email settings).
@@ -2165,6 +2199,7 @@ impl AppState {
                         telegram_outbound_hint: telegram_outbound_hint_dispatch.clone(),
                         telegram_chat_log: telegram_chat_log_dispatch.clone(),
                         owner_check: owner_check_dispatch.clone(),
+                        github_identity_resolver: github_identity_resolver_dispatch.clone(),
                         initial_user_images: Vec::new(),
                         attachment_store: attachment_store_loop.clone(),
                         compaction_trigger_tokens,
@@ -4119,6 +4154,38 @@ fn build_provider_instance(
 /// Generate a human-readable Arc identifier: `arc_YYYYMMDD_HHMMSS`.
 fn generate_arc_id() -> String {
     chrono::Utc::now().format("arc_%Y%m%d_%H%M%S").to_string()
+}
+
+/// Look up the active agent profile's `github_identity` for a given arc.
+///
+/// Falls back to `GithubIdentity::None` on every missing-piece path: no
+/// arc_store, no profile_store, arc isn't persisted, profile lookup
+/// fails. The shell tool's env injection is also a no-op for `None`, so
+/// this whole chain degrades gracefully — at worst, git/gh commands run
+/// without auth instead of erroring at command time.
+pub(crate) async fn resolve_github_identity_for_arc(
+    profile_store: Option<&Arc<athen_persistence::profiles::SqliteProfileStore>>,
+    arc_store: Option<&athen_persistence::arcs::ArcStore>,
+    arc_id: &str,
+) -> athen_core::agent_profile::GithubIdentity {
+    use athen_core::traits::profile::ProfileStore;
+    let Some(pstore) = profile_store else {
+        return athen_core::agent_profile::GithubIdentity::None;
+    };
+    // Determine the active profile id: explicit on the arc row, falling
+    // back to the default profile.
+    let active_id: Option<String> = if let Some(astore) = arc_store {
+        match astore.get_arc(arc_id).await {
+            Ok(Some(meta)) => meta.active_profile_id,
+            _ => None,
+        }
+    } else {
+        None
+    };
+    match pstore.get_or_default(active_id.as_ref()).await {
+        Ok(p) => p.github_identity,
+        Err(_) => athen_core::agent_profile::GithubIdentity::None,
+    }
 }
 
 /// Try to restore the most recent active Arc from persistent storage.

@@ -767,7 +767,7 @@ fn parse_llm_classifier_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_profile::{ExpertiseDeclaration, ToolSelection};
+    use crate::agent_profile::{ExpertiseDeclaration, GithubIdentity, ToolSelection};
     use chrono::Utc;
 
     fn make_profile(
@@ -792,6 +792,7 @@ mod tests {
                 ..Default::default()
             },
             model_profile_hint: None,
+            github_identity: GithubIdentity::None,
             builtin: false,
             created_at: now,
             updated_at: now,
@@ -810,6 +811,7 @@ mod tests {
             primary_groups: vec![],
             expertise: ExpertiseDeclaration::default(),
             model_profile_hint: None,
+            github_identity: GithubIdentity::None,
             builtin: true,
             created_at: now,
             updated_at: now,

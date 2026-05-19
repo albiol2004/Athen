@@ -4450,6 +4450,7 @@ async function loadSettings() {
         await loadCloudApis();
         await loadAttachmentPolicySettings();
         await loadOwnerContact();
+        await loadGithubIdentities();
 
         // Let opt-in listeners (e.g. the email setup wizard's connected-pill
         // + advanced-auto-open logic) react after every settings field is in
@@ -4691,6 +4692,7 @@ function openProfileEditor(mode, source) {
     const personaEl = document.getElementById('profile-persona');
     const strengthsEl = document.getElementById('profile-strengths');
     const modelEl = document.getElementById('profile-model-hint');
+    const ghIdentityEl = document.getElementById('profile-github-identity');
     const errEl = document.getElementById('profile-modal-error');
     const editIdEl = document.getElementById('profile-edit-id');
 
@@ -4707,6 +4709,7 @@ function openProfileEditor(mode, source) {
         personaEl.value = source.custom_persona_addendum || '';
         strengthsEl.value = (source.expertise?.strengths || []).join(', ');
         modelEl.value = source.model_profile_hint || '';
+        if (ghIdentityEl) ghIdentityEl.value = source.github_identity || 'none';
         renderProfileChips(source.expertise || {});
     } else if (mode === 'clone' && source) {
         titleEl.textContent = 'Clone profile';
@@ -4718,6 +4721,7 @@ function openProfileEditor(mode, source) {
         personaEl.value = source.custom_persona_addendum || '';
         strengthsEl.value = (source.expertise?.strengths || []).join(', ');
         modelEl.value = source.model_profile_hint || '';
+        if (ghIdentityEl) ghIdentityEl.value = source.github_identity || 'none';
         renderProfileChips(source.expertise || {});
     } else {
         titleEl.textContent = 'New profile';
@@ -4729,6 +4733,7 @@ function openProfileEditor(mode, source) {
         personaEl.value = '';
         strengthsEl.value = '';
         modelEl.value = '';
+        if (ghIdentityEl) ghIdentityEl.value = 'none';
         renderProfileChips({});
     }
 
@@ -4845,6 +4850,8 @@ async function saveProfileFromEditor() {
     const persona = document.getElementById('profile-persona').value.trim();
     const strengthsRaw = document.getElementById('profile-strengths').value;
     const modelHint = document.getElementById('profile-model-hint').value.trim();
+    const ghIdentity =
+        document.getElementById('profile-github-identity')?.value || 'none';
     const errEl = document.getElementById('profile-modal-error');
 
     const showError = (msg) => {
@@ -4897,6 +4904,7 @@ async function saveProfileFromEditor() {
             avoid: input.expertise.avoid,
         },
         model_profile_hint: input.modelProfileHint,
+        github_identity: ghIdentity,
     };
 
     try {
@@ -7591,6 +7599,104 @@ function showTelegramTestResult(success, message) {
     el.textContent = message;
     el.classList.remove('hidden');
     setTimeout(() => el.classList.add('hidden'), 5000);
+}
+
+// ─── GitHub Identity ───
+
+function showGhTestResult(which, success, message) {
+    const el = document.getElementById(`gh-${which}-test-result`);
+    if (!el) return;
+    el.className = 'test-result ' + (success ? 'test-success' : 'test-error');
+    el.textContent = message;
+    el.classList.remove('hidden');
+    setTimeout(() => el.classList.add('hidden'), 6000);
+}
+
+async function loadGithubIdentities() {
+    try {
+        const snap = await window.__TAURI__.core.invoke('get_github_identities');
+        // The Rust struct uses serde defaults (snake_case fields).
+        const fill = (which, slot) => {
+            const tokenInput = document.getElementById(`gh-${which}-token`);
+            const nameInput = document.getElementById(`gh-${which}-name`);
+            const emailInput = document.getElementById(`gh-${which}-email`);
+            const hint = document.getElementById(`gh-${which}-token-hint`);
+            if (nameInput) nameInput.value = slot.user_name || '';
+            if (emailInput) emailInput.value = slot.user_email || '';
+            if (tokenInput) {
+                tokenInput.value = '';
+                tokenInput.placeholder = slot.has_token
+                    ? '(token saved — type to replace)'
+                    : 'github_pat_...';
+            }
+            if (hint) {
+                hint.textContent = slot.has_token
+                    ? 'Token is stored. Leave blank to keep, type a new one to replace.'
+                    : '';
+            }
+        };
+        if (snap?.bot) fill('bot', snap.bot);
+        if (snap?.user) fill('user', snap.user);
+    } catch (e) {
+        console.warn('get_github_identities failed:', e);
+    }
+}
+
+for (const which of ['bot', 'user']) {
+    document.getElementById(`gh-${which}-token-toggle`)?.addEventListener('click', () => {
+        const input = document.getElementById(`gh-${which}-token`);
+        if (input) input.type = input.type === 'password' ? 'text' : 'password';
+    });
+
+    document.getElementById(`save-gh-${which}-btn`)?.addEventListener('click', async () => {
+        const tokenInput = document.getElementById(`gh-${which}-token`);
+        const nameInput = document.getElementById(`gh-${which}-name`);
+        const emailInput = document.getElementById(`gh-${which}-email`);
+        const tokenVal = tokenInput?.value ?? '';
+        // Empty input means "keep what's there" — only send when the user
+        // typed something. Use the explicit empty-string path to clear.
+        const tokenArg = tokenVal.length > 0 ? tokenVal : null;
+        try {
+            const result = await window.__TAURI__.core.invoke('save_github_identity', {
+                identity: which,
+                token: tokenArg,
+                userName: nameInput?.value ?? '',
+                userEmail: emailInput?.value ?? '',
+            });
+            showGhTestResult(which, true, result);
+            await loadGithubIdentities();
+        } catch (e) {
+            showGhTestResult(which, false, e.toString());
+        }
+    });
+
+    document.getElementById(`test-gh-${which}-btn`)?.addEventListener('click', async (ev) => {
+        const btn = ev.currentTarget;
+        const tokenInput = document.getElementById(`gh-${which}-token`);
+        const tokenVal = tokenInput?.value ?? '';
+        if (!tokenVal) {
+            showGhTestResult(
+                which,
+                false,
+                'Type a PAT into the field to test. Saved tokens are write-only.'
+            );
+            return;
+        }
+        const origText = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = 'Testing...';
+        try {
+            const result = await window.__TAURI__.core.invoke('test_github_identity', {
+                token: tokenVal,
+            });
+            showGhTestResult(which, result.success, result.message);
+        } catch (e) {
+            showGhTestResult(which, false, e.toString());
+        } finally {
+            btn.disabled = false;
+            btn.textContent = origText;
+        }
+    });
 }
 
 // ─── Owner Contact ("My Contact Info") ───

@@ -120,6 +120,7 @@ fn spawn_router_approval(
         telegram_outbound_hint: state.telegram_outbound_hint.clone(),
         telegram_chat_log: state.telegram_chat_log.clone(),
         owner_check: state.owner_destination_check(),
+        github_identity_resolver: state.github_identity_resolver.clone(),
         attachment_store: state.attachment_store(),
         active_provider_id_snapshot: active_provider_id_snapshot.clone(),
         wakeup_store: state
@@ -264,6 +265,7 @@ fn spawn_router_approval(
             telegram_outbound_hint: bg_ctx.telegram_outbound_hint.clone(),
             telegram_chat_log: bg_ctx.telegram_chat_log.clone(),
             owner_check: bg_ctx.owner_check.clone(),
+            github_identity_resolver: bg_ctx.github_identity_resolver.clone(),
             initial_user_images: Vec::new(),
             attachment_store: bg_ctx.attachment_store.clone(),
             compaction_trigger_tokens,
@@ -373,6 +375,9 @@ struct ApprovedTaskBgCtx {
     telegram_chat_log: Option<Arc<athen_persistence::telegram_chat_log::TelegramChatLogStore>>,
     /// See [`ApprovedTaskCtx::owner_check`].
     owner_check: Option<Arc<dyn athen_agent::OwnerDestinationCheck>>,
+    /// Resolver for GitHub identity env vars injected into shell_execute.
+    /// Mirrors `email_sender` in lifecycle. Built once at AppState::new.
+    github_identity_resolver: Option<Arc<dyn athen_agent::tools::GithubIdentityResolver>>,
     attachment_store: Option<athen_persistence::attachments::AttachmentStore>,
     /// Active provider id at the moment `spawn_router_approval` was called.
     /// Used inside the spawned async block to resolve the effective
@@ -2662,6 +2667,7 @@ pub async fn approve_task(
         telegram_outbound_hint: state.telegram_outbound_hint.clone(),
         telegram_chat_log: state.telegram_chat_log.clone(),
         owner_check: state.owner_destination_check(),
+        github_identity_resolver: state.github_identity_resolver.clone(),
         // Approved-via-card path: original images aren't restashed yet
         // (Phase 2 will mirror `pending_message` for images). For now,
         // images flow through the direct-execution path in `send_message`,
@@ -2818,6 +2824,12 @@ pub(crate) struct ApprovedTaskCtx {
     /// firing the approval gate. `None` when no contact store / no owner
     /// is configured — `email_send` falls back to gate-every-send.
     pub owner_check: Option<Arc<dyn athen_agent::OwnerDestinationCheck>>,
+    /// Resolver for GitHub identity env vars injected into shell_execute.
+    /// Built once at AppState::new and threaded through every execute
+    /// path so wake-ups + approved-task replays inject the same creds as
+    /// in-app runs. `None` on CLI/test builds — shell_execute then runs
+    /// git/gh unauthed.
+    pub github_identity_resolver: Option<Arc<dyn athen_agent::tools::GithubIdentityResolver>>,
     /// Images attached to this turn's user message. Empty in the
     /// background/Telegram path; the in-app composer populates this when
     /// the user pastes or drops an image. Forwarded into the executor so
@@ -3171,6 +3183,12 @@ pub(crate) async fn execute_approved_task(
 
     // Build the tool registry, mirroring AppState::build_tool_registry —
     // inlined here because the bg path doesn't own `&AppState`.
+    let github_identity_for_arc = crate::state::resolve_github_identity_for_arc(
+        ctx.profile_store.as_ref(),
+        ctx.arc_store.as_ref(),
+        &ctx.active_arc_id,
+    )
+    .await;
     let mut shell_registry = athen_agent::ShellToolRegistry::new()
         .await
         .with_spawned_processes(ctx.spawned_processes.clone())
@@ -3178,7 +3196,9 @@ pub(crate) async fn execute_approved_task(
         .with_web_search(Arc::clone(&ctx.web_search))
         .with_email_sender_opt(ctx.email_sender.clone())
         .with_telegram_sender_opt(ctx.telegram_sender.clone())
-        .with_owner_check_opt(ctx.owner_check.clone());
+        .with_owner_check_opt(ctx.owner_check.clone())
+        .with_github_identity(github_identity_for_arc)
+        .with_github_identity_resolver_opt(ctx.github_identity_resolver.clone());
     if let Some(ref store) = ctx.grant_store {
         let provider = Arc::new(crate::file_gate::ArcWritableProvider {
             arc_id: crate::file_gate::arc_uuid(&ctx.active_arc_id),
@@ -4199,6 +4219,12 @@ pub(crate) async fn execute_dispatched_task(
     }
 
     // Build the tool registry, mirroring execute_approved_task.
+    let github_identity_for_arc = crate::state::resolve_github_identity_for_arc(
+        ctx.profile_store.as_ref(),
+        ctx.arc_store.as_ref(),
+        &arc_id,
+    )
+    .await;
     let mut shell_registry = athen_agent::ShellToolRegistry::new()
         .await
         .with_spawned_processes(ctx.spawned_processes.clone())
@@ -4206,7 +4232,9 @@ pub(crate) async fn execute_dispatched_task(
         .with_web_search(Arc::clone(&ctx.web_search))
         .with_email_sender_opt(ctx.email_sender.clone())
         .with_telegram_sender_opt(ctx.telegram_sender.clone())
-        .with_owner_check_opt(ctx.owner_check.clone());
+        .with_owner_check_opt(ctx.owner_check.clone())
+        .with_github_identity(github_identity_for_arc)
+        .with_github_identity_resolver_opt(ctx.github_identity_resolver.clone());
     if let Some(ref store) = ctx.grant_store {
         let provider = Arc::new(crate::file_gate::ArcWritableProvider {
             arc_id: crate::file_gate::arc_uuid(&arc_id),
@@ -5739,6 +5767,11 @@ pub struct AgentProfileInput {
     pub expertise: athen_core::agent_profile::ExpertiseDeclaration,
     #[serde(default)]
     pub model_profile_hint: Option<String>,
+    /// Which GitHub creds (if any) shell_execute should inject for
+    /// this profile. Defaults to `None`; the frontend exposes Bot/User
+    /// in the profile editor dropdown.
+    #[serde(default)]
+    pub github_identity: athen_core::agent_profile::GithubIdentity,
 }
 
 fn input_to_profile(
@@ -5757,6 +5790,7 @@ fn input_to_profile(
         primary_groups: input.primary_groups,
         expertise: input.expertise,
         model_profile_hint: input.model_profile_hint,
+        github_identity: input.github_identity,
         builtin: false,
         created_at,
         updated_at: now,

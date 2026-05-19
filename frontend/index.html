@@ -555,6 +555,71 @@
                 <div id="telegram-test-result" class="test-result hidden"></div>
             </section>
 
+            <section class="settings-section" id="github-identity-section">
+                <h2>GitHub Identity</h2>
+                <p class="settings-description">
+                    Two separate credential slots so Athen's git/gh commands authenticate as
+                    your own account or a dedicated bot account, never silently as whoever's
+                    logged into the host shell. Pick which identity each agent profile uses
+                    in the Agent Profile editor.
+                </p>
+                <p class="settings-description">
+                    Use a <a href="https://github.com/settings/tokens?type=beta" target="_blank">fine-grained personal access token</a>
+                    scoped to the repos you want Athen to touch. For the Bot row, create a
+                    second GitHub account first, then issue the PAT from there.
+                </p>
+
+                <div class="setting-row">
+                    <h3 class="settings-subhead">Bot identity (default for code-flavoured profiles)</h3>
+                </div>
+                <div class="setting-row">
+                    <label for="gh-bot-token">Personal Access Token</label>
+                    <div class="api-key-wrapper">
+                        <input type="password" id="gh-bot-token" class="settings-input" placeholder="github_pat_..." autocomplete="off">
+                        <button class="api-key-toggle" id="gh-bot-token-toggle" title="Show/hide token">&#128065;</button>
+                    </div>
+                    <p class="setting-hint" id="gh-bot-token-hint"></p>
+                </div>
+                <div class="setting-row">
+                    <label for="gh-bot-name">Commit author name</label>
+                    <input type="text" id="gh-bot-name" class="settings-input" placeholder="Athen Bot">
+                </div>
+                <div class="setting-row">
+                    <label for="gh-bot-email">Commit author email</label>
+                    <input type="text" id="gh-bot-email" class="settings-input" placeholder="athen-bot@users.noreply.github.com">
+                </div>
+                <div class="setting-actions">
+                    <button id="test-gh-bot-btn" class="btn-secondary">Test Bot Token</button>
+                    <button id="save-gh-bot-btn" class="btn-primary">Save Bot Identity</button>
+                </div>
+                <div id="gh-bot-test-result" class="test-result hidden"></div>
+
+                <div class="setting-row" style="margin-top:1.5rem;">
+                    <h3 class="settings-subhead">Your identity (for profiles that act as you)</h3>
+                </div>
+                <div class="setting-row">
+                    <label for="gh-user-token">Personal Access Token</label>
+                    <div class="api-key-wrapper">
+                        <input type="password" id="gh-user-token" class="settings-input" placeholder="github_pat_..." autocomplete="off">
+                        <button class="api-key-toggle" id="gh-user-token-toggle" title="Show/hide token">&#128065;</button>
+                    </div>
+                    <p class="setting-hint" id="gh-user-token-hint"></p>
+                </div>
+                <div class="setting-row">
+                    <label for="gh-user-name">Commit author name</label>
+                    <input type="text" id="gh-user-name" class="settings-input" placeholder="Your name">
+                </div>
+                <div class="setting-row">
+                    <label for="gh-user-email">Commit author email</label>
+                    <input type="text" id="gh-user-email" class="settings-input" placeholder="you@example.com">
+                </div>
+                <div class="setting-actions">
+                    <button id="test-gh-user-btn" class="btn-secondary">Test Your Token</button>
+                    <button id="save-gh-user-btn" class="btn-primary">Save Your Identity</button>
+                </div>
+                <div id="gh-user-test-result" class="test-result hidden"></div>
+            </section>
+
             <section class="settings-section" id="calendar-sources-section">
                 <h2>Calendar Sources</h2>
                 <p class="settings-description">
@@ -1325,6 +1390,15 @@
                 <div class="cal-field">
                     <label for="profile-model-hint">Model hint <span class="permissions-subnote">(optional — defaults to your active model)</span></label>
                     <input type="text" id="profile-model-hint" class="settings-input" placeholder="e.g. Smart">
+                </div>
+                <div class="cal-field">
+                    <label for="profile-github-identity">GitHub identity <span class="permissions-subnote">(credentials injected into shell_execute for git/gh)</span></label>
+                    <select id="profile-github-identity" class="settings-input">
+                        <option value="none">None — no git credentials</option>
+                        <option value="bot">Bot — Athen's dedicated GitHub account</option>
+                        <option value="user">You — your own GitHub account</option>
+                    </select>
+                    <p class="setting-hint">Configure each identity's PAT + name + email in Settings → GitHub Identity. The agent never chooses — every shell_execute uses what this profile says.</p>
                 </div>
                 <div class="cal-field profile-token-budget" id="profile-token-budget">
                     <label>Token budget at fresh start <span class="permissions-subnote">(heuristic — actual varies by tokenizer)</span></label>

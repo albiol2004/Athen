@@ -273,6 +273,7 @@ mod tests {
                 primary_groups: vec![],
                 expertise: ExpertiseDeclaration::default(),
                 model_profile_hint: None,
+                github_identity: athen_core::agent_profile::GithubIdentity::None,
                 builtin: false,
                 created_at: now,
                 updated_at: now,

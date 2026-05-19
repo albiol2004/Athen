@@ -48,6 +48,53 @@ pub enum PersonaCategory {
     OutputStyle,
 }
 
+/// Which GitHub credentials, if any, the agent should run git/gh commands
+/// under inside this profile.
+///
+/// Wired by injecting env vars into every `shell_execute` invocation —
+/// `GH_TOKEN`, `GIT_AUTHOR_NAME` / `EMAIL`, `GIT_COMMITTER_NAME` / `EMAIL`,
+/// and a per-identity `GH_CONFIG_DIR`. The agent does not pick its
+/// identity per-command; identity is a property of the profile, set
+/// once by the user in Settings.
+///
+/// Vault scope conventions:
+/// - `github:bot`  → keys `token`, `user_name`, `user_email`
+/// - `github:user` → keys `token`, `user_name`, `user_email`
+///
+/// When the chosen scope has no token configured, no env vars are
+/// injected; the command runs as if `None` had been set. This is
+/// intentional — it means "the profile asks for bot creds but the user
+/// hasn't set them up yet" degrades to "unauthed shell git," not an
+/// error at command time.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum GithubIdentity {
+    /// No GitHub credentials injected. Git/gh commands run with whatever
+    /// the host shell would see (typically nothing — the agent
+    /// workspace is isolated from the user's ~/.gitconfig).
+    #[default]
+    None,
+    /// The bot identity — a dedicated GitHub account whose PAT and
+    /// commit-author identity belong to Athen, not the user.
+    Bot,
+    /// The user's own GitHub identity — agent acts as you. Use when you
+    /// want Athen to operate on repos the bot doesn't have access to,
+    /// or when the audit trail should read as you.
+    User,
+}
+
+impl GithubIdentity {
+    /// Vault scope for this identity's credentials. Returns `None` for
+    /// `GithubIdentity::None` since there are no credentials to fetch.
+    pub fn vault_scope(self) -> Option<&'static str> {
+        match self {
+            GithubIdentity::None => None,
+            GithubIdentity::Bot => Some("github:bot"),
+            GithubIdentity::User => Some("github:user"),
+        }
+    }
+}
+
 /// Which tools a profile can call. `All` is the default; profiles
 /// progressively restrict via `Groups` (group-id whitelist), `Explicit`
 /// (exact-name whitelist), or `Deny` (start from all, subtract these).
@@ -183,6 +230,16 @@ pub struct AgentProfile {
     /// `athen_core::llm::ModelProfile`). When `None`, the default model
     /// profile is used.
     pub model_profile_hint: Option<String>,
+    /// Which GitHub credentials (if any) `shell_execute` should inject
+    /// into every git/gh invocation made under this profile. See
+    /// [`GithubIdentity`].
+    ///
+    /// Defaults to `None`. Built-in profiles whose work is plausibly
+    /// "git-flavoured" (coder / devops / systems_architect) seed to
+    /// `Bot` so the agent has a separate identity by default; the user
+    /// can switch to `User` per-profile in the editor.
+    #[serde(default)]
+    pub github_identity: GithubIdentity,
     pub builtin: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -248,6 +305,7 @@ mod tests {
                 avoid: vec![TaskKindTag::Coding, TaskKindTag::Debugging],
             },
             model_profile_hint: Some("Smart".into()),
+            github_identity: GithubIdentity::None,
             builtin: false,
             created_at: now,
             updated_at: now,

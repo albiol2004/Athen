@@ -18,6 +18,7 @@ pub(crate) mod email_gate;
 pub(crate) mod email_test;
 pub(crate) mod endpoints_render;
 pub(crate) mod file_gate;
+pub(crate) mod github_identity;
 pub(crate) mod http_presets;
 pub(crate) mod http_rate_limiter;
 pub(crate) mod identity_render;
@@ -113,6 +114,9 @@ pub fn run() {
             settings::test_smtp_connection,
             settings::save_telegram_settings,
             settings::test_telegram_connection,
+            settings::get_github_identities,
+            settings::save_github_identity,
+            settings::test_github_identity,
             settings::save_web_search_settings,
             settings::test_web_search_provider,
             settings::get_attachment_policy_settings,

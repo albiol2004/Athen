@@ -26,8 +26,8 @@ use rusqlite::{params, Connection};
 use tokio::sync::Mutex;
 
 use athen_core::agent_profile::{
-    AgentProfile, DomainTag, ExpertiseDeclaration, PersonaCategory, PersonaTemplate, ProfileId,
-    TaskKindTag, TemplateId, ToolSelection,
+    AgentProfile, DomainTag, ExpertiseDeclaration, GithubIdentity, PersonaCategory,
+    PersonaTemplate, ProfileId, TaskKindTag, TemplateId, ToolSelection,
 };
 use athen_core::error::{AthenError, Result};
 use athen_core::traits::profile::ProfileStore;
@@ -45,7 +45,8 @@ CREATE TABLE IF NOT EXISTS agent_profiles (
     builtin INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    primary_groups_json TEXT NOT NULL DEFAULT '[]'
+    primary_groups_json TEXT NOT NULL DEFAULT '[]',
+    github_identity TEXT NOT NULL DEFAULT 'none'
 );
 
 CREATE TABLE IF NOT EXISTS persona_templates (
@@ -85,6 +86,20 @@ impl SqliteProfileStore {
                 if !msg.contains("duplicate column name") {
                     return Err(AthenError::Other(format!(
                         "Add primary_groups_json column: {e}"
+                    )));
+                }
+            }
+            // Same idempotent ALTER for the github_identity field. Installs
+            // predating GithubIdentity inherit the 'none' default — no
+            // surprise credential injection on upgrade.
+            if let Err(e) = conn.execute(
+                "ALTER TABLE agent_profiles ADD COLUMN github_identity TEXT NOT NULL DEFAULT 'none'",
+                [],
+            ) {
+                let msg = e.to_string();
+                if !msg.contains("duplicate column name") {
+                    return Err(AthenError::Other(format!(
+                        "Add github_identity column: {e}"
                     )));
                 }
             }
@@ -236,13 +251,14 @@ impl SqliteProfileStore {
                 serde_json::to_string(&p.expertise).map_err(AthenError::Serialization)?;
             let primary_groups_json =
                 serde_json::to_string(&p.primary_groups).map_err(AthenError::Serialization)?;
+            let github_identity_str = github_identity_to_str(p.github_identity);
             conn.execute(
                 "INSERT OR REPLACE INTO agent_profiles \
                  (id, display_name, description, persona_template_ids_json, \
                   custom_persona_addendum, tool_selection_json, expertise_json, \
                   model_profile_hint, builtin, created_at, updated_at, \
-                  primary_groups_json) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                  primary_groups_json, github_identity) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
                 params![
                     p.id,
                     p.display_name,
@@ -256,6 +272,7 @@ impl SqliteProfileStore {
                     p.created_at.to_rfc3339(),
                     p.updated_at.to_rfc3339(),
                     primary_groups_json,
+                    github_identity_str,
                 ],
             )
             .map_err(|e| AthenError::Other(format!("Insert profile: {e}")))?;
@@ -291,7 +308,8 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
               strengths: Vec<&str>,
               avoid: Vec<TaskKindTag>,
               tool_selection: ToolSelection,
-              primary_groups: Vec<&str>|
+              primary_groups: Vec<&str>,
+              github_identity: GithubIdentity|
      -> AgentProfile {
         AgentProfile {
             id: id.to_string(),
@@ -309,6 +327,7 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
                 avoid,
             },
             model_profile_hint: None,
+            github_identity,
             builtin: true,
             created_at: now,
             updated_at: now,
@@ -329,6 +348,7 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
             primary_groups: vec![],
             expertise: ExpertiseDeclaration::default(),
             model_profile_hint: None,
+            github_identity: GithubIdentity::None,
             builtin: true,
             created_at: now,
             updated_at: now,
@@ -359,6 +379,7 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
             vec![],
             ToolSelection::All,
             vec![],
+            GithubIdentity::None,
         ),
         mk(
             "coder",
@@ -410,6 +431,11 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
             ]),
             // Tier-1 schema set mirrors the callable surface.
             vec!["files", "shell", "memory", "install", "uninstall"],
+            // Code work touches git constantly — seed the bot identity so
+            // commits/pushes/PRs don't accidentally land under the user's
+            // GitHub account. The user can flip to `User` in the profile
+            // editor if they want Athen to act as them.
+            GithubIdentity::Bot,
         ),
         mk(
             "devops",
@@ -437,6 +463,7 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
             vec![],
             ToolSelection::All,
             vec!["files", "shell", "memory", "install", "uninstall"],
+            GithubIdentity::Bot,
         ),
         mk(
             "systems_architect",
@@ -464,6 +491,7 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
             // belongs in the per-profile schema-tiering work, not here.
             ToolSelection::All,
             vec!["files", "web", "memory"],
+            GithubIdentity::Bot,
         ),
         mk(
             "technical_support",
@@ -488,6 +516,7 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
             vec![],
             ToolSelection::All,
             vec![],
+            GithubIdentity::None,
         ),
         mk(
             "researcher",
@@ -505,6 +534,7 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
             vec![],
             ToolSelection::All,
             vec!["web", "files", "memory"],
+            GithubIdentity::None,
         ),
         mk(
             "marketing",
@@ -531,6 +561,7 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
             vec![TaskKindTag::Coding, TaskKindTag::Debugging],
             ToolSelection::All,
             vec!["web", "email", "send", "files", "memory", "contacts"],
+            GithubIdentity::None,
         ),
         mk(
             "social_media",
@@ -561,6 +592,7 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
             vec![TaskKindTag::Coding, TaskKindTag::Debugging],
             ToolSelection::All,
             vec!["web", "send", "files", "memory"],
+            GithubIdentity::None,
         ),
         mk(
             "outreach",
@@ -584,6 +616,7 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
             vec![TaskKindTag::Coding, TaskKindTag::Debugging],
             ToolSelection::All,
             vec!["web", "email", "send", "files", "memory", "contacts"],
+            GithubIdentity::None,
         ),
         mk(
             "lawyer",
@@ -611,6 +644,7 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
             vec![],
             ToolSelection::All,
             vec!["web", "files", "memory"],
+            GithubIdentity::None,
         ),
         mk(
             "doctor",
@@ -638,6 +672,7 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
             vec![],
             ToolSelection::All,
             vec!["web", "files", "memory"],
+            GithubIdentity::None,
         ),
     ]
 }
@@ -682,6 +717,27 @@ struct ProfileRow {
     created_at: String,
     updated_at: String,
     primary_groups_json: String,
+    github_identity: String,
+}
+
+fn github_identity_to_str(g: GithubIdentity) -> &'static str {
+    match g {
+        GithubIdentity::None => "none",
+        GithubIdentity::Bot => "bot",
+        GithubIdentity::User => "user",
+    }
+}
+
+fn str_to_github_identity(s: &str) -> GithubIdentity {
+    // Unknown values silently fall back to `None`. The column has a
+    // server-side default, but an older binary writing rows then a newer
+    // binary reading them could in principle see anything; failing soft
+    // means a typo never blocks the agent from running.
+    match s {
+        "bot" => GithubIdentity::Bot,
+        "user" => GithubIdentity::User,
+        _ => GithubIdentity::None,
+    }
 }
 
 fn row_to_profile(row: ProfileRow) -> Result<AgentProfile> {
@@ -703,6 +759,7 @@ fn row_to_profile(row: ProfileRow) -> Result<AgentProfile> {
         primary_groups,
         expertise,
         model_profile_hint: row.model_profile_hint,
+        github_identity: str_to_github_identity(&row.github_identity),
         builtin: row.builtin != 0,
         created_at: parse_datetime(&row.created_at)?,
         updated_at: parse_datetime(&row.updated_at)?,
@@ -711,7 +768,8 @@ fn row_to_profile(row: ProfileRow) -> Result<AgentProfile> {
 
 const PROFILE_COLS: &str = "id, display_name, description, persona_template_ids_json, \
      custom_persona_addendum, tool_selection_json, expertise_json, \
-     model_profile_hint, builtin, created_at, updated_at, primary_groups_json";
+     model_profile_hint, builtin, created_at, updated_at, primary_groups_json, \
+     github_identity";
 
 fn read_profile_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProfileRow> {
     Ok(ProfileRow {
@@ -727,6 +785,7 @@ fn read_profile_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProfileRow> {
         created_at: row.get(9)?,
         updated_at: row.get(10)?,
         primary_groups_json: row.get(11)?,
+        github_identity: row.get(12)?,
     })
 }
 
@@ -1123,6 +1182,7 @@ mod tests {
                 ..Default::default()
             },
             model_profile_hint: None,
+            github_identity: GithubIdentity::None,
             builtin: false,
             created_at: now,
             updated_at: now,
@@ -1227,6 +1287,7 @@ mod tests {
             primary_groups: vec![],
             expertise: ExpertiseDeclaration::default(),
             model_profile_hint: None,
+            github_identity: GithubIdentity::None,
             builtin: false,
             created_at: now,
             updated_at: now,

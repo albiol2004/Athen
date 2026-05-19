@@ -2904,6 +2904,221 @@ async fn test_google(
 }
 
 // ---------------------------------------------------------------------------
+// GitHub identity settings commands
+// ---------------------------------------------------------------------------
+//
+// Two vault scopes — `github:bot` and `github:user` — each hold:
+//   - `token`       (the PAT)
+//   - `user_name`   (commit author/committer name)
+//   - `user_email`  (commit author/committer email)
+//
+// Agents that opt into a github identity on their profile get these env
+// vars injected into every `shell_execute` (see
+// `athen-app/src/github_identity.rs`). Identity is selected per-profile;
+// the Settings UI just maintains the two credential rows.
+
+const GH_SCOPE_BOT: &str = "github:bot";
+const GH_SCOPE_USER: &str = "github:user";
+const GH_KEY_TOKEN: &str = "token";
+const GH_KEY_USER_NAME: &str = "user_name";
+const GH_KEY_USER_EMAIL: &str = "user_email";
+
+/// Light snapshot of one identity — credentials are NEVER returned;
+/// only "is each field set?" + the non-secret name/email so the UI can
+/// echo what's configured.
+#[derive(serde::Serialize, Debug)]
+pub struct GithubIdentitySettings {
+    pub has_token: bool,
+    pub user_name: String,
+    pub user_email: String,
+}
+
+#[derive(serde::Serialize, Debug)]
+pub struct GithubIdentitiesSnapshot {
+    pub bot: GithubIdentitySettings,
+    pub user: GithubIdentitySettings,
+}
+
+fn which_scope(identity: &str) -> std::result::Result<&'static str, String> {
+    match identity {
+        "bot" => Ok(GH_SCOPE_BOT),
+        "user" => Ok(GH_SCOPE_USER),
+        other => Err(format!(
+            "Unknown GitHub identity '{other}' — expected 'bot' or 'user'"
+        )),
+    }
+}
+
+async fn load_one_identity(
+    vault: &Arc<dyn athen_core::traits::vault::Vault>,
+    scope: &str,
+) -> GithubIdentitySettings {
+    let has_token = matches!(
+        vault.get(scope, GH_KEY_TOKEN).await,
+        Ok(Some(t)) if !t.is_empty()
+    );
+    let user_name = vault
+        .get(scope, GH_KEY_USER_NAME)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let user_email = vault
+        .get(scope, GH_KEY_USER_EMAIL)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    GithubIdentitySettings {
+        has_token,
+        user_name,
+        user_email,
+    }
+}
+
+/// Return what's configured for both identities. Credentials never leave
+/// the vault — only the public commit name/email + a `has_token` flag.
+#[tauri::command]
+pub async fn get_github_identities(
+    state: State<'_, AppState>,
+) -> std::result::Result<GithubIdentitiesSnapshot, String> {
+    let Some(vault) = state.vault.as_ref() else {
+        return Ok(GithubIdentitiesSnapshot {
+            bot: GithubIdentitySettings {
+                has_token: false,
+                user_name: String::new(),
+                user_email: String::new(),
+            },
+            user: GithubIdentitySettings {
+                has_token: false,
+                user_name: String::new(),
+                user_email: String::new(),
+            },
+        });
+    };
+    Ok(GithubIdentitiesSnapshot {
+        bot: load_one_identity(vault, GH_SCOPE_BOT).await,
+        user: load_one_identity(vault, GH_SCOPE_USER).await,
+    })
+}
+
+/// Save credentials for one identity (`bot` or `user`).
+///
+/// `token`: `None` keeps the existing value, `Some("")` clears, `Some(x)` sets.
+/// `user_name`/`user_email`: always overwrite (these aren't secret).
+#[tauri::command]
+pub async fn save_github_identity(
+    identity: String,
+    token: Option<String>,
+    user_name: String,
+    user_email: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<String, String> {
+    let scope = which_scope(&identity)?;
+    let Some(vault) = state.vault.as_ref() else {
+        return Err("Vault not available — credentials cannot be stored.".to_string());
+    };
+
+    match token {
+        Some(t) if t.is_empty() => {
+            vault
+                .delete(scope, GH_KEY_TOKEN)
+                .await
+                .map_err(|e| format!("Clear token: {e}"))?;
+        }
+        Some(t) => {
+            vault
+                .set(scope, GH_KEY_TOKEN, &t)
+                .await
+                .map_err(|e| format!("Store token: {e}"))?;
+        }
+        None => {}
+    }
+
+    vault
+        .set(scope, GH_KEY_USER_NAME, &user_name)
+        .await
+        .map_err(|e| format!("Store user_name: {e}"))?;
+    vault
+        .set(scope, GH_KEY_USER_EMAIL, &user_email)
+        .await
+        .map_err(|e| format!("Store user_email: {e}"))?;
+
+    Ok(format!("{identity} identity saved."))
+}
+
+/// Test a GitHub PAT by hitting `GET /user` on api.github.com. Returns
+/// the resolved login + `name` for the UI to confirm "yes, this is the
+/// account we'll commit as." Token isn't persisted by this call —
+/// callers pass it explicitly so they can validate before saving.
+#[tauri::command]
+pub async fn test_github_identity(token: String) -> std::result::Result<TestResult, String> {
+    if token.is_empty() {
+        return Ok(TestResult {
+            success: false,
+            message: "Token is required.".to_string(),
+        });
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+    let resp = client
+        .get("https://api.github.com/user")
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header("User-Agent", "Athen")
+        .send()
+        .await;
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            let body: serde_json::Value = r
+                .json()
+                .await
+                .map_err(|e| format!("Invalid response: {e}"))?;
+            let login = body
+                .get("login")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let name = body
+                .get("name")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+            let msg = if let Some(n) = name {
+                format!("Authenticated as @{login} ({n})")
+            } else {
+                format!("Authenticated as @{login}")
+            };
+            Ok(TestResult {
+                success: true,
+                message: msg,
+            })
+        }
+        Ok(r) => {
+            let status = r.status();
+            let text = r.text().await.unwrap_or_default();
+            let detail = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|v| {
+                    v.get("message")
+                        .and_then(|m| m.as_str())
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_else(|| text.chars().take(200).collect());
+            Ok(TestResult {
+                success: false,
+                message: format!("HTTP {status}: {detail}"),
+            })
+        }
+        Err(e) => Ok(TestResult {
+            success: false,
+            message: format!("Connection failed: {e}"),
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests — onboarding non-destructive behavior
 // ---------------------------------------------------------------------------
 //
