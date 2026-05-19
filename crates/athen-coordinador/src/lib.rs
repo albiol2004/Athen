@@ -465,6 +465,7 @@ mod tests {
                 },
                 evaluation_method: EvaluationMethod::RuleBased,
                 complexity: None,
+                plan: None,
             })
         }
 

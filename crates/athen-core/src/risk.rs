@@ -21,6 +21,31 @@ pub struct RiskScore {
     /// the static call-site tier.
     #[serde(default)]
     pub complexity: Option<ComplexityTag>,
+    /// LLM-drafted mini-plan piggybacked on the risk evaluation step. The
+    /// compactor uses both fields (acceptance_criteria + scope) to decide
+    /// what to keep verbatim and what to drop. The completion judge uses
+    /// `acceptance_criteria` only — scope on the judge would invite false
+    /// "out-of-scope" failures when the user actually wanted the side-quest.
+    /// `None` for regex-only scored actions and for any persisted score
+    /// predating this field.
+    #[serde(default)]
+    pub plan: Option<TriagePlan>,
+}
+
+/// A tiny task plan drafted by the same LLM call that evaluates risk, so
+/// we don't pay for a second classification round-trip. Both fields are
+/// short by design — this rides in the static prefix and survives
+/// compaction as arc-level metadata, not as a chat message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TriagePlan {
+    /// One to three lines describing what "done" looks like for this task.
+    /// Fed to the completion judge and used by the compactor as a relevance
+    /// signal (turns mentioning these tokens are sticky).
+    pub acceptance_criteria: String,
+    /// One sentence describing what the task is NOT — drift fence used by
+    /// the compactor to drop turns that wandered off-mission. Never fed to
+    /// the completion judge.
+    pub scope: String,
 }
 
 /// LLM-judged hardness of a task. Mapped to a `ModelProfile` via

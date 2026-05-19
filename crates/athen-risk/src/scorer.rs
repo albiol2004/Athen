@@ -50,6 +50,8 @@ impl RiskScorer {
             // Regex can't judge hardness — absence is the right signal,
             // the LLM-fallback path is the only one that fills this in.
             complexity: None,
+            // Same story for the triage plan: regex doesn't draft plans.
+            plan: None,
         }
     }
 }

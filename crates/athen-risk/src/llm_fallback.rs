@@ -7,10 +7,21 @@ use athen_core::contact::TrustLevel;
 use athen_core::llm::{ChatMessage, LlmRequest, LlmResponse, MessageContent, ModelProfile, Role};
 use athen_core::risk::{
     BaseImpact, ComplexityTag, DataSensitivity, EvaluationMethod, RiskContext, RiskScore,
+    TriagePlan,
 };
 use athen_core::traits::llm::LlmRouter;
 
 use crate::scorer::RiskScorer;
+
+/// Parsed payload from the LLM risk-evaluation response. Internal —
+/// callers consume the assembled `RiskScore`, not this intermediate.
+struct ParsedRiskResponse {
+    impact: BaseImpact,
+    sensitivity: DataSensitivity,
+    confidence: f64,
+    complexity: Option<ComplexityTag>,
+    plan: Option<TriagePlan>,
+}
 
 /// LLM-assisted risk evaluator for cases where regex rules are insufficient.
 pub struct LlmRiskEvaluator {
@@ -59,7 +70,13 @@ impl LlmRiskEvaluator {
             }
         };
 
-        let (impact, sensitivity, confidence, complexity) = match self.parse_response(&response) {
+        let ParsedRiskResponse {
+            impact,
+            sensitivity,
+            confidence,
+            complexity,
+            plan,
+        } = match self.parse_response(&response) {
             Some(parsed) => parsed,
             None => {
                 tracing::warn!(
@@ -85,6 +102,7 @@ impl LlmRiskEvaluator {
             self.scorer
                 .compute(impact, &effective_context, EvaluationMethod::LlmAssisted);
         score.complexity = complexity;
+        score.plan = plan;
         Ok(score)
     }
 
@@ -133,11 +151,21 @@ impl LlmRiskEvaluator {
             "- \"sensitivity\": one of \"plain\", \"personal_info\", \"secrets\"\n",
             "- \"confidence\": a float between 0.0 and 1.0 indicating your confidence\n",
             "- \"complexity\": one of \"low\", \"medium\", \"high\" — how hard the task is for the agent (NOT how risky)\n",
+            "- \"acceptance_criteria\": one or two short lines describing what \"done\" looks like for this task. Concrete and testable. Empty string \"\" if the task is conversational and has no done-criterion.\n",
+            "- \"scope\": one short sentence naming what the task is NOT, to fence the agent from drift. Empty string \"\" if there is no useful fence.\n",
             "- \"reasoning\": a brief explanation\n\n",
             "Complexity levels (judge difficulty, not danger — a one-line `rm -rf /` is HIGH risk but LOW complexity):\n",
             "- low: single-shot trivial — read one file, look up a fact, summarize a short message, send a one-line reply\n",
             "- medium: multi-step but standard — write a small script, edit a few files, send a structured reply, look up + summarize\n",
             "- high: open-ended / requires reasoning across many constraints — design a system, debug across modules, write substantial code, plan a multi-day workflow\n\n",
+            "acceptance_criteria examples:\n",
+            "- \"Reply to João's email confirming the Q3 contract terms.\" (for \"draft reply to that contract email\")\n",
+            "- \"src/auth.rs no longer panics on empty tokens; test suite passes.\" (for \"fix the auth bug\")\n",
+            "- \"\" (for \"hey how are you\" — no done-criterion)\n\n",
+            "scope examples:\n",
+            "- \"NOT a full refactor of the auth module.\" (fences a bug-fix task)\n",
+            "- \"NOT a multi-message conversation — single reply only.\" (fences an email task)\n",
+            "- \"\" (when no fence helps)\n\n",
             "Impact levels:\n",
             "- read: Read-only, no side effects (listing files, reading, searching)\n",
             "- write_temp: Creates temporary/reversible changes (writing to /tmp)\n",
@@ -165,7 +193,9 @@ impl LlmRiskEvaluator {
                 role: Role::User,
                 content: MessageContent::Text(user_message),
             }],
-            max_tokens: Some(256),
+            // Bumped from 256 to fit acceptance_criteria + scope alongside
+            // the existing impact/sensitivity/complexity/reasoning fields.
+            max_tokens: Some(512),
             temperature: Some(0.0),
             tools: None,
             system_prompt: Some(system_prompt.to_string()),
@@ -178,10 +208,7 @@ impl LlmRiskEvaluator {
     /// trust-weighted conservative fallback on `None` — embedding a fixed
     /// "assume the worst" tuple here used to silently HardBlock trusted
     /// contacts on any local-model JSON wobble.
-    fn parse_response(
-        &self,
-        response: &LlmResponse,
-    ) -> Option<(BaseImpact, DataSensitivity, f64, Option<ComplexityTag>)> {
+    fn parse_response(&self, response: &LlmResponse) -> Option<ParsedRiskResponse> {
         let content = &response.content;
         let v: serde_json::Value = serde_json::from_str(content).ok()?;
 
@@ -218,7 +245,37 @@ impl LlmRiskEvaluator {
             }
         });
 
-        Some((impact, sensitivity, confidence, complexity))
+        // Plan is best-effort like complexity. Both fields must be present
+        // and non-empty after trimming for the plan to be useful; otherwise
+        // we drop it cleanly rather than persisting a half-formed plan that
+        // would mislead the compactor + judge downstream.
+        let plan = {
+            let acceptance = v
+                .get("acceptance_criteria")
+                .and_then(|c| c.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let scope = v
+                .get("scope")
+                .and_then(|c| c.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            match (acceptance, scope) {
+                (Some(a), Some(s)) => Some(TriagePlan {
+                    acceptance_criteria: a.to_string(),
+                    scope: s.to_string(),
+                }),
+                _ => None,
+            }
+        };
+
+        Some(ParsedRiskResponse {
+            impact,
+            sensitivity,
+            confidence,
+            complexity,
+            plan,
+        })
     }
 }
 
@@ -454,6 +511,93 @@ mod tests {
             EvaluationMethod::RuleBased,
         );
         assert!(score.complexity.is_none());
+    }
+
+    #[tokio::test]
+    async fn parses_plan_when_both_fields_present() {
+        let json = r#"{"impact":"read","sensitivity":"plain","confidence":1.0,"acceptance_criteria":"Reply to João confirming Q3 terms.","scope":"NOT a multi-message thread."}"#;
+        let router = MockRouter::new(json);
+        let evaluator = LlmRiskEvaluator::new(Box::new(router));
+        let score = evaluator
+            .evaluate("draft reply", &default_ctx())
+            .await
+            .unwrap();
+        let plan = score.plan.expect("plan should be parsed");
+        assert_eq!(
+            plan.acceptance_criteria,
+            "Reply to João confirming Q3 terms."
+        );
+        assert_eq!(plan.scope, "NOT a multi-message thread.");
+    }
+
+    #[tokio::test]
+    async fn plan_missing_falls_through_to_none() {
+        // Older / smaller models that ignore the new rubric must not break
+        // the score; plan stays None and downstream consumers (executor,
+        // compactor, judge) fall through to plan-less behaviour.
+        let json = r#"{"impact":"read","sensitivity":"plain","confidence":1.0}"#;
+        let router = MockRouter::new(json);
+        let evaluator = LlmRiskEvaluator::new(Box::new(router));
+        let score = evaluator
+            .evaluate("anything", &default_ctx())
+            .await
+            .unwrap();
+        assert!(score.plan.is_none());
+    }
+
+    #[tokio::test]
+    async fn plan_with_only_acceptance_is_dropped() {
+        let json = r#"{"impact":"read","sensitivity":"plain","confidence":1.0,"acceptance_criteria":"foo done"}"#;
+        let router = MockRouter::new(json);
+        let evaluator = LlmRiskEvaluator::new(Box::new(router));
+        let score = evaluator
+            .evaluate("anything", &default_ctx())
+            .await
+            .unwrap();
+        assert!(
+            score.plan.is_none(),
+            "half-formed plan must not persist — both fields required"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_with_only_scope_is_dropped() {
+        let json =
+            r#"{"impact":"read","sensitivity":"plain","confidence":1.0,"scope":"NOT a refactor"}"#;
+        let router = MockRouter::new(json);
+        let evaluator = LlmRiskEvaluator::new(Box::new(router));
+        let score = evaluator
+            .evaluate("anything", &default_ctx())
+            .await
+            .unwrap();
+        assert!(score.plan.is_none());
+    }
+
+    #[tokio::test]
+    async fn plan_with_empty_strings_is_dropped() {
+        // Models tend to emit empty-string placeholders for fields they
+        // don't know how to fill. Treat as missing — empty acceptance
+        // would poison the completion judge's mismatch check.
+        let json = r#"{"impact":"read","sensitivity":"plain","confidence":1.0,"acceptance_criteria":"   ","scope":""}"#;
+        let router = MockRouter::new(json);
+        let evaluator = LlmRiskEvaluator::new(Box::new(router));
+        let score = evaluator
+            .evaluate("hey how are you", &default_ctx())
+            .await
+            .unwrap();
+        assert!(score.plan.is_none());
+    }
+
+    #[test]
+    fn regex_scorer_emits_no_plan() {
+        // Regex can't draft plans either — same fall-through as complexity.
+        let scorer = RiskScorer::new();
+        let score = scorer.compute(
+            BaseImpact::Read,
+            &default_ctx(),
+            EvaluationMethod::RuleBased,
+        );
+        assert!(score.plan.is_none());
     }
 
     #[tokio::test]

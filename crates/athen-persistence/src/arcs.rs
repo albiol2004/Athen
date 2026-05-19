@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use athen_core::error::{AthenError, Result};
+use athen_core::risk::TriagePlan;
 
 /// The source that originated an Arc.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -139,6 +140,31 @@ pub struct ArcMeta {
     /// distinct from the first-call-wins `pinned_*` columns because this
     /// is a durable user preference, not an in-flight snapshot.
     pub tier_override: Option<String>,
+    /// Mini-plan drafted by the triage LLM call (same call that evaluates
+    /// risk + complexity — see `RiskScore.plan`). Captured once at task
+    /// creation, then survives compaction as arc-level metadata. The
+    /// executor renders it into a `<MISSION>` block in the static prefix,
+    /// the completion judge reads `acceptance_criteria`, and the
+    /// compactor reads both fields as a relevance + drift-fence signal.
+    /// Both fields must be present and non-empty for the plan to be
+    /// considered usable — half-plans collapse to `None` (same invariant
+    /// as the parser in `athen-risk::llm_fallback`).
+    pub triage_plan: Option<TriagePlan>,
+}
+
+/// Assemble a `TriagePlan` from two raw columns. Returns `None` unless
+/// both fields are present and non-empty after trimming — the same
+/// "half-plan is no plan" rule the LLM parser enforces, applied here so
+/// a database that somehow ended up with one column populated and the
+/// other null doesn't surface a malformed plan to downstream consumers.
+fn assemble_plan(acceptance: Option<String>, scope: Option<String>) -> Option<TriagePlan> {
+    match (acceptance, scope) {
+        (Some(a), Some(s)) if !a.trim().is_empty() && !s.trim().is_empty() => Some(TriagePlan {
+            acceptance_criteria: a,
+            scope: s,
+        }),
+        _ => None,
+    }
 }
 
 /// The type of an entry within an Arc.
@@ -376,6 +402,23 @@ impl ArcStore {
                     .map_err(|e| AthenError::Other(format!("Add tier_override: {e}")))?;
             }
 
+            // Column-level migration: `triage_plan_acceptance` +
+            // `triage_plan_scope` hold the mini-plan drafted by the LLM
+            // risk-evaluation call at task triage. Two columns rather
+            // than one JSON blob so a future "search arcs by mission"
+            // can index `acceptance_criteria` directly.
+            if !cols.contains("triage_plan_acceptance") {
+                conn.execute(
+                    "ALTER TABLE arcs ADD COLUMN triage_plan_acceptance TEXT",
+                    [],
+                )
+                .map_err(|e| AthenError::Other(format!("Add triage_plan_acceptance: {e}")))?;
+            }
+            if !cols.contains("triage_plan_scope") {
+                conn.execute("ALTER TABLE arcs ADD COLUMN triage_plan_scope TEXT", [])
+                    .map_err(|e| AthenError::Other(format!("Add triage_plan_scope: {e}")))?;
+            }
+
             Ok(())
         })
         .await
@@ -446,7 +489,8 @@ impl ArcStore {
                             a.summarized_through_entry_id, \
                             a.pinned_provider_id, a.pinned_slug, \
                             a.reasoning_effort_override, \
-                            a.tier_override \
+                            a.tier_override, \
+                            a.triage_plan_acceptance, a.triage_plan_scope \
                      FROM arcs a \
                      LEFT JOIN ( \
                          SELECT arc_id, COUNT(*) AS cnt \
@@ -475,6 +519,7 @@ impl ArcStore {
                         pinned_slug: row.get(13)?,
                         reasoning_effort_override: row.get(14)?,
                         tier_override: row.get(15)?,
+                        triage_plan: assemble_plan(row.get(16)?, row.get(17)?),
                     })
                 })
                 .map_err(|e| AthenError::Other(format!("Query get arc: {e}")))?;
@@ -523,7 +568,8 @@ impl ArcStore {
                         a.summarized_through_entry_id, \
                         a.pinned_provider_id, a.pinned_slug, \
                         a.reasoning_effort_override, \
-                        a.tier_override \
+                        a.tier_override, \
+                        a.triage_plan_acceptance, a.triage_plan_scope \
                  FROM arcs a \
                  LEFT JOIN ( \
                      SELECT arc_id, COUNT(*) AS cnt \
@@ -555,6 +601,7 @@ impl ArcStore {
                         pinned_slug: row.get(13)?,
                         reasoning_effort_override: row.get(14)?,
                         tier_override: row.get(15)?,
+                        triage_plan: assemble_plan(row.get(16)?, row.get(17)?),
                     })
                 })
                 .map_err(|e| AthenError::Other(format!("Query list arcs: {e}")))?;
@@ -772,6 +819,64 @@ impl ArcStore {
             )
             .map_err(|e| AthenError::Other(format!("Set tier_override: {e}")))?;
             Ok(())
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
+    /// Store the triage plan drafted at task creation. Pass `None` to
+    /// clear both columns (used when an arc rolls into a wholly new
+    /// task and the prior plan no longer describes what's running).
+    /// Both columns are updated atomically so an interrupted write can't
+    /// leave a half-plan behind that `assemble_plan` would silently drop.
+    pub async fn set_triage_plan(&self, id: &str, plan: Option<&TriagePlan>) -> Result<()> {
+        let conn = self.conn.clone();
+        let id = id.to_string();
+        let acceptance = plan.map(|p| p.acceptance_criteria.clone());
+        let scope = plan.map(|p| p.scope.clone());
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE arcs SET triage_plan_acceptance = ?1, triage_plan_scope = ?2 \
+                 WHERE id = ?3",
+                params![acceptance, scope, id],
+            )
+            .map_err(|e| AthenError::Other(format!("Set triage_plan: {e}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
+    /// Write-once variant: store the plan only if both columns are
+    /// currently NULL or empty. Returns `true` if it wrote, `false` if
+    /// the arc already had a plan. Mirrors `set_pinned_provider_if_unset`
+    /// — the production "first task on the arc sets the mission, later
+    /// turns inherit" policy. Pass `None` and it short-circuits without
+    /// writing.
+    pub async fn set_triage_plan_if_absent(
+        &self,
+        id: &str,
+        plan: Option<&TriagePlan>,
+    ) -> Result<bool> {
+        let Some(plan) = plan else { return Ok(false) };
+        let conn = self.conn.clone();
+        let id = id.to_string();
+        let acceptance = plan.acceptance_criteria.clone();
+        let scope = plan.scope.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let affected = conn
+                .execute(
+                    "UPDATE arcs \
+                     SET triage_plan_acceptance = ?1, triage_plan_scope = ?2 \
+                     WHERE id = ?3 \
+                       AND (triage_plan_acceptance IS NULL OR triage_plan_acceptance = '') \
+                       AND (triage_plan_scope IS NULL OR triage_plan_scope = '')",
+                    params![acceptance, scope, id],
+                )
+                .map_err(|e| AthenError::Other(format!("Set triage_plan_if_absent: {e}")))?;
+            Ok(affected > 0)
         })
         .await
         .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
@@ -1231,7 +1336,9 @@ CREATE TABLE IF NOT EXISTS arcs (
     pinned_provider_id TEXT,
     pinned_slug TEXT,
     reasoning_effort_override TEXT,
-    tier_override TEXT
+    tier_override TEXT,
+    triage_plan_acceptance TEXT,
+    triage_plan_scope TEXT
 );
 
 CREATE TABLE IF NOT EXISTS arc_entries (
@@ -2659,5 +2766,130 @@ mod tests {
         store.set_tier_override("arc_t", None).await.unwrap();
         let meta = store.get_arc("arc_t").await.unwrap().expect("arc present");
         assert_eq!(meta.tier_override, None);
+    }
+
+    /// Triage plan round-trip: defaults to None, both columns are
+    /// updated atomically, half-plans on the database side collapse to
+    /// None when read back, and the value surfaces through both
+    /// `get_arc` and `list_arcs`.
+    #[tokio::test]
+    async fn test_triage_plan_set_get_clear() {
+        let store = setup_arc_store().await;
+        store
+            .create_arc("arc_p", "Plan arc", ArcSource::UserInput)
+            .await
+            .unwrap();
+
+        let meta = store.get_arc("arc_p").await.unwrap().expect("arc present");
+        assert!(meta.triage_plan.is_none());
+
+        let plan = TriagePlan {
+            acceptance_criteria: "Reply once with Q3 terms confirmed.".to_string(),
+            scope: "NOT a multi-message thread.".to_string(),
+        };
+        store.set_triage_plan("arc_p", Some(&plan)).await.unwrap();
+        let meta = store.get_arc("arc_p").await.unwrap().expect("arc present");
+        let stored = meta.triage_plan.expect("plan stored");
+        assert_eq!(stored.acceptance_criteria, plan.acceptance_criteria);
+        assert_eq!(stored.scope, plan.scope);
+
+        // list_arcs sees the same plan.
+        let listed = store.list_arcs().await.unwrap();
+        let row = listed.iter().find(|a| a.id == "arc_p").unwrap();
+        assert_eq!(
+            row.triage_plan
+                .as_ref()
+                .map(|p| p.acceptance_criteria.as_str()),
+            Some(plan.acceptance_criteria.as_str())
+        );
+
+        // Clear restores None.
+        store.set_triage_plan("arc_p", None).await.unwrap();
+        let meta = store.get_arc("arc_p").await.unwrap().expect("arc present");
+        assert!(meta.triage_plan.is_none());
+    }
+
+    /// Write-once helper: first call wins, subsequent calls observe and
+    /// return false. Modeled on `set_pinned_provider_if_unset`.
+    #[tokio::test]
+    async fn test_triage_plan_if_absent_write_once() {
+        let store = setup_arc_store().await;
+        store
+            .create_arc("arc_once", "Once", ArcSource::UserInput)
+            .await
+            .unwrap();
+
+        let plan_a = TriagePlan {
+            acceptance_criteria: "first plan".to_string(),
+            scope: "first scope".to_string(),
+        };
+        let wrote = store
+            .set_triage_plan_if_absent("arc_once", Some(&plan_a))
+            .await
+            .unwrap();
+        assert!(wrote, "first write should succeed");
+
+        let plan_b = TriagePlan {
+            acceptance_criteria: "second plan".to_string(),
+            scope: "second scope".to_string(),
+        };
+        let wrote = store
+            .set_triage_plan_if_absent("arc_once", Some(&plan_b))
+            .await
+            .unwrap();
+        assert!(!wrote, "second write must be a no-op");
+
+        let meta = store
+            .get_arc("arc_once")
+            .await
+            .unwrap()
+            .expect("arc present");
+        let stored = meta.triage_plan.expect("plan stored");
+        assert_eq!(stored.acceptance_criteria, "first plan");
+        assert_eq!(stored.scope, "first scope");
+
+        // Passing None short-circuits cleanly.
+        let wrote = store
+            .set_triage_plan_if_absent("arc_once", None)
+            .await
+            .unwrap();
+        assert!(!wrote);
+    }
+
+    /// Half-plans on the database side (one column populated, the other
+    /// NULL or empty) must collapse to None — same invariant the LLM
+    /// parser enforces, applied at read time as a defense layer in case
+    /// some future code path writes only one column.
+    #[tokio::test]
+    async fn test_triage_plan_half_plan_collapses_to_none() {
+        let store = setup_arc_store().await;
+        store
+            .create_arc("arc_half", "Half plan", ArcSource::UserInput)
+            .await
+            .unwrap();
+
+        // Write directly via raw SQL to simulate a malformed row.
+        let conn = store.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE arcs SET triage_plan_acceptance = ?1, triage_plan_scope = ?2 \
+                 WHERE id = ?3",
+                params!["acceptance only", Option::<String>::None, "arc_half"],
+            )
+            .unwrap();
+        })
+        .await
+        .unwrap();
+
+        let meta = store
+            .get_arc("arc_half")
+            .await
+            .unwrap()
+            .expect("arc present");
+        assert!(
+            meta.triage_plan.is_none(),
+            "half-plan must collapse to None on read"
+        );
     }
 }
