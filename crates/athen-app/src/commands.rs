@@ -121,6 +121,7 @@ fn spawn_router_approval(
         telegram_chat_log: state.telegram_chat_log.clone(),
         owner_check: state.owner_destination_check(),
         github_identity_resolver: state.github_identity_resolver.clone(),
+        checkpoint_store: state.checkpoint_store.clone(),
         attachment_store: state.attachment_store(),
         active_provider_id_snapshot: active_provider_id_snapshot.clone(),
         wakeup_store: state
@@ -266,6 +267,7 @@ fn spawn_router_approval(
             telegram_chat_log: bg_ctx.telegram_chat_log.clone(),
             owner_check: bg_ctx.owner_check.clone(),
             github_identity_resolver: bg_ctx.github_identity_resolver.clone(),
+            checkpoint_store: bg_ctx.checkpoint_store.clone(),
             initial_user_images: Vec::new(),
             attachment_store: bg_ctx.attachment_store.clone(),
             compaction_trigger_tokens,
@@ -378,6 +380,9 @@ struct ApprovedTaskBgCtx {
     /// Resolver for GitHub identity env vars injected into shell_execute.
     /// Mirrors `email_sender` in lifecycle. Built once at AppState::new.
     github_identity_resolver: Option<Arc<dyn athen_agent::tools::GithubIdentityResolver>>,
+    /// Git-backed snapshot store for agent-action undo. `None` on CLI/test
+    /// builds. Threaded into the per-arc registry by `execute_dispatched_task`.
+    checkpoint_store: Option<Arc<dyn athen_core::traits::checkpoint::CheckpointStore>>,
     attachment_store: Option<athen_persistence::attachments::AttachmentStore>,
     /// Active provider id at the moment `spawn_router_approval` was called.
     /// Used inside the spawned async block to resolve the effective
@@ -2693,6 +2698,7 @@ pub async fn approve_task(
         telegram_chat_log: state.telegram_chat_log.clone(),
         owner_check: state.owner_destination_check(),
         github_identity_resolver: state.github_identity_resolver.clone(),
+        checkpoint_store: state.checkpoint_store.clone(),
         // Approved-via-card path: original images aren't restashed yet
         // (Phase 2 will mirror `pending_message` for images). For now,
         // images flow through the direct-execution path in `send_message`,
@@ -2855,6 +2861,10 @@ pub(crate) struct ApprovedTaskCtx {
     /// in-app runs. `None` on CLI/test builds — shell_execute then runs
     /// git/gh unauthed.
     pub github_identity_resolver: Option<Arc<dyn athen_agent::tools::GithubIdentityResolver>>,
+    /// Git-backed snapshot store. When wired, `write`/`edit` tools
+    /// snapshot pre-state into the arc's snapshot branch before
+    /// mutating. `None` on CLI/test builds.
+    pub checkpoint_store: Option<Arc<dyn athen_core::traits::checkpoint::CheckpointStore>>,
     /// Images attached to this turn's user message. Empty in the
     /// background/Telegram path; the in-app composer populates this when
     /// the user pastes or drops an image. Forwarded into the executor so
@@ -3223,7 +3233,9 @@ pub(crate) async fn execute_approved_task(
         .with_telegram_sender_opt(ctx.telegram_sender.clone())
         .with_owner_check_opt(ctx.owner_check.clone())
         .with_github_identity(github_identity_for_arc)
-        .with_github_identity_resolver_opt(ctx.github_identity_resolver.clone());
+        .with_github_identity_resolver_opt(ctx.github_identity_resolver.clone())
+        .with_checkpoint_store_opt(ctx.checkpoint_store.clone())
+        .with_checkpoint_arc_id(ctx.active_arc_id.clone());
     if let Some(ref store) = ctx.grant_store {
         let provider = Arc::new(crate::file_gate::ArcWritableProvider {
             arc_id: crate::file_gate::arc_uuid(&ctx.active_arc_id),
@@ -4281,7 +4293,9 @@ pub(crate) async fn execute_dispatched_task(
         .with_telegram_sender_opt(ctx.telegram_sender.clone())
         .with_owner_check_opt(ctx.owner_check.clone())
         .with_github_identity(github_identity_for_arc)
-        .with_github_identity_resolver_opt(ctx.github_identity_resolver.clone());
+        .with_github_identity_resolver_opt(ctx.github_identity_resolver.clone())
+        .with_checkpoint_store_opt(ctx.checkpoint_store.clone())
+        .with_checkpoint_arc_id(ctx.active_arc_id.clone());
     if let Some(ref store) = ctx.grant_store {
         let provider = Arc::new(crate::file_gate::ArcWritableProvider {
             arc_id: crate::file_gate::arc_uuid(&arc_id),
@@ -5322,6 +5336,42 @@ pub async fn list_active_agents(
     let mut snap = reg.snapshot().await;
     snap.sort_by_key(|a| std::cmp::Reverse(a.started_at));
     Ok(snap)
+}
+
+/// Phase-1 smoke surface for the checkpoint store. Returns every
+/// snapshotted action recorded against the given arc, newest first.
+/// Frontend integration (Changes side rail) lands in phase 3; for now
+/// this is callable from the dev console as
+/// `__TAURI__.core.invoke('list_arc_snapshots', { arcId })`.
+#[tauri::command]
+pub async fn list_arc_snapshots(
+    state: State<'_, AppState>,
+    arc_id: String,
+) -> std::result::Result<Vec<athen_core::traits::checkpoint::ActionRecord>, String> {
+    let store = state
+        .checkpoint_store
+        .as_ref()
+        .ok_or_else(|| "checkpoint store not initialized".to_string())?;
+    store.list_actions(&arc_id).await.map_err(|e| e.to_string())
+}
+
+/// Revert a single snapshotted action by its `action_id`. Idempotent —
+/// reverting an already-reverted action returns an empty outcome with no
+/// error. Phase-1 smoke surface; future phase 3 wires this to the
+/// Revert button on tool cards.
+#[tauri::command]
+pub async fn revert_snapshot(
+    state: State<'_, AppState>,
+    action_id: String,
+) -> std::result::Result<athen_core::traits::checkpoint::RevertOutcome, String> {
+    let store = state
+        .checkpoint_store
+        .as_ref()
+        .ok_or_else(|| "checkpoint store not initialized".to_string())?;
+    store
+        .revert_action(&action_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Most recent finalized agent runs, newest-first. Backs the "history"

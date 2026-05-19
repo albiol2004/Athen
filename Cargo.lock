@@ -312,6 +312,7 @@ dependencies = [
  "async-trait",
  "athen-agent",
  "athen-caldav",
+ "athen-checkpoint",
  "athen-contacts",
  "athen-coordinador",
  "athen-core",

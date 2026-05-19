@@ -15,6 +15,7 @@ use athen_core::paths;
 use athen_core::risk::{BaseImpact, DataSensitivity, RiskContext, RiskLevel};
 use athen_core::sandbox::{SandboxLevel, SandboxProfile};
 use athen_core::tool::{ToolBackend, ToolDefinition, ToolResult};
+use athen_core::traits::checkpoint::CheckpointStore;
 use athen_core::traits::email_sender::{EmailSender, OutboundEmail};
 use athen_core::traits::shell::{ShellExecutor, ShellOptions};
 use athen_core::traits::telegram_sender::{
@@ -392,6 +393,14 @@ pub struct ShellToolRegistry {
     /// Wired by `athen-app` against the vault. When `None` (CLI/tests),
     /// no env injection happens regardless of `github_identity`.
     github_identity_resolver: Option<Arc<dyn GithubIdentityResolver>>,
+    /// Git-backed snapshot store. When wired together with
+    /// `checkpoint_arc_id`, the `write`/`edit` tools snapshot pre-state
+    /// before mutating so the user can revert. `None` on CLI/tests.
+    checkpoint_store: Option<Arc<dyn CheckpointStore>>,
+    /// Arc the snapshot store should associate this registry's actions
+    /// with. Set per-arc by the composition root. `None` falls back to
+    /// "no snapshot" even if the store is wired.
+    checkpoint_arc_id: Option<String>,
 }
 
 /// Defense-in-depth: tolerate args delivered as a JSON-encoded string
@@ -721,6 +730,8 @@ impl ShellToolRegistry {
             spawn_persistence: None,
             github_identity: athen_core::agent_profile::GithubIdentity::None,
             github_identity_resolver: None,
+            checkpoint_store: None,
+            checkpoint_arc_id: None,
         }
     }
 
@@ -757,6 +768,71 @@ impl ShellToolRegistry {
         match resolver {
             Some(r) => self.with_github_identity_resolver(r),
             None => self,
+        }
+    }
+
+    /// Wire the git-backed snapshot store. Pair with
+    /// [`Self::with_checkpoint_arc_id`] — both are required before any
+    /// snapshot actually fires. Without them, `write`/`edit` behave
+    /// exactly as before.
+    pub fn with_checkpoint_store(mut self, store: Arc<dyn CheckpointStore>) -> Self {
+        self.checkpoint_store = Some(store);
+        self
+    }
+
+    /// `Option`-flavoured variant.
+    pub fn with_checkpoint_store_opt(self, store: Option<Arc<dyn CheckpointStore>>) -> Self {
+        match store {
+            Some(s) => self.with_checkpoint_store(s),
+            None => self,
+        }
+    }
+
+    /// Tell the registry which arc its snapshots should attach to. The
+    /// composition root (athen-app) sets this from the per-arc
+    /// registry build.
+    pub fn with_checkpoint_arc_id(mut self, arc_id: impl Into<String>) -> Self {
+        self.checkpoint_arc_id = Some(arc_id.into());
+        self
+    }
+
+    /// Snapshot the given paths if the store + arc_id are both wired,
+    /// otherwise no-op. Returns the action_id so the caller can stash
+    /// it in the tool's output JSON for the auditor to lift onto the
+    /// arc-entry metadata. Failures are logged but never block the
+    /// tool — a missing snapshot is degraded UX, not a hard error.
+    async fn maybe_snapshot(
+        &self,
+        tool_name: &str,
+        args_summary: &str,
+        paths: &[PathBuf],
+    ) -> Option<String> {
+        let store = self.checkpoint_store.as_ref()?;
+        let arc_id = self.checkpoint_arc_id.as_deref()?;
+        let entry_id = uuid::Uuid::new_v4().to_string();
+        match store
+            .snapshot_paths(arc_id, &entry_id, None, tool_name, args_summary, paths)
+            .await
+        {
+            Ok(Some(id)) => {
+                tracing::info!(
+                    arc_id = arc_id,
+                    action_id = %id,
+                    tool = tool_name,
+                    "checkpoint: snapshot recorded"
+                );
+                Some(id)
+            }
+            Ok(None) => None, // every path filtered out — nothing to record
+            Err(e) => {
+                tracing::warn!(
+                    arc_id = arc_id,
+                    tool = tool_name,
+                    error = %e,
+                    "checkpoint: snapshot failed (revert won't be available)"
+                );
+                None
+            }
         }
     }
 
@@ -1700,17 +1776,30 @@ impl ShellToolRegistry {
             text.replacen(old_string, new_string, 1)
         };
 
+        // Snapshot pre-mutation state so the action is revertable.
+        let snapshot_action_id = self
+            .maybe_snapshot(
+                "edit",
+                &format!("edit {path}"),
+                std::slice::from_ref(&resolved),
+            )
+            .await;
+
         atomic_write(p, new_text.as_bytes()).await?;
         self.record_hash(p, new_text.as_bytes()).await;
 
         let elapsed_ms = start.elapsed().as_millis() as u64;
+        let mut output = json!({
+            "path": path,
+            "replacements": if replace_all { count } else { 1 },
+            "bytes_written": new_text.len(),
+        });
+        if let Some(id) = snapshot_action_id {
+            output["_snapshot_action_id"] = serde_json::Value::String(id);
+        }
         Ok(ToolResult {
             success: true,
-            output: json!({
-                "path": path,
-                "replacements": if replace_all { count } else { 1 },
-                "bytes_written": new_text.len(),
-            }),
+            output,
             error: None,
             execution_time_ms: elapsed_ms,
         })
@@ -1766,16 +1855,30 @@ impl ShellToolRegistry {
         }
         // (else: new file — allowed without prior read.)
 
+        // Snapshot pre-mutation state. For a brand-new file this records
+        // an `absent_paths` entry so revert can delete it.
+        let snapshot_action_id = self
+            .maybe_snapshot(
+                "write",
+                &format!("write {path}"),
+                std::slice::from_ref(&resolved),
+            )
+            .await;
+
         atomic_write(p, content.as_bytes()).await?;
         self.record_hash(p, content.as_bytes()).await;
 
         let elapsed_ms = start.elapsed().as_millis() as u64;
+        let mut output = json!({
+            "path": path,
+            "bytes_written": content.len(),
+        });
+        if let Some(id) = snapshot_action_id {
+            output["_snapshot_action_id"] = serde_json::Value::String(id);
+        }
         Ok(ToolResult {
             success: true,
-            output: json!({
-                "path": path,
-                "bytes_written": content.len(),
-            }),
+            output,
             error: None,
             execution_time_ms: elapsed_ms,
         })

@@ -414,6 +414,11 @@ pub struct AppState {
     /// executor entry point so it can register/finalize and by the
     /// `list_active_agents` Tauri command.
     pub agent_registry: Option<Arc<crate::agent_registry::AgentRegistry>>,
+    /// Git-backed snapshot store powering agent-action undo. `None` only
+    /// on builds without a data dir (CLI/tests). When present, the tool
+    /// registry's `write`/`edit` hooks call into it before the tool
+    /// mutates the filesystem so the user can revert later.
+    pub checkpoint_store: Option<Arc<dyn athen_core::traits::checkpoint::CheckpointStore>>,
 }
 
 impl AppState {
@@ -448,6 +453,31 @@ impl AppState {
             None => None,
         };
         crate::vault_creds::hydrate_secrets_from_vault(vault.as_ref(), &mut config).await;
+
+        // Git-backed snapshot store for agent action undo. Opens or
+        // initializes a bare repo at `<data_dir>/athen-snapshots`.
+        // Failure is non-fatal — without it, write/edit just don't get
+        // snapshotted (no undo for that action) but the rest of the app
+        // continues to work.
+        let checkpoint_store: Option<Arc<dyn athen_core::traits::checkpoint::CheckpointStore>> =
+            match ensure_data_dir() {
+                Some(dir) => match athen_checkpoint::GixCheckpointStore::open(&dir) {
+                    Ok(store) => {
+                        info!(
+                            "Checkpoint store ready at {}/athen-snapshots",
+                            dir.display()
+                        );
+                        Some(Arc::new(store))
+                    }
+                    Err(e) => {
+                        warn!(
+                        "Checkpoint store unavailable: {e} — agent actions will not be revertable"
+                    );
+                        None
+                    }
+                },
+                None => None,
+            };
 
         // Resolver for AgentProfile.github_identity → env-var bundle on
         // `shell_execute`. Per-identity `GH_CONFIG_DIR` lives under
@@ -645,6 +675,7 @@ impl AppState {
             cloud_apis_doc_path,
             agent_run_store,
             agent_registry: None,
+            checkpoint_store,
         };
 
         if let Err(e) = state.refresh_tools_doc().await {
@@ -1057,7 +1088,9 @@ impl AppState {
             .with_telegram_sender_opt(self.telegram_sender.clone())
             .with_owner_check_opt(self.owner_destination_check())
             .with_github_identity(github_identity)
-            .with_github_identity_resolver_opt(self.github_identity_resolver.clone());
+            .with_github_identity_resolver_opt(self.github_identity_resolver.clone())
+            .with_checkpoint_store_opt(self.checkpoint_store.clone())
+            .with_checkpoint_arc_id(arc_id);
         if let Some(store) = self.grant_store.clone() {
             let provider = Arc::new(crate::file_gate::ArcWritableProvider {
                 arc_id: crate::file_gate::arc_uuid(arc_id),
@@ -2050,6 +2083,7 @@ impl AppState {
         let telegram_chat_log_dispatch = self.telegram_chat_log.clone();
         let owner_check_dispatch = self.owner_destination_check();
         let github_identity_resolver_dispatch = self.github_identity_resolver.clone();
+        let checkpoint_store_dispatch = self.checkpoint_store.clone();
         // Snapshot the vault so the per-task IMAP mark-seen flow can
         // hydrate the IMAP password from it (the password lives in the
         // vault for installs that have re-saved their email settings).
@@ -2200,6 +2234,7 @@ impl AppState {
                         telegram_chat_log: telegram_chat_log_dispatch.clone(),
                         owner_check: owner_check_dispatch.clone(),
                         github_identity_resolver: github_identity_resolver_dispatch.clone(),
+                        checkpoint_store: checkpoint_store_dispatch.clone(),
                         initial_user_images: Vec::new(),
                         attachment_store: attachment_store_loop.clone(),
                         compaction_trigger_tokens,
