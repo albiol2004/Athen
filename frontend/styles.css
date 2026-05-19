@@ -8075,3 +8075,64 @@ option:hover {
     opacity: 0.55;
     cursor: default;
 }
+
+/* Between-card rewind divider. Sits in the vertical flow between nodes
+   (and above the first one). Hovering it highlights every card below
+   so the cascade scope is visible BEFORE the confirm dialog. */
+.changes-divider {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: 4px 0 4px -22px;
+    padding-left: 22px;
+}
+.changes-divider.top { margin-top: 0; }
+.changes-divider-line {
+    flex: 1;
+    height: 1px;
+    background: var(--border);
+    transition: background 120ms var(--ease);
+}
+.changes-divider-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 10.5px;
+    font-family: inherit;
+    color: var(--text-3);
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 2px 9px;
+    cursor: pointer;
+    opacity: 0.65;
+    transition: opacity 120ms var(--ease),
+                color 120ms var(--ease),
+                border-color 120ms var(--ease),
+                background 120ms var(--ease);
+}
+.changes-divider:hover .changes-divider-line,
+.changes-divider:focus-within .changes-divider-line {
+    background: rgba(185, 81, 99, 0.45);
+}
+.changes-divider-btn:hover,
+.changes-divider-btn:focus-visible {
+    opacity: 1;
+    color: var(--text-1);
+    border-color: var(--brand-warm);
+    background: rgba(185, 81, 99, 0.10);
+    outline: none;
+}
+.changes-divider-icon { display: inline-flex; color: var(--brand-warm); }
+
+/* Preview state: when a divider is hovered/focused, every card BELOW it
+   on the spine dims with a coral wash so the user sees what will be
+   undone. Driven by `highlightCascade` in app.js. */
+.changes-node.will-undo .changes-node-card {
+    background: rgba(229, 72, 77, 0.06);
+    border-color: rgba(229, 72, 77, 0.35);
+}
+.changes-node.will-undo .changes-node-dot {
+    border-color: var(--danger);
+    box-shadow: 0 0 0 3px rgba(229, 72, 77, 0.10);
+}

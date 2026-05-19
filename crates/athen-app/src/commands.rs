@@ -5409,14 +5409,20 @@ pub async fn rewind_changes(
 
     if outcome.discarded > 0 {
         if let Some(arc_store) = state.arc_store.as_ref() {
-            let hint = build_rewind_hint(&outcome);
+            let (user_facing, llm_hint) = build_rewind_hints(&outcome);
+            // The entry's `content` is what the chat UI renders verbatim
+            // (no agent framing — it's the user's own action surfaced
+            // back at them). The agent-facing version lives in
+            // `metadata.llm_hint` and is substituted in `to_context_entry`
+            // when this entry rides into the next LLM turn.
+            let metadata = serde_json::json!({ "llm_hint": llm_hint });
             if let Err(e) = arc_store
                 .add_entry(
                     &arc_id,
                     athen_persistence::arcs::EntryType::Message,
                     "system",
-                    &hint,
-                    None,
+                    &user_facing,
+                    Some(metadata),
                     None,
                 )
                 .await
@@ -5429,10 +5435,11 @@ pub async fn rewind_changes(
     Ok(outcome)
 }
 
-/// Build the one-shot reminder body the next LLM turn will see. Lists
-/// up to N affected paths verbatim so the agent can target re-reads
-/// without guessing.
-fn build_rewind_hint(outcome: &athen_core::traits::checkpoint::RevertOutcome) -> String {
+/// Produce two parallel summaries of a rewind: a short user-facing line
+/// for the chat UI ("Reverted 3 changes …") and a longer agent-facing
+/// reminder ("Out-of-band notice from the Athen app … re-read …") for
+/// the next LLM turn.
+fn build_rewind_hints(outcome: &athen_core::traits::checkpoint::RevertOutcome) -> (String, String) {
     const MAX_PATHS: usize = 8;
     let mut all_paths: Vec<String> = Vec::new();
     for p in &outcome.restored {
@@ -5451,24 +5458,50 @@ fn build_rewind_hint(outcome: &athen_core::traits::checkpoint::RevertOutcome) ->
     let extra = total.saturating_sub(shown.len());
 
     let n = outcome.discarded;
-    let mut s = if n == 1 {
-        String::from("The user just reverted your most recent change via Athen's Changes panel.")
+    let paths_user = if shown.is_empty() {
+        String::new()
     } else {
-        format!("The user just reverted your last {n} changes via Athen's Changes panel.")
-    };
-    if !shown.is_empty() {
-        s.push_str(" Files restored to their pre-edit state: ");
+        let mut s = String::from(" Files restored: ");
         s.push_str(&shown.join(", "));
         if extra > 0 {
             s.push_str(&format!(" (+{extra} more)"));
         }
         s.push('.');
+        s
+    };
+    let paths_llm = if shown.is_empty() {
+        String::new()
+    } else {
+        let mut s = String::from(" Files were restored to their previous on-disk state: ");
+        s.push_str(&shown.join(", "));
+        if extra > 0 {
+            s.push_str(&format!(" (+{extra} more)"));
+        }
+        s.push('.');
+        s
+    };
+
+    let user_facing = if n == 1 {
+        format!("Reverted the most recent change via the Changes panel.{paths_user}")
+    } else {
+        format!("Reverted the last {n} changes via the Changes panel.{paths_user}")
+    };
+
+    let mut llm_hint = String::from("Out-of-band notice from the Athen app — not from the user. ");
+    if n == 1 {
+        llm_hint.push_str("The user just reverted your most recent change via the Changes panel.");
+    } else {
+        llm_hint.push_str(&format!(
+            "The user just reverted your last {n} changes via the Changes panel."
+        ));
     }
-    s.push_str(
-        " Your prior edits to these files are no longer on disk. \
-                Re-read any file in this list before referring to its contents in this turn.",
+    llm_hint.push_str(&paths_llm);
+    llm_hint.push_str(
+        " Your prior edits to these files are no longer present. \
+         Re-read any file in this list before referring to its contents in this turn.",
     );
-    s
+
+    (user_facing, llm_hint)
 }
 
 /// Most recent finalized agent runs, newest-first. Backs the "history"

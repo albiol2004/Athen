@@ -254,6 +254,19 @@ function registerTauriEventListeners() {
         const card = buildToolCardBlock(meta);
         appendLiveToolCard(currentToolContainer, card, tool_name, status, step);
 
+        // If the Changes rail is open, pull a fresh action list so newly
+        // snapshotted edits/writes appear without the user having to
+        // close+reopen the panel. We only re-poll on terminal states
+        // (snapshots are written before atomic_write returns) and only
+        // for tools that actually trigger snapshots today — adding new
+        // snapshotting tools just means listing them here.
+        if (status === 'Completed'
+            && (tool_name === 'edit' || tool_name === 'write')
+            && changesRailEl
+            && !changesRailEl.classList.contains('hidden')) {
+            refreshChangesRail();
+        }
+
         // Scroll to keep latest card visible.
         requestAnimationFrame(() => {
             messagesEl.parentElement.scrollTo({
@@ -4301,34 +4314,131 @@ async function refreshChangesRail() {
         changesRailBodyEl.appendChild(empty);
         return;
     }
-    // Oldest first — top of the timeline is the earliest change, bottom is
-    // the latest. Reads like a normal chronology. Clicking a node reverts
-    // that action *and everything newer* (point-in-time semantics), so the
-    // only valid revert anchor among un-reverted rows is the newest
-    // (bottom). Older un-reverted rows show "Revert through here".
+    // Oldest first — top of the timeline is the earliest change, bottom
+    // is the latest. Revert affordances live *between* cards as
+    // horizontal dividers: a divider represents a point in time, and
+    // clicking it rewinds to that state (every card BELOW the divider
+    // gets undone). The very first divider sits above the oldest card
+    // and represents the pristine pre-arc state. There is no divider
+    // below the newest card — that point IS "now", nothing to revert.
     actions.sort((a, b) => (a.created_at || '').localeCompare(b.created_at || ''));
 
     const timeline = document.createElement('div');
     timeline.className = 'changes-timeline';
-    actions.forEach((action, idx) => {
-        // Every un-reverted node is revertable. Cascading from older
-        // nodes skips already-reverted siblings (revert_action is
-        // idempotent), so there's no need to forbid mid-history reverts —
-        // the user picks a point in time and we rewind from "now" back
-        // to it, no-op'ing over anything already undone.
-        const isLatest = idx === actions.length - 1;
-        timeline.appendChild(buildChangesNode(action, isLatest, actions));
-    });
-    changesRailBodyEl.appendChild(timeline);
 
-    // Auto-scroll to the latest (bottom) so the most recent change is in
-    // view the moment the rail opens.
-    changesRailBodyEl.scrollTop = changesRailBodyEl.scrollHeight;
+    actions.forEach((action, idx) => {
+        // Divider that sits ABOVE this card. Reverts this card + every
+        // card below. The first one is labelled "Revert all" — clicking
+        // it rewinds to the pristine pre-action state.
+        const divider = buildRewindDivider(action, idx === 0, actions.slice(idx));
+        timeline.appendChild(divider);
+        timeline.appendChild(buildChangesNode(action));
+    });
+
+    // Preserve scroll behaviour across re-renders: if the user was
+    // already pinned near the bottom (or this is the first paint),
+    // follow the newest change. If they had scrolled up to inspect
+    // older entries, leave their position alone — auto-refresh
+    // shouldn't yank focus.
+    const prevScrollTop = changesRailBodyEl.scrollTop;
+    const prevHeight = changesRailBodyEl.scrollHeight;
+    const wasNearBottom = prevHeight - (prevScrollTop + changesRailBodyEl.clientHeight) < 40;
+    changesRailBodyEl.appendChild(timeline);
+    if (wasNearBottom) {
+        changesRailBodyEl.scrollTop = changesRailBodyEl.scrollHeight;
+    } else {
+        changesRailBodyEl.scrollTop = prevScrollTop;
+    }
 }
 
-function buildChangesNode(action, isLatest, allActions) {
+// A horizontal divider between cards. Clicking it rewinds to this point
+// in time — i.e. undoes `target` and every action newer. Hovering it
+// highlights the cards that will be undone so the scope is visible
+// before commit.
+function buildRewindDivider(target, isTop, undoneChain) {
+    const divider = document.createElement('div');
+    divider.className = 'changes-divider' + (isTop ? ' top' : '');
+
+    const line = document.createElement('span');
+    line.className = 'changes-divider-line';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'changes-divider-btn';
+    const count = undoneChain.length;
+    btn.innerHTML =
+        '<span class="changes-divider-icon" aria-hidden="true">' +
+        '<svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7"/><polyline points="3 4 3 10 9 10"/></svg>' +
+        '</span>' +
+        '<span>' + (isTop
+            ? `Revert all ${count} change${count === 1 ? '' : 's'}`
+            : `Rewind here · undo ${count} change${count === 1 ? '' : 's'}`) +
+        '</span>';
+    btn.title = isTop
+        ? 'Rewind to the state before any of these changes happened.'
+        : 'Rewind to this point in time — everything below this line gets undone.';
+
+    btn.addEventListener('mouseenter', () => highlightCascade(divider, true));
+    btn.addEventListener('mouseleave', () => highlightCascade(divider, false));
+    btn.addEventListener('focus', () => highlightCascade(divider, true));
+    btn.addEventListener('blur', () => highlightCascade(divider, false));
+    btn.addEventListener('click', () => rewindToBefore(target, undoneChain, btn));
+
+    divider.appendChild(line);
+    divider.appendChild(btn);
+    divider.appendChild(line.cloneNode(true));
+    return divider;
+}
+
+function highlightCascade(divider, on) {
+    let sib = divider.nextElementSibling;
+    while (sib) {
+        if (sib.classList.contains('changes-node')) {
+            sib.classList.toggle('will-undo', on);
+        }
+        sib = sib.nextElementSibling;
+    }
+}
+
+// Cascade rewind triggered from a divider. Confirms, then calls the
+// single backend op that restores files + trims history.
+async function rewindToBefore(target, undoneChain, btn) {
+    if (!invoke || btn.disabled || !activeArcId) return;
+    const count = undoneChain.length;
+    const confirmMsg = count > 1
+        ? `Rewind ${count} changes?\n\nFiles will be restored to their state at this point in time. The ${count} changes will be removed from the timeline and cannot be brought back.`
+        : `Rewind 1 change?\n\nThe file will be restored to its previous state. This change will be removed from the timeline and cannot be brought back.`;
+    if (!window.confirm(confirmMsg)) return;
+
+    btn.disabled = true;
+    const prevHtml = btn.innerHTML;
+    btn.textContent = count > 1 ? `Rewinding ${count}…` : 'Rewinding…';
+    try {
+        const outcome = await invoke('rewind_changes', {
+            arcId: activeArcId,
+            actionId: target.entry_id,
+        });
+        reportRewindOutcome(outcome);
+        await refreshChangesRail();
+        if (activeArcId) {
+            try {
+                const entries = await invoke('get_arc_entries', { arcId: activeArcId });
+                clearChatUI();
+                renderEntries(entries || []);
+            } catch (e) {
+                console.warn('Rewind succeeded but arc refresh failed:', e);
+            }
+        }
+    } catch (err) {
+        console.error('Rewind failed:', err);
+        showToast('Rewind failed: ' + (err && err.toString ? err.toString() : 'unknown error'), 'error');
+        btn.innerHTML = prevHtml;
+        btn.disabled = false;
+    }
+}
+
+function buildChangesNode(action) {
     const wrap = document.createElement('div');
-    wrap.className = 'changes-node' + (action.reverted ? ' reverted' : '');
+    wrap.className = 'changes-node';
 
     const dot = document.createElement('span');
     dot.className = 'changes-node-dot';
@@ -4363,74 +4473,8 @@ function buildChangesNode(action, isLatest, allActions) {
         card.appendChild(pathsEl);
     }
 
-    const actionsRow = document.createElement('div');
-    actionsRow.className = 'changes-node-actions';
-    if (action.reverted) {
-        const badge = document.createElement('span');
-        badge.className = 'changes-node-badge';
-        badge.textContent = 'reverted';
-        actionsRow.appendChild(badge);
-    } else {
-        const btn = document.createElement('button');
-        btn.type = 'button';
-        btn.className = 'changes-revert-btn';
-        // Newest (bottom) is just "Revert"; older nodes phrase the
-        // cascade as a rewind to a point in time.
-        btn.textContent = isLatest ? 'Revert this change' : 'Revert up to this change';
-        btn.title = isLatest
-            ? 'Roll this action back.'
-            : 'Rewind history back to just before this action — every newer un-reverted change gets undone too.';
-        btn.addEventListener('click', () => revertThroughPoint(action, allActions, btn));
-        actionsRow.appendChild(btn);
-    }
-    card.appendChild(actionsRow);
-
     wrap.appendChild(card);
     return wrap;
-}
-
-// "Revert up to this point" — confirms with the user, then asks the
-// backend to atomically restore files to `target`'s pre-state AND drop
-// every action from `target` onward out of history. After confirmation
-// there is no in-app undo (the snapshots are deleted), so the dialog
-// must be unambiguous about scope.
-async function revertThroughPoint(target, allActions, btn) {
-    if (!invoke || btn.disabled || !activeArcId) return;
-    const targetTime = target.created_at || '';
-    const cascadeCount = allActions
-        .filter((a) => (a.created_at || '') >= targetTime)
-        .length;
-    const confirmMsg = cascadeCount > 1
-        ? `Revert this change and ${cascadeCount - 1} newer change${cascadeCount - 1 === 1 ? '' : 's'}?\n\n` +
-          `Files will be restored to their state just before this point. The reverted changes will be removed from this timeline and cannot be brought back.`
-        : `Revert this change?\n\nThe file will be restored to its previous state. This change will be removed from the timeline and cannot be brought back.`;
-    if (!window.confirm(confirmMsg)) return;
-
-    btn.disabled = true;
-    const prevLabel = btn.textContent;
-    btn.textContent = cascadeCount > 1 ? `Reverting ${cascadeCount}…` : 'Reverting…';
-    try {
-        const outcome = await invoke('rewind_changes', {
-            arcId: activeArcId,
-            actionId: target.entry_id,
-        });
-        reportRewindOutcome(outcome);
-        await refreshChangesRail();
-        if (activeArcId) {
-            try {
-                const entries = await invoke('get_arc_entries', { arcId: activeArcId });
-                clearChatUI();
-                renderEntries(entries || []);
-            } catch (e) {
-                console.warn('Revert succeeded but arc refresh failed:', e);
-            }
-        }
-    } catch (err) {
-        console.error('Revert failed:', err);
-        showToast('Revert failed: ' + (err && err.toString ? err.toString() : 'unknown error'), 'error');
-        btn.textContent = prevLabel;
-        btn.disabled = false;
-    }
 }
 
 // Shared toast for both rail + inline revert paths. `outcome` is the

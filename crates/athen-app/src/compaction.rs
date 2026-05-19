@@ -206,8 +206,22 @@ fn to_context_entry(e: &ArcEntry) -> ContextEntry {
     // the metadata into the content string here. That way every caller —
     // the rebuilt chat history, the tool_cache rendering, anyone else —
     // sees a single readable line instead of a bare tool name.
+    //
+    // Source="system" Message rows (the post-rewind hint and friends)
+    // carry parallel summaries: a user-facing line in `content` and an
+    // agent-facing line in `metadata.llm_hint`. The chat UI shows
+    // `content` directly; here, when building the LLM view, we swap in
+    // `llm_hint` if present so the model gets the version that addresses
+    // it as the agent.
     let content = if e.entry_type == EntryType::ToolCall {
         render_tool_call_audit(e)
+    } else if e.entry_type == EntryType::Message && e.source == "system" {
+        e.metadata
+            .as_ref()
+            .and_then(|m| m.get("llm_hint"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| e.content.clone())
     } else {
         e.content.clone()
     };
@@ -1045,13 +1059,17 @@ mod tests {
             .add_entry("a", EntryType::Message, "user", "first turn", None, None)
             .await
             .unwrap();
+        // user-facing in content, agent-facing in metadata.llm_hint.
+        // The LLM view must substitute the agent-facing variant.
         store
             .add_entry(
                 "a",
                 EntryType::Message,
                 "system",
-                "The user just reverted your most recent change. Re-read foo.rs.",
-                None,
+                "Reverted the most recent change. Files restored: foo.rs.",
+                Some(serde_json::json!({
+                    "llm_hint": "Out-of-band notice — the user just reverted your most recent change. Re-read foo.rs before referring to it."
+                })),
                 None,
             )
             .await
@@ -1075,7 +1093,10 @@ mod tests {
         };
         assert!(body.starts_with("<system-reminder>"), "got: {body}");
         assert!(body.ends_with("</system-reminder>"), "got: {body}");
-        assert!(body.contains("reverted"), "got: {body}");
+        // The LLM-facing variant from metadata, not the bare user-facing
+        // content — so the agent sees the "Re-read foo.rs" instruction.
+        assert!(body.contains("Re-read foo.rs"), "got: {body}");
+        assert!(body.contains("Out-of-band"), "got: {body}");
     }
 
     #[tokio::test]
