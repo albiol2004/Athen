@@ -4,7 +4,7 @@
 
 ### Built-in Tool Registry (`ShellToolRegistry`)
 
-Defined in `crates/athen-agent/src/tools.rs`. Sixteen built-in tools:
+Defined in `crates/athen-agent/src/tools.rs`. Twenty-one built-in tools:
 
 | Tool | Risk | Backend |
 |------|------|---------|
@@ -17,10 +17,12 @@ Defined in `crates/athen-agent/src/tools.rs`. Sixteen built-in tools:
 | `write` | `WritePersist` | full overwrite, atomic, prior `read` required for existing files |
 | `grep` | `Read` | ripgrep wrapper |
 | `list_directory` | `Read` | `tokio::fs` direct |
-| `memory_store` | `Read` | in-session `HashMap<String,String>` |
-| `memory_recall` | `Read` | same `HashMap` — key lookup or list-all |
-| `web_search` | `Read` | `WebSearchProvider` (production default: `MultiSearchProvider` chaining Brave → Tavily → DDG with quota-aware cooldowns) |
-| `web_fetch` | `Read` | `PageReader` (default: HybridReader, see below) |
+| `memory_store` | `Read` | persistent semantic memory (or in-session `HashMap<String,String>` if not configured); auto-dedup at store/judge/recall layers; recall threshold 0.6 |
+| `memory_recall` | `Read` | search persistent semantic memory by key; Tier 2 (revealed on first call, not always-on) to avoid small-model over-recall |
+| `web_search` | `Read` | `WebSearchProvider` (production default: `MultiSearchProvider` chaining Brave → Tavily → DDG with quota-aware cooldowns); Tier 1 always-revealed |
+| `web_fetch` | `Read` | `PageReader` (default: HybridReader chaining Local → Jina → Wayback); Tier 1 always-revealed |
+| `send_telegram` | `WritePersist` | outbound Telegram text + attachments (photo/document); auto-chunk long text at 4096 chars; owner chat auto-approved; non-owner routed through `ApprovalRouter` |
+| `email_send` | `WritePersist` | outbound SMTP; Tier 1 always-revealed; subject/body/recipients auto-sanitized; approval-gated via `EmailSendApprovalGate` |
 | `install_package` | `WritePersist` | pip/npm install into `~/.athen/toolbox/`; gated by `ToolboxApprovalGate` |
 | `uninstall_package` | `WritePersist` | reversible removal from toolbox (no approval needed) |
 | `list_installed_packages` | `Read` | reads `~/.athen/toolbox/manifest.json` |
@@ -102,24 +104,35 @@ The system prompt's `WEB ACCESS` section steers the model away from `curl`/`wget
 
 ### Composition (`AppToolRegistry`)
 
-`crates/athen-app/src/app_tools.rs:34` composes the production tool surface from optional adapters:
+`crates/athen-app/src/app_tools.rs:48` composes the production tool surface from optional adapters:
 
 ```rust
 struct AppToolRegistry {
-    inner: ShellToolRegistry,
+    inner: Arc<ShellToolRegistry>,
     calendar: Option<CalendarStore>,
     contacts: Option<SqliteContactStore>,
-    memory:   Option<Arc<Memory>>,
-    mcp:      Option<Arc<dyn McpClient>>,
+    memory: Option<Arc<Memory>>,
+    mcp: Option<Arc<dyn McpClient>>,
     file_gate: Option<Arc<FileGate>>,
+    attachments: Option<AttachmentStore>,
+    identity: Option<Arc<SqliteIdentityStore>>,
+    skills: Option<Arc<SqliteSkillStore>>,
+    http_endpoints: Option<Arc<SqliteHttpEndpointStore>>,
+    vault: Option<Arc<dyn Vault>>,
+    http_rate_limiter: Option<Arc<HttpRateLimiter>>,
+    http_client: Option<reqwest::Client>,
 }
 ```
 
-Constructed eagerly with the first four; `mcp` and `file_gate` are attached via builders (`with_mcp`, `with_file_gate`) so the same struct works in tests without those subsystems.
+Constructed eagerly with the first four; remaining fields are attached via builders so the same struct works in tests without those subsystems.
 
-**Tools added on top of the inner six:**
-- 4 calendar tools when `calendar.is_some()` — `calendar_list/create/update/delete` (`Read`, `WritePersist`, `WritePersist`, `WritePersist`).
+**Tools added on top of the inner tools:**
+- 4 calendar tools when `calendar.is_some()` — `calendar_list/create/update/delete` (`Read`, `WritePersist`, `WritePersist`, `WritePersist`). `calendar_create` now pushes agent-authored events to remote calendars (iCloud/Google/Fastmail via CalDAV) when configured; takes optional `target_calendar_id`; uses `agent_default_calendar_id` from settings as fallback.
 - 5 contacts tools when `contacts.is_some()` — `contacts_list/search/create/update/delete` (`Read`, `Read`, `WritePersist`, `WritePersist`, `WritePersist`).
+- 2 attachment tools when `attachments.is_some()` — `read_attachment_full/fetch_attachment` (`Read`, `Read`). Used when inline-surfaced PDF/email text was truncated or bytes were purged by TTL sweeper.
+- `http_request` when `http_endpoints`, `vault`, `http_rate_limiter`, and `http_client` are all present. Calls registered cloud APIs by name (Hunter, Brave, Open-Meteo, etc.) with vault-backed credentials and per-endpoint rate limiting.
+- `load_skill` when `skills.is_some()` — load full markdown body of user-authored skills on demand.
+- `identity_add` when `identity.is_some()` — agent can persist personality/rules/knowledge/user/team statements into the user-editable identity store; entries live in static prefix on next startup.
 - N MCP tools when `mcp.is_some()` — each tool returned by `McpClient::list_tools` is namespaced `<mcp_id>__<tool_name>` (e.g. `slack__post_message`) using `MCP_TOOL_SEPARATOR`.
 
 **Description override:** when `memory.is_some()`, the inner `memory_store` / `memory_recall` descriptions are rewritten to point at persistent semantic memory rather than the in-session `HashMap` (`app_tools.rs:820-829`).
@@ -149,8 +162,8 @@ Phase 1 limits (deliberate cuts):
 
 The executor (`crates/athen-agent/src/executor.rs`) keeps the system prompt small by separating tools into two tiers:
 
-- **Tier 1 — capability index** (always in prompt): one line per group listing tool names and a one-liner description. Groups are derived from tool name prefixes: `memory`, `calendar`, `shell`, `files`, `contacts`, and any MCP id (`tool_grouping.rs:16-28`).
-- **Tier 2 — revealed schemas** (inline in prompt): full description for each tool that has been called at least once this session ("tolerant dispatch") plus `memory_store` and `send_telegram` / `email_send` which are always revealed (`tool_grouping.rs:101-105`).
+- **Tier 1 — capability index** (always in prompt): one line per group listing tool names and a one-liner description. Groups are derived from tool name prefixes: `memory`, `calendar`, `shell`, `files`, `contacts`, and any MCP id (`tool_grouping.rs:16-28`). When a profile declares `primary_groups` (shipped 2026-05-12), only those groups appear in Tier 1; all tools remain callable.
+- **Tier 2 — revealed schemas** (inline in prompt): full description for each tool that has been called at least once this session ("tolerant dispatch") plus `memory_store`, `send_telegram`, `email_send`, `web_search`, and `web_fetch` which are always revealed (`tool_grouping.rs:101-105`).
 
 `memory_recall` is deliberately kept in Tier 2 (revealed on first call, not always-on) even though `memory_store` is Tier 1. The coordinator already injects relevant memories into the leading system message via the `BACKGROUND RECALL` block when the user message is substantive, so the agent rarely needs to call recall directly. Surfacing its full schema in every prompt biased small models to over-recall on short or pronoun-heavy messages and act on stale entries as if they were instructions (`tool_grouping.rs:120-126`).
 
@@ -263,7 +276,7 @@ All monitors implement `SenseMonitor` from `athen-core`. `SenseRunner<M>` drives
 ### Source priority (highest → lowest)
 
 1. **UserInput** — `RiskLevel::Safe`. UI layer pushes strings to `UserInputMonitor::sender()`, drained as `EventKind::Command` events. No network, no latency.
-2. **Calendar** — `RiskLevel::Safe`. Polls `~/.athen/athen.db` every 60 s via `tokio::task::spawn_blocking` to keep SQLite off the async runtime (`calendar.rs:324-358`). `query_upcoming_events` returns events whose `start_time` is within the maximum lead time of any reminder, plus a small look-ahead. `generate_reminder_events` (`calendar.rs:271-305`) emits one `EventKind::Reminder` per `(event_id, reminder_minutes)` tuple as the start time approaches that lead time, plus an extra "starting now" reminder when `0 ≤ minutes_until ≤ 1`. A per-monitor `Mutex<HashSet<(String, i64)>>` (`fired_reminders`) deduplicates within the session; cross-restart dedup is the persistence layer's responsibility (`fired_reminders` table in athen-persistence).
+2. **Calendar** — `RiskLevel::Safe`. Polls local `CalendarStore` (SQLite) every 60 s via `tokio::task::spawn_blocking` (`calendar.rs:324-358`). Generates reminders as `EventKind::Reminder` when events approach their lead times; a per-monitor `Mutex<HashSet<(String, i64)>>` deduplicates within the session. **Calendar source sync loop** (`crates/athen-app/src/calendar_sources.rs`) pulls remote events from configured sources (iCloud/Google-via-CalDAV/Fastmail/Yandex/Nextcloud) into the local store every 5 min (configurable), reconciling on `(source_id, remote_id)`. Producer side: agent `calendar_create` tool can write directly to remote on creation. Consumer side: remote pull observes divergences from agent edits, so sync is one-way-push-at-create, remote-pull-reconcile-at-sync (bi-sync is deferred).
 3. **Telegram** — `RiskLevel::Caution`. Polls `getUpdates` via long-polling HTTP. Tracks `last_update_id` to avoid reprocessing. Owner chat messages are elevated to `L1` trust at the coordinator layer; all other senders are triaged normally. (`telegram.rs:73-76`)
    - **Owner Telegram cross-channel continuity**: the agent's `send_telegram` tool (text + attachments via Bot API; `athen-sentidos/src/telegram_send.rs`) stamps `telegram_outbound_hint` *and* appends to `telegram_chat_log` (`athen-persistence/src/telegram_chat_log.rs`) on every successful send. The owner-Telegram handler (`state.rs::execute_owner_telegram_message`) uses that store for two things: (a) **arc routing**: when the outbound-hint tier misses but candidate arcs exist (recent Messaging / telegram-channel arcs within 30 min), it asks the LLM with the new message + last-4 transcript + each candidate's last entry to pick an existing arc or say `NEW`; the response is validated against the candidate set so the model can't invent ids (`state::pick_arc_with_llm`). (b) **Context injection**: when arc routing creates a fresh arc, the last 4 transcript entries are prepended as a `<CONTEXT type="telegram-chat-history">` system bubble so the agent has continuity even when routing fell through. Reused arcs skip the injection (their own history is already loaded).
    - **Non-owner Telegram triage**: `sense_router::triage_event` also receives the per-chat_id transcript via a `Recent exchange with this chat` block when `EventSource::Messaging`, so the spam-or-link decision benefits from the same cross-arc continuity. Inbound non-owner messages are appended to `telegram_chat_log` right after the history fetch.

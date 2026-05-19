@@ -1,6 +1,6 @@
 # Prompt Caching — Provider Audit & Fix Plan
 
-Status: **design / not yet shipped**. Audit performed 2026-05-09 against current docs for Anthropic, OpenAI, DeepSeek, Google.
+Status: **design / not yet shipped** (verified 2026-05-19: zero cache_control markers, no `tools` field in Anthropic; no `prompt_cache_key` in OpenAI; no `usageMetadata.cachedContentTokenCount` parsing in Google; DeepSeek cache firing but no `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` observability). Audit performed 2026-05-09 against current docs for Anthropic, OpenAI, DeepSeek, Google.
 
 Athen's prompt-build path is already cache-friendly in shape: the system message is byte-stable across turns (persona + identity + workspace + tools + revealed tool schemas), and per-turn volatile content (current time, recalled memories, attachments, compaction state) lives in a `<CONTEXT>...</CONTEXT>` wrapper at the top of the first user message. See `feedback_volatile_content_belongs_in_body.md` and `crates/athen-agent/src/executor.rs::build_context_preamble`.
 
@@ -36,7 +36,7 @@ Despite that, none of the four cloud providers actually realise the savings. Thi
 
 **How it works.** **Opt-in only.** Add `cache_control: { type: "ephemeral" }` markers on individual content blocks in `system`, `messages`, or `tools`. Up to 4 breakpoints per request. Default 5-minute TTL (write = 1.25× input rate); optional 1-hour TTL (write = 2× input rate). Cache reads = 0.1× input. Minimums vary by model: 4096 tokens for Claude Opus 4.5–4.7 + Haiku 4.5; 1024 for Sonnet 4–4.5 / Opus 4–4.1; 2048 for Haiku 3.5. Below the threshold it silently skips, no error. Response carries `cache_read_input_tokens` + `cache_creation_input_tokens`. Cache invalidates on changes to `tools`, `system`, `tool_choice`, or image presence. Ref: <https://docs.claude.com/en/docs/build-with-claude/prompt-caching>.
 
-**Athen state.** **Zero cache benefit on Claude today.** No `cache_control` markers anywhere in `build_request_body`. `system` is a bare `Option<String>`; would need to become `Option<Vec<ContentBlock>>` to attach markers. `AnthropicUsage` ignores both cache token fields. **Separate bug caught by the audit:** `build_request_body` does not include the `tools` field at all — Claude is being called without any tools defined.
+**Athen state** (verified 2026-05-19). **Zero cache benefit on Claude today.** No `cache_control` markers anywhere in `build_request_body` (anthropic.rs:93-126). `system` is a bare `Option<String>` with no content blocks for marker placement. `AnthropicUsage` ignores both cache token fields. **Critical gap:** `AnthropicRequest` struct (anthropic.rs:420-431) has no `tools` field — requests are sent without any tools defined, and the `reasoning` → `thinking` field (mapping at anthropic.rs:124) is wired. The tools field is mandatory for effective Claude use.
 
 **Fix.**
 - Refactor `system` to a `Vec<ContentBlock>` form so a `cache_control` marker can sit on the last block.

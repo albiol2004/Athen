@@ -1,10 +1,14 @@
 # Subscription-Relay Providers — Picking Menu
 
+**STATUS:** DESIGN 2026-05-13. No implementations shipped yet. Poe + Copilot relay marked for future `http_presets` entries.
+
 Synthesized 2026-05-13 from three parallel Haiku research streams (Windsurf/Cursor wrappers, GitHub Copilot proxies, Poe/Perplexity/xAI/HF/DDG and friends).
 
 **Question driving this doc:** Several community projects expose paid AI-product subscriptions (Cursor, Windsurf, Copilot, Poe, …) as OpenAI-compatible local HTTP endpoints so a single $20/mo plan can be used programmatically. Should Athen ship first-class providers for any of them?
 
 **Scope exclusions:** ChatGPT/Claude.ai/Gemini retail subscriptions are off the table — their ToS unambiguously bans programmatic reuse and Anthropic/OpenAI have enforced. This doc covers only adjacent products.
+
+**Current ship status:** Poe and self-hosted Copilot are marked for future `http_presets.rs` entries in the Cloud APIs system (see [CLOUD_APIS.md](CLOUD_APIS.md)). OpenCode Go wired as first-class `OpenAiCompatibleProvider` is open-ended; see §Findings below.
 
 ---
 
@@ -26,7 +30,7 @@ Synthesized 2026-05-13 from three parallel Haiku research streams (Windsurf/Curs
 | **OpenCode Go** ($5 first mo, then $10/mo) | Curated open-source coding models bundle — DeepSeek V4 Pro/Flash, Qwen 3.5/3.6, Kimi K2.5/K2.6, GLM-5.1, MiniMax M2.5/M2.7 — direct provider contracts, not account-pooled | 🟢 **"Use Go with any agent"** is the explicit on-site copy. OpenAI-compatible at `https://opencode.ai/zen/go/v1`. Generic ToS boilerplate about automation is CYA; the marketing surface and the supported-tools docs are the load-bearing signal (same pattern that flipped MiniMax Token Plan). Tiered per-model 5h rolling windows: 31.6K req/5h DeepSeek V4 Flash, 10K req/5h Qwen 3.5 Plus, 3.45K req/5h V4 Pro, 1.15K req/5h Kimi K2.6. | **Wire as first-class provider** via `OpenAiCompatibleProvider`. Same shape as DeepSeek wire path. Cheapest legitimate coding bundle Athen can ship today; complements MiniMax (which adds Anthropic-compat + prompt-cache at $20+). |
 | **ZenMux Pro** ($20/$100/$400/mo) | Enterprise aggregator across ~200 models (OpenAI/Anthropic/Google/DeepSeek/…) via official provider contracts | 🔴 Legitimate, but no differentiation over OpenRouter (already a Cloud APIs preset). "Insurance" upsell (latency/hallucination coverage) doesn't fit agent loops. ToS quiet on agent automation. | Skip — OpenRouter fills this niche with a smaller markup and explicit agent-loop tolerance. |
 
-**Net move:** add two presets to `athen-app/src/http_presets.rs` (Poe + self-hosted Copilot relay). No new bespoke provider in `athen-llm`. Total work: ~30 minutes.
+**Net move (deferred):** add two presets to `athen-app/src/http_presets.rs` (Poe + self-hosted Copilot relay) as part of Cloud APIs v0.1. No new bespoke provider in `athen-llm`. Total work: ~30 minutes when scheduled.
 
 ---
 

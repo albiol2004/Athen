@@ -80,13 +80,12 @@ control-char repair (`feedback_deepseek_tool_args_repair.md`) runs on
 the resulting JSON args before dispatch — every strategy must produce
 output that flows through that pipeline, not bypass it.
 
-**Reasoning-content fallback for inline strategies.** When the
+**Reasoning-content fallback for inline strategies.** SHIPPED (2026-05-19). When the
 provider routes the entire reply (think tags + tool call markup) into
 `reasoning_content` instead of `content` — which llama.cpp does under
 `--jinja --reasoning-format` for Qwen-class models — the inline
-extractor must scan `reasoning_content` as a fallback when `content`
-is empty and no `tool_calls` came through. Implemented at
-`crates/athen-llm/src/quirks/mod.rs:213–221`. Without this, Qwen3.5/3.6
+extractor scans `reasoning_content` as a fallback when `content`
+is empty and no `tool_calls` came through (crates/athen-llm/src/quirks/mod.rs:213–221). Without this, Qwen3.5/3.6
 under `--reasoning-format` returns "no tool calls" and the executor
 fires its hardcoded fallback string. See
 `feedback_quirks_scan_reasoning_content.md`.
@@ -241,8 +240,7 @@ The code carries one row per **wire format**, not per model SKU. A user
 running any GPT-5.x chat model picks `Gpt5`; the slug field is where
 they put their exact model id. The full per-vendor SKU list lives in §5b.
 
-Last verified: **2026-05-08** (8-agent vendor sweep + Anthropic / OpenAI /
-Google / DeepSeek / Qwen / Llama / Mistral docs).
+Last verified: **2026-05-19** (code audit: quirks/mod.rs reasoning_content fallback shipped at lines 213–221; all 5 axes confirmed in seed.rs and extractors/).
 
 | Family preset (code) | UI label | Default slug | tool_extraction | reasoning_surface | template_strictness | tool_arg_repair | sub-flags |
 |---|---|---|---|---|---|---|---|

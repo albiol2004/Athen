@@ -396,7 +396,7 @@ trait Vault: Send + Sync {
     async fn list(&self, scope: &str) -> Result<Vec<String>>;
 }
 ```
-Encrypted at-rest storage for secrets (API keys, passwords, OAuth tokens). Secrets are addressed by `(scope, key)` where scope is a logical namespace such as `endpoint:jina`, `imap:gmail`, or `oauth:google`. Two implementations in `athen-vault`: `KeyringVault` (OS keychain via the `keyring` crate, with a SQLite index for `list`) and `EncryptedFileVault` (chacha20poly1305 with AAD bound to `(scope, key)` to prevent row-swap attacks). Use `athen_vault::open_vault(data_dir, "athen")` — tries keychain first with a sentinel round-trip, falls back to encrypted file on failure.
+Encrypted at-rest storage for secrets (API keys, passwords, OAuth tokens). Secrets are addressed by `(scope, key)` where scope is a logical namespace such as `endpoint:jina`, `imap:gmail`, or `oauth:google`. SHIPPED 2026-05-10: Two implementations in `athen-vault`: `KeyringVault` (OS keychain via the `keyring` crate, with a SQLite index for `list`) and `EncryptedFileVault` (chacha20poly1305 with AAD bound to `(scope, key)` to prevent row-swap attacks). Use `athen_vault::open_vault(data_dir, "athen")` — tries keychain first with a sentinel round-trip, falls back to encrypted file on failure.
 
 ### ProfileStore (`traits/profile.rs`)
 ```rust
@@ -487,6 +487,16 @@ trait ApprovalSink: Send + Sync {
 ```
 A single channel through which an approval question can be delivered and awaited. Multiple sinks (in-app, Telegram) race in parallel; whichever answers first wins and the router cancels the rest. In-app sink parks a oneshot keyed by `question.id`; Telegram sink sends an inline keyboard and resolves on the corresponding `callback_query`. See `docs/ARCHITECTURE.md` §IPC for the `ApprovalRequest`/`ApprovalResponse` IPC messages that feed this.
 
+### CalendarSource (`traits/calendar_source.rs`)
+```rust
+trait CalendarSource: Send + Sync {
+    async fn authenticate(&mut self, config: &CalendarConfig) -> Result<()>;
+    async fn list_calendars(&self) -> Result<Vec<RemoteCalendar>>;
+    async fn pull_events(&self, calendar_id: &str, window: &(DateTime<Utc>, DateTime<Utc>)) -> Result<Vec<RemoteEvent>>;
+}
+```
+Syncs remote calendar events into the local `CalendarStore`. Implemented in `athen-caldav` (RFC 4791 CalDAV, generic over iCloud/Google-via-CalDAV/Fastmail/Nextcloud/Yandex). SHIPPED 2026-05-15. Producer side in `athen-app/src/calendar_sources.rs` runs a background loop polling each enabled source. Reconciliation key: `(source_id, remote_id)`. See crate-level docs in `IMPLEMENTATION.md`.
+
 ### HttpEndpointStore (`traits/http_endpoint.rs`)
 ```rust
 trait HttpEndpointStore: Send + Sync {
@@ -499,7 +509,7 @@ trait HttpEndpointStore: Send + Sync {
     async fn set_enabled(&self, id: Uuid, enabled: bool) -> Result<()>;
 }
 ```
-Storage for `RegisteredEndpoint` rows backing the `http_request` agent tool. Names are unique (case-insensitive); the UUID is the primary key for rename safety. `get_by_name` is the hot path used by the tool dispatcher. `record_call` bumps the call counter and `last_used` after a successful call (non-fatal on failure). Implemented in `athen-persistence`. See `docs/CLOUD_APIS.md`.
+Storage for `RegisteredEndpoint` rows backing the `http_request` agent tool. Names are unique (case-insensitive); the UUID is the primary key for rename safety. `get_by_name` is the hot path used by the tool dispatcher. `record_call` bumps the call counter and `last_used` after a successful call (non-fatal on failure). SHIPPED 2026-05-10. Implemented in `athen-persistence`. See `docs/CLOUD_APIS.md`.
 
 ### SystemReminderBuilder (`traits/reminder.rs`)
 ```rust

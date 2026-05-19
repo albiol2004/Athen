@@ -24,14 +24,19 @@ Things being built right now.
 
 - **Athen shows its work.** Render code, files, HTML pages, charts, and images inline rather than dumping them as text. Save artifacts to disk with one click. Persisted thumbnails on reopened arcs are shipped — an image or document you attached two days ago renders inline when you scroll back to that conversation instead of degrading to a "_(1 image attached)_" placeholder.
 
-- **Athen wakes itself up at the right time.** Shipped (Phase 5 complete). Schedule recurring or one-shot wake-ups — "remind me to follow up if no reply in 3 days", "every Monday at 9am summarize my week", "check on this in 2 hours". Agents can author their own wake-ups via `create_wakeup`; dynamic risk bands and AutonomyBand escalation are wired.
+- **Athen wakes itself up at the right time.** [SHIPPED] Phase 5 complete. Schedule recurring or one-shot wake-ups — "remind me to follow up if no reply in 3 days", "every Monday at 9am summarize my week", "check on this in 2 hours". Agents can author their own wake-ups via `create_wakeup`; dynamic risk bands and AutonomyBand escalation are wired (shipped 2026-05-09).
+
+- **Calendar sources & bidirectional sync.** [SHIPPED 2026-05-15] CalDAV adapter syncs remote calendars (iCloud, Google-via-CalDAV, Fastmail, Nextcloud, Yandex, on-prem Exchange) into local store. Agent calendar_create/update/delete now push back to remote (2026-05-17). Settings → Connections → Calendar Sources panel for add/remove/pick-calendars. CardDAV (contacts) deferred.
 
 ## Next
 
 What we're planning to do after Now lands.
+
 - **Athen survives crashes and reboots.** Pending actions persist so a closed laptop or a power cut never drops work mid-flight. Includes:
   - *Stale-action confirmation:* if Athen was about to send an email six hours ago, it asks "still relevant?" before acting on the resumed approval.
   - *Sense-driven invalidation:* if you reply to that email yourself in the meantime, or the calendar event was cancelled externally, Athen notices and quietly drops the obsolete task.
+
+- **Personal OAuth integrations.** MS Graph (Outlook Mail + Calendar), Notion, Linear, GitHub — device-code flow, vault-backed token refresh. Reduces friction vs today's API-key pastes. [INTEGRATIONS_PUSH.md](docs/INTEGRATIONS_PUSH.md) Move #3; design-stage.
 
 ## Exploring
 

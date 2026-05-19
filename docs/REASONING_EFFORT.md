@@ -8,7 +8,7 @@ Companion to [PER_MODEL_QUIRKS.md](PER_MODEL_QUIRKS.md): that doc covers
 *response* parsing (where thinking output lands), this one covers *request*
 control (how to ask for more or less of it).
 
-**Status:** Shipped (enum + `ChatRequest` wiring + per-provider mapping for OpenAI, Anthropic, Google, DeepSeek; 2026-05-13).
+**Status:** SHIPPED (verified 2026-05-19: enum + `ChatRequest` + `ArcMeta.reasoning_effort_override` field + lifecycle methods + per-provider mappers + migration all in place).
 
 Live today:
 - `ReasoningEffort` enum with all 7 variants at `crates/athen-core/src/llm.rs` (`Default`, `Off`, `Minimal`, `Low`, `Medium`, `High`, `Max`), serde + `FromStr` round-tripping.
@@ -17,7 +17,7 @@ Live today:
 
 Still pending:
 - Local providers (`llamacpp.rs`, `ollama.rs`) ignore the field today — Qwen/Gemma `enable_thinking` template-kwarg path not wired.
-- Per-arc `ArcSettings.reasoning_effort` setting and the segmented control in the arc settings panel.
+- Per-arc UI segmented control in the arc settings panel (backend `ArcMeta.reasoning_effort_override` field shipped with migration 2026-05-19; set_reasoning_effort_override lifecycle method tested).
 - `delegate_to_agent` per-call `reasoning_effort` parameter.
 - Per-tier Settings UI column for power-user defaults.
 

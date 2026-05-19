@@ -1,13 +1,14 @@
 # Skills (Design Doc)
 
-**Status:** Shipped (2026-05-15). v0 build order steps 1-7 all landed.
+**Status:** Shipped (2026-05-15, as of 2026-05-19). v0 build order steps 1-7 all landed; per-arc idempotency is design not yet implemented.
 
 Live today:
-- Core types + `SkillStore` trait at `crates/athen-core/src/skill.rs` and `crates/athen-core/src/traits/skill.rs` (includes `SyncReport`).
-- Filesystem + SQLite index store at `crates/athen-persistence/src/skills.rs` (~761 lines).
-- `load_skill` agent tool at `crates/athen-app/src/app_tools.rs` (~line 1433), idempotent per arc, refuses cleanly when the store isn't wired.
-- Tauri commands at `crates/athen-app/src/commands.rs` (~lines 7620 and 7689).
-- Settings → Skills panel at `frontend/index.html` (~lines 320-327) + `frontend/app.js` (~line 5340+).
+- Core types + `SkillStore` trait at `crates/athen-core/src/skill.rs` and `crates/athen-core/src/traits/skill.rs`.
+- Filesystem + SQLite index store at `crates/athen-persistence/src/skills.rs`.
+- `load_skill` agent tool at `crates/athen-app/src/app_tools.rs` (~line 1585), refuses cleanly when the store isn't wired. Per-arc idempotency (skipping body re-fetch on repeated calls in same arc) is a design pattern shown below but not yet implemented.
+- Tauri commands in `crates/athen-app/src/commands.rs`.
+- Settings → Skills panel at `frontend/index.html` + `frontend/app.js`.
+- Static-prefix listing of skill names + descriptions in executor (gated on `load_skill` tool presence).
 
 The "v0 scope explicitly excludes" section below is still authoritative — `write_skill` (agent-authored skills), vector-recall discovery, sibling-file auto-bundling, bundled-skills shipping, and the marketplace are all deferred. Use the design doc as the reference for what's intentionally out of scope.
 
@@ -196,19 +197,27 @@ heavy.
 
 ## Invocation — the `load_skill` tool
 
-New agent tool in `crates/athen-app/src/app_tools.rs`:
+New agent tool in `crates/athen-app/src/app_tools.rs` (~line 1585):
 
 ```rust
-async fn do_load_skill(state: &AppState, slug: &str) -> Result<String> {
-    // Idempotent: if already loaded in this arc, return a short
-    // "already loaded" notice — don't refire the body and double the cost.
-    if state.arc_skill_cache.contains(arc_id, slug).await {
-        return Ok(format!("Skill `{slug}` is already loaded in this arc."));
-    }
-    let body = state.skills.load_body(slug).await?;
-    state.arc_skill_cache.mark_loaded(arc_id, slug).await;
+async fn do_load_skill(store: &SkillStore, slug: &str) -> Result<String> {
+    let body = store.load_body(slug).await?;
     Ok(body)
 }
+```
+
+**v0 note**: Per-arc idempotency (the pattern below) is a future optimization not yet in code. Today `load_skill` always returns the full body. Once implemented, it will cache `(arc_id, slug)` pairs and return a stub "already loaded" notice on repeated calls.
+
+```rust
+// Future per-arc idempotency pattern (design, not yet shipped):
+// Idempotent: if already loaded in this arc, return a short
+// "already loaded" notice — don't refire the body and double the cost.
+if state.arc_skill_cache.contains(arc_id, slug).await {
+    return Ok(format!("Skill `{slug}` is already loaded in this arc."));
+}
+let body = state.skills.load_body(slug).await?;
+state.arc_skill_cache.mark_loaded(arc_id, slug).await;
+Ok(body)
 ```
 
 Risk tier: read-only, no side effects on external systems. Goes in

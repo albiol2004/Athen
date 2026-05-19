@@ -1,6 +1,6 @@
 # Multi-Intent Routing (Design Doc)
 
-**Status:** Design only — not yet implemented. Tracked as task #152.
+**Status (2026-05-19):** Design only — not yet implemented. Tracked as task #152.
 
 A single user message — typically arriving via Telegram — can carry instructions for **multiple arcs at once**. The current pipeline assumes one event = one task = one arc. Lifting that assumption is the natural endpoint of "the user shouldn't have to think about arcs"; this doc captures the design so we don't have to re-derive it later.
 

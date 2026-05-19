@@ -1,8 +1,10 @@
 # Cloud API Expansion — `http_request` + Registered Endpoints
 
+**STATUS:** SHIPPED v0 2026-05-10. Code is authoritative for current behavior.
+
 Companion to `TOOL_EXPANSION.md` (which covers OS-level CLI wrapping). This doc covers the **cloud-API expansion** — a single generic `http_request` tool backed by a "Registered HTTP Endpoints" store, mirroring the Contacts / Identity / proposed-Registered-Databases pattern.
 
-The bet: **one ship unlocks ~15 APIs.** Instead of wrapping each cloud service in bespoke Rust, we ship a generic GET/POST tool whose credentials come from an encrypted SQLite store, plus a preset library so onboarding is "click provider → paste key → enable."
+The bet: **one ship unlocks ~15 APIs.** Instead of wrapping each cloud service in bespoke Rust, we ship a generic GET/POST tool whose credentials come from an encrypted vault, plus a preset library so onboarding is "click provider → paste key → enable."
 
 Surveyed 2026-05-10. APIs verified live; pricing snapshots will drift — re-verify before recommending paid tiers.
 
@@ -10,38 +12,13 @@ Surveyed 2026-05-10. APIs verified live; pricing snapshots will drift — re-ver
 
 ## Architecture
 
-### Data model — `crates/athen-core/src/http_endpoint.rs` (new)
+### Data model — `crates/athen-core/src/http_endpoint.rs` (SHIPPED)
 
-```rust
-pub struct RegisteredEndpoint {
-    pub id: Uuid,
-    pub name: String,                              // PK display, e.g. "Jina"
-    pub provider: String,                          // "Jina Reader"
-    pub base_url: Url,
-    pub enabled: bool,
-    pub auth_method: AuthMethod,                   // see below
-    pub default_headers: Vec<(String, String)>,
-    pub default_query_params: Vec<(String, String)>,
-    pub rate_limit: Option<RateLimit>,             // requests/min
-    pub risk_override: Option<EndpointRisk>,
-    pub notes: Option<String>,
-    pub last_used: Option<DateTime<Utc>>,
-    pub call_count_30d: u32,
-    pub created_at: DateTime<Utc>,
-}
+`RegisteredEndpoint` struct with `id`, `name`, `provider`, `base_url`, `enabled`, `auth_method`, `rate_limit`, `risk_override`, `notes`, `last_used`, `call_count_30d`, `created_at`. See source (lines 13–80) for full enum shapes.
 
-pub enum AuthMethod {
-    None,
-    BearerToken { token: String },
-    Header { name: String, value: String },        // X-API-Key, etc
-    QueryParam { name: String, value: String },    // ?api_key=...
-    BasicAuth { user: String, pass: String },
-}
+**Key shape:** `AuthMethod` is `None | BearerToken | Header { name } | QueryParam { name } | BasicAuth { user }`. Credentials are **never** stored inline; they live in the vault under scope `endpoint:<uuid>` (see `vault_key()` method, line 57–69). This design prevents credentials from round-tripping through logs or serialization.
 
-pub enum EndpointRisk { Low, Medium, High }
-```
-
-Credentials encrypted at rest (reuse existing `athen-core::crypto`); decrypted only inside the `http_request` executor and scrubbed from any error logs. The store implementation lives in `crates/athen-persistence/src/http_endpoints.rs`, parallels `identity.rs` / `contacts.rs`.
+Credentials encrypted at rest via `athen-vault` (shipped 2026-05-10 as `KeyringVault` + fallback `EncryptedFileVault`); decrypted only inside the `http_request` executor and scrubbed from any error logs. The store implementation lives in `crates/athen-persistence/src/http_endpoints.rs` (trait in `athen-core::traits::http_endpoint::HttpEndpointStore`), parallels `identity.rs` / `contacts.rs`.
 
 ### Tool — `http_request`
 
@@ -101,7 +78,9 @@ Mirrors the Identity panel layout: list of registered endpoints with provider, l
 
 ---
 
-## Preset library — ship 15 enabled-by-default-disabled out of the box
+## Preset library — 15 SHIPPED in `athen-app/src/http_presets.rs`
+
+All 15 presets are live in the codebase as of 2026-05-10. See `crates/athen-app/src/http_presets.rs` (lines 51–278) for the implementation; the table below is the authoritative snapshot.
 
 | Preset | Base URL | Auth | Default risk | Free tier (verify before recommending) |
 |---|---|---|---|---|
@@ -121,9 +100,9 @@ Mirrors the Identity panel layout: list of registered endpoints with provider, l
 | OpenRouter (LLM fallback) | `https://openrouter.ai/api/v1/` | Bearer | Medium | Some free models |
 | Groq (LLM + Whisper) | `https://api.groq.com/openai/v1/` | Bearer | Medium | 30 req/min, 7.2k audio-sec/hr |
 
-Deferred / future presets (not yet in `http_presets.rs`): Crawlbase, Snov.io, Adzuna, Cal.com, Wikipedia.
+Deferred / future presets (not yet in `http_presets.rs`): Crawlbase, Snov.io, Adzuna, Cal.com, Wikipedia, Poe, self-hosted Copilot relay.
 
-User picks from the list, pastes key (or leaves blank for keyless ones), enables. Never bigger than ~5 minutes of setup per endpoint.
+User picks from the list, pastes key (or leaves blank for keyless ones), enables. Never bigger than ~5 minutes of setup per endpoint. See `crates/athen-app/src/settings.rs` for the Settings → Cloud APIs panel (`add_http_endpoint`, `list_http_endpoints`, `delete_http_endpoint`, `test_http_endpoint`).
 
 ---
 
@@ -188,12 +167,15 @@ Updated ship order (replaces §"Recommended ship order" in `TOOL_EXPANSION.md`):
 
 ---
 
-## Cross-cutting prerequisite still to land
+## Credentials: vault-backed encryption (SHIPPED)
 
-**Encryption at rest for credentials.** Today Athen stores config in plain SQLite. Before shipping `http_request`, we need a `crypto` module (`athen-core::crypto` or new `athen-crypto` crate) that gives us:
-- Master key derivation (Argon2id from a user passphrase OR system-keychain-managed key)
-- AEAD encrypt/decrypt (chacha20poly1305 or AES-256-GCM)
+**SHIPPED 2026-05-10:** Credentials live in `athen-vault` (new crate), not in SQLite. Two backend implementations:
 
-Same module will be reused for: HTTP endpoint credentials, future Registered Databases connection strings, OAuth tokens for X / LinkedIn / Gmail. So this is **infrastructure work**, not just for `http_request`.
+1. **KeyringVault** — OS keychain (macOS Keychain, Windows Credential Manager, Linux Secret Service if available)
+2. **EncryptedFileVault** (fallback) — chacha20poly1305 at `~/.athen/vault.key` (0600), with random 32-byte master key and AAD bound to `(scope, key)` to prevent row swaps
 
-If we want to ship `http_request` ASAP without the crypto module, the v0 cut can store credentials base64-encoded with a clear "v0 — credentials are NOT encrypted at rest yet" warning in the UI. Trades security for ship speed; would only be acceptable in dev builds.
+`open_vault(data_dir, "athen")` tries keyring first, self-checks with a sentinel round-trip, falls back to encrypted file on failure. Scope is always `endpoint:<uuid>` for HTTP endpoint credentials; vault key is determined by the `AuthMethod::vault_key()` method (token, value, password, etc).
+
+Credentials are never logged or serialized outside the vault. Decryption happens at call time inside the `http_request` executor; no plaintext ever rides in memory after the request completes (scrubbed via Drop + zeroize).
+
+Future use: same `athen-vault` will back IMAP/SMTP credentials, OAuth tokens for GitHub/Notion/Linear, etc.

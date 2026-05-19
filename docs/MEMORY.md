@@ -85,7 +85,7 @@ The `success: true` shape is deliberate — LLMs treat tool errors as "retry har
 
 ### `memory_recall`
 
-Searches the persistent memory by embedding similarity, returns top-N hits. No special handling beyond the global threshold.
+Searches the persistent memory by embedding similarity, returns top-N hits. If called without a `key` argument, returns an empty list with a hint to provide a search query. No special handling beyond the global threshold.
 
 ### `memory_forget`
 

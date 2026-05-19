@@ -2,7 +2,7 @@
 
 Strategic picking menu for the "become the gods of integrations" pillar. Synthesized 2026-05-12 from four parallel Haiku research streams: MCP ecosystem audit, personal-OAuth landscape, credential-setup UX, and bespoke-vs-`http_request` criteria.
 
-**Status:** Move #2 (IMAP/SMTP autodetect wizard) shipped after 2026-05-12 — see [EMAIL_SETUP.md](EMAIL_SETUP.md) and `email_detect` / `email_test_connection` / `email_translate_error` Tauri commands. Moves #1, #3, #4 still design-only; Move #5's LLM error translator is the only piece of that cross-cutting layer that's landed today.
+**Status:** Move #2 (IMAP/SMTP autodetect wizard) shipped 2026-05-12 — see [EMAIL_SETUP.md](EMAIL_SETUP.md). Move #4 (CalDAV sync) shipped 2026-05-15 — `crates/athen-caldav/` RFC 4791 adapter + sync loop in `crates/athen-app/src/calendar_sources.rs` + agent calendar_create/update now push to remote (2026-05-17 commits). CardDAV deferred. Moves #1, #3 still design-only; Move #5's LLM error translator landed 2026-05-12.
 
 This is a **picking menu**, not a build plan. Per-feature implementation docs land when each item is picked up. Related: [TOOL_EXPANSION.md](TOOL_EXPANSION.md) (the 10-category CLI/API menu, complementary), [CLOUD_APIS.md](CLOUD_APIS.md) (the `http_request` substrate this builds on).
 
@@ -89,17 +89,12 @@ The "no friction" tier. All four offer free developer apps with zero verificatio
 
 ---
 
-### 4. CalDAV / CardDAV calendar + contacts sync (status: design)
+### 4. CalDAV / CardDAV calendar + contacts sync — **CalDAV SHIPPED (2026-05-15), CardDAV deferred**
 
 
-Apple iCloud has no OAuth — but CalDAV (calendar) and CardDAV (contacts) work with the same app-specific-password flow as iCloud Mail. Fastmail, Nextcloud, Yandex, Posteo, and on-prem Exchange all speak CalDAV/CardDAV too. **One protocol, ten providers.**
+[SHIPPED] **CalDAV calendar sync:** RFC 4791 adapter in `crates/athen-caldav/` handles iCloud, Google-via-CalDAV, Fastmail, Nextcloud, Yandex. Bidirectional sync loop at `crates/athen-app/src/calendar_sources.rs` polls every 5 min and reconciles on `(source_id, remote_id)` keys via ETag. Agent tools `calendar_create`/`update`/`delete` now push back to remote (committed 2026-05-17, `0b8e818`). Settings → Connections → Calendar Sources panel surfaces add/remove/pick-calendars UX with per-provider credential capture and automatic test-sync.
 
-**Build shape:**
-- Bidirectional sync between athen-persistence's calendar/contacts tables and the remote CalDAV/CardDAV store. ETags for change detection.
-- Reuse the IMAP wizard's provider autodetect — for each provider, store the server URL alongside IMAP creds.
-- Tools: agent already has `calendar_*` and `contacts_*` — those become _local writes_ that sync up in the background. No new tool surface.
-
-**Effort:** 1–1.5 weeks. Mostly conflict resolution and ETag bookkeeping.
+**CardDAV contacts sync:** deferred. Same architectural shape (provider autodetect, ETags, bidirectional). Lower urgency than calendar.
 
 **Why behind OAuth wraps:** Microsoft / Google calendars are reachable via Graph and (eventually) Google APIs. CalDAV is the long-tail fallback. But it's the only path to iCloud, which matters for Mac-heavy users.
 

@@ -10,7 +10,7 @@ distribution channel.
 |---------|--------|-------------|--------------------|--------|
 | GitHub Releases | `.AppImage`, `.dmg`, `.msi`, `.exe`, `.deb`, `.rpm` | AppImage / macOS / Windows only | Automatic via `release.yml` | Live |
 | AUR | `athen-bin` | No (pacman) | `packaging/aur/bump.sh` (~5s) | Live |
-| Fedora COPR | source-built RPM | No (dnf) | Webhook-driven | In setup |
+| Fedora COPR | source-built RPM | No (dnf) | Webhook-driven | Live |
 
 ## Decisions
 
@@ -53,6 +53,14 @@ official Fedora repos), we'll switch to a vendored Source1 tarball with
 webhook, so every published release tag triggers rebuilds for every
 selected chroot. Zero per-release packaging work.
 
+### Fedora .rpm / .deb preferred over AppImage
+
+On Fedora 44+ (Mesa 26 with RADV), the bundled wayland libs in AppImage
+collide with Mesa's EGL stack, causing crashes (`EGL_BAD_PARAMETER`). Ship
+`.rpm` + `.deb` bundles as primary artifacts; AppImage is best-effort fallback
+for users on other distros. The `.rpm` is built by COPR; GitHub Releases hosts
+all three formats for maximum portability.
+
 ### Auto-updater is split by install kind
 
 `tauri-plugin-updater` only supports updating the binary it can swap in
@@ -61,7 +69,7 @@ place — AppImage on Linux, `.app` bundle on macOS, MSI/NSIS on Windows.
 those binaries live at `/usr/bin/athen-app` and are owned by the package
 manager.
 
-The fix in `crates/athen-app/src/commands.rs::detect_installer_kind`:
+The fix in `crates/athen-app/src/commands.rs::detect_installer_kind` (line 7239):
 
 - Linux + `$APPIMAGE` set → `"appimage"` → in-app updater swaps the binary.
 - Linux without `$APPIMAGE` → `"system"` → updater UI shows "Open download
@@ -71,8 +79,8 @@ The fix in `crates/athen-app/src/commands.rs::detect_installer_kind`:
   `.app` bundles and MSI/NSIS installs both work.
 
 Frontend gates the install button on `installer_kind` returned from
-`check_for_update`. Backend `install_update` also gates as
-defense-in-depth — returns a friendly error pointing at the release page
+`check_for_update` (line 7260). Backend `install_update` also gates as
+defense-in-depth (line 7320) — returns a friendly error pointing at the release page
 if anything bypasses the frontend gate.
 
 ### Versioning rules
@@ -108,19 +116,21 @@ After cutting a new tag:
 
 ```bash
 # 1. Bump versions before tagging (NEVER tag without this — see "Versioning rules")
-#    crates/athen-app/Cargo.toml      version = "0.1.X"
-#    crates/athen-app/tauri.conf.json "version": "0.1.X"
-git commit -am "v0.1.X"
-git tag v0.1.X && git push origin v0.1.X
+#    crates/athen-app/Cargo.toml      version = "0.2.X"
+#    crates/athen-app/tauri.conf.json "version": "0.2.X"
+git commit -am "v0.2.X"
+git tag v0.2.X && git push origin v0.2.X
 
 # 2. Wait for release.yml to finish, then publish the draft
-gh release edit v0.1.X --draft=false
+#    release.yml builds: .deb, .rpm, .AppImage (Linux); .dmg, .app.tar.gz (macOS); .msi, .exe (Windows)
+#    publish-manifest auto-generates latest.json from signed artifacts
+gh release edit v0.2.X --draft=false
 
 # 3. Bump AUR (one command — pushes to AUR remote)
-./packaging/aur/bump.sh 0.1.X ~/aur-athen-bin
+./packaging/aur/bump.sh 0.2.X ~/aur-athen-bin
 
 # 4. COPR auto-rebuilds via webhook. No manual step required.
 #    If the webhook isn't wired yet:
-#    ./packaging/copr/bump.sh 0.1.X && git commit -am "copr: $(date)" && git push
+#    ./packaging/copr/bump.sh 0.2.X && git commit -am "copr: $(date)" && git push
 #    copr-cli build albiol2004/athen packaging/copr/athen.spec
 ```

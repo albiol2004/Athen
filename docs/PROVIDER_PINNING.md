@@ -23,7 +23,7 @@ provider-specific ways:
 The user's intent when switching active is "from now on, new arcs use the new
 provider." Breaking in-flight arcs is collateral damage, not the goal.
 
-**Status:** Shipped (columns, lifecycle methods, executor entry-pin + arc-idle clear; 2026-05-13).
+**Status:** SHIPPED (verified 2026-05-19: columns + migration + lifecycle methods + executor entry/exit wiring all in place).
 
 Live today:
 - `ArcMeta.pinned_provider_id` + `ArcMeta.pinned_slug` columns at `crates/athen-persistence/src/arcs.rs` (~lines 115/123), with `init_schema` migration that `ALTER TABLE`-adds them to legacy DBs (~lines 342-348).

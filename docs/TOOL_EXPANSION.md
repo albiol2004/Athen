@@ -1,6 +1,8 @@
 # Tool Expansion Menu
 
-Survey of best-in-class CLIs / APIs across 10 categories, performed 2026-05-10 by parallel Haiku research agents. Each entry: top pick, install footprint, license, wrap shape, risk class, expected fit for Athen's user (AI Engineer in Switzerland building a consulting practice).
+Survey of best-in-class CLIs / APIs across 10 categories, synthesized 2026-05-10 from parallel Haiku research. Updated 2026-05-19.
+
+**Note:** `http_request` tool + 15 Cloud API presets (including Jina, Firecrawl, Brave, SerpAPI, etc., shipped 2026-05-10) covers stateless REST calls generically. This menu focuses on category-specific wraps (browser automation, OCR, database tools, etc.) that require tight binding, streaming, or state management.
 
 This is a **picking menu**, not a build plan. Pick categories to wrap first, then write per-category implementation docs.
 

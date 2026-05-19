@@ -23,7 +23,7 @@ a single native binary you double-click, with a tray icon and a clean
 window — but underneath, a hexagonal Rust core, a real risk model, MCP
 support, and a tool surface you can extend.
 
-> ⚠️ **Status: alpha (v0.2.3) — early but moving fast.** Core agent loop,
+> ⚠️ **Status: alpha (v0.2.4) — early but moving fast.** Core agent loop,
 > tools, risk system, senses, MCP runtime, and infrastructure are working
 > and well-tested. The surface is small on purpose and the UI is being
 > polished release by release. Pre-built binaries are **unsigned** today —
@@ -80,7 +80,7 @@ Chromium fork, no Node runtime, no React-on-Windows quirks.
 | **Shell + filesystem tools** — `shell_execute/spawn/kill/logs`, `read/edit/write/grep`, sandboxed via bwrap/Landlock/sandbox-exec/Job Objects | ✅ |
 | **Persistent semantic memory** — vector index + knowledge graph in SQLite, multiple embedding backends | ✅ |
 | **Web search & fetch** — DuckDuckGo (no key), Tavily (optional), Jina Reader → Wayback fallback chain | ✅ |
-| **Calendar & contacts** — local SQLite, trust-level model that adjusts risk for unknown senders | ✅ |
+| **Calendar & contacts** — local SQLite, CalDAV sync (iCloud, Google, Fastmail, Nextcloud, etc.), trust-level model for unknown senders | ✅ |
 | **MCP runtime** — spawn and route any Model Context Protocol server (stdio JSON-RPC) | ✅ |
 | **Senses** — Email (IMAP), Calendar, Telegram, generic User input | ✅ |
 | **Risk system** — regex rules + LLM fallback, base-impact × trust-multiplier scoring | ✅ |
@@ -193,7 +193,7 @@ through MCP.
 - **Memory:** `memory_store`, `memory_recall` (semantic, persistent; dedup at recall + store)
 - **Identity:** `identity_add` — agent can write to your personality / rules / knowledge / team store
 - **Web:** `web_search`, `web_fetch` (static → Jina Reader → Wayback fallback chain)
-- **Calendar:** `calendar_list` / `create` / `update` / `delete`
+- **Calendar:** `calendar_list` / `create` / `update` / `delete` (updates push to CalDAV remotes)
 - **Contacts:** `contacts_list` / `search` / `create` / `update` / `delete`
 - **Email:** `send_email` (auto-approves when recipient is the owner; risk-gated otherwise)
 - **Cloud APIs:** `http_request` against any endpoint you register — 15 presets out of the box (Jina, Firecrawl, Brave, SerpAPI, Hunter, Apollo, PDL, DeepL, NewsAPI, Open-Meteo, Frankfurter, OpenCage, ElevenLabs, OpenRouter, Groq); vault-backed credentials, per-endpoint rate limiting

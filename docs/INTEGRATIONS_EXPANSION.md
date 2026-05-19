@@ -27,7 +27,7 @@ Stream tag in parens: (A) workspace, (B) deploy, (C) whitespace, (D) capability 
 | 5 | **Linear — GraphQL issues + create** | A | API-key + `http_request` preset | 2–3 d | Agent-native GraphQL, zero friction, dev-focused user base. |
 | 6 | **Home Assistant — smart-home command** | C | Dedicated tool (LAN reach) | 1–2 wk | Uniquely possible: cloud agents can't reach 192.168.x.x. Zero competitor coverage. Risk-tier per entity (lock = HIGH, light = MED). |
 | 7 | **CI/CD wake-ups (GitHub Actions / GitLab CI)** | D | `http_request` + `create_wakeup` | 1–2 wk | Closes "babysit the deploy" pain. Athen's wake-ups are uniquely cheap (sleeping arc, 0 cost while waiting). Claude Code Loop has 72 h cap + token burn. |
-| 8 | **CalDAV / CardDAV unified sync** (Move #4) | A | Bespoke (stateful protocol) | 5–7 d | One wrap unlocks Apple iCloud + Fastmail + Nextcloud + Yandex + on-prem Exchange. The only viable Apple path (no OAuth, no REST). |
+| 8 | **[SHIPPED] CalDAV / CardDAV** | A | RFC 4791 adapter (Move #4, done 2026-05-15) | — | CalDAV sync shipped: iCloud + Fastmail + Nextcloud + Yandex + on-prem. Agent calendar_create now pushes to remote. CardDAV deferred. |
 | 9 | **DigitalOcean App Platform + GCP Cloud Run** | B | MCP import (Move #1) | 0 d after Move #1 | Both ship official MCP servers GA 2026 — subsumed by MCP-byo, no bespoke code. Skip unless Move #1 slips. |
 | 10 | **Spotlight / Windows-Search / browser-history local search** | C+D | Dedicated tool (native OS) | 1 wk per OS | Desktop-exclusive. Cloud agents can't read SQLite history files or query Spotlight. Powers "you've been reading X, pre-load that context." |
 
@@ -160,7 +160,7 @@ Where competitor agents structurally fail. Athen's existing primitives close mos
 ### Phase 2 — v0.4 (6–8 weeks)
 5. **CI/CD wake-ups** (pick #7) — GitHub Actions + GitLab CI webhook ingest, wired to `create_wakeup`.
 6. **Home Assistant smart-home tool** (pick #6) — REST API + per-entity risk tier + LAN discovery.
-7. **CalDAV / CardDAV unified sync** (pick #8) — Move #4 from INTEGRATIONS_PUSH.
+7. **[DONE] CalDAV / CardDAV** — CalDAV shipped 2026-05-15 (Move #4 from INTEGRATIONS_PUSH). CardDAV deferred to Phase 3+.
 8. **Approval batching** — risk-UI redesign for multi-action approval.
 
 ### Phase 3 — v0.5+ (rolling)

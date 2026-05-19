@@ -130,6 +130,30 @@ See: `athen-core/config.rs:EmbeddingConfig` (lines 315–353), `athen-app/src/se
 
 ---
 
+## Calendar Configuration
+
+Configured entirely through the UI (Settings → Connections → Calendar Sources). No config files.
+
+### CalendarConfig (athen-core/src/config.rs, lines 31–51)
+
+Four fields drive calendar-reminder agent behavior:
+
+1. **`agent_prompt`** — Free-form instruction prepended to every calendar-reminder sense event. Empty = no instruction. Lets the user tell Athen "when a Trabajo event fires, draft a 3-line prep summary" without code changes.
+2. **`agent_default_source_id`** — Calendar source UUID (from `calendar_sources` table) that the agent targets when calling `calendar_create` without an explicit `target_calendar_id`. None → fall back to `auto_pick_write_target` (fires only with one source) → local-only.
+3. **`agent_default_calendar_id`** — Remote calendar ID on the default source (e.g. `calendar-uuid@icloud.com` on iCloud). Persisted for Settings UX.
+4. **`agent_default_calendar_name`** — Display name of the remote calendar (for the Settings panel display).
+
+### Calendar sync loop (`athen-app/src/calendar_sources.rs`)
+
+Pulls events from configured remote sources into the local SQLite `CalendarStore`. Config rows live in the `calendar_sources` table (`athen-persistence`); credentials in the vault under `calendar:<uuid>:password`. `start_calendar_sync()` on AppState reads enabled rows, builds a `Box<dyn CalendarSource>` per row (currently routes only to `CalDavSource`), spawns one tokio loop per source. Default interval 5 min; pull window now-1d → now+30d. Reconciliation key: `(source_id, remote_id)`. INSERTs new, UPDATES on etag mismatch, DELETEs rows whose start is inside the window but not in the pull. Local-only events (`source_id IS NULL`) are never deleted. Write direction (agent edits → remote) is deferred.
+
+Tauri command surface in `settings_calendar.rs`: `list_calendar_sources`, `add_calendar_source`, `delete_calendar_source`, `enable_calendar_source`, `get_selected_calendars`, `test_calendar_source`, `sync_calendar_sources_now`, `list_remote_calendars`. Plus `get_agent_default_calendar`, `save_agent_default_calendar` to manage the config fields above.
+
+See `docs/` for full design details:
+- **Core design** — `athen-caldav` — CalDAV adapter implementing `athen_core::traits::calendar_source::CalendarSource`. One generic `CalDavSource` struct speaks RFC 4791 over HTTPS with HTTP Basic auth. Same code handles iCloud, Google Calendar via CalDAV (sidesteps Google OAuth verification entirely), Fastmail, Nextcloud, Yandex. See `docs/` for full module breakdown (client.rs, multistatus.rs, discovery.rs, ical_codec.rs, presets).
+
+---
+
 ## Web Search Configuration
 
 Configured entirely through the UI (onboarding wizard's `search` step + Settings → Web Search). No config files. Both providers are optional — Athen always falls back to bundled DuckDuckGo if neither key is set.

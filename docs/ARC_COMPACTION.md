@@ -1,6 +1,6 @@
 # Arc Compaction
 
-> **Status (2026-05-08): Phase-1 shipped.** The `ArcCompactor` trait, the
+> **Status (2026-05-19): Phase-1 shipped.** The `ArcCompactor` trait, the
 > `LlmArcCompactor` implementation, summary persistence, per-provider
 > budgets, settings UI, and executor integration are all live. Phase-2/3
 > items (explicit `burst_id`, entropy pre-pass, embedding salience,
@@ -431,7 +431,7 @@ Phase 1 is the smallest end-to-end slice that delivers value (arcs no
 longer break when long). Phases 2–3 are improvements layered on the same
 trait surface.
 
-## 12. Implementation status (2026-05-08)
+## 12. Implementation status (2026-05-19)
 
 This section is the live status map; sections 1–11 above are the design.
 Update this section, not the design body, when implementation moves.
@@ -441,18 +441,18 @@ Update this section, not the design body, when implementation moves.
 | Design section | Status | File:line |
 |---|---|---|
 | §3 Summary entry + `summarized_through_entry_id` pointer | ✅ | `EntryType::Summary` row written via `ArcStore::compact_arc`; `ArcMeta.summarized_through_entry_id` updated in the same transaction |
-| §3 Latest-per-tool-series cache | ✅ | `crates/athen-app/src/compaction.rs:380–399` — `BTreeMap` keyed by tool name, scans `id ≤ cutoff_id` of type `ToolCall`, keeps latest per tool |
-| §4 Hard-coded summarization prompt | ✅ | `crates/athen-app/src/compaction.rs:214–231`; `ModelProfile::Fast`, `max_tokens=2048`, `temperature=0.0` |
+| §3 Latest-per-tool-series cache | ✅ | `crates/athen-app/src/compaction.rs:464–483` — `BTreeMap` keyed by tool name, scans `id ≤ cutoff_id` of type `ToolCall`, keeps latest per tool |
+| §4 Hard-coded summarization prompt | ✅ | `crates/athen-app/src/compaction.rs:297–313`; `ModelProfile::Fast`, `max_tokens=2048`, `temperature=0.0` |
 | §5 Per-model budgets + trigger thresholds | ✅ | `ProviderConfig.context_window_tokens` / `compaction_trigger_pct` / `compaction_target_pct` (defaults 128k / 65 / 30); resolution in `resolve_compaction_budget` |
-| §2 Phase-1 burst heuristic (keep last 25% verbatim) | ✅ | `compaction.rs:264–276`; refuses to compact if <4 entries |
+| §2 Phase-1 burst heuristic (keep last 25% verbatim) | ✅ | `compaction.rs:347–358`; refuses to compact if <4 entries |
 | §7 Trait shape | ✅ | `athen-core::traits::compaction::ArcCompactor` |
-| §7 `LlmArcCompactor` Phase-1 implementation | ✅ | `crates/athen-app/src/compaction.rs` (the trait impl, ~420 LoC) |
+| §7 `LlmArcCompactor` Phase-1 implementation | ✅ | `crates/athen-app/src/compaction.rs:318–484` (the trait impl + helpers) |
 | §8 Atomic SQLite write (summary + pointer) | ✅ | Inside `arc_store.compact_arc()` |
-| §8 Discipline rule: executor goes through `load_context_view` | ✅ | Executor path runs `compactor.prepare_context(...)` at `crates/athen-app/src/commands.rs:2218–2234`; `view_to_messages()` at `compaction.rs:108–145` converts to `(Vec<ChatMessage>, system_suffix)` |
+| §8 Discipline rule: executor goes through `load_context_view` | ✅ | Executor path runs `compactor.prepare_context(...)` at `crates/athen-app/src/commands.rs:2939, 3973`; `view_to_messages()` at `compaction.rs:108–145` converts to `(Vec<ChatMessage>, system_suffix)` |
 | §9 UI shows full history including originals | ✅ | Summary entries render as collapsed `<details>` block "Earlier in this arc" in `frontend/app.js:2467` |
 | §10 Memory recall fix (no `context.insert(0, ...)`) | ✅ | Memory now flows through `external_system_suffix` appended to leading system prompt; the §10 violation is resolved |
 | §11 Phase-1.5 manual `compact_arc` Tauri command | ✅ | `crates/athen-app/src/commands.rs:3653`; force via `target_tokens = 0` |
-| Settings UI for budgets | ✅ | `frontend/app.js:3646–3656` (`provider-context-window`, `provider-compaction-trigger`, `provider-compaction-target`); validators in `crates/athen-app/src/settings.rs:791–839` |
+| Settings UI for budgets | ✅ | `frontend/app.js:6222–6232` (`provider-context-window`, `provider-compaction-trigger`, `provider-compaction-target`); validators in `crates/athen-app/src/settings.rs:791–839` |
 
 ### What's not yet implemented
 
@@ -467,15 +467,16 @@ Update this section, not the design body, when implementation moves.
 
 ### Test coverage
 
-`crates/athen-app/src/compaction.rs::tests` — 8 tests:
+`crates/athen-app/src/compaction.rs::tests` — 9 tests:
 
 - `estimate_tokens_chars_div_four` — token estimator
 - `resolve_compaction_budget_uses_active_provider` — budget resolution
 - `resolve_compaction_budget_falls_back_for_unknown_provider` — fallback defaults
 - `resolve_compaction_budget_clamps_trigger_above_target` — hysteresis clamp
-- `resolve_provider_temperature_reads_active_override_or_returns_none` — temperature resolver (lives here because it shares the provider-resolver helper)
+- `resolve_provider_temperature_reads_active_override_or_returns_none` — temperature resolver
 - `build_summary_prompt_tags_roles_and_strips_newlines` — prompt construction
 - `load_context_view_with_no_summary_returns_all_tail` — loader fresh arc
+- `view_to_messages_preserves_tool_calls_across_rehydration` — tool-call rehydration across provider failover
 - `load_context_view_with_summary_returns_summary_plus_tail` — loader post-compaction
 
 Plus `crates/athen-core/src/traits/compaction.rs:125–164` — dyn-compatibility sanity check on the trait.

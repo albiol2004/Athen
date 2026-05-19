@@ -59,7 +59,8 @@
     --shadow-raised: 0 8px 24px -8px rgba(0, 0, 0, 0.5), 0 0 0 1px var(--border);
     --shadow-modal:  0 24px 60px -10px rgba(0, 0, 0, 0.6), 0 0 0 1px var(--border-strong);
     --shadow-glow:   0 0 24px var(--brand-glow);
-    --ring-focus:    0 0 0 3px var(--brand-glow);
+    /* Two-stop focus ring: tight inner brand-solid + wider translucent halo. */
+    --ring-focus:    0 0 0 1.5px var(--brand-solid), 0 0 0 4px var(--brand-glow);
 
     /* type */
     --font: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Inter", system-ui, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
@@ -73,6 +74,23 @@
 
 /* ─── Reset & base ─── */
 *, *::before, *::after { box-sizing: border-box; }
+
+/* Coral-tinted text selection across the app. */
+::selection {
+    background: rgba(185, 81, 99, 0.35); /* fallback */
+    background: color-mix(in oklab, var(--brand-solid) 35%, transparent);
+    color: var(--text);
+}
+
+/* Respect users who've asked their OS to reduce motion. */
+@media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+    }
+}
 
 
 html, body {
@@ -458,6 +476,12 @@ header h1 {
     display: flex;
     flex-direction: column;
     gap: 1px;
+    -webkit-mask-image: linear-gradient(to bottom,
+        transparent 0, #000 14px,
+        #000 calc(100% - 18px), transparent 100%);
+    mask-image: linear-gradient(to bottom,
+        transparent 0, #000 14px,
+        #000 calc(100% - 18px), transparent 100%);
 }
 
 .session-list-empty {
@@ -1009,6 +1033,24 @@ header h1 {
     background: var(--brand-grad);
     opacity: 0.7;
     box-shadow: 2px 0 12px var(--brand-glow);
+}
+
+/* Streaming caret — coral block that blinks at the end of the in-flight
+   assistant message. Removed when the .streaming class drops on stream-end. */
+.message-bubble.streaming::after {
+    content: '';
+    display: inline-block;
+    width: 2px;
+    height: 0.95em;
+    background: var(--brand-warm);
+    vertical-align: -0.15em;
+    margin-left: 3px;
+    border-radius: 1px;
+    box-shadow: 0 0 6px var(--brand-glow);
+    animation: caret-blink 1.05s steps(2, start) infinite;
+}
+@keyframes caret-blink {
+    50% { opacity: 0; }
 }
 
 .message-row.user .message-bubble {
@@ -2608,6 +2650,12 @@ footer {
     max-width: 880px;
     width: 100%;
     margin: 0 auto;
+    -webkit-mask-image: linear-gradient(to bottom,
+        transparent 0, #000 16px,
+        #000 calc(100% - 20px), transparent 100%);
+    mask-image: linear-gradient(to bottom,
+        transparent 0, #000 16px,
+        #000 calc(100% - 20px), transparent 100%);
 }
 
 .settings-tabs {
@@ -3826,6 +3874,12 @@ option:hover {
     flex: 1;
     overflow: auto;
     padding: 16px 24px 24px;
+    -webkit-mask-image: linear-gradient(to bottom,
+        transparent 0, #000 18px,
+        #000 calc(100% - 22px), transparent 100%);
+    mask-image: linear-gradient(to bottom,
+        transparent 0, #000 18px,
+        #000 calc(100% - 22px), transparent 100%);
 }
 
 .cal-month-grid {

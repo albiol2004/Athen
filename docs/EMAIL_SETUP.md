@@ -1,8 +1,10 @@
 # Email Setup Wizard
 
+[SHIPPED] **Status: Phases 1–3 shipped 2026-05-12. Phase 4 (polish) deferred.**
+
 Design for the **Settings → Email** panel: a one-screen account-add flow that figures out IMAP/SMTP servers from just an email + password, deep-links the user to their provider's app-password page when needed, and translates auth/connection errors into plain English.
 
-Synthesized 2026-05-12 from five parallel research streams (provider autodetect mechanics, Rust crate audit, credential UX patterns, error catalog, IDLE monitoring). Builds on the existing `athen-sentidos/src/email.rs` polling monitor and `athen-sentidos/src/email_send.rs` SMTP sender — this is an **additive UX layer**, not a rewrite.
+Synthesized 2026-05-12 from five parallel research streams (provider autodetect mechanics, Rust crate audit, credential UX patterns, error catalog, IDLE monitoring). Builds on the existing `athen-sentidos/src/email.rs` polling monitor and `athen-sentidos/src/email_send.rs` SMTP sender — this is an **additive UX layer**, not a rewrite. Credentials now live in `athen-vault` (encrypted keychain) under scope `email:<account_id>`.
 
 ## Scope and non-goals
 
@@ -163,32 +165,30 @@ Today's `EmailConfig` (in `athen-core::config`) holds plaintext `imap_password`.
 
 This is the same pattern `athen-vault` already serves for the `http_request` registered endpoints and MCP env bindings; no new vault scope conventions needed.
 
-## Phasing
+## Phasing — Shipped Status
 
-**Phase 1 — Data plane (3 days):**
+**Phase 1 — Data plane [SHIPPED 2026-05-12]:**
 - `crates/athen-core/src/email_provider.rs`: `ProviderHint { incoming, outgoing, auth_kind, app_password_url, notes }`.
-- `crates/athen-app/src/email_autodetect.rs`: hardcoded table + Thunderbird autoconfig fetcher (`reqwest::Client`, parallel lookups via `futures::future::select_ok`, simple XML parsing with `quick-xml`).
-- `crates/athen-app/src/email_errors.rs`: static error catalog + matcher.
-- Tauri commands: `email_detect(email) -> ProviderHint | None`, `email_test_connection(config, password) -> TestResult`.
-- Vault migration: move plaintext passwords to scope `email:<account_id>` at startup.
+- `crates/athen-app/src/email_autodetect.rs`: hardcoded table + Thunderbird autoconfig fetcher.
+- `crates/athen-app/src/email_errors.rs`: static error catalog + matcher (50+ common IMAP/SMTP errors).
+- Tauri commands: `email_detect(email) -> ProviderHint | None`, `email_test_connection(config, password) -> TestResult`, `email_translate_error(error, domain) -> TranslatedError`.
+- Vault integration: passwords stored under scope `email:<account_id>`.
 
-**Phase 2 — Settings UI (2 days):**
-- Settings → Email panel: email field → live provider detection → app-password button → password field → Test & Save.
-- Advanced disclosure with manual host/port form.
-- Connected state: green banner with provider name + Disconnect + Edit.
-- Error banner with translator output + contextual action button.
+**Phase 2 — Settings UI [SHIPPED 2026-05-12]:**
+- Settings → Email panel live: email field → live provider detection → app-password button → password field → Test & Save.
+- Advanced disclosure with manual host/port/security form.
+- Connected state: banner with provider + last-poll time + Disconnect + Edit.
+- Error banner with LLM-translated message + contextual action button.
 
-**Phase 3 — LLM error translator (1 day):**
-- Wire `email_translate_error` Tauri command into the LLM router (same path the `judge_*` calls use).
-- Session-scoped cache.
-- Fall back gracefully if the LLM call fails (show the raw error with a "Sorry, the error is too unusual to translate" preface).
+**Phase 3 — LLM error translator [SHIPPED 2026-05-12]:**
+- `email_translate_error` Tauri command wired into the LLM router.
+- Session-scoped response cache (deduped on `hash(error + domain)`).
+- Graceful fallback on LLM unavailable (raw error with disclaimer).
 
-**Phase 4 — Optional polish (2 days, can be deferred):**
+**Phase 4 — Optional polish [DEFERRED]:**
 - Hostname probing as a "Probe" button when autodetect fails.
 - Per-provider hint copy ("Gmail: 2FA must be on first"; "iCloud: passwords appear at appleid.apple.com under Sign-In and Security").
-- Connected-state freshness indicator (last poll time, last error, queue depth).
-
-Total: 6 days if Phases 1–3 only; 8 days with polish.
+- Connected-state freshness indicator improvements.
 
 ## Out of scope (and why)
 

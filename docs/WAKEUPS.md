@@ -210,35 +210,29 @@ through the same execution path.
   edits an existing wake-up's schedule" or "user duplicates and
   tweaks." Adding a preset library is a follow-up, not v1.
 
-## Dependencies
+## Dependencies (shipped 2026-05-09 onwards)
 
-- **Send-Telegram tool** (separate task). Several digest use cases
-  want Telegram as the output channel. Wake-ups can ship without
-  it — the channel is just unavailable until that tool lands —
-  but the two are natural neighbours.
+- **Send-Telegram tool** (shipped 2026-05-11). Outbound Telegram text + attachments backed by `send_telegram` in `ShellToolRegistry`. Auto-chunks long text at 4096 chars; owner chat auto-approved; non-owner routes through `ApprovalRouter`. Used by wake-ups for Telegram-channel output (both as a declared output destination in the instruction and as the `preferred_channel` notification sink).
+- **Tool-call parameter visibility** (shipped 2026-05-12). Arc audit interface now shows full tool-call args (`tool_error_hints.rs`), so wake-up parameter audits are no longer blind when run unattended.
 - **Auditor-based loop cap (#166).** A weekly digest legitimately
   takes longer than a foreground task. The current iteration cap
-  will fight this. Wake-ups can ship with the existing cap, but
-  expect to bump #166 forward soon after.
-- **Tool-call parameter visibility (#167).** When wake-ups run
-  unattended, the user reviews what happened by reading the arc
-  later. If tool-call args are hidden in the UI, wake-up audits are
-  blind. Fix #167 before declaring wake-ups done.
+  will fight this; expect a bump forward soon after.
 
 ## Open questions
 
 - **Cron expression UX.** Power users want raw cron; most users
-  don't. Probably ship a small set of presets ("daily at HH:MM",
+  don't. Currently ships a small set of presets ("daily at HH:MM",
   "every Monday at HH:MM", "every N hours") plus an "advanced"
-  field for raw cron. Match how Reminders apps handle this.
-- **Risk-gate UI for agent-authored wake-ups.** When the agent
-  proposes a wake-up via tool call, does the user see the
-  instruction text + declared allowlists in a dialog and approve
-  the whole bundle? Probably yes — same shape as today's risky-
-  action approval, just with "this will happen on schedule X"
-  appended.
+  field for raw cron (via `create_wakeup` in `wakeup_commands.rs`).
+- **Risk-gate UI for agent-authored wake-ups** (shipped Phase 5, 2026-05-09).
+  When the agent proposes a wake-up via `create_wakeup` tool call,
+  the user sees the instruction text + declared allowlists in an
+  approval dialog (same shape as risky-action approval, with
+  "this will happen on schedule X" appended). The call is
+  rejected if not approved or if it requires escalation via
+  `ApprovalRouter` and no router is wired.
 - **Re-arming on partial failure.** If a fire pauses for approval
-  and the user denies, does the schedule re-arm for the next slot
-  or disable itself? Probably re-arm; one denied fire is not a
-  signal to kill a recurring schedule. But cap consecutive denials
-  → auto-disable + notify.
+  and the user denies, the schedule re-arms for the next slot
+  (one denied fire is not a signal to kill a recurring schedule).
+  Consecutive denials → auto-disable + notify (design; not yet
+  instrumented).
