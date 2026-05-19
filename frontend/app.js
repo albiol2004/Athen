@@ -4061,6 +4061,14 @@ function renderSubAgentSteps(container, entries) {
 // routed through renderToolGroup via buildRenderUnits, not here.
 function renderHistoryEntry(entry) {
     if (entry.entry_type === 'message') {
+        // App-authored notices (post-rewind hint, etc.) live as
+        // Message+source=system. They aren't real user/assistant turns,
+        // so render them as a compact inline system note rather than
+        // through addMessage.
+        if (entry.source === 'system') {
+            addRevertNotice(entry.content);
+            return;
+        }
         const meta = parseEntryMetadata(entry.metadata) || {};
         const eventId = meta.attachment_event_id || (meta.source === 'user_upload' ? meta.event_id : null);
         if (eventId) {
@@ -4186,6 +4194,23 @@ function addSystemEntry(content, type) {
     row.className = 'message-row system';
     const icon = type === 'tool' ? '&#128295;' : '&#9881;';
     row.innerHTML = '<div class="system-inline-entry">' + icon + ' ' + escapeHtml(content) + '</div>';
+    messagesEl.appendChild(row);
+}
+
+// Compact inline note for the post-rewind LLM hint (Message+source=system).
+// The same text rides into the next LLM turn wrapped in <system-reminder>
+// framing, so showing it to the user is non-load-bearing — purely a
+// "you reverted, the agent has been told" affordance.
+function addRevertNotice(content) {
+    const row = document.createElement('div');
+    row.className = 'message-row system';
+    row.innerHTML =
+        '<div class="system-inline-entry revert-notice">' +
+        '<span class="revert-notice-icon" aria-hidden="true">' +
+        '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7"/><polyline points="3 4 3 10 9 10"/></svg>' +
+        '</span>' +
+        '<span>' + escapeHtml(content) + '</span>' +
+        '</div>';
     messagesEl.appendChild(row);
 }
 

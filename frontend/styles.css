@@ -2324,6 +2324,20 @@ mark.grep-match {
     color: var(--text-2);
     font-size: 12px;
 }
+.system-inline-entry.revert-notice {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    line-height: 1.45;
+    background: rgba(185, 81, 99, 0.05);
+    border-color: rgba(185, 81, 99, 0.22);
+}
+.system-inline-entry.revert-notice .revert-notice-icon {
+    color: var(--brand-warm);
+    display: inline-flex;
+    flex-shrink: 0;
+    margin-top: 1px;
+}
 
 .email-notification {
     display: flex;

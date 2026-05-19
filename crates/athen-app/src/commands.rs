@@ -5388,7 +5388,10 @@ pub async fn revert_snapshot(
 /// Rewind the arc to just before a given snapshotted action: restore
 /// files to that action's pre-state AND drop the action plus every
 /// newer one from history. Atomic at the trait boundary; idempotent
-/// when `action_id` is unknown.
+/// when `action_id` is unknown. On success, appends a one-shot
+/// system-source Message entry to the arc so the next LLM turn knows
+/// state changed under it and re-reads affected files. The entry is
+/// written at the tail so the cached prompt prefix stays valid.
 #[tauri::command]
 pub async fn rewind_changes(
     state: State<'_, AppState>,
@@ -5399,10 +5402,73 @@ pub async fn rewind_changes(
         .checkpoint_store
         .as_ref()
         .ok_or_else(|| "checkpoint store not initialized".to_string())?;
-    store
+    let outcome = store
         .rewind_to_before(&arc_id, &action_id)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+    if outcome.discarded > 0 {
+        if let Some(arc_store) = state.arc_store.as_ref() {
+            let hint = build_rewind_hint(&outcome);
+            if let Err(e) = arc_store
+                .add_entry(
+                    &arc_id,
+                    athen_persistence::arcs::EntryType::Message,
+                    "system",
+                    &hint,
+                    None,
+                    None,
+                )
+                .await
+            {
+                warn!("rewind_changes: failed to persist hint entry: {e}");
+            }
+        }
+    }
+
+    Ok(outcome)
+}
+
+/// Build the one-shot reminder body the next LLM turn will see. Lists
+/// up to N affected paths verbatim so the agent can target re-reads
+/// without guessing.
+fn build_rewind_hint(outcome: &athen_core::traits::checkpoint::RevertOutcome) -> String {
+    const MAX_PATHS: usize = 8;
+    let mut all_paths: Vec<String> = Vec::new();
+    for p in &outcome.restored {
+        all_paths.push(p.display().to_string());
+    }
+    for p in &outcome.recreated {
+        all_paths.push(p.display().to_string());
+    }
+    for p in &outcome.deleted {
+        all_paths.push(p.display().to_string());
+    }
+    all_paths.sort();
+    all_paths.dedup();
+    let total = all_paths.len();
+    let shown: Vec<String> = all_paths.into_iter().take(MAX_PATHS).collect();
+    let extra = total.saturating_sub(shown.len());
+
+    let n = outcome.discarded;
+    let mut s = if n == 1 {
+        String::from("The user just reverted your most recent change via Athen's Changes panel.")
+    } else {
+        format!("The user just reverted your last {n} changes via Athen's Changes panel.")
+    };
+    if !shown.is_empty() {
+        s.push_str(" Files restored to their pre-edit state: ");
+        s.push_str(&shown.join(", "));
+        if extra > 0 {
+            s.push_str(&format!(" (+{extra} more)"));
+        }
+        s.push('.');
+    }
+    s.push_str(
+        " Your prior edits to these files are no longer on disk. \
+                Re-read any file in this list before referring to its contents in this turn.",
+    );
+    s
 }
 
 /// Most recent finalized agent runs, newest-first. Backs the "history"

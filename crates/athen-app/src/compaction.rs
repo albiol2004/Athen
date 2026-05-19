@@ -153,20 +153,34 @@ pub fn view_to_messages(view: &ArcContextView) -> (Vec<ChatMessage>, String) {
 
     let mut tail = Vec::new();
     for e in &view.tail {
-        let role = match (e.entry_type.as_str(), e.source.as_str()) {
-            ("message", "user") => Role::User,
-            ("message", "assistant") => Role::Assistant,
-            ("message", "system") => Role::System,
-            ("message", "tool") => Role::Tool,
+        // Source="system" Message entries are app-authored one-shot
+        // notices (e.g. the post-rewind hint). They ride as Role::User
+        // wrapped in `<system-reminder>` framing — strict chat templates
+        // (Qwen / Llama) reject Role::System past position 0, and the
+        // framing tags are the Claude-Code-style convention models react
+        // to anyway. Appending these at the tail keeps the prompt
+        // cache-friendly: existing cached prefix is untouched and the
+        // notice itself folds into the cache after the next turn.
+        let (role, content) = match (e.entry_type.as_str(), e.source.as_str()) {
+            ("message", "user") => (Role::User, e.content.clone()),
+            ("message", "assistant") => (Role::Assistant, e.content.clone()),
+            ("message", "system") => (
+                Role::User,
+                format!(
+                    "<system-reminder>\n{}\n</system-reminder>",
+                    e.content.trim()
+                ),
+            ),
+            ("message", "tool") => (Role::Tool, e.content.clone()),
             // Persisted tool_call rows replay as assistant-side audit
             // prose at their chronological position. The content was
             // already flattened in `to_context_entry` so we just push it.
-            ("tool_call", _) => Role::Assistant,
+            ("tool_call", _) => (Role::Assistant, e.content.clone()),
             _ => continue,
         };
         tail.push(ChatMessage {
             role,
-            content: MessageContent::Text(e.content.clone()),
+            content: MessageContent::Text(content),
         });
     }
     (tail, suffix)
@@ -1014,6 +1028,54 @@ mod tests {
         assert!(m2.contains("tool=shell_spawn"), "got: {m2}");
         assert!(m2.contains("python3"), "got: {m2}");
         assert!(m2.contains("\"alive\":true"), "got: {m2}");
+    }
+
+    /// source="system" Message entries (used by the post-rewind hint)
+    /// must ride as Role::User wrapped in `<system-reminder>` framing.
+    /// Mid-stream Role::System breaks strict chat templates (Qwen/Llama),
+    /// and the framing tags are the convention models react to anyway.
+    #[tokio::test]
+    async fn view_to_messages_wraps_system_source_message_as_user_reminder() {
+        let store = empty_store().await;
+        store
+            .create_arc("a", "A", athen_persistence::arcs::ArcSource::UserInput)
+            .await
+            .unwrap();
+        store
+            .add_entry("a", EntryType::Message, "user", "first turn", None, None)
+            .await
+            .unwrap();
+        store
+            .add_entry(
+                "a",
+                EntryType::Message,
+                "system",
+                "The user just reverted your most recent change. Re-read foo.rs.",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let router = athen_llm::router::DefaultLlmRouter::new(
+            Default::default(),
+            Default::default(),
+            athen_llm::budget::BudgetTracker::new(None),
+        );
+        let router = StdArc::new(tokio::sync::RwLock::new(StdArc::new(router)));
+        let compactor = LlmArcCompactor::new(store.clone(), router);
+
+        let view = compactor.load_context_view("a").await.unwrap();
+        let (messages, _suffix) = view_to_messages(&view);
+
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(messages[1].role, Role::User));
+        let MessageContent::Text(ref body) = messages[1].content else {
+            panic!("expected text");
+        };
+        assert!(body.starts_with("<system-reminder>"), "got: {body}");
+        assert!(body.ends_with("</system-reminder>"), "got: {body}");
+        assert!(body.contains("reverted"), "got: {body}");
     }
 
     #[tokio::test]
