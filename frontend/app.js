@@ -991,7 +991,14 @@ function renderArcList(arcs) {
     sessionListEl.innerHTML = '';
 
     if (!arcs || arcs.length === 0) {
-        sessionListEl.innerHTML = '<div class="session-list-empty">No conversations yet</div>';
+        sessionListEl.innerHTML = `
+            <div class="session-list-empty">
+                <svg class="session-list-empty-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/>
+                </svg>
+                <div class="session-list-empty-title">No conversations yet</div>
+                <div class="session-list-empty-hint">Type below to start a new one</div>
+            </div>`;
         return;
     }
 
@@ -9192,6 +9199,7 @@ function renderNotificationList(notifications) {
     for (const notif of notifications) {
         const item = document.createElement('div');
         item.className = 'notification-item' + (notif.is_read ? ' read' : ' unread');
+        if (notif.urgency) item.setAttribute('data-urgency', notif.urgency);
 
         const urgencyIcons = { Low: '\u2139\uFE0F', Medium: '\uD83D\uDCEC', High: '\u26A0\uFE0F', Critical: '\uD83D\uDEA8' };
         const icon = urgencyIcons[notif.urgency] || '\uD83D\uDCEC';

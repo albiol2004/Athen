@@ -502,10 +502,43 @@ header h1 {
 }
 
 .session-list-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
     color: var(--text-3);
     font-size: 12px;
     text-align: center;
-    padding: 24px 12px;
+    padding: 32px 16px;
+}
+.session-list-empty-icon {
+    width: 32px;
+    height: 32px;
+    color: var(--text-3);
+    opacity: 0.6;
+    margin-bottom: 4px;
+}
+.session-list-empty-title {
+    font-size: 12.5px;
+    font-weight: 500;
+    color: var(--text-2);
+}
+.session-list-empty-hint {
+    font-size: 11px;
+    color: var(--text-3);
+    line-height: 1.5;
+}
+.session-list-empty-hint kbd {
+    display: inline-block;
+    padding: 1px 5px;
+    font-family: var(--mono);
+    font-size: 10.5px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-bottom-width: 2px;
+    border-radius: 4px;
+    color: var(--text-2);
+    line-height: 1.2;
 }
 
 .session-item {
@@ -1103,9 +1136,13 @@ header h1 {
 }
 
 .message-row.user .message-bubble {
-    color: var(--text-2);
-    text-align: right;
+    color: var(--text);
+    text-align: left;
     white-space: pre-wrap;
+    padding: 8px 14px;
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: 14px 14px 4px 14px;
 }
 
 .message-row.system .message-bubble {
@@ -4579,9 +4616,16 @@ option:hover {
     background: var(--surface-1);
     border: 1px solid var(--border);
     border-radius: var(--r-md);
-    padding: 12px 14px;
+    padding: 12px 14px 12px 17px;
     transition: border-color var(--dur) var(--ease);
 }
+
+/* Urgency stripe — inset shadow keeps the rounded corner clean, unlike a
+   border-left override. Matches the agent-card pattern. */
+.notification-item[data-urgency="Critical"] { box-shadow: inset 3px 0 0 0 var(--danger); }
+.notification-item[data-urgency="High"]     { box-shadow: inset 3px 0 0 0 var(--warning); }
+.notification-item[data-urgency="Medium"]   { box-shadow: inset 3px 0 0 0 var(--info); }
+.notification-item[data-urgency="Low"]      { box-shadow: inset 3px 0 0 0 var(--text-3); }
 .notification-item.unread {
     border-color: rgba(255, 122, 107, 0.25);
     background: linear-gradient(to right, rgba(255, 122, 107, 0.04), transparent);
@@ -5649,6 +5693,7 @@ option:hover {
     border-radius: var(--r-lg);
     box-shadow: var(--shadow-modal);
     overflow: hidden;
+    animation: modal-in var(--dur-slow) var(--ease);
 }
 .profile-modal-header {
     display: flex;
