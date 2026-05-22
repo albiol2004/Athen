@@ -46,9 +46,17 @@ pub fn athen_attachments_dir() -> Option<PathBuf> {
 /// `write { path: "test.html", ... }` lands here instead of the project the
 /// app was launched from.
 ///
+/// - `ATHEN_WORKSPACE_DIR` env var (if set & non-empty) takes precedence —
+///   used by benchmark harnesses (TerminalBench, etc.) to point the agent
+///   at the task's working directory instead of the user's data dir.
 /// - Unix: `~/.athen/workspace`
 /// - Windows: `%APPDATA%\Athen\workspace`
 pub fn athen_workspace_dir() -> Option<PathBuf> {
+    if let Ok(s) = std::env::var("ATHEN_WORKSPACE_DIR") {
+        if !s.is_empty() {
+            return Some(PathBuf::from(s));
+        }
+    }
     athen_data_dir().map(|d| d.join("workspace"))
 }
 

@@ -33,6 +33,9 @@ pub struct DeepSeekProvider {
     /// reasoning); switch to `DeepSeekR1` to enable reasoning_content
     /// promotion + echo-on-tool-turn.
     quirks: ModelQuirks,
+    /// Family kept alongside `quirks` so request-shaping (specifically the
+    /// V4 Flash `"thinking": {"type": "disabled"}` knob) can branch on it.
+    family: ModelFamily,
 }
 
 impl DeepSeekProvider {
@@ -47,6 +50,7 @@ impl DeepSeekProvider {
             // Callers can override via `with_family(ModelFamily::DeepSeekR1)`
             // if they're pointed at the reasoner endpoint.
             quirks: seed::quirks_for_family(ModelFamily::DeepSeekV4Chat),
+            family: ModelFamily::DeepSeekV4Chat,
         }
     }
 
@@ -55,6 +59,7 @@ impl DeepSeekProvider {
     /// reasoner endpoint so reasoning_content is promoted and echoed.
     pub fn with_family(mut self, family: ModelFamily) -> Self {
         self.quirks = seed::quirks_for_family(family);
+        self.family = family;
         self
     }
 
@@ -214,6 +219,21 @@ impl DeepSeekProvider {
                 .collect()
         });
 
+        let reasoning_effort = map_deepseek_reasoning_effort(request.reasoning_effort);
+        // DeepSeek V4 Flash defaults to thinking-on, regardless of whether
+        // `reasoning_effort` is sent. The only way to get a pure non-thinking
+        // response shape is to opt out via `"thinking": {"type": "disabled"}`.
+        // Emit it when the family is `DeepSeekV4Chat` (the "chat / non-thinking"
+        // semantic) AND no explicit reasoning effort was requested. Callers who
+        // want reasoning on V4 should pass any non-default effort, or pick
+        // `DeepSeekV4Pro` / `DeepSeekR1` which keep thinking on.
+        let thinking = match (self.family, request.reasoning_effort) {
+            (ModelFamily::DeepSeekV4Chat, ReasoningEffort::Default | ReasoningEffort::Off) => {
+                Some(serde_json::json!({ "type": "disabled" }))
+            }
+            _ => None,
+        };
+
         OpenAiRequestOut {
             model: self.default_model.clone(),
             messages,
@@ -221,7 +241,8 @@ impl DeepSeekProvider {
             temperature: request.temperature.unwrap_or(0.7),
             tools,
             stream: false,
-            reasoning_effort: map_deepseek_reasoning_effort(request.reasoning_effort),
+            reasoning_effort,
+            thinking,
         }
     }
 
@@ -560,6 +581,10 @@ struct OpenAiRequestOut {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'static str>,
+    /// V4 Flash defaults to thinking-on. Send `{"type": "disabled"}` to
+    /// get a clean non-thinking response. Omitted when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<serde_json::Value>,
 }
 
 /// DeepSeek V4 chat exposes `reasoning_effort` with only two valid
@@ -811,6 +836,50 @@ mod arg_parse_tests {
     fn deepseek_max_maps_to_max() {
         let body = deepseek_body_with(ReasoningEffort::Max);
         assert_eq!(body["reasoning_effort"], "max");
+    }
+
+    /// V4 Flash defaults to thinking-on regardless of `reasoning_effort`
+    /// omission. `DeepSeekV4Chat` family is the "chat / non-thinking"
+    /// semantic, so Default + Off MUST emit the disable knob.
+    #[test]
+    fn deepseek_v4_chat_default_disables_thinking() {
+        let body = deepseek_body_with(ReasoningEffort::Default);
+        assert_eq!(body["thinking"], serde_json::json!({"type": "disabled"}));
+    }
+
+    #[test]
+    fn deepseek_v4_chat_off_disables_thinking() {
+        let body = deepseek_body_with(ReasoningEffort::Off);
+        assert_eq!(body["thinking"], serde_json::json!({"type": "disabled"}));
+    }
+
+    /// Any non-default effort leaves thinking up to the model's
+    /// `reasoning_effort` handling. Don't send the disable knob.
+    #[test]
+    fn deepseek_v4_chat_high_omits_thinking_disable() {
+        let body = deepseek_body_with(ReasoningEffort::High);
+        assert!(body.get("thinking").is_none(), "{body}");
+    }
+
+    /// `DeepSeekV4Pro` keeps thinking-on by default (it's the flagship
+    /// reasoner-friendly variant), so we don't auto-disable for it.
+    #[test]
+    fn deepseek_v4_pro_default_omits_thinking_disable() {
+        let provider = DeepSeekProvider::new("k".into()).with_family(ModelFamily::DeepSeekV4Pro);
+        let req = LlmRequest {
+            profile: ModelProfile::Powerful,
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: MessageContent::Text("hi".into()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            tools: None,
+            system_prompt: None,
+            reasoning_effort: ReasoningEffort::Default,
+        };
+        let body = serde_json::to_value(provider.build_request_body(&req)).expect("serializes");
+        assert!(body.get("thinking").is_none(), "{body}");
     }
 
     /// DeepSeek thinking-mode demands prior assistant turns' reasoning_content

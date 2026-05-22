@@ -146,27 +146,53 @@ fn build_coordinator(router: &Arc<DefaultLlmRouter>) -> Coordinator {
 // Headless one-shot mode (benchmark harness driver)
 // ---------------------------------------------------------------------------
 
-/// Build a router backed by a single OpenAI-compatible provider. All model
-/// profiles are mapped to the same provider so any internal call routes back
-/// to the local backend.
+/// Build a router backed by a single provider. DeepSeek-family selections
+/// route through the dedicated `DeepSeekProvider` (which knows the wire
+/// quirks: V4 Flash thinking-disable, reasoning_content echo, etc.); all
+/// other families go through the generic `OpenAiCompatibleProvider`.
 fn build_openai_compat_router(
     base_url: String,
     model: String,
     api_key: Option<String>,
     family: ModelFamily,
 ) -> Arc<DefaultLlmRouter> {
-    let provider_id = "openai-compat".to_string();
-    let mut provider = OpenAiCompatibleProvider::new(base_url)
-        .with_model(model)
-        .with_provider_id(provider_id.clone())
-        .with_family(family);
-    if let Some(key) = api_key {
-        provider = provider.with_api_key(key);
-    }
+    let is_deepseek_family = matches!(
+        family,
+        ModelFamily::DeepSeekV4Chat | ModelFamily::DeepSeekV4Pro | ModelFamily::DeepSeekR1
+    );
+
+    let (provider_id, provider): (String, Box<dyn athen_core::traits::llm::LlmProvider>) =
+        if is_deepseek_family {
+            // DeepSeek provider hits `{base_url}/v1/chat/completions`, so the
+            // caller's base URL must be the host root (e.g. `https://api.deepseek.com`).
+            // If the caller passed a `/v1` suffix (the OpenAI-compat convention),
+            // strip it so we don't double up.
+            let host_root = base_url
+                .strip_suffix("/v1")
+                .or_else(|| base_url.strip_suffix("/v1/"))
+                .unwrap_or(&base_url)
+                .to_string();
+            let key = api_key.unwrap_or_default();
+            let provider = DeepSeekProvider::new(key)
+                .with_base_url(host_root)
+                .with_model(model)
+                .with_family(family);
+            ("deepseek".to_string(), Box::new(provider))
+        } else {
+            let pid = "openai-compat".to_string();
+            let mut provider = OpenAiCompatibleProvider::new(base_url)
+                .with_model(model)
+                .with_provider_id(pid.clone())
+                .with_family(family);
+            if let Some(key) = api_key {
+                provider = provider.with_api_key(key);
+            }
+            (pid, Box::new(provider))
+        };
 
     let mut providers: HashMap<String, Box<dyn athen_core::traits::llm::LlmProvider>> =
         HashMap::new();
-    providers.insert(provider_id.clone(), Box::new(provider));
+    providers.insert(provider_id.clone(), provider);
 
     let profile = ProfileConfig {
         description: "OpenAI-compatible local backend".into(),
@@ -213,6 +239,8 @@ fn print_usage() {
     println!("    --temperature <F>  Sampling temperature for the main agent loop (e.g. 0.2 for");
     println!("                       benchmark determinism, 0.7 default, 1.0+ for exploration).");
     println!("                       Overrides ATHEN_TEMPERATURE. Not clamped.");
+    println!("    --max-steps <N>    Per-task iteration cap (default 50). Use 0 for unlimited.");
+    println!("                       The 600s timeout still applies. Overrides ATHEN_MAX_STEPS.");
     println!();
     println!("HEADLESS MODE ENV VARS:");
     println!("    ATHEN_BASE_URL    (required)  e.g. http://localhost:8000/v1");
@@ -303,6 +331,7 @@ async fn run_headless(
     profile_id: Option<String>,
     family: ModelFamily,
     temperature: Option<f32>,
+    max_steps: u32,
 ) -> std::result::Result<(), (i32, String)> {
     // 1. Read required env vars.
     let base_url = match std::env::var("ATHEN_BASE_URL") {
@@ -346,7 +375,7 @@ async fn run_headless(
     let mut builder = AgentBuilder::new()
         .llm_router(exec_router)
         .tool_registry(Box::new(registry))
-        .max_steps(50)
+        .max_steps(max_steps)
         .timeout(Duration::from_secs(600))
         .default_temperature(temperature);
     if let Some(rp) = resolved_profile {
@@ -522,8 +551,37 @@ async fn main() {
         },
     };
 
+    // Per-task iteration cap. `--max-steps` overrides `ATHEN_MAX_STEPS`. 0 ⇒ unlimited
+    // (mapped to `u32::MAX`). Default 50 matches the interactive REPL build.
+    let max_steps_arg = match extract_flag(&args, "--max-steps") {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("Error: {msg}");
+            eprintln!(
+                "Usage: athen-cli --prompt <PROMPT> [--profile <ID>] [--family <ID>] [--max-steps <N>]"
+            );
+            std::process::exit(2);
+        }
+    };
+    let max_steps_str = max_steps_arg.or_else(|| {
+        std::env::var("ATHEN_MAX_STEPS")
+            .ok()
+            .filter(|s| !s.is_empty())
+    });
+    let max_steps = match max_steps_str.as_deref() {
+        None => 50u32,
+        Some(s) => match s.parse::<u32>() {
+            Ok(0) => u32::MAX,
+            Ok(n) => n,
+            Err(_) => {
+                eprintln!("Error: --max-steps expects a non-negative integer, got '{s}'.");
+                std::process::exit(2);
+            }
+        },
+    };
+
     if let Some(prompt) = prompt_arg {
-        match run_headless(prompt, profile_arg, family, temperature).await {
+        match run_headless(prompt, profile_arg, family, temperature, max_steps).await {
             Ok(()) => std::process::exit(0),
             Err((code, msg)) => {
                 eprintln!("{msg}");
