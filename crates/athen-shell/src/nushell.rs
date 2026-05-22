@@ -16,8 +16,11 @@ use athen_core::traits::shell::{ShellExecutor, ShellOptions};
 
 use crate::native::NativeShell;
 
-/// Default command timeout in seconds.
-const DEFAULT_TIMEOUT_SECS: u64 = 30;
+/// Default command timeout in seconds. See sibling `native.rs` — set to
+/// the `shell_execute` tool's surface ceiling (10 min) so the inner shell
+/// doesn't silently truncate longer commands the agent legitimately
+/// requested.
+const DEFAULT_TIMEOUT_SECS: u64 = 600;
 
 /// Process-based Nushell executor.
 ///

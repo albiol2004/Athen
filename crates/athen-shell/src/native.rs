@@ -11,8 +11,12 @@ use athen_core::error::{AthenError, Result};
 use athen_core::traits::sandbox::SandboxOutput;
 use athen_core::traits::shell::{ShellExecutor, ShellOptions};
 
-/// Default command timeout in seconds.
-const DEFAULT_TIMEOUT_SECS: u64 = 30;
+/// Default command timeout in seconds. Set to the upper bound of the
+/// `shell_execute` tool's `timeout_ms` surface (600,000ms = 600s = 10min)
+/// so the inner shell never silently undercuts what the agent asked for.
+/// The agent tool layer already enforces tighter per-call timeouts via
+/// `tokio::time::timeout(timeout_ms)` — this constant is just the ceiling.
+const DEFAULT_TIMEOUT_SECS: u64 = 600;
 
 /// Native platform shell executor.
 ///

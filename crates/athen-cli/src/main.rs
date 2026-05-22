@@ -372,11 +372,20 @@ async fn run_headless(
     let exec_router: Box<dyn LlmRouter> = Box::new(SharedRouter(Arc::clone(&router)));
     let registry = ShellToolRegistry::new().await;
 
+    // Per-task overall timeout. Defaults to 30 min for benchmarks where a
+    // single task can include a long compile/install (Caffe, kernel build,
+    // etc.). The CLI's per-shell-command `timeout_ms` still caps individual
+    // commands at 10 min by default. Override with `ATHEN_TASK_TIMEOUT_SECS`.
+    let task_timeout_secs: u64 = std::env::var("ATHEN_TASK_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1800);
+
     let mut builder = AgentBuilder::new()
         .llm_router(exec_router)
         .tool_registry(Box::new(registry))
         .max_steps(max_steps)
-        .timeout(Duration::from_secs(600))
+        .timeout(Duration::from_secs(task_timeout_secs))
         .default_temperature(temperature);
     if let Some(rp) = resolved_profile {
         builder = builder.active_profile(rp);

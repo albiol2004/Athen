@@ -1351,13 +1351,28 @@ impl ShellToolRegistry {
         // Pre-execution risk check: evaluate the ACTUAL command (not user's
         // natural language) through the rule engine. This catches dangerous
         // commands like `rm -rf` regardless of what language the user spoke.
+        //
+        // Benchmark escape hatch: `ATHEN_DISABLE_RISK_GATE=1` skips the rule
+        // engine entirely. Only set this in sandboxed harnesses where every
+        // command is throw-away (TB2 containers are deleted after each task).
+        // Never set in production — it removes the last defense before
+        // `rm -rf`, `mkfs`, etc.
+        let risk_gate_disabled = std::env::var("ATHEN_DISABLE_RISK_GATE")
+            .ok()
+            .filter(|s| !s.is_empty() && s != "0" && s.to_lowercase() != "false")
+            .is_some();
         let risk_ctx = RiskContext {
             trust_level: TrustLevel::AuthUser,
             data_sensitivity: DataSensitivity::Plain,
             llm_confidence: Some(1.0),
             accumulated_risk: 0,
         };
-        if let Some(score) = self.rule_engine.evaluate(command, &risk_ctx) {
+        let maybe_score = if risk_gate_disabled {
+            None
+        } else {
+            self.rule_engine.evaluate(command, &risk_ctx)
+        };
+        if let Some(score) = maybe_score {
             if score.level == RiskLevel::Danger || score.level == RiskLevel::Critical {
                 tracing::warn!(
                     tool = "shell_execute",
@@ -2339,14 +2354,24 @@ impl ShellToolRegistry {
         let start = Instant::now();
 
         // Same risk check as shell_execute — a long-lived daemon can do as
-        // much damage as a one-shot command.
+        // much damage as a one-shot command. Honors the same
+        // `ATHEN_DISABLE_RISK_GATE` benchmark escape hatch.
+        let risk_gate_disabled = std::env::var("ATHEN_DISABLE_RISK_GATE")
+            .ok()
+            .filter(|s| !s.is_empty() && s != "0" && s.to_lowercase() != "false")
+            .is_some();
         let risk_ctx = RiskContext {
             trust_level: TrustLevel::AuthUser,
             data_sensitivity: DataSensitivity::Plain,
             llm_confidence: Some(1.0),
             accumulated_risk: 0,
         };
-        if let Some(score) = self.rule_engine.evaluate(command, &risk_ctx) {
+        let maybe_score = if risk_gate_disabled {
+            None
+        } else {
+            self.rule_engine.evaluate(command, &risk_ctx)
+        };
+        if let Some(score) = maybe_score {
             if score.level == RiskLevel::Danger || score.level == RiskLevel::Critical {
                 tracing::warn!(
                     tool = "shell_spawn",
