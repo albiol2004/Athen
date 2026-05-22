@@ -128,6 +128,7 @@ mod tests {
             completion_tokens: 50,
             total_tokens: 150,
             estimated_cost_usd: Some(7.0),
+            ..TokenUsage::default()
         });
 
         // Should not afford another 5.0 (7 + 5 > 10)
@@ -144,6 +145,7 @@ mod tests {
             completion_tokens: 100,
             total_tokens: 300,
             estimated_cost_usd: Some(5.0),
+            ..TokenUsage::default()
         });
 
         let status = tracker.status();
@@ -163,6 +165,7 @@ mod tests {
             completion_tokens: 0,
             total_tokens: 0,
             estimated_cost_usd: Some(80.0),
+            ..TokenUsage::default()
         });
         assert!(tracker.is_warning());
     }
@@ -175,6 +178,7 @@ mod tests {
             completion_tokens: 200,
             total_tokens: 700,
             estimated_cost_usd: None,
+            ..TokenUsage::default()
         });
 
         let status = tracker.status();

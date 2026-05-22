@@ -1785,12 +1785,7 @@ impl AgentExecutor for DefaultExecutor {
                             },
                             model_used: String::new(),
                             provider: String::new(),
-                            usage: athen_core::llm::TokenUsage {
-                                prompt_tokens: 0,
-                                completion_tokens: 0,
-                                total_tokens: 0,
-                                estimated_cost_usd: None,
-                            },
+                            usage: athen_core::llm::TokenUsage::default(),
                             tool_calls: result.tool_calls,
                             finish_reason,
                         }
@@ -1811,12 +1806,7 @@ impl AgentExecutor for DefaultExecutor {
                                     reasoning_content: None,
                                     model_used: String::new(),
                                     provider: String::new(),
-                                    usage: athen_core::llm::TokenUsage {
-                                        prompt_tokens: 0,
-                                        completion_tokens: 0,
-                                        total_tokens: 0,
-                                        estimated_cost_usd: None,
-                                    },
+                                    usage: athen_core::llm::TokenUsage::default(),
                                     tool_calls: vec![],
                                     finish_reason: athen_core::llm::FinishReason::Stop,
                                 }
@@ -2347,6 +2337,7 @@ mod tests {
                     completion_tokens: 20,
                     total_tokens: 30,
                     estimated_cost_usd: None,
+                    ..TokenUsage::default()
                 },
                 tool_calls,
                 finish_reason,

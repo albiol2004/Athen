@@ -446,6 +446,7 @@ mod tests {
                         completion_tokens: 5,
                         total_tokens: 15,
                         estimated_cost_usd: Some(0.001),
+                        ..TokenUsage::default()
                     },
                     tool_calls: vec![],
                     finish_reason: FinishReason::Stop,

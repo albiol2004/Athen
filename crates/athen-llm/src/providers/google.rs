@@ -384,13 +384,9 @@ impl GoogleProvider {
                     u.prompt_token_count.unwrap_or(0),
                     u.candidates_token_count.unwrap_or(0),
                 )),
+                ..TokenUsage::default()
             },
-            None => TokenUsage {
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                total_tokens: 0,
-                estimated_cost_usd: None,
-            },
+            None => TokenUsage::default(),
         };
 
         let mut response = LlmResponse {

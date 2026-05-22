@@ -230,6 +230,7 @@ impl LlmProvider for AnthropicProvider {
                 api_response.usage.input_tokens,
                 api_response.usage.output_tokens,
             )),
+            ..TokenUsage::default()
         };
 
         let mut response = LlmResponse {

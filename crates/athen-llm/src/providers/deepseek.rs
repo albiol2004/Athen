@@ -320,6 +320,7 @@ impl LlmProvider for DeepSeekProvider {
         };
 
         let usage = if let Some(ref u) = api_response.usage {
+            let cache_hit = u.prompt_cache_hit_tokens.unwrap_or(0);
             TokenUsage {
                 prompt_tokens: u.prompt_tokens,
                 completion_tokens: u.completion_tokens,
@@ -328,15 +329,13 @@ impl LlmProvider for DeepSeekProvider {
                     &api_response.model,
                     u.prompt_tokens,
                     u.completion_tokens,
+                    cache_hit,
                 )),
+                cached_tokens: u.prompt_cache_hit_tokens,
+                cache_creation_tokens: None,
             }
         } else {
-            TokenUsage {
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                total_tokens: 0,
-                estimated_cost_usd: None,
-            }
+            TokenUsage::default()
         };
 
         let mut response = LlmResponse {
@@ -502,17 +501,34 @@ fn observe_deepseek_chunks<S>(
 /// Cost estimation for DeepSeek models.
 ///
 /// DeepSeek pricing is very competitive (as of 2025):
-/// - deepseek-chat: ~$0.14/M input, ~$0.28/M output
-/// - deepseek-reasoner: ~$0.55/M input, ~$2.19/M output
-fn estimate_deepseek_cost(model: &str, input_tokens: u32, output_tokens: u32) -> f64 {
+/// - deepseek-chat: ~$0.14/M input miss, ~$0.014/M input hit, ~$0.28/M output
+/// - deepseek-reasoner: ~$0.55/M input miss, ~$0.055/M input hit, ~$2.19/M output
+///
+/// Cache hits bill at ~10% of the miss rate. `cache_hit_tokens` is the
+/// portion of `input_tokens` already served from cache; we split the
+/// input total into miss + hit and bill each at its own rate. Pass `0`
+/// when the response didn't include `prompt_cache_hit_tokens` (the prior
+/// behaviour billed everything at the miss rate, overstating cost by up
+/// to 10× whenever a hit landed).
+fn estimate_deepseek_cost(
+    model: &str,
+    input_tokens: u32,
+    output_tokens: u32,
+    cache_hit_tokens: u32,
+) -> f64 {
     let (input_per_m, output_per_m) = if model.contains("reasoner") {
         (0.55, 2.19)
     } else {
         // deepseek-chat and other models
         (0.14, 0.28)
     };
+    let cache_hit_per_m = input_per_m / 10.0;
 
-    let input_cost = (input_tokens as f64 / 1_000_000.0) * input_per_m;
+    let hit = cache_hit_tokens.min(input_tokens);
+    let miss = input_tokens.saturating_sub(hit);
+
+    let input_cost =
+        (miss as f64 / 1_000_000.0) * input_per_m + (hit as f64 / 1_000_000.0) * cache_hit_per_m;
     let output_cost = (output_tokens as f64 / 1_000_000.0) * output_per_m;
     input_cost + output_cost
 }
@@ -650,6 +666,20 @@ struct OpenAiUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
     total_tokens: u32,
+    /// DeepSeek-specific: portion of `prompt_tokens` served from the
+    /// on-disk KV cache. Caching is fully automatic (64-token block
+    /// granularity, exact-prefix match) — we just need to read the
+    /// counter back to bill it at the discounted rate and surface the
+    /// hit count to the UI. Absent on older responses, hence `default`.
+    /// Ref: <https://api-docs.deepseek.com/guides/kv_cache>.
+    #[serde(default)]
+    prompt_cache_hit_tokens: Option<u32>,
+    /// DeepSeek-specific: complement of `prompt_cache_hit_tokens`. We
+    /// recompute it locally as `prompt_tokens - cache_hit` if absent,
+    /// so this is informational only.
+    #[serde(default)]
+    #[allow(dead_code)]
+    prompt_cache_miss_tokens: Option<u32>,
 }
 
 #[cfg(test)]
@@ -870,6 +900,83 @@ mod arg_parse_tests {
         assert!(
             assistant.get("reasoning_content").is_none(),
             "expected reasoning_content to be absent: {assistant}"
+        );
+    }
+
+    /// Cache hits should bill at 10% of the miss rate. A 1M-token call
+    /// that is 100% cache hit costs ~10× less than the same call entirely
+    /// served from a fresh prefix.
+    #[test]
+    fn deepseek_cost_discounts_cache_hits() {
+        // 1M input tokens, 0 output. No hits: full price.
+        let full = estimate_deepseek_cost("deepseek-chat", 1_000_000, 0, 0);
+        // Same call, all-cache. Should be exactly 10% of full.
+        let all_hit = estimate_deepseek_cost("deepseek-chat", 1_000_000, 0, 1_000_000);
+        assert!(
+            (full - 0.14).abs() < 1e-9,
+            "full-miss baseline expected $0.14, got {full}"
+        );
+        assert!(
+            (all_hit - 0.014).abs() < 1e-9,
+            "all-hit expected $0.014, got {all_hit}"
+        );
+    }
+
+    /// Mixed hit/miss splits should weight the two rates correctly: 50%
+    /// hit on 1M tokens = 500k × $0.14/M + 500k × $0.014/M = $0.077.
+    #[test]
+    fn deepseek_cost_handles_partial_cache_hit() {
+        let mixed = estimate_deepseek_cost("deepseek-chat", 1_000_000, 0, 500_000);
+        assert!(
+            (mixed - 0.077).abs() < 1e-9,
+            "50%% hit expected $0.077, got {mixed}"
+        );
+    }
+
+    /// A bogus `cache_hit > prompt_tokens` value (shouldn't happen but
+    /// defending against API quirks) must not produce a negative miss
+    /// count. Clamp keeps cost finite.
+    #[test]
+    fn deepseek_cost_clamps_oversized_cache_hit() {
+        let clamped = estimate_deepseek_cost("deepseek-chat", 100, 0, 999_999);
+        // All 100 tokens are hits, miss = 0.
+        let expected = (100.0 / 1_000_000.0) * 0.014;
+        assert!(
+            (clamped - expected).abs() < 1e-12,
+            "oversized hit should clamp, expected {expected}, got {clamped}"
+        );
+    }
+
+    /// Response parser plumbs `prompt_cache_hit_tokens` from the wire into
+    /// `TokenUsage.cached_tokens` and bills the cost accordingly.
+    #[test]
+    fn deepseek_response_surfaces_cache_hit_tokens() {
+        let raw = r#"{
+            "model": "deepseek-chat",
+            "choices": [{
+                "message": {"content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 10,
+                "total_tokens": 1010,
+                "prompt_cache_hit_tokens": 800,
+                "prompt_cache_miss_tokens": 200
+            }
+        }"#;
+        let parsed: OpenAiResponse = serde_json::from_str(raw).expect("parses");
+        let u = parsed.usage.expect("usage present");
+        assert_eq!(u.prompt_cache_hit_tokens, Some(800));
+        // Cost on 200 miss + 800 hit: 200/M × 0.14 + 800/M × 0.014 = $0.0000392
+        let cost =
+            estimate_deepseek_cost("deepseek-chat", u.prompt_tokens, u.completion_tokens, 800);
+        let expected = (200.0 / 1_000_000.0) * 0.14
+            + (800.0 / 1_000_000.0) * 0.014
+            + (10.0 / 1_000_000.0) * 0.28;
+        assert!(
+            (cost - expected).abs() < 1e-12,
+            "expected {expected}, got {cost}"
         );
     }
 }

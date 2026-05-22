@@ -637,12 +637,7 @@ mod tests {
                 reasoning_content: None,
                 model_used: "test-stub".to_string(),
                 provider: "test".to_string(),
-                usage: athen_core::llm::TokenUsage {
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    total_tokens: 0,
-                    estimated_cost_usd: None,
-                },
+                usage: athen_core::llm::TokenUsage::default(),
                 tool_calls: vec![],
                 finish_reason: athen_core::llm::FinishReason::Stop,
             })

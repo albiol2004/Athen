@@ -159,12 +159,28 @@ pub struct ToolCall {
     pub thought_signature: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
     pub estimated_cost_usd: Option<f64>,
+    /// Cache hits — the portion of `prompt_tokens` that came from a prompt
+    /// cache. Surfaces DeepSeek `prompt_cache_hit_tokens`, OpenAI
+    /// `prompt_tokens_details.cached_tokens`, Anthropic
+    /// `cache_read_input_tokens`, and Gemini
+    /// `usageMetadata.cachedContentTokenCount`. `None` when the provider
+    /// didn't report it (older response shapes, providers without caching).
+    /// Cost estimators should subtract this from `prompt_tokens` before
+    /// applying the full input rate and bill the cached portion at the
+    /// provider's discounted rate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u32>,
+    /// Tokens written into a fresh cache entry. Anthropic-only today
+    /// (`cache_creation_input_tokens`); billed at 1.25× (5-min TTL) or
+    /// 2× (1-h TTL) the base input rate. `None` for every other provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

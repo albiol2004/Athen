@@ -391,14 +391,10 @@ impl LlmProvider for OpenAiCompatibleProvider {
                     u.prompt_tokens,
                     u.completion_tokens,
                 )),
+                ..TokenUsage::default()
             }
         } else {
-            TokenUsage {
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                total_tokens: 0,
-                estimated_cost_usd: None,
-            }
+            TokenUsage::default()
         };
 
         let mut response = LlmResponse {

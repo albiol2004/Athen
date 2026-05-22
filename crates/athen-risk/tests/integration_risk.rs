@@ -81,6 +81,7 @@ impl LlmRouter for MockRouter {
                 completion_tokens: 10,
                 total_tokens: 20,
                 estimated_cost_usd: None,
+                ..TokenUsage::default()
             },
             tool_calls: vec![],
             finish_reason: FinishReason::Stop,

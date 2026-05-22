@@ -329,12 +329,7 @@ mod tests {
             reasoning_content: None,
             model_used: "test".into(),
             provider: "test".into(),
-            usage: TokenUsage {
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                total_tokens: 0,
-                estimated_cost_usd: None,
-            },
+            usage: TokenUsage::default(),
             tool_calls: vec![],
             finish_reason: FinishReason::Stop,
         }

@@ -49,6 +49,7 @@ impl MockLlmRouter {
                 completion_tokens: 20,
                 total_tokens: 30,
                 estimated_cost_usd: None,
+                ..TokenUsage::default()
             },
             tool_calls,
             finish_reason,
