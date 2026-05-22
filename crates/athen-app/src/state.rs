@@ -1810,6 +1810,13 @@ impl AppState {
         let http_client_ref = self.http_client.clone();
         let cloud_apis_doc_path_ref = self.cloud_apis_doc_path.clone();
         let agent_registry_ref = self.agent_registry.clone();
+        let calendar_source_store_ref: Option<
+            Arc<dyn athen_core::traits::calendar_source_config::CalendarSourceConfigStore>,
+        > = self.calendar_source_store().map(|s| {
+            Arc::new(s)
+                as Arc<dyn athen_core::traits::calendar_source_config::CalendarSourceConfigStore>
+        });
+        let checkpoint_store_ref = self.checkpoint_store.clone();
 
         tauri::async_runtime::spawn(async move {
             if let Err(e) = monitor.init(&telegram_config).await {
@@ -1903,6 +1910,8 @@ impl AppState {
                                     let http_client_c = http_client_ref.clone();
                                     let cloud_apis_doc_path_c = cloud_apis_doc_path_ref.clone();
                                     let agent_registry_c = agent_registry_ref.clone();
+                                    let calendar_source_store_c = calendar_source_store_ref.clone();
+                                    let checkpoint_store_c = checkpoint_store_ref.clone();
                                     let telegram_outbound_hint_c =
                                         telegram_outbound_hint_ref.clone();
                                     let event_id = event.id;
@@ -1947,6 +1956,8 @@ impl AppState {
                                             &http_client_c,
                                             cloud_apis_doc_path_c.as_ref(),
                                             agent_registry_c.as_ref(),
+                                            calendar_source_store_c,
+                                            checkpoint_store_c,
                                         )
                                         .await;
                                     });
@@ -2400,6 +2411,10 @@ async fn execute_owner_telegram_message(
     http_client: &reqwest::Client,
     cloud_apis_doc_path: Option<&std::path::PathBuf>,
     agent_registry: Option<&Arc<crate::agent_registry::AgentRegistry>>,
+    calendar_source_store: Option<
+        Arc<dyn athen_core::traits::calendar_source_config::CalendarSourceConfigStore>,
+    >,
+    checkpoint_store: Option<Arc<dyn athen_core::traits::checkpoint::CheckpointStore>>,
 ) {
     use std::time::Duration;
 
@@ -2790,6 +2805,14 @@ async fn execute_owner_telegram_message(
     // Build the executor (mirrors send_message logic but without risk/coordinator).
     let exec_router: Box<dyn athen_core::traits::llm::LlmRouter> =
         Box::new(SharedRouter(Arc::clone(router)));
+    // NOTE: this registry build duplicates AppState::build_tool_registry.
+    // Mirror any `.with_*` added there here too — currently this path
+    // intentionally omits the delegation wrapper, the wakeup-authoring
+    // wrapper, and the per-arc GitHub identity resolution (Telegram owner
+    // path is a simpler trust-bypass flow). Calendar-source store and
+    // checkpoint store, by contrast, MUST be wired or the agent silently
+    // creates local-only events / skips snapshots — see #248 for the
+    // long-overdue consolidation.
     let mut shell_registry = ShellToolRegistry::new()
         .await
         .with_spawned_processes(spawned_processes.clone())
@@ -2797,7 +2820,9 @@ async fn execute_owner_telegram_message(
         .with_web_search(web_search.clone())
         .with_email_sender_opt(email_sender.clone())
         .with_telegram_sender_opt(telegram_sender.clone())
-        .with_owner_check_opt(owner_check.cloned());
+        .with_owner_check_opt(owner_check.cloned())
+        .with_checkpoint_store_opt(checkpoint_store.clone())
+        .with_checkpoint_arc_id(target_arc_id.clone().unwrap_or_default());
     if let (Some(store), Some(arc_id_str)) = (grant_store, target_arc_id.as_ref()) {
         let provider = Arc::new(crate::file_gate::ArcWritableProvider {
             arc_id: crate::file_gate::arc_uuid(arc_id_str),
@@ -2858,6 +2883,9 @@ async fn execute_owner_telegram_message(
             http_client.clone(),
             cloud_apis_doc_path.cloned(),
         );
+    }
+    if let Some(cstore) = calendar_source_store {
+        registry = registry.with_calendar_remote(cstore);
     }
     if let (Some(store), Some(arc_id_str)) = (grant_store, target_arc_id.as_ref()) {
         let mut gate = crate::file_gate::FileGate::new(
@@ -2951,9 +2979,7 @@ async fn execute_owner_telegram_message(
 
     // Pin the user's enabled HTTP endpoints into the static prefix so
     // the Telegram path's agent ALSO knows what's pre-configured (the
-    // ElevenLabs failure was on this exact path). Identity isn't wired
-    // here yet — the Telegram path predates the identity store
-    // composition — so we only ship endpoints through.
+    // ElevenLabs failure was on this exact path).
     let endpoints_block =
         crate::endpoints_render::render_endpoints_block(http_endpoint_store).await;
     // Owner Telegram turns don't go through the risk LLM, so capture

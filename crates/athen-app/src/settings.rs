@@ -2456,6 +2456,7 @@ pub async fn save_calendar_prompt(
 
 /// Default-calendar info returned to the Settings UI.
 #[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CalendarAgentDefault {
     pub source_id: Option<String>,
     pub calendar_id: Option<String>,

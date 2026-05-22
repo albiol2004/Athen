@@ -9587,6 +9587,12 @@ document.getElementById('cal-prompt-btn')?.addEventListener('click', async () =>
                 } else {
                     defSel.value = '';
                 }
+                // Stamp the initial value so the Save handler can tell
+                // whether the user actually touched the dropdown. Without
+                // this, a transient empty state (slow `list_writable_calendars`,
+                // race with re-population, etc.) would silently wipe the
+                // saved default on the next Save click.
+                defSel.dataset.initial = defSel.value;
             } catch (err) {
                 console.warn('Failed to load agent default calendar:', err);
             }
@@ -9607,7 +9613,11 @@ document.getElementById('cal-prompt-save')?.addEventListener('click', async () =
     try {
         await invoke('save_calendar_prompt', { prompt: ta.value });
         const defSel = document.getElementById('cal-agent-default-select');
-        if (defSel) {
+        // Only push the default-calendar selection when the user actually
+        // changed it. Comparing against the stamped initial value avoids
+        // wiping the saved default if the dropdown was still empty due to
+        // a slow/failed list_writable_calendars or a missed re-population.
+        if (defSel && defSel.dataset.initial !== undefined && defSel.value !== defSel.dataset.initial) {
             const v = defSel.value || '';
             if (v) {
                 const [sourceId, calendarId, ...rest] = v.split('|');
