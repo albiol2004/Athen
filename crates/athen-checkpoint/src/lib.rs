@@ -218,7 +218,7 @@ impl GixCheckpointStore {
         let parent = repo
             .find_reference(&branch)
             .ok()
-            .and_then(|mut r| r.peel_to_id_in_place().ok())
+            .and_then(|mut r| r.peel_to_id().ok())
             .map(|id| id.detach());
 
         let meta = CommitMeta {
@@ -233,7 +233,7 @@ impl GixCheckpointStore {
             .map_err(|e| AthenError::Other(format!("encode commit meta: {e}")))?;
 
         let now = chrono::Utc::now();
-        let signature = gix::actor::SignatureRef {
+        let signature = gix::actor::Signature {
             name: "athen-checkpoint".into(),
             email: "athen@localhost".into(),
             time: gix::date::Time::new(now.timestamp() as gix::date::SecondsSinceUnixEpoch, 0),
@@ -241,8 +241,8 @@ impl GixCheckpointStore {
         let commit = gix::objs::Commit {
             tree: tree_oid,
             parents: parent.iter().copied().collect(),
-            author: signature.into(),
-            committer: signature.into(),
+            author: signature.clone(),
+            committer: signature,
             encoding: None,
             message: message.into(),
             extra_headers: Vec::new(),
@@ -281,7 +281,7 @@ impl GixCheckpointStore {
             Err(_) => return Ok(RevertOutcome::default()), // nothing to revert
         };
         let commit_id = tag_ref
-            .peel_to_id_in_place()
+            .peel_to_id()
             .map_err(|e| AthenError::Other(format!("peel tag {tag}: {e}")))?
             .detach();
         let commit = repo
@@ -364,7 +364,7 @@ impl GixCheckpointStore {
             Err(_) => return Ok(RevertOutcome::default()), // no branch -> nothing to do
         };
         let head_id = branch_ref
-            .peel_to_id_in_place()
+            .peel_to_id()
             .map_err(|e| AthenError::Other(format!("peel branch {branch}: {e}")))?
             .detach();
 
@@ -462,7 +462,7 @@ impl GixCheckpointStore {
             Err(_) => return Ok(Vec::new()),
         };
         let head_id = branch_ref
-            .peel_to_id_in_place()
+            .peel_to_id()
             .map_err(|e| AthenError::Other(format!("peel branch {branch}: {e}")))?
             .detach();
 
@@ -530,7 +530,7 @@ impl GixCheckpointStore {
         // the commits may become unreachable).
         let mut tags_to_drop: Vec<String> = Vec::new();
         if let Ok(mut branch_ref) = repo.find_reference(&branch) {
-            if let Ok(head_id) = branch_ref.peel_to_id_in_place() {
+            if let Ok(head_id) = branch_ref.peel_to_id() {
                 let head_id = head_id.detach();
                 if let Ok(walk) = repo.rev_walk([head_id]).all() {
                     for info in walk.flatten() {

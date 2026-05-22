@@ -12,7 +12,7 @@ chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-gix = { version = "0.66", default-features = false, features = ["max-performance-safe", "revision"] }
+gix = { version = "0.83", default-features = false, features = ["max-performance-safe", "revision", "sha1"] }
 
 [dev-dependencies]
 tempfile = "3"
