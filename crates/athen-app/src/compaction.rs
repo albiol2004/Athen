@@ -391,7 +391,7 @@ impl LlmArcCompactor {
     /// rows. Limited to a small cap so a pathological burst doesn't
     /// dominate the prompt; the LLM only needs the protect-list as
     /// guidance, not exhaustive enumeration.
-    fn collect_write_provenance<'a>(entries: &'a [ArcEntry]) -> Vec<&'a ArcEntry> {
+    fn collect_write_provenance(entries: &[ArcEntry]) -> Vec<&ArcEntry> {
         const MAX_WRITE_ENTRIES: usize = 24;
         let mut out: Vec<&ArcEntry> = Vec::new();
         for e in entries {
@@ -404,7 +404,7 @@ impl LlmArcCompactor {
                 .and_then(|m| m.get("tool"))
                 .and_then(|v| v.as_str());
             if let Some(name) = tool {
-                if WRITE_PROVENANCE_TOOLS.iter().any(|w| *w == name) {
+                if WRITE_PROVENANCE_TOOLS.contains(&name) {
                     out.push(e);
                     if out.len() >= MAX_WRITE_ENTRIES {
                         break;
