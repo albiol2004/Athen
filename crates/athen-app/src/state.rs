@@ -421,6 +421,215 @@ pub struct AppState {
     pub checkpoint_store: Option<Arc<dyn athen_core::traits::checkpoint::CheckpointStore>>,
 }
 
+/// Snapshot of every AppState field the per-arc tool registry needs.
+///
+/// Built once via [`AppState::tool_registry_deps`] and cloned per-spawn
+/// (cheap — every field is an `Arc`, a clone-of-Arc'd store, or a
+/// `PathBuf`). Routed through [`assemble_app_tool_registry`] so the
+/// in-app dispatch path AND the owner-Telegram trust-bypass path go
+/// through one assembly site — adding a new tool only requires
+/// touching the helper.
+#[derive(Clone)]
+pub(crate) struct ToolRegistryDeps {
+    pub spawned_processes: athen_agent::SpawnedProcessMap,
+    pub spawn_persistence: Option<Arc<dyn athen_agent::SpawnPersistenceHook>>,
+    pub web_search: Arc<dyn WebSearchProvider>,
+    pub email_sender: Option<Arc<dyn athen_core::traits::email_sender::EmailSender>>,
+    pub telegram_sender: Option<Arc<dyn athen_core::traits::telegram_sender::TelegramSender>>,
+    pub owner_check: Option<Arc<dyn athen_agent::OwnerDestinationCheck>>,
+    pub github_identity_resolver: Option<Arc<dyn athen_agent::tools::GithubIdentityResolver>>,
+    pub checkpoint_store: Option<Arc<dyn athen_core::traits::checkpoint::CheckpointStore>>,
+    pub grant_store: Option<Arc<GrantStore>>,
+    pub approval_router: Option<Arc<crate::approval::ApprovalRouter>>,
+    pub telegram_approval_sink: Option<Arc<crate::approval::TelegramApprovalSink>>,
+    pub telegram_outbound_hint: crate::notifier::TelegramOutboundHint,
+    pub telegram_chat_log: Option<Arc<athen_persistence::telegram_chat_log::TelegramChatLogStore>>,
+    pub pending_grants: PendingGrants,
+    pub calendar_store: Option<CalendarStore>,
+    pub contact_store: Option<SqliteContactStore>,
+    pub memory: Option<Arc<Memory>>,
+    pub mcp: Arc<McpRegistry>,
+    pub attachment_store: Option<athen_persistence::attachments::AttachmentStore>,
+    pub identity_store: Option<Arc<athen_persistence::identity::SqliteIdentityStore>>,
+    pub skill_store: Option<Arc<athen_persistence::skills::SqliteSkillStore>>,
+    pub http_endpoint_store:
+        Option<Arc<athen_persistence::http_endpoints::SqliteHttpEndpointStore>>,
+    pub vault: Option<Arc<dyn athen_core::traits::vault::Vault>>,
+    pub http_rate_limiter: Arc<crate::http_rate_limiter::HttpRateLimiter>,
+    pub http_client: reqwest::Client,
+    pub cloud_apis_doc_path: Option<std::path::PathBuf>,
+    pub calendar_source_store:
+        Option<Arc<dyn athen_core::traits::calendar_source_config::CalendarSourceConfigStore>>,
+    pub profile_store: Option<Arc<athen_persistence::profiles::SqliteProfileStore>>,
+    pub arc_store: Option<ArcStore>,
+    pub tool_doc_dir: Option<std::path::PathBuf>,
+    pub router: Arc<RwLock<Arc<DefaultLlmRouter>>>,
+    pub wakeup_store: Option<Arc<dyn athen_core::traits::wakeup::WakeupStore>>,
+}
+
+/// Single source of truth for assembling the per-arc agent tool
+/// registry. Called by:
+///   - [`AppState::build_tool_registry`] (in-app dispatch, sense
+///     events, manual chat, wake-up tool inventory).
+///   - `execute_owner_telegram_message` (owner-Telegram trust-bypass
+///     path that runs without risk/coordinator but with the SAME
+///     tool surface).
+///
+/// Adding a new `.with_*` here picks it up for both paths
+/// automatically — that was the whole point of #248.
+pub(crate) async fn assemble_app_tool_registry(
+    deps: ToolRegistryDeps,
+    arc_id: &str,
+    app_handle: Option<tauri::AppHandle>,
+) -> Box<dyn athen_core::traits::tool::ToolRegistry> {
+    let delegation_app_handle = app_handle.clone();
+    // Resolve the active profile's GitHub identity once at registry
+    // build time so every shell_execute in this arc uses the same
+    // creds. Falls back to `None` whenever lookup is unavailable
+    // (CLI builds, missing profile_store, etc.) — never errors.
+    let github_identity = resolve_github_identity_for_arc(
+        deps.profile_store.as_ref(),
+        deps.arc_store.as_ref(),
+        arc_id,
+    )
+    .await;
+    let mut shell = athen_agent::ShellToolRegistry::new()
+        .await
+        .with_spawned_processes(deps.spawned_processes.clone())
+        .with_spawn_persistence_hook_opt(deps.spawn_persistence.clone())
+        .with_web_search(deps.web_search.clone())
+        .with_email_sender_opt(deps.email_sender.clone())
+        .with_telegram_sender_opt(deps.telegram_sender.clone())
+        .with_owner_check_opt(deps.owner_check.clone())
+        .with_github_identity(github_identity)
+        .with_github_identity_resolver_opt(deps.github_identity_resolver.clone())
+        .with_checkpoint_store_opt(deps.checkpoint_store.clone())
+        .with_checkpoint_arc_id(arc_id);
+    if let Some(store) = deps.grant_store.clone() {
+        let provider = Arc::new(crate::file_gate::ArcWritableProvider {
+            arc_id: crate::file_gate::arc_uuid(arc_id),
+            store,
+        });
+        shell = shell.with_extra_writable(provider);
+    }
+    if let Some(router) = deps.approval_router.clone() {
+        shell = shell.with_toolbox_approval(Arc::new(
+            crate::file_gate::RouterToolboxApprovalGate::new(
+                router.clone(),
+                Some(arc_id.to_string()),
+            ),
+        ));
+        let gate: Arc<dyn athen_agent::EmailSendApprovalGate> =
+            Arc::new(crate::email_gate::RouterEmailApprovalGate::new(
+                router.clone(),
+                Some(arc_id.to_string()),
+            ));
+        shell = shell.with_email_approval(gate);
+        let tg_gate: Arc<dyn athen_agent::tools::TelegramSendApprovalGate> = Arc::new(
+            crate::email_gate::RouterTelegramApprovalGate::new(router, Some(arc_id.to_string())),
+        );
+        shell = shell.with_telegram_approval(tg_gate);
+    }
+    // Cross-channel arc routing: stamp the outbound hint after a
+    // successful send_telegram so the user's Telegram reply lands
+    // back in this arc instead of being re-triaged as fresh.
+    let tg_recorder: Arc<dyn athen_agent::tools::TelegramOutboundRecorder> =
+        Arc::new(crate::email_gate::ArcAwareTelegramOutboundRecorder::new(
+            deps.telegram_outbound_hint.clone(),
+            Some(arc_id.to_string()),
+            deps.telegram_chat_log.clone(),
+        ));
+    shell = shell.with_telegram_outbound_recorder(tg_recorder);
+    let mut registry = crate::app_tools::AppToolRegistry::new(
+        shell,
+        deps.calendar_store.clone(),
+        deps.contact_store.clone(),
+        deps.memory.clone(),
+    )
+    .with_mcp(deps.mcp.clone() as Arc<dyn athen_core::traits::mcp::McpClient>);
+    if let Some(astore) = deps.attachment_store.clone() {
+        registry = registry.with_attachments(astore);
+    }
+    if let Some(istore) = deps.identity_store.clone() {
+        registry = registry.with_identity(istore);
+    }
+    if let Some(sstore) = deps.skill_store.clone() {
+        registry = registry.with_skills(sstore);
+    }
+    if let (Some(estore), Some(vault)) = (deps.http_endpoint_store.clone(), deps.vault.clone()) {
+        registry = registry.with_http_endpoints(
+            estore,
+            vault,
+            deps.http_rate_limiter.clone(),
+            deps.http_client.clone(),
+            deps.cloud_apis_doc_path.clone(),
+        );
+    }
+    if let Some(cstore) = deps.calendar_source_store.clone() {
+        registry = registry.with_calendar_remote(cstore);
+    }
+    if let Some(grants) = deps.grant_store.clone() {
+        let mut gate = crate::file_gate::FileGate::new(
+            arc_id.to_string(),
+            grants,
+            deps.pending_grants.clone(),
+            app_handle,
+        );
+        if let Some(ref sink) = deps.telegram_approval_sink {
+            gate = gate.with_telegram_approval(sink.clone());
+        }
+        registry = registry.with_file_gate(Arc::new(gate));
+    }
+
+    // Wrap the registry with the delegation layer when a profile store
+    // is available. The wrapped registry exposes `delegate_to_agent`
+    // on top of every other tool. Sub-agents spawned via that tool
+    // receive the bare AppToolRegistry — no delegate_to_agent — which
+    // is how depth=1 is enforced.
+    let base: Arc<dyn athen_core::traits::tool::ToolRegistry> = Arc::new(registry);
+    let with_delegation: Box<dyn athen_core::traits::tool::ToolRegistry> =
+        if let (Some(profile_store), Some(arc_store)) =
+            (deps.profile_store.clone(), deps.arc_store.clone())
+        {
+            let ctx = crate::delegation::DelegationContext {
+                profile_store,
+                identity_store: deps.identity_store.clone(),
+                skill_store: deps.skill_store.clone(),
+                http_endpoint_store: deps.http_endpoint_store.clone(),
+                arc_store,
+                llm_router: Arc::clone(&deps.router),
+                parent_arc_id: arc_id.to_string(),
+                tool_doc_dir: deps.tool_doc_dir.clone(),
+                app_handle: delegation_app_handle,
+                wakeup_restrictions: None,
+            };
+            Box::new(crate::delegation::DelegationToolRegistry::new(base, ctx))
+        } else {
+            Box::new(crate::delegation::ArcRegistryAdapter(base))
+        };
+
+    // Wrap with the wake-up authoring layer so the agent can call
+    // `create_wakeup` to schedule its own follow-ups. Sits OUTSIDE
+    // delegation so a wake-up declaring `delegate_to_agent` in its
+    // allowlist still works; sits INSIDE the wake-up restriction
+    // wrapper (which the firing path adds in commands.rs) so a
+    // locked-down wake-up's tool_allowlist can hide create_wakeup.
+    // Skipped when no wakeup_store is wired (CLI / test builds).
+    if let Some(store) = deps.wakeup_store.clone() {
+        let ctx = crate::wakeup_tool::WakeupToolContext {
+            wakeup_store: store,
+            approval_router: deps.approval_router.clone(),
+            parent_arc_id: arc_id.to_string(),
+        };
+        Box::new(crate::wakeup_tool::WakeupAuthoringRegistry::new(
+            with_delegation,
+            ctx,
+        ))
+    } else {
+        with_delegation
+    }
+}
+
 impl AppState {
     /// Create a new `AppState`, loading configuration from TOML files and
     /// environment variables.
@@ -1059,176 +1268,64 @@ impl AppState {
         Ok(())
     }
 
+    /// Snapshot the AppState fields the per-arc registry needs.
+    /// Cheap — every field is `Arc`-backed or a clone-of-Arc'd store.
+    pub(crate) fn tool_registry_deps(&self) -> ToolRegistryDeps {
+        ToolRegistryDeps {
+            spawned_processes: self.spawned_processes.clone(),
+            spawn_persistence: self.spawn_persistence.clone(),
+            web_search: self.web_search.clone(),
+            email_sender: self.email_sender.clone(),
+            telegram_sender: self.telegram_sender.clone(),
+            owner_check: self.owner_destination_check(),
+            github_identity_resolver: self.github_identity_resolver.clone(),
+            checkpoint_store: self.checkpoint_store.clone(),
+            grant_store: self.grant_store.clone(),
+            approval_router: self.approval_router.clone(),
+            telegram_approval_sink: self.telegram_approval_sink.clone(),
+            telegram_outbound_hint: self.telegram_outbound_hint.clone(),
+            telegram_chat_log: self.telegram_chat_log.clone(),
+            pending_grants: self.pending_grants.clone(),
+            calendar_store: self.calendar_store.clone(),
+            contact_store: self.contact_store.clone(),
+            memory: self.memory.clone(),
+            mcp: self.mcp.clone(),
+            attachment_store: self.attachment_store(),
+            identity_store: self.identity_store.clone(),
+            skill_store: self.skill_store.clone(),
+            http_endpoint_store: self.http_endpoint_store.clone(),
+            vault: self.vault.clone(),
+            http_rate_limiter: self.http_rate_limiter.clone(),
+            http_client: self.http_client.clone(),
+            cloud_apis_doc_path: self.cloud_apis_doc_path.clone(),
+            calendar_source_store: self.calendar_source_store().map(|s| {
+                Arc::new(s)
+                    as Arc<
+                        dyn athen_core::traits::calendar_source_config::CalendarSourceConfigStore,
+                    >
+            }),
+            profile_store: self.profile_store.clone(),
+            arc_store: self._database.as_ref().map(|db| db.arc_store()),
+            tool_doc_dir: self.tool_doc_dir.clone(),
+            router: Arc::clone(&self.router),
+            wakeup_store: self
+                .wakeup_store
+                .clone()
+                .map(|s| s as Arc<dyn athen_core::traits::wakeup::WakeupStore>),
+        }
+    }
+
     /// Build a per-arc tool registry wired with the file-permission gate
-    /// and the shell sandbox grant provider. Called from every code path
-    /// that constructs an executor so the agent always sees the same
-    /// permission picture.
+    /// and the shell sandbox grant provider. Thin wrapper around
+    /// [`assemble_app_tool_registry`] — see there for the actual
+    /// assembly. Same helper is used by the owner-Telegram dispatch
+    /// path so the tool surface stays consistent.
     pub async fn build_tool_registry(
         &self,
         arc_id: &str,
         app_handle: Option<tauri::AppHandle>,
     ) -> Box<dyn athen_core::traits::tool::ToolRegistry> {
-        let delegation_app_handle = app_handle.clone();
-        // Resolve the active profile's GitHub identity once at registry
-        // build time so every shell_execute in this arc uses the same
-        // creds. Falls back to `None` whenever lookup is unavailable
-        // (CLI builds, missing profile_store, etc.) — never errors.
-        let github_identity = resolve_github_identity_for_arc(
-            self.profile_store.as_ref(),
-            self.arc_store.as_ref(),
-            arc_id,
-        )
-        .await;
-        let mut shell = athen_agent::ShellToolRegistry::new()
-            .await
-            .with_spawned_processes(self.spawned_processes.clone())
-            .with_spawn_persistence_hook_opt(self.spawn_persistence.clone())
-            .with_web_search(self.web_search.clone())
-            .with_email_sender_opt(self.email_sender.clone())
-            .with_telegram_sender_opt(self.telegram_sender.clone())
-            .with_owner_check_opt(self.owner_destination_check())
-            .with_github_identity(github_identity)
-            .with_github_identity_resolver_opt(self.github_identity_resolver.clone())
-            .with_checkpoint_store_opt(self.checkpoint_store.clone())
-            .with_checkpoint_arc_id(arc_id);
-        if let Some(store) = self.grant_store.clone() {
-            let provider = Arc::new(crate::file_gate::ArcWritableProvider {
-                arc_id: crate::file_gate::arc_uuid(arc_id),
-                store,
-            });
-            shell = shell.with_extra_writable(provider);
-        }
-        if let Some(router) = self.approval_router.clone() {
-            shell = shell.with_toolbox_approval(Arc::new(
-                crate::file_gate::RouterToolboxApprovalGate::new(
-                    router.clone(),
-                    Some(arc_id.to_string()),
-                ),
-            ));
-            let gate: Arc<dyn athen_agent::EmailSendApprovalGate> =
-                Arc::new(crate::email_gate::RouterEmailApprovalGate::new(
-                    router.clone(),
-                    Some(arc_id.to_string()),
-                ));
-            shell = shell.with_email_approval(gate);
-            let tg_gate: Arc<dyn athen_agent::tools::TelegramSendApprovalGate> =
-                Arc::new(crate::email_gate::RouterTelegramApprovalGate::new(
-                    router,
-                    Some(arc_id.to_string()),
-                ));
-            shell = shell.with_telegram_approval(tg_gate);
-        }
-        // Cross-channel arc routing: stamp the outbound hint after a
-        // successful send_telegram so the user's Telegram reply lands
-        // back in this arc instead of being re-triaged as fresh.
-        let tg_recorder: Arc<dyn athen_agent::tools::TelegramOutboundRecorder> =
-            Arc::new(crate::email_gate::ArcAwareTelegramOutboundRecorder::new(
-                self.telegram_outbound_hint.clone(),
-                Some(arc_id.to_string()),
-                self.telegram_chat_log.clone(),
-            ));
-        shell = shell.with_telegram_outbound_recorder(tg_recorder);
-        let mut registry = crate::app_tools::AppToolRegistry::new(
-            shell,
-            self.calendar_store.clone(),
-            self.contact_store.clone(),
-            self.memory.clone(),
-        )
-        .with_mcp(self.mcp.clone() as Arc<dyn athen_core::traits::mcp::McpClient>);
-        if let Some(astore) = self.attachment_store() {
-            registry = registry.with_attachments(astore);
-        }
-        if let Some(istore) = self.identity_store.clone() {
-            registry = registry.with_identity(istore);
-        }
-        if let Some(sstore) = self.skill_store.clone() {
-            registry = registry.with_skills(sstore);
-        }
-        if let (Some(estore), Some(vault)) = (self.http_endpoint_store.clone(), self.vault.clone())
-        {
-            registry = registry.with_http_endpoints(
-                estore,
-                vault,
-                self.http_rate_limiter.clone(),
-                self.http_client.clone(),
-                self.cloud_apis_doc_path.clone(),
-            );
-        }
-        if let Some(cstore) = self.calendar_source_store() {
-            let cstore: Arc<
-                dyn athen_core::traits::calendar_source_config::CalendarSourceConfigStore,
-            > = Arc::new(cstore);
-            registry = registry.with_calendar_remote(cstore);
-        }
-        if let Some(grants) = self.grant_store.clone() {
-            let mut gate = crate::file_gate::FileGate::new(
-                arc_id.to_string(),
-                grants,
-                self.pending_grants.clone(),
-                app_handle,
-            );
-            // Attach the Telegram approval sink so file-permission
-            // prompts also surface on Telegram alongside the in-app
-            // card; whichever channel responds first wins.
-            if let Some(ref sink) = self.telegram_approval_sink {
-                gate = gate.with_telegram_approval(sink.clone());
-            }
-            registry = registry.with_file_gate(Arc::new(gate));
-        }
-
-        // Wrap the registry with the delegation layer when a profile store
-        // is available. The wrapped registry exposes `delegate_to_agent`
-        // on top of every other tool. Sub-agents spawned via that tool
-        // receive the bare AppToolRegistry — no delegate_to_agent — which
-        // is how depth=1 is enforced.
-        let base: Arc<dyn athen_core::traits::tool::ToolRegistry> = Arc::new(registry);
-        let with_delegation: Box<dyn athen_core::traits::tool::ToolRegistry> =
-            if let (Some(profile_store), Some(arc_store)) = (
-                self.profile_store.clone(),
-                self._database.as_ref().map(|db| db.arc_store()),
-            ) {
-                let ctx = crate::delegation::DelegationContext {
-                    profile_store,
-                    identity_store: self.identity_store.clone(),
-                    skill_store: self.skill_store.clone(),
-                    http_endpoint_store: self.http_endpoint_store.clone(),
-                    arc_store,
-                    llm_router: Arc::clone(&self.router),
-                    parent_arc_id: arc_id.to_string(),
-                    tool_doc_dir: self.tool_doc_dir.clone(),
-                    app_handle: delegation_app_handle,
-                    // build_tool_registry is the generic registry builder
-                    // (sense events, manual chat, wake-up tool inventory). The
-                    // wake-up firing path constructs its own DelegationContext
-                    // with restrictions in commands.rs; this one runs without.
-                    wakeup_restrictions: None,
-                };
-                Box::new(crate::delegation::DelegationToolRegistry::new(base, ctx))
-            } else {
-                Box::new(crate::delegation::ArcRegistryAdapter(base))
-            };
-
-        // Wrap with the wake-up authoring layer so the agent can call
-        // `create_wakeup` to schedule its own follow-ups. Sits OUTSIDE
-        // delegation so a wake-up declaring `delegate_to_agent` in its
-        // allowlist still works; sits INSIDE the wake-up restriction
-        // wrapper (which the firing path adds in commands.rs) so a
-        // locked-down wake-up's tool_allowlist can hide create_wakeup.
-        // Skipped when no wakeup_store is wired (CLI / test builds).
-        if let Some(store) = self.wakeup_store.clone() {
-            let store: Arc<dyn athen_core::traits::wakeup::WakeupStore> = store;
-            let ctx = crate::wakeup_tool::WakeupToolContext {
-                wakeup_store: store,
-                approval_router: self.approval_router.clone(),
-                parent_arc_id: arc_id.to_string(),
-            };
-            Box::new(crate::wakeup_tool::WakeupAuthoringRegistry::new(
-                with_delegation,
-                ctx,
-            ))
-        } else {
-            with_delegation
-        }
+        assemble_app_tool_registry(self.tool_registry_deps(), arc_id, app_handle).await
     }
 
     /// Initialize the notification orchestrator.
@@ -1777,46 +1874,28 @@ impl AppState {
         let router = Arc::clone(&self.router);
         let arc_store_ref = self._database.as_ref().map(|db| db.arc_store());
         let attachment_store_ref = self._database.as_ref().map(|db| db.attachment_store());
+        // Refs that the non-owner branch (process_sense_event) still
+        // needs at the outer scope. Everything else the owner-Telegram
+        // executor wants lives in `tool_registry_deps_ref` below.
         let profile_store_ref = self.profile_store.clone();
         let profile_embedder_ref = Arc::clone(&self.profile_embedder);
         let profile_embedding_cache_ref = Arc::clone(&self.profile_embedding_cache);
-        let calendar_store_ref = self.calendar_store.clone();
         let contact_store_ref = self.contact_store.clone();
-        let identity_store_ref = self.identity_store.clone();
-        let skill_store_ref = self.skill_store.clone();
-        let memory_ref = self.memory.clone();
-        let mcp_ref = self.mcp.clone();
-        let tool_doc_dir_ref = self.tool_doc_dir.clone();
         let notifier = self.notifier.clone();
-        let grant_store_ref = self.grant_store.clone();
-        let pending_grants_ref = self.pending_grants.clone();
-        let spawned_processes_ref = self.spawned_processes.clone();
-        let spawn_persistence_ref = self.spawn_persistence.clone();
         let telegram_approval_sink = self.telegram_approval_sink.clone();
         let approval_router_ref = self.approval_router.clone();
         let coordinator_ref = Arc::clone(&self.coordinator);
         let task_arc_map_ref = Arc::clone(&self.task_arc_map);
         let pending_email_marks_ref = Arc::clone(&self.pending_email_marks);
         let dispatch_signal_ref = Arc::clone(&self.dispatch_signal);
-        let web_search_ref = Arc::clone(&self.web_search);
-        let email_sender_ref = self.email_sender.clone();
-        let telegram_sender_ref = self.telegram_sender.clone();
         let telegram_chat_log_ref = self.telegram_chat_log.clone();
-        let owner_check_ref = self.owner_destination_check();
-        let telegram_outbound_hint_ref = self.telegram_outbound_hint.clone();
-        let http_endpoint_store_ref = self.http_endpoint_store.clone();
-        let vault_ref = self.vault.clone();
-        let http_rate_limiter_ref = self.http_rate_limiter.clone();
-        let http_client_ref = self.http_client.clone();
-        let cloud_apis_doc_path_ref = self.cloud_apis_doc_path.clone();
         let agent_registry_ref = self.agent_registry.clone();
-        let calendar_source_store_ref: Option<
-            Arc<dyn athen_core::traits::calendar_source_config::CalendarSourceConfigStore>,
-        > = self.calendar_source_store().map(|s| {
-            Arc::new(s)
-                as Arc<dyn athen_core::traits::calendar_source_config::CalendarSourceConfigStore>
-        });
-        let checkpoint_store_ref = self.checkpoint_store.clone();
+        // Single bundle of everything the per-arc tool registry needs.
+        // The owner-Telegram dispatch path clones this and hands it to
+        // `assemble_app_tool_registry`, so the registry it sees is
+        // structurally identical to what `AppState::build_tool_registry`
+        // produces for the in-app flow.
+        let tool_registry_deps_ref = self.tool_registry_deps();
 
         tauri::async_runtime::spawn(async move {
             if let Err(e) = monitor.init(&telegram_config).await {
@@ -1877,43 +1956,13 @@ impl AppState {
                                     // the agent finished some other way.
                                     let text_owned = text.to_string();
                                     let bot_token_c = bot_token.clone();
-                                    let router_c = Arc::clone(&router);
-                                    let arc_store_c = arc_store_ref.clone();
-                                    let attachment_store_c = attachment_store_ref.clone();
-                                    let calendar_store_c = calendar_store_ref.clone();
-                                    let contact_store_c = contact_store_ref.clone();
-                                    let identity_store_c = identity_store_ref.clone();
-                                    let skill_store_c = skill_store_ref.clone();
-                                    let memory_c = memory_ref.clone();
-                                    let mcp_c = Arc::clone(&mcp_ref);
-                                    let tool_doc_dir_c = tool_doc_dir_ref.clone();
                                     let app_handle_c = app_handle.clone();
                                     let notifier_c = notifier.clone();
-                                    let grant_store_c = grant_store_ref.clone();
-                                    let pending_grants_c = pending_grants_ref.clone();
-                                    let spawned_processes_c = spawned_processes_ref.clone();
-                                    let spawn_persistence_c = spawn_persistence_ref.clone();
-                                    let telegram_approval_sink_c = telegram_approval_sink.clone();
-                                    let profile_store_c = profile_store_ref.clone();
                                     let profile_embedder_c = Arc::clone(&profile_embedder_ref);
                                     let profile_embedding_cache_c =
                                         Arc::clone(&profile_embedding_cache_ref);
-                                    let approval_router_c = approval_router_ref.clone();
-                                    let web_search_c = Arc::clone(&web_search_ref);
-                                    let email_sender_c = email_sender_ref.clone();
-                                    let telegram_sender_c = telegram_sender_ref.clone();
-                                    let telegram_chat_log_c = telegram_chat_log_ref.clone();
-                                    let owner_check_c = owner_check_ref.clone();
-                                    let http_endpoint_store_c = http_endpoint_store_ref.clone();
-                                    let vault_c = vault_ref.clone();
-                                    let http_rate_limiter_c = Arc::clone(&http_rate_limiter_ref);
-                                    let http_client_c = http_client_ref.clone();
-                                    let cloud_apis_doc_path_c = cloud_apis_doc_path_ref.clone();
                                     let agent_registry_c = agent_registry_ref.clone();
-                                    let calendar_source_store_c = calendar_source_store_ref.clone();
-                                    let checkpoint_store_c = checkpoint_store_ref.clone();
-                                    let telegram_outbound_hint_c =
-                                        telegram_outbound_hint_ref.clone();
+                                    let deps_c = tool_registry_deps_ref.clone();
                                     let event_id = event.id;
                                     let attachments_owned = event.content.attachments.clone();
                                     tauri::async_runtime::spawn(async move {
@@ -1923,41 +1972,12 @@ impl AppState {
                                             &bot_token_c,
                                             event_id,
                                             &attachments_owned,
-                                            &router_c,
-                                            &arc_store_c,
-                                            attachment_store_c.as_ref(),
-                                            &calendar_store_c,
-                                            &contact_store_c,
-                                            &identity_store_c,
-                                            skill_store_c.as_ref(),
-                                            &memory_c,
-                                            &mcp_c,
-                                            tool_doc_dir_c.as_deref(),
                                             &app_handle_c,
                                             notifier_c.as_ref(),
-                                            grant_store_c.as_ref(),
-                                            &pending_grants_c,
-                                            &spawned_processes_c,
-                                            spawn_persistence_c.as_ref(),
-                                            telegram_approval_sink_c.as_ref(),
-                                            &profile_store_c,
                                             &profile_embedder_c,
                                             &profile_embedding_cache_c,
-                                            approval_router_c.as_ref(),
-                                            &web_search_c,
-                                            &email_sender_c,
-                                            &telegram_sender_c,
-                                            owner_check_c.as_ref(),
-                                            &telegram_outbound_hint_c,
-                                            telegram_chat_log_c.as_ref(),
-                                            http_endpoint_store_c.as_ref(),
-                                            vault_c.as_ref(),
-                                            &http_rate_limiter_c,
-                                            &http_client_c,
-                                            cloud_apis_doc_path_c.as_ref(),
                                             agent_registry_c.as_ref(),
-                                            calendar_source_store_c,
-                                            checkpoint_store_c,
+                                            deps_c,
                                         )
                                         .await;
                                     });
@@ -2378,52 +2398,33 @@ async fn execute_owner_telegram_message(
     bot_token: &str,
     event_id: uuid::Uuid,
     attachments: &[athen_core::event::Attachment],
-    router: &Arc<RwLock<Arc<DefaultLlmRouter>>>,
-    arc_store: &Option<ArcStore>,
-    attachment_store: Option<&athen_persistence::attachments::AttachmentStore>,
-    calendar_store: &Option<CalendarStore>,
-    contact_store: &Option<SqliteContactStore>,
-    identity_store: &Option<Arc<athen_persistence::identity::SqliteIdentityStore>>,
-    skill_store: Option<&Arc<athen_persistence::skills::SqliteSkillStore>>,
-    memory: &Option<Arc<Memory>>,
-    mcp: &Arc<McpRegistry>,
-    tool_doc_dir: Option<&std::path::Path>,
     app_handle: &tauri::AppHandle,
     notifier: Option<&Arc<NotificationOrchestrator>>,
-    grant_store: Option<&Arc<GrantStore>>,
-    pending_grants: &PendingGrants,
-    spawned_processes: &athen_agent::SpawnedProcessMap,
-    spawn_persistence: Option<&Arc<dyn athen_agent::SpawnPersistenceHook>>,
-    telegram_approval_sink: Option<&Arc<crate::approval::TelegramApprovalSink>>,
-    profile_store: &Option<Arc<athen_persistence::profiles::SqliteProfileStore>>,
     profile_embedder: &Arc<dyn athen_core::traits::embedding::EmbeddingProvider>,
     profile_embedding_cache: &ProfileEmbeddingCache,
-    approval_router: Option<&Arc<crate::approval::ApprovalRouter>>,
-    web_search: &Arc<dyn WebSearchProvider>,
-    email_sender: &Option<Arc<dyn athen_core::traits::email_sender::EmailSender>>,
-    telegram_sender: &Option<Arc<dyn athen_core::traits::telegram_sender::TelegramSender>>,
-    owner_check: Option<&Arc<dyn athen_agent::OwnerDestinationCheck>>,
-    telegram_outbound_hint: &crate::notifier::TelegramOutboundHint,
-    telegram_chat_log: Option<&Arc<athen_persistence::telegram_chat_log::TelegramChatLogStore>>,
-    http_endpoint_store: Option<&Arc<athen_persistence::http_endpoints::SqliteHttpEndpointStore>>,
-    vault: Option<&Arc<dyn athen_core::traits::vault::Vault>>,
-    http_rate_limiter: &Arc<crate::http_rate_limiter::HttpRateLimiter>,
-    http_client: &reqwest::Client,
-    cloud_apis_doc_path: Option<&std::path::PathBuf>,
     agent_registry: Option<&Arc<crate::agent_registry::AgentRegistry>>,
-    calendar_source_store: Option<
-        Arc<dyn athen_core::traits::calendar_source_config::CalendarSourceConfigStore>,
-    >,
-    checkpoint_store: Option<Arc<dyn athen_core::traits::checkpoint::CheckpointStore>>,
+    deps: ToolRegistryDeps,
 ) {
     use std::time::Duration;
 
-    use crate::app_tools::AppToolRegistry;
     use crate::commands::{new_tool_log, spawn_stream_forwarder, AgentProgress, TauriAuditor};
-    use athen_agent::{AgentBuilder, ShellToolRegistry};
+    use athen_agent::AgentBuilder;
     use athen_core::task::{DomainType, Task, TaskPriority, TaskStatus};
     use athen_core::traits::agent::AgentExecutor;
     use tauri::Emitter;
+
+    // Local aliases so the body keeps reading like the original — every
+    // collaborator reaches into `deps` so the registry build below uses
+    // the SAME values we surface to the executor / arc-matching / footer
+    // logic. Owner-Telegram now goes through `assemble_app_tool_registry`
+    // exactly like the in-app path (#248).
+    let router = &deps.router;
+    let arc_store = &deps.arc_store;
+    let attachment_store = deps.attachment_store.as_ref();
+    let profile_store = &deps.profile_store;
+    let telegram_chat_log = deps.telegram_chat_log.as_ref();
+    let http_endpoint_store = deps.http_endpoint_store.as_ref();
+    let telegram_outbound_hint = &deps.telegram_outbound_hint;
 
     info!("Executing owner Telegram message through agent: {}", text);
 
@@ -2805,100 +2806,15 @@ async fn execute_owner_telegram_message(
     // Build the executor (mirrors send_message logic but without risk/coordinator).
     let exec_router: Box<dyn athen_core::traits::llm::LlmRouter> =
         Box::new(SharedRouter(Arc::clone(router)));
-    // NOTE: this registry build duplicates AppState::build_tool_registry.
-    // Mirror any `.with_*` added there here too — currently this path
-    // intentionally omits the delegation wrapper, the wakeup-authoring
-    // wrapper, and the per-arc GitHub identity resolution (Telegram owner
-    // path is a simpler trust-bypass flow). Calendar-source store and
-    // checkpoint store, by contrast, MUST be wired or the agent silently
-    // creates local-only events / skips snapshots — see #248 for the
-    // long-overdue consolidation.
-    let mut shell_registry = ShellToolRegistry::new()
-        .await
-        .with_spawned_processes(spawned_processes.clone())
-        .with_spawn_persistence_hook_opt(spawn_persistence.cloned())
-        .with_web_search(web_search.clone())
-        .with_email_sender_opt(email_sender.clone())
-        .with_telegram_sender_opt(telegram_sender.clone())
-        .with_owner_check_opt(owner_check.cloned())
-        .with_checkpoint_store_opt(checkpoint_store.clone())
-        .with_checkpoint_arc_id(target_arc_id.clone().unwrap_or_default());
-    if let (Some(store), Some(arc_id_str)) = (grant_store, target_arc_id.as_ref()) {
-        let provider = Arc::new(crate::file_gate::ArcWritableProvider {
-            arc_id: crate::file_gate::arc_uuid(arc_id_str),
-            store: store.clone(),
-        });
-        shell_registry = shell_registry.with_extra_writable(provider);
-    }
-    if let Some(router) = approval_router {
-        shell_registry = shell_registry.with_toolbox_approval(Arc::new(
-            crate::file_gate::RouterToolboxApprovalGate::new(
-                Arc::clone(router),
-                target_arc_id.clone(),
-            ),
-        ));
-        let gate: Arc<dyn athen_agent::EmailSendApprovalGate> =
-            Arc::new(crate::email_gate::RouterEmailApprovalGate::new(
-                Arc::clone(router),
-                target_arc_id.clone(),
-            ));
-        shell_registry = shell_registry.with_email_approval(gate);
-        let tg_gate: Arc<dyn athen_agent::tools::TelegramSendApprovalGate> =
-            Arc::new(crate::email_gate::RouterTelegramApprovalGate::new(
-                Arc::clone(router),
-                target_arc_id.clone(),
-            ));
-        shell_registry = shell_registry.with_telegram_approval(tg_gate);
-    }
-    // Cross-channel arc routing: stamp outbound hint after each
-    // successful send_telegram so the next reply lands here too.
-    let tg_recorder: Arc<dyn athen_agent::tools::TelegramOutboundRecorder> =
-        Arc::new(crate::email_gate::ArcAwareTelegramOutboundRecorder::new(
-            telegram_outbound_hint.clone(),
-            target_arc_id.clone(),
-            telegram_chat_log.cloned(),
-        ));
-    shell_registry = shell_registry.with_telegram_outbound_recorder(tg_recorder);
-    let mut registry = AppToolRegistry::new(
-        shell_registry,
-        calendar_store.clone(),
-        contact_store.clone(),
-        memory.clone(),
+    // Single shared assembly site — same helper the in-app dispatch
+    // path uses. Owner-Telegram now gets delegation + wake-up + per-arc
+    // GitHub identity automatically (no more silent feature carve-outs).
+    let registry = assemble_app_tool_registry(
+        deps.clone(),
+        target_arc_id.as_deref().unwrap_or(""),
+        Some(app_handle.clone()),
     )
-    .with_mcp(mcp.clone() as Arc<dyn athen_core::traits::mcp::McpClient>);
-    if let Some(astore) = attachment_store {
-        registry = registry.with_attachments(astore.clone());
-    }
-    if let Some(istore) = identity_store.clone() {
-        registry = registry.with_identity(istore);
-    }
-    if let Some(sstore) = skill_store {
-        registry = registry.with_skills(sstore.clone());
-    }
-    if let (Some(estore), Some(v)) = (http_endpoint_store, vault) {
-        registry = registry.with_http_endpoints(
-            estore.clone(),
-            v.clone(),
-            http_rate_limiter.clone(),
-            http_client.clone(),
-            cloud_apis_doc_path.cloned(),
-        );
-    }
-    if let Some(cstore) = calendar_source_store {
-        registry = registry.with_calendar_remote(cstore);
-    }
-    if let (Some(store), Some(arc_id_str)) = (grant_store, target_arc_id.as_ref()) {
-        let mut gate = crate::file_gate::FileGate::new(
-            arc_id_str.clone(),
-            store.clone(),
-            pending_grants.clone(),
-            Some(app_handle.clone()),
-        );
-        if let Some(sink) = telegram_approval_sink {
-            gate = gate.with_telegram_approval(sink.clone());
-        }
-        registry = registry.with_file_gate(Arc::new(gate));
-    }
+    .await;
     // Shared list of successful tool names; the auditor appends as steps
     // finish, and we read it after execute to build the Telegram footer.
     let tool_log = new_tool_log();
@@ -2998,7 +2914,7 @@ async fn execute_owner_telegram_message(
 
     let mut builder = AgentBuilder::new()
         .llm_router(exec_router)
-        .tool_registry(Box::new(registry))
+        .tool_registry(registry)
         .auditor(Box::new(auditor))
         .max_steps(50)
         .timeout(Duration::from_secs(300))
@@ -3010,7 +2926,7 @@ async fn execute_owner_telegram_message(
         .acceptance_criteria(acceptance_criteria)
         .enable_default_reminders(true)
         .default_temperature(sampling_temperature);
-    if let Some(p) = tool_doc_dir {
+    if let Some(p) = deps.tool_doc_dir.as_deref() {
         builder = builder.tool_doc_dir(p.to_path_buf());
     }
     builder = builder
