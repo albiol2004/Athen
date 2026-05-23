@@ -2212,13 +2212,14 @@ impl AppState {
                     // tune compaction without restarting the loop.
                     let cfg_for_resolvers = crate::state::load_config();
                     let active_id_now = crate::state::resolve_active_provider(&cfg_for_resolvers);
-                    let effective_provider_id = crate::state::resolve_effective_provider_for_arc(
+                    let effective_target = crate::state::resolve_effective_provider_for_arc(
                         arc_store.as_ref(),
                         &arc_id,
                         &active_id_now,
                         athen_core::llm::ModelProfile::Powerful,
                     )
                     .await;
+                    let effective_provider_id = effective_target.provider_id.clone();
                     let (compaction_trigger_tokens, compaction_target_tokens) =
                         crate::compaction::resolve_compaction_budget(
                             &cfg_for_resolvers,
@@ -2231,9 +2232,19 @@ impl AppState {
                     let reasoning_effort =
                         crate::state::resolve_reasoning_effort_for_arc(arc_store.as_ref(), &arc_id)
                             .await;
+                    // Per-arc router build: keeps the global router when
+                    // no pin is in force, swaps in a slug-locked router
+                    // when the arc has captured `(provider, slug)`. See
+                    // `arc_router_for` and `docs/PROVIDER_PINNING.md`.
+                    let arc_router = crate::state::arc_router_for(
+                        &router,
+                        &effective_target,
+                        &active_id_now,
+                        &cfg_for_resolvers,
+                    );
                     let ctx = crate::commands::ApprovedTaskCtx {
                         coordinator: Arc::clone(&coordinator),
-                        router: Arc::clone(&router),
+                        router: arc_router,
                         arc_store: arc_store.clone(),
                         calendar_store: calendar_store.clone(),
                         contact_store: contact_store.clone(),
@@ -3522,7 +3533,29 @@ pub(crate) fn load_config() -> AthenConfig {
         Some(dir) => {
             info!("Loading config from: {}", dir.display());
             match config_loader::load_config_dir(&dir) {
-                Ok(c) => c,
+                Ok(mut c) => {
+                    // load_config_dir already ran the migration, but we
+                    // re-run here to surface the report at info level. The
+                    // second call is a no-op once the legacy ids are gone.
+                    let report = c.migrate_legacy_provider_ids();
+                    if report.changed() {
+                        if let Some(old) = &report.renamed_active {
+                            info!(
+                                from = %old,
+                                to = "opencode_go",
+                                "Migrated active_provider id (legacy → unified opencode_go)"
+                            );
+                        }
+                        if let Some((from, into)) = &report.merged_provider {
+                            info!(
+                                from = %from,
+                                into = %into,
+                                "Merged legacy opencode_go_anthropic provider entry into unified opencode_go"
+                            );
+                        }
+                    }
+                    c
+                }
                 Err(e) => {
                     warn!("Error loading config: {e}. Falling back to defaults.");
                     AthenConfig::default()
@@ -3560,46 +3593,115 @@ fn ensure_data_dir() -> Option<PathBuf> {
     Some(data_dir)
 }
 
-/// Resolve the effective provider id for an arc-scoped LLM call,
-/// honouring an existing pin or installing one if none is present.
+/// Resolved provider target for an arc-scoped LLM call.
+///
+/// `pinned_slug` is `Some` only when the arc has an active pin AND the
+/// pinned provider id is still present in config (so the slug actually
+/// belongs to the provider id we're returning). The downstream router
+/// builder treats `Some(slug)` as "override every tier with this slug",
+/// effectively freezing the model choice for the rest of the arc — see
+/// `docs/PROVIDER_PINNING.md` and the "captured but never read" gap
+/// it was created to close.
+///
+/// When the pinned provider has been removed from config and we fall
+/// back to the active provider, `pinned_slug` is forced to `None` —
+/// sending a slug captured against provider X to provider Y would
+/// almost certainly fail at the wire layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EffectiveProviderTarget {
+    pub provider_id: String,
+    /// Pinned model slug captured on the first LLM call of the arc.
+    /// `None` means the caller should consult the provider's live
+    /// `tier_models[tier]` (legacy behaviour for unpinned arcs).
+    pub pinned_slug: Option<String>,
+}
+
+/// Resolve the effective provider id (and pinned slug) for an arc-scoped
+/// LLM call, honouring an existing pin or installing one if none is
+/// present.
 ///
 /// First-call-wins semantics: when the arc has no pin yet, the current
-/// active provider id is snapshotted onto the arc row. Subsequent calls
-/// against the same arc read that pinned value back, isolating the
-/// arc's in-flight task from a mid-flight active-provider switch (see
-/// `docs/PROVIDER_PINNING.md`).
+/// active provider id is snapshotted onto the arc row alongside the
+/// resolved slug for the supplied `tier`. Subsequent calls against the
+/// same arc read both values back, isolating the arc's in-flight task
+/// from a mid-flight active-provider switch *and* from a tier_models
+/// edit on the same provider (see `docs/PROVIDER_PINNING.md`).
 ///
 /// If the pinned provider has been removed from config the function
-/// logs a warning and returns the current active id — recoverability
-/// over purity.
+/// logs a warning and returns the current active id with `pinned_slug:
+/// None` — recoverability over purity, and we refuse to send a foreign
+/// slug to a different provider.
 pub(crate) async fn resolve_effective_provider_for_arc(
     arc_store: Option<&ArcStore>,
     arc_id: &str,
     active_provider_id: &str,
     tier: ModelProfile,
-) -> String {
+) -> EffectiveProviderTarget {
+    let cfg = load_config();
+    resolve_effective_provider_for_arc_with_config(
+        arc_store,
+        arc_id,
+        active_provider_id,
+        tier,
+        &cfg,
+    )
+    .await
+}
+
+/// Test-friendly variant of `resolve_effective_provider_for_arc` that
+/// takes the config explicitly instead of reading it from disk. The
+/// public wrapper above just loads the config and delegates here.
+pub(crate) async fn resolve_effective_provider_for_arc_with_config(
+    arc_store: Option<&ArcStore>,
+    arc_id: &str,
+    active_provider_id: &str,
+    tier: ModelProfile,
+    cfg: &AthenConfig,
+) -> EffectiveProviderTarget {
     let Some(store) = arc_store else {
-        return active_provider_id.to_string();
+        return EffectiveProviderTarget {
+            provider_id: active_provider_id.to_string(),
+            pinned_slug: None,
+        };
     };
     let arc = match store.get_arc(arc_id).await {
         Ok(Some(arc)) => arc,
-        Ok(None) => return active_provider_id.to_string(),
+        Ok(None) => {
+            return EffectiveProviderTarget {
+                provider_id: active_provider_id.to_string(),
+                pinned_slug: None,
+            }
+        }
         Err(e) => {
             warn!(arc_id = %arc_id, error = %e, "pin lookup failed; using active provider");
-            return active_provider_id.to_string();
+            return EffectiveProviderTarget {
+                provider_id: active_provider_id.to_string(),
+                pinned_slug: None,
+            };
         }
     };
-    let cfg = load_config();
     if let Some(pinned) = arc.pinned_provider_id.as_deref() {
         if cfg.models.providers.contains_key(pinned) {
-            return pinned.to_string();
+            // Slug pin only flows through when it's paired with the
+            // provider we're actually returning — sending an
+            // OpenAI-captured slug to an Anthropic adapter would 4xx
+            // immediately, and a missing slug column simply collapses
+            // back to the provider's live tier_models map.
+            let pinned_slug = arc.pinned_slug.clone().filter(|s| !s.is_empty());
+            return EffectiveProviderTarget {
+                provider_id: pinned.to_string(),
+                pinned_slug,
+            };
         }
         warn!(
             arc_id = %arc_id,
             pinned_provider_id = %pinned,
-            "pinned provider missing from config; falling back to active"
+            "pinned provider missing from config; falling back to active (slug pin dropped)"
         );
-        return active_provider_id.to_string();
+        return EffectiveProviderTarget {
+            provider_id: active_provider_id.to_string(),
+            pinned_slug: None,
+        };
     }
     let slug = cfg
         .models
@@ -3619,7 +3721,16 @@ pub(crate) async fn resolve_effective_provider_for_arc(
     {
         warn!(arc_id = %arc_id, error = %e, "failed to install provider pin");
     }
-    active_provider_id.to_string()
+    // First call: we just installed the pin atomically above. From the
+    // caller's perspective we behave like an unpinned resolve — the
+    // caller will use the freshly built router whose tiers map to
+    // exactly the same slugs we just persisted, so honouring the slug
+    // here would be a no-op. Subsequent calls take the
+    // `pinned_provider_id.is_some()` branch above and surface the slug.
+    EffectiveProviderTarget {
+        provider_id: active_provider_id.to_string(),
+        pinned_slug: None,
+    }
 }
 
 /// Clear an arc's provider pin. Best-effort: logs and swallows errors
@@ -3768,11 +3879,39 @@ pub(crate) fn resolve_active_provider(config: &AthenConfig) -> String {
         .unwrap_or_else(|| "deepseek".to_string())
 }
 
-/// Build a router for the given provider ID, reading configuration from the
-/// supplied `AthenConfig`.  Returns `(Arc<DefaultLlmRouter>, model_name)`.
+/// Build a router for the given provider ID, reading configuration from
+/// the supplied `AthenConfig`.  Returns `(Arc<DefaultLlmRouter>, model_name)`.
+///
+/// Thin wrapper around `build_router_for_provider_from_config_with_pinned_slug`
+/// with `pinned_slug = None`. Kept for the bootstrap / non-arc paths
+/// (e.g. risk LLM, compaction LLM) that have no notion of an arc and
+/// should always honour the live `tier_models` map.
 fn build_router_for_provider_from_config(
     provider_id: &str,
     config: &AthenConfig,
+) -> (Arc<DefaultLlmRouter>, String) {
+    build_router_for_provider_from_config_with_pinned_slug(provider_id, config, None)
+}
+
+/// Build a router for the given provider ID, optionally overriding the
+/// per-tier slug for arcs whose pin is in force. Returns
+/// `(Arc<DefaultLlmRouter>, model_name)`.
+///
+/// When `pinned_slug` is `Some(s)`, every tier (Cheap / Fast / Code /
+/// Powerful) is wired to a single provider instance built for slug `s`,
+/// regardless of what `tier_models` says. This is the load-bearing
+/// behaviour for arc pinning: once an arc has captured `(provider, slug)`
+/// on its first LLM call, a subsequent user edit to `tier_models` on the
+/// same provider must not redirect the in-flight task to a different
+/// model. See `docs/PROVIDER_PINNING.md`.
+///
+/// `model_name` in the returned tuple reflects what the router will
+/// actually use as its primary slug — the pinned slug when set,
+/// otherwise the provider's `default_model`.
+fn build_router_for_provider_from_config_with_pinned_slug(
+    provider_id: &str,
+    config: &AthenConfig,
+    pinned_slug: Option<&str>,
 ) -> (Arc<DefaultLlmRouter>, String) {
     let provider_cfg = config.models.providers.get(provider_id);
 
@@ -3809,8 +3948,47 @@ fn build_router_for_provider_from_config(
         supports_documents,
         family,
         tier_models,
+        pinned_slug,
     );
-    (router, model)
+    let primary_model = pinned_slug
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or(model);
+    (router, primary_model)
+}
+
+/// Resolve the router an arc-bound execution should hand to
+/// `ApprovedTaskCtx.router`. Returns the shared global router when the
+/// arc has no pin (or pins to the current active provider with no slug
+/// captured — degenerate case), and a freshly built per-arc router
+/// otherwise.
+///
+/// The arc-specific router is wrapped in its own `Arc<RwLock<_>>` so it
+/// matches the existing context field type without forcing the caller to
+/// know which branch we took. The freshly built variant lives only for
+/// the duration of the executor run; once the task completes and
+/// `clear_provider_pin_for_arc` fires, the next dispatch on the same arc
+/// resolves back to the global router via the no-pin branch.
+pub(crate) fn arc_router_for(
+    global_router: &Arc<tokio::sync::RwLock<Arc<DefaultLlmRouter>>>,
+    target: &EffectiveProviderTarget,
+    active_provider_id: &str,
+    config: &AthenConfig,
+) -> Arc<tokio::sync::RwLock<Arc<DefaultLlmRouter>>> {
+    // No pin in force AND no provider switch ⇒ keep using the shared
+    // global router. This is the fast path on the very first call of an
+    // arc (resolver returns `pinned_slug: None` immediately after
+    // installing the pin — see `resolve_effective_provider_for_arc`)
+    // and on every call of an arc that was never pinned.
+    if target.pinned_slug.is_none() && target.provider_id == active_provider_id {
+        return Arc::clone(global_router);
+    }
+    let (router, _model) = build_router_for_provider_from_config_with_pinned_slug(
+        &target.provider_id,
+        config,
+        target.pinned_slug.as_deref(),
+    );
+    Arc::new(tokio::sync::RwLock::new(router))
 }
 
 /// Build an `EmbeddingRouter` from `config.embeddings`.
@@ -3939,7 +4117,7 @@ fn default_base_url_for(id: &str) -> &str {
         "openai" => "https://api.openai.com",
         "anthropic" => "https://api.anthropic.com",
         "google" => "https://generativelanguage.googleapis.com",
-        "opencode_go" | "opencode_go_anthropic" => "https://opencode.ai/zen/go",
+        "opencode_go" => "https://opencode.ai/zen/go",
         "minimax" => "https://api.minimax.io",
         "minimax_anthropic" => "https://api.minimax.io/anthropic",
         "ollama" => "http://localhost:11434",
@@ -3958,7 +4136,6 @@ fn default_model_for(id: &str) -> &str {
         "anthropic" => "claude-sonnet-4-6",
         "google" => "gemini-3.1-flash-lite-preview",
         "opencode_go" => "deepseek-v4-flash",
-        "opencode_go_anthropic" => "minimax-m2.7",
         "minimax" | "minimax_anthropic" => "MiniMax-M2.7",
         "ollama" => "llama3",
         "llamacpp" => "default",
@@ -3997,6 +4174,12 @@ fn resolve_api_key_for(
 /// the OpenAI Chat Completions shape (DeepSeek, Anthropic, Ollama, llama.cpp).
 /// Everything else (OpenAI proper, Mistral, OpenRouter, custom OpenAI-compat
 /// endpoints) goes through `OpenAiCompatibleProvider`.
+///
+/// When `override_slug` is `Some(s)`, every tier is wired to a single
+/// provider instance built for slug `s` instead of consulting
+/// `tier_models`. This is how an arc with a captured pin keeps its
+/// model stable across tier_models edits — see `docs/PROVIDER_PINNING.md`
+/// and the `EffectiveProviderTarget::pinned_slug` field.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_router_for_provider(
     provider_id: &str,
@@ -4007,6 +4190,7 @@ pub(crate) fn build_router_for_provider(
     supports_documents: bool,
     family: athen_core::llm::ModelFamily,
     tier_models: &HashMap<ModelProfile, String>,
+    override_slug: Option<&str>,
 ) -> Arc<DefaultLlmRouter> {
     let mut providers: HashMap<String, Box<dyn LlmProvider>> = HashMap::new();
     let mut profiles: HashMap<ModelProfile, ProfileConfig> = HashMap::new();
@@ -4038,22 +4222,38 @@ pub(crate) fn build_router_for_provider(
         key
     };
 
-    // Resolve each tier: caller-supplied slug from `tier_models`, falling
-    // back to the parent provider's `model`. Empty map ⇒ all four tiers
-    // point at one provider instance under the default slug, preserving
-    // the legacy single-model behaviour for configs that predate the
-    // per-tier field.
+    // Normalise the override: an empty string is treated as "no
+    // override" so a stale empty `pinned_slug` column can't blank-out
+    // the slug at request time.
+    let override_slug = override_slug.filter(|s| !s.is_empty());
+
+    // Resolve each tier: when `override_slug` is set, use it for every
+    // tier (pin path — slug is frozen for the rest of the arc). Else
+    // consult caller-supplied `tier_models`, falling back to the parent
+    // provider's `model`. Empty map ⇒ all four tiers point at one
+    // provider instance under the default slug, preserving the legacy
+    // single-model behaviour for configs that predate the per-tier field.
     for tier in [
         ModelProfile::Cheap,
         ModelProfile::Fast,
         ModelProfile::Code,
         ModelProfile::Powerful,
     ] {
-        let slug = tier_models
-            .get(&tier)
-            .map(|s| s.as_str())
-            .filter(|s| !s.is_empty())
-            .unwrap_or(model);
+        let slug = if let Some(pinned) = override_slug {
+            tracing::debug!(
+                provider_id = %provider_id,
+                tier = ?tier,
+                pinned_slug = %pinned,
+                "honoring pinned slug instead of tier_models"
+            );
+            pinned
+        } else {
+            tier_models
+                .get(&tier)
+                .map(|s| s.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(model)
+        };
         let key = ensure_slug(slug, &mut providers, &mut slug_to_key);
         profiles.insert(
             tier,
@@ -4070,6 +4270,29 @@ pub(crate) fn build_router_for_provider(
         profiles,
         BudgetTracker::new(None),
     ))
+}
+
+/// Heuristic: does this slug name a MiniMax M2.x model on the OpenCode
+/// Go relay? Used to dispatch the unified `opencode_go` provider id to
+/// the Anthropic-compat wire (`/v1/messages`) vs the OpenAI-compat wire
+/// (`/v1/chat/completions`).
+///
+/// Match rule (case-insensitive): the slug starts with `minimax-m2`
+/// followed by either end-of-string, `.`, `-`, or `_`. This catches
+/// `minimax-m2`, `minimax-m2.5`, `minimax-m2.7`, `minimax-m2-foo`,
+/// `minimax-m2_bar` and rejects future generations like `minimax-m3`
+/// (different wire shape may apply — re-evaluate when shipped) plus
+/// non-MiniMax slugs like `kimi-k2.5`.
+pub(crate) fn is_minimax_slug(slug: &str) -> bool {
+    let lower = slug.to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("minimax-m2") else {
+        return false;
+    };
+    // Bare "minimax-m2" or one of the expected separators next.
+    matches!(
+        rest.as_bytes().first().copied(),
+        None | Some(b'.') | Some(b'-') | Some(b'_')
+    )
 }
 
 /// Construct a single adapter instance for `provider_id` with the given
@@ -4096,13 +4319,11 @@ fn build_provider_instance(
             }
             Box::new(p)
         }
-        "anthropic" | "minimax_anthropic" | "opencode_go_anthropic" => {
-            // minimax_anthropic + opencode_go_anthropic route through
-            // AnthropicProvider for the /v1/messages wire format. MiniMax
-            // Token Plan exposes it at api.minimax.io/anthropic (with
-            // prompt-cache); OpenCode Go exposes it at opencode.ai/zen/go
-            // for its MiniMax M2.5 / M2.7 slots. Provider adapter is
-            // identical; only the base URL differs.
+        "anthropic" | "minimax_anthropic" => {
+            // minimax_anthropic routes through AnthropicProvider for the
+            // /v1/messages wire format. MiniMax Token Plan exposes it at
+            // api.minimax.io/anthropic (with prompt-cache). Provider
+            // adapter is identical; only the base URL differs.
             let key = api_key.unwrap_or_default().to_string();
             let mut p = AnthropicProvider::new(key, model.to_string())
                 .with_family(family)
@@ -4112,6 +4333,42 @@ fn build_provider_instance(
                 p = p.with_base_url(base_url.to_string());
             }
             Box::new(p)
+        }
+        "opencode_go" => {
+            // OpenCode Go is one logical provider covering two wire
+            // formats on the same relay host: OpenAI-compat
+            // `/v1/chat/completions` for DeepSeek/Qwen/Kimi/GLM/MiMo and
+            // Anthropic-compat `/v1/messages` for MiniMax M2.x. The
+            // per-tier slug loop in `build_router_for_provider` calls us
+            // once per tier, so dispatching by slug here is enough — tier
+            // Cheap=`deepseek-v4-flash` lands on the OpenAI adapter, tier
+            // Code=`minimax-m2.7` lands on the Anthropic adapter.
+            //
+            // The persisted `family` field is intentionally ignored — it
+            // is no longer authoritative under per-slug dispatch (the
+            // migration normalises it to DeepSeekV4Chat for clarity, but
+            // a stale MiniMaxM25Cloud value would otherwise mis-quirk the
+            // DeepSeek slugs).
+            let key = api_key.unwrap_or_default().to_string();
+            if is_minimax_slug(model) {
+                let mut p = AnthropicProvider::new(key, model.to_string())
+                    .with_family(athen_core::llm::ModelFamily::MiniMaxM25Cloud)
+                    .with_vision(supports_vision)
+                    .with_documents(supports_documents);
+                if !base_url.is_empty() {
+                    p = p.with_base_url(base_url.to_string());
+                }
+                Box::new(p)
+            } else {
+                let mut p = OpenAiCompatibleProvider::new(base_url.to_string())
+                    .with_model(model.to_string())
+                    .with_provider_id(provider_id.to_string())
+                    .with_family(athen_core::llm::ModelFamily::DeepSeekV4Chat)
+                    .with_vision(supports_vision)
+                    .with_documents(supports_documents);
+                p = p.with_api_key(key);
+                Box::new(p)
+            }
         }
         "google" => {
             let key = api_key.unwrap_or_default().to_string();
@@ -4775,5 +5032,353 @@ mod resolve_effective_tier_tests {
         )
         .await;
         assert_eq!(tier, ModelProfile::Powerful);
+    }
+}
+
+#[cfg(test)]
+mod is_minimax_slug_tests {
+    use super::is_minimax_slug;
+
+    #[test]
+    fn matches_known_minimax_slugs() {
+        // Canonical: M2.7 / M2.5 / bare M2.
+        assert!(is_minimax_slug("minimax-m2.7"));
+        assert!(is_minimax_slug("minimax-m2.5"));
+        assert!(is_minimax_slug("minimax-m2"));
+        // Hyphen / underscore suffix variants stay routed to Anthropic
+        // wire — relay-side variant slugs follow this shape.
+        assert!(is_minimax_slug("minimax-m2-preview"));
+        assert!(is_minimax_slug("minimax-m2_foo"));
+    }
+
+    #[test]
+    fn case_insensitive() {
+        assert!(is_minimax_slug("MiniMax-M2.7"));
+        assert!(is_minimax_slug("MINIMAX-M2.5"));
+        assert!(is_minimax_slug("Minimax-m2"));
+    }
+
+    #[test]
+    fn rejects_other_slugs() {
+        // DeepSeek / Kimi / Qwen / GLM all hit the OpenAI-compat wire.
+        assert!(!is_minimax_slug("deepseek-v4-flash"));
+        assert!(!is_minimax_slug("deepseek-v4-pro"));
+        assert!(!is_minimax_slug("kimi-k2.5"));
+        assert!(!is_minimax_slug("qwen-3-coder"));
+        assert!(!is_minimax_slug("glm-4-air"));
+        assert!(!is_minimax_slug(""));
+        assert!(!is_minimax_slug("minimax"));
+    }
+
+    #[test]
+    fn rejects_future_or_adjacent_generations() {
+        // Future generations may need their own quirks profile — opt them
+        // in explicitly rather than silently routing to Anthropic wire.
+        assert!(!is_minimax_slug("minimax-m3"));
+        assert!(!is_minimax_slug("minimax-m3.0"));
+        assert!(!is_minimax_slug("minimax-m25"));
+        assert!(!is_minimax_slug("minimax-m20"));
+        // Sneaky-looking close-match.
+        assert!(!is_minimax_slug("not-minimax-m2.7"));
+    }
+}
+
+#[cfg(test)]
+mod resolve_effective_provider_tests {
+    use super::{resolve_effective_provider_for_arc_with_config, EffectiveProviderTarget};
+    use athen_core::config::{AthenConfig, AuthType, ProviderConfig};
+    use athen_core::llm::{ModelFamily, ModelProfile};
+    use athen_persistence::arcs::{ArcSource, ArcStore};
+    use rusqlite::Connection;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    async fn setup_store() -> ArcStore {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        let store = ArcStore::new(Arc::new(Mutex::new(conn)));
+        store.init_schema().await.expect("init arc schema");
+        store
+    }
+
+    fn mk_provider(default_model: &str) -> ProviderConfig {
+        ProviderConfig {
+            auth: AuthType::None,
+            default_model: default_model.to_string(),
+            endpoint: None,
+            context_window_tokens: 128_000,
+            compaction_trigger_pct: 65,
+            compaction_target_pct: 30,
+            supports_vision: false,
+            supports_documents: false,
+            family: ModelFamily::Default,
+            temperature: None,
+            tier_models: HashMap::new(),
+        }
+    }
+
+    fn mk_config(provider_ids: &[(&str, &str)]) -> AthenConfig {
+        let mut cfg = AthenConfig::default();
+        for (id, default_model) in provider_ids {
+            cfg.models
+                .providers
+                .insert((*id).to_string(), mk_provider(default_model));
+        }
+        cfg
+    }
+
+    /// Arc with no pin yet, first call: resolver installs a pin against
+    /// the active provider and returns `pinned_slug: None` (no override
+    /// needed — the freshly-built router already uses the persisted slug
+    /// for every tier).
+    #[tokio::test]
+    async fn first_call_installs_pin_returns_none_slug() {
+        let store = setup_store().await;
+        store
+            .create_arc("arc_a", "t", ArcSource::UserInput)
+            .await
+            .unwrap();
+        let cfg = mk_config(&[("opencode_go", "deepseek-v4-flash")]);
+
+        let target = resolve_effective_provider_for_arc_with_config(
+            Some(&store),
+            "arc_a",
+            "opencode_go",
+            ModelProfile::Powerful,
+            &cfg,
+        )
+        .await;
+
+        assert_eq!(
+            target,
+            EffectiveProviderTarget {
+                provider_id: "opencode_go".to_string(),
+                pinned_slug: None,
+            }
+        );
+
+        // The pin row should now exist with the resolved slug captured.
+        let arc = store.get_arc("arc_a").await.unwrap().unwrap();
+        assert_eq!(arc.pinned_provider_id.as_deref(), Some("opencode_go"));
+        assert_eq!(arc.pinned_slug.as_deref(), Some("deepseek-v4-flash"));
+    }
+
+    /// Arc already pinned to a provider that's still in config:
+    /// resolver returns both the pinned provider and the pinned slug,
+    /// regardless of what the active provider currently is.
+    #[tokio::test]
+    async fn pinned_arc_returns_both_provider_and_slug() {
+        let store = setup_store().await;
+        store
+            .create_arc("arc_p", "t", ArcSource::UserInput)
+            .await
+            .unwrap();
+        store
+            .set_pinned_provider_if_unset("arc_p", "opencode_go", "minimax-m2.7")
+            .await
+            .unwrap();
+        let cfg = mk_config(&[
+            ("opencode_go", "deepseek-v4-flash"),
+            ("deepseek", "deepseek-v4-flash"),
+        ]);
+
+        // Even with a different "active" provider, the pin wins.
+        let target = resolve_effective_provider_for_arc_with_config(
+            Some(&store),
+            "arc_p",
+            "deepseek",
+            ModelProfile::Powerful,
+            &cfg,
+        )
+        .await;
+
+        assert_eq!(
+            target,
+            EffectiveProviderTarget {
+                provider_id: "opencode_go".to_string(),
+                pinned_slug: Some("minimax-m2.7".to_string()),
+            }
+        );
+    }
+
+    /// Arc pinned to a provider that has since been removed from
+    /// config: resolver falls back to the active provider AND clears
+    /// the slug pin (we won't ship a foreign slug to a different
+    /// provider — the wire format would almost certainly mismatch).
+    #[tokio::test]
+    async fn pinned_provider_missing_drops_slug() {
+        let store = setup_store().await;
+        store
+            .create_arc("arc_x", "t", ArcSource::UserInput)
+            .await
+            .unwrap();
+        store
+            .set_pinned_provider_if_unset("arc_x", "deleted_provider", "kimi-k2.5")
+            .await
+            .unwrap();
+        let cfg = mk_config(&[("deepseek", "deepseek-v4-flash")]);
+
+        let target = resolve_effective_provider_for_arc_with_config(
+            Some(&store),
+            "arc_x",
+            "deepseek",
+            ModelProfile::Powerful,
+            &cfg,
+        )
+        .await;
+
+        assert_eq!(
+            target,
+            EffectiveProviderTarget {
+                provider_id: "deepseek".to_string(),
+                pinned_slug: None,
+            }
+        );
+    }
+
+    /// Arc with no `arc_store` available at all (CLI tests, etc.): the
+    /// resolver collapses to the active provider with no slug pin.
+    #[tokio::test]
+    async fn no_arc_store_returns_active_only() {
+        let cfg = mk_config(&[("openai", "gpt-5.4-mini")]);
+        let target = resolve_effective_provider_for_arc_with_config(
+            None,
+            "arc_irrelevant",
+            "openai",
+            ModelProfile::Powerful,
+            &cfg,
+        )
+        .await;
+
+        assert_eq!(
+            target,
+            EffectiveProviderTarget {
+                provider_id: "openai".to_string(),
+                pinned_slug: None,
+            }
+        );
+    }
+}
+
+#[cfg(test)]
+mod build_router_override_slug_tests {
+    use super::build_router_for_provider;
+    use athen_core::llm::{ModelFamily, ModelProfile};
+    use std::collections::HashMap;
+
+    /// `override_slug=Some(s)` collapses every tier to a single
+    /// provider key derived from `s`, even when `tier_models` would
+    /// pick something else per tier. This is the load-bearing slug
+    /// freeze the arc pin relies on.
+    #[test]
+    fn override_slug_collapses_every_tier_to_pinned_key() {
+        // Tier map says Cheap=A, Fast=B, Code=C, Powerful=D — would
+        // pick a different slug per tier under normal routing.
+        let mut tiers: HashMap<ModelProfile, String> = HashMap::new();
+        tiers.insert(ModelProfile::Cheap, "cheap-slug".into());
+        tiers.insert(ModelProfile::Fast, "fast-slug".into());
+        tiers.insert(ModelProfile::Code, "code-slug".into());
+        tiers.insert(ModelProfile::Powerful, "powerful-slug".into());
+
+        let router = build_router_for_provider(
+            "openai", // OpenAI-compatible adapter doesn't make network calls at build time.
+            "http://localhost:0",
+            "default-model",
+            Some("test-key"),
+            false,
+            false,
+            ModelFamily::Default,
+            &tiers,
+            Some("kimi-k2.5"),
+        );
+
+        let expected = vec!["openai.kimi-k2.5".to_string()];
+        // Every tier collapses to the pinned slug's single provider key.
+        for tier in [
+            ModelProfile::Cheap,
+            ModelProfile::Fast,
+            ModelProfile::Code,
+            ModelProfile::Powerful,
+        ] {
+            assert_eq!(
+                router.profile_provider_keys(tier),
+                expected.as_slice(),
+                "tier {:?} should map to the pinned slug's key",
+                tier
+            );
+        }
+    }
+
+    /// `override_slug=None` preserves the existing tier_models routing:
+    /// each tier maps to whichever slug-keyed provider its tier_models
+    /// entry names, with `default_model` filling in for unset tiers.
+    #[test]
+    fn no_override_preserves_tier_models_routing() {
+        let mut tiers: HashMap<ModelProfile, String> = HashMap::new();
+        tiers.insert(ModelProfile::Cheap, "cheap-slug".into());
+        tiers.insert(ModelProfile::Powerful, "powerful-slug".into());
+        // Fast + Code are unset → fall back to default_model.
+
+        let router = build_router_for_provider(
+            "openai",
+            "http://localhost:0",
+            "default-model",
+            Some("test-key"),
+            false,
+            false,
+            ModelFamily::Default,
+            &tiers,
+            None,
+        );
+
+        assert_eq!(
+            router.profile_provider_keys(ModelProfile::Cheap),
+            &["openai.cheap-slug".to_string()]
+        );
+        assert_eq!(
+            router.profile_provider_keys(ModelProfile::Powerful),
+            &["openai.powerful-slug".to_string()]
+        );
+        // Unset tiers fall through to default_model.
+        assert_eq!(
+            router.profile_provider_keys(ModelProfile::Fast),
+            &["openai.default-model".to_string()]
+        );
+        assert_eq!(
+            router.profile_provider_keys(ModelProfile::Code),
+            &["openai.default-model".to_string()]
+        );
+    }
+
+    /// `override_slug=Some("")` is treated as no override — a stale
+    /// empty `pinned_slug` column must not blank-out the slug at
+    /// request time (would route to provider key `openai.` and 404).
+    #[test]
+    fn empty_override_slug_treated_as_none() {
+        let mut tiers: HashMap<ModelProfile, String> = HashMap::new();
+        tiers.insert(ModelProfile::Powerful, "powerful-slug".into());
+
+        let router = build_router_for_provider(
+            "openai",
+            "http://localhost:0",
+            "default-model",
+            Some("test-key"),
+            false,
+            false,
+            ModelFamily::Default,
+            &tiers,
+            Some(""),
+        );
+
+        // Powerful tier still consults tier_models, not the empty pin.
+        assert_eq!(
+            router.profile_provider_keys(ModelProfile::Powerful),
+            &["openai.powerful-slug".to_string()]
+        );
+        // Unset tier falls through to default_model.
+        assert_eq!(
+            router.profile_provider_keys(ModelProfile::Fast),
+            &["openai.default-model".to_string()]
+        );
     }
 }

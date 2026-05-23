@@ -202,13 +202,14 @@ fn spawn_router_approval(
         // IPC `approve_task` already started this task.
         let turn_id = Uuid::new_v4().to_string();
 
-        let effective_provider_id = crate::state::resolve_effective_provider_for_arc(
+        let effective_target = crate::state::resolve_effective_provider_for_arc(
             bg_ctx.arc_store.as_ref(),
             &bg_ctx.active_arc_id,
             &bg_ctx.active_provider_id_snapshot,
             athen_core::llm::ModelProfile::Powerful,
         )
         .await;
+        let effective_provider_id = effective_target.provider_id.clone();
         let cfg_for_resolvers = crate::state::load_config();
         let (compaction_trigger_tokens, compaction_target_tokens) =
             crate::compaction::resolve_compaction_budget(
@@ -224,10 +225,19 @@ fn spawn_router_approval(
             &bg_ctx.active_arc_id,
         )
         .await;
+        // Per-arc router build: keeps the global router when no pin is
+        // in force, swaps in a slug-locked router when the arc has
+        // captured `(provider, slug)`. See `crate::state::arc_router_for`.
+        let arc_router = crate::state::arc_router_for(
+            &bg_ctx.router_arc,
+            &effective_target,
+            &bg_ctx.active_provider_id_snapshot,
+            &cfg_for_resolvers,
+        );
 
         let ctx = ApprovedTaskCtx {
             coordinator: bg_ctx.coordinator,
-            router: bg_ctx.router_arc,
+            router: arc_router,
             arc_store: bg_ctx.arc_store,
             calendar_store: bg_ctx.calendar_store,
             contact_store: bg_ctx.contact_store,
@@ -2198,8 +2208,32 @@ pub async fn send_message(
                 }
             }
 
+            // Resolve the arc's pinned provider/slug *before* wiring the
+            // executor's router so a captured pin freezes the model for
+            // this run even if the user edits tier_models mid-task. The
+            // no-pin path returns the shared global router unchanged
+            // (fast path); a pinned arc gets its own slug-locked router
+            // built fresh from config. See `state::arc_router_for` and
+            // `docs/PROVIDER_PINNING.md`.
+            let active_id_for_router = state.active_provider_id.lock().await.clone();
+            let effective_target = crate::state::resolve_effective_provider_for_arc(
+                state.arc_store.as_ref(),
+                &active_arc,
+                &active_id_for_router,
+                athen_core::llm::ModelProfile::Powerful,
+            )
+            .await;
+            let cfg_for_arc_router = crate::state::load_config();
+            let arc_router_handle = crate::state::arc_router_for(
+                &state.router,
+                &effective_target,
+                &active_id_for_router,
+                &cfg_for_arc_router,
+            );
+
             // Build executor with real tool execution (same as athen-cli).
-            let exec_router: Box<dyn LlmRouter> = Box::new(SharedRouter(Arc::clone(&state.router)));
+            let exec_router: Box<dyn LlmRouter> =
+                Box::new(SharedRouter(Arc::clone(&arc_router_handle)));
             let registry = state
                 .build_tool_registry(&active_arc, Some(app_handle.clone()))
                 .await;
@@ -2312,16 +2346,14 @@ pub async fn send_message(
             )
             .await;
 
-            let active_id_now = state.active_provider_id.lock().await.clone();
-            let effective_provider_id = crate::state::resolve_effective_provider_for_arc(
-                state.arc_store.as_ref(),
-                &active_arc,
-                &active_id_now,
-                athen_core::llm::ModelProfile::Powerful,
-            )
-            .await;
+            // Reuse the `effective_target` snapshotted before exec_router
+            // was wired — re-resolving here would race with a concurrent
+            // pin install / clear and could yield a different
+            // provider_id than the router we're actually about to use
+            // for execution.
+            let effective_provider_id = effective_target.provider_id.clone();
             let sampling_temperature = crate::compaction::resolve_provider_temperature(
-                &crate::state::load_config(),
+                &cfg_for_arc_router,
                 &effective_provider_id,
             );
             let reasoning_effort = crate::state::resolve_reasoning_effort_for_arc(
@@ -2660,13 +2692,14 @@ pub async fn approve_task(
 
     let active_arc = state.active_arc_id.lock().await.clone();
     let active_provider_id_snapshot = state.active_provider_id.lock().await.clone();
-    let effective_provider_id = crate::state::resolve_effective_provider_for_arc(
+    let effective_target = crate::state::resolve_effective_provider_for_arc(
         state.arc_store.as_ref(),
         &active_arc,
         &active_provider_id_snapshot,
         athen_core::llm::ModelProfile::Powerful,
     )
     .await;
+    let effective_provider_id = effective_target.provider_id.clone();
     let cfg_for_resolvers = crate::state::load_config();
     let (compaction_trigger_tokens, compaction_target_tokens) =
         crate::compaction::resolve_compaction_budget(&cfg_for_resolvers, &effective_provider_id);
@@ -2674,10 +2707,19 @@ pub async fn approve_task(
         crate::compaction::resolve_provider_temperature(&cfg_for_resolvers, &effective_provider_id);
     let reasoning_effort =
         crate::state::resolve_reasoning_effort_for_arc(state.arc_store.as_ref(), &active_arc).await;
+    // Per-arc router build: keeps the global router when no pin is in
+    // force, swaps in a slug-locked router otherwise. See
+    // `crate::state::arc_router_for` and `docs/PROVIDER_PINNING.md`.
+    let arc_router = crate::state::arc_router_for(
+        &state.router,
+        &effective_target,
+        &active_provider_id_snapshot,
+        &cfg_for_resolvers,
+    );
 
     let ctx = ApprovedTaskCtx {
         coordinator: Arc::clone(&state.coordinator),
-        router: Arc::clone(&state.router),
+        router: arc_router,
         arc_store: state.arc_store.clone(),
         calendar_store: state.calendar_store.clone(),
         contact_store: state.contact_store.clone(),

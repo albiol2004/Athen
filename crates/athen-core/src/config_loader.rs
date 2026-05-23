@@ -4,12 +4,18 @@ use crate::config::AthenConfig;
 use crate::error::{AthenError, Result};
 
 /// Load config from a TOML file, falling back to defaults for missing fields.
+///
+/// Applies in-process legacy-id migrations on the deserialised config —
+/// see [`AthenConfig::migrate_legacy_provider_ids`]. Migrations are pure
+/// (no I/O, no logging) so the caller decides whether/how to surface
+/// them.
 pub fn load_config(path: &Path) -> Result<AthenConfig> {
     if path.exists() {
         let content = std::fs::read_to_string(path)
             .map_err(|e| AthenError::Config(format!("Failed to read {}: {e}", path.display())))?;
-        let config: AthenConfig = toml::from_str(&content)
+        let mut config: AthenConfig = toml::from_str(&content)
             .map_err(|e| AthenError::Config(format!("Failed to parse {}: {e}", path.display())))?;
+        let _ = config.migrate_legacy_provider_ids();
         Ok(config)
     } else {
         Ok(AthenConfig::default())
@@ -35,6 +41,12 @@ pub fn load_config_dir(dir: &Path) -> Result<AthenConfig> {
         config.models = toml::from_str(&content)
             .map_err(|e| AthenError::Config(format!("Failed to parse models.toml: {e}")))?;
     }
+
+    // Apply legacy-id migrations after both files have been merged so the
+    // assignments + providers maps see their final shape (e.g. an active-
+    // provider set in config.toml + a providers map loaded from
+    // models.toml).
+    let _ = config.migrate_legacy_provider_ids();
 
     Ok(config)
 }
@@ -274,5 +286,130 @@ default_model = "deepseek-chat"
             AuthType::ApiKey(key) => assert_eq!(key, "sk-ant-test"),
             _ => panic!("Expected ApiKey auth"),
         }
+    }
+
+    /// An existing user has the legacy `opencode_go_anthropic` provider
+    /// id pinned as the active provider, AND both legacy + unified
+    /// entries in their providers map with mixed tier slugs across the
+    /// two wire formats. After load, the active id rewrites to
+    /// `opencode_go`, the legacy entry vanishes, and the tier_models map
+    /// merges with Anthropic-entry slugs winning on collision.
+    #[test]
+    fn test_load_migrates_opencode_go_anthropic() {
+        use crate::config::ProviderConfig;
+        use crate::llm::{ModelFamily, ModelProfile};
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let mut config = AthenConfig::default();
+
+        // Both legacy and unified provider rows present. Collision on
+        // Cheap (different slugs) — Anthropic-entry slug should win.
+        let mut legacy_tiers: HashMap<ModelProfile, String> = HashMap::new();
+        legacy_tiers.insert(ModelProfile::Cheap, "minimax-m2.5".into());
+        legacy_tiers.insert(ModelProfile::Powerful, "minimax-m2.7".into());
+
+        let mut unified_tiers: HashMap<ModelProfile, String> = HashMap::new();
+        unified_tiers.insert(ModelProfile::Cheap, "deepseek-v4-flash".into());
+        unified_tiers.insert(ModelProfile::Code, "deepseek-v4-pro".into());
+
+        config.models.providers.insert(
+            "opencode_go_anthropic".into(),
+            ProviderConfig {
+                auth: AuthType::ApiKey("sk-test".into()),
+                default_model: "minimax-m2.7".into(),
+                endpoint: None,
+                context_window_tokens: 200_000,
+                compaction_trigger_pct: 65,
+                compaction_target_pct: 30,
+                supports_vision: false,
+                supports_documents: false,
+                family: ModelFamily::MiniMaxM25Cloud,
+                temperature: None,
+                tier_models: legacy_tiers,
+            },
+        );
+        config.models.providers.insert(
+            "opencode_go".into(),
+            ProviderConfig {
+                auth: AuthType::ApiKey("sk-test".into()),
+                default_model: "deepseek-v4-flash".into(),
+                endpoint: None,
+                context_window_tokens: 200_000,
+                compaction_trigger_pct: 65,
+                compaction_target_pct: 30,
+                supports_vision: false,
+                supports_documents: false,
+                family: ModelFamily::DeepSeekV4Chat,
+                temperature: None,
+                tier_models: unified_tiers,
+            },
+        );
+        config
+            .models
+            .assignments
+            .insert("active_provider".into(), "opencode_go_anthropic".into());
+
+        let content = toml::to_string_pretty(&config).unwrap();
+        std::fs::write(&path, &content).unwrap();
+
+        let loaded = load_config(&path).unwrap();
+
+        // active_provider rewritten.
+        assert_eq!(
+            loaded.models.assignments.get("active_provider"),
+            Some(&"opencode_go".to_string())
+        );
+        // Legacy entry gone.
+        assert!(!loaded
+            .models
+            .providers
+            .contains_key("opencode_go_anthropic"));
+        // Unified entry survives.
+        let unified = loaded
+            .models
+            .providers
+            .get("opencode_go")
+            .expect("opencode_go must survive merge");
+        // Anthropic-entry Cheap slug wins on collision.
+        assert_eq!(
+            unified.tier_models.get(&ModelProfile::Cheap),
+            Some(&"minimax-m2.5".to_string())
+        );
+        // Anthropic-entry Powerful slug copied across.
+        assert_eq!(
+            unified.tier_models.get(&ModelProfile::Powerful),
+            Some(&"minimax-m2.7".to_string())
+        );
+        // Unified-entry Code slug preserved (no collision).
+        assert_eq!(
+            unified.tier_models.get(&ModelProfile::Code),
+            Some(&"deepseek-v4-pro".to_string())
+        );
+        // Family normalised to DeepSeekV4Chat regardless of inbound value.
+        assert!(matches!(unified.family, ModelFamily::DeepSeekV4Chat));
+    }
+
+    /// Migration is idempotent — running load on an already-migrated
+    /// config is a no-op.
+    #[test]
+    fn test_load_migration_idempotent_when_no_legacy() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let mut config = AthenConfig::default();
+        config
+            .models
+            .assignments
+            .insert("active_provider".into(), "deepseek".into());
+        let content = toml::to_string_pretty(&config).unwrap();
+        std::fs::write(&path, &content).unwrap();
+
+        let loaded = load_config(&path).unwrap();
+        assert_eq!(
+            loaded.models.assignments.get("active_provider"),
+            Some(&"deepseek".to_string())
+        );
     }
 }

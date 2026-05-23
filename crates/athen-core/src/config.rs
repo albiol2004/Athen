@@ -70,6 +70,99 @@ impl Default for AthenConfig {
     }
 }
 
+/// Outcome of a single-pass legacy-id migration. Returned by
+/// [`AthenConfig::migrate_legacy_provider_ids`] so the caller can decide
+/// whether to log / persist. Each field is `Some` only if that specific
+/// rewrite fired.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ProviderIdMigrationReport {
+    /// `Some(old_id)` when `models.assignments["active_provider"]` was
+    /// renamed.
+    pub renamed_active: Option<String>,
+    /// `Some((from_id, into_id))` when a legacy entry in `models.providers`
+    /// was merged into the surviving id and dropped.
+    pub merged_provider: Option<(String, String)>,
+}
+
+impl ProviderIdMigrationReport {
+    /// `true` when any migration step fired and the caller should consider
+    /// emitting a one-shot log line.
+    pub fn changed(&self) -> bool {
+        self.renamed_active.is_some() || self.merged_provider.is_some()
+    }
+}
+
+impl AthenConfig {
+    /// Collapse legacy `opencode_go_anthropic` provider id into the unified
+    /// `opencode_go` id. The OpenCode Go relay exposes both an OpenAI-style
+    /// `/v1/chat/completions` wire and an Anthropic-style `/v1/messages`
+    /// wire from the same host; previously each lived under its own
+    /// provider id, forcing users to pick one format and lose access to
+    /// the other's models. Today the in-process router dispatches by slug
+    /// (see `is_minimax_slug` in `athen-app::state`), so one logical
+    /// provider can carry slugs from both wire formats.
+    ///
+    /// Migration rules:
+    /// * `models.assignments["active_provider"]` rewritten from the legacy
+    ///   id to the unified id.
+    /// * `models.providers["opencode_go_anthropic"]` removed; its
+    ///   `tier_models` are merged into `opencode_go`. Anthropic-entry slugs
+    ///   take precedence on collision — they were configured by the user
+    ///   more recently / for the Anthropic wire and are still valid under
+    ///   per-slug dispatch.
+    /// * The surviving entry's `family` is forced to `DeepSeekV4Chat`. The
+    ///   persisted `family` is no longer authoritative for OpenCode Go
+    ///   because dispatch is per-slug — we pick `DeepSeekV4Chat` so the
+    ///   non-Anthropic path inherits sensible quirks, and the Anthropic
+    ///   branch overrides to `MiniMaxM25Cloud` at adapter-build time.
+    ///
+    /// Returns a [`ProviderIdMigrationReport`] so the caller can log once
+    /// per startup when a migration actually fired.
+    pub fn migrate_legacy_provider_ids(&mut self) -> ProviderIdMigrationReport {
+        const LEGACY: &str = "opencode_go_anthropic";
+        const UNIFIED: &str = "opencode_go";
+
+        let mut report = ProviderIdMigrationReport::default();
+
+        // Rewrite the active-provider pointer.
+        if let Some(v) = self.models.assignments.get_mut("active_provider") {
+            if v == LEGACY {
+                report.renamed_active = Some(v.clone());
+                *v = UNIFIED.to_string();
+            }
+        }
+
+        // Merge / drop the legacy provider entry.
+        if let Some(legacy_cfg) = self.models.providers.remove(LEGACY) {
+            report.merged_provider = Some((LEGACY.to_string(), UNIFIED.to_string()));
+            match self.models.providers.get_mut(UNIFIED) {
+                Some(unified) => {
+                    // Anthropic-entry slugs win on collision (more recent
+                    // user intent + valid under per-slug dispatch).
+                    for (tier, slug) in legacy_cfg.tier_models {
+                        unified.tier_models.insert(tier, slug);
+                    }
+                    // Persisted family is meaningless for opencode_go now
+                    // that dispatch is per-slug. Normalise to the OpenAI-
+                    // compat default; the Anthropic branch in
+                    // build_provider_instance forces MiniMaxM25Cloud at
+                    // adapter-build time.
+                    unified.family = crate::llm::ModelFamily::DeepSeekV4Chat;
+                }
+                None => {
+                    // No surviving entry — promote the legacy one in place
+                    // under the unified id with the family normalised.
+                    let mut promoted = legacy_cfg;
+                    promoted.family = crate::llm::ModelFamily::DeepSeekV4Chat;
+                    self.models.providers.insert(UNIFIED.to_string(), promoted);
+                }
+            }
+        }
+
+        report
+    }
+}
+
 fn default_domains() -> HashMap<String, DomainConfig> {
     let mut m = HashMap::new();
     m.insert(

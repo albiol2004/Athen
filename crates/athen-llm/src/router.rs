@@ -199,6 +199,18 @@ impl DefaultLlmRouter {
         self.providers.values().any(|p| p.supports_vision())
     }
 
+    /// Returns the priority list of provider keys for `profile`, or an
+    /// empty slice if the profile isn't registered. Used by callers (and
+    /// tests) that need to verify which slug-keyed provider instance a
+    /// tier maps to — in particular, the arc pinning path needs to
+    /// assert that every tier collapses to the pinned slug's single key.
+    pub fn profile_provider_keys(&self, profile: ModelProfile) -> &[String] {
+        self.profiles
+            .get(&profile)
+            .map(|c| c.priority.as_slice())
+            .unwrap_or(&[])
+    }
+
     /// True if any registered provider supports native document/PDF input
     /// (Anthropic document blocks, Gemini `application/pdf` inlineData).
     /// Until `MessageContent` grows a Document variant, this is purely

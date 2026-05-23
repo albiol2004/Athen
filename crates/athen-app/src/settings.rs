@@ -493,10 +493,11 @@ fn default_base_url(id: &str) -> &str {
         "google" => "https://generativelanguage.googleapis.com",
         "mistral" => "https://api.mistral.ai",
         "openrouter" => "https://openrouter.ai/api",
+        // Single logical entry for the OpenCode Go relay. Both the OpenAI-
+        // compat `/v1/chat/completions` wire and the Anthropic `/v1/messages`
+        // wire live on the same host; the in-process router dispatches
+        // per-slug, so users no longer have to pick a wire format.
         "opencode_go" => "https://opencode.ai/zen/go",
-        // Same host as opencode_go — Anthropic provider appends /v1/messages
-        // which is the wire path OpenCode Go uses for MiniMax M2.5 / M2.7.
-        "opencode_go_anthropic" => "https://opencode.ai/zen/go",
         "minimax" => "https://api.minimax.io",
         "minimax_anthropic" => "https://api.minimax.io/anthropic",
         "ollama" => "http://localhost:11434",
@@ -523,9 +524,6 @@ fn default_model(id: &str) -> &str {
         // on the $10 tier — the right default for an agent loop. Pro/Kimi/
         // Qwen are selectable from the model picker.
         "opencode_go" => "deepseek-v4-flash",
-        // Anthropic-protocol slot of OpenCode Go: the bundle exposes
-        // MiniMax M2.7 / M2.5 via /v1/messages. M2.7 is the newer flagship.
-        "opencode_go_anthropic" => "minimax-m2.7",
         // MiniMax Token Plan: M2.7 is the newest flagship; Starter tier
         // exposes only this model, higher tiers add the full lineup.
         "minimax" | "minimax_anthropic" => "MiniMax-M2.7",
@@ -544,8 +542,7 @@ fn display_name(id: &str) -> &str {
         "google" => "Google (Gemini)",
         "mistral" => "Mistral",
         "openrouter" => "OpenRouter",
-        "opencode_go" => "OpenCode Go (OpenAI-compat — DeepSeek/Qwen/Kimi/GLM/MiMo)",
-        "opencode_go_anthropic" => "OpenCode Go (Anthropic-compat — MiniMax M2.x)",
+        "opencode_go" => "OpenCode Go (DeepSeek / Kimi / Qwen / MiniMax / GLM / MiMo)",
         "minimax" => "MiniMax Token Plan (OpenAI-compat)",
         "minimax_anthropic" => "MiniMax Token Plan (Anthropic-compat + prompt cache)",
         "ollama" => "Ollama",
@@ -581,11 +578,12 @@ fn default_family(id: &str) -> &str {
         "google" => "Gemini3Flash",
         "mistral" => "MistralLarge3",
         // OpenCode Go's default bundle model is DeepSeek V4 Flash — same
-        // quirks profile as DeepSeek direct.
+        // quirks profile as DeepSeek direct. Note: the persisted `family`
+        // is no longer authoritative for opencode_go — `build_provider_
+        // instance` ignores it and picks DeepSeekV4Chat / MiniMaxM25Cloud
+        // per-slug. This default still drives the "+ Add Provider"
+        // autofill UX.
         "opencode_go" => "DeepSeekV4Chat",
-        // OpenCode Go Anthropic-protocol slot — defaults to MiniMax M2.7
-        // so its quirks profile is the MiniMax one.
-        "opencode_go_anthropic" => "MiniMaxM25Cloud",
         // MiniMax M2.7 — closest existing family is MiniMaxM25Cloud (same
         // tool-call extraction shape). User can switch in the family
         // dropdown if a more specific profile lands later.
@@ -649,17 +647,17 @@ fn default_tier_slugs(id: &str) -> (&'static str, &'static str, &'static str, &'
             "anthropic/claude-sonnet-4-6",
             "anthropic/claude-opus-4-7",
         ),
+        // OpenCode Go covers both OpenAI-compat (DeepSeek/Qwen/Kimi/GLM/
+        // MiMo) and Anthropic-compat (MiniMax M2.x) slugs — dispatch is
+        // per-slug. Default seed leans on the DeepSeek V4 line for its
+        // generous 5h quota; users can swap any tier to e.g.
+        // `minimax-m2.7` and the router automatically routes that tier
+        // through the Anthropic adapter.
         "opencode_go" => (
             "deepseek-v4-flash",
             "deepseek-v4-flash",
             "deepseek-v4-pro",
             "deepseek-v4-pro",
-        ),
-        "opencode_go_anthropic" => (
-            "minimax-m2.5",
-            "minimax-m2.7",
-            "minimax-m2.7",
-            "minimax-m2.7",
         ),
         "minimax" | "minimax_anthropic" => (
             "MiniMax-M2.7",
@@ -683,7 +681,7 @@ fn api_key_hint(id: &str) -> &str {
         // MiniMax Token Plan issues coding-plan keys with the `sk-cp-` prefix
         // (distinct from their standard API keys, which are JWT-shaped).
         "minimax" | "minimax_anthropic" => "sk-cp-...",
-        "deepseek" | "openai" | "mistral" | "opencode_go" | "opencode_go_anthropic" => "sk-...",
+        "deepseek" | "openai" | "mistral" | "opencode_go" => "sk-...",
         _ => "",
     }
 }
@@ -701,7 +699,6 @@ const PROVIDER_IDS: &[&str] = &[
     "mistral",
     "openrouter",
     "opencode_go",
-    "opencode_go_anthropic",
     "minimax",
     "minimax_anthropic",
     "ollama",
@@ -1268,6 +1265,10 @@ pub async fn save_provider(
             supports_documents,
             family_for_router,
             tier_models_for_router,
+            // Global router rebuild on Settings save — no arc context,
+            // so no slug pin applies. Per-arc pinning rebuilds its own
+            // router at execution time when a pin is in force.
+            None,
         );
 
         {
@@ -1367,6 +1368,8 @@ pub async fn delete_provider(
             supports_documents,
             family_for_router,
             tier_models_for_router,
+            // Global router rebuild on provider delete — no arc context.
+            None,
         );
 
         {
@@ -1518,6 +1521,8 @@ pub async fn set_active_provider(
         supports_documents,
         family_for_router,
         tier_models_for_router,
+        // Global router rebuild via `set_active_provider` — no arc context.
+        None,
     );
 
     // Swap the router atomically.
