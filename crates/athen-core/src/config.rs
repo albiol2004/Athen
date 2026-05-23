@@ -1,9 +1,23 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use uuid::Uuid;
 
 use crate::attachment_policy::AttachmentPolicy;
 use crate::llm::ModelProfile;
+
+/// Assignment-map key that holds the active Bundle id (stringified Uuid).
+/// Replaces the legacy `"active_provider"` key as the source of routing
+/// truth — see `docs/BUNDLES.md`. The legacy key still exists during the
+/// transition and is what `synthesize_default_bundle_if_empty` reads from
+/// to seed the first Bundle.
+pub const ACTIVE_BUNDLE_KEY: &str = "active_bundle";
+
+/// Display name applied to the auto-synthesised Bundle created from a
+/// user's pre-Bundles `active_provider + tier_models` config. Visible in
+/// the (future) Settings → Bundles panel header.
+pub const DEFAULT_BUNDLE_NAME: &str = "Default";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -161,6 +175,73 @@ impl AthenConfig {
 
         report
     }
+
+    /// First-load Bundles migration: synthesise a "Default" Bundle from
+    /// the legacy `active_provider + tier_models` shape so the new
+    /// resolver path has something to consult and existing users see
+    /// zero behavioural change.
+    ///
+    /// No-op when:
+    /// * `models.bundles` is already non-empty (user has Bundles).
+    /// * `assignments["active_provider"]` is missing (no provider chosen
+    ///   yet — first-run state; the onboarding wizard will write the
+    ///   Bundle directly).
+    /// * The active provider id is not in `models.providers` (broken
+    ///   config — leave it to the user to repair via Settings).
+    ///
+    /// Otherwise, builds one Bundle whose `tiers` contain every
+    /// [`ModelProfile`] variant — sourced from `provider.tier_models[tier]`
+    /// when present, falling back to `provider.default_model`. This
+    /// preserves today's behaviour exactly: the legacy code path falls
+    /// back to `default_model` whenever a tier is unmapped, and so does
+    /// the synthesised Bundle. Sparseness comes later when users edit.
+    ///
+    /// Returns the newly-created Bundle id when synthesis fired.
+    pub fn synthesize_default_bundle_if_empty(&mut self) -> Option<Uuid> {
+        if !self.models.bundles.is_empty() {
+            return None;
+        }
+        let active_id = self.models.assignments.get("active_provider")?.clone();
+        let provider = self.models.providers.get(&active_id)?;
+
+        let default_slug = provider.default_model.clone();
+        let mut tiers: HashMap<ModelProfile, BundleTier> = HashMap::new();
+        for profile in [
+            ModelProfile::Cheap,
+            ModelProfile::Fast,
+            ModelProfile::Code,
+            ModelProfile::Powerful,
+            ModelProfile::Local,
+        ] {
+            let slug = provider
+                .tier_models
+                .get(&profile)
+                .cloned()
+                .unwrap_or_else(|| default_slug.clone());
+            tiers.insert(
+                profile,
+                BundleTier {
+                    connection_id: active_id.clone(),
+                    slug,
+                },
+            );
+        }
+
+        let now = Utc::now();
+        let bundle = Bundle {
+            id: Uuid::new_v4(),
+            name: DEFAULT_BUNDLE_NAME.to_string(),
+            created_at: now,
+            updated_at: now,
+            tiers,
+        };
+        let id = bundle.id;
+        self.models.bundles.insert(id.to_string(), bundle);
+        self.models
+            .assignments
+            .insert(ACTIVE_BUNDLE_KEY.to_string(), id.to_string());
+        Some(id)
+    }
 }
 
 fn default_domains() -> HashMap<String, DomainConfig> {
@@ -257,6 +338,44 @@ pub struct ModelsConfig {
     pub providers: HashMap<String, ProviderConfig>,
     pub profiles: HashMap<String, ProfileConfig>,
     pub assignments: HashMap<String, String>,
+    /// Named per-tier `(connection, slug)` loadouts. The active Bundle id
+    /// lives in `assignments["active_bundle"]` ([`ACTIVE_BUNDLE_KEY`]). On
+    /// first load after upgrade, [`AthenConfig::synthesize_default_bundle_if_empty`]
+    /// populates this from the legacy `active_provider + tier_models`
+    /// shape so existing users see zero behavioural change. Map key is
+    /// the stringified [`Bundle::id`] — TOML cannot key on `Uuid`.
+    ///
+    /// See `docs/BUNDLES.md`.
+    #[serde(default)]
+    pub bundles: HashMap<String, Bundle>,
+}
+
+/// A named set of per-tier `(connection, slug)` picks. One is "active" at
+/// a time (see `models.assignments["active_bundle"]`). Cross-vendor mixing
+/// is first-class — every tier can reference a different `connection_id`.
+///
+/// See `docs/BUNDLES.md`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Bundle {
+    pub id: Uuid,
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    /// Sparse per-tier picks. A missing tier falls back along the ladder
+    /// `Code → Fast → Cheap`, `Powerful → Fast → Cheap`, `Fast → Cheap`.
+    /// Sparseness is a valid config — "I don't care to distinguish."
+    pub tiers: HashMap<ModelProfile, BundleTier>,
+}
+
+/// One tier's pick inside a [`Bundle`]: which Connection to send through
+/// and which wire-format slug to send. The slug may be a curated catalog
+/// entry or a user-typed Custom slug.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BundleTier {
+    /// References a key in `models.providers` (renamed to
+    /// `models.connections` in a later phase).
+    pub connection_id: String,
+    pub slug: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

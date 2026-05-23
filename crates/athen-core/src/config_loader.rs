@@ -16,6 +16,7 @@ pub fn load_config(path: &Path) -> Result<AthenConfig> {
         let mut config: AthenConfig = toml::from_str(&content)
             .map_err(|e| AthenError::Config(format!("Failed to parse {}: {e}", path.display())))?;
         let _ = config.migrate_legacy_provider_ids();
+        let _ = config.synthesize_default_bundle_if_empty();
         Ok(config)
     } else {
         Ok(AthenConfig::default())
@@ -47,6 +48,11 @@ pub fn load_config_dir(dir: &Path) -> Result<AthenConfig> {
     // provider set in config.toml + a providers map loaded from
     // models.toml).
     let _ = config.migrate_legacy_provider_ids();
+    // Then synthesise a Default Bundle from the (now-unified) active
+    // provider so the new resolver path has a Bundle to consult on first
+    // load after upgrade. No-op for users who already have Bundles, or
+    // who have no `active_provider` yet (onboarding writes one directly).
+    let _ = config.synthesize_default_bundle_if_empty();
 
     Ok(config)
 }
@@ -389,6 +395,196 @@ default_model = "deepseek-chat"
         );
         // Family normalised to DeepSeekV4Chat regardless of inbound value.
         assert!(matches!(unified.family, ModelFamily::DeepSeekV4Chat));
+    }
+
+    /// First load after upgrade: an existing user with `active_provider`
+    /// plus a populated `tier_models` map gets a synthesised "Default"
+    /// Bundle, and the active-bundle assignment is set to its id.
+    #[test]
+    fn test_load_synthesises_default_bundle_from_legacy_shape() {
+        use crate::config::{ProviderConfig, ACTIVE_BUNDLE_KEY, DEFAULT_BUNDLE_NAME};
+        use crate::llm::{ModelFamily, ModelProfile};
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let mut config = AthenConfig::default();
+
+        let mut tier_models: HashMap<ModelProfile, String> = HashMap::new();
+        tier_models.insert(ModelProfile::Cheap, "deepseek-v4-flash".into());
+        tier_models.insert(ModelProfile::Code, "minimax-m2.7".into());
+
+        config.models.providers.insert(
+            "opencode_go".into(),
+            ProviderConfig {
+                auth: AuthType::ApiKey("sk-test".into()),
+                default_model: "deepseek-v4-flash".into(),
+                endpoint: None,
+                context_window_tokens: 200_000,
+                compaction_trigger_pct: 65,
+                compaction_target_pct: 30,
+                supports_vision: false,
+                supports_documents: false,
+                family: ModelFamily::DeepSeekV4Chat,
+                temperature: None,
+                tier_models,
+            },
+        );
+        config
+            .models
+            .assignments
+            .insert("active_provider".into(), "opencode_go".into());
+        // No bundles persisted — represents pre-upgrade state.
+        assert!(config.models.bundles.is_empty());
+
+        let content = toml::to_string_pretty(&config).unwrap();
+        std::fs::write(&path, &content).unwrap();
+
+        let loaded = load_config(&path).unwrap();
+
+        // Exactly one Bundle was synthesised.
+        assert_eq!(loaded.models.bundles.len(), 1);
+        let (bundle_id, bundle) = loaded.models.bundles.iter().next().unwrap();
+        assert_eq!(bundle.name, DEFAULT_BUNDLE_NAME);
+
+        // Active-bundle assignment points at it.
+        assert_eq!(
+            loaded.models.assignments.get(ACTIVE_BUNDLE_KEY),
+            Some(bundle_id)
+        );
+
+        // Tier-mapped slugs preserved verbatim.
+        assert_eq!(
+            bundle
+                .tiers
+                .get(&ModelProfile::Cheap)
+                .map(|t| t.slug.as_str()),
+            Some("deepseek-v4-flash")
+        );
+        assert_eq!(
+            bundle
+                .tiers
+                .get(&ModelProfile::Code)
+                .map(|t| t.slug.as_str()),
+            Some("minimax-m2.7")
+        );
+        // Unmapped tier falls back to default_model — preserves the
+        // legacy behaviour where the resolver also fell back to
+        // default_model when tier_models had no entry for the tier.
+        assert_eq!(
+            bundle
+                .tiers
+                .get(&ModelProfile::Powerful)
+                .map(|t| t.slug.as_str()),
+            Some("deepseek-v4-flash")
+        );
+        assert_eq!(
+            bundle
+                .tiers
+                .get(&ModelProfile::Fast)
+                .map(|t| t.slug.as_str()),
+            Some("deepseek-v4-flash")
+        );
+
+        // Every tier references the active provider.
+        for tier in bundle.tiers.values() {
+            assert_eq!(tier.connection_id, "opencode_go");
+        }
+    }
+
+    /// Synthesis is idempotent: a second load of the just-migrated config
+    /// observes the existing Bundle and does not stamp a second one.
+    #[test]
+    fn test_load_synthesis_idempotent_when_bundle_exists() {
+        use crate::config::{ProviderConfig, ACTIVE_BUNDLE_KEY};
+        use crate::llm::ModelFamily;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let mut config = AthenConfig::default();
+        config.models.providers.insert(
+            "deepseek".into(),
+            ProviderConfig {
+                auth: AuthType::ApiKey("sk-test".into()),
+                default_model: "deepseek-chat".into(),
+                endpoint: None,
+                context_window_tokens: 128_000,
+                compaction_trigger_pct: 65,
+                compaction_target_pct: 30,
+                supports_vision: false,
+                supports_documents: false,
+                family: ModelFamily::Default,
+                temperature: None,
+                tier_models: HashMap::new(),
+            },
+        );
+        config
+            .models
+            .assignments
+            .insert("active_provider".into(), "deepseek".into());
+
+        // First load: synthesises.
+        let content = toml::to_string_pretty(&config).unwrap();
+        std::fs::write(&path, &content).unwrap();
+        let first = load_config(&path).unwrap();
+        let first_bundle_id = first
+            .models
+            .assignments
+            .get(ACTIVE_BUNDLE_KEY)
+            .cloned()
+            .expect("first load should set active_bundle");
+
+        // Persist the now-migrated config and reload.
+        let content = toml::to_string_pretty(&first).unwrap();
+        std::fs::write(&path, &content).unwrap();
+        let second = load_config(&path).unwrap();
+
+        // Same bundle id, same count.
+        assert_eq!(second.models.bundles.len(), 1);
+        assert_eq!(
+            second.models.assignments.get(ACTIVE_BUNDLE_KEY),
+            Some(&first_bundle_id),
+        );
+    }
+
+    /// First-run config with no active provider: synthesis is a no-op
+    /// and the active-bundle assignment stays unset. The onboarding
+    /// wizard writes both directly.
+    #[test]
+    fn test_load_synthesis_noop_when_no_active_provider() {
+        use crate::config::ACTIVE_BUNDLE_KEY;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        save_default_config(&path).unwrap();
+
+        let loaded = load_config(&path).unwrap();
+        assert!(loaded.models.bundles.is_empty());
+        assert!(!loaded.models.assignments.contains_key(ACTIVE_BUNDLE_KEY));
+    }
+
+    /// Active provider id pointing at a missing entry (broken config —
+    /// user deleted the row manually). Synthesis must not panic and must
+    /// not invent an empty Bundle; leave the user to fix it via Settings.
+    #[test]
+    fn test_load_synthesis_noop_when_active_provider_missing() {
+        use crate::config::ACTIVE_BUNDLE_KEY;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let mut config = AthenConfig::default();
+        config
+            .models
+            .assignments
+            .insert("active_provider".into(), "ghost".into());
+        let content = toml::to_string_pretty(&config).unwrap();
+        std::fs::write(&path, &content).unwrap();
+
+        let loaded = load_config(&path).unwrap();
+        assert!(loaded.models.bundles.is_empty());
+        assert!(!loaded.models.assignments.contains_key(ACTIVE_BUNDLE_KEY));
     }
 
     /// Migration is idempotent — running load on an already-migrated
