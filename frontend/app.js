@@ -4562,6 +4562,9 @@ const timelineView = document.getElementById('timeline-view');
 const providerListEl = document.getElementById('provider-list');
 const addProviderBtn = document.getElementById('add-provider-btn');
 const providerTemplates = document.getElementById('provider-templates');
+const bundleListEl = document.getElementById('bundle-list');
+const activeBundleSelectEl = document.getElementById('active-bundle-select');
+const addBundleBtn = document.getElementById('add-bundle-btn');
 const securityModeEl = document.getElementById('security-mode');
 const securityHintEl = document.getElementById('security-hint');
 const saveSecurityBtn = document.getElementById('save-security-btn');
@@ -4685,6 +4688,7 @@ async function loadSettings() {
     try {
         const settings = await invoke('get_settings');
         renderProviders(settings.providers);
+        renderBundles(settings.bundles || [], settings.providers || []);
         updateComposerVisionGate(settings.providers);
         securityModeEl.value = settings.security_mode;
         securityHintEl.textContent = SECURITY_HINTS[settings.security_mode] || '';
@@ -6471,6 +6475,237 @@ async function handleSaveMcpConfig(card, entry) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Bundles panel (docs/BUNDLES.md). A Bundle binds each ModelProfile tier
+// (Cheap / Fast / Code / Powerful) to a (Connection, slug) pair. One
+// Bundle is active at a time; switching Bundles via the dropdown
+// rebuilds the global LLM router server-side.
+// ---------------------------------------------------------------------------
+
+const BUNDLE_TIERS = ['cheap', 'fast', 'code', 'powerful'];
+const BUNDLE_TIER_LABELS = {
+    cheap: 'Cheap',
+    fast: 'Fast',
+    code: 'Code',
+    powerful: 'Powerful',
+};
+
+function renderBundles(bundles, providers) {
+    if (!bundleListEl || !activeBundleSelectEl) return;
+
+    // --- Active dropdown -----------------------------------------------
+    activeBundleSelectEl.innerHTML = '';
+    if (bundles.length === 0) {
+        const opt = document.createElement('option');
+        opt.value = '';
+        opt.textContent = '(no Bundles yet — click "+ New Bundle" below)';
+        activeBundleSelectEl.appendChild(opt);
+        activeBundleSelectEl.disabled = true;
+    } else {
+        activeBundleSelectEl.disabled = false;
+        for (const b of bundles) {
+            const opt = document.createElement('option');
+            opt.value = b.id;
+            opt.textContent = b.name + (b.is_active ? ' (active)' : '');
+            if (b.is_active) opt.selected = true;
+            activeBundleSelectEl.appendChild(opt);
+        }
+    }
+    activeBundleSelectEl.onchange = async () => {
+        const id = activeBundleSelectEl.value;
+        if (!id) return;
+        try {
+            const msg = await invoke('set_active_bundle', { id });
+            showToast(msg, 'success');
+            await loadSettings();
+        } catch (err) {
+            showToast('Failed to switch Bundle: ' + err, 'error');
+            await loadSettings();
+        }
+    };
+
+    // --- Per-Bundle cards ----------------------------------------------
+    bundleListEl.innerHTML = '';
+    for (const bundle of bundles) {
+        bundleListEl.appendChild(createBundleCard(bundle, providers));
+    }
+}
+
+function createBundleCard(bundle, providers) {
+    const card = document.createElement('div');
+    card.className = 'provider-card bundle-card' + (bundle.is_active ? ' active' : '');
+    card.dataset.bundleId = bundle.id;
+
+    const header = document.createElement('div');
+    header.className = 'provider-card-header';
+    const title = document.createElement('div');
+    title.className = 'provider-card-title';
+    const dot = document.createElement('span');
+    dot.className = 'provider-status-dot ' + (bundle.is_active ? 'active' : 'inactive');
+    const name = document.createElement('span');
+    name.className = 'provider-name';
+    name.textContent = bundle.name;
+    const subtitle = document.createElement('span');
+    subtitle.className = 'provider-subtitle';
+    const summary = BUNDLE_TIERS
+        .map((t) => bundle.tiers[t])
+        .filter(Boolean)
+        .map((t) => t.slug)
+        .join(' · ') || '(no tiers set)';
+    subtitle.textContent = summary;
+    title.appendChild(dot);
+    title.appendChild(name);
+    title.appendChild(subtitle);
+    header.appendChild(title);
+
+    const right = document.createElement('div');
+    right.style.display = 'flex';
+    right.style.alignItems = 'center';
+    right.style.gap = '8px';
+    if (bundle.is_active) {
+        const badge = document.createElement('span');
+        badge.className = 'provider-active-badge';
+        badge.textContent = 'Active';
+        right.appendChild(badge);
+    }
+    const chevron = document.createElement('span');
+    chevron.className = 'provider-card-chevron';
+    chevron.innerHTML = '&#9654;';
+    right.appendChild(chevron);
+    header.appendChild(right);
+    header.addEventListener('click', () => card.classList.toggle('expanded'));
+    card.appendChild(header);
+
+    // Body
+    const body = document.createElement('div');
+    body.className = 'provider-card-body';
+
+    // Name editor
+    const nameField = document.createElement('div');
+    nameField.className = 'provider-field';
+    nameField.innerHTML = `
+        <label>Name</label>
+        <input type="text" class="bundle-name" value="${escapeHtml(bundle.name)}">
+    `;
+    body.appendChild(nameField);
+
+    // Per-tier rows
+    const connectionOptions = (id) => {
+        let out = '<option value="">(unset — falls back to a sibling tier)</option>';
+        for (const p of providers) {
+            const sel = (p.id === id) ? ' selected' : '';
+            out += `<option value="${escapeHtml(p.id)}"${sel}>${escapeHtml(p.name)}</option>`;
+        }
+        return out;
+    };
+
+    const tierRows = document.createElement('div');
+    tierRows.className = 'provider-field';
+    tierRows.innerHTML = `
+        <label>Tier picks</label>
+        <div class="field-hint">Sparse Bundles are valid — Code falls back to Fast, Fast falls back to Cheap.</div>
+    `;
+    for (const t of BUNDLE_TIERS) {
+        const pick = bundle.tiers[t] || { connection_id: '', slug: '' };
+        const row = document.createElement('div');
+        row.className = 'provider-tier-row bundle-tier-row';
+        row.dataset.tier = t;
+        row.innerHTML = `
+            <span class="provider-tier-label">${BUNDLE_TIER_LABELS[t]}</span>
+            <select class="bundle-tier-connection">${connectionOptions(pick.connection_id)}</select>
+            <input type="text" class="bundle-tier-slug" value="${escapeHtml(pick.slug || '')}" placeholder="model slug (e.g. deepseek-v4-flash)">
+        `;
+        tierRows.appendChild(row);
+    }
+    body.appendChild(tierRows);
+
+    // Actions
+    const actions = document.createElement('div');
+    actions.className = 'provider-card-actions';
+    actions.innerHTML = `
+        <button class="btn-secondary bundle-duplicate-btn">Duplicate</button>
+        <button class="btn-primary bundle-save-btn">Save</button>
+        <button class="btn-danger bundle-delete-btn" ${bundle.is_active ? 'disabled title="Switch to a different Bundle first"' : ''}>Delete</button>
+        <span class="test-result"></span>
+    `;
+    body.appendChild(actions);
+    card.appendChild(body);
+
+    actions.querySelector('.bundle-save-btn').addEventListener('click', () => handleSaveBundle(card, bundle.id));
+    actions.querySelector('.bundle-delete-btn').addEventListener('click', () => handleDeleteBundle(bundle.id, bundle.name));
+    actions.querySelector('.bundle-duplicate-btn').addEventListener('click', () => handleDuplicateBundle(bundle.id, bundle.name));
+
+    return card;
+}
+
+async function handleSaveBundle(card, id) {
+    if (!invoke) return;
+    const name = (card.querySelector('.bundle-name')?.value || '').trim();
+    const tiers = {};
+    for (const t of BUNDLE_TIERS) {
+        const row = card.querySelector(`.bundle-tier-row[data-tier="${t}"]`);
+        if (!row) continue;
+        const conn = (row.querySelector('.bundle-tier-connection')?.value || '').trim();
+        const slug = (row.querySelector('.bundle-tier-slug')?.value || '').trim();
+        // A tier counts as "set" only if BOTH connection and slug are
+        // filled. Half-filled tiers silently become unset — let the
+        // sparse-fallback ladder handle them.
+        tiers[t] = (conn && slug) ? { connection_id: conn, slug } : null;
+    }
+    const saveBtn = card.querySelector('.bundle-save-btn');
+    saveBtn.disabled = true;
+    saveBtn.textContent = 'Saving...';
+    try {
+        await invoke('update_bundle', { id, name: name || null, tiers });
+        showToast('Bundle saved', 'success');
+        await loadSettings();
+    } catch (err) {
+        showToast('Failed to save Bundle: ' + err, 'error');
+    }
+    saveBtn.disabled = false;
+    saveBtn.textContent = 'Save';
+}
+
+async function handleDeleteBundle(id, name) {
+    if (!invoke) return;
+    if (!confirm(`Delete Bundle "${name}"? You can re-create it later.`)) return;
+    try {
+        await invoke('delete_bundle', { id });
+        showToast('Bundle deleted', 'success');
+        await loadSettings();
+    } catch (err) {
+        showToast('Failed to delete: ' + err, 'error');
+    }
+}
+
+async function handleDuplicateBundle(id, name) {
+    if (!invoke) return;
+    const newName = prompt(`Duplicate "${name}" as:`, `${name} (copy)`);
+    if (!newName) return;
+    try {
+        await invoke('duplicate_bundle', { id, newName: newName.trim() });
+        showToast('Bundle duplicated', 'success');
+        await loadSettings();
+    } catch (err) {
+        showToast('Failed to duplicate: ' + err, 'error');
+    }
+}
+
+if (addBundleBtn) {
+    addBundleBtn.addEventListener('click', async () => {
+        if (!invoke) return;
+        const name = prompt('Name for the new Bundle:');
+        if (!name) return;
+        try {
+            await invoke('create_bundle', { name: name.trim() });
+            showToast('Bundle created', 'success');
+            await loadSettings();
+        } catch (err) {
+            showToast('Failed to create: ' + err, 'error');
+        }
+    });
+}
+
 function renderProviders(providers) {
     providerListEl.innerHTML = '';
     for (const p of providers) {
@@ -6615,26 +6850,8 @@ function createProviderCard(provider) {
                 <input type="number" class="provider-temperature" min="0" max="2" step="0.05" value="${provider.temperature ?? ''}" placeholder="Adapter default (~0.7)">
                 <div class="field-hint">Lower = more deterministic. Leave blank for the provider's default (0.7 across most APIs). Try 0.0–0.3 for benchmarking, code, or strict tool-calling; 0.7+ for creative tasks.</div>
             </div>
-            <div class="provider-field provider-tier-models">
-                <label>Per-tier model slugs</label>
-                <div class="field-hint">Athen's internal tasks are tagged with a complexity tier — "Cheap" for memory judgments and error translations, "Fast" for the main agent loop, "Code" for code-heavy work, "Powerful" for high-stakes reasoning. Pick a different slug per tier to route lightweight tasks to a cheaper model while keeping the powerful one reserved for the main loop. Leave any slot empty to use the Model slug above.</div>
-                <div class="provider-tier-row">
-                    <span class="provider-tier-label">Cheap</span>
-                    <input type="text" class="provider-tier-cheap" value="${escapeHtml(provider.tier_models?.Cheap || '')}" placeholder="${escapeHtml((providerById(provider.id) || {}).default_tier_cheap || provider.model)}">
-                </div>
-                <div class="provider-tier-row">
-                    <span class="provider-tier-label">Fast</span>
-                    <input type="text" class="provider-tier-fast" value="${escapeHtml(provider.tier_models?.Fast || '')}" placeholder="${escapeHtml((providerById(provider.id) || {}).default_tier_fast || provider.model)}">
-                </div>
-                <div class="provider-tier-row">
-                    <span class="provider-tier-label">Code</span>
-                    <input type="text" class="provider-tier-code" value="${escapeHtml(provider.tier_models?.Code || '')}" placeholder="${escapeHtml((providerById(provider.id) || {}).default_tier_code || provider.model)}">
-                </div>
-                <div class="provider-tier-row">
-                    <span class="provider-tier-label">Powerful</span>
-                    <input type="text" class="provider-tier-powerful" value="${escapeHtml(provider.tier_models?.Powerful || '')}" placeholder="${escapeHtml((providerById(provider.id) || {}).default_tier_powerful || provider.model)}">
-                </div>
-                <button class="btn-tertiary provider-tier-reset" type="button">Use defaults</button>
+            <div class="provider-field provider-tier-models-note">
+                <div class="field-hint">Per-tier model picks now live in <strong>Bundles</strong> (above). One Connection can power multiple tiers in multiple Bundles — credentials here, routing there.</div>
             </div>
         </div>
         <div class="provider-card-actions">
@@ -6764,16 +6981,11 @@ async function handleSaveProvider(card, id) {
     const tempVal = tempInput ? tempInput.value.trim() : '';
     const temperature = tempVal === '' ? null : parseFloat(tempVal);
 
-    // Collect the four per-tier slug inputs. Empty strings are passed
-    // through verbatim — the backend treats them as "fall back to the
-    // default Model slug" rather than "preserve the existing tier_models
-    // map" (which is what passing `null` does).
-    const tierModels = {
-        Cheap: (card.querySelector('.provider-tier-cheap')?.value || '').trim(),
-        Fast: (card.querySelector('.provider-tier-fast')?.value || '').trim(),
-        Code: (card.querySelector('.provider-tier-code')?.value || '').trim(),
-        Powerful: (card.querySelector('.provider-tier-powerful')?.value || '').trim(),
-    };
+    // Tier routing moved to Bundles. Send `null` so the backend
+    // preserves whatever's already persisted (legacy tier_models maps
+    // from pre-Bundles users) without clobbering it from the
+    // Connections panel.
+    const tierModels = null;
 
     if (compactionTriggerPct !== null && compactionTargetPct !== null
         && compactionTriggerPct <= compactionTargetPct) {

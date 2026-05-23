@@ -7,6 +7,7 @@ pub(crate) mod agent_registry;
 pub(crate) mod app_tools;
 pub(crate) mod approval;
 pub(crate) mod attachment_purger;
+pub(crate) mod bundle_settings;
 pub(crate) mod calendar_sources;
 mod commands;
 pub(crate) mod compaction;
@@ -104,6 +105,12 @@ pub fn run() {
             settings::test_provider,
             settings::save_settings,
             settings::set_active_provider,
+            bundle_settings::list_bundles,
+            bundle_settings::create_bundle,
+            bundle_settings::update_bundle,
+            bundle_settings::delete_bundle,
+            bundle_settings::set_active_bundle,
+            bundle_settings::duplicate_bundle,
             settings::is_first_launch,
             settings::complete_onboarding,
             settings::detect_device_capabilities,

@@ -249,11 +249,24 @@
 
             <div class="settings-tab-pane active" data-settings-pane="models">
             <section class="settings-section">
-                <h2>LLM Providers</h2>
-                <p class="settings-description">Configure the AI models Athen uses. Changes take effect after restarting the app.</p>
+                <h2>Bundles</h2>
+                <p class="settings-description">A Bundle picks which Connection &amp; model to use for each tier (Cheap / Fast / Code / Powerful). Switch Bundles to swap your whole loadout at once.</p>
+                <div class="setting-row bundle-active-row">
+                    <label for="active-bundle-select">Active Bundle</label>
+                    <select id="active-bundle-select" class="settings-select"></select>
+                </div>
+                <div id="bundle-list"></div>
+                <div class="add-bundle-area">
+                    <button id="add-bundle-btn" class="add-provider-btn">+ New Bundle</button>
+                </div>
+            </section>
+
+            <section class="settings-section">
+                <h2>Connections</h2>
+                <p class="settings-description">Credentials for each LLM provider. Add an API key here, then reference the connection from one or more Bundles above.</p>
                 <div id="provider-list"></div>
                 <div class="add-provider-area">
-                    <button id="add-provider-btn" class="add-provider-btn">+ Add Provider</button>
+                    <button id="add-provider-btn" class="add-provider-btn">+ Add Connection</button>
                     <!-- Buttons rendered at runtime from list_provider_catalog. -->
                     <div id="provider-templates" class="provider-templates hidden"></div>
                 </div>

@@ -182,7 +182,17 @@ pub struct EmbeddingSettingsInfo {
 #[derive(Debug, Clone, Serialize)]
 pub struct SettingsResponse {
     pub providers: Vec<ProviderInfo>,
+    /// Legacy field — points at the Connection used by the active
+    /// Bundle's Fast tier (or Cheap if Fast is empty). Vision-check and
+    /// other single-provider callers still read this. Real activation
+    /// truth lives in `active_bundle_id`.
     pub active_provider: String,
+    /// Stringified UUID of the currently active Bundle, or empty when
+    /// no Bundle is set (first-run before migration / wizard write).
+    pub active_bundle_id: String,
+    /// Every Bundle the user has, with `is_active` flagging the live
+    /// one. Ordered alphabetically by name.
+    pub bundles: Vec<crate::bundle_settings::BundleView>,
     pub security_mode: String,
     pub email: EmailSettingsInfo,
     pub telegram: TelegramSettingsInfo,
@@ -234,7 +244,7 @@ pub(crate) fn load_models_config() -> ModelsConfig {
 }
 
 /// Save the models config to `~/.athen/models.toml`.
-fn save_models_config(config: &ModelsConfig) -> Result<(), String> {
+pub(crate) fn save_models_config(config: &ModelsConfig) -> Result<(), String> {
     let dir = ensure_athen_dir()?;
     let path = dir.join("models.toml");
     let content = toml::to_string_pretty(config)
@@ -485,7 +495,7 @@ pub async fn detect_device_capabilities() -> std::result::Result<DeviceCapabilit
 // ---------------------------------------------------------------------------
 
 /// Default base URL for a provider ID.
-fn default_base_url(id: &str) -> &str {
+pub(crate) fn default_base_url(id: &str) -> &str {
     match id {
         "deepseek" => "https://api.deepseek.com",
         "openai" => "https://api.openai.com",
@@ -507,7 +517,7 @@ fn default_base_url(id: &str) -> &str {
 }
 
 /// Default model for a provider ID.
-fn default_model(id: &str) -> &str {
+pub(crate) fn default_model(id: &str) -> &str {
     match id {
         // Refreshed 2026-05-13: DeepSeek slugs migrated from `deepseek-chat`
         // / `deepseek-reasoner` to the V4 Flash/Pro split. Anthropic Sonnet
@@ -993,9 +1003,65 @@ pub async fn get_settings(
         }
     };
 
+    // Project Bundles for the new Bundles panel. Reuses the bundle
+    // command's projection so list_bundles and get_settings agree.
+    let active_bundle_id = models
+        .assignments
+        .get(athen_core::config::ACTIVE_BUNDLE_KEY)
+        .cloned()
+        .unwrap_or_default();
+    let mut bundles: Vec<crate::bundle_settings::BundleView> = models
+        .bundles
+        .values()
+        .map(|b| {
+            // Tiny inline projection — kept here so settings.rs doesn't
+            // re-import the projection helper. Matches the shape
+            // returned by `bundle_settings::list_bundles`.
+            let id = b.id.to_string();
+            let tiers = crate::bundle_settings::BundleTiersView {
+                cheap: b.tiers.get(&athen_core::llm::ModelProfile::Cheap).map(|t| {
+                    crate::bundle_settings::BundleTierView {
+                        connection_id: t.connection_id.clone(),
+                        slug: t.slug.clone(),
+                    }
+                }),
+                fast: b.tiers.get(&athen_core::llm::ModelProfile::Fast).map(|t| {
+                    crate::bundle_settings::BundleTierView {
+                        connection_id: t.connection_id.clone(),
+                        slug: t.slug.clone(),
+                    }
+                }),
+                code: b.tiers.get(&athen_core::llm::ModelProfile::Code).map(|t| {
+                    crate::bundle_settings::BundleTierView {
+                        connection_id: t.connection_id.clone(),
+                        slug: t.slug.clone(),
+                    }
+                }),
+                powerful: b
+                    .tiers
+                    .get(&athen_core::llm::ModelProfile::Powerful)
+                    .map(|t| crate::bundle_settings::BundleTierView {
+                        connection_id: t.connection_id.clone(),
+                        slug: t.slug.clone(),
+                    }),
+            };
+            crate::bundle_settings::BundleView {
+                is_active: id == active_bundle_id,
+                id,
+                name: b.name.clone(),
+                tiers,
+                created_at: b.created_at.to_rfc3339(),
+                updated_at: b.updated_at.to_rfc3339(),
+            }
+        })
+        .collect();
+    bundles.sort_by(|a, b| a.name.cmp(&b.name));
+
     Ok(SettingsResponse {
         providers,
         active_provider: active,
+        active_bundle_id,
+        bundles,
         security_mode,
         email,
         telegram,
@@ -1300,10 +1366,31 @@ pub async fn delete_provider(
 ) -> std::result::Result<String, String> {
     let mut models = load_models_config();
 
-    if models.providers.remove(&id).is_none() {
+    if !models.providers.contains_key(&id) {
         return Err(format!("Provider '{}' not found.", id));
     }
 
+    // Block deletion when any Bundle references this Connection. The
+    // FE must move the bundle's pick off this connection (or delete
+    // the bundle) before this connection can disappear — otherwise the
+    // active Bundle's tier slot would silently fall back to the legacy
+    // path or become undispatchable. Spelled out in `docs/BUNDLES.md`
+    // §"Connection deleted while in-flight arcs are pinned to it".
+    let referencing: Vec<String> = models
+        .bundles
+        .values()
+        .filter(|b| b.tiers.values().any(|t| t.connection_id == id))
+        .map(|b| b.name.clone())
+        .collect();
+    if !referencing.is_empty() {
+        return Err(format!(
+            "Cannot delete '{id}' — referenced by Bundle(s): {}. \
+             Edit those Bundles to point at a different Connection first.",
+            referencing.join(", ")
+        ));
+    }
+
+    models.providers.remove(&id);
     save_models_config(&models)?;
 
     // Drop the deleted provider's vault entry so we don't leak it for the
@@ -1379,7 +1466,16 @@ pub async fn delete_provider(
         *state.active_provider_id.lock().await = fallback_id.clone();
         *state.model_name.lock().await = model;
 
-        if let Err(e) = persist_active_provider(&fallback_id) {
+        // Persist the legacy `active_provider` assignment for any
+        // resolver fallback path that still reads it. The active Bundle
+        // assignment is unaffected (delete_provider blocks earlier when
+        // a Bundle references the deleted Connection, so the active
+        // Bundle is guaranteed not to point at it).
+        let mut persisted = load_models_config();
+        persisted
+            .assignments
+            .insert("active_provider".to_string(), fallback_id.clone());
+        if let Err(e) = save_models_config(&persisted) {
             warn!("Failed to persist active provider after delete: {e}");
         }
 
@@ -1461,97 +1557,146 @@ pub async fn test_provider(
     }
 }
 
-/// Switch the active LLM provider at runtime without restarting the app.
+/// Switch the active LLM provider at runtime — compat shim retained so
+/// the Connections panel's per-card "Set Active" button and the
+/// onboarding wizard keep working under the Bundles model.
 ///
-/// Builds a new `DefaultLlmRouter` for the requested provider and swaps it
-/// into the shared `RwLock`, so all subsequent LLM calls use the new provider.
-/// Also persists the choice to `~/.athen/models.toml` so it survives restarts.
+/// Under Bundles the source of truth for "what model do I use" is the
+/// active Bundle, not a single active provider. This command does the
+/// natural one-click thing for a user thinking in terms of providers:
+/// **synthesise (or refresh) a Bundle named after this Connection with
+/// every tier pointing at it, then activate that Bundle**. The result
+/// is identical to clicking "+ New Bundle", filling each tier with
+/// `(this connection, its default slug)`, and activating — collapsed
+/// into one call.
+///
+/// Idempotent: re-running on the same provider id reuses the existing
+/// auto-generated Bundle (matched by name) rather than spawning
+/// duplicates on every click.
 #[tauri::command]
 pub async fn set_active_provider(
     id: String,
     state: State<'_, AppState>,
 ) -> std::result::Result<String, String> {
-    let models = load_models_config_hydrated(state.vault.as_ref()).await;
-    let provider_cfg = models.providers.get(&id);
+    let mut models = load_models_config_hydrated(state.vault.as_ref()).await;
+    let provider_cfg = models
+        .providers
+        .get(&id)
+        .ok_or_else(|| format!("Provider '{id}' not found in config."))?
+        .clone();
 
-    let base_url = provider_cfg
-        .and_then(|c| c.endpoint.as_deref())
-        .unwrap_or_else(|| default_base_url(&id))
-        .to_string();
-
-    let model = provider_cfg
-        .map(|c| c.default_model.as_str())
-        .filter(|m| !m.is_empty())
-        .unwrap_or_else(|| default_model(&id))
-        .to_string();
-
-    // Resolve API key: saved config takes priority over env var.
-    let api_key = provider_cfg
-        .and_then(|c| match &c.auth {
-            AuthType::ApiKey(key) if !key.is_empty() && !key.starts_with("${") => Some(key.clone()),
-            _ => None,
-        })
-        .or_else(|| {
-            let env_var = format!("{}_API_KEY", id.to_uppercase());
-            std::env::var(&env_var).ok().filter(|k| !k.is_empty())
-        });
-
-    // Cloud providers require an API key.
+    // Reject up-front if a cloud Connection has no key — the bundle
+    // would activate but every request would 401. Matches today's UX
+    // ("can't activate without a key").
+    let has_key = matches!(&provider_cfg.auth, AuthType::ApiKey(k) if !k.is_empty() && !k.starts_with("${"))
+        || std::env::var(format!("{}_API_KEY", id.to_uppercase()))
+            .ok()
+            .filter(|k| !k.is_empty())
+            .is_some();
     let is_local = matches!(id.as_str(), "ollama" | "llamacpp");
-    if !is_local && api_key.is_none() {
+    if !is_local && !has_key {
         let env_var = format!("{}_API_KEY", id.to_uppercase());
         return Err(format!(
-            "No API key found for '{}'. Set {} env var or configure a key in settings first.",
-            id, env_var,
+            "No API key found for '{id}'. Set {env_var} env var or configure a key first."
         ));
     }
 
-    // Build the new router.
-    let supports_vision = provider_cfg.is_some_and(|c| c.supports_vision);
-    let supports_documents = provider_cfg.is_some_and(|c| c.supports_documents);
-    let family_for_router = provider_cfg.map(|c| c.family).unwrap_or_default();
-    let empty_tiers = std::collections::HashMap::new();
-    let tier_models_for_router = provider_cfg.map(|c| &c.tier_models).unwrap_or(&empty_tiers);
-    let new_router = build_router_for_provider(
-        &id,
-        &base_url,
-        &model,
-        api_key.as_deref(),
-        supports_vision,
-        supports_documents,
-        family_for_router,
-        tier_models_for_router,
-        // Global router rebuild via `set_active_provider` — no arc context.
-        None,
-    );
-
-    // Swap the router atomically.
-    {
-        let mut router_guard = state.router.write().await;
-        *router_guard = new_router;
+    // Build the per-tier picks. Prefer this Connection's `tier_models`
+    // entries when set (preserves any per-tier slug a power user wrote
+    // pre-Bundles), falling back to `default_model`.
+    let default_slug = if provider_cfg.default_model.is_empty() {
+        default_model(&id).to_string()
+    } else {
+        provider_cfg.default_model.clone()
+    };
+    let mut tiers: std::collections::HashMap<
+        athen_core::llm::ModelProfile,
+        athen_core::config::BundleTier,
+    > = std::collections::HashMap::new();
+    for tier in [
+        athen_core::llm::ModelProfile::Cheap,
+        athen_core::llm::ModelProfile::Fast,
+        athen_core::llm::ModelProfile::Code,
+        athen_core::llm::ModelProfile::Powerful,
+    ] {
+        let slug = provider_cfg
+            .tier_models
+            .get(&tier)
+            .filter(|s| !s.is_empty())
+            .cloned()
+            .unwrap_or_else(|| default_slug.clone());
+        tiers.insert(
+            tier,
+            athen_core::config::BundleTier {
+                connection_id: id.clone(),
+                slug,
+            },
+        );
     }
 
-    // Update runtime state.
-    *state.active_provider_id.lock().await = id.clone();
-    *state.model_name.lock().await = model.clone();
+    // Idempotency: if there's already a Bundle with the auto-generated
+    // name, refresh its tiers in place. Otherwise create a new one.
+    let auto_name = display_name(&id);
+    let now = chrono::Utc::now();
+    let bundle = if let Some(existing) = models
+        .bundles
+        .values()
+        .find(|b| b.name == auto_name)
+        .cloned()
+    {
+        let mut updated = existing;
+        updated.tiers = tiers;
+        updated.updated_at = now;
+        models
+            .bundles
+            .insert(updated.id.to_string(), updated.clone());
+        updated
+    } else {
+        let bundle = athen_core::config::Bundle {
+            id: uuid::Uuid::new_v4(),
+            name: auto_name.to_string(),
+            created_at: now,
+            updated_at: now,
+            tiers,
+        };
+        models.bundles.insert(bundle.id.to_string(), bundle.clone());
+        bundle
+    };
 
-    // Persist the active provider choice.
-    if let Err(e) = persist_active_provider(&id) {
-        warn!("Failed to persist active provider: {e}");
+    // Activate it + persist.
+    models.assignments.insert(
+        athen_core::config::ACTIVE_BUNDLE_KEY.to_string(),
+        bundle.id.to_string(),
+    );
+    // Also stamp the legacy `active_provider` key so resolver paths
+    // that still read it as a fallback hint stay consistent.
+    models
+        .assignments
+        .insert("active_provider".to_string(), id.clone());
+    save_models_config(&models)?;
+
+    // Rebuild the global router from the Bundle. Hydrate again to
+    // resolve any vault-backed credential we just persisted.
+    let hydrated = load_models_config_hydrated(state.vault.as_ref()).await;
+    let new_router = crate::state::build_router_for_bundle(&bundle, &hydrated.providers);
+    *state.router.write().await = new_router;
+
+    // Keep the legacy `active_provider_id` / `model_name` snapshots in
+    // sync — they back vision-check and a few other single-provider
+    // call sites that still ask "what's the active one?"
+    if let Some((cid, slug)) = crate::bundle_settings::derive_primary_connection(&bundle) {
+        *state.active_provider_id.lock().await = cid;
+        *state.model_name.lock().await = slug;
     }
 
     let name = display_name(&id);
-    info!("Switched active provider to {} ({})", name, model);
-    Ok(format!("Switched to {} ({})", name, model))
-}
-
-/// Persist the active provider choice to `~/.athen/models.toml`.
-fn persist_active_provider(provider_id: &str) -> Result<(), String> {
-    let mut models = load_models_config();
-    models
-        .assignments
-        .insert("active_provider".to_string(), provider_id.to_string());
-    save_models_config(&models)
+    info!(
+        bundle_id = %bundle.id,
+        provider = %id,
+        "Activated Bundle '{}' (one-Connection compat shim)",
+        bundle.name
+    );
+    Ok(format!("Switched to {name}"))
 }
 
 /// Save general settings (security mode, etc.).

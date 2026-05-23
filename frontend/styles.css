@@ -3188,6 +3188,38 @@ option:hover {
     flex: 1 1 0;
     min-width: 0;
 }
+/* ─── Bundles panel ─── */
+.bundle-active-row {
+    align-items: center;
+}
+.bundle-active-row select {
+    flex: 1 1 0;
+    min-width: 0;
+}
+.add-bundle-area {
+    margin-top: 12px;
+    margin-bottom: 8px;
+}
+.bundle-tier-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 6px;
+}
+.bundle-tier-row .provider-tier-label {
+    flex: 0 0 80px;
+    font-size: 12px;
+    color: var(--text-2);
+}
+.bundle-tier-row select.bundle-tier-connection {
+    flex: 0 0 200px;
+    min-width: 0;
+}
+.bundle-tier-row input.bundle-tier-slug {
+    flex: 1 1 0;
+    min-width: 0;
+}
+
 .provider-tier-reset {
     margin-top: 10px;
     background: transparent;

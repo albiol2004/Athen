@@ -4351,6 +4351,108 @@ pub(crate) fn build_router_for_provider(
     ))
 }
 
+/// Build a global `LlmRouter` from a Bundle's per-tier `(connection,
+/// slug)` picks. Each unique `(connection_id, slug)` pair becomes one
+/// provider instance keyed `"{connection_id}.{slug}"`; the router's
+/// `profiles` map points each `ModelProfile` at the matching key.
+///
+/// Cross-vendor by construction: Cheap tier may be DeepSeek, Code tier
+/// Anthropic, Powerful tier OpenAI — each lands on its own adapter built
+/// from its own Connection's credentials.
+///
+/// Sparse Bundles use the [`pick_bundle_tier`] fallback ladder
+/// (Code→Fast→Cheap, Powerful→Fast→Cheap, Fast→Cheap). Tier slots that
+/// still resolve to nothing — empty Bundle, deleted Connection — are
+/// skipped: the router still builds, but requests for that profile fail
+/// at dispatch time with "no provider for profile X". This mirrors how
+/// [`build_router_for_provider`] handles a missing active provider: keep
+/// the surface alive, surface the misconfiguration at request time.
+///
+/// `connections` must be the *hydrated* `models.providers` map (vault
+/// secrets already filled into each `ProviderConfig.auth`). Caller is
+/// `set_active_bundle` and friends, which all go through
+/// `load_models_config_hydrated`.
+pub(crate) fn build_router_for_bundle(
+    bundle: &Bundle,
+    connections: &HashMap<String, athen_core::config::ProviderConfig>,
+) -> Arc<DefaultLlmRouter> {
+    let mut providers: HashMap<String, Box<dyn LlmProvider>> = HashMap::new();
+    let mut profiles: HashMap<ModelProfile, ProfileConfig> = HashMap::new();
+    // Dedup by `(connection_id, slug)` so two tiers sharing the same
+    // pick (e.g. Cheap=Fast=`deepseek-v4-flash` on `deepseek`) reuse one
+    // provider instance instead of constructing two reqwest::Clients.
+    let mut built_keys: HashMap<String, String> = HashMap::new();
+
+    for tier in [
+        ModelProfile::Cheap,
+        ModelProfile::Fast,
+        ModelProfile::Code,
+        ModelProfile::Powerful,
+    ] {
+        let Some((cid, slug)) = pick_bundle_tier(bundle, tier) else {
+            continue;
+        };
+        let Some(cfg) = connections.get(&cid) else {
+            warn!(
+                tier = ?tier,
+                connection_id = %cid,
+                bundle = %bundle.name,
+                "Bundle references unknown Connection; tier will be undispatchable"
+            );
+            continue;
+        };
+
+        let pair_key = format!("{cid}::{slug}");
+        let provider_key = if let Some(k) = built_keys.get(&pair_key) {
+            k.clone()
+        } else {
+            let key = format!("{cid}.{slug}");
+            // Credential resolution: prefer the hydrated `auth` field;
+            // fall back to `{CID}_API_KEY` env var (preserves the
+            // env-only legacy path used by CLI smoke runs). Empty +
+            // unsubstituted-template (`${VAR}`) auth values fall through
+            // to env to avoid sending placeholder text upstream.
+            let api_key = match &cfg.auth {
+                AuthType::ApiKey(k) if !k.is_empty() && !k.starts_with("${") => Some(k.clone()),
+                _ => std::env::var(format!("{}_API_KEY", cid.to_uppercase()))
+                    .ok()
+                    .filter(|k| !k.is_empty()),
+            };
+            let base_url = cfg
+                .endpoint
+                .clone()
+                .unwrap_or_else(|| crate::settings::default_base_url(&cid).to_string());
+            let provider = build_provider_instance(
+                &cid,
+                &base_url,
+                &slug,
+                api_key.as_deref(),
+                cfg.supports_vision,
+                cfg.supports_documents,
+                cfg.family,
+            );
+            providers.insert(key.clone(), provider);
+            built_keys.insert(pair_key, key.clone());
+            key
+        };
+
+        profiles.insert(
+            tier,
+            ProfileConfig {
+                description: format!("{cid} {tier:?}"),
+                priority: vec![provider_key],
+                fallback: None,
+            },
+        );
+    }
+
+    Arc::new(DefaultLlmRouter::new(
+        providers,
+        profiles,
+        BudgetTracker::new(None),
+    ))
+}
+
 /// Heuristic: does this slug name a MiniMax M2.x model on the OpenCode
 /// Go relay? Used to dispatch the unified `opencode_go` provider id to
 /// the Anthropic-compat wire (`/v1/messages`) vs the OpenAI-compat wire
