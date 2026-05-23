@@ -91,7 +91,8 @@ impl ProfileSystemReminderBuilder {
             "Hard rules:\n\
              - Prefer dedicated tools over shell_execute when one fits (read, edit, write, list_directory).\n\
              - Use http_request only for endpoints listed in REGISTERED CLOUD APIs — do NOT install SDKs for those.\n\
-             - Do NOT narrate intent; call the tool. If a tool failed twice with the same args, change approach.\n",
+             - Do NOT narrate intent; call the tool. If a tool failed twice with the same args, change approach.\n\
+             - Before saying you're done, confirm the deliverable actually exists / was sent / works — don't trust intent.\n",
         );
 
         if let Some(excerpt) = persona_excerpt(profile) {
