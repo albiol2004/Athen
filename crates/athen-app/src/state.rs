@@ -17,7 +17,7 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
 use athen_contacts::trust::TrustManager;
-use athen_core::config::{AthenConfig, AuthType, ProfileConfig};
+use athen_core::config::{AthenConfig, AuthType, Bundle, ProfileConfig, ACTIVE_BUNDLE_KEY};
 use athen_core::config_loader;
 use athen_core::traits::notification::NotificationChannel;
 use athen_persistence::contacts::SqliteContactStore;
@@ -3703,6 +3703,57 @@ pub(crate) async fn resolve_effective_provider_for_arc_with_config(
             pinned_slug: None,
         };
     }
+    // Unpinned path. Try the active Bundle first (the world Bundles
+    // unlocks: cross-provider per-tier mixing) — fall back to the
+    // legacy `active_provider + tier_models` shape when no Bundle is
+    // set or the picked connection has vanished from config.
+    let (provider_id, slug) = resolve_unpinned_target(cfg, active_provider_id, tier);
+    if let Err(e) = store
+        .set_pinned_provider_if_unset(arc_id, &provider_id, &slug)
+        .await
+    {
+        warn!(arc_id = %arc_id, error = %e, "failed to install provider pin");
+    }
+    // First call: we just installed the pin atomically above. From the
+    // caller's perspective we behave like an unpinned resolve — the
+    // caller will use the freshly built router whose tiers map to
+    // exactly the same slugs we just persisted, so honouring the slug
+    // here would be a no-op. Subsequent calls take the
+    // `pinned_provider_id.is_some()` branch above and surface the slug.
+    EffectiveProviderTarget {
+        provider_id,
+        pinned_slug: None,
+    }
+}
+
+/// Pick the `(provider_id, slug)` pair to pin onto an arc on its first
+/// LLM call, honouring the active Bundle when present.
+///
+/// Resolution order:
+/// 1. **Active Bundle** (`models.assignments["active_bundle"]`): look up
+///    the tier in the bundle, applying the sparse-tier fallback ladder
+///    (Code→Fast→Cheap, Powerful→Fast→Cheap, Fast→Cheap). The bundle's
+///    `connection_id` must still exist in `models.providers` — if it
+///    doesn't (user deleted the Connection without picking a different
+///    active Bundle), we fall through with a warning.
+/// 2. **Legacy `active_provider + tier_models`**: today's behaviour for
+///    users who haven't gone through the Bundles migration, or whose
+///    migration was skipped (no active provider set). Reads
+///    `provider.tier_models[tier]` and falls back to `default_model`.
+///
+/// Both branches return *something*: an empty-string slug if both
+/// branches fail to resolve. That mirrors the pre-Bundles behaviour and
+/// lets the wire layer surface the actual misconfiguration on the next
+/// call instead of panicking here.
+fn resolve_unpinned_target(
+    cfg: &AthenConfig,
+    active_provider_id: &str,
+    tier: ModelProfile,
+) -> (String, String) {
+    if let Some(pick) = resolve_from_active_bundle(cfg, tier) {
+        return pick;
+    }
+    // Legacy fallback.
     let slug = cfg
         .models
         .providers
@@ -3715,22 +3766,50 @@ pub(crate) async fn resolve_effective_provider_for_arc_with_config(
                 .unwrap_or_else(|| p.default_model.clone())
         })
         .unwrap_or_default();
-    if let Err(e) = store
-        .set_pinned_provider_if_unset(arc_id, active_provider_id, &slug)
-        .await
-    {
-        warn!(arc_id = %arc_id, error = %e, "failed to install provider pin");
+    (active_provider_id.to_string(), slug)
+}
+
+/// Returns the `(connection_id, slug)` pick for `tier` from the active
+/// Bundle, applying the sparse-tier fallback ladder. `None` when no
+/// active Bundle is set, the active Bundle id doesn't resolve, no tier
+/// in the ladder is filled, or the picked connection has been deleted.
+fn resolve_from_active_bundle(cfg: &AthenConfig, tier: ModelProfile) -> Option<(String, String)> {
+    let bundle_id = cfg.models.assignments.get(ACTIVE_BUNDLE_KEY)?;
+    let bundle = cfg.models.bundles.get(bundle_id)?;
+    let (connection_id, slug) = pick_bundle_tier(bundle, tier)?;
+    if !cfg.models.providers.contains_key(&connection_id) {
+        warn!(
+            connection_id = %connection_id,
+            bundle = %bundle.name,
+            "active Bundle references a deleted Connection; falling back to legacy active_provider path"
+        );
+        return None;
     }
-    // First call: we just installed the pin atomically above. From the
-    // caller's perspective we behave like an unpinned resolve — the
-    // caller will use the freshly built router whose tiers map to
-    // exactly the same slugs we just persisted, so honouring the slug
-    // here would be a no-op. Subsequent calls take the
-    // `pinned_provider_id.is_some()` branch above and surface the slug.
-    EffectiveProviderTarget {
-        provider_id: active_provider_id.to_string(),
-        pinned_slug: None,
+    Some((connection_id, slug))
+}
+
+/// Sparse-tier fallback ladder per `docs/BUNDLES.md`. A Bundle that only
+/// sets Cheap is a valid config — every other tier collapses onto it.
+/// Local stays isolated (no cross-tier fallback) because Local routing
+/// is meaningfully different from cloud tiers.
+fn pick_bundle_tier(bundle: &Bundle, tier: ModelProfile) -> Option<(String, String)> {
+    let ladder: &[ModelProfile] = match tier {
+        ModelProfile::Code => &[ModelProfile::Code, ModelProfile::Fast, ModelProfile::Cheap],
+        ModelProfile::Powerful => &[
+            ModelProfile::Powerful,
+            ModelProfile::Fast,
+            ModelProfile::Cheap,
+        ],
+        ModelProfile::Fast => &[ModelProfile::Fast, ModelProfile::Cheap],
+        ModelProfile::Cheap => &[ModelProfile::Cheap],
+        ModelProfile::Local => &[ModelProfile::Local],
+    };
+    for t in ladder {
+        if let Some(bt) = bundle.tiers.get(t) {
+            return Some((bt.connection_id.clone(), bt.slug.clone()));
+        }
     }
+    None
 }
 
 /// Clear an arc's provider pin. Best-effort: logs and swallows errors
@@ -5257,6 +5336,184 @@ mod resolve_effective_provider_tests {
                 pinned_slug: None,
             }
         );
+    }
+
+    // ---- Bundles Phase 1b: active Bundle takes precedence over the
+    // ---- legacy active_provider + tier_models path.
+
+    fn mk_bundle(
+        name: &str,
+        tiers: &[(ModelProfile, &str, &str)], // (tier, connection_id, slug)
+    ) -> athen_core::config::Bundle {
+        let mut map: HashMap<ModelProfile, athen_core::config::BundleTier> = HashMap::new();
+        for (tier, cid, slug) in tiers {
+            map.insert(
+                *tier,
+                athen_core::config::BundleTier {
+                    connection_id: (*cid).to_string(),
+                    slug: (*slug).to_string(),
+                },
+            );
+        }
+        let now = chrono::Utc::now();
+        athen_core::config::Bundle {
+            id: uuid::Uuid::new_v4(),
+            name: name.to_string(),
+            created_at: now,
+            updated_at: now,
+            tiers: map,
+        }
+    }
+
+    fn install_active_bundle(cfg: &mut AthenConfig, bundle: athen_core::config::Bundle) {
+        let id = bundle.id.to_string();
+        cfg.models.bundles.insert(id.clone(), bundle);
+        cfg.models
+            .assignments
+            .insert(athen_core::config::ACTIVE_BUNDLE_KEY.to_string(), id);
+    }
+
+    /// Active Bundle present + tier filled: resolver pins the bundle's
+    /// `(connection_id, slug)` *regardless* of what `active_provider_id`
+    /// the caller passed. This is the load-bearing cross-vendor mixing
+    /// guarantee.
+    #[tokio::test]
+    async fn bundle_tier_overrides_active_provider() {
+        let store = setup_store().await;
+        store
+            .create_arc("arc_b", "t", ArcSource::UserInput)
+            .await
+            .unwrap();
+        let mut cfg = mk_config(&[
+            ("opencode_go", "deepseek-v4-flash"),
+            ("anthropic", "claude-sonnet-4-6"),
+        ]);
+        // Bundle picks Anthropic for Code even though caller's "active"
+        // provider is OpenCode Go.
+        install_active_bundle(
+            &mut cfg,
+            mk_bundle(
+                "Default",
+                &[(ModelProfile::Code, "anthropic", "claude-opus-4-7")],
+            ),
+        );
+
+        let target = resolve_effective_provider_for_arc_with_config(
+            Some(&store),
+            "arc_b",
+            "opencode_go",
+            ModelProfile::Code,
+            &cfg,
+        )
+        .await;
+
+        assert_eq!(
+            target,
+            EffectiveProviderTarget {
+                provider_id: "anthropic".to_string(),
+                pinned_slug: None,
+            }
+        );
+
+        // Pin row captured the Bundle's pick.
+        let arc = store.get_arc("arc_b").await.unwrap().unwrap();
+        assert_eq!(arc.pinned_provider_id.as_deref(), Some("anthropic"));
+        assert_eq!(arc.pinned_slug.as_deref(), Some("claude-opus-4-7"));
+    }
+
+    /// Sparse Bundle (only Cheap set): Powerful tier falls through to
+    /// Fast, then to Cheap.
+    #[tokio::test]
+    async fn sparse_bundle_falls_through_to_cheap() {
+        let store = setup_store().await;
+        store
+            .create_arc("arc_sparse", "t", ArcSource::UserInput)
+            .await
+            .unwrap();
+        let mut cfg = mk_config(&[("deepseek", "deepseek-chat")]);
+        install_active_bundle(
+            &mut cfg,
+            mk_bundle(
+                "Cheap-only",
+                &[(ModelProfile::Cheap, "deepseek", "deepseek-v4-flash")],
+            ),
+        );
+
+        let target = resolve_effective_provider_for_arc_with_config(
+            Some(&store),
+            "arc_sparse",
+            "deepseek",
+            ModelProfile::Powerful,
+            &cfg,
+        )
+        .await;
+
+        let arc = store.get_arc("arc_sparse").await.unwrap().unwrap();
+        assert_eq!(arc.pinned_provider_id.as_deref(), Some("deepseek"));
+        assert_eq!(arc.pinned_slug.as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(target.provider_id, "deepseek");
+    }
+
+    /// Bundle exists but points at a Connection that was deleted from
+    /// `models.providers`. Resolver must NOT pin a dead provider — it
+    /// falls back to the legacy `active_provider + tier_models` path.
+    #[tokio::test]
+    async fn bundle_pointing_at_deleted_connection_falls_back() {
+        let store = setup_store().await;
+        store
+            .create_arc("arc_dead", "t", ArcSource::UserInput)
+            .await
+            .unwrap();
+        let mut cfg = mk_config(&[("deepseek", "deepseek-chat")]);
+        // Bundle references "ghost" which is not in cfg.models.providers.
+        install_active_bundle(
+            &mut cfg,
+            mk_bundle(
+                "Broken",
+                &[(ModelProfile::Powerful, "ghost", "ghost-model")],
+            ),
+        );
+
+        let target = resolve_effective_provider_for_arc_with_config(
+            Some(&store),
+            "arc_dead",
+            "deepseek",
+            ModelProfile::Powerful,
+            &cfg,
+        )
+        .await;
+
+        assert_eq!(target.provider_id, "deepseek");
+        let arc = store.get_arc("arc_dead").await.unwrap().unwrap();
+        assert_eq!(arc.pinned_provider_id.as_deref(), Some("deepseek"));
+        assert_eq!(arc.pinned_slug.as_deref(), Some("deepseek-chat"));
+    }
+
+    /// No active Bundle assignment: behaviour matches pre-Bundles
+    /// (legacy `active_provider + default_model` path). Existing users
+    /// without a migration must observe zero change.
+    #[tokio::test]
+    async fn no_active_bundle_uses_legacy_path() {
+        let store = setup_store().await;
+        store
+            .create_arc("arc_legacy", "t", ArcSource::UserInput)
+            .await
+            .unwrap();
+        let cfg = mk_config(&[("deepseek", "deepseek-chat")]);
+        assert!(cfg.models.bundles.is_empty());
+
+        let target = resolve_effective_provider_for_arc_with_config(
+            Some(&store),
+            "arc_legacy",
+            "deepseek",
+            ModelProfile::Fast,
+            &cfg,
+        )
+        .await;
+
+        assert_eq!(target.provider_id, "deepseek");
+        let arc = store.get_arc("arc_legacy").await.unwrap().unwrap();
+        assert_eq!(arc.pinned_slug.as_deref(), Some("deepseek-chat"));
     }
 }
 
