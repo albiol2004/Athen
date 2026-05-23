@@ -21,6 +21,15 @@ pub struct RiskScore {
     /// the static call-site tier.
     #[serde(default)]
     pub complexity: Option<ComplexityTag>,
+    /// Orthogonal "this is a coding task" signal from the same LLM call.
+    /// True for tasks dominated by read/edit/grep/shell over a source
+    /// tree — bug fixes, small features, refactors, code review. Routes
+    /// the main executor to `ModelProfile::Code` regardless of complexity
+    /// when set (see `resolve_tier_from_signals`). Defaults to false /
+    /// missing on regex-only scored actions and on persisted scores
+    /// predating this field, so existing callers keep the old behaviour.
+    #[serde(default)]
+    pub is_code_task: bool,
     /// LLM-drafted mini-plan piggybacked on the risk evaluation step. The
     /// compactor uses both fields (acceptance_criteria + scope) to decide
     /// what to keep verbatim and what to drop. The completion judge uses
@@ -67,6 +76,31 @@ pub fn complexity_to_tier(tag: ComplexityTag) -> ModelProfile {
         ComplexityTag::Low => ModelProfile::Cheap,
         ComplexityTag::Medium => ModelProfile::Fast,
         ComplexityTag::High => ModelProfile::Powerful,
+    }
+}
+
+/// Resolve a `ModelProfile` from the orthogonal signals the risk LLM
+/// emits: hardness (`ComplexityTag`) and the "this is a coding task"
+/// boolean. `is_code_task` wins over complexity for Low/Medium tasks —
+/// these are the cases where a Code-tuned model materially beats a
+/// generalist Fast/Cheap one. High-complexity coding tasks still route
+/// to `Powerful` because they're more likely to be architectural /
+/// cross-module reasoning than line-level edit work — the Code tier is
+/// intentionally a small/fast specialist, not a general "harder than
+/// Fast" upgrade. Callers without a complexity tag pass `None` and the
+/// caller-supplied default is used; if `is_code_task` is true with no
+/// complexity, Code wins (we know it's code, we just don't know how
+/// hard — Code is the safer default than the static label).
+pub fn resolve_tier_from_signals(
+    complexity: Option<ComplexityTag>,
+    is_code_task: bool,
+    default_label: ModelProfile,
+) -> ModelProfile {
+    match (complexity, is_code_task) {
+        (Some(ComplexityTag::High), _) => ModelProfile::Powerful,
+        (_, true) => ModelProfile::Code,
+        (Some(tag), false) => complexity_to_tier(tag),
+        (None, false) => default_label,
     }
 }
 
@@ -189,5 +223,64 @@ mod complexity_tests {
         });
         let score: RiskScore = serde_json::from_value(raw).unwrap();
         assert!(score.complexity.is_none());
+        // Same rehydration must default the new boolean to false so older
+        // persisted scores keep their pre-Code routing behaviour.
+        assert!(!score.is_code_task);
+    }
+
+    #[test]
+    fn resolve_tier_routes_code_task_to_code_tier() {
+        // Low / Medium coding tasks route to Code regardless of complexity.
+        assert_eq!(
+            resolve_tier_from_signals(Some(ComplexityTag::Low), true, ModelProfile::Fast),
+            ModelProfile::Code
+        );
+        assert_eq!(
+            resolve_tier_from_signals(Some(ComplexityTag::Medium), true, ModelProfile::Fast),
+            ModelProfile::Code
+        );
+    }
+
+    #[test]
+    fn resolve_tier_high_complexity_beats_code_flag() {
+        // Architectural / cross-module reasoning still wants Powerful —
+        // Code tier is a small/fast specialist, not a "harder than Fast"
+        // upgrade.
+        assert_eq!(
+            resolve_tier_from_signals(Some(ComplexityTag::High), true, ModelProfile::Fast),
+            ModelProfile::Powerful
+        );
+    }
+
+    #[test]
+    fn resolve_tier_no_complexity_with_code_flag_picks_code() {
+        // We know it's code, we just don't know how hard — Code beats the
+        // static call-site default.
+        assert_eq!(
+            resolve_tier_from_signals(None, true, ModelProfile::Fast),
+            ModelProfile::Code
+        );
+    }
+
+    #[test]
+    fn resolve_tier_non_code_paths_match_complexity_to_tier() {
+        // No code flag: behaviour identical to the old complexity-only path.
+        assert_eq!(
+            resolve_tier_from_signals(Some(ComplexityTag::Low), false, ModelProfile::Fast),
+            ModelProfile::Cheap
+        );
+        assert_eq!(
+            resolve_tier_from_signals(Some(ComplexityTag::Medium), false, ModelProfile::Fast),
+            ModelProfile::Fast
+        );
+        assert_eq!(
+            resolve_tier_from_signals(Some(ComplexityTag::High), false, ModelProfile::Fast),
+            ModelProfile::Powerful
+        );
+        // No signal at all — fall through to the caller-supplied default.
+        assert_eq!(
+            resolve_tier_from_signals(None, false, ModelProfile::Powerful),
+            ModelProfile::Powerful
+        );
     }
 }

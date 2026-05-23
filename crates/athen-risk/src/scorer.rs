@@ -52,6 +52,9 @@ impl RiskScorer {
             complexity: None,
             // Same story for the triage plan: regex doesn't draft plans.
             plan: None,
+            // Regex can't sniff "this is a coding task" either; only the
+            // LLM-fallback path sets this.
+            is_code_task: false,
         }
     }
 }

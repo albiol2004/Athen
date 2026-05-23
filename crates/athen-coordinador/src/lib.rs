@@ -466,6 +466,7 @@ mod tests {
                 evaluation_method: EvaluationMethod::RuleBased,
                 complexity: None,
                 plan: None,
+                is_code_task: false,
             })
         }
 

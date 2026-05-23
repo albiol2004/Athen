@@ -2330,12 +2330,13 @@ pub async fn send_message(
             )
             .await;
             // In-app direct turns don't go through the risk LLM, so the
-            // task carries no complexity tag — resolver collapses to
-            // `override > Fast`.
+            // task carries no complexity tag and no code-task signal —
+            // resolver collapses to `override > Fast`.
             let default_tier = crate::state::resolve_effective_tier_for_arc(
                 state.arc_store.as_ref(),
                 &active_arc,
                 None,
+                false,
                 athen_core::llm::ModelProfile::Fast,
             )
             .await;
@@ -3509,15 +3510,22 @@ pub(crate) async fn execute_approved_task(
         crate::mission_render::read_acceptance_criteria(ctx.arc_store.as_ref(), &ctx.active_arc_id)
             .await;
 
-    // Tier resolution: arc override > task complexity (piggybacked on
-    // the risk LLM that already ran on this approved task) > static
-    // `Fast`. The other LLM call sites (memory extractor, completion
-    // judge, risk LLM itself) keep their static tier labels.
+    // Tier resolution: arc override > task signals (complexity +
+    // is_code_task, both piggybacked on the risk LLM that already ran on
+    // this approved task) > static `Fast`. The other LLM call sites
+    // (memory extractor, completion judge, risk LLM itself) keep their
+    // static tier labels.
     let task_complexity = approved_task.risk_score.as_ref().and_then(|r| r.complexity);
+    let task_is_code = approved_task
+        .risk_score
+        .as_ref()
+        .map(|r| r.is_code_task)
+        .unwrap_or(false);
     let default_tier = crate::state::resolve_effective_tier_for_arc(
         ctx.arc_store.as_ref(),
         &ctx.active_arc_id,
         task_complexity,
+        task_is_code,
         athen_core::llm::ModelProfile::Fast,
     )
     .await;
@@ -4570,10 +4578,16 @@ pub(crate) async fn execute_dispatched_task(
     // Tier resolution mirrors the approval path; `task` carries the
     // risk_score the dispatch loop installed.
     let task_complexity = task.risk_score.as_ref().and_then(|r| r.complexity);
+    let task_is_code = task
+        .risk_score
+        .as_ref()
+        .map(|r| r.is_code_task)
+        .unwrap_or(false);
     let default_tier = crate::state::resolve_effective_tier_for_arc(
         ctx.arc_store.as_ref(),
         &arc_id,
         task_complexity,
+        task_is_code,
         athen_core::llm::ModelProfile::Fast,
     )
     .await;

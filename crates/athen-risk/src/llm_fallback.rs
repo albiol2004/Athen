@@ -21,6 +21,7 @@ struct ParsedRiskResponse {
     confidence: f64,
     complexity: Option<ComplexityTag>,
     plan: Option<TriagePlan>,
+    is_code_task: bool,
 }
 
 /// LLM-assisted risk evaluator for cases where regex rules are insufficient.
@@ -76,6 +77,7 @@ impl LlmRiskEvaluator {
             confidence,
             complexity,
             plan,
+            is_code_task,
         } = match self.parse_response(&response) {
             Some(parsed) => parsed,
             None => {
@@ -103,6 +105,7 @@ impl LlmRiskEvaluator {
                 .compute(impact, &effective_context, EvaluationMethod::LlmAssisted);
         score.complexity = complexity;
         score.plan = plan;
+        score.is_code_task = is_code_task;
         Ok(score)
     }
 
@@ -151,6 +154,7 @@ impl LlmRiskEvaluator {
             "- \"sensitivity\": one of \"plain\", \"personal_info\", \"secrets\"\n",
             "- \"confidence\": a float between 0.0 and 1.0 indicating your confidence\n",
             "- \"complexity\": one of \"low\", \"medium\", \"high\" — how hard the task is for the agent (NOT how risky)\n",
+            "- \"is_code_task\": boolean true/false — true ONLY when the task is dominated by reading/editing/grepping/running source code on a project (bug fix, small feature, refactor, code review, test fix). False for chat, email, search, planning, calendar, generic shell.\n",
             "- \"acceptance_criteria\": one or two short lines describing what \"done\" looks like for this task. Concrete and testable. Empty string \"\" if the task is conversational and has no done-criterion.\n",
             "- \"scope\": one short sentence naming what the task is NOT, to fence the agent from drift. Empty string \"\" if there is no useful fence.\n",
             "- \"reasoning\": a brief explanation\n\n",
@@ -269,12 +273,20 @@ impl LlmRiskEvaluator {
             }
         };
 
+        // is_code_task is best-effort too: missing / non-bool defaults to
+        // false so older models silently keep the pre-Code routing path.
+        let is_code_task = v
+            .get("is_code_task")
+            .and_then(|c| c.as_bool())
+            .unwrap_or(false);
+
         Some(ParsedRiskResponse {
             impact,
             sensitivity,
             confidence,
             complexity,
             plan,
+            is_code_task,
         })
     }
 }
@@ -486,6 +498,63 @@ mod tests {
             .await
             .unwrap();
         assert!(score.complexity.is_none());
+    }
+
+    #[tokio::test]
+    async fn parses_is_code_task_when_present() {
+        let json =
+            r#"{"impact":"read","sensitivity":"plain","confidence":1.0,"is_code_task":true}"#;
+        let router = MockRouter::new(json);
+        let evaluator = LlmRiskEvaluator::new(Box::new(router));
+        let score = evaluator
+            .evaluate("fix the bug in src/auth.rs", &default_ctx())
+            .await
+            .unwrap();
+        assert!(score.is_code_task);
+    }
+
+    #[tokio::test]
+    async fn is_code_task_defaults_false_when_missing() {
+        // Older / smaller models that ignore the new field must not break
+        // the score; is_code_task defaults to false so routing falls
+        // through to the complexity-only path.
+        let json = r#"{"impact":"read","sensitivity":"plain","confidence":1.0}"#;
+        let router = MockRouter::new(json);
+        let evaluator = LlmRiskEvaluator::new(Box::new(router));
+        let score = evaluator
+            .evaluate("read a file", &default_ctx())
+            .await
+            .unwrap();
+        assert!(!score.is_code_task);
+    }
+
+    #[tokio::test]
+    async fn is_code_task_non_bool_is_ignored() {
+        // Models occasionally stringify booleans. Treat anything that
+        // isn't a real JSON boolean as false rather than coercing.
+        let json =
+            r#"{"impact":"read","sensitivity":"plain","confidence":1.0,"is_code_task":"yes"}"#;
+        let router = MockRouter::new(json);
+        let evaluator = LlmRiskEvaluator::new(Box::new(router));
+        let score = evaluator
+            .evaluate("anything", &default_ctx())
+            .await
+            .unwrap();
+        assert!(!score.is_code_task);
+    }
+
+    #[test]
+    fn regex_scorer_emits_no_code_task_flag() {
+        // Regex can't tell whether a task is code-flavoured; the field
+        // must always be false in the RuleBased path so routing falls
+        // through to complexity / static defaults.
+        let scorer = RiskScorer::new();
+        let score = scorer.compute(
+            BaseImpact::Read,
+            &default_ctx(),
+            EvaluationMethod::RuleBased,
+        );
+        assert!(!score.is_code_task);
     }
 
     #[tokio::test]

@@ -3679,7 +3679,10 @@ fn parse_model_profile_wire(s: &str) -> Option<ModelProfile> {
 /// Resolve the effective `ModelProfile` for the main-executor call of a
 /// task. Resolution order (highest first):
 /// 1. Arc's `tier_override` (user said "force this tier for this arc")
-/// 2. Task's `risk_score.complexity` mapped via `complexity_to_tier`
+/// 2. Task's `risk_score` signals (`complexity` + `is_code_task`) mapped
+///    via `athen_core::risk::resolve_tier_from_signals`. The `Code` tier
+///    wins for Low/Medium coding tasks; `High` complexity still routes to
+///    `Powerful` regardless of the code flag.
 /// 3. Caller-supplied `default_label` (the static per-call-site tier)
 ///
 /// Only the main executor should call this — the memory extractor,
@@ -3692,6 +3695,7 @@ pub(crate) async fn resolve_effective_tier_for_arc(
     arc_store: Option<&ArcStore>,
     arc_id: &str,
     task_complexity: Option<athen_core::risk::ComplexityTag>,
+    task_is_code: bool,
     default_label: ModelProfile,
 ) -> ModelProfile {
     let (chosen, reason): (ModelProfile, &'static str) = if let Some(store) = arc_store {
@@ -3705,15 +3709,15 @@ pub(crate) async fn resolve_effective_tier_for_arc(
                             tier_override = %raw,
                             "unknown tier_override wire value; ignoring"
                         );
-                        complexity_path(task_complexity, default_label)
+                        complexity_path(task_complexity, task_is_code, default_label)
                     }
                 },
-                None => complexity_path(task_complexity, default_label),
+                None => complexity_path(task_complexity, task_is_code, default_label),
             },
-            _ => complexity_path(task_complexity, default_label),
+            _ => complexity_path(task_complexity, task_is_code, default_label),
         }
     } else {
-        complexity_path(task_complexity, default_label)
+        complexity_path(task_complexity, task_is_code, default_label)
     };
 
     if chosen != default_label {
@@ -3728,24 +3732,26 @@ pub(crate) async fn resolve_effective_tier_for_arc(
     chosen
 }
 
-/// Sub-resolver for the complexity-then-default fallthrough. Pulled out
-/// so the override branch above stays readable — the reason string is
-/// what differs between the override path and this one.
+/// Sub-resolver for the signal-then-default fallthrough. Pulled out so
+/// the override branch above stays readable — the reason string is what
+/// differs between the override path and this one. Reason strings are
+/// chosen so logs cleanly distinguish "complexity_*" vs "code_task" vs
+/// "default" — useful when debugging why a tier diverged.
 fn complexity_path(
     task_complexity: Option<athen_core::risk::ComplexityTag>,
+    task_is_code: bool,
     default_label: ModelProfile,
 ) -> (ModelProfile, &'static str) {
-    match task_complexity {
-        Some(tag) => (
-            athen_core::risk::complexity_to_tier(tag),
-            match tag {
-                athen_core::risk::ComplexityTag::Low => "complexity_low",
-                athen_core::risk::ComplexityTag::Medium => "complexity_medium",
-                athen_core::risk::ComplexityTag::High => "complexity_high",
-            },
-        ),
-        None => (default_label, "default"),
-    }
+    let chosen =
+        athen_core::risk::resolve_tier_from_signals(task_complexity, task_is_code, default_label);
+    let reason = match (task_complexity, task_is_code) {
+        (Some(athen_core::risk::ComplexityTag::High), _) => "complexity_high",
+        (_, true) => "code_task",
+        (Some(athen_core::risk::ComplexityTag::Low), false) => "complexity_low",
+        (Some(athen_core::risk::ComplexityTag::Medium), false) => "complexity_medium",
+        (None, false) => "default",
+    };
+    (chosen, reason)
 }
 
 /// Determine the active provider ID from config, falling back to "deepseek".
@@ -4632,6 +4638,7 @@ mod resolve_effective_tier_tests {
             Some(&store),
             "arc1",
             Some(ComplexityTag::High),
+            false,
             ModelProfile::Fast,
         )
         .await;
@@ -4652,6 +4659,7 @@ mod resolve_effective_tier_tests {
             Some(&store),
             "arc2",
             Some(ComplexityTag::High),
+            false,
             ModelProfile::Fast,
         )
         .await;
@@ -4669,7 +4677,8 @@ mod resolve_effective_tier_tests {
             .unwrap();
 
         let tier =
-            resolve_effective_tier_for_arc(Some(&store), "arc3", None, ModelProfile::Fast).await;
+            resolve_effective_tier_for_arc(Some(&store), "arc3", None, false, ModelProfile::Fast)
+                .await;
         assert_eq!(tier, ModelProfile::Fast);
     }
 
@@ -4692,9 +4701,79 @@ mod resolve_effective_tier_tests {
             Some(&store),
             "arc4",
             Some(ComplexityTag::Low),
+            false,
             ModelProfile::Fast,
         )
         .await;
         assert_eq!(tier, ModelProfile::Cheap);
+    }
+
+    /// `is_code_task` flips the resolved tier to `Code` for Low/Medium
+    /// complexity tasks — the whole point of this signal. Regression
+    /// guard for the original bug: `ModelProfile::Code` was unreachable
+    /// from the auto-tier path.
+    #[tokio::test]
+    async fn code_task_flag_routes_to_code_tier() {
+        let store = setup_store().await;
+        store
+            .create_arc("arc5", "t", ArcSource::UserInput)
+            .await
+            .unwrap();
+
+        let tier = resolve_effective_tier_for_arc(
+            Some(&store),
+            "arc5",
+            Some(ComplexityTag::Medium),
+            true,
+            ModelProfile::Fast,
+        )
+        .await;
+        assert_eq!(tier, ModelProfile::Code);
+    }
+
+    /// High-complexity coding tasks still escalate to `Powerful`. Code
+    /// tier is a small/fast specialist, not a "harder than Fast" upgrade.
+    #[tokio::test]
+    async fn high_complexity_beats_code_flag() {
+        let store = setup_store().await;
+        store
+            .create_arc("arc6", "t", ArcSource::UserInput)
+            .await
+            .unwrap();
+
+        let tier = resolve_effective_tier_for_arc(
+            Some(&store),
+            "arc6",
+            Some(ComplexityTag::High),
+            true,
+            ModelProfile::Fast,
+        )
+        .await;
+        assert_eq!(tier, ModelProfile::Powerful);
+    }
+
+    /// Arc tier override still wins even when the task is flagged as
+    /// code — the user's explicit per-arc choice trumps auto-routing.
+    #[tokio::test]
+    async fn override_beats_code_task_flag() {
+        let store = setup_store().await;
+        store
+            .create_arc("arc7", "t", ArcSource::UserInput)
+            .await
+            .unwrap();
+        store
+            .set_tier_override("arc7", Some("Powerful"))
+            .await
+            .unwrap();
+
+        let tier = resolve_effective_tier_for_arc(
+            Some(&store),
+            "arc7",
+            Some(ComplexityTag::Low),
+            true,
+            ModelProfile::Fast,
+        )
+        .await;
+        assert_eq!(tier, ModelProfile::Powerful);
     }
 }
