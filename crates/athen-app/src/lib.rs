@@ -5,6 +5,7 @@
 
 pub(crate) mod agent_registry;
 pub(crate) mod app_tools;
+pub(crate) mod athen_docs;
 pub(crate) mod approval;
 pub(crate) mod attachment_purger;
 pub(crate) mod bundle_settings;

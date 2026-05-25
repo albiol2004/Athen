@@ -1612,6 +1612,45 @@ impl AppToolRegistry {
         })
     }
 
+    // ── athen_docs ────────────────────────────────────────────────
+
+    fn athen_docs_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "get"],
+                    "description": "Use 'list' to browse all available guide topics, or 'get' to read a specific guide."
+                },
+                "topic": {
+                    "type": "string",
+                    "description": "The guide slug to read (required when action is 'get'). Get available slugs from the 'list' action."
+                }
+            },
+            "required": ["action"]
+        })
+    }
+
+    fn do_athen_docs(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let action = args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("list");
+        let topic = args.get("topic").and_then(|v| v.as_str());
+
+        let start = Instant::now();
+        let body = crate::athen_docs::do_athen_docs(action, topic)?;
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+
+        Ok(ToolResult {
+            success: true,
+            output: json!({ "content": body }),
+            error: None,
+            execution_time_ms: elapsed_ms,
+        })
+    }
+
     // ── http_request ────────────────────────────────────────────────
 
     fn http_request_schema() -> serde_json::Value {
@@ -2311,6 +2350,17 @@ impl ToolRegistry for AppToolRegistry {
             });
         }
 
+        tools.push(ToolDefinition {
+            name: "athen_docs".to_string(),
+            description: "Browse and read Athen's built-in guides for setup, configuration, and troubleshooting. Use action 'list' to see all available topics, or action 'get' with a topic slug to read a specific guide.".to_string(),
+            parameters: Self::athen_docs_schema(),
+            backend: ToolBackend::Shell {
+                command: String::new(),
+                native: false,
+            },
+            base_risk: BaseImpact::Read,
+        });
+
         if self.identity.is_some() {
             tools.push(ToolDefinition {
                 name: "identity_add".to_string(),
@@ -2441,6 +2491,7 @@ impl ToolRegistry for AppToolRegistry {
             "fetch_attachment" => self.do_fetch_attachment(&args).await,
             "identity_add" => self.do_identity_add(&args).await,
             "load_skill" => self.do_load_skill(&args).await,
+            "athen_docs" => self.do_athen_docs(&args),
             "http_request" => self.do_http_request(&args).await,
             _ => self.inner.call_tool(name, args).await,
         }

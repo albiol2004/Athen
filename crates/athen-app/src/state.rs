@@ -902,6 +902,29 @@ impl AppState {
         // sync is idempotent and cheap when nothing changed.
         if let Some(skills) = state.skill_store.as_ref() {
             use athen_core::traits::skill::SkillStore;
+
+            // Seed the builtin "athen-docs" skill that teaches the agent
+            // about the `athen_docs` tool. Written once; survives sync
+            // because it has a real folder+file on disk.
+            let docs_slug = "athen-docs";
+            let docs_body = include_str!("../../../skills/system/athen-docs/SKILL.md");
+            match skills.get(docs_slug).await {
+                Ok(None) => {
+                    match athen_core::skill::parse_skill_md(docs_body) {
+                        Ok((front, body)) => {
+                            if let Err(e) = skills.upsert(docs_slug, &front, &body).await {
+                                warn!("Failed to seed athen-docs skill: {e}");
+                            } else {
+                                info!("Seeded builtin skill: athen-docs");
+                            }
+                        }
+                        Err(e) => warn!("Failed to parse athen-docs SKILL.md: {e}"),
+                    }
+                }
+                Ok(Some(_)) => {} // already exists, don't overwrite
+                Err(e) => warn!("Failed to check athen-docs skill: {e}"),
+            }
+
             match skills.sync().await {
                 Ok(report) => {
                     if report.inserted + report.updated + report.deleted > 0 {
