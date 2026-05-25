@@ -203,7 +203,7 @@ impl LlmRiskEvaluator {
             temperature: Some(0.0),
             tools: None,
             system_prompt: Some(system_prompt.to_string()),
-            reasoning_effort: athen_core::llm::ReasoningEffort::default(),
+            reasoning_effort: athen_core::llm::ReasoningEffort::Off,
         }
     }
 

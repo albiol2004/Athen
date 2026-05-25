@@ -1123,6 +1123,20 @@ pub(crate) fn map_reasoning_effort(
     family: ModelFamily,
     effort: ReasoningEffort,
 ) -> Option<serde_json::Value> {
+    // DeepSeek V4 Flash/Pro default to thinking-on regardless of whether
+    // a reasoning_effort field is present. The ONLY way to get a pure
+    // non-thinking response shape is `"thinking": {"type": "disabled"}`.
+    // This must fire for both Default and Off — Default means "I don't
+    // care about reasoning" which for V4 Chat should mean "off".
+    // Same logic as deepseek.rs build_request_body, extended to relays.
+    if matches!(
+        family,
+        ModelFamily::DeepSeekV4Chat | ModelFamily::DeepSeekV4Pro
+    ) && matches!(effort, ReasoningEffort::Default | ReasoningEffort::Off)
+    {
+        return Some(serde_json::json!({ "thinking": { "type": "disabled" } }));
+    }
+
     if matches!(effort, ReasoningEffort::Default) {
         return None;
     }

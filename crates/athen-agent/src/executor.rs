@@ -1375,7 +1375,7 @@ impl DefaultExecutor {
             temperature: Some(0.0),
             tools: None,
             system_prompt: None,
-            reasoning_effort: athen_core::llm::ReasoningEffort::default(),
+            reasoning_effort: athen_core::llm::ReasoningEffort::Off,
         };
 
         match tokio::time::timeout(
@@ -1703,7 +1703,7 @@ impl AgentExecutor for DefaultExecutor {
                     temperature: Some(0.5),
                     tools: None, // no tools — just summarise
                     system_prompt: Some(system_prompt),
-                    reasoning_effort: athen_core::llm::ReasoningEffort::default(),
+                    reasoning_effort: athen_core::llm::ReasoningEffort::Off,
                 };
                 let summary = match self.llm_router.route(&summary_request).await {
                     Ok(resp) => resp.content,
