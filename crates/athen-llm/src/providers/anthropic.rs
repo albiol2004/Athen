@@ -96,9 +96,13 @@ impl AnthropicProvider {
             .iter()
             .filter(|m| m.role != Role::System)
             .map(|m| {
+                let is_tool = m.role == Role::Tool;
+                let is_assistant = m.role == Role::Assistant;
                 let content = match &m.content {
                     MessageContent::Text(t) => serde_json::Value::String(t.clone()),
-                    MessageContent::Structured(v) => v.clone(),
+                    MessageContent::Structured(v) => {
+                        structured_to_anthropic_content(v, is_assistant, is_tool)
+                    }
                     MessageContent::Multimodal { text, images } => {
                         anthropic_multimodal_blocks(text, images)
                     }
@@ -275,19 +279,70 @@ impl LlmProvider for AnthropicProvider {
 
         let byte_stream = http_response.bytes_stream();
 
-        // Parse SSE events from the byte stream.
-        let chunk_stream = byte_stream
-            .map(|result| match result {
-                Ok(bytes) => {
-                    let text = String::from_utf8_lossy(&bytes).to_string();
-                    parse_sse_chunks(&text)
-                }
-                Err(e) => vec![Err(AthenError::LlmProvider {
-                    provider: "anthropic".into(),
-                    message: format!("stream error: {}", e),
-                })],
+        // Buffer raw bytes across TCP chunks and split on `\n\n` (the SSE
+        // event boundary). Without this, an event split across two TCP
+        // segments yields two partial JSON fragments that both fail to parse,
+        // silently dropping the text delta — causing intermittent tool-call
+        // extraction failures for inline-format models (MiniMax M2.7).
+        let raw_chunks = byte_stream
+            .scan(Vec::<u8>::new(), |buffer, result| {
+                let emitted: Vec<Result<LlmChunk>> = match result {
+                    Ok(bytes) => {
+                        buffer.extend_from_slice(&bytes);
+                        drain_complete_sse_events(buffer)
+                    }
+                    Err(e) => vec![Err(AthenError::LlmProvider {
+                        provider: "anthropic".into(),
+                        message: format!("stream error: {}", e),
+                    })],
+                };
+                futures::future::ready(Some(emitted))
             })
             .flat_map(futures::stream::iter);
+
+        // Wrap the raw SSE stream for inline tool-call extraction.
+        // Models like MiniMax M2.7 emit tool calls as text in
+        // `content_block_delta` events, not as structured `tool_use`
+        // blocks. Buffer content deltas and run `extract_streaming_tail`
+        // at end-of-stream to recover them.
+        let quirks = self.quirks;
+        let chunk_stream = futures::stream::unfold(
+            (
+                Box::pin(raw_chunks)
+                    as std::pin::Pin<Box<dyn futures::Stream<Item = Result<LlmChunk>> + Send>>,
+                String::new(),
+                false,
+                quirks,
+            ),
+            |(mut inner, mut content_buf, mut saw_structured, quirks)| async move {
+                let item = inner.next().await?;
+                let extra = match &item {
+                    Ok(chunk) => {
+                        if !chunk.delta.is_empty() && !chunk.is_thinking {
+                            content_buf.push_str(&chunk.delta);
+                        }
+                        if !chunk.tool_calls.is_empty() {
+                            saw_structured = true;
+                        }
+                        if chunk.is_final {
+                            quirks::extract_streaming_tail(&quirks, &content_buf, saw_structured)
+                        } else {
+                            None
+                        }
+                    }
+                    Err(_) => None,
+                };
+                let mut out = vec![item];
+                if let Some(tail) = extra {
+                    out.push(Ok(tail));
+                }
+                Some((
+                    futures::stream::iter(out),
+                    (inner, content_buf, saw_structured, quirks),
+                ))
+            },
+        )
+        .flatten();
 
         Ok(Box::pin(chunk_stream))
     }
@@ -304,6 +359,65 @@ impl LlmProvider for AnthropicProvider {
     fn supports_documents(&self) -> bool {
         self.supports_documents
     }
+}
+
+/// Convert the executor's internal Structured envelope into valid Anthropic
+/// API content blocks. Without this, inline-extracted tool calls (MiniMax
+/// M2.7, Qwen) produce garbled conversation history that the model can't
+/// connect tool results to → infinite loops.
+///
+/// Two envelope shapes exist in the conversation:
+///
+/// **Assistant turn** — `{"text":"...", "tool_calls":[...], "reasoning_content":"..."}`
+/// → `[{"type":"text","text":"..."},{"type":"tool_use","id":"...","name":"...","input":{...}},...]`
+///
+/// **Tool result** — `{"tool_call_id":"...", "content":"..."}`
+/// → `[{"type":"tool_result","tool_use_id":"...","content":"..."}]`
+fn structured_to_anthropic_content(
+    v: &serde_json::Value,
+    is_assistant: bool,
+    is_tool: bool,
+) -> serde_json::Value {
+    if is_assistant {
+        if let Some(text) = v.get("text").and_then(|t| t.as_str()) {
+            let mut blocks: Vec<serde_json::Value> = Vec::new();
+            if !text.is_empty() {
+                blocks.push(serde_json::json!({"type": "text", "text": text}));
+            }
+            if let Some(calls) = v.get("tool_calls").and_then(|c| c.as_array()) {
+                for call in calls {
+                    let id = call.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                    let name = call.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                    let input = call
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or(serde_json::json!({}));
+                    blocks.push(serde_json::json!({
+                        "type": "tool_use",
+                        "id": id,
+                        "name": name,
+                        "input": input,
+                    }));
+                }
+            }
+            if blocks.is_empty() {
+                blocks.push(serde_json::json!({"type": "text", "text": ""}));
+            }
+            return serde_json::Value::Array(blocks);
+        }
+    }
+    if is_tool {
+        if let Some(tool_call_id) = v.get("tool_call_id").and_then(|i| i.as_str()) {
+            let content = v.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            return serde_json::json!([{
+                "type": "tool_result",
+                "tool_use_id": tool_call_id,
+                "content": content,
+            }]);
+        }
+    }
+    // Unrecognized Structured shape — pass through as-is (backwards compat).
+    v.clone()
 }
 
 /// Build the Claude `content` array for a multimodal user turn.
@@ -333,6 +447,22 @@ fn anthropic_multimodal_blocks(text: &str, images: &[ImageInput]) -> serde_json:
         }));
     }
     serde_json::Value::Array(blocks)
+}
+
+/// Drain every complete SSE event from `buffer`. Events are delimited by a
+/// blank line (`\n\n`). Partial events (bytes after the last `\n\n`) stay
+/// in the buffer for the next TCP chunk to complete. This prevents the
+/// per-chunk parsing bug where a JSON payload split across two TCP
+/// segments yields two fragments that both fail `serde_json::from_str`.
+fn drain_complete_sse_events(buffer: &mut Vec<u8>) -> Vec<Result<LlmChunk>> {
+    let mut out = Vec::new();
+    while let Some(end) = buffer.windows(2).position(|w| w == b"\n\n") {
+        let event_bytes: Vec<u8> = buffer.drain(..end).collect();
+        buffer.drain(..2); // drop the `\n\n` terminator
+        let event_text = String::from_utf8_lossy(&event_bytes);
+        out.extend(parse_sse_chunks(&event_text));
+    }
+    out
 }
 
 /// Parse SSE text into LlmChunk results.

@@ -36,6 +36,7 @@ pub fn default_slug_for_family(family: ModelFamily) -> &'static str {
         ModelFamily::Gemma4Local => "gemma-4-27b-it",
         ModelFamily::KimiK26Cloud => "kimi-k2-6",
         ModelFamily::MiniMaxM25Cloud => "minimax-m2-5",
+        ModelFamily::MiniMaxM27Cloud => "minimax-m2.7",
         ModelFamily::Llama32Instruct => "llama-3.2-90b-vision-instruct",
         ModelFamily::Llama33Instruct => "meta-llama/Llama-3.3-70B-Instruct",
         ModelFamily::Llama4Instruct => "llama-4-maverick-17b-128e-instruct",
@@ -159,6 +160,14 @@ pub fn quirks_for_family(family: ModelFamily) -> ModelQuirks {
             ..ModelQuirks::default()
         },
 
+        // MiniMax M2.7 cloud: bracket-delimited tool calls with Ruby-hash
+        // body and CLI-flag-style args, inline think tags.
+        ModelFamily::MiniMaxM27Cloud => ModelQuirks {
+            tool_extraction: ToolExtractionStrategy::MiniMaxM27Bracket,
+            reasoning_surface: ReasoningSurface::InlineThinkTags,
+            ..ModelQuirks::default()
+        },
+
         // Llama 3.2 (Vision / 70B class) and Llama 3.3 70B instruct: inline
         // JSON-array tool calls `[{"name":..., "parameters":{...}}]`.
         // (Llama 3.2 1B / 3B emit pythonic instead — see below.)
@@ -268,6 +277,12 @@ const BUILTIN_SLUG_QUIRKS: &[(&str, &str, ModelFamily)] = &[
     ("google", "gemini-3-pro*", ModelFamily::Gemini3Pro),
     ("google", "gemini-3-flash*", ModelFamily::Gemini3Flash),
     ("google", "gemini-3.0-flash*", ModelFamily::Gemini3Flash),
+    // M2.7 before the M2.5 wildcard (first-match-wins).
+    (
+        "minimax_anthropic",
+        "minimax-m2.7*",
+        ModelFamily::MiniMaxM27Cloud,
+    ),
     (
         "minimax_anthropic",
         "minimax-m2*",
@@ -286,6 +301,8 @@ const BUILTIN_SLUG_QUIRKS: &[(&str, &str, ModelFamily)] = &[
     ("opencode_go", "deepseek-chat", ModelFamily::DeepSeekV4Chat),
     ("opencode_go", "kimi-k2*", ModelFamily::KimiK26Cloud),
     ("opencode_go", "qwen3-coder*", ModelFamily::Qwen3CoderNext),
+    // M2.7 before the M2.5 wildcard (first-match-wins).
+    ("opencode_go", "minimax-m2.7*", ModelFamily::MiniMaxM27Cloud),
     ("opencode_go", "minimax-m2*", ModelFamily::MiniMaxM25Cloud),
     // glm-4.6 and mimo-7b have no profiled family yet — they fall through
     // to None and inherit the Connection's family (Default for opencode_go,
@@ -443,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn minimax_uses_vendor_tagged_xml() {
+    fn minimax_m25_uses_vendor_tagged_xml() {
         let q = quirks_for_family(ModelFamily::MiniMaxM25Cloud);
         match q.tool_extraction {
             ToolExtractionStrategy::InlineXmlVendorTagged(prefix) => {
@@ -451,6 +468,13 @@ mod tests {
             }
             other => panic!("expected vendor-tagged XML, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn minimax_m27_uses_bracket_extraction() {
+        let q = quirks_for_family(ModelFamily::MiniMaxM27Cloud);
+        assert_eq!(q.tool_extraction, ToolExtractionStrategy::MiniMaxM27Bracket);
+        assert_eq!(q.reasoning_surface, ReasoningSurface::InlineThinkTags);
     }
 
     // -----------------------------------------------------------------------
@@ -471,11 +495,11 @@ mod tests {
 
     #[test]
     fn slug_lookup_picks_minimax_for_relay_anthropic_wire() {
-        // Same Connection, different wire family — exactly the case that
-        // breaks per-Connection quirks dispatch.
+        // M2.7 resolves to its own family (bracket tool-call format).
         let q = lookup_slug_quirks("opencode_go", "minimax-m2.7").unwrap();
-        assert_eq!(q.family, ModelFamily::MiniMaxM25Cloud);
+        assert_eq!(q.family, ModelFamily::MiniMaxM27Cloud);
 
+        // M2.5 still resolves to the M2.5 family (vendor-tagged XML).
         let q = lookup_slug_quirks("opencode_go", "minimax-m2.5").unwrap();
         assert_eq!(q.family, ModelFamily::MiniMaxM25Cloud);
     }
@@ -484,7 +508,7 @@ mod tests {
     fn slug_lookup_is_case_insensitive_both_sides() {
         // User-typed casings — MiniMax-M2.7 was the original failure mode.
         let q = lookup_slug_quirks("OpenCode_Go", "MiniMax-M2.7").unwrap();
-        assert_eq!(q.family, ModelFamily::MiniMaxM25Cloud);
+        assert_eq!(q.family, ModelFamily::MiniMaxM27Cloud);
         let q = lookup_slug_quirks("ANTHROPIC", "Claude-Opus-4-7").unwrap();
         assert_eq!(q.family, ModelFamily::ClaudeOpus47);
     }
@@ -529,5 +553,22 @@ mod tests {
         // reorder breaks loudly.
         let q = lookup_slug_quirks("opencode_go", "deepseek-v4-flash").unwrap();
         assert_eq!(q.family, ModelFamily::DeepSeekV4Chat);
+    }
+
+    #[test]
+    fn slug_lookup_minimax_m27_on_minimax_anthropic_connection() {
+        let q = lookup_slug_quirks("minimax_anthropic", "minimax-m2.7").unwrap();
+        assert_eq!(q.family, ModelFamily::MiniMaxM27Cloud);
+
+        // M2.5 still resolves to the old family on the same connection.
+        let q = lookup_slug_quirks("minimax_anthropic", "minimax-m2.5").unwrap();
+        assert_eq!(q.family, ModelFamily::MiniMaxM25Cloud);
+    }
+
+    #[test]
+    fn slug_lookup_minimax_m27_prefix_match_dated_variant() {
+        // E.g. "minimax-m2.7-20260601" should still match M2.7.
+        let q = lookup_slug_quirks("opencode_go", "minimax-m2.7-20260601").unwrap();
+        assert_eq!(q.family, ModelFamily::MiniMaxM27Cloud);
     }
 }

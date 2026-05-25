@@ -133,6 +133,28 @@ fn extract_think_tags(text: &str) -> (String, String) {
     (content.trim().to_string(), thinking)
 }
 
+/// Strip inline tool-call markup from streaming content when tool calls
+/// were recovered by the provider's `extract_streaming_tail`. Covers the
+/// known inline formats — `[TOOL_CALL]...[/TOOL_CALL]` (MiniMax M2.7) and
+/// `<tool_call>...</tool_call>` (Qwen/Hermes).
+fn strip_inline_tool_markup(text: &str) -> String {
+    let mut result = text.to_string();
+    for (open, close) in [
+        ("[TOOL_CALL]", "[/TOOL_CALL]"),
+        ("<tool_call>", "</tool_call>"),
+    ] {
+        while let Some(start) = result.find(open) {
+            if let Some(rel_end) = result[start..].find(close) {
+                let end = start + rel_end + close.len();
+                result = format!("{}{}", &result[..start], &result[end..]);
+            } else {
+                break;
+            }
+        }
+    }
+    result.trim().to_string()
+}
+
 /// Clean up model responses that are wrapped in JSON or empty.
 ///
 /// Small/local models sometimes output JSON like `{"response": "text"}` or
@@ -1438,6 +1460,17 @@ impl DefaultExecutor {
                 "collected reasoning/thinking content from stream"
             );
         }
+
+        // When tool calls were recovered from inline markup (streaming
+        // tail extraction), strip the raw tags from the persisted content.
+        // The markup was already streamed as text deltas (cosmetic leak
+        // inherent to streaming + inline extraction) but the conversation
+        // history and subsequent LLM turns should be clean prose.
+        let final_content = if !tool_calls_collected.is_empty() {
+            strip_inline_tool_markup(&final_content)
+        } else {
+            final_content
+        };
 
         Ok(StreamResult {
             content: final_content,

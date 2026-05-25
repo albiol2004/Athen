@@ -58,6 +58,10 @@ pub enum ToolExtractionStrategy {
     /// Mistral local: `[TOOL_CALLS]` (or another fixed token) followed by
     /// JSON. The `&'static str` is the literal token.
     SpecialTokenBlock(&'static str),
+    /// MiniMax M2.7 bracket format:
+    /// `[TOOL_CALL] {tool => "NAME", args => {--key "value" ...}} [/TOOL_CALL]`.
+    /// Ruby-hash body with CLI-flag-style args. Multiple blocks per response.
+    MiniMaxM27Bracket,
 }
 
 /// Where the model puts its chain-of-thought in the response.
@@ -220,6 +224,16 @@ pub fn apply_to_response(quirks: &ModelQuirks, response: &mut LlmResponse) {
                     }
                 }
             }
+            ToolExtractionStrategy::MiniMaxM27Bracket => {
+                let (stripped, calls) = extractors::extract_minimax_m27_bracket(&response.content);
+                if !calls.is_empty() {
+                    response.content = stripped;
+                    response.tool_calls = calls;
+                    response.finish_reason = athen_core::llm::FinishReason::ToolUse;
+                }
+                // No reasoning_content fallback needed — M2.7 doesn't route
+                // tool calls through reasoning_content.
+            }
             // Other inline strategies land in later slices.
             ToolExtractionStrategy::InlineXmlVendorTagged(_)
             | ToolExtractionStrategy::InlineJsonLlama
@@ -297,6 +311,9 @@ pub fn extract_streaming_tail(
     let (_, calls) = match quirks.tool_extraction {
         ToolExtractionStrategy::InlineXmlQwenStyle => {
             extractors::extract_qwen_style(buffered_content)
+        }
+        ToolExtractionStrategy::MiniMaxM27Bracket => {
+            extractors::extract_minimax_m27_bracket(buffered_content)
         }
         // Other inline strategies land in later slices.
         _ => return None,
