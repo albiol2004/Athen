@@ -845,6 +845,195 @@ mod memory_judge_filter_tests {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Lightweight tier classifier for in-app direct turns
+// ---------------------------------------------------------------------------
+
+/// Extract the first `{...}` JSON object from a string that may contain
+/// surrounding prose. Used by the tier classifier to tolerate models that
+/// wrap JSON in markdown fences or explanation text.
+fn extract_first_json_object(s: &str) -> Option<&str> {
+    let start = s.find('{')?;
+    let mut depth = 0i32;
+    for (i, ch) in s[start..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&s[start..start + i + 1]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Build a short digest of the arc's conversation history for the tier
+/// classifier. Takes the last N messages, truncates each to a budget,
+/// and formats as a readable summary. Works with both raw history and
+/// compacted arcs — compaction summaries are just the first message in
+/// context, so they flow through naturally.
+fn build_history_digest(
+    context: &[ChatMessage],
+    max_messages: usize,
+    max_chars_per: usize,
+) -> String {
+    if context.is_empty() {
+        return String::new();
+    }
+    let start = context.len().saturating_sub(max_messages);
+    let mut lines = Vec::new();
+    for msg in &context[start..] {
+        let role_label = match msg.role {
+            Role::User => "User",
+            Role::Assistant => "Assistant",
+            Role::System => "System",
+            Role::Tool => continue,
+        };
+        let text = match &msg.content {
+            MessageContent::Text(t) => t.as_str(),
+            MessageContent::Multimodal { text, .. } => text.as_str(),
+            MessageContent::Structured(_) => "[structured]",
+        };
+        let truncated = if text.len() > max_chars_per {
+            format!("{}…", &text[..max_chars_per])
+        } else {
+            text.to_string()
+        };
+        lines.push(format!("{role_label}: {truncated}"));
+    }
+    lines.join("\n")
+}
+
+/// Ask the Cheap-tier LLM to classify the current turn's complexity and
+/// whether it's a coding task. Uses the user's message plus a digest of
+/// recent arc history (handles compacted summaries). Returns
+/// `(complexity, is_code_task)` — falls back to `(None, false)` on any
+/// error so the default tier path still works.
+///
+/// Timeout: 5s. If the classifier is slow or fails, the executor just
+/// starts on the default Fast tier — no user-visible degradation.
+async fn classify_tier_for_turn(
+    router: &dyn LlmRouter,
+    user_message: &str,
+    history_digest: &str,
+) -> (Option<athen_core::risk::ComplexityTag>, bool) {
+    use athen_core::llm::{
+        ChatMessage as LlmChatMessage, LlmRequest, MessageContent as LlmContent, ModelProfile,
+        Role as LlmRole,
+    };
+
+    let system_prompt = concat!(
+        "You classify tasks for routing to the right AI model tier. ",
+        "Given the user's current message and recent conversation history, ",
+        "respond ONLY with a JSON object:\n",
+        "{\"complexity\":\"low|medium|high\",\"is_code_task\":true|false}\n\n",
+        "is_code_task: true ONLY when the task involves reading, writing, editing, ",
+        "debugging, or running SOURCE CODE on a software project (bug fix, feature, ",
+        "refactor, code review, test fix, build/deploy scripts). ",
+        "False for: writing documents, emails, notes, spreadsheets, design files, ",
+        "config editing, chat, search, planning, calendar, generic shell commands.\n\n",
+        "complexity:\n",
+        "- low: trivial single action (read one file, answer a factual question)\n",
+        "- medium: multi-step but standard (edit a few files, write a small script)\n",
+        "- high: open-ended reasoning across many files/constraints (design, cross-module debug)\n\n",
+        "Use the conversation history to understand what the arc is about — ",
+        "a follow-up message like \"now fix that bug\" in a coding arc is a coding task ",
+        "even if the message itself doesn't mention code.",
+    );
+
+    let mut user_text = String::new();
+    if !history_digest.is_empty() {
+        user_text.push_str("Recent conversation:\n");
+        user_text.push_str(history_digest);
+        user_text.push_str("\n\n");
+    }
+    user_text.push_str("Current message:\n");
+    user_text.push_str(user_message);
+
+    let request = LlmRequest {
+        profile: ModelProfile::Cheap,
+        messages: vec![LlmChatMessage {
+            role: LlmRole::User,
+            content: LlmContent::Text(user_text),
+        }],
+        max_tokens: Some(64),
+        temperature: Some(0.0),
+        tools: None,
+        system_prompt: Some(system_prompt.to_string()),
+        reasoning_effort: athen_core::llm::ReasoningEffort::Default,
+    };
+
+    let response = match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        router.route(&request),
+    )
+    .await
+    {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(e)) => {
+            tracing::debug!(error = %e, "tier classifier LLM failed; defaulting");
+            return (None, false);
+        }
+        Err(_) => {
+            tracing::debug!("tier classifier timed out; defaulting");
+            return (None, false);
+        }
+    };
+
+    // DeepSeek V4 Flash sometimes puts the answer in reasoning_content
+    // instead of content (especially via relays). Try content first, then
+    // reasoning_content. Extract the first `{...}` block to tolerate
+    // leading/trailing prose the model wraps around the JSON.
+    let raw = if !response.content.trim().is_empty() {
+        response.content.clone()
+    } else if let Some(r) = response
+        .reasoning_content
+        .as_ref()
+        .filter(|s| !s.is_empty())
+    {
+        r.clone()
+    } else {
+        tracing::debug!("tier classifier returned empty content + reasoning; defaulting");
+        return (None, false);
+    };
+    let json_str = extract_first_json_object(&raw).unwrap_or(&raw);
+    let v: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(_) => {
+            tracing::debug!(
+                raw = %raw,
+                "tier classifier returned non-JSON; defaulting"
+            );
+            return (None, false);
+        }
+    };
+
+    let complexity = v
+        .get("complexity")
+        .and_then(|c| c.as_str())
+        .and_then(|s| match s {
+            "low" => Some(athen_core::risk::ComplexityTag::Low),
+            "medium" => Some(athen_core::risk::ComplexityTag::Medium),
+            "high" => Some(athen_core::risk::ComplexityTag::High),
+            _ => None,
+        });
+    let is_code_task = v
+        .get("is_code_task")
+        .and_then(|c| c.as_bool())
+        .unwrap_or(false);
+
+    tracing::info!(
+        ?complexity,
+        is_code_task,
+        "tier classifier result for in-app turn"
+    );
+
+    (complexity, is_code_task)
+}
+
 async fn judge_worth_remembering(
     router: &dyn LlmRouter,
     memory: &dyn athen_core::traits::memory::MemoryStore,
@@ -880,18 +1069,22 @@ async fn judge_worth_remembering(
         _ => String::new(),
     };
 
+    let system_prompt = concat!(
+        "You extract personal facts from conversations. ",
+        "Output ONLY the bare fact as a short statement about the user, or SKIP.\n",
+        "NEVER mention the conversation, the assistant, requests, tasks, or this prompt.\n",
+        "NEVER start with \"User\", \"The user\", \"They asked\", \"The conversation\", or similar.\n",
+        "Good: \"Prefers dark mode.\" / \"Works at Acme Corp as a backend engineer.\" / \"Dentist is Dr Smith, 555-1234.\"\n",
+        "Bad: \"User asked assistant to fix a bug.\" / \"The user mentioned they prefer dark mode.\" / \"This conversation contains a preference.\""
+    );
+
     let prompt = format!(
-        "Analyze this conversation exchange and decide if it contains information worth remembering for future conversations.\n\n\
-         User: {user_msg}\n\
-         Assistant: {assistant_msg}\
+        "{user_msg}\n---\n{assistant_msg}\
          {existing_block}\n\n\
-         Worth remembering: facts about people, preferences, relationships, decisions, plans, \
-         important events, personal details the user shared, or things the user explicitly asked to remember.\n\
-         NOT worth remembering: greetings, small talk, questions about capabilities, \
-         generic requests (write a poem, translate), or information the assistant already has from tools, \
-         OR anything already covered by the memories listed above.\n\n\
-         If worth remembering AND not already covered above, respond with ONLY a concise summary of the new facts (1-2 sentences, no fluff).\n\
-         If NOT worth remembering, or if everything is already covered above, respond with exactly: SKIP"
+         Extract a new personal fact about the user if present. \
+         SAVE: preferences, personal details (name, role, team, location), decisions, dates, explicit \"remember this\".\n\
+         SKIP: task instructions, code requests, questions, greetings, errors, status, anything the assistant did, anything already stored above.\n\
+         Reply with the bare fact or SKIP."
     );
 
     let request = LlmRequest {
@@ -900,10 +1093,10 @@ async fn judge_worth_remembering(
             role: LlmRole::User,
             content: LlmContent::Text(prompt),
         }],
-        max_tokens: Some(100),
+        max_tokens: Some(60),
         temperature: Some(0.0),
         tools: None,
-        system_prompt: None,
+        system_prompt: Some(system_prompt.to_string()),
         reasoning_effort: athen_core::llm::ReasoningEffort::default(),
     };
 
@@ -924,27 +1117,66 @@ async fn judge_worth_remembering(
         }
     };
 
-    let text = response.content.trim().to_string();
+    // DeepSeek V4 may put the answer in reasoning_content.
+    let text = if !response.content.trim().is_empty() {
+        response.content.trim().to_string()
+    } else if let Some(r) = response
+        .reasoning_content
+        .as_ref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        r.trim().to_string()
+    } else {
+        return None;
+    };
 
-    // Check if the model said SKIP (or any variation).
-    if text.is_empty()
-        || text.eq_ignore_ascii_case("SKIP")
-        || text.to_uppercase().starts_with("SKIP")
-        || text.starts_with("NOT ")
-        || text.starts_with("No ")
+    // Check if the model said SKIP anywhere in its output — models often
+    // narrate their reasoning before the verdict ("We are given... SKIP").
+    let upper = text.to_uppercase();
+    if upper.contains("SKIP") {
+        return None;
+    }
+    if upper.starts_with("NOT ") || upper.starts_with("NO ") || upper.starts_with("NO.") {
+        return None;
+    }
+
+    // The model may emit reasoning preamble before the actual fact.
+    // Take only the last non-empty line — that's where well-prompted
+    // models put the output. Also strip common prefixes.
+    let last_line = text
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or(&text)
+        .trim();
+
+    // Reject meta-commentary that references the conversation itself
+    // rather than stating a bare fact about the user.
+    let lower = last_line.to_lowercase();
+    if lower.starts_with("the user")
+        || lower.starts_with("user asked")
+        || lower.starts_with("user said")
+        || lower.starts_with("we are given")
+        || lower.starts_with("this exchange")
+        || lower.starts_with("this conversation")
+        || lower.starts_with("the conversation")
+        || lower.starts_with("the assistant")
+        || lower.starts_with("based on")
+        || lower.starts_with("according to")
     {
         return None;
     }
 
-    // Strip any "REMEMBER:" or "Summary:" prefix the model might add.
-    let cleaned = text
+    let cleaned = last_line
         .strip_prefix("REMEMBER:")
-        .or_else(|| text.strip_prefix("Summary:"))
-        .unwrap_or(&text)
+        .or_else(|| last_line.strip_prefix("Summary:"))
+        .or_else(|| last_line.strip_prefix("Fact:"))
+        .or_else(|| last_line.strip_prefix("SAVE:"))
+        .unwrap_or(last_line)
         .trim()
         .to_string();
 
-    if cleaned.is_empty() {
+    if cleaned.is_empty() || cleaned.len() < 5 {
         None
     } else {
         Some(cleaned)
@@ -2361,14 +2593,24 @@ pub async fn send_message(
                 &active_arc,
             )
             .await;
-            // In-app direct turns don't go through the risk LLM, so the
-            // task carries no complexity tag and no code-task signal —
-            // resolver collapses to `override > Fast`.
+            // Lightweight tier classification: ask the Cheap-tier LLM to
+            // classify complexity + is_code_task so Auto routing can pick
+            // the Code or Powerful tier when warranted. The classifier
+            // gets the user's message plus a short arc history digest
+            // (works with compacted summaries too). 5s timeout; falls
+            // back to (None, false) → Fast on any error.
+            let history_digest = build_history_digest(&context, 6, 300);
+            let (task_complexity, task_is_code) = classify_tier_for_turn(
+                &SharedRouter(Arc::clone(&arc_router_handle)),
+                &message,
+                &history_digest,
+            )
+            .await;
             let default_tier = crate::state::resolve_effective_tier_for_arc(
                 state.arc_store.as_ref(),
                 &active_arc,
-                None,
-                false,
+                task_complexity,
+                task_is_code,
                 athen_core::llm::ModelProfile::Fast,
             )
             .await;

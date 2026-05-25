@@ -86,11 +86,16 @@ pub fn quirks_for_family(family: ModelFamily) -> ModelQuirks {
             ..ModelQuirks::default()
         },
 
-        // DeepSeek V4 chat / V4 Pro (non-thinking mode): structured tool
-        // calls, no reasoning surface, control-char repair on streaming
-        // tool args. If the user enables thinking mode on either model,
-        // they should pick `DeepSeekR1` instead (same wire shape).
+        // DeepSeek V4 chat / V4 Pro: structured tool calls, control-char
+        // repair on streaming tool args. `SeparateField` reasoning surface
+        // because V4 Flash/Pro return `reasoning_content` even without
+        // explicit thinking-mode — the OpenCode Go relay and the native
+        // DeepSeek API both surface it. Without promotion, turns where
+        // the model reasons but produces no text content arrive empty and
+        // the executor falls back to the "I don't have enough information"
+        // placeholder.
         ModelFamily::DeepSeekV4Chat | ModelFamily::DeepSeekV4Pro => ModelQuirks {
+            reasoning_surface: ReasoningSurface::SeparateField,
             tool_arg_repair: ToolArgRepair {
                 control_chars_to_unicode_escape: true,
                 ..ToolArgRepair::empty()
@@ -423,13 +428,13 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_v4_pro_uses_control_char_repair_no_reasoning() {
-        // V4 Pro non-thinking shares the V4 chat shape: structured tool
-        // calls + control-char repair, no reasoning surface. (Thinking-mode
-        // users pick `DeepSeekR1` instead — same wire shape.)
+    fn deepseek_v4_pro_uses_control_char_repair_and_separate_reasoning() {
+        // V4 Flash / Pro return `reasoning_content` even without explicit
+        // thinking mode. `SeparateField` ensures reasoning-only turns get
+        // promoted to content instead of arriving empty.
         let q = quirks_for_family(ModelFamily::DeepSeekV4Pro);
         assert_eq!(q.tool_extraction, ToolExtractionStrategy::Structured);
-        assert_eq!(q.reasoning_surface, ReasoningSurface::None);
+        assert_eq!(q.reasoning_surface, ReasoningSurface::SeparateField);
         assert!(q.tool_arg_repair.control_chars_to_unicode_escape);
     }
 
