@@ -233,7 +233,23 @@ pub(crate) fn load_models_config() -> ModelsConfig {
         if path.exists() {
             match std::fs::read_to_string(&path) {
                 Ok(content) => match toml::from_str::<ModelsConfig>(&content) {
-                    Ok(cfg) => return cfg,
+                    Ok(mut cfg) => {
+                        // First-load Bundles migration: if the user has a
+                        // legacy active_provider + tier_models shape but
+                        // no bundles yet, synthesise the Default Bundle
+                        // and persist it back so the resolver and UI both
+                        // see the same state on the next read.
+                        if let Some(id) = cfg.synthesize_default_bundle_if_empty() {
+                            info!(
+                                "Synthesised Default Bundle {} from legacy active_provider",
+                                id
+                            );
+                            if let Err(e) = save_models_config(&cfg) {
+                                warn!("Failed to persist synthesised Default Bundle: {e}");
+                            }
+                        }
+                        return cfg;
+                    }
                     Err(e) => warn!("Failed to parse models.toml: {e}"),
                 },
                 Err(e) => warn!("Failed to read models.toml: {e}"),
@@ -536,7 +552,7 @@ pub(crate) fn default_model(id: &str) -> &str {
         "opencode_go" => "deepseek-v4-flash",
         // MiniMax Token Plan: M2.7 is the newest flagship; Starter tier
         // exposes only this model, higher tiers add the full lineup.
-        "minimax" | "minimax_anthropic" => "MiniMax-M2.7",
+        "minimax" | "minimax_anthropic" => "minimax-m2.7",
         "ollama" => "llama3",
         "llamacpp" => "default",
         _ => "",
@@ -670,15 +686,116 @@ fn default_tier_slugs(id: &str) -> (&'static str, &'static str, &'static str, &'
             "deepseek-v4-pro",
         ),
         "minimax" | "minimax_anthropic" => (
-            "MiniMax-M2.7",
-            "MiniMax-M2.7",
-            "MiniMax-M2.7",
-            "MiniMax-M2.7",
+            "minimax-m2.7",
+            "minimax-m2.7",
+            "minimax-m2.7",
+            "minimax-m2.7",
         ),
         // Local providers leave tiers empty by default — the user only
         // has one model loaded most of the time.
         _ => ("", "", "", ""),
     }
+}
+
+/// Curated model catalog per provider — `(slug, display_name)` pairs the
+/// Bundles UI offers in a dropdown alongside a "Custom..." escape hatch.
+///
+/// Goal is breadth of "what users actually pick", not exhaustive coverage.
+/// Live `/models` enumeration is Phase 3; this static list ships now so
+/// users stop guessing slug spellings. Empty slice = "no curated picks,
+/// user types a custom slug" (used for local providers).
+pub(crate) fn curated_models(id: &str) -> &'static [(&'static str, &'static str)] {
+    match id {
+        "deepseek" => &[
+            ("deepseek-v4-flash", "DeepSeek V4 Flash"),
+            ("deepseek-v4-pro", "DeepSeek V4 Pro"),
+            ("deepseek-chat", "DeepSeek Chat (legacy)"),
+            ("deepseek-reasoner", "DeepSeek Reasoner (legacy)"),
+        ],
+        "anthropic" => &[
+            ("claude-haiku-4-5-20251001", "Claude Haiku 4.5"),
+            ("claude-sonnet-4-6", "Claude Sonnet 4.6"),
+            ("claude-opus-4-7", "Claude Opus 4.7"),
+        ],
+        "google" => &[
+            ("gemini-3.1-flash-lite-preview", "Gemini 3.1 Flash Lite"),
+            ("gemini-3.1-flash-preview", "Gemini 3.1 Flash"),
+            ("gemini-3.1-pro-preview", "Gemini 3.1 Pro"),
+            ("gemini-3-flash-preview", "Gemini 3 Flash (legacy)"),
+            ("gemini-2.5-pro", "Gemini 2.5 Pro (legacy)"),
+        ],
+        "openai" => &[
+            ("gpt-5.4-nano", "GPT-5.4 Nano"),
+            ("gpt-5.4-mini", "GPT-5.4 Mini"),
+            ("gpt-5.5", "GPT-5.5"),
+            ("gpt-5.5-pro", "GPT-5.5 Pro"),
+            ("o4-mini", "o4-mini (reasoning)"),
+            ("gpt-4o", "GPT-4o (legacy)"),
+        ],
+        "mistral" => &[
+            ("ministral-3b-latest", "Ministral 3B"),
+            ("ministral-8b-latest", "Ministral 8B"),
+            ("mistral-small-latest", "Mistral Small"),
+            ("mistral-large-latest", "Mistral Large"),
+            ("codestral-latest", "Codestral"),
+        ],
+        "openrouter" => &[
+            ("openai/gpt-5.4-mini", "OpenAI GPT-5.4 Mini"),
+            ("openai/gpt-5.5", "OpenAI GPT-5.5"),
+            ("openai/gpt-5.5-pro", "OpenAI GPT-5.5 Pro"),
+            ("anthropic/claude-haiku-4-5", "Anthropic Claude Haiku 4.5"),
+            ("anthropic/claude-sonnet-4-6", "Anthropic Claude Sonnet 4.6"),
+            ("anthropic/claude-opus-4-7", "Anthropic Claude Opus 4.7"),
+            (
+                "google/gemini-3.1-flash-lite",
+                "Google Gemini 3.1 Flash Lite",
+            ),
+            ("google/gemini-3.1-pro", "Google Gemini 3.1 Pro"),
+            ("deepseek/deepseek-v4", "DeepSeek V4"),
+            ("meta-llama/llama-4-70b-instruct", "Meta Llama 4 70B"),
+            ("qwen/qwen-3-72b-instruct", "Qwen 3 72B"),
+        ],
+        "opencode_go" => &[
+            ("deepseek-v4-flash", "DeepSeek V4 Flash"),
+            ("deepseek-v4-pro", "DeepSeek V4 Pro"),
+            ("kimi-k2", "Kimi K2"),
+            ("qwen3-coder-plus", "Qwen 3 Coder Plus"),
+            ("glm-4.6", "GLM 4.6"),
+            ("mimo-7b", "MiMo 7B"),
+            ("minimax-m2.7", "MiniMax M2.7 (Anthropic wire)"),
+        ],
+        "minimax" | "minimax_anthropic" => &[
+            ("minimax-m2.7", "MiniMax M2.7"),
+            ("minimax-m2.5", "MiniMax M2.5 (legacy)"),
+        ],
+        // Local providers: user picks whatever they pulled. The text input
+        // remains the only path.
+        _ => &[],
+    }
+}
+
+/// One catalog row returned to the frontend's Bundle dropdown.
+#[derive(Serialize)]
+pub struct ModelCatalogEntry {
+    pub slug: &'static str,
+    pub display_name: &'static str,
+}
+
+/// Return the curated `(slug, display_name)` list for a given Connection's
+/// provider id. The frontend uses this to populate the per-tier model
+/// dropdown in each Bundle card. Unknown ids return an empty list, which
+/// the UI treats as "show the text input only".
+#[tauri::command]
+pub async fn list_curated_models(
+    provider_id: String,
+) -> std::result::Result<Vec<ModelCatalogEntry>, String> {
+    Ok(curated_models(&provider_id)
+        .iter()
+        .map(|(slug, name)| ModelCatalogEntry {
+            slug,
+            display_name: name,
+        })
+        .collect())
 }
 
 /// Placeholder text for the API key field in the UI. Empty for local

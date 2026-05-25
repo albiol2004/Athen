@@ -176,71 +176,10 @@ impl AthenConfig {
         report
     }
 
-    /// First-load Bundles migration: synthesise a "Default" Bundle from
-    /// the legacy `active_provider + tier_models` shape so the new
-    /// resolver path has something to consult and existing users see
-    /// zero behavioural change.
-    ///
-    /// No-op when:
-    /// * `models.bundles` is already non-empty (user has Bundles).
-    /// * `assignments["active_provider"]` is missing (no provider chosen
-    ///   yet — first-run state; the onboarding wizard will write the
-    ///   Bundle directly).
-    /// * The active provider id is not in `models.providers` (broken
-    ///   config — leave it to the user to repair via Settings).
-    ///
-    /// Otherwise, builds one Bundle whose `tiers` contain every
-    /// [`ModelProfile`] variant — sourced from `provider.tier_models[tier]`
-    /// when present, falling back to `provider.default_model`. This
-    /// preserves today's behaviour exactly: the legacy code path falls
-    /// back to `default_model` whenever a tier is unmapped, and so does
-    /// the synthesised Bundle. Sparseness comes later when users edit.
-    ///
-    /// Returns the newly-created Bundle id when synthesis fired.
+    /// First-load Bundles migration on the embedded `models` field. See
+    /// [`ModelsConfig::synthesize_default_bundle_if_empty`] for the rules.
     pub fn synthesize_default_bundle_if_empty(&mut self) -> Option<Uuid> {
-        if !self.models.bundles.is_empty() {
-            return None;
-        }
-        let active_id = self.models.assignments.get("active_provider")?.clone();
-        let provider = self.models.providers.get(&active_id)?;
-
-        let default_slug = provider.default_model.clone();
-        let mut tiers: HashMap<ModelProfile, BundleTier> = HashMap::new();
-        for profile in [
-            ModelProfile::Cheap,
-            ModelProfile::Fast,
-            ModelProfile::Code,
-            ModelProfile::Powerful,
-            ModelProfile::Local,
-        ] {
-            let slug = provider
-                .tier_models
-                .get(&profile)
-                .cloned()
-                .unwrap_or_else(|| default_slug.clone());
-            tiers.insert(
-                profile,
-                BundleTier {
-                    connection_id: active_id.clone(),
-                    slug,
-                },
-            );
-        }
-
-        let now = Utc::now();
-        let bundle = Bundle {
-            id: Uuid::new_v4(),
-            name: DEFAULT_BUNDLE_NAME.to_string(),
-            created_at: now,
-            updated_at: now,
-            tiers,
-        };
-        let id = bundle.id;
-        self.models.bundles.insert(id.to_string(), bundle);
-        self.models
-            .assignments
-            .insert(ACTIVE_BUNDLE_KEY.to_string(), id.to_string());
-        Some(id)
+        self.models.synthesize_default_bundle_if_empty()
     }
 }
 
@@ -348,6 +287,72 @@ pub struct ModelsConfig {
     /// See `docs/BUNDLES.md`.
     #[serde(default)]
     pub bundles: HashMap<String, Bundle>,
+}
+
+impl ModelsConfig {
+    /// First-load Bundles migration: synthesise a "Default" Bundle from
+    /// the legacy `active_provider + tier_models` shape so the new
+    /// resolver path has something to consult and existing users see
+    /// zero behavioural change.
+    ///
+    /// No-op when:
+    /// * `bundles` is already non-empty (user has Bundles).
+    /// * `assignments["active_provider"]` is missing (no provider chosen
+    ///   yet — first-run state; the onboarding wizard will write the
+    ///   Bundle directly).
+    /// * The active provider id is not in `providers` (broken config —
+    ///   leave it to the user to repair via Settings).
+    ///
+    /// Otherwise, builds one Bundle whose `tiers` contain every
+    /// [`ModelProfile`] variant — sourced from `provider.tier_models[tier]`
+    /// when present, falling back to `provider.default_model`. Sparseness
+    /// comes later when users edit.
+    ///
+    /// Returns the newly-created Bundle id when synthesis fired.
+    pub fn synthesize_default_bundle_if_empty(&mut self) -> Option<Uuid> {
+        if !self.bundles.is_empty() {
+            return None;
+        }
+        let active_id = self.assignments.get("active_provider")?.clone();
+        let provider = self.providers.get(&active_id)?;
+
+        let default_slug = provider.default_model.clone();
+        let mut tiers: HashMap<ModelProfile, BundleTier> = HashMap::new();
+        for profile in [
+            ModelProfile::Cheap,
+            ModelProfile::Fast,
+            ModelProfile::Code,
+            ModelProfile::Powerful,
+            ModelProfile::Local,
+        ] {
+            let slug = provider
+                .tier_models
+                .get(&profile)
+                .cloned()
+                .unwrap_or_else(|| default_slug.clone());
+            tiers.insert(
+                profile,
+                BundleTier {
+                    connection_id: active_id.clone(),
+                    slug,
+                },
+            );
+        }
+
+        let now = Utc::now();
+        let bundle = Bundle {
+            id: Uuid::new_v4(),
+            name: DEFAULT_BUNDLE_NAME.to_string(),
+            created_at: now,
+            updated_at: now,
+            tiers,
+        };
+        let id = bundle.id;
+        self.bundles.insert(id.to_string(), bundle);
+        self.assignments
+            .insert(ACTIVE_BUNDLE_KEY.to_string(), id.to_string());
+        Some(id)
+    }
 }
 
 /// A named set of per-tier `(connection, slug)` picks. One is "active" at

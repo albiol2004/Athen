@@ -3212,7 +3212,11 @@ option:hover {
     color: var(--text-2);
 }
 .bundle-tier-row select.bundle-tier-connection {
-    flex: 0 0 200px;
+    flex: 0 0 180px;
+    min-width: 0;
+}
+.bundle-tier-row select.bundle-tier-model {
+    flex: 1 1 0;
     min-width: 0;
 }
 .bundle-tier-row input.bundle-tier-slug {

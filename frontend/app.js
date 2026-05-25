@@ -4688,7 +4688,7 @@ async function loadSettings() {
     try {
         const settings = await invoke('get_settings');
         renderProviders(settings.providers);
-        renderBundles(settings.bundles || [], settings.providers || []);
+        await renderBundles(settings.bundles || [], settings.providers || []);
         updateComposerVisionGate(settings.providers);
         securityModeEl.value = settings.security_mode;
         securityHintEl.textContent = SECURITY_HINTS[settings.security_mode] || '';
@@ -6490,7 +6490,79 @@ const BUNDLE_TIER_LABELS = {
     powerful: 'Powerful',
 };
 
-function renderBundles(bundles, providers) {
+// Sentinel value in the model-select dropdown signalling "user wants to
+// type their own slug". The accompanying text input becomes visible and
+// authoritative when this is selected.
+const BUNDLE_CUSTOM_SLUG_SENTINEL = '__custom__';
+
+// Provider id → curated [{slug, display_name}] cache. Populated lazily by
+// renderBundles before rendering any cards so every <select> can paint
+// synchronously.
+const curatedModelsCache = new Map();
+
+async function getCuratedModels(providerId) {
+    if (!providerId) return [];
+    if (curatedModelsCache.has(providerId)) return curatedModelsCache.get(providerId);
+    if (!invoke) {
+        curatedModelsCache.set(providerId, []);
+        return [];
+    }
+    try {
+        const list = await invoke('list_curated_models', { providerId });
+        const arr = Array.isArray(list) ? list : [];
+        curatedModelsCache.set(providerId, arr);
+        return arr;
+    } catch (err) {
+        console.warn('list_curated_models failed for', providerId, err);
+        curatedModelsCache.set(providerId, []);
+        return [];
+    }
+}
+
+function buildModelSelectOptions(curated, selectedSlug) {
+    let out = '<option value="">(unset)</option>';
+    let matched = false;
+    for (const m of curated) {
+        const sel = (m.slug === selectedSlug) ? ' selected' : '';
+        if (sel) matched = true;
+        out += `<option value="${escapeHtml(m.slug)}"${sel}>${escapeHtml(m.display_name)}</option>`;
+    }
+    // If the persisted slug isn't in the curated list (e.g. user typed a
+    // custom one earlier, or list churned), surface it as a one-off so
+    // the dropdown reflects current state instead of silently flipping to
+    // unset. We mark it as custom so the input stays visible.
+    if (selectedSlug && !matched) {
+        out += `<option value="${escapeHtml(selectedSlug)}" selected>${escapeHtml(selectedSlug)} (custom)</option>`;
+    }
+    const customSel = (!selectedSlug && curated.length === 0) ? ' selected' : '';
+    out += `<option value="${BUNDLE_CUSTOM_SLUG_SENTINEL}"${customSel}>Custom slug…</option>`;
+    return out;
+}
+
+async function rebuildTierModelSelect(row, providerId, currentSlug) {
+    const select = row.querySelector('.bundle-tier-model');
+    const customInput = row.querySelector('.bundle-tier-slug');
+    if (!select || !customInput) return;
+    const curated = await getCuratedModels(providerId);
+    select.innerHTML = buildModelSelectOptions(curated, currentSlug);
+    // When the user types a custom slug then changes Connection, the
+    // typed slug becomes meaningless under the new provider — clear and
+    // hide the input so they re-pick.
+    const matched = curated.some((m) => m.slug === currentSlug);
+    if (matched) {
+        customInput.value = currentSlug;
+        customInput.style.display = 'none';
+    } else if (currentSlug) {
+        // Carried-through custom slug — keep visible.
+        customInput.value = currentSlug;
+        customInput.style.display = '';
+    } else {
+        customInput.value = '';
+        customInput.style.display = curated.length === 0 ? '' : 'none';
+    }
+}
+
+async function renderBundles(bundles, providers) {
     if (!bundleListEl || !activeBundleSelectEl) return;
 
     // --- Active dropdown -----------------------------------------------
@@ -6525,6 +6597,19 @@ function renderBundles(bundles, providers) {
     };
 
     // --- Per-Bundle cards ----------------------------------------------
+    // Pre-warm the curated-models cache for every provider referenced by
+    // any Bundle so each tier <select> can paint synchronously inside
+    // createBundleCard. Misses fall through to an empty list (the row
+    // simply shows "Custom slug…" as the only option).
+    const providerIds = new Set(providers.map((p) => p.id));
+    for (const b of bundles) {
+        for (const t of BUNDLE_TIERS) {
+            const pick = b.tiers && b.tiers[t];
+            if (pick && pick.connection_id) providerIds.add(pick.connection_id);
+        }
+    }
+    await Promise.all(Array.from(providerIds).map((id) => getCuratedModels(id)));
+
     bundleListEl.innerHTML = '';
     for (const bundle of bundles) {
         bundleListEl.appendChild(createBundleCard(bundle, providers));
@@ -6610,12 +6695,46 @@ function createBundleCard(bundle, providers) {
         const row = document.createElement('div');
         row.className = 'provider-tier-row bundle-tier-row';
         row.dataset.tier = t;
+        // Cache lookup is synchronous because renderBundles pre-warmed
+        // every relevant provider id before this card was built.
+        const curated = curatedModelsCache.get(pick.connection_id) || [];
+        const slugMatched = pick.slug && curated.some((m) => m.slug === pick.slug);
+        const customVisible = !slugMatched && (pick.slug || curated.length === 0);
         row.innerHTML = `
             <span class="provider-tier-label">${BUNDLE_TIER_LABELS[t]}</span>
             <select class="bundle-tier-connection">${connectionOptions(pick.connection_id)}</select>
-            <input type="text" class="bundle-tier-slug" value="${escapeHtml(pick.slug || '')}" placeholder="model slug (e.g. deepseek-v4-flash)">
+            <select class="bundle-tier-model">${buildModelSelectOptions(curated, pick.slug || '')}</select>
+            <input type="text" class="bundle-tier-slug" value="${escapeHtml(pick.slug || '')}" placeholder="custom slug (e.g. deepseek-v4-flash)" style="${customVisible ? '' : 'display: none;'}">
         `;
         tierRows.appendChild(row);
+
+        const connSelect = row.querySelector('.bundle-tier-connection');
+        const modelSelect = row.querySelector('.bundle-tier-model');
+        const slugInput = row.querySelector('.bundle-tier-slug');
+
+        connSelect.addEventListener('change', () => {
+            const newProviderId = connSelect.value;
+            // Carry the typed slug across so the user doesn't lose it
+            // when toggling Connections; rebuild will preserve it as
+            // "(custom)" if it isn't curated under the new provider.
+            const carried = (modelSelect.value === BUNDLE_CUSTOM_SLUG_SENTINEL)
+                ? (slugInput.value || '')
+                : (modelSelect.value || '');
+            rebuildTierModelSelect(row, newProviderId, carried);
+        });
+
+        modelSelect.addEventListener('change', () => {
+            if (modelSelect.value === BUNDLE_CUSTOM_SLUG_SENTINEL) {
+                slugInput.style.display = '';
+                slugInput.focus();
+            } else {
+                // Mirror the picked slug into the hidden input so save
+                // can read a single source for "the picked slug" without
+                // branching on display state.
+                slugInput.value = modelSelect.value;
+                slugInput.style.display = 'none';
+            }
+        });
     }
     body.appendChild(tierRows);
 

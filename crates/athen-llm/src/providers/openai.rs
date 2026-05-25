@@ -158,6 +158,7 @@ impl OpenAiCompatibleProvider {
                 content: Some(serde_json::Value::String(system.clone())),
                 tool_call_id: None,
                 tool_calls: None,
+                reasoning_content: None,
             });
         }
 
@@ -170,9 +171,18 @@ impl OpenAiCompatibleProvider {
             };
 
             match (&m.role, &m.content) {
-                // Assistant messages with embedded tool_calls metadata.
+                // Assistant messages stored as a Structured envelope —
+                // carries tool_calls and/or reasoning_content alongside
+                // the text. Some upstreams behind this adapter (notably
+                // DeepSeek thinking-mode, reached directly or via the
+                // OpenCode Go OpenAI-compat wire) return HTTP 400 on the
+                // next call if the prior turn's reasoning_content isn't
+                // echoed back. The wire field is omitted entirely when
+                // absent, so non-thinking flows stay byte-identical.
                 (Role::Assistant, MessageContent::Structured(v))
-                    if v.get("tool_calls").is_some() =>
+                    if v.get("tool_calls").is_some()
+                        || v.get("reasoning_content").is_some()
+                        || v.get("text").is_some() =>
                 {
                     let text = v.get("text").and_then(|t| t.as_str()).unwrap_or_default();
                     let content = if text.is_empty() {
@@ -181,10 +191,17 @@ impl OpenAiCompatibleProvider {
                         Some(serde_json::Value::String(text.to_string()))
                     };
 
+                    let reasoning_content = v
+                        .get("reasoning_content")
+                        .and_then(|t| t.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string());
+
                     // Convert our ToolCall structs into OpenAI wire format.
                     let tool_calls: Option<Vec<OpenAiToolCallOut>> = v
                         .get("tool_calls")
                         .and_then(|tc| serde_json::from_value::<Vec<ToolCallWire>>(tc.clone()).ok())
+                        .filter(|calls| !calls.is_empty())
                         .map(|calls| {
                             calls
                                 .into_iter()
@@ -208,6 +225,7 @@ impl OpenAiCompatibleProvider {
                         content,
                         tool_call_id: None,
                         tool_calls,
+                        reasoning_content,
                     });
                 }
                 // Tool result messages with tool_call_id.
@@ -224,6 +242,7 @@ impl OpenAiCompatibleProvider {
                         content: Some(serde_json::Value::String(content_str.to_string())),
                         tool_call_id: Some(tool_call_id),
                         tool_calls: None,
+                        reasoning_content: None,
                     });
                 }
                 // All other messages: plain text, structured, or multimodal.
@@ -241,6 +260,7 @@ impl OpenAiCompatibleProvider {
                         content: Some(content_value),
                         tool_call_id: None,
                         tool_calls: None,
+                        reasoning_content: None,
                     });
                 }
             }
@@ -1217,6 +1237,16 @@ struct OpenAiMessageOut {
     tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<OpenAiToolCallOut>>,
+    /// Mandatory echo on the prior assistant turn when the upstream is a
+    /// DeepSeek thinking-mode endpoint (direct DeepSeek with
+    /// reasoning_effort, or any relay forwarding to DeepSeek — notably
+    /// OpenCode Go's `/v1/chat/completions` with `deepseek-v4-*` slugs).
+    /// Sending without it returns HTTP 400 ("The reasoning_content in the
+    /// thinking mode must be passed back to the API."). Omitted from the
+    /// wire when `None` so non-thinking turns stay byte-identical to the
+    /// legacy shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

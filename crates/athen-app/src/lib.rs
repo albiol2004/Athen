@@ -115,6 +115,7 @@ pub fn run() {
             settings::complete_onboarding,
             settings::detect_device_capabilities,
             settings::list_provider_catalog,
+            settings::list_curated_models,
             settings::list_model_families,
             settings::save_email_settings,
             settings::test_email_connection,

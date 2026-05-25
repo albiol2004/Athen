@@ -204,6 +204,133 @@ pub fn quirks_for_family(family: ModelFamily) -> ModelQuirks {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Per-slug quirks registry (Bundles Phase 3)
+// ---------------------------------------------------------------------------
+//
+// Until Bundles, the wire-format `ModelFamily` was selected per-Connection.
+// That falls apart the moment one Connection hosts slugs spanning multiple
+// wire families (OpenCode Go relays DeepSeek + Qwen + Kimi + GLM + MiMo via
+// OpenAI-compat AND MiniMax M2.x via Anthropic-compat under one provider id;
+// OpenRouter likewise multiplexes vendors). The registry below moves the
+// lookup key from `connection_id` alone to `(connection_id, slug)`, so each
+// tier in a Bundle resolves to its own correct family.
+//
+// Today's `SlugQuirks` carries only `family` — the field that already gates
+// every quirks branch in `apply_to_response`. `default_reasoning` and
+// `catalog_label` (see `docs/BUNDLES.md` §"Per-slug quirks registry") are
+// follow-ups; adding fields is non-breaking because lookups return `Option`
+// and callers fall back to the Connection's own family for unknown slugs.
+
+/// Per-slug wire-format quirks override. Resolved at provider-construction
+/// time inside `build_provider_instance`. When a slug appears in
+/// `BUILTIN_SLUG_QUIRKS`, its family wins over whatever family the
+/// Connection itself was configured with — necessary for relays
+/// (`opencode_go`, `openrouter`) that host slugs from multiple wire
+/// families behind one credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlugQuirks {
+    pub family: ModelFamily,
+}
+
+/// `(connection_pattern, slug_pattern, family)` entries — first match wins,
+/// order matters. Patterns are case-insensitive.
+///
+/// - `connection_pattern == "*"` matches any connection id (use sparingly,
+///   only for slugs whose wire shape is unambiguous regardless of which
+///   relay serves them — e.g. `claude-*` is always the Anthropic wire).
+/// - `slug_pattern` ending in `*` is a prefix match (e.g. `claude-opus-4-7*`
+///   matches dated variants `claude-opus-4-7-20260301`).
+/// - Otherwise both patterns are exact (case-insensitive) matches.
+///
+/// Adding a row here is the supported way to teach Athen about a new slug.
+/// A `None` lookup result is fine — the caller falls back to the
+/// Connection's `family` field, preserving today's behaviour for slugs the
+/// registry has never seen (typed via the "Custom" escape hatch).
+const BUILTIN_SLUG_QUIRKS: &[(&str, &str, ModelFamily)] = &[
+    // --- Direct providers ---------------------------------------------------
+    ("deepseek", "deepseek-chat", ModelFamily::DeepSeekV4Chat),
+    ("deepseek", "deepseek-v4-flash", ModelFamily::DeepSeekV4Chat),
+    ("deepseek", "deepseek-v4-pro", ModelFamily::DeepSeekV4Pro),
+    ("deepseek", "deepseek-reasoner", ModelFamily::DeepSeekR1),
+    ("deepseek", "deepseek-r1*", ModelFamily::DeepSeekR1),
+    ("anthropic", "claude-opus-4-7*", ModelFamily::ClaudeOpus47),
+    (
+        "anthropic",
+        "claude-sonnet-4-6*",
+        ModelFamily::ClaudeSonnet46,
+    ),
+    ("anthropic", "claude-haiku-4-5*", ModelFamily::ClaudeHaiku45),
+    ("openai", "gpt-5*", ModelFamily::Gpt5),
+    ("openai", "o3*", ModelFamily::OpenAiO3),
+    ("openai", "o4-mini*", ModelFamily::OpenAiO3),
+    ("google", "gemini-3.1-pro*", ModelFamily::Gemini3Pro),
+    ("google", "gemini-3-pro*", ModelFamily::Gemini3Pro),
+    ("google", "gemini-3-flash*", ModelFamily::Gemini3Flash),
+    ("google", "gemini-3.0-flash*", ModelFamily::Gemini3Flash),
+    (
+        "minimax_anthropic",
+        "minimax-m2*",
+        ModelFamily::MiniMaxM25Cloud,
+    ),
+    // --- OpenCode Go relay (per-slug wire dispatch) ------------------------
+    // The provider adapter is selected by `is_minimax_slug` in
+    // `build_provider_instance`; the family below drives apply_to_response
+    // post-processing for each slug.
+    (
+        "opencode_go",
+        "deepseek-v4-flash",
+        ModelFamily::DeepSeekV4Chat,
+    ),
+    ("opencode_go", "deepseek-v4-pro", ModelFamily::DeepSeekV4Pro),
+    ("opencode_go", "deepseek-chat", ModelFamily::DeepSeekV4Chat),
+    ("opencode_go", "kimi-k2*", ModelFamily::KimiK26Cloud),
+    ("opencode_go", "qwen3-coder*", ModelFamily::Qwen3CoderNext),
+    ("opencode_go", "minimax-m2*", ModelFamily::MiniMaxM25Cloud),
+    // glm-4.6 and mimo-7b have no profiled family yet — they fall through
+    // to None and inherit the Connection's family (Default for opencode_go,
+    // which yields baseline quirks).
+
+    // --- Cross-provider fallbacks ------------------------------------------
+    // Any connection serving these well-known slugs (e.g. an OpenRouter
+    // Connection routing claude-* / gemini-*) gets the right family without
+    // a per-connection row.
+    ("*", "claude-opus-4-7*", ModelFamily::ClaudeOpus47),
+    ("*", "claude-sonnet-4-6*", ModelFamily::ClaudeSonnet46),
+    ("*", "claude-haiku-4-5*", ModelFamily::ClaudeHaiku45),
+    ("*", "gemini-3.1-pro*", ModelFamily::Gemini3Pro),
+    ("*", "gemini-3-pro*", ModelFamily::Gemini3Pro),
+    ("*", "gemini-3-flash*", ModelFamily::Gemini3Flash),
+    ("*", "gpt-5*", ModelFamily::Gpt5),
+];
+
+/// Look up per-slug quirks. Returns `None` when no row matches — callers
+/// should fall back to the Connection's own `family` field, which itself
+/// defaults to `ModelFamily::Default` (baseline behaviour).
+///
+/// Connection ids and slugs are matched case-insensitively. Slugs ending
+/// in `*` in the table match the literal prefix.
+pub fn lookup_slug_quirks(connection_id: &str, slug: &str) -> Option<SlugQuirks> {
+    let slug_lower = slug.to_ascii_lowercase();
+    let conn_lower = connection_id.to_ascii_lowercase();
+    for (conn_pat, slug_pat, family) in BUILTIN_SLUG_QUIRKS {
+        let conn_match = *conn_pat == "*" || conn_pat.eq_ignore_ascii_case(&conn_lower);
+        if !conn_match {
+            continue;
+        }
+        let pat_lower = slug_pat.to_ascii_lowercase();
+        let slug_match = if let Some(prefix) = pat_lower.strip_suffix('*') {
+            slug_lower.starts_with(prefix)
+        } else {
+            pat_lower == slug_lower
+        };
+        if slug_match {
+            return Some(SlugQuirks { family: *family });
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,5 +451,83 @@ mod tests {
             }
             other => panic!("expected vendor-tagged XML, got {:?}", other),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-slug registry (Phase 3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn slug_lookup_exact_match_on_opencode_go_deepseek() {
+        // OpenCode Go's DeepSeek slugs resolve to the DeepSeek family even
+        // though the Connection itself defaults to Default — this is the
+        // bug Phase 3 exists to fix.
+        let q = lookup_slug_quirks("opencode_go", "deepseek-v4-flash").unwrap();
+        assert_eq!(q.family, ModelFamily::DeepSeekV4Chat);
+
+        let q = lookup_slug_quirks("opencode_go", "deepseek-v4-pro").unwrap();
+        assert_eq!(q.family, ModelFamily::DeepSeekV4Pro);
+    }
+
+    #[test]
+    fn slug_lookup_picks_minimax_for_relay_anthropic_wire() {
+        // Same Connection, different wire family — exactly the case that
+        // breaks per-Connection quirks dispatch.
+        let q = lookup_slug_quirks("opencode_go", "minimax-m2.7").unwrap();
+        assert_eq!(q.family, ModelFamily::MiniMaxM25Cloud);
+
+        let q = lookup_slug_quirks("opencode_go", "minimax-m2.5").unwrap();
+        assert_eq!(q.family, ModelFamily::MiniMaxM25Cloud);
+    }
+
+    #[test]
+    fn slug_lookup_is_case_insensitive_both_sides() {
+        // User-typed casings — MiniMax-M2.7 was the original failure mode.
+        let q = lookup_slug_quirks("OpenCode_Go", "MiniMax-M2.7").unwrap();
+        assert_eq!(q.family, ModelFamily::MiniMaxM25Cloud);
+        let q = lookup_slug_quirks("ANTHROPIC", "Claude-Opus-4-7").unwrap();
+        assert_eq!(q.family, ModelFamily::ClaudeOpus47);
+    }
+
+    #[test]
+    fn slug_lookup_prefix_match_handles_dated_variants() {
+        // Anthropic publishes dated slugs (`claude-opus-4-7-20260301`);
+        // the prefix pattern must catch them.
+        let q = lookup_slug_quirks("anthropic", "claude-opus-4-7-20260301").unwrap();
+        assert_eq!(q.family, ModelFamily::ClaudeOpus47);
+    }
+
+    #[test]
+    fn slug_lookup_returns_none_for_unknown_slug() {
+        // mimo-7b and glm-4.6 are deliberately not in the table — they fall
+        // through so the caller can use the Connection's family. Same for
+        // anything genuinely Custom.
+        assert!(lookup_slug_quirks("opencode_go", "mimo-7b").is_none());
+        assert!(lookup_slug_quirks("opencode_go", "glm-4.6").is_none());
+        assert!(lookup_slug_quirks("anything", "totally-unknown-model").is_none());
+    }
+
+    #[test]
+    fn slug_lookup_wildcard_connection_catches_well_known_slugs() {
+        // An OpenRouter-style Connection (not in the per-connection rows)
+        // still resolves claude-* / gemini-* / gpt-* via the "*" patterns.
+        let q = lookup_slug_quirks("openrouter", "claude-sonnet-4-6").unwrap();
+        assert_eq!(q.family, ModelFamily::ClaudeSonnet46);
+
+        let q = lookup_slug_quirks("openrouter", "gemini-3.1-pro-preview").unwrap();
+        assert_eq!(q.family, ModelFamily::Gemini3Pro);
+
+        let q = lookup_slug_quirks("openrouter", "gpt-5.5").unwrap();
+        assert_eq!(q.family, ModelFamily::Gpt5);
+    }
+
+    #[test]
+    fn slug_lookup_per_connection_row_wins_over_wildcard() {
+        // First-match-wins ordering: the per-connection `opencode_go` rows
+        // are listed before the `*` rows, so they take precedence — even
+        // when a `*` row would also match. Verified here so a future
+        // reorder breaks loudly.
+        let q = lookup_slug_quirks("opencode_go", "deepseek-v4-flash").unwrap();
+        assert_eq!(q.family, ModelFamily::DeepSeekV4Chat);
     }
 }

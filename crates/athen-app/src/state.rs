@@ -37,6 +37,7 @@ use athen_llm::providers::google::GoogleProvider;
 use athen_llm::providers::llamacpp::LlamaCppProvider;
 use athen_llm::providers::ollama::OllamaProvider;
 use athen_llm::providers::openai::OpenAiCompatibleProvider;
+use athen_llm::quirks::seed as quirks_seed;
 use athen_llm::router::DefaultLlmRouter;
 use athen_mcp::McpRegistry;
 use athen_memory::Memory;
@@ -703,10 +704,13 @@ impl AppState {
                 resolver
             });
 
-        // Determine which provider to activate on startup.
-        let active_id = resolve_active_provider(&config);
-        let (router, model_name) = build_router_for_provider_from_config(&active_id, &config);
-
+        // Determine which provider to activate on startup. Prefer the
+        // active Bundle when present — it's the post-2026-05-23 source of
+        // truth for per-tier `(connection, slug)` picks. Fall back to the
+        // legacy single-provider router for pre-Bundles configs and for
+        // the degenerate case where the active Bundle id no longer
+        // resolves (deleted bundle without a fresh selection).
+        let (router, active_id, model_name) = build_startup_router(&config);
         let router = Arc::new(RwLock::new(router));
 
         let (coordinator, database, contact_store) =
@@ -4453,6 +4457,77 @@ pub(crate) fn build_router_for_bundle(
     ))
 }
 
+/// Pick the right startup router for the AppState constructor.
+///
+/// Resolution order:
+/// 1. **Active Bundle** (`models.assignments["active_bundle"]`): build a
+///    cross-vendor router from its per-tier `(connection, slug)` picks
+///    via [`build_router_for_bundle`]. `active_provider_id` is set to
+///    [`derive_primary_connection_pair`]'s pick so legacy snapshot
+///    readers (vision-check, fallback router rebuilds in commands.rs)
+///    stay coherent with the Bundle's "primary" tier.
+/// 2. **Legacy single-provider** (`models.assignments["active_provider"]`):
+///    today's behaviour for pre-Bundles configs or migrated configs whose
+///    active Bundle id has gone stale. Builds the router via
+///    [`build_router_for_provider_from_config`].
+///
+/// Returns `(router, active_provider_id, model_name)`. Callers stamp the
+/// last two onto `state.active_provider_id` and `state.model_name`.
+fn build_startup_router(config: &AthenConfig) -> (Arc<DefaultLlmRouter>, String, String) {
+    if let Some(bundle_id) = config.models.assignments.get(ACTIVE_BUNDLE_KEY) {
+        if let Some(bundle) = config.models.bundles.get(bundle_id) {
+            let router = build_router_for_bundle(bundle, &config.models.providers);
+            let (cid, slug) = derive_primary_connection_pair(bundle).unwrap_or_else(|| {
+                // Bundle has no tiers at all (degenerate). Fall back to
+                // the legacy active_provider so the rest of the app has a
+                // sane snapshot to read.
+                let legacy = resolve_active_provider(config);
+                let model = config
+                    .models
+                    .providers
+                    .get(&legacy)
+                    .map(|p| p.default_model.clone())
+                    .unwrap_or_else(|| default_model_for(&legacy).to_string());
+                (legacy, model)
+            });
+            info!(
+                bundle_name = %bundle.name,
+                primary_connection = %cid,
+                primary_slug = %slug,
+                "Startup router built from active Bundle"
+            );
+            return (router, cid, slug);
+        }
+        warn!(
+            stale_bundle_id = %bundle_id,
+            "active_bundle id does not resolve in models.bundles; using legacy single-provider router"
+        );
+    }
+    let active_id = resolve_active_provider(config);
+    let (router, model_name) = build_router_for_provider_from_config(&active_id, config);
+    (router, active_id, model_name)
+}
+
+/// `bundle_settings::derive_primary_connection` mirror that doesn't
+/// require pulling in the `bundle_settings` module from state.rs (which
+/// would create a cycle: bundle_settings already depends on state).
+/// Prefers `Fast → Cheap → Code → Powerful → Local` — the everyday-loop
+/// tier first, then the cheapest fallback.
+fn derive_primary_connection_pair(bundle: &Bundle) -> Option<(String, String)> {
+    for tier in [
+        ModelProfile::Fast,
+        ModelProfile::Cheap,
+        ModelProfile::Code,
+        ModelProfile::Powerful,
+        ModelProfile::Local,
+    ] {
+        if let Some(bt) = bundle.tiers.get(&tier) {
+            return Some((bt.connection_id.clone(), bt.slug.clone()));
+        }
+    }
+    None
+}
+
 /// Heuristic: does this slug name a MiniMax M2.x model on the OpenCode
 /// Go relay? Used to dispatch the unified `opencode_go` provider id to
 /// the Anthropic-compat wire (`/v1/messages`) vs the OpenAI-compat wire
@@ -4488,6 +4563,14 @@ fn build_provider_instance(
     supports_documents: bool,
     family: athen_core::llm::ModelFamily,
 ) -> Box<dyn LlmProvider> {
+    // Per-slug quirks (Bundles Phase 3): if the slug appears in the
+    // registry, its family wins over the Connection-level fallback. The
+    // Connection's `family` field stays as the safety net for Custom slugs
+    // the registry has never seen, preserving today's behaviour for
+    // self-hosted or unprofiled models.
+    let family = quirks_seed::lookup_slug_quirks(provider_id, model)
+        .map(|q| q.family)
+        .unwrap_or(family);
     match provider_id {
         "deepseek" => {
             let key = api_key.unwrap_or_default().to_string();
@@ -4506,7 +4589,16 @@ fn build_provider_instance(
             // api.minimax.io/anthropic (with prompt-cache). Provider
             // adapter is identical; only the base URL differs.
             let key = api_key.unwrap_or_default().to_string();
-            let mut p = AnthropicProvider::new(key, model.to_string())
+            // MiniMax slugs go on the wire lowercase regardless of the
+            // casing the user picked / persisted. Native Anthropic models
+            // (`claude-*`) are unaffected — `is_minimax_slug` only matches
+            // the `minimax-m2*` family.
+            let model_for_wire = if provider_id == "minimax_anthropic" || is_minimax_slug(model) {
+                model.to_ascii_lowercase()
+            } else {
+                model.to_string()
+            };
+            let mut p = AnthropicProvider::new(key, model_for_wire)
                 .with_family(family)
                 .with_vision(supports_vision)
                 .with_documents(supports_documents);
@@ -4519,21 +4611,20 @@ fn build_provider_instance(
             // OpenCode Go is one logical provider covering two wire
             // formats on the same relay host: OpenAI-compat
             // `/v1/chat/completions` for DeepSeek/Qwen/Kimi/GLM/MiMo and
-            // Anthropic-compat `/v1/messages` for MiniMax M2.x. The
-            // per-tier slug loop in `build_router_for_provider` calls us
-            // once per tier, so dispatching by slug here is enough — tier
-            // Cheap=`deepseek-v4-flash` lands on the OpenAI adapter, tier
-            // Code=`minimax-m2.7` lands on the Anthropic adapter.
-            //
-            // The persisted `family` field is intentionally ignored — it
-            // is no longer authoritative under per-slug dispatch (the
-            // migration normalises it to DeepSeekV4Chat for clarity, but
-            // a stale MiniMaxM25Cloud value would otherwise mis-quirk the
-            // DeepSeek slugs).
+            // Anthropic-compat `/v1/messages` for MiniMax M2.x. Wire
+            // dispatch is by slug (`is_minimax_slug`); per-slug family
+            // (DeepSeekV4Chat vs DeepSeekV4Pro vs MiniMaxM25Cloud vs
+            // KimiK26Cloud vs Qwen3CoderNext) was resolved at the top of
+            // this fn via the per-slug quirks registry.
             let key = api_key.unwrap_or_default().to_string();
             if is_minimax_slug(model) {
-                let mut p = AnthropicProvider::new(key, model.to_string())
-                    .with_family(athen_core::llm::ModelFamily::MiniMaxM25Cloud)
+                // OpenCode Go's Anthropic-compat relay rejects mixed-case
+                // ids (`MiniMax-M2.7` → "Model … is not supported"); the
+                // canonical wire id is lowercase. Normalise here so any
+                // historical or user-typed casing still resolves.
+                let wire_slug = model.to_ascii_lowercase();
+                let mut p = AnthropicProvider::new(key, wire_slug)
+                    .with_family(family)
                     .with_vision(supports_vision)
                     .with_documents(supports_documents);
                 if !base_url.is_empty() {
@@ -4544,7 +4635,7 @@ fn build_provider_instance(
                 let mut p = OpenAiCompatibleProvider::new(base_url.to_string())
                     .with_model(model.to_string())
                     .with_provider_id(provider_id.to_string())
-                    .with_family(athen_core::llm::ModelFamily::DeepSeekV4Chat)
+                    .with_family(family)
                     .with_vision(supports_vision)
                     .with_documents(supports_documents);
                 p = p.with_api_key(key);
