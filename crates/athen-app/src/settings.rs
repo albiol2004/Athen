@@ -813,6 +813,125 @@ fn api_key_hint(id: &str) -> &str {
     }
 }
 
+fn dashboard_url(id: &str) -> &'static str {
+    match id {
+        "deepseek" => "https://platform.deepseek.com/api_keys",
+        "anthropic" => "https://console.anthropic.com/settings/keys",
+        "google" => "https://aistudio.google.com/apikey",
+        "openai" => "https://platform.openai.com/api-keys",
+        "mistral" => "https://console.mistral.ai/api-keys/",
+        "openrouter" => "https://openrouter.ai/keys",
+        "opencode_go" => "https://opencode.ai/",
+        "minimax" | "minimax_anthropic" => "https://platform.minimaxi.com/",
+        "ollama" => "https://ollama.com/",
+        "llamacpp" => "https://github.com/ggml-org/llama.cpp",
+        _ => "",
+    }
+}
+
+fn cost_note(id: &str) -> &'static str {
+    match id {
+        "deepseek" => "Pay-as-you-go. V4 Flash: ~$0.07/1M input, $0.28/1M output.",
+        "anthropic" => "Pay-as-you-go. Sonnet 4.6: $3/1M input, $15/1M output.",
+        "google" => "Free tier: 15 RPM, 1M TPM for Flash models. Paid plans available.",
+        "openai" => "Pay-as-you-go. GPT-5.4-mini: $0.15/1M input, $0.60/1M output.",
+        "mistral" => "Free tier for some models. Large: $2/1M input, $6/1M output.",
+        "openrouter" => "Aggregator — prices vary by model. Some models are free.",
+        "opencode_go" => "Relay service with own pricing — check their dashboard.",
+        "minimax" | "minimax_anthropic" => "Token plan — check MiniMax pricing page.",
+        "ollama" | "llamacpp" => "Free — runs on your hardware.",
+        _ => "",
+    }
+}
+
+fn key_format_hint(id: &str) -> &'static str {
+    match id {
+        "deepseek" => "Starts with \"sk-\", about 35 characters.",
+        "anthropic" => "Starts with \"sk-ant-\", about 100 characters.",
+        "google" => "Starts with \"AIza\", about 39 characters.",
+        "openai" => "Starts with \"sk-\", about 50 characters.",
+        "mistral" => "About 32 characters, alphanumeric.",
+        "openrouter" => "Starts with \"sk-or-\", about 60 characters.",
+        "opencode_go" => "Check OpenCode dashboard for format.",
+        "minimax" | "minimax_anthropic" => "Starts with \"sk-cp-\" (Token Plan coding key).",
+        _ => "",
+    }
+}
+
+fn setup_steps(id: &str) -> &'static [&'static str] {
+    match id {
+        "deepseek" => &[
+            "Go to platform.deepseek.com and sign up or log in.",
+            "Navigate to API Keys in the left sidebar.",
+            "Click \"Create new API key\" and copy it.",
+            "Paste the key into Athen's API Key field.",
+        ],
+        "anthropic" => &[
+            "Go to console.anthropic.com and sign up or log in.",
+            "Open Settings → API Keys.",
+            "Click \"Create Key\", name it, and copy the value.",
+            "Paste the key into Athen's API Key field.",
+        ],
+        "google" => &[
+            "Go to aistudio.google.com/apikey.",
+            "Sign in with your Google account.",
+            "Click \"Create API key\" and copy it.",
+            "Paste the key into Athen's API Key field.",
+        ],
+        "openai" => &[
+            "Go to platform.openai.com and sign up or log in.",
+            "Navigate to API Keys in the sidebar.",
+            "Click \"Create new secret key\" and copy it.",
+            "Paste the key into Athen's API Key field.",
+        ],
+        "mistral" => &[
+            "Go to console.mistral.ai and sign up or log in.",
+            "Open API Keys from the sidebar.",
+            "Click \"Create new key\" and copy it.",
+            "Paste the key into Athen's API Key field.",
+        ],
+        "openrouter" => &[
+            "Go to openrouter.ai and sign up or log in.",
+            "Navigate to Keys from your dashboard.",
+            "Click \"Create Key\" and copy it.",
+            "Paste the key into Athen's API Key field.",
+        ],
+        "ollama" => &[
+            "Install Ollama (see install commands below).",
+            "Run: ollama pull <model-name> (e.g. ollama pull qwen3:8b).",
+            "Ollama runs on port 11434 by default — no API key needed.",
+            "In Athen, set the model slug to the name you pulled.",
+        ],
+        "llamacpp" => &[
+            "Download llama.cpp from GitHub or install via package manager.",
+            "Download a GGUF model file from HuggingFace.",
+            "Run: llama-server -m <model-file.gguf> --port 8080",
+            "In Athen, leave base URL as http://localhost:8080.",
+        ],
+        _ => &[],
+    }
+}
+
+const OLLAMA_SNIPPETS: &[InstallSnippet] = &[
+    InstallSnippet { os: "linux", label: "Install Ollama", cmd: "curl -fsSL https://ollama.com/install.sh | sh" },
+    InstallSnippet { os: "macos", label: "Install Ollama", cmd: "brew install ollama" },
+    InstallSnippet { os: "windows", label: "Install Ollama", cmd: "Download from https://ollama.com/download/windows" },
+];
+
+const LLAMACPP_SNIPPETS: &[InstallSnippet] = &[
+    InstallSnippet { os: "linux", label: "Install llama.cpp", cmd: "git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp && make -j" },
+    InstallSnippet { os: "macos", label: "Install llama.cpp", cmd: "brew install llama.cpp" },
+    InstallSnippet { os: "windows", label: "Install llama.cpp", cmd: "Download pre-built from https://github.com/ggml-org/llama.cpp/releases" },
+];
+
+fn install_snippets(id: &str) -> &'static [InstallSnippet] {
+    match id {
+        "ollama" => OLLAMA_SNIPPETS,
+        "llamacpp" => LLAMACPP_SNIPPETS,
+        _ => &[],
+    }
+}
+
 /// Canonical list of provider IDs the backend knows how to talk to.
 /// Adding a new provider only requires adding it here plus implementing
 /// the matching `match` arms in `default_*`/`display_name`/`provider_type`/
@@ -856,6 +975,24 @@ pub struct ProviderCatalogEntry {
     pub default_tier_fast: &'static str,
     pub default_tier_code: &'static str,
     pub default_tier_powerful: &'static str,
+    // ── L1 help fields ─────────────────────────────────────────────
+    /// Direct link to the provider's API key dashboard.
+    pub dashboard_url: &'static str,
+    /// Free-tier / pricing one-liner.
+    pub cost_note: &'static str,
+    /// Key format hint (e.g. "Starts with sk-...").
+    pub key_format_hint: &'static str,
+    /// 2-4 step quick-start instructions.
+    pub setup_steps: &'static [&'static str],
+    /// Install snippets for local providers (empty for cloud).
+    pub install_snippets: &'static [InstallSnippet],
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InstallSnippet {
+    pub os: &'static str,
+    pub label: &'static str,
+    pub cmd: &'static str,
 }
 
 /// Return the canonical list of providers the app supports. Single source
@@ -878,6 +1015,11 @@ pub async fn list_provider_catalog() -> std::result::Result<Vec<ProviderCatalogE
                 default_tier_fast: fast,
                 default_tier_code: code,
                 default_tier_powerful: powerful,
+                dashboard_url: dashboard_url(id),
+                cost_note: cost_note(id),
+                key_format_hint: key_format_hint(id),
+                setup_steps: setup_steps(id),
+                install_snippets: install_snippets(id),
             }
         })
         .collect())

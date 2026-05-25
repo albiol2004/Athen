@@ -6864,6 +6864,45 @@ function renderProviders(providers) {
     }
 }
 
+function showProviderHelpModal(entry) {
+    const overlay = document.getElementById('provider-help-modal-overlay');
+    const title = document.getElementById('provider-help-modal-title');
+    const body = document.getElementById('provider-help-modal-body');
+    title.textContent = (entry.name || entry.label || entry.provider || 'Provider') + ' Setup';
+    let html = '';
+    if (entry.cost_note || entry.free_tier_blurb) {
+        html += '<p style="color:var(--fg-muted);margin:0 0 12px">' + (entry.cost_note || entry.free_tier_blurb) + '</p>';
+    }
+    const url = entry.dashboard_url || entry.signup_url || '';
+    if (url) {
+        html += '<div style="margin-bottom:14px"><strong>Get your API key:</strong> <a href="' + url + '" style="color:var(--accent)">' + url.replace(/^https?:\/\//, '') + '</a></div>';
+    }
+    if (entry.key_format_hint) {
+        html += '<div style="margin-bottom:14px;color:var(--fg-muted);font-size:0.85rem">Key format: ' + entry.key_format_hint + '</div>';
+    }
+    const steps = entry.setup_steps || [];
+    if (steps.length) {
+        html += '<div style="margin-bottom:14px"><strong>Quick start:</strong><ol style="margin:6px 0 0;padding-left:20px">';
+        for (const s of steps) html += '<li style="margin-bottom:4px">' + s + '</li>';
+        html += '</ol></div>';
+    }
+    const snippets = entry.install_snippets || [];
+    if (snippets.length) {
+        html += '<div style="margin-bottom:6px"><strong>Install:</strong></div>';
+        for (const sn of snippets) {
+            html += '<div style="margin-bottom:8px"><span style="font-size:0.8rem;color:var(--fg-muted)">' + sn.os + ':</span><pre style="margin:2px 0;padding:6px 10px;background:var(--bg-deeper);border-radius:4px;font-size:0.82rem;overflow-x:auto">' + sn.cmd + '</pre></div>';
+        }
+    }
+    body.innerHTML = html;
+    overlay.classList.remove('hidden');
+}
+document.getElementById('provider-help-modal-close').addEventListener('click', () => {
+    document.getElementById('provider-help-modal-overlay').classList.add('hidden');
+});
+document.getElementById('provider-help-modal-overlay').addEventListener('click', (e) => {
+    if (e.target === e.currentTarget) e.currentTarget.classList.add('hidden');
+});
+
 function createProviderCard(provider) {
     const card = document.createElement('div');
     card.className = 'provider-card' + (provider.is_active ? ' active' : '');
@@ -6895,6 +6934,20 @@ function createProviderCard(provider) {
     rightSide.style.display = 'flex';
     rightSide.style.alignItems = 'center';
     rightSide.style.gap = '8px';
+
+    // L1 help button
+    const catalogEntry = providerById(provider.id);
+    if (catalogEntry && catalogEntry.dashboard_url) {
+        const helpBtn = document.createElement('button');
+        helpBtn.className = 'btn-provider-help';
+        helpBtn.textContent = '?';
+        helpBtn.title = 'Setup help for ' + provider.name;
+        helpBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            showProviderHelpModal(catalogEntry);
+        });
+        rightSide.appendChild(helpBtn);
+    }
 
     if (provider.is_active) {
         const badge = document.createElement('span');
@@ -12560,6 +12613,7 @@ function renderCloudApisList() {
                     <div class="cloud-api-row-url">${escapeHtml(e.base_url)}</div>
                 </div>
                 <div class="cloud-api-row-actions">
+                    <button class="btn-provider-help cloud-api-help-btn" data-endpoint-name="${escapeHtml(e.name)}" type="button" title="Setup help">?</button>
                     <label class="toggle-label">
                         <input type="checkbox" class="cloud-api-enabled" ${e.enabled ? 'checked' : ''} data-endpoint-id="${escapeHtml(e.id)}">
                         <span>Enabled</span>
@@ -12581,6 +12635,17 @@ function renderCloudApisList() {
             } catch (err) {
                 showToast('Failed to toggle: ' + err, 'error');
                 ev.target.checked = !ev.target.checked;
+            }
+        });
+    });
+    list.querySelectorAll('.cloud-api-help-btn').forEach((b) => {
+        b.addEventListener('click', () => {
+            const name = b.dataset.endpointName;
+            const preset = cloudApiPresets.find((p) => p.label === name || p.provider === name);
+            if (preset) {
+                showProviderHelpModal(preset);
+            } else {
+                showProviderHelpModal({ name, dashboard_url: '', cost_note: 'Custom endpoint — no preset help available.' });
             }
         });
     });
