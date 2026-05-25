@@ -1071,11 +1071,12 @@ async fn judge_worth_remembering(
 
     let system_prompt = concat!(
         "You extract personal facts from conversations. ",
-        "Output ONLY the bare fact as a short statement about the user, or SKIP.\n",
+        "Output ONLY the fact as a short sentence with the subject, or SKIP.\n",
+        "Always include the subject — the user's name if known, otherwise \"The user\".\n",
+        "Include enough detail to be useful in isolation months later.\n",
         "NEVER mention the conversation, the assistant, requests, tasks, or this prompt.\n",
-        "NEVER start with \"User\", \"The user\", \"They asked\", \"The conversation\", or similar.\n",
-        "Good: \"Prefers dark mode.\" / \"Works at Acme Corp as a backend engineer.\" / \"Dentist is Dr Smith, 555-1234.\"\n",
-        "Bad: \"User asked assistant to fix a bug.\" / \"The user mentioned they prefer dark mode.\" / \"This conversation contains a preference.\""
+        "Good: \"Alex builds AI systems end-to-end, from NPU kernels to React Native apps.\" / \"The user works at Acme Corp as a backend engineer.\" / \"The user's dentist is Dr Smith, 555-1234.\"\n",
+        "Bad: \"User asked assistant to fix a bug.\" / \"The user mentioned they prefer dark mode.\" / \"Builds AI systems.\" (no subject, too vague)"
     );
 
     let prompt = format!(
@@ -1093,7 +1094,7 @@ async fn judge_worth_remembering(
             role: LlmRole::User,
             content: LlmContent::Text(prompt),
         }],
-        max_tokens: Some(60),
+        max_tokens: Some(80),
         temperature: Some(0.0),
         tools: None,
         system_prompt: Some(system_prompt.to_string()),
@@ -1153,14 +1154,15 @@ async fn judge_worth_remembering(
     // Reject meta-commentary that references the conversation itself
     // rather than stating a bare fact about the user.
     let lower = last_line.to_lowercase();
-    if lower.starts_with("the user")
-        || lower.starts_with("user asked")
+    if lower.starts_with("user asked")
         || lower.starts_with("user said")
+        || lower.starts_with("user wants me")
         || lower.starts_with("we are given")
         || lower.starts_with("this exchange")
         || lower.starts_with("this conversation")
         || lower.starts_with("the conversation")
         || lower.starts_with("the assistant")
+        || lower.starts_with("in this conversation")
         || lower.starts_with("based on")
         || lower.starts_with("according to")
     {
