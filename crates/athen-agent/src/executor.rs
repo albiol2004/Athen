@@ -202,7 +202,6 @@ pub struct DefaultExecutor {
     llm_router: Box<dyn LlmRouter>,
     tool_registry: Box<dyn ToolRegistry>,
     auditor: Box<dyn StepAuditor>,
-    max_steps: u32,
     timeout: Duration,
     context_messages: Vec<ChatMessage>,
     stream_sender: Option<tokio::sync::mpsc::UnboundedSender<String>>,
@@ -338,7 +337,7 @@ pub struct DefaultExecutor {
     /// `state::resolve_effective_tier_for_arc`, which honours the arc's
     /// `tier_override` and the task's `risk_score.complexity` on top of
     /// the static `Fast` call-site label. The completion-judge,
-    /// max-step-summary, and other helpers keep their own hardcoded
+    /// runaway-summary, and other helpers keep their own hardcoded
     /// tiers (Cheap / Fast) regardless of this field — they're cheap by
     /// design.
     default_tier: athen_core::llm::ModelProfile,
@@ -350,7 +349,6 @@ impl DefaultExecutor {
         llm_router: Box<dyn LlmRouter>,
         tool_registry: Box<dyn ToolRegistry>,
         auditor: Box<dyn StepAuditor>,
-        max_steps: u32,
         timeout: Duration,
         context_messages: Vec<ChatMessage>,
     ) -> Self {
@@ -358,7 +356,6 @@ impl DefaultExecutor {
             llm_router,
             tool_registry,
             auditor,
-            max_steps,
             timeout,
             context_messages,
             stream_sender: None,
@@ -1400,6 +1397,106 @@ impl DefaultExecutor {
         }
     }
 
+    /// Ask a cheap LLM whether the agent is stuck (repeating the same tools,
+    /// loop guards firing, no progress) or making forward progress.
+    /// Returns `true` when the agent should be stopped.
+    async fn judge_runaway(
+        &self,
+        task_description: &str,
+        conversation: &[ChatMessage],
+        steps_completed: u32,
+    ) -> bool {
+        // Build a digest of the last 10 tool calls from conversation
+        let mut recent_tools: Vec<String> = Vec::new();
+        for msg in conversation.iter().rev() {
+            if recent_tools.len() >= 10 {
+                break;
+            }
+            if let MessageContent::Structured(v) = &msg.content {
+                if let Some(tool) = v.get("tool_calls") {
+                    if let Some(arr) = tool.as_array() {
+                        for tc in arr.iter().rev() {
+                            if recent_tools.len() >= 10 {
+                                break;
+                            }
+                            let name = tc.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                            recent_tools.push(name.to_string());
+                        }
+                    }
+                }
+                // Also check tool results
+                if let Some(content) = v.get("content") {
+                    if let Some(s) = content.as_str() {
+                        if s.contains("loop_guard") || s.contains("DEDUPE") {
+                            recent_tools.push("[loop_guard/dedupe hit]".to_string());
+                        }
+                    }
+                }
+            }
+        }
+        recent_tools.reverse();
+
+        let prompt = format!(
+            "You are evaluating whether an AI agent is stuck or making progress.\n\
+             \n\
+             TASK: {task_description}\n\
+             STEPS COMPLETED: {steps_completed}\n\
+             RECENT TOOL CALLS (newest last): {recent_list}\n\
+             \n\
+             Signs the agent is STUCK:\n\
+             - Repeating the same tools with same/similar arguments\n\
+             - Loop guard or dedupe messages appearing\n\
+             - No meaningful progress toward the task goal\n\
+             - Oscillating between two states\n\
+             \n\
+             Signs the agent is making PROGRESS:\n\
+             - Using different tools or different arguments\n\
+             - Building toward the task goal step by step\n\
+             - Reading/exploring then acting on findings\n\
+             \n\
+             Reply with ONLY one word: STOP or CONTINUE.",
+            recent_list = recent_tools.join(", "),
+        );
+
+        let request = LlmRequest {
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: MessageContent::Text(prompt),
+            }],
+            profile: ModelProfile::Cheap,
+            max_tokens: Some(5),
+            temperature: Some(0.0),
+            tools: None,
+            system_prompt: None,
+            reasoning_effort: athen_core::llm::ReasoningEffort::Off,
+        };
+
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            self.llm_router.route(&request),
+        )
+        .await
+        {
+            Ok(Ok(resp)) => {
+                let answer = resp.content.trim().to_uppercase();
+                tracing::debug!(
+                    steps = steps_completed,
+                    verdict = %answer,
+                    "Runaway judge verdict"
+                );
+                answer.contains("STOP")
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("Runaway judge LLM error: {e}, defaulting to CONTINUE");
+                false // don't stop on judge failure
+            }
+            Err(_) => {
+                tracing::warn!("Runaway judge timed out, defaulting to CONTINUE");
+                false
+            }
+        }
+    }
+
     /// Attempt a streaming LLM call. Collects text deltas and forwards them
     /// through `self.stream_sender`. Also collects tool calls from SSE chunks.
     ///
@@ -1509,6 +1606,13 @@ impl AgentExecutor for DefaultExecutor {
         // (after which the existing loop guard fires), and reduces the
         // educational gap between "you already saw this" and "STOP".
         let mut prior_call_signatures: std::collections::HashMap<String, (String, bool)> =
+            std::collections::HashMap::new();
+
+        // Consecutive error tracking: count sequential failed tool calls.
+        // After 3 consecutive errors on the SAME tool, inject steering.
+        // After 5 consecutive errors on ANY tools, inject stronger steering.
+        let mut consecutive_errors: u32 = 0;
+        let mut consecutive_same_tool_errors: std::collections::HashMap<String, u32> =
             std::collections::HashMap::new();
 
         // Gather available tools for the LLM, then apply the active
@@ -1679,48 +1783,56 @@ impl AgentExecutor for DefaultExecutor {
                 return Err(AthenError::Timeout(self.timeout));
             }
 
-            // Check step limit — ask the LLM for a summary before giving up.
-            if steps_completed >= self.max_steps {
-                tracing::warn!(
-                    task_id = %task_id,
-                    steps = steps_completed,
-                    max = self.max_steps,
-                    "Task reached max steps limit"
-                );
-
-                // Ask the LLM to summarise what it found so far.
-                conversation.push(ChatMessage {
-                    role: Role::User,
-                    content: MessageContent::Text(
-                        "You've run out of steps. Summarise what you found and accomplished so far."
-                            .to_string(),
-                    ),
-                });
-                let summary_request = LlmRequest {
-                    profile: self.default_tier,
-                    messages: conversation.clone(),
-                    max_tokens: Some(2048),
-                    temperature: Some(0.5),
-                    tools: None, // no tools — just summarise
-                    system_prompt: Some(system_prompt),
-                    reasoning_effort: athen_core::llm::ReasoningEffort::Off,
-                };
-                let summary = match self.llm_router.route(&summary_request).await {
-                    Ok(resp) => resp.content,
-                    Err(_) => "Task reached step limit before completion.".to_string(),
-                };
-
-                return Ok(TaskResult {
-                    task_id,
-                    success: false,
-                    output: Some(serde_json::json!({
-                        "reason": "max_steps_exceeded",
-                        "steps_completed": steps_completed,
-                        "response": summary,
-                    })),
-                    steps_completed,
-                    total_risk_used: 0,
-                });
+            // Periodic runaway check — every 20 steps after the first 15,
+            // ask a cheap LLM whether the agent is making progress.
+            const RUNAWAY_CHECK_INTERVAL: u32 = 20;
+            const RUNAWAY_CHECK_START: u32 = 15;
+            if steps_completed >= RUNAWAY_CHECK_START
+                && (steps_completed - RUNAWAY_CHECK_START).is_multiple_of(RUNAWAY_CHECK_INTERVAL)
+            {
+                let should_stop = self
+                    .judge_runaway(&task.description, &conversation, steps_completed)
+                    .await;
+                if should_stop {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        steps = steps_completed,
+                        "Runaway judge: agent appears stuck, stopping"
+                    );
+                    // Ask for summary before stopping
+                    conversation.push(ChatMessage {
+                        role: Role::User,
+                        content: MessageContent::Text(
+                            "You appear to be stuck in a loop or not making progress. \
+                             Summarise what you accomplished so far and what remains."
+                                .to_string(),
+                        ),
+                    });
+                    let summary_request = LlmRequest {
+                        profile: self.default_tier,
+                        messages: conversation.clone(),
+                        max_tokens: Some(2048),
+                        temperature: Some(0.5),
+                        tools: None,
+                        system_prompt: None,
+                        reasoning_effort: athen_core::llm::ReasoningEffort::Off,
+                    };
+                    let summary = match self.llm_router.route(&summary_request).await {
+                        Ok(resp) => resp.content,
+                        Err(_) => "Agent stopped by runaway detection.".to_string(),
+                    };
+                    return Ok(TaskResult {
+                        task_id,
+                        success: false,
+                        output: Some(serde_json::json!({
+                            "reason": "runaway_detected",
+                            "steps_completed": steps_completed,
+                            "response": summary,
+                        })),
+                        steps_completed,
+                        total_risk_used: 0,
+                    });
+                }
             }
 
             // ── System-reminder injection ──
@@ -2325,6 +2437,56 @@ impl AgentExecutor for DefaultExecutor {
                         "content": tool_response_content,
                     })),
                 });
+
+                // Track consecutive errors for steering
+                let tool_failed = match &tool_result {
+                    Ok(r) => !r.success,
+                    Err(_) => true,
+                };
+                let is_synthetic = matches!(
+                    &tool_result,
+                    Ok(r) if matches!(r.error.as_deref(), Some("loop_guard") | Some("duplicate_in_batch"))
+                );
+
+                if tool_failed && !is_synthetic {
+                    consecutive_errors += 1;
+                    *consecutive_same_tool_errors
+                        .entry(tool_call.name.clone())
+                        .or_insert(0) += 1;
+                } else if !is_synthetic {
+                    consecutive_errors = 0;
+                    consecutive_same_tool_errors.clear();
+                }
+            }
+
+            // Steer the agent if it's hitting too many consecutive errors
+            if consecutive_errors >= 5 {
+                conversation.push(ChatMessage {
+                    role: Role::User,
+                    content: MessageContent::Text(
+                        "<system-reminder>You have had 5+ consecutive tool failures. STOP and reconsider your approach entirely. \
+                         Re-read the user's original request. The approach you are taking is not working. \
+                         Either try a completely different strategy or explain to the user what is blocking you.</system-reminder>"
+                            .to_string(),
+                    ),
+                });
+            } else {
+                // Check per-tool consecutive errors
+                for (tool_name, count) in &consecutive_same_tool_errors {
+                    if *count >= 3 {
+                        conversation.push(ChatMessage {
+                            role: Role::User,
+                            content: MessageContent::Text(format!(
+                                "<system-reminder>Tool '{}' has failed {} times consecutively. \
+                                 This tool is not working for your current approach. \
+                                 Try a DIFFERENT tool or DIFFERENT arguments. \
+                                 If you cannot proceed, explain the blocker to the user.</system-reminder>",
+                                tool_name, count
+                            )),
+                        });
+                        break; // one steering message per iteration
+                    }
+                }
             }
         }
     }
@@ -2473,7 +2635,6 @@ mod tests {
             Box::new(router),
             Box::new(MockToolRegistry::empty()),
             Box::new(InMemoryAuditor::new()),
-            10,
             Duration::from_secs(60),
             vec![],
         );
@@ -2512,7 +2673,6 @@ mod tests {
             Box::new(MockLlmRouter::new(responses)),
             Box::new(MockToolRegistry::new(vec![], vec![tool_result])),
             Box::new(InMemoryAuditor::new()),
-            10,
             Duration::from_secs(60),
             vec![],
         );
@@ -2523,36 +2683,6 @@ mod tests {
         assert!(result.success);
         // 1 tool call step + 1 completion step
         assert_eq!(result.steps_completed, 2);
-    }
-
-    #[tokio::test]
-    async fn test_executor_respects_max_steps() {
-        // LLM always requests tool calls, never finishes
-        let tool_call = ToolCall {
-            id: "call_loop".to_string(),
-            name: "noop".to_string(),
-            arguments: serde_json::json!({}),
-            thought_signature: None,
-        };
-
-        let responses: Vec<LlmResponse> = (0..10)
-            .map(|_| MockLlmRouter::make_response("Calling tool again.", vec![tool_call.clone()]))
-            .collect();
-
-        let executor = DefaultExecutor::new(
-            Box::new(MockLlmRouter::new(responses)),
-            Box::new(MockToolRegistry::empty()),
-            Box::new(InMemoryAuditor::new()),
-            3, // max 3 steps
-            Duration::from_secs(60),
-            vec![],
-        );
-
-        let task = make_task("Infinite loop task");
-        let result = executor.execute(task).await.unwrap();
-
-        assert!(!result.success);
-        assert_eq!(result.steps_completed, 3);
     }
 
     #[tokio::test]
@@ -2574,7 +2704,6 @@ mod tests {
             Box::new(MockLlmRouter::new(responses)),
             Box::new(MockToolRegistry::empty()),
             Box::new(InMemoryAuditor::new()),
-            100,
             Duration::ZERO, // instant timeout
             vec![],
         );
@@ -2633,7 +2762,6 @@ mod tests {
             Box::new(MockLlmRouter::new(responses)),
             Box::new(MockToolRegistry::empty()),
             Box::new(ArcAuditor(Arc::clone(&auditor))),
-            10,
             Duration::from_secs(60),
             vec![],
         );
@@ -2665,7 +2793,6 @@ mod tests {
             Box::new(MockLlmRouter::new(responses)),
             Box::new(MockToolRegistry::empty()),
             Box::new(InMemoryAuditor::new()),
-            100,
             Duration::from_secs(60),
             vec![],
         );
@@ -2713,7 +2840,6 @@ mod tests {
             Box::new(MockLlmRouter::new(responses)),
             Box::new(MockToolRegistry::empty()),
             Box::new(InMemoryAuditor::new()),
-            100,
             Duration::from_secs(60),
             vec![],
         );
@@ -2829,7 +2955,6 @@ mod tests {
             Box::new(MockLlmRouter::new(responses)),
             Box::new(MockToolRegistry::empty()),
             Box::new(InMemoryAuditor::new()),
-            10,
             Duration::from_secs(60),
             vec![],
         );
@@ -3583,7 +3708,6 @@ mod tests {
             Box::new(MockLlmRouter::new(responses)),
             Box::new(registry),
             Box::new(InMemoryAuditor::new()),
-            10,
             Duration::from_secs(60),
             vec![],
         );
@@ -3635,7 +3759,6 @@ mod tests {
                 }],
             )),
             Box::new(InMemoryAuditor::new()),
-            5,
             Duration::from_secs(60),
             vec![],
         );
@@ -3700,7 +3823,6 @@ mod tests {
                 vec![make_result(), make_result(), make_result()],
             )),
             Box::new(ArcAuditor(Arc::clone(&auditor))),
-            20,
             Duration::from_secs(60),
             vec![],
         );
@@ -3767,7 +3889,6 @@ mod tests {
                 }],
             )),
             Box::new(ArcAuditor(Arc::clone(&auditor))),
-            10,
             Duration::from_secs(60),
             vec![],
         );
@@ -3914,7 +4035,6 @@ mod tests {
                 vec![tool_result.clone(), tool_result.clone()],
             )),
             Box::new(InMemoryAuditor::new()),
-            10,
             Duration::from_secs(60),
             vec![],
         );
@@ -4008,7 +4128,6 @@ mod tests {
             Box::new(ArcRouter(router.clone())),
             Box::new(MockToolRegistry::new(vec![], results)),
             Box::new(InMemoryAuditor::new()),
-            10,
             Duration::from_secs(60),
             vec![],
         );
@@ -4067,7 +4186,6 @@ mod tests {
                 vec![failing.clone(), failing.clone()],
             )),
             Box::new(InMemoryAuditor::new()),
-            10,
             Duration::from_secs(60),
             vec![],
         );

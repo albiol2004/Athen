@@ -418,7 +418,6 @@ async fn run_delegation(
     let mut builder = AgentBuilder::new()
         .llm_router(exec_router)
         .tool_registry(sub_registry)
-        .max_steps(30)
         .timeout(Duration::from_secs(180))
         .active_profile(resolved)
         .identity_block(identity_block)

@@ -472,8 +472,8 @@ fn format_user_error(err: &str) -> String {
         "Authentication failed. Please check your API key in Settings.".into()
     } else if err.contains("rate_limit") || err.contains("429") {
         "Rate limit reached. Please wait a moment and try again.".into()
-    } else if err.contains("max_steps") {
-        "I ran out of steps before finishing. Try breaking the task into smaller parts.".into()
+    } else if err.contains("runaway_detected") {
+        "I appeared to be stuck in a loop and was stopped. Try breaking the task into smaller parts.".into()
     } else if err.contains("budget") || err.contains("Budget") {
         "Budget limit reached. Check your spending limits in Settings.".into()
     } else if err.contains("RiskThresholdExceeded") {
@@ -2628,7 +2628,6 @@ pub async fn send_message(
                 .llm_router(exec_router)
                 .tool_registry(registry)
                 .auditor(Box::new(auditor))
-                .max_steps(50)
                 .timeout(Duration::from_secs(300))
                 .context_messages(context)
                 .stream_sender(stream_tx)
@@ -3818,7 +3817,6 @@ pub(crate) async fn execute_approved_task(
         .llm_router(exec_router)
         .tool_registry(registry)
         .auditor(Box::new(auditor))
-        .max_steps(50)
         .timeout(Duration::from_secs(300))
         .context_messages(context)
         .stream_sender(stream_tx)
@@ -4880,7 +4878,6 @@ pub(crate) async fn execute_dispatched_task(
         .llm_router(exec_router)
         .tool_registry(registry)
         .auditor(Box::new(auditor))
-        .max_steps(50)
         .timeout(Duration::from_secs(300))
         .context_messages(context)
         .stream_sender(stream_tx)

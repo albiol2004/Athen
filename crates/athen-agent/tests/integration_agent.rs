@@ -120,7 +120,6 @@ async fn test_agent_executes_shell_tool_and_completes() {
     let executor = AgentBuilder::new()
         .llm_router(Box::new(MockLlmRouter::new(responses)))
         .tool_registry(Box::new(registry))
-        .max_steps(10)
         .timeout(Duration::from_secs(30))
         .build()
         .unwrap();
@@ -162,7 +161,6 @@ async fn test_agent_reads_file_via_tool() {
     let executor = AgentBuilder::new()
         .llm_router(Box::new(MockLlmRouter::new(responses)))
         .tool_registry(Box::new(registry))
-        .max_steps(10)
         .timeout(Duration::from_secs(30))
         .build()
         .unwrap();
@@ -205,7 +203,6 @@ async fn test_agent_multi_step_tool_usage() {
     let executor = AgentBuilder::new()
         .llm_router(Box::new(MockLlmRouter::new(responses)))
         .tool_registry(Box::new(registry))
-        .max_steps(10)
         .timeout(Duration::from_secs(30))
         .build()
         .unwrap();

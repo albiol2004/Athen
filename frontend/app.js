@@ -223,6 +223,11 @@ function registerTauriEventListeners() {
         // Skip non-tool steps (e.g. "Evaluating risk...", "Task completed").
         if (step === 0 || tool_name === 'Task completed') return;
 
+        // Snapshot scroll-pinned state BEFORE any DOM mutations.
+        // Creating a tool group or card adds height and can push the
+        // measured distance past the 80px threshold, falsely un-pinning.
+        const wasPinned = isScrollPinned(messagesEl.parentElement);
+
         // Create tool container if it does not exist yet. Before opening
         // a new group, seal any in-flight streaming row so the text
         // bubble commits *above* the tool group rather than getting
@@ -269,7 +274,7 @@ function registerTauriEventListeners() {
 
         // Follow the new card to the bottom only if the user was
         // already pinned there — see `scrollChatIfPinned`.
-        scrollChatIfPinned(messagesEl.parentElement);
+        scrollChatIfPinned(messagesEl.parentElement, undefined, wasPinned);
     });
 
     // Listen for streaming text chunks from the agent executor.
@@ -311,6 +316,12 @@ function registerTauriEventListeners() {
 
         // For background arcs, silently accumulate but don't render.
         if (!isActiveArc) return;
+
+        // Snapshot scroll-pinned state BEFORE any DOM mutations.
+        // Creating a thinking block or streaming bubble adds height and
+        // can push the measured distance past the 80px threshold, falsely
+        // un-pinning the user.
+        const wasPinned = isScrollPinned(messagesEl.parentElement);
 
         didReceiveStreamChunks = true;
 
@@ -406,7 +417,7 @@ function registerTauriEventListeners() {
             streamingBubble.textContent = streamingText;
         }
 
-        scrollChatIfPinned(messagesEl.parentElement, 'auto');
+        scrollChatIfPinned(messagesEl.parentElement, 'auto', wasPinned);
     });
 
     // Listen for arc updates (e.g. Telegram auto-execution).
@@ -656,6 +667,16 @@ function startInitialDataLoads() {
 const messagesEl = document.getElementById('messages');
 const inputEl = document.getElementById('message-input');
 
+// Returns true when the user is "pinned" near the bottom of a scroll
+// container (within 80px). Callers snapshot this BEFORE DOM mutations
+// so that newly-appended elements (tool groups, thinking blocks) don't
+// inflate scrollHeight and falsely un-pin the user.
+function isScrollPinned(scrollEl) {
+    if (!scrollEl) return false;
+    const dist = scrollEl.scrollHeight - (scrollEl.scrollTop + scrollEl.clientHeight);
+    return dist <= 80;
+}
+
 // Scroll the chat (or any vertical scroll container) to the bottom — but
 // ONLY when the user is already pinned near it. Streaming text deltas
 // and tool-card append events fire constantly and used to yank the
@@ -663,10 +684,21 @@ const inputEl = document.getElementById('message-input');
 // earlier content while the agent was active. Threshold is permissive
 // (under 80px from the bottom counts as "pinned") so a casual nudge
 // off-bottom doesn't fight the auto-follow.
-function scrollChatIfPinned(scrollEl, behavior) {
+//
+// Optional third parameter `wasPinned` (boolean): when provided, the
+// caller has already snapshotted the pinned state BEFORE DOM mutations.
+// This prevents the race where newly-created DOM elements (tool groups,
+// thinking blocks) add height and push the distance past 80px before
+// this function runs. When omitted, the function measures live (backward
+// compatible with all existing call sites).
+function scrollChatIfPinned(scrollEl, behavior, wasPinned) {
     if (!scrollEl) return;
-    const dist = scrollEl.scrollHeight - (scrollEl.scrollTop + scrollEl.clientHeight);
-    if (dist > 80) return;
+    if (typeof wasPinned === 'undefined') {
+        const dist = scrollEl.scrollHeight - (scrollEl.scrollTop + scrollEl.clientHeight);
+        if (dist > 80) return;
+    } else if (!wasPinned) {
+        return;
+    }
     requestAnimationFrame(() => {
         scrollEl.scrollTo({
             top: scrollEl.scrollHeight,

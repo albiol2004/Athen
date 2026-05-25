@@ -331,7 +331,6 @@ async fn run_headless(
     profile_id: Option<String>,
     family: ModelFamily,
     temperature: Option<f32>,
-    max_steps: u32,
 ) -> std::result::Result<(), (i32, String)> {
     // 1. Read required env vars.
     let base_url = match std::env::var("ATHEN_BASE_URL") {
@@ -384,7 +383,6 @@ async fn run_headless(
     let mut builder = AgentBuilder::new()
         .llm_router(exec_router)
         .tool_registry(Box::new(registry))
-        .max_steps(max_steps)
         .timeout(Duration::from_secs(task_timeout_secs))
         .default_temperature(temperature);
     if let Some(rp) = resolved_profile {
@@ -560,37 +558,8 @@ async fn main() {
         },
     };
 
-    // Per-task iteration cap. `--max-steps` overrides `ATHEN_MAX_STEPS`. 0 ⇒ unlimited
-    // (mapped to `u32::MAX`). Default 50 matches the interactive REPL build.
-    let max_steps_arg = match extract_flag(&args, "--max-steps") {
-        Ok(v) => v,
-        Err(msg) => {
-            eprintln!("Error: {msg}");
-            eprintln!(
-                "Usage: athen-cli --prompt <PROMPT> [--profile <ID>] [--family <ID>] [--max-steps <N>]"
-            );
-            std::process::exit(2);
-        }
-    };
-    let max_steps_str = max_steps_arg.or_else(|| {
-        std::env::var("ATHEN_MAX_STEPS")
-            .ok()
-            .filter(|s| !s.is_empty())
-    });
-    let max_steps = match max_steps_str.as_deref() {
-        None => 50u32,
-        Some(s) => match s.parse::<u32>() {
-            Ok(0) => u32::MAX,
-            Ok(n) => n,
-            Err(_) => {
-                eprintln!("Error: --max-steps expects a non-negative integer, got '{s}'.");
-                std::process::exit(2);
-            }
-        },
-    };
-
     if let Some(prompt) = prompt_arg {
-        match run_headless(prompt, profile_arg, family, temperature, max_steps).await {
+        match run_headless(prompt, profile_arg, family, temperature).await {
             Ok(()) => std::process::exit(0),
             Err((code, msg)) => {
                 eprintln!("{msg}");
@@ -702,7 +671,6 @@ async fn main() {
             let executor = AgentBuilder::new()
                 .llm_router(exec_router)
                 .tool_registry(Box::new(registry))
-                .max_steps(50)
                 .timeout(Duration::from_secs(120))
                 .build()?;
 

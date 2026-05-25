@@ -46,7 +46,6 @@ pub struct AgentBuilder {
     llm_router: Option<Box<dyn LlmRouter>>,
     tool_registry: Option<Box<dyn ToolRegistry>>,
     auditor: Option<Box<dyn StepAuditor>>,
-    max_steps: u32,
     timeout: Duration,
     context_messages: Vec<ChatMessage>,
     stream_sender: Option<tokio::sync::mpsc::UnboundedSender<String>>,
@@ -75,7 +74,6 @@ impl AgentBuilder {
     /// Create a new builder with default values.
     ///
     /// Defaults:
-    /// - `max_steps`: 50
     /// - `timeout`: 5 minutes
     /// - `auditor`: [`InMemoryAuditor`]
     pub fn new() -> Self {
@@ -83,7 +81,6 @@ impl AgentBuilder {
             llm_router: None,
             tool_registry: None,
             auditor: None,
-            max_steps: 50,
             timeout: Duration::from_secs(300),
             context_messages: Vec::new(),
             stream_sender: None,
@@ -303,12 +300,6 @@ impl AgentBuilder {
         self
     }
 
-    /// Set the maximum number of steps before the executor gives up.
-    pub fn max_steps(mut self, n: u32) -> Self {
-        self.max_steps = n;
-        self
-    }
-
     /// Set the maximum execution time for a task.
     pub fn timeout(mut self, d: Duration) -> Self {
         self.timeout = d;
@@ -382,7 +373,6 @@ impl AgentBuilder {
             llm_router,
             tool_registry,
             auditor,
-            self.max_steps,
             self.timeout,
             self.context_messages,
         );
@@ -524,7 +514,6 @@ mod tests {
         let result = AgentBuilder::new()
             .llm_router(Box::new(DummyRouter))
             .tool_registry(Box::new(DummyRegistry))
-            .max_steps(100)
             .timeout(Duration::from_secs(600))
             .build();
         assert!(result.is_ok());

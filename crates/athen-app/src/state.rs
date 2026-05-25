@@ -2931,7 +2931,6 @@ async fn execute_owner_telegram_message(
         .llm_router(exec_router)
         .tool_registry(registry)
         .auditor(Box::new(auditor))
-        .max_steps(50)
         .timeout(Duration::from_secs(300))
         .context_messages(context)
         .stream_sender(stream_tx)
