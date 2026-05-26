@@ -71,6 +71,12 @@ pub struct AppToolRegistry {
     /// When set to `"athen_setup"`, the registry includes the 6 setup_*
     /// tools for interactive onboarding. Other profiles never see them.
     active_profile_id: Option<String>,
+    /// Per-arc cache of already-loaded skill slugs. The second call to
+    /// `load_skill` with the same slug returns a short "already loaded"
+    /// stub instead of the full body, saving tokens. Uses interior
+    /// mutability so `call_tool(&self, …)` can update the cache without
+    /// requiring `&mut self`.
+    loaded_skills: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl AppToolRegistry {
@@ -98,6 +104,7 @@ impl AppToolRegistry {
             cloud_apis_doc_path: None,
             calendar_source_store: None,
             active_profile_id: None,
+            loaded_skills: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -1612,6 +1619,32 @@ impl AppToolRegistry {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| AthenError::Other("load_skill: 'slug' is required".to_string()))?
             .to_string();
+
+        // Idempotency: if this slug was already loaded earlier in this arc,
+        // return a lightweight stub instead of the full body. The Mutex is
+        // never contended (one agent per arc, sequential tool calls) so the
+        // lock is always uncontested.
+        {
+            let mut cache = self
+                .loaded_skills
+                .lock()
+                .expect("loaded_skills mutex poisoned");
+            if cache.contains(&slug) {
+                tracing::debug!(slug, "load_skill: returning already-loaded stub");
+                return Ok(ToolResult {
+                    success: true,
+                    output: json!({
+                        "ok": true,
+                        "slug": slug,
+                        "already_loaded": true,
+                        "message": "Skill already loaded in this arc. Refer to the content returned earlier.",
+                    }),
+                    error: None,
+                    execution_time_ms: 0,
+                });
+            }
+            cache.insert(slug.clone());
+        }
 
         let start = Instant::now();
         let body = store.load_body(&slug).await?;
@@ -3890,6 +3923,122 @@ mod tests {
                 by_name.get("fs__write_file").copied(),
                 Some(BaseImpact::WritePersist)
             );
+        }
+    }
+
+    // ── load_skill idempotency tests ─────────────────────────────────
+
+    mod load_skill_idempotency {
+        use super::*;
+        use athen_core::identity::ProfileTag;
+        use athen_core::skill::SkillFrontmatter;
+        use athen_core::traits::skill::SkillStore;
+        use athen_persistence::skills::SqliteSkillStore;
+        use rusqlite::Connection;
+        use std::sync::Arc;
+        use tempfile::TempDir;
+        use tokio::sync::Mutex as TokioMutex;
+
+        async fn setup_with_skill(slug: &str, body: &str) -> (AppToolRegistry, TempDir) {
+            let dir = TempDir::new().unwrap();
+            let conn = Connection::open_in_memory().unwrap();
+            let conn = Arc::new(TokioMutex::new(conn));
+            athen_persistence::skills::init_schema(&conn).await.unwrap();
+            let store = Arc::new(SqliteSkillStore::new(conn, dir.path().to_path_buf()));
+
+            let front = SkillFrontmatter {
+                name: slug.to_string(),
+                description: "test skill".to_string(),
+                applies_to: vec![ProfileTag::Always],
+            };
+            store.upsert(slug, &front, body).await.unwrap();
+
+            let shell = ShellToolRegistry::new().await;
+            let registry = AppToolRegistry::new(shell, None, None, None).with_skills(store);
+            (registry, dir)
+        }
+
+        /// First call returns the full body; second call with the same slug
+        /// returns the "already_loaded" stub without hitting the store again.
+        #[tokio::test]
+        async fn second_call_returns_already_loaded_stub() {
+            let (registry, _dir) = setup_with_skill("cold-email", "## Steps\n1. Write email.\n").await;
+
+            // First call — must return the full body.
+            let first = registry
+                .call_tool("load_skill", json!({ "slug": "cold-email" }))
+                .await
+                .unwrap();
+            assert!(first.success);
+            assert!(first.output.get("already_loaded").is_none(),
+                "First call must NOT have already_loaded key");
+            assert!(
+                first.output["body"].as_str().unwrap().contains("Write email"),
+                "First call must return the full body"
+            );
+
+            // Second call — must return the stub.
+            let second = registry
+                .call_tool("load_skill", json!({ "slug": "cold-email" }))
+                .await
+                .unwrap();
+            assert!(second.success);
+            assert_eq!(
+                second.output["already_loaded"].as_bool(),
+                Some(true),
+                "Second call must have already_loaded=true"
+            );
+            assert!(second.output.get("body").is_none(),
+                "Second call must NOT return the full body");
+        }
+
+        /// Different slugs on the same registry are each loaded only once.
+        #[tokio::test]
+        async fn different_slugs_each_load_once() {
+            let dir = TempDir::new().unwrap();
+            let conn = Connection::open_in_memory().unwrap();
+            let conn = Arc::new(TokioMutex::new(conn));
+            athen_persistence::skills::init_schema(&conn).await.unwrap();
+            let store = Arc::new(SqliteSkillStore::new(conn, dir.path().to_path_buf()));
+
+            let front_a = SkillFrontmatter {
+                name: "alpha".to_string(),
+                description: "a".to_string(),
+                applies_to: vec![ProfileTag::Always],
+            };
+            let front_b = SkillFrontmatter {
+                name: "beta".to_string(),
+                description: "b".to_string(),
+                applies_to: vec![ProfileTag::Always],
+            };
+            store.upsert("alpha", &front_a, "alpha body").await.unwrap();
+            store.upsert("beta", &front_b, "beta body").await.unwrap();
+
+            let shell = ShellToolRegistry::new().await;
+            let registry = AppToolRegistry::new(shell, None, None, None).with_skills(store);
+
+            // Load alpha — first time.
+            let r = registry
+                .call_tool("load_skill", json!({ "slug": "alpha" }))
+                .await
+                .unwrap();
+            assert!(r.output.get("already_loaded").is_none());
+            assert!(r.output["body"].as_str().unwrap().contains("alpha body"));
+
+            // Load beta — first time (different slug).
+            let r = registry
+                .call_tool("load_skill", json!({ "slug": "beta" }))
+                .await
+                .unwrap();
+            assert!(r.output.get("already_loaded").is_none());
+            assert!(r.output["body"].as_str().unwrap().contains("beta body"));
+
+            // Load alpha again — should be stub.
+            let r = registry
+                .call_tool("load_skill", json!({ "slug": "alpha" }))
+                .await
+                .unwrap();
+            assert_eq!(r.output["already_loaded"].as_bool(), Some(true));
         }
     }
 }
