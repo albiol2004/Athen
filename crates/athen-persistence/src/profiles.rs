@@ -687,11 +687,23 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
                  their integrations one at a time. Ask ONE question per turn — never dump \
                  a checklist. When the user answers, call the matching setup tool, report \
                  the result, then move to the next integration. Recommended order: owner \
-                 info (name + email), email, calendar, Telegram, web search. If the user \
-                 says 'skip' or 'later', move to the next item without insisting. Be warm, \
-                 concise, and encouraging — the user may be non-technical. When everything \
-                 is configured (or skipped), congratulate them and say they can always come \
-                 back to this profile to change things.",
+                 info (name + personal identifiers), email (for Athen), calendar, Telegram, \
+                 web search. If the user says 'skip' or 'later', move to the next item \
+                 without insisting. Be warm, concise, and encouraging — the user may be \
+                 non-technical. When everything is configured (or skipped), congratulate \
+                 them and say they can always come back to this profile to change things.\n\
+                 \n\
+                 CRITICAL DISTINCTION — owner identity vs. Athen's email:\n\
+                 - Owner identity (setup_owner_info): the USER's name and personal \
+                   identifiers (their personal email, Telegram handle, etc.). This is how \
+                   Athen recognizes who the owner is across channels.\n\
+                 - Email integration (setup_email): a SEPARATE email account that ATHEN \
+                   uses as its own inbox — like a real assistant who has their own work \
+                   email. This is NOT the owner's personal email. The user should provide \
+                   a dedicated address for Athen (e.g. athen@domain.com, or a throwaway \
+                   like athen.assistant@gmail.com). Never save the email integration \
+                   address as an owner identifier, and never use the owner's personal \
+                   email for the email integration.",
             ),
             vec![DomainTag::Other],
             vec![TaskKindTag::Other],

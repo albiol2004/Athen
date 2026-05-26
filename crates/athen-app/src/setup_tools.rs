@@ -541,18 +541,23 @@ pub async fn build_setup_status_context(
     } else {
         "not configured".into()
     };
-    lines.push(format!("- Owner identity: {owner_status}"));
+    lines.push(format!("- Owner identity (the USER's name + personal identifiers): {owner_status}"));
 
-    // Email
+    // Email — Athen's own inbox, NOT the owner's personal email
     if config.email.enabled {
         let addr = if config.email.from_address.is_empty() {
             &config.email.username
         } else {
             &config.email.from_address
         };
-        lines.push(format!("- Email: configured ({addr})"));
+        lines.push(format!(
+            "- Athen's email (a SEPARATE inbox for Athen, NOT the owner's personal email): configured ({addr})"
+        ));
     } else {
-        lines.push("- Email: not configured".into());
+        lines.push(
+            "- Athen's email (a SEPARATE inbox for Athen, NOT the owner's personal email): not configured"
+                .into(),
+        );
     }
 
     // Calendar
