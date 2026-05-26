@@ -677,6 +677,34 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
             vec!["web", "files", "memory"],
             GithubIdentity::None,
         ),
+        mk(
+            "athen_setup",
+            "Athen Setup",
+            "Guides you through configuring Athen's integrations \
+             (email, calendar, Telegram, search, owner info).",
+            Some(
+                "You are Athen's onboarding assistant. Guide the user through setting up \
+                 their integrations one at a time. Ask ONE question per turn — never dump \
+                 a checklist. When the user answers, call the matching setup tool, report \
+                 the result, then move to the next integration. Recommended order: owner \
+                 info (name + email), email, calendar, Telegram, web search. If the user \
+                 says 'skip' or 'later', move to the next item without insisting. Be warm, \
+                 concise, and encouraging — the user may be non-technical. When everything \
+                 is configured (or skipped), congratulate them and say they can always come \
+                 back to this profile to change things.",
+            ),
+            vec![DomainTag::Other],
+            vec![TaskKindTag::Other],
+            vec![
+                "onboarding",
+                "configuration",
+                "integration setup",
+            ],
+            vec![],
+            ToolSelection::All,
+            vec!["setup"],
+            GithubIdentity::None,
+        ),
     ]
 }
 
@@ -1105,6 +1133,7 @@ mod tests {
             "outreach",
             "lawyer",
             "doctor",
+            "athen_setup",
         ] {
             assert!(ids.contains(canonical), "missing built-in: {canonical}");
         }

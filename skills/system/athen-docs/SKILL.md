@@ -31,3 +31,7 @@ You have access to Athen's built-in documentation via the `athen_docs` tool.
 
 ### Troubleshooting
 - **troubleshoot-no-llm-response** -- Diagnostic checklist when Athen isn't responding
+
+## Agent-driven setup
+
+If the user needs to configure an integration (email, calendar, Telegram, search, owner info) and this conversation isn't using the **Athen Setup** profile, suggest they switch to it via the profile picker in the chat header. The Athen Setup profile has specialized `setup_*` tools that can configure integrations directly — you read the guide, the tools do the work.

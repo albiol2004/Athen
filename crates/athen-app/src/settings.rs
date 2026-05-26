@@ -320,7 +320,7 @@ pub(crate) async fn load_models_config_hydrated(
 }
 
 /// Save the main config to `~/.athen/config.toml`.
-fn save_main_config(config: &AthenConfig) -> Result<(), String> {
+pub(crate) fn save_main_config(config: &AthenConfig) -> Result<(), String> {
     let dir = ensure_athen_dir()?;
     let path = dir.join("config.toml");
     let content =

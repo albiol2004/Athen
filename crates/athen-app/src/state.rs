@@ -572,6 +572,20 @@ pub(crate) async fn assemble_app_tool_registry(
     if let Some(cstore) = deps.calendar_source_store.clone() {
         registry = registry.with_calendar_remote(cstore);
     }
+    // Standalone vault wiring for setup tools (vault may already be
+    // set via with_http_endpoints above, but this covers the case
+    // where http endpoints aren't configured yet).
+    if let Some(vault) = deps.vault.clone() {
+        registry = registry.with_vault_standalone(vault);
+    }
+    // Resolve the active profile so setup tools are conditionally registered.
+    let active_profile_id = crate::commands::active_profile_id_for_arc(
+        deps.profile_store.as_ref(),
+        deps.arc_store.as_ref(),
+        arc_id,
+    )
+    .await;
+    registry = registry.with_active_profile_id(active_profile_id);
     if let Some(grants) = deps.grant_store.clone() {
         let mut gate = crate::file_gate::FileGate::new(
             arc_id.to_string(),

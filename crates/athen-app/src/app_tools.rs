@@ -68,6 +68,9 @@ pub struct AppToolRegistry {
     /// alongside the local insert. When `None`, agent calendar writes
     /// stay local-only.
     calendar_source_store: Option<Arc<dyn CalendarSourceConfigStore>>,
+    /// When set to `"athen_setup"`, the registry includes the 6 setup_*
+    /// tools for interactive onboarding. Other profiles never see them.
+    active_profile_id: Option<String>,
 }
 
 impl AppToolRegistry {
@@ -94,7 +97,20 @@ impl AppToolRegistry {
             http_client: None,
             cloud_apis_doc_path: None,
             calendar_source_store: None,
+            active_profile_id: None,
         }
+    }
+
+    pub fn with_active_profile_id(mut self, id: Option<String>) -> Self {
+        self.active_profile_id = id;
+        self
+    }
+
+    pub fn with_vault_standalone(mut self, vault: Arc<dyn Vault>) -> Self {
+        if self.vault.is_none() {
+            self.vault = Some(vault);
+        }
+        self
     }
 
     /// Attach the calendar source config store so `calendar_create` can
@@ -2109,6 +2125,182 @@ impl AppToolRegistry {
             execution_time_ms: elapsed_ms,
         })
     }
+
+    // ── Setup tools (profile-gated) ──────────────────────────────
+
+    async fn dispatch_setup_tool(
+        &self,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> Result<ToolResult> {
+        let start = std::time::Instant::now();
+        let body = match name {
+            "setup_email" => {
+                let addr = args["address"].as_str().unwrap_or_default();
+                let pw = args["password"].as_str().unwrap_or_default();
+                let vault = self.vault.as_ref().ok_or_else(|| {
+                    AthenError::Other("Vault not available for setup".into())
+                })?;
+                crate::setup_tools::do_setup_email(vault, addr, pw).await?
+            }
+            "setup_calendar_connect" => {
+                let provider = args["provider"].as_str().unwrap_or_default();
+                let username = args["username"].as_str().unwrap_or_default();
+                let password = args["password"].as_str().unwrap_or_default();
+                let base_url = args["base_url"].as_str();
+                let vault = self.vault.as_ref().ok_or_else(|| {
+                    AthenError::Other("Vault not available for setup".into())
+                })?;
+                let cstore = self.calendar_source_store.as_ref().ok_or_else(|| {
+                    AthenError::Other("Calendar source store not available".into())
+                })?;
+                crate::setup_tools::do_setup_calendar_connect(
+                    vault, &**cstore, provider, username, password, base_url,
+                )
+                .await?
+            }
+            "setup_calendar_configure" => {
+                let source_id_str = args["source_id"].as_str().unwrap_or_default();
+                let source_id = uuid::Uuid::parse_str(source_id_str).map_err(|e| {
+                    AthenError::Other(format!("Invalid source_id UUID: {e}"))
+                })?;
+                let selected: Vec<String> = args["selected_calendars"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                let default_cal = args["default_calendar_id"].as_str();
+                let cstore = self.calendar_source_store.as_ref().ok_or_else(|| {
+                    AthenError::Other("Calendar source store not available".into())
+                })?;
+                crate::setup_tools::do_setup_calendar_configure(
+                    &**cstore, source_id, &selected, default_cal,
+                )
+                .await?
+            }
+            "setup_telegram" => {
+                let token = args["bot_token"].as_str().unwrap_or_default();
+                let vault = self.vault.as_ref().ok_or_else(|| {
+                    AthenError::Other("Vault not available for setup".into())
+                })?;
+                crate::setup_tools::do_setup_telegram(vault, token).await?
+            }
+            "setup_owner_info" => {
+                let field = args["field"].as_str().unwrap_or_default();
+                let value = args["value"].as_str().unwrap_or_default();
+                let cstore = self.contacts.as_ref().ok_or_else(|| {
+                    AthenError::Other("Contact store not available".into())
+                })?;
+                crate::setup_tools::do_setup_owner_info(cstore, field, value).await?
+            }
+            "setup_search_key" => {
+                let provider = args["provider"].as_str().unwrap_or_default();
+                let key = args["key"].as_str().unwrap_or_default();
+                let vault = self.vault.as_ref().ok_or_else(|| {
+                    AthenError::Other("Vault not available for setup".into())
+                })?;
+                crate::setup_tools::do_setup_search_key(vault, provider, key).await?
+            }
+            _ => return Err(AthenError::ToolNotFound(name.to_string())),
+        };
+        let elapsed = start.elapsed().as_millis() as u64;
+        Ok(ToolResult {
+            success: true,
+            output: serde_json::Value::String(body),
+            error: None,
+            execution_time_ms: elapsed,
+        })
+    }
+
+    fn setup_tool_definitions() -> Vec<ToolDefinition> {
+        vec![
+            ToolDefinition {
+                name: "setup_email".into(),
+                description: "Set up email (IMAP + SMTP). Autodetects servers from the email address, tests, and saves. Use an app-specific password, not the main account password.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "address": { "type": "string", "description": "Email address" },
+                        "password": { "type": "string", "description": "App-specific password" }
+                    },
+                    "required": ["address", "password"]
+                }),
+                backend: ToolBackend::Shell { command: String::new(), native: false },
+                base_risk: BaseImpact::WritePersist,
+            },
+            ToolDefinition {
+                name: "setup_calendar_connect".into(),
+                description: "Connect a CalDAV calendar source. Tests the connection and returns the list of available calendars so you can ask which to sync.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "provider": { "type": "string", "enum": ["icloud", "google", "fastmail", "yandex", "nextcloud", "custom"] },
+                        "username": { "type": "string", "description": "CalDAV username (usually your email)" },
+                        "password": { "type": "string", "description": "App-specific password" },
+                        "base_url": { "type": "string", "description": "Required only for nextcloud or custom" }
+                    },
+                    "required": ["provider", "username", "password"]
+                }),
+                backend: ToolBackend::Shell { command: String::new(), native: false },
+                base_risk: BaseImpact::WritePersist,
+            },
+            ToolDefinition {
+                name: "setup_calendar_configure".into(),
+                description: "Finalize calendar setup: select which calendars to sync and optionally set a default for new events.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "source_id": { "type": "string" },
+                        "selected_calendars": { "type": "array", "items": { "type": "string" } },
+                        "default_calendar_id": { "type": "string" }
+                    },
+                    "required": ["source_id", "selected_calendars"]
+                }),
+                backend: ToolBackend::Shell { command: String::new(), native: false },
+                base_risk: BaseImpact::WritePersist,
+            },
+            ToolDefinition {
+                name: "setup_telegram".into(),
+                description: "Connect a Telegram bot for notifications. Provide the token from @BotFather.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "bot_token": { "type": "string" }
+                    },
+                    "required": ["bot_token"]
+                }),
+                backend: ToolBackend::Shell { command: String::new(), native: false },
+                base_risk: BaseImpact::WritePersist,
+            },
+            ToolDefinition {
+                name: "setup_owner_info".into(),
+                description: "Set your personal info so Athen knows who you are. Set one field at a time.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "field": { "type": "string", "enum": ["name", "email", "phone", "telegram_user_id"] },
+                        "value": { "type": "string" }
+                    },
+                    "required": ["field", "value"]
+                }),
+                backend: ToolBackend::Shell { command: String::new(), native: false },
+                base_risk: BaseImpact::WritePersist,
+            },
+            ToolDefinition {
+                name: "setup_search_key".into(),
+                description: "Add a web search API key. Brave offers 2,000 free queries/month.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "provider": { "type": "string", "enum": ["brave", "tavily"] },
+                        "key": { "type": "string" }
+                    },
+                    "required": ["provider", "key"]
+                }),
+                backend: ToolBackend::Shell { command: String::new(), native: false },
+                base_risk: BaseImpact::WritePersist,
+            },
+        ]
+    }
 }
 
 fn join_base_and_path(base: &str, path: &str) -> Result<reqwest::Url> {
@@ -2419,6 +2611,11 @@ impl ToolRegistry for AppToolRegistry {
             });
         }
 
+        // Setup tools: only visible under the "athen_setup" profile.
+        if self.active_profile_id.as_deref() == Some("athen_setup") {
+            tools.extend(Self::setup_tool_definitions());
+        }
+
         Ok(tools)
     }
 
@@ -2493,6 +2690,13 @@ impl ToolRegistry for AppToolRegistry {
             "load_skill" => self.do_load_skill(&args).await,
             "athen_docs" => self.do_athen_docs(&args),
             "http_request" => self.do_http_request(&args).await,
+            // Setup tools (gated by profile in list_tools)
+            "setup_email" => self.dispatch_setup_tool(name, &args).await,
+            "setup_calendar_connect" => self.dispatch_setup_tool(name, &args).await,
+            "setup_calendar_configure" => self.dispatch_setup_tool(name, &args).await,
+            "setup_telegram" => self.dispatch_setup_tool(name, &args).await,
+            "setup_owner_info" => self.dispatch_setup_tool(name, &args).await,
+            "setup_search_key" => self.dispatch_setup_tool(name, &args).await,
             _ => self.inner.call_tool(name, args).await,
         }
     }

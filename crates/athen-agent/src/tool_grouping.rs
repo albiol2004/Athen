@@ -81,6 +81,7 @@ fn pretty_group_name(id: &str) -> String {
         "shell" => "Shell".to_string(),
         "files" => "Files".to_string(),
         "web" => "Web".to_string(),
+        "setup" => "Setup".to_string(),
         // Capitalize first letter for unknown groups (MCPs etc.)
         other => {
             let mut chars = other.chars();
@@ -101,6 +102,7 @@ fn group_one_liner(id: &str, tools: &[&ToolDefinition]) -> String {
         "shell" => "execute shell commands".to_string(),
         "files" => "read, edit, write, search and list files".to_string(),
         "web" => "search the web and fetch URLs as clean markdown".to_string(),
+        "setup" => "configure Athen's integrations (email, calendar, Telegram, identity, web search)".to_string(),
         // Fallback: show the bare tool names so the agent can recognise them.
         _ => format!("tools: {}", names.join(", ")),
     }

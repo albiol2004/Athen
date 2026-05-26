@@ -32,6 +32,7 @@ pub(crate) mod process;
 pub(crate) mod sense_router;
 mod settings;
 mod settings_calendar;
+pub(crate) mod setup_tools;
 pub(crate) mod skills_render;
 pub(crate) mod spawn_pidfile;
 pub(crate) mod state;
