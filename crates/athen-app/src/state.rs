@@ -420,6 +420,9 @@ pub struct AppState {
     /// registry's `write`/`edit` hooks call into it before the tool
     /// mutates the filesystem so the user can revert later.
     pub checkpoint_store: Option<Arc<dyn athen_core::traits::checkpoint::CheckpointStore>>,
+    /// Proactive hint dismissal store. Tracks which setup nudges the user
+    /// has permanently dismissed so the background checker skips them.
+    pub hint_dismissal_store: Option<athen_persistence::hint_dismissals::HintDismissalStore>,
 }
 
 /// Snapshot of every AppState field the per-arc tool registry needs.
@@ -765,6 +768,7 @@ impl AppState {
         let telegram_chat_log = database
             .as_ref()
             .map(|db| Arc::new(db.telegram_chat_log_store()));
+        let hint_dismissal_store = database.as_ref().map(|db| db.hint_dismissal_store());
         let http_rate_limiter = Arc::new(crate::http_rate_limiter::HttpRateLimiter::new());
         // Single reqwest client reused across every per-arc registry —
         // avoids per-call connection setup cost. Defaults are fine; the
@@ -889,6 +893,7 @@ impl AppState {
             agent_run_store,
             agent_registry: None,
             checkpoint_store,
+            hint_dismissal_store,
         };
 
         if let Err(e) = state.refresh_tools_doc().await {
@@ -1518,6 +1523,57 @@ impl AppState {
                         tracing::warn!("agent_runs pruner failed: {e}");
                     }
                 }
+            }
+        });
+    }
+
+    /// Start the proactive help hint checker.
+    ///
+    /// Runs 60 seconds after startup (to let monitors settle), then every
+    /// 15 minutes. Rate-limited internally to at most 1 hint per hour.
+    /// Emits a `proactive-hint` Tauri event for the frontend to render.
+    pub fn start_proactive_hint_checker(&self, app_handle: tauri::AppHandle) {
+        let Some(store) = self.hint_dismissal_store.clone() else {
+            tracing::debug!("No hint_dismissal_store wired; skipping hint checker");
+            return;
+        };
+        let notifier = self.notifier.clone();
+        let config_snapshot = self.load_hydrated_config_sync();
+        let active_id = self.active_provider_id.blocking_lock().clone();
+        let cal_source_store = self.calendar_source_store();
+
+        let checker = std::sync::Arc::new(crate::proactive_hints::ProactiveHintChecker::new(store));
+
+        tauri::async_runtime::spawn(async move {
+            // Initial delay so the app has time to finish loading.
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+
+            let interval = std::time::Duration::from_secs(15 * 60);
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+            loop {
+                ticker.tick().await;
+
+                let cal_count = if let Some(ref cs) = cal_source_store {
+                    use athen_core::traits::calendar_source_config::CalendarSourceConfigStore;
+                    cs.list().await.map(|v| v.len()).unwrap_or(0)
+                } else {
+                    0
+                };
+
+                let is_local = matches!(active_id.as_str(), "ollama" | "llamacpp");
+
+                let ctx = crate::proactive_hints::HintContext {
+                    config: config_snapshot.clone(),
+                    calendar_source_count: cal_count,
+                    active_provider_id: active_id.clone(),
+                    is_local_provider: is_local,
+                };
+
+                checker
+                    .check_and_emit(ctx, &app_handle, notifier.as_ref())
+                    .await;
             }
         });
     }

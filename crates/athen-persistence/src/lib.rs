@@ -11,6 +11,7 @@ pub mod chat;
 pub mod checkpoint;
 pub mod contacts;
 pub mod grants;
+pub mod hint_dismissals;
 pub mod http_endpoints;
 pub mod identity;
 pub mod mcp;
@@ -37,6 +38,7 @@ use crate::calendar_sources::SqliteCalendarSourceStore;
 use crate::chat::ChatStore;
 use crate::contacts::SqliteContactStore;
 use crate::grants::GrantStore;
+use crate::hint_dismissals::HintDismissalStore;
 use crate::http_endpoints::SqliteHttpEndpointStore;
 use crate::identity::SqliteIdentityStore;
 use crate::mcp::McpStore;
@@ -118,6 +120,8 @@ impl Database {
         agent_runs.init_schema().await?;
         let tg_log = self.telegram_chat_log_store();
         tg_log.init_schema().await?;
+        let hints = self.hint_dismissal_store();
+        hints.init_schema().await?;
         profiles.seed_builtins_if_empty().await
     }
 
@@ -209,6 +213,10 @@ impl Database {
     /// owner-Telegram handler to prepend as system context.
     pub fn telegram_chat_log_store(&self) -> crate::telegram_chat_log::TelegramChatLogStore {
         crate::telegram_chat_log::TelegramChatLogStore::new(self.conn.clone())
+    }
+
+    pub fn hint_dismissal_store(&self) -> HintDismissalStore {
+        HintDismissalStore::new(self.conn.clone())
     }
 
     /// Force-checkpoint the WAL and truncate it. Called from the graceful

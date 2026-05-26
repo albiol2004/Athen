@@ -4920,6 +4920,38 @@ option:hover {
     line-height: 1.5;
 }
 
+/* ─── Proactive hints ─── */
+.notification-toast.proactive-hint {
+    border-left: 3px solid var(--accent);
+}
+.hint-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 8px;
+}
+.hint-action-btn {
+    font-size: 11px;
+    padding: 4px 10px;
+    border-radius: var(--r-xs);
+    cursor: pointer;
+    transition: background var(--dur) var(--ease);
+}
+.hint-setup {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+}
+.hint-setup:hover { filter: brightness(1.15); }
+.hint-dismiss-permanent {
+    background: transparent;
+    color: var(--text-3);
+    border: 1px solid var(--border);
+}
+.hint-dismiss-permanent:hover {
+    background: rgba(255,255,255,0.04);
+    color: var(--text-2);
+}
+
 /* ─── Channel order ─── */
 #notif-channel-order {
     display: flex;

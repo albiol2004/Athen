@@ -8182,6 +8182,25 @@ pub async fn email_translate_error(
     Ok(crate::email_errors::translate_with_llm(&raw_error, domain.as_deref(), &router).await)
 }
 
+// ---------------------------------------------------------------------------
+// Proactive hint dismissal
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn dismiss_hint(
+    state: State<'_, AppState>,
+    hint_id: String,
+    permanent: bool,
+) -> std::result::Result<(), String> {
+    if let Some(ref store) = state.hint_dismissal_store {
+        store
+            .dismiss(&hint_id, permanent)
+            .await
+            .map_err(|e| format!("Failed to dismiss hint: {e}"))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod key_term_tests {
     use super::extract_key_terms;

@@ -1,6 +1,6 @@
 # Self-Support: Athen as Its Own IT Help Desk (Design Doc)
 
-**Status:** Design, not yet implemented. Builds on shipped [Skills](SKILLS.md) and shipped onboarding wizard (`frontend/app.js` ~10759).
+**Status:** L1 (help modals) + L2 (athen_docs tool + 11 guides) + Proactive help sense SHIPPED. L3 (skill-gated settings tools), `cargo xtask gen-skills`, and CI staleness check deferred. Builds on shipped [Skills](SKILLS.md) and shipped onboarding wizard (`frontend/app.js` ~10759).
 
 The thesis: Athen is for non-technical users, but Athen has a Settings surface that already covers ~20 panels (providers, calendars, email, MCP servers, Cloud APIs, GitHub identity, profiles, vault, runtimes, …). Onboarding only walks through the LLM step. After that the user is on their own, staring at fields like "CalDAV principal URL" or "MCP server stdio command" with no agent help — because the help they'd ask the agent for IS the help to configure the agent.
 

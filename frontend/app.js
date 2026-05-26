@@ -436,6 +436,11 @@ function registerTauriEventListeners() {
         }
     });
 
+    // Proactive help hints — setup nudges the background checker emits.
+    window.__TAURI__.event.listen('proactive-hint', (event) => {
+        showProactiveHintCard(event.payload);
+    });
+
     // Listen for path-grant requests from the file gate.
     window.__TAURI__.event.listen('grant-requested', (event) => {
         enqueueGrantRequest(event.payload);
@@ -7739,6 +7744,106 @@ function showNotificationToast(data) {
         document.body.appendChild(container);
     }
     container.appendChild(toast);
+}
+
+// ─── Proactive Help Hints ───
+
+function showProactiveHintCard(hint) {
+    let container = document.getElementById('toast-container');
+    if (!container) {
+        container = document.createElement('div');
+        container.id = 'toast-container';
+        document.body.appendChild(container);
+    }
+
+    const card = document.createElement('div');
+    card.className = 'notification-toast proactive-hint';
+
+    const header = document.createElement('div');
+    header.className = 'toast-header';
+
+    const icon = document.createElement('span');
+    icon.className = 'toast-icon';
+    icon.textContent = '💡';
+
+    const title = document.createElement('span');
+    title.className = 'toast-title';
+    title.textContent = hint.title;
+
+    const closeBtn = document.createElement('button');
+    closeBtn.className = 'toast-close';
+    closeBtn.textContent = '×';
+    closeBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        card.remove();
+    });
+
+    header.appendChild(icon);
+    header.appendChild(title);
+    header.appendChild(closeBtn);
+    card.appendChild(header);
+
+    if (hint.body) {
+        const body = document.createElement('div');
+        body.className = 'toast-body';
+        body.textContent = hint.body;
+        card.appendChild(body);
+    }
+
+    const actions = document.createElement('div');
+    actions.className = 'hint-actions';
+
+    if (hint.action_panel) {
+        const setupBtn = document.createElement('button');
+        setupBtn.className = 'hint-action-btn hint-setup';
+        setupBtn.textContent = 'Open Settings';
+        setupBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            card.remove();
+            showSettings();
+            const panel = hint.action_panel;
+            if (panel === 'calendar-sources') {
+                const calSection = document.getElementById('calendar-sources-section');
+                if (calSection) calSection.scrollIntoView({ behavior: 'smooth' });
+            } else if (panel === 'email') {
+                const emailSection = document.getElementById('email-settings-section');
+                if (emailSection) emailSection.scrollIntoView({ behavior: 'smooth' });
+            } else if (panel === 'telegram') {
+                const tgSection = document.getElementById('telegram-settings-section');
+                if (tgSection) tgSection.scrollIntoView({ behavior: 'smooth' });
+            } else if (panel === 'cloud-apis') {
+                const apiSection = document.getElementById('cloud-apis-section');
+                if (apiSection) apiSection.scrollIntoView({ behavior: 'smooth' });
+            } else if (panel === 'embedding') {
+                const embSection = document.getElementById('embedding-settings-section');
+                if (embSection) embSection.scrollIntoView({ behavior: 'smooth' });
+            } else if (panel === 'bundles') {
+                const bundleSection = document.getElementById('bundles-section');
+                if (bundleSection) bundleSection.scrollIntoView({ behavior: 'smooth' });
+            }
+        });
+        actions.appendChild(setupBtn);
+    }
+
+    const dontShowBtn = document.createElement('button');
+    dontShowBtn.className = 'hint-action-btn hint-dismiss-permanent';
+    dontShowBtn.textContent = "Don’t show again";
+    dontShowBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        card.remove();
+        if (invoke) {
+            invoke('dismiss_hint', { hintId: hint.hint_id, permanent: true }).catch(() => {});
+        }
+    });
+    actions.appendChild(dontShowBtn);
+
+    card.appendChild(actions);
+    container.appendChild(card);
+
+    // Auto-dismiss after 30s if user doesn't interact.
+    setTimeout(() => {
+        if (card.parentNode) card.remove();
+    }, 30000);
 }
 
 // ─── Email Settings ───

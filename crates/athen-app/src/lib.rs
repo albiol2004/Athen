@@ -27,6 +27,7 @@ pub(crate) mod identity_render;
 pub(crate) mod mission_render;
 pub(crate) mod notifier;
 pub(crate) mod owner_migration;
+pub(crate) mod proactive_hints;
 pub(crate) mod process;
 pub(crate) mod sense_router;
 mod settings;
@@ -247,6 +248,7 @@ pub fn run() {
             commands::email_detect,
             commands::email_test_connection,
             commands::email_translate_error,
+            commands::dismiss_hint,
         ])
         .setup(|app| {
             use tauri::Manager;
@@ -341,6 +343,10 @@ pub fn run() {
             // Sweep finalized agent_runs older than 30 days. Cheap; runs
             // once at startup and then every 6 hours.
             state.start_agent_run_pruner();
+
+            // Start proactive help hint checker. Runs 60s after startup
+            // then every 15 min; rate-limits to 1 hint per hour.
+            state.start_proactive_hint_checker(app.handle().clone());
 
             app.manage(state);
 
