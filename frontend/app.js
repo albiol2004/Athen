@@ -7825,14 +7825,41 @@ function showProactiveHintCard(hint) {
         actions.appendChild(setupBtn);
     }
 
-    const dontShowBtn = document.createElement('button');
-    dontShowBtn.className = 'hint-action-btn hint-dismiss-permanent';
+    const setupHints = [‘no_calendar_source’, ‘no_email’, ‘no_telegram’, ‘no_search_key’];
+    if (setupHints.includes(hint.hint_id)) {
+        const agentBtn = document.createElement(‘button’);
+        agentBtn.className = ‘hint-action-btn hint-setup’;
+        agentBtn.textContent = ‘Let Athen set it up’;
+        agentBtn.addEventListener(‘click’, async (e) => {
+            e.stopPropagation();
+            card.remove();
+            if (!invoke) return;
+            try {
+                const arcId = await invoke(‘create_setup_arc’);
+                activeArcId = arcId;
+                arcHasMessages = false;
+                clearChatUI();
+                returnToChatIfOnSubView();
+                await loadArcs();
+                renderProfilePicker();
+                const msg = `Help me set up ${hint.title.toLowerCase().replace(‘connect your ‘, ‘’).replace(‘better ‘, ‘’)}.`;
+                inputEl.value = msg;
+                formEl?.dispatchEvent(new Event(‘submit’));
+            } catch (err) {
+                console.warn(‘[athen] setup arc from hint failed:’, err);
+            }
+        });
+        actions.appendChild(agentBtn);
+    }
+
+    const dontShowBtn = document.createElement(‘button’);
+    dontShowBtn.className = ‘hint-action-btn hint-dismiss-permanent’;
     dontShowBtn.textContent = "Don’t show again";
-    dontShowBtn.addEventListener('click', (e) => {
+    dontShowBtn.addEventListener(‘click’, (e) => {
         e.stopPropagation();
         card.remove();
         if (invoke) {
-            invoke('dismiss_hint', { hintId: hint.hint_id, permanent: true }).catch(() => {});
+            invoke(‘dismiss_hint’, { hintId: hint.hint_id, permanent: true }).catch(() => {});
         }
     });
     actions.appendChild(dontShowBtn);
@@ -11320,6 +11347,11 @@ function populateOnboardingProviderPickers() {
     }
 }
 
+// When true the user chose "Manual Setup" and gets the full old wizard
+// (memory → search → runtimes → identity → done). When false (default)
+// the interactive path creates a setup arc and lets the agent drive.
+let onbManualMode = false;
+
 // Memory step state — captured cloud key from the LLM step is offered as
 // a default for the OpenAI embedding key so users don't paste twice.
 let onbCloudKeyCache = '';
@@ -11350,10 +11382,16 @@ function showOnboardingStep(name) {
     if (progress) {
         const target = ONB_PROGRESS_FOR_STEP[name];
         if (target) {
-            progress.style.display = '';
-            progress.querySelectorAll('.onb-progress-step').forEach((p) => {
-                p.classList.toggle('active', p.dataset.step === target);
-            });
+            // Interactive mode only has the pick step — hide the progress
+            // bar entirely since a single dot is meaningless.
+            if (!onbManualMode) {
+                progress.style.display = 'none';
+            } else {
+                progress.style.display = '';
+                progress.querySelectorAll('.onb-progress-step').forEach((p) => {
+                    p.classList.toggle('active', p.dataset.step === target);
+                });
+            }
         } else {
             progress.style.display = 'none';
         }
@@ -11371,12 +11409,38 @@ async function finishOnboarding() {
     try {
         await invoke('complete_onboarding');
     } catch (e) {
-        // Hide the overlay anyway — better to land in a usable app than
-        // to trap the user behind a broken sentinel write.
         console.warn('[athen] complete_onboarding failed:', e);
     }
     const overlay = document.getElementById('onboarding-overlay');
     if (overlay) overlay.style.display = 'none';
+}
+
+async function finishOnboardingInteractive() {
+    try {
+        await invoke('complete_onboarding');
+    } catch (e) {
+        console.warn('[athen] complete_onboarding failed:', e);
+    }
+    const overlay = document.getElementById('onboarding-overlay');
+    if (overlay) overlay.style.display = 'none';
+
+    try {
+        const arcId = await invoke('create_setup_arc');
+        activeArcId = arcId;
+        arcHasMessages = false;
+        clearChatUI();
+        await loadArcs();
+        renderProfilePicker();
+        renderReasoningPicker();
+        renderTierPicker();
+
+        // Trigger the agent by sending an initial message.
+        const msg = "Hi! I just set up my AI provider. Help me configure the rest of Athen.";
+        inputEl.value = msg;
+        formEl?.dispatchEvent(new Event('submit'));
+    } catch (e) {
+        console.warn('[athen] create_setup_arc failed:', e);
+    }
 }
 
 async function onboardingTestAndSave({ statusElId, id, baseUrl, model, apiKey }) {
@@ -11417,6 +11481,11 @@ async function onboardingTestAndSave({ statusElId, id, baseUrl, model, apiKey })
 
 function wireOnboardingButtons() {
     document.getElementById('onb-start-btn')?.addEventListener('click', () => {
+        onbManualMode = false;
+        showOnboardingStep('pick');
+    });
+    document.getElementById('onb-manual-btn')?.addEventListener('click', () => {
+        onbManualMode = true;
         showOnboardingStep('pick');
     });
     document.getElementById('onb-skip-1')?.addEventListener('click', finishOnboarding);
@@ -11462,7 +11531,10 @@ function wireOnboardingButtons() {
             model,
             apiKey: null,
         });
-        if (ok) enterMemoryStep();
+        if (ok) {
+            if (onbManualMode) enterMemoryStep();
+            else finishOnboardingInteractive();
+        }
     });
 
     document.getElementById('onb-cloud-test')?.addEventListener('click', async () => {
@@ -11483,7 +11555,8 @@ function wireOnboardingButtons() {
         if (ok) {
             onbCloudKeyCache = apiKey;
             onbCloudIdCache = id;
-            enterMemoryStep();
+            if (onbManualMode) enterMemoryStep();
+            else finishOnboardingInteractive();
         }
     });
 

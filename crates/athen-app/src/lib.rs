@@ -91,6 +91,7 @@ pub fn run() {
             commands::cancel_agent,
             commands::queue_user_input,
             commands::new_arc,
+            commands::create_setup_arc,
             commands::get_arc_history,
             commands::get_arc_entries,
             commands::compact_arc,

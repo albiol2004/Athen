@@ -5877,6 +5877,35 @@ pub async fn new_arc(state: State<'_, AppState>) -> std::result::Result<String, 
     Ok(new_id)
 }
 
+/// Create a dedicated setup arc with the `athen_setup` profile pre-assigned.
+/// Called by the onboarding wizard after the user picks an LLM provider so the
+/// agent can drive a conversational setup flow.
+#[tauri::command]
+pub async fn create_setup_arc(
+    state: State<'_, AppState>,
+) -> std::result::Result<String, String> {
+    *state.history.lock().await = Vec::new();
+    let new_id = chrono::Utc::now().format("arc_%Y%m%d_%H%M%S").to_string();
+    *state.active_arc_id.lock().await = new_id.clone();
+
+    if let Some(ref store) = state.arc_store {
+        if let Err(e) = store
+            .create_arc(&new_id, "Athen Setup", arcs::ArcSource::System)
+            .await
+        {
+            warn!("Failed to create setup arc: {e}");
+        }
+        if let Err(e) = store
+            .set_active_profile_id(&new_id, Some("athen_setup"))
+            .await
+        {
+            warn!("Failed to set setup arc profile: {e}");
+        }
+    }
+
+    Ok(new_id)
+}
+
 /// Return the current arc's entries for the frontend to render on startup.
 ///
 /// Falls back to in-memory history if the arc store is unavailable.
