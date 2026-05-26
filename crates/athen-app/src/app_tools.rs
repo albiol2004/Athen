@@ -76,7 +76,7 @@ pub struct AppToolRegistry {
     /// stub instead of the full body, saving tokens. Uses interior
     /// mutability so `call_tool(&self, …)` can update the cache without
     /// requiring `&mut self`.
-    loaded_skills: std::sync::Mutex<std::collections::HashSet<String>>,
+    pub(crate) loaded_skills: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl AppToolRegistry {

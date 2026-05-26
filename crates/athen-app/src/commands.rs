@@ -6177,12 +6177,14 @@ pub async fn get_current_arc(state: State<'_, AppState>) -> std::result::Result<
 
 /// Create a new arc branched from an existing parent arc.
 ///
-/// The new arc starts empty but records the parent relationship.
-/// Switches the active arc to the new branch.
+/// Copies all entries up to and including `up_to_entry_id` into the
+/// new arc. If `up_to_entry_id` is 0, creates an empty branch (legacy
+/// behaviour). Switches the active arc to the new branch.
 #[tauri::command]
 pub async fn branch_arc(
     parent_arc_id: String,
     name: String,
+    up_to_entry_id: i64,
     state: State<'_, AppState>,
 ) -> std::result::Result<String, String> {
     let new_id = chrono::Utc::now().format("arc_%Y%m%d_%H%M%S").to_string();
@@ -6191,6 +6193,13 @@ pub async fn branch_arc(
             .create_arc_with_parent(&new_id, &name, arcs::ArcSource::UserInput, &parent_arc_id)
             .await
             .map_err(|e| e.to_string())?;
+
+        if up_to_entry_id > 0 {
+            store
+                .copy_entries_up_to(&parent_arc_id, &new_id, up_to_entry_id)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
     }
 
     // Switch to the new branch.
@@ -6198,6 +6207,115 @@ pub async fn branch_arc(
     *state.history.lock().await = Vec::new();
 
     Ok(new_id)
+}
+
+/// Response from an edit-and-rewind operation.
+#[derive(Serialize)]
+pub struct EditRewindResponse {
+    pub deleted_count: usize,
+    pub reverted_files: Vec<String>,
+}
+
+/// Rewind the arc to just before a user message, deleting it and
+/// everything after. The frontend re-sends the (possibly edited) text
+/// through `send_message` afterwards, which creates a fresh entry.
+///
+/// Optionally reverts checkpointed file changes from the deleted span.
+#[tauri::command]
+pub async fn edit_and_rewind(
+    arc_id: String,
+    entry_id: i64,
+    revert_changes: bool,
+    state: State<'_, AppState>,
+) -> std::result::Result<EditRewindResponse, String> {
+    let store = state
+        .arc_store
+        .as_ref()
+        .ok_or_else(|| "arc store not initialized".to_string())?;
+
+    // Verify the entry exists and is a user message.
+    let entry = store
+        .get_entry(entry_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Entry {entry_id} not found"))?;
+    if entry.source != "user" {
+        return Err("Can only edit user messages".to_string());
+    }
+    if entry.arc_id != arc_id {
+        return Err("Entry does not belong to this arc".to_string());
+    }
+
+    let mut reverted_files: Vec<String> = Vec::new();
+
+    // Optionally revert checkpointed file changes from entries that
+    // will be deleted. Load entries from entry_id onward, extract
+    // snapshot_action_ids, revert newest-first for correct cascade.
+    if revert_changes {
+        if let Some(ref checkpoint_store) = state.checkpoint_store {
+            let all_entries = store
+                .load_entries(&arc_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut action_ids: Vec<String> = Vec::new();
+            for e in &all_entries {
+                if e.id < entry_id {
+                    continue;
+                }
+                if let Some(ref meta) = e.metadata {
+                    if let Some(aid) = meta
+                        .get("snapshot_action_id")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
+                        action_ids.push(aid.to_string());
+                    }
+                }
+            }
+            action_ids.reverse();
+            for aid in &action_ids {
+                match checkpoint_store.revert_action(aid).await {
+                    Ok(outcome) => {
+                        for p in &outcome.restored {
+                            reverted_files.push(p.display().to_string());
+                        }
+                        for p in &outcome.recreated {
+                            reverted_files.push(p.display().to_string());
+                        }
+                    }
+                    Err(e) => {
+                        warn!("edit_and_rewind: revert {aid} failed: {e}");
+                    }
+                }
+            }
+        }
+    }
+
+    // Delete the target entry and everything after it.
+    let deleted_ids = store
+        .delete_entries_from(&arc_id, entry_id)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Reset compaction pointer if it pointed past the truncation.
+    if let Some(arc_meta) = store.get_arc(&arc_id).await.map_err(|e| e.to_string())? {
+        if let Some(ptr) = arc_meta.summarized_through_entry_id {
+            if ptr >= entry_id {
+                store
+                    .reset_summarized_through(&arc_id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+    }
+
+    // Clear in-memory history so the executor rebuilds from DB.
+    *state.history.lock().await = Vec::new();
+
+    Ok(EditRewindResponse {
+        deleted_count: deleted_ids.len(),
+        reverted_files,
+    })
 }
 
 /// Merge all entries from a source arc into a target arc.

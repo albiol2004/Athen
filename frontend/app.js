@@ -1771,13 +1771,14 @@ function formatAttachmentSize(bytes) {
     return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
-function addMessage(role, content, meta) {
+function addMessage(role, content, meta, entryId) {
     // Remove welcome message on first real message
     const welcome = messagesEl.querySelector('.welcome-message');
     if (welcome) welcome.remove();
 
     const row = document.createElement('div');
     row.className = `message-row ${role}`;
+    if (entryId) row.dataset.entryId = entryId;
 
     const avatar = document.createElement('div');
     avatar.className = 'message-avatar';
@@ -1785,6 +1786,30 @@ function addMessage(role, content, meta) {
 
     const wrap = document.createElement('div');
     wrap.className = 'message-content-wrap';
+
+    // Hover action buttons (edit for user, branch for all)
+    if (entryId) {
+        const actions = document.createElement('div');
+        actions.className = 'msg-hover-actions';
+        if (role === 'user') {
+            const editBtn = document.createElement('button');
+            editBtn.className = 'msg-action-btn msg-edit-btn';
+            editBtn.title = 'Edit & rewind';
+            editBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>';
+            editBtn.addEventListener('click', () => startInlineEdit(row, entryId, content));
+            actions.appendChild(editBtn);
+        }
+        const branchBtn = document.createElement('button');
+        branchBtn.className = 'msg-action-btn msg-branch-btn';
+        branchBtn.title = 'Branch from here';
+        branchBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M6 21V9a9 9 0 0 0 9 9"/></svg>';
+        branchBtn.addEventListener('click', () => {
+            const arcName = document.querySelector('.arc-item.active .arc-name');
+            branchFromArc(activeArcId, arcName ? arcName.textContent : 'Arc', entryId);
+        });
+        actions.appendChild(branchBtn);
+        wrap.appendChild(actions);
+    }
 
     // Tool calls go above the bubble
     if (meta && meta.toolCallsHtml) {
@@ -4189,13 +4214,13 @@ function renderHistoryEntry(entry) {
             // Splitting it this way avoids stalling history render on the
             // file reads — long arcs with many attachments would
             // otherwise serialize behind every Tauri round-trip.
-            addMessage(entry.source, entry.content);
+            addMessage(entry.source, entry.content, undefined, entry.id);
             const lastRow = messagesEl.lastElementChild;
             if (lastRow && lastRow.classList.contains('message-row')) {
                 hydrateAttachmentsAsync(lastRow, eventId);
             }
         } else {
-            addMessage(entry.source, entry.content);
+            addMessage(entry.source, entry.content, undefined, entry.id);
         }
     } else if (entry.entry_type === 'email_event') {
         const meta = parseEntryMetadata(entry.metadata) || {};
@@ -4344,21 +4369,183 @@ async function newArc() {
     }
 }
 
-async function branchFromArc(parentArcId, parentName) {
+async function branchFromArc(parentArcId, parentName, upToEntryId) {
     if (!invoke) return;
     const branchName = prompt('Name for the new branch:', parentName + ' (branch)');
     if (!branchName) return;
     try {
-        const newId = await invoke('branch_arc', { parentArcId, name: branchName });
+        const newId = await invoke('branch_arc', {
+            parentArcId,
+            name: branchName,
+            upToEntryId: upToEntryId || 0,
+        });
         activeArcId = newId;
-        arcHasMessages = false;
+        arcHasMessages = upToEntryId > 0;
         clearChatUI();
+        if (arcHasMessages) {
+            const entries = await invoke('get_arc_history');
+            renderEntries(entries);
+        }
         closeSidebar();
         await loadArcs();
         inputEl.focus();
     } catch (err) {
         console.error('Failed to branch arc:', err);
     }
+}
+
+async function editAndRewind(entryId, revertChanges) {
+    if (!invoke) return;
+    try {
+        const result = await invoke('edit_and_rewind', {
+            arcId: activeArcId,
+            entryId,
+            revertChanges,
+        });
+        clearChatUI();
+        const entries = await invoke('get_arc_history');
+        renderEntries(entries);
+        arcHasMessages = !!(entries && entries.length > 0);
+        await loadArcs();
+
+        const count = result.deleted_count || 0;
+        const files = (result.reverted_files || []).length;
+        let msg = `Rewound ${count} message${count !== 1 ? 's' : ''}`;
+        if (files > 0) msg += `, reverted ${files} file${files !== 1 ? 's' : ''}`;
+        showToast(msg, 'success');
+
+        return true;
+    } catch (err) {
+        console.error('Edit and rewind failed:', err);
+        showToast('Rewind failed: ' + err, 'error');
+        return false;
+    }
+}
+
+function startInlineEdit(row, entryId, originalText) {
+    if (row.classList.contains('editing')) return;
+    row.classList.add('editing');
+
+    const bubble = row.querySelector('.message-bubble');
+    if (!bubble) return;
+
+    const textarea = document.createElement('textarea');
+    textarea.className = 'msg-edit-textarea';
+    textarea.value = originalText;
+    textarea.rows = Math.max(2, Math.min(10, originalText.split('\n').length));
+
+    const bar = document.createElement('div');
+    bar.className = 'msg-edit-bar';
+
+    const sendBtn = document.createElement('button');
+    sendBtn.className = 'msg-edit-send';
+    sendBtn.textContent = 'Send';
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'msg-edit-cancel';
+    cancelBtn.textContent = 'Cancel';
+
+    bar.appendChild(cancelBtn);
+    bar.appendChild(sendBtn);
+
+    bubble.style.display = 'none';
+    const wrap = bubble.parentElement;
+    wrap.insertBefore(textarea, bubble.nextSibling);
+    wrap.insertBefore(bar, textarea.nextSibling);
+    textarea.focus();
+    textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+
+    const cleanup = () => {
+        row.classList.remove('editing');
+        textarea.remove();
+        bar.remove();
+        bubble.style.display = '';
+    };
+
+    cancelBtn.addEventListener('click', cleanup);
+
+    sendBtn.addEventListener('click', () => {
+        const newText = textarea.value.trim();
+        if (!newText) return;
+        showRewindDialog(entryId, newText, cleanup);
+    });
+
+    textarea.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') {
+            e.preventDefault();
+            cleanup();
+        }
+        if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+            e.preventDefault();
+            sendBtn.click();
+        }
+    });
+}
+
+function showRewindDialog(entryId, newText, cleanupFn) {
+    const overlay = document.createElement('div');
+    overlay.className = 'rewind-dialog-overlay';
+
+    const dialog = document.createElement('div');
+    dialog.className = 'rewind-dialog';
+
+    const title = document.createElement('h3');
+    title.textContent = 'Rewind conversation?';
+    dialog.appendChild(title);
+
+    const desc = document.createElement('p');
+    desc.textContent = 'All messages after the edited one will be deleted. This cannot be undone.';
+    dialog.appendChild(desc);
+
+    const checkRow = document.createElement('label');
+    checkRow.className = 'rewind-dialog-check';
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.checked = true;
+    checkRow.appendChild(checkbox);
+    const checkLabel = document.createTextNode(' Also revert file changes');
+    checkRow.appendChild(checkLabel);
+    dialog.appendChild(checkRow);
+
+    const btnRow = document.createElement('div');
+    btnRow.className = 'rewind-dialog-buttons';
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'rewind-dialog-cancel';
+    cancelBtn.textContent = 'Cancel';
+
+    const confirmBtn = document.createElement('button');
+    confirmBtn.className = 'rewind-dialog-confirm';
+    confirmBtn.textContent = 'Rewind & send';
+
+    btnRow.appendChild(cancelBtn);
+    btnRow.appendChild(confirmBtn);
+    dialog.appendChild(btnRow);
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+
+    const close = () => overlay.remove();
+
+    cancelBtn.addEventListener('click', () => {
+        close();
+    });
+
+    overlay.addEventListener('click', (e) => {
+        if (e.target === overlay) close();
+    });
+
+    confirmBtn.addEventListener('click', async () => {
+        confirmBtn.disabled = true;
+        confirmBtn.textContent = 'Rewinding...';
+        const revert = checkbox.checked;
+        close();
+        cleanupFn();
+        const ok = await editAndRewind(entryId, revert);
+        if (ok) {
+            inputEl.value = newText;
+            formEl.dispatchEvent(new Event('submit', { cancelable: true }));
+        }
+    });
 }
 
 const newChatBtn = document.getElementById('new-chat-btn');

@@ -1066,6 +1066,7 @@ header h1 {
 .message-avatar { display: none; }
 
 .message-content-wrap {
+    position: relative;
     max-width: 100%;
     width: 100%;
     display: flex;
@@ -1219,6 +1220,184 @@ header h1 {
     color: var(--danger, #c0392b);
     font-size: 10px;
     margin-left: 4px;
+}
+
+/* ─── Message hover actions (edit / branch) ─── */
+.msg-hover-actions {
+    position: absolute;
+    top: -4px;
+    right: 4px;
+    display: flex;
+    gap: 2px;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 150ms ease;
+    z-index: 2;
+}
+.message-row.user .msg-hover-actions {
+    right: auto;
+    left: -4px;
+}
+.message-row:hover .msg-hover-actions,
+.message-row.editing .msg-hover-actions {
+    opacity: 1;
+    pointer-events: auto;
+}
+.msg-action-btn {
+    width: 26px;
+    height: 26px;
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    background: var(--surface-0);
+    color: var(--text-3);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    transition: color 120ms, border-color 120ms, background 120ms;
+}
+.msg-action-btn:hover {
+    color: var(--text);
+    border-color: var(--brand);
+    background: var(--surface-1);
+}
+
+/* ─── Inline edit mode ─── */
+.msg-edit-textarea {
+    width: 100%;
+    min-height: 38px;
+    max-height: 200px;
+    padding: 8px 14px;
+    background: var(--surface-1);
+    border: 1px solid var(--brand);
+    border-radius: 14px 14px 4px 14px;
+    color: var(--text);
+    font: inherit;
+    font-size: 14px;
+    line-height: 1.65;
+    resize: vertical;
+    outline: none;
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--brand) 20%, transparent);
+}
+.msg-edit-bar {
+    display: flex;
+    gap: 6px;
+    justify-content: flex-end;
+    margin-top: 4px;
+}
+.msg-edit-cancel,
+.msg-edit-send {
+    padding: 4px 14px;
+    border-radius: var(--r-sm);
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    border: 1px solid var(--border);
+    transition: background 120ms, border-color 120ms;
+}
+.msg-edit-cancel {
+    background: transparent;
+    color: var(--text-2);
+}
+.msg-edit-cancel:hover {
+    background: var(--surface-1);
+}
+.msg-edit-send {
+    background: var(--brand-grad);
+    color: #fff;
+    border-color: transparent;
+}
+.msg-edit-send:hover {
+    filter: brightness(1.1);
+}
+
+/* ─── Rewind confirmation dialog ─── */
+.rewind-dialog-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.55);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 9999;
+    animation: fade-in 150ms ease;
+}
+@keyframes fade-in {
+    from { opacity: 0; }
+    to   { opacity: 1; }
+}
+.rewind-dialog {
+    background: var(--surface-0);
+    border: 1px solid var(--border);
+    border-radius: var(--r-lg, 12px);
+    padding: 24px;
+    max-width: 400px;
+    width: 90%;
+    box-shadow: 0 16px 48px rgba(0,0,0,0.35);
+    animation: dialog-pop 200ms var(--ease);
+}
+@keyframes dialog-pop {
+    from { opacity: 0; transform: scale(0.95) translateY(8px); }
+    to   { opacity: 1; transform: scale(1) translateY(0); }
+}
+.rewind-dialog h3 {
+    margin: 0 0 8px;
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--text);
+}
+.rewind-dialog p {
+    margin: 0 0 16px;
+    font-size: 13px;
+    color: var(--text-2);
+    line-height: 1.5;
+}
+.rewind-dialog-check {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: var(--text-2);
+    margin-bottom: 20px;
+    cursor: pointer;
+}
+.rewind-dialog-check input[type="checkbox"] {
+    accent-color: var(--brand);
+}
+.rewind-dialog-buttons {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+}
+.rewind-dialog-cancel,
+.rewind-dialog-confirm {
+    padding: 6px 18px;
+    border-radius: var(--r-sm);
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    border: 1px solid var(--border);
+    transition: background 120ms;
+}
+.rewind-dialog-cancel {
+    background: transparent;
+    color: var(--text-2);
+}
+.rewind-dialog-cancel:hover {
+    background: var(--surface-1);
+}
+.rewind-dialog-confirm {
+    background: var(--brand-grad);
+    color: #fff;
+    border-color: transparent;
+}
+.rewind-dialog-confirm:hover {
+    filter: brightness(1.1);
+}
+.rewind-dialog-confirm:disabled {
+    opacity: 0.6;
+    cursor: wait;
 }
 
 /* Markdown bits inside messages */

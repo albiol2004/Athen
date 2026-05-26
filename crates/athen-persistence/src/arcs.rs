@@ -710,6 +710,179 @@ impl ArcStore {
         .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
     }
 
+    /// Delete all entries strictly after `after_entry_id` for the given arc.
+    /// Returns the IDs of deleted entries (useful for checkpoint cascade).
+    pub async fn delete_entries_after(
+        &self,
+        arc_id: &str,
+        after_entry_id: i64,
+    ) -> Result<Vec<i64>> {
+        let conn = self.conn.clone();
+        let arc_id = arc_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare("SELECT id FROM arc_entries WHERE arc_id = ?1 AND id > ?2 ORDER BY id ASC")
+                .map_err(|e| {
+                    AthenError::Other(format!("Prepare delete_entries_after select: {e}"))
+                })?;
+            let ids: Vec<i64> = stmt
+                .query_map(params![arc_id, after_entry_id], |row| row.get(0))
+                .map_err(|e| AthenError::Other(format!("Query delete_entries_after: {e}")))?
+                .filter_map(|r| r.ok())
+                .collect();
+            if !ids.is_empty() {
+                conn.execute(
+                    "DELETE FROM arc_entries WHERE arc_id = ?1 AND id > ?2",
+                    params![arc_id, after_entry_id],
+                )
+                .map_err(|e| AthenError::Other(format!("Delete entries after: {e}")))?;
+            }
+            Ok(ids)
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
+    /// Delete `from_entry_id` and all entries after it for the given arc.
+    /// Returns the IDs of deleted entries (inclusive of `from_entry_id`).
+    pub async fn delete_entries_from(&self, arc_id: &str, from_entry_id: i64) -> Result<Vec<i64>> {
+        let conn = self.conn.clone();
+        let arc_id = arc_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id FROM arc_entries WHERE arc_id = ?1 AND id >= ?2 ORDER BY id ASC",
+                )
+                .map_err(|e| {
+                    AthenError::Other(format!("Prepare delete_entries_from select: {e}"))
+                })?;
+            let ids: Vec<i64> = stmt
+                .query_map(params![arc_id, from_entry_id], |row| row.get(0))
+                .map_err(|e| AthenError::Other(format!("Query delete_entries_from: {e}")))?
+                .filter_map(|r| r.ok())
+                .collect();
+            if !ids.is_empty() {
+                conn.execute(
+                    "DELETE FROM arc_entries WHERE arc_id = ?1 AND id >= ?2",
+                    params![arc_id, from_entry_id],
+                )
+                .map_err(|e| AthenError::Other(format!("Delete entries from: {e}")))?;
+            }
+            Ok(ids)
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
+    /// Update the text content of a single entry.
+    pub async fn update_entry_content(&self, entry_id: i64, new_content: &str) -> Result<()> {
+        let conn = self.conn.clone();
+        let new_content = new_content.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let changed = conn
+                .execute(
+                    "UPDATE arc_entries SET content = ?1 WHERE id = ?2",
+                    params![new_content, entry_id],
+                )
+                .map_err(|e| AthenError::Other(format!("Update entry content: {e}")))?;
+            if changed == 0 {
+                return Err(AthenError::Other(format!("Entry {entry_id} not found")));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
+    /// Copy all entries from `source_arc_id` up to and including
+    /// `up_to_entry_id` into `target_arc_id`. Returns the number of
+    /// entries copied. The new entries get fresh auto-increment IDs.
+    pub async fn copy_entries_up_to(
+        &self,
+        source_arc_id: &str,
+        target_arc_id: &str,
+        up_to_entry_id: i64,
+    ) -> Result<u32> {
+        let conn = self.conn.clone();
+        let source = source_arc_id.to_string();
+        let target = target_arc_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let count = conn
+                .execute(
+                    "INSERT INTO arc_entries (arc_id, entry_type, source, content, metadata, created_at, turn_id) \
+                     SELECT ?1, entry_type, source, content, metadata, created_at, turn_id \
+                     FROM arc_entries WHERE arc_id = ?2 AND id <= ?3 ORDER BY id ASC",
+                    params![target, source, up_to_entry_id],
+                )
+                .map_err(|e| AthenError::Other(format!("Copy entries: {e}")))?;
+            Ok(count as u32)
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
+    /// Reset `summarized_through_entry_id` to NULL when truncation
+    /// invalidates the compaction pointer.
+    pub async fn reset_summarized_through(&self, arc_id: &str) -> Result<()> {
+        let conn = self.conn.clone();
+        let arc_id = arc_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE arcs SET summarized_through_entry_id = NULL WHERE id = ?1",
+                params![arc_id],
+            )
+            .map_err(|e| AthenError::Other(format!("Reset summarized_through: {e}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
+    /// Load a single entry by its ID.
+    pub async fn get_entry(&self, entry_id: i64) -> Result<Option<ArcEntry>> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, arc_id, entry_type, source, content, metadata, created_at, turn_id \
+                     FROM arc_entries WHERE id = ?1",
+                )
+                .map_err(|e| AthenError::Other(format!("Prepare get_entry: {e}")))?;
+            let mut rows = stmt
+                .query_map(params![entry_id], |row| {
+                    let metadata_str: Option<String> = row.get(5)?;
+                    let metadata = metadata_str.and_then(|s| serde_json::from_str(&s).ok());
+                    Ok(ArcEntry {
+                        id: row.get(0)?,
+                        arc_id: row.get(1)?,
+                        entry_type: EntryType::from_str(&row.get::<_, String>(2)?),
+                        source: row.get(3)?,
+                        content: row.get(4)?,
+                        metadata,
+                        created_at: row.get(6)?,
+                        turn_id: row.get(7)?,
+                    })
+                })
+                .map_err(|e| AthenError::Other(format!("Query get_entry: {e}")))?;
+            match rows.next() {
+                Some(row) => {
+                    Ok(Some(row.map_err(|e| {
+                        AthenError::Other(format!("Entry row: {e}"))
+                    })?))
+                }
+                None => Ok(None),
+            }
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
     /// Set the agent profile this arc runs under. Pass `None` to clear (which
     /// makes the arc fall back to the seeded default profile).
     pub async fn set_active_profile_id(&self, id: &str, profile_id: Option<&str>) -> Result<()> {

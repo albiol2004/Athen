@@ -101,6 +101,7 @@ pub fn run() {
             commands::delete_arc,
             commands::get_current_arc,
             commands::branch_arc,
+            commands::edit_and_rewind,
             commands::merge_arcs,
             commands::get_timeline_data,
             settings::get_settings,
