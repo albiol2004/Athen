@@ -5881,9 +5881,7 @@ pub async fn new_arc(state: State<'_, AppState>) -> std::result::Result<String, 
 /// Called by the onboarding wizard after the user picks an LLM provider so the
 /// agent can drive a conversational setup flow.
 #[tauri::command]
-pub async fn create_setup_arc(
-    state: State<'_, AppState>,
-) -> std::result::Result<String, String> {
+pub async fn create_setup_arc(state: State<'_, AppState>) -> std::result::Result<String, String> {
     *state.history.lock().await = Vec::new();
     let new_id = chrono::Utc::now().format("arc_%Y%m%d_%H%M%S").to_string();
     *state.active_arc_id.lock().await = new_id.clone();

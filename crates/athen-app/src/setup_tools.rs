@@ -42,13 +42,15 @@ pub async fn do_setup_email(
     password: &str,
 ) -> Result<String> {
     // Step 1: autodetect provider.
-    let hint = crate::email_autodetect::detect(address).await.ok_or_else(|| {
-        AthenError::Other(
-            "Could not autodetect servers for that address. \
+    let hint = crate::email_autodetect::detect(address)
+        .await
+        .ok_or_else(|| {
+            AthenError::Other(
+                "Could not autodetect servers for that address. \
              Ask the user for the IMAP/SMTP server details."
-                .to_string(),
-        )
-    })?;
+                    .to_string(),
+            )
+        })?;
 
     // Step 2: build test config from hint.
     let config = crate::email_test::EmailTestConfig {
@@ -94,10 +96,7 @@ pub async fn do_setup_email(
     let mut cfg = crate::settings::load_main_config_public();
 
     let imap_use_tls = hint.incoming.security == Security::Ssl;
-    let smtp_use_tls = matches!(
-        hint.outgoing.security,
-        Security::Ssl | Security::StartTls
-    );
+    let smtp_use_tls = matches!(hint.outgoing.security, Security::Ssl | Security::StartTls);
 
     cfg.email.enabled = true;
     cfg.email.imap_server = hint.incoming.host.clone();
@@ -208,9 +207,8 @@ pub async fn do_setup_calendar_connect(
     }
 
     // Probe the remote: authenticate + list calendars.
-    let parsed_url = url::Url::parse(&resolved_url).map_err(|e| {
-        AthenError::Other(format!("Invalid base URL \"{resolved_url}\": {e}"))
-    })?;
+    let parsed_url = url::Url::parse(&resolved_url)
+        .map_err(|e| AthenError::Other(format!("Invalid base URL \"{resolved_url}\": {e}")))?;
     let source = CalDavSource::new(
         source_id.to_string(),
         &display_name,
@@ -403,18 +401,21 @@ pub async fn do_setup_owner_info(
     };
 
     // Load or create owner contact.
-    let mut owner = contact_store.find_owner().await?.unwrap_or_else(|| Contact {
-        id: Uuid::new_v4(),
-        name: String::new(),
-        trust_level: TrustLevel::AuthUser,
-        trust_manual_override: true,
-        identifiers: Vec::new(),
-        interaction_count: 0,
-        last_interaction: None,
-        notes: None,
-        blocked: false,
-        is_owner: true,
-    });
+    let mut owner = contact_store
+        .find_owner()
+        .await?
+        .unwrap_or_else(|| Contact {
+            id: Uuid::new_v4(),
+            name: String::new(),
+            trust_level: TrustLevel::AuthUser,
+            trust_manual_override: true,
+            identifiers: Vec::new(),
+            interaction_count: 0,
+            last_interaction: None,
+            notes: None,
+            blocked: false,
+            is_owner: true,
+        });
 
     match kind {
         None => {
@@ -423,11 +424,7 @@ pub async fn do_setup_owner_info(
         }
         Some(ident_kind) => {
             // Update or add identifier of the given kind.
-            if let Some(existing) = owner
-                .identifiers
-                .iter_mut()
-                .find(|i| i.kind == ident_kind)
-            {
+            if let Some(existing) = owner.identifiers.iter_mut().find(|i| i.kind == ident_kind) {
                 existing.value = value.to_string();
             } else {
                 owner.identifiers.push(ContactIdentifier {

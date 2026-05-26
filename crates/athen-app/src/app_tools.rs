@@ -2138,9 +2138,10 @@ impl AppToolRegistry {
             "setup_email" => {
                 let addr = args["address"].as_str().unwrap_or_default();
                 let pw = args["password"].as_str().unwrap_or_default();
-                let vault = self.vault.as_ref().ok_or_else(|| {
-                    AthenError::Other("Vault not available for setup".into())
-                })?;
+                let vault = self
+                    .vault
+                    .as_ref()
+                    .ok_or_else(|| AthenError::Other("Vault not available for setup".into()))?;
                 crate::setup_tools::do_setup_email(vault, addr, pw).await?
             }
             "setup_calendar_connect" => {
@@ -2148,9 +2149,10 @@ impl AppToolRegistry {
                 let username = args["username"].as_str().unwrap_or_default();
                 let password = args["password"].as_str().unwrap_or_default();
                 let base_url = args["base_url"].as_str();
-                let vault = self.vault.as_ref().ok_or_else(|| {
-                    AthenError::Other("Vault not available for setup".into())
-                })?;
+                let vault = self
+                    .vault
+                    .as_ref()
+                    .ok_or_else(|| AthenError::Other("Vault not available for setup".into()))?;
                 let cstore = self.calendar_source_store.as_ref().ok_or_else(|| {
                     AthenError::Other("Calendar source store not available".into())
                 })?;
@@ -2161,43 +2163,52 @@ impl AppToolRegistry {
             }
             "setup_calendar_configure" => {
                 let source_id_str = args["source_id"].as_str().unwrap_or_default();
-                let source_id = uuid::Uuid::parse_str(source_id_str).map_err(|e| {
-                    AthenError::Other(format!("Invalid source_id UUID: {e}"))
-                })?;
+                let source_id = uuid::Uuid::parse_str(source_id_str)
+                    .map_err(|e| AthenError::Other(format!("Invalid source_id UUID: {e}")))?;
                 let selected: Vec<String> = args["selected_calendars"]
                     .as_array()
-                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let default_cal = args["default_calendar_id"].as_str();
                 let cstore = self.calendar_source_store.as_ref().ok_or_else(|| {
                     AthenError::Other("Calendar source store not available".into())
                 })?;
                 crate::setup_tools::do_setup_calendar_configure(
-                    &**cstore, source_id, &selected, default_cal,
+                    &**cstore,
+                    source_id,
+                    &selected,
+                    default_cal,
                 )
                 .await?
             }
             "setup_telegram" => {
                 let token = args["bot_token"].as_str().unwrap_or_default();
-                let vault = self.vault.as_ref().ok_or_else(|| {
-                    AthenError::Other("Vault not available for setup".into())
-                })?;
+                let vault = self
+                    .vault
+                    .as_ref()
+                    .ok_or_else(|| AthenError::Other("Vault not available for setup".into()))?;
                 crate::setup_tools::do_setup_telegram(vault, token).await?
             }
             "setup_owner_info" => {
                 let field = args["field"].as_str().unwrap_or_default();
                 let value = args["value"].as_str().unwrap_or_default();
-                let cstore = self.contacts.as_ref().ok_or_else(|| {
-                    AthenError::Other("Contact store not available".into())
-                })?;
+                let cstore = self
+                    .contacts
+                    .as_ref()
+                    .ok_or_else(|| AthenError::Other("Contact store not available".into()))?;
                 crate::setup_tools::do_setup_owner_info(cstore, field, value).await?
             }
             "setup_search_key" => {
                 let provider = args["provider"].as_str().unwrap_or_default();
                 let key = args["key"].as_str().unwrap_or_default();
-                let vault = self.vault.as_ref().ok_or_else(|| {
-                    AthenError::Other("Vault not available for setup".into())
-                })?;
+                let vault = self
+                    .vault
+                    .as_ref()
+                    .ok_or_else(|| AthenError::Other("Vault not available for setup".into()))?;
                 crate::setup_tools::do_setup_search_key(vault, provider, key).await?
             }
             _ => return Err(AthenError::ToolNotFound(name.to_string())),

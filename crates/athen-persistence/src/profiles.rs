@@ -695,11 +695,7 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
             ),
             vec![DomainTag::Other],
             vec![TaskKindTag::Other],
-            vec![
-                "onboarding",
-                "configuration",
-                "integration setup",
-            ],
+            vec!["onboarding", "configuration", "integration setup"],
             vec![],
             ToolSelection::All,
             vec!["setup"],
