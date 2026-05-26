@@ -556,7 +556,7 @@ impl ArcStore {
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             let where_clause = if roots_only {
-                "WHERE a.parent_arc_id IS NULL "
+                "WHERE (a.parent_arc_id IS NULL OR a.source = 'user_input') "
             } else {
                 ""
             };

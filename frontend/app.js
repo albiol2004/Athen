@@ -1787,30 +1787,6 @@ function addMessage(role, content, meta, entryId) {
     const wrap = document.createElement('div');
     wrap.className = 'message-content-wrap';
 
-    // Hover action buttons (edit for user, branch for all)
-    if (entryId) {
-        const actions = document.createElement('div');
-        actions.className = 'msg-hover-actions';
-        if (role === 'user') {
-            const editBtn = document.createElement('button');
-            editBtn.className = 'msg-action-btn msg-edit-btn';
-            editBtn.title = 'Edit & rewind';
-            editBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>';
-            editBtn.addEventListener('click', () => startInlineEdit(row, entryId, content));
-            actions.appendChild(editBtn);
-        }
-        const branchBtn = document.createElement('button');
-        branchBtn.className = 'msg-action-btn msg-branch-btn';
-        branchBtn.title = 'Branch from here';
-        branchBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M6 21V9a9 9 0 0 0 9 9"/></svg>';
-        branchBtn.addEventListener('click', () => {
-            const arcName = document.querySelector('.arc-item.active .arc-name');
-            branchFromArc(activeArcId, arcName ? arcName.textContent : 'Arc', entryId);
-        });
-        actions.appendChild(branchBtn);
-        wrap.appendChild(actions);
-    }
-
     // Tool calls go above the bubble
     if (meta && meta.toolCallsHtml) {
         const toolsDiv = document.createElement('div');
@@ -1875,6 +1851,10 @@ function addMessage(role, content, meta, entryId) {
     }
 
     wrap.appendChild(bubble);
+
+    if (entryId) {
+        wrap.appendChild(buildMsgHoverActions(entryId, content, role === 'user'));
+    }
 
     // Inline attachment thumbnails (composer uploads on live send;
     // hydrated from `list_attachments_for_event` on arc reload). Sits
@@ -2741,6 +2721,9 @@ formEl.addEventListener('submit', async (e) => {
 
     // Refresh sidebar to update message counts.
     loadArcs();
+    // Stamp entry IDs on the latest message rows so edit/branch buttons
+    // work without switching arcs. We patch untagged rows bottom-up.
+    patchEntryIds();
 });
 
 // ─── Cancel / Stop Button ───
@@ -4407,6 +4390,7 @@ async function editAndRewind(entryId, revertChanges) {
         renderEntries(entries);
         arcHasMessages = !!(entries && entries.length > 0);
         await loadArcs();
+        refreshChangesRail();
 
         const count = result.deleted_count || 0;
         const files = (result.reverted_files || []).length;
@@ -4421,6 +4405,114 @@ async function editAndRewind(entryId, revertChanges) {
         return false;
     }
 }
+
+async function patchEntryIds() {
+    if (!invoke) return;
+    try {
+        const entries = await invoke('get_arc_history');
+        if (!entries || entries.length === 0) return;
+        const msgEntries = entries.filter(
+            (e) => e.entry_type === 'message' && (e.source === 'user' || e.source === 'assistant')
+        );
+        const rows = messagesEl.querySelectorAll('.message-row.user, .message-row.assistant');
+        const untagged = Array.from(rows).filter((r) => !r.dataset.entryId);
+        if (untagged.length === 0) return;
+        // Match bottom-up: last N untagged rows correspond to the last N
+        // message entries. Walk both arrays from the end.
+        let ei = msgEntries.length - 1;
+        for (let ri = untagged.length - 1; ri >= 0 && ei >= 0; ri--, ei--) {
+            const row = untagged[ri];
+            const entry = msgEntries[ei];
+            row.dataset.entryId = entry.id;
+            // If it's a user row missing hover actions, inject them now.
+            const wrap = row.querySelector('.message-content-wrap');
+            if (wrap && !wrap.querySelector('.msg-hover-actions')) {
+                const content = entry.content;
+                const isUser = entry.source === 'user';
+                const actions = buildMsgHoverActions(entry.id, content, isUser);
+                const bubble = wrap.querySelector('.message-bubble');
+                if (bubble && bubble.nextSibling) {
+                    wrap.insertBefore(actions, bubble.nextSibling);
+                } else {
+                    wrap.appendChild(actions);
+                }
+            }
+        }
+    } catch (err) {
+        console.error('patchEntryIds failed:', err);
+    }
+}
+
+function buildMsgHoverActions(entryId, content, isUser) {
+    const wrap = document.createElement('div');
+    wrap.className = 'msg-hover-actions';
+
+    const trigger = document.createElement('button');
+    trigger.className = 'msg-action-btn msg-dots-btn';
+    trigger.title = 'Actions';
+    trigger.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="5" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="12" cy="19" r="2"/></svg>';
+    wrap.appendChild(trigger);
+
+    const menu = document.createElement('div');
+    menu.className = 'msg-action-menu';
+
+    if (isUser) {
+        const editItem = document.createElement('button');
+        editItem.className = 'msg-action-menu-item';
+        editItem.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg> Edit & rewind';
+        editItem.addEventListener('click', () => {
+            menu.classList.remove('open');
+            const row = trigger.closest('.message-row');
+            if (row) startInlineEdit(row, entryId, content);
+        });
+        menu.appendChild(editItem);
+    }
+
+    const branchItem = document.createElement('button');
+    branchItem.className = 'msg-action-menu-item';
+    branchItem.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M6 21V9a9 9 0 0 0 9 9"/></svg> Branch from here';
+    branchItem.addEventListener('click', () => {
+        menu.classList.remove('open');
+        const arcName = document.querySelector('.arc-item.active .arc-name');
+        branchFromArc(activeArcId, arcName ? arcName.textContent : 'Arc', entryId);
+    });
+    menu.appendChild(branchItem);
+    wrap.appendChild(menu);
+
+    function closeAllMsgMenus(except) {
+        document.querySelectorAll('.msg-action-menu.open').forEach((m) => {
+            if (m !== except) {
+                m.classList.remove('open');
+                const w = m.closest('.msg-hover-actions');
+                if (w) w.classList.remove('menu-open');
+                const r = m.closest('.message-row');
+                if (r) r.classList.remove('menu-open');
+            }
+        });
+    }
+
+    trigger.addEventListener('click', (e) => {
+        e.stopPropagation();
+        closeAllMsgMenus(menu);
+        const opening = !menu.classList.contains('open');
+        menu.classList.toggle('open');
+        wrap.classList.toggle('menu-open', opening);
+        const row = trigger.closest('.message-row');
+        if (row) row.classList.toggle('menu-open', opening);
+    });
+
+    return wrap;
+}
+
+document.addEventListener('click', () => {
+    document.querySelectorAll('.msg-action-menu.open').forEach((m) => {
+        m.classList.remove('open');
+        const w = m.closest('.msg-hover-actions');
+        if (w) w.classList.remove('menu-open');
+        const r = m.closest('.message-row');
+        if (r) r.classList.remove('menu-open');
+    });
+});
 
 function startInlineEdit(row, entryId, originalText) {
     if (row.classList.contains('editing')) return;

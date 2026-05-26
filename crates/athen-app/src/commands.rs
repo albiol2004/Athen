@@ -6202,9 +6202,36 @@ pub async fn branch_arc(
         }
     }
 
-    // Switch to the new branch.
+    // Switch to the new branch and rebuild in-memory history from
+    // the copied entries so the executor has full context.
     *state.active_arc_id.lock().await = new_id.clone();
-    *state.history.lock().await = Vec::new();
+    if let Some(ref store) = state.arc_store {
+        if up_to_entry_id > 0 {
+            let entries = store
+                .load_entries(&new_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            let history: Vec<ChatMessage> = entries
+                .iter()
+                .filter(|e| e.entry_type == arcs::EntryType::Message)
+                .map(|e| ChatMessage {
+                    role: match e.source.as_str() {
+                        "user" => Role::User,
+                        "assistant" => Role::Assistant,
+                        "system" => Role::System,
+                        "tool" => Role::Tool,
+                        _ => Role::User,
+                    },
+                    content: MessageContent::Text(e.content.clone()),
+                })
+                .collect();
+            *state.history.lock().await = history;
+        } else {
+            *state.history.lock().await = Vec::new();
+        }
+    } else {
+        *state.history.lock().await = Vec::new();
+    }
 
     Ok(new_id)
 }
@@ -6309,8 +6336,27 @@ pub async fn edit_and_rewind(
         }
     }
 
-    // Clear in-memory history so the executor rebuilds from DB.
-    *state.history.lock().await = Vec::new();
+    // Rebuild in-memory history from remaining entries so the executor
+    // sees the prior conversation context on the next send_message.
+    let remaining = store
+        .load_entries(&arc_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let history: Vec<ChatMessage> = remaining
+        .iter()
+        .filter(|e| e.entry_type == arcs::EntryType::Message)
+        .map(|e| ChatMessage {
+            role: match e.source.as_str() {
+                "user" => Role::User,
+                "assistant" => Role::Assistant,
+                "system" => Role::System,
+                "tool" => Role::Tool,
+                _ => Role::User,
+            },
+            content: MessageContent::Text(e.content.clone()),
+        })
+        .collect();
+    *state.history.lock().await = history;
 
     Ok(EditRewindResponse {
         deleted_count: deleted_ids.len(),
