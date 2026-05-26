@@ -541,7 +541,9 @@ pub async fn build_setup_status_context(
     } else {
         "not configured".into()
     };
-    lines.push(format!("- Owner identity (the USER's name + personal identifiers): {owner_status}"));
+    lines.push(format!(
+        "- Owner identity (the USER's name + personal identifiers): {owner_status}"
+    ));
 
     // Email — Athen's own inbox, NOT the owner's personal email
     if config.email.enabled {
