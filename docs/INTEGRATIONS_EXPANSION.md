@@ -5,7 +5,7 @@ APIs, (B) cloud deployment platforms, (C) whitespace proactive integrations, and
 agent capability gaps vs Claude Code / Cursor / Devin / ChatGPT.
 
 Builds on:
-- [INTEGRATIONS_PUSH.md](INTEGRATIONS_PUSH.md) — original 5-move integrations menu (MCP-byo, IMAP/SMTP autodetect, OAuth wave, CalDAV/CardDAV, LLM-assisted credential UX)
+- [INTEGRATIONS_PUSH.md](INTEGRATIONS_PUSH.md) — original 5-move integrations menu (MCP-byo SHIPPED, IMAP/SMTP autodetect SHIPPED, OAuth wave design-only, CalDAV SHIPPED/CardDAV deferred, LLM error translator SHIPPED)
 - [CLOUD_APIS.md](CLOUD_APIS.md) — 15 `http_request` presets already shipped
 - [EMAIL_SETUP.md](EMAIL_SETUP.md) — Move #2 (shipped)
 
@@ -28,7 +28,7 @@ Stream tag in parens: (A) workspace, (B) deploy, (C) whitespace, (D) capability 
 | 6 | **Home Assistant — smart-home command** | C | Dedicated tool (LAN reach) | 1–2 wk | Uniquely possible: cloud agents can't reach 192.168.x.x. Zero competitor coverage. Risk-tier per entity (lock = HIGH, light = MED). |
 | 7 | **CI/CD wake-ups (GitHub Actions / GitLab CI)** | D | `http_request` + `create_wakeup` | 1–2 wk | Closes "babysit the deploy" pain. Athen's wake-ups are uniquely cheap (sleeping arc, 0 cost while waiting). Claude Code Loop has 72 h cap + token burn. |
 | 8 | **[SHIPPED] CalDAV / CardDAV** | A | RFC 4791 adapter (Move #4, done 2026-05-15) | — | CalDAV sync shipped: iCloud + Fastmail + Nextcloud + Yandex + on-prem. Agent calendar_create now pushes to remote. CardDAV deferred. |
-| 9 | **DigitalOcean App Platform + GCP Cloud Run** | B | MCP import (Move #1) | 0 d after Move #1 | Both ship official MCP servers GA 2026 — subsumed by MCP-byo, no bespoke code. Skip unless Move #1 slips. |
+| 9 | **DigitalOcean App Platform + GCP Cloud Run** | B | MCP import (Move #1 shipped) | 0 d | Both ship official MCP servers GA 2026 — subsumed by MCP-byo (now shipped), no bespoke code. Users install via Settings → MCP Servers. |
 | 10 | **Spotlight / Windows-Search / browser-history local search** | C+D | Dedicated tool (native OS) | 1 wk per OS | Desktop-exclusive. Cloud agents can't read SQLite history files or query Spotlight. Powers "you've been reading X, pre-load that context." |
 
 Three honorable mentions just below the cut: **GitHub OAuth wave** (originally Move #3 lead, demoted: dev users tolerate gh-cli + `http_request` token), **Approval batching** (UX polish, not differentiation), **Audit-log export** (compliance gap, ship later when an enterprise user asks).
@@ -164,7 +164,7 @@ Where competitor agents structurally fail. Athen's existing primitives close mos
 8. **Approval batching** — risk-UI redesign for multi-action approval.
 
 ### Phase 3 — v0.5+ (rolling)
-9. **Move #1 MCP-byo** — unlocks DO App Platform / GCP Cloud Run / Slack / Teams without bespoke code.
+9. **[DONE] Move #1 MCP-byo** — shipped. DO App Platform / GCP Cloud Run / Slack / Teams all available via Settings → MCP Servers.
 10. **Proactive personal-context wave** — Spotlight/Windows-Search + Garmin + Miniflux (pick #10 + stream-C runner-ups).
 11. **Audit log export, cost meter, multi-user profiles** — UX polish for power users + enterprise readiness.
 12. **Move #5 LLM-assisted credential UX** — translates provider errors to plain English; helps every prior wave.

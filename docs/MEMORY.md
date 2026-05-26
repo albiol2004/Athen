@@ -58,6 +58,7 @@ The injected block sits in the host's `external_system_suffix` (which the execut
 
 After the agent's response lands, three sites in `commands.rs` spawn a fire-and-forget task that calls `judge_worth_remembering`. This is a Cheap-tier LLM call (timeout 60s) that:
 
+0. **Pre-filter:** `is_substantive_user_msg` runs first (see `commands.rs:726`). Short imperatives ("Do it", "Ok", "Delete it"), single-word acks, and other filler are rejected immediately without an LLM call. This prevents poisoned recall — a stored "Delete it" would match a future "Delete it" perfectly and surface the wrong referent. If the user message is not substantive, `judge_worth_remembering` returns `None` with a debug log entry.
 1. Recalls the **top 3 existing memories** that overlap with the user's message, threshold-gated.
 2. Folds them into the prompt as `MEMORIES ALREADY STORED that may overlap`.
 3. Asks the judge to summarise any genuinely new facts in 1–2 sentences, or respond `SKIP`.
@@ -89,7 +90,7 @@ Searches the persistent memory by embedding similarity, returns top-N hits. If c
 
 ### `memory_forget`
 
-Available but rarely surfaced. Settings → Memory has a UI list with per-row delete; that's the primary path for users.
+Not yet wired as an agent-callable tool (tracked as #217). Settings → Memory has a UI list with per-row delete; that's the primary path for users. The `MemoryStore::forget` trait method exists and is tested, but no tool dispatch entry in `app_tools.rs` calls it yet.
 
 ## Identity vs memory: when to put a fact where
 

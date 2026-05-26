@@ -2,7 +2,7 @@
 
 Strategic picking menu for the "become the gods of integrations" pillar. Synthesized 2026-05-12 from four parallel Haiku research streams: MCP ecosystem audit, personal-OAuth landscape, credential-setup UX, and bespoke-vs-`http_request` criteria.
 
-**Status:** Move #2 (IMAP/SMTP autodetect wizard) shipped 2026-05-12 — see [EMAIL_SETUP.md](EMAIL_SETUP.md). Move #4 (CalDAV sync) shipped 2026-05-15 — `crates/athen-caldav/` RFC 4791 adapter + sync loop in `crates/athen-app/src/calendar_sources.rs` + agent calendar_create/update now push to remote (2026-05-17 commits). CardDAV deferred. Moves #1, #3 still design-only; Move #5's LLM error translator landed 2026-05-12.
+**Status:** Move #1 (Custom MCP BYO) shipped — `mcp_add_custom`/`mcp_remove_custom`/`mcp_list_custom` Tauri commands + `McpRegistry::enable_custom` + vault env-binding + Settings panel live. Move #2 (IMAP/SMTP autodetect wizard) shipped 2026-05-12 — see [EMAIL_SETUP.md](EMAIL_SETUP.md). Move #4 (CalDAV sync) shipped 2026-05-15 — `crates/athen-caldav/` RFC 4791 adapter + sync loop in `crates/athen-app/src/calendar_sources.rs` + agent calendar_create/update now push to remote (2026-05-17 commits). CardDAV deferred. Move #3 still design-only; Move #5's LLM error translator landed 2026-05-12.
 
 This is a **picking menu**, not a build plan. Per-feature implementation docs land when each item is picked up. Related: [TOOL_EXPANSION.md](TOOL_EXPANSION.md) (the 10-category CLI/API menu, complementary), [CLOUD_APIS.md](CLOUD_APIS.md) (the `http_request` substrate this builds on).
 
@@ -15,12 +15,13 @@ This is a **picking menu**, not a build plan. Per-feature implementation docs la
 
 ## The five-move push (ship order)
 
-### 1. Custom MCP servers (BYO) — **highest leverage** (status: design)
-
+### 1. Custom MCP servers (BYO) — **SHIPPED**
 
 Single biggest move. Every Claude Desktop / Cursor / Zed user has stdio MCPs configured for Slack, Notion, Linear, GitHub, filesystem, Postgres, etc. Athen reads the same config schema and gets the whole ecosystem for free.
 
-**What's already there:** stub `athen-mcp` crate. No UI to add custom MCPs.
+**What shipped:** `athen-mcp` crate with `McpRegistry::enable_custom` + `disable_custom`. Tauri commands `mcp_add_custom`, `mcp_remove_custom`, `mcp_list_custom`, `mcp_update_config` wired in `commands.rs:7292+`. The tool name prefix convention (`<server>__<tool>`) is live in `tool_grouping.rs`. Vault env-binding at spawn time (`resolve_env` in `registry.rs`). Per-server enable/disable. Settings → MCP Servers panel live.
+
+**Still open (tracked separately):** pick-from-registry gallery (top-30 cached server list), import from `claude_desktop_config.json` one-click UI, per-server/per-tool risk downgrade UI after first call.
 
 **Key findings from research:**
 - Claude Desktop's `claude_desktop_config.json` and Cursor's `~/.cursor/mcp.json` are **schema-identical** — `mcpServers: { name: { command, args, env } }`. Athen can import either verbatim.
@@ -28,14 +29,12 @@ Single biggest move. Every Claude Desktop / Cursor / Zed user has stdio MCPs con
 - ~95% are `npx -y @scope/server` or `uvx server-name`. Athen's portable Node/Python wizard already covers ~90% of bootstrap (gaps: Playwright browsers, `kubectl` binary — handle per-server).
 - Tool discovery is one JSON-RPC `tools/list` round-trip after `initialize`. Schemas are JSON Schema subset.
 
-**Build shape:**
-- Settings → MCP Servers panel: import from `claude_desktop_config.json`, paste-config form, or pick-from-registry (cached gallery of top ~30 servers).
-- Spawn = stdio subprocess + `initialize` ping with timeout. Tools register into `AppToolRegistry` with name prefix `<server>__<tool>` (the convention `tool_grouping.rs:18` already handles).
-- **Risk gating:** treat all third-party MCP tools as `WritePersist` by default (the spec has no scope model — Athen must add). User can per-server or per-tool downgrade after first call.
-- **Credential pass-through via vault:** never let MCP env vars hold raw API keys. Resolve from `athen-vault` at spawn time. Doppler-style: 48% of servers leak via `process.env`; vault solves it.
-- **Subprocess hygiene (critical):** track child PIDs in `AppState`, `SIGTERM → 180s wait → SIGKILL` on shutdown. The "Claude Code zombie ate 14 GB of RAM" precedent is real. Reuse the PID reconciliation from #205.
-
-**Effort:** 1–2 weeks for "import + spawn + tools/list + vault env". Subagent risk gating + per-server allowlist is an additional ~3 days.
+**Shipped shape:**
+- Settings → MCP Servers panel: paste-config form + per-server enable/disable. Live (`mcp_add_custom` / `mcp_remove_custom` / `mcp_list_custom` / `mcp_update_config` Tauri commands).
+- Spawn = stdio subprocess + `initialize` ping with timeout. Tools register into `AppToolRegistry` with name prefix `<server>__<tool>` (`tool_grouping.rs:18`).
+- **Risk gating:** all third-party MCP tools default to `WritePersist` (the spec has no scope model). User can per-server downgrade after first call.
+- **Credential pass-through via vault:** MCP env vars resolved from `athen-vault` at spawn time (`resolve_env` in `registry.rs`). Raw API keys never live in env at rest.
+- **Subprocess hygiene:** child PIDs tracked in `AppState`, `SIGTERM → 180s wait → SIGKILL` on shutdown.
 
 **Why first:** unlocks ~50 ecosystem integrations in one shot. Anything Athen would otherwise wrap bespoke (Slack search, Notion query, Linear issues, GitHub PRs) is already an off-the-shelf MCP.
 
@@ -102,7 +101,7 @@ The "no friction" tier. All four offer free developer apps with zero verificatio
 
 ### 5. LLM-assisted credential setup panel (cross-cutting, status: partial)
 
-Not a single integration — a UX layer that makes all of the above feel painless. **Partial today:** the LLM error translator landed alongside Move #2 (`email_translate_error` command) and is reusable for any future credential form. The rest of the cross-cutting tier (universal Test button state, device-code + QR flow, proactive token refresh, three-tier setup) is still design-only and lights up as Moves #1/#3/#4 land.
+Not a single integration — a UX layer that makes all of the above feel painless. **Partial today:** the LLM error translator landed alongside Move #2 (`email_translate_error` command) and is reusable for any future credential form. Move #1 (MCP-byo) and Move #4 (CalDAV) are shipped; the remaining cross-cutting tier (device-code + QR OAuth flow, proactive token refresh, universal Test button state) lights up as Move #3 (OAuth wave) lands.
 
 **The pattern (Thunderbird-ish but with LLM hindsight):**
 1. **Test button on every credential form.** Spinner → ✓ green / ✗ red.

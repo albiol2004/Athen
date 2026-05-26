@@ -49,16 +49,58 @@ Tasks are classified into domains with optimized flows:
 
 ## LLM Configuration
 
-### Providers
-Anthropic, OpenAI, Google, DeepSeek, Ollama (local), llama.cpp (local). Each configurable with API key or OAuth. Any OpenAI-compatible endpoint supported via `OpenAiCompatibleProvider`.
+### Providers / Connections
+Anthropic, OpenAI, Google, DeepSeek, Ollama (local), llama.cpp (local). Each configurable with API key or OAuth. Any OpenAI-compatible endpoint supported via `OpenAiCompatibleProvider`. Stored as `models.providers: HashMap<String, ProviderConfig>` (internally called "Connections" in the Bundles design; the map key is the connection id).
 
 `ProviderConfig.supports_vision` (per-provider, defaults `false`) flips a model from text-only to multimodal. Tick it in Settings when the configured `default_model` is one of: Claude Sonnet/Opus 3.5+, GPT-4o / GPT-4o-mini, Gemini 1.5+, or any other vision-capable model. With the flag on, Athen forwards images attached in the composer to the LLM via `MessageContent::Multimodal`. Adapters that can't accept images (DeepSeek standard models, plain Ollama/llama.cpp) reject the request up-front with a clear error rather than silently dropping the images.
 
-### Model Profiles
-- **Powerful**: Claude Opus -> Gemini Ultra -> o3 (fallback: DeepSeek)
-- **Fast**: DeepSeek -> Gemini Pro -> Claude Sonnet
-- **Code**: Claude Opus -> DeepSeek
-- **Cheap**: DeepSeek -> Local models
+### Bundles — SHIPPED
+Named per-tier `(connection, slug)` loadouts replace the legacy `active_provider + tier_models` flat structure. The active bundle id is stored in `models.assignments["active_bundle"]`.
+
+```
+Bundle {
+  id, name,
+  tiers: {
+    Powerful: { connection_id: "anthropic", slug: "claude-opus-4-7" },
+    Fast:     { connection_id: "deepseek",  slug: "deepseek-v4-flash" },
+    Code:     { connection_id: "anthropic", slug: "claude-sonnet-4-6" },
+    Cheap:    { connection_id: "deepseek",  slug: "deepseek-v4-flash" },
+    Local:    { connection_id: "ollama",    slug: "qwen3.5-9b-instruct" },
+  }
+}
+```
+
+- Tiers are sparse — a missing tier falls back along the ladder `Code → Fast → Cheap`, `Powerful → Fast → Cheap`.
+- Cross-vendor mixing is first-class: every tier can reference a different `connection_id`.
+- On first load after upgrade, `synthesize_default_bundle_if_empty()` auto-creates a "Default" Bundle from existing `active_provider + tier_models` config (zero user action needed).
+- `ModelFamily` field on a connection drives `ModelQuirks` lookup (tool extraction, reasoning surface, template strictness, arg repair). Set via Settings → Bundles dropdown. No auto-detection — user-driven per the `docs/PER_MODEL_QUIRKS.md` policy.
+
+See `docs/BUNDLES.md` for the full design.
+
+### Per-Slug Quirks (`athen-llm/src/quirks/`) — SHIPPED
+`ModelQuirks` is a typed profile recorded per `ModelFamily` across five orthogonal axes:
+
+| Axis | Type | Purpose |
+|------|------|---------|
+| `tool_extraction` | `ToolExtractionStrategy` | How to recover tool calls: `Structured` (cloud APIs, trust `tool_calls` field) or inline variants (`InlineXmlQwenStyle`, `InlineXmlVendorTagged`, `InlineJsonLlama`, `InlinePythonicLlama`, `SpecialTokenBlock`, `MiniMaxM27Bracket`) |
+| `reasoning_surface` | `ReasoningSurface` | Where chain-of-thought appears: `None`, `SeparateField` (DeepSeek R1 `reasoning_content`), `InlineThinkTags` (Qwen/Gemma `<think>…</think>`), `NativeContentBlock` (Anthropic thinking blocks, Gemini thought parts), `HiddenServerSide` (OpenAI o-series) |
+| `template_strictness` | `TemplateStrictness` | `Lenient` (cloud APIs), `SystemMustBeFirst` (Qwen3.5/3.6, Gemma4, DeepSeek V3.1), `SystemAbsorbedIntoUser` (Mistral) |
+| `tool_arg_repair` | `ToolArgRepair` | Composable pre-parse fixes: `control_chars_to_unicode_escape` (DeepSeek streaming), `unescape_double_encoded_json_arrays` (Gemma4 via Ollama) |
+| `echo_reasoning_on_tool_turn` | `bool` | DeepSeek-R1: prior turn's `reasoning_content` must be echoed back on tool turns |
+
+`apply_to_response(quirks, &mut response)` is called once per completed `LlmResponse` to normalize the response to a uniform shape. `seed::quirks_for_family(family)` returns the canonical profile per family; `seed::default_slug_for_family(family)` returns the default wire-format slug. See `docs/PER_MODEL_QUIRKS.md`.
+
+### Provider Pinning — SHIPPED
+First-call-wins: the first LLM call on an arc snapshots `(provider_id, slug)` onto the arc row. All subsequent calls on the same arc use the pinned values, isolating the task from mid-flight provider switches. `resolve_effective_provider_for_arc()` reads or installs the pin; `arc_router_for()` builds a per-arc router that overrides the slug. See `docs/PROVIDER_PINNING.md`.
+
+### ReasoningEffort — design doc, not yet wired to all providers
+`ReasoningEffort` enum with seven values: `Default`, `Off`, `Minimal`, `Low`, `Medium`, `High`, `Max`. Carried on `LlmRequest.reasoning_effort`. Maps to 7 distinct wire shapes depending on provider (Anthropic `thinking` budget tokens, OpenAI `reasoning_effort` string, Google `thinkingConfig.thinkingBudget`, DeepSeek enable/disable flag). Per-arc setting + `delegate_to_agent` param planned. See `docs/REASONING_EFFORT.md`.
+
+### Model Profiles (legacy tier names, superseded by Bundles)
+- **Powerful**: Claude Opus → Gemini Ultra → o3 (fallback: DeepSeek)
+- **Fast**: DeepSeek → Gemini Pro → Claude Sonnet
+- **Code**: Claude Opus → DeepSeek
+- **Cheap**: DeepSeek → Local models
 - **Local**: Ollama models only (max privacy)
 
 ### Failover
@@ -66,6 +108,9 @@ If a model fails: try next in priority list. If rate limited: wait and retry sam
 
 ### Budget
 Optional daily USD limit with warning threshold. Per-provider rate limits. Token tracking.
+
+### GitHub Identity per Profile — SHIPPED
+`AgentProfile.github_identity: GithubIdentity` (`None | Bot | User`). When set, `shell_execute` env-injects the PAT + `GIT_AUTHOR_NAME` / `GIT_COMMITTER_NAME` / `GIT_AUTHOR_EMAIL` / `GIT_COMMITTER_EMAIL` + `GH_CONFIG_DIR` (isolated temp dir to prevent gh CLI credential leakage). Vault scopes: `github:bot` (bot PAT) and `github:user` (user PAT). Settings UI: per-profile dropdown. No command parsing — env injection only.
 
 ---
 

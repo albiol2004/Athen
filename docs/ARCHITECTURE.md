@@ -149,10 +149,28 @@ All inter-process communication uses `IpcMessage` envelopes with `IpcPayload` va
 TOML-based configuration:
 - `OperationMode`: AlwaysOn, WakeTimer, CloudRelay
 - `SecurityMode`: Bunker (everything L2+ needs approval), Assistant (standard), Yolo (only L4)
-- `ModelsConfig`: Providers, profiles (Powerful/Fast/Code/Cheap/Local), domain assignments
+- `ModelsConfig`: Providers (keyed `HashMap<String, ProviderConfig>`), Bundles (named per-tier loadouts, one active), domain assignments
 - `DomainConfig`: Per-domain model profile, max steps, timeout, custom options
 - `EmailConfig`: enabled, imap_server, imap_port, username, password, use_tls, folders, poll_interval_secs, lookback_hours
 - `TelegramConfig`: enabled, bot_token, owner_user_id (Option<i64>), allowed_chat_ids (Vec<i64>), poll_interval_secs (default 5). Added as `telegram: TelegramConfig` field on `AthenConfig` with `#[serde(default)]`.
+
+### Bundles (`config.rs`) — SHIPPED
+Named per-tier `(connection, slug)` loadouts replace the legacy `active_provider + tier_models` flat structure.
+
+```rust
+Bundle {
+    id: Uuid,
+    name: String,
+    tiers: HashMap<ModelProfile, BundleTier>,  // sparse; missing tiers fall back along a ladder
+}
+
+BundleTier {
+    connection_id: String,   // references a key in models.providers
+    slug: String,            // wire-format model slug
+}
+```
+
+The active bundle id is stored in `models.assignments["active_bundle"]`. On first load after upgrade, `AthenConfig::synthesize_default_bundle_if_empty()` migrates existing `active_provider + tier_models` config into a single "Default" Bundle so no user action is required. Cross-vendor mixing is first-class — each tier in a bundle can reference a different connection. See `docs/BUNDLES.md`.
 
 ---
 
@@ -431,6 +449,37 @@ trait IdentityStore: Send + Sync {
 ```
 Storage for user-editable identity (personality, rules, knowledge, team, and custom categories). Implementations seed the four canonical categories on first use. Listing is deterministically ordered by `sort_order` so the static prompt-cache prefix stays valid. `entries_for_profile` is the prompt-builder entry point — filters by `applies_to` tag and groups by category, omitting empty categories. Implemented in `athen-persistence`. See `docs/IDENTITY.md`.
 
+### CheckpointStore (`traits/checkpoint.rs`) — SHIPPED
+File-snapshot port for agent action undo. Implemented in `athen-checkpoint` (gix-backed bare git repo). One bare repo shared across the app, one branch per arc, one tag per action, cross-arc blob dedup for free.
+
+```rust
+trait CheckpointStore: Send + Sync {
+    /// Snapshot pre-state of paths. Returns Some(entry_id) when at least one
+    /// path was snapshotted; None when all paths were filtered out.
+    async fn snapshot_paths(
+        &self, arc_id: &str, entry_id: &str, turn_id: Option<&str>,
+        tool_name: &str, args_summary: &str, paths: &[PathBuf],
+    ) -> Result<Option<String>>;
+
+    /// Revert a single action by entry_id. Idempotent.
+    async fn revert_action(&self, entry_id: &str) -> Result<RevertOutcome>;
+
+    /// Cascade-revert to just before entry_id: restores filesystem state and
+    /// drops entry_id + all newer actions. Walks newest-first.
+    async fn rewind_to_before(&self, arc_id: &str, entry_id: &str) -> Result<RevertOutcome>;
+
+    /// List action records for an arc, newest first.
+    async fn list_actions(&self, arc_id: &str) -> Result<Vec<ActionRecord>>;
+
+    /// Drop snapshot history for an archived arc.
+    async fn forget_arc(&self, arc_id: &str) -> Result<()>;
+}
+```
+
+The agent never sees this layer. `ShellToolRegistry` calls `maybe_snapshot()` before each destructive tool (`write`, `edit`); the UI later calls `revert_action` / `rewind_to_before` when the user clicks Revert in the Changes rail. Failures are logged but never block the tool — a missing snapshot degrades to "Revert unavailable" rather than blocking the command.
+
+`ActionRecord` carries `entry_id`, `turn_id`, `tool_name`, `args_summary`, `created_at`, `paths`, and `reverted` (flag so the UI can grey the button without losing the history row). `RevertOutcome` reports `restored`, `recreated`, `deleted`, and `failed` paths plus `discarded` count.
+
 ### SkillStore (`traits/skill.rs`)
 ```rust
 trait SkillStore: Send + Sync {
@@ -443,6 +492,43 @@ trait SkillStore: Send + Sync {
 }
 ```
 Storage for user-authored procedural playbooks (Claude-Code-style `SKILL.md` folders). Storage is hybrid: bodies live on disk as plain `SKILL.md` files (source of truth, human-editable, git-friendly) and SQLite holds a derived index for cheap listing. Bodies are loaded lazily via `load_body` when the agent calls the `load_skill` tool. `sync` reconciles the SQLite index against the filesystem on boot. User skills shadow bundled skills with the same slug. Implemented in `athen-persistence`. See `docs/SKILLS.md`.
+
+### Provider Pinning (`athen-app/src/state.rs`) — SHIPPED
+First-call-wins semantics: the first LLM call on an arc snapshots the active provider id and resolved model slug onto the arc row (`pinned_provider_id`, `pinned_slug` columns in SQLite). Subsequent calls on the same arc read these back, isolating the in-flight task from mid-flight provider switches or `tier_models` edits.
+
+```rust
+struct EffectiveProviderTarget {
+    provider_id: String,
+    pinned_slug: Option<String>,  // None → consult live tier_models (unpinned arcs)
+}
+```
+
+`resolve_effective_provider_for_arc(arc_store, arc_id, active_provider_id, tier)` resolves the target (reading or writing the pin). `arc_router_for(state, target)` builds a per-arc `LlmRouter` with `override_slug` when a pin is in force so every LLM call on the arc uses exactly the pinned slug. If the pinned provider has been removed from config, the function falls back to the active provider with `pinned_slug: None` (refuse to send a foreign slug to a different provider). See `docs/PROVIDER_PINNING.md`.
+
+### Proactive Hints (`athen-app/src/proactive_hints.rs`) — SHIPPED
+Background rules engine that surfaces one-liner nudges when the user's config is missing important integrations. Rate-limited to 1 hint per hour; permanently dismissable per `hint_id`.
+
+```rust
+struct ProactiveHint {
+    hint_id: String,
+    title: String,
+    body: String,
+    action_panel: Option<String>,   // Settings panel to navigate to
+    skill_topic: Option<String>,    // athen_docs topic slug
+}
+```
+
+Six rules fire in order: `no_calendar_source`, `no_email`, `no_search_key`, `no_telegram`, `embedding_off`, `local_no_family`. `evaluate_rules(ctx)` returns all triggered hints; `ProactiveHintChecker::check_and_emit()` filters out permanently dismissed ones, applies the 1h rate limit, and emits the first actionable hint via `proactive-hint` Tauri event. Also delivers through the notifier for Telegram-away delivery.
+
+`HintDismissalStore` (SQLite, in `athen-persistence`) tracks permanent dismissals. `HintContext` is a pure-data snapshot (config, calendar source count, provider id, is_local_provider flag) with no store references — cheap to construct per check loop.
+
+### Tier Classifier (`athen-app/src/commands.rs`) — SHIPPED
+`classify_tier_for_turn(router, user_message, history_digest)` asks the Cheap-tier LLM (5s timeout, falls back to `(None, false)` on any error) to classify an in-app direct message turn:
+
+- **complexity**: `"low"` | `"medium"` | `"high"` — drives tier selection (low→Fast, high→Powerful/Code)
+- **is_code_task**: `bool` — true only for reading/writing/debugging source code on a software project
+
+The classifier is consulted in `send_message` before the executor starts so the right model tier is selected per-turn rather than using a single fixed profile for all in-app interactions.
 
 ### ArcCompactor (`traits/compaction.rs`)
 ```rust
@@ -486,6 +572,24 @@ trait ApprovalSink: Send + Sync {
 }
 ```
 A single channel through which an approval question can be delivered and awaited. Multiple sinks (in-app, Telegram) race in parallel; whichever answers first wins and the router cancels the rest. In-app sink parks a oneshot keyed by `question.id`; Telegram sink sends an inline keyboard and resolves on the corresponding `callback_query`. See `docs/ARCHITECTURE.md` §IPC for the `ApprovalRequest`/`ApprovalResponse` IPC messages that feed this.
+
+### MCP-BYO (`athen-core/src/traits/mcp.rs`) — SHIPPED
+The `McpCatalogEntry` now supports user-supplied stdio MCP servers alongside bundled ones:
+
+```rust
+enum McpSource {
+    Bundled { binary_name: String },
+    Download { url: String, binary_name: String },  // reserved
+    Process {                                        // BYO: Claude Desktop / Cursor compatible
+        command: String,
+        args: Vec<String>,
+        env: Vec<EnvBinding>,        // vault-backed secrets never appear in persisted config
+        working_dir: Option<String>,
+    },
+}
+```
+
+`McpCatalogEntry` also carries `base_risk: BaseImpact` (per-server fallback risk, defaults to `WritePersist` for backward compat) and `tool_risks: HashMap<String, BaseImpact>` (per-tool overrides by bare tool name, no `<mcp_id>__` prefix). When a tool isn't keyed in `tool_risks`, `base_risk` applies. Tools are namespaced `<mcp_id>__<tool_name>` (e.g. `slack__post_message`) in `AppToolRegistry`.
 
 ### CalendarSource (`traits/calendar_source.rs`)
 ```rust

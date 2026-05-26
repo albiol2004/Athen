@@ -2,9 +2,18 @@
 
 Per-tier model loadouts. A Bundle is a named set of `(provider, slug)` picks — one per `ModelProfile` tier — that the user can switch between as a single unit. Replaces the current "active provider + per-tier slug overrides" coupling with a flatter "active Bundle" model that natively supports cross-vendor mixing.
 
-**Status:** Design only. Not yet implemented. Builds on shipped [Provider Pinning](PROVIDER_PINNING.md) (2026-05-23 fix made pinning load-bearing for routing, not just compaction/temperature — this design depends on that).
+**Status:** SHIPPED (Phases 1-3). Core types + migration in `athen-core`, resolver reads active Bundle, Settings UI (Connections + Bundles panels), per-slug quirks registry (`SlugQuirks` + `BUILTIN_SLUG_QUIRKS` table), `build_provider_instance` wired to per-slug registry. `ProviderConfig` rename → `Connection` is the one remaining gap (field is still `providers: HashMap<String, ProviderConfig>` in `config.rs`; UI already calls them "Connections"). Builds on shipped [Provider Pinning](PROVIDER_PINNING.md) (2026-05-23 fix made pinning load-bearing for routing, not just compaction/temperature — this design depends on that).
 
-**Sequencing:** Bundles is a Settings-layer rework + a small data-model change. The hard parts (per-arc pinning of (provider, slug), per-slug quirks dispatch inside one provider) already shipped via [PROVIDER_PINNING](PROVIDER_PINNING.md) and the OpenCode Go merge (task #254). The remaining work is mostly UX + persistence + a quirks registry.
+Live today:
+- `Bundle` + `BundleTier` + `ACTIVE_BUNDLE_KEY` + `synthesize_default_bundle_if_empty` at `crates/athen-core/src/config.rs` (~lines 280-360). First-load migration synthesises one "Default" Bundle from old `tier_models` automatically.
+- `ModelsConfig.bundles: HashMap<String, Bundle>` field alongside the legacy `providers` map.
+- `EffectiveProviderTarget` resolver at `crates/athen-app/src/state.rs` (~line 3705): reads active Bundle, resolves `(connection_id, slug)` per tier, installs arc pin.
+- `arc_router_for` (~line 4145) + `build_router_for_bundle` (~line 4469) — per-arc router construction honoring Bundle tiers and pinned slugs.
+- `SlugQuirks` struct + `BUILTIN_SLUG_QUIRKS` static table + `lookup_slug_quirks` at `crates/athen-llm/src/quirks/seed.rs` (~line 264). `build_provider_instance` consults the registry first; Connection-level `family` is the safety-net fallback.
+- Bundle CRUD Tauri commands in `crates/athen-app/src/bundle_settings.rs` (449 lines): `list_bundles`, `create_bundle`, `patch_bundle`, `delete_bundle`, `set_active_bundle`, `derive_primary_connection`.
+- Settings → Bundles panel + Settings → Connections panel at `frontend/app.js` (~lines 6516+, 7063+). Active-Bundle dropdown in the header, per-tier Connection+slug pickers, custom-slug escape hatch.
+
+**Open gaps (post-Phase 3):** `ProviderConfig` is not yet renamed to `Connection` in the Rust types (field name is still `models.providers` in `config.rs`). UI badge "pinned: X" on arc cards is still silent (backend pin works, no visual indicator yet). Live `/models` endpoint fetch for Bundle tier dropdowns is not yet wired (hardcoded curated catalog only). `Probe` button for custom slugs is deferred. Per-profile Bundle override is deferred. Bundle export/import is deferred.
 
 ## Problem
 

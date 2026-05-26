@@ -4,30 +4,32 @@
 
 ### Built-in Tool Registry (`ShellToolRegistry`)
 
-Defined in `crates/athen-agent/src/tools.rs`. Twenty-one built-in tools:
+Defined in `crates/athen-agent/src/tools.rs`. Core built-in tools:
 
 | Tool | Risk | Backend |
 |------|------|---------|
-| `shell_execute` | `WritePersist` | nushell when available; otherwise `sh -c` (Unix) or `cmd /C` (Windows); sandboxed via bwrap (Linux) / Seatbelt (macOS) / Job Object + AppContainer (Windows) when available; PYTHONPATH/PATH/cwd injected through OS process API, not a shell-syntax wrapper |
+| `shell_execute` | `WritePersist` | nushell when available; otherwise `sh -c` (Unix) or `cmd /C` (Windows); sandboxed via bwrap (Linux) / Seatbelt (macOS) / Job Object + AppContainer (Windows) when available; PYTHONPATH/PATH/cwd injected through OS process API, not a shell-syntax wrapper; pre-run `RuleEngine` check |
 | `shell_spawn` | `WritePersist` | detached spawn, log file capture |
 | `shell_kill` | `WritePersist` | SIGTERM/SIGKILL on tracked PIDs only |
 | `shell_logs` | `Read` | tail of spawn log file |
 | `read` | `Read` | `tokio::fs`, `cat -n` style numbering, offset/limit |
-| `edit` | `WritePersist` | exact-string replace, requires prior `read`, atomic write |
-| `write` | `WritePersist` | full overwrite, atomic, prior `read` required for existing files |
+| `edit` | `WritePersist` | exact-string replace, requires prior `read`, atomic write; snapshot via `CheckpointStore` before write |
+| `write` | `WritePersist` | full overwrite, atomic, prior `read` required for existing files; snapshot via `CheckpointStore` before write |
 | `grep` | `Read` | ripgrep wrapper |
 | `list_directory` | `Read` | `tokio::fs` direct |
 | `memory_store` | `Read` | persistent semantic memory (or in-session `HashMap<String,String>` if not configured); auto-dedup at store/judge/recall layers; recall threshold 0.6 |
 | `memory_recall` | `Read` | search persistent semantic memory by key; Tier 2 (revealed on first call, not always-on) to avoid small-model over-recall |
 | `web_search` | `Read` | `WebSearchProvider` (production default: `MultiSearchProvider` chaining Brave → Tavily → DDG with quota-aware cooldowns); Tier 1 always-revealed |
 | `web_fetch` | `Read` | `PageReader` (default: HybridReader chaining Local → Jina → Wayback); Tier 1 always-revealed |
-| `send_telegram` | `WritePersist` | outbound Telegram text + attachments (photo/document); auto-chunk long text at 4096 chars; owner chat auto-approved; non-owner routed through `ApprovalRouter` |
+| `send_telegram` | `WritePersist` | outbound Telegram text + attachments (`TelegramAttachmentKind::Photo | Document | Auto`); auto-chunk long text at 4096 chars; owner chat auto-approved; non-owner routed through `ApprovalRouter`; appends to `telegram_chat_log` on every successful send |
 | `email_send` | `WritePersist` | outbound SMTP; Tier 1 always-revealed; subject/body/recipients auto-sanitized; approval-gated via `EmailSendApprovalGate` |
 | `install_package` | `WritePersist` | pip/npm install into `~/.athen/toolbox/`; gated by `ToolboxApprovalGate` |
 | `uninstall_package` | `WritePersist` | reversible removal from toolbox (no approval needed) |
 | `list_installed_packages` | `Read` | reads `~/.athen/toolbox/manifest.json` |
 
 `shell_execute` passes the command through `RuleEngine` before dispatch; `Danger` or `Critical` risk score returns an error without executing.
+
+**Checkpointing hooks on write tools.** `ShellToolRegistry` carries an optional `CheckpointStore` (wired by the composition root per-arc via `with_checkpoint_arc_id`). Before each `edit` or `write` call, `maybe_snapshot(tool_name, args_summary, paths)` is called — it captures the pre-state and returns an `action_id` the auditor stamps onto the arc-entry metadata. Failures are logged but never block the tool — a missing snapshot degrades to "Revert unavailable" in the Changes rail rather than blocking the command. See `docs/ARCHITECTURE.md §CheckpointStore` and `athen-checkpoint` crate.
 
 ### Persistent Toolbox
 
@@ -104,7 +106,7 @@ The system prompt's `WEB ACCESS` section steers the model away from `curl`/`wget
 
 ### Composition (`AppToolRegistry`)
 
-`crates/athen-app/src/app_tools.rs:48` composes the production tool surface from optional adapters:
+`crates/athen-app/src/app_tools.rs` composes the production tool surface from optional adapters:
 
 ```rust
 struct AppToolRegistry {
@@ -121,6 +123,9 @@ struct AppToolRegistry {
     vault: Option<Arc<dyn Vault>>,
     http_rate_limiter: Option<Arc<HttpRateLimiter>>,
     http_client: Option<reqwest::Client>,
+    cloud_apis_doc_path: Option<PathBuf>,          // path to auto-generated cloud_apis.md index
+    calendar_source_store: Option<Arc<dyn CalendarSourceConfigStore>>,  // for remote CalDAV push
+    active_profile_id: Option<String>,             // "athen_setup" gates setup tools
 }
 ```
 
@@ -130,18 +135,27 @@ Constructed eagerly with the first four; remaining fields are attached via build
 - 4 calendar tools when `calendar.is_some()` — `calendar_list/create/update/delete` (`Read`, `WritePersist`, `WritePersist`, `WritePersist`). `calendar_create` now pushes agent-authored events to remote calendars (iCloud/Google/Fastmail via CalDAV) when configured; takes optional `target_calendar_id`; uses `agent_default_calendar_id` from settings as fallback.
 - 5 contacts tools when `contacts.is_some()` — `contacts_list/search/create/update/delete` (`Read`, `Read`, `WritePersist`, `WritePersist`, `WritePersist`).
 - 2 attachment tools when `attachments.is_some()` — `read_attachment_full/fetch_attachment` (`Read`, `Read`). Used when inline-surfaced PDF/email text was truncated or bytes were purged by TTL sweeper.
-- `http_request` when `http_endpoints`, `vault`, `http_rate_limiter`, and `http_client` are all present. Calls registered cloud APIs by name (Hunter, Brave, Open-Meteo, etc.) with vault-backed credentials and per-endpoint rate limiting.
+- `http_request` when `http_endpoints`, `vault`, `http_rate_limiter`, and `http_client` are all present. Calls registered cloud APIs by name (Hunter, Brave, Open-Meteo, etc.) with vault-backed credentials and per-endpoint rate limiting. See `docs/CLOUD_APIS.md`.
 - `load_skill` when `skills.is_some()` — load full markdown body of user-authored skills on demand.
 - `identity_add` when `identity.is_some()` — agent can persist personality/rules/knowledge/user/team statements into the user-editable identity store; entries live in static prefix on next startup.
-- N MCP tools when `mcp.is_some()` — each tool returned by `McpClient::list_tools` is namespaced `<mcp_id>__<tool_name>` (e.g. `slack__post_message`) using `MCP_TOOL_SEPARATOR`.
+- `athen_docs` — always registered. Built-in self-help tool serving setup guides for the agent. Two actions: `list` (returns all available topic slugs) and `get` (returns the full guide for a slug). Topics include `setup-email`, `setup-calendar-source`, `setup-cloud-api-endpoint`, `pick-local-model`, etc. Used by the proactive hints system (`skill_topic` field) and by the Setup agent.
+- `create_wakeup` — registered by `WakeupToolRegistry` wrapper. Agent-authored scheduled follow-ups (one-shot or recurring). `Auto`-band wakeups with autonomous tools escalate through the `ApprovalRouter`. See `docs/WAKEUPS.md`.
+- 6 **setup tools** when `active_profile_id == "athen_setup"` (profile-gated, never visible to other profiles):
+  - `setup_email` — store IMAP/SMTP credentials in the vault + enable email monitor
+  - `setup_calendar_connect` — test CalDAV connection, list available calendars
+  - `setup_calendar_configure` — configure default calendar + sync settings
+  - `setup_telegram` — store bot token in vault + enable Telegram monitor
+  - `setup_owner_info` — write owner name/email/timezone into the config store
+  - `setup_search_key` — store Brave or Tavily API key in the vault
+- N MCP tools when `mcp.is_some()` — each tool returned by `McpClient::list_tools` is namespaced `<mcp_id>__<tool_name>` (e.g. `slack__post_message`) using `MCP_TOOL_SEPARATOR`. Per-tool risk comes from `McpCatalogEntry.tool_risks` (overrides) falling back to `base_risk` (per-server default).
 
-**Description override:** when `memory.is_some()`, the inner `memory_store` / `memory_recall` descriptions are rewritten to point at persistent semantic memory rather than the in-session `HashMap` (`app_tools.rs:820-829`).
+**Description override:** when `memory.is_some()`, the inner `memory_store` / `memory_recall` descriptions are rewritten to point at persistent semantic memory rather than the in-session `HashMap`.
 
-**`call_tool` dispatch order** (`app_tools.rs:930-1024`):
+**`call_tool` dispatch order:**
 1. **`FileGate` interception** — if a `file_gate` is set and `FileGate::is_file_tool(name)` matches, the call is routed through `gate.handle()` which evaluates the path against `PathRiskEvaluator` + grants. The gate either runs the op directly (paths outside the sandbox), or hands back to a `dispatch_inside_sandbox` closure (paths the MCP can serve).
 2. **MCP routing** — names containing `MCP_TOOL_SEPARATOR` are split and forwarded to `McpClient::call_tool(mcp_id, tool, args)`.
 3. **Persistent memory override** — `memory_store` / `memory_recall` are intercepted to call `Memory::remember` / `Memory::recall` instead of the inner `HashMap`.
-4. **Built-in match** — calendar and contacts tools dispatch to `do_calendar_*` / `do_contacts_*` async methods.
+4. **Built-in match** — calendar, contacts, `identity_add`, `load_skill`, `athen_docs`, `http_request`, and setup tools dispatch to their respective `do_*` async methods.
 5. **Fallback** — anything else delegates to `inner.call_tool(name, args)` (the original `ShellToolRegistry`).
 
 ### Vision input (Phase 1)
@@ -244,7 +258,14 @@ Limits are **fixed**, not configurable via UI — keeping them off the settings 
 `crates/athen-mcp/` is split into two parts:
 
 - **`catalog.rs`** — hardcoded list of branded MCPs the user can enable. Currently one entry: **Files** (`id: "files"`). Future entries can be downloadable (`McpSource::Download`).
-- **`registry.rs`** — runtime state: `McpRegistry` holds an `enabled` map and a `clients` map of lazy-spawned child processes. Enabling an MCP eagerly spawns the child and runs the rmcp handshake so config errors surface immediately (`registry.rs:100-116`). Disabling drops the live client which kills the process.
+- **`registry.rs`** — runtime state: `McpRegistry` holds an `enabled` map and a `clients` map of lazy-spawned child processes. Enabling an MCP eagerly spawns the child and runs the rmcp handshake so config errors surface immediately. Disabling drops the live client which kills the process.
+
+### MCP-BYO (User-Supplied MCP Servers) — SHIPPED
+Users can add arbitrary stdio MCP servers (schema-compatible with Claude Desktop / Cursor `mcpServers` entries) via Settings → Connections → MCPs. These use `McpSource::Process { command, args, env, working_dir }`. Env bindings support vault-backed values that never appear in persisted config.
+
+Per-server risk customization: `McpCatalogEntry.base_risk` (server-wide fallback, defaults `WritePersist`) and `McpCatalogEntry.tool_risks: HashMap<String, BaseImpact>` (per-tool overrides by bare tool name). The risk gate fires at the `AppToolRegistry` dispatch point for every MCP tool call.
+
+Tools from BYO servers appear in the agent's tool surface namespaced as `<mcp_id>__<tool_name>` alongside bundled MCPs. The `athen_setup` profile can also use BYO MCP tools.
 
 ### Enable / Disable via UI
 
@@ -284,6 +305,29 @@ All monitors implement `SenseMonitor` from `athen-core`. `SenseRunner<M>` drives
 5. **Email** — `RiskLevel::Caution`. IMAP poll every 60 s (configurable). Tracks `last_seen_uid` to fetch only new unseen messages. Attachments parsed via `mailparse`. (`email.rs:27-55`)
 
 Each monitor normalizes its input into `SenseEvent` (uuid, timestamp, `EventSource`, `EventKind`, `SenderInfo`, `NormalizedContent`, `source_risk`, `raw_id`) before the coordinator sees it.
+
+### Proactive Help Sense (`athen-app/src/proactive_hints.rs`) — SHIPPED
+Not a `SenseMonitor` in the polling sense — a background rules engine that fires on a 30-minute check loop. Surfaces one-liner nudges as in-app notifications (and via Telegram when away) when the user's config is missing important integrations.
+
+**Six rules (evaluated in order):**
+1. `no_calendar_source` — no CalDAV source configured → "Connect your calendar" → panel `calendar-sources`
+2. `no_email` — email not enabled → "Connect your email" → panel `email`
+3. `no_search_key` — no Brave/Tavily key → "Better web search available" → panel `cloud-apis`
+4. `no_telegram` — Telegram not enabled → "Get notifications on your phone" → panel `telegram`
+5. `embedding_off` — embeddings mode is `Off` → "Enable memory" → panel `embedding`
+6. `local_no_family` — local provider active with no model family set → "Set your model family" → panel `bundles`
+
+Rate-limited to 1 hint per hour. Permanently dismissable per `hint_id` via `HintDismissalStore` (SQLite). Emits first actionable (non-dismissed) hint only via `proactive-hint` Tauri event. Each hint carries an optional `action_panel` (Settings nav target) and `skill_topic` (athen_docs slug the Setup agent can fetch). `ProactiveHintChecker::check_and_emit()` is started via `AppState::start_proactive_hint_checker()` in `lib.rs`.
+
+### L1 Help Modals (`athen-app/src/settings.rs`) — SHIPPED
+`ProviderCatalogEntry` now carries static L1 help fields returned by `list_provider_catalog`:
+- `dashboard_url` — direct link to provider's API key dashboard
+- `cost_note` — free-tier / pricing one-liner
+- `key_format_hint` — key format hint (e.g. "Starts with sk-...")
+- `setup_steps: &[&str]` — 2–4 step quick-start instructions
+- `install_snippets: &[InstallSnippet]` — per-OS install commands (local providers only)
+
+The frontend renders these as a help card directly inside the provider config panel, requiring no LLM call (L1 = static data only). All providers in `PROVIDER_IDS` have populated L1 fields.
 
 ---
 

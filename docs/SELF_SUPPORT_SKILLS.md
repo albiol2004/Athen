@@ -1,6 +1,13 @@
 # Self-Support: Athen as Its Own IT Help Desk (Design Doc)
 
-**Status:** L1 (help modals) + L2 (athen_docs tool + 11 guides) + Proactive help sense SHIPPED. L3 (skill-gated settings tools), `cargo xtask gen-skills`, and CI staleness check deferred. Builds on shipped [Skills](SKILLS.md) and shipped onboarding wizard (`frontend/app.js` ~10759).
+**Status:**
+- **L1 — Per-field help modals:** SHIPPED. `dashboard_url`, `cost_note`, `install_snippets` / `InstallSnippet` fields on `ProviderCatalogEntry` at `crates/athen-app/src/settings.rs` (~lines 816-1044). `?` icon + modal wired in onboarding and Settings → Providers.
+- **L2 — System Skills (athen_docs tool):** SHIPPED. `athen_docs` tool at `crates/athen-app/src/athen_docs.rs` + `crates/athen-app/src/app_tools.rs` (~line 1631). 11 system guides compiled into the binary via `include_str!` from `skills/system/`: `setup-calendar-source`, `setup-email`, `setup-mcp-server`, `setup-cloud-api-endpoint`, `setup-github-identity`, `setup-skill`, `setup-wakeup`, `pick-local-model`, `understand-risk-system`, `understand-profiles`, `troubleshoot-no-llm-response`. The `athen_docs` approach compiles guides into the binary rather than using the `SkillStore` filesystem/SQLite path — system guides are always available without disk access.
+- **Interactive onboarding (athen_setup profile + 6 setup tools):** SHIPPED. `"athen_setup"` profile triggers 6 setup tools (`setup_email`, `setup_calendar_connect`, `setup_calendar_configure`, `setup_telegram`, `setup_owner_info`, `setup_search_key`) at `crates/athen-app/src/setup_tools.rs` + `app_tools.rs` (~line 2131). Only active when `active_profile_id == "athen_setup"`.
+- **Proactive help sense:** SHIPPED. Rules engine + background checker at `crates/athen-app/src/proactive_hints.rs`. Rules: no calendar source, no email, no search key, no telegram, embedding off, local model without family set. Rate-limited (1 hint/hour), permanently dismissable via `HintDismissalStore`.
+- **L3 — Skill-gated settings tools, `cargo xtask gen-skills`, CI staleness check:** DEFERRED.
+
+Builds on shipped [Skills](SKILLS.md) and shipped onboarding wizard (`frontend/app.js` ~10759).
 
 The thesis: Athen is for non-technical users, but Athen has a Settings surface that already covers ~20 panels (providers, calendars, email, MCP servers, Cloud APIs, GitHub identity, profiles, vault, runtimes, …). Onboarding only walks through the LLM step. After that the user is on their own, staring at fields like "CalDAV principal URL" or "MCP server stdio command" with no agent help — because the help they'd ask the agent for IS the help to configure the agent.
 
@@ -63,12 +70,11 @@ One Skill per Settings area. Each is a folder under a new `skills/system/` tree,
 - `understand-profiles` — how to make a specialized agent (outreach, personal assistant, coder)
 - `troubleshoot-no-llm-response` — provider key wrong? quota hit? network? walks through diagnostic checks
 
-**Storage model.** Re-use the existing `SkillStore` machinery (`athen-persistence/src/skills.rs`). Two flags on the row:
+**Implementation (as shipped).** System guides are compiled into the binary via `include_str!` in `crates/athen-app/src/athen_docs.rs` rather than riding through the `SkillStore` filesystem path. The agent calls `athen_docs(action="get", topic="setup-calendar-source")` — the tool returns the guide body directly from the compiled-in table, no disk read. `athen_docs(action="list")` returns all available topic slugs.
 
-- `system: bool` — read-only, can't be deleted via UI, can be hidden per-user (`hidden: bool` already in design).
-- `version: String` — bumps with the binary; on upgrade we replace the on-disk skill body and bump version, but never blow away user edits to user skills.
+The original design called for a `system: bool` flag on `SkillStore` rows and listing via the static prefix, but the shipped approach is simpler: `athen_docs` is always registered (it's a standard tier-2 tool), and the guide bodies are immutable binary artifacts. User skills in `SkillStore` are separate and unchanged.
 
-**Discovery surface.** System Skills appear in the static prefix listing like any other Skill, with a small `[system]` tag in the picker. The agent calls `load_skill("setup-calendar-source")` just like a user Skill.
+**Discovery surface.** `athen_docs` is listed in the agent's tool schema at all times. The agent calls it directly when a user asks for help with a settings topic.
 
 **What the body looks like.** Plain markdown, walk-through style. Example sketch for `setup-calendar-source`:
 

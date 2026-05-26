@@ -73,7 +73,7 @@ enum AutonomyBand {
 
 enum NotificationChannel {
     InApp,
-    Telegram,    // requires Send-Telegram tool; out-of-scope until that lands
+    Telegram,    // shipped — wired via send_telegram tool + wakeup_tool.rs channel routing
     Email,
     Silent,      // result is persisted, no ping
 }
