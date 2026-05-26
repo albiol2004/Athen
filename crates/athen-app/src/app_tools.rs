@@ -3962,7 +3962,8 @@ mod tests {
         /// returns the "already_loaded" stub without hitting the store again.
         #[tokio::test]
         async fn second_call_returns_already_loaded_stub() {
-            let (registry, _dir) = setup_with_skill("cold-email", "## Steps\n1. Write email.\n").await;
+            let (registry, _dir) =
+                setup_with_skill("cold-email", "## Steps\n1. Write email.\n").await;
 
             // First call — must return the full body.
             let first = registry
@@ -3970,10 +3971,15 @@ mod tests {
                 .await
                 .unwrap();
             assert!(first.success);
-            assert!(first.output.get("already_loaded").is_none(),
-                "First call must NOT have already_loaded key");
             assert!(
-                first.output["body"].as_str().unwrap().contains("Write email"),
+                first.output.get("already_loaded").is_none(),
+                "First call must NOT have already_loaded key"
+            );
+            assert!(
+                first.output["body"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Write email"),
                 "First call must return the full body"
             );
 
@@ -3988,8 +3994,10 @@ mod tests {
                 Some(true),
                 "Second call must have already_loaded=true"
             );
-            assert!(second.output.get("body").is_none(),
-                "Second call must NOT return the full body");
+            assert!(
+                second.output.get("body").is_none(),
+                "Second call must NOT return the full body"
+            );
         }
 
         /// Different slugs on the same registry are each loaded only once.
