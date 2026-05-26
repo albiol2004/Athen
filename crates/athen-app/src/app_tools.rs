@@ -2550,7 +2550,11 @@ mod tests {
     async fn list_tools_includes_calendar_tools() {
         let (_db, registry) = setup_with_calendar().await;
         let tools = registry.list_tools().await.unwrap();
-        assert_eq!(tools.len(), 23, "Expected 18 shell + 4 calendar + 1 athen_docs tools");
+        assert_eq!(
+            tools.len(),
+            23,
+            "Expected 18 shell + 4 calendar + 1 athen_docs tools"
+        );
 
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"calendar_list"));

@@ -913,15 +913,39 @@ fn setup_steps(id: &str) -> &'static [&'static str] {
 }
 
 const OLLAMA_SNIPPETS: &[InstallSnippet] = &[
-    InstallSnippet { os: "linux", label: "Install Ollama", cmd: "curl -fsSL https://ollama.com/install.sh | sh" },
-    InstallSnippet { os: "macos", label: "Install Ollama", cmd: "brew install ollama" },
-    InstallSnippet { os: "windows", label: "Install Ollama", cmd: "Download from https://ollama.com/download/windows" },
+    InstallSnippet {
+        os: "linux",
+        label: "Install Ollama",
+        cmd: "curl -fsSL https://ollama.com/install.sh | sh",
+    },
+    InstallSnippet {
+        os: "macos",
+        label: "Install Ollama",
+        cmd: "brew install ollama",
+    },
+    InstallSnippet {
+        os: "windows",
+        label: "Install Ollama",
+        cmd: "Download from https://ollama.com/download/windows",
+    },
 ];
 
 const LLAMACPP_SNIPPETS: &[InstallSnippet] = &[
-    InstallSnippet { os: "linux", label: "Install llama.cpp", cmd: "git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp && make -j" },
-    InstallSnippet { os: "macos", label: "Install llama.cpp", cmd: "brew install llama.cpp" },
-    InstallSnippet { os: "windows", label: "Install llama.cpp", cmd: "Download pre-built from https://github.com/ggml-org/llama.cpp/releases" },
+    InstallSnippet {
+        os: "linux",
+        label: "Install llama.cpp",
+        cmd: "git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp && make -j",
+    },
+    InstallSnippet {
+        os: "macos",
+        label: "Install llama.cpp",
+        cmd: "brew install llama.cpp",
+    },
+    InstallSnippet {
+        os: "windows",
+        label: "Install llama.cpp",
+        cmd: "Download pre-built from https://github.com/ggml-org/llama.cpp/releases",
+    },
 ];
 
 fn install_snippets(id: &str) -> &'static [InstallSnippet] {
