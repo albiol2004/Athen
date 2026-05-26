@@ -128,23 +128,20 @@ impl DelegationToolRegistry {
     fn delegate_tool_definition() -> ToolDefinition {
         ToolDefinition {
             name: DELEGATE_TOOL_NAME.to_string(),
-            description: "Hand off a self-contained task to a specialist agent profile. \
-                 Use when another profile is genuinely better-suited (e.g. marketing \
-                 expertise for a landing-page review, coder profile for writing code). \
-                 The specialist runs in a fresh context with their own tools, completes \
-                 the task, and returns a structured result you can reason over. The \
-                 specialist cannot delegate further — depth is capped at 1, like a \
-                 real-life referral.\n\
+            description: "Spawn a sub-agent to handle a task in parallel. Use this when:\n\
+                 - A task needs a different specialist profile (e.g. coder for code, \
+                   researcher for web research, marketing for copy)\n\
+                 - You want to offload a self-contained subtask while you continue \
+                   working on the main thread\n\
+                 - The task benefits from a fresh context with a focused brief\n\
                  \n\
-                 IMPORTANT — the brief is a SPECIFICATION, not the deliverable. Describe \
-                 *what* the specialist should produce; do NOT paste the deliverable itself \
-                 inside the brief. If you ask the coder agent to write a landing page, the \
-                 brief should describe the sections, copy intent, CTAs, and constraints — \
-                 NOT contain the literal HTML you want them to emit. The specialist will \
-                 write the deliverable; you describe it.\n\
+                 The sub-agent runs independently with its own tools and returns a \
+                 structured result. It cannot delegate further (depth = 1).\n\
                  \n\
-                 Keep the brief under ~2000 characters. The specialist sees only the \
-                 brief, not your conversation history, so make it self-contained but tight."
+                 The `brief` is a SPECIFICATION — describe what the sub-agent should \
+                 produce, don't paste the deliverable. The sub-agent sees ONLY the \
+                 brief (not your conversation), so make it self-contained. Keep it \
+                 under ~2000 characters."
                 .to_string(),
             parameters: Self::delegate_schema(),
             backend: ToolBackend::Shell {

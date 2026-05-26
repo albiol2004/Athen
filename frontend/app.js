@@ -127,6 +127,15 @@ const BUILTIN_TOOL_ICONS = {
     'load_skill': ICON_SKILL,
     // generic cloud HTTP API call (registered endpoint via Settings → Cloud APIs)
     'http_request': ICON_GLOBE,
+    // self-help docs lookup
+    'athen_docs': ICON_INFO,
+    // interactive setup tools (athen_setup profile)
+    'setup_email': ICON_MAIL,
+    'setup_calendar_connect': ICON_CALENDAR,
+    'setup_calendar_configure': ICON_CAL_PLUS,
+    'setup_telegram': ICON_PAPER_PLANE,
+    'setup_owner_info': ICON_USER,
+    'setup_search_key': ICON_SEARCH,
 };
 
 const BUILTIN_TOOL_LABELS = {
@@ -143,7 +152,7 @@ const BUILTIN_TOOL_LABELS = {
     'contacts_list': 'Contacts', 'contacts_search': 'Find contact',
     'contacts_create': 'Add contact', 'contacts_update': 'Update contact',
     'contacts_delete': 'Delete contact',
-    'delegate_to_agent': 'Consult specialist',
+    'delegate_to_agent': 'Sub-agent',
     'install_package': 'Install package',
     'uninstall_package': 'Uninstall package',
     'list_installed_packages': 'List packages',
@@ -151,6 +160,13 @@ const BUILTIN_TOOL_LABELS = {
     'identity_add': 'Note about you',
     'load_skill': 'Load skill',
     'http_request': 'Cloud API',
+    'athen_docs': 'Help guide',
+    'setup_email': 'Setup email',
+    'setup_calendar_connect': 'Connect calendar',
+    'setup_calendar_configure': 'Configure calendar',
+    'setup_telegram': 'Setup Telegram',
+    'setup_owner_info': 'Set owner info',
+    'setup_search_key': 'Setup search',
 };
 
 // MCP-prefixed tools (e.g. `slack__post_message`) — strip prefix and try common
@@ -3084,6 +3100,13 @@ function renderToolBody(meta) {
         case 'identity_add':    main = renderIdentityAdd(args, result); break;
         case 'load_skill':      main = renderLoadSkill(args, result); break;
         case 'http_request':    main = renderHttpRequest(args, result); break;
+        case 'athen_docs':      main = renderAthenDocs(args, result); break;
+        case 'setup_email':
+        case 'setup_calendar_connect':
+        case 'setup_calendar_configure':
+        case 'setup_telegram':
+        case 'setup_owner_info':
+        case 'setup_search_key': main = renderSetupResult(tool, args, result); break;
         default:
             // No bespoke layout — fall back to a labelled-fields dump
             // so the user still gets a structured view instead of the
@@ -3973,6 +3996,49 @@ function renderHttpRequest(args, result) {
         contentType ? ['Content-Type', contentType, { mono: true }] : null,
         bodyDisplay ? ['Response',     bodyDisplay, { block: bodyBlock, mono: bodyMono }] : null,
     ];
+    return renderFields(fields);
+}
+
+function renderAthenDocs(args, result) {
+    const action = String(args.action || 'get');
+    const topic = String(args.topic || result.topic || '');
+    if (action === 'list') {
+        const guides = result.guides || [];
+        if (!guides.length) return renderFields([['Guides', 'No guides available']]);
+        const list = guides.map((g) => `${g.slug} - ${g.description || ''}`).join('\n');
+        return renderFields([['Available guides', list, { block: true }]]);
+    }
+    const body = String(result.body || '');
+    const preview = body.split('\n').filter((l) => l.trim()).slice(0, 2).join(' ').slice(0, 150);
+    return renderFields([
+        ['Guide', topic, { mono: true }],
+        preview ? ['Preview', preview] : null,
+    ]);
+}
+
+function renderSetupResult(toolLabel, args, result) {
+    const ok = result.ok === true;
+    const msg = String(result.message || '');
+    const pill = renderPill(ok ? 'OK' : 'Failed', ok ? 'success' : 'warning');
+    const fields = [['Status', pill]];
+
+    if (args.address) fields.push(['Address', args.address, { mono: true }]);
+    if (args.provider) fields.push(['Provider', args.provider]);
+    if (args.username) fields.push(['User', args.username, { mono: true }]);
+    if (args.bot_token) fields.push(['Bot', '***' + String(args.bot_token).slice(-4)]);
+    if (args.field) fields.push(['Field', `${args.field} = ${args.value || ''}`]);
+    if (result.bot_username) fields.push(['Bot', '@' + result.bot_username]);
+    if (result.provider) fields.push(['Provider', result.provider]);
+
+    if (result.calendars && result.calendars.length) {
+        const list = result.calendars.map((c) => c.name || c.id).join(', ');
+        fields.push(['Calendars', list]);
+    }
+    if (args.selected_calendars && args.selected_calendars.length) {
+        fields.push(['Selected', args.selected_calendars.join(', ')]);
+    }
+
+    if (msg) fields.push(['Message', msg]);
     return renderFields(fields);
 }
 

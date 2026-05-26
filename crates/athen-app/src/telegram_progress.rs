@@ -62,7 +62,7 @@ const BUILTIN_TOOL_LABELS: &[(&str, &str)] = &[
     ("move_path", "Move"),
     ("exists", "Check"),
     ("stat", "Info"),
-    ("delegate_to_agent", "Consult specialist"),
+    ("delegate_to_agent", "Sub-agent"),
     ("install_package", "Install package"),
     ("uninstall_package", "Uninstall package"),
     ("list_installed_packages", "List packages"),
@@ -422,7 +422,7 @@ mod tests {
         assert_eq!(pretty_tool_label("shell_execute"), "Run");
         assert_eq!(pretty_tool_label("read"), "Read");
         assert_eq!(pretty_tool_label("list_directory"), "List");
-        assert_eq!(pretty_tool_label("delegate_to_agent"), "Consult specialist");
+        assert_eq!(pretty_tool_label("delegate_to_agent"), "Sub-agent");
     }
 
     #[test]
