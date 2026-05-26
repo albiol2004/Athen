@@ -520,7 +520,11 @@ pub async fn build_setup_status_context(
     let owner_status = if let Some(cs) = contact_store {
         match cs.find_owner().await {
             Ok(Some(c)) => {
-                let name = if c.name.is_empty() { "unnamed" } else { &c.name };
+                let name = if c.name.is_empty() {
+                    "unnamed"
+                } else {
+                    &c.name
+                };
                 let ids: Vec<String> = c
                     .identifiers
                     .iter()

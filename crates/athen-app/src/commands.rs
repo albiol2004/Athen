@@ -2492,8 +2492,9 @@ pub async fn send_message(
             if active_profile_id_for_run.as_deref() == Some("athen_setup") {
                 let setup_cfg = crate::state::load_config();
                 let cal_store = state.calendar_source_store();
-                let cal_dyn: Option<Arc<dyn athen_core::traits::calendar_source_config::CalendarSourceConfigStore>> =
-                    cal_store.map(|s| Arc::new(s) as _);
+                let cal_dyn: Option<
+                    Arc<dyn athen_core::traits::calendar_source_config::CalendarSourceConfigStore>,
+                > = cal_store.map(|s| Arc::new(s) as _);
                 let status = crate::setup_tools::build_setup_status_context(
                     &setup_cfg,
                     cal_dyn.as_ref(),
