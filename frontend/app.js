@@ -7825,41 +7825,41 @@ function showProactiveHintCard(hint) {
         actions.appendChild(setupBtn);
     }
 
-    const setupHints = [‘no_calendar_source’, ‘no_email’, ‘no_telegram’, ‘no_search_key’];
+    const setupHints = ['no_calendar_source', 'no_email', 'no_telegram', 'no_search_key'];
     if (setupHints.includes(hint.hint_id)) {
-        const agentBtn = document.createElement(‘button’);
-        agentBtn.className = ‘hint-action-btn hint-setup’;
-        agentBtn.textContent = ‘Let Athen set it up’;
-        agentBtn.addEventListener(‘click’, async (e) => {
+        const agentBtn = document.createElement('button');
+        agentBtn.className = 'hint-action-btn hint-setup';
+        agentBtn.textContent = 'Let Athen set it up';
+        agentBtn.addEventListener('click', async (e) => {
             e.stopPropagation();
             card.remove();
             if (!invoke) return;
             try {
-                const arcId = await invoke(‘create_setup_arc’);
+                const arcId = await invoke('create_setup_arc');
                 activeArcId = arcId;
                 arcHasMessages = false;
                 clearChatUI();
                 returnToChatIfOnSubView();
                 await loadArcs();
                 renderProfilePicker();
-                const msg = `Help me set up ${hint.title.toLowerCase().replace(‘connect your ‘, ‘’).replace(‘better ‘, ‘’)}.`;
+                const msg = `Help me set up ${hint.title.toLowerCase().replace('connect your ', '').replace('better ', '')}.`;
                 inputEl.value = msg;
-                formEl?.dispatchEvent(new Event(‘submit’));
+                formEl?.dispatchEvent(new Event('submit'));
             } catch (err) {
-                console.warn(‘[athen] setup arc from hint failed:’, err);
+                console.warn('[athen] setup arc from hint failed:', err);
             }
         });
         actions.appendChild(agentBtn);
     }
 
-    const dontShowBtn = document.createElement(‘button’);
-    dontShowBtn.className = ‘hint-action-btn hint-dismiss-permanent’;
-    dontShowBtn.textContent = "Don’t show again";
-    dontShowBtn.addEventListener(‘click’, (e) => {
+    const dontShowBtn = document.createElement('button');
+    dontShowBtn.className = 'hint-action-btn hint-dismiss-permanent';
+    dontShowBtn.textContent = "Don't show again";
+    dontShowBtn.addEventListener('click', (e) => {
         e.stopPropagation();
         card.remove();
         if (invoke) {
-            invoke(‘dismiss_hint’, { hintId: hint.hint_id, permanent: true }).catch(() => {});
+            invoke('dismiss_hint', { hintId: hint.hint_id, permanent: true }).catch(() => {});
         }
     });
     actions.appendChild(dontShowBtn);
