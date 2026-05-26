@@ -2488,6 +2488,21 @@ pub async fn send_message(
                 &active_arc,
             )
             .await;
+
+            if active_profile_id_for_run.as_deref() == Some("athen_setup") {
+                let setup_cfg = crate::state::load_config();
+                let cal_store = state.calendar_source_store();
+                let cal_dyn: Option<Arc<dyn athen_core::traits::calendar_source_config::CalendarSourceConfigStore>> =
+                    cal_store.map(|s| Arc::new(s) as _);
+                let status = crate::setup_tools::build_setup_status_context(
+                    &setup_cfg,
+                    cal_dyn.as_ref(),
+                    state.contact_store.as_ref(),
+                )
+                .await;
+                system_suffix.push_str(&status);
+            }
+
             let agent_guard = if let Some(reg) = state.agent_registry.as_ref() {
                 let now = Utc::now();
                 let title = truncate_title(&message, 200);

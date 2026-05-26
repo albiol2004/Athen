@@ -503,6 +503,103 @@ pub async fn do_setup_search_key(
 // Tests
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Setup status context (injected into system_suffix for athen_setup profile)
+// ---------------------------------------------------------------------------
+
+pub async fn build_setup_status_context(
+    config: &athen_core::config::AthenConfig,
+    calendar_source_store: Option<&Arc<dyn CalendarSourceConfigStore>>,
+    contact_store: Option<&athen_persistence::contacts::SqliteContactStore>,
+) -> String {
+    use athen_contacts::ContactStore as _;
+
+    let mut lines = Vec::new();
+
+    // Owner identity
+    let owner_status = if let Some(cs) = contact_store {
+        match cs.find_owner().await {
+            Ok(Some(c)) => {
+                let name = if c.name.is_empty() { "unnamed" } else { &c.name };
+                let ids: Vec<String> = c
+                    .identifiers
+                    .iter()
+                    .map(|i| format!("{:?}: {}", i.kind, i.value))
+                    .collect();
+                if ids.is_empty() {
+                    format!("set (name: {name}, no identifiers)")
+                } else {
+                    format!("set (name: {name}, {})", ids.join(", "))
+                }
+            }
+            _ => "not configured".into(),
+        }
+    } else {
+        "not configured".into()
+    };
+    lines.push(format!("- Owner identity: {owner_status}"));
+
+    // Email
+    if config.email.enabled {
+        let addr = if config.email.from_address.is_empty() {
+            &config.email.username
+        } else {
+            &config.email.from_address
+        };
+        lines.push(format!("- Email: configured ({addr})"));
+    } else {
+        lines.push("- Email: not configured".into());
+    }
+
+    // Calendar
+    let cal_status = if let Some(store) = calendar_source_store {
+        match store.list().await {
+            Ok(sources) if !sources.is_empty() => {
+                let enabled = sources.iter().filter(|s| s.enabled).count();
+                format!("{} source(s) connected ({enabled} enabled)", sources.len())
+            }
+            _ => "not configured".into(),
+        }
+    } else {
+        "not configured".into()
+    };
+    lines.push(format!("- Calendar: {cal_status}"));
+
+    // Telegram
+    if config.telegram.enabled {
+        lines.push("- Telegram: configured".into());
+    } else {
+        lines.push("- Telegram: not configured".into());
+    }
+
+    // Web search
+    let brave = !config.web_search.brave_api_key.trim().is_empty();
+    let tavily = !config.web_search.tavily_api_key.trim().is_empty();
+    let search_status = match (brave, tavily) {
+        (true, true) => "Brave + Tavily keys set",
+        (true, false) => "Brave key set",
+        (false, true) => "Tavily key set",
+        (false, false) => "no API keys (using DuckDuckGo fallback)",
+    };
+    lines.push(format!("- Web search: {search_status}"));
+
+    // Embeddings
+    let emb_status = match config.embeddings.mode {
+        athen_core::config::EmbeddingMode::Off => "off (keyword fallback)",
+        athen_core::config::EmbeddingMode::Specific => "on",
+        athen_core::config::EmbeddingMode::Automatic => "auto",
+        _ => "on",
+    };
+    lines.push(format!("- Memory/Embeddings: {emb_status}"));
+
+    format!(
+        "CURRENT SETUP STATUS — do NOT offer to configure integrations \
+         that are already done. Only ask about items marked \"not configured\" \
+         if the user wants help with them:\n{}\n\n",
+        lines.join("\n")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
