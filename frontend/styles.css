@@ -76,7 +76,7 @@
     --overlay-active: rgba(255, 255, 255, 0.14);
 
     /* glass */
-    --glass-bg:      rgba(19, 18, 18, 0.65);
+    --glass-bg:      rgba(19, 18, 18, 0.50);
     --glass-blur:    blur(16px) saturate(1.4);
     --glass-border:  rgba(255, 255, 255, 0.06);
     --glass-shimmer: rgba(255, 255, 255, 0.04) 0px 1px 0px 0px inset;
@@ -131,7 +131,7 @@
     --overlay-active: rgba(0, 0, 0, 0.08);
 
     /* glass */
-    --glass-bg:      rgba(255, 255, 255, 0.70);
+    --glass-bg:      rgba(255, 255, 255, 0.55);
     --glass-blur:    blur(24px) saturate(1.6);
     --glass-border:  rgba(0, 0, 0, 0.06);
     --glass-shimmer: rgba(255, 255, 255, 0.9) 0px 1px 0px 0px inset;
@@ -364,7 +364,11 @@ a:hover { color: var(--brand-warm); }
     flex: 1;
     min-height: 0;
     width: 100vw;
-    background: var(--bg-deep);
+    background:
+        radial-gradient(ellipse 60% 50% at 0% 0%, rgba(194, 88, 104, 0.15) 0%, transparent 70%),
+        radial-gradient(ellipse 50% 60% at 100% 100%, rgba(120, 80, 160, 0.12) 0%, transparent 70%),
+        radial-gradient(ellipse 40% 50% at 100% 0%, rgba(215, 132, 113, 0.10) 0%, transparent 60%),
+        var(--bg-deep);
     position: relative;
     padding: 8px;
     gap: 8px;
@@ -3097,7 +3101,11 @@ footer {
     flex: 1;
     display: flex;
     flex-direction: column;
-    background: transparent;
+    background: var(--glass-bg);
+    backdrop-filter: var(--glass-blur);
+    -webkit-backdrop-filter: var(--glass-blur);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--r-xl);
     overflow: hidden;
     min-width: 0;
 }
@@ -4363,7 +4371,11 @@ option:hover {
     flex: 1;
     display: flex;
     flex-direction: column;
-    background: var(--bg);
+    background: var(--glass-bg);
+    backdrop-filter: var(--glass-blur);
+    -webkit-backdrop-filter: var(--glass-blur);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--r-xl);
     overflow: hidden;
     min-width: 0;
 }
@@ -4862,7 +4874,11 @@ option:hover {
     flex: 1;
     display: flex;
     flex-direction: column;
-    background: var(--bg);
+    background: var(--glass-bg);
+    backdrop-filter: var(--glass-blur);
+    -webkit-backdrop-filter: var(--glass-blur);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--r-xl);
     overflow: hidden;
     min-width: 0;
 }
@@ -5114,7 +5130,11 @@ option:hover {
     flex: 1;
     display: flex;
     flex-direction: column;
-    background: var(--bg);
+    background: var(--glass-bg);
+    backdrop-filter: var(--glass-blur);
+    -webkit-backdrop-filter: var(--glass-blur);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--r-xl);
     overflow: hidden;
     min-width: 0;
 }
@@ -5370,7 +5390,11 @@ option:hover {
     flex: 1;
     display: flex;
     flex-direction: column;
-    background: var(--bg);
+    background: var(--glass-bg);
+    backdrop-filter: var(--glass-blur);
+    -webkit-backdrop-filter: var(--glass-blur);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--r-xl);
     overflow: hidden;
     min-width: 0;
 }
@@ -5649,7 +5673,11 @@ option:hover {
 .timeline-view {
     position: absolute;
     inset: 0;
-    background: var(--bg);
+    background: var(--glass-bg);
+    backdrop-filter: var(--glass-blur);
+    -webkit-backdrop-filter: var(--glass-blur);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--r-xl);
     display: flex;
     flex-direction: column;
     overflow: hidden;
@@ -6622,7 +6650,12 @@ option:hover {
     display: flex;
     flex-direction: column;
     min-height: 0;
-    background: var(--bg);
+    background: var(--glass-bg);
+    backdrop-filter: var(--glass-blur);
+    -webkit-backdrop-filter: var(--glass-blur);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--r-xl);
+    overflow: hidden;
 }
 
 .wakeups-header {
@@ -7265,7 +7298,12 @@ option:hover {
     display: flex;
     flex-direction: column;
     min-height: 0;
-    background: var(--bg);
+    background: var(--glass-bg);
+    backdrop-filter: var(--glass-blur);
+    -webkit-backdrop-filter: var(--glass-blur);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--r-xl);
+    overflow: hidden;
 }
 
 .agent-control-header {
@@ -8618,7 +8656,10 @@ option:hover {
 /* Select dropdown arrow: darken for visibility on light bg.
    Re-assert appearance:none — color-scheme:light makes WebKitGTK
    re-inject the native dropdown arrow on top of the custom SVG. */
-:root[data-theme="light"] .settings-select {
+:root[data-theme="light"] .settings-select,
+:root[data-theme="light"] .cal-view-select,
+:root[data-theme="light"] .contact-trust-select,
+:root[data-theme="light"] #contact-trust-modal-select {
     appearance: none;
     -webkit-appearance: none;
     background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'><path fill='none' stroke='%236B6360' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round' d='M3 4.5l3 3 3-3'/></svg>");
@@ -8663,4 +8704,38 @@ option:hover {
 
 :root[data-theme="light"] header {
     box-shadow: var(--glass-shimmer), 0 1px 0 rgba(255, 255, 255, 0.5);
+}
+
+/* Light-mode ambient gradient orbs — slightly stronger so frosted
+   white panels still show the colour washes through. */
+:root[data-theme="light"] #app-layout {
+    background:
+        radial-gradient(ellipse 60% 50% at 0% 0%, rgba(194, 88, 104, 0.18) 0%, transparent 70%),
+        radial-gradient(ellipse 50% 60% at 100% 100%, rgba(120, 80, 160, 0.14) 0%, transparent 70%),
+        radial-gradient(ellipse 40% 50% at 100% 0%, rgba(215, 132, 113, 0.12) 0%, transparent 60%),
+        var(--bg-deep);
+}
+
+/* Light-mode select dropdown arrow: pin background-image on :active/:focus
+   to prevent WebKitGTK's user-agent animation from duplicating the arrow. */
+:root[data-theme="light"] .settings-select:active,
+:root[data-theme="light"] .settings-select:focus,
+:root[data-theme="light"] .cal-view-select:active,
+:root[data-theme="light"] .cal-view-select:focus,
+:root[data-theme="light"] .contact-trust-select:active,
+:root[data-theme="light"] .contact-trust-select:focus,
+:root[data-theme="light"] #contact-trust-modal-select:active,
+:root[data-theme="light"] #contact-trust-modal-select:focus {
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'><path fill='none' stroke='%236B6360' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round' d='M3 4.5l3 3 3-3'/></svg>") !important;
+    background-repeat: no-repeat !important;
+    background-position: right 10px center !important;
+}
+
+/* Suppress any native pseudo-element arrow injected by WebKitGTK. */
+:root[data-theme="light"] .settings-select::after,
+:root[data-theme="light"] .cal-view-select::after,
+:root[data-theme="light"] .contact-trust-select::after,
+:root[data-theme="light"] #contact-trust-modal-select::after {
+    display: none !important;
+    content: none !important;
 }
