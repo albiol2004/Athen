@@ -9182,19 +9182,18 @@ pub async fn start_plan(
     state: State<'_, AppState>,
     app_handle: AppHandle,
 ) -> std::result::Result<ChatResponse, String> {
+    let plan_instructions = "\
+         Call submit_plan with a detailed, actionable plan. Be specific where you can — \
+         name files, functions, and tools when you already know them. When you don't, \
+         mention what to check or read first, or the general direction. Think like a \
+         senior engineer writing a task breakdown. Use what you already know from our \
+         conversation — only explore further if you genuinely lack information for a step.";
     let plan_prompt = if description.trim().is_empty() {
-        "Based on our conversation so far, create a structured plan. \
-         Call submit_plan now with your goal, acceptance criteria, and ordered steps. \
-         Use what you already know — do NOT re-read files you've already examined."
-            .to_string()
-    } else {
         format!(
-            "Create a structured plan for: {}\n\n\
-             Based on our conversation so far, call submit_plan with your goal, \
-             acceptance criteria, and ordered steps. Use what you already know \
-             from the conversation — only read new files if strictly necessary.",
-            description
+            "Based on our conversation so far, create a structured plan.\n\n{plan_instructions}"
         )
+    } else {
+        format!("Create a structured plan for: {description}\n\n{plan_instructions}")
     };
     // Reuse send_message internally
     send_message(plan_prompt, None, None, state, app_handle).await

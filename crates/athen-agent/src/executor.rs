@@ -935,11 +935,19 @@ impl DefaultExecutor {
             Some(b) if !b.trim().is_empty() => b.trim(),
             _ => return String::new(),
         };
-        format!(
-            "--- MISSION (this task) ---\n\
-             {body}\n\
-             --- END MISSION ---\n\n"
-        )
+        let has_goal = body.contains("GOAL (user-set):");
+        let has_plan = body.contains("PLAN STEPS");
+        let mut section = format!("--- MISSION (this task) ---\n{body}\n");
+        if has_goal || has_plan {
+            section.push_str(
+                "You have an active goal. Work through it thoroughly — do not stop \
+                 until every aspect is addressed or you are genuinely blocked by \
+                 something outside your control. If you have a plan, follow the \
+                 steps in order and call complete_step after each one.\n",
+            );
+        }
+        section.push_str("--- END MISSION ---\n\n");
+        section
     }
 
     /// Slot 2.55: registered HTTP endpoints. Pinned in the static

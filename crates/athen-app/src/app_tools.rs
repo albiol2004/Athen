@@ -349,11 +349,11 @@ impl AppToolRegistry {
             "properties": {
                 "goal": {
                     "type": "string",
-                    "description": "What the plan aims to accomplish."
+                    "description": "What the plan aims to accomplish — one clear sentence."
                 },
                 "acceptance_criteria": {
                     "type": "string",
-                    "description": "How to know the entire plan is done — concrete, verifiable conditions."
+                    "description": "How to verify the plan is done — concrete, testable conditions (e.g. 'all tests pass', 'endpoint returns 200')."
                 },
                 "steps": {
                     "type": "array",
@@ -364,7 +364,7 @@ impl AppToolRegistry {
                         },
                         "required": ["description"]
                     },
-                    "description": "Ordered list of concrete, actionable steps."
+                    "description": "Ordered steps. Ideally each step names the specific files, functions, or tools involved when you already know them. When you don't, mention what to check or read first, or at least the general direction. Bad: 'Update the config'. Good: 'Edit crates/athen-app/src/settings.rs — change default_tier_slugs() to return Haiku for Fast tier' or 'Check the timeout handling in the LLM providers (crates/athen-llm/src/providers/) and add per-request timeouts where missing'."
                 }
             },
             "required": ["goal", "acceptance_criteria", "steps"]
@@ -3019,7 +3019,7 @@ impl ToolRegistry for AppToolRegistry {
         if self.arc_store.is_some() {
             tools.push(ToolDefinition {
                 name: "submit_plan".to_string(),
-                description: "Submit a structured plan for this arc. Provide a goal, acceptance criteria, and an ordered list of concrete steps. The plan is saved and can be tracked with complete_step / update_plan.".to_string(),
+                description: "Submit a structured plan for this arc. Be comprehensive: provide a clear goal, verifiable acceptance criteria, and detailed ordered steps. Each step should give enough context (files, functions, approach, expected outcome) that you could follow it without re-exploring. The more specific you are, the better execution will go. The plan is saved and tracked with complete_step / update_plan.".to_string(),
                 parameters: Self::submit_plan_schema(),
                 backend: ToolBackend::Shell { command: String::new(), native: false },
                 base_risk: BaseImpact::WritePersist,
