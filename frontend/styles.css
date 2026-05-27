@@ -194,10 +194,10 @@ body {
     display: flex;
     flex-direction: column;
     background:
-        radial-gradient(ellipse 60% 50% at 0% 0%, rgba(194, 88, 104, 0.18) 0%, transparent 70%),
-        radial-gradient(ellipse 50% 60% at 100% 100%, rgba(80, 100, 200, 0.14) 0%, transparent 70%),
-        radial-gradient(ellipse 40% 50% at 100% 0%, rgba(215, 132, 113, 0.12) 0%, transparent 60%),
-        radial-gradient(ellipse 35% 40% at 50% 100%, rgba(160, 80, 180, 0.10) 0%, transparent 60%),
+        radial-gradient(ellipse 60% 50% at 0% 0%, rgba(194, 88, 104, 0.35) 0%, transparent 70%),
+        radial-gradient(ellipse 50% 60% at 100% 100%, rgba(80, 100, 200, 0.28) 0%, transparent 70%),
+        radial-gradient(ellipse 40% 50% at 100% 0%, rgba(215, 132, 113, 0.22) 0%, transparent 60%),
+        radial-gradient(ellipse 35% 40% at 50% 100%, rgba(160, 80, 180, 0.20) 0%, transparent 60%),
         var(--bg-deep);
 }
 
