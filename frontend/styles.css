@@ -8584,9 +8584,33 @@ option:hover {
     box-shadow: 0 1px 3px rgba(80, 40, 20, 0.08), 0 0 20px rgba(194, 88, 104, 0.06);
 }
 
-/* Select dropdown arrow: darken for visibility on light bg */
+/* Select dropdown arrow: darken for visibility on light bg.
+   Re-assert appearance:none — color-scheme:light makes WebKitGTK
+   re-inject the native dropdown arrow on top of the custom SVG. */
 :root[data-theme="light"] .settings-select {
+    appearance: none;
+    -webkit-appearance: none;
     background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'><path fill='none' stroke='%236B6360' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round' d='M3 4.5l3 3 3-3'/></svg>");
+}
+
+/* Generic select/option: pin surface colors so color-scheme:light
+   doesn't let WebKitGTK paint its own chrome. */
+:root[data-theme="light"] select,
+:root[data-theme="light"] option {
+    background-color: var(--surface-1);
+    color: var(--text);
+}
+
+/* Branded-bg buttons: force white text.  In dark mode --text is already
+   light, but in light mode --text is near-black → invisible on coral. */
+:root[data-theme="light"] #send-btn,
+:root[data-theme="light"] .btn-primary,
+:root[data-theme="light"] .btn-approve,
+:root[data-theme="light"] .notif-badge {
+    color: #FFFFFF;
+}
+:root[data-theme="light"] .btn-danger {
+    color: #FFFFFF;
 }
 
 /* Profile picker <option> background */
