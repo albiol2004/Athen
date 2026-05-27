@@ -9183,17 +9183,25 @@ pub async fn start_plan(
     app_handle: AppHandle,
 ) -> std::result::Result<ChatResponse, String> {
     let plan_instructions = "\
-         Call submit_plan with a detailed, actionable plan. Be specific where you can — \
-         name files, functions, and tools when you already know them. When you don't, \
-         mention what to check or read first, or the general direction. Think like a \
-         senior engineer writing a task breakdown. Use what you already know from our \
-         conversation — only explore further if you genuinely lack information for a step.";
+         First, explore and analyze the problem using your read-only tools (read, list, \
+         grep, web_search). Understand what needs to happen before committing to a plan.\n\
+         \n\
+         Then, once you have enough understanding, call submit_plan with ACTION steps — \
+         what to change, fix, create, or configure. NOT exploration steps (never 'read file X' \
+         or 'investigate Y' as a step — that's your job NOW, before submitting the plan). \
+         Each step should be something concrete the agent will execute: edit a file, run a \
+         command, create a resource, verify a result.\n\
+         \n\
+         Be specific where you can — name files, functions, and expected outcomes. When you \
+         can't be specific yet, give the direction and what to look for. Think like a senior \
+         engineer writing a task breakdown after completing their investigation.";
     let plan_prompt = if description.trim().is_empty() {
         format!(
-            "Based on our conversation so far, create a structured plan.\n\n{plan_instructions}"
+            "The user wants you to create a plan based on this conversation.\n\n\
+             {plan_instructions}"
         )
     } else {
-        format!("Create a structured plan for: {description}\n\n{plan_instructions}")
+        format!("The user wants you to plan: {description}\n\n{plan_instructions}")
     };
     // Reuse send_message internally
     send_message(plan_prompt, None, None, state, app_handle).await

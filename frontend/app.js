@@ -306,6 +306,19 @@ function registerTauriEventListeners() {
         const card = buildToolCardBlock(meta);
         appendLiveToolCard(currentToolContainer, card, tool_name, status, step);
 
+        // Promote submit_plan to a standalone card below the tool group
+        // so the Approve/Discard buttons are immediately visible without
+        // digging into the collapsed tool group.
+        if (tool_name === 'submit_plan' && status === 'Completed' && args) {
+            const standalone = renderToolBody_submit_plan(args, result, null);
+            if (standalone) {
+                const row = document.createElement('div');
+                row.className = 'message-row system plan-card-standalone';
+                row.appendChild(standalone);
+                messagesEl.appendChild(row);
+            }
+        }
+
         // If the Changes rail is open, pull a fresh action list so newly
         // snapshotted edits/writes appear without the user having to
         // close+reopen the panel. We only re-poll on terminal states
@@ -3285,6 +3298,26 @@ function renderToolGroup(toolCalls) {
     details.appendChild(body);
 
     messagesEl.appendChild(details);
+
+    // Promote the last submit_plan in this group to a standalone card
+    // below the tool group so Approve/Discard buttons are immediately
+    // visible on history reload.
+    const lastPlan = [...toolCalls].reverse().find((tc) => {
+        const m = parseEntryMetadata(tc.metadata) || {};
+        return (m.tool || tc.content || '') === 'submit_plan';
+    });
+    if (lastPlan) {
+        const pm = parseEntryMetadata(lastPlan.metadata) || {};
+        if (pm.args) {
+            const standalone = renderToolBody_submit_plan(pm.args, pm.result, null);
+            if (standalone) {
+                const row = document.createElement('div');
+                row.className = 'message-row system plan-card-standalone';
+                row.appendChild(standalone);
+                messagesEl.appendChild(row);
+            }
+        }
+    }
 }
 
 // Build a fresh <details> tool group for the live agent-progress path.
