@@ -6,19 +6,19 @@
      * and pops a white menu over our dark UI. */
     color-scheme: dark;
     /* warm-dark palette — "Her" temperature */
-    --bg:            #0E0A00;
-    --bg-deep:       #090700;
-    --surface-1:     #16120A;
-    --surface-2:     #1E1A12;
-    --surface-3:     #27221A;
-    --surface-4:     #322C24;
+    --bg:            #0B0800;
+    --bg-deep:       #070500;
+    --surface-1:     #131212;
+    --surface-2:     #1A1919;
+    --surface-3:     #232222;
+    --surface-4:     #2E2D2D;
     --border:        rgba(255, 255, 255, 0.06);
     --border-strong: rgba(255, 255, 255, 0.10);
     --border-bright: rgba(255, 255, 255, 0.14);
     --text:          #F4EFE9;
     --text-2:        #ADA59A;
     --text-3:        #736B60;
-    --text-inverse:  #0E0A00;
+    --text-inverse:  #0B0800;
 
     /* brand — single deep coral, vertical lift, no rainbow */
     --brand-grad:    linear-gradient(180deg, #C25868 0%, #A24556 100%);
@@ -69,7 +69,7 @@
     /* layout */
     --sidebar-w: 240px;
     --header-h:  52px;
-    --content-max: 760px;
+    --content-max: 1060px;
 }
 
 /* ─── Reset & base ─── */
@@ -2761,11 +2761,15 @@ footer {
     border-radius: var(--r-xl);
     padding: 8px 8px 8px 16px;
     transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
-    box-shadow: 0 1px 2px rgba(0,0,0,0.3);
+    box-shadow: 0 1px 2px rgba(0,0,0,0.3), 0 0 20px rgba(194, 88, 104, 0.10);
 }
 .input-wrapper:focus-within {
-    border-color: rgba(255, 122, 107, 0.5);
-    box-shadow: var(--ring-focus);
+    border-color: rgba(194, 88, 104, 0.30);
+    box-shadow:
+        0 0 8px rgba(194, 88, 104, 0.15),
+        0 0 32px rgba(194, 88, 104, 0.18),
+        0 0 72px rgba(194, 88, 104, 0.12),
+        0 0 140px rgba(194, 88, 104, 0.06);
 }
 
 #message-input {
