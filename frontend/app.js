@@ -315,8 +315,11 @@ function registerTauriEventListeners() {
         }
 
         // Follow the new card to the bottom only if the user was
-        // already pinned there — see `scrollChatIfPinned`.
-        scrollChatIfPinned(messagesEl.parentElement, undefined, wasPinned);
+        // already pinned there. Use 'auto' (instant) instead of 'smooth'
+        // so rapid-fire tool events don't race with the previous smooth
+        // animation — smooth scroll leaves scrollTop mid-flight, making
+        // the next event's isScrollPinned snapshot falsely un-pin.
+        scrollChatIfPinned(messagesEl.parentElement, 'auto', wasPinned);
     });
 
     // Listen for streaming text chunks from the agent executor.
@@ -330,6 +333,11 @@ function registerTauriEventListeners() {
         const isActiveArc = !arc_id || arc_id === activeArcId;
 
         if (is_final) {
+            // Snapshot pinned state before the markdown render inflates
+            // the bubble height (code blocks, lists, tables grow it).
+            const wasPinnedFinal = isActiveArc
+                ? isScrollPinned(messagesEl.parentElement) : false;
+
             if (isActiveArc && streamingBubble && streamingText) {
                 streamingBubble.innerHTML = renderMarkdown(streamingText);
                 streamingBubble.classList.remove('streaming');
@@ -346,6 +354,13 @@ function registerTauriEventListeners() {
                 markArcWithNotification(arc_id);
                 loadArcs();
             }
+
+            // Scroll after markdown finalization — the rendered content
+            // is often taller than the raw streaming text it replaced.
+            if (isActiveArc) {
+                scrollChatIfPinned(messagesEl.parentElement, 'auto', wasPinnedFinal);
+            }
+
             streamingBubble = null;
             streamingText = '';
             thinkingBlock = null;
@@ -4716,6 +4731,7 @@ function addRevertNotice(content) {
 // Uses a collapsible <details> so the full body doesn't overwhelm the
 // conversation — the one-liner label is always visible.
 function addSkillInjectionCard(name, slug, body) {
+    const wasPinned = isScrollPinned(messagesEl.parentElement);
     const row = document.createElement('div');
     row.className = 'message-row system';
     const card = document.createElement('div');
@@ -4731,7 +4747,7 @@ function addSkillInjectionCard(name, slug, body) {
     card.appendChild(details);
     row.appendChild(card);
     messagesEl.appendChild(row);
-    scrollChatIfPinned();
+    scrollChatIfPinned(messagesEl.parentElement, 'auto', wasPinned);
 }
 
 // ─── New Arc (both sidebar button and header button) ───
@@ -15642,6 +15658,9 @@ if (goalSaveBtn) {
 }
 
 function addGoalCard(type, goal, extra) {
+    // Snapshot BEFORE appending — the new card inflates scrollHeight.
+    const wasPinned = isScrollPinned(messagesEl.parentElement);
+
     const row = document.createElement('div');
     row.className = 'message-row system';
     const card = document.createElement('div');
@@ -15677,7 +15696,7 @@ function addGoalCard(type, goal, extra) {
 
     row.appendChild(card);
     messagesEl.appendChild(row);
-    scrollChatIfPinned();
+    scrollChatIfPinned(messagesEl.parentElement, 'auto', wasPinned);
 }
 
 let goalBannerEl = null;
