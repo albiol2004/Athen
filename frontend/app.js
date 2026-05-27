@@ -2527,6 +2527,54 @@ formEl.addEventListener('submit', async (e) => {
     const message = inputEl.value.trim();
     if (!message) return;
 
+    // Slash commands — intercept before sending to backend.
+    // TODO: /compact from Telegram (needs coordinator-layer routing, follow-up task).
+    if (message.startsWith('/')) {
+        const slashMatch = message.match(/^\/(\S+)\s*(.*)/);
+        if (slashMatch) {
+            const [, cmd, rawArg] = slashMatch;
+            if (cmd === 'compact') {
+                inputEl.value = '';
+                inputEl.style.height = 'auto';
+                if (activeArcId) {
+                    handleCompactArc(activeArcId);
+                } else {
+                    showToast('No active arc to compact.', 'error');
+                }
+                return;
+            }
+            else if (cmd === 'skills') {
+                inputEl.value = '';
+                inputEl.style.height = 'auto';
+                const arg = rawArg.trim();
+                if (!arg) {
+                    // No argument — open Settings → Agents & Tools → Skills section
+                    showSettings();
+                    setSettingsTab('agents');
+                    // Defer so the tab pane is visible before we target the section.
+                    requestAnimationFrame(() => {
+                        const pane = document.querySelector('.settings-tab-pane[data-settings-pane="agents"]');
+                        if (pane) setSettingsSection(pane, 'settings-section-skills');
+                    });
+                } else {
+                    // Load skill into current arc context
+                    if (!activeArcId) {
+                        showToast('No active arc to inject skill into.', 'error');
+                        return;
+                    }
+                    try {
+                        const result = await invoke('inject_skill', { slug: arg });
+                        addSkillInjectionCard(result.name, result.slug, result.body);
+                    } catch (err) {
+                        const msg = typeof err === 'string' ? err : (err.message || String(err));
+                        showToast(msg, 'error');
+                    }
+                }
+                return;
+            }
+        }
+    }
+
     if (!invoke) {
         addMessage('assistant', 'Tauri backend not connected. Is the app running inside Tauri?', { isError: true });
         return;
@@ -4332,6 +4380,28 @@ function addRevertNotice(content) {
         '<span>' + escapeHtml(content) + '</span>' +
         '</div>';
     messagesEl.appendChild(row);
+}
+
+// Render a skill injection card in the chat after `/skills <slug>`.
+// Uses a collapsible <details> so the full body doesn't overwhelm the
+// conversation — the one-liner label is always visible.
+function addSkillInjectionCard(name, slug, body) {
+    const row = document.createElement('div');
+    row.className = 'message-row system';
+    const card = document.createElement('div');
+    card.className = 'system-inline-entry skill-injection-card';
+    const details = document.createElement('details');
+    const summary = document.createElement('summary');
+    summary.textContent = 'Skill loaded: ' + name + ' (' + slug + ')';
+    details.appendChild(summary);
+    const pre = document.createElement('pre');
+    pre.className = 'skill-injection-body';
+    pre.textContent = body;
+    details.appendChild(pre);
+    card.appendChild(details);
+    row.appendChild(card);
+    messagesEl.appendChild(row);
+    scrollChatIfPinned();
 }
 
 // ─── New Arc (both sidebar button and header button) ───

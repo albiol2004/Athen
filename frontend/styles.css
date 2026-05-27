@@ -2557,6 +2557,27 @@ mark.grep-match {
     flex-shrink: 0;
     margin-top: 1px;
 }
+.system-inline-entry.skill-injection-card {
+    background: rgba(80, 140, 200, 0.06);
+    border-color: rgba(80, 140, 200, 0.22);
+}
+.skill-injection-card summary {
+    cursor: pointer;
+    font-weight: 500;
+    user-select: none;
+}
+.skill-injection-body {
+    margin: 8px 0 0;
+    padding: 8px;
+    background: var(--surface-0);
+    border-radius: var(--r-sm);
+    font-size: 11.5px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 300px;
+    overflow-y: auto;
+}
 
 .email-notification {
     display: flex;

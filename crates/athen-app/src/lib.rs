@@ -222,6 +222,7 @@ pub fn run() {
             commands::upsert_skill,
             commands::delete_skill,
             commands::sync_skills,
+            commands::inject_skill,
             commands::list_attachments_for_event,
             commands::check_for_update,
             commands::install_update,

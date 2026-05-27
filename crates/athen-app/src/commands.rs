@@ -8821,6 +8821,69 @@ pub async fn sync_skills(
     store.sync().await.map_err(|e| e.to_string())
 }
 
+/// Wire shape returned by [`inject_skill`] so the frontend can render the
+/// loaded skill body directly in the chat without a second round-trip.
+#[derive(Serialize)]
+pub struct SkillInjection {
+    pub slug: String,
+    pub name: String,
+    pub body: String,
+}
+
+/// Load a skill and inject it as a SystemEvent entry into the active arc so
+/// the agent sees it in context on the next turn. Called by the `/skills
+/// <slug>` frontend slash command.
+#[tauri::command]
+pub async fn inject_skill(
+    slug: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<SkillInjection, String> {
+    use athen_core::traits::skill::SkillStore;
+
+    let store = state
+        .skill_store
+        .as_ref()
+        .ok_or_else(|| "Skill store not available".to_string())?;
+
+    let skill = store
+        .get(&slug)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Skill '{}' not found", slug))?;
+
+    let body = store.load_body(&slug).await.map_err(|e| e.to_string())?;
+
+    // Get active arc and persist the skill body as a system entry.
+    let arc_store = state
+        .arc_store
+        .as_ref()
+        .ok_or_else(|| "Arc store not available".to_string())?;
+
+    let active_arc = state.active_arc_id.lock().await.clone();
+    if active_arc.is_empty() {
+        return Err("No active arc".to_string());
+    }
+
+    let content = format!("[Skill: {}]\n\n{}", skill.name, body);
+    arc_store
+        .add_entry(
+            &active_arc,
+            arcs::EntryType::SystemEvent,
+            "skill",
+            &content,
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(SkillInjection {
+        slug: skill.slug,
+        name: skill.name,
+        body,
+    })
+}
+
 /// Wire shape for an attachment thumbnail returned to the frontend.
 /// Image rows ship `data_url` populated with a `data:<mime>;base64,...`
 /// payload so the UI can render them inline without a second round-trip;
