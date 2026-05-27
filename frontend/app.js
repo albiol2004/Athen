@@ -48,6 +48,26 @@ function retryLastMessage() {
     }
 }
 
+// ─── Theme Toggle ───
+const THEME_STORAGE_KEY = 'athen-theme';
+
+function applyTheme(theme) {
+    if (theme === 'light') {
+        document.documentElement.dataset.theme = 'light';
+    } else {
+        delete document.documentElement.dataset.theme;
+    }
+    try { localStorage.setItem(THEME_STORAGE_KEY, theme); } catch (_) {}
+}
+
+// Restore saved theme immediately to avoid a dark→light flash.
+(function initTheme() {
+    try {
+        const saved = localStorage.getItem(THEME_STORAGE_KEY);
+        if (saved === 'light') applyTheme('light');
+    } catch (_) {}
+})();
+
 // Schedule a non-critical callback for an idle slice, with a setTimeout
 // fallback for environments lacking requestIdleCallback (older WebKitGTK).
 function scheduleIdle(fn) {
@@ -5347,6 +5367,12 @@ async function loadSettings() {
         securityModeEl.value = settings.security_mode;
         securityHintEl.textContent = SECURITY_HINTS[settings.security_mode] || '';
 
+        // Sync theme dropdown with current localStorage value
+        const themeSelect = document.getElementById('theme-select');
+        if (themeSelect) {
+            themeSelect.value = localStorage.getItem(THEME_STORAGE_KEY) || 'dark';
+        }
+
         // Populate email settings
         if (settings.email) {
             document.getElementById('email-enabled').checked = settings.email.enabled;
@@ -8013,6 +8039,17 @@ if (saveSecurityBtn) {
         saveSecurityBtn.textContent = 'Save Security Settings';
     });
 }
+
+// ─── Theme toggle (one-time wire) ───
+(function wireThemeToggle() {
+    const themeSelect = document.getElementById('theme-select');
+    if (!themeSelect) return;
+    const current = localStorage.getItem(THEME_STORAGE_KEY) || 'dark';
+    themeSelect.value = current;
+    themeSelect.addEventListener('change', () => {
+        applyTheme(themeSelect.value);
+    });
+})();
 
 // Settings navigation
 if (settingsBtn) {

@@ -70,6 +70,59 @@
     --sidebar-w: 240px;
     --header-h:  52px;
     --content-max: 1060px;
+
+    /* overlays — used for hover/active backgrounds, theme-aware */
+    --overlay-hover:  rgba(255, 255, 255, 0.08);
+    --overlay-active: rgba(255, 255, 255, 0.14);
+}
+
+/* ─── Light theme ─── */
+:root[data-theme="light"] {
+    color-scheme: light;
+
+    --bg:            #FCF6F1;
+    --bg-deep:       #F5EDE6;
+    --surface-1:     #FFFFFF;
+    --surface-2:     #FAFAFA;
+    --surface-3:     #F0EDEA;
+    --surface-4:     #E8E4E0;
+    --border:        rgba(0, 0, 0, 0.06);
+    --border-strong: rgba(0, 0, 0, 0.10);
+    --border-bright: rgba(0, 0, 0, 0.14);
+    --text:          #1A1614;
+    --text-2:        #6B6360;
+    --text-3:        #9C938C;
+    --text-inverse:  #FCF6F1;
+
+    /* brand — slightly deeper coral for contrast on light */
+    --brand-grad:    linear-gradient(180deg, #B94D5C 0%, #9E3F50 100%);
+    --brand-grad-soft: linear-gradient(180deg, rgba(185,77,92,0.10) 0%, rgba(158,63,80,0.10) 100%);
+    --brand-solid:   #B94D5C;
+    --brand-warm:    #C25868;
+    --brand-amber:   #D07862;
+    --brand-glow:    rgba(185, 81, 99, 0.08);
+    --brand-glow-strong: rgba(185, 81, 99, 0.16);
+
+    /* semantic — slightly muted for light bg */
+    --success:       #3D9B3C;
+    --success-soft:  rgba(61, 155, 60, 0.12);
+    --warning:       #C4912E;
+    --warning-soft:  rgba(196, 145, 46, 0.12);
+    --danger:        #D63B40;
+    --danger-soft:   rgba(214, 59, 64, 0.12);
+    --info:          #4A7AE0;
+    --info-soft:     rgba(74, 122, 224, 0.12);
+
+    /* shadows — lighter, warmer, less intense */
+    --shadow-card:   0 1px 3px rgba(80, 40, 20, 0.08), 0 0 0 1px var(--border);
+    --shadow-raised: 0 8px 24px -8px rgba(80, 40, 20, 0.12), 0 0 0 1px var(--border);
+    --shadow-modal:  0 24px 60px -10px rgba(80, 40, 20, 0.18), 0 0 0 1px var(--border-strong);
+    --shadow-glow:   0 0 24px var(--brand-glow);
+    --ring-focus:    0 0 0 1.5px var(--brand-solid), 0 0 0 4px var(--brand-glow);
+
+    /* overlays — dark tint instead of white */
+    --overlay-hover:  rgba(0, 0, 0, 0.04);
+    --overlay-active: rgba(0, 0, 0, 0.08);
 }
 
 /* ─── Reset & base ─── */
@@ -282,13 +335,13 @@ a:hover { color: var(--brand-warm); }
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb {
-    background: rgba(255, 255, 255, 0.08);
+    background: var(--overlay-hover);
     border-radius: var(--r-pill);
     border: 2px solid transparent;
     background-clip: padding-box;
 }
 ::-webkit-scrollbar-thumb:hover {
-    background: rgba(255, 255, 255, 0.14);
+    background: var(--overlay-active);
     background-clip: padding-box;
     border: 2px solid transparent;
 }
@@ -482,7 +535,7 @@ header h1 {
 }
 #sidebar-new-chat-btn:hover,
 #timeline-toggle-btn:hover {
-    background: rgba(255, 255, 255, 0.05);
+    background: var(--overlay-hover);
     color: var(--text);
 }
 
@@ -571,7 +624,7 @@ header h1 {
 .session-item:nth-child(11) { animation-delay: 300ms; }
 .session-item:nth-child(12) { animation-delay: 330ms; }
 .session-item:hover {
-    background: rgba(255, 255, 255, 0.04);
+    background: var(--overlay-hover);
     color: var(--text);
 }
 .session-item.active {
@@ -617,7 +670,7 @@ header h1 {
 .session-item-date { color: var(--text-3); }
 
 .session-item-count {
-    background: rgba(255, 255, 255, 0.06);
+    background: var(--overlay-hover);
     padding: 1px 6px;
     border-radius: var(--r-pill);
     font-size: 10px;
@@ -642,7 +695,7 @@ header h1 {
     font-size: 10px;
     padding: 1px 5px;
     border-radius: var(--r-xs);
-    background: rgba(255, 255, 255, 0.06);
+    background: var(--overlay-hover);
     color: var(--text-2);
 }
 
@@ -664,7 +717,7 @@ header h1 {
     transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
 }
 .session-action-btn:hover {
-    background: rgba(255, 255, 255, 0.06);
+    background: var(--overlay-hover);
     color: var(--text);
 }
 .session-action-btn.delete:hover {
@@ -679,7 +732,7 @@ header h1 {
     cursor: default;
 }
 .session-action-btn.active {
-    background: rgba(255, 255, 255, 0.08);
+    background: var(--overlay-active);
     color: var(--text);
 }
 /* Keep the trigger visible while its menu is open, even when the
@@ -718,7 +771,7 @@ header h1 {
     cursor: pointer;
     transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
 }
-.arc-menu-item:hover { background: rgba(255, 255, 255, 0.06); }
+.arc-menu-item:hover { background: var(--overlay-hover); }
 .arc-menu-item.danger { color: var(--danger); }
 .arc-menu-item.danger:hover { background: var(--danger-soft); }
 .arc-menu-icon {
@@ -761,7 +814,7 @@ header h1 {
     transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
 }
 .sidebar-toggle:hover {
-    background: rgba(255, 255, 255, 0.05);
+    background: var(--overlay-hover);
     color: var(--text);
 }
 
@@ -812,7 +865,7 @@ header h1 {
     transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
 }
 .sidebar-footer-btn:hover {
-    background: rgba(255, 255, 255, 0.04);
+    background: var(--overlay-hover);
     color: var(--text);
 }
 
@@ -1569,7 +1622,7 @@ header h1 {
     border-bottom: none;
 }
 .message-bubble .md-table tbody tr:hover {
-    background: rgba(255, 255, 255, 0.02);
+    background: var(--overlay-hover);
 }
 .message-bubble .md-table .inline-code {
     font-size: 11.5px;
@@ -1766,7 +1819,7 @@ header h1 {
     transition: transform 120ms var(--ease);
 }
 .tool-group-history[open] > summary::after { transform: rotate(180deg); }
-.tool-group-history:hover > summary { background: rgba(255, 255, 255, 0.02); }
+.tool-group-history:hover > summary { background: var(--overlay-hover); }
 .tool-group-icons {
     display: inline-flex;
     align-items: center;
@@ -1823,7 +1876,7 @@ header h1 {
     transition: background 100ms var(--ease);
 }
 .tool-card-expand > summary.tool-card-expand-summary:hover > .tool-execution-card {
-    background: rgba(255, 255, 255, 0.025);
+    background: var(--overlay-hover);
 }
 .tool-card-expand[open] > summary.tool-card-expand-summary > .tool-execution-card {
     border-bottom-left-radius: 0;
@@ -2349,7 +2402,7 @@ mark.grep-match {
 .thinking-block {
     margin: 8px 0;
     padding: 10px 12px;
-    background: rgba(255, 255, 255, 0.02);
+    background: var(--overlay-hover);
     border: 1px dashed var(--border);
     border-radius: var(--r-md);
     color: var(--text-3);
@@ -3072,7 +3125,7 @@ footer {
     transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
 }
 .settings-back-btn:hover {
-    background: rgba(255, 255, 255, 0.05);
+    background: var(--overlay-hover);
     color: var(--text);
 }
 
@@ -3120,7 +3173,7 @@ footer {
 }
 
 .settings-tab:hover {
-    background: rgba(255, 255, 255, 0.04);
+    background: var(--overlay-hover);
     color: var(--text);
 }
 
@@ -3552,7 +3605,7 @@ option:hover {
     transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
 }
 .api-key-toggle:hover {
-    background: rgba(255, 255, 255, 0.06);
+    background: var(--overlay-hover);
     color: var(--text);
 }
 .api-key-hint {
@@ -3806,7 +3859,7 @@ option:hover {
     cursor: pointer;
     transition: background var(--dur) var(--ease);
 }
-.provider-card-header:hover { background: rgba(255, 255, 255, 0.02); }
+.provider-card-header:hover { background: var(--overlay-hover); }
 
 .provider-card-title {
     flex: 1;
@@ -6710,7 +6763,7 @@ option:hover {
 }
 
 .wakeup-allowlist-row:hover {
-    background: var(--bg-2, rgba(255, 255, 255, 0.04));
+    background: var(--bg-2, var(--overlay-hover));
 }
 
 .wakeup-allowlist-row input[type="checkbox"] {
@@ -7272,7 +7325,7 @@ option:hover {
 }
 
 .agent-control-tab:hover {
-    background: rgba(255, 255, 255, 0.04);
+    background: var(--overlay-hover);
     color: var(--text);
 }
 
@@ -7299,7 +7352,7 @@ option:hover {
 }
 
 .agent-control-tab.active .tab-count {
-    background: rgba(255, 255, 255, 0.18);
+    background: var(--overlay-active);
     color: #fff;
     border-color: transparent;
 }
@@ -7354,7 +7407,7 @@ option:hover {
 }
 
 .agent-filter-chip:hover {
-    background: rgba(255, 255, 255, 0.04);
+    background: var(--overlay-hover);
     color: var(--text);
 }
 
@@ -7968,8 +8021,8 @@ option:hover {
 
 .mcp-server-row-expanded {
     padding: 12px 16px;
-    border-top: 1px solid var(--border-color, #2a2a2a);
-    background: rgba(255, 255, 255, 0.02);
+    border-top: 1px solid var(--border-color, var(--border));
+    background: var(--overlay-hover);
 }
 
 .mcp-server-tool-list {
@@ -8121,12 +8174,12 @@ option:hover {
     font-size: 12px;
     padding: 8px 10px;
     border-radius: 4px;
-    background: rgba(255, 255, 255, 0.04);
+    background: var(--overlay-hover);
     word-break: break-word;
     white-space: pre-wrap;
 }
-.mcp-server-test-result.mcp-server-test-ok { background: rgba(34, 197, 94, 0.12); color: #4ade80; }
-.mcp-server-test-result.mcp-server-test-fail { background: rgba(239, 68, 68, 0.12); color: #fca5a5; }
+.mcp-server-test-result.mcp-server-test-ok { background: var(--success-soft); color: var(--success); }
+.mcp-server-test-result.mcp-server-test-fail { background: var(--danger-soft); color: var(--danger); }
 .mcp-server-test-result.mcp-server-test-pending { background: rgba(96, 165, 250, 0.12); color: #93c5fd; }
 
 /* ─── Calendar Sources (Settings → Connections) ─── */
@@ -8509,4 +8562,41 @@ option:hover {
 .changes-node.will-undo .changes-node-dot {
     border-color: var(--danger);
     box-shadow: 0 0 0 3px rgba(229, 72, 77, 0.10);
+}
+
+/* ─── Light theme element overrides ───
+   Things that can't be fixed by variable swaps alone. */
+
+:root[data-theme="light"] .ambient-orb {
+    opacity: 0.04;
+    animation: none;
+}
+
+/* Settings / agent-control active tab: swap the inner highlight for a
+   dark inset since the gradient is still coral-on-coral. */
+:root[data-theme="light"] .settings-tab.active,
+:root[data-theme="light"] .agent-control-tab.active {
+    box-shadow: 0 1px 3px rgba(80, 40, 20, 0.18), 0 0 0 1px rgba(0, 0, 0, 0.06) inset;
+}
+
+/* Input wrapper shadow: warm brown instead of black */
+:root[data-theme="light"] .input-wrapper {
+    box-shadow: 0 1px 3px rgba(80, 40, 20, 0.08), 0 0 20px rgba(194, 88, 104, 0.06);
+}
+
+/* Select dropdown arrow: darken for visibility on light bg */
+:root[data-theme="light"] .settings-select {
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'><path fill='none' stroke='%236B6360' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round' d='M3 4.5l3 3 3-3'/></svg>");
+}
+
+/* Profile picker <option> background */
+:root[data-theme="light"] .profile-picker option {
+    background: var(--surface-1);
+    color: var(--text);
+}
+
+/* Window-blurred traffic lights: neutral grey that reads on both themes */
+:root[data-theme="light"] body.window-blurred .traffic-btn {
+    background: #C8C5C0;
+    border-color: rgba(0, 0, 0, 0.12);
 }
