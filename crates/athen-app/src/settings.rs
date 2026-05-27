@@ -650,15 +650,15 @@ fn default_tier_slugs(id: &str) -> (&'static str, &'static str, &'static str, &'
         ),
         "anthropic" => (
             "claude-haiku-4-5-20251001",
+            "claude-haiku-4-5-20251001",
             "claude-sonnet-4-6",
             "claude-sonnet-4-6",
-            "claude-opus-4-7",
         ),
         "google" => (
             "gemini-3.1-flash-lite-preview",
             "gemini-3.1-flash-lite-preview",
-            "gemini-3.1-pro-preview",
-            "gemini-3.1-pro-preview",
+            "gemini-3.5-flash",
+            "gemini-3.5-flash",
         ),
         "openai" => ("gpt-5.4-nano", "gpt-5.4-mini", "gpt-5.5", "gpt-5.5-pro"),
         "mistral" => (
@@ -718,6 +718,7 @@ pub(crate) fn curated_models(id: &str) -> &'static [(&'static str, &'static str)
             ("claude-opus-4-7", "Claude Opus 4.7"),
         ],
         "google" => &[
+            ("gemini-3.5-flash", "Gemini 3.5 Flash"),
             ("gemini-3.1-flash-lite-preview", "Gemini 3.1 Flash Lite"),
             ("gemini-3.1-flash-preview", "Gemini 3.1 Flash"),
             ("gemini-3.1-pro-preview", "Gemini 3.1 Pro"),
