@@ -15619,8 +15619,28 @@ function closeGoalModal() {
     if (overlay) overlay.classList.add('hidden');
 }
 
-const goalBtn = document.getElementById('goal-btn');
-if (goalBtn) goalBtn.addEventListener('click', openGoalModal);
+// ─── Composer action menu (three-dot) ───
+const composerMenuBtn = document.getElementById('composer-menu-btn');
+const composerMenu = document.getElementById('composer-menu');
+if (composerMenuBtn && composerMenu) {
+    composerMenuBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        composerMenu.classList.toggle('hidden');
+    });
+    document.addEventListener('click', () => composerMenu.classList.add('hidden'));
+    composerMenu.addEventListener('click', (e) => {
+        const item = e.target.closest('.composer-menu-item');
+        if (!item) return;
+        composerMenu.classList.add('hidden');
+        const action = item.dataset.action;
+        if (action === 'compact') {
+            if (activeArcId) handleCompactArc(activeArcId);
+            else showToast('No active arc to compact.', 'error');
+        } else if (action === 'goal') {
+            openGoalModal();
+        }
+    });
+}
 
 const goalModalClose = document.getElementById('goal-modal-close');
 if (goalModalClose) goalModalClose.addEventListener('click', closeGoalModal);
@@ -15709,20 +15729,29 @@ function updateGoalBanner(goalState) {
     if (!goalBannerEl) {
         goalBannerEl = document.createElement('div');
         goalBannerEl.className = 'goal-banner';
-        // Insert at the top of the messages scroll container
         const container = messagesEl.parentElement;
         if (container) container.insertBefore(goalBannerEl, container.firstChild);
     }
-    const icon = goalState.status === 'blocked' ? '⚠️' : '🎯';
+    goalBannerEl.classList.toggle('blocked', goalState.status === 'blocked');
     goalBannerEl.innerHTML = '';
+
+    const dot = document.createElement('span');
+    dot.className = 'goal-banner-indicator';
+    goalBannerEl.appendChild(dot);
+
+    const label = document.createElement('span');
+    label.className = 'goal-banner-label';
+    label.textContent = goalState.status === 'blocked' ? 'Blocked' : 'Goal';
+    goalBannerEl.appendChild(label);
+
     const textSpan = document.createElement('span');
     textSpan.className = 'goal-banner-text';
-    textSpan.textContent = icon + ' ' + goalState.goal;
+    textSpan.textContent = goalState.goal;
     goalBannerEl.appendChild(textSpan);
 
     const clearBtn = document.createElement('button');
     clearBtn.className = 'goal-banner-clear';
-    clearBtn.textContent = '✕ clear';
+    clearBtn.textContent = 'Clear';
     clearBtn.addEventListener('click', async () => {
         if (!invoke) return;
         try {

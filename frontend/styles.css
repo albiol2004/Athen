@@ -8720,16 +8720,41 @@ option:hover {
         var(--bg-deep);
 }
 
-/* ── Goal button (composer) ── */
-#goal-btn {
-    background: none; border: none; cursor: pointer;
-    color: var(--text-2); padding: 6px;
-    border-radius: var(--r-md);
-    display: flex; align-items: center; justify-content: center;
-    transition: color var(--dur) var(--ease), background var(--dur) var(--ease);
-    flex-shrink: 0;
+/* ── Composer action menu (three-dot) ── */
+.composer-menu-wrap {
+    position: relative; flex-shrink: 0;
 }
-#goal-btn:hover { color: var(--brand-solid); background: var(--surface-1); }
+#composer-menu-btn {
+    background: transparent; border: none; cursor: pointer;
+    color: var(--text-soft, #888);
+    width: 28px; height: 28px; border-radius: 6px;
+    display: flex; align-items: center; justify-content: center;
+    transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+#composer-menu-btn:hover {
+    background: var(--surface-3, rgba(255,255,255,0.04));
+    color: var(--text);
+}
+.composer-menu {
+    position: absolute; bottom: calc(100% + 6px); left: 50%;
+    transform: translateX(-50%);
+    background: var(--surface-2); border: 1px solid var(--border-strong);
+    border-radius: var(--r-md); padding: 4px;
+    min-width: 160px; box-shadow: var(--shadow-raised);
+    z-index: 50;
+    animation: fade-in 0.1s var(--ease);
+}
+.composer-menu.hidden { display: none; }
+.composer-menu-item {
+    display: flex; align-items: center; gap: 8px;
+    width: 100%; padding: 8px 10px;
+    background: none; border: none; border-radius: var(--r-xs);
+    color: var(--text); font-size: 0.82rem; font-family: inherit;
+    cursor: pointer; text-align: left; white-space: nowrap;
+    transition: background var(--dur) var(--ease);
+}
+.composer-menu-item svg { color: var(--text-2); flex-shrink: 0; }
+.composer-menu-item:hover { background: var(--surface-3); }
 
 /* ── Goal modal ── */
 .goal-modal-overlay {
@@ -8779,21 +8804,33 @@ option:hover {
 
 /* ── Goal banner ── */
 .goal-banner {
-    display: flex; align-items: center; gap: 8px;
-    padding: 6px 12px;
-    background: var(--surface-1);
+    display: flex; align-items: center; gap: 10px;
+    padding: 7px 14px;
+    background: var(--surface-2);
     border-bottom: 1px solid var(--border);
-    font-size: 0.8rem; color: var(--text-2);
+    font-size: 0.78rem;
+}
+.goal-banner-indicator {
+    width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0;
+    background: var(--brand-solid);
+}
+.goal-banner.blocked .goal-banner-indicator {
+    background: #D78471;
+}
+.goal-banner-label {
+    color: var(--text-2); font-weight: 500; flex-shrink: 0;
 }
 .goal-banner-text {
     flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    color: var(--text);
 }
 .goal-banner-clear {
     background: none; border: none; cursor: pointer;
-    color: var(--text-2); font-size: 0.75rem; padding: 2px 6px;
-    border-radius: var(--r-sm);
+    color: var(--text-3); font-size: 0.7rem; padding: 2px 8px;
+    border-radius: var(--r-xs); font-family: inherit;
+    transition: color var(--dur) var(--ease), background var(--dur) var(--ease);
 }
-.goal-banner-clear:hover { color: var(--text); background: var(--surface-2); }
+.goal-banner-clear:hover { color: var(--text); background: var(--surface-3); }
 
 /* ── Goal cards ── */
 .goal-card {
