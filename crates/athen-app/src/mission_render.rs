@@ -15,7 +15,7 @@
 //!
 //! Companion to `identity_render`, `endpoints_render`, `skills_render`.
 
-use athen_persistence::arcs::ArcStore;
+use athen_persistence::arcs::{ArcStore, PlanStatus, StepStatus};
 
 /// Format the mission body — user-set goal (if active) first, then the
 /// auto-drafted triage plan (if any).  The executor's
@@ -72,6 +72,40 @@ pub async fn render_mission_block(arc_store: Option<&ArcStore>, arc_id: &str) ->
             body.push_str("Not in scope: ");
             body.push_str(scope);
             body.push('\n');
+        }
+    }
+
+    // Plan steps (when plan is executing)
+    if let Some(ref plan) = meta.plan {
+        if plan.status == PlanStatus::Executing {
+            body.push_str("\nPLAN STEPS (mark done with complete_step, adapt with update_plan):\n");
+            for step in &plan.steps {
+                let marker = match step.status {
+                    StepStatus::Completed => "[✓]",
+                    StepStatus::InProgress => "[→]",
+                    StepStatus::Skipped => "[—]",
+                    StepStatus::Pending => "[ ]",
+                };
+                body.push_str(marker);
+                body.push(' ');
+                body.push_str(&format!("{}. {}", step.index + 1, step.description));
+                if let Some(ref out) = step.output {
+                    body.push_str(&format!(" — done: \"{}\"", out));
+                }
+                body.push('\n');
+            }
+            // Find the current step (first InProgress or first Pending)
+            if let Some(current) = plan
+                .steps
+                .iter()
+                .find(|s| s.status == StepStatus::InProgress || s.status == StepStatus::Pending)
+            {
+                body.push_str(&format!(
+                    "\nFocus on step {} next. Call complete_step({}, \"summary\") when done.\n",
+                    current.index + 1,
+                    current.index
+                ));
+            }
         }
     }
 

@@ -84,6 +84,41 @@ impl ArcStatus {
     }
 }
 
+/// A structured plan the agent builds and tracks during arc execution.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ArcPlan {
+    pub goal: String,
+    pub acceptance_criteria: String,
+    pub steps: Vec<PlanStep>,
+    pub status: PlanStatus,
+}
+
+/// A single step within an [`ArcPlan`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PlanStep {
+    pub index: u32,
+    pub description: String,
+    pub status: StepStatus,
+    pub output: Option<String>,
+}
+
+/// Overall status of an [`ArcPlan`].
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum PlanStatus {
+    Drafting,
+    Executing,
+    Completed,
+}
+
+/// Status of a single [`PlanStep`].
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub enum StepStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Skipped,
+}
+
 /// Metadata for an Arc displayed in the sidebar.
 #[derive(Debug, Clone, Serialize)]
 pub struct ArcMeta {
@@ -160,6 +195,10 @@ pub struct ArcMeta {
     /// Human-readable reason the goal is blocked (only set when
     /// `goal_status == "blocked"`).
     pub goal_blocked_reason: Option<String>,
+    /// Structured plan the agent builds and updates during arc execution.
+    /// Stored as a single JSON blob (`plan_json` column). `None` means no
+    /// plan has been drafted yet.
+    pub plan: Option<ArcPlan>,
 }
 
 /// Assemble a `TriagePlan` from two raw columns. Returns `None` unless
@@ -448,6 +487,13 @@ impl ArcStore {
                     .map_err(|e| AthenError::Other(format!("Add goal_blocked_reason: {e}")))?;
             }
 
+            // Column-level migration: `plan_json` stores the agent-authored
+            // structured plan as a single JSON blob.
+            if !cols.contains("plan_json") {
+                conn.execute("ALTER TABLE arcs ADD COLUMN plan_json TEXT", [])
+                    .map_err(|e| AthenError::Other(format!("Add plan_json: {e}")))?;
+            }
+
             Ok(())
         })
         .await
@@ -521,7 +567,8 @@ impl ArcStore {
                             a.tier_override, \
                             a.triage_plan_acceptance, a.triage_plan_scope, \
                             a.user_goal, a.user_goal_criteria, \
-                            a.goal_status, a.goal_blocked_reason \
+                            a.goal_status, a.goal_blocked_reason, \
+                            a.plan_json \
                      FROM arcs a \
                      LEFT JOIN ( \
                          SELECT arc_id, COUNT(*) AS cnt \
@@ -555,6 +602,9 @@ impl ArcStore {
                         user_goal_criteria: row.get(19)?,
                         goal_status: row.get(20)?,
                         goal_blocked_reason: row.get(21)?,
+                        plan: row
+                            .get::<_, Option<String>>(22)?
+                            .and_then(|s| serde_json::from_str(&s).ok()),
                     })
                 })
                 .map_err(|e| AthenError::Other(format!("Query get arc: {e}")))?;
@@ -606,7 +656,8 @@ impl ArcStore {
                         a.tier_override, \
                         a.triage_plan_acceptance, a.triage_plan_scope, \
                         a.user_goal, a.user_goal_criteria, \
-                        a.goal_status, a.goal_blocked_reason \
+                        a.goal_status, a.goal_blocked_reason, \
+                        a.plan_json \
                  FROM arcs a \
                  LEFT JOIN ( \
                      SELECT arc_id, COUNT(*) AS cnt \
@@ -643,6 +694,9 @@ impl ArcStore {
                         user_goal_criteria: row.get(19)?,
                         goal_status: row.get(20)?,
                         goal_blocked_reason: row.get(21)?,
+                        plan: row
+                            .get::<_, Option<String>>(22)?
+                            .and_then(|s| serde_json::from_str(&s).ok()),
                     })
                 })
                 .map_err(|e| AthenError::Other(format!("Query list arcs: {e}")))?;
@@ -1177,6 +1231,43 @@ impl ArcStore {
         .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
     }
 
+    /// Store (or overwrite) the structured plan for this arc. The plan is
+    /// serialized as a single JSON blob in the `plan_json` column.
+    pub async fn set_plan(&self, id: &str, plan: &ArcPlan) -> Result<()> {
+        let conn = self.conn.clone();
+        let id = id.to_string();
+        let json = serde_json::to_string(plan)
+            .map_err(|e| AthenError::Other(format!("Serialize plan: {e}")))?;
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE arcs SET plan_json = ?1, updated_at = ?2 WHERE id = ?3",
+                params![json, Utc::now().to_rfc3339(), id],
+            )
+            .map_err(|e| AthenError::Other(format!("set_plan: {e}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
+    /// Clear the structured plan for this arc (sets `plan_json` to NULL).
+    pub async fn clear_plan(&self, id: &str) -> Result<()> {
+        let conn = self.conn.clone();
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE arcs SET plan_json = NULL, updated_at = ?1 WHERE id = ?2",
+                params![Utc::now().to_rfc3339(), id],
+            )
+            .map_err(|e| AthenError::Other(format!("clear_plan: {e}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
     /// Set the entry-id watermark covered by the latest compaction summary.
     /// Pass `None` to clear (e.g. if a summary is invalidated).
     pub async fn set_summarized_through_entry_id(
@@ -1637,7 +1728,8 @@ CREATE TABLE IF NOT EXISTS arcs (
     user_goal TEXT,
     user_goal_criteria TEXT,
     goal_status TEXT,
-    goal_blocked_reason TEXT
+    goal_blocked_reason TEXT,
+    plan_json TEXT
 );
 
 CREATE TABLE IF NOT EXISTS arc_entries (

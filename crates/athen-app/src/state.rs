@@ -551,6 +551,9 @@ pub(crate) async fn assemble_app_tool_registry(
         deps.memory.clone(),
     )
     .with_mcp(deps.mcp.clone() as Arc<dyn athen_core::traits::mcp::McpClient>);
+    if let Some(arc_s) = deps.arc_store.clone() {
+        registry = registry.with_arc_store(arc_s, arc_id);
+    }
     if let Some(astore) = deps.attachment_store.clone() {
         registry = registry.with_attachments(astore);
     }

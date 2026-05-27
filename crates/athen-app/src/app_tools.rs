@@ -29,6 +29,7 @@ use athen_core::traits::skill::SkillStore;
 use athen_core::traits::tool::ToolRegistry;
 use athen_core::traits::vault::Vault;
 use athen_memory::Memory;
+use athen_persistence::arcs::{ArcPlan, ArcStore, PlanStatus, PlanStep, StepStatus};
 use athen_persistence::attachments::AttachmentStore;
 use athen_persistence::calendar::{CalendarEvent, CalendarStore, EventCreator};
 use athen_persistence::contacts::SqliteContactStore;
@@ -71,6 +72,11 @@ pub struct AppToolRegistry {
     /// When set to `"athen_setup"`, the registry includes the 6 setup_*
     /// tools for interactive onboarding. Other profiles never see them.
     active_profile_id: Option<String>,
+    /// Arc store for reading/writing structured plans on arcs.
+    arc_store: Option<ArcStore>,
+    /// The arc ID this registry was built for. Needed by plan tools to
+    /// know which arc's plan to read/write.
+    arc_id: Option<String>,
     /// Per-arc cache of already-loaded skill slugs. The second call to
     /// `load_skill` with the same slug returns a short "already loaded"
     /// stub instead of the full body, saving tokens. Uses interior
@@ -104,12 +110,23 @@ impl AppToolRegistry {
             cloud_apis_doc_path: None,
             calendar_source_store: None,
             active_profile_id: None,
+            arc_store: None,
+            arc_id: None,
             loaded_skills: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
     pub fn with_active_profile_id(mut self, id: Option<String>) -> Self {
         self.active_profile_id = id;
+        self
+    }
+
+    /// Attach the arc store and arc ID so the plan tools (`submit_plan`,
+    /// `complete_step`, `update_plan`) can read and write structured plans
+    /// on the active arc.
+    pub fn with_arc_store(mut self, store: ArcStore, arc_id: impl Into<String>) -> Self {
+        self.arc_store = Some(store);
+        self.arc_id = Some(arc_id.into());
         self
     }
 
@@ -321,6 +338,75 @@ impl AppToolRegistry {
                 }
             },
             "required": ["id"]
+        })
+    }
+
+    // ── Plan schemas ─────────────────────────────────────────────────
+
+    fn submit_plan_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "goal": {
+                    "type": "string",
+                    "description": "What the plan aims to accomplish."
+                },
+                "acceptance_criteria": {
+                    "type": "string",
+                    "description": "How to know the entire plan is done — concrete, verifiable conditions."
+                },
+                "steps": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "description": { "type": "string" }
+                        },
+                        "required": ["description"]
+                    },
+                    "description": "Ordered list of concrete, actionable steps."
+                }
+            },
+            "required": ["goal", "acceptance_criteria", "steps"]
+        })
+    }
+
+    fn complete_step_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "step_index": {
+                    "type": "integer",
+                    "description": "Zero-based index of the step to mark as completed."
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "Brief summary of what was done for this step."
+                }
+            },
+            "required": ["step_index", "summary"]
+        })
+    }
+
+    fn update_plan_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["add", "skip"],
+                    "description": "'add' appends a new step, 'skip' marks a step as skipped."
+                },
+                "step_index": {
+                    "type": "integer",
+                    "description": "Step index (required for 'skip')."
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Step description (required for 'add')."
+                }
+            },
+            "required": ["action"]
         })
     }
 
@@ -2159,6 +2245,277 @@ impl AppToolRegistry {
         })
     }
 
+    // ── Plan tools ───────────────────────────────────────────────
+
+    /// Resolve the arc store + arc ID or return a clear error.
+    fn plan_deps(&self) -> Result<(&ArcStore, &str)> {
+        let store = self.arc_store.as_ref().ok_or_else(|| {
+            AthenError::Other("plan tools: arc store is not wired into this agent".into())
+        })?;
+        let arc_id = self.arc_id.as_deref().ok_or_else(|| {
+            AthenError::Other("plan tools: arc ID is not set on this registry".into())
+        })?;
+        Ok((store, arc_id))
+    }
+
+    async fn do_submit_plan(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let (store, arc_id) = self.plan_deps()?;
+        let start = Instant::now();
+
+        let goal = args
+            .get("goal")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| AthenError::Other("submit_plan: 'goal' is required".into()))?
+            .to_string();
+
+        let acceptance_criteria = args
+            .get("acceptance_criteria")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                AthenError::Other("submit_plan: 'acceptance_criteria' is required".into())
+            })?
+            .to_string();
+
+        let steps_raw = args
+            .get("steps")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| AthenError::Other("submit_plan: 'steps' array is required".into()))?;
+
+        if steps_raw.is_empty() {
+            return Err(AthenError::Other(
+                "submit_plan: at least one step is required".into(),
+            ));
+        }
+
+        let steps: Vec<PlanStep> = steps_raw
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let desc = s
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                PlanStep {
+                    index: i as u32,
+                    description: desc,
+                    status: StepStatus::Pending,
+                    output: None,
+                }
+            })
+            .collect();
+
+        let plan = ArcPlan {
+            goal,
+            acceptance_criteria,
+            steps,
+            status: PlanStatus::Drafting,
+        };
+
+        store.set_plan(arc_id, &plan).await?;
+
+        let plan_json = serde_json::to_value(&plan)
+            .map_err(|e| AthenError::Other(format!("serialize plan: {e}")))?;
+
+        Ok(ToolResult {
+            success: true,
+            output: plan_json,
+            error: None,
+            execution_time_ms: start.elapsed().as_millis() as u64,
+        })
+    }
+
+    async fn do_complete_step(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let (store, arc_id) = self.plan_deps()?;
+        let start = Instant::now();
+
+        // Load current plan
+        let meta = store
+            .get_arc(arc_id)
+            .await?
+            .ok_or_else(|| AthenError::Other(format!("complete_step: arc '{arc_id}' not found")))?;
+
+        let mut plan = meta
+            .plan
+            .ok_or_else(|| AthenError::Other("complete_step: no plan exists on this arc".into()))?;
+
+        if plan.status != PlanStatus::Executing {
+            return Err(AthenError::Other(format!(
+                "complete_step: plan status is {:?}, expected Executing",
+                plan.status
+            )));
+        }
+
+        let step_index = args
+            .get("step_index")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| {
+                AthenError::Other("complete_step: 'step_index' (integer) is required".into())
+            })? as usize;
+
+        let summary = args
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| AthenError::Other("complete_step: 'summary' is required".into()))?
+            .to_string();
+
+        if step_index >= plan.steps.len() {
+            return Err(AthenError::Other(format!(
+                "complete_step: step_index {} is out of range (plan has {} steps)",
+                step_index,
+                plan.steps.len()
+            )));
+        }
+
+        // Mark the step as completed
+        plan.steps[step_index].status = StepStatus::Completed;
+        plan.steps[step_index].output = Some(summary);
+
+        // Find the next Pending step and mark it InProgress
+        if let Some(next) = plan
+            .steps
+            .iter_mut()
+            .find(|s| s.status == StepStatus::Pending)
+        {
+            next.status = StepStatus::InProgress;
+        }
+
+        // Check if ALL steps are Completed or Skipped → mark plan as Completed
+        let all_done = plan
+            .steps
+            .iter()
+            .all(|s| s.status == StepStatus::Completed || s.status == StepStatus::Skipped);
+
+        if all_done {
+            plan.status = PlanStatus::Completed;
+            // Clear user_goal on the arc when the plan completes
+            let _ = store.clear_user_goal(arc_id).await;
+        }
+
+        store.set_plan(arc_id, &plan).await?;
+
+        let steps_json = serde_json::to_value(&plan.steps)
+            .map_err(|e| AthenError::Other(format!("serialize steps: {e}")))?;
+
+        Ok(ToolResult {
+            success: true,
+            output: json!({
+                "plan_status": format!("{:?}", plan.status),
+                "steps": steps_json,
+            }),
+            error: None,
+            execution_time_ms: start.elapsed().as_millis() as u64,
+        })
+    }
+
+    async fn do_update_plan(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let (store, arc_id) = self.plan_deps()?;
+        let start = Instant::now();
+
+        // Load current plan
+        let meta = store
+            .get_arc(arc_id)
+            .await?
+            .ok_or_else(|| AthenError::Other(format!("update_plan: arc '{arc_id}' not found")))?;
+
+        let mut plan = meta
+            .plan
+            .ok_or_else(|| AthenError::Other("update_plan: no plan exists on this arc".into()))?;
+
+        if plan.status != PlanStatus::Executing {
+            return Err(AthenError::Other(format!(
+                "update_plan: plan status is {:?}, expected Executing",
+                plan.status
+            )));
+        }
+
+        let action = args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AthenError::Other("update_plan: 'action' is required".into()))?;
+
+        match action {
+            "add" => {
+                let desc = args
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        AthenError::Other(
+                            "update_plan: 'description' is required for 'add' action".into(),
+                        )
+                    })?
+                    .to_string();
+
+                let next_index = plan.steps.len() as u32;
+                plan.steps.push(PlanStep {
+                    index: next_index,
+                    description: desc,
+                    status: StepStatus::Pending,
+                    output: None,
+                });
+            }
+            "skip" => {
+                let step_index =
+                    args.get("step_index")
+                        .and_then(|v| v.as_u64())
+                        .ok_or_else(|| {
+                            AthenError::Other(
+                                "update_plan: 'step_index' is required for 'skip' action".into(),
+                            )
+                        })? as usize;
+
+                if step_index >= plan.steps.len() {
+                    return Err(AthenError::Other(format!(
+                        "update_plan: step_index {} is out of range (plan has {} steps)",
+                        step_index,
+                        plan.steps.len()
+                    )));
+                }
+
+                plan.steps[step_index].status = StepStatus::Skipped;
+
+                // Check if ALL steps are Completed or Skipped → mark plan as Completed
+                let all_done = plan
+                    .steps
+                    .iter()
+                    .all(|s| s.status == StepStatus::Completed || s.status == StepStatus::Skipped);
+
+                if all_done {
+                    plan.status = PlanStatus::Completed;
+                    let _ = store.clear_user_goal(arc_id).await;
+                }
+            }
+            other => {
+                return Err(AthenError::Other(format!(
+                    "update_plan: unknown action '{other}' — expected 'add' or 'skip'"
+                )));
+            }
+        }
+
+        store.set_plan(arc_id, &plan).await?;
+
+        let steps_json = serde_json::to_value(&plan.steps)
+            .map_err(|e| AthenError::Other(format!("serialize steps: {e}")))?;
+
+        Ok(ToolResult {
+            success: true,
+            output: json!({
+                "plan_status": format!("{:?}", plan.status),
+                "steps": steps_json,
+            }),
+            error: None,
+            execution_time_ms: start.elapsed().as_millis() as u64,
+        })
+    }
+
     // ── Setup tools (profile-gated) ──────────────────────────────
 
     async fn dispatch_setup_tool(
@@ -2655,6 +3012,34 @@ impl ToolRegistry for AppToolRegistry {
             });
         }
 
+        // Plan tools: submit_plan, complete_step, and update_plan are
+        // always advertised when arc_store is wired. The agent only calls
+        // submit_plan when instructed by the plan-mode prompt; the handler
+        // validates plan state.
+        if self.arc_store.is_some() {
+            tools.push(ToolDefinition {
+                name: "submit_plan".to_string(),
+                description: "Submit a structured plan for this arc. Provide a goal, acceptance criteria, and an ordered list of concrete steps. The plan is saved and can be tracked with complete_step / update_plan.".to_string(),
+                parameters: Self::submit_plan_schema(),
+                backend: ToolBackend::Shell { command: String::new(), native: false },
+                base_risk: BaseImpact::WritePersist,
+            });
+            tools.push(ToolDefinition {
+                name: "complete_step".to_string(),
+                description: "Mark a plan step as completed with a brief summary of what was done. Automatically advances the next pending step to in-progress. When all steps are done the plan is marked completed.".to_string(),
+                parameters: Self::complete_step_schema(),
+                backend: ToolBackend::Shell { command: String::new(), native: false },
+                base_risk: BaseImpact::WritePersist,
+            });
+            tools.push(ToolDefinition {
+                name: "update_plan".to_string(),
+                description: "Modify the active plan: 'add' appends a new step, 'skip' marks a step as skipped. Use when the plan needs to evolve during execution.".to_string(),
+                parameters: Self::update_plan_schema(),
+                backend: ToolBackend::Shell { command: String::new(), native: false },
+                base_risk: BaseImpact::WritePersist,
+            });
+        }
+
         // Setup tools: only visible under the "athen_setup" profile.
         if self.active_profile_id.as_deref() == Some("athen_setup") {
             tools.extend(Self::setup_tool_definitions());
@@ -2734,6 +3119,10 @@ impl ToolRegistry for AppToolRegistry {
             "load_skill" => self.do_load_skill(&args).await,
             "athen_docs" => self.do_athen_docs(&args),
             "http_request" => self.do_http_request(&args).await,
+            // Plan tools
+            "submit_plan" => self.do_submit_plan(&args).await,
+            "complete_step" => self.do_complete_step(&args).await,
+            "update_plan" => self.do_update_plan(&args).await,
             // Setup tools (gated by profile in list_tools)
             "setup_email" => self.dispatch_setup_tool(name, &args).await,
             "setup_calendar_connect" => self.dispatch_setup_tool(name, &args).await,

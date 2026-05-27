@@ -124,6 +124,8 @@ const ICON_ALARM       = toolSvg('<circle cx="12" cy="13" r="8"/><polyline point
 const ICON_IDENTITY    = toolSvg('<circle cx="12" cy="8" r="4"/><path d="M4 21v-1a8 8 0 0 1 16 0v1"/><line x1="9" y1="13" x2="15" y2="13"/>');
 // Open book with spine: communicates "load a procedural playbook on demand".
 const ICON_SKILL       = toolSvg('<path d="M3 5a2 2 0 0 1 2-2h5a2 2 0 0 1 2 2v15"/><path d="M21 5a2 2 0 0 0-2-2h-5a2 2 0 0 0-2 2v15"/><path d="M3 5v15h8"/><path d="M21 5v15h-8"/>');
+// Clipboard with checklist: communicates "submit a plan for review".
+const ICON_PLAN        = toolSvg('<rect x="5" y="2" width="14" height="20" rx="2"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="9" y1="12" x2="15" y2="12"/><line x1="9" y1="16" x2="13" y2="16"/>');
 
 const BUILTIN_TOOL_ICONS = {
     'read': ICON_FILE_TEXT, 'list_directory': ICON_FOLDER, 'grep': ICON_FILE_SEARCH,
@@ -155,6 +157,8 @@ const BUILTIN_TOOL_ICONS = {
     'http_request': ICON_GLOBE,
     // self-help docs lookup
     'athen_docs': ICON_INFO,
+    // plan lifecycle tools
+    'submit_plan': ICON_PLAN, 'complete_step': ICON_CHECK, 'update_plan': ICON_PLAN,
     // interactive setup tools (athen_setup profile)
     'setup_email': ICON_MAIL,
     'setup_calendar_connect': ICON_CALENDAR,
@@ -187,6 +191,7 @@ const BUILTIN_TOOL_LABELS = {
     'load_skill': 'Load skill',
     'http_request': 'Cloud API',
     'athen_docs': 'Help guide',
+    'submit_plan': 'Plan', 'complete_step': 'Step done', 'update_plan': 'Update plan',
     'setup_email': 'Setup email',
     'setup_calendar_connect': 'Connect calendar',
     'setup_calendar_configure': 'Configure calendar',
@@ -503,8 +508,8 @@ function registerTauriEventListeners() {
     // Listen for arc updates (e.g. Telegram auto-execution, goal state changes).
     window.__TAURI__.event.listen('arc-updated', async () => {
         loadArcs();
-        // Refresh goal banner — the backend may have changed goal status
-        // (e.g. goal completed after successful execution, or blocked).
+        // Refresh goal + plan banners — the backend may have changed state
+        // (e.g. goal completed after successful execution, step completed).
         if (invoke && activeArcId) {
             try {
                 const newGoal = await invoke('get_arc_goal');
@@ -514,6 +519,10 @@ function registerTauriEventListeners() {
                 }
                 currentGoalState = newGoal || null;
                 updateGoalBanner(currentGoalState);
+            } catch (_) {}
+            try {
+                const plan = await invoke('get_plan');
+                updatePlanBanner(plan);
             } catch (_) {}
         }
     });
@@ -1285,6 +1294,14 @@ async function handleSwitchArc(arcId) {
             updateGoalBanner(null);
         }
 
+        // Load plan state for the newly active arc.
+        try {
+            const plan = await invoke('get_plan');
+            updatePlanBanner(plan);
+        } catch (_) {
+            updatePlanBanner(null);
+        }
+
         // Update active highlight in sidebar.
         document.querySelectorAll('.session-item').forEach((el) => {
             el.classList.toggle('active', el.dataset.arcId === arcId);
@@ -1366,6 +1383,13 @@ async function handleDeleteArc(arcId) {
             } catch (_) {
                 currentGoalState = null;
                 updateGoalBanner(null);
+            }
+            // Load plan state for the new active arc.
+            try {
+                const plan = await invoke('get_plan');
+                updatePlanBanner(plan);
+            } catch (_) {
+                updatePlanBanner(null);
             }
         }
 
@@ -2126,6 +2150,7 @@ const SLASH_COMMANDS = [
     { cmd: 'compact', desc: 'Compact the current arc' },
     { cmd: 'skills',  desc: 'Load a skill or open skills panel' },
     { cmd: 'goal',    desc: 'Set a goal for this arc' },
+    { cmd: 'plan',    desc: 'Create a structured plan' },
 ];
 
 let slashAcEl = null;        // the popup element
@@ -2906,6 +2931,45 @@ formEl.addEventListener('submit', async (e) => {
                 }
                 return;
             }
+            else if (cmd === 'plan') {
+                inputEl.value = '';
+                inputEl.style.height = 'auto';
+                const arg = rawArg.trim();
+                if (arg === 'clear') {
+                    if (!invoke || !activeArcId) return;
+                    try {
+                        await invoke('clear_plan');
+                        updatePlanBanner(null);
+                        showToast('Plan cleared', 'success');
+                    } catch (err) {
+                        showToast(typeof err === 'string' ? err : String(err), 'error');
+                    }
+                } else if (!arg) {
+                    // /plan with no arg — prefill input so user types what to plan
+                    inputEl.value = '/plan ';
+                    inputEl.focus();
+                    inputEl.setSelectionRange(inputEl.value.length, inputEl.value.length);
+                    return;
+                } else {
+                    // /plan <description> — start planning run
+                    if (!invoke || !activeArcId) {
+                        showToast('No active arc', 'error');
+                        return;
+                    }
+                    try {
+                        setStatus('working', 'Planning...');
+                        setQueueMode();
+                        const response = await invoke('start_plan', { description: arg });
+                        setStatus('idle', 'Ready');
+                        setIdleMode();
+                    } catch (err) {
+                        setStatus('idle', 'Ready');
+                        setIdleMode();
+                        showToast(typeof err === 'string' ? err : String(err), 'error');
+                    }
+                }
+                return;
+            }
         }
     }
 
@@ -3355,6 +3419,7 @@ function buildToolCardBlock(meta) {
 
     const details = document.createElement('details');
     details.className = 'tool-card-expand';
+    if (toolName === 'submit_plan') details.open = true;
     const summary = document.createElement('summary');
     summary.className = 'tool-card-expand-summary';
     summary.appendChild(card);
@@ -3491,6 +3556,9 @@ function renderToolBody(meta) {
         case 'load_skill':      main = renderLoadSkill(args, result); break;
         case 'http_request':    main = renderHttpRequest(args, result); break;
         case 'athen_docs':      main = renderAthenDocs(args, result); break;
+        case 'submit_plan':     main = renderToolBody_submit_plan(args, result, null); break;
+        case 'complete_step':   main = renderToolBody_complete_step(args, result); break;
+        case 'update_plan':     main = renderToolBody_update_plan(args, result); break;
         case 'setup_email':
         case 'setup_calendar_connect':
         case 'setup_calendar_configure':
@@ -4406,6 +4474,112 @@ function renderAthenDocs(args, result) {
     ]);
 }
 
+function renderToolBody_submit_plan(args, result, toolCardEl) {
+    const wrap = document.createElement('div');
+    wrap.className = 'plan-card';
+
+    // Header
+    const header = document.createElement('div');
+    header.className = 'plan-card-header';
+    header.textContent = args.goal || 'Plan';
+    wrap.appendChild(header);
+
+    if (args.acceptance_criteria) {
+        const criteria = document.createElement('div');
+        criteria.className = 'plan-card-criteria';
+        criteria.textContent = 'Done when: ' + args.acceptance_criteria;
+        wrap.appendChild(criteria);
+    }
+
+    // Steps
+    const stepList = document.createElement('div');
+    stepList.className = 'plan-step-list';
+    const steps = args.steps || [];
+    steps.forEach((step, i) => {
+        const row = document.createElement('div');
+        row.className = 'plan-step-row';
+        const checkbox = document.createElement('span');
+        checkbox.className = 'plan-step-check';
+        checkbox.textContent = '□';
+        row.appendChild(checkbox);
+        const desc = document.createElement('span');
+        desc.className = 'plan-step-desc';
+        desc.textContent = `${i + 1}. ${step.description}`;
+        row.appendChild(desc);
+        stepList.appendChild(row);
+    });
+    wrap.appendChild(stepList);
+
+    // Action buttons
+    const actions = document.createElement('div');
+    actions.className = 'plan-card-actions';
+
+    const approveBtn = document.createElement('button');
+    approveBtn.className = 'btn-primary';
+    approveBtn.textContent = 'Approve & Execute';
+
+    const discardBtn = document.createElement('button');
+    discardBtn.textContent = 'Discard';
+
+    approveBtn.addEventListener('click', async () => {
+        if (!invoke) return;
+        approveBtn.disabled = true;
+        try {
+            await invoke('approve_plan');
+            approveBtn.textContent = 'Executing...';
+            discardBtn.remove();
+            // Refresh plan banner
+            try {
+                const plan = await invoke('get_plan');
+                updatePlanBanner(plan);
+            } catch (_) {}
+            showToast('Plan approved — executing', 'success');
+            // Auto-send execution message
+            await invoke('send_message', { message: 'Execute the plan step by step.' });
+        } catch (err) {
+            approveBtn.disabled = false;
+            showToast(typeof err === 'string' ? err : String(err), 'error');
+        }
+    });
+    actions.appendChild(approveBtn);
+
+    discardBtn.addEventListener('click', async () => {
+        if (!invoke) return;
+        try {
+            await invoke('clear_plan');
+            wrap.style.opacity = '0.5';
+            approveBtn.disabled = true;
+            discardBtn.disabled = true;
+            updatePlanBanner(null);
+            showToast('Plan discarded', 'success');
+        } catch (err) { showToast(String(err), 'error'); }
+    });
+    actions.appendChild(discardBtn);
+
+    wrap.appendChild(actions);
+    return wrap;
+}
+
+function renderToolBody_complete_step(args, result) {
+    const wrap = document.createElement('div');
+    wrap.style.cssText = 'font-size:0.85rem;padding:4px 0';
+    const idx = (args.step_index != null) ? args.step_index + 1 : '?';
+    wrap.textContent = '✓ Step ' + idx + ' completed: ' + (args.summary || '');
+    wrap.style.color = '#22c55e';
+    return wrap;
+}
+
+function renderToolBody_update_plan(args, result) {
+    const wrap = document.createElement('div');
+    wrap.style.cssText = 'font-size:0.85rem;padding:4px 0';
+    if (args.action === 'add') {
+        wrap.textContent = '+ Added step: ' + (args.description || '');
+    } else if (args.action === 'skip') {
+        wrap.textContent = '— Skipped step ' + (args.step_index != null ? args.step_index + 1 : '?');
+    }
+    return wrap;
+}
+
 function renderSetupResult(toolLabel, args, result) {
     const ok = result.ok === true;
     const msg = String(result.message || '');
@@ -4692,6 +4866,14 @@ async function loadHistory() {
         updateGoalBanner(null);
     }
 
+    // Load plan state for the initial arc.
+    try {
+        const plan = await invoke('get_plan');
+        updatePlanBanner(plan);
+    } catch (_) {
+        updatePlanBanner(null);
+    }
+
     drainPendingApprovalQuestionsForActiveArc();
 }
 
@@ -4760,9 +4942,10 @@ async function newArc() {
         arcHasMessages = false;
         returnToChatIfOnSubView();
         clearChatUI();
-        // New arc has no goal — clear the banner.
+        // New arc has no goal/plan — clear the banners.
         currentGoalState = null;
         updateGoalBanner(null);
+        updatePlanBanner(null);
         closeSidebar();
         await loadArcs();
         inputEl.focus();
@@ -4788,9 +4971,10 @@ async function branchFromArc(parentArcId, parentName, upToEntryId) {
             const entries = await invoke('get_arc_history');
             renderEntries(entries);
         }
-        // Branched arc starts fresh — no goal.
+        // Branched arc starts fresh — no goal/plan.
         currentGoalState = null;
         updateGoalBanner(null);
+        updatePlanBanner(null);
         closeSidebar();
         await loadArcs();
         inputEl.focus();
@@ -15638,6 +15822,11 @@ if (composerMenuBtn && composerMenu) {
             else showToast('No active arc to compact.', 'error');
         } else if (action === 'goal') {
             openGoalModal();
+        } else if (action === 'plan') {
+            // Prompt user for plan description via the input
+            inputEl.value = '/plan ';
+            inputEl.focus();
+            inputEl.setSelectionRange(inputEl.value.length, inputEl.value.length);
         }
     });
 }
@@ -15720,6 +15909,7 @@ function addGoalCard(type, goal, extra) {
 }
 
 let goalBannerEl = null;
+let planBannerEl = null;
 
 function updateGoalBanner(goalState) {
     if (!goalState || !goalState.goal || goalState.status === 'completed') {
@@ -15764,6 +15954,47 @@ function updateGoalBanner(goalState) {
         }
     });
     goalBannerEl.appendChild(clearBtn);
+}
+
+function updatePlanBanner(plan) {
+    if (!plan || plan.status === 'Completed') {
+        if (planBannerEl) { planBannerEl.remove(); planBannerEl = null; }
+        return;
+    }
+    if (!planBannerEl) {
+        planBannerEl = document.createElement('div');
+        planBannerEl.className = 'plan-banner';
+        const container = messagesEl.parentElement;
+        if (container) {
+            // Insert after goal banner if present, otherwise at top
+            const goalBanner = container.querySelector('.goal-banner');
+            if (goalBanner) goalBanner.after(planBannerEl);
+            else container.insertBefore(planBannerEl, container.firstChild);
+        }
+    }
+    const done = plan.steps.filter(s => s.status === 'Completed' || s.status === 'Skipped').length;
+    const total = plan.steps.length;
+    const icon = plan.status === 'Drafting' ? '\u{1F4DD}' : '\u{1F4CB}';
+    const statusText = plan.status === 'Drafting' ? 'Draft' : `${done}/${total} steps`;
+
+    planBannerEl.innerHTML = '';
+    const textSpan = document.createElement('span');
+    textSpan.className = 'plan-banner-text';
+    textSpan.textContent = `${icon} ${statusText} — ${plan.goal}`;
+    planBannerEl.appendChild(textSpan);
+
+    const clearBtn = document.createElement('button');
+    clearBtn.className = 'plan-banner-clear';
+    clearBtn.textContent = '✕';
+    clearBtn.addEventListener('click', async () => {
+        if (!invoke) return;
+        try {
+            await invoke('clear_plan');
+            updatePlanBanner(null);
+            showToast('Plan cleared', 'success');
+        } catch (err) { showToast(String(err), 'error'); }
+    });
+    planBannerEl.appendChild(clearBtn);
 }
 
 // ─── Initialize ───

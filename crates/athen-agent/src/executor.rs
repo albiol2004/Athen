@@ -1848,10 +1848,12 @@ impl AgentExecutor for DefaultExecutor {
                 return Err(AthenError::Timeout(self.timeout));
             }
 
-            // Periodic runaway check — every 20 steps after the first 15,
+            // Periodic runaway check — every 30 steps after the first 25,
             // ask a cheap LLM whether the agent is making progress.
-            const RUNAWAY_CHECK_INTERVAL: u32 = 20;
-            const RUNAWAY_CHECK_START: u32 = 15;
+            // Generous thresholds: exploration-heavy tasks (planning, code
+            // audits) routinely hit 30+ read/list calls before acting.
+            const RUNAWAY_CHECK_INTERVAL: u32 = 30;
+            const RUNAWAY_CHECK_START: u32 = 25;
             if steps_completed >= RUNAWAY_CHECK_START
                 && (steps_completed - RUNAWAY_CHECK_START).is_multiple_of(RUNAWAY_CHECK_INTERVAL)
             {

@@ -9171,6 +9171,185 @@ pub async fn clear_arc_goal(state: State<'_, AppState>) -> std::result::Result<(
         .map_err(|e| e.to_string())
 }
 
+// ── Plan management commands ───────────────────────────────────────
+
+/// Kick off a planning run by sending a plan-mode prompt through the
+/// normal `send_message` path. The `submit_plan` tool is always available
+/// so the agent can call it when instructed.
+#[tauri::command]
+pub async fn start_plan(
+    description: String,
+    state: State<'_, AppState>,
+    app_handle: AppHandle,
+) -> std::result::Result<ChatResponse, String> {
+    let plan_prompt = if description.trim().is_empty() {
+        "Based on our conversation so far, create a structured plan. \
+         Call submit_plan now with your goal, acceptance criteria, and ordered steps. \
+         Use what you already know — do NOT re-read files you've already examined."
+            .to_string()
+    } else {
+        format!(
+            "Create a structured plan for: {}\n\n\
+             Based on our conversation so far, call submit_plan with your goal, \
+             acceptance criteria, and ordered steps. Use what you already know \
+             from the conversation — only read new files if strictly necessary.",
+            description
+        )
+    };
+    // Reuse send_message internally
+    send_message(plan_prompt, None, None, state, app_handle).await
+}
+
+/// Approve a plan that is in Drafting state: transition it to Executing,
+/// mark the first step as InProgress, and set the arc goal from the plan.
+#[tauri::command]
+pub async fn approve_plan(state: State<'_, AppState>) -> std::result::Result<GoalState, String> {
+    let arc_store = state
+        .arc_store
+        .as_ref()
+        .ok_or_else(|| "Arc store not available".to_string())?;
+    let active_arc = state.active_arc_id.lock().await.clone();
+    if active_arc.is_empty() {
+        return Err("No active arc".to_string());
+    }
+
+    let meta = arc_store
+        .get_arc(&active_arc)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Arc not found".to_string())?;
+
+    let mut plan = meta.plan.ok_or_else(|| "No plan on this arc".to_string())?;
+
+    if plan.status != arcs::PlanStatus::Drafting {
+        return Err("Plan is not in drafting state".to_string());
+    }
+
+    // Transition plan to Executing, first step to InProgress
+    plan.status = arcs::PlanStatus::Executing;
+    if let Some(first) = plan.steps.first_mut() {
+        first.status = arcs::StepStatus::InProgress;
+    }
+    arc_store
+        .set_plan(&active_arc, &plan)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Set goal from plan
+    let goal = plan.goal.clone();
+    let criteria = plan.acceptance_criteria.clone();
+    arc_store
+        .set_user_goal(&active_arc, &goal, Some(&criteria))
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(GoalState {
+        goal,
+        criteria: Some(criteria),
+        status: "active".to_string(),
+        blocked_reason: None,
+    })
+}
+
+/// Incoming shape for updating a plan draft's steps from the frontend.
+#[derive(serde::Deserialize)]
+pub struct PlanDraftUpdate {
+    pub steps: Vec<PlanStepInput>,
+}
+
+/// A single step description in a [`PlanDraftUpdate`].
+#[derive(serde::Deserialize)]
+pub struct PlanStepInput {
+    pub description: String,
+}
+
+/// Replace the steps of a plan that is still in Drafting state.
+/// Used by the frontend plan-editor to let the user reorder / add / remove
+/// steps before approving.
+#[tauri::command]
+pub async fn update_plan_draft(
+    update: PlanDraftUpdate,
+    state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    let arc_store = state
+        .arc_store
+        .as_ref()
+        .ok_or_else(|| "Arc store not available".to_string())?;
+    let active_arc = state.active_arc_id.lock().await.clone();
+    if active_arc.is_empty() {
+        return Err("No active arc".to_string());
+    }
+
+    let meta = arc_store
+        .get_arc(&active_arc)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Arc not found".to_string())?;
+
+    let mut plan = meta.plan.ok_or_else(|| "No plan".to_string())?;
+    if plan.status != arcs::PlanStatus::Drafting {
+        return Err("Can only edit plan in drafting state".to_string());
+    }
+
+    plan.steps = update
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(i, s)| arcs::PlanStep {
+            index: i as u32,
+            description: s.description.clone(),
+            status: arcs::StepStatus::Pending,
+            output: None,
+        })
+        .collect();
+
+    arc_store
+        .set_plan(&active_arc, &plan)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Fetch the plan attached to the active arc, if any.
+#[tauri::command]
+pub async fn get_plan(
+    state: State<'_, AppState>,
+) -> std::result::Result<Option<arcs::ArcPlan>, String> {
+    let arc_store = state
+        .arc_store
+        .as_ref()
+        .ok_or_else(|| "Arc store not available".to_string())?;
+    let active_arc = state.active_arc_id.lock().await.clone();
+    if active_arc.is_empty() {
+        return Ok(None);
+    }
+    let meta = arc_store
+        .get_arc(&active_arc)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(meta.and_then(|m| m.plan))
+}
+
+/// Remove the plan from the active arc and clear the goal if it was set
+/// from the plan.
+#[tauri::command]
+pub async fn clear_plan(state: State<'_, AppState>) -> std::result::Result<(), String> {
+    let arc_store = state
+        .arc_store
+        .as_ref()
+        .ok_or_else(|| "Arc store not available".to_string())?;
+    let active_arc = state.active_arc_id.lock().await.clone();
+    if active_arc.is_empty() {
+        return Err("No active arc".to_string());
+    }
+    arc_store
+        .clear_plan(&active_arc)
+        .await
+        .map_err(|e| e.to_string())?;
+    // Also clear goal if it was set from the plan
+    let _ = arc_store.clear_user_goal(&active_arc).await;
+    Ok(())
+}
+
 /// Wire shape for an attachment thumbnail returned to the frontend.
 /// Image rows ship `data_url` populated with a `data:<mime>;base64,...`
 /// payload so the UI can render them inline without a second round-trip;
