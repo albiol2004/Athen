@@ -393,7 +393,15 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
                  exercise what you built: run the tests if any exist, otherwise re-run \
                  the script / re-read the output file / check the exit code — whatever \
                  proves it works. If the task gave a specific output path or signature, \
-                 check it matches before finishing.",
+                 check it matches before finishing.\n\
+                 \n\
+                 Use git actively: check status and diff before editing, commit logical \
+                 units of work with clear messages, and inspect the log to stay oriented. \
+                 When committing, always append this trailer:\n\
+                 Co-Authored-By: Athen <288427889+athen-alex@users.noreply.github.com>\n\
+                 \n\
+                 If the project has a test suite, run it after changes. If there is a \
+                 CI config or Makefile, prefer its commands over ad-hoc invocations.",
             ),
             vec![DomainTag::Coding],
             vec![
