@@ -6,19 +6,19 @@
      * and pops a white menu over our dark UI. */
     color-scheme: dark;
     /* warm-dark palette — "Her" temperature */
-    --bg:            #0E0B12;
-    --bg-deep:       #09070C;
-    --surface-1:     #16131C;
-    --surface-2:     #1E1A26;
-    --surface-3:     #272230;
-    --surface-4:     #322C3D;
+    --bg:            #0E0A00;
+    --bg-deep:       #090700;
+    --surface-1:     #16120A;
+    --surface-2:     #1E1A12;
+    --surface-3:     #27221A;
+    --surface-4:     #322C24;
     --border:        rgba(255, 255, 255, 0.06);
     --border-strong: rgba(255, 255, 255, 0.10);
     --border-bright: rgba(255, 255, 255, 0.14);
     --text:          #F4EFE9;
-    --text-2:        #A8A2B0;
-    --text-3:        #6E6878;
-    --text-inverse:  #0E0B12;
+    --text-2:        #ADA59A;
+    --text-3:        #736B60;
+    --text-inverse:  #0E0A00;
 
     /* brand — single deep coral, vertical lift, no rainbow */
     --brand-grad:    linear-gradient(180deg, #C25868 0%, #A24556 100%);
@@ -2752,6 +2752,7 @@ footer {
 }
 
 .input-wrapper {
+    position: relative;
     display: flex;
     align-items: flex-end;
     gap: 8px;
@@ -2782,6 +2783,49 @@ footer {
     font-family: inherit;
 }
 #message-input::placeholder { color: var(--text-3); }
+#message-input.has-command { color: var(--brand-warm); }
+
+/* ─── Slash Command Autocomplete ─── */
+.slash-autocomplete {
+    position: absolute;
+    bottom: 100%;
+    left: 0;
+    right: 0;
+    max-height: 200px;
+    overflow-y: auto;
+    background: var(--surface-3);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--r-lg);
+    box-shadow: var(--shadow-raised);
+    margin-bottom: 4px;
+    z-index: 100;
+    padding: 4px;
+}
+.slash-autocomplete.hidden { display: none; }
+.slash-ac-item {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 6px 10px;
+    border-radius: var(--r-md);
+    cursor: pointer;
+    font-size: 13px;
+}
+.slash-ac-item.active,
+.slash-ac-item:hover {
+    background: var(--surface-4);
+}
+.slash-ac-cmd {
+    color: var(--brand-warm);
+    font-weight: 600;
+    flex-shrink: 0;
+}
+.slash-ac-desc {
+    color: var(--text-3);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
 
 #send-btn,
 #stop-btn {

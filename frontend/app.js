@@ -2024,9 +2024,211 @@ function autoResize() {
 
 inputEl.addEventListener('input', autoResize);
 
+// ─── Slash Command Autocomplete ───
+
+const SLASH_COMMANDS = [
+    { cmd: 'compact', desc: 'Compact the current arc' },
+    { cmd: 'skills',  desc: 'Load a skill or open skills panel' },
+];
+
+let slashAcEl = null;        // the popup element
+let slashAcItems = [];       // current filtered items [{label, desc, value}]
+let slashAcIndex = -1;       // highlighted index (-1 = none)
+let slashAcMode = 'none';    // 'none' | 'command' | 'skill'
+
+function ensureSlashAcPopup() {
+    if (slashAcEl) return;
+    slashAcEl = document.createElement('div');
+    slashAcEl.id = 'slash-autocomplete';
+    slashAcEl.className = 'slash-autocomplete hidden';
+    // Append inside .input-wrapper so it positions relative to it.
+    const wrapper = document.querySelector('.input-wrapper');
+    wrapper.appendChild(slashAcEl);
+}
+
+function hideSlashAc() {
+    if (slashAcEl) slashAcEl.classList.add('hidden');
+    slashAcItems = [];
+    slashAcIndex = -1;
+    slashAcMode = 'none';
+}
+
+function renderSlashAc(items) {
+    ensureSlashAcPopup();
+    slashAcItems = items;
+    slashAcIndex = items.length > 0 ? 0 : -1;
+
+    slashAcEl.innerHTML = '';
+    const maxVisible = 8;
+    const visible = items.slice(0, maxVisible);
+    visible.forEach((item, i) => {
+        const row = document.createElement('div');
+        row.className = 'slash-ac-item' + (i === slashAcIndex ? ' active' : '');
+        row.dataset.idx = i;
+
+        const cmdSpan = document.createElement('span');
+        cmdSpan.className = 'slash-ac-cmd';
+        cmdSpan.textContent = item.label;
+
+        const descSpan = document.createElement('span');
+        descSpan.className = 'slash-ac-desc';
+        descSpan.textContent = item.desc;
+
+        row.appendChild(cmdSpan);
+        row.appendChild(descSpan);
+
+        row.addEventListener('mousedown', (e) => {
+            // mousedown instead of click — click would blur the textarea first
+            e.preventDefault();
+            acceptSlashAc(i);
+        });
+        row.addEventListener('mouseenter', () => {
+            slashAcIndex = i;
+            updateSlashAcHighlight();
+        });
+        slashAcEl.appendChild(row);
+    });
+
+    slashAcEl.classList.remove('hidden');
+}
+
+function updateSlashAcHighlight() {
+    if (!slashAcEl) return;
+    const rows = slashAcEl.querySelectorAll('.slash-ac-item');
+    rows.forEach((r, i) => r.classList.toggle('active', i === slashAcIndex));
+    // Scroll highlighted item into view inside the popup
+    if (slashAcIndex >= 0 && rows[slashAcIndex]) {
+        rows[slashAcIndex].scrollIntoView({ block: 'nearest' });
+    }
+}
+
+function acceptSlashAc(idx) {
+    const item = slashAcItems[idx];
+    if (!item) return;
+
+    if (slashAcMode === 'command') {
+        inputEl.value = '/' + item.value + ' ';
+    } else if (slashAcMode === 'skill') {
+        inputEl.value = '/skills ' + item.value;
+    }
+    hideSlashAc();
+    inputEl.focus();
+    autoResize();
+    updateCommandHighlight();
+    // Re-check: if we just accepted "/skills ", trigger skill autocomplete
+    updateSlashAutocomplete();
+}
+
+function updateCommandHighlight() {
+    const text = inputEl.value;
+    if (/^\/\S+/.test(text)) {
+        const cmdWord = text.match(/^\/(\S+)/)[1].toLowerCase();
+        const known = SLASH_COMMANDS.some(c => c.cmd === cmdWord);
+        inputEl.classList.toggle('has-command', known);
+    } else {
+        inputEl.classList.remove('has-command');
+    }
+}
+
+async function ensureSkillsListLoaded() {
+    if (skillsList && skillsList.length > 0) return;
+    try {
+        skillsList = (await invoke('list_skills')) || [];
+    } catch (_) {
+        // silently fail — list stays empty
+    }
+}
+
+async function updateSlashAutocomplete() {
+    const text = inputEl.value;
+
+    // (A) Command palette: text is "/" or "/partial" (no space yet)
+    const cmdPrefixMatch = text.match(/^\/([^\s]*)$/);
+    if (cmdPrefixMatch) {
+        const partial = cmdPrefixMatch[1].toLowerCase();
+        const matches = SLASH_COMMANDS.filter(c => c.cmd.startsWith(partial));
+        if (matches.length > 0) {
+            slashAcMode = 'command';
+            renderSlashAc(matches.map(c => ({
+                label: '/' + c.cmd,
+                desc: c.desc,
+                value: c.cmd,
+            })));
+        } else {
+            hideSlashAc();
+        }
+        return;
+    }
+
+    // (B) Skill slug autocomplete: text is "/skills <partial>"
+    const skillMatch = text.match(/^\/skills\s+(.*)$/i);
+    if (skillMatch) {
+        await ensureSkillsListLoaded();
+        const partial = skillMatch[1].toLowerCase();
+        const matches = skillsList.filter(s =>
+            s.slug.toLowerCase().startsWith(partial) ||
+            (s.name && s.name.toLowerCase().includes(partial))
+        );
+        if (matches.length > 0) {
+            slashAcMode = 'skill';
+            renderSlashAc(matches.map(s => ({
+                label: s.slug,
+                desc: s.description || s.name || '',
+                value: s.slug,
+            })));
+        } else {
+            hideSlashAc();
+        }
+        return;
+    }
+
+    // No match — hide
+    hideSlashAc();
+}
+
+// Wire input event (alongside existing autoResize)
+inputEl.addEventListener('input', () => {
+    updateSlashAutocomplete();
+    updateCommandHighlight();
+});
+
+// Dismiss on blur (with small delay so mousedown on popup fires first)
+inputEl.addEventListener('blur', () => {
+    setTimeout(hideSlashAc, 150);
+});
+
 // ─── Keyboard Handling ───
 
 inputEl.addEventListener('keydown', (e) => {
+    // When autocomplete popup is visible, intercept nav keys
+    if (slashAcMode !== 'none' && slashAcItems.length > 0) {
+        if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            slashAcIndex = (slashAcIndex + 1) % slashAcItems.length;
+            updateSlashAcHighlight();
+            return;
+        }
+        if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            slashAcIndex = (slashAcIndex - 1 + slashAcItems.length) % slashAcItems.length;
+            updateSlashAcHighlight();
+            return;
+        }
+        if (e.key === 'Enter' || e.key === 'Tab') {
+            if (slashAcIndex >= 0) {
+                e.preventDefault();
+                acceptSlashAc(slashAcIndex);
+                return;
+            }
+        }
+        if (e.key === 'Escape') {
+            e.preventDefault();
+            hideSlashAc();
+            return;
+        }
+    }
+
+    // Normal Enter → submit
     if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         formEl.requestSubmit();
