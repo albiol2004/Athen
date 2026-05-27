@@ -29,6 +29,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -62,7 +63,10 @@ impl GoogleProvider {
         Self {
             api_key,
             default_model,
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(120))
+                .build()
+                .expect("reqwest Client should build with timeout"),
             base_url: DEFAULT_BASE_URL.to_string(),
             supports_vision: false,
             supports_documents: false,
@@ -432,9 +436,15 @@ impl LlmProvider for GoogleProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AthenError::LlmProvider {
-                provider: "google".into(),
-                message: format!("request failed: {}", e),
+            .map_err(|e| {
+                if e.is_timeout() {
+                    AthenError::Timeout(Duration::from_secs(120))
+                } else {
+                    AthenError::LlmProvider {
+                        provider: "google".into(),
+                        message: format!("request failed: {}", e),
+                    }
+                }
             })?;
 
         let status = http_response.status();
@@ -472,9 +482,15 @@ impl LlmProvider for GoogleProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AthenError::LlmProvider {
-                provider: "google".into(),
-                message: format!("streaming request failed: {}", e),
+            .map_err(|e| {
+                if e.is_timeout() {
+                    AthenError::Timeout(Duration::from_secs(120))
+                } else {
+                    AthenError::LlmProvider {
+                        provider: "google".into(),
+                        message: format!("streaming request failed: {}", e),
+                    }
+                }
             })?;
 
         let status = http_response.status();

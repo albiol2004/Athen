@@ -7,6 +7,7 @@
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tracing::debug;
 
 use athen_core::error::{AthenError, Result};
@@ -51,7 +52,10 @@ impl OpenAiEmbedding {
     /// Uses `text-embedding-3-small` (1536 dimensions) by default.
     pub fn openai(api_key: &str) -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(120))
+                .build()
+                .expect("reqwest Client should build with timeout"),
             base_url: DEFAULT_BASE_URL.to_string(),
             model: DEFAULT_MODEL.to_string(),
             api_key: Some(api_key.to_string()),
@@ -66,7 +70,10 @@ impl OpenAiEmbedding {
     /// [`with_model`] as needed. Dimensions are auto-detected on first call.
     pub fn compatible(base_url: &str) -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(120))
+                .build()
+                .expect("reqwest Client should build with timeout"),
             base_url: base_url.to_string(),
             model: "default".to_string(),
             api_key: None,
@@ -140,9 +147,15 @@ impl OpenAiEmbedding {
             self.build_request(&url, &body)
                 .send()
                 .await
-                .map_err(|e| AthenError::LlmProvider {
-                    provider: self.provider_id.clone(),
-                    message: format!("embedding request failed: {}", e),
+                .map_err(|e| {
+                    if e.is_timeout() {
+                        AthenError::Timeout(Duration::from_secs(120))
+                    } else {
+                        AthenError::LlmProvider {
+                            provider: self.provider_id.clone(),
+                            message: format!("embedding request failed: {}", e),
+                        }
+                    }
                 })?;
 
         let status = response.status();

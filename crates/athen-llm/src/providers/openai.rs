@@ -5,6 +5,7 @@
 //! and any other compatible endpoint.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -72,7 +73,10 @@ impl OpenAiCompatibleProvider {
         Self {
             api_key: None,
             default_model: DEFAULT_MODEL.to_string(),
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(120))
+                .build()
+                .expect("reqwest Client should build with timeout"),
             base_url,
             provider_id: "openai".to_string(),
             cost_estimator: Box::new(OpenAiCostEstimator),
@@ -344,9 +348,15 @@ impl LlmProvider for OpenAiCompatibleProvider {
             .build_http_request(&url, &body)
             .send()
             .await
-            .map_err(|e| AthenError::LlmProvider {
-                provider: self.provider_id.clone(),
-                message: format!("request failed: {}", e),
+            .map_err(|e| {
+                if e.is_timeout() {
+                    AthenError::Timeout(Duration::from_secs(120))
+                } else {
+                    AthenError::LlmProvider {
+                        provider: self.provider_id.clone(),
+                        message: format!("request failed: {}", e),
+                    }
+                }
             })?;
 
         let status = http_response.status();
@@ -489,9 +499,15 @@ impl LlmProvider for OpenAiCompatibleProvider {
             .build_http_request(&url, &body)
             .send()
             .await
-            .map_err(|e| AthenError::LlmProvider {
-                provider: self.provider_id.clone(),
-                message: format!("streaming request failed: {}", e),
+            .map_err(|e| {
+                if e.is_timeout() {
+                    AthenError::Timeout(Duration::from_secs(120))
+                } else {
+                    AthenError::LlmProvider {
+                        provider: self.provider_id.clone(),
+                        message: format!("streaming request failed: {}", e),
+                    }
+                }
             })?;
 
         let status = http_response.status();

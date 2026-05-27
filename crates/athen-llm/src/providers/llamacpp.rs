@@ -5,6 +5,7 @@
 
 use async_trait::async_trait;
 use reqwest::Client;
+use std::time::Duration;
 use tracing::debug;
 
 use athen_core::error::Result;
@@ -35,7 +36,10 @@ impl LlamaCppProvider {
     ///
     /// Connects to `http://localhost:8080` by default.
     pub fn new(base_url: String, model: String) -> Self {
-        let client = Client::new();
+        let client = Client::builder()
+            .timeout(Duration::from_secs(120))
+            .build()
+            .expect("reqwest Client should build with timeout");
         Self {
             inner: OpenAiCompatibleProvider::new(base_url.clone())
                 .with_model(model)

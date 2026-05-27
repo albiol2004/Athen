@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tracing::debug;
 
 use athen_core::error::{AthenError, Result};
@@ -44,7 +45,10 @@ impl DeepSeekProvider {
         Self {
             api_key,
             default_model: DEFAULT_MODEL.to_string(),
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(120))
+                .build()
+                .expect("reqwest Client should build with timeout"),
             base_url: DEFAULT_BASE_URL.to_string(),
             // DeepSeek-V4 chat is the typical default for this provider.
             // Callers can override via `with_family(ModelFamily::DeepSeekR1)`
@@ -284,9 +288,15 @@ impl LlmProvider for DeepSeekProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AthenError::LlmProvider {
-                provider: "deepseek".into(),
-                message: format!("request failed: {}", e),
+            .map_err(|e| {
+                if e.is_timeout() {
+                    AthenError::Timeout(Duration::from_secs(120))
+                } else {
+                    AthenError::LlmProvider {
+                        provider: "deepseek".into(),
+                        message: format!("request failed: {}", e),
+                    }
+                }
             })?;
 
         let status = http_response.status();
@@ -388,9 +398,15 @@ impl LlmProvider for DeepSeekProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AthenError::LlmProvider {
-                provider: "deepseek".into(),
-                message: format!("streaming request failed: {}", e),
+            .map_err(|e| {
+                if e.is_timeout() {
+                    AthenError::Timeout(Duration::from_secs(120))
+                } else {
+                    AthenError::LlmProvider {
+                        provider: "deepseek".into(),
+                        message: format!("streaming request failed: {}", e),
+                    }
+                }
             })?;
 
         let status = http_response.status();

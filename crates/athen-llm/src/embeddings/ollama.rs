@@ -6,6 +6,7 @@
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tracing::debug;
 
 use athen_core::error::{AthenError, Result};
@@ -41,7 +42,10 @@ impl OllamaEmbedding {
     /// Connects to `http://localhost:11434` by default.
     pub fn new(model: &str) -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(120))
+                .build()
+                .expect("reqwest Client should build with timeout"),
             base_url: DEFAULT_BASE_URL.to_string(),
             model: model.to_string(),
             dimensions: std::sync::RwLock::new(0),
@@ -80,9 +84,15 @@ impl OllamaEmbedding {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AthenError::LlmProvider {
-                provider: "ollama-embed".to_string(),
-                message: format!("embed request failed: {}", e),
+            .map_err(|e| {
+                if e.is_timeout() {
+                    AthenError::Timeout(Duration::from_secs(120))
+                } else {
+                    AthenError::LlmProvider {
+                        provider: "ollama-embed".to_string(),
+                        message: format!("embed request failed: {}", e),
+                    }
+                }
             })?;
 
         let status = response.status();

@@ -6,6 +6,7 @@
 
 use async_trait::async_trait;
 use reqwest::Client;
+use std::time::Duration;
 use tracing::debug;
 
 use athen_core::error::Result;
@@ -36,7 +37,10 @@ impl OllamaProvider {
     ///
     /// Connects to `http://localhost:11434` by default.
     pub fn new(model: String) -> Self {
-        let client = Client::new();
+        let client = Client::builder()
+            .timeout(Duration::from_secs(120))
+            .build()
+            .expect("reqwest Client should build with timeout");
         Self {
             inner: OpenAiCompatibleProvider::new(DEFAULT_BASE_URL.to_string())
                 .with_model(model)
