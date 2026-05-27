@@ -140,6 +140,7 @@
 /* ─── Reset & base ─── */
 *, *::before, *::after { box-sizing: border-box; }
 
+
 /* Coral-tinted text selection across the app. */
 ::selection {
     background: rgba(185, 81, 99, 0.35); /* fallback */
