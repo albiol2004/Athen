@@ -23,6 +23,19 @@ use crate::tool_grouping::{group_for, is_always_revealed_for_profile, summarize_
 use std::collections::HashSet;
 use std::path::PathBuf;
 
+/// Verdict returned by the completion judge.
+///
+/// In the default (non-goal) mode only `Continue` and `Done` are used,
+/// preserving the historical mismatch-only behaviour. In goal mode the
+/// judge can additionally signal `Blocked` when the agent explicitly
+/// states it cannot proceed.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum GoalVerdict {
+    Continue,
+    Done,
+    Blocked(String),
+}
+
 /// Filter a tool list according to a profile's `ToolSelection`.
 ///
 /// Default behavior (`ToolSelection::All`) returns the input unchanged, so
@@ -313,6 +326,11 @@ pub struct DefaultExecutor {
     /// `None` keeps the historical judge behavior (mismatch-only) which
     /// is the right fallback for arcs without a plan.
     acceptance_criteria: Option<String>,
+    /// When `true`, the completion judge uses an aggressive goal-aware prompt
+    /// that defaults to CONTINUE (keep iterating) unless the goal is clearly
+    /// accomplished or the agent is genuinely blocked. Set from the host
+    /// based on `arc.goal_status == "active"`.
+    goal_mode: bool,
     /// User-supplied reminder builder (custom impl). Takes precedence over
     /// `auto_reminders` when set. `None` is the test-default — no custom
     /// builder.
@@ -374,6 +392,7 @@ impl DefaultExecutor {
             skills_block: None,
             mission_block: None,
             acceptance_criteria: None,
+            goal_mode: false,
             reminder_builder: None,
             auto_reminders: false,
             default_reasoning_effort: athen_core::llm::ReasoningEffort::Default,
@@ -480,6 +499,13 @@ impl DefaultExecutor {
     /// mismatch-only behavior.
     pub fn set_acceptance_criteria(&mut self, criterion: Option<String>) {
         self.acceptance_criteria = criterion.filter(|s| !s.trim().is_empty());
+    }
+
+    /// Activate goal-aware completion judge. When `true` and acceptance
+    /// criteria are present, the judge flips from "DONE unless mismatch"
+    /// to "CONTINUE unless goal clearly accomplished or blocked."
+    pub fn set_goal_mode(&mut self, mode: bool) {
+        self.goal_mode = mode;
     }
 
     /// Inject host-supplied volatile content (e.g. memory recall,
@@ -1295,12 +1321,36 @@ impl DefaultExecutor {
         agent_response: &str,
         tools_called: &[String],
         acceptance_criteria: Option<&str>,
+        goal_mode: bool,
     ) -> String {
         let tools_str = if tools_called.is_empty() {
             "NONE".to_string()
         } else {
             tools_called.join(", ")
         };
+
+        // Goal-aware prompt: completely different shape — defaults to
+        // CONTINUE and only terminates on clear completion or an
+        // explicit block.
+        if let (true, Some(criterion)) = (goal_mode, acceptance_criteria) {
+            return format!(
+                "You are a goal-completion judge. The user set an explicit goal for this task.\n\n\
+                 User's goal: \"{criterion}\"\n\n\
+                 Agent's response: \"{agent_response}\"\n\
+                 Tools called so far: [{tools_str}]\n\n\
+                 Answer ONE word:\n\
+                 - CONTINUE — the goal is NOT yet fully met and the agent can still make progress. \
+                   Default to this when uncertain.\n\
+                 - COMPLETED — the goal is clearly accomplished based on the agent's actions and output. \
+                   Only answer this when ALL aspects of the goal are demonstrably finished.\n\
+                 - BLOCKED — the agent cannot proceed due to a specific obstacle it has no way around \
+                   (missing credentials, external dependency, user decision needed, permission denied). \
+                   The agent must have explicitly stated it cannot continue.\n\n\
+                 When in doubt, answer CONTINUE. The user wants this goal finished.\n\
+                 Reply with ONLY one word: CONTINUE, COMPLETED, or BLOCKED."
+            );
+        }
+
         let criterion_section = match acceptance_criteria {
             Some(c) if !c.trim().is_empty() => format!(
                 "Task's explicit done-criterion (drafted at triage): \"{c}\"\n\n\
@@ -1354,12 +1404,13 @@ impl DefaultExecutor {
         user_request: &str,
         agent_response: &str,
         tools_called: &[String],
-    ) -> bool {
+    ) -> GoalVerdict {
         let prompt = Self::build_judge_prompt(
             user_request,
             agent_response,
             tools_called,
             self.acceptance_criteria.as_deref(),
+            self.goal_mode,
         );
 
         let request = LlmRequest {
@@ -1384,15 +1435,29 @@ impl DefaultExecutor {
             Ok(Ok(resp)) => {
                 let answer = resp.content.trim().to_uppercase();
                 tracing::debug!("Completion judge verdict: {}", answer);
-                answer.contains("CONTINUE")
+                if answer.contains("BLOCKED") {
+                    // Extract a reason from the agent's response (first sentence)
+                    let reason = agent_response
+                        .lines()
+                        .find(|l| !l.trim().is_empty())
+                        .unwrap_or("Agent reported being blocked")
+                        .chars()
+                        .take(200)
+                        .collect::<String>();
+                    GoalVerdict::Blocked(reason)
+                } else if answer.contains("CONTINUE") {
+                    GoalVerdict::Continue
+                } else {
+                    GoalVerdict::Done
+                }
             }
             Ok(Err(e)) => {
                 tracing::warn!("Completion judge LLM error: {e}, defaulting to DONE");
-                false // Don't block on judge failure
+                GoalVerdict::Done
             }
             Err(_) => {
                 tracing::warn!("Completion judge timed out, defaulting to DONE");
-                false
+                GoalVerdict::Done
             }
         }
     }
@@ -2114,30 +2179,77 @@ impl AgentExecutor for DefaultExecutor {
                 // Completion judge: before accepting a text-only response as
                 // "done", ask a cheap LLM whether the task was actually
                 // completed.  This catches narration, false claims, and
-                // incomplete tool use — in any language.
+                // incomplete tool use — in any language. In goal mode the
+                // judge can also signal BLOCKED, which exits the loop
+                // cleanly with a `goal_blocked` marker for the frontend.
                 if !available_tools.is_empty() && !has_been_judged {
-                    let should_continue = self
+                    let verdict = self
                         .judge_completion(&task.description, &response_content, &tools_called)
                         .await;
 
-                    if should_continue {
-                        tracing::info!(
-                            task_id = %task_id,
-                            "Completion judge: task NOT done, nudging agent"
-                        );
-                        has_been_judged = true;
-                        conversation.push(ChatMessage {
-                            role: Role::User,
-                            content: MessageContent::Text(
+                    match verdict {
+                        GoalVerdict::Continue => {
+                            tracing::info!(
+                                task_id = %task_id,
+                                "Completion judge: task NOT done, nudging agent"
+                            );
+                            has_been_judged = true;
+                            let nudge = if self.goal_mode {
+                                "The goal is not yet fully accomplished. Review the goal and \
+                                 continue working toward it. If you are genuinely blocked by \
+                                 something outside your control, explain exactly what obstacle \
+                                 prevents further progress."
+                            } else {
                                 "Your reply claims an action that you did not actually perform \
                                  with a tool. Either call the tool now to make the claim true, \
                                  OR rewrite your reply to honestly describe what happened (or \
                                  didn't). Do not announce an action without doing it."
+                            };
+                            conversation.push(ChatMessage {
+                                role: Role::User,
+                                content: MessageContent::Text(nudge.to_string()),
+                            });
+                            steps_completed += 1;
+                            continue;
+                        }
+                        GoalVerdict::Blocked(reason) => {
+                            tracing::info!(task_id = %task_id, reason = %reason, "Goal blocked");
+                            // Emit stream event for the frontend
+                            if let Some(ref tx) = self.stream_sender {
+                                let _ = tx.send(
+                                    serde_json::json!({
+                                        "type": "goal-blocked",
+                                        "reason": reason,
+                                    })
                                     .to_string(),
-                            ),
-                        });
-                        steps_completed += 1;
-                        continue;
+                                );
+                            }
+                            let step = TaskStep {
+                                id: Uuid::new_v4(),
+                                index: steps_completed,
+                                description: "Goal blocked".to_string(),
+                                status: StepStatus::Completed,
+                                started_at: Some(Utc::now()),
+                                completed_at: Some(Utc::now()),
+                                output: Some(
+                                    serde_json::json!({ "response": response_content, "goal_blocked": reason }),
+                                ),
+                                checkpoint: None,
+                            };
+                            self.auditor.record_step(task_id, &step).await?;
+                            return Ok(TaskResult {
+                                task_id,
+                                success: true,
+                                output: Some(
+                                    serde_json::json!({ "response": response_content, "goal_blocked": reason }),
+                                ),
+                                steps_completed: steps_completed + 1,
+                                total_risk_used: 0,
+                            });
+                        }
+                        GoalVerdict::Done => {
+                            // fall through to existing exit path below
+                        }
                     }
                 }
 
@@ -3266,6 +3378,7 @@ mod tests {
             "I deleted it.",
             &["read".to_string()],
             None,
+            false,
         );
         assert!(!p.contains("done-criterion"));
         assert!(!p.contains("clearly NOT addressed"));
@@ -3286,6 +3399,7 @@ mod tests {
             "I sent it.",
             &[],
             Some("Reply once to João confirming Q3 terms."),
+            false,
         );
         assert!(p.contains("Reply once to João confirming Q3 terms."));
         assert!(p.contains("done-criterion"));
@@ -3304,8 +3418,8 @@ mod tests {
     /// shape — half-formed plans must not change the judge's behavior.
     #[test]
     fn judge_prompt_empty_criterion_treated_as_absent() {
-        let with_empty = DefaultExecutor::build_judge_prompt("x", "y", &[], Some("   \n\n"));
-        let with_none = DefaultExecutor::build_judge_prompt("x", "y", &[], None);
+        let with_empty = DefaultExecutor::build_judge_prompt("x", "y", &[], Some("   \n\n"), false);
+        let with_none = DefaultExecutor::build_judge_prompt("x", "y", &[], None, false);
         assert_eq!(with_empty, with_none);
     }
 

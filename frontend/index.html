@@ -185,6 +185,9 @@
                         <button type="button" id="composer-attach-btn" title="Attach image, PDF, or text file" aria-label="Attach file">
                             <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
                         </button>
+                        <button type="button" id="goal-btn" title="Set a goal" aria-label="Set goal">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>
+                        </button>
                         <textarea id="message-input" placeholder="Send a message..." rows="1" autofocus></textarea>
                         <button type="submit" id="send-btn" title="Send message" aria-label="Send message">
                             <span class="send-icon" aria-hidden="true">
@@ -1895,6 +1898,26 @@
                 <button id="provider-help-modal-close" class="profile-modal-close">&times;</button>
             </div>
             <div class="profile-modal-body" id="provider-help-modal-body" style="padding:16px 20px"></div>
+        </div>
+    </div>
+
+    <!-- Goal modal -->
+    <div id="goal-modal-overlay" class="goal-modal-overlay hidden" role="dialog" aria-modal="true">
+        <div class="goal-modal">
+            <div class="goal-modal-header">
+                <h2>Set a Goal</h2>
+                <button id="goal-modal-close" class="close-btn" aria-label="Close">&times;</button>
+            </div>
+            <div class="goal-modal-body">
+                <label for="goal-task-input">What should Athen accomplish?</label>
+                <textarea id="goal-task-input" rows="3" placeholder="e.g. Refactor the auth module and add comprehensive tests"></textarea>
+                <label for="goal-criteria-input">How will you know it's done? <span style="opacity:0.5">(optional)</span></label>
+                <textarea id="goal-criteria-input" rows="2" placeholder="e.g. All tests pass, no clippy warnings, functions under 50 lines"></textarea>
+            </div>
+            <div class="goal-modal-actions">
+                <button id="goal-cancel-btn">Cancel</button>
+                <button id="goal-save-btn" class="btn-primary">Set Goal</button>
+            </div>
         </div>
     </div>
 

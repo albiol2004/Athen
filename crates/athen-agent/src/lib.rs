@@ -64,6 +64,7 @@ pub struct AgentBuilder {
     endpoints_block: Option<String>,
     mission_block: Option<String>,
     acceptance_criteria: Option<String>,
+    goal_mode: bool,
     reminder_builder: Option<Arc<dyn SystemReminderBuilder>>,
     auto_reminders: bool,
     default_reasoning_effort: athen_core::llm::ReasoningEffort,
@@ -99,6 +100,7 @@ impl AgentBuilder {
             endpoints_block: None,
             mission_block: None,
             acceptance_criteria: None,
+            goal_mode: false,
             reminder_builder: None,
             auto_reminders: false,
             default_reasoning_effort: athen_core::llm::ReasoningEffort::Default,
@@ -191,6 +193,14 @@ impl AgentBuilder {
     /// mismatch-only behavior — safe fallback for arcs without a plan.
     pub fn acceptance_criteria(mut self, criterion: Option<String>) -> Self {
         self.acceptance_criteria = criterion.filter(|s| !s.trim().is_empty());
+        self
+    }
+
+    /// Activate goal-aware completion judge. When `true` + acceptance
+    /// criteria are present, the judge flips from "DONE unless mismatch"
+    /// to "CONTINUE unless goal clearly accomplished or blocked."
+    pub fn goal_mode(mut self, v: bool) -> Self {
+        self.goal_mode = v;
         self
     }
 
@@ -439,6 +449,10 @@ impl AgentBuilder {
 
         if self.acceptance_criteria.is_some() {
             executor.set_acceptance_criteria(self.acceptance_criteria);
+        }
+
+        if self.goal_mode {
+            executor.set_goal_mode(true);
         }
 
         if let Some(rb) = self.reminder_builder {

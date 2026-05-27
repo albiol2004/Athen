@@ -36,6 +36,12 @@ const arcsWithNotifications = new Set();
 // `approve_task` itself emits — from re-entering and double-executing.
 const approvalsInFlight = new Set();
 
+// ─── Goal State ───
+
+// Tracks the currently displayed goal so we can detect transitions
+// (e.g. active -> null means goal completed).
+let currentGoalState = null;
+
 // ─── Error Retry State ───
 
 // Stores the last user message so we can retry on transient errors.
@@ -350,6 +356,29 @@ function registerTauriEventListeners() {
 
         if (!delta) return;
 
+        // Intercept structured JSON events piped through the stream
+        // channel (e.g. goal-blocked). These are NOT text deltas and
+        // must not be appended to the streaming bubble.
+        if (delta.startsWith('{"type":')) {
+            try {
+                const parsed = JSON.parse(delta);
+                if (parsed.type === 'goal-blocked' && isActiveArc) {
+                    const goalText = currentGoalState ? currentGoalState.goal : 'Goal';
+                    addGoalCard('blocked', goalText, parsed.reason || null);
+                    // Refresh the banner from backend state
+                    if (invoke) {
+                        invoke('get_arc_goal').then((gs) => {
+                            currentGoalState = gs || null;
+                            updateGoalBanner(currentGoalState);
+                        }).catch(() => {});
+                    }
+                    return; // consumed — don't append to streaming text
+                }
+            } catch (_) {
+                // Not valid JSON — fall through to normal delta handling.
+            }
+        }
+
         // For background arcs, silently accumulate but don't render.
         if (!isActiveArc) return;
 
@@ -456,9 +485,22 @@ function registerTauriEventListeners() {
         scrollChatIfPinned(messagesEl.parentElement, 'auto', wasPinned);
     });
 
-    // Listen for arc updates (e.g. Telegram auto-execution).
-    window.__TAURI__.event.listen('arc-updated', () => {
+    // Listen for arc updates (e.g. Telegram auto-execution, goal state changes).
+    window.__TAURI__.event.listen('arc-updated', async () => {
         loadArcs();
+        // Refresh goal banner — the backend may have changed goal status
+        // (e.g. goal completed after successful execution, or blocked).
+        if (invoke && activeArcId) {
+            try {
+                const newGoal = await invoke('get_arc_goal');
+                // Detect goal completion: had a goal before, now gone.
+                if (currentGoalState && currentGoalState.goal && !newGoal) {
+                    addGoalCard('completed', currentGoalState.goal, null);
+                }
+                currentGoalState = newGoal || null;
+                updateGoalBanner(currentGoalState);
+            } catch (_) {}
+        }
     });
 
     // Listen for notifications from the agent
@@ -1218,6 +1260,16 @@ async function handleSwitchArc(arcId) {
         clearChatUI();
         renderEntries(entries);
 
+        // Load goal state for the newly active arc.
+        try {
+            const goalState = await invoke('get_arc_goal');
+            currentGoalState = goalState || null;
+            updateGoalBanner(currentGoalState);
+        } catch (_) {
+            currentGoalState = null;
+            updateGoalBanner(null);
+        }
+
         // Update active highlight in sidebar.
         document.querySelectorAll('.session-item').forEach((el) => {
             el.classList.toggle('active', el.dataset.arcId === arcId);
@@ -1290,6 +1342,15 @@ async function handleDeleteArc(arcId) {
             } catch (err2) {
                 console.error('Failed to load history after delete:', err2);
                 clearChatUI();
+            }
+            // Load goal state for the new active arc.
+            try {
+                const goalState = await invoke('get_arc_goal');
+                currentGoalState = goalState || null;
+                updateGoalBanner(currentGoalState);
+            } catch (_) {
+                currentGoalState = null;
+                updateGoalBanner(null);
             }
         }
 
@@ -2049,6 +2110,7 @@ inputEl.addEventListener('input', autoResize);
 const SLASH_COMMANDS = [
     { cmd: 'compact', desc: 'Compact the current arc' },
     { cmd: 'skills',  desc: 'Load a skill or open skills panel' },
+    { cmd: 'goal',    desc: 'Set a goal for this arc' },
 ];
 
 let slashAcEl = null;        // the popup element
@@ -2790,6 +2852,41 @@ formEl.addEventListener('submit', async (e) => {
                     } catch (err) {
                         const msg = typeof err === 'string' ? err : (err.message || String(err));
                         showToast(msg, 'error');
+                    }
+                }
+                return;
+            }
+            else if (cmd === 'goal') {
+                inputEl.value = '';
+                inputEl.style.height = 'auto';
+                const arg = rawArg.trim();
+                if (!arg) {
+                    openGoalModal();
+                } else if (arg === 'clear') {
+                    if (!invoke || !activeArcId) return;
+                    try {
+                        await invoke('clear_arc_goal');
+                        addGoalCard('completed', 'Goal cleared', null);
+                        currentGoalState = null;
+                        updateGoalBanner(null);
+                        showToast('Goal cleared', 'success');
+                    } catch (err) {
+                        showToast(typeof err === 'string' ? err : String(err), 'error');
+                    }
+                } else {
+                    // /goal <text> — set goal directly from command
+                    if (!invoke || !activeArcId) {
+                        showToast('No active arc', 'error');
+                        return;
+                    }
+                    try {
+                        await invoke('set_arc_goal', { goal: arg, criteria: null });
+                        addGoalCard('active', arg, null);
+                        currentGoalState = { goal: arg, status: 'active' };
+                        updateGoalBanner(currentGoalState);
+                        showToast('Goal set', 'success');
+                    } catch (err) {
+                        showToast(typeof err === 'string' ? err : String(err), 'error');
                     }
                 }
                 return;
@@ -4569,6 +4666,17 @@ async function loadHistory() {
     } catch (err) {
         console.error('Failed to load history:', err);
     }
+
+    // Load goal state for the initial arc.
+    try {
+        const goalState = await invoke('get_arc_goal');
+        currentGoalState = goalState || null;
+        updateGoalBanner(currentGoalState);
+    } catch (_) {
+        currentGoalState = null;
+        updateGoalBanner(null);
+    }
+
     drainPendingApprovalQuestionsForActiveArc();
 }
 
@@ -4636,6 +4744,9 @@ async function newArc() {
         arcHasMessages = false;
         returnToChatIfOnSubView();
         clearChatUI();
+        // New arc has no goal — clear the banner.
+        currentGoalState = null;
+        updateGoalBanner(null);
         closeSidebar();
         await loadArcs();
         inputEl.focus();
@@ -4661,6 +4772,9 @@ async function branchFromArc(parentArcId, parentName, upToEntryId) {
             const entries = await invoke('get_arc_history');
             renderEntries(entries);
         }
+        // Branched arc starts fresh — no goal.
+        currentGoalState = null;
+        updateGoalBanner(null);
         closeSidebar();
         await loadArcs();
         inputEl.focus();
@@ -15469,6 +15583,139 @@ function humanRelativeTime(rfc3339) {
 
 function escapeAttr(s) {
     return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+// ─── Goal Modal ───
+
+function openGoalModal() {
+    const overlay = document.getElementById('goal-modal-overlay');
+    const taskInput = document.getElementById('goal-task-input');
+    const criteriaInput = document.getElementById('goal-criteria-input');
+    if (!overlay) return;
+    taskInput.value = '';
+    criteriaInput.value = '';
+    overlay.classList.remove('hidden');
+    taskInput.focus();
+}
+
+function closeGoalModal() {
+    const overlay = document.getElementById('goal-modal-overlay');
+    if (overlay) overlay.classList.add('hidden');
+}
+
+const goalBtn = document.getElementById('goal-btn');
+if (goalBtn) goalBtn.addEventListener('click', openGoalModal);
+
+const goalModalClose = document.getElementById('goal-modal-close');
+if (goalModalClose) goalModalClose.addEventListener('click', closeGoalModal);
+
+const goalCancelBtn = document.getElementById('goal-cancel-btn');
+if (goalCancelBtn) goalCancelBtn.addEventListener('click', closeGoalModal);
+
+// Close on overlay click
+const goalOverlay = document.getElementById('goal-modal-overlay');
+if (goalOverlay) {
+    goalOverlay.addEventListener('click', (e) => {
+        if (e.target === goalOverlay) closeGoalModal();
+    });
+}
+
+// Save button — wired later when backend commands are ready
+const goalSaveBtn = document.getElementById('goal-save-btn');
+if (goalSaveBtn) {
+    goalSaveBtn.addEventListener('click', async () => {
+        const goal = document.getElementById('goal-task-input').value.trim();
+        if (!goal) { showToast('Goal cannot be empty', 'error'); return; }
+        const criteria = document.getElementById('goal-criteria-input').value.trim() || null;
+        if (!invoke) return;
+        try {
+            await invoke('set_arc_goal', { goal, criteria });
+            closeGoalModal();
+            addGoalCard('active', goal, criteria);
+            currentGoalState = { goal, criteria, status: 'active' };
+            updateGoalBanner(currentGoalState);
+            showToast('Goal set', 'success');
+        } catch (err) {
+            showToast(typeof err === 'string' ? err : String(err), 'error');
+        }
+    });
+}
+
+function addGoalCard(type, goal, extra) {
+    const row = document.createElement('div');
+    row.className = 'message-row system';
+    const card = document.createElement('div');
+    card.className = 'system-inline-entry goal-card goal-' + type;
+
+    const title = document.createElement('div');
+    title.className = 'goal-card-title';
+    if (type === 'active') title.textContent = 'Goal set';
+    else if (type === 'completed') title.textContent = 'Goal completed';
+    else if (type === 'blocked') title.textContent = 'Goal blocked';
+    card.appendChild(title);
+
+    const body = document.createElement('div');
+    body.textContent = goal;
+    card.appendChild(body);
+
+    if (extra && type === 'active') {
+        const criteria = document.createElement('div');
+        criteria.style.cssText = 'margin-top:4px;opacity:0.7;font-size:0.8rem';
+        criteria.textContent = 'Done when: ' + extra;
+        card.appendChild(criteria);
+    }
+    if (type === 'blocked' && extra) {
+        const reason = document.createElement('div');
+        reason.style.cssText = 'margin-top:4px';
+        reason.textContent = extra;
+        card.appendChild(reason);
+        const hint = document.createElement('div');
+        hint.className = 'goal-card-hint';
+        hint.textContent = 'Send a message to continue, or /goal clear to dismiss.';
+        card.appendChild(hint);
+    }
+
+    row.appendChild(card);
+    messagesEl.appendChild(row);
+    scrollChatIfPinned();
+}
+
+let goalBannerEl = null;
+
+function updateGoalBanner(goalState) {
+    if (!goalState || !goalState.goal || goalState.status === 'completed') {
+        if (goalBannerEl) { goalBannerEl.remove(); goalBannerEl = null; }
+        return;
+    }
+    if (!goalBannerEl) {
+        goalBannerEl = document.createElement('div');
+        goalBannerEl.className = 'goal-banner';
+        // Insert at the top of the messages scroll container
+        const container = messagesEl.parentElement;
+        if (container) container.insertBefore(goalBannerEl, container.firstChild);
+    }
+    const icon = goalState.status === 'blocked' ? '⚠️' : '🎯';
+    goalBannerEl.innerHTML = '';
+    const textSpan = document.createElement('span');
+    textSpan.className = 'goal-banner-text';
+    textSpan.textContent = icon + ' ' + goalState.goal;
+    goalBannerEl.appendChild(textSpan);
+
+    const clearBtn = document.createElement('button');
+    clearBtn.className = 'goal-banner-clear';
+    clearBtn.textContent = '✕ clear';
+    clearBtn.addEventListener('click', async () => {
+        if (!invoke) return;
+        try {
+            await invoke('clear_arc_goal');
+            currentGoalState = null;
+            updateGoalBanner(null);
+            showToast('Goal cleared', 'success');
+        } catch (err) {
+            showToast(String(err), 'error');
+        }
+    });
+    goalBannerEl.appendChild(clearBtn);
 }
 
 // ─── Initialize ───

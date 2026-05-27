@@ -2180,6 +2180,10 @@ mod tests {
                 reasoning_effort_override: None,
                 tier_override: None,
                 triage_plan: None,
+                user_goal: None,
+                user_goal_criteria: None,
+                goal_status: None,
+                goal_blocked_reason: None,
             },
             ArcMeta {
                 id: "arc_recent".into(),
@@ -2199,6 +2203,10 @@ mod tests {
                 reasoning_effort_override: None,
                 tier_override: None,
                 triage_plan: None,
+                user_goal: None,
+                user_goal_criteria: None,
+                goal_status: None,
+                goal_blocked_reason: None,
             },
         ];
 

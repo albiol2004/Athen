@@ -8720,6 +8720,107 @@ option:hover {
         var(--bg-deep);
 }
 
+/* ── Goal button (composer) ── */
+#goal-btn {
+    background: none; border: none; cursor: pointer;
+    color: var(--text-2); padding: 6px;
+    border-radius: var(--r-md);
+    display: flex; align-items: center; justify-content: center;
+    transition: color var(--dur) var(--ease), background var(--dur) var(--ease);
+    flex-shrink: 0;
+}
+#goal-btn:hover { color: var(--brand-solid); background: var(--surface-1); }
+
+/* ── Goal modal ── */
+.goal-modal-overlay {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.7);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 200;
+    animation: fade-in var(--dur) var(--ease);
+}
+.goal-modal-overlay.hidden { display: none; }
+.goal-modal {
+    background: var(--surface-1);
+    border-radius: var(--r-xl);
+    width: 90vw; max-width: 480px;
+    box-shadow: 0 24px 64px rgba(0,0,0,0.4);
+    animation: modal-in var(--dur-slow) var(--ease);
+}
+.goal-modal-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 18px 20px 12px;
+    border-bottom: 1px solid var(--border);
+}
+.goal-modal-header h2 { font-size: 1rem; font-weight: 600; margin: 0; }
+.goal-modal-body {
+    padding: 16px 20px;
+    display: flex; flex-direction: column; gap: 10px;
+}
+.goal-modal-body label {
+    font-size: 0.8rem; font-weight: 500; color: var(--text-2);
+}
+.goal-modal-body textarea {
+    width: 100%; resize: vertical;
+    background: var(--surface-2); color: var(--text);
+    border: 1px solid var(--border); border-radius: var(--r-md);
+    padding: 10px 12px; font-size: 0.85rem; font-family: inherit;
+    transition: border-color var(--dur) var(--ease);
+    box-sizing: border-box;
+}
+.goal-modal-body textarea:focus {
+    outline: none; border-color: var(--brand-solid);
+}
+.goal-modal-actions {
+    display: flex; justify-content: flex-end; gap: 8px;
+    padding: 14px 20px 18px;
+    border-top: 1px solid var(--border);
+}
+
+/* ── Goal banner ── */
+.goal-banner {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 12px;
+    background: var(--surface-1);
+    border-bottom: 1px solid var(--border);
+    font-size: 0.8rem; color: var(--text-2);
+}
+.goal-banner-text {
+    flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.goal-banner-clear {
+    background: none; border: none; cursor: pointer;
+    color: var(--text-2); font-size: 0.75rem; padding: 2px 6px;
+    border-radius: var(--r-sm);
+}
+.goal-banner-clear:hover { color: var(--text); background: var(--surface-2); }
+
+/* ── Goal cards ── */
+.goal-card {
+    padding: 10px 14px;
+    border-radius: var(--r-md);
+    font-size: 0.85rem;
+    margin: 4px 0;
+}
+.goal-card.goal-active {
+    background: color-mix(in srgb, var(--brand-solid) 8%, var(--surface-1));
+    border: 1px solid color-mix(in srgb, var(--brand-solid) 20%, var(--border));
+}
+.goal-card.goal-completed {
+    background: color-mix(in srgb, #22c55e 8%, var(--surface-1));
+    border: 1px solid color-mix(in srgb, #22c55e 20%, var(--border));
+}
+.goal-card.goal-blocked {
+    background: color-mix(in srgb, #f59e0b 8%, var(--surface-1));
+    border: 1px solid color-mix(in srgb, #f59e0b 20%, var(--border));
+}
+.goal-card-title {
+    font-weight: 600; margin-bottom: 4px;
+}
+.goal-card-hint {
+    font-size: 0.75rem; opacity: 0.7; margin-top: 6px;
+}
+
 /* Light-mode select dropdown arrow: pin background-image on :active/:focus
    to prevent WebKitGTK's user-agent animation from duplicating the arrow. */
 :root[data-theme="light"] .settings-select:active,

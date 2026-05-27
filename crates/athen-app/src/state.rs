@@ -2768,6 +2768,37 @@ async fn execute_owner_telegram_message(
         }
     }
 
+    // Goal-intent triage: if the arc has a blocked goal, classify the user's
+    // message as CONTINUE (reactivate goal) or ABANDON (clear goal) before
+    // the executor runs. Same logic as the in-app path in commands.rs.
+    if let (Some(store), Some(ref arc_id)) = (arc_store, &target_arc_id) {
+        if let Ok(Some(meta)) = store.get_arc(arc_id).await {
+            if meta.goal_status.as_deref() == Some("blocked") {
+                if let (Some(ref goal), Some(ref reason)) =
+                    (&meta.user_goal, &meta.goal_blocked_reason)
+                {
+                    let router_guard = router.read().await;
+                    let router_clone = router_guard.clone();
+                    drop(router_guard);
+                    let should_abandon = crate::commands::classify_goal_intent(
+                        router_clone.as_ref(),
+                        text,
+                        goal,
+                        reason,
+                    )
+                    .await;
+                    if should_abandon {
+                        let _ = store.clear_user_goal(arc_id).await;
+                        tracing::info!(arc = %arc_id, "Goal abandoned by user intent (Telegram)");
+                    } else {
+                        let _ = store.set_goal_active(arc_id).await;
+                        tracing::info!(arc = %arc_id, "Goal reactivated by user intent (Telegram)");
+                    }
+                }
+            }
+        }
+    }
+
     // Load conversation history from the arc for context continuity.
     let mut context = if let (Some(store), Some(ref arc_id)) = (arc_store, &target_arc_id) {
         match store.load_entries(arc_id).await {

@@ -150,6 +150,16 @@ pub struct ArcMeta {
     /// considered usable — half-plans collapse to `None` (same invariant
     /// as the parser in `athen-risk::llm_fallback`).
     pub triage_plan: Option<TriagePlan>,
+    /// Free-text user goal for this arc, set by the agent's `set_user_goal`
+    /// tool. Describes what the user ultimately wants to achieve.
+    pub user_goal: Option<String>,
+    /// Measurable criteria that determine when the goal is complete.
+    pub user_goal_criteria: Option<String>,
+    /// Current status of the goal: `"active"` or `"blocked"`.
+    pub goal_status: Option<String>,
+    /// Human-readable reason the goal is blocked (only set when
+    /// `goal_status == "blocked"`).
+    pub goal_blocked_reason: Option<String>,
 }
 
 /// Assemble a `TriagePlan` from two raw columns. Returns `None` unless
@@ -419,6 +429,25 @@ impl ArcStore {
                     .map_err(|e| AthenError::Other(format!("Add triage_plan_scope: {e}")))?;
             }
 
+            // Column-level migration: goal data model — user_goal,
+            // user_goal_criteria, goal_status, goal_blocked_reason.
+            if !cols.contains("user_goal") {
+                conn.execute("ALTER TABLE arcs ADD COLUMN user_goal TEXT", [])
+                    .map_err(|e| AthenError::Other(format!("Add user_goal: {e}")))?;
+            }
+            if !cols.contains("user_goal_criteria") {
+                conn.execute("ALTER TABLE arcs ADD COLUMN user_goal_criteria TEXT", [])
+                    .map_err(|e| AthenError::Other(format!("Add user_goal_criteria: {e}")))?;
+            }
+            if !cols.contains("goal_status") {
+                conn.execute("ALTER TABLE arcs ADD COLUMN goal_status TEXT", [])
+                    .map_err(|e| AthenError::Other(format!("Add goal_status: {e}")))?;
+            }
+            if !cols.contains("goal_blocked_reason") {
+                conn.execute("ALTER TABLE arcs ADD COLUMN goal_blocked_reason TEXT", [])
+                    .map_err(|e| AthenError::Other(format!("Add goal_blocked_reason: {e}")))?;
+            }
+
             Ok(())
         })
         .await
@@ -490,7 +519,9 @@ impl ArcStore {
                             a.pinned_provider_id, a.pinned_slug, \
                             a.reasoning_effort_override, \
                             a.tier_override, \
-                            a.triage_plan_acceptance, a.triage_plan_scope \
+                            a.triage_plan_acceptance, a.triage_plan_scope, \
+                            a.user_goal, a.user_goal_criteria, \
+                            a.goal_status, a.goal_blocked_reason \
                      FROM arcs a \
                      LEFT JOIN ( \
                          SELECT arc_id, COUNT(*) AS cnt \
@@ -520,6 +551,10 @@ impl ArcStore {
                         reasoning_effort_override: row.get(14)?,
                         tier_override: row.get(15)?,
                         triage_plan: assemble_plan(row.get(16)?, row.get(17)?),
+                        user_goal: row.get(18)?,
+                        user_goal_criteria: row.get(19)?,
+                        goal_status: row.get(20)?,
+                        goal_blocked_reason: row.get(21)?,
                     })
                 })
                 .map_err(|e| AthenError::Other(format!("Query get arc: {e}")))?;
@@ -569,7 +604,9 @@ impl ArcStore {
                         a.pinned_provider_id, a.pinned_slug, \
                         a.reasoning_effort_override, \
                         a.tier_override, \
-                        a.triage_plan_acceptance, a.triage_plan_scope \
+                        a.triage_plan_acceptance, a.triage_plan_scope, \
+                        a.user_goal, a.user_goal_criteria, \
+                        a.goal_status, a.goal_blocked_reason \
                  FROM arcs a \
                  LEFT JOIN ( \
                      SELECT arc_id, COUNT(*) AS cnt \
@@ -602,6 +639,10 @@ impl ArcStore {
                         reasoning_effort_override: row.get(14)?,
                         tier_override: row.get(15)?,
                         triage_plan: assemble_plan(row.get(16)?, row.get(17)?),
+                        user_goal: row.get(18)?,
+                        user_goal_criteria: row.get(19)?,
+                        goal_status: row.get(20)?,
+                        goal_blocked_reason: row.get(21)?,
                     })
                 })
                 .map_err(|e| AthenError::Other(format!("Query list arcs: {e}")))?;
@@ -1050,6 +1091,87 @@ impl ArcStore {
                 )
                 .map_err(|e| AthenError::Other(format!("Set triage_plan_if_absent: {e}")))?;
             Ok(affected > 0)
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
+    /// Set the user goal for this arc. Resets `goal_status` to `"active"` and
+    /// clears any blocked reason. Pass `criteria` as measurable completion
+    /// conditions; `None` means the goal has no formal acceptance criteria.
+    pub async fn set_user_goal(&self, id: &str, goal: &str, criteria: Option<&str>) -> Result<()> {
+        let conn = self.conn.clone();
+        let id = id.to_string();
+        let goal = goal.to_string();
+        let criteria = criteria.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE arcs SET user_goal = ?1, user_goal_criteria = ?2, \
+                 goal_status = 'active', goal_blocked_reason = NULL, \
+                 updated_at = ?3 WHERE id = ?4",
+                params![goal, criteria, Utc::now().to_rfc3339(), id],
+            )
+            .map_err(|e| AthenError::Other(format!("set_user_goal: {e}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
+    /// Clear all goal fields for this arc (goal text, criteria, status, and
+    /// blocked reason).
+    pub async fn clear_user_goal(&self, id: &str) -> Result<()> {
+        let conn = self.conn.clone();
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE arcs SET user_goal = NULL, user_goal_criteria = NULL, \
+                 goal_status = NULL, goal_blocked_reason = NULL, \
+                 updated_at = ?1 WHERE id = ?2",
+                params![Utc::now().to_rfc3339(), id],
+            )
+            .map_err(|e| AthenError::Other(format!("clear_user_goal: {e}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
+    /// Mark this arc's goal as blocked with a human-readable reason.
+    pub async fn set_goal_blocked(&self, id: &str, reason: &str) -> Result<()> {
+        let conn = self.conn.clone();
+        let id = id.to_string();
+        let reason = reason.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE arcs SET goal_status = 'blocked', goal_blocked_reason = ?1, \
+                 updated_at = ?2 WHERE id = ?3",
+                params![reason, Utc::now().to_rfc3339(), id],
+            )
+            .map_err(|e| AthenError::Other(format!("set_goal_blocked: {e}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
+    /// Transition this arc's goal back to `"active"`, clearing the blocked
+    /// reason. No-op if the goal was already active.
+    pub async fn set_goal_active(&self, id: &str) -> Result<()> {
+        let conn = self.conn.clone();
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE arcs SET goal_status = 'active', goal_blocked_reason = NULL, \
+                 updated_at = ?1 WHERE id = ?2",
+                params![Utc::now().to_rfc3339(), id],
+            )
+            .map_err(|e| AthenError::Other(format!("set_goal_active: {e}")))?;
+            Ok(())
         })
         .await
         .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
@@ -1511,7 +1633,11 @@ CREATE TABLE IF NOT EXISTS arcs (
     reasoning_effort_override TEXT,
     tier_override TEXT,
     triage_plan_acceptance TEXT,
-    triage_plan_scope TEXT
+    triage_plan_scope TEXT,
+    user_goal TEXT,
+    user_goal_criteria TEXT,
+    goal_status TEXT,
+    goal_blocked_reason TEXT
 );
 
 CREATE TABLE IF NOT EXISTS arc_entries (

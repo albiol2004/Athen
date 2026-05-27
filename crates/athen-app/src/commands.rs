@@ -1034,6 +1034,67 @@ async fn classify_tier_for_turn(
     (complexity, is_code_task)
 }
 
+/// Cheap LLM classifier for goal-intent triage. Returns `true` when the
+/// user wants to abandon the blocked goal, `false` when they want to
+/// continue. Defaults to `false` (continue) on any error -- the safe
+/// default is "keep the goal, let the agent run with the new context."
+pub(crate) async fn classify_goal_intent(
+    router: &dyn LlmRouter,
+    user_message: &str,
+    goal: &str,
+    blocked_reason: &str,
+) -> bool {
+    use athen_core::llm::{
+        ChatMessage as LlmChatMessage, LlmRequest, MessageContent as LlmContent, ModelProfile,
+        Role as LlmRole,
+    };
+
+    let prompt = format!(
+        "The user had a goal set: \"{goal}\"\n\
+         It was blocked because: \"{blocked_reason}\"\n\
+         The user just said: \"{user_message}\"\n\n\
+         Does the user want to CONTINUE working on the goal (with new info \
+         or direction), or ABANDON it entirely (move on to something else)?\n\
+         Answer CONTINUE or ABANDON. One word only."
+    );
+
+    let request = LlmRequest {
+        messages: vec![LlmChatMessage {
+            role: LlmRole::User,
+            content: LlmContent::Text(prompt),
+        }],
+        profile: ModelProfile::Cheap,
+        max_tokens: Some(5),
+        temperature: Some(0.0),
+        tools: None,
+        system_prompt: None,
+        reasoning_effort: athen_core::llm::ReasoningEffort::Off,
+    };
+
+    match tokio::time::timeout(std::time::Duration::from_secs(5), router.route(&request)).await {
+        Ok(Ok(resp)) => {
+            // DeepSeek V4 Flash sometimes puts the answer in
+            // reasoning_content instead of content (relay quirk).
+            let raw = if !resp.content.trim().is_empty() {
+                &resp.content
+            } else {
+                resp.reasoning_content.as_deref().unwrap_or("")
+            };
+            let answer = raw.trim().to_uppercase();
+            tracing::debug!(answer = %answer, "Goal intent classifier result");
+            answer.contains("ABANDON")
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "Goal intent classifier failed, defaulting to CONTINUE");
+            false
+        }
+        Err(_) => {
+            tracing::warn!("Goal intent classifier timed out, defaulting to CONTINUE");
+            false
+        }
+    }
+}
+
 async fn judge_worth_remembering(
     router: &dyn LlmRouter,
     memory: &dyn athen_core::traits::memory::MemoryStore,
@@ -2099,6 +2160,32 @@ pub async fn send_message(
         }
     }
 
+    // Goal-intent triage: if the arc has a blocked goal, classify the user's
+    // message as CONTINUE (reactivate goal) or ABANDON (clear goal) before
+    // the executor runs. The classifier uses Cheap tier, max 5 tokens, 5s timeout.
+    if let Some(ref arc_store) = state.arc_store {
+        if let Ok(Some(meta)) = arc_store.get_arc(&active_arc).await {
+            if meta.goal_status.as_deref() == Some("blocked") {
+                if let (Some(ref goal), Some(ref reason)) =
+                    (&meta.user_goal, &meta.goal_blocked_reason)
+                {
+                    let router_guard = state.router.read().await;
+                    let router_clone = router_guard.clone();
+                    drop(router_guard);
+                    let should_abandon =
+                        classify_goal_intent(router_clone.as_ref(), &message, goal, reason).await;
+                    if should_abandon {
+                        let _ = arc_store.clear_user_goal(&active_arc).await;
+                        tracing::info!(arc = %active_arc, "Goal abandoned by user intent");
+                    } else {
+                        let _ = arc_store.set_goal_active(&active_arc).await;
+                        tracing::info!(arc = %active_arc, "Goal reactivated by user intent");
+                    }
+                }
+            }
+        }
+    }
+
     // Persist composer-uploaded files (PDFs, docs, etc.) AND composer
     // images before the executor runs. We unify both into the same
     // AttachmentStore so the surfacing path picks them up uniformly,
@@ -2595,6 +2682,11 @@ pub async fn send_message(
                 &active_arc,
             )
             .await;
+            let goal_active =
+                crate::mission_render::read_goal_status(state.arc_store.as_ref(), &active_arc)
+                    .await
+                    .map(|(s, _)| s == "active")
+                    .unwrap_or(false);
 
             // Reuse the `effective_target` snapshotted before exec_router
             // was wired — re-resolving here would race with a concurrent
@@ -2657,6 +2749,7 @@ pub async fn send_message(
                 .skills_block(skills_block)
                 .mission_block(mission_block)
                 .acceptance_criteria(acceptance_criteria)
+                .goal_mode(goal_active)
                 .enable_default_reminders(true)
                 .default_temperature(sampling_temperature)
                 .default_reasoning_effort(reasoning_effort)
@@ -2756,6 +2849,31 @@ pub async fn send_message(
             };
             if let Some(g) = agent_guard {
                 g.complete().await;
+            }
+
+            // --- Goal state persistence ---
+            if let Some(ref arc_store) = state.arc_store {
+                let goal_blocked = result
+                    .output
+                    .as_ref()
+                    .and_then(|o| o.get("goal_blocked"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+
+                if let Some(reason) = goal_blocked {
+                    if let Err(e) = arc_store.set_goal_blocked(&active_arc, &reason).await {
+                        tracing::warn!(arc = %active_arc, error = %e, "set_goal_blocked failed");
+                    }
+                    let _ =
+                        app_handle.emit("arc-updated", serde_json::json!({ "arc_id": active_arc }));
+                } else if goal_active {
+                    // Goal was active and executor completed without blocking — mark done.
+                    if let Err(e) = arc_store.clear_user_goal(&active_arc).await {
+                        tracing::warn!(arc = %active_arc, error = %e, "clear_user_goal on completion failed");
+                    }
+                    let _ =
+                        app_handle.emit("arc-updated", serde_json::json!({ "arc_id": active_arc }));
+                }
             }
 
             // Extract response content from the executor output.
@@ -3810,6 +3928,11 @@ pub(crate) async fn execute_approved_task(
     let acceptance_criteria =
         crate::mission_render::read_acceptance_criteria(ctx.arc_store.as_ref(), &ctx.active_arc_id)
             .await;
+    let goal_active =
+        crate::mission_render::read_goal_status(ctx.arc_store.as_ref(), &ctx.active_arc_id)
+            .await
+            .map(|(s, _)| s == "active")
+            .unwrap_or(false);
 
     // Tier resolution: arc override > task signals (complexity +
     // is_code_task, both piggybacked on the risk LLM that already ran on
@@ -3845,6 +3968,7 @@ pub(crate) async fn execute_approved_task(
         .skills_block(skills_block)
         .mission_block(mission_block)
         .acceptance_criteria(acceptance_criteria)
+        .goal_mode(goal_active)
         .enable_default_reminders(true)
         .default_temperature(ctx.sampling_temperature)
         .default_reasoning_effort(ctx.reasoning_effort)
@@ -3933,6 +4057,37 @@ pub(crate) async fn execute_approved_task(
     };
     if let Some(g) = agent_guard {
         g.complete().await;
+    }
+
+    // --- Goal state persistence ---
+    if let Some(ref arc_store) = ctx.arc_store {
+        let goal_blocked = result
+            .output
+            .as_ref()
+            .and_then(|o| o.get("goal_blocked"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        if let Some(reason) = goal_blocked {
+            if let Err(e) = arc_store
+                .set_goal_blocked(&ctx.active_arc_id, &reason)
+                .await
+            {
+                tracing::warn!(arc = %ctx.active_arc_id, error = %e, "set_goal_blocked failed");
+            }
+            let _ = ctx.app_handle.emit(
+                "arc-updated",
+                serde_json::json!({ "arc_id": ctx.active_arc_id }),
+            );
+        } else if goal_active {
+            if let Err(e) = arc_store.clear_user_goal(&ctx.active_arc_id).await {
+                tracing::warn!(arc = %ctx.active_arc_id, error = %e, "clear_user_goal on completion failed");
+            }
+            let _ = ctx.app_handle.emit(
+                "arc-updated",
+                serde_json::json!({ "arc_id": ctx.active_arc_id }),
+            );
+        }
     }
 
     let content = if !result.success {
@@ -4874,6 +5029,10 @@ pub(crate) async fn execute_dispatched_task(
         crate::mission_render::render_mission_block(ctx.arc_store.as_ref(), &arc_id).await;
     let acceptance_criteria =
         crate::mission_render::read_acceptance_criteria(ctx.arc_store.as_ref(), &arc_id).await;
+    let goal_active = crate::mission_render::read_goal_status(ctx.arc_store.as_ref(), &arc_id)
+        .await
+        .map(|(s, _)| s == "active")
+        .unwrap_or(false);
 
     // Tier resolution mirrors the approval path; `task` carries the
     // risk_score the dispatch loop installed.
@@ -4907,6 +5066,7 @@ pub(crate) async fn execute_dispatched_task(
         .skills_block(skills_block)
         .mission_block(mission_block)
         .acceptance_criteria(acceptance_criteria)
+        .goal_mode(goal_active)
         .enable_default_reminders(true)
         .default_temperature(ctx.sampling_temperature)
         .default_reasoning_effort(ctx.reasoning_effort)
@@ -4993,6 +5153,32 @@ pub(crate) async fn execute_dispatched_task(
             g.complete().await;
         } else {
             g.fail("agent stopped before finishing").await;
+        }
+    }
+
+    // --- Goal state persistence ---
+    if let Some(ref arc_store) = ctx.arc_store {
+        let goal_blocked = result
+            .output
+            .as_ref()
+            .and_then(|o| o.get("goal_blocked"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        if let Some(reason) = goal_blocked {
+            if let Err(e) = arc_store.set_goal_blocked(&arc_id, &reason).await {
+                tracing::warn!(arc = %arc_id, error = %e, "set_goal_blocked failed");
+            }
+            let _ = ctx
+                .app_handle
+                .emit("arc-updated", serde_json::json!({ "arc_id": arc_id }));
+        } else if goal_active {
+            if let Err(e) = arc_store.clear_user_goal(&arc_id).await {
+                tracing::warn!(arc = %arc_id, error = %e, "clear_user_goal on completion failed");
+            }
+            let _ = ctx
+                .app_handle
+                .emit("arc-updated", serde_json::json!({ "arc_id": arc_id }));
         }
     }
 
@@ -8882,6 +9068,107 @@ pub async fn inject_skill(
         name: skill.name,
         body,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Goal management
+// ---------------------------------------------------------------------------
+
+/// Wire shape returned by [`set_arc_goal`] and [`get_arc_goal`].
+#[derive(Serialize)]
+pub struct GoalState {
+    pub goal: String,
+    pub criteria: Option<String>,
+    pub status: String,
+    pub blocked_reason: Option<String>,
+}
+
+/// Set (or replace) the user goal on the active arc.
+#[tauri::command]
+pub async fn set_arc_goal(
+    goal: String,
+    criteria: Option<String>,
+    state: State<'_, AppState>,
+) -> std::result::Result<GoalState, String> {
+    let goal = goal.trim().to_string();
+    if goal.is_empty() {
+        return Err("Goal cannot be empty".to_string());
+    }
+    let criteria = criteria
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let arc_store = state
+        .arc_store
+        .as_ref()
+        .ok_or_else(|| "Arc store not available".to_string())?;
+
+    let active_arc = state.active_arc_id.lock().await.clone();
+    if active_arc.is_empty() {
+        return Err("No active arc".to_string());
+    }
+
+    arc_store
+        .set_user_goal(&active_arc, &goal, criteria.as_deref())
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(GoalState {
+        goal,
+        criteria,
+        status: "active".to_string(),
+        blocked_reason: None,
+    })
+}
+
+/// Fetch the goal attached to the active arc, if any.
+#[tauri::command]
+pub async fn get_arc_goal(
+    state: State<'_, AppState>,
+) -> std::result::Result<Option<GoalState>, String> {
+    let arc_store = state
+        .arc_store
+        .as_ref()
+        .ok_or_else(|| "Arc store not available".to_string())?;
+
+    let active_arc = state.active_arc_id.lock().await.clone();
+    if active_arc.is_empty() {
+        return Ok(None);
+    }
+
+    let meta = arc_store
+        .get_arc(&active_arc)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match meta {
+        Some(m) if m.user_goal.is_some() && m.goal_status.is_some() => Ok(Some(GoalState {
+            goal: m.user_goal.unwrap(),
+            criteria: m.user_goal_criteria,
+            status: m.goal_status.unwrap(),
+            blocked_reason: m.goal_blocked_reason,
+        })),
+        _ => Ok(None),
+    }
+}
+
+/// Remove the goal from the active arc.
+#[tauri::command]
+pub async fn clear_arc_goal(state: State<'_, AppState>) -> std::result::Result<(), String> {
+    let arc_store = state
+        .arc_store
+        .as_ref()
+        .ok_or_else(|| "Arc store not available".to_string())?;
+
+    let active_arc = state.active_arc_id.lock().await.clone();
+    if active_arc.is_empty() {
+        return Err("No active arc".to_string());
+    }
+
+    arc_store
+        .clear_user_goal(&active_arc)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Wire shape for an attachment thumbnail returned to the frontend.
