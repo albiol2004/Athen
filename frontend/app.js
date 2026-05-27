@@ -4,6 +4,8 @@ let invoke;
 
 // Container for tool execution cards during the current request.
 let currentToolContainer = null;
+// Deferred submit_plan card data — rendered after the final message bubble.
+let pendingPlanCard = null;
 
 // ─── Streaming State ───
 
@@ -306,17 +308,10 @@ function registerTauriEventListeners() {
         const card = buildToolCardBlock(meta);
         appendLiveToolCard(currentToolContainer, card, tool_name, status, step);
 
-        // Promote submit_plan to a standalone card below the tool group
-        // so the Approve/Discard buttons are immediately visible without
-        // digging into the collapsed tool group.
+        // Stash submit_plan data so the standalone card renders AFTER the
+        // final assistant message bubble (not above it).
         if (tool_name === 'submit_plan' && status === 'Completed' && args) {
-            const standalone = renderToolBody_submit_plan(args, result, null);
-            if (standalone) {
-                const row = document.createElement('div');
-                row.className = 'message-row system plan-card-standalone';
-                row.appendChild(standalone);
-                messagesEl.appendChild(row);
-            }
+            pendingPlanCard = { args, result };
         }
 
         // If the Changes rail is open, pull a fresh action list so newly
@@ -1311,6 +1306,7 @@ async function handleSwitchArc(arcId) {
         try {
             const plan = await invoke('get_plan');
             updatePlanBanner(plan);
+            renderPlanCardIfDrafting(plan);
         } catch (_) {
             updatePlanBanner(null);
         }
@@ -1401,6 +1397,7 @@ async function handleDeleteArc(arcId) {
             try {
                 const plan = await invoke('get_plan');
                 updatePlanBanner(plan);
+                renderPlanCardIfDrafting(plan);
             } catch (_) {
                 updatePlanBanner(null);
             }
@@ -3060,6 +3057,7 @@ formEl.addEventListener('submit', async (e) => {
 
     // Reset tool container and streaming state for this new request.
     currentToolContainer = null;
+    pendingPlanCard = null;
     streamingBubble = null;
     streamingText = '';
     didReceiveStreamChunks = false;
@@ -3162,11 +3160,13 @@ formEl.addEventListener('submit', async (e) => {
         }
 
         currentToolContainer = null;
+        flushPendingPlanCard();
         setStatus('idle', 'Ready');
     } catch (err) {
         console.error('Tauri invoke error:', err);
         addMessage('assistant', `Error: ${err}`, { isError: true });
         currentToolContainer = null;
+        flushPendingPlanCard();
         setStatus('error', 'Error');
     }
 
@@ -3298,26 +3298,6 @@ function renderToolGroup(toolCalls) {
     details.appendChild(body);
 
     messagesEl.appendChild(details);
-
-    // Promote the last submit_plan in this group to a standalone card
-    // below the tool group so Approve/Discard buttons are immediately
-    // visible on history reload.
-    const lastPlan = [...toolCalls].reverse().find((tc) => {
-        const m = parseEntryMetadata(tc.metadata) || {};
-        return (m.tool || tc.content || '') === 'submit_plan';
-    });
-    if (lastPlan) {
-        const pm = parseEntryMetadata(lastPlan.metadata) || {};
-        if (pm.args) {
-            const standalone = renderToolBody_submit_plan(pm.args, pm.result, null);
-            if (standalone) {
-                const row = document.createElement('div');
-                row.className = 'message-row system plan-card-standalone';
-                row.appendChild(standalone);
-                messagesEl.appendChild(row);
-            }
-        }
-    }
 }
 
 // Build a fresh <details> tool group for the live agent-progress path.
@@ -3452,7 +3432,6 @@ function buildToolCardBlock(meta) {
 
     const details = document.createElement('details');
     details.className = 'tool-card-expand';
-    if (toolName === 'submit_plan') details.open = true;
     const summary = document.createElement('summary');
     summary.className = 'tool-card-expand-summary';
     summary.appendChild(card);
@@ -4507,6 +4486,35 @@ function renderAthenDocs(args, result) {
     ]);
 }
 
+function renderPlanCardIfDrafting(plan) {
+    if (!plan || plan.status !== 'Drafting') return;
+    const standalone = renderToolBody_submit_plan(
+        { goal: plan.goal, acceptance_criteria: plan.acceptance_criteria, steps: plan.steps },
+        null, null,
+    );
+    if (standalone) {
+        const row = document.createElement('div');
+        row.className = 'message-row system plan-card-standalone';
+        row.appendChild(standalone);
+        messagesEl.appendChild(row);
+        scrollChatIfPinned();
+    }
+}
+
+function flushPendingPlanCard() {
+    if (!pendingPlanCard) return;
+    const { args, result } = pendingPlanCard;
+    pendingPlanCard = null;
+    const standalone = renderToolBody_submit_plan(args, result, null);
+    if (standalone) {
+        const row = document.createElement('div');
+        row.className = 'message-row system plan-card-standalone';
+        row.appendChild(standalone);
+        messagesEl.appendChild(row);
+        scrollChatIfPinned();
+    }
+}
+
 function renderToolBody_submit_plan(args, result, toolCardEl) {
     const wrap = document.createElement('div');
     wrap.className = 'plan-card';
@@ -4903,6 +4911,7 @@ async function loadHistory() {
     try {
         const plan = await invoke('get_plan');
         updatePlanBanner(plan);
+        renderPlanCardIfDrafting(plan);
     } catch (_) {
         updatePlanBanner(null);
     }
