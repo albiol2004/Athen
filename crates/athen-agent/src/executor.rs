@@ -354,10 +354,9 @@ pub struct DefaultExecutor {
     /// (athen-app) resolves this *before* building the executor — via
     /// `state::resolve_effective_tier_for_arc`, which honours the arc's
     /// `tier_override` and the task's `risk_score.complexity` on top of
-    /// the static `Fast` call-site label. The completion-judge,
-    /// runaway-summary, and other helpers keep their own hardcoded
-    /// tiers (Cheap / Fast) regardless of this field — they're cheap by
-    /// design.
+    /// the static `Fast` call-site label. The completion-judge and other
+    /// helpers keep their own hardcoded tiers (Cheap / Fast) regardless
+    /// of this field — they're cheap by design.
     default_tier: athen_core::llm::ModelProfile,
 }
 
@@ -1470,106 +1469,6 @@ impl DefaultExecutor {
         }
     }
 
-    /// Ask a cheap LLM whether the agent is stuck (repeating the same tools,
-    /// loop guards firing, no progress) or making forward progress.
-    /// Returns `true` when the agent should be stopped.
-    async fn judge_runaway(
-        &self,
-        task_description: &str,
-        conversation: &[ChatMessage],
-        steps_completed: u32,
-    ) -> bool {
-        // Build a digest of the last 10 tool calls from conversation
-        let mut recent_tools: Vec<String> = Vec::new();
-        for msg in conversation.iter().rev() {
-            if recent_tools.len() >= 10 {
-                break;
-            }
-            if let MessageContent::Structured(v) = &msg.content {
-                if let Some(tool) = v.get("tool_calls") {
-                    if let Some(arr) = tool.as_array() {
-                        for tc in arr.iter().rev() {
-                            if recent_tools.len() >= 10 {
-                                break;
-                            }
-                            let name = tc.get("name").and_then(|n| n.as_str()).unwrap_or("?");
-                            recent_tools.push(name.to_string());
-                        }
-                    }
-                }
-                // Also check tool results
-                if let Some(content) = v.get("content") {
-                    if let Some(s) = content.as_str() {
-                        if s.contains("loop_guard") || s.contains("DEDUPE") {
-                            recent_tools.push("[loop_guard/dedupe hit]".to_string());
-                        }
-                    }
-                }
-            }
-        }
-        recent_tools.reverse();
-
-        let prompt = format!(
-            "You are evaluating whether an AI agent is stuck or making progress.\n\
-             \n\
-             TASK: {task_description}\n\
-             STEPS COMPLETED: {steps_completed}\n\
-             RECENT TOOL CALLS (newest last): {recent_list}\n\
-             \n\
-             Signs the agent is STUCK:\n\
-             - Repeating the same tools with same/similar arguments\n\
-             - Loop guard or dedupe messages appearing\n\
-             - No meaningful progress toward the task goal\n\
-             - Oscillating between two states\n\
-             \n\
-             Signs the agent is making PROGRESS:\n\
-             - Using different tools or different arguments\n\
-             - Building toward the task goal step by step\n\
-             - Reading/exploring then acting on findings\n\
-             \n\
-             Reply with ONLY one word: STOP or CONTINUE.",
-            recent_list = recent_tools.join(", "),
-        );
-
-        let request = LlmRequest {
-            messages: vec![ChatMessage {
-                role: Role::User,
-                content: MessageContent::Text(prompt),
-            }],
-            profile: ModelProfile::Cheap,
-            max_tokens: Some(5),
-            temperature: Some(0.0),
-            tools: None,
-            system_prompt: None,
-            reasoning_effort: athen_core::llm::ReasoningEffort::Off,
-        };
-
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            self.llm_router.route(&request),
-        )
-        .await
-        {
-            Ok(Ok(resp)) => {
-                let answer = resp.content.trim().to_uppercase();
-                tracing::debug!(
-                    steps = steps_completed,
-                    verdict = %answer,
-                    "Runaway judge verdict"
-                );
-                answer.contains("STOP")
-            }
-            Ok(Err(e)) => {
-                tracing::warn!("Runaway judge LLM error: {e}, defaulting to CONTINUE");
-                false // don't stop on judge failure
-            }
-            Err(_) => {
-                tracing::warn!("Runaway judge timed out, defaulting to CONTINUE");
-                false
-            }
-        }
-    }
-
     /// Attempt a streaming LLM call. Collects text deltas and forwards them
     /// through `self.stream_sender`. Also collects tool calls from SSE chunks.
     ///
@@ -1854,60 +1753,6 @@ impl AgentExecutor for DefaultExecutor {
             if timeout_guard.is_expired() {
                 tracing::warn!(task_id = %task_id, "Task execution timed out");
                 return Err(AthenError::Timeout(self.timeout));
-            }
-
-            // Periodic runaway check — every 30 steps after the first 25,
-            // ask a cheap LLM whether the agent is making progress.
-            // Generous thresholds: exploration-heavy tasks (planning, code
-            // audits) routinely hit 30+ read/list calls before acting.
-            const RUNAWAY_CHECK_INTERVAL: u32 = 30;
-            const RUNAWAY_CHECK_START: u32 = 25;
-            if steps_completed >= RUNAWAY_CHECK_START
-                && (steps_completed - RUNAWAY_CHECK_START).is_multiple_of(RUNAWAY_CHECK_INTERVAL)
-            {
-                let should_stop = self
-                    .judge_runaway(&task.description, &conversation, steps_completed)
-                    .await;
-                if should_stop {
-                    tracing::warn!(
-                        task_id = %task_id,
-                        steps = steps_completed,
-                        "Runaway judge: agent appears stuck, stopping"
-                    );
-                    // Ask for summary before stopping
-                    conversation.push(ChatMessage {
-                        role: Role::User,
-                        content: MessageContent::Text(
-                            "You appear to be stuck in a loop or not making progress. \
-                             Summarise what you accomplished so far and what remains."
-                                .to_string(),
-                        ),
-                    });
-                    let summary_request = LlmRequest {
-                        profile: self.default_tier,
-                        messages: conversation.clone(),
-                        max_tokens: Some(2048),
-                        temperature: Some(0.5),
-                        tools: None,
-                        system_prompt: None,
-                        reasoning_effort: athen_core::llm::ReasoningEffort::Off,
-                    };
-                    let summary = match self.llm_router.route(&summary_request).await {
-                        Ok(resp) => resp.content,
-                        Err(_) => "Agent stopped by runaway detection.".to_string(),
-                    };
-                    return Ok(TaskResult {
-                        task_id,
-                        success: false,
-                        output: Some(serde_json::json!({
-                            "reason": "runaway_detected",
-                            "steps_completed": steps_completed,
-                            "response": summary,
-                        })),
-                        steps_completed,
-                        total_risk_used: 0,
-                    });
-                }
             }
 
             // ── System-reminder injection ──

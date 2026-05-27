@@ -143,20 +143,16 @@ impl OpenAiEmbedding {
             "sending OpenAI embedding request"
         );
 
-        let response =
-            self.build_request(&url, &body)
-                .send()
-                .await
-                .map_err(|e| {
-                    if e.is_timeout() {
-                        AthenError::Timeout(Duration::from_secs(120))
-                    } else {
-                        AthenError::LlmProvider {
-                            provider: self.provider_id.clone(),
-                            message: format!("embedding request failed: {}", e),
-                        }
-                    }
-                })?;
+        let response = self.build_request(&url, &body).send().await.map_err(|e| {
+            if e.is_timeout() {
+                AthenError::Timeout(Duration::from_secs(120))
+            } else {
+                AthenError::LlmProvider {
+                    provider: self.provider_id.clone(),
+                    message: format!("embedding request failed: {}", e),
+                }
+            }
+        })?;
 
         let status = response.status();
         if !status.is_success() {

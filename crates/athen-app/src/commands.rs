@@ -472,8 +472,6 @@ fn format_user_error(err: &str) -> String {
         "Authentication failed. Please check your API key in Settings.".into()
     } else if err.contains("rate_limit") || err.contains("429") {
         "Rate limit reached. Please wait a moment and try again.".into()
-    } else if err.contains("runaway_detected") {
-        "I appeared to be stuck in a loop and was stopped. Try breaking the task into smaller parts.".into()
     } else if err.contains("budget") || err.contains("Budget") {
         "Budget limit reached. Check your spending limits in Settings.".into()
     } else if err.contains("RiskThresholdExceeded") {
@@ -9191,6 +9189,10 @@ pub async fn start_plan(
          or 'investigate Y' as a step — that's your job NOW, before submitting the plan). \
          Each step should be something concrete the agent will execute: edit a file, run a \
          command, create a resource, verify a result.\n\
+         \n\
+         Include VALIDATION steps — how to confirm the work is correct. Run tests, build the \
+         project, check output, try the feature. A good plan doesn't just make changes, it \
+         proves they work. Every non-trivial plan should end with at least one verification step.\n\
          \n\
          Be specific where you can — name files, functions, and expected outcomes. When you \
          can't be specific yet, give the direction and what to look for. Think like a senior \
