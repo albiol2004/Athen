@@ -125,7 +125,8 @@ pub fn system_summary(data_dir: &Path) -> SystemSummary {
     // Apple Silicon: ask sysctl directly — `sysinfo`'s brand string on
     // macOS is sometimes empty or generically "Apple M2", which loses
     // the generation digit we want for the recommendation heuristic.
-    let (cpu_brand, apple_silicon, apple_silicon_gen) = detect_apple_silicon(cpu_brand_from_sysinfo);
+    let (cpu_brand, apple_silicon, apple_silicon_gen) =
+        detect_apple_silicon(cpu_brand_from_sysinfo);
 
     let free_disk_gb = free_disk_gb_for(data_dir);
     let is_vm_or_wsl = detect_vm_or_wsl();

@@ -8944,3 +8944,177 @@ option:hover {
     display: none !important;
     content: none !important;
 }
+
+/* ─── Built-in (multilingual) embeddings sub-panel ─── */
+
+.bundled-emb-panel {
+    margin: 8px 0 16px;
+    padding: 16px 18px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--r-lg, 10px);
+}
+
+.bundled-emb-header h3 {
+    margin: 0 0 4px;
+    font-size: 14px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    color: var(--text);
+}
+.bundled-emb-blurb {
+    margin: 0 0 14px;
+    font-size: 12.5px;
+    color: var(--text-2);
+    line-height: 1.5;
+}
+
+.bundled-emb-rec {
+    margin: 0 0 14px;
+    padding: 10px 12px;
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm, 6px);
+    font-size: 12.5px;
+}
+.bundled-emb-rec-label {
+    color: var(--text-2);
+    margin-right: 6px;
+}
+.bundled-emb-rec-tier {
+    color: var(--accent, var(--brand-solid, #E36A5C));
+    font-weight: 600;
+}
+.bundled-emb-rec-sub {
+    margin-top: 4px;
+    font-size: 11.5px;
+    color: var(--text-3, var(--text-2));
+}
+
+.bundled-emb-tiers {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 12px;
+}
+
+.bundled-emb-tier-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 12px;
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm, 6px);
+    cursor: pointer;
+    transition: border-color var(--dur, 0.15s) var(--ease, ease);
+}
+.bundled-emb-tier-row:hover {
+    border-color: var(--border-strong);
+}
+.bundled-emb-tier-row.is-selected {
+    border-color: var(--accent, var(--brand-solid, #E36A5C));
+}
+
+.bundled-emb-tier-main {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+    flex: 1 1 auto;
+}
+.bundled-emb-tier-main input[type="radio"] {
+    flex: 0 0 auto;
+    margin: 0;
+}
+.bundled-emb-tier-info {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+.bundled-emb-tier-name {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.bundled-emb-tier-meta {
+    font-size: 11.5px;
+    color: var(--text-2);
+    margin-top: 2px;
+}
+
+.bundled-emb-rec-badge {
+    display: inline-block;
+    padding: 1px 7px;
+    border-radius: var(--r-pill, 999px);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    background: var(--accent-soft, rgba(227, 106, 92, 0.15));
+    color: var(--accent, var(--brand-solid, #E36A5C));
+}
+
+.bundled-emb-tier-action {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 0 0 auto;
+}
+
+.bundled-emb-downloaded {
+    font-size: 11.5px;
+    color: var(--success, #4CAF73);
+    font-weight: 500;
+}
+.bundled-emb-active {
+    font-size: 11.5px;
+    color: var(--accent, var(--brand-solid, #E36A5C));
+    font-weight: 600;
+}
+
+.bundled-emb-download-btn,
+.bundled-emb-delete-btn {
+    padding: 5px 11px;
+    border-radius: var(--r-sm, 6px);
+    font-size: 11.5px;
+    font-weight: 500;
+    border: 1px solid var(--border-strong);
+    background: var(--surface-2);
+    color: var(--text);
+    cursor: pointer;
+    transition: background var(--dur, 0.15s) var(--ease, ease),
+                border-color var(--dur, 0.15s) var(--ease, ease);
+}
+.bundled-emb-download-btn:hover,
+.bundled-emb-delete-btn:hover {
+    background: var(--surface-1);
+    border-color: var(--border-bright);
+}
+.bundled-emb-delete-btn {
+    color: var(--text-2);
+}
+
+.bundled-emb-cache {
+    margin: 0 0 12px;
+    font-size: 11.5px;
+    color: var(--text-3, var(--text-2));
+}
+
+/* Spinner used in the download modal */
+.bundled-emb-spinner {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    border: 2.5px solid var(--border);
+    border-top-color: var(--accent, var(--brand-solid, #E36A5C));
+    margin: 4px auto;
+    animation: bundled-emb-spin 0.9s linear infinite;
+}
+@keyframes bundled-emb-spin {
+    to { transform: rotate(360deg); }
+}

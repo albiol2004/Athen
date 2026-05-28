@@ -5822,6 +5822,8 @@ async function loadSettings() {
                 if (adv) adv.style.display = 'block';
                 if (arrow) arrow.textContent = '\u25BC';
             }
+            // Reveal the Built-in sub-panel if Bundled is the saved mode.
+            toggleBundledEmbPanel(settings.embeddings.mode || 'Automatic');
         }
         // Populate web search settings — keys are NOT echoed verbatim;
         // backend returns has-key + masked hint. Empty inputs mean
@@ -10006,14 +10008,28 @@ document.getElementById('save-notif-btn')?.addEventListener('click', async funct
 
 const EMBEDDING_MODE_HINTS = {
     'Automatic': 'Auto-detects the best available provider for generating embeddings.',
+    'Bundled': 'Runs a multilingual embedding model locally. No API key, no data leaves your machine.',
     'Cloud': 'Uses a cloud provider (requires API key) for highest quality embeddings.',
     'LocalOnly': 'Forces local-only embedding generation. No data leaves your machine.',
     'Off': 'Disables memory and embeddings entirely.',
 };
 
+function toggleBundledEmbPanel(mode) {
+    const panel = document.getElementById('bundled-emb-panel');
+    if (!panel) return;
+    if (mode === 'Bundled') {
+        panel.style.display = '';
+        // Lazy-load state on first reveal — invoke is gated inside.
+        loadBundledEmbState();
+    } else {
+        panel.style.display = 'none';
+    }
+}
+
 document.getElementById('embedding-mode')?.addEventListener('change', function() {
     const hint = document.getElementById('embedding-mode-hint');
     if (hint) hint.textContent = EMBEDDING_MODE_HINTS[this.value] || '';
+    toggleBundledEmbPanel(this.value);
 });
 
 document.getElementById('embedding-advanced-toggle')?.addEventListener('click', function() {
@@ -10098,6 +10114,327 @@ function showEmbeddingTestResult(success, message) {
     el.classList.remove('hidden');
     setTimeout(() => el.classList.add('hidden'), 5000);
 }
+
+// ─── Built-in (multilingual) embeddings sub-panel ───
+//
+// Backend contract (parallel agent):
+//   recommend_embedding_tier()        → SystemSummary
+//   get_bundled_embedding_status()    → { downloadedTiers, activeTier, cacheDir, totalCacheSizeMb }
+//   download_bundled_model({ tier })  → null   (long-running; emits embedding-download-progress)
+//   delete_bundled_model({ tier })    → null
+//   set_embedding_mode_bundled({ tier }) → null
+//
+// Progress event payload: { tier, phase: "starting"|"downloading"|"complete"|"failed", message }
+//
+// invoke is undefined until initTauri() — we gate on `typeof invoke === 'function'`
+// the same way wireCalendarSourcesPanel does.
+
+const BUNDLED_EMB_TIERS = [
+    {
+        id: 'light',
+        label: 'Light',
+        size: '~270 MB',
+        dim: '384-dim',
+        model: 'multilingual-e5-small',
+    },
+    {
+        id: 'standard',
+        label: 'Standard',
+        size: '~530 MB',
+        dim: '768-dim',
+        model: 'multilingual-e5-base',
+    },
+    {
+        id: 'high-quality',
+        label: 'HighQuality',
+        size: '~1.2 GB',
+        dim: '1024-dim',
+        model: 'BGE-M3',
+    },
+];
+
+const bundledEmbState = {
+    recommendedTier: null,    // "light" | "standard" | "high-quality"
+    activeTier: null,
+    downloadedTiers: [],
+    cacheDir: null,
+    totalCacheSizeMb: 0,
+    selectedTier: null,
+    systemSummary: null,
+    progressUnlisten: null,   // resolved fn from tauri listen()
+    downloading: false,
+};
+
+function bundledEmbTierLabel(id) {
+    const t = BUNDLED_EMB_TIERS.find(x => x.id === id);
+    return t ? t.label : id;
+}
+
+async function loadBundledEmbState() {
+    if (typeof invoke !== 'function') {
+        // Tauri not ready yet — retry shortly. Mirrors
+        // scheduleFirstCalendarSourcesRefresh.
+        setTimeout(loadBundledEmbState, 150);
+        return;
+    }
+    try {
+        const [summary, status] = await Promise.all([
+            invoke('recommend_embedding_tier'),
+            invoke('get_bundled_embedding_status'),
+        ]);
+        bundledEmbState.systemSummary = summary || null;
+        bundledEmbState.recommendedTier = summary && summary.recommendedTier ? summary.recommendedTier : null;
+        bundledEmbState.activeTier = status && status.activeTier ? status.activeTier : null;
+        bundledEmbState.downloadedTiers = (status && Array.isArray(status.downloadedTiers)) ? status.downloadedTiers : [];
+        bundledEmbState.cacheDir = status ? status.cacheDir || null : null;
+        bundledEmbState.totalCacheSizeMb = status ? status.totalCacheSizeMb || 0 : 0;
+
+        if (!bundledEmbState.selectedTier) {
+            bundledEmbState.selectedTier = bundledEmbState.activeTier
+                || bundledEmbState.recommendedTier
+                || 'standard';
+        }
+    } catch (err) {
+        console.warn('[athen] bundled embedding state load failed:', err);
+        showToast('Could not load built-in embeddings status: ' + err, 'error');
+    }
+    renderBundledEmbPanel();
+}
+
+function renderBundledEmbPanel() {
+    const recTierEl = document.getElementById('bundled-emb-rec-tier');
+    const recSubEl = document.getElementById('bundled-emb-rec-sub');
+    if (recTierEl) {
+        recTierEl.textContent = bundledEmbState.recommendedTier
+            ? bundledEmbTierLabel(bundledEmbState.recommendedTier)
+            : 'unknown';
+    }
+    if (recSubEl) {
+        const s = bundledEmbState.systemSummary;
+        if (s) {
+            const parts = [];
+            if (s.ramGb != null) parts.push(`${Math.round(s.ramGb)}GB RAM`);
+            if (s.physicalCores != null) parts.push(`${s.physicalCores} cores`);
+            if (s.freeDiskGb != null) parts.push(`${Math.round(s.freeDiskGb)}GB free`);
+            if (s.appleSilicon) parts.push('Apple Silicon');
+            if (s.isVmOrWsl) parts.push('VM/WSL');
+            recSubEl.textContent = parts.length ? `(${parts.join(', ')})` : '';
+        } else {
+            recSubEl.textContent = '';
+        }
+    }
+
+    const tiersEl = document.getElementById('bundled-emb-tiers');
+    if (tiersEl) {
+        tiersEl.innerHTML = '';
+        for (const t of BUNDLED_EMB_TIERS) {
+            tiersEl.appendChild(buildBundledEmbTierRow(t));
+        }
+    }
+
+    const cacheEl = document.getElementById('bundled-emb-cache');
+    if (cacheEl) {
+        if (bundledEmbState.downloadedTiers.length === 0) {
+            cacheEl.textContent = 'No models downloaded yet.';
+        } else {
+            const sz = bundledEmbState.totalCacheSizeMb;
+            const szTxt = sz >= 1024 ? `${(sz / 1024).toFixed(1)} GB` : `${Math.round(sz)} MB`;
+            cacheEl.textContent = `Cache: ${szTxt}${bundledEmbState.cacheDir ? ` (${bundledEmbState.cacheDir})` : ''}`;
+        }
+    }
+}
+
+function buildBundledEmbTierRow(tier) {
+    const row = document.createElement('div');
+    row.className = 'bundled-emb-tier-row';
+    if (bundledEmbState.selectedTier === tier.id) row.classList.add('is-selected');
+
+    const main = document.createElement('label');
+    main.className = 'bundled-emb-tier-main';
+
+    const radio = document.createElement('input');
+    radio.type = 'radio';
+    radio.name = 'bundled-emb-tier';
+    radio.value = tier.id;
+    radio.checked = bundledEmbState.selectedTier === tier.id;
+    radio.addEventListener('change', () => {
+        if (radio.checked) {
+            bundledEmbState.selectedTier = tier.id;
+            renderBundledEmbPanel();
+        }
+    });
+
+    const info = document.createElement('div');
+    info.className = 'bundled-emb-tier-info';
+
+    const name = document.createElement('div');
+    name.className = 'bundled-emb-tier-name';
+    name.textContent = tier.label;
+    if (bundledEmbState.recommendedTier === tier.id) {
+        const badge = document.createElement('span');
+        badge.className = 'bundled-emb-rec-badge';
+        badge.textContent = 'Recommended';
+        name.appendChild(badge);
+    }
+    if (bundledEmbState.activeTier === tier.id) {
+        const badge = document.createElement('span');
+        badge.className = 'bundled-emb-active';
+        badge.textContent = '· Active';
+        name.appendChild(badge);
+    }
+
+    const meta = document.createElement('div');
+    meta.className = 'bundled-emb-tier-meta';
+    meta.textContent = `${tier.size} · ${tier.dim} · ${tier.model}`;
+
+    info.appendChild(name);
+    info.appendChild(meta);
+    main.appendChild(radio);
+    main.appendChild(info);
+
+    const action = document.createElement('div');
+    action.className = 'bundled-emb-tier-action';
+
+    const isDownloaded = bundledEmbState.downloadedTiers.includes(tier.id);
+    if (isDownloaded) {
+        const ok = document.createElement('span');
+        ok.className = 'bundled-emb-downloaded';
+        ok.textContent = 'Downloaded ✓';
+        action.appendChild(ok);
+
+        const del = document.createElement('button');
+        del.type = 'button';
+        del.className = 'bundled-emb-delete-btn';
+        del.textContent = 'Delete';
+        del.addEventListener('click', async (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (bundledEmbState.downloading) return;
+            await deleteBundledTier(tier.id);
+        });
+        action.appendChild(del);
+    } else {
+        const dl = document.createElement('button');
+        dl.type = 'button';
+        dl.className = 'bundled-emb-download-btn';
+        dl.textContent = 'Download';
+        dl.addEventListener('click', async (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (bundledEmbState.downloading) return;
+            await downloadBundledTier(tier.id, false);
+        });
+        action.appendChild(dl);
+    }
+
+    row.appendChild(main);
+    row.appendChild(action);
+    return row;
+}
+
+async function deleteBundledTier(tierId) {
+    if (typeof invoke !== 'function') return;
+    try {
+        await invoke('delete_bundled_model', { tier: tierId });
+        showToast(`${bundledEmbTierLabel(tierId)} deleted`, 'success');
+        await loadBundledEmbState();
+    } catch (err) {
+        showToast('Delete failed: ' + err, 'error');
+    }
+}
+
+function showBundledEmbModal(tierLabel) {
+    const overlay = document.getElementById('bundled-emb-modal-overlay');
+    const title = document.getElementById('bundled-emb-modal-title');
+    const phase = document.getElementById('bundled-emb-modal-phase');
+    if (title) title.textContent = `Downloading ${tierLabel}`;
+    if (phase) phase.textContent = '';
+    if (overlay) overlay.classList.remove('hidden');
+}
+
+function hideBundledEmbModal() {
+    const overlay = document.getElementById('bundled-emb-modal-overlay');
+    if (overlay) overlay.classList.add('hidden');
+}
+
+function setBundledEmbModalPhase(text) {
+    const phase = document.getElementById('bundled-emb-modal-phase');
+    if (phase) phase.textContent = text || '';
+}
+
+async function ensureBundledEmbProgressListener() {
+    if (bundledEmbState.progressUnlisten) return;
+    if (!(window.__TAURI__ && window.__TAURI__.event && window.__TAURI__.event.listen)) return;
+    try {
+        bundledEmbState.progressUnlisten = await window.__TAURI__.event.listen(
+            'embedding-download-progress',
+            (event) => {
+                const p = event && event.payload ? event.payload : {};
+                const phaseTxt = p.phase ? `${p.phase}${p.message ? ' — ' + p.message : ''}` : '';
+                setBundledEmbModalPhase(phaseTxt);
+                // The awaited invoke('download_bundled_model') resolution is the
+                // authoritative "finished" signal; we just surface progress here.
+            }
+        );
+    } catch (err) {
+        console.warn('[athen] embedding progress listen failed:', err);
+    }
+}
+
+// Returns true on success, false on failure. Caller decides what to do next.
+async function downloadBundledTier(tierId, silent) {
+    if (typeof invoke !== 'function') return false;
+    if (bundledEmbState.downloading) return false;
+    bundledEmbState.downloading = true;
+    const tierLabel = bundledEmbTierLabel(tierId);
+    if (!silent) showBundledEmbModal(tierLabel);
+    await ensureBundledEmbProgressListener();
+    let ok = false;
+    try {
+        await invoke('download_bundled_model', { tier: tierId });
+        ok = true;
+        if (!silent) showToast(`${tierLabel} downloaded`, 'success');
+    } catch (err) {
+        showToast(`Download failed: ${err}`, 'error');
+    } finally {
+        bundledEmbState.downloading = false;
+        if (!silent) hideBundledEmbModal();
+        await loadBundledEmbState();
+    }
+    return ok;
+}
+
+document.getElementById('bundled-emb-apply-btn')?.addEventListener('click', async function() {
+    if (typeof invoke !== 'function') return;
+    const btn = this;
+    const tier = bundledEmbState.selectedTier;
+    if (!tier) {
+        showToast('Pick a tier first.', 'error');
+        return;
+    }
+    btn.disabled = true;
+    const origTxt = btn.textContent;
+    btn.textContent = 'Applying…';
+    try {
+        if (!bundledEmbState.downloadedTiers.includes(tier)) {
+            const ok = await downloadBundledTier(tier, false);
+            if (!ok) {
+                return;
+            }
+        }
+        await invoke('set_embedding_mode_bundled', { tier: tier });
+        // Keep the parent <select> in sync so a later Save isn't ambiguous.
+        const modeEl = document.getElementById('embedding-mode');
+        if (modeEl) modeEl.value = 'Bundled';
+        showToast(`Built-in embeddings active (tier: ${bundledEmbTierLabel(tier)})`, 'success');
+        await loadBundledEmbState();
+    } catch (err) {
+        showToast('Apply failed: ' + err, 'error');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = origTxt || 'Apply';
+    }
+});
 
 // ─── Arc Timeline ───
 

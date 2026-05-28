@@ -3053,11 +3053,9 @@ pub async fn save_embedding_settings(
         "Bundled:standard" => EmbeddingMode::Bundled {
             tier: BundledTier::Standard,
         },
-        "Bundled:high-quality" | "Bundled:highquality" | "Bundled:hq" => {
-            EmbeddingMode::Bundled {
-                tier: BundledTier::HighQuality,
-            }
-        }
+        "Bundled:high-quality" | "Bundled:highquality" | "Bundled:hq" => EmbeddingMode::Bundled {
+            tier: BundledTier::HighQuality,
+        },
         _ => EmbeddingMode::Automatic,
     };
 

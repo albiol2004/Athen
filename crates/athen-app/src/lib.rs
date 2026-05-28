@@ -9,6 +9,7 @@ pub(crate) mod approval;
 pub(crate) mod athen_docs;
 pub(crate) mod attachment_purger;
 pub(crate) mod bundle_settings;
+pub(crate) mod bundled_embeddings;
 pub(crate) mod calendar_sources;
 mod commands;
 pub(crate) mod compaction;
@@ -175,6 +176,11 @@ pub fn run() {
             settings::save_notification_settings,
             settings::save_embedding_settings,
             settings::test_embedding_provider,
+            bundled_embeddings::recommend_embedding_tier,
+            bundled_embeddings::get_bundled_embedding_status,
+            bundled_embeddings::download_bundled_model,
+            bundled_embeddings::delete_bundled_model,
+            bundled_embeddings::set_embedding_mode_bundled,
             commands::list_memories,
             commands::update_memory,
             commands::delete_memory,

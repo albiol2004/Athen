@@ -197,7 +197,10 @@ impl EmbeddingProvider for BundledEmbedding {
         // first `embed()` then fails (e.g. offline + no cached weights)
         // that error propagates from `ensure_model` and the router
         // moves on to the next provider.
-        info!(provider = Self::provider_id_static(self.tier), "bundled embedder marked available");
+        info!(
+            provider = Self::provider_id_static(self.tier),
+            "bundled embedder marked available"
+        );
         true
     }
 }

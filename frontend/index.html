@@ -299,11 +299,35 @@
                     <label for="embedding-mode">Memory Quality</label>
                     <select id="embedding-mode" class="settings-select">
                         <option value="Automatic">Automatic (recommended)</option>
+                        <option value="Bundled">Built-in (multilingual)</option>
                         <option value="Cloud">Cloud (highest quality)</option>
                         <option value="LocalOnly">Local only (private)</option>
                         <option value="Off">Off</option>
                     </select>
                     <p class="setting-hint" id="embedding-mode-hint">Auto-detects the best available provider for generating embeddings.</p>
+                </div>
+
+                <div id="bundled-emb-panel" class="bundled-emb-panel" style="display: none;">
+                    <div class="bundled-emb-header">
+                        <h3>Built-in multilingual embeddings</h3>
+                        <p class="bundled-emb-blurb">Runs locally on your machine, no API key needed. Supports 95+ languages.</p>
+                    </div>
+
+                    <div class="bundled-emb-rec" id="bundled-emb-rec">
+                        <span class="bundled-emb-rec-label">Recommended for your hardware:</span>
+                        <span class="bundled-emb-rec-tier" id="bundled-emb-rec-tier">…</span>
+                        <div class="bundled-emb-rec-sub" id="bundled-emb-rec-sub"></div>
+                    </div>
+
+                    <div class="bundled-emb-tiers" id="bundled-emb-tiers">
+                        <!-- Filled at runtime; one .bundled-emb-tier-row per tier. -->
+                    </div>
+
+                    <div class="bundled-emb-cache" id="bundled-emb-cache"></div>
+
+                    <div class="setting-actions">
+                        <button id="bundled-emb-apply-btn" class="btn-primary">Apply</button>
+                    </div>
                 </div>
 
                 <div class="setting-row">
@@ -1915,6 +1939,22 @@
                 <button id="provider-help-modal-close" class="profile-modal-close">&times;</button>
             </div>
             <div class="profile-modal-body" id="provider-help-modal-body" style="padding:16px 20px"></div>
+        </div>
+    </div>
+
+    <!-- Bundled embedding download modal -->
+    <div id="bundled-emb-modal-overlay" class="profile-modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="bundled-emb-modal-title">
+        <div class="profile-modal" style="max-width:460px">
+            <div class="profile-modal-header">
+                <h2 id="bundled-emb-modal-title">Downloading model</h2>
+            </div>
+            <div class="profile-modal-body" style="padding:16px 20px">
+                <p id="bundled-emb-modal-msg" style="margin:0 0 12px;color:var(--text-2);font-size:13px;line-height:1.55">
+                    Downloading model &mdash; this may take 1&ndash;5 minutes depending on your connection.
+                </p>
+                <div class="bundled-emb-spinner" aria-hidden="true"></div>
+                <p id="bundled-emb-modal-phase" style="margin:12px 0 0;color:var(--text-3);font-size:12px;font-family:var(--mono)"></p>
+            </div>
         </div>
     </div>
 
