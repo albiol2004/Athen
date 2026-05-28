@@ -670,6 +670,21 @@ impl KnowledgeGraph for SqliteGraph {
         .map_err(|e| AthenError::Other(e.to_string()))?;
         Ok(())
     }
+
+    async fn find_entity_by_name(&self, name: &str) -> Result<Option<EntityId>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| AthenError::Other(e.to_string()))?;
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT id FROM entities WHERE name = ?1 COLLATE NOCASE LIMIT 1",
+                params![name],
+                |row| row.get(0),
+            )
+            .ok();
+        Ok(existing.and_then(|s| Uuid::parse_str(&s).ok()))
+    }
 }
 
 #[cfg(test)]

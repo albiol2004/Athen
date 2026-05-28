@@ -271,6 +271,18 @@ impl KnowledgeGraph for InMemoryGraph {
             .retain(|e| !(e.from == from && e.to == to && e.relation == relation));
         Ok(())
     }
+
+    async fn find_entity_by_name(&self, name: &str) -> Result<Option<EntityId>> {
+        let entities = self.entities.read().await;
+        for e in entities.values() {
+            if e.name.eq_ignore_ascii_case(name) {
+                if let Some(id) = e.id {
+                    return Ok(Some(id));
+                }
+            }
+        }
+        Ok(None)
+    }
 }
 
 /// A shared wrapper around `InMemoryGraph` that allows inspecting internal state
@@ -357,6 +369,10 @@ impl KnowledgeGraph for SharedInMemoryGraph {
 
     async fn reinforce_entity(&self, entity_id: EntityId, amount: f32) -> Result<()> {
         self.inner.reinforce_entity(entity_id, amount).await
+    }
+
+    async fn find_entity_by_name(&self, name: &str) -> Result<Option<EntityId>> {
+        self.inner.find_entity_by_name(name).await
     }
 }
 

@@ -100,6 +100,50 @@ fn extract_entity_names_from_metadata(metadata: &serde_json::Value) -> Vec<Strin
     names
 }
 
+/// Cheap entity-name extraction from a query string when no extractor
+/// is wired (or it times out / fails). Picks out capitalized tokens
+/// (e.g. "Alice", "Acme Corp") and drops common stopwords / pronouns
+/// that often appear capitalized at sentence start. Conservative on
+/// purpose — false positives just cost an extra graph lookup that
+/// returns `None`.
+fn extract_entity_names_cheap(query: &str) -> Vec<String> {
+    // Pronouns and common interrogatives that often appear capitalized
+    // at sentence start but are never real entity names. NOTE: "User"
+    // is intentionally NOT in this list — it's the conventional name
+    // of the owner entity in Athen's graph and a legitimate pivot.
+    const PRONOUN_STOP: &[&str] = &[
+        "I", "Me", "My", "Mine", "You", "Your", "Yours", "We", "Us", "Our", "He", "She", "Him",
+        "Her", "His", "Hers", "It", "Its", "They", "Them", "Their", "What", "When", "Where",
+        "Which", "Who", "Why", "How", "Tell", "Show", "Find", "List", "Give", "Get", "About",
+    ];
+    let mut out: Vec<String> = Vec::new();
+    let mut current: Vec<&str> = Vec::new();
+    for raw_tok in query.split_whitespace() {
+        // Strip surrounding punctuation but keep internal hyphens/apostrophes.
+        let tok = raw_tok.trim_matches(|c: char| !c.is_alphanumeric());
+        if tok.is_empty() {
+            if !current.is_empty() {
+                out.push(current.join(" "));
+                current.clear();
+            }
+            continue;
+        }
+        let first = tok.chars().next().unwrap();
+        if first.is_uppercase() && !PRONOUN_STOP.contains(&tok) {
+            current.push(tok);
+        } else {
+            if !current.is_empty() {
+                out.push(current.join(" "));
+                current.clear();
+            }
+        }
+    }
+    if !current.is_empty() {
+        out.push(current.join(" "));
+    }
+    out
+}
+
 #[async_trait]
 impl MemoryStore for Memory {
     async fn remember(&self, item: MemoryItem) -> Result<()> {
@@ -204,14 +248,27 @@ impl MemoryStore for Memory {
         // Better than `found:false` (or surfacing a transient API error)
         // when the user expects "look something up by name" to just work.
         let Some(ref embedder) = self.embedder else {
-            return self.recall_keyword(query, limit).await;
+            let mut items = self.recall_keyword(query, limit).await?;
+            // Even on the keyword path, the graph hop is still useful:
+            // a memory linked only via an entity neighbor (e.g. "User
+            // works at Acme") won't contain the literal query tokens
+            // but is still semantically relevant. Pull entity-name
+            // candidates from the query cheaply and merge KG hops.
+            let names_from_query = extract_entity_names_cheap(query);
+            self.merge_graph_hops(&names_from_query, &[], &mut items, limit)
+                .await?;
+            return Ok(items);
         };
 
         let query_embedding = match embedder.embed(query).await {
             Ok(emb) => emb,
             Err(e) => {
                 warn!("embedder failed during recall ({e}); falling back to keyword search");
-                return self.recall_keyword(query, limit).await;
+                let mut items = self.recall_keyword(query, limit).await?;
+                let names_from_query = extract_entity_names_cheap(query);
+                self.merge_graph_hops(&names_from_query, &[], &mut items, limit)
+                    .await?;
+                return Ok(items);
             }
         };
 
@@ -309,7 +366,7 @@ impl MemoryStore for Memory {
         sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         // Filter by minimum relevance score, then take top `limit`.
-        let items = sorted
+        let mut items: Vec<MemoryItem> = sorted
             .into_iter()
             .filter(|(_, score, _)| *score >= self.min_relevance_score)
             .take(limit)
@@ -326,6 +383,18 @@ impl MemoryStore for Memory {
                 }
             })
             .collect();
+
+        // KG hop: pivot on entity names from the query (extractor if
+        // wired, with a short timeout, else a cheap capitalized-token
+        // scan) AND from the vector hits we just returned. For each
+        // entity ID we find via `find_entity_by_name`, walk one graph
+        // hop and pull in any neighbor-linked memories that weren't
+        // already in the vector results. This is purely additive — if
+        // the KG is empty or no entities match, items is unchanged.
+        let names_from_query = self.extract_query_entity_names(query).await;
+        let names_from_hits: Vec<String> = all_entity_names.into_iter().collect();
+        self.merge_graph_hops(&names_from_query, &names_from_hits, &mut items, limit)
+            .await?;
 
         Ok(items)
     }
@@ -482,6 +551,177 @@ impl Memory {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Pull candidate entity names from the recall query. Tries the
+    /// LLM extractor first under a 5s budget; if it isn't wired, times
+    /// out, or errors, falls back to the cheap regex-ish path.
+    /// Always returns *something* (possibly empty) — never blocks the
+    /// caller.
+    async fn extract_query_entity_names(&self, query: &str) -> Vec<String> {
+        if let Some(ref extractor) = self.extractor {
+            let fut = extractor.extract(query);
+            match tokio::time::timeout(std::time::Duration::from_secs(5), fut).await {
+                Ok(Ok(result)) => {
+                    let mut names: Vec<String> =
+                        result.entities.into_iter().map(|e| e.name).collect();
+                    // Augment with cheap-path names — extractors miss
+                    // single-token proper nouns sometimes.
+                    for n in extract_entity_names_cheap(query) {
+                        if !names.iter().any(|x| x.eq_ignore_ascii_case(&n)) {
+                            names.push(n);
+                        }
+                    }
+                    return names;
+                }
+                Ok(Err(e)) => {
+                    debug!("query entity extraction failed ({e}); using cheap fallback");
+                }
+                Err(_) => {
+                    debug!("query entity extraction timed out; using cheap fallback");
+                }
+            }
+        }
+        extract_entity_names_cheap(query)
+    }
+
+    /// Walk one graph hop from each candidate entity name, then merge
+    /// any newly-discovered memories into `items` with a graph-boost
+    /// score. Idempotent — memories already in `items` are skipped.
+    ///
+    /// `names_from_query` and `names_from_hits` are deduped together
+    /// (case-insensitive) before lookup. Skips silently if the graph
+    /// has no matching entities — never regresses today's behavior.
+    async fn merge_graph_hops(
+        &self,
+        names_from_query: &[String],
+        names_from_hits: &[String],
+        items: &mut Vec<MemoryItem>,
+        limit: usize,
+    ) -> Result<()> {
+        // Dedup candidate names case-insensitively.
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut candidate_names: Vec<&str> = Vec::new();
+        for n in names_from_query.iter().chain(names_from_hits.iter()) {
+            let key = n.to_lowercase();
+            if seen.insert(key) {
+                candidate_names.push(n.as_str());
+            }
+        }
+        if candidate_names.is_empty() {
+            return Ok(());
+        }
+
+        // For each candidate name, look up an entity ID and explore one hop.
+        let mut neighbor_names: HashSet<String> = HashSet::new();
+        // Track which names were pivot points so we don't re-fetch their
+        // own memories (vector path already covered them when relevant).
+        let mut pivot_lc: HashSet<String> = HashSet::new();
+
+        for name in &candidate_names {
+            let id_opt = match self.graph.find_entity_by_name(name).await {
+                Ok(opt) => opt,
+                Err(e) => {
+                    debug!("find_entity_by_name({name}) failed: {e}");
+                    continue;
+                }
+            };
+            let Some(id) = id_opt else { continue };
+            pivot_lc.insert(name.to_lowercase());
+
+            let params = ExploreParams {
+                max_depth: 1,
+                max_nodes: 5,
+                relevance_threshold: 0.0,
+                ..Default::default()
+            };
+            let nodes = match self.graph.explore(id, params).await {
+                Ok(n) => n,
+                Err(e) => {
+                    debug!("graph.explore({name}) failed: {e}");
+                    continue;
+                }
+            };
+
+            for node in nodes {
+                if node.depth == 0 {
+                    // The pivot itself — skip; we don't want to use
+                    // the pivot name as a search key (memories with
+                    // it should already be in the vector results).
+                    continue;
+                }
+                neighbor_names.insert(node.entity.name.clone());
+            }
+        }
+
+        if neighbor_names.is_empty() && pivot_lc.is_empty() {
+            return Ok(());
+        }
+
+        // Scan all stored memories once and pick those whose metadata
+        // `_entities` (or legacy `entities`) names match either a
+        // neighbor entity OR a pivot entity. Pivot inclusion is what
+        // surfaces "User's job is AI Engineer" when the query was
+        // "things about me" — the pivot is `User`, no neighbor exists
+        // for an isolated entity, so we need direct-pivot-membership
+        // as a fallback.
+        let existing_ids: HashSet<String> = items.iter().map(|m| m.id.clone()).collect();
+        let all = match self.vector.list_all().await {
+            Ok(v) => v,
+            Err(e) => {
+                debug!("vector.list_all failed during graph hop: {e}");
+                return Ok(());
+            }
+        };
+
+        let mut graph_hits: Vec<MemoryItem> = Vec::new();
+        for r in all {
+            if existing_ids.contains(&r.id) {
+                continue;
+            }
+            let names = extract_entity_names_from_metadata(&r.metadata);
+            if names.is_empty() {
+                continue;
+            }
+            let matches = names.iter().any(|n| {
+                let lc = n.to_lowercase();
+                neighbor_names.iter().any(|nb| nb.eq_ignore_ascii_case(n))
+                    || pivot_lc.contains(&lc)
+            });
+            if !matches {
+                continue;
+            }
+            let content = r
+                .metadata
+                .get("_content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            graph_hits.push(MemoryItem {
+                id: r.id,
+                content,
+                metadata: r.metadata,
+            });
+        }
+
+        if graph_hits.is_empty() {
+            return Ok(());
+        }
+
+        debug!(
+            "graph hop contributed {} additional memory hits ({} pivots, {} neighbors)",
+            graph_hits.len(),
+            pivot_lc.len(),
+            neighbor_names.len()
+        );
+
+        // Append graph-discovered hits and re-trim to `limit`. The
+        // existing vector hits keep their order at the top (they
+        // scored above min_relevance_score); graph hits come after.
+        items.extend(graph_hits);
+        items.truncate(limit);
+
         Ok(())
     }
 
@@ -1144,5 +1384,156 @@ mod tests {
                 edges[0].strength
             );
         }
+    }
+
+    // --- Graph-traversal recall tests (the bug this fixes) ---
+
+    /// Memory linked to a `User` entity surfaces on a recall whose
+    /// literal tokens don't appear in the content, because the graph
+    /// hop walks from the `User` pivot. Before this fix, the recall
+    /// was vector-only — `things about me` wouldn't surface
+    /// `Job: AI Engineer` because the embedding similarity between the
+    /// query and the content was below threshold.
+    #[tokio::test]
+    async fn recall_surfaces_memory_via_graph_pivot() {
+        let mem = Memory::new(
+            Box::new(InMemoryVectorIndex::new()),
+            Box::new(InMemoryGraph::new()),
+        )
+        .with_embedder(Box::new(KeywordEmbedding::new()))
+        .with_min_score(0.5); // Force the vector path to miss the job memory.
+
+        // Pre-seed the graph with a `User` entity so the pivot lookup
+        // works. Real `remember()` calls would normally add this via
+        // the metadata.entities path.
+        mem.graph
+            .add_entity(Entity {
+                id: None,
+                entity_type: EntityType::Person,
+                name: "User".to_string(),
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+
+        // Store a memory linked to `User` via metadata.entities. Its
+        // literal content has no overlap with "things about me", so
+        // a keyword/embedding match would miss it.
+        mem.remember(MemoryItem {
+            id: "job".to_string(),
+            content: "Job: AI Engineer".to_string(),
+            metadata: serde_json::json!({
+                "entities": [
+                    {"name": "User", "type": "Person"}
+                ]
+            }),
+        })
+        .await
+        .unwrap();
+
+        // Query mentions "User" so the cheap extractor picks it up
+        // as a pivot. Embedding similarity to "Job: AI Engineer" is
+        // low (well below min_score 0.5), so the vector path filters
+        // it out. The KG hop should put it back.
+        let hits = mem.recall("tell me about User", 5).await.unwrap();
+        assert!(
+            hits.iter().any(|m| m.id == "job"),
+            "expected 'job' memory to surface via KG pivot; got {:?}",
+            hits.iter().map(|m| &m.id).collect::<Vec<_>>()
+        );
+    }
+
+    /// Recall on a query with no entity matches and no graph
+    /// connections behaves exactly as the pre-fix vector-only path.
+    /// This is the regression guard.
+    #[tokio::test]
+    async fn recall_with_no_entities_matches_vector_only_path() {
+        let mem = make_memory().with_min_score(0.0);
+
+        // No entities anywhere — pure-content memories.
+        for (id, content) in &[
+            ("a", "Rust programming language tutorial"),
+            ("b", "Python data science notes"),
+            ("c", "JavaScript web development guide"),
+        ] {
+            mem.remember(MemoryItem {
+                id: id.to_string(),
+                content: content.to_string(),
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        }
+
+        // Query with no capitalized tokens → cheap extractor returns
+        // empty → merge_graph_hops short-circuits → vector path is
+        // the only thing that runs.
+        let results = mem.recall("rust programming", 5).await.unwrap();
+        assert!(!results.is_empty(), "vector path should still hit");
+        // Rust item should win.
+        assert_eq!(results[0].id, "a");
+        // No extras came from the KG path (graph is empty anyway).
+        assert!(results.iter().all(|m| ["a", "b", "c"].contains(&m.id.as_str())));
+    }
+
+    /// With no extractor wired and no embedder, the cheap entity
+    /// extraction from the query still drives a successful KG hop.
+    /// Confirms the keyword-fallback path also benefits from the fix.
+    #[tokio::test]
+    async fn recall_extractor_disabled_still_uses_graph() {
+        // No embedder → keyword path. No extractor → cheap regex path
+        // for query entity names.
+        let mem = make_memory_no_embedder();
+
+        // Seed graph with an "Acme" entity by hand (no extractor to
+        // do it for us during remember).
+        let acme_id = mem
+            .graph
+            .add_entity(Entity {
+                id: None,
+                entity_type: EntityType::Organization,
+                name: "Acme".to_string(),
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        let payroll_id = mem
+            .graph
+            .add_entity(Entity {
+                id: None,
+                entity_type: EntityType::Concept,
+                name: "Payroll".to_string(),
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        mem.graph
+            .add_relation(acme_id, "has", payroll_id)
+            .await
+            .unwrap();
+
+        // Pre-populate the vector store directly — content has zero
+        // token overlap with "Acme" so keyword fallback can't find
+        // it. The KG path must.
+        mem.vector
+            .upsert(
+                "doc",
+                vec![],
+                serde_json::json!({
+                    "_content": "Quarterly compensation breakdown for engineering",
+                    "entities": [
+                        {"name": "Payroll", "type": "Concept"}
+                    ]
+                }),
+            )
+            .await
+            .unwrap();
+
+        let hits = mem.recall("info about Acme", 5).await.unwrap();
+        assert!(
+            hits.iter().any(|m| m.id == "doc"),
+            "expected 'doc' memory to surface via cheap-extractor + KG hop on the keyword path; got {:?}",
+            hits.iter().map(|m| &m.id).collect::<Vec<_>>()
+        );
     }
 }

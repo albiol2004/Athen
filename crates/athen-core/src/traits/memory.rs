@@ -81,6 +81,27 @@ pub trait KnowledgeGraph: Send + Sync {
     async fn reinforce_entity(&self, _entity_id: EntityId, _amount: f32) -> Result<()> {
         Ok(())
     }
+
+    /// Look up an entity ID by its name (case-insensitive).
+    ///
+    /// Used by hybrid recall to pivot from a name (extracted from the
+    /// query or from a vector hit's metadata) into the graph for a
+    /// neighbor hop. Returns `None` if no entity matches.
+    ///
+    /// Default implementation scans `list_entities` and does a
+    /// case-insensitive name compare. Storage-backed impls (SQLite)
+    /// should override with an indexed lookup.
+    async fn find_entity_by_name(&self, name: &str) -> Result<Option<EntityId>> {
+        let entities = self.list_entities().await?;
+        for e in entities {
+            if e.name.eq_ignore_ascii_case(name) {
+                if let Some(id) = e.id {
+                    return Ok(Some(id));
+                }
+            }
+        }
+        Ok(None)
+    }
 }
 
 /// Unified memory facade.
