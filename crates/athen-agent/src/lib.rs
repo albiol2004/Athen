@@ -70,6 +70,8 @@ pub struct AgentBuilder {
     auto_reminders: bool,
     default_reasoning_effort: athen_core::llm::ReasoningEffort,
     default_tier: athen_core::llm::ModelProfile,
+    grant_lookup: Option<Arc<dyn athen_risk::path_eval::GrantLookup>>,
+    arc_uuid: Option<uuid::Uuid>,
 }
 
 impl AgentBuilder {
@@ -106,7 +108,26 @@ impl AgentBuilder {
             auto_reminders: false,
             default_reasoning_effort: athen_core::llm::ReasoningEffort::Default,
             default_tier: athen_core::llm::ModelProfile::Fast,
+            grant_lookup: None,
+            arc_uuid: None,
         }
+    }
+
+    /// Attach an optional grant-lookup port so the executor can compute
+    /// `cwd_in_grant` for the per-call `shell_classifier`. Without this
+    /// the classifier still runs but `LowerToSilent` hints never fire
+    /// — only `ForceHumanConfirm` (always-prompt verbs) gets through.
+    pub fn grant_lookup(mut self, lookup: Arc<dyn athen_risk::path_eval::GrantLookup>) -> Self {
+        self.grant_lookup = Some(lookup);
+        self
+    }
+
+    /// Stamp the arc UUID used as the grant-lookup key (the host derives
+    /// this with `file_gate::arc_uuid(&arc_id)`). Required alongside
+    /// `grant_lookup` for `LowerToSilent` to fire.
+    pub fn arc_uuid(mut self, arc: uuid::Uuid) -> Self {
+        self.arc_uuid = Some(arc);
+        self
     }
 
     /// Attach a custom `SystemReminderBuilder` (trajectory-aware /
@@ -466,6 +487,13 @@ impl AgentBuilder {
 
         executor.set_default_reasoning_effort(self.default_reasoning_effort);
         executor.set_default_tier(self.default_tier);
+
+        if let Some(lookup) = self.grant_lookup {
+            executor.set_grant_lookup(lookup);
+        }
+        if let Some(arc) = self.arc_uuid {
+            executor.set_arc_uuid(arc);
+        }
 
         Ok(executor)
     }

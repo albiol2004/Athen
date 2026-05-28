@@ -358,6 +358,21 @@ pub struct DefaultExecutor {
     /// helpers keep their own hardcoded tiers (Cheap / Fast) regardless
     /// of this field — they're cheap by design.
     default_tier: athen_core::llm::ModelProfile,
+    /// Optional grant-lookup port used to decide whether the
+    /// `shell_execute` cwd is covered by a write-grant. When set, the
+    /// executor calls `shell_classifier::classify` before dispatching
+    /// `shell_execute` and folds the hint into a per-call
+    /// [`athen_core::risk::RiskDecision`] via
+    /// `shell_classifier::merge_shell_hint`. `None` (the default)
+    /// reproduces today's behavior — no per-call classifier override.
+    grant_lookup: Option<Arc<dyn athen_risk::path_eval::GrantLookup>>,
+    /// Arc UUID used as the lookup key for `grant_lookup`. The host
+    /// (athen-app) derives this with `file_gate::arc_uuid(&arc_id)` and
+    /// passes it through the builder. When `None` the per-call shell
+    /// classifier still runs but always sees `cwd_in_grant=false`, so
+    /// only `ForceHumanConfirm` (dangerous-verb) hits ever override
+    /// upstream — `LowerToSilent` never fires without an arc.
+    arc_uuid: Option<Uuid>,
 }
 
 impl DefaultExecutor {
@@ -396,7 +411,67 @@ impl DefaultExecutor {
             auto_reminders: false,
             default_reasoning_effort: athen_core::llm::ReasoningEffort::Default,
             default_tier: athen_core::llm::ModelProfile::Fast,
+            grant_lookup: None,
+            arc_uuid: None,
         }
+    }
+
+    /// Attach an optional grant-lookup port for the per-call shell
+    /// classifier. Used to compute `cwd_in_grant` before
+    /// `shell_execute` dispatch.
+    pub fn set_grant_lookup(&mut self, lookup: Arc<dyn athen_risk::path_eval::GrantLookup>) {
+        self.grant_lookup = Some(lookup);
+    }
+
+    /// Stamp the arc UUID used as the grant-lookup key. Without this
+    /// the classifier always sees `cwd_in_grant=false`, which means
+    /// `LowerToSilent` hints never fire (`ForceHumanConfirm` for
+    /// dangerous verbs still does — those are grant-independent).
+    pub fn set_arc_uuid(&mut self, arc: Uuid) {
+        self.arc_uuid = Some(arc);
+    }
+
+    /// Resolve the `cwd_in_grant` boolean fed to
+    /// `shell_classifier::classify`. Reads `cwd` from the tool args
+    /// (relative paths resolve against the host process's current
+    /// directory, mirroring how the shell tool itself resolves them),
+    /// then asks the configured `GrantLookup` whether the directory
+    /// is covered by an arc write-grant.
+    ///
+    /// Returns `false` (the conservative default) when any prerequisite
+    /// is missing: no `GrantLookup` wired, no arc UUID stamped, no
+    /// resolvable cwd, or the lookup errors. This matches the
+    /// classifier's contract: `false` means LowerToSilent never fires
+    /// for this call.
+    async fn compute_cwd_in_grant(&self, args: &serde_json::Value) -> bool {
+        let Some(lookup) = self.grant_lookup.as_ref() else {
+            return false;
+        };
+        let Some(arc) = self.arc_uuid else {
+            return false;
+        };
+        let cwd_arg = args.get("cwd").and_then(|v| v.as_str());
+        let cwd: PathBuf = match cwd_arg {
+            Some(s) if !s.is_empty() => {
+                let p = PathBuf::from(s);
+                if p.is_absolute() {
+                    p
+                } else if let Ok(abs) = std::env::current_dir().map(|c| c.join(&p)) {
+                    abs
+                } else {
+                    return false;
+                }
+            }
+            _ => match std::env::current_dir() {
+                Ok(p) => p,
+                Err(_) => return false,
+            },
+        };
+        // Write access — the relevant question is "is this directory
+        // writable by the agent under an arc grant?", since shell calls
+        // are dispatch-side and we want to lower only when the cwd is
+        // already part of the trusted project root.
+        lookup.check(arc, &cwd, true).await.unwrap_or(false)
     }
 
     /// Attach a custom `SystemReminderBuilder` whose `build()` output
@@ -2229,12 +2304,93 @@ impl AgentExecutor for DefaultExecutor {
             // racing the shell's internal timeout.
             let executor_remaining_ms = timeout_guard.remaining().as_millis() as u64;
 
+            // Per-call shell-classifier short-circuits. Computed
+            // up-front (the lookup is async — can't run inside the
+            // per-dispatch closure cleanly) so each shell_execute call
+            // already knows whether to bypass the underlying tool
+            // because the classifier folded into a refusing
+            // RiskDecision. `None` = no override; proceed normally.
+            let mut classifier_short_circuit: Vec<Option<athen_core::tool::ToolResult>> =
+                vec![None; response.tool_calls.len()];
+            for (idx, tc) in response.tool_calls.iter().enumerate() {
+                if tc.name != "shell_execute" {
+                    continue;
+                }
+                let Some(command) = tc.arguments.get("command").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let cwd_in_grant = self.compute_cwd_in_grant(&tc.arguments).await;
+                let hint = crate::shell_classifier::classify(command, cwd_in_grant);
+                // Treat the per-call upstream as NotifyAndProceed today:
+                // there is no per-tool-call risk evaluator in the
+                // executor (sense-level RiskDecision applies once at
+                // event triage). NotifyAndProceed is the implicit
+                // "tool can run" stance the dispatch loop has used
+                // historically. The merge then lets ForceHumanConfirm
+                // upgrade to a prompt-style refusal and LowerToSilent
+                // drop to SilentApprove (logged but otherwise pass-through).
+                let upstream = athen_core::risk::RiskDecision::NotifyAndProceed;
+                let merged = crate::shell_classifier::merge_shell_hint(upstream, hint);
+                match merged {
+                    athen_core::risk::RiskDecision::HumanConfirm => {
+                        tracing::warn!(
+                            tool = "shell_execute",
+                            command,
+                            ?hint,
+                            "shell_classifier forced HumanConfirm — refusing dispatch without approval"
+                        );
+                        classifier_short_circuit[idx] = Some(athen_core::tool::ToolResult {
+                            success: false,
+                            output: serde_json::json!({
+                                "error": "Command requires explicit user approval",
+                                "reason": "The shell classifier flagged this command as always-prompt (e.g. sudo, package install, pipe-to-shell, force-push, dd, chmod 777). Approval routing for shell is not yet wired — refusing the call so the model can ask the user explicitly or pick a safer alternative.",
+                                "command": command,
+                                "hint": format!("{:?}", hint),
+                            }),
+                            error: Some("shell_classifier_force_confirm".to_string()),
+                            execution_time_ms: 0,
+                        });
+                    }
+                    athen_core::risk::RiskDecision::HardBlock => {
+                        // Defensive — today's `upstream = NotifyAndProceed`
+                        // means this branch is unreachable, but keeping
+                        // it makes the merge contract explicit when a
+                        // real upstream evaluator lands later.
+                        tracing::warn!(
+                            tool = "shell_execute",
+                            command,
+                            ?hint,
+                            "shell_classifier merged to HardBlock — refusing dispatch"
+                        );
+                        classifier_short_circuit[idx] = Some(athen_core::tool::ToolResult {
+                            success: false,
+                            output: serde_json::json!({
+                                "error": "Command hard-blocked",
+                                "command": command,
+                            }),
+                            error: Some("shell_classifier_hard_block".to_string()),
+                            execution_time_ms: 0,
+                        });
+                    }
+                    athen_core::risk::RiskDecision::SilentApprove => {
+                        tracing::debug!(
+                            tool = "shell_execute",
+                            command,
+                            ?hint,
+                            "shell_classifier lowered to SilentApprove (cwd in grant)"
+                        );
+                    }
+                    athen_core::risk::RiskDecision::NotifyAndProceed => { /* default */ }
+                }
+            }
+
             let dispatches = response.tool_calls.iter().enumerate().map(|(idx, tc)| {
                 let name = tc.name.clone();
                 let mut args = tc.arguments.clone();
                 let started_at = Utc::now();
                 let loop_guarded = should_loop_guard[idx];
                 let dedup_of = dedup_target[idx];
+                let classifier_refusal = classifier_short_circuit[idx].take();
 
                 // Clamp timeout_ms for shell tools that accept it.
                 let clamped_short_circuit = if name == "shell_execute" || name == "shell_spawn" {
@@ -2244,6 +2400,9 @@ impl AgentExecutor for DefaultExecutor {
                 };
 
                 async move {
+                    if let Some(refusal) = classifier_refusal {
+                        return (started_at, Ok(refusal));
+                    }
                     if loop_guarded {
                         return (
                             started_at,
@@ -4177,6 +4336,251 @@ mod tests {
             b.contains("change your approach"),
             "failed-prior pointer should advise changing approach, got: {}",
             b
+        );
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // Shell-classifier integration with the dispatch loop.
+    //
+    // These check the executor-pull wiring: the per-call classifier
+    // runs only for `shell_execute`, `ForceHumanConfirm` short-circuits
+    // dispatch with a refusal ToolResult (and the underlying tool is
+    // never invoked), and `cwd_in_grant=false` keeps a borderline
+    // command at the upstream NotifyAndProceed default (i.e. dispatch
+    // proceeds normally).
+    // ───────────────────────────────────────────────────────────────
+
+    /// `GrantLookup` test double — returns the same boolean for every call.
+    struct StubGrantLookup(bool);
+
+    #[async_trait]
+    impl athen_risk::path_eval::GrantLookup for StubGrantLookup {
+        async fn check(
+            &self,
+            _arc_id: Uuid,
+            _path: &std::path::Path,
+            _write: bool,
+        ) -> Result<bool> {
+            Ok(self.0)
+        }
+    }
+
+    /// Counts dispatch calls — used to assert the underlying tool was
+    /// (or wasn't) invoked when the classifier short-circuits.
+    struct CountingRegistry {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl CountingRegistry {
+        fn new() -> (Self, Arc<AtomicUsize>) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            (
+                Self {
+                    calls: calls.clone(),
+                },
+                calls,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl ToolRegistry for CountingRegistry {
+        async fn list_tools(&self) -> Result<Vec<ToolDefinition>> {
+            Ok(vec![])
+        }
+        async fn call_tool(
+            &self,
+            _name: &str,
+            _args: serde_json::Value,
+        ) -> Result<CoreToolResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(CoreToolResult {
+                success: true,
+                output: serde_json::json!({"ran": true}),
+                error: None,
+                execution_time_ms: 1,
+            })
+        }
+    }
+
+    /// `ForceHumanConfirm` (pip install) must short-circuit with a
+    /// refusal ToolResult — the underlying shell tool is never called.
+    #[tokio::test]
+    async fn shell_classifier_force_blocks_dispatch() {
+        let tool_call = ToolCall {
+            id: "call_pip".to_string(),
+            name: "shell_execute".to_string(),
+            arguments: serde_json::json!({"command": "pip install evil"}),
+            thought_signature: None,
+        };
+        let responses = vec![
+            MockLlmRouter::make_response("Installing.", vec![tool_call]),
+            MockLlmRouter::make_response("Done.", vec![]),
+        ];
+
+        let (registry, calls) = CountingRegistry::new();
+        let mut executor = DefaultExecutor::new(
+            Box::new(MockLlmRouter::new(responses)),
+            Box::new(registry),
+            Box::new(InMemoryAuditor::new()),
+            Duration::from_secs(60),
+            vec![],
+        );
+        // Grant lookup says yes — irrelevant: ForceHumanConfirm wins
+        // regardless of grant.
+        executor.set_grant_lookup(Arc::new(StubGrantLookup(true)));
+        executor.set_arc_uuid(Uuid::new_v4());
+
+        let _ = executor.execute(make_task("install evil")).await.unwrap();
+        // The underlying shell tool must NOT have been invoked.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "ForceHumanConfirm should short-circuit dispatch — tool was called {} times",
+            calls.load(Ordering::SeqCst)
+        );
+    }
+
+    /// `KeepHumanConfirm` (vim) on a granted cwd must NOT short-circuit
+    /// — the merge returns NotifyAndProceed and dispatch proceeds.
+    #[tokio::test]
+    async fn shell_classifier_keep_proceeds() {
+        let tool_call = ToolCall {
+            id: "call_vim".to_string(),
+            name: "shell_execute".to_string(),
+            arguments: serde_json::json!({"command": "vim README.md"}),
+            thought_signature: None,
+        };
+        let responses = vec![
+            MockLlmRouter::make_response("Opening.", vec![tool_call]),
+            MockLlmRouter::make_response("Done.", vec![]),
+        ];
+
+        let (registry, calls) = CountingRegistry::new();
+        let mut executor = DefaultExecutor::new(
+            Box::new(MockLlmRouter::new(responses)),
+            Box::new(registry),
+            Box::new(InMemoryAuditor::new()),
+            Duration::from_secs(60),
+            vec![],
+        );
+        executor.set_grant_lookup(Arc::new(StubGrantLookup(true)));
+        executor.set_arc_uuid(Uuid::new_v4());
+
+        let _ = executor.execute(make_task("edit")).await.unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "KeepHumanConfirm should pass through to the underlying tool"
+        );
+    }
+
+    /// `LowerToSilent` (cargo build) only fires when `cwd_in_grant=true`.
+    /// With `cwd_in_grant=false` the classifier returns KeepHumanConfirm,
+    /// the merge keeps the upstream NotifyAndProceed default, and
+    /// dispatch proceeds normally — no refusal.
+    #[tokio::test]
+    async fn shell_classifier_no_grant_keeps_dispatch() {
+        let tool_call = ToolCall {
+            id: "call_cargo".to_string(),
+            name: "shell_execute".to_string(),
+            arguments: serde_json::json!({"command": "cargo build"}),
+            thought_signature: None,
+        };
+        let responses = vec![
+            MockLlmRouter::make_response("Building.", vec![tool_call]),
+            MockLlmRouter::make_response("Done.", vec![]),
+        ];
+
+        let (registry, calls) = CountingRegistry::new();
+        let mut executor = DefaultExecutor::new(
+            Box::new(MockLlmRouter::new(responses)),
+            Box::new(registry),
+            Box::new(InMemoryAuditor::new()),
+            Duration::from_secs(60),
+            vec![],
+        );
+        // No grant — classifier returns KeepHumanConfirm.
+        executor.set_grant_lookup(Arc::new(StubGrantLookup(false)));
+        executor.set_arc_uuid(Uuid::new_v4());
+
+        let _ = executor.execute(make_task("build")).await.unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "No grant + cargo build should pass through"
+        );
+    }
+
+    /// Non-shell-execute tool names must never go through the
+    /// classifier — even with the same dangerous-looking command in args.
+    #[tokio::test]
+    async fn shell_classifier_skips_non_shell_tools() {
+        let tool_call = ToolCall {
+            id: "call_other".to_string(),
+            name: "write".to_string(),
+            // Same JSON as shell_execute would carry — confirms the
+            // gate keys on tool name, not args shape.
+            arguments: serde_json::json!({"command": "pip install evil"}),
+            thought_signature: None,
+        };
+        let responses = vec![
+            MockLlmRouter::make_response("Writing.", vec![tool_call]),
+            MockLlmRouter::make_response("Done.", vec![]),
+        ];
+
+        let (registry, calls) = CountingRegistry::new();
+        let mut executor = DefaultExecutor::new(
+            Box::new(MockLlmRouter::new(responses)),
+            Box::new(registry),
+            Box::new(InMemoryAuditor::new()),
+            Duration::from_secs(60),
+            vec![],
+        );
+        executor.set_grant_lookup(Arc::new(StubGrantLookup(true)));
+        executor.set_arc_uuid(Uuid::new_v4());
+
+        let _ = executor.execute(make_task("write")).await.unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "Non-shell-execute tools must not be classifier-gated"
+        );
+    }
+
+    /// Without a `GrantLookup` wired, the classifier still runs but
+    /// `cwd_in_grant=false` — so dangerous verbs still trigger
+    /// `ForceHumanConfirm` and short-circuit, while LowerToSilent
+    /// hints never fire. The dangerous-verb path is the safety-critical
+    /// one and is grant-independent by design.
+    #[tokio::test]
+    async fn shell_classifier_works_without_grant_lookup() {
+        let tool_call = ToolCall {
+            id: "call_sudo".to_string(),
+            name: "shell_execute".to_string(),
+            arguments: serde_json::json!({"command": "sudo rm -rf /home/x"}),
+            thought_signature: None,
+        };
+        let responses = vec![
+            MockLlmRouter::make_response("Nope.", vec![tool_call]),
+            MockLlmRouter::make_response("Done.", vec![]),
+        ];
+
+        let (registry, calls) = CountingRegistry::new();
+        let executor = DefaultExecutor::new(
+            Box::new(MockLlmRouter::new(responses)),
+            Box::new(registry),
+            Box::new(InMemoryAuditor::new()),
+            Duration::from_secs(60),
+            vec![],
+        );
+        // Intentionally no `set_grant_lookup` / `set_arc_uuid`.
+
+        let _ = executor.execute(make_task("sudo rm")).await.unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "ForceHumanConfirm must short-circuit even without a grant lookup wired"
         );
     }
 }

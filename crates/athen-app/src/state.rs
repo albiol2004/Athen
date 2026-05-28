@@ -3070,6 +3070,18 @@ async fn execute_owner_telegram_message(
         .acceptance_criteria(acceptance_criteria)
         .enable_default_reminders(true)
         .default_temperature(sampling_temperature);
+    // Per-call shell classifier needs a GrantLookup + arc UUID. Wire
+    // them when both the grant store and a target arc id are available
+    // (owner-Telegram may run before the arc is allocated, in which
+    // case `LowerToSilent` simply never fires — `ForceHumanConfirm`
+    // still does, which is the safety-critical path).
+    if let (Some(store), Some(arc_str)) =
+        (deps.grant_store.clone(), target_arc_id.as_ref())
+    {
+        builder = builder
+            .grant_lookup(Arc::new(crate::file_gate::GrantStoreLookup::new(store)))
+            .arc_uuid(crate::file_gate::arc_uuid(arc_str));
+    }
     if let Some(p) = deps.tool_doc_dir.as_deref() {
         builder = builder.tool_doc_dir(p.to_path_buf());
     }

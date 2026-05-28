@@ -7,9 +7,16 @@
 //! (when the command does something inherently scary — sudo, pipes to shell,
 //! package installs, force-pushes, etc.).
 //!
-//! This module is intentionally side-effect free. The executor wires it up
-//! in Batch 3; tests here cover the classifier in isolation.
+//! [`merge_shell_hint`] folds a [`ShellRiskHint`] into an upstream
+//! [`RiskDecision`] following the priority rules described on its docs. The
+//! executor calls it before dispatching `shell_execute` so an
+//! always-prompt verb forces a HumanConfirm regardless of any autonomy
+//! lowering the upstream evaluator did first.
+//!
+//! This module is intentionally side-effect free. Tests here cover both
+//! the classifier and the merge helper in isolation.
 
+use athen_core::risk::RiskDecision;
 use regex::Regex;
 use std::sync::LazyLock;
 
@@ -405,6 +412,39 @@ fn basename(s: &str) -> &str {
     match s.rsplit_once('/') {
         Some((_, last)) if !last.is_empty() => last,
         _ => s,
+    }
+}
+
+/// Fold a [`ShellRiskHint`] into an `upstream` [`RiskDecision`] for
+/// `shell_execute`.
+///
+/// Priority rules:
+/// - **`ForceHumanConfirm` wins.** Always coerce to
+///   [`RiskDecision::HumanConfirm`], even if the upstream evaluator
+///   already lowered the decision to `SilentApprove` or
+///   `NotifyAndProceed`. The dangerous-verb classifier must override
+///   autonomy lowering — that is its entire reason for existing. The
+///   one exception is `HardBlock`: an upstream block is non-negotiable
+///   and shouldn't be loosened to a prompt.
+/// - **`LowerToSilent`** only weakens an upstream `HumanConfirm` or
+///   `NotifyAndProceed` to `SilentApprove`. `HardBlock` stays a block
+///   (lowering shouldn't unblock); `SilentApprove` is already at the
+///   floor.
+/// - **`KeepHumanConfirm`** is the no-op — upstream stays unchanged.
+pub fn merge_shell_hint(upstream: RiskDecision, hint: ShellRiskHint) -> RiskDecision {
+    use RiskDecision::*;
+    match hint {
+        ShellRiskHint::ForceHumanConfirm => match upstream {
+            // HardBlock stays — never loosen a block to a prompt.
+            HardBlock => HardBlock,
+            _ => HumanConfirm,
+        },
+        ShellRiskHint::LowerToSilent => match upstream {
+            HumanConfirm | NotifyAndProceed => SilentApprove,
+            // HardBlock is non-negotiable. SilentApprove already at floor.
+            other => other,
+        },
+        ShellRiskHint::KeepHumanConfirm => upstream,
     }
 }
 
@@ -854,5 +894,95 @@ mod tests {
             classify("/usr/bin/git status", true),
             ShellRiskHint::LowerToSilent
         );
+    }
+
+    // ---- merge_shell_hint ----
+
+    #[test]
+    fn merge_force_overrides_silent() {
+        // Force must win even when upstream lowered to SilentApprove —
+        // an autonomy band shouldn't bypass an always-prompt verb.
+        assert_eq!(
+            merge_shell_hint(RiskDecision::SilentApprove, ShellRiskHint::ForceHumanConfirm),
+            RiskDecision::HumanConfirm
+        );
+    }
+
+    #[test]
+    fn merge_force_overrides_notify() {
+        assert_eq!(
+            merge_shell_hint(
+                RiskDecision::NotifyAndProceed,
+                ShellRiskHint::ForceHumanConfirm
+            ),
+            RiskDecision::HumanConfirm
+        );
+    }
+
+    #[test]
+    fn merge_force_keeps_human_confirm() {
+        assert_eq!(
+            merge_shell_hint(RiskDecision::HumanConfirm, ShellRiskHint::ForceHumanConfirm),
+            RiskDecision::HumanConfirm
+        );
+    }
+
+    #[test]
+    fn merge_force_does_not_unblock_hardblock() {
+        // HardBlock is non-negotiable — Force shouldn't loosen it to a prompt.
+        assert_eq!(
+            merge_shell_hint(RiskDecision::HardBlock, ShellRiskHint::ForceHumanConfirm),
+            RiskDecision::HardBlock
+        );
+    }
+
+    #[test]
+    fn merge_lower_to_silent_lowers_notify() {
+        assert_eq!(
+            merge_shell_hint(RiskDecision::NotifyAndProceed, ShellRiskHint::LowerToSilent),
+            RiskDecision::SilentApprove
+        );
+    }
+
+    #[test]
+    fn merge_lower_to_silent_lowers_human_confirm() {
+        assert_eq!(
+            merge_shell_hint(RiskDecision::HumanConfirm, ShellRiskHint::LowerToSilent),
+            RiskDecision::SilentApprove
+        );
+    }
+
+    #[test]
+    fn merge_lower_to_silent_keeps_hardblock() {
+        // HardBlock is non-negotiable — lowering shouldn't unblock.
+        assert_eq!(
+            merge_shell_hint(RiskDecision::HardBlock, ShellRiskHint::LowerToSilent),
+            RiskDecision::HardBlock
+        );
+    }
+
+    #[test]
+    fn merge_lower_to_silent_idempotent_on_silent() {
+        assert_eq!(
+            merge_shell_hint(RiskDecision::SilentApprove, ShellRiskHint::LowerToSilent),
+            RiskDecision::SilentApprove
+        );
+    }
+
+    #[test]
+    fn merge_keep_human_confirm_is_noop() {
+        for upstream in [
+            RiskDecision::SilentApprove,
+            RiskDecision::NotifyAndProceed,
+            RiskDecision::HumanConfirm,
+            RiskDecision::HardBlock,
+        ] {
+            assert_eq!(
+                merge_shell_hint(upstream, ShellRiskHint::KeepHumanConfirm),
+                upstream,
+                "KeepHumanConfirm must preserve upstream={:?}",
+                upstream
+            );
+        }
     }
 }

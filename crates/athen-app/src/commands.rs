@@ -2752,6 +2752,14 @@ pub async fn send_message(
                 .default_temperature(sampling_temperature)
                 .default_reasoning_effort(reasoning_effort)
                 .default_tier(default_tier);
+            // Per-call shell classifier — see executor.rs
+            // `compute_cwd_in_grant`. Without the grant lookup the
+            // classifier still runs but `LowerToSilent` never fires.
+            if let Some(store) = state.grant_store.clone() {
+                builder = builder
+                    .grant_lookup(Arc::new(crate::file_gate::GrantStoreLookup::new(store)))
+                    .arc_uuid(crate::file_gate::arc_uuid(&active_arc));
+            }
             if let Some(p) = state.tool_doc_dir.clone() {
                 builder = builder.tool_doc_dir(p);
             }
@@ -3971,6 +3979,12 @@ pub(crate) async fn execute_approved_task(
         .default_temperature(ctx.sampling_temperature)
         .default_reasoning_effort(ctx.reasoning_effort)
         .default_tier(default_tier);
+    // Per-call shell classifier — see executor.rs `compute_cwd_in_grant`.
+    if let Some(store) = ctx.grant_store.clone() {
+        builder = builder
+            .grant_lookup(Arc::new(crate::file_gate::GrantStoreLookup::new(store)))
+            .arc_uuid(crate::file_gate::arc_uuid(&ctx.active_arc_id));
+    }
     if let Some(p) = ctx.tool_doc_dir.clone() {
         builder = builder.tool_doc_dir(p);
     }
@@ -5069,6 +5083,12 @@ pub(crate) async fn execute_dispatched_task(
         .default_temperature(ctx.sampling_temperature)
         .default_reasoning_effort(ctx.reasoning_effort)
         .default_tier(default_tier);
+    // Per-call shell classifier — see executor.rs `compute_cwd_in_grant`.
+    if let Some(store) = ctx.grant_store.clone() {
+        builder = builder
+            .grant_lookup(Arc::new(crate::file_gate::GrantStoreLookup::new(store)))
+            .arc_uuid(crate::file_gate::arc_uuid(&arc_id));
+    }
     if let Some(p) = ctx.tool_doc_dir.clone() {
         builder = builder.tool_doc_dir(p);
     }
