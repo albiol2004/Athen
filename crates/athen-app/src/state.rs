@@ -4305,6 +4305,34 @@ fn build_embedding_router(
             }
         },
         EmbeddingMode::Automatic => {
+            // Phase 1 smoke test for the bundled fastembed provider:
+            // gated on both the cargo feature AND an explicit opt-in
+            // env var so default builds and default runs are
+            // unaffected. When live, push it FIRST so its
+            // `is_available() == true` wins resolution before Ollama.
+            #[cfg(feature = "bundled-embeddings")]
+            {
+                if std::env::var("ATHEN_BUNDLED_EMBEDDINGS")
+                    .map(|v| v == "1")
+                    .unwrap_or(false)
+                {
+                    if let Some(data_dir) = ensure_data_dir() {
+                        let cache_dir = data_dir.join("embeddings");
+                        info!(
+                            cache_dir = %cache_dir.display(),
+                            "Bundled multilingual embeddings enabled (model: multilingual-e5-small)"
+                        );
+                        providers.push(Box::new(
+                            athen_llm::embeddings::bundled::BundledEmbedding::new(cache_dir),
+                        ));
+                    } else {
+                        warn!(
+                            "ATHEN_BUNDLED_EMBEDDINGS=1 but no data_dir available; skipping bundled embedder"
+                        );
+                    }
+                }
+            }
+
             // Try Ollama at the default endpoint first. is_available()
             // pings /api/tags and returns false fast when nothing's
             // listening, so this is cheap. Cloud requires explicit

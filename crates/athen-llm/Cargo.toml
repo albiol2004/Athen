@@ -15,6 +15,16 @@ chrono = { workspace = true }
 reqwest = { workspace = true }
 futures = { workspace = true }
 uuid = { workspace = true }
+fastembed = { version = "5", optional = true }
+
+[features]
+# Bundled local embeddings via fastembed-rs (ONNX). When enabled, a
+# pure-Rust multilingual-e5-small embedder becomes available; the model
+# is downloaded to disk on first use (~270 MB) and cached. NOT enabled
+# by default — Phase 1 is opt-in via the ATHEN_BUNDLED_EMBEDDINGS=1
+# env var at the call site.
+bundled-embeddings = ["dep:fastembed"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
+tempfile = "3"

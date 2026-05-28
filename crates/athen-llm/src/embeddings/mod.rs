@@ -8,3 +8,9 @@ pub mod keyword;
 pub mod ollama;
 pub mod openai;
 pub mod router;
+
+#[cfg(feature = "bundled-embeddings")]
+pub mod bundled;
+
+#[cfg(feature = "bundled-embeddings")]
+pub use bundled::BundledEmbedding;

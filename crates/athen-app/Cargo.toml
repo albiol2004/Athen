@@ -48,6 +48,13 @@ url = { workspace = true }
 quick-xml = { workspace = true }
 lettre = { workspace = true }
 
+[features]
+# Forward to athen-llm's bundled-embeddings feature. NOT enabled by
+# default — Phase 1 ships the binding but leaves activation to a
+# manual `--features bundled-embeddings` build plus the
+# ATHEN_BUNDLED_EMBEDDINGS=1 env var at runtime.
+bundled-embeddings = ["athen-llm/bundled-embeddings"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
