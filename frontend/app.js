@@ -5853,6 +5853,7 @@ async function loadSettings() {
         await loadIdentityManager();
         await loadSkillsManager();
         await loadCloudApis();
+        loadVoicePanel();
         await loadAttachmentPolicySettings();
         await loadOwnerContact();
         await loadGithubIdentities();
@@ -16402,11 +16403,278 @@ function updatePlanBanner(plan) {
     planBannerEl.appendChild(clearBtn);
 }
 
+// ─── Voice & phone calls panel ───
+//
+// Backend contract (athen-app::voice):
+//   get_voice_settings()  → VoiceConfig
+//   save_voice_settings({ config }) → null
+//   list_voice_options()  → { sttEndpoints, ttsEndpoints, phoneEndpoints,
+//                             llmConnections, fastTierLabel }
+//
+// invoke timing: gated on `typeof invoke === 'function'` (per memory
+// feedback_frontend_invoke_timing) — same pattern as loadBundledEmbState.
+
+const voiceState = {
+    loaded: false,
+    loading: false,
+    config: null,
+    options: null,
+};
+
+function voiceDefaultConfig() {
+    return {
+        sttEndpointId: null,
+        ttsEndpointId: null,
+        phoneEndpointId: null,
+        voiceId: null,
+        fromNumber: null,
+        userNumber: null,
+        llmOverrideConnectionId: null,
+        llmOverrideSlug: null,
+        maxCallDurationS: 600,
+    };
+}
+
+async function loadVoicePanel() {
+    if (typeof invoke !== 'function') {
+        // Tauri not ready — retry shortly. Matches loadBundledEmbState.
+        setTimeout(loadVoicePanel, 150);
+        return;
+    }
+    if (voiceState.loading) return;
+    voiceState.loading = true;
+    try {
+        const [config, options] = await Promise.all([
+            invoke('get_voice_settings'),
+            invoke('list_voice_options'),
+        ]);
+        voiceState.config = config || voiceDefaultConfig();
+        voiceState.options = options || {
+            sttEndpoints: [],
+            ttsEndpoints: [],
+            phoneEndpoints: [],
+            llmConnections: [],
+            fastTierLabel: null,
+        };
+        voiceState.loaded = true;
+        renderVoicePanel();
+    } catch (err) {
+        console.error('voice panel load failed', err);
+        const status = document.getElementById('voice-status');
+        if (status) {
+            status.className = 'voice-status voice-status-error';
+            status.textContent = 'Failed to load voice settings: ' + err;
+        }
+    } finally {
+        voiceState.loading = false;
+    }
+}
+
+function populateVoiceEndpointSelect(selectId, items, currentId, setupLinkBucket) {
+    const select = document.getElementById(selectId);
+    if (!select) return;
+    select.innerHTML = '';
+    const link = document.querySelector(`.voice-setup-link[data-for="${setupLinkBucket}"]`);
+
+    if (!items || items.length === 0) {
+        const opt = document.createElement('option');
+        opt.value = '';
+        opt.textContent = '(none configured)';
+        select.appendChild(opt);
+        select.disabled = true;
+        if (link) link.classList.remove('hidden');
+        return;
+    }
+
+    select.disabled = false;
+    if (link) link.classList.add('hidden');
+
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.textContent = '— select —';
+    select.appendChild(placeholder);
+
+    for (const item of items) {
+        const opt = document.createElement('option');
+        opt.value = item.id;
+        opt.textContent = item.label || `${item.provider} (${item.slug})`;
+        select.appendChild(opt);
+    }
+    if (currentId) {
+        select.value = currentId;
+        // If the saved id no longer matches any registered endpoint
+        // (user deleted the row from Cloud APIs), the dropdown falls
+        // back to "— select —" silently — fine because the saved id
+        // is also useless until they re-register or pick another.
+    }
+}
+
+function populateVoiceLlmOverride() {
+    const select = document.getElementById('voice-llm-override');
+    if (!select) return;
+    select.innerHTML = '';
+    const opts = voiceState.options || {};
+    const cfg = voiceState.config || voiceDefaultConfig();
+
+    const fastLabel = opts.fastTierLabel || 'Use Fast tier (default)';
+    const fastOpt = document.createElement('option');
+    fastOpt.value = '';
+    fastOpt.textContent = fastLabel;
+    select.appendChild(fastOpt);
+
+    const list = Array.isArray(opts.llmConnections) ? opts.llmConnections : [];
+    for (const c of list) {
+        const opt = document.createElement('option');
+        // Pack both fields in the value so we can split on save without
+        // a parallel array lookup.
+        opt.value = `${c.connectionId}::${c.slug}`;
+        opt.textContent = c.display || `${c.connectionLabel} :: ${c.slug}`;
+        select.appendChild(opt);
+    }
+
+    if (cfg.llmOverrideConnectionId && cfg.llmOverrideSlug) {
+        const target = `${cfg.llmOverrideConnectionId}::${cfg.llmOverrideSlug}`;
+        // Add a "missing" option if the saved pick was removed from the
+        // catalog; better the user see it than silently lose their pick.
+        if (!Array.from(select.options).some((o) => o.value === target)) {
+            const opt = document.createElement('option');
+            opt.value = target;
+            opt.textContent = `${cfg.llmOverrideConnectionId} :: ${cfg.llmOverrideSlug} (not in current catalog)`;
+            select.appendChild(opt);
+        }
+        select.value = target;
+    } else {
+        select.value = '';
+    }
+}
+
+function renderVoicePanel() {
+    const cfg = voiceState.config || voiceDefaultConfig();
+    const opts = voiceState.options || {
+        sttEndpoints: [], ttsEndpoints: [], phoneEndpoints: [], llmConnections: [], fastTierLabel: null,
+    };
+
+    populateVoiceEndpointSelect('voice-stt-endpoint', opts.sttEndpoints, cfg.sttEndpointId, 'stt');
+    populateVoiceEndpointSelect('voice-tts-endpoint', opts.ttsEndpoints, cfg.ttsEndpointId, 'tts');
+    populateVoiceEndpointSelect('voice-phone-endpoint', opts.phoneEndpoints, cfg.phoneEndpointId, 'phone');
+    populateVoiceLlmOverride();
+
+    const voiceIdEl = document.getElementById('voice-voice-id');
+    if (voiceIdEl) voiceIdEl.value = cfg.voiceId || '';
+    const fromEl = document.getElementById('voice-from-number');
+    if (fromEl) fromEl.value = cfg.fromNumber || '';
+    const userEl = document.getElementById('voice-user-number');
+    if (userEl) userEl.value = cfg.userNumber || '';
+    const maxEl = document.getElementById('voice-max-duration');
+    if (maxEl) maxEl.value = cfg.maxCallDurationS || 600;
+}
+
+function collectVoiceForm() {
+    const stt = document.getElementById('voice-stt-endpoint');
+    const tts = document.getElementById('voice-tts-endpoint');
+    const phone = document.getElementById('voice-phone-endpoint');
+    const voiceId = document.getElementById('voice-voice-id');
+    const from = document.getElementById('voice-from-number');
+    const user = document.getElementById('voice-user-number');
+    const llm = document.getElementById('voice-llm-override');
+    const dur = document.getElementById('voice-max-duration');
+
+    const blank = (v) => (typeof v === 'string' && v.trim()) ? v.trim() : null;
+
+    let overrideConnection = null;
+    let overrideSlug = null;
+    if (llm && llm.value) {
+        const idx = llm.value.indexOf('::');
+        if (idx > 0) {
+            overrideConnection = llm.value.slice(0, idx);
+            overrideSlug = llm.value.slice(idx + 2);
+        }
+    }
+
+    let parsedDuration = parseInt(dur && dur.value, 10);
+    if (!Number.isFinite(parsedDuration) || parsedDuration <= 0) parsedDuration = 600;
+
+    return {
+        sttEndpointId: blank(stt && stt.value),
+        ttsEndpointId: blank(tts && tts.value),
+        phoneEndpointId: blank(phone && phone.value),
+        voiceId: blank(voiceId && voiceId.value),
+        fromNumber: blank(from && from.value),
+        userNumber: blank(user && user.value),
+        llmOverrideConnectionId: overrideConnection,
+        llmOverrideSlug: overrideSlug,
+        maxCallDurationS: parsedDuration,
+    };
+}
+
+function wireVoicePanel() {
+    const saveBtn = document.getElementById('voice-save-btn');
+    if (saveBtn) {
+        saveBtn.addEventListener('click', async () => {
+            if (typeof invoke !== 'function') return;
+            const status = document.getElementById('voice-status');
+            const config = collectVoiceForm();
+            saveBtn.disabled = true;
+            const original = saveBtn.textContent;
+            saveBtn.textContent = 'Saving…';
+            try {
+                await invoke('save_voice_settings', { config });
+                voiceState.config = config;
+                if (status) {
+                    status.className = 'voice-status voice-status-ok';
+                    status.textContent = 'Voice config saved.';
+                }
+                if (typeof showToast === 'function') {
+                    showToast('Voice config saved', 'success');
+                }
+            } catch (err) {
+                console.error('save_voice_settings failed', err);
+                if (status) {
+                    status.className = 'voice-status voice-status-error';
+                    status.textContent = 'Save failed: ' + err;
+                }
+                if (typeof showToast === 'function') {
+                    showToast('Save failed: ' + err, 'error');
+                }
+            } finally {
+                saveBtn.disabled = false;
+                saveBtn.textContent = original;
+            }
+        });
+    }
+
+    const testBtn = document.getElementById('voice-test-btn');
+    if (testBtn) {
+        testBtn.addEventListener('click', () => {
+            const status = document.getElementById('voice-status');
+            const msg = 'Test will be wired in the next batch (place_call tool).';
+            if (status) {
+                status.className = 'voice-status';
+                status.textContent = msg;
+            }
+            if (typeof showToast === 'function') showToast(msg, 'info');
+        });
+    }
+
+    // Setup-link clicks switch the user to the same Cloud APIs panel
+    // (it lives in the same tab pane, so we just scroll to it).
+    document.querySelectorAll('.voice-setup-link').forEach((link) => {
+        link.addEventListener('click', (e) => {
+            e.preventDefault();
+            const target = document.getElementById('cloud-apis-list');
+            if (target && target.scrollIntoView) {
+                target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }
+        });
+    });
+}
+
 // ─── Initialize ───
 
 inputEl.focus();
 wireOnboardingButtons();
 wireCloudApisModal();
+wireVoicePanel();
 wireMcpServersPanel();
 wireActiveAgentsPanel();
 wireCalendarSourcesPanel();

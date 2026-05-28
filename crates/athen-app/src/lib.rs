@@ -40,6 +40,7 @@ pub(crate) mod spawn_pidfile;
 pub(crate) mod state;
 pub(crate) mod telegram_progress;
 pub(crate) mod vault_creds;
+pub(crate) mod voice;
 mod wakeup_commands;
 pub(crate) mod wakeup_registry;
 pub(crate) mod wakeup_sink;
@@ -181,6 +182,9 @@ pub fn run() {
             bundled_embeddings::download_bundled_model,
             bundled_embeddings::delete_bundled_model,
             bundled_embeddings::set_embedding_mode_bundled,
+            voice::get_voice_settings,
+            voice::save_voice_settings,
+            voice::list_voice_options,
             commands::list_memories,
             commands::update_memory,
             commands::delete_memory,

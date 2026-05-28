@@ -40,6 +40,12 @@ pub struct AthenConfig {
     pub attachment_policy: AttachmentPolicy,
     #[serde(default)]
     pub calendar: CalendarConfig,
+    /// Opaque JSON blob carrying the voice subsystem configuration.
+    /// Typed shape (`VoiceConfig`) lives in the `athen-voice` crate, which
+    /// `athen-core` cannot depend on (hexagonal rules). `athen-app`
+    /// serializes / deserializes around this field.
+    #[serde(default)]
+    pub voice: serde_json::Value,
 }
 
 /// User-facing calendar settings. Currently just one free-form prompt
@@ -80,6 +86,7 @@ impl Default for AthenConfig {
             web_search: WebSearchConfig::default(),
             attachment_policy: AttachmentPolicy::default(),
             calendar: CalendarConfig::default(),
+            voice: serde_json::Value::Null,
         }
     }
 }

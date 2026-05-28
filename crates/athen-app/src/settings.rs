@@ -277,6 +277,13 @@ pub(crate) fn load_main_config_public() -> AthenConfig {
     load_main_config()
 }
 
+/// Save the main config from outside the `settings` module. Thin wrapper
+/// over [`save_main_config`] so peer modules (e.g. `voice.rs`) don't have
+/// to widen the private save path.
+pub(crate) fn save_main_config_public(config: &AthenConfig) -> Result<(), String> {
+    save_main_config(config)
+}
+
 /// Load the main config from `~/.athen/config.toml`, or return defaults.
 fn load_main_config() -> AthenConfig {
     if let Ok(dir) = ensure_athen_dir() {

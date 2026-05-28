@@ -21,6 +21,7 @@ athen-scheduler = { workspace = true }
 athen-vault = { workspace = true }
 athen-checkpoint = { workspace = true }
 athen-caldav = { workspace = true }
+athen-voice = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

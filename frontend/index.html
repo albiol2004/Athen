@@ -813,6 +813,66 @@
                 </div>
             </section>
 
+            <section class="settings-section" id="voice-section">
+                <h2>Voice &amp; Phone Calls</h2>
+                <p class="settings-description voice-tagline">Wire up speech-to-text, text-to-speech, and a phone service to let Athen place outbound calls. Each provider lives in <strong>Cloud APIs</strong> above — register the endpoint there first, then pick it here.</p>
+
+                <div id="voice-panel" class="voice-panel">
+                    <div class="voice-wiring">
+                        <div class="voice-row">
+                            <label for="voice-stt-endpoint">Speech-to-text</label>
+                            <select id="voice-stt-endpoint" class="settings-select"></select>
+                            <a class="voice-setup-link hidden" data-for="stt" href="#">Set up Deepgram in Cloud APIs →</a>
+                        </div>
+                        <div class="voice-row">
+                            <label for="voice-tts-endpoint">Text-to-speech</label>
+                            <select id="voice-tts-endpoint" class="settings-select"></select>
+                            <a class="voice-setup-link hidden" data-for="tts" href="#">Set up ElevenLabs or Cartesia in Cloud APIs →</a>
+                        </div>
+                        <div class="voice-row" id="voice-voice-id-row">
+                            <label for="voice-voice-id">Voice</label>
+                            <input id="voice-voice-id" type="text" class="settings-input" placeholder="voice ID (paste from provider's voice library)" />
+                            <p class="setting-hint">Find voices in your ElevenLabs / Cartesia dashboard and paste the ID here.</p>
+                        </div>
+                        <div class="voice-row">
+                            <label for="voice-phone-endpoint">Phone service</label>
+                            <select id="voice-phone-endpoint" class="settings-select"></select>
+                            <a class="voice-setup-link hidden" data-for="phone" href="#">Set up Twilio in Cloud APIs →</a>
+                        </div>
+                        <div class="voice-row">
+                            <label for="voice-from-number">"From" number</label>
+                            <input id="voice-from-number" type="tel" class="settings-input" placeholder="+14155551234" />
+                            <p class="setting-hint">Must be a phone number purchased on your phone provider (Twilio).</p>
+                        </div>
+                        <div class="voice-row">
+                            <label for="voice-user-number">Your number (for reminder calls)</label>
+                            <input id="voice-user-number" type="tel" class="settings-input" placeholder="+14155551234" />
+                        </div>
+                    </div>
+
+                    <details class="voice-advanced">
+                        <summary>Advanced — voice LLM override</summary>
+                        <div class="voice-row">
+                            <label for="voice-llm-override">Voice LLM</label>
+                            <select id="voice-llm-override" class="settings-select"></select>
+                            <p class="setting-hint">Defaults to your active Bundle's Fast tier. Override only if Fast is too slow for live conversation — anything &gt; ~500 ms TTFT will feel laggy on a call.</p>
+                        </div>
+                        <div class="voice-row">
+                            <label for="voice-max-duration">Max call duration (seconds)</label>
+                            <input id="voice-max-duration" type="number" class="settings-input" min="30" max="1800" step="30" value="600" />
+                        </div>
+                    </details>
+
+                    <div class="voice-actions">
+                        <button id="voice-save-btn" class="btn-primary" type="button">Save voice config</button>
+                        <button id="voice-test-btn" class="btn-secondary" type="button" disabled title="Will be wired in next release">Test setup</button>
+                        <span class="voice-pending-note">The <code>place_call</code> tool itself ships in the next release — saving now just stores wiring.</span>
+                    </div>
+
+                    <p id="voice-status" class="voice-status"></p>
+                </div>
+            </section>
+
             <section class="settings-section">
                 <h2>Attachments</h2>
                 <p class="settings-description">
