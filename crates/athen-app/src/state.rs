@@ -486,6 +486,45 @@ pub(crate) struct ToolRegistryDeps {
 ///
 /// Adding a new `.with_*` here picks it up for both paths
 /// automatically — that was the whole point of #248.
+/// Build the `place_call` telephony deps bundle. Returns `None` when any
+/// of the three core wirings (approval router, vault, http endpoint
+/// store) is unavailable — the tool then stays hidden from the agent.
+///
+/// Lives here (next to `assemble_app_tool_registry`) so the in-app and
+/// background registry build sites can call into the same code path,
+/// matching the #248 consolidation rule. Without this, the wake-up and
+/// sense-event registries silently drop `place_call` even when in-app
+/// chat advertises it — the kind of registry drift the
+/// `feedback_owner_telegram_registry_drift` memory was filed against.
+pub(crate) fn build_telephony_deps(
+    arc_id: &str,
+    approval_router: Option<Arc<crate::approval::ApprovalRouter>>,
+    vault: Option<Arc<dyn athen_core::traits::vault::Vault>>,
+    http_endpoint_store: Option<Arc<athen_persistence::http_endpoints::SqliteHttpEndpointStore>>,
+    notifier: Option<Arc<crate::notifier::NotificationOrchestrator>>,
+    active_provider_id: String,
+) -> Option<crate::place_call::TelephonyDeps> {
+    let (router, vault, store) = match (approval_router, vault, http_endpoint_store) {
+        (Some(r), Some(v), Some(s)) => (r, v, s),
+        _ => return None,
+    };
+    let cfg = crate::settings::load_main_config_public();
+    let voice_config: athen_voice::VoiceConfig =
+        serde_json::from_value(cfg.voice.clone()).unwrap_or_default();
+    let gate: Arc<dyn athen_voice::TelephonyApprovalGate> = Arc::new(
+        crate::telephony_gate::RouterTelephonyApprovalGate::new(router, Some(arc_id.to_string())),
+    );
+    Some(crate::place_call::TelephonyDeps {
+        gate,
+        vault,
+        http_endpoint_store: store,
+        notifier,
+        active_provider_id,
+        voice_config,
+        config: cfg,
+    })
+}
+
 pub(crate) async fn assemble_app_tool_registry(
     deps: ToolRegistryDeps,
     arc_id: &str,
@@ -592,36 +631,22 @@ pub(crate) async fn assemble_app_tool_registry(
         registry = registry.with_vault_standalone(vault);
     }
 
-    // Telephony wiring for the `place_call` tool. Requires the
-    // approval router + vault + http_endpoint_store all to be present;
-    // the AppHandle is folded in below (only available when the tool
-    // dispatcher actually runs under Tauri, not in test/CLI builds).
-    if let (Some(router), Some(vault), Some(store), Some(handle)) = (
-        deps.approval_router.clone(),
-        deps.vault.clone(),
-        deps.http_endpoint_store.clone(),
+    // Telephony wiring for the `place_call` tool. Delegated to the
+    // shared helper so the wake-up + sense-event registry builds in
+    // `commands.rs` stay in lockstep — drift here is what kept the tool
+    // hidden from background paths until 2026-05-28.
+    if let (Some(telephony), Some(handle)) = (
+        build_telephony_deps(
+            arc_id,
+            deps.approval_router.clone(),
+            deps.vault.clone(),
+            deps.http_endpoint_store.clone(),
+            deps.notifier.clone(),
+            deps.active_provider_id.clone(),
+        ),
         app_handle.clone(),
     ) {
-        let cfg = crate::settings::load_main_config_public();
-        let voice_config: athen_voice::VoiceConfig =
-            serde_json::from_value(cfg.voice.clone()).unwrap_or_default();
-        let gate: Arc<dyn athen_voice::TelephonyApprovalGate> =
-            Arc::new(crate::telephony_gate::RouterTelephonyApprovalGate::new(
-                router,
-                Some(arc_id.to_string()),
-            ));
-        let telephony_deps = crate::place_call::TelephonyDeps {
-            gate,
-            vault,
-            http_endpoint_store: store,
-            notifier: deps.notifier.clone(),
-            active_provider_id: deps.active_provider_id.clone(),
-            voice_config,
-            config: cfg,
-        };
-        registry = registry
-            .with_telephony(telephony_deps)
-            .with_app_handle(handle);
+        registry = registry.with_telephony(telephony).with_app_handle(handle);
     }
     // Resolve the active profile so setup tools are conditionally registered.
     let active_profile_id = crate::commands::active_profile_id_for_arc(

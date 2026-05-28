@@ -3732,6 +3732,18 @@ pub(crate) async fn execute_approved_task(
         ctx.memory.clone(),
     )
     .with_mcp(ctx.mcp.clone() as Arc<dyn athen_core::traits::mcp::McpClient>);
+    if let Some(telephony) = crate::state::build_telephony_deps(
+        &ctx.active_arc_id,
+        ctx.approval_router.clone(),
+        ctx.vault.clone(),
+        ctx.http_endpoint_store.clone(),
+        ctx.notifier.clone(),
+        ctx.active_provider_id.clone(),
+    ) {
+        registry = registry
+            .with_telephony(telephony)
+            .with_app_handle(ctx.app_handle.clone());
+    }
     if let Some(ref astore) = ctx.attachment_store {
         registry = registry.with_attachments(astore.clone());
     }
@@ -4841,6 +4853,18 @@ pub(crate) async fn execute_dispatched_task(
         ctx.memory.clone(),
     )
     .with_mcp(ctx.mcp.clone() as Arc<dyn athen_core::traits::mcp::McpClient>);
+    if let Some(telephony) = crate::state::build_telephony_deps(
+        &arc_id,
+        ctx.approval_router.clone(),
+        ctx.vault.clone(),
+        ctx.http_endpoint_store.clone(),
+        ctx.notifier.clone(),
+        ctx.active_provider_id.clone(),
+    ) {
+        registry = registry
+            .with_telephony(telephony)
+            .with_app_handle(ctx.app_handle.clone());
+    }
     if let Some(ref astore) = ctx.attachment_store {
         registry = registry.with_attachments(astore.clone());
     }
