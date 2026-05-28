@@ -20,7 +20,7 @@ use uuid::Uuid;
 use athen_agent::tools::{ShellExtraWritableProvider, ToolboxApprovalGate};
 use athen_core::contact::TrustLevel;
 use athen_core::error::{AthenError, Result};
-use athen_core::paths;
+use athen_core::paths::{self, DetectedRoot};
 use athen_core::risk::{DataSensitivity, RiskContext, RiskDecision};
 use athen_core::tool::ToolResult;
 use athen_core::traits::approval::ApprovalSink;
@@ -40,15 +40,28 @@ pub fn arc_uuid(arc_id: &str) -> Uuid {
 }
 
 /// Decision returned by the user when resolving a pending grant.
-#[derive(Debug, Clone, Copy, serde::Deserialize, Serialize, PartialEq, Eq)]
+///
+/// `AllowProjectRoot` carries the detected project-root path (git root,
+/// Cargo workspace, npm package, etc.) so the gate can issue a directory
+/// grant scoped to the whole project rather than just the touched file.
+/// Wire shape from the frontend uses serde's externally-tagged default,
+/// e.g. `"Allow"`, `"AllowAlways"`, `"Deny"`, or `{"AllowProjectRoot":"/path"}`.
+#[derive(Debug, Clone, serde::Deserialize, Serialize, PartialEq, Eq)]
 pub enum GrantDecision {
     Allow,
     AllowAlways,
+    AllowProjectRoot(PathBuf),
     Deny,
 }
 
 /// Snapshot of a pending grant request, safe to send across threads to
 /// the frontend.
+///
+/// `detected_root` is populated when [`paths::detect_project_root`] finds
+/// a project marker (git, Cargo, npm, Python, Go, Maven, Gradle) at or
+/// above the first requested path. The frontend uses it to render a
+/// "Allow <root> (<marker>)" recommended button that grants the whole
+/// project tree rather than just the touched file.
 #[derive(Debug, Clone, Serialize)]
 pub struct PendingGrantSummary {
     pub id: Uuid,
@@ -56,6 +69,41 @@ pub struct PendingGrantSummary {
     pub paths: Vec<String>,
     pub access: String,
     pub tool: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detected_root: Option<DetectedRootSummary>,
+}
+
+/// Serializable mirror of [`DetectedRoot`] for the frontend. Uses
+/// `camelCase` since the FE consumes it through Tauri events.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetectedRootSummary {
+    pub path: String,
+    pub path_display: String,
+    pub marker: String,
+}
+
+impl DetectedRootSummary {
+    fn from_detected(root: &DetectedRoot) -> Self {
+        Self {
+            path: root.path.display().to_string(),
+            path_display: friendly_path(&root.path),
+            marker: root.marker.label().to_string(),
+        }
+    }
+}
+
+/// Render a path with `$HOME` substituted for `~` when applicable.
+fn friendly_path(path: &Path) -> String {
+    if let Some(home) = paths::home_dir() {
+        if let Ok(rest) = path.strip_prefix(&home) {
+            if rest.as_os_str().is_empty() {
+                return "~".to_string();
+            }
+            return format!("~/{}", rest.display());
+        }
+    }
+    path.display().to_string()
 }
 
 /// In-flight request for a directory grant, parked until the user
@@ -65,6 +113,7 @@ pub struct PendingGrantRequest {
     pub paths: Vec<PathBuf>,
     pub access: Access,
     pub tool: String,
+    pub detected_root: Option<DetectedRoot>,
     pub responder: oneshot::Sender<GrantDecision>,
 }
 
@@ -79,6 +128,10 @@ impl PendingGrantRequest {
                 Access::Write => "write".to_string(),
             },
             tool: self.tool.clone(),
+            detected_root: self
+                .detected_root
+                .as_ref()
+                .map(DetectedRootSummary::from_detected),
         }
     }
 }
@@ -316,6 +369,7 @@ impl FileGate {
         paths_in: Vec<PathBuf>,
         access: Access,
         tool: &str,
+        detected_root: Option<DetectedRoot>,
     ) -> Result<GrantDecision> {
         let (tx, rx) = oneshot::channel();
         let req = PendingGrantRequest {
@@ -323,6 +377,7 @@ impl FileGate {
             paths: paths_in.clone(),
             access,
             tool: tool.to_string(),
+            detected_root: detected_root.clone(),
             responder: tx,
         };
         let id = Uuid::new_v4();
@@ -341,7 +396,16 @@ impl FileGate {
         };
 
         // With Telegram, race the in-app oneshot vs a Telegram question.
-        let question = build_grant_question(&paths_in, access, tool, Some(self.arc_id_str.clone()));
+        // `detected_root` is captured here so the Telegram answer can
+        // reconstruct `GrantDecision::AllowProjectRoot(path)` without
+        // round-tripping the path through the choice key (Option A).
+        let question = build_grant_question(
+            &paths_in,
+            access,
+            tool,
+            Some(self.arc_id_str.clone()),
+            detected_root.as_ref(),
+        );
         let q_id = question.id;
 
         let pending_for_cleanup = self.pending.clone();
@@ -363,7 +427,7 @@ impl FileGate {
                 if let Some(handle) = app_handle_for_cancel {
                     let _ = handle.emit("grant-resolved-elsewhere", id.to_string());
                 }
-                tg.map(approval_choice_to_grant_decision)
+                tg.map(|ans| approval_choice_to_grant_decision(ans, detected_root.as_ref()))
             }
         }
     }
@@ -393,7 +457,15 @@ impl FileGate {
         match decision {
             RiskDecision::SilentApprove | RiskDecision::NotifyAndProceed => {}
             RiskDecision::HumanConfirm => {
-                let user = self.ask_user(abs_paths.clone(), access_kind, name).await?;
+                // Best-effort project-root detection so the user gets a
+                // "Allow ~/myrepo (git root)" recommended choice that
+                // grants the whole project, not just this single file.
+                let detected_root = abs_paths
+                    .first()
+                    .and_then(|p| paths::detect_project_root(p));
+                let user = self
+                    .ask_user(abs_paths.clone(), access_kind, name, detected_root)
+                    .await?;
                 match user {
                     GrantDecision::Deny => {
                         return Err(AthenError::Other(format!(
@@ -406,6 +478,15 @@ impl FileGate {
                         for p in &abs_paths {
                             self.grants.grant_arc(self.arc_uuid, p, access_kind).await?;
                         }
+                    }
+                    GrantDecision::AllowProjectRoot(root) => {
+                        // For Access::Read access requests, the
+                        // grant_arc with access_kind=Read is honored
+                        // directly; write grants imply read via the
+                        // existing GrantStore rule.
+                        self.grants
+                            .grant_arc(self.arc_uuid, &root, access_kind)
+                            .await?;
                     }
                     GrantDecision::Allow => {}
                 }
@@ -464,7 +545,9 @@ fn access_label(a: Access) -> &'static str {
 /// Build the [`ApprovalQuestion`] sent through the Telegram sink for a
 /// path-permission prompt.
 ///
-/// Three choices map cleanly to [`GrantDecision`]:
+/// Choices map cleanly to [`GrantDecision`]:
+///   - "allow_root"   → AllowProjectRoot (only when `detected_root` is `Some`;
+///     prepended as the recommended first button)
 ///   - "allow"        → Allow once (this call only)
 ///   - "allow_always" → AllowAlways (grant stored, future calls auto-approve)
 ///   - "deny"         → Deny
@@ -473,6 +556,7 @@ fn build_grant_question(
     access: Access,
     tool: &str,
     arc_id: Option<String>,
+    detected_root: Option<&DetectedRoot>,
 ) -> athen_core::approval::ApprovalQuestion {
     use athen_core::approval::{ApprovalChoice, ApprovalChoiceKind, ApprovalQuestion};
     use athen_core::notification::{NotificationOrigin, NotificationUrgency};
@@ -483,27 +567,40 @@ fn build_grant_question(
     } else {
         Some(format!("Path: {}", display_paths(paths_in)))
     };
+
+    let mut choices = Vec::with_capacity(4);
+    if let Some(root) = detected_root {
+        choices.push(ApprovalChoice {
+            key: "allow_root".to_string(),
+            label: format!("Allow {} ({})", friendly_path(&root.path), root.marker.label()),
+            // Kind is just an icon hint per the existing comment; the
+            // server side disambiguates on `key`.
+            kind: ApprovalChoiceKind::AllowOnce,
+        });
+    }
+    choices.extend([
+        ApprovalChoice {
+            key: "allow".to_string(),
+            label: "Allow once".to_string(),
+            kind: ApprovalChoiceKind::AllowOnce,
+        },
+        ApprovalChoice {
+            key: "allow_always".to_string(),
+            label: "Allow always".to_string(),
+            kind: ApprovalChoiceKind::AllowAlways,
+        },
+        ApprovalChoice {
+            key: "deny".to_string(),
+            label: "Deny".to_string(),
+            kind: ApprovalChoiceKind::Deny,
+        },
+    ]);
+
     ApprovalQuestion {
         id: Uuid::new_v4(),
         prompt,
         description,
-        choices: vec![
-            ApprovalChoice {
-                key: "allow".to_string(),
-                label: "Allow once".to_string(),
-                kind: ApprovalChoiceKind::AllowOnce,
-            },
-            ApprovalChoice {
-                key: "allow_always".to_string(),
-                label: "Allow always".to_string(),
-                kind: ApprovalChoiceKind::AllowAlways,
-            },
-            ApprovalChoice {
-                key: "deny".to_string(),
-                label: "Deny".to_string(),
-                kind: ApprovalChoiceKind::Deny,
-            },
-        ],
+        choices,
         arc_id,
         task_id: None,
         origin: NotificationOrigin::SenseRouter,
@@ -514,12 +611,25 @@ fn build_grant_question(
 
 /// Map an [`ApprovalAnswer`] choice key back to [`GrantDecision`].
 /// Unknown keys default to `Deny` — fail-closed for permission prompts.
+///
+/// `detected_root` must be the same root passed into
+/// [`build_grant_question`]; it's how the `"allow_root"` choice round-trips
+/// its `PathBuf` payload server-side (Option A from the design plan —
+/// the choice key itself stays a plain string, no path encoding).
 fn approval_choice_to_grant_decision(
     answer: athen_core::approval::ApprovalAnswer,
+    detected_root: Option<&DetectedRoot>,
 ) -> GrantDecision {
     match answer.choice_key.as_str() {
         "allow" => GrantDecision::Allow,
         "allow_always" => GrantDecision::AllowAlways,
+        "allow_root" => match detected_root {
+            Some(root) => GrantDecision::AllowProjectRoot(root.path.clone()),
+            // Telegram somehow returned `allow_root` without a stashed
+            // root (shouldn't happen — the choice is only offered when
+            // we had one). Fall back to fail-closed.
+            None => GrantDecision::Deny,
+        },
         _ => GrantDecision::Deny,
     }
 }
@@ -765,7 +875,7 @@ mod tests {
         // Spawn a task that races against the resolver.
         let p_clone = pending.clone();
         let join = tokio::spawn(async move {
-            gate.ask_user(vec![target.clone()], Access::Write, "write")
+            gate.ask_user(vec![target.clone()], Access::Write, "write", None)
                 .await
         });
 
@@ -808,7 +918,7 @@ mod tests {
         let target_clone = target.clone();
         let join = tokio::spawn(async move {
             let dec = gate
-                .ask_user(vec![target_clone.clone()], Access::Write, "write")
+                .ask_user(vec![target_clone.clone()], Access::Write, "write", None)
                 .await
                 .unwrap();
             if dec == GrantDecision::AllowAlways {
@@ -850,7 +960,7 @@ mod tests {
                 question_id: q,
                 choice_key: key.to_string(),
             };
-            assert_eq!(approval_choice_to_grant_decision(answer), expected);
+            assert_eq!(approval_choice_to_grant_decision(answer, None), expected);
         }
     }
 
@@ -861,7 +971,7 @@ mod tests {
             choice_key: "garbage".into(),
         };
         assert_eq!(
-            approval_choice_to_grant_decision(answer),
+            approval_choice_to_grant_decision(answer, None),
             GrantDecision::Deny
         );
     }
@@ -869,7 +979,7 @@ mod tests {
     #[test]
     fn build_grant_question_carries_paths_in_description_and_three_choices() {
         let paths = vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")];
-        let q = build_grant_question(&paths, Access::Write, "write", Some("arc_x".into()));
+        let q = build_grant_question(&paths, Access::Write, "write", Some("arc_x".into()), None);
         assert!(q.prompt.contains("write"));
         let desc = q.description.expect("description present");
         assert!(desc.contains("/tmp/a"));
@@ -879,5 +989,71 @@ mod tests {
         assert_eq!(q.choices[1].key, "allow_always");
         assert_eq!(q.choices[2].key, "deny");
         assert_eq!(q.arc_id.as_deref(), Some("arc_x"));
+    }
+
+    #[test]
+    fn build_grant_question_prepends_allow_root_when_root_present() {
+        use athen_core::paths::RootMarker;
+        let root = DetectedRoot {
+            path: PathBuf::from("/tmp/myproj"),
+            marker: RootMarker::Git,
+        };
+        let paths = vec![PathBuf::from("/tmp/myproj/src/main.rs")];
+        let q = build_grant_question(
+            &paths,
+            Access::Write,
+            "write",
+            Some("arc_x".into()),
+            Some(&root),
+        );
+        assert_eq!(q.choices.len(), 4);
+        assert_eq!(q.choices[0].key, "allow_root");
+        assert!(q.choices[0].label.contains("git root"));
+        assert!(q.choices[0].label.contains("/tmp/myproj"));
+        assert_eq!(q.choices[1].key, "allow");
+        assert_eq!(q.choices[2].key, "allow_always");
+        assert_eq!(q.choices[3].key, "deny");
+    }
+
+    #[test]
+    fn allow_root_choice_key_carries_root_path_via_stash() {
+        use athen_core::approval::ApprovalAnswer;
+        use athen_core::paths::RootMarker;
+        let root = DetectedRoot {
+            path: PathBuf::from("/tmp/myrepo"),
+            marker: RootMarker::Cargo,
+        };
+        let answer = ApprovalAnswer {
+            question_id: Uuid::new_v4(),
+            choice_key: "allow_root".into(),
+        };
+        let dec = approval_choice_to_grant_decision(answer, Some(&root));
+        assert_eq!(dec, GrantDecision::AllowProjectRoot(root.path.clone()));
+    }
+
+    #[test]
+    fn allow_root_without_stashed_root_fails_closed_to_deny() {
+        use athen_core::approval::ApprovalAnswer;
+        let answer = ApprovalAnswer {
+            question_id: Uuid::new_v4(),
+            choice_key: "allow_root".into(),
+        };
+        assert_eq!(
+            approval_choice_to_grant_decision(answer, None),
+            GrantDecision::Deny
+        );
+    }
+
+    #[test]
+    fn friendly_path_substitutes_home_with_tilde() {
+        let Some(home) = paths::home_dir() else { return };
+        let sub = home.join("projects/foo");
+        let rendered = friendly_path(&sub);
+        assert_eq!(rendered, "~/projects/foo");
+        // Exact home should render as "~".
+        assert_eq!(friendly_path(&home), "~");
+        // Non-home paths render verbatim.
+        let other = PathBuf::from("/tmp/somewhere");
+        assert_eq!(friendly_path(&other), "/tmp/somewhere");
     }
 }

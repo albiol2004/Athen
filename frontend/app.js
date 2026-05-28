@@ -12125,6 +12125,7 @@ function renderGrantModal(req) {
     const pathsEl = document.getElementById('grant-modal-paths');
     const toolEl = document.getElementById('grant-modal-tool');
     const allowAlwaysBtn = document.getElementById('grant-allow-always-btn');
+    const allowRootBtn = document.getElementById('grant-allow-root-btn');
 
     const access = (req.access || 'read').toLowerCase();
     const accessLabel = access === 'write' ? 'Write' : 'Read';
@@ -12164,6 +12165,24 @@ function renderGrantModal(req) {
         allowAlwaysBtn.title = '';
     }
 
+    // Project-root grant: when the backend detected a project root above
+    // the touched path (git/Cargo/npm/…), surface a primary "Allow <root>"
+    // button and demote "Allow always" to secondary. Otherwise hide it.
+    const root = req.detected_root || null;
+    if (root && root.path) {
+        allowRootBtn.classList.remove('hidden');
+        allowRootBtn.textContent = `Allow ${root.pathDisplay || root.path} (${root.marker || 'project root'})`;
+        allowRootBtn.title = root.path;
+        allowRootBtn.disabled = anySystem;
+        // Demote Allow Always to secondary so there is exactly one primary.
+        allowAlwaysBtn.classList.remove('btn-primary');
+        allowAlwaysBtn.classList.add('btn-secondary');
+    } else {
+        allowRootBtn.classList.add('hidden');
+        allowAlwaysBtn.classList.remove('btn-secondary');
+        allowAlwaysBtn.classList.add('btn-primary');
+    }
+
     updateGrantQueueIndicator();
 }
 
@@ -12184,7 +12203,9 @@ async function resolveCurrentGrant(decision) {
     grantInFlight = null;
     try {
         await invoke('resolve_pending_grant', { id: req.id, decision });
-        if (decision === 'AllowAlways') {
+        const isAlwaysLike = decision === 'AllowAlways'
+            || (decision && typeof decision === 'object' && 'AllowProjectRoot' in decision);
+        if (isAlwaysLike) {
             // Refresh arc grants list if settings is open.
             if (document.getElementById('settings-view') &&
                 !document.getElementById('settings-view').classList.contains('hidden')) {
@@ -12201,6 +12222,11 @@ async function resolveCurrentGrant(decision) {
 document.getElementById('grant-allow-btn')?.addEventListener('click', () => resolveCurrentGrant('Allow'));
 document.getElementById('grant-allow-always-btn')?.addEventListener('click', () => resolveCurrentGrant('AllowAlways'));
 document.getElementById('grant-deny-btn')?.addEventListener('click', () => resolveCurrentGrant('Deny'));
+document.getElementById('grant-allow-root-btn')?.addEventListener('click', () => {
+    const root = grantInFlight && grantInFlight.detected_root;
+    if (!root || !root.path) return;
+    resolveCurrentGrant({ AllowProjectRoot: root.path });
+});
 
 // ESC closes the modal as Deny (only when modal is visible).
 document.addEventListener('keydown', (e) => {
