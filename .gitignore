@@ -19,3 +19,7 @@
 
 # User config (if copied into repo)
 .athen/
+
+# Python bytecode
+__pycache__/
+*.pyc
