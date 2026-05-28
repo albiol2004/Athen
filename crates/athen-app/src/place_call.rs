@@ -158,8 +158,7 @@ fn parse_args(args: &Value) -> Result<ParsedArgs> {
     let raw_dur = args
         .get("max_duration_s")
         .and_then(|v| v.as_u64())
-        .unwrap_or(VoiceConfig::DEFAULT_MAX_DURATION_S as u64)
-        as u32;
+        .unwrap_or(VoiceConfig::DEFAULT_MAX_DURATION_S as u64) as u32;
     let (max_duration_s, _) = VoiceConfig::clamp_duration(raw_dur);
 
     Ok(ParsedArgs {
@@ -239,7 +238,11 @@ pub(crate) fn pipecat_kind_for(connection_id: &str, family: ModelFamily) -> Opti
 /// per-call override in [`VoiceConfig`]; otherwise pulls the Fast tier
 /// from the active Bundle, falling back to the active provider's
 /// `default_model`.
-pub(crate) fn pick_voice_llm(cfg: &AthenConfig, voice: &VoiceConfig, active_id: &str) -> (String, String) {
+pub(crate) fn pick_voice_llm(
+    cfg: &AthenConfig,
+    voice: &VoiceConfig,
+    active_id: &str,
+) -> (String, String) {
     if let (Some(cid), Some(slug)) = (
         voice.llm_override_connection_id.as_deref(),
         voice.llm_override_slug.as_deref(),
@@ -282,7 +285,8 @@ fn pick_tier(bundle: &Bundle, tier: ModelProfile) -> Option<&athen_core::config:
 }
 
 fn resolve_llm(deps: &TelephonyDeps) -> Result<ResolvedLlm> {
-    let (connection_id, slug) = pick_voice_llm(&deps.config, &deps.voice_config, &deps.active_provider_id);
+    let (connection_id, slug) =
+        pick_voice_llm(&deps.config, &deps.voice_config, &deps.active_provider_id);
     let provider = deps
         .config
         .models
@@ -351,8 +355,9 @@ async fn load_endpoint(
     id_str: &str,
     role: &str,
 ) -> Result<RegisteredEndpoint> {
-    let id = Uuid::parse_str(id_str)
-        .map_err(|e| AthenError::Other(format!("place_call: {role} endpoint id is not a UUID: {e}")))?;
+    let id = Uuid::parse_str(id_str).map_err(|e| {
+        AthenError::Other(format!("place_call: {role} endpoint id is not a UUID: {e}"))
+    })?;
     store.get(id).await?.ok_or_else(|| {
         AthenError::Other(format!(
             "place_call: {role} endpoint not found — open Settings → Voice and re-pick."
@@ -490,7 +495,9 @@ async fn run_pipecat(
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
 
-    let mut child = cmd.spawn().map_err(|e| format!("spawn pipecat_runner: {e}"))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("spawn pipecat_runner: {e}"))?;
     let stdout = child
         .stdout
         .take()
@@ -548,10 +555,7 @@ async fn run_pipecat(
                         continue;
                     }
                 };
-                let event = parsed
-                    .get("event")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let event = parsed.get("event").and_then(|v| v.as_str()).unwrap_or("");
                 emit_progress(app_handle, arc_id, &parsed);
                 match event {
                     "transcript" => {
@@ -795,9 +799,8 @@ pub async fn do_place_call(
         .map_err(|e| AthenError::Other(format!("place_call: cannot create temp config: {e}")))?;
     {
         use std::io::Write;
-        let body = serde_json::to_vec_pretty(&config_blob).map_err(|e| {
-            AthenError::Other(format!("place_call: serialize config: {e}"))
-        })?;
+        let body = serde_json::to_vec_pretty(&config_blob)
+            .map_err(|e| AthenError::Other(format!("place_call: serialize config: {e}")))?;
         tf.write_all(&body)
             .and_then(|_| tf.flush())
             .map_err(|e| AthenError::Other(format!("place_call: write temp config: {e}")))?;
@@ -825,13 +828,7 @@ pub async fn do_place_call(
         Err(e) => {
             // Surface the failure as a tool error + notification.
             if let Some(n) = &deps.notifier {
-                fire_notification(
-                    n,
-                    arc_id,
-                    &format!("Call to {destination} failed"),
-                    &e,
-                )
-                .await;
+                fire_notification(n, arc_id, &format!("Call to {destination} failed"), &e).await;
             }
             // Drop tempfile here implicitly when `tf` falls out of scope.
             drop(tf);
@@ -1074,10 +1071,7 @@ mod tests {
             async fn delete(&self, _scope: &str, _key: &str) -> athen_core::error::Result<()> {
                 Ok(())
             }
-            async fn list(
-                &self,
-                _scope: &str,
-            ) -> athen_core::error::Result<Vec<String>> {
+            async fn list(&self, _scope: &str) -> athen_core::error::Result<Vec<String>> {
                 Ok(Vec::new())
             }
         }
@@ -1123,7 +1117,12 @@ mod tests {
 
     #[tokio::test]
     async fn place_call_rejects_invalid_e164() {
-        let deps = mk_deps(Arc::new(ApproveGate), populated_voice(), ModelFamily::Default).await;
+        let deps = mk_deps(
+            Arc::new(ApproveGate),
+            populated_voice(),
+            ModelFamily::Default,
+        )
+        .await;
         let err = preflight(
             &deps,
             &json!({"number": "not-a-number", "objective": "test"}),
@@ -1131,7 +1130,10 @@ mod tests {
         .unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("place_call"), "got: {msg}");
-        assert!(msg.contains("must start with") || msg.contains("E.164"), "got: {msg}");
+        assert!(
+            msg.contains("must start with") || msg.contains("E.164"),
+            "got: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -1154,7 +1156,12 @@ mod tests {
 
     #[tokio::test]
     async fn place_call_user_party_substitutes_user_number() {
-        let deps = mk_deps(Arc::new(ApproveGate), populated_voice(), ModelFamily::Default).await;
+        let deps = mk_deps(
+            Arc::new(ApproveGate),
+            populated_voice(),
+            ModelFamily::Default,
+        )
+        .await;
         let req = preflight(
             &deps,
             &json!({
@@ -1188,7 +1195,12 @@ mod tests {
 
     #[tokio::test]
     async fn place_call_clamps_max_duration() {
-        let deps = mk_deps(Arc::new(ApproveGate), populated_voice(), ModelFamily::Default).await;
+        let deps = mk_deps(
+            Arc::new(ApproveGate),
+            populated_voice(),
+            ModelFamily::Default,
+        )
+        .await;
         let req = preflight(
             &deps,
             &json!({
@@ -1209,11 +1221,7 @@ mod tests {
             ModelFamily::ClaudeOpus47,
         )
         .await;
-        let req = preflight(
-            &deps,
-            &json!({"number": "+14155551234", "objective": "x"}),
-        )
-        .unwrap();
+        let req = preflight(&deps, &json!({"number": "+14155551234", "objective": "x"})).unwrap();
         assert!(req.llm_label.contains("deepseek-chat"));
     }
 
@@ -1262,4 +1270,3 @@ mod tests {
         );
     }
 }
-

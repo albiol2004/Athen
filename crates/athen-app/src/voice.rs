@@ -29,9 +29,7 @@ use std::sync::Arc;
 use athen_agent::runtimes::{self as agent_runtimes, InstallProgress, RuntimeKind};
 use athen_core::config::{Bundle, ACTIVE_BUNDLE_KEY};
 use athen_core::llm::ModelProfile;
-use athen_voice::pipecat_runtime::{
-    self, PipecatPaths, SetupPhase, SetupProgress, SetupStatus,
-};
+use athen_voice::pipecat_runtime::{self, PipecatPaths, SetupPhase, SetupProgress, SetupStatus};
 use athen_voice::VoiceConfig;
 use serde::{Deserialize, Serialize};
 use tauri::path::BaseDirectory;
@@ -144,8 +142,8 @@ pub async fn save_voice_settings(
     config.max_call_duration_s = clamped;
 
     let mut main = crate::settings::load_main_config_public();
-    main.voice = serde_json::to_value(&config)
-        .map_err(|e| format!("serialize VoiceConfig: {e}"))?;
+    main.voice =
+        serde_json::to_value(&config).map_err(|e| format!("serialize VoiceConfig: {e}"))?;
     crate::settings::save_main_config_public(&main)?;
     tracing::info!("Voice config saved");
     Ok(())
@@ -235,9 +233,7 @@ async fn collect_endpoints(
 /// plus one per (connection × tier slug) the user has set. This is a
 /// pragmatic-not-exhaustive list — most users only see "<provider> ::
 /// <default model>" and that's enough.
-fn collect_llm_connections(
-    cfg: &athen_core::config::AthenConfig,
-) -> Vec<LlmConnectionOption> {
+fn collect_llm_connections(cfg: &athen_core::config::AthenConfig) -> Vec<LlmConnectionOption> {
     let mut out: Vec<LlmConnectionOption> = Vec::new();
     let mut seen: HashSet<(String, String)> = HashSet::new();
 
@@ -329,14 +325,11 @@ pub fn ensure_runner_extracted(app_handle: &AppHandle) -> std::result::Result<Pa
                 .ok()
                 .filter(|p| p.exists())
         })
-        .ok_or_else(|| {
-            format!("bundled {PIPECAT_RUNNER_NAME} not found in app resources")
-        })?;
+        .ok_or_else(|| format!("bundled {PIPECAT_RUNNER_NAME} not found in app resources"))?;
 
     let toolbox = athen_core::paths::athen_toolbox_dir()
         .ok_or_else(|| "could not resolve athen toolbox dir".to_string())?;
-    std::fs::create_dir_all(&toolbox)
-        .map_err(|e| format!("create toolbox dir: {e}"))?;
+    std::fs::create_dir_all(&toolbox).map_err(|e| format!("create toolbox dir: {e}"))?;
     let target = toolbox.join(PIPECAT_RUNNER_NAME);
 
     let should_copy = match (std::fs::metadata(&target), std::fs::metadata(&bundled)) {
@@ -351,8 +344,7 @@ pub fn ensure_runner_extracted(app_handle: &AppHandle) -> std::result::Result<Pa
     };
 
     if should_copy {
-        std::fs::copy(&bundled, &target)
-            .map_err(|e| format!("copy {PIPECAT_RUNNER_NAME}: {e}"))?;
+        std::fs::copy(&bundled, &target).map_err(|e| format!("copy {PIPECAT_RUNNER_NAME}: {e}"))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -373,9 +365,7 @@ pub fn ensure_runner_extracted(app_handle: &AppHandle) -> std::result::Result<Pa
 /// string. Wired into the install button (batch 2B) and the place_call
 /// tool wiring (batch 3).
 #[tauri::command]
-pub async fn extract_pipecat_runner(
-    app_handle: AppHandle,
-) -> std::result::Result<String, String> {
+pub async fn extract_pipecat_runner(app_handle: AppHandle) -> std::result::Result<String, String> {
     let p = ensure_runner_extracted(&app_handle)?;
     Ok(p.to_string_lossy().to_string())
 }
@@ -430,9 +420,7 @@ pub async fn install_pipecat(
         let app_for_cb = app_handle.clone();
         let cb: agent_runtimes::ProgressCb = Arc::new(move |progress: InstallProgress| {
             let (msg, percent) = match &progress {
-                InstallProgress::Resolving => {
-                    ("Resolving Python download…".to_string(), Some(2))
-                }
+                InstallProgress::Resolving => ("Resolving Python download…".to_string(), Some(2)),
                 InstallProgress::Downloading { downloaded, total } => {
                     let pct = total
                         .map(|t| {
@@ -455,39 +443,24 @@ pub async fn install_pipecat(
                     };
                     (msg, Some(pct))
                 }
-                InstallProgress::Verifying => {
-                    ("Verifying Python checksum…".to_string(), Some(42))
-                }
-                InstallProgress::Extracting => {
-                    ("Extracting Python…".to_string(), Some(45))
-                }
+                InstallProgress::Verifying => ("Verifying Python checksum…".to_string(), Some(42)),
+                InstallProgress::Extracting => ("Extracting Python…".to_string(), Some(45)),
                 InstallProgress::Done => ("Portable Python ready.".to_string(), Some(50)),
             };
-            emit_setup_progress(
-                &app_for_cb,
-                SetupPhase::PythonInstalling,
-                msg,
-                percent,
-            );
+            emit_setup_progress(&app_for_cb, SetupPhase::PythonInstalling, msg, percent);
         });
 
         agent_runtimes::install_runtime(RuntimeKind::Python, cb)
             .await
             .map_err(|e| {
                 let msg = format!("portable Python install failed: {e}");
-                emit_setup_progress(
-                    &app_handle,
-                    SetupPhase::Failed,
-                    msg.clone(),
-                    None,
-                );
+                emit_setup_progress(&app_handle, SetupPhase::Failed, msg.clone(), None);
                 msg
             })?;
     }
 
     let python_exe = athen_core::paths::athen_portable_python_bin().ok_or_else(|| {
-        let msg =
-            "portable Python install completed but binary path is unavailable".to_string();
+        let msg = "portable Python install completed but binary path is unavailable".to_string();
         emit_setup_progress(&app_handle, SetupPhase::Failed, msg.clone(), None);
         msg
     })?;
@@ -504,14 +477,11 @@ pub async fn install_pipecat(
     // Phase 2: Pipecat install. Move the AppHandle into the callback so
     // each progress event reaches the frontend on the right channel.
     let app_for_pipecat = app_handle.clone();
-    let result = pipecat_runtime::install_pipecat(
-        &python_exe,
-        &paths,
-        move |progress: SetupProgress| {
+    let result =
+        pipecat_runtime::install_pipecat(&python_exe, &paths, move |progress: SetupProgress| {
             emit_setup_progress_raw(&app_for_pipecat, progress);
-        },
-    )
-    .await;
+        })
+        .await;
 
     match result {
         Ok(status) => Ok(status),
@@ -526,12 +496,7 @@ pub async fn install_pipecat(
 
 /// Build + emit a `SetupProgress` from raw fields. Keeps the
 /// translation callsites tidy.
-fn emit_setup_progress(
-    app: &AppHandle,
-    phase: SetupPhase,
-    message: String,
-    percent: Option<u8>,
-) {
+fn emit_setup_progress(app: &AppHandle, phase: SetupPhase, message: String, percent: Option<u8>) {
     emit_setup_progress_raw(
         app,
         SetupProgress {

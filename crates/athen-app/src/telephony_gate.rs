@@ -142,5 +142,4 @@ mod tests {
         let desc = RouterTelephonyApprovalGate::build_description(&req);
         assert!(desc.contains("Voice: (default)"));
     }
-
 }

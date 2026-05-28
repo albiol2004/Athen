@@ -189,10 +189,7 @@ where
 
     let env_dir = paths.pipecat_env();
     tokio::fs::create_dir_all(&env_dir).await.map_err(|e| {
-        VoiceError::PipecatInstallFailed(format!(
-            "mkdir {} failed: {e}",
-            env_dir.display()
-        ))
+        VoiceError::PipecatInstallFailed(format!("mkdir {} failed: {e}", env_dir.display()))
     })?;
 
     // Build the pip arg list. `--target` isolates the install without
@@ -238,10 +235,7 @@ where
         .stderr(Stdio::piped());
 
     let mut child = cmd.spawn().map_err(|e| {
-        VoiceError::PipecatInstallFailed(format!(
-            "spawn {} pip failed: {e}",
-            python_exe.display()
-        ))
+        VoiceError::PipecatInstallFailed(format!("spawn {} pip failed: {e}", python_exe.display()))
     })?;
 
     // Take both pipes; pip writes most "Collecting"/"Downloading" lines
@@ -295,9 +289,10 @@ where
         buf
     });
 
-    let status = child.wait().await.map_err(|e| {
-        VoiceError::PipecatInstallFailed(format!("wait pip exit: {e}"))
-    })?;
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| VoiceError::PipecatInstallFailed(format!("wait pip exit: {e}")))?;
 
     let _stdout_buf = stdout_task.await.unwrap_or_default();
     let stderr_buf = stderr_task.await.unwrap_or_default();
@@ -432,16 +427,11 @@ fn build_python_path_env(python_exe: &Path) -> Option<String> {
 /// installed if the marker exists).
 pub async fn pipecat_version(python_exe: &Path, env_dir: &Path) -> Option<String> {
     let mut cmd = Command::new(python_exe);
-    cmd.args([
-        "-m",
-        "pip",
-        "show",
-        "pipecat-ai",
-    ])
-    .env("PYTHONPATH", env_dir.as_os_str())
-    .env_remove("PYTHONHOME")
-    .stdout(Stdio::piped())
-    .stderr(Stdio::null());
+    cmd.args(["-m", "pip", "show", "pipecat-ai"])
+        .env("PYTHONPATH", env_dir.as_os_str())
+        .env_remove("PYTHONHOME")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
 
     let output = cmd.output().await.ok()?;
     if !output.status.success() {
@@ -475,7 +465,9 @@ mod tests {
         assert_eq!(paths.pipecat_env(), tmp.path().join("pipecat_env"));
         assert_eq!(
             paths.marker(),
-            tmp.path().join("pipecat_env").join("pipecat_runner_marker.json"),
+            tmp.path()
+                .join("pipecat_env")
+                .join("pipecat_runner_marker.json"),
         );
         assert_eq!(paths.runner_script(), tmp.path().join("pipecat_runner.py"));
     }
