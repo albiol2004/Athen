@@ -62,6 +62,45 @@ impl Memory {
     }
 }
 
+/// Normalize text for duplicate comparison: trim, lowercase, strip
+/// trailing ASCII punctuation. Conservative — we only want to collapse
+/// trivial differences (case, trailing period) before falling through
+/// to the more permissive Jaccard check.
+fn normalize_for_dedup(s: &str) -> String {
+    s.trim()
+        .trim_end_matches(|c: char| c.is_ascii_punctuation())
+        .to_lowercase()
+}
+
+/// Whitespace-tokenize + lowercase + strip surrounding punctuation per
+/// token. Used by `jaccard_similarity`. Empty tokens are dropped.
+fn dedup_tokens(s: &str) -> std::collections::HashSet<String> {
+    s.split_whitespace()
+        .map(|t| {
+            t.trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase()
+        })
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+/// Jaccard similarity over whitespace-split tokens. Returns 0.0 when
+/// either side is empty so very short strings can't accidentally match.
+fn jaccard_similarity(a: &str, b: &str) -> f32 {
+    let ta = dedup_tokens(a);
+    let tb = dedup_tokens(b);
+    if ta.is_empty() || tb.is_empty() {
+        return 0.0;
+    }
+    let intersection = ta.intersection(&tb).count() as f32;
+    let union = ta.union(&tb).count() as f32;
+    if union == 0.0 {
+        0.0
+    } else {
+        intersection / union
+    }
+}
+
 /// Tokenize a recall query into lowercased keyword tokens. Strips
 /// trivial punctuation and drops common English/Spanish stopwords plus
 /// tokens shorter than 3 chars. Used by the keyword-fallback path that
@@ -147,6 +186,42 @@ fn extract_entity_names_cheap(query: &str) -> Vec<String> {
 #[async_trait]
 impl MemoryStore for Memory {
     async fn remember(&self, item: MemoryItem) -> Result<()> {
+        // Write-time dedup. The agent-tool path (`memory_store`)
+        // pre-recalls and skips, but the LLM auto-judge path
+        // (`judge_worth_remembering`) calls remember() directly and
+        // historically piled up near-duplicate entries (e.g. three
+        // copies of "pet in August"). Catch duplicates here so EVERY
+        // caller benefits.
+        //
+        // Skip condition: incoming item has no pre-existing ID (i.e.
+        // not an explicit update), AND a recall surfaces something
+        // whose content is text-equal (case + trailing-punct normalized)
+        // OR Jaccard > 0.85 over whitespace tokens. Explicit-id
+        // overwrites fall through to vector.upsert which handles them.
+        let id_already_exists = {
+            // We treat "id already in the store" as an explicit update
+            // and skip dedup. list_all is the cheapest extant API.
+            let all = self.vector.list_all().await.unwrap_or_default();
+            all.iter().any(|r| r.id == item.id)
+        };
+
+        if !id_already_exists {
+            let candidates = self.recall(&item.content, 3).await.unwrap_or_default();
+            let new_norm = normalize_for_dedup(&item.content);
+            for cand in &candidates {
+                let existing_norm = normalize_for_dedup(&cand.content);
+                let is_text_equal = !new_norm.is_empty() && new_norm == existing_norm;
+                let jaccard = jaccard_similarity(&item.content, &cand.content);
+                if is_text_equal || jaccard > 0.85 {
+                    debug!(
+                        "Skipping near-duplicate memory: existing={:?} new={:?} (jaccard={:.2})",
+                        cand.content, item.content, jaccard
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
         // Generate embedding from content if an embedder is available.
         let embedding = if let Some(ref embedder) = self.embedder {
             embedder.embed(&item.content).await?
@@ -1474,6 +1549,102 @@ mod tests {
         assert_eq!(results[0].id, "a");
         // No extras came from the KG path (graph is empty anyway).
         assert!(results.iter().all(|m| ["a", "b", "c"].contains(&m.id.as_str())));
+    }
+
+    /// Storing a near-identical sentence (case + trailing punctuation
+    /// differences only) should be skipped silently. Cures the
+    /// "3 copies of 'pet in August'" bug from the auto-judge path.
+    #[tokio::test]
+    async fn remember_skips_near_duplicate_text() {
+        let mem = make_memory().with_min_score(0.0);
+
+        mem.remember(MemoryItem {
+            id: "first".into(),
+            content: "User likes coffee".into(),
+            metadata: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+
+        // Different ID, same content modulo case + trailing period.
+        mem.remember(MemoryItem {
+            id: "second".into(),
+            content: "user likes coffee.".into(),
+            metadata: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+
+        let all = mem.list_all().await.unwrap();
+        assert_eq!(
+            all.len(),
+            1,
+            "near-duplicate should be skipped; got {:?}",
+            all.iter().map(|m| &m.content).collect::<Vec<_>>()
+        );
+    }
+
+    /// Storing with an ID that already exists is an update, not a
+    /// duplicate. The dedup check must let it through so the new
+    /// content replaces the old via vector.upsert semantics.
+    #[tokio::test]
+    async fn remember_allows_explicit_id_update() {
+        let mem = make_memory().with_min_score(0.0);
+
+        mem.remember(MemoryItem {
+            id: "stable-id".into(),
+            content: "first content version".into(),
+            metadata: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+
+        mem.remember(MemoryItem {
+            id: "stable-id".into(),
+            content: "second completely different content version replacement".into(),
+            metadata: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+
+        let all = mem.list_all().await.unwrap();
+        assert_eq!(all.len(), 1, "id-based update should not add a row");
+        assert!(
+            all[0].content.contains("second"),
+            "update should replace content; got {:?}",
+            all[0].content
+        );
+    }
+
+    /// Genuinely different content should both land. Regression guard
+    /// for over-eager dedup.
+    #[tokio::test]
+    async fn remember_allows_genuinely_different_content() {
+        let mem = make_memory().with_min_score(0.0);
+
+        mem.remember(MemoryItem {
+            id: "coffee".into(),
+            content: "User likes coffee".into(),
+            metadata: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+
+        mem.remember(MemoryItem {
+            id: "dog".into(),
+            content: "User has a dog".into(),
+            metadata: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+
+        let all = mem.list_all().await.unwrap();
+        assert_eq!(
+            all.len(),
+            2,
+            "distinct memories should both store; got {:?}",
+            all.iter().map(|m| &m.content).collect::<Vec<_>>()
+        );
     }
 
     /// With no extractor wired and no embedder, the cheap entity
