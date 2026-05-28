@@ -9243,3 +9243,132 @@ option:hover {
 .voice-status-error {
     color: var(--danger, #E0584C);
 }
+
+/* ─── Voice — runtime setup subsection ─── */
+
+.voice-setup {
+    margin-top: 18px;
+    padding: 12px 14px;
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm, 6px);
+}
+
+.voice-setup > summary {
+    cursor: pointer;
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--text-2);
+    user-select: none;
+    list-style: none;
+    padding: 2px 0;
+}
+.voice-setup > summary::-webkit-details-marker {
+    display: none;
+}
+.voice-setup > summary::before {
+    content: '\25B6';
+    display: inline-block;
+    margin-right: 6px;
+    transition: transform 0.15s ease;
+    color: var(--text-3, var(--text-2));
+    font-size: 10px;
+}
+.voice-setup[open] > summary::before {
+    transform: rotate(90deg);
+}
+
+.voice-setup p {
+    margin: 8px 0 6px;
+    font-size: 12px;
+    color: var(--text-2);
+}
+
+.voice-setup-blurb {
+    color: var(--text-3, var(--text-2));
+    font-size: 11.5px;
+}
+
+.voice-setup-checks {
+    list-style: none;
+    padding: 0;
+    margin: 6px 0 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.voice-setup-checks li {
+    font-size: 12px;
+    color: var(--text-2);
+    padding: 2px 0;
+    font-variant-numeric: tabular-nums;
+}
+
+.voice-setup-checks li.is-ok {
+    color: var(--success, #4CAF73);
+}
+
+.voice-setup-checks li.is-pending {
+    color: var(--text-3, var(--text-2));
+}
+
+.voice-setup-checks li.is-fail {
+    color: var(--danger, #E0584C);
+}
+
+#voice-install-btn {
+    margin-top: 4px;
+    padding: 6px 12px;
+    font-size: 12px;
+    background: var(--accent, var(--brand-solid, #E36A5C));
+    color: white;
+    border: 1px solid transparent;
+    border-radius: var(--r-sm, 6px);
+    cursor: pointer;
+    font-weight: 600;
+}
+#voice-install-btn:hover {
+    filter: brightness(1.05);
+}
+#voice-install-btn:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+}
+#voice-install-btn.is-hidden {
+    display: none;
+}
+
+.voice-setup-progress {
+    margin-top: 10px;
+}
+
+.voice-setup-progress-bar {
+    width: 100%;
+    max-width: 480px;
+    height: 8px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    overflow: hidden;
+}
+
+.voice-setup-progress-fill {
+    height: 100%;
+    width: 0%;
+    background: var(--accent, var(--brand-solid, #E36A5C));
+    transition: width 0.25s ease;
+}
+.voice-setup-progress-fill.is-failed {
+    background: var(--danger, #E0584C);
+}
+.voice-setup-progress-fill.is-done {
+    background: var(--success, #4CAF73);
+}
+
+.voice-setup-progress-msg {
+    margin-top: 6px;
+    font-size: 11.5px;
+    color: var(--text-2);
+    min-height: 16px;
+}

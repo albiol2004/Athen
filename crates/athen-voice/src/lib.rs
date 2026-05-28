@@ -1,9 +1,12 @@
 //! Voice subsystem types — VoiceConfig, providers, vault scope helpers.
 //!
-//! Pure types + helpers. Subprocess orchestration (pipecat_runtime) and
-//! the place_call tool live in separate batches; this crate is the contract.
+//! Pure types + helpers. The `place_call` tool lives in a separate batch;
+//! the `pipecat_runtime` submodule implements the install pipeline for
+//! the Python-side runner.
 
 use serde::{Deserialize, Serialize};
+
+pub mod pipecat_runtime;
 
 /// Persisted voice configuration. Stored as a single JSON row in the
 /// settings table — voice_config.
@@ -110,6 +113,10 @@ pub enum VoiceError {
     InvalidPhoneNumber(String),
     #[error("max_duration_s out of range (1..={max}): {got}", max = VoiceConfig::HARD_MAX_DURATION_S)]
     DurationOutOfRange { got: u32 },
+    #[error("pipecat install failed: {0}")]
+    PipecatInstallFailed(String),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// Very loose E.164 sanity check — does NOT validate the number is reachable,

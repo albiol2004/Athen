@@ -23,12 +23,19 @@
 //! manually still lands in the right bucket.
 
 use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::Arc;
 
+use athen_agent::runtimes::{self as agent_runtimes, InstallProgress, RuntimeKind};
 use athen_core::config::{Bundle, ACTIVE_BUNDLE_KEY};
 use athen_core::llm::ModelProfile;
+use athen_voice::pipecat_runtime::{
+    self, PipecatPaths, SetupPhase, SetupProgress, SetupStatus,
+};
 use athen_voice::VoiceConfig;
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::path::BaseDirectory;
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::state::AppState;
 
@@ -283,6 +290,261 @@ fn display_connection_label(id: &str) -> String {
     match chars.next() {
         Some(c) => c.to_ascii_uppercase().to_string() + chars.as_str(),
         None => String::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bundled Pipecat runner extraction
+// ---------------------------------------------------------------------------
+
+/// File name the script lives under both in the Tauri bundle resources
+/// and in the user-side toolbox dir.
+const PIPECAT_RUNNER_NAME: &str = "pipecat_runner.py";
+
+/// Resolve the bundled `pipecat_runner.py` and copy it into the user's
+/// toolbox dir at `<athen_data_dir>/toolbox/pipecat_runner.py`. The copy
+/// happens on first call and on every subsequent call where the bundled
+/// resource is newer than the cached copy (so app updates ship fresh
+/// runners). Returns the target path.
+///
+/// All errors are returned as `String` because this helper is called from
+/// a Tauri command and the frontend wants a plain message.
+pub fn ensure_runner_extracted(app_handle: &AppHandle) -> std::result::Result<PathBuf, String> {
+    // The bundled resource path. With
+    // `tauri.conf.json -> bundle.resources = ["../../assets/pipecat_runner.py"]`,
+    // Tauri flattens the file to `<resource_dir>/pipecat_runner.py`. We
+    // also probe `assets/pipecat_runner.py` as a fallback in case a
+    // future config change preserves the leading directory.
+    let resolver = app_handle.path();
+    let bundled = resolver
+        .resolve(PIPECAT_RUNNER_NAME, BaseDirectory::Resource)
+        .ok()
+        .filter(|p| p.exists())
+        .or_else(|| {
+            resolver
+                .resolve(
+                    format!("assets/{PIPECAT_RUNNER_NAME}"),
+                    BaseDirectory::Resource,
+                )
+                .ok()
+                .filter(|p| p.exists())
+        })
+        .ok_or_else(|| {
+            format!("bundled {PIPECAT_RUNNER_NAME} not found in app resources")
+        })?;
+
+    let toolbox = athen_core::paths::athen_toolbox_dir()
+        .ok_or_else(|| "could not resolve athen toolbox dir".to_string())?;
+    std::fs::create_dir_all(&toolbox)
+        .map_err(|e| format!("create toolbox dir: {e}"))?;
+    let target = toolbox.join(PIPECAT_RUNNER_NAME);
+
+    let should_copy = match (std::fs::metadata(&target), std::fs::metadata(&bundled)) {
+        (Err(_), _) => true,
+        (Ok(t), Ok(b)) => match (t.modified(), b.modified()) {
+            (Ok(tt), Ok(bt)) => bt > tt,
+            // Modtime unavailable on this fs — be safe, recopy.
+            _ => true,
+        },
+        // Bundle metadata read failed but file existed — try to copy and surface error there.
+        (Ok(_), Err(_)) => true,
+    };
+
+    if should_copy {
+        std::fs::copy(&bundled, &target)
+            .map_err(|e| format!("copy {PIPECAT_RUNNER_NAME}: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(&target) {
+                let mut perm = meta.permissions();
+                perm.set_mode(0o755);
+                let _ = std::fs::set_permissions(&target, perm);
+            }
+        }
+        tracing::info!(target = %target.display(), "extracted pipecat runner");
+    }
+
+    Ok(target)
+}
+
+/// Tauri command — extracts the bundled `pipecat_runner.py` to the
+/// toolbox dir (if needed) and returns the absolute target path as a
+/// string. Wired into the install button (batch 2B) and the place_call
+/// tool wiring (batch 3).
+#[tauri::command]
+pub async fn extract_pipecat_runner(
+    app_handle: AppHandle,
+) -> std::result::Result<String, String> {
+    let p = ensure_runner_extracted(&app_handle)?;
+    Ok(p.to_string_lossy().to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Pipecat install pipeline
+// ---------------------------------------------------------------------------
+
+/// Frontend progress event name for the voice setup pipeline.
+const VOICE_SETUP_PROGRESS_EVENT: &str = "voice-setup-progress";
+
+/// Resolve the toolbox root the installer writes into. Errors if the
+/// data dir can't be located (basically only on misconfigured CI).
+fn voice_toolbox_root() -> Result<PathBuf, String> {
+    athen_core::paths::athen_toolbox_dir()
+        .ok_or_else(|| "could not resolve athen toolbox dir".to_string())
+}
+
+/// Snapshot the current state of the Voice runtime install. Cheap —
+/// filesystem stats + a marker read, no subprocesses.
+#[tauri::command]
+pub async fn get_voice_setup_status(
+    _state: State<'_, AppState>,
+) -> std::result::Result<SetupStatus, String> {
+    let toolbox = voice_toolbox_root()?;
+    let paths = PipecatPaths::new(toolbox);
+    let python_installed = agent_runtimes::is_portable_python_installed();
+    Ok(pipecat_runtime::check_status(&paths, python_installed))
+}
+
+/// Long-running. Ensures portable Python is installed, then runs
+/// `pip install --target` for Pipecat. Emits `voice-setup-progress`
+/// events through the lifecycle.
+#[tauri::command]
+pub async fn install_pipecat(
+    _state: State<'_, AppState>,
+    app_handle: AppHandle,
+) -> std::result::Result<SetupStatus, String> {
+    let toolbox = voice_toolbox_root()?;
+    let paths = PipecatPaths::new(toolbox);
+
+    // Phase 1: Python (skipped if already present).
+    if !agent_runtimes::is_portable_python_installed() {
+        emit_setup_progress(
+            &app_handle,
+            SetupPhase::PythonInstalling,
+            "Installing portable Python (~50 MB)…".into(),
+            Some(0),
+        );
+
+        // Translate athen-agent's InstallProgress into our SetupProgress.
+        let app_for_cb = app_handle.clone();
+        let cb: agent_runtimes::ProgressCb = Arc::new(move |progress: InstallProgress| {
+            let (msg, percent) = match &progress {
+                InstallProgress::Resolving => {
+                    ("Resolving Python download…".to_string(), Some(2))
+                }
+                InstallProgress::Downloading { downloaded, total } => {
+                    let pct = total
+                        .map(|t| {
+                            if t == 0 {
+                                0u8
+                            } else {
+                                // Map Python phase to 0..40% of overall.
+                                let frac = (*downloaded as f64 / t as f64).clamp(0.0, 1.0);
+                                (frac * 40.0) as u8
+                            }
+                        })
+                        .unwrap_or(0);
+                    let mb = downloaded / (1024 * 1024);
+                    let msg = match total {
+                        Some(t) => {
+                            let total_mb = t / (1024 * 1024);
+                            format!("Downloading Python… {mb}/{total_mb} MB")
+                        }
+                        None => format!("Downloading Python… {mb} MB"),
+                    };
+                    (msg, Some(pct))
+                }
+                InstallProgress::Verifying => {
+                    ("Verifying Python checksum…".to_string(), Some(42))
+                }
+                InstallProgress::Extracting => {
+                    ("Extracting Python…".to_string(), Some(45))
+                }
+                InstallProgress::Done => ("Portable Python ready.".to_string(), Some(50)),
+            };
+            emit_setup_progress(
+                &app_for_cb,
+                SetupPhase::PythonInstalling,
+                msg,
+                percent,
+            );
+        });
+
+        agent_runtimes::install_runtime(RuntimeKind::Python, cb)
+            .await
+            .map_err(|e| {
+                let msg = format!("portable Python install failed: {e}");
+                emit_setup_progress(
+                    &app_handle,
+                    SetupPhase::Failed,
+                    msg.clone(),
+                    None,
+                );
+                msg
+            })?;
+    }
+
+    let python_exe = athen_core::paths::athen_portable_python_bin().ok_or_else(|| {
+        let msg =
+            "portable Python install completed but binary path is unavailable".to_string();
+        emit_setup_progress(&app_handle, SetupPhase::Failed, msg.clone(), None);
+        msg
+    })?;
+
+    if !python_exe.exists() {
+        let msg = format!(
+            "portable Python install reported success but {} is missing",
+            python_exe.display()
+        );
+        emit_setup_progress(&app_handle, SetupPhase::Failed, msg.clone(), None);
+        return Err(msg);
+    }
+
+    // Phase 2: Pipecat install. Move the AppHandle into the callback so
+    // each progress event reaches the frontend on the right channel.
+    let app_for_pipecat = app_handle.clone();
+    let result = pipecat_runtime::install_pipecat(
+        &python_exe,
+        &paths,
+        move |progress: SetupProgress| {
+            emit_setup_progress_raw(&app_for_pipecat, progress);
+        },
+    )
+    .await;
+
+    match result {
+        Ok(status) => Ok(status),
+        Err(e) => {
+            let msg = e.to_string();
+            // pipecat_runtime::install_pipecat already emitted a Failed
+            // event before returning; we don't double-emit here.
+            Err(msg)
+        }
+    }
+}
+
+/// Build + emit a `SetupProgress` from raw fields. Keeps the
+/// translation callsites tidy.
+fn emit_setup_progress(
+    app: &AppHandle,
+    phase: SetupPhase,
+    message: String,
+    percent: Option<u8>,
+) {
+    emit_setup_progress_raw(
+        app,
+        SetupProgress {
+            phase,
+            message,
+            percent,
+        },
+    );
+}
+
+fn emit_setup_progress_raw(app: &AppHandle, payload: SetupProgress) {
+    if let Err(e) = app.emit(VOICE_SETUP_PROGRESS_EVENT, payload) {
+        tracing::warn!(error = %e, "failed to emit voice-setup-progress");
     }
 }
 

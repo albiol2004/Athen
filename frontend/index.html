@@ -863,6 +863,21 @@
                         </div>
                     </details>
 
+                    <details class="voice-setup" id="voice-setup-details">
+                        <summary>Voice runtime setup</summary>
+                        <p id="voice-setup-status">Checking…</p>
+                        <ul class="voice-setup-checks">
+                            <li id="voice-check-python" class="is-pending">⏳ Portable Python</li>
+                            <li id="voice-check-pipecat" class="is-pending">⏳ Pipecat (audio runtime)</li>
+                        </ul>
+                        <p class="voice-setup-blurb">One-time download. Pipecat is ~80 MB; portable Python (if missing) is another ~50 MB.</p>
+                        <button id="voice-install-btn" type="button">Install runtime</button>
+                        <div id="voice-setup-progress" class="voice-setup-progress" hidden>
+                            <div class="voice-setup-progress-bar"><div class="voice-setup-progress-fill"></div></div>
+                            <p class="voice-setup-progress-msg"></p>
+                        </div>
+                    </details>
+
                     <div class="voice-actions">
                         <button id="voice-save-btn" class="btn-primary" type="button">Save voice config</button>
                         <button id="voice-test-btn" class="btn-secondary" type="button" disabled title="Will be wired in next release">Test setup</button>

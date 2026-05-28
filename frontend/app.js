@@ -16419,6 +16419,10 @@ const voiceState = {
     loading: false,
     config: null,
     options: null,
+    setup: null,            // SetupStatus from get_voice_setup_status
+    setupLoading: false,
+    installing: false,
+    progressUnlisten: null,
 };
 
 function voiceDefaultConfig() {
@@ -16467,6 +16471,184 @@ async function loadVoicePanel() {
         }
     } finally {
         voiceState.loading = false;
+    }
+    // Setup-status load is independent of the wiring load — render the
+    // checks even if list_voice_options blew up (empty connections is a
+    // valid state at first launch). Best-effort; never blocks the user.
+    loadVoiceSetupStatus();
+}
+
+async function loadVoiceSetupStatus() {
+    if (typeof invoke !== 'function') return;
+    if (voiceState.setupLoading) return;
+    voiceState.setupLoading = true;
+    try {
+        const setup = await invoke('get_voice_setup_status');
+        voiceState.setup = setup || null;
+        renderVoiceSetupChecks();
+    } catch (err) {
+        console.warn('voice setup status failed', err);
+        const msg = document.getElementById('voice-setup-status');
+        if (msg) {
+            msg.textContent = 'Could not read setup status: ' + err;
+        }
+    } finally {
+        voiceState.setupLoading = false;
+    }
+}
+
+function renderVoiceSetupChecks() {
+    const setup = voiceState.setup;
+    const statusEl = document.getElementById('voice-setup-status');
+    const pythonEl = document.getElementById('voice-check-python');
+    const pipecatEl = document.getElementById('voice-check-pipecat');
+    const btn = document.getElementById('voice-install-btn');
+
+    if (!setup) {
+        if (statusEl) statusEl.textContent = 'Checking…';
+        return;
+    }
+
+    if (pythonEl) {
+        if (setup.pythonInstalled) {
+            pythonEl.className = 'is-ok';
+            pythonEl.textContent = '✓ Portable Python';
+        } else {
+            pythonEl.className = 'is-pending';
+            pythonEl.textContent = '⏳ Portable Python (will install)';
+        }
+    }
+    if (pipecatEl) {
+        if (setup.pipecatInstalled) {
+            pipecatEl.className = 'is-ok';
+            pipecatEl.textContent = setup.pipecatVersion
+                ? `✓ Pipecat (audio runtime) — v${setup.pipecatVersion}`
+                : '✓ Pipecat (audio runtime)';
+        } else {
+            pipecatEl.className = 'is-pending';
+            pipecatEl.textContent = '⏳ Pipecat (audio runtime)';
+        }
+    }
+
+    const allReady = !!(setup.pythonInstalled && setup.pipecatInstalled);
+    if (statusEl) {
+        statusEl.textContent = allReady
+            ? 'Voice runtime is installed.'
+            : 'Voice runtime not installed yet.';
+    }
+    if (btn && !voiceState.installing) {
+        if (allReady) {
+            btn.classList.add('is-hidden');
+        } else {
+            btn.classList.remove('is-hidden');
+            btn.disabled = false;
+            btn.textContent = 'Install runtime';
+        }
+    }
+}
+
+async function ensureVoiceSetupProgressListener() {
+    if (voiceState.progressUnlisten) return;
+    if (!(window.__TAURI__ && window.__TAURI__.event && window.__TAURI__.event.listen)) return;
+    try {
+        voiceState.progressUnlisten = await window.__TAURI__.event.listen(
+            'voice-setup-progress',
+            (event) => {
+                const p = (event && event.payload) ? event.payload : {};
+                applyVoiceSetupProgress(p);
+            },
+        );
+    } catch (err) {
+        console.warn('voice setup progress listen failed', err);
+    }
+}
+
+function applyVoiceSetupProgress(progress) {
+    const wrap = document.getElementById('voice-setup-progress');
+    const fill = wrap ? wrap.querySelector('.voice-setup-progress-fill') : null;
+    const msgEl = wrap ? wrap.querySelector('.voice-setup-progress-msg') : null;
+    if (!wrap || !fill || !msgEl) return;
+    wrap.hidden = false;
+
+    const phase = progress.phase || '';
+    fill.classList.remove('is-failed', 'is-done');
+    if (phase === 'failed') {
+        fill.classList.add('is-failed');
+    } else if (phase === 'done') {
+        fill.classList.add('is-done');
+    }
+
+    if (typeof progress.percent === 'number') {
+        const pct = Math.max(0, Math.min(100, Math.round(progress.percent)));
+        fill.style.width = pct + '%';
+    } else if (phase === 'done') {
+        fill.style.width = '100%';
+    }
+
+    msgEl.textContent = progress.message || phase || '';
+
+    // Reflect intermediate progress in the check list so the user sees
+    // movement even before install finishes.
+    const pythonEl = document.getElementById('voice-check-python');
+    const pipecatEl = document.getElementById('voice-check-pipecat');
+    if (phase === 'python_installing' && pythonEl) {
+        pythonEl.className = 'is-pending';
+        pythonEl.textContent = '… Portable Python (installing)';
+    }
+    if (phase === 'pipecat_installing' && pipecatEl) {
+        pipecatEl.className = 'is-pending';
+        pipecatEl.textContent = '… Pipecat (installing)';
+    }
+}
+
+async function runVoiceInstall() {
+    if (typeof invoke !== 'function') return;
+    if (voiceState.installing) return;
+    voiceState.installing = true;
+
+    const btn = document.getElementById('voice-install-btn');
+    const wrap = document.getElementById('voice-setup-progress');
+    const fill = wrap ? wrap.querySelector('.voice-setup-progress-fill') : null;
+    const msgEl = wrap ? wrap.querySelector('.voice-setup-progress-msg') : null;
+
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Installing…';
+    }
+    if (wrap) wrap.hidden = false;
+    if (fill) {
+        fill.classList.remove('is-failed', 'is-done');
+        fill.style.width = '0%';
+    }
+    if (msgEl) msgEl.textContent = 'Preparing…';
+
+    await ensureVoiceSetupProgressListener();
+
+    try {
+        const status = await invoke('install_pipecat');
+        voiceState.setup = status || voiceState.setup;
+        renderVoiceSetupChecks();
+        if (typeof showToast === 'function') {
+            showToast('Voice runtime installed', 'success');
+        }
+    } catch (err) {
+        console.error('install_pipecat failed', err);
+        if (msgEl) msgEl.textContent = 'Install failed: ' + err;
+        if (fill) {
+            fill.classList.add('is-failed');
+        }
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = 'Retry install';
+        }
+        if (typeof showToast === 'function') {
+            showToast('Install failed: ' + err, 'error');
+        }
+    } finally {
+        voiceState.installing = false;
+        // Re-poll the canonical status (marker + filesystem) so the
+        // ✓/⏳ row reflects ground truth, not just the last event.
+        loadVoiceSetupStatus();
     }
 }
 
@@ -16667,6 +16849,13 @@ function wireVoicePanel() {
             }
         });
     });
+
+    const installBtn = document.getElementById('voice-install-btn');
+    if (installBtn) {
+        installBtn.addEventListener('click', () => {
+            runVoiceInstall();
+        });
+    }
 }
 
 // ─── Initialize ───
