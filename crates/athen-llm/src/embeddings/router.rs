@@ -4,7 +4,7 @@
 //! provider if no neural embedding provider is available.
 
 use async_trait::async_trait;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use athen_core::error::Result;
 use athen_core::traits::embedding::EmbeddingProvider;
@@ -43,7 +43,10 @@ impl EmbeddingRouter {
                 return provider.as_ref();
             }
         }
-        debug!("no neural embedding provider available, falling back to keyword");
+        warn!(
+            "no neural embedding provider available (Auto mode: tried Ollama + OpenAI), \
+             falling back to keyword embeddings — semantic recall quality will be reduced"
+        );
         &self.fallback
     }
 }
