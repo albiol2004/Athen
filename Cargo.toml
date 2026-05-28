@@ -20,6 +20,7 @@ members = [
     "crates/athen-vault",
     "crates/athen-caldav",
     "crates/athen-checkpoint",
+    "crates/athen-voice",
     "crates/athen-cli",
 ]
 
@@ -43,6 +44,7 @@ athen-scheduler = { path = "crates/athen-scheduler" }
 athen-vault = { path = "crates/athen-vault" }
 athen-caldav = { path = "crates/athen-caldav" }
 athen-checkpoint = { path = "crates/athen-checkpoint" }
+athen-voice = { path = "crates/athen-voice" }
 
 # External
 tokio = { version = "1", features = ["full"] }

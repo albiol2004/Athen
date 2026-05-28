@@ -367,6 +367,7 @@ dependencies = [
  "athen-sentidos",
  "athen-shell",
  "athen-vault",
+ "athen-voice",
  "athen-web",
  "base64 0.22.1",
  "chrono",
@@ -686,6 +687,18 @@ dependencies = [
  "tokio",
  "tracing",
  "zeroize",
+]
+
+[[package]]
+name = "athen-voice"
+version = "0.1.0"
+dependencies = [
+ "athen-core",
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "uuid",
 ]
 
 [[package]]
