@@ -761,8 +761,7 @@ impl Memory {
             }
             let matches = names.iter().any(|n| {
                 let lc = n.to_lowercase();
-                neighbor_names.iter().any(|nb| nb.eq_ignore_ascii_case(n))
-                    || pivot_lc.contains(&lc)
+                neighbor_names.iter().any(|nb| nb.eq_ignore_ascii_case(n)) || pivot_lc.contains(&lc)
             });
             if !matches {
                 continue;
@@ -1548,7 +1547,9 @@ mod tests {
         // Rust item should win.
         assert_eq!(results[0].id, "a");
         // No extras came from the KG path (graph is empty anyway).
-        assert!(results.iter().all(|m| ["a", "b", "c"].contains(&m.id.as_str())));
+        assert!(results
+            .iter()
+            .all(|m| ["a", "b", "c"].contains(&m.id.as_str())));
     }
 
     /// Storing a near-identical sentence (case + trailing punctuation
