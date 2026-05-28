@@ -18,6 +18,7 @@ pub(crate) mod email_autodetect;
 pub(crate) mod email_errors;
 pub(crate) mod email_gate;
 pub(crate) mod email_test;
+pub mod embedding_hardware;
 pub(crate) mod endpoints_render;
 pub(crate) mod file_gate;
 pub(crate) mod github_identity;

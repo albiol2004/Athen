@@ -373,6 +373,7 @@ dependencies = [
  "futures",
  "glib 0.20.12",
  "imap",
+ "is-wsl",
  "lettre",
  "quick-xml 0.36.2",
  "reqwest 0.12.28",
