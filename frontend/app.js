@@ -17060,14 +17060,39 @@ function wireVoicePanel() {
 
     const testBtn = document.getElementById('voice-test-btn');
     if (testBtn) {
-        testBtn.addEventListener('click', () => {
+        testBtn.addEventListener('click', async () => {
             const status = document.getElementById('voice-status');
-            const msg = 'Self-test self-call command is a follow-up. To validate end-to-end now, ask Athen in chat to call your number.';
+            const original = testBtn.textContent;
+            testBtn.disabled = true;
+            testBtn.textContent = 'Checking…';
             if (status) {
                 status.className = 'voice-status';
-                status.textContent = msg;
+                status.textContent = 'Running preflight check…';
             }
-            if (typeof showToast === 'function') showToast(msg, 'info');
+            try {
+                const result = await invoke('test_voice_setup');
+                if (status) {
+                    status.className = `voice-status ${result.ok ? 'voice-status-ok' : 'voice-status-error'}`;
+                    status.style.whiteSpace = 'pre-line';
+                    const lines = [result.summary];
+                    if (result.ok && Array.isArray(result.checks) && result.checks.length) {
+                        for (const c of result.checks) lines.push(`  • ${c}`);
+                    }
+                    status.textContent = lines.join('\n');
+                }
+                if (typeof showToast === 'function') {
+                    showToast(result.summary, result.ok ? 'success' : 'error');
+                }
+            } catch (err) {
+                if (status) {
+                    status.className = 'voice-status voice-status-error';
+                    status.textContent = 'Preflight failed: ' + err;
+                }
+                if (typeof showToast === 'function') showToast('Preflight failed: ' + err, 'error');
+            } finally {
+                testBtn.disabled = false;
+                testBtn.textContent = original;
+            }
         });
     }
 

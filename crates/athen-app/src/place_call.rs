@@ -968,7 +968,10 @@ async fn fire_notification(
 /// minimally-configured check, LLM resolution) so we can test rejection
 /// paths without spawning subprocesses. Returns the synthesized
 /// CallRequest the gate would receive on success.
-#[cfg(test)]
+///
+/// Also reused by the Settings → Voice "Test setup" button via
+/// [`crate::voice::test_voice_setup`] to validate configuration without
+/// placing a real call.
 pub(crate) fn preflight(deps: &TelephonyDeps, args: &Value) -> Result<CallRequest> {
     let parsed = parse_args(args)?;
     let voice = &deps.voice_config;

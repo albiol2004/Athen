@@ -370,6 +370,81 @@ pub async fn extract_pipecat_runner(app_handle: AppHandle) -> std::result::Resul
     Ok(p.to_string_lossy().to_string())
 }
 
+/// Result of the Settings → Voice "Test setup" button — a non-call
+/// preflight that validates the saved wiring without burning a Twilio
+/// minute. Surfaces the same checks that `place_call`'s preflight
+/// performs at tool dispatch (E.164 parse, endpoint coverage, LLM
+/// resolution).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceSetupTestResult {
+    /// True when every check passed.
+    pub ok: bool,
+    /// One-line headline shown next to the button.
+    pub summary: String,
+    /// Human-readable list of validated wirings — empty when `ok` is false.
+    pub checks: Vec<String>,
+}
+
+/// Pre-flight check for the Voice panel. Doesn't place an actual call;
+/// just verifies the saved settings would let `place_call` run.
+///
+/// Picks `called_party = "user"` so the user_number validation fires
+/// (the most common configuration error). Synthesises a test arc id
+/// so the telephony deps can be assembled — no UI artefacts attach to
+/// it because no call is placed.
+#[tauri::command]
+pub async fn test_voice_setup(
+    state: State<'_, AppState>,
+    _app_handle: AppHandle,
+) -> std::result::Result<VoiceSetupTestResult, String> {
+    let synthetic_arc = "voice-setup-test";
+    let active_provider_id = state.active_provider_id.lock().await.clone();
+    let telephony = crate::state::build_telephony_deps(
+        synthetic_arc,
+        state.approval_router.clone(),
+        state.vault.clone(),
+        state.http_endpoint_store.clone(),
+        state.notifier.clone(),
+        active_provider_id,
+    )
+    .ok_or_else(|| {
+        "Voice subsystem is not wired in this build (missing approval router, vault, or endpoint store)."
+            .to_string()
+    })?;
+
+    let args = serde_json::json!({
+        "number": "+10000000000",
+        "objective": "Voice setup pre-flight check (not a real call).",
+        "called_party": "user",
+    });
+
+    match crate::place_call::preflight(&telephony, &args) {
+        Ok(req) => {
+            let voice_id = req.voice_id.clone().unwrap_or_else(|| "(none)".into());
+            let checks = vec![
+                format!("Destination resolved: {}", req.to_number),
+                format!("Voice ID: {voice_id}"),
+                format!("LLM: {}", req.llm_label),
+                format!(
+                    "Estimated cost cap ({}s): ${:.2}",
+                    req.max_duration_s, req.est_cost_usd
+                ),
+            ];
+            Ok(VoiceSetupTestResult {
+                ok: true,
+                summary: "Setup looks good. Ask Athen in chat to place a real call to verify end-to-end.".into(),
+                checks,
+            })
+        }
+        Err(e) => Ok(VoiceSetupTestResult {
+            ok: false,
+            summary: format!("Not ready: {e}"),
+            checks: Vec::new(),
+        }),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pipecat install pipeline
 // ---------------------------------------------------------------------------

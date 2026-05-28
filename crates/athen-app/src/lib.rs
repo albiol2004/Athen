@@ -190,6 +190,7 @@ pub fn run() {
             voice::extract_pipecat_runner,
             voice::get_voice_setup_status,
             voice::install_pipecat,
+            voice::test_voice_setup,
             commands::list_memories,
             commands::update_memory,
             commands::delete_memory,
