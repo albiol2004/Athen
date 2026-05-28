@@ -17062,7 +17062,7 @@ function wireVoicePanel() {
     if (testBtn) {
         testBtn.addEventListener('click', () => {
             const status = document.getElementById('voice-status');
-            const msg = 'Test will be wired in the next batch (place_call tool).';
+            const msg = 'Self-test self-call command is a follow-up. To validate end-to-end now, ask Athen in chat to call your number.';
             if (status) {
                 status.className = 'voice-status';
                 status.textContent = msg;
