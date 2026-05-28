@@ -33,6 +33,7 @@
             "icons/icon.png"
         ],
         "externalBin": ["binaries/nu"],
+        "resources": ["../../assets/pipecat_runner.py"],
         "createUpdaterArtifacts": true
     },
     "plugins": {
