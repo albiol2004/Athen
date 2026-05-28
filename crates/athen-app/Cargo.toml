@@ -48,6 +48,7 @@ base64 = { workspace = true }
 url = { workspace = true }
 quick-xml = { workspace = true }
 lettre = { workspace = true }
+tempfile = "3"
 
 [features]
 # Phase 2c flipped this default-ON. Released binaries now include

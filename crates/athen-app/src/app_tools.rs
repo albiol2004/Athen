@@ -83,6 +83,15 @@ pub struct AppToolRegistry {
     /// mutability so `call_tool(&self, …)` can update the cache without
     /// requiring `&mut self`.
     pub(crate) loaded_skills: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Dependencies + approval gate the `place_call` tool needs. When
+    /// `None`, the tool is not advertised. Wired by the composition root
+    /// via [`AppToolRegistry::with_telephony`] alongside an `AppHandle`
+    /// for live progress events.
+    telephony: Option<crate::place_call::TelephonyDeps>,
+    /// Tauri AppHandle used by `place_call` to emit `place-call-progress`
+    /// events. Optional so non-Tauri builds (CLI / tests) just see no
+    /// progress events instead of failing to compile.
+    app_handle: Option<tauri::AppHandle>,
 }
 
 impl AppToolRegistry {
@@ -113,7 +122,25 @@ impl AppToolRegistry {
             arc_store: None,
             arc_id: None,
             loaded_skills: std::sync::Mutex::new(std::collections::HashSet::new()),
+            telephony: None,
+            app_handle: None,
         }
+    }
+
+    /// Attach the dependencies the `place_call` tool needs (approval
+    /// gate, vault, registered-endpoint store, notifier, LLM config).
+    /// Without this AND `with_app_handle`, the tool is not advertised
+    /// and calls refuse with a clear "not wired" error.
+    pub fn with_telephony(mut self, deps: crate::place_call::TelephonyDeps) -> Self {
+        self.telephony = Some(deps);
+        self
+    }
+
+    /// Attach the Tauri `AppHandle` used by `place_call` to emit the
+    /// live `place-call-progress` events the frontend renderer consumes.
+    pub fn with_app_handle(mut self, app: tauri::AppHandle) -> Self {
+        self.app_handle = Some(app);
+        self
     }
 
     pub fn with_active_profile_id(mut self, id: Option<String>) -> Self {
@@ -2516,6 +2543,30 @@ impl AppToolRegistry {
         })
     }
 
+    // ── place_call ───────────────────────────────────────────────
+
+    /// Bridge from the tool dispatcher to [`crate::place_call::do_place_call`].
+    /// Refuses when either the telephony deps or the AppHandle isn't
+    /// wired (CLI / test builds).
+    async fn do_place_call(&self, args: serde_json::Value) -> Result<ToolResult> {
+        let Some(deps) = self.telephony.as_ref() else {
+            return Err(AthenError::Other(
+                "place_call: voice subsystem not wired into this agent (no telephony deps)"
+                    .into(),
+            ));
+        };
+        let Some(app) = self.app_handle.as_ref() else {
+            return Err(AthenError::Other(
+                "place_call: Tauri AppHandle not wired into this agent".into(),
+            ));
+        };
+        let arc_id = self
+            .arc_id
+            .as_deref()
+            .ok_or_else(|| AthenError::Other("place_call: no arc id on this registry".into()))?;
+        crate::place_call::do_place_call(deps, app, arc_id, args).await
+    }
+
     // ── Setup tools (profile-gated) ──────────────────────────────
 
     async fn dispatch_setup_tool(
@@ -3045,6 +3096,24 @@ impl ToolRegistry for AppToolRegistry {
             tools.extend(Self::setup_tool_definitions());
         }
 
+        // place_call: only advertised when both the telephony deps and
+        // the Tauri AppHandle are wired (CLI / test builds skip it). The
+        // tool description doesn't change with VoiceConfig state — the
+        // handler surfaces a precise "missing X" error so the agent
+        // still knows what to ask the user.
+        if self.telephony.is_some() && self.app_handle.is_some() {
+            tools.push(ToolDefinition {
+                name: "place_call".to_string(),
+                description: crate::place_call::PLACE_CALL_DESCRIPTION.to_string(),
+                parameters: crate::place_call::place_call_schema(),
+                backend: ToolBackend::Shell {
+                    command: String::new(),
+                    native: false,
+                },
+                base_risk: BaseImpact::WritePersist,
+            });
+        }
+
         Ok(tools)
     }
 
@@ -3119,6 +3188,7 @@ impl ToolRegistry for AppToolRegistry {
             "load_skill" => self.do_load_skill(&args).await,
             "athen_docs" => self.do_athen_docs(&args),
             "http_request" => self.do_http_request(&args).await,
+            "place_call" => self.do_place_call(args).await,
             // Plan tools
             "submit_plan" => self.do_submit_plan(&args).await,
             "complete_step" => self.do_complete_step(&args).await,

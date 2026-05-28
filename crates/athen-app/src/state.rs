@@ -469,6 +469,11 @@ pub(crate) struct ToolRegistryDeps {
     pub tool_doc_dir: Option<std::path::PathBuf>,
     pub router: Arc<RwLock<Arc<DefaultLlmRouter>>>,
     pub wakeup_store: Option<Arc<dyn athen_core::traits::wakeup::WakeupStore>>,
+    /// Wired only when the voice subsystem is fully assembled (vault +
+    /// http_endpoint_store + approval_router present + notifier
+    /// optional). Drives the `place_call` agent tool.
+    pub notifier: Option<Arc<NotificationOrchestrator>>,
+    pub active_provider_id: String,
 }
 
 /// Single source of truth for assembling the per-arc agent tool
@@ -585,6 +590,39 @@ pub(crate) async fn assemble_app_tool_registry(
     // where http endpoints aren't configured yet).
     if let Some(vault) = deps.vault.clone() {
         registry = registry.with_vault_standalone(vault);
+    }
+
+    // Telephony wiring for the `place_call` tool. Requires the
+    // approval router + vault + http_endpoint_store all to be present;
+    // the AppHandle is folded in below (only available when the tool
+    // dispatcher actually runs under Tauri, not in test/CLI builds).
+    if let (Some(router), Some(vault), Some(store), Some(handle)) = (
+        deps.approval_router.clone(),
+        deps.vault.clone(),
+        deps.http_endpoint_store.clone(),
+        app_handle.clone(),
+    ) {
+        let cfg = crate::settings::load_main_config_public();
+        let voice_config: athen_voice::VoiceConfig =
+            serde_json::from_value(cfg.voice.clone()).unwrap_or_default();
+        let gate: Arc<dyn athen_voice::TelephonyApprovalGate> = Arc::new(
+            crate::telephony_gate::RouterTelephonyApprovalGate::new(
+                router,
+                Some(arc_id.to_string()),
+            ),
+        );
+        let telephony_deps = crate::place_call::TelephonyDeps {
+            gate,
+            vault,
+            http_endpoint_store: store,
+            notifier: deps.notifier.clone(),
+            active_provider_id: deps.active_provider_id.clone(),
+            voice_config,
+            config: cfg,
+        };
+        registry = registry
+            .with_telephony(telephony_deps)
+            .with_app_handle(handle);
     }
     // Resolve the active profile so setup tools are conditionally registered.
     let active_profile_id = crate::commands::active_profile_id_for_arc(
@@ -1364,6 +1402,12 @@ impl AppState {
                 .wakeup_store
                 .clone()
                 .map(|s| s as Arc<dyn athen_core::traits::wakeup::WakeupStore>),
+            notifier: self.notifier.clone(),
+            active_provider_id: self
+                .active_provider_id
+                .try_lock()
+                .map(|g| g.clone())
+                .unwrap_or_default(),
         }
     }
 

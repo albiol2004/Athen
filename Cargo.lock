@@ -693,6 +693,7 @@ dependencies = [
 name = "athen-voice"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "athen-core",
  "chrono",
  "serde",

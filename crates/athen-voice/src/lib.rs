@@ -4,9 +4,95 @@
 //! the `pipecat_runtime` submodule implements the install pipeline for
 //! the Python-side runner.
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 pub mod pipecat_runtime;
+
+// ---------------------------------------------------------------------------
+// place_call approval gate
+// ---------------------------------------------------------------------------
+
+/// One outbound call about to be placed. Handed to the
+/// [`TelephonyApprovalGate`] before the runner is spawned. Carries the
+/// full set of fields the user needs to decide: who's being called, the
+/// objective, the call-cost estimate, the voice/LLM/stack picks. Mirrors
+/// [`athen_agent::tools::EmailSendSummary`] in spirit — same fail-closed
+/// approval surface, same arc-aware routing through the cross-channel
+/// ApprovalRouter (InApp + Telegram with escalation).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallRequest {
+    pub arc_id: uuid::Uuid,
+    /// E.164 destination — the resolved number we will actually dial.
+    /// For `called_party = User` callers, this is the user's own
+    /// `user_number` from `VoiceConfig`, not the original `number` arg.
+    pub to_number: String,
+    pub objective: String,
+    pub called_party: CalledParty,
+    pub voice_id: Option<String>,
+    pub max_duration_s: u32,
+    /// Pre-call dollar estimate at the requested `max_duration_s` cap.
+    /// Computed via [`estimate_call_cost_usd`].
+    pub est_cost_usd: f64,
+    /// Human-readable LLM picker label, e.g.
+    /// `"DeepSeek :: deepseek-chat"`. Shown verbatim in the approval
+    /// dialog so the user sees which model will hold the conversation.
+    pub llm_label: String,
+    pub voice_provider: String,
+    pub stt_provider: String,
+    pub phone_provider: String,
+}
+
+/// Who is being called.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CalledParty {
+    /// Calling the user themselves — typically a reminder. Destination
+    /// number is auto-substituted with [`VoiceConfig::user_number`].
+    User,
+    /// Calling an external party (restaurant, hotel, service desk…).
+    Other,
+}
+
+/// Approval gate consulted before the `place_call` tool spawns the
+/// Pipecat runner. Mirrors `EmailSendApprovalGate`: implementations
+/// surface a confirmation prompt and return `true` only on Approve.
+/// Every other outcome (deny, timeout, transport error) returns `false`
+/// so calls fail closed.
+#[async_trait]
+pub trait TelephonyApprovalGate: Send + Sync {
+    /// Returns `true` only when the user approves the call.
+    async fn confirm_call(&self, request: &CallRequest) -> bool;
+}
+
+// ---------------------------------------------------------------------------
+// Cost estimation
+// ---------------------------------------------------------------------------
+
+/// Per-minute aggregate cost in USD for a typical Twilio + Deepgram +
+/// ElevenLabs/Cartesia stack, with an LLM surcharge applied. Mirrors
+/// `_cost_estimate` in `pipecat_runner.py` so the pre-call estimate the
+/// approval dialog shows matches the actual after-the-fact figure the
+/// runner emits in its final `result` event.
+///
+/// Numbers are conservative published rates (USD):
+/// * Twilio outbound:  $0.014 / min
+/// * Deepgram STT:     $0.0058 / min
+/// * ElevenLabs / Cartesia TTS: ~$0.05 / min
+/// * LLM surcharge:    +30 % on top of the above three lines
+pub const TWILIO_USD_PER_MIN: f64 = 0.014;
+pub const DEEPGRAM_USD_PER_MIN: f64 = 0.0058;
+pub const TTS_USD_PER_MIN: f64 = 0.05;
+pub const LLM_SURCHARGE_FACTOR: f64 = 1.30;
+
+/// Returns the pre-call cost estimate (USD) for a call capped at
+/// `max_duration_s` seconds. Pure function — kept testable.
+pub fn estimate_call_cost_usd(max_duration_s: u32) -> f64 {
+    let per_minute = TWILIO_USD_PER_MIN + DEEPGRAM_USD_PER_MIN + TTS_USD_PER_MIN;
+    let voice_cost = (max_duration_s as f64 / 60.0) * per_minute;
+    let total = voice_cost * LLM_SURCHARGE_FACTOR;
+    (total * 100.0).round() / 100.0
+}
 
 /// Persisted voice configuration. Stored as a single JSON row in the
 /// settings table — voice_config.
@@ -209,6 +295,40 @@ mod tests {
     #[test]
     fn validate_e164_rejects_too_short() {
         assert!(validate_e164("+123").is_err());
+    }
+
+    #[test]
+    fn cost_estimate_math_is_sensible() {
+        // 10-minute call: per-minute total = .014 + .0058 + .05 = .0698
+        // voice cost = 10 * .0698 = .698
+        // total with 30% LLM surcharge = .698 * 1.3 = .9074 → rounds to .91
+        let cost = estimate_call_cost_usd(600);
+        assert!(
+            (cost - 0.91).abs() < 0.005,
+            "expected ~$0.91 for 10min, got ${cost}"
+        );
+
+        // 1-minute call should round to ~$0.09 (.0698 * 1.3 = .09074).
+        let one_min = estimate_call_cost_usd(60);
+        assert!(
+            (one_min - 0.09).abs() < 0.005,
+            "expected ~$0.09 for 1min, got ${one_min}"
+        );
+
+        // Zero duration costs nothing.
+        assert!((estimate_call_cost_usd(0) - 0.0).abs() < 1e-9);
+
+        // Hard cap (1800s = 30min) should be reasonable, never NaN/inf.
+        let cap = estimate_call_cost_usd(VoiceConfig::HARD_MAX_DURATION_S);
+        assert!(cap.is_finite() && cap > 0.0);
+    }
+
+    #[test]
+    fn called_party_serde_lowercase() {
+        let user = serde_json::to_value(CalledParty::User).unwrap();
+        assert_eq!(user, serde_json::json!("user"));
+        let other = serde_json::to_value(CalledParty::Other).unwrap();
+        assert_eq!(other, serde_json::json!("other"));
     }
 
     #[test]

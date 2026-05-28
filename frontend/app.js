@@ -677,6 +677,59 @@ function registerTauriEventListeners() {
             loadCalendarEvents();
         }
     });
+
+    // place_call progress: a stream of jsonl events from pipecat_runner.py
+    // wrapped as { arc_id, event: { event: "ringing"|"answered"|"transcript"|"result", ... } }.
+    // We keep a per-arc buffer so the (later) tool-card render can pick up
+    // any frames that arrived before the tool_call entry was persisted.
+    window.__TAURI__.event.listen('place-call-progress', (event) => {
+        const payload = event && event.payload ? event.payload : {};
+        const arcId = String(payload.arc_id || '');
+        const ev = payload.event || {};
+        if (!arcId) return;
+        if (!window.__activePlaceCalls) window.__activePlaceCalls = {};
+        const slot = window.__activePlaceCalls[arcId] || {
+            status: 'starting',
+            transcript: [],
+            to: '',
+        };
+        const kind = String(ev.event || '');
+        if (kind === 'starting') {
+            slot.status = 'starting';
+            if (ev.to) slot.to = String(ev.to);
+        } else if (kind === 'ringing') {
+            slot.status = 'ringing';
+            if (ev.number) slot.to = String(ev.number);
+        } else if (kind === 'answered') {
+            slot.status = 'answered';
+        } else if (kind === 'transcript') {
+            slot.transcript.push({
+                speaker: String(ev.speaker || 'agent'),
+                text: String(ev.text || ''),
+                ts: typeof ev.ts === 'number' ? ev.ts : null,
+            });
+            slot.status = slot.status === 'starting' ? 'answered' : slot.status;
+        } else if (kind === 'result') {
+            slot.status = 'completed';
+            slot.summary = String(ev.summary || '');
+            slot.outcome = String(ev.outcome || '');
+        }
+        window.__activePlaceCalls[arcId] = slot;
+        // Refresh any rendered place_call cards for this arc.
+        document
+            .querySelectorAll(`[data-place-call-arc="${cssEscape(arcId)}"]`)
+            .forEach((node) => {
+                const updated = renderPlaceCallLive(slot);
+                node.replaceChildren(updated);
+            });
+    });
+}
+
+// Tiny escape for selector matching; CSS.escape is well-supported in WebKit
+// but we keep a fallback for any embedded view that's pre-2019.
+function cssEscape(value) {
+    if (window.CSS && typeof window.CSS.escape === 'function') return window.CSS.escape(value);
+    return String(value).replace(/["\\]/g, '\\$&');
 }
 
 // Route `<a target="_blank">` and any external http(s) anchor through the
@@ -3567,6 +3620,7 @@ function renderToolBody(meta) {
         case 'identity_add':    main = renderIdentityAdd(args, result); break;
         case 'load_skill':      main = renderLoadSkill(args, result); break;
         case 'http_request':    main = renderHttpRequest(args, result); break;
+        case 'place_call':      main = renderPlaceCall(args, result); break;
         case 'athen_docs':      main = renderAthenDocs(args, result); break;
         case 'submit_plan':     main = renderToolBody_submit_plan(args, result, null); break;
         case 'complete_step':   main = renderToolBody_complete_step(args, result); break;
@@ -4467,6 +4521,153 @@ function renderHttpRequest(args, result) {
         bodyDisplay ? ['Response',     bodyDisplay, { block: bodyBlock, mono: bodyMono }] : null,
     ];
     return renderFields(fields);
+}
+
+// place_call card. Two-mode renderer:
+//   1. When the persisted result includes a transcript + outcome (post-call),
+//      we render the final state directly from `args`/`result`.
+//   2. When the result is empty / still streaming, we pull the live slot
+//      from window.__activePlaceCalls[arc_id] and render in-progress UI;
+//      the place-call-progress listener will refresh the DOM as new events
+//      arrive.
+function renderPlaceCall(args, result) {
+    const arcId = activeArcId ? String(activeArcId) : '';
+    const to = String(args.number || result.to_number || '');
+    const objective = String(args.objective || result.objective || '');
+    const calledParty = String(args.called_party || 'other');
+
+    const card = document.createElement('div');
+    card.className = 'place-call-card';
+    if (arcId) card.setAttribute('data-place-call-arc', arcId);
+
+    // If we already have a finished result, render the post-call view.
+    const hasFinalResult = !!(result && (result.outcome || result.summary || Array.isArray(result.transcript)));
+    if (hasFinalResult) {
+        card.appendChild(renderPlaceCallFinal({
+            to,
+            objective,
+            calledParty,
+            outcome: String(result.outcome || ''),
+            durationS: typeof result.duration_s === 'number' ? result.duration_s : 0,
+            costUsd: typeof result.cost_estimate_usd === 'number' ? result.cost_estimate_usd : null,
+            summary: String(result.summary || ''),
+            transcript: Array.isArray(result.transcript) ? result.transcript : [],
+        }));
+        return card;
+    }
+
+    // Otherwise — live mode. Pull from the per-arc slot if any.
+    const slot = (window.__activePlaceCalls && window.__activePlaceCalls[arcId]) || {
+        status: 'starting',
+        transcript: [],
+        to,
+        objective,
+    };
+    card.appendChild(renderPlaceCallLive(Object.assign({ to, objective }, slot)));
+    return card;
+}
+
+function renderPlaceCallLive(slot) {
+    const frag = document.createElement('div');
+    const head = document.createElement('div');
+    head.className = 'place-call-header';
+    const title = document.createElement('span');
+    title.className = 'place-call-title';
+    title.textContent = `📞 Call to ${slot.to || '(unknown)'}`;
+    head.appendChild(title);
+    head.appendChild(placeCallStatusPill(slot.status || 'starting'));
+    frag.appendChild(head);
+
+    if (slot.objective) {
+        const obj = document.createElement('div');
+        obj.className = 'place-call-objective';
+        obj.textContent = slot.objective;
+        frag.appendChild(obj);
+    }
+    const transcriptEl = document.createElement('div');
+    transcriptEl.className = 'place-call-transcript';
+    for (const line of slot.transcript || []) {
+        transcriptEl.appendChild(renderPlaceCallBubble(line.speaker, line.text));
+    }
+    frag.appendChild(transcriptEl);
+    return frag;
+}
+
+function renderPlaceCallFinal(state) {
+    const frag = document.createElement('div');
+    const head = document.createElement('div');
+    head.className = 'place-call-header';
+    const title = document.createElement('span');
+    title.className = 'place-call-title';
+    title.textContent = `📞 Call to ${state.to}`;
+    head.appendChild(title);
+    head.appendChild(placeCallStatusPill(state.outcome || 'completed'));
+    frag.appendChild(head);
+
+    if (state.objective) {
+        const obj = document.createElement('div');
+        obj.className = 'place-call-objective';
+        obj.textContent = state.objective;
+        frag.appendChild(obj);
+    }
+
+    const meta = document.createElement('div');
+    meta.className = 'place-call-meta';
+    const bits = [];
+    if (state.durationS) bits.push(`${state.durationS}s`);
+    if (state.costUsd != null) bits.push(`~$${state.costUsd.toFixed(2)}`);
+    if (state.calledParty === 'user') bits.push('called you');
+    meta.textContent = bits.join(' • ');
+    if (bits.length) frag.appendChild(meta);
+
+    if (state.summary) {
+        const sum = document.createElement('div');
+        sum.className = 'place-call-summary';
+        sum.textContent = state.summary;
+        frag.appendChild(sum);
+    }
+
+    const transcriptEl = document.createElement('div');
+    transcriptEl.className = 'place-call-transcript';
+    for (const line of state.transcript || []) {
+        transcriptEl.appendChild(renderPlaceCallBubble(line.speaker, line.text));
+    }
+    if ((state.transcript || []).length) {
+        frag.appendChild(transcriptEl);
+    }
+    return frag;
+}
+
+function placeCallStatusPill(status) {
+    const kindMap = {
+        starting: 'info',
+        ringing: 'warning',
+        answered: 'info',
+        completed: 'good',
+        booked: 'good',
+        info_gathered: 'good',
+        unclear: 'neutral',
+        failed: 'danger',
+        timeout: 'danger',
+        error: 'danger',
+    };
+    const kind = kindMap[status] || 'neutral';
+    return renderPill(status, kind);
+}
+
+function renderPlaceCallBubble(speaker, text) {
+    const row = document.createElement('div');
+    const cls = speaker === 'user' ? 'place-call-bubble user' : 'place-call-bubble agent';
+    row.className = cls;
+    const speakerEl = document.createElement('span');
+    speakerEl.className = 'place-call-speaker';
+    speakerEl.textContent = speaker === 'user' ? 'them' : 'athen';
+    const textEl = document.createElement('span');
+    textEl.className = 'place-call-text';
+    textEl.textContent = text;
+    row.appendChild(speakerEl);
+    row.appendChild(textEl);
+    return row;
 }
 
 function renderAthenDocs(args, result) {
