@@ -1116,7 +1116,7 @@ async fn judge_worth_remembering(
         return None;
     }
 
-    let existing_block = match memory.recall(user_msg, 3).await {
+    let existing_block = match memory.recall(user_msg, 10).await {
         Ok(items) if !items.is_empty() => {
             let lines = items
                 .iter()
@@ -2412,7 +2412,7 @@ pub async fn send_message(
                 if is_substantive_user_msg(&message) {
                     let mut all_items = Vec::new();
                     let mut seen_ids = std::collections::HashSet::new();
-                    if let Ok(items) = memory.recall(&message, 3).await {
+                    if let Ok(items) = memory.recall(&message, 8).await {
                         for item in items {
                             if seen_ids.insert(item.id.clone()) {
                                 all_items.push(item);
@@ -3506,7 +3506,7 @@ pub(crate) async fn execute_approved_task(
         if is_substantive_user_msg(&message) {
             let mut all_items = Vec::new();
             let mut seen_ids = std::collections::HashSet::new();
-            if let Ok(items) = memory.recall(&message, 3).await {
+            if let Ok(items) = memory.recall(&message, 8).await {
                 for item in items {
                     if seen_ids.insert(item.id.clone()) {
                         all_items.push(item);
@@ -4637,7 +4637,7 @@ pub(crate) async fn execute_dispatched_task(
         } else {
             let mut all_items = Vec::new();
             let mut seen_ids = std::collections::HashSet::new();
-            if let Ok(items) = memory.recall(&message, 3).await {
+            if let Ok(items) = memory.recall(&message, 8).await {
                 for item in items {
                     if seen_ids.insert(item.id.clone()) {
                         all_items.push(item);
