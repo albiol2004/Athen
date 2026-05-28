@@ -895,8 +895,9 @@ fn build_history_digest(
             MessageContent::Multimodal { text, .. } => text.as_str(),
             MessageContent::Structured(_) => "[structured]",
         };
-        let truncated = if text.len() > max_chars_per {
-            format!("{}…", &text[..max_chars_per])
+        let truncated = if text.chars().count() > max_chars_per {
+            let cut: String = text.chars().take(max_chars_per).collect();
+            format!("{cut}…")
         } else {
             text.to_string()
         };
