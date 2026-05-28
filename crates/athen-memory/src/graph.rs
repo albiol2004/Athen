@@ -79,9 +79,22 @@ fn edge_score(edge: &Edge, params: &ExploreParams) -> f32 {
 #[async_trait]
 impl KnowledgeGraph for InMemoryGraph {
     async fn add_entity(&self, mut entity: Entity) -> Result<EntityId> {
+        let mut entities = self.entities.write().await;
+
+        // Deduplicate by name (case-insensitive): if an entity with the same name
+        // already exists, return its ID. Matches the SQLite backend's behavior
+        // (see SqliteGraph::add_entity, `WHERE name = ?1 COLLATE NOCASE`).
+        for existing in entities.values() {
+            if existing.name.eq_ignore_ascii_case(&entity.name) {
+                if let Some(existing_id) = existing.id {
+                    return Ok(existing_id);
+                }
+            }
+        }
+
         let id = entity.id.unwrap_or_else(Uuid::new_v4);
         entity.id = Some(id);
-        self.entities.write().await.insert(id, entity);
+        entities.insert(id, entity);
         Ok(id)
     }
 
@@ -380,6 +393,16 @@ mod tests {
         };
         let id = graph.add_entity(entity).await.unwrap();
         assert_eq!(id, given_id);
+    }
+
+    #[tokio::test]
+    async fn test_add_entity_dedups_by_name_case_insensitive() {
+        let graph = InMemoryGraph::new();
+        let first = graph.add_entity(person("Alice")).await.unwrap();
+        let second = graph.add_entity(person("alice")).await.unwrap();
+        assert_eq!(first, second);
+        let entities = graph.entities.read().await;
+        assert_eq!(entities.len(), 1);
     }
 
     #[tokio::test]
