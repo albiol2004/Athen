@@ -102,23 +102,36 @@ pub fn estimate_call_cost_usd(max_duration_s: u32) -> f64 {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VoiceConfig {
+    // NOTE: every Option must carry `skip_serializing_if`. VoiceConfig is
+    // stored as a serde_json::Value inside AthenConfig, which is written to
+    // disk as TOML — and TOML rejects null/unit values. Without skip, a
+    // half-filled panel saves a blob with embedded nulls and the whole
+    // config write fails with "unsupported unit type".
     /// Registered Cloud APIs endpoint id for the STT provider. None until configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stt_endpoint_id: Option<String>,
     /// Registered Cloud APIs endpoint id for the TTS provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tts_endpoint_id: Option<String>,
     /// Registered Cloud APIs endpoint id for the phone-service provider (Twilio).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phone_endpoint_id: Option<String>,
 
     /// TTS-specific voice ID (e.g. ElevenLabs voice ID, Cartesia UUID).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice_id: Option<String>,
     /// E.164 number the call is placed FROM (must be a number purchased on phone provider).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_number: Option<String>,
     /// E.164 number for the user themselves — used by reminder calls (called_party="user").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_number: Option<String>,
 
     /// Override the Fast-tier LLM for voice calls. None = use the resolved Fast tier.
     /// (connection_id, slug) tuple split into two fields for serde simplicity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm_override_connection_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm_override_slug: Option<String>,
 
     /// Hard cap on call length, seconds. Default 600; enforced cap 1800.
