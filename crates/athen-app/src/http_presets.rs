@@ -286,5 +286,63 @@ pub fn presets() -> Vec<EndpointPreset> {
             test_path: "models",
             usage_hints: "**OpenAI-compatible** at `/openai/v1/`: `chat/completions`, `models`, `audio/transcriptions`, `audio/translations`, `audio/speech` (TTS), limited `embeddings`.\n\n**Flagship models (Q2 2026):** `llama-3.3-70b-versatile`, `llama-3.1-8b-instant`, Qwen3 32B, DeepSeek R1 distill (70B/32B), GPT-OSS 20B/120B, `whisper-large-v3-turbo`. Tool use + JSON mode supported on most chat models.\n\n**Whisper transcription:** multipart `file` + `model=whisper-large-v3-turbo` + optional `language`, `prompt`, `response_format=verbose_json`.\n\n**Headline feature:** raw throughput — 300–1000+ tok/s on chat.\n\n**Free tier has THREE cascading limits:** 30 RPM, ~6k TPM (chat), 7,200 audio-sec/hr — 429 hits whichever arrives first. Response includes `x-ratelimit-reset-*` headers telling you exactly when to retry.",
         },
+        EndpointPreset {
+            slug: "twilio",
+            label: "Twilio (Voice + SMS)",
+            provider: "Twilio",
+            base_url: "https://api.twilio.com/2010-04-01/",
+            // HTTP Basic: username = Account SID (entered at registration),
+            // password = Auth Token (lives in the vault under "password").
+            // The empty `user` here is a placeholder; the registration UI
+            // prompts for the SID and rewrites the variant before save.
+            auth_method: AuthMethod::BasicAuth {
+                user: String::new(),
+            },
+            default_headers: vec![],
+            suggested_risk: Some("write_network"),
+            default_rate_limit_per_minute: 60,
+            free_tier_blurb: "Free trial includes ~$15 credit — buy a phone number (~$1/mo) and pay per call/SMS (~$0.014/min voice US).",
+            signup_url: "https://www.twilio.com/try-twilio",
+            test_path: "Accounts/{AccountSid}.json",
+            usage_hints: "**REST surface (form-encoded, NOT JSON):** all POST bodies use `application/x-www-form-urlencoded`. Path always includes the Account SID — replace `{AccountSid}` with your SID (the same value you entered as the Basic-auth username).\n\n- `Accounts/{AccountSid}.json` (GET) — account info; doubles as auth health check.\n- `Accounts/{AccountSid}/Calls.json` (POST) — outbound voice call. Body: `From` (a Twilio-purchased number you own), `To` (E.164), and EITHER `Url` (TwiML XML endpoint) OR `Twiml` (inline TwiML) OR a Media Streams `<Connect><Stream>` TwiML for real-time audio.\n- `Accounts/{AccountSid}/Messages.json` (POST) — SMS. Body: `From`, `To`, `Body`.\n- `Accounts/{AccountSid}/IncomingPhoneNumbers.json` — list/buy/configure numbers.\n\n**Athen's `place_call` tool drives outbound voice via Programmable Voice + Media Streams** (TwiML `<Connect><Stream url=\"wss://...\">`), bridging the call audio to Deepgram (STT) and Cartesia (TTS) over WebSocket.\n\n**Trial-account gotchas:** can only call/SMS numbers you've verified in the console; every call/SMS gets a \"trial account\" prepended message; messaging in many countries requires A2P 10DLC / regulatory registration even on paid plans.",
+        },
+        EndpointPreset {
+            slug: "deepgram",
+            label: "Deepgram (Speech-to-Text)",
+            provider: "Deepgram",
+            base_url: "https://api.deepgram.com/v1/",
+            // Deepgram wants `Authorization: Token <key>` (NOT `Bearer`).
+            // The `AuthMethod::Header { name: "Authorization" }` variant
+            // inserts the vault value verbatim, so the user must paste
+            // the full string `Token <api_key>` (including the `Token `
+            // prefix) when saving — mirrors the DeepL `DeepL-Auth-Key <key>`
+            // pattern already shipped here.
+            auth_method: AuthMethod::Header {
+                name: "Authorization".to_string(),
+            },
+            default_headers: vec![],
+            suggested_risk: Some("read_network"),
+            default_rate_limit_per_minute: 100,
+            free_tier_blurb: "$200 free credit on signup, no credit card required. After that ~$0.0058/min for streaming (nova-2 model).",
+            signup_url: "https://console.deepgram.com/signup",
+            test_path: "projects",
+            usage_hints: "**Auth value MUST be `Token <api_key>`** — bare key fails with 401. Athen's `AuthMethod::Header` variant pastes the vault value verbatim into `Authorization`, so include the `Token ` prefix yourself (same pattern as DeepL).\n\n**REST endpoints under `/v1/`:**\n- `projects` (GET) — list projects; doubles as auth health check.\n- `listen` (POST, binary or URL body) — pre-recorded transcription. Params: `model=nova-2|nova-3`, `language`, `punctuate=true`, `diarize=true`, `smart_format=true`, `utterances=true`.\n- `projects/{id}/keys` — manage scoped keys.\n\n**Streaming STT (the path Athen's `place_call` uses) is NOT REST** — it's a WebSocket at `wss://api.deepgram.com/v1/listen?model=nova-2&...` with PCM/Opus audio frames in and JSON transcript frames out. The same `Authorization: Token <key>` header authenticates the WS handshake. Low-latency models are `nova-2` (or `nova-3` where available) — `nova-2-general` for multilingual.\n\nSupports diarization, punctuation, interim results (`interim_results=true`), and language hints (`language=en|es|...` or auto-detect via `detect_language=true`).",
+        },
+        EndpointPreset {
+            slug: "cartesia",
+            label: "Cartesia (Text-to-Speech)",
+            provider: "Cartesia",
+            base_url: "https://api.cartesia.ai/",
+            auth_method: AuthMethod::Header {
+                name: "X-API-Key".to_string(),
+            },
+            default_headers: vec![h("Cartesia-Version", "2024-06-10")],
+            suggested_risk: Some("read_network"),
+            default_rate_limit_per_minute: 60,
+            free_tier_blurb: "10k characters/month free, then ~$5/1M chars on Pro. Lowest-latency TTS (~80ms TTFB) — best pick for voice calls if you can spare the spend.",
+            signup_url: "https://play.cartesia.ai/",
+            test_path: "voices",
+            usage_hints: "**Auth:** `X-API-Key: <key>` (raw key, no prefix). The `Cartesia-Version: 2024-06-10` header is required on every request — already in `default_headers` for this preset; bump the date when Cartesia rev's the API.\n\n**REST endpoints:**\n- `voices` (GET) — list available voices; doubles as auth health check. Each voice has a UUID `id` used by the synthesis endpoints.\n- `tts/bytes` (POST) — one-shot synthesis, returns binary audio. Body: `model_id` (e.g. `sonic-english`, `sonic-multilingual`, `sonic-2`), `transcript`, `voice.mode=\"id\"|\"embedding\"`, `voice.id`, `output_format.{container, encoding, sample_rate}`.\n- `voices/clone` (POST, multipart) — voice cloning (paid plans only).\n\n**Streaming TTS (the path Athen's `place_call` uses) is NOT REST** — it's a WebSocket at `wss://api.cartesia.ai/tts/websocket?api_key=<key>&cartesia_version=2024-06-10` that streams audio chunks back per text chunk in. Optimised for sub-100ms TTFB on Sonic models — the headline reason to pick Cartesia over ElevenLabs for live voice calls.\n\n**Voice IDs are UUIDs from `/voices`** — list once at setup, store the chosen ID in your voice settings; the agent then references that ID instead of hitting `/voices` each turn.",
+        },
     ]
 }
