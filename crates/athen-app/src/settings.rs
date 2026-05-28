@@ -12,7 +12,7 @@ use tauri::State;
 use tracing::{info, warn};
 
 use athen_core::config::{
-    AthenConfig, AuthType, EmbeddingMode, ModelsConfig, NotificationChannelKind,
+    AthenConfig, AuthType, BundledTier, EmbeddingMode, ModelsConfig, NotificationChannelKind,
     NotificationConfig, ProviderConfig, QuietHours, SecurityMode,
 };
 use athen_core::config_loader;
@@ -3039,11 +3039,25 @@ pub async fn save_embedding_settings(
     use crate::vault_creds::{KEY_API_KEY, SCOPE_EMBEDDING};
     let mut config = load_main_config();
 
+    // `mode` accepts either a bare variant name (legacy) or the
+    // bundled-tier shorthand `Bundled:<tier>` (light / standard /
+    // high-quality). Unknown values fall through to Automatic.
     config.embeddings.mode = match mode.as_str() {
         "Cloud" => EmbeddingMode::Cloud,
         "LocalOnly" => EmbeddingMode::LocalOnly,
         "Specific" => EmbeddingMode::Specific,
         "Off" => EmbeddingMode::Off,
+        "Bundled:light" | "Bundled" => EmbeddingMode::Bundled {
+            tier: BundledTier::Light,
+        },
+        "Bundled:standard" => EmbeddingMode::Bundled {
+            tier: BundledTier::Standard,
+        },
+        "Bundled:high-quality" | "Bundled:highquality" | "Bundled:hq" => {
+            EmbeddingMode::Bundled {
+                tier: BundledTier::HighQuality,
+            }
+        }
         _ => EmbeddingMode::Automatic,
     };
 

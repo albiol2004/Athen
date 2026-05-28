@@ -49,10 +49,11 @@ quick-xml = { workspace = true }
 lettre = { workspace = true }
 
 [features]
-# Forward to athen-llm's bundled-embeddings feature. NOT enabled by
-# default — Phase 1 ships the binding but leaves activation to a
-# manual `--features bundled-embeddings` build plus the
-# ATHEN_BUNDLED_EMBEDDINGS=1 env var at runtime.
+# Phase 2c flipped this default-ON. Released binaries now include
+# the bundled fastembed-rs embedder; users activate a specific tier
+# via Settings (`EmbeddingMode::Bundled { tier }`). The old
+# `ATHEN_BUNDLED_EMBEDDINGS=1` env var no longer does anything.
+default = ["bundled-embeddings"]
 bundled-embeddings = ["athen-llm/bundled-embeddings"]
 
 [build-dependencies]

@@ -4249,6 +4249,35 @@ fn build_embedding_router(
         EmbeddingMode::Off => {
             info!("Embeddings: mode=Off, keyword fallback only");
         }
+        EmbeddingMode::Bundled { tier } => {
+            // Explicit user choice — make this the SOLE provider so
+            // we don't silently fall through to Ollama/OpenAI.
+            #[cfg(feature = "bundled-embeddings")]
+            {
+                if let Some(data_dir) = ensure_data_dir() {
+                    let cache_dir = data_dir.join("embeddings");
+                    info!(
+                        cache_dir = %cache_dir.display(),
+                        tier = ?tier,
+                        "Embeddings: Bundled fastembed (user-selected tier)"
+                    );
+                    providers.push(Box::new(
+                        athen_llm::embeddings::bundled::BundledEmbedding::new(cache_dir, tier),
+                    ));
+                } else {
+                    warn!(
+                        "EmbeddingMode::Bundled selected but no data_dir available; falling back to keyword"
+                    );
+                }
+            }
+            #[cfg(not(feature = "bundled-embeddings"))]
+            {
+                let _ = tier;
+                warn!(
+                    "EmbeddingMode::Bundled selected but the bundled-embeddings cargo feature is OFF; falling back to keyword"
+                );
+            }
+        }
         EmbeddingMode::LocalOnly => {
             let model = model_or("nomic-embed-text");
             let mut p = OllamaEmbedding::new(&model);
@@ -4305,33 +4334,11 @@ fn build_embedding_router(
             }
         },
         EmbeddingMode::Automatic => {
-            // Phase 1 smoke test for the bundled fastembed provider:
-            // gated on both the cargo feature AND an explicit opt-in
-            // env var so default builds and default runs are
-            // unaffected. When live, push it FIRST so its
-            // `is_available() == true` wins resolution before Ollama.
-            #[cfg(feature = "bundled-embeddings")]
-            {
-                if std::env::var("ATHEN_BUNDLED_EMBEDDINGS")
-                    .map(|v| v == "1")
-                    .unwrap_or(false)
-                {
-                    if let Some(data_dir) = ensure_data_dir() {
-                        let cache_dir = data_dir.join("embeddings");
-                        info!(
-                            cache_dir = %cache_dir.display(),
-                            "Bundled multilingual embeddings enabled (model: multilingual-e5-small)"
-                        );
-                        providers.push(Box::new(
-                            athen_llm::embeddings::bundled::BundledEmbedding::new(cache_dir),
-                        ));
-                    } else {
-                        warn!(
-                            "ATHEN_BUNDLED_EMBEDDINGS=1 but no data_dir available; skipping bundled embedder"
-                        );
-                    }
-                }
-            }
+            // TODO(phase-3): once the bundled model has actually been
+            // downloaded to <data_dir>/embeddings/ (status check), the
+            // Automatic arm should prefer it over Ollama. For now,
+            // Automatic stays Ollama-first; users who want the bundled
+            // model pick `EmbeddingMode::Bundled { tier }` explicitly.
 
             // Try Ollama at the default endpoint first. is_available()
             // pings /api/tags and returns false fast when nothing's

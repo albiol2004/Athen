@@ -663,7 +663,59 @@ pub struct EmbeddingConfig {
     pub api_key: Option<String>,
 }
 
+/// Tier for the bundled fastembed-rs embedder. Selected via the
+/// Settings UI; surfaces in `EmbeddingMode::Bundled { tier }`. All
+/// three tiers map to fastembed-native, MIT-licensed, multilingual
+/// models — only the size/dimensions/quality differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BundledTier {
+    /// `MultilingualE5Small` — ~270 MB on disk, 384-dim output.
+    Light,
+    /// `MultilingualE5Base` — ~530 MB on disk, 768-dim output.
+    Standard,
+    /// `BGEM3` — ~1.2 GB on disk, 1024-dim output.
+    HighQuality,
+}
+
+impl BundledTier {
+    /// Output dimensionality the model emits per call to `embed()`.
+    pub fn dimensions(&self) -> usize {
+        match self {
+            BundledTier::Light => 384,
+            BundledTier::Standard => 768,
+            BundledTier::HighQuality => 1024,
+        }
+    }
+
+    /// Approximate on-disk weight size in MiB. Used for the
+    /// "X MB download" hint in the Settings tier picker.
+    pub fn approx_disk_mb(&self) -> u32 {
+        match self {
+            BundledTier::Light => 270,
+            BundledTier::Standard => 530,
+            BundledTier::HighQuality => 1200,
+        }
+    }
+
+    /// Short label suitable for the Settings dropdown when the
+    /// frontend hasn't localised the option (e.g. "Light (270MB)").
+    pub fn human_label(&self) -> &'static str {
+        match self {
+            BundledTier::Light => "Light (270MB)",
+            BundledTier::Standard => "Standard (530MB)",
+            BundledTier::HighQuality => "High quality (1.2GB)",
+        }
+    }
+}
+
 /// How the embedding provider is selected.
+///
+/// Unit variants serialize as bare strings (`"Automatic"`, `"Cloud"`,
+/// `"LocalOnly"`, `"Specific"`, `"Off"`) — preserved verbatim from
+/// the pre-bundled-tier shape so older on-disk configs deserialize
+/// unchanged. The struct variant `Bundled` uses the default
+/// externally-tagged form: `{"Bundled":{"tier":"light"}}`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum EmbeddingMode {
     /// Auto-detect best available provider (NPU > GPU > Ollama > CPU > keyword).
@@ -676,6 +728,11 @@ pub enum EmbeddingMode {
     Specific,
     /// Disable memory/embeddings entirely.
     Off,
+    /// Use the bundled fastembed-rs model at the chosen tier. The
+    /// `bundled-embeddings` cargo feature on `athen-app` must be on
+    /// (it is, by default) for the underlying provider to be
+    /// constructible at runtime.
+    Bundled { tier: BundledTier },
 }
 
 impl Default for EmbeddingConfig {
