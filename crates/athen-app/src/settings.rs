@@ -1259,7 +1259,22 @@ pub async fn get_settings(
 
     let embeddings = {
         let ec = &main_config.embeddings;
-        let mode_str = format!("{:?}", ec.mode);
+        // Encode the mode as the bare dropdown option string the
+        // frontend selector expects. `format!("{:?}", …)` used to live
+        // here, which produced "Bundled { tier: Light }" — the
+        // dropdown silently failed to match and showed blank on reload
+        // (2026-05-28 bug report). Tier selection rides on a separate
+        // `get_bundled_embedding_status` call, so the mode string
+        // collapses every Bundled variant to bare "Bundled".
+        let mode_str = match ec.mode {
+            EmbeddingMode::Automatic => "Automatic",
+            EmbeddingMode::Cloud => "Cloud",
+            EmbeddingMode::LocalOnly => "LocalOnly",
+            EmbeddingMode::Specific => "Specific",
+            EmbeddingMode::Off => "Off",
+            EmbeddingMode::Bundled { .. } => "Bundled",
+        }
+        .to_string();
         let (has_key, hint) = match &ec.api_key {
             Some(key) if !key.is_empty() => (true, Some(mask_api_key(key))),
             _ => (false, None),

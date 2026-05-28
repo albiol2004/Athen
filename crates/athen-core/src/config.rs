@@ -44,7 +44,15 @@ pub struct AthenConfig {
     /// Typed shape (`VoiceConfig`) lives in the `athen-voice` crate, which
     /// `athen-core` cannot depend on (hexagonal rules). `athen-app`
     /// serializes / deserializes around this field.
-    #[serde(default)]
+    ///
+    /// `skip_serializing_if` on `is_null` is load-bearing: AthenConfig is
+    /// written to disk as TOML, which rejects null/unit values. A fresh
+    /// install (or any save before the user touches Voice settings) has
+    /// `voice = Value::Null`, and without this attribute every other
+    /// settings panel's Save would silently fail with "unsupported unit
+    /// type" — that's how the 2026-05-28 embedding-settings persistence
+    /// bug presented.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub voice: serde_json::Value,
 }
 
