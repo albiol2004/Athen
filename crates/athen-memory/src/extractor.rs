@@ -117,6 +117,41 @@ fn parse_entity_type(s: &str) -> EntityType {
     }
 }
 
+/// Classification of a candidate entity name w.r.t. role-label handling.
+///
+/// The LLM frequently surfaces the speaker as `"user"`, `"the user"`, or `"you"`.
+/// We must keep the user as a stable subject node (so the KG isn't full of
+/// orphans like `puppy ← arrives_in August` with no owner), but we must also
+/// drop true role labels (`assistant`, `system`) — those are conversational
+/// scaffolding, not entities.
+///
+/// Returns:
+/// - `NameDecision::Drop` for `assistant` / `system` (case-insensitive)
+/// - `NameDecision::Keep("user")` for `user` / `the user` / `you` (case-insensitive)
+/// - `NameDecision::Keep(original)` for everything else
+///
+/// Only those three exact aliases collapse to `user`; anything containing
+/// "user" as a substring (e.g. "power user", "user_id") is left alone.
+#[derive(Debug, PartialEq, Eq)]
+enum NameDecision {
+    Drop,
+    Keep(String),
+}
+
+fn classify_name(name: &str) -> NameDecision {
+    let trimmed = name.trim();
+    if trimmed.eq_ignore_ascii_case("assistant") || trimmed.eq_ignore_ascii_case("system") {
+        return NameDecision::Drop;
+    }
+    if trimmed.eq_ignore_ascii_case("user")
+        || trimmed.eq_ignore_ascii_case("the user")
+        || trimmed.eq_ignore_ascii_case("you")
+    {
+        return NameDecision::Keep("user".to_string());
+    }
+    NameDecision::Keep(trimmed.to_string())
+}
+
 fn parse_extraction_json(val: &serde_json::Value) -> ExtractionResult {
     let entities = val
         .get("entities")
@@ -124,20 +159,26 @@ fn parse_extraction_json(val: &serde_json::Value) -> ExtractionResult {
         .map(|arr| {
             arr.iter()
                 .filter_map(|e| {
-                    let name = e.get("name")?.as_str()?.trim().to_string();
-                    // Filter out garbage: too short, tool names, generic words.
-                    if name.len() < 2
-                        || name.contains('_')
-                        || name.contains('(')
-                        || name.eq_ignore_ascii_case("user")
-                        || name.eq_ignore_ascii_case("assistant")
-                        || name.eq_ignore_ascii_case("system")
-                    {
+                    let raw = e.get("name")?.as_str()?.trim().to_string();
+                    // Normalise role-ish aliases ("user" / "the user" / "you" → "user";
+                    // "assistant" / "system" → dropped). Keeps the user as a stable
+                    // subject node so the KG doesn't get orphaned objects.
+                    let (name, entity_type) = match classify_name(&raw) {
+                        NameDecision::Drop => return None,
+                        NameDecision::Keep(n) if n == "user" => (n, EntityType::Person),
+                        NameDecision::Keep(n) => {
+                            let et = parse_entity_type(
+                                e.get("type").and_then(|v| v.as_str()).unwrap_or("Concept"),
+                            );
+                            (n, et)
+                        }
+                    };
+                    // Filter out garbage: too short, tool names, parenthesised junk.
+                    // (We DON'T re-apply role-label filtering here — classify_name
+                    // already handled that.)
+                    if name.len() < 2 || name.contains('_') || name.contains('(') {
                         return None;
                     }
-                    let entity_type = parse_entity_type(
-                        e.get("type").and_then(|v| v.as_str()).unwrap_or("Concept"),
-                    );
                     Some(Entity {
                         id: None,
                         entity_type,
@@ -155,9 +196,20 @@ fn parse_extraction_json(val: &serde_json::Value) -> ExtractionResult {
         .map(|arr| {
             arr.iter()
                 .filter_map(|r| {
-                    let from = r.get("from")?.as_str()?.to_string();
+                    let from_raw = r.get("from")?.as_str()?.to_string();
                     let relation = r.get("relation")?.as_str()?.to_string();
-                    let to = r.get("to")?.as_str()?.to_string();
+                    let to_raw = r.get("to")?.as_str()?.to_string();
+                    // Normalise endpoints so they match what the entity-side
+                    // pass stored: drop relations whose endpoint is a true
+                    // role label, collapse user-aliases to canonical "user".
+                    let from = match classify_name(&from_raw) {
+                        NameDecision::Drop => return None,
+                        NameDecision::Keep(n) => n,
+                    };
+                    let to = match classify_name(&to_raw) {
+                        NameDecision::Drop => return None,
+                        NameDecision::Keep(n) => n,
+                    };
                     let importance =
                         r.get("importance").and_then(|v| v.as_f64()).unwrap_or(0.5) as f32;
                     Some((from, relation, to, importance.clamp(0.0, 1.0)))
@@ -284,7 +336,7 @@ mod tests {
     }
 
     #[test]
-    fn test_filters_generic_role_names() {
+    fn test_drops_assistant_and_system_but_keeps_user() {
         let val = serde_json::json!({
             "entities": [
                 {"name": "user", "type": "Person"},
@@ -293,9 +345,60 @@ mod tests {
             ]
         });
         let result = parse_extraction_json(&val);
-        assert!(
-            result.entities.is_empty(),
-            "Generic role names should be filtered"
+        assert_eq!(
+            result.entities.len(),
+            1,
+            "assistant + system drop, user stays as subject node"
+        );
+        assert_eq!(result.entities[0].name, "user");
+        assert_eq!(result.entities[0].entity_type, EntityType::Person);
+    }
+
+    #[test]
+    fn test_normalises_user_aliases_to_canonical_user() {
+        let val = serde_json::json!({
+            "entities": [
+                {"name": "User", "type": "Person"},
+                {"name": "the user", "type": "Person"},
+                {"name": "You", "type": "Person"}
+            ]
+        });
+        let result = parse_extraction_json(&val);
+        assert_eq!(result.entities.len(), 3);
+        for ent in &result.entities {
+            assert_eq!(ent.name, "user", "all three aliases collapse to 'user'");
+            assert_eq!(ent.entity_type, EntityType::Person);
+        }
+    }
+
+    #[test]
+    fn test_normalises_user_aliases_in_relations() {
+        let val = serde_json::json!({
+            "relations": [
+                {"from": "The User", "relation": "is_getting", "to": "puppy"},
+                {"from": "you", "relation": "owns", "to": "car"},
+                {"from": "Assistant", "relation": "says", "to": "hello"}
+            ]
+        });
+        let result = parse_extraction_json(&val);
+        // Two user-aliased relations survive, normalised; the assistant one drops.
+        assert_eq!(result.relations.len(), 2);
+        assert_eq!(result.relations[0].0, "user");
+        assert_eq!(result.relations[0].2, "puppy");
+        assert_eq!(result.relations[1].0, "user");
+        assert_eq!(result.relations[1].2, "car");
+    }
+
+    #[test]
+    fn test_classify_name_does_not_collapse_substring_matches() {
+        // Substring "user" inside another word must NOT be normalised.
+        assert_eq!(
+            classify_name("power user"),
+            NameDecision::Keep("power user".to_string())
+        );
+        assert_eq!(
+            classify_name("user_id"),
+            NameDecision::Keep("user_id".to_string())
         );
     }
 
@@ -311,8 +414,10 @@ mod tests {
             ]
         });
         let result = parse_extraction_json(&val);
-        assert_eq!(result.entities.len(), 2);
+        // Nadia, Acme Corp, user — memory_recall (underscore) and "A" (<2 chars) drop.
+        assert_eq!(result.entities.len(), 3);
         assert_eq!(result.entities[0].name, "Nadia");
         assert_eq!(result.entities[1].name, "Acme Corp");
+        assert_eq!(result.entities[2].name, "user");
     }
 }
