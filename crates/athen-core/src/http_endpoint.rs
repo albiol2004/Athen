@@ -39,12 +39,18 @@ pub enum AuthMethod {
     None,
     /// `Authorization: Bearer <vault.get(endpoint:<id>, "token")>`.
     BearerToken,
-    /// Custom header. Header value is sourced from the vault. The header
-    /// name is fixed at registration (e.g. `X-Api-Key`, `xi-api-key`,
-    /// `X-Subscription-Token`). DeepL is the special case where the name is
-    /// `Authorization` and the value is `DeepL-Auth-Key <key>` — that
-    /// prefix is encoded into the value template handled by the executor.
+    /// Custom header. Header value is sourced from the vault verbatim. The
+    /// header name is fixed at registration (e.g. `X-Api-Key`, `xi-api-key`,
+    /// `X-Subscription-Token`). Use `HeaderPrefixed` when the API wants a
+    /// fixed token-style prefix (`Token …`, `DeepL-Auth-Key …`) so the user
+    /// pastes only the raw key.
     Header { name: String },
+    /// Custom header where the value is composed as `<prefix><vault.get(..,"value")>`.
+    /// Used by APIs like Deepgram (`Authorization: Token <key>`) and DeepL
+    /// (`Authorization: DeepL-Auth-Key <key>`) so the user pastes the raw
+    /// key and the dispatcher adds the prefix. `prefix` is part of the row
+    /// (never secret) and persists across edits.
+    HeaderPrefixed { name: String, prefix: String },
     /// Query parameter, value sourced from the vault. Used by SerpAPI,
     /// Hunter, Crawlbase, NewsAPI, OpenCage, etc. The param name is fixed
     /// at registration (e.g. `api_key`, `apiKey`, `key`, `token`).
@@ -62,6 +68,7 @@ impl AuthMethod {
             AuthMethod::None => None,
             AuthMethod::BearerToken => Some("token"),
             AuthMethod::Header { .. } => Some("value"),
+            AuthMethod::HeaderPrefixed { .. } => Some("value"),
             AuthMethod::QueryParam { .. } => Some("value"),
             AuthMethod::BasicAuth { .. } => Some("password"),
         }

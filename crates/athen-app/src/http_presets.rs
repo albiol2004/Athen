@@ -171,16 +171,17 @@ pub fn presets() -> Vec<EndpointPreset> {
             label: "DeepL",
             provider: "DeepL",
             base_url: "https://api-free.deepl.com/v2/",
-            auth_method: AuthMethod::Header {
+            auth_method: AuthMethod::HeaderPrefixed {
                 name: "Authorization".to_string(),
+                prefix: "DeepL-Auth-Key ".to_string(),
             },
             default_headers: vec![],
             suggested_risk: Some("low"),
             default_rate_limit_per_minute: 60,
-            free_tier_blurb: "500k chars/mo (free key prefix 'DeepL-Auth-Key ')",
+            free_tier_blurb: "500k chars/mo. Paste your raw key — Athen prepends 'DeepL-Auth-Key ' automatically.",
             signup_url: "https://www.deepl.com/pro-api",
             test_path: "usage",
-            usage_hints: "**Auth value MUST be `DeepL-Auth-Key <key>`** — bare key fails with 403. Free keys end `:fx` and ONLY work at `api-free.deepl.com`; pro keys (no suffix) at `api.deepl.com`.\n\n**Endpoints (POST unless noted):**\n- `translate` — JSON or form-encoded; body: `text[]`, `target_lang`, `source_lang`, `formality`, `preserve_formatting`, `tag_handling`.\n- `usage` (GET) — returns `character_count`, `character_limit`.\n- `languages` (GET), `glossaries` (CRUD), `document` (upload).\n\n**Response:** `translations[].text`, `translations[].detected_source_language`. Each text item in one call translates independently — no cross-text context. JSON body is preferred over form-encoded.",
+            usage_hints: "Athen sends `Authorization: DeepL-Auth-Key <key>` for you — paste only your raw API key in the credential field. Free keys end `:fx` and ONLY work at `api-free.deepl.com`; pro keys (no suffix) at `api.deepl.com`.\n\n**Endpoints (POST unless noted):**\n- `translate` — JSON or form-encoded; body: `text[]`, `target_lang`, `source_lang`, `formality`, `preserve_formatting`, `tag_handling`.\n- `usage` (GET) — returns `character_count`, `character_limit`.\n- `languages` (GET), `glossaries` (CRUD), `document` (upload).\n\n**Response:** `translations[].text`, `translations[].detected_source_language`. Each text item in one call translates independently — no cross-text context. JSON body is preferred over form-encoded.",
         },
         EndpointPreset {
             slug: "newsapi",
@@ -312,21 +313,19 @@ pub fn presets() -> Vec<EndpointPreset> {
             provider: "Deepgram",
             base_url: "https://api.deepgram.com/v1/",
             // Deepgram wants `Authorization: Token <key>` (NOT `Bearer`).
-            // The `AuthMethod::Header { name: "Authorization" }` variant
-            // inserts the vault value verbatim, so the user must paste
-            // the full string `Token <api_key>` (including the `Token `
-            // prefix) when saving — mirrors the DeepL `DeepL-Auth-Key <key>`
-            // pattern already shipped here.
-            auth_method: AuthMethod::Header {
+            // `HeaderPrefixed` composes the value so the user pastes only
+            // the raw API key and we add the `Token ` prefix on every request.
+            auth_method: AuthMethod::HeaderPrefixed {
                 name: "Authorization".to_string(),
+                prefix: "Token ".to_string(),
             },
             default_headers: vec![],
             suggested_risk: Some("read_network"),
             default_rate_limit_per_minute: 100,
-            free_tier_blurb: "$200 free credit on signup, no credit card required. After that ~$0.0058/min for streaming (nova-2 model).",
+            free_tier_blurb: "$200 free credit on signup, no credit card required. Paste your raw key — Athen prepends 'Token ' automatically. ~$0.0058/min for streaming after the credit.",
             signup_url: "https://console.deepgram.com/signup",
             test_path: "projects",
-            usage_hints: "**Auth value MUST be `Token <api_key>`** — bare key fails with 401. Athen's `AuthMethod::Header` variant pastes the vault value verbatim into `Authorization`, so include the `Token ` prefix yourself (same pattern as DeepL).\n\n**REST endpoints under `/v1/`:**\n- `projects` (GET) — list projects; doubles as auth health check.\n- `listen` (POST, binary or URL body) — pre-recorded transcription. Params: `model=nova-2|nova-3`, `language`, `punctuate=true`, `diarize=true`, `smart_format=true`, `utterances=true`.\n- `projects/{id}/keys` — manage scoped keys.\n\n**Streaming STT (the path Athen's `place_call` uses) is NOT REST** — it's a WebSocket at `wss://api.deepgram.com/v1/listen?model=nova-2&...` with PCM/Opus audio frames in and JSON transcript frames out. The same `Authorization: Token <key>` header authenticates the WS handshake. Low-latency models are `nova-2` (or `nova-3` where available) — `nova-2-general` for multilingual.\n\nSupports diarization, punctuation, interim results (`interim_results=true`), and language hints (`language=en|es|...` or auto-detect via `detect_language=true`).",
+            usage_hints: "Athen sends `Authorization: Token <key>` for you — paste only your raw API key (no `Token ` prefix).\n\n**REST endpoints under `/v1/`:**\n- `projects` (GET) — list projects; doubles as auth health check.\n- `listen` (POST, binary or URL body) — pre-recorded transcription. Params: `model=nova-2|nova-3`, `language`, `punctuate=true`, `diarize=true`, `smart_format=true`, `utterances=true`.\n- `projects/{id}/keys` — manage scoped keys.\n\n**Streaming STT (the path Athen's `place_call` uses) is NOT REST** — it's a WebSocket at `wss://api.deepgram.com/v1/listen?model=nova-2&...` with PCM/Opus audio frames in and JSON transcript frames out. The same `Authorization: Token <key>` header authenticates the WS handshake. Low-latency models are `nova-2` (or `nova-3` where available) — `nova-2-general` for multilingual.\n\nSupports diarization, punctuation, interim results (`interim_results=true`), and language hints (`language=en|es|...` or auto-detect via `detect_language=true`).",
         },
         EndpointPreset {
             slug: "cartesia",

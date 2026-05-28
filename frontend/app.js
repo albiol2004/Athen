@@ -14417,6 +14417,7 @@ function describeAuthMethod(am) {
     if (!am || am === 'None') return 'no auth';
     if (am === 'BearerToken') return 'Bearer token';
     if (am.Header) return `Header: ${am.Header.name}`;
+    if (am.HeaderPrefixed) return `Header: ${am.HeaderPrefixed.name} (prefix “${am.HeaderPrefixed.prefix}”)`;
     if (am.QueryParam) return `?${am.QueryParam.name}=…`;
     if (am.BasicAuth) return `Basic (${am.BasicAuth.user})`;
     return 'unknown';
@@ -14550,13 +14551,22 @@ function applyAuthMethodToForm(form, am) {
     let kind = 'None';
     let paramName = '';
     let user = '';
+    let prefix = '';
     if (am === 'BearerToken') kind = 'BearerToken';
     else if (am && am.Header) { kind = 'Header'; paramName = am.Header.name; }
+    else if (am && am.HeaderPrefixed) {
+        kind = 'Header';
+        paramName = am.HeaderPrefixed.name;
+        prefix = am.HeaderPrefixed.prefix;
+    }
     else if (am && am.QueryParam) { kind = 'QueryParam'; paramName = am.QueryParam.name; }
     else if (am && am.BasicAuth) { kind = 'BasicAuth'; user = am.BasicAuth.user; }
     form.authKind.value = kind;
     form.authParam.value = paramName;
     form.authUser.value = user;
+    // Stash prefix on the hidden field for read-back at save time.
+    const prefixEl = document.getElementById('cloud-api-auth-prefix');
+    if (prefixEl) prefixEl.value = prefix;
     refreshCloudApiAuthFields();
 }
 
@@ -14564,10 +14574,16 @@ function readAuthMethodFromForm() {
     const kind = document.getElementById('cloud-api-auth-kind').value;
     const paramName = document.getElementById('cloud-api-auth-param').value.trim();
     const user = document.getElementById('cloud-api-auth-user').value.trim();
+    const prefixEl = document.getElementById('cloud-api-auth-prefix');
+    const prefix = prefixEl ? prefixEl.value : '';
     switch (kind) {
         case 'None': return 'None';
         case 'BearerToken': return 'BearerToken';
-        case 'Header': return { Header: { name: paramName || 'X-Api-Key' } };
+        case 'Header':
+            if (prefix) {
+                return { HeaderPrefixed: { name: paramName || 'X-Api-Key', prefix } };
+            }
+            return { Header: { name: paramName || 'X-Api-Key' } };
         case 'QueryParam': return { QueryParam: { name: paramName || 'api_key' } };
         case 'BasicAuth': return { BasicAuth: { user: user } };
         default: return 'None';
@@ -14585,6 +14601,22 @@ function refreshCloudApiAuthFields() {
     const param = document.getElementById('cloud-api-auth-param');
     if (kind === 'Header') param.placeholder = 'X-Api-Key';
     else if (kind === 'QueryParam') param.placeholder = 'api_key';
+
+    // Surface the auth-value prefix when present (preset-driven, e.g. Deepgram/DeepL).
+    // Only meaningful with Header; clear it if the user manually switched kinds.
+    const prefixEl = document.getElementById('cloud-api-auth-prefix');
+    const hintEl = document.getElementById('cloud-api-auth-prefix-hint');
+    if (prefixEl && hintEl) {
+        if (kind !== 'Header') prefixEl.value = '';
+        const prefix = prefixEl.value;
+        if (prefix) {
+            hintEl.hidden = false;
+            hintEl.textContent = `Athen will prepend “${prefix}” to your key. Paste only the raw API key.`;
+        } else {
+            hintEl.hidden = true;
+            hintEl.textContent = '';
+        }
+    }
 }
 
 function applyPresetToModal(slug) {

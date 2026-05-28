@@ -2008,6 +2008,19 @@ impl AppToolRegistry {
                     })?;
                 insert_header(&mut header_map, name, &value)?;
             }
+            AuthMethod::HeaderPrefixed { name, prefix } => {
+                let value = vault
+                    .get(&scope, "value")
+                    .await?
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        AthenError::Other(format!(
+                            "http_request: endpoint '{}' has no header credential in the vault.",
+                            endpoint.name
+                        ))
+                    })?;
+                insert_header(&mut header_map, name, &format!("{prefix}{value}"))?;
+            }
             AuthMethod::QueryParam { name } => {
                 let value = vault
                     .get(&scope, "value")
@@ -2551,8 +2564,7 @@ impl AppToolRegistry {
     async fn do_place_call(&self, args: serde_json::Value) -> Result<ToolResult> {
         let Some(deps) = self.telephony.as_ref() else {
             return Err(AthenError::Other(
-                "place_call: voice subsystem not wired into this agent (no telephony deps)"
-                    .into(),
+                "place_call: voice subsystem not wired into this agent (no telephony deps)".into(),
             ));
         };
         let Some(app) = self.app_handle.as_ref() else {

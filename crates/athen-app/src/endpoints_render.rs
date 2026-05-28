@@ -179,6 +179,7 @@ fn auth_label(auth: &AuthMethod) -> Option<&'static str> {
         AuthMethod::None => None,
         AuthMethod::BearerToken => Some("bearer token"),
         AuthMethod::Header { .. } => Some("api key header"),
+        AuthMethod::HeaderPrefixed { .. } => Some("api key header (prefixed)"),
         AuthMethod::QueryParam { .. } => Some("api key query param"),
         AuthMethod::BasicAuth { .. } => Some("basic auth"),
     }

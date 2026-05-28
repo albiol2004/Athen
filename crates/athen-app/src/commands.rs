@@ -5798,6 +5798,17 @@ pub async fn test_http_endpoint(
                 return Err("No header credential set in vault for this endpoint".into());
             }
         }
+        AuthMethod::HeaderPrefixed { name, prefix } => {
+            if let Some(v) = vault
+                .get(&scope, "value")
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                builder = builder.header(name.as_str(), format!("{prefix}{v}"));
+            } else {
+                return Err("No header credential set in vault for this endpoint".into());
+            }
+        }
         AuthMethod::QueryParam { name } => {
             if let Some(v) = vault
                 .get(&scope, "value")

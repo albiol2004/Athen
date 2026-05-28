@@ -605,12 +605,11 @@ pub(crate) async fn assemble_app_tool_registry(
         let cfg = crate::settings::load_main_config_public();
         let voice_config: athen_voice::VoiceConfig =
             serde_json::from_value(cfg.voice.clone()).unwrap_or_default();
-        let gate: Arc<dyn athen_voice::TelephonyApprovalGate> = Arc::new(
-            crate::telephony_gate::RouterTelephonyApprovalGate::new(
+        let gate: Arc<dyn athen_voice::TelephonyApprovalGate> =
+            Arc::new(crate::telephony_gate::RouterTelephonyApprovalGate::new(
                 router,
                 Some(arc_id.to_string()),
-            ),
-        );
+            ));
         let telephony_deps = crate::place_call::TelephonyDeps {
             gate,
             vault,
@@ -5171,6 +5170,7 @@ fn auth_method_short(am: &athen_core::http_endpoint::AuthMethod) -> String {
         A::None => "no auth".to_string(),
         A::BearerToken => "Bearer token".to_string(),
         A::Header { name } => format!("header `{name}`"),
+        A::HeaderPrefixed { name, prefix } => format!("header `{name}` (prefix `{prefix}`)"),
         A::QueryParam { name } => format!("query param `{name}`"),
         A::BasicAuth { user } => format!("basic auth (user `{user}`)"),
     }

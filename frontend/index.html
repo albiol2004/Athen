@@ -1649,6 +1649,8 @@
                 <div class="cal-field" id="cloud-api-credential-row">
                     <label for="cloud-api-credential">API key / token</label>
                     <input type="password" id="cloud-api-credential" class="settings-input" placeholder="Paste API key" autocomplete="off">
+                    <input type="hidden" id="cloud-api-auth-prefix" value="">
+                    <p class="setting-hint" id="cloud-api-auth-prefix-hint" hidden></p>
                     <p class="setting-hint">Stored encrypted in the OS keychain (or encrypted-file fallback). Never written to <code>config.toml</code>.</p>
                 </div>
                 <div class="cal-field">
