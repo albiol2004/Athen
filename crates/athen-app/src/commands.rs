@@ -129,6 +129,7 @@ fn spawn_router_approval(
             .clone()
             .map(|s| s as Arc<dyn athen_core::traits::wakeup::WakeupStore>),
         agent_registry: state.agent_registry.clone(),
+        vault: state.vault.clone(),
     };
 
     tauri::async_runtime::spawn(async move {
@@ -294,6 +295,8 @@ fn spawn_router_approval(
             wakeup: None,
             wakeup_store: bg_ctx.wakeup_store,
             agent_registry: bg_ctx.agent_registry.clone(),
+            vault: bg_ctx.vault.clone(),
+            active_provider_id: effective_provider_id.clone(),
         };
 
         let outcome = match execute_approved_task(task_id, ctx).await {
@@ -405,6 +408,9 @@ struct ApprovedTaskBgCtx {
     /// Live agent registry handle, ferried into `ApprovedTaskCtx` so the
     /// bg approval flow can register the run and stream step updates.
     agent_registry: Option<Arc<crate::agent_registry::AgentRegistry>>,
+    /// Vault snapshot ferried into `ApprovedTaskCtx` so `place_call` can
+    /// dispatch under the same telephony deps used by in-app chat.
+    vault: Option<Arc<dyn athen_core::traits::vault::Vault>>,
 }
 
 /// Resolve the agent profile that should drive execution for a given arc.
@@ -3154,6 +3160,8 @@ pub async fn approve_task(
             .clone()
             .map(|s| s as Arc<dyn athen_core::traits::wakeup::WakeupStore>),
         agent_registry: state.agent_registry.clone(),
+        vault: state.vault.clone(),
+        active_provider_id: effective_provider_id.clone(),
     };
 
     let outcome = match execute_approved_task(task_uuid, ctx).await {
@@ -3352,6 +3360,16 @@ pub(crate) struct ApprovedTaskCtx {
     /// pushes step updates so the FE "watch the agents work" panel
     /// reflects this task in real time.
     pub agent_registry: Option<Arc<crate::agent_registry::AgentRegistry>>,
+    /// Vault snapshot, needed by the `place_call` tool's telephony deps so
+    /// the runner subprocess can read Twilio / STT / TTS credentials.
+    /// `None` on CLI/test builds — `place_call` is then not advertised on
+    /// the wake-up + sense-event paths.
+    pub vault: Option<Arc<dyn athen_core::traits::vault::Vault>>,
+    /// Effective provider id resolved at ctx construction time. Used by
+    /// the telephony wiring to pick the right Fast-tier LLM connection
+    /// for the voice subprocess. Empty string acceptable — telephony
+    /// then falls back to the active-bundle Fast tier.
+    pub active_provider_id: String,
 }
 
 /// Drive a risk-flagged task all the way through approval, dispatch,

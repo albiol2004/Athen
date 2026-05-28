@@ -2439,6 +2439,8 @@ impl AppState {
                             .clone()
                             .map(|s| s as Arc<dyn athen_core::traits::wakeup::WakeupStore>),
                         agent_registry: agent_registry_loop.clone(),
+                        vault: vault_snapshot.clone(),
+                        active_provider_id: effective_provider_id.clone(),
                     };
 
                     let task_arc_map_clone = Arc::clone(&task_arc_map);
