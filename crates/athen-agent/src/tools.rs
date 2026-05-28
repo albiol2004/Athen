@@ -1544,11 +1544,8 @@ impl ShellToolRegistry {
                                 stderr = %output.stderr.trim(),
                                 "Sandbox infrastructure failed, falling back to unsandboxed shell"
                             );
-                            notify_sandbox_fallback_once(
-                                self.notifier.as_ref(),
-                                &output.stderr,
-                            )
-                            .await;
+                            notify_sandbox_fallback_once(self.notifier.as_ref(), &output.stderr)
+                                .await;
                             let output = self
                                 .shell
                                 .execute_with(

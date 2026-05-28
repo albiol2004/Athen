@@ -3075,9 +3075,7 @@ async fn execute_owner_telegram_message(
     // (owner-Telegram may run before the arc is allocated, in which
     // case `LowerToSilent` simply never fires — `ForceHumanConfirm`
     // still does, which is the safety-critical path).
-    if let (Some(store), Some(arc_str)) =
-        (deps.grant_store.clone(), target_arc_id.as_ref())
-    {
+    if let (Some(store), Some(arc_str)) = (deps.grant_store.clone(), target_arc_id.as_ref()) {
         builder = builder
             .grant_lookup(Arc::new(crate::file_gate::GrantStoreLookup::new(store)))
             .arc_uuid(crate::file_gate::arc_uuid(arc_str));

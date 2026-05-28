@@ -572,7 +572,11 @@ fn build_grant_question(
     if let Some(root) = detected_root {
         choices.push(ApprovalChoice {
             key: "allow_root".to_string(),
-            label: format!("Allow {} ({})", friendly_path(&root.path), root.marker.label()),
+            label: format!(
+                "Allow {} ({})",
+                friendly_path(&root.path),
+                root.marker.label()
+            ),
             // Kind is just an icon hint per the existing comment; the
             // server side disambiguates on `key`.
             kind: ApprovalChoiceKind::AllowOnce,
@@ -1046,7 +1050,9 @@ mod tests {
 
     #[test]
     fn friendly_path_substitutes_home_with_tilde() {
-        let Some(home) = paths::home_dir() else { return };
+        let Some(home) = paths::home_dir() else {
+            return;
+        };
         let sub = home.join("projects/foo");
         let rendered = friendly_path(&sub);
         assert_eq!(rendered, "~/projects/foo");

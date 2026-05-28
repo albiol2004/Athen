@@ -4388,11 +4388,7 @@ mod tests {
         async fn list_tools(&self) -> Result<Vec<ToolDefinition>> {
             Ok(vec![])
         }
-        async fn call_tool(
-            &self,
-            _name: &str,
-            _args: serde_json::Value,
-        ) -> Result<CoreToolResult> {
+        async fn call_tool(&self, _name: &str, _args: serde_json::Value) -> Result<CoreToolResult> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(CoreToolResult {
                 success: true,

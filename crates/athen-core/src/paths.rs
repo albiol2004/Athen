@@ -368,7 +368,10 @@ pub fn detect_project_root(start: &Path) -> Option<DetectedRoot> {
         Ok(_) => canonical.parent()?.to_path_buf(),
         Err(_) => {
             // Non-existent or unreadable — try parent if any, else use as-is.
-            canonical.parent().map(|p| p.to_path_buf()).unwrap_or(canonical.clone())
+            canonical
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or(canonical.clone())
         }
     };
 

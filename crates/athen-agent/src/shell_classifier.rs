@@ -259,12 +259,9 @@ fn is_force_confirm(raw_clause: &str, tokens: &[String]) -> bool {
             .iter()
             .any(|t| matches!(t.as_str(), "-rf" | "-fr" | "-Rf" | "-fR" | "-f" | "--force"));
         // Combined short flag like `-rf` covers both; rely on that quick path too
-        let combined = tokens.iter().any(|t| {
-            matches!(
-                t.as_str(),
-                "-rf" | "-fr" | "-Rf" | "-fR" | "-rF" | "-Fr"
-            )
-        });
+        let combined = tokens
+            .iter()
+            .any(|t| matches!(t.as_str(), "-rf" | "-fr" | "-Rf" | "-fR" | "-rF" | "-Fr"));
         let combined_or_pair = combined || has_recursive_force;
         if combined_or_pair {
             // Any token starting with '/' (positional absolute path)
@@ -557,10 +554,7 @@ mod tests {
             classify("npm install evil", true),
             ShellRiskHint::ForceHumanConfirm
         );
-        assert_eq!(
-            classify("npm ci", true),
-            ShellRiskHint::ForceHumanConfirm
-        );
+        assert_eq!(classify("npm ci", true), ShellRiskHint::ForceHumanConfirm);
         assert_eq!(
             classify("npm i lodash", true),
             ShellRiskHint::ForceHumanConfirm
@@ -751,10 +745,7 @@ mod tests {
 
     #[test]
     fn silent_make_target() {
-        assert_eq!(
-            classify("make build", true),
-            ShellRiskHint::LowerToSilent
-        );
+        assert_eq!(classify("make build", true), ShellRiskHint::LowerToSilent);
     }
 
     #[test]
@@ -764,15 +755,15 @@ mod tests {
 
     #[test]
     fn silent_tsc_no_emit() {
-        assert_eq!(
-            classify("tsc --noEmit", true),
-            ShellRiskHint::LowerToSilent
-        );
+        assert_eq!(classify("tsc --noEmit", true), ShellRiskHint::LowerToSilent);
     }
 
     #[test]
     fn silent_go_build() {
-        assert_eq!(classify("go build ./...", true), ShellRiskHint::LowerToSilent);
+        assert_eq!(
+            classify("go build ./...", true),
+            ShellRiskHint::LowerToSilent
+        );
     }
 
     #[test]
@@ -903,7 +894,10 @@ mod tests {
         // Force must win even when upstream lowered to SilentApprove —
         // an autonomy band shouldn't bypass an always-prompt verb.
         assert_eq!(
-            merge_shell_hint(RiskDecision::SilentApprove, ShellRiskHint::ForceHumanConfirm),
+            merge_shell_hint(
+                RiskDecision::SilentApprove,
+                ShellRiskHint::ForceHumanConfirm
+            ),
             RiskDecision::HumanConfirm
         );
     }
