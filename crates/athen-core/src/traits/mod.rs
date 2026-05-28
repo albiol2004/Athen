@@ -22,5 +22,6 @@ pub mod shell;
 pub mod skill;
 pub mod telegram_sender;
 pub mod tool;
+pub mod user_notify;
 pub mod vault;
 pub mod wakeup;

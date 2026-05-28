@@ -10,6 +10,7 @@ pub mod executor;
 pub mod reminders;
 pub mod resource;
 pub mod runtimes;
+pub mod shell_classifier;
 pub mod timeout;
 pub mod tool_error_hints;
 pub mod tool_grouping;

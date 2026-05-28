@@ -22,6 +22,7 @@ use athen_core::traits::telegram_sender::{
     OutboundTelegramMessage, TelegramAttachment, TelegramAttachmentKind, TelegramSender,
 };
 use athen_core::traits::tool::ToolRegistry;
+use athen_core::traits::user_notify::UserNotifier;
 use athen_risk::rules::RuleEngine;
 use athen_sandbox::UnifiedSandbox;
 use athen_shell::Shell;
@@ -401,6 +402,75 @@ pub struct ShellToolRegistry {
     /// with. Set per-arc by the composition root. `None` falls back to
     /// "no snapshot" even if the store is wired.
     checkpoint_arc_id: Option<String>,
+    /// User-visible notification sink. Currently only used to surface
+    /// the one-shot "sandbox unavailable — running unsandboxed" warning
+    /// (see [`SANDBOX_FALLBACK_NOTIFIED`]). `None` on CLI/tests; the
+    /// tracing warn-log still fires either way.
+    notifier: Option<Arc<dyn UserNotifier>>,
+}
+
+/// Tripped the first time `shell_execute` falls back from the sandbox to
+/// an unsandboxed shell within this process. Guards a single user-visible
+/// notification — every subsequent fallback only logs at `warn` level.
+/// Process-global by design: the warning is about host-level sandbox
+/// breakage, not per-arc state.
+static SANDBOX_FALLBACK_NOTIFIED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Emit a user-visible `Notification` the FIRST time the sandbox fallback
+/// path is taken in this process. `stderr_excerpt` is the captured stderr
+/// from the sandbox failure (truncated + trimmed before display). Logs at
+/// `tracing::warn!` on every call; only the very first call actually
+/// notifies the user.
+async fn notify_sandbox_fallback_once(
+    notifier: Option<&Arc<dyn UserNotifier>>,
+    stderr_excerpt: &str,
+) {
+    let Some(notifier) = notifier else {
+        return;
+    };
+    // compare_exchange semantics: only the first caller flips false→true
+    // and proceeds; all later callers see true and return without
+    // notifying again.
+    if SANDBOX_FALLBACK_NOTIFIED
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        return;
+    }
+    let trimmed = stderr_excerpt.trim();
+    // Cap at 200 chars on a char boundary so we don't split a multibyte
+    // codepoint (`String::truncate` panics if the index isn't a char
+    // boundary, and stderr from foreign locales may be UTF-8).
+    let mut body = String::with_capacity(trimmed.len().min(200));
+    for (i, ch) in trimmed.char_indices() {
+        if i >= 200 {
+            break;
+        }
+        body.push(ch);
+    }
+    if body.is_empty() {
+        body.push_str("Sandbox spawn failed; shell commands are running directly on the host.");
+    }
+    let notif = athen_core::notification::Notification {
+        id: uuid::Uuid::new_v4(),
+        urgency: athen_core::notification::NotificationUrgency::High,
+        title: "Sandbox unavailable — running shell commands unsandboxed".to_string(),
+        body,
+        origin: athen_core::notification::NotificationOrigin::RiskSystem,
+        arc_id: None,
+        task_id: None,
+        created_at: chrono::Utc::now(),
+        requires_response: false,
+        skip_humanize: true,
+        body_long: None,
+    };
+    notifier.notify(notif).await;
 }
 
 /// Defense-in-depth: tolerate args delivered as a JSON-encoded string
@@ -732,6 +802,25 @@ impl ShellToolRegistry {
             github_identity_resolver: None,
             checkpoint_store: None,
             checkpoint_arc_id: None,
+            notifier: None,
+        }
+    }
+
+    /// Inject a user-visible notification sink. Currently powers the
+    /// one-shot "sandbox unavailable" warning emitted from
+    /// `shell_execute` when the bwrap/AppContainer/sandbox-exec spawn
+    /// fails. Without a notifier the fallback still happens (and still
+    /// `tracing::warn!`s) — the user just won't see an in-app notice.
+    pub fn with_notifier(mut self, notifier: Arc<dyn UserNotifier>) -> Self {
+        self.notifier = Some(notifier);
+        self
+    }
+
+    /// `Option`-flavoured variant — see [`Self::with_notifier`].
+    pub fn with_notifier_opt(self, notifier: Option<Arc<dyn UserNotifier>>) -> Self {
+        match notifier {
+            Some(n) => self.with_notifier(n),
+            None => self,
         }
     }
 
@@ -1455,6 +1544,11 @@ impl ShellToolRegistry {
                                 stderr = %output.stderr.trim(),
                                 "Sandbox infrastructure failed, falling back to unsandboxed shell"
                             );
+                            notify_sandbox_fallback_once(
+                                self.notifier.as_ref(),
+                                &output.stderr,
+                            )
+                            .await;
                             let output = self
                                 .shell
                                 .execute_with(
@@ -1475,11 +1569,13 @@ impl ShellToolRegistry {
                         }
                     }
                     Err(e) => {
+                        let err_str = e.to_string();
                         tracing::warn!(
                             tool = "shell_execute",
-                            error = %e,
+                            error = %err_str,
                             "Sandbox execution failed, falling back to unsandboxed shell"
                         );
+                        notify_sandbox_fallback_once(self.notifier.as_ref(), &err_str).await;
                         let output = self
                             .shell
                             .execute_with(

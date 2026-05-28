@@ -497,6 +497,11 @@ pub(crate) async fn assemble_app_tool_registry(
         arc_id,
     )
     .await;
+    // TODO(plan-cake): wire UserNotifier impl that forwards a
+    // Notification to the same plumbing proactive_hints.rs uses
+    // (app_handle.emit("notification", ...) + NotificationOrchestrator)
+    // so the sandbox-fallback warning reaches the user. Pass it via
+    // `.with_notifier_opt(deps.user_notifier.clone())`.
     let mut shell = athen_agent::ShellToolRegistry::new()
         .await
         .with_spawned_processes(deps.spawned_processes.clone())

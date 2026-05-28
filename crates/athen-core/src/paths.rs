@@ -309,6 +309,134 @@ fn normalize(p: &Path) -> PathBuf {
     out
 }
 
+/// Marker file/directory used to detect a project root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootMarker {
+    Git,
+    Cargo,
+    Npm,
+    PyProject,
+    GoMod,
+    Maven,
+    Gradle,
+}
+
+impl RootMarker {
+    /// Human-readable label suitable for the approval button
+    /// ("Allow ~/foo (git root)").
+    pub fn label(self) -> &'static str {
+        match self {
+            RootMarker::Git => "git root",
+            RootMarker::Cargo => "Cargo project",
+            RootMarker::Npm => "npm project",
+            RootMarker::PyProject => "Python project",
+            RootMarker::GoMod => "Go module",
+            RootMarker::Maven => "Maven project",
+            RootMarker::Gradle => "Gradle project",
+        }
+    }
+}
+
+/// A detected project root with the marker that identified it.
+#[derive(Debug, Clone)]
+pub struct DetectedRoot {
+    pub path: PathBuf,
+    pub marker: RootMarker,
+}
+
+/// Walk parent directories from `start` looking for a project-root marker.
+///
+/// Priority order at each level: `.git/` directory, `Cargo.toml`,
+/// `package.json`, `pyproject.toml`, `go.mod`, `pom.xml`,
+/// `build.gradle`/`build.gradle.kts`.
+///
+/// Refuses to return a system path (see [`is_system_path`]) or the user's
+/// home directory itself — a subdirectory of home is fine.
+///
+/// Returns `None` if we walk to the filesystem root without finding a
+/// marker, or if every candidate is rejected by the safety checks.
+/// Permission errors are treated as "marker not found, keep walking".
+pub fn detect_project_root(start: &Path) -> Option<DetectedRoot> {
+    if start.as_os_str().is_empty() {
+        return None;
+    }
+    let canonical = canonicalize_loose(start);
+    // If it's a file, start from parent. If it doesn't exist or we can't
+    // tell, also try the parent (best effort).
+    let mut current: PathBuf = match std::fs::metadata(&canonical) {
+        Ok(md) if md.is_dir() => canonical.clone(),
+        Ok(_) => canonical.parent()?.to_path_buf(),
+        Err(_) => {
+            // Non-existent or unreadable — try parent if any, else use as-is.
+            canonical.parent().map(|p| p.to_path_buf()).unwrap_or(canonical.clone())
+        }
+    };
+
+    let home = home_dir().map(|h| canonicalize_loose(&h));
+
+    loop {
+        // Safety: refuse system paths and home itself.
+        if is_system_path(&current) {
+            return None;
+        }
+        if let Some(h) = home.as_ref() {
+            if &current == h {
+                return None;
+            }
+        }
+
+        if let Some(marker) = detect_marker_at(&current) {
+            return Some(DetectedRoot {
+                path: current,
+                marker,
+            });
+        }
+
+        match current.parent() {
+            Some(parent) if parent != current => {
+                current = parent.to_path_buf();
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Check the priority-ordered list of marker files at `dir`.
+/// Permission/IO errors are swallowed (treated as "not present").
+fn detect_marker_at(dir: &Path) -> Option<RootMarker> {
+    // `.git` may be a directory (normal repo) or a file (git submodule /
+    // worktree). Either counts.
+    if path_exists(&dir.join(".git")) {
+        return Some(RootMarker::Git);
+    }
+    if path_exists(&dir.join("Cargo.toml")) {
+        return Some(RootMarker::Cargo);
+    }
+    if path_exists(&dir.join("package.json")) {
+        return Some(RootMarker::Npm);
+    }
+    if path_exists(&dir.join("pyproject.toml")) {
+        return Some(RootMarker::PyProject);
+    }
+    if path_exists(&dir.join("go.mod")) {
+        return Some(RootMarker::GoMod);
+    }
+    if path_exists(&dir.join("pom.xml")) {
+        return Some(RootMarker::Maven);
+    }
+    if path_exists(&dir.join("build.gradle")) || path_exists(&dir.join("build.gradle.kts")) {
+        return Some(RootMarker::Gradle);
+    }
+    None
+}
+
+/// `Path::exists` swallows permission errors as `false`; mirror that
+/// shape explicitly so the intent is obvious at the call site.
+#[inline]
+fn path_exists(p: &Path) -> bool {
+    std::fs::metadata(p).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,5 +560,132 @@ mod tests {
     fn strip_verbatim_prefix_is_noop_on_unix() {
         let p = PathBuf::from("/home/alex/.athen");
         assert_eq!(strip_windows_verbatim(p.clone()), p);
+    }
+
+    // -------- detect_project_root --------
+
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn detect_root_git_precedence_over_cargo() {
+        let td = tempdir().unwrap();
+        let root = td.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::write(root.join("Cargo.toml"), "[package]").unwrap();
+
+        let got = detect_project_root(root).expect("should detect");
+        assert_eq!(got.marker, RootMarker::Git);
+        assert_eq!(canonicalize_loose(&got.path), canonicalize_loose(root));
+    }
+
+    #[test]
+    fn detect_root_cargo_fallback_when_no_git() {
+        let td = tempdir().unwrap();
+        let root = td.path();
+        fs::write(root.join("Cargo.toml"), "[package]").unwrap();
+
+        let got = detect_project_root(root).expect("should detect");
+        assert_eq!(got.marker, RootMarker::Cargo);
+    }
+
+    #[test]
+    fn detect_root_package_json_fallback() {
+        let td = tempdir().unwrap();
+        let root = td.path();
+        fs::write(root.join("package.json"), "{}").unwrap();
+
+        let got = detect_project_root(root).expect("should detect");
+        assert_eq!(got.marker, RootMarker::Npm);
+    }
+
+    #[test]
+    fn detect_root_walks_up_from_nested_file() {
+        let td = tempdir().unwrap();
+        let root = td.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        let deep = root.join("a").join("b").join("c");
+        fs::create_dir_all(&deep).unwrap();
+        let file = deep.join("file.rs");
+        fs::write(&file, "// hi").unwrap();
+
+        let got = detect_project_root(&file).expect("should walk up");
+        assert_eq!(got.marker, RootMarker::Git);
+        assert_eq!(canonicalize_loose(&got.path), canonicalize_loose(root));
+    }
+
+    #[test]
+    fn detect_root_none_when_no_markers_walking_to_root() {
+        let td = tempdir().unwrap();
+        // Nested dir, no marker anywhere.
+        let sub = td.path().join("x").join("y");
+        fs::create_dir_all(&sub).unwrap();
+        // No marker between `sub` and `/` (the tempdir is under
+        // /tmp or similar — `/tmp` itself has no marker, and the walk
+        // stops at `/` returning None).
+        let got = detect_project_root(&sub);
+        assert!(got.is_none(), "expected None, got {:?}", got);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn detect_root_refuses_system_path() {
+        // /etc itself is a system path even if a marker happened to exist.
+        assert!(detect_project_root(Path::new("/etc")).is_none());
+        assert!(detect_project_root(Path::new("/usr/local")).is_none());
+    }
+
+    #[test]
+    fn detect_root_refuses_home_itself() {
+        let Some(home) = home_dir() else { return };
+        // Don't actually create files in $HOME; just verify that
+        // even if we point AT $HOME, we get None (no marker), and
+        // that asking about $HOME itself is safely rejected by the
+        // home guard rather than promoted to a root.
+        let got = detect_project_root(&home);
+        // If the user happens to have a marker right at $HOME (rare),
+        // we still refuse it explicitly.
+        assert!(
+            got.is_none(),
+            "home dir itself must never be returned as a project root: {:?}",
+            got
+        );
+    }
+
+    #[test]
+    fn detect_root_empty_path_returns_none() {
+        assert!(detect_project_root(Path::new("")).is_none());
+    }
+
+    #[test]
+    fn detect_root_nonexistent_path_returns_none_gracefully() {
+        // A made-up path that almost certainly doesn't exist and has no
+        // markers up the parent chain. Must not panic.
+        let bogus = std::env::temp_dir()
+            .join(format!("athen-nope-{}", uuid::Uuid::new_v4()))
+            .join("deeper")
+            .join("file.rs");
+        // No panic; result is whatever the parent walk produces (likely
+        // None, but if /tmp's ancestors had a marker, that's fine too —
+        // the point is the call doesn't blow up).
+        let _ = detect_project_root(&bogus);
+    }
+
+    #[test]
+    fn root_marker_labels_are_distinct() {
+        let labels = [
+            RootMarker::Git.label(),
+            RootMarker::Cargo.label(),
+            RootMarker::Npm.label(),
+            RootMarker::PyProject.label(),
+            RootMarker::GoMod.label(),
+            RootMarker::Maven.label(),
+            RootMarker::Gradle.label(),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for l in labels {
+            assert!(seen.insert(l), "duplicate label: {}", l);
+            assert!(!l.is_empty());
+        }
     }
 }

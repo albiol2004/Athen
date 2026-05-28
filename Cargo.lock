@@ -291,10 +291,12 @@ dependencies = [
  "flate2",
  "futures",
  "nix 0.29.0",
+ "regex",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sha2",
+ "shell-words",
  "tar",
  "tempfile",
  "tokio",
@@ -307,7 +309,7 @@ dependencies = [
 
 [[package]]
 name = "athen-app"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "athen-agent",
