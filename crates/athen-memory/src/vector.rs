@@ -1,16 +1,20 @@
 //! Vector embeddings and semantic search.
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use tokio::sync::RwLock;
 
 use athen_core::error::Result;
-use athen_core::traits::memory::{SearchResult, VectorIndex};
+use athen_core::traits::memory::{RankedRow, SearchResult, VectorIndex};
 
 struct VectorEntry {
     id: String,
     embedding: Vec<f32>,
     metadata: Value,
+    created_at: DateTime<Utc>,
+    last_recalled_at: Option<DateTime<Utc>>,
+    recall_count: u32,
 }
 
 /// In-memory brute-force vector index for semantic search.
@@ -63,11 +67,15 @@ impl VectorIndex for InMemoryVectorIndex {
         if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
             entry.embedding = embedding;
             entry.metadata = metadata;
+            // Preserve created_at + consult signals across updates.
         } else {
             entries.push(VectorEntry {
                 id: id.to_string(),
                 embedding,
                 metadata,
+                created_at: Utc::now(),
+                last_recalled_at: None,
+                recall_count: 0,
             });
         }
         Ok(())
@@ -113,6 +121,36 @@ impl VectorIndex for InMemoryVectorIndex {
                 metadata: e.metadata.clone(),
             })
             .collect())
+    }
+
+    async fn scan_scored(&self, query_embedding: Vec<f32>) -> Result<Vec<RankedRow>> {
+        let entries = self.entries.read().await;
+        Ok(entries
+            .iter()
+            .map(|e| RankedRow {
+                id: e.id.clone(),
+                cosine: cosine_similarity(&query_embedding, &e.embedding),
+                created_at: Some(e.created_at),
+                last_recalled_at: e.last_recalled_at,
+                recall_count: e.recall_count,
+                metadata: e.metadata.clone(),
+            })
+            .collect())
+    }
+
+    async fn bump_recall_stats(&self, ids: &[&str]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let now = Utc::now();
+        let mut entries = self.entries.write().await;
+        for entry in entries.iter_mut() {
+            if ids.contains(&entry.id.as_str()) {
+                entry.recall_count += 1;
+                entry.last_recalled_at = Some(now);
+            }
+        }
+        Ok(())
     }
 }
 

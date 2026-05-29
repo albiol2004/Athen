@@ -11,7 +11,7 @@ use uuid::Uuid;
 use athen_core::error::{AthenError, Result};
 use athen_core::traits::memory::{
     Entity, EntityId, EntityType, ExploreParams, GraphEdge, GraphNode, KnowledgeGraph,
-    SearchResult, VectorIndex,
+    LexicalIndex, RankedRow, SearchResult, VectorIndex,
 };
 
 // ---------------------------------------------------------------------------
@@ -32,13 +32,32 @@ impl SqliteVectorIndex {
                 "CREATE TABLE IF NOT EXISTS vectors (
                     id TEXT PRIMARY KEY,
                     embedding BLOB NOT NULL,
-                    metadata_json TEXT NOT NULL
+                    metadata_json TEXT NOT NULL,
+                    created_at TEXT,
+                    last_recalled_at TEXT,
+                    recall_count INTEGER NOT NULL DEFAULT 0
                 );",
             )
             .map_err(|e| AthenError::Other(e.to_string()))?;
+
+            // Migration for pre-existing DBs: add the ranking-signal columns.
+            // SQLite has no IF NOT EXISTS for ADD COLUMN, so ignore the error
+            // when the column already exists (matches the edges-table pattern).
+            let _ = c.execute_batch("ALTER TABLE vectors ADD COLUMN created_at TEXT;");
+            let _ = c.execute_batch("ALTER TABLE vectors ADD COLUMN last_recalled_at TEXT;");
+            let _ = c.execute_batch(
+                "ALTER TABLE vectors ADD COLUMN recall_count INTEGER NOT NULL DEFAULT 0;",
+            );
         }
         Ok(Self { conn })
     }
+}
+
+/// Parse an optional RFC3339 timestamp column into `Option<DateTime<Utc>>`.
+fn parse_opt_ts(s: Option<String>) -> Option<DateTime<Utc>> {
+    s.filter(|v| !v.is_empty())
+        .and_then(|v| DateTime::parse_from_rfc3339(&v).ok())
+        .map(|dt| dt.with_timezone(&Utc))
 }
 
 fn embedding_to_bytes(embedding: &[f32]) -> Vec<u8> {
@@ -90,10 +109,13 @@ impl VectorIndex for SqliteVectorIndex {
             .map_err(|e| AthenError::Other(e.to_string()))?;
         let blob = embedding_to_bytes(&embedding);
         let json = serde_json::to_string(&metadata)?;
+        let now = Utc::now().to_rfc3339();
+        // Stamp created_at on first insert; preserve it (and the consult
+        // signals) on update so re-storing a memory doesn't reset its age.
         conn.execute(
-            "INSERT INTO vectors (id, embedding, metadata_json) VALUES (?1, ?2, ?3)
+            "INSERT INTO vectors (id, embedding, metadata_json, created_at) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(id) DO UPDATE SET embedding = excluded.embedding, metadata_json = excluded.metadata_json",
-            params![id, blob, json],
+            params![id, blob, json, now],
         )
         .map_err(|e| AthenError::Other(e.to_string()))?;
         Ok(())
@@ -181,6 +203,76 @@ impl VectorIndex for SqliteVectorIndex {
         }
         Ok(results)
     }
+
+    async fn scan_scored(&self, query_embedding: Vec<f32>) -> Result<Vec<RankedRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| AthenError::Other(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, embedding, metadata_json, created_at, last_recalled_at, recall_count
+                 FROM vectors",
+            )
+            .map_err(|e| AthenError::Other(e.to_string()))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let blob: Vec<u8> = row.get(1)?;
+                let meta_str: String = row.get(2)?;
+                let created_at: Option<String> = row.get(3)?;
+                let last_recalled_at: Option<String> = row.get(4)?;
+                let recall_count: i64 = row.get(5)?;
+                Ok((
+                    id,
+                    blob,
+                    meta_str,
+                    created_at,
+                    last_recalled_at,
+                    recall_count,
+                ))
+            })
+            .map_err(|e| AthenError::Other(e.to_string()))?;
+
+        let mut out: Vec<RankedRow> = Vec::new();
+        for row in rows {
+            let (id, blob, meta_str, created_at, last_recalled_at, recall_count) =
+                row.map_err(|e| AthenError::Other(e.to_string()))?;
+            let emb = bytes_to_embedding(&blob);
+            let cosine = cosine_similarity(&query_embedding, &emb);
+            let metadata: serde_json::Value =
+                serde_json::from_str(&meta_str).unwrap_or(serde_json::Value::Null);
+            out.push(RankedRow {
+                id,
+                cosine,
+                created_at: parse_opt_ts(created_at),
+                last_recalled_at: parse_opt_ts(last_recalled_at),
+                recall_count: recall_count.max(0) as u32,
+                metadata,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn bump_recall_stats(&self, ids: &[&str]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| AthenError::Other(e.to_string()))?;
+        let now = Utc::now().to_rfc3339();
+        for id in ids {
+            conn.execute(
+                "UPDATE vectors SET recall_count = recall_count + 1, last_recalled_at = ?1 WHERE id = ?2",
+                params![now, id],
+            )
+            .map_err(|e| AthenError::Other(e.to_string()))?;
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -227,6 +319,20 @@ impl SqliteGraph {
             );
             let _ =
                 c.execute_batch("ALTER TABLE edges ADD COLUMN last_used TEXT NOT NULL DEFAULT '';");
+
+            // memory↔entity links: which entities a given memory mentions.
+            // The graph arm of hybrid recall joins through this (indexed)
+            // instead of full-scanning every memory's metadata for name matches.
+            c.execute_batch(
+                "CREATE TABLE IF NOT EXISTS mentions (
+                    memory_id TEXT NOT NULL,
+                    entity_id TEXT NOT NULL REFERENCES entities(id),
+                    PRIMARY KEY (memory_id, entity_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_mentions_entity ON mentions(entity_id);
+                CREATE INDEX IF NOT EXISTS idx_mentions_memory ON mentions(memory_id);",
+            )
+            .map_err(|e| AthenError::Other(e.to_string()))?;
         }
         Ok(Self { conn })
     }
@@ -685,6 +791,204 @@ impl KnowledgeGraph for SqliteGraph {
             .ok();
         Ok(existing.and_then(|s| Uuid::parse_str(&s).ok()))
     }
+
+    async fn link_memory(&self, memory_id: &str, entity_ids: &[EntityId]) -> Result<()> {
+        if entity_ids.is_empty() {
+            return Ok(());
+        }
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| AthenError::Other(e.to_string()))?;
+        for eid in entity_ids {
+            conn.execute(
+                "INSERT OR IGNORE INTO mentions (memory_id, entity_id) VALUES (?1, ?2)",
+                params![memory_id, eid.to_string()],
+            )
+            .map_err(|e| AthenError::Other(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    async fn memories_for_entities(&self, entity_ids: &[EntityId]) -> Result<Vec<String>> {
+        if entity_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| AthenError::Other(e.to_string()))?;
+        // Build a parameterized IN-list (?1, ?2, ...).
+        let placeholders = (1..=entity_ids.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql =
+            format!("SELECT DISTINCT memory_id FROM mentions WHERE entity_id IN ({placeholders})");
+        let id_strings: Vec<String> = entity_ids.iter().map(|e| e.to_string()).collect();
+        let param_refs: Vec<&dyn rusqlite::ToSql> = id_strings
+            .iter()
+            .map(|s| s as &dyn rusqlite::ToSql)
+            .collect();
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| AthenError::Other(e.to_string()))?;
+        let rows = stmt
+            .query_map(param_refs.as_slice(), |row| row.get::<_, String>(0))
+            .map_err(|e| AthenError::Other(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| AthenError::Other(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
+    async fn unlink_memory(&self, memory_id: &str) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| AthenError::Other(e.to_string()))?;
+        conn.execute(
+            "DELETE FROM mentions WHERE memory_id = ?1",
+            params![memory_id],
+        )
+        .map_err(|e| AthenError::Other(e.to_string()))?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SqliteLexicalIndex (FTS5 / BM25)
+// ---------------------------------------------------------------------------
+
+/// SQLite FTS5-backed lexical index over memory content. The keyword arm of
+/// hybrid recall: `bm25()` ranking, complementary to the semantic cosine arm.
+pub struct SqliteLexicalIndex {
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl SqliteLexicalIndex {
+    pub fn new(conn: Arc<Mutex<Connection>>) -> Result<Self> {
+        {
+            let c = conn.lock().map_err(|e| AthenError::Other(e.to_string()))?;
+            // Contentless-ish FTS5 table: `content` is indexed, `memory_id`
+            // is stored UNINDEXED so we can map matches back to memory ids.
+            // Requires SQLite built with FTS5 (rusqlite `bundled` ships it).
+            c.execute_batch(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
+                    content,
+                    memory_id UNINDEXED,
+                    tokenize = 'porter unicode61'
+                );",
+            )
+            .map_err(|e| {
+                AthenError::Other(format!(
+                    "FTS5 init failed (is SQLite built with FTS5?): {e}"
+                ))
+            })?;
+        }
+        Ok(Self { conn })
+    }
+}
+
+/// Turn an arbitrary user query into a safe FTS5 MATCH expression: extract
+/// alphanumeric tokens (len >= 2), quote each (so punctuation can't break the
+/// MATCH grammar), and OR them together for recall breadth. Returns None when
+/// the query has no usable tokens.
+fn fts5_match_query(query: &str) -> Option<String> {
+    let tokens: Vec<String> = query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.chars().count() >= 2)
+        .map(|t| format!("\"{}\"", t.to_lowercase()))
+        .collect();
+    if tokens.is_empty() {
+        None
+    } else {
+        Some(tokens.join(" OR "))
+    }
+}
+
+#[async_trait]
+impl LexicalIndex for SqliteLexicalIndex {
+    async fn upsert(&self, id: &str, text: &str) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| AthenError::Other(e.to_string()))?;
+        // FTS5 has no UPSERT; delete any prior rows for this id then insert.
+        conn.execute("DELETE FROM memory_fts WHERE memory_id = ?1", params![id])
+            .map_err(|e| AthenError::Other(e.to_string()))?;
+        conn.execute(
+            "INSERT INTO memory_fts (content, memory_id) VALUES (?1, ?2)",
+            params![text, id],
+        )
+        .map_err(|e| AthenError::Other(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn search(&self, query: &str, top_k: usize) -> Result<Vec<(String, f32)>> {
+        let Some(match_expr) = fts5_match_query(query) else {
+            return Ok(vec![]);
+        };
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| AthenError::Other(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT memory_id, bm25(memory_fts) AS rank
+                 FROM memory_fts
+                 WHERE memory_fts MATCH ?1
+                 ORDER BY rank
+                 LIMIT ?2",
+            )
+            .map_err(|e| AthenError::Other(e.to_string()))?;
+
+        // bm25() returns smaller (more negative) = better. Collect raw scores,
+        // convert to "higher = better", then min-max normalize the batch to
+        // [0,1] so the fusion layer sees a comparable signal.
+        let rows = stmt
+            .query_map(params![match_expr, top_k as i64], |row| {
+                let id: String = row.get(0)?;
+                let rank: f64 = row.get(1)?;
+                Ok((id, rank))
+            })
+            .map_err(|e| AthenError::Other(e.to_string()))?;
+
+        let mut raw: Vec<(String, f64)> = Vec::new();
+        for row in rows {
+            let (id, rank) = row.map_err(|e| AthenError::Other(e.to_string()))?;
+            raw.push((id, -rank)); // negate: higher = better match
+        }
+        if raw.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let max = raw.iter().map(|(_, s)| *s).fold(f64::MIN, f64::max);
+        let min = raw.iter().map(|(_, s)| *s).fold(f64::MAX, f64::min);
+        let span = max - min;
+        Ok(raw
+            .into_iter()
+            .map(|(id, s)| {
+                let norm = if span > f64::EPSILON {
+                    (s - min) / span
+                } else {
+                    1.0
+                };
+                (id, norm as f32)
+            })
+            .collect())
+    }
+
+    async fn delete(&self, id: &str) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| AthenError::Other(e.to_string()))?;
+        conn.execute("DELETE FROM memory_fts WHERE memory_id = ?1", params![id])
+            .map_err(|e| AthenError::Other(e.to_string()))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -703,6 +1007,93 @@ mod tests {
             name: name.to_string(),
             metadata: serde_json::json!({}),
         }
+    }
+
+    // -- C2 de-risk: FTS5 availability + mentions + scan_scored --
+
+    #[tokio::test]
+    async fn test_fts5_lexical_index_roundtrip() {
+        let conn = in_memory_conn();
+        let lex = SqliteLexicalIndex::new(conn).unwrap();
+        lex.upsert("m1", "the quarterly revenue report for Acme")
+            .await
+            .unwrap();
+        lex.upsert("m2", "a recipe for sourdough bread")
+            .await
+            .unwrap();
+
+        let hits = lex.search("revenue report", 10).await.unwrap();
+        assert!(hits.iter().any(|(id, _)| id == "m1"), "expected m1 hit");
+        assert!(
+            !hits.iter().any(|(id, _)| id == "m2"),
+            "m2 should not match"
+        );
+        for (_, score) in &hits {
+            assert!((0.0..=1.0).contains(score), "score normalized: {score}");
+        }
+
+        // Re-index then delete.
+        lex.upsert("m1", "completely different text about gardening")
+            .await
+            .unwrap();
+        assert!(lex
+            .search("revenue", 10)
+            .await
+            .unwrap()
+            .iter()
+            .all(|(id, _)| id != "m1"));
+        lex.delete("m1").await.unwrap();
+        assert!(lex.search("gardening", 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_mentions_link_and_query() {
+        let conn = in_memory_conn();
+        let graph = SqliteGraph::new(conn).unwrap();
+        let acme = graph.add_entity(person("Acme")).await.unwrap();
+        let beta = graph.add_entity(person("Beta")).await.unwrap();
+
+        graph.link_memory("mem-1", &[acme]).await.unwrap();
+        graph.link_memory("mem-2", &[acme, beta]).await.unwrap();
+
+        let mut for_acme = graph.memories_for_entities(&[acme]).await.unwrap();
+        for_acme.sort();
+        assert_eq!(for_acme, vec!["mem-1".to_string(), "mem-2".to_string()]);
+
+        let for_beta = graph.memories_for_entities(&[beta]).await.unwrap();
+        assert_eq!(for_beta, vec!["mem-2".to_string()]);
+
+        graph.unlink_memory("mem-2").await.unwrap();
+        let for_acme_after = graph.memories_for_entities(&[acme]).await.unwrap();
+        assert_eq!(for_acme_after, vec!["mem-1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_scan_scored_and_bump_recall() {
+        let conn = in_memory_conn();
+        let index = SqliteVectorIndex::new(conn).unwrap();
+        index
+            .upsert("a", vec![1.0, 0.0], serde_json::json!({"_content": "a"}))
+            .await
+            .unwrap();
+        index
+            .upsert("b", vec![0.0, 1.0], serde_json::json!({"_content": "b"}))
+            .await
+            .unwrap();
+
+        let rows = index.scan_scored(vec![1.0, 0.0]).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        let a = rows.iter().find(|r| r.id == "a").unwrap();
+        assert!((a.cosine - 1.0).abs() < 1e-6);
+        assert!(a.created_at.is_some(), "created_at stamped on upsert");
+        assert_eq!(a.recall_count, 0);
+        assert!(a.last_recalled_at.is_none());
+
+        index.bump_recall_stats(&["a", "a"]).await.unwrap();
+        let rows2 = index.scan_scored(vec![1.0, 0.0]).await.unwrap();
+        let a2 = rows2.iter().find(|r| r.id == "a").unwrap();
+        assert_eq!(a2.recall_count, 2);
+        assert!(a2.last_recalled_at.is_some());
     }
 
     // -- SqliteVectorIndex tests --

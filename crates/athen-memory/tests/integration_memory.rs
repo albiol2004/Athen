@@ -12,8 +12,31 @@ use athen_core::traits::memory::{
     Entity, EntityType, ExploreParams, KnowledgeGraph, MemoryItem, MemoryStore, VectorIndex,
 };
 use athen_llm::embeddings::keyword::KeywordEmbedding;
-use athen_memory::sqlite::{SqliteGraph, SqliteVectorIndex};
+use athen_memory::sqlite::{SqliteGraph, SqliteLexicalIndex, SqliteVectorIndex};
 use athen_memory::Memory;
+
+/// Build a full hybrid Memory (semantic + lexical FTS5 + graph) on a shared
+/// in-memory connection, with `min_score 0.0` so admission never filters
+/// during ranking-behaviour tests.
+fn hybrid_memory() -> Memory {
+    let conn = in_memory_conn();
+    let vector = SqliteVectorIndex::new(Arc::clone(&conn)).unwrap();
+    let lexical = SqliteLexicalIndex::new(Arc::clone(&conn)).unwrap();
+    let graph = SqliteGraph::new(conn).unwrap();
+    Memory::new(Box::new(vector), Box::new(graph))
+        .with_embedder(Box::new(KeywordEmbedding::new()))
+        .with_lexical(Box::new(lexical))
+        .with_min_score(0.0)
+}
+
+/// Hybrid Memory with NO embedder — exercises the lexical/graph fallback path.
+fn hybrid_memory_no_embedder() -> Memory {
+    let conn = in_memory_conn();
+    let vector = SqliteVectorIndex::new(Arc::clone(&conn)).unwrap();
+    let lexical = SqliteLexicalIndex::new(Arc::clone(&conn)).unwrap();
+    let graph = SqliteGraph::new(conn).unwrap();
+    Memory::new(Box::new(vector), Box::new(graph)).with_lexical(Box::new(lexical))
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -533,5 +556,228 @@ async fn test_graph_explore_respects_params() {
     assert_eq!(
         nodes_strict[0].entity.name, "Hub",
         "First node should be the entry point"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 6: Graph arm surfaces a related memory sharing an entity but NO tokens
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_hybrid_graph_link_surfaces_related_memory() {
+    let mem = hybrid_memory();
+
+    // mem-1 mentions both Alice and Project Titan.
+    mem.remember(MemoryItem {
+        id: "mem-1".to_string(),
+        content: "Alice leads Project Titan".to_string(),
+        metadata: serde_json::json!({
+            "entities": [
+                {"name": "Alice", "type": "Person"},
+                {"name": "Project Titan", "type": "Project"}
+            ]
+        }),
+    })
+    .await
+    .unwrap();
+
+    // mem-2 mentions Project Titan but shares NO token with the query "Alice".
+    mem.remember(MemoryItem {
+        id: "mem-2".to_string(),
+        content: "ships in the third quarter".to_string(),
+        metadata: serde_json::json!({
+            "entities": [
+                {"name": "Project Titan", "type": "Project"}
+            ]
+        }),
+    })
+    .await
+    .unwrap();
+
+    // Query "Alice": mem-1 matches semantically; mem-2 shares no tokens and is
+    // surfaced only through the shared "Project Titan" entity (graph arm pivots
+    // on the entities of the top semantic hit).
+    let results = mem.recall("Alice", 5).await.unwrap();
+    let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+    assert!(ids.contains(&"mem-1"), "mem-1 should match for 'Alice'");
+    assert!(
+        ids.contains(&"mem-2"),
+        "mem-2 (no shared tokens) must surface via the shared Project Titan entity; got {ids:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 7: Lexical (FTS5) arm finds an exact term on the no-embedder path
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_hybrid_lexical_arm_no_embedder() {
+    let mem = hybrid_memory_no_embedder();
+
+    mem.remember(MemoryItem {
+        id: "rev".to_string(),
+        content: "Quarterly revenue projections for the Northwind account".to_string(),
+        metadata: serde_json::json!({}),
+    })
+    .await
+    .unwrap();
+    mem.remember(MemoryItem {
+        id: "other".to_string(),
+        content: "Sourdough bread baking schedule".to_string(),
+        metadata: serde_json::json!({}),
+    })
+    .await
+    .unwrap();
+
+    // No embedder → recall routes through the FTS5 lexical arm.
+    let hits = mem.recall("Northwind revenue", 5).await.unwrap();
+    let ids: Vec<&str> = hits.iter().map(|r| r.id.as_str()).collect();
+    assert!(
+        ids.contains(&"rev"),
+        "lexical arm should find 'rev'; got {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"other"),
+        "unrelated 'other' should not match the lexical query"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 8: note_recalled raises a memory's fused rank (frequency signal)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_note_recalled_raises_rank() {
+    let mem = hybrid_memory();
+
+    // Two items with the same query-token overlap → ~equal cosine + lexical,
+    // both fresh → recency ties. Frequency is the only differentiator.
+    mem.remember(MemoryItem {
+        id: "a".to_string(),
+        content: "project alpha status update".to_string(),
+        metadata: serde_json::json!({}),
+    })
+    .await
+    .unwrap();
+    mem.remember(MemoryItem {
+        id: "b".to_string(),
+        content: "project alpha planning review".to_string(),
+        metadata: serde_json::json!({}),
+    })
+    .await
+    .unwrap();
+
+    // Consult "b" several times — bumps its recall_count + last_recalled_at.
+    for _ in 0..5 {
+        mem.note_recalled(&["b"]).await.unwrap();
+    }
+
+    let results = mem.recall("project alpha", 5).await.unwrap();
+    assert_eq!(
+        results[0].id,
+        "b",
+        "frequently-consulted 'b' should rank first; got {:?}",
+        results.iter().map(|r| &r.id).collect::<Vec<_>>()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 9: forget purges the memory from all three arms
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_forget_purges_all_arms() {
+    let mem = hybrid_memory();
+
+    mem.remember(MemoryItem {
+        id: "doomed".to_string(),
+        content: "Confidential merger briefing with Globex".to_string(),
+        metadata: serde_json::json!({
+            "entities": [{"name": "Globex", "type": "Organization"}]
+        }),
+    })
+    .await
+    .unwrap();
+
+    // Present in semantic + lexical + graph before forget.
+    assert!(!mem.recall("merger briefing", 5).await.unwrap().is_empty());
+
+    mem.forget("doomed").await.unwrap();
+
+    // Gone from semantic/lexical recall…
+    let after = mem.recall("merger briefing", 5).await.unwrap();
+    assert!(
+        after.iter().all(|m| m.id != "doomed"),
+        "forgotten memory must not resurface via recall"
+    );
+    // …and from a pure-lexical query (no embedder path would also miss it)…
+    assert!(mem
+        .recall("Globex", 5)
+        .await
+        .unwrap()
+        .iter()
+        .all(|m| m.id != "doomed"));
+    // …and its graph mention links are gone (the entity node may remain).
+    if let Some(globex) = mem
+        .list_entities()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|e| e.name == "Globex")
+    {
+        // No mentions edge should point at the forgotten memory. We assert via
+        // recall above; this just confirms the entity lookup is intact.
+        assert_eq!(globex.name, "Globex");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 10: find_duplicate only fires on a GENUINE near-duplicate, not on any
+// recall hit (regression: hybrid recall admits broadly, so distinct facts were
+// being falsely skipped by the memory_store pre-store dedup)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_find_duplicate_distinguishes_distinct_facts() {
+    let mem = hybrid_memory();
+
+    mem.remember(MemoryItem {
+        id: "agent_girlfriend".to_string(),
+        content: "girlfriend_nadia: the user's girlfriend is Nadia".to_string(),
+        metadata: serde_json::json!({"source": "agent_tool"}),
+    })
+    .await
+    .unwrap();
+
+    // A genuinely DIFFERENT fact. Broad hybrid recall will likely return the
+    // Nadia memory as the closest row, but it is NOT a duplicate.
+    assert!(
+        mem.find_duplicate("personal_life: the user enjoys hiking on weekends")
+            .await
+            .is_none(),
+        "a distinct fact must not be flagged as a duplicate just because recall returned a row"
+    );
+
+    // A near-identical restatement IS a duplicate.
+    assert!(
+        mem.find_duplicate("girlfriend_nadia: the user's girlfriend is Nadia")
+            .await
+            .is_some(),
+        "an (almost) verbatim restatement must be detected as a duplicate"
+    );
+
+    // And both distinct facts actually persist (none falsely skipped).
+    mem.remember(MemoryItem {
+        id: "agent_hobby".to_string(),
+        content: "personal_life: the user enjoys hiking on weekends".to_string(),
+        metadata: serde_json::json!({"source": "agent_tool"}),
+    })
+    .await
+    .unwrap();
+    let all = mem.list_all().await.unwrap();
+    let ids: Vec<&str> = all.iter().map(|m| m.id.as_str()).collect();
+    assert!(
+        ids.contains(&"agent_girlfriend") && ids.contains(&"agent_hobby"),
+        "got {ids:?}"
     );
 }

@@ -30,6 +30,8 @@ pub(crate) struct Edge {
 pub struct InMemoryGraph {
     pub(crate) entities: RwLock<HashMap<EntityId, Entity>>,
     pub(crate) edges: RwLock<Vec<Edge>>,
+    /// memory_id -> entities that memory mentions (the memory↔entity edge).
+    pub(crate) mentions: RwLock<HashMap<String, HashSet<EntityId>>>,
 }
 
 impl InMemoryGraph {
@@ -37,6 +39,7 @@ impl InMemoryGraph {
         Self {
             entities: RwLock::new(HashMap::new()),
             edges: RwLock::new(Vec::new()),
+            mentions: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -143,6 +146,39 @@ impl KnowledgeGraph for InMemoryGraph {
                 edge.last_used = now;
             }
         }
+        Ok(())
+    }
+
+    async fn link_memory(&self, memory_id: &str, entity_ids: &[EntityId]) -> Result<()> {
+        if entity_ids.is_empty() {
+            return Ok(());
+        }
+        let mut mentions = self.mentions.write().await;
+        let set = mentions.entry(memory_id.to_string()).or_default();
+        for id in entity_ids {
+            set.insert(*id);
+        }
+        Ok(())
+    }
+
+    async fn memories_for_entities(&self, entity_ids: &[EntityId]) -> Result<Vec<String>> {
+        if entity_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let wanted: HashSet<EntityId> = entity_ids.iter().copied().collect();
+        let mentions = self.mentions.read().await;
+        let mut out: Vec<String> = mentions
+            .iter()
+            .filter(|(_, set)| !set.is_disjoint(&wanted))
+            .map(|(mid, _)| mid.clone())
+            .collect();
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
+    async fn unlink_memory(&self, memory_id: &str) -> Result<()> {
+        self.mentions.write().await.remove(memory_id);
         Ok(())
     }
 

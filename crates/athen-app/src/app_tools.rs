@@ -1505,32 +1505,31 @@ impl AppToolRegistry {
         let start = Instant::now();
         let lookup = format!("{key}: {value}");
 
-        // Pre-store dedup: skip if a sufficiently similar memory already
-        // exists. Recall is gated by the global min-relevance threshold
-        // (0.6 cosine), so any hit is a high-confidence overlap. Returning
-        // success-with-status lets the LLM see the existing memory and
-        // decide whether to retry with a genuinely new fact.
-        if let Ok(hits) = memory.recall(&lookup, 1).await {
-            if let Some(existing) = hits.first() {
-                tracing::info!(
-                    tool = "memory_store",
-                    key,
-                    existing_id = %existing.id,
-                    "Skipping duplicate memory_store; similar entry already known"
-                );
-                return Ok(ToolResult {
-                    success: true,
-                    output: json!({
-                        "status": "skipped",
-                        "reason": "already_known",
-                        "existing_id": existing.id,
-                        "existing_content": existing.content,
-                        "hint": "A similar memory is already stored. If you have genuinely NEW information beyond what's shown above, call memory_store again with the new fact only.",
-                    }),
-                    error: None,
-                    execution_time_ms: start.elapsed().as_millis() as u64,
-                });
-            }
+        // Pre-store dedup: skip only on a GENUINE near-duplicate (text-equal or
+        // Jaccard > 0.85), the same bar `remember` uses internally. We must NOT
+        // treat "recall returned a row" as a duplicate: hybrid recall admits at
+        // a low cosine floor plus lexical/graph hits, so it returns the closest
+        // memory for almost any query — using mere presence here caused every
+        // distinct fact to be falsely skipped against one unrelated memory.
+        if let Some(existing) = memory.find_duplicate(&lookup).await {
+            tracing::info!(
+                tool = "memory_store",
+                key,
+                existing_id = %existing.id,
+                "Skipping duplicate memory_store; near-duplicate entry already known"
+            );
+            return Ok(ToolResult {
+                success: true,
+                output: json!({
+                    "status": "skipped",
+                    "reason": "already_known",
+                    "existing_id": existing.id,
+                    "existing_content": existing.content,
+                    "hint": "A near-identical memory is already stored. If you have genuinely NEW information beyond what's shown above, call memory_store again with the new fact only.",
+                }),
+                error: None,
+                execution_time_ms: start.elapsed().as_millis() as u64,
+            });
         }
 
         let item = MemoryItem {
@@ -1577,6 +1576,10 @@ impl AppToolRegistry {
                     json!({ "query": query, "found": false, "memories": [] })
                 }
                 Ok(items) => {
+                    // Genuine recall: record the consult so recency/frequency
+                    // signals + linked-entity reinforcement climb over time.
+                    let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+                    let _ = memory.note_recalled(&ids).await;
                     let memories: Vec<serde_json::Value> = items
                         .iter()
                         .map(|item| {

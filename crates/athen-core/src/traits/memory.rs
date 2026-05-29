@@ -1,10 +1,27 @@
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::Result;
 
 pub type EntityId = Uuid;
+
+/// A memory row scored against a query in a single index pass, carrying the
+/// ranking signals the fusion layer needs. Returned by [`VectorIndex::scan_scored`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RankedRow {
+    pub id: String,
+    /// Cosine similarity of this row's embedding against the query embedding.
+    pub cosine: f32,
+    /// When the memory was first stored (None for legacy rows pre-migration).
+    pub created_at: Option<DateTime<Utc>>,
+    /// When the memory was last surfaced by a genuine recall (None if never).
+    pub last_recalled_at: Option<DateTime<Utc>>,
+    /// How many times the memory has been surfaced by a genuine recall.
+    pub recall_count: u32,
+    pub metadata: serde_json::Value,
+}
 
 /// Semantic vector search over stored knowledge.
 #[async_trait]
@@ -22,6 +39,93 @@ pub trait VectorIndex: Send + Sync {
     /// Default implementation returns empty (not all backends support this).
     async fn list_all(&self) -> Result<Vec<SearchResult>> {
         Ok(vec![])
+    }
+
+    /// Score *every* stored memory against the query in one pass, returning the
+    /// cosine similarity plus the per-memory ranking signals (timestamps +
+    /// recall count). This is the semantic arm of hybrid recall: the brute-force
+    /// scan already computes cosine for all rows, so emitting them all is free.
+    ///
+    /// Default implementation degrades to `search` over the whole store with no
+    /// signal columns (so non-SQLite backends still function, just without
+    /// recency/frequency fusion).
+    async fn scan_scored(&self, query_embedding: Vec<f32>) -> Result<Vec<RankedRow>> {
+        let results = self.search(query_embedding, usize::MAX).await?;
+        Ok(results
+            .into_iter()
+            .map(|r| RankedRow {
+                id: r.id,
+                cosine: r.score,
+                created_at: None,
+                last_recalled_at: None,
+                recall_count: 0,
+                metadata: r.metadata,
+            })
+            .collect())
+    }
+
+    /// Bump the consult signals (`recall_count`, `last_recalled_at`) for the
+    /// given memory ids. Called out-of-band from genuine recall sites, never
+    /// from write-time dedup. Default is a no-op (backends without signal
+    /// columns simply don't track usage).
+    async fn bump_recall_stats(&self, _ids: &[&str]) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Lexical (BM25 / full-text) search over memory content. The keyword arm of
+/// hybrid recall, complementary to the semantic [`VectorIndex`]. Backed by
+/// SQLite FTS5 in production.
+#[async_trait]
+pub trait LexicalIndex: Send + Sync {
+    /// Index (or re-index) a memory's text under its id.
+    async fn upsert(&self, id: &str, text: &str) -> Result<()>;
+    /// Return `(memory_id, score)` best-first, where `score` is normalized to
+    /// `[0,1]` (higher = better match).
+    async fn search(&self, query: &str, top_k: usize) -> Result<Vec<(String, f32)>>;
+    /// Remove a memory from the lexical index.
+    async fn delete(&self, id: &str) -> Result<()>;
+}
+
+/// Weights + thresholds for the hybrid-recall fusion ranker. Each retrieval
+/// arm contributes a signal in `[0,1]`; the final score is their weighted sum.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct FusionWeights {
+    /// Semantic (cosine) weight.
+    pub w_sem: f32,
+    /// Lexical (BM25) weight.
+    pub w_lex: f32,
+    /// Graph relation-strength weight.
+    pub w_graph: f32,
+    /// Recency-of-consult weight.
+    pub w_recency: f32,
+    /// Consult-frequency weight.
+    pub w_freq: f32,
+    /// A candidate is admitted to ranking if its cosine clears this floor, OR
+    /// it has any lexical match, OR it is graph-linked. This is the real noise
+    /// gate; `min_final` only trims near-zero fused scores afterwards.
+    pub cosine_floor: f32,
+    /// Anti-noise floor on the fused score. Kept low so a strong single-arm
+    /// hit (e.g. graph-only ≈ `w_graph`, lexical-only ≈ `w_lex`) still passes —
+    /// admission is decided by `cosine_floor`/lexical/graph, ordering by fusion.
+    pub min_final: f32,
+}
+
+impl Default for FusionWeights {
+    fn default() -> Self {
+        Self {
+            w_sem: 0.45,
+            w_lex: 0.25,
+            w_graph: 0.15,
+            w_recency: 0.10,
+            w_freq: 0.05,
+            cosine_floor: 0.35,
+            // Deliberately low: the admission gate (cosine_floor OR lexical OR
+            // graph) is the real relevance filter; min_final only drops
+            // degenerate near-zero fused scores, so a strong graph/lexical-only
+            // hit (which can have low cosine) still survives.
+            min_final: 0.08,
+        }
     }
 }
 
@@ -102,6 +206,27 @@ pub trait KnowledgeGraph: Send + Sync {
         }
         Ok(None)
     }
+
+    /// Link a memory to the entities it mentions. This is the memory↔entity
+    /// edge that lets the graph arm of hybrid recall walk from an entity (found
+    /// in the query or a semantic hit) to the memories that mention it — an
+    /// indexed join, replacing the old full-scan string match over metadata.
+    /// Default is a no-op for backends without a mentions store.
+    async fn link_memory(&self, _memory_id: &str, _entity_ids: &[EntityId]) -> Result<()> {
+        Ok(())
+    }
+
+    /// Return the ids of all memories that mention any of the given entities.
+    /// Default returns empty (no mentions store).
+    async fn memories_for_entities(&self, _entity_ids: &[EntityId]) -> Result<Vec<String>> {
+        Ok(vec![])
+    }
+
+    /// Remove all memory↔entity links for a memory (used by `forget`).
+    /// Default is a no-op.
+    async fn unlink_memory(&self, _memory_id: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Unified memory facade.
@@ -110,6 +235,16 @@ pub trait MemoryStore: Send + Sync {
     async fn remember(&self, item: MemoryItem) -> Result<()>;
     async fn recall(&self, query: &str, limit: usize) -> Result<Vec<MemoryItem>>;
     async fn forget(&self, id: &str) -> Result<()>;
+
+    /// Record that the given memories were surfaced by a *genuine* recall
+    /// (the `memory_recall` tool or auto-recall injection) — bumps each
+    /// memory's consult signals (`recall_count`/`last_recalled_at`) and
+    /// reinforces its linked entities. MUST NOT be called from write-time
+    /// dedup recalls, or the frequency signal would be inflated by stores.
+    /// Default is a no-op.
+    async fn note_recalled(&self, _ids: &[&str]) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -11,24 +11,26 @@ pub mod vector;
 use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use tracing::{debug, warn};
 
 use athen_core::error::Result;
 use athen_core::traits::embedding::EmbeddingProvider;
 use athen_core::traits::memory::{
-    Entity, EntityExtractor, EntityId, EntityType, ExploreParams, KnowledgeGraph, MemoryItem,
-    MemoryStore, SearchResult, VectorIndex,
+    Entity, EntityExtractor, EntityId, EntityType, ExploreParams, FusionWeights, KnowledgeGraph,
+    LexicalIndex, MemoryItem, MemoryStore, RankedRow, VectorIndex,
 };
 
-/// Unified memory facade combining vector search and knowledge graph.
+/// Unified memory facade combining semantic, lexical, and graph retrieval.
 pub struct Memory {
     vector: Box<dyn VectorIndex>,
     graph: Box<dyn KnowledgeGraph>,
+    /// Lexical (BM25/FTS5) arm. `None` falls back to substring keyword search.
+    lexical: Option<Box<dyn LexicalIndex>>,
     embedder: Option<Box<dyn EmbeddingProvider>>,
     extractor: Option<Box<dyn EntityExtractor>>,
-    /// Minimum relevance score for `recall()` results. Items below this
-    /// threshold are filtered out before the `limit` is applied.
-    min_relevance_score: f32,
+    /// Weights + thresholds for the hybrid-recall fusion ranker.
+    fusion: FusionWeights,
 }
 
 impl Memory {
@@ -36,9 +38,10 @@ impl Memory {
         Self {
             vector,
             graph,
+            lexical: None,
             embedder: None,
             extractor: None,
-            min_relevance_score: 0.3,
+            fusion: FusionWeights::default(),
         }
     }
 
@@ -54,11 +57,56 @@ impl Memory {
         self
     }
 
-    /// Set the minimum relevance score for `recall()`. Results below this
-    /// threshold are discarded before the `limit` is applied. Default: 0.3.
-    pub fn with_min_score(mut self, score: f32) -> Self {
-        self.min_relevance_score = score;
+    /// Attach the lexical (BM25/FTS5) retrieval arm.
+    pub fn with_lexical(mut self, lexical: Box<dyn LexicalIndex>) -> Self {
+        self.lexical = Some(lexical);
         self
+    }
+
+    /// Override the full set of fusion weights/thresholds.
+    pub fn with_fusion(mut self, fusion: FusionWeights) -> Self {
+        self.fusion = fusion;
+        self
+    }
+
+    /// Back-compat shim: sets the semantic admission floor (`cosine_floor`).
+    /// A candidate is admitted to ranking if its cosine clears this floor, OR it
+    /// has a lexical/graph hit — so raising this forces the vector path to miss
+    /// without suppressing graph/lexical-surfaced memories (those are gated by
+    /// the low `min_final`, not by `cosine_floor`). Prefer `with_fusion` for
+    /// full control.
+    pub fn with_min_score(mut self, score: f32) -> Self {
+        self.fusion.cosine_floor = score;
+        self
+    }
+}
+
+/// Exponential recency decay in `[0,1]`: 1.0 now, 0.5 at 30 days, →0 beyond.
+/// `ts` is the last consult (or, absent that, the creation) time.
+fn recency_decay(now: DateTime<Utc>, ts: DateTime<Utc>) -> f32 {
+    let age_secs = (now - ts).num_seconds().max(0) as f64;
+    let half_life_secs = 30.0 * 24.0 * 3600.0;
+    (-age_secs * 2.0f64.ln() / half_life_secs).exp() as f32
+}
+
+/// Saturating frequency signal in `[0,1)`: 0 consults → 0, 3 → 0.5, 9 → 0.75.
+fn freq_sat(recall_count: u32) -> f32 {
+    let c = recall_count as f32;
+    c / (c + 3.0)
+}
+
+/// Build a `MemoryItem` from a stored row's metadata (content lives under
+/// `_content`). Never substitutes the query — absent content stays empty.
+fn item_from_metadata(id: String, metadata: &serde_json::Value) -> MemoryItem {
+    let content = metadata
+        .get("_content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    MemoryItem {
+        id,
+        content,
+        metadata: metadata.clone(),
     }
 }
 
@@ -206,19 +254,12 @@ impl MemoryStore for Memory {
         };
 
         if !id_already_exists {
-            let candidates = self.recall(&item.content, 3).await.unwrap_or_default();
-            let new_norm = normalize_for_dedup(&item.content);
-            for cand in &candidates {
-                let existing_norm = normalize_for_dedup(&cand.content);
-                let is_text_equal = !new_norm.is_empty() && new_norm == existing_norm;
-                let jaccard = jaccard_similarity(&item.content, &cand.content);
-                if is_text_equal || jaccard > 0.85 {
-                    debug!(
-                        "Skipping near-duplicate memory: existing={:?} new={:?} (jaccard={:.2})",
-                        cand.content, item.content, jaccard
-                    );
-                    return Ok(());
-                }
+            if let Some(dup) = self.find_duplicate(&item.content).await {
+                debug!(
+                    "Skipping near-duplicate memory: existing={:?} new={:?}",
+                    dup.content, item.content
+                );
+                return Ok(());
             }
         }
 
@@ -313,171 +354,148 @@ impl MemoryStore for Memory {
 
         self.vector.upsert(&item.id, embedding, metadata).await?;
 
+        // Link this memory to the entities it mentions (the memory↔entity edge
+        // the graph arm of recall walks), and index its text in the lexical arm.
+        let mention_ids: Vec<EntityId> = entity_ids.iter().map(|(_, id)| *id).collect();
+        if !mention_ids.is_empty() {
+            if let Err(e) = self.graph.link_memory(&item.id, &mention_ids).await {
+                warn!("failed to link memory {} to entities: {e}", item.id);
+            }
+        }
+        if let Some(ref lexical) = self.lexical {
+            if let Err(e) = lexical.upsert(&item.id, &item.content).await {
+                warn!("failed to index memory {} in lexical arm: {e}", item.id);
+            }
+        }
+
         Ok(())
     }
 
     async fn recall(&self, query: &str, limit: usize) -> Result<Vec<MemoryItem>> {
-        // No embedder configured (or embedding the query fails — API
-        // outage, rate limit, network timeout): fall back to a simple
-        // case-insensitive keyword overlap over the stored `_content`.
-        // Better than `found:false` (or surfacing a transient API error)
-        // when the user expects "look something up by name" to just work.
-        let Some(ref embedder) = self.embedder else {
-            let mut items = self.recall_keyword(query, limit).await?;
-            // Even on the keyword path, the graph hop is still useful:
-            // a memory linked only via an entity neighbor (e.g. "User
-            // works at Acme") won't contain the literal query tokens
-            // but is still semantically relevant. Pull entity-name
-            // candidates from the query cheaply and merge KG hops.
-            let names_from_query = extract_entity_names_cheap(query);
-            self.merge_graph_hops(&names_from_query, &[], &mut items, limit)
-                .await?;
-            return Ok(items);
+        // Embed the query. No embedder (or a transient embed failure) drops to
+        // the lexical/graph path — never `found:false` when a name lookup
+        // should just work.
+        let query_embedding = match self.embedder.as_ref() {
+            Some(embedder) => match embedder.embed(query).await {
+                Ok(emb) => emb,
+                Err(e) => {
+                    warn!("embedder failed during recall ({e}); using lexical/graph fallback");
+                    return self.recall_no_embedder(query, limit).await;
+                }
+            },
+            None => return self.recall_no_embedder(query, limit).await,
         };
 
-        let query_embedding = match embedder.embed(query).await {
-            Ok(emb) => emb,
-            Err(e) => {
-                warn!("embedder failed during recall ({e}); falling back to keyword search");
-                let mut items = self.recall_keyword(query, limit).await?;
-                let names_from_query = extract_entity_names_cheap(query);
-                self.merge_graph_hops(&names_from_query, &[], &mut items, limit)
-                    .await?;
-                return Ok(items);
-            }
-        };
-
-        // Phase 3: Hybrid retrieval — vector search + graph exploration.
-
-        // Step 1: Direct vector search (fetch more than limit to leave room for merging).
-        let fetch_count = limit * 3;
-        let direct_results: Vec<SearchResult> =
-            self.vector.search(query_embedding, fetch_count).await?;
-
-        // Step 2: Collect entity names from direct results.
-        let mut all_entity_names: HashSet<String> = HashSet::new();
-        for result in &direct_results {
-            let names = extract_entity_names_from_metadata(&result.metadata);
-            all_entity_names.extend(names);
+        // Arm 1 — semantic: cosine over every row, plus the ranking-signal
+        // columns. The brute-force scan already computes cosine for all rows,
+        // so emitting them all (instead of an early top-k truncation) is free
+        // and lets the lexical/graph arms reuse the cached metadata + signals.
+        let rows = self.vector.scan_scored(query_embedding).await?;
+        let mut by_id: HashMap<String, RankedRow> = HashMap::with_capacity(rows.len());
+        for r in rows {
+            by_id.insert(r.id.clone(), r);
         }
 
-        // Step 3: For each entity, explore the graph to find related entities.
-        let mut related_entity_names: HashSet<String> = HashSet::new();
-        if !all_entity_names.is_empty() {
-            let _params = ExploreParams {
-                max_depth: 1,
-                max_nodes: 20,
-                relevance_threshold: 0.0,
-                ..Default::default()
-            };
-
-            // Search for memory items that mention entities related to the direct results.
-            // Simple approach: embed each entity name and search.
-            for name in &all_entity_names {
-                // Embed the entity name and search for memory items mentioning related entities.
-                if let Some(ref embedder) = self.embedder {
-                    if let Ok(entity_embedding) = embedder.embed(name).await {
-                        if let Ok(entity_results) = self.vector.search(entity_embedding, 5).await {
-                            for er in &entity_results {
-                                let names = extract_entity_names_from_metadata(&er.metadata);
-                                related_entity_names.extend(names);
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Remove names we already have from direct results.
-            for name in &all_entity_names {
-                related_entity_names.remove(name);
-            }
-        }
-
-        // Step 4: Search for memory items connected through related entities.
-        let mut graph_results: Vec<(String, f32)> = Vec::new(); // (id, boosted_score)
-        let direct_ids: HashSet<&str> = direct_results.iter().map(|r| r.id.as_str()).collect();
-
-        for entity_name in &related_entity_names {
-            if let Some(ref embedder) = self.embedder {
-                if let Ok(emb) = embedder.embed(entity_name).await {
-                    if let Ok(results) = self.vector.search(emb, 5).await {
-                        for r in results {
-                            if !direct_ids.contains(r.id.as_str()) {
-                                // Graph-connected result: boost score.
-                                let boosted = r.score * 0.5 + 0.5;
-                                graph_results.push((r.id.clone(), boosted));
-                            }
-                        }
-                    }
+        // Arm 2 — lexical (BM25/FTS5).
+        let mut lex: HashMap<String, f32> = HashMap::new();
+        if let Some(ref lexical) = self.lexical {
+            let k = (limit * 4).max(20);
+            if let Ok(hits) = lexical.search(query, k).await {
+                for (id, score) in hits {
+                    lex.insert(id, score);
                 }
             }
         }
 
-        // Step 5: Merge and deduplicate.
-        let mut scored: HashMap<String, (f32, serde_json::Value)> = HashMap::new();
+        // Arm 3 — graph: pivot on query entities + entities named in the
+        // strongest semantic hits, walk one hop, then join entities → memories
+        // through the indexed `mentions` table.
+        let graph = self.graph_arm(query, &by_id, limit).await;
 
-        for r in &direct_results {
-            scored
-                .entry(r.id.clone())
-                .or_insert((r.score, r.metadata.clone()));
+        // Fuse over the union of admitted candidates.
+        let w = self.fusion;
+        let now = Utc::now();
+        let mut candidates: HashSet<String> = HashSet::new();
+        for (id, r) in &by_id {
+            if r.cosine >= w.cosine_floor {
+                candidates.insert(id.clone());
+            }
         }
+        candidates.extend(lex.keys().cloned());
+        candidates.extend(graph.keys().cloned());
 
-        // For graph-connected results, we need to fetch their metadata.
-        // They came from vector search results so we already have them — but we may
-        // need to re-fetch. To avoid that, search for them again.
-        for (id, boosted_score) in &graph_results {
-            scored.entry(id.clone()).or_insert_with(|| {
-                // We don't have metadata cached, but it will be in vector results
-                // from the entity name searches. Use empty metadata as fallback.
-                (*boosted_score, serde_json::json!({}))
-            });
+        let mut scored: Vec<(String, f32)> = Vec::with_capacity(candidates.len());
+        for id in candidates {
+            let row = by_id.get(&id);
+            let cosine = row.map(|r| r.cosine.max(0.0)).unwrap_or(0.0);
+            let lexical_score = lex.get(&id).copied().unwrap_or(0.0);
+            let graph_score = graph.get(&id).copied().unwrap_or(0.0);
+            let recency = row
+                .and_then(|r| r.last_recalled_at.or(r.created_at))
+                .map(|ts| recency_decay(now, ts))
+                .unwrap_or(0.0);
+            let frequency = row.map(|r| freq_sat(r.recall_count)).unwrap_or(0.0);
+            let final_score = w.w_sem * cosine
+                + w.w_lex * lexical_score
+                + w.w_graph * graph_score
+                + w.w_recency * recency
+                + w.w_freq * frequency;
+            if final_score >= w.min_final {
+                scored.push((id, final_score));
+            }
         }
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit);
 
-        // Sort by score descending.
-        let mut sorted: Vec<(String, f32, serde_json::Value)> = scored
+        // Hydrate from the cached metadata — every candidate id came from
+        // `by_id` (which holds all rows), so no empty-metadata fallback.
+        Ok(scored
             .into_iter()
-            .map(|(id, (score, meta))| (id, score, meta))
-            .collect();
-        sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        // Filter by minimum relevance score, then take top `limit`.
-        let mut items: Vec<MemoryItem> = sorted
-            .into_iter()
-            .filter(|(_, score, _)| *score >= self.min_relevance_score)
-            .take(limit)
-            .map(|(id, _score, metadata)| {
-                let content = metadata
-                    .get("_content")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(query)
-                    .to_string();
-                MemoryItem {
-                    id,
-                    content,
-                    metadata,
-                }
-            })
-            .collect();
-
-        // KG hop: pivot on entity names from the query (extractor if
-        // wired, with a short timeout, else a cheap capitalized-token
-        // scan) AND from the vector hits we just returned. For each
-        // entity ID we find via `find_entity_by_name`, walk one graph
-        // hop and pull in any neighbor-linked memories that weren't
-        // already in the vector results. This is purely additive — if
-        // the KG is empty or no entities match, items is unchanged.
-        let names_from_query = self.extract_query_entity_names(query).await;
-        let names_from_hits: Vec<String> = all_entity_names.into_iter().collect();
-        self.merge_graph_hops(&names_from_query, &names_from_hits, &mut items, limit)
-            .await?;
-
-        Ok(items)
+            .filter_map(|(id, _)| by_id.get(&id).map(|r| item_from_metadata(id, &r.metadata)))
+            .collect())
     }
 
     async fn forget(&self, id: &str) -> Result<()> {
         self.vector.delete(id).await?;
-        // Note: We don't remove from graph since entities may be referenced
-        // by other memory items. Graph cleanup would require reference counting.
+        if let Some(ref lexical) = self.lexical {
+            if let Err(e) = lexical.delete(id).await {
+                warn!("failed to remove memory {id} from lexical index: {e}");
+            }
+        }
+        // Drop the memory↔entity links. Entity nodes themselves stay (they may
+        // be referenced by other memories — graph GC is a separate concern).
+        if let Err(e) = self.graph.unlink_memory(id).await {
+            warn!("failed to unlink memory {id} from graph: {e}");
+        }
+        Ok(())
+    }
+
+    async fn note_recalled(&self, ids: &[&str]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        // Bump per-memory consult signals (recency + frequency).
+        self.vector.bump_recall_stats(ids).await?;
+
+        // Reinforce the entities those memories mention, so a frequently
+        // consulted relation stays strong (and otherwise decays). Bounded:
+        // `ids` is at most the recall limit (~8). Entity names come from the
+        // memories' stored metadata.
+        let want: HashSet<&str> = ids.iter().copied().collect();
+        let all = self.vector.list_all().await.unwrap_or_default();
+        let mut names: HashSet<String> = HashSet::new();
+        for r in all {
+            if want.contains(r.id.as_str()) {
+                for n in extract_entity_names_from_metadata(&r.metadata) {
+                    names.insert(n);
+                }
+            }
+        }
+        for name in names {
+            if let Err(e) = self.reinforce_by_name(&name, 0.1).await {
+                debug!("reinforce_by_name({name}) failed during note_recalled: {e}");
+            }
+        }
         Ok(())
     }
 }
@@ -540,6 +558,79 @@ impl Memory {
         Ok(scored.into_iter().take(limit).map(|(_, m)| m).collect())
     }
 
+    /// One-time migration for memories stored before the hybrid rework: they
+    /// have `_entities` in their metadata but no `mentions` graph links and no
+    /// lexical-index rows. Walk every stored memory, (re-)create its entity
+    /// nodes (dedup by name), link them via `link_memory`, and index the
+    /// content in the lexical arm. Idempotent — `link_memory` is INSERT OR
+    /// IGNORE and lexical `upsert` delete-then-inserts — so it is safe to run
+    /// more than once, but callers should guard it with a marker to avoid the
+    /// per-boot O(memories) cost. Returns the number of memories processed.
+    pub async fn backfill_hybrid(&self) -> Result<usize> {
+        let all = self.vector.list_all().await?;
+        let mut processed = 0usize;
+        for r in &all {
+            let content = r
+                .metadata
+                .get("_content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            // Re-create + link the entities named in the memory's metadata.
+            let names = extract_entity_names_from_metadata(&r.metadata);
+            if !names.is_empty() {
+                let mut ids: Vec<EntityId> = Vec::with_capacity(names.len());
+                for name in names {
+                    let entity = Entity {
+                        id: None,
+                        entity_type: EntityType::Concept,
+                        name,
+                        metadata: serde_json::json!({}),
+                    };
+                    if let Ok(id) = self.graph.add_entity(entity).await {
+                        ids.push(id);
+                    }
+                }
+                if !ids.is_empty() {
+                    let _ = self.graph.link_memory(&r.id, &ids).await;
+                }
+            }
+
+            // Index in the lexical arm.
+            if !content.is_empty() {
+                if let Some(ref lexical) = self.lexical {
+                    let _ = lexical.upsert(&r.id, content).await;
+                }
+            }
+            processed += 1;
+        }
+        Ok(processed)
+    }
+
+    /// Return an existing memory that is a *genuine* near-duplicate of
+    /// `content` — text-equal (case + trailing-punctuation normalized) OR
+    /// Jaccard token overlap > 0.85 — or `None` if there is no true duplicate.
+    ///
+    /// This is the single source of truth for "is this a duplicate?", shared
+    /// by `remember`'s write-time dedup and the `memory_store` tool's
+    /// pre-store check. It deliberately re-checks similarity on the recall
+    /// candidates rather than trusting that `recall` returned *anything*:
+    /// hybrid recall admits at a low cosine floor (plus lexical/graph hits),
+    /// so "recall returned a row" is NOT evidence of a duplicate.
+    pub async fn find_duplicate(&self, content: &str) -> Option<MemoryItem> {
+        let candidates = self.recall(content, 3).await.unwrap_or_default();
+        let new_norm = normalize_for_dedup(content);
+        for cand in candidates {
+            let existing_norm = normalize_for_dedup(&cand.content);
+            let is_text_equal = !new_norm.is_empty() && new_norm == existing_norm;
+            let jaccard = jaccard_similarity(content, &cand.content);
+            if is_text_equal || jaccard > 0.85 {
+                return Some(cand);
+            }
+        }
+        None
+    }
+
     /// List all stored memories for UI display.
     pub async fn list_all(&self) -> Result<Vec<MemoryItem>> {
         let results = self.vector.list_all().await?;
@@ -571,7 +662,14 @@ impl Memory {
         let metadata = serde_json::json!({
             "_content": new_content,
         });
-        self.vector.upsert(id, embedding, metadata).await
+        self.vector.upsert(id, embedding, metadata).await?;
+        // Keep the lexical arm consistent with the new content.
+        if let Some(ref lexical) = self.lexical {
+            if let Err(e) = lexical.upsert(id, new_content).await {
+                warn!("failed to re-index updated memory {id} in lexical arm: {e}");
+            }
+        }
+        Ok(())
     }
 
     /// List all entities in the knowledge graph.
@@ -661,142 +759,150 @@ impl Memory {
         extract_entity_names_cheap(query)
     }
 
-    /// Walk one graph hop from each candidate entity name, then merge
-    /// any newly-discovered memories into `items` with a graph-boost
-    /// score. Idempotent — memories already in `items` are skipped.
-    ///
-    /// `names_from_query` and `names_from_hits` are deduped together
-    /// (case-insensitive) before lookup. Skips silently if the graph
-    /// has no matching entities — never regresses today's behavior.
-    async fn merge_graph_hops(
+    /// Graph arm of hybrid recall. Pivots on entity names from the query and
+    /// from the strongest semantic hits, walks one hop, then maps the pivot +
+    /// neighbor entities back to the memories that mention them through the
+    /// indexed `mentions` table (replacing the old full-scan string match).
+    /// Returns `memory_id -> graph_strength` in `[0,1]`: pivot-mentioned
+    /// memories carry full strength, one-hop-neighbor memories a discount.
+    async fn graph_arm(
         &self,
-        names_from_query: &[String],
-        names_from_hits: &[String],
-        items: &mut Vec<MemoryItem>,
+        query: &str,
+        by_id: &HashMap<String, RankedRow>,
         limit: usize,
-    ) -> Result<()> {
-        // Dedup candidate names case-insensitively.
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut candidate_names: Vec<&str> = Vec::new();
-        for n in names_from_query.iter().chain(names_from_hits.iter()) {
-            let key = n.to_lowercase();
-            if seen.insert(key) {
-                candidate_names.push(n.as_str());
+    ) -> HashMap<String, f32> {
+        // Candidate pivot names: query entities + entities named in the
+        // *genuinely relevant* semantic hits (cosine clears the admission
+        // floor). Harvesting from every top-N hit regardless of score would
+        // make each memory its own pivot when the store is small, diluting the
+        // graph signal (an unrelated memory must NOT self-promote — it should
+        // surface only when it shares an entity with a real hit).
+        let mut names = self.extract_query_entity_names(query).await;
+        if !by_id.is_empty() {
+            let mut relevant: Vec<&RankedRow> = by_id
+                .values()
+                .filter(|r| r.cosine >= self.fusion.cosine_floor)
+                .collect();
+            relevant.sort_by(|a, b| {
+                b.cosine
+                    .partial_cmp(&a.cosine)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for r in relevant.into_iter().take(limit.max(5)) {
+                for n in extract_entity_names_from_metadata(&r.metadata) {
+                    if !names.iter().any(|x| x.eq_ignore_ascii_case(&n)) {
+                        names.push(n);
+                    }
+                }
             }
         }
-        if candidate_names.is_empty() {
-            return Ok(());
+        if names.is_empty() {
+            return HashMap::new();
         }
 
-        // For each candidate name, look up an entity ID and explore one hop.
-        let mut neighbor_names: HashSet<String> = HashSet::new();
-        // Track which names were pivot points so we don't re-fetch their
-        // own memories (vector path already covered them when relevant).
-        let mut pivot_lc: HashSet<String> = HashSet::new();
-
-        for name in &candidate_names {
-            let id_opt = match self.graph.find_entity_by_name(name).await {
-                Ok(opt) => opt,
+        // Resolve names → entity ids, exploring one hop. Pivot entities carry
+        // full strength; one-hop neighbors carry a discounted strength.
+        const PIVOT_STRENGTH: f32 = 1.0;
+        const NEIGHBOR_STRENGTH: f32 = 0.6;
+        let mut entity_strength: HashMap<EntityId, f32> = HashMap::new();
+        let mut seen_names: HashSet<String> = HashSet::new();
+        for name in &names {
+            if !seen_names.insert(name.to_lowercase()) {
+                continue;
+            }
+            let pivot = match self.graph.find_entity_by_name(name).await {
+                Ok(Some(id)) => id,
+                Ok(None) => continue,
                 Err(e) => {
                     debug!("find_entity_by_name({name}) failed: {e}");
                     continue;
                 }
             };
-            let Some(id) = id_opt else { continue };
-            pivot_lc.insert(name.to_lowercase());
+            entity_strength
+                .entry(pivot)
+                .and_modify(|s| *s = s.max(PIVOT_STRENGTH))
+                .or_insert(PIVOT_STRENGTH);
 
             let params = ExploreParams {
                 max_depth: 1,
-                max_nodes: 5,
+                max_nodes: 8,
                 relevance_threshold: 0.0,
                 ..Default::default()
             };
-            let nodes = match self.graph.explore(id, params).await {
-                Ok(n) => n,
-                Err(e) => {
-                    debug!("graph.explore({name}) failed: {e}");
-                    continue;
+            if let Ok(nodes) = self.graph.explore(pivot, params).await {
+                for node in nodes {
+                    if node.depth == 0 {
+                        continue; // the pivot itself
+                    }
+                    if let Some(nid) = node.entity.id {
+                        entity_strength
+                            .entry(nid)
+                            .and_modify(|s| *s = s.max(NEIGHBOR_STRENGTH))
+                            .or_insert(NEIGHBOR_STRENGTH);
+                    }
                 }
-            };
+            }
+        }
+        if entity_strength.is_empty() {
+            return HashMap::new();
+        }
 
-            for node in nodes {
-                if node.depth == 0 {
-                    // The pivot itself — skip; we don't want to use
-                    // the pivot name as a search key (memories with
-                    // it should already be in the vector results).
-                    continue;
+        // Map entities → memories, keeping the strongest contributing entity's
+        // strength per memory.
+        let mut out: HashMap<String, f32> = HashMap::new();
+        for (eid, strength) in &entity_strength {
+            if let Ok(mem_ids) = self.graph.memories_for_entities(&[*eid]).await {
+                for mid in mem_ids {
+                    out.entry(mid)
+                        .and_modify(|s| *s = s.max(*strength))
+                        .or_insert(*strength);
                 }
-                neighbor_names.insert(node.entity.name.clone());
             }
         }
+        out
+    }
 
-        if neighbor_names.is_empty() && pivot_lc.is_empty() {
-            return Ok(());
+    /// Recall without a working embedder: lexical (FTS5) + graph arms, fused by
+    /// their weights. Falls back to the legacy substring keyword scan only if
+    /// neither arm produces anything (e.g. no lexical index configured).
+    async fn recall_no_embedder(&self, query: &str, limit: usize) -> Result<Vec<MemoryItem>> {
+        let w = self.fusion;
+        let mut scores: HashMap<String, f32> = HashMap::new();
+        if let Some(ref lexical) = self.lexical {
+            let k = (limit * 4).max(20);
+            if let Ok(hits) = lexical.search(query, k).await {
+                for (id, s) in hits {
+                    scores.insert(id, w.w_lex * s);
+                }
+            }
+        }
+        let empty: HashMap<String, RankedRow> = HashMap::new();
+        for (id, s) in self.graph_arm(query, &empty, limit).await {
+            scores
+                .entry(id)
+                .and_modify(|v| *v += w.w_graph * s)
+                .or_insert(w.w_graph * s);
+        }
+        if scores.is_empty() {
+            return self.recall_keyword(query, limit).await;
         }
 
-        // Scan all stored memories once and pick those whose metadata
-        // `_entities` (or legacy `entities`) names match either a
-        // neighbor entity OR a pivot entity. Pivot inclusion is what
-        // surfaces "User's job is AI Engineer" when the query was
-        // "things about me" — the pivot is `User`, no neighbor exists
-        // for an isolated entity, so we need direct-pivot-membership
-        // as a fallback.
-        let existing_ids: HashSet<String> = items.iter().map(|m| m.id.clone()).collect();
-        let all = match self.vector.list_all().await {
-            Ok(v) => v,
-            Err(e) => {
-                debug!("vector.list_all failed during graph hop: {e}");
-                return Ok(());
-            }
-        };
-
-        let mut graph_hits: Vec<MemoryItem> = Vec::new();
-        for r in all {
-            if existing_ids.contains(&r.id) {
-                continue;
-            }
-            let names = extract_entity_names_from_metadata(&r.metadata);
-            if names.is_empty() {
-                continue;
-            }
-            let matches = names.iter().any(|n| {
-                let lc = n.to_lowercase();
-                neighbor_names.iter().any(|nb| nb.eq_ignore_ascii_case(n)) || pivot_lc.contains(&lc)
-            });
-            if !matches {
-                continue;
-            }
-            let content = r
-                .metadata
-                .get("_content")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            graph_hits.push(MemoryItem {
-                id: r.id,
-                content,
-                metadata: r.metadata,
-            });
-        }
-
-        if graph_hits.is_empty() {
-            return Ok(());
-        }
-
-        debug!(
-            "graph hop contributed {} additional memory hits ({} pivots, {} neighbors)",
-            graph_hits.len(),
-            pivot_lc.len(),
-            neighbor_names.len()
-        );
-
-        // Append graph-discovered hits and re-trim to `limit`. The
-        // existing vector hits keep their order at the top (they
-        // scored above min_relevance_score); graph hits come after.
-        items.extend(graph_hits);
-        items.truncate(limit);
-
-        Ok(())
+        // Hydrate metadata for the surviving ids.
+        let meta_by_id: HashMap<String, serde_json::Value> = self
+            .vector
+            .list_all()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| (r.id, r.metadata))
+            .collect();
+        let mut scored: Vec<(String, f32)> = scores.into_iter().collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit);
+        Ok(scored
+            .into_iter()
+            .filter_map(|(id, _)| meta_by_id.get(&id).map(|m| item_from_metadata(id, m)))
+            .collect())
     }
 
     /// Extract entities from manual metadata (Phase 1 fallback).
@@ -1684,22 +1790,23 @@ mod tests {
             .await
             .unwrap();
 
-        // Pre-populate the vector store directly — content has zero
-        // token overlap with "Acme" so keyword fallback can't find
-        // it. The KG path must.
-        mem.vector
-            .upsert(
-                "doc",
-                vec![],
-                serde_json::json!({
-                    "_content": "Quarterly compensation breakdown for engineering",
-                    "entities": [
-                        {"name": "Payroll", "type": "Concept"}
-                    ]
-                }),
-            )
-            .await
-            .unwrap();
+        // Store via remember() so the memory↔entity link (the `mentions`
+        // edge the graph arm joins through) is created. Content has zero
+        // token overlap with "Acme" so the lexical/keyword path can't find
+        // it — only the KG hop (Acme --has--> Payroll, doc mentions Payroll)
+        // can. The `Payroll` entity from metadata dedups onto the one we
+        // hand-seeded above.
+        mem.remember(MemoryItem {
+            id: "doc".to_string(),
+            content: "Quarterly compensation breakdown for engineering".to_string(),
+            metadata: serde_json::json!({
+                "entities": [
+                    {"name": "Payroll", "type": "Concept"}
+                ]
+            }),
+        })
+        .await
+        .unwrap();
 
         let hits = mem.recall("info about Acme", 5).await.unwrap();
         assert!(

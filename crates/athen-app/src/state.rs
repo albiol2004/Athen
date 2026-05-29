@@ -5400,7 +5400,7 @@ async fn build_memory(
     embeddings: &athen_core::config::EmbeddingConfig,
 ) -> Option<Arc<Memory>> {
     use athen_memory::extractor::LlmEntityExtractor;
-    use athen_memory::sqlite::{SqliteGraph, SqliteVectorIndex};
+    use athen_memory::sqlite::{SqliteGraph, SqliteLexicalIndex, SqliteVectorIndex};
 
     let data_dir = ensure_data_dir()?;
     let db_path = data_dir.join("athen.db");
@@ -5433,6 +5433,15 @@ async fn build_memory(
             return None;
         }
     };
+    let lexical = match SqliteLexicalIndex::new(conn.clone()) {
+        Ok(l) => l,
+        Err(e) => {
+            warn!("Failed to create lexical (FTS5) index: {e}");
+            return None;
+        }
+    };
+    // Keep a handle to the shared connection for the backfill marker check.
+    let marker_conn = conn.clone();
     let graph = match SqliteGraph::new(conn) {
         Ok(g) => g,
         Err(e) => {
@@ -5449,12 +5458,52 @@ async fn build_memory(
     let extractor_router: Box<dyn LlmRouter> = Box::new(SharedRouter(Arc::clone(router)));
     let extractor = LlmEntityExtractor::new(extractor_router);
 
+    // Default fusion weights (cosine_floor 0.45 admission, low min_final).
+    // The hybrid ranker fuses semantic + lexical (BM25) + graph + recency +
+    // frequency; see athen_core::traits::memory::FusionWeights.
     let memory = Memory::new(Box::new(vector), Box::new(graph))
         .with_embedder(Box::new(embedding_router))
         .with_extractor(Box::new(extractor))
-        .with_min_score(0.6);
+        .with_lexical(Box::new(lexical));
 
-    info!("Memory system initialized with SQLite persistence");
+    // One-time backfill for DBs predating the hybrid rework: populate the
+    // `mentions` links + lexical (FTS5) index from each memory's stored
+    // metadata. Guarded by a marker row so it runs at most once.
+    let needs_backfill = {
+        let guard = marker_conn.lock();
+        match guard {
+            Ok(c) => {
+                let _ = c.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS memory_migrations (key TEXT PRIMARY KEY);",
+                );
+                let done: bool = c
+                    .query_row(
+                        "SELECT 1 FROM memory_migrations WHERE key = 'hybrid_backfill_v1'",
+                        [],
+                        |_| Ok(true),
+                    )
+                    .unwrap_or(false);
+                !done
+            }
+            Err(_) => false,
+        }
+    };
+    if needs_backfill {
+        match memory.backfill_hybrid().await {
+            Ok(n) => {
+                info!("Memory hybrid backfill: processed {n} existing memories");
+                if let Ok(c) = marker_conn.lock() {
+                    let _ = c.execute(
+                        "INSERT OR IGNORE INTO memory_migrations (key) VALUES ('hybrid_backfill_v1')",
+                        [],
+                    );
+                }
+            }
+            Err(e) => warn!("Memory hybrid backfill failed (will retry next boot): {e}"),
+        }
+    }
+
+    info!("Memory system initialized with SQLite persistence (hybrid recall)");
     Some(Arc::new(memory))
 }
 

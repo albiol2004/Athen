@@ -2434,6 +2434,13 @@ pub async fn send_message(
                             }
                         }
                     }
+                    // Genuine recall → record the consult so recency/frequency
+                    // signals and linked-entity reinforcement climb. Not called
+                    // from write-time dedup recalls (would inflate frequency).
+                    if !all_items.is_empty() {
+                        let ids: Vec<&str> = all_items.iter().map(|i| i.id.as_str()).collect();
+                        let _ = memory.note_recalled(&ids).await;
+                    }
 
                     if !all_items.is_empty() {
                         tracing::info!(
@@ -3547,6 +3554,13 @@ pub(crate) async fn execute_approved_task(
                         all_items.push(item);
                     }
                 }
+            }
+            // Genuine recall → record the consult so recency/frequency signals
+            // and linked-entity reinforcement climb. Not called from write-time
+            // dedup recalls (which would inflate the frequency signal).
+            if !all_items.is_empty() {
+                let ids: Vec<&str> = all_items.iter().map(|i| i.id.as_str()).collect();
+                let _ = memory.note_recalled(&ids).await;
             }
 
             if !all_items.is_empty() {
@@ -4690,6 +4704,13 @@ pub(crate) async fn execute_dispatched_task(
                         all_items.push(item);
                     }
                 }
+            }
+            // Genuine recall → record the consult so recency/frequency signals
+            // and linked-entity reinforcement climb. Not called from write-time
+            // dedup recalls (which would inflate the frequency signal).
+            if !all_items.is_empty() {
+                let ids: Vec<&str> = all_items.iter().map(|i| i.id.as_str()).collect();
+                let _ = memory.note_recalled(&ids).await;
             }
 
             if !all_items.is_empty() {
