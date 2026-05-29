@@ -903,6 +903,7 @@ async function loadArcs() {
         renderProfilePicker();
         renderReasoningPicker();
         renderTierPicker();
+        renderSecurityPicker();
     } catch (err) {
         console.error('Failed to load arcs:', err);
     }
@@ -921,6 +922,7 @@ async function loadAgentProfiles() {
         renderProfilePicker();
         renderReasoningPicker();
         renderTierPicker();
+        renderSecurityPicker();
     } catch (err) {
         console.error('Failed to load agent profiles:', err);
         agentProfiles = [];
@@ -961,6 +963,7 @@ async function onProfileChange(ev) {
         renderProfilePicker();
         renderReasoningPicker();
         renderTierPicker();
+        renderSecurityPicker();
     }
 }
 
@@ -1006,6 +1009,30 @@ async function onTierChange(ev) {
     } catch (err) {
         console.error('set_arc_tier failed:', err);
         renderTierPicker();
+    }
+}
+
+function renderSecurityPicker() {
+    const sel = document.getElementById('arc-security-picker');
+    if (!sel) return;
+    sel.disabled = !activeArcId;
+    const meta = activeArcId ? arcMetaById.get(activeArcId) : null;
+    // 'global' is the cleared-override sentinel (no per-arc override).
+    sel.value = (meta && meta.security_mode_override) || 'global';
+}
+
+async function onSecurityChange(ev) {
+    if (!invoke || !activeArcId) return;
+    const chosen = ev.target.value;
+    // 'global' clears the override so the arc follows the app-wide mode.
+    const mode = chosen === 'global' ? null : chosen;
+    try {
+        await invoke('set_arc_security_mode', { arcId: activeArcId, mode });
+        const meta = arcMetaById.get(activeArcId);
+        if (meta) meta.security_mode_override = mode;
+    } catch (err) {
+        console.error('set_arc_security_mode failed:', err);
+        renderSecurityPicker();
     }
 }
 
@@ -1334,6 +1361,7 @@ async function handleSwitchArc(arcId) {
         renderProfilePicker();
         renderReasoningPicker();
         renderTierPicker();
+        renderSecurityPicker();
 
         // Clear notification dot for this arc.
         arcsWithNotifications.delete(arcId);
@@ -5755,6 +5783,11 @@ if (arcTierPicker) {
     arcTierPicker.addEventListener('change', onTierChange);
 }
 
+const arcSecurityPicker = document.getElementById('arc-security-picker');
+if (arcSecurityPicker) {
+    arcSecurityPicker.addEventListener('change', onSecurityChange);
+}
+
 const newProfileBtn = document.getElementById('new-profile-btn');
 if (newProfileBtn) {
     newProfileBtn.addEventListener('click', () => openProfileEditor('create', null));
@@ -6129,6 +6162,7 @@ async function loadProfileManager() {
         renderProfilePicker();
         renderReasoningPicker();
         renderTierPicker();
+        renderSecurityPicker();
     } catch (err) {
         console.error('Failed to load profiles:', err);
         listEl.innerHTML = '<p class="setting-hint">Failed to load profiles.</p>';
@@ -13018,6 +13052,7 @@ async function finishOnboardingInteractive() {
         renderProfilePicker();
         renderReasoningPicker();
         renderTierPicker();
+        renderSecurityPicker();
 
         // Trigger the agent by sending an initial message.
         const msg = "Hi! I just set up my AI provider. Help me configure the rest of Athen.";

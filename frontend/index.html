@@ -140,6 +140,15 @@
                             <option value="Powerful">Powerful</option>
                         </select>
                     </label>
+                    <label class="profile-picker-wrap" title="Security posture for this arc. Global = follow the app-wide Security Mode. Bunker asks before anything beyond read-only; Yolo only asks on critical actions.">
+                        <span class="profile-picker-label">Security:</span>
+                        <select id="arc-security-picker" class="profile-picker">
+                            <option value="global">Global</option>
+                            <option value="bunker">Bunker</option>
+                            <option value="assistant">Assistant</option>
+                            <option value="yolo">Yolo</option>
+                        </select>
+                    </label>
                     <button id="new-chat-btn" title="Start a new conversation">New Arc</button>
                 </div>
             </header>
