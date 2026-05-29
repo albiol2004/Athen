@@ -115,8 +115,12 @@ fn spawn_router_approval(
         notifier: state.notifier.clone(),
         compactor: state.compactor.clone(),
         web_search: Arc::clone(&state.web_search),
-        email_sender: state.email_sender.clone(),
-        telegram_sender: state.telegram_sender.clone(),
+        email_sender: state.email_sender.read().expect("email_sender lock").clone(),
+        telegram_sender: state
+            .telegram_sender
+            .read()
+            .expect("telegram_sender lock")
+            .clone(),
         telegram_outbound_hint: state.telegram_outbound_hint.clone(),
         telegram_chat_log: state.telegram_chat_log.clone(),
         owner_check: state.owner_destination_check(),
@@ -3135,8 +3139,12 @@ pub async fn approve_task(
         notifier: state.notifier.clone(),
         compactor: state.compactor.clone(),
         web_search: Arc::clone(&state.web_search),
-        email_sender: state.email_sender.clone(),
-        telegram_sender: state.telegram_sender.clone(),
+        email_sender: state.email_sender.read().expect("email_sender lock").clone(),
+        telegram_sender: state
+            .telegram_sender
+            .read()
+            .expect("telegram_sender lock")
+            .clone(),
         telegram_outbound_hint: state.telegram_outbound_hint.clone(),
         telegram_chat_log: state.telegram_chat_log.clone(),
         owner_check: state.owner_destination_check(),

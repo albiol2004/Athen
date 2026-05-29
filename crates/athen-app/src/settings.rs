@@ -2277,7 +2277,9 @@ pub async fn save_smtp_settings(
     }
 
     save_main_config(&config)?;
-    Ok("SMTP settings saved. Restart to apply.".to_string())
+    // Hot-swap the live SMTP sender so the change applies without a restart.
+    state.reload_email_sender().await;
+    Ok("SMTP settings saved and applied.".to_string())
 }
 
 /// Test SMTP connection with the provided settings.
@@ -2425,7 +2427,12 @@ pub async fn save_telegram_settings(
     }
 
     save_main_config(&config)?;
-    Ok("Telegram settings saved. Restart to apply.".to_string())
+    // Hot-swap the live outbound Telegram sender so the token/owner change
+    // applies without a restart. The inbound monitor is respawned separately
+    // (see save_telegram_settings' monitor restart) — handled in the monitor
+    // live-apply commit.
+    state.reload_telegram_sender().await;
+    Ok("Telegram settings saved and applied.".to_string())
 }
 
 /// Test Telegram bot connectivity by calling the `getMe` API endpoint.

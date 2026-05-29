@@ -359,14 +359,22 @@ pub struct AppState {
     /// SMTP outbound. Built from `config.email` when SMTP fields are
     /// populated. `None` means the `email_send` tool will refuse with a
     /// "not configured" error until the user wires SMTP via Settings.
-    pub email_sender: Option<Arc<dyn athen_core::traits::email_sender::EmailSender>>,
+    /// Hot-swappable: `save_smtp_settings` rebuilds and swaps this under the
+    /// lock so SMTP changes apply without a restart. New arcs/tasks read the
+    /// current sender via `.read()`; in-flight arcs keep the one they already
+    /// snapshotted. (`RwLock` rather than `arc-swap` because a `dyn` trait
+    /// object is a fat pointer that arc-swap's single-word atomic can't hold.)
+    pub email_sender:
+        std::sync::RwLock<Option<Arc<dyn athen_core::traits::email_sender::EmailSender>>>,
     /// Outbound Telegram. Built from `config.telegram` when the bot
     /// token is populated. The bot's owner chat (from `owner_user_id`)
     /// is the default destination — `send_telegram` calls without an
     /// explicit `chat_id` go there and skip the approval gate.
     /// `None` means the `send_telegram` tool will refuse with a "not
     /// configured" error until the user wires the bot via Settings.
-    pub telegram_sender: Option<Arc<dyn athen_core::traits::telegram_sender::TelegramSender>>,
+    /// Hot-swappable: `save_telegram_settings` rebuilds and swaps this.
+    pub telegram_sender:
+        std::sync::RwLock<Option<Arc<dyn athen_core::traits::telegram_sender::TelegramSender>>>,
     /// Encrypted credential vault. Backs registered HTTP endpoints,
     /// IMAP/SMTP credentials, OAuth tokens, and any other at-rest secret.
     /// Always `Some` whenever a data directory is available; falls back
@@ -966,8 +974,8 @@ impl AppState {
             dispatch_loop_shutdown: None,
             compactor,
             web_search,
-            email_sender,
-            telegram_sender,
+            email_sender: std::sync::RwLock::new(email_sender),
+            telegram_sender: std::sync::RwLock::new(telegram_sender),
             vault,
             github_identity_resolver,
             http_endpoint_store,
@@ -1229,8 +1237,13 @@ impl AppState {
             .with_spawned_processes(self.spawned_processes.clone())
             .with_spawn_persistence_hook_opt(self.spawn_persistence.clone())
             .with_web_search(self.web_search.clone())
-            .with_email_sender_opt(self.email_sender.clone())
-            .with_telegram_sender_opt(self.telegram_sender.clone())
+            .with_email_sender_opt(self.email_sender.read().expect("email_sender lock").clone())
+            .with_telegram_sender_opt(
+                self.telegram_sender
+                    .read()
+                    .expect("telegram_sender lock")
+                    .clone(),
+            )
             .with_owner_check_opt(self.owner_destination_check());
         if let Some(router) = self.approval_router.clone() {
             shell_registry = shell_registry.with_toolbox_approval(Arc::new(
@@ -1389,8 +1402,12 @@ impl AppState {
             spawned_processes: self.spawned_processes.clone(),
             spawn_persistence: self.spawn_persistence.clone(),
             web_search: self.web_search.clone(),
-            email_sender: self.email_sender.clone(),
-            telegram_sender: self.telegram_sender.clone(),
+            email_sender: self.email_sender.read().expect("email_sender lock").clone(),
+            telegram_sender: self
+                .telegram_sender
+                .read()
+                .expect("telegram_sender lock")
+                .clone(),
             owner_check: self.owner_destination_check(),
             github_identity_resolver: self.github_identity_resolver.clone(),
             checkpoint_store: self.checkpoint_store.clone(),
@@ -1802,6 +1819,28 @@ impl AppState {
             crate::attachment_purger::DEFAULT_SWEEP_INTERVAL,
             shutdown_rx,
         ));
+    }
+
+    /// Rebuild the SMTP sender from current (vault-hydrated) config and
+    /// hot-swap it in. Called by `save_smtp_settings` so SMTP changes apply
+    /// without an app restart. New `email_send` calls `.load_full()` the
+    /// fresh sender; arcs already mid-flight keep the one they snapshotted.
+    pub(crate) async fn reload_email_sender(&self) {
+        let mut cfg = crate::settings::load_main_config_public();
+        crate::vault_creds::hydrate_secrets_from_vault(self.vault.as_ref(), &mut cfg).await;
+        let rebuilt = build_email_sender(&cfg.email);
+        *self.email_sender.write().expect("email_sender lock") = rebuilt;
+    }
+
+    /// Rebuild the Telegram outbound sender from current (vault-hydrated)
+    /// config and hot-swap it in. Called by `save_telegram_settings`.
+    pub(crate) async fn reload_telegram_sender(&self) {
+        let mut cfg = crate::settings::load_main_config_public();
+        crate::vault_creds::hydrate_secrets_from_vault(self.vault.as_ref(), &mut cfg).await;
+        let owner_chat_id_override =
+            resolve_owner_telegram_chat_id(self.contact_store.as_ref()).await;
+        let rebuilt = build_telegram_sender(&cfg.telegram, owner_chat_id_override);
+        *self.telegram_sender.write().expect("telegram_sender lock") = rebuilt;
     }
 
     /// Spawn the wake-up scheduler loop. Idempotent — does nothing if the
@@ -2279,8 +2318,12 @@ impl AppState {
         let notifier = self.notifier.clone();
         let compactor = self.compactor.clone();
         let web_search = Arc::clone(&self.web_search);
-        let email_sender = self.email_sender.clone();
-        let telegram_sender_dispatch = self.telegram_sender.clone();
+        let email_sender = self.email_sender.read().expect("email_sender lock").clone();
+        let telegram_sender_dispatch = self
+            .telegram_sender
+            .read()
+            .expect("telegram_sender lock")
+            .clone();
         let telegram_outbound_hint_dispatch = self.telegram_outbound_hint.clone();
         let telegram_chat_log_dispatch = self.telegram_chat_log.clone();
         let owner_check_dispatch = self.owner_destination_check();
