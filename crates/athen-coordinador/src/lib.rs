@@ -47,6 +47,92 @@ fn coerce_for_autonomy(decision: RiskDecision, autonomy: AutonomyBand) -> RiskDe
     }
 }
 
+/// Coerce a per-task risk decision according to the active security posture.
+///
+/// This is the global (and per-arc) `SecurityMode` knob, the sibling of
+/// [`coerce_for_autonomy`]. It is applied to *every* event's triage decision
+/// (not just wake-ups). Semantics match the shipped Settings → Security hint
+/// text:
+/// - `Bunker` ("everything above read-only requires approval"): a
+///   `NotifyAndProceed` (anything beyond a silent read) escalates to a prompt.
+/// - `Assistant` ("standard"): passthrough — today's behaviour.
+/// - `Yolo` ("only critical actions need approval"): a `HumanConfirm`
+///   de-escalates to notify-and-proceed; `HardBlock` (critical) always stays.
+///
+/// `SilentApprove` and `HardBlock` are never moved here — read-only stays
+/// silent and critical stays blocked under every mode.
+// `allow(dead_code)`: wired into `process_event_inner` in the next step; kept
+// here with tests so the pure coercion lands and is verified on its own.
+#[allow(dead_code)]
+fn coerce_for_security_mode(
+    decision: RiskDecision,
+    mode: athen_core::config::SecurityMode,
+) -> RiskDecision {
+    use athen_core::config::SecurityMode;
+    use RiskDecision::*;
+    match (mode, decision) {
+        (SecurityMode::Bunker, NotifyAndProceed) => HumanConfirm,
+        (SecurityMode::Yolo, HumanConfirm) => NotifyAndProceed,
+        (_, d) => d,
+    }
+}
+
+#[cfg(test)]
+mod security_mode_coercion_tests {
+    use super::coerce_for_security_mode;
+    use athen_core::config::SecurityMode;
+    use athen_core::risk::RiskDecision::*;
+
+    #[test]
+    fn bunker_escalates_only_notify_and_proceed() {
+        assert_eq!(
+            coerce_for_security_mode(NotifyAndProceed, SecurityMode::Bunker),
+            HumanConfirm
+        );
+        // read-only stays silent; prompts/blocks unchanged.
+        assert_eq!(
+            coerce_for_security_mode(SilentApprove, SecurityMode::Bunker),
+            SilentApprove
+        );
+        assert_eq!(
+            coerce_for_security_mode(HumanConfirm, SecurityMode::Bunker),
+            HumanConfirm
+        );
+        assert_eq!(
+            coerce_for_security_mode(HardBlock, SecurityMode::Bunker),
+            HardBlock
+        );
+    }
+
+    #[test]
+    fn yolo_deescalates_only_human_confirm() {
+        assert_eq!(
+            coerce_for_security_mode(HumanConfirm, SecurityMode::Yolo),
+            NotifyAndProceed
+        );
+        // critical still blocks; the rest is unchanged.
+        assert_eq!(
+            coerce_for_security_mode(HardBlock, SecurityMode::Yolo),
+            HardBlock
+        );
+        assert_eq!(
+            coerce_for_security_mode(SilentApprove, SecurityMode::Yolo),
+            SilentApprove
+        );
+        assert_eq!(
+            coerce_for_security_mode(NotifyAndProceed, SecurityMode::Yolo),
+            NotifyAndProceed
+        );
+    }
+
+    #[test]
+    fn assistant_is_identity() {
+        for d in [SilentApprove, NotifyAndProceed, HumanConfirm, HardBlock] {
+            assert_eq!(coerce_for_security_mode(d, SecurityMode::Assistant), d);
+        }
+    }
+}
+
 /// Infer the `IdentifierKind` from a sender identifier string.
 fn infer_identifier_kind(identifier: &str) -> IdentifierKind {
     if identifier.contains('@') {

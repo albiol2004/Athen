@@ -531,6 +531,67 @@ pub enum SecurityMode {
     Yolo,
 }
 
+impl SecurityMode {
+    /// Lowercase wire form used at the DB / Tauri boundary (matches the
+    /// frontend `<select>` values). Distinct from the serde representation,
+    /// which uses the PascalCase variant names — do not mix the two.
+    pub fn to_wire_str(self) -> &'static str {
+        match self {
+            SecurityMode::Bunker => "bunker",
+            SecurityMode::Assistant => "assistant",
+            SecurityMode::Yolo => "yolo",
+        }
+    }
+}
+
+impl std::str::FromStr for SecurityMode {
+    type Err = ();
+
+    fn from_str(s: &str) -> std::result::Result<Self, ()> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "bunker" => Ok(SecurityMode::Bunker),
+            "assistant" | "" | "default" => Ok(SecurityMode::Assistant),
+            "yolo" => Ok(SecurityMode::Yolo),
+            _ => Err(()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod security_mode_tests {
+    use super::SecurityMode;
+    use std::str::FromStr;
+
+    #[test]
+    fn wire_round_trips_every_variant() {
+        for mode in [
+            SecurityMode::Bunker,
+            SecurityMode::Assistant,
+            SecurityMode::Yolo,
+        ] {
+            assert_eq!(SecurityMode::from_str(mode.to_wire_str()), Ok(mode));
+        }
+    }
+
+    #[test]
+    fn empty_and_default_map_to_assistant() {
+        assert_eq!(SecurityMode::from_str(""), Ok(SecurityMode::Assistant));
+        assert_eq!(SecurityMode::from_str("default"), Ok(SecurityMode::Assistant));
+        assert_eq!(SecurityMode::from_str("  DEFAULT "), Ok(SecurityMode::Assistant));
+    }
+
+    #[test]
+    fn case_insensitive_and_trimmed() {
+        assert_eq!(SecurityMode::from_str(" Bunker "), Ok(SecurityMode::Bunker));
+        assert_eq!(SecurityMode::from_str("YOLO"), Ok(SecurityMode::Yolo));
+    }
+
+    #[test]
+    fn unknown_is_err() {
+        assert_eq!(SecurityMode::from_str("paranoid"), Err(()));
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PersistenceConfig {
