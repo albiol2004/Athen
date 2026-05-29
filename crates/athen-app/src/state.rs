@@ -142,6 +142,21 @@ pub type InflightApprovals = Arc<Mutex<HashSet<Uuid>>>;
 /// Top-level application state managed by Tauri.
 pub struct AppState {
     pub coordinator: Arc<Coordinator>,
+    /// Live security posture (mode + thresholds), hot-swappable so a
+    /// Settings → General save applies without a restart.
+    ///
+    /// NOTE: as of this writing the risk pipeline does NOT yet read this —
+    /// auto-approval is gated by per-arc `AutonomyBand` + risk-score
+    /// thresholds in the coordinator, not by `SecurityMode`. The swap
+    /// plumbing exists so that when risk gating is wired to honour it, the
+    /// setting already applies on save with no further refactor.
+    ///
+    /// Contract for the future consumer: snapshot `security.load_full()` at
+    /// **arc/task creation** (the same boundary where `ToolRegistryDeps` /
+    /// `ApprovedTaskCtx` snapshot the other live components) so a running
+    /// arc keeps the posture it started with — new-arcs-only semantics.
+    // TODO(security-enforcement): wire this into the risk evaluator.
+    pub security: arc_swap::ArcSwap<athen_core::config::SecurityConfig>,
     /// The LLM router, wrapped in `RwLock` so it can be swapped at runtime
     /// when the user switches active provider.
     pub router: Arc<RwLock<Arc<DefaultLlmRouter>>>,
@@ -939,6 +954,7 @@ impl AppState {
 
         let state = Self {
             coordinator: Arc::new(coordinator),
+            security: arc_swap::ArcSwap::from_pointee(config.security.clone()),
             router,
             active_provider_id: Mutex::new(active_id),
             history: Mutex::new(history),

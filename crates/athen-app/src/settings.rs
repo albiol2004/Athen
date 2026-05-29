@@ -2007,7 +2007,10 @@ pub async fn set_active_provider(
 
 /// Save general settings (security mode, etc.).
 #[tauri::command]
-pub async fn save_settings(security_mode: String) -> std::result::Result<String, String> {
+pub async fn save_settings(
+    security_mode: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<String, String> {
     let mut config = load_main_config();
 
     config.security.mode = match security_mode.to_lowercase().as_str() {
@@ -2017,7 +2020,14 @@ pub async fn save_settings(security_mode: String) -> std::result::Result<String,
     };
 
     save_main_config(&config)?;
-    Ok("Settings saved. Restart the app to apply changes.".to_string())
+    // Hot-swap the live security posture. The risk pipeline doesn't read it
+    // yet (see AppState::security TODO(security-enforcement)), but the swap
+    // keeps the live value current so it applies on save the day it's wired —
+    // new-arcs-only, per the snapshot-at-arc-creation contract.
+    state
+        .security
+        .store(std::sync::Arc::new(config.security.clone()));
+    Ok("Settings saved and applied.".to_string())
 }
 
 // ---------------------------------------------------------------------------
