@@ -108,7 +108,15 @@ pub fn spawn_loop(
             "Attachment TTL purger started"
         );
         loop {
-            let cutoff = Utc::now() - chrono::Duration::days(i64::from(ttl_days));
+            // Re-read the TTL from live config each sweep so a Settings →
+            // Attachment-policy save takes effect on the next sweep without
+            // an app restart (load_main_config_public is infallible — it
+            // returns defaults on error). `ttl_days` captured at spawn is now
+            // only the value stamped in the startup log line above.
+            let live_ttl = crate::settings::load_main_config_public()
+                .attachment_policy
+                .byte_ttl_days;
+            let cutoff = Utc::now() - chrono::Duration::days(i64::from(live_ttl));
             if let Err(e) = sweep_once(&store, cutoff).await {
                 tracing::warn!(error = %e, "Attachment TTL sweep failed");
             }

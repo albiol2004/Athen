@@ -433,7 +433,9 @@ pub async fn test_voice_setup(
             ];
             Ok(VoiceSetupTestResult {
                 ok: true,
-                summary: "Setup looks good. Ask Athen in chat to place a real call to verify end-to-end.".into(),
+                summary:
+                    "Setup looks good. Ask Athen in chat to place a real call to verify end-to-end."
+                        .into(),
                 checks,
             })
         }

@@ -2746,7 +2746,9 @@ pub async fn save_attachment_policy_settings(
     cfg.attachment_policy.byte_ttl_days = byte_ttl_days;
 
     save_main_config(&cfg)?;
-    Ok("Attachment policy saved. Restart to apply.".to_string())
+    // No restart needed: AttachmentPolicy.decide() reads config per-call, and
+    // the TTL purger re-reads byte_ttl_days from live config each sweep.
+    Ok("Attachment policy saved.".to_string())
 }
 
 /// Test a web search provider key with a tiny smoke query. The provider
