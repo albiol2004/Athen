@@ -1408,11 +1408,25 @@ impl AppState {
         if let Some(vault) = self.vault.as_ref() {
             let vault = vault.clone();
             let cfg = std::mem::take(&mut config);
-            config = tauri::async_runtime::block_on(async move {
+            let hydrate = async move {
                 let mut c = cfg;
                 crate::vault_creds::hydrate_secrets_from_vault(Some(&vault), &mut c).await;
                 c
-            });
+            };
+            // This fn is sync but is reached from two kinds of caller:
+            //   - boot hooks (no runtime is driving this thread), and
+            //   - restart paths invoked *from inside* an async Tauri command
+            //     (e.g. `save_smtp_settings` → `restart_email_monitor` →
+            //     `start_email_monitor`).
+            // A bare `block_on` panics with "Cannot start a runtime from
+            // within a runtime" in the latter case. So if a runtime handle is
+            // already current, run the (vault-I/O) future on it via
+            // `block_in_place` (legal on Tauri's multi-thread runtime);
+            // otherwise fall back to the standalone `block_on`.
+            config = match tokio::runtime::Handle::try_current() {
+                Ok(handle) => tokio::task::block_in_place(move || handle.block_on(hydrate)),
+                Err(_) => tauri::async_runtime::block_on(hydrate),
+            };
         }
         config
     }
