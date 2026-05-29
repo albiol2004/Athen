@@ -2038,6 +2038,7 @@ pub async fn save_email_settings(
     poll_interval_secs: u64,
     lookback_hours: u32,
     state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
 ) -> std::result::Result<String, String> {
     let mut config = load_main_config();
 
@@ -2113,7 +2114,10 @@ pub async fn save_email_settings(
     }
 
     save_main_config(&config)?;
-    Ok("Email settings saved. Restart to apply.".to_string())
+    // Stop + respawn the IMAP monitor so server/credential/interval/enabled
+    // changes apply without a restart.
+    state.restart_email_monitor(app_handle);
+    Ok("Email settings saved and applied.".to_string())
 }
 
 /// Test email connection with the provided IMAP settings.
@@ -2350,6 +2354,7 @@ pub async fn save_telegram_settings(
     allowed_chat_ids: Vec<i64>,
     poll_interval_secs: Option<u64>,
     state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
 ) -> std::result::Result<String, String> {
     let mut config = load_main_config();
 
@@ -2427,11 +2432,11 @@ pub async fn save_telegram_settings(
     }
 
     save_main_config(&config)?;
-    // Hot-swap the live outbound Telegram sender so the token/owner change
-    // applies without a restart. The inbound monitor is respawned separately
-    // (see save_telegram_settings' monitor restart) — handled in the monitor
-    // live-apply commit.
+    // Hot-swap the live outbound Telegram sender (token/owner) and stop +
+    // respawn the inbound monitor (token/allowlist/interval/enabled), so the
+    // whole Telegram subsystem applies without a restart.
     state.reload_telegram_sender().await;
+    state.restart_telegram_monitor(app_handle);
     Ok("Telegram settings saved and applied.".to_string())
 }
 

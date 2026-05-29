@@ -183,10 +183,13 @@ pub struct AppState {
     /// without cancelling.
     pub pending_user_inputs:
         std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<String, PendingInputSlot>>>,
-    /// Shutdown sender for the email monitor background task.
-    pub email_shutdown: Option<tokio::sync::broadcast::Sender<()>>,
-    /// Shutdown sender for the Telegram monitor background task.
-    pub telegram_shutdown: Option<tokio::sync::broadcast::Sender<()>>,
+    /// Shutdown sender for the email monitor background task. Behind a Mutex
+    /// so the monitor can be stopped + respawned from a `&self` Settings-save
+    /// handler (`restart_email_monitor`) without an app restart.
+    pub email_shutdown: std::sync::Mutex<Option<tokio::sync::broadcast::Sender<()>>>,
+    /// Shutdown sender for the Telegram monitor background task. Behind a Mutex
+    /// for the same live-restart reason as `email_shutdown`.
+    pub telegram_shutdown: std::sync::Mutex<Option<tokio::sync::broadcast::Sender<()>>>,
     /// Shutdown sender for the calendar monitor background task. Set by
     /// [`Self::start_calendar_monitor`]; consumed by [`Self::shutdown_all`].
     pub calendar_shutdown: Option<tokio::sync::broadcast::Sender<()>>,
@@ -952,8 +955,8 @@ impl AppState {
             _database: database,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             pending_user_inputs: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            email_shutdown: None,
-            telegram_shutdown: None,
+            email_shutdown: std::sync::Mutex::new(None),
+            telegram_shutdown: std::sync::Mutex::new(None),
             calendar_shutdown: None,
             calendar_sync_shutdown: None,
             attachment_purger_shutdown: None,
@@ -1092,8 +1095,14 @@ impl AppState {
         // We take() conceptually but only have &self here, so just clone
         // the inner Sender — broadcast senders are cheap to clone and
         // can be dropped freely after the send.
-        pulse!(self.email_shutdown.as_ref().cloned(), "email monitor");
-        pulse!(self.telegram_shutdown.as_ref().cloned(), "telegram monitor");
+        pulse!(
+            self.email_shutdown.lock().ok().and_then(|g| g.clone()),
+            "email monitor"
+        );
+        pulse!(
+            self.telegram_shutdown.lock().ok().and_then(|g| g.clone()),
+            "telegram monitor"
+        );
         pulse!(self.calendar_shutdown.as_ref().cloned(), "calendar monitor");
         pulse!(
             self.calendar_sync_shutdown.as_ref().cloned(),
@@ -1731,7 +1740,7 @@ impl AppState {
     /// LLM for relevance triage.  Only emails classified as `medium` or
     /// `high` relevance are forwarded to the frontend as actionable cards.
     /// Spam and irrelevant messages are silently logged and discarded.
-    pub fn start_email_monitor(&mut self, app_handle: tauri::AppHandle) {
+    pub fn start_email_monitor(&self, app_handle: tauri::AppHandle) {
         use athen_core::traits::sense::SenseMonitor;
         use athen_sentidos::email::EmailMonitor;
 
@@ -1747,7 +1756,7 @@ impl AppState {
         }
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-        self.email_shutdown = Some(shutdown_tx);
+        *self.email_shutdown.lock().expect("email_shutdown lock") = Some(shutdown_tx);
 
         let mut monitor = EmailMonitor::new();
         if let Some(lookup) = self.owner_lookup() {
@@ -1826,6 +1835,23 @@ impl AppState {
             }
             info!("Email monitor stopped");
         });
+    }
+
+    /// Stop the running email monitor (if any) and start a fresh one from
+    /// current config. Called by `save_email_settings` so server/credential/
+    /// interval/enabled changes apply without an app restart. When the panel
+    /// disables email, the old loop is signalled to stop and `start_email_monitor`
+    /// returns early — leaving no monitor running.
+    pub fn restart_email_monitor(&self, app_handle: tauri::AppHandle) {
+        if let Some(tx) = self
+            .email_shutdown
+            .lock()
+            .expect("email_shutdown lock")
+            .take()
+        {
+            let _ = tx.send(());
+        }
+        self.start_email_monitor(app_handle);
     }
 
     /// Start the calendar monitor background task.
@@ -2115,7 +2141,7 @@ impl AppState {
     /// executed through the agent — exactly as if the user typed them in
     /// the chat UI.  Non-owner messages continue through the standard
     /// sense router triage only.
-    pub fn start_telegram_monitor(&mut self, app_handle: tauri::AppHandle) {
+    pub fn start_telegram_monitor(&self, app_handle: tauri::AppHandle) {
         use athen_core::traits::sense::SenseMonitor;
         use athen_sentidos::telegram::TelegramMonitor;
 
@@ -2131,7 +2157,7 @@ impl AppState {
         }
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-        self.telegram_shutdown = Some(shutdown_tx);
+        *self.telegram_shutdown.lock().expect("telegram_shutdown lock") = Some(shutdown_tx);
 
         let mut monitor = TelegramMonitor::new(config.telegram.clone());
         if let Some(lookup) = self.owner_lookup() {
@@ -2324,6 +2350,22 @@ impl AppState {
             }
             info!("Telegram monitor stopped");
         });
+    }
+
+    /// Stop the running Telegram monitor (if any) and start a fresh one from
+    /// current config. Called by `save_telegram_settings` so token/allowlist/
+    /// interval/enabled changes apply without an app restart. The outbound
+    /// sender is hot-swapped separately by `reload_telegram_sender`.
+    pub fn restart_telegram_monitor(&self, app_handle: tauri::AppHandle) {
+        if let Some(tx) = self
+            .telegram_shutdown
+            .lock()
+            .expect("telegram_shutdown lock")
+            .take()
+        {
+            let _ = tx.send(());
+        }
+        self.start_telegram_monitor(app_handle);
     }
 
     /// Spawn the autonomous-execution dispatch loop.
