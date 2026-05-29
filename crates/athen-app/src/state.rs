@@ -566,12 +566,18 @@ pub(crate) fn build_telephony_deps(
     })
 }
 
-pub(crate) async fn assemble_app_tool_registry(
+/// Build the BARE per-arc tool registry — everything up to and including the
+/// file gate / telephony, but WITHOUT the delegation or wake-up authoring
+/// wrappers. GitHub identity and the active profile are resolved from
+/// `arc_id`, so calling this for a sub-arc produces a registry correctly
+/// scoped to that arc + its profile. Sub-agents get exactly this (bare ⇒ no
+/// `spawn_subagent` ⇒ depth=1). The public `assemble_app_tool_registry`
+/// wraps this with delegation + wake-up authoring for top-level agents.
+pub(crate) async fn assemble_base_app_tool_registry(
     deps: ToolRegistryDeps,
     arc_id: &str,
     app_handle: Option<tauri::AppHandle>,
-) -> Box<dyn athen_core::traits::tool::ToolRegistry> {
-    let delegation_app_handle = app_handle.clone();
+) -> Arc<dyn athen_core::traits::tool::ToolRegistry> {
     // Resolve the active profile's GitHub identity once at registry
     // build time so every shell_execute in this arc uses the same
     // creds. Falls back to `None` whenever lookup is unavailable
@@ -710,44 +716,130 @@ pub(crate) async fn assemble_app_tool_registry(
         registry = registry.with_file_gate(Arc::new(gate));
     }
 
-    // Wrap the registry with the delegation layer when a profile store
-    // is available. The wrapped registry exposes `delegate_to_agent`
-    // on top of every other tool. Sub-agents spawned via that tool
-    // receive the bare AppToolRegistry — no delegate_to_agent — which
-    // is how depth=1 is enforced.
-    let base: Arc<dyn athen_core::traits::tool::ToolRegistry> = Arc::new(registry);
+    Arc::new(registry)
+}
+
+/// Build a sub-agent's registry + router factories from the live `AppState`
+/// (reached through the Tauri `AppHandle`). Returns `(None, None)` when no
+/// handle is available (CLI / tests) so delegation falls back to reusing the
+/// parent's base registry + shared router. The factories let the delegation
+/// tool build a registry/router scoped to the sub-agent's own arc + profile.
+///
+/// Cost note: the router factory rebuilds a provider router only when the
+/// sub-arc carries a pin that differs from the global active provider
+/// (`arc_router_for`'s fast path returns the shared global cell otherwise).
+/// Delegation is rare, so one build per pinned delegation is acceptable.
+pub(crate) fn build_subagent_factories(
+    app_handle: Option<&tauri::AppHandle>,
+) -> (
+    Option<crate::delegation::SubRegistryFactory>,
+    Option<crate::delegation::SubRouterFactory>,
+) {
+    let Some(handle) = app_handle else {
+        return (None, None);
+    };
+    let h_reg = handle.clone();
+    let reg: crate::delegation::SubRegistryFactory = Arc::new(move |sub_arc, _sub_profile_id| {
+        let h = h_reg.clone();
+        Box::pin(async move {
+            use tauri::Manager;
+            // Snapshot deps and drop the State borrow before awaiting.
+            let deps = {
+                let state = h.state::<AppState>();
+                state.tool_registry_deps()
+            };
+            let base = assemble_base_app_tool_registry(deps, &sub_arc, Some(h.clone())).await;
+            Box::new(crate::delegation::ArcRegistryAdapter(base))
+                as Box<dyn athen_core::traits::tool::ToolRegistry>
+        })
+    });
+    let h_rt = handle.clone();
+    let rt: crate::delegation::SubRouterFactory = Arc::new(move |sub_arc: String| {
+        let h = h_rt.clone();
+        Box::pin(async move {
+            use tauri::Manager;
+            // Snapshot the global router + arc store, drop the State borrow,
+            // then resolve the sub-arc's effective provider and build its
+            // per-arc router (honoring the pin propagated by delegation).
+            let (global_router, arc_store) = {
+                let state = h.state::<AppState>();
+                (
+                    Arc::clone(&state.router),
+                    state._database.as_ref().map(|db| db.arc_store()),
+                )
+            };
+            let cfg = load_config();
+            let active_id = resolve_active_provider(&cfg);
+            let target = resolve_effective_provider_for_arc_with_config(
+                arc_store.as_ref(),
+                &sub_arc,
+                &active_id,
+                ModelProfile::Powerful,
+                &cfg,
+            )
+            .await;
+            arc_router_for(&global_router, &target, &active_id, &cfg)
+        })
+    });
+    (Some(reg), Some(rt))
+}
+
+/// Single source of truth for the per-arc tool registry handed to a
+/// top-level agent: the bare base (see [`assemble_base_app_tool_registry`])
+/// wrapped with the delegation layer (`spawn_subagent`) and the wake-up
+/// authoring layer (`create_wakeup`). Sub-agents get the bare base only, so
+/// they cannot delegate further (depth=1).
+pub(crate) async fn assemble_app_tool_registry(
+    deps: ToolRegistryDeps,
+    arc_id: &str,
+    app_handle: Option<tauri::AppHandle>,
+) -> Box<dyn athen_core::traits::tool::ToolRegistry> {
+    // Clone the bits the delegation + wake-up wrappers need before `deps` is
+    // moved into the base assembler.
+    let profile_store = deps.profile_store.clone();
+    let arc_store_for_delegation = deps.arc_store.clone();
+    let identity_store = deps.identity_store.clone();
+    let skill_store = deps.skill_store.clone();
+    let http_endpoint_store = deps.http_endpoint_store.clone();
+    let tool_doc_dir = deps.tool_doc_dir.clone();
+    let router = Arc::clone(&deps.router);
+    let wakeup_store = deps.wakeup_store.clone();
+    let approval_router = deps.approval_router.clone();
+
+    let base = assemble_base_app_tool_registry(deps, arc_id, app_handle.clone()).await;
+
     let with_delegation: Box<dyn athen_core::traits::tool::ToolRegistry> =
-        if let (Some(profile_store), Some(arc_store)) =
-            (deps.profile_store.clone(), deps.arc_store.clone())
-        {
+        if let (Some(profile_store), Some(arc_store)) = (profile_store, arc_store_for_delegation) {
+            let (sub_registry_factory, sub_router_factory) =
+                build_subagent_factories(app_handle.as_ref());
             let ctx = crate::delegation::DelegationContext {
                 profile_store,
-                identity_store: deps.identity_store.clone(),
-                skill_store: deps.skill_store.clone(),
-                http_endpoint_store: deps.http_endpoint_store.clone(),
+                identity_store,
+                skill_store,
+                http_endpoint_store,
                 arc_store,
-                llm_router: Arc::clone(&deps.router),
+                llm_router: router,
                 parent_arc_id: arc_id.to_string(),
-                tool_doc_dir: deps.tool_doc_dir.clone(),
-                app_handle: delegation_app_handle,
+                tool_doc_dir,
+                app_handle,
                 wakeup_restrictions: None,
+                sub_registry_factory,
+                sub_router_factory,
             };
             Box::new(crate::delegation::DelegationToolRegistry::new(base, ctx))
         } else {
             Box::new(crate::delegation::ArcRegistryAdapter(base))
         };
 
-    // Wrap with the wake-up authoring layer so the agent can call
-    // `create_wakeup` to schedule its own follow-ups. Sits OUTSIDE
-    // delegation so a wake-up declaring `delegate_to_agent` in its
-    // allowlist still works; sits INSIDE the wake-up restriction
-    // wrapper (which the firing path adds in commands.rs) so a
-    // locked-down wake-up's tool_allowlist can hide create_wakeup.
-    // Skipped when no wakeup_store is wired (CLI / test builds).
-    if let Some(store) = deps.wakeup_store.clone() {
+    // Wake-up authoring layer sits OUTSIDE delegation so a wake-up declaring
+    // `spawn_subagent` in its allowlist still works; sits INSIDE the wake-up
+    // restriction wrapper (added by the firing path in commands.rs) so a
+    // locked-down wake-up can still hide create_wakeup. Skipped when no
+    // wakeup_store is wired (CLI / test builds).
+    if let Some(store) = wakeup_store {
         let ctx = crate::wakeup_tool::WakeupToolContext {
             wakeup_store: store,
-            approval_router: deps.approval_router.clone(),
+            approval_router,
             parent_arc_id: arc_id.to_string(),
         };
         Box::new(crate::wakeup_tool::WakeupAuthoringRegistry::new(

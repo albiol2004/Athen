@@ -3835,6 +3835,8 @@ pub(crate) async fn execute_approved_task(
     let registry: Box<dyn athen_core::traits::tool::ToolRegistry> =
         if let Some(profile_store) = ctx.profile_store.clone() {
             if let Some(arc_store) = ctx.arc_store.clone() {
+                let (sub_registry_factory, sub_router_factory) =
+                    crate::state::build_subagent_factories(Some(&ctx.app_handle));
                 let dctx = crate::delegation::DelegationContext {
                     profile_store,
                     identity_store: ctx.identity_store.clone(),
@@ -3846,6 +3848,8 @@ pub(crate) async fn execute_approved_task(
                     tool_doc_dir: ctx.tool_doc_dir.clone(),
                     app_handle: Some(ctx.app_handle.clone()),
                     wakeup_restrictions: subagent_restrictions,
+                    sub_registry_factory,
+                    sub_router_factory,
                 };
                 Box::new(crate::delegation::DelegationToolRegistry::new(
                     base_registry,
@@ -4953,6 +4957,8 @@ pub(crate) async fn execute_dispatched_task(
     let registry: Box<dyn athen_core::traits::tool::ToolRegistry> =
         if let Some(profile_store) = ctx.profile_store.clone() {
             if let Some(arc_store) = ctx.arc_store.clone() {
+                let (sub_registry_factory, sub_router_factory) =
+                    crate::state::build_subagent_factories(Some(&ctx.app_handle));
                 let dctx = crate::delegation::DelegationContext {
                     profile_store,
                     identity_store: ctx.identity_store.clone(),
@@ -4964,6 +4970,8 @@ pub(crate) async fn execute_dispatched_task(
                     tool_doc_dir: ctx.tool_doc_dir.clone(),
                     app_handle: Some(ctx.app_handle.clone()),
                     wakeup_restrictions: subagent_restrictions,
+                    sub_registry_factory,
+                    sub_router_factory,
                 };
                 Box::new(crate::delegation::DelegationToolRegistry::new(
                     base_registry,

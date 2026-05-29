@@ -25,6 +25,8 @@
 //! the executor level. Sub-agent's *own* risky tool calls go through the
 //! same approval router as any other tool call. No special-casing.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -41,6 +43,38 @@ use athen_core::tool::{ToolBackend, ToolDefinition, ToolResult};
 use athen_core::traits::agent::AgentExecutor;
 use athen_core::traits::llm::LlmRouter;
 use athen_core::traits::tool::ToolRegistry;
+
+/// Builds the BARE sub-arc-scoped tool registry (no delegation wrapper —
+/// depth=1). Constructed by the composition root from `AppState` (captured
+/// through the Tauri `AppHandle`), so `delegation.rs` never depends on
+/// `AppState`. The returned registry is scoped to `(sub_arc_id,
+/// sub_profile_id)`: GitHub identity, checkpoint branch, approval-arc tag,
+/// `active_profile_id`, and identity/skill blocks all follow the sub-agent's
+/// own arc + profile rather than the parent's.
+pub type SubRegistryFactory = Arc<
+    dyn Fn(String, String) -> Pin<Box<dyn Future<Output = Box<dyn ToolRegistry>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Builds the per-arc LLM router cell for the sub-arc, honoring whatever pin
+/// was propagated onto it (provider + `pinned_slug`). Same
+/// `Arc<RwLock<Arc<DefaultLlmRouter>>>` shape `SharedRouter` wraps, so the
+/// sub-agent runs on the SAME provider+model as the parent unless overridden.
+pub type SubRouterFactory = Arc<
+    dyn Fn(
+            String,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Arc<
+                            tokio::sync::RwLock<Arc<athen_llm::router::DefaultLlmRouter>>,
+                        >,
+                    > + Send,
+            >,
+        > + Send
+        + Sync,
+>;
 
 /// Everything the delegation tool needs to spin up a sub-agent. Cloneable
 /// (every field is `Arc` or owned/`Clone`) so the wrapper can capture it
@@ -83,6 +117,13 @@ pub struct DelegationContext {
     /// surface (either we're not inside a wake-up firing, or the wake-up
     /// opted out of inheritance via `Wakeup::inherit_restrictions = false`).
     pub wakeup_restrictions: Option<crate::wakeup_registry::WakeupSubagentRestrictions>,
+    /// Builds the sub-agent's bare registry scoped to its own sub-arc +
+    /// profile. `None` (CLI / tests) falls back to reusing the parent's base
+    /// registry — today's behavior.
+    pub sub_registry_factory: Option<SubRegistryFactory>,
+    /// Builds the sub-agent's per-arc router honoring the inherited pin.
+    /// `None` falls back to sharing the parent's handed-in router.
+    pub sub_router_factory: Option<SubRouterFactory>,
 }
 
 /// Wraps a base tool registry and exposes `delegate_to_agent` as an
@@ -254,6 +295,51 @@ impl ToolRegistry for DelegationToolRegistry {
     }
 }
 
+/// Copy the parent arc's runtime context onto a freshly-created sub-arc so
+/// the sub-agent runs with the SAME provider, model slug, tier, and
+/// reasoning effort as its parent. The sub-arc is brand new (pins unset), so
+/// `set_pinned_provider_if_unset` installs the parent's pin cleanly; tier +
+/// effort are last-write-wins setters. The per-call `reasoning_effort`
+/// delegate param (if any) is applied by the caller AFTER this runs, so it
+/// still wins over the inherited effort. Best-effort: a failed lookup or
+/// setter just leaves the sub-arc to re-pin against the live active provider.
+async fn propagate_parent_pins(
+    arc_store: &athen_persistence::arcs::ArcStore,
+    parent_arc_id: &str,
+    sub_arc_id: &str,
+) {
+    let parent = match arc_store.get_arc(parent_arc_id).await {
+        Ok(Some(p)) => p,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!("delegation: parent arc lookup failed: {e}");
+            return;
+        }
+    };
+    if let Some(provider_id) = parent.pinned_provider_id.as_deref() {
+        let slug = parent.pinned_slug.as_deref().unwrap_or_default();
+        if let Err(e) = arc_store
+            .set_pinned_provider_if_unset(sub_arc_id, provider_id, slug)
+            .await
+        {
+            tracing::warn!("delegation: propagate provider pin failed: {e}");
+        }
+    }
+    if let Some(tier) = parent.tier_override.as_deref() {
+        if let Err(e) = arc_store.set_tier_override(sub_arc_id, Some(tier)).await {
+            tracing::warn!("delegation: propagate tier override failed: {e}");
+        }
+    }
+    if let Some(effort) = parent.reasoning_effort_override.as_deref() {
+        if let Err(e) = arc_store
+            .set_reasoning_effort_override(sub_arc_id, Some(effort))
+            .await
+        {
+            tracing::warn!("delegation: propagate reasoning effort failed: {e}");
+        }
+    }
+}
+
 /// The actual delegation run: resolve the target profile, create a sub-arc,
 /// build a fresh executor whose tool registry is the bare base (no
 /// delegation), and execute a synthetic task built from the brief.
@@ -330,6 +416,12 @@ async fn run_delegation(
     {
         tracing::warn!("delegation: set_active_profile_id on sub-arc failed: {e}");
     }
+    // Inherit the parent arc's runtime context (provider pin, model slug,
+    // tier, reasoning effort) so the specialist runs on the SAME model as
+    // the parent rather than silently snapping to the global active
+    // provider. Runs BEFORE the per-call reasoning_effort block below so an
+    // explicit delegate-time effort still overrides the inherited one.
+    propagate_parent_pins(&ctx.arc_store, &ctx.parent_arc_id, &sub_arc_id).await;
     // Per-call reasoning_effort: write onto the sub-arc so the standard
     // resolver chain (state::resolve_reasoning_effort_for_arc) picks it
     // up when the sub-executor builds its LlmRequest. Validated via
@@ -366,28 +458,54 @@ async fn run_delegation(
     //    tool/contact allowlist + autonomy band propagate down. The
     //    restrictions snapshot was pre-resolved on the parent side, so
     //    no second contact-store lookup is needed.
+    //
+    //    Router: when a router factory is wired (the app paths), build a
+    //    per-arc router for the sub-arc — after `propagate_parent_pins` ran,
+    //    the sub-arc carries the parent's pin, so the factory resolves to the
+    //    same provider+slug. Without a factory (CLI/tests) we fall back to
+    //    sharing the parent's handed-in router.
+    let sub_router_cell = match &ctx.sub_router_factory {
+        Some(factory) => factory(sub_arc_id.clone()).await,
+        None => Arc::clone(&ctx.llm_router),
+    };
     let exec_router: Box<dyn LlmRouter> =
-        Box::new(crate::state::SharedRouter(Arc::clone(&ctx.llm_router)));
+        Box::new(crate::state::SharedRouter(Arc::clone(&sub_router_cell)));
+    //
+    //    Registry: when a registry factory is wired, build a registry scoped
+    //    to the sub-arc + sub-profile (correct GitHub identity, checkpoint
+    //    branch, approval-arc tag, identity/skill blocks). Without it we
+    //    reuse the parent's base — today's behavior. Either way the result is
+    //    bare (no delegation wrapper), so depth=1 holds.
+    let sub_base: Box<dyn ToolRegistry> = match &ctx.sub_registry_factory {
+        Some(factory) => factory(sub_arc_id.clone(), resolved.profile.id.clone()).await,
+        None => Box::new(ArcRegistryAdapter(base)),
+    };
     let sub_registry: Box<dyn ToolRegistry> = match &ctx.wakeup_restrictions {
         Some(restrictions) => Box::new(
             crate::wakeup_registry::WakeupRestrictedRegistry::new_with_resolved(
-                Box::new(ArcRegistryAdapter(base)),
+                sub_base,
                 restrictions.clone(),
             ),
         ),
-        None => Box::new(ArcRegistryAdapter(base)),
+        None => sub_base,
     };
 
-    // Sub-agent inherits the parent's router (and therefore the parent's
-    // provider), so the temperature override comes from the same active
-    // provider entry. Re-read config here rather than threading
-    // `active_provider_id` through `DelegationContext` — the alternative
-    // adds a field that has no other use, and `load_config` is already
-    // cheap (small TOML, fires per delegation, which is rare).
+    // Temperature follows the sub-arc's *effective* provider — the same one
+    // the router factory resolved above — rather than the global active
+    // provider. After `propagate_parent_pins`, that's the parent's pinned
+    // provider when the parent was pinned, so router + temperature agree.
     let sampling_temperature = {
         let cfg = crate::state::load_config();
         let active_id = crate::state::resolve_active_provider(&cfg);
-        crate::compaction::resolve_provider_temperature(&cfg, &active_id)
+        let target = crate::state::resolve_effective_provider_for_arc_with_config(
+            Some(&ctx.arc_store),
+            &sub_arc_id,
+            &active_id,
+            athen_core::llm::ModelProfile::Powerful,
+            &cfg,
+        )
+        .await;
+        crate::compaction::resolve_provider_temperature(&cfg, &target.provider_id)
     };
 
     // Identity block follows the *sub-agent's* profile, not the parent's —
