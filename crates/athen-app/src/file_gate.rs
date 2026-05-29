@@ -18,6 +18,7 @@ use tokio::sync::{oneshot, Mutex};
 use uuid::Uuid;
 
 use athen_agent::tools::{ShellExtraWritableProvider, ToolboxApprovalGate};
+use athen_core::config::SecurityMode;
 use athen_core::contact::TrustLevel;
 use athen_core::error::{AthenError, Result};
 use athen_core::paths::{self, DetectedRoot};
@@ -251,6 +252,13 @@ pub struct FileGate {
     /// question so the user can also answer from Telegram if they're
     /// not at the UI.
     telegram_approval_sink: Option<Arc<crate::approval::TelegramApprovalSink>>,
+    /// Effective security posture for this arc (per-arc override ⊕ live
+    /// global). Drives whether an out-of-workspace `HumanConfirm` write
+    /// prompt is lowered to silent-proceed under `Yolo`. See
+    /// [`file_write_decision_for_mode`]. Defaults to `Assistant`
+    /// (today's prompt-on-out-of-workspace behaviour) for callers that
+    /// don't set it.
+    security_mode: SecurityMode,
 }
 
 impl FileGate {
@@ -270,6 +278,7 @@ impl FileGate {
             pending,
             app_handle,
             telegram_approval_sink: None,
+            security_mode: SecurityMode::Assistant,
         }
     }
 
@@ -281,6 +290,18 @@ impl FileGate {
         sink: Arc<crate::approval::TelegramApprovalSink>,
     ) -> Self {
         self.telegram_approval_sink = Some(sink);
+        self
+    }
+
+    /// Set the effective security posture for this arc. Mirrors the shell
+    /// gate's `AgentBuilder::security_mode(...)`: under `Yolo`, an
+    /// out-of-workspace write that would normally prompt
+    /// (`HumanConfirm`) is lowered to silent-proceed. `HardBlock`
+    /// (system paths) is never lowered — exactly as the shell classifier
+    /// keeps `sudo` / `rm -rf` refused under Yolo. `Assistant` / `Bunker`
+    /// keep today's prompting behaviour.
+    pub fn with_security_mode(mut self, mode: SecurityMode) -> Self {
+        self.security_mode = mode;
         self
     }
 
@@ -452,7 +473,27 @@ impl FileGate {
             Access::Read
         };
 
-        let decision = self.evaluate_all(&abs_paths, access).await?;
+        let raw_decision = self.evaluate_all(&abs_paths, access).await?;
+        // Apply the arc's security posture: under Yolo, an
+        // out-of-workspace write that would prompt (HumanConfirm) is
+        // lowered to a silent notify-and-proceed. HardBlock (system
+        // paths) is never lowered. Mirrors the executor shell gate's
+        // `shell_upstream_for_mode`. Only the write side is affected —
+        // reads keep their own classification.
+        let decision = if access == PathAccess::Write {
+            let lowered = file_write_decision_for_mode(raw_decision, self.security_mode);
+            if lowered != raw_decision {
+                tracing::debug!(
+                    tool = name,
+                    mode = ?self.security_mode,
+                    paths = %display_paths(&abs_paths),
+                    "file gate lowered out-of-workspace write {raw_decision:?} -> {lowered:?} under Yolo",
+                );
+            }
+            lowered
+        } else {
+            raw_decision
+        };
 
         match decision {
             RiskDecision::SilentApprove | RiskDecision::NotifyAndProceed => {}
@@ -509,6 +550,30 @@ impl FileGate {
         }
 
         execute_direct(name, &abs_paths).await
+    }
+}
+
+/// Lower an out-of-workspace file-write gate decision according to the
+/// arc's security posture. Mirrors `executor::shell_upstream_for_mode`:
+///
+/// - `Yolo` lowers a `HumanConfirm` prompt (e.g. writing under `$HOME`
+///   outside the workspace) to `NotifyAndProceed` — the write runs, with
+///   a notification at most, never an approval prompt. This is the
+///   file-write analogue of the shell gate's `Yolo => SilentApprove`:
+///   only genuinely critical actions should still ask under Yolo.
+/// - `Assistant` / `Bunker` leave the decision untouched (today's
+///   prompt-on-out-of-workspace behaviour).
+///
+/// `HardBlock` (system-critical paths like `/etc`) is NEVER lowered,
+/// for any mode — exactly as the shell classifier keeps `sudo` / `rm -rf`
+/// refused under Yolo. `SilentApprove` / `NotifyAndProceed` are already
+/// non-prompting and pass through unchanged.
+fn file_write_decision_for_mode(decision: RiskDecision, mode: SecurityMode) -> RiskDecision {
+    match (mode, decision) {
+        (SecurityMode::Yolo, RiskDecision::HumanConfirm) => RiskDecision::NotifyAndProceed,
+        // HardBlock stays a refusal even under Yolo; everything else
+        // (including Assistant/Bunker HumanConfirm) is unchanged.
+        (_, d) => d,
     }
 }
 
@@ -788,6 +853,70 @@ mod tests {
             strictest(RiskDecision::HumanConfirm, RiskDecision::NotifyAndProceed),
             RiskDecision::HumanConfirm
         );
+    }
+
+    #[test]
+    fn yolo_lowers_out_of_workspace_write_gate() {
+        // Mirrors the executor shell gate: under Yolo, an out-of-workspace
+        // write that would prompt (HumanConfirm) proceeds silently with a
+        // notification instead.
+        assert_eq!(
+            file_write_decision_for_mode(RiskDecision::HumanConfirm, SecurityMode::Yolo),
+            RiskDecision::NotifyAndProceed,
+        );
+        // Already-silent decisions are unaffected.
+        assert_eq!(
+            file_write_decision_for_mode(RiskDecision::SilentApprove, SecurityMode::Yolo),
+            RiskDecision::SilentApprove,
+        );
+        assert_eq!(
+            file_write_decision_for_mode(RiskDecision::NotifyAndProceed, SecurityMode::Yolo),
+            RiskDecision::NotifyAndProceed,
+        );
+    }
+
+    #[test]
+    fn yolo_still_refuses_system_path_hard_block() {
+        // HardBlock (system-critical paths like /etc) is never lowered,
+        // exactly as the shell classifier keeps sudo / rm -rf refused
+        // under Yolo.
+        assert_eq!(
+            file_write_decision_for_mode(RiskDecision::HardBlock, SecurityMode::Yolo),
+            RiskDecision::HardBlock,
+        );
+    }
+
+    #[test]
+    fn assistant_and_bunker_keep_prompting() {
+        // Default builder = Assistant: out-of-workspace writes keep
+        // prompting. Bunker behaves identically here (no lowering).
+        for mode in [SecurityMode::Assistant, SecurityMode::Bunker] {
+            assert_eq!(
+                file_write_decision_for_mode(RiskDecision::HumanConfirm, mode),
+                RiskDecision::HumanConfirm,
+            );
+            assert_eq!(
+                file_write_decision_for_mode(RiskDecision::HardBlock, mode),
+                RiskDecision::HardBlock,
+            );
+        }
+        // The default `FileGate` (no `with_security_mode`) is Assistant.
+        assert_eq!(SecurityMode::Assistant, default_gate_mode());
+    }
+
+    /// Helper: the mode a freshly-built `FileGate` carries before any
+    /// `with_security_mode` call. Kept as a tiny fn so the default
+    /// contract is asserted in one place.
+    fn default_gate_mode() -> SecurityMode {
+        let conn = rusqlite::Connection::open_in_memory().expect("open db");
+        let store = GrantStore::new(Arc::new(TokioMutex::new(conn)));
+        let gate = FileGate::new(
+            "arc_default_mode".into(),
+            Arc::new(store),
+            Arc::new(TokioMutex::new(HashMap::new())),
+            None,
+        );
+        gate.security_mode
     }
 
     #[tokio::test]

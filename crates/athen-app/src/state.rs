@@ -515,6 +515,12 @@ pub(crate) struct ToolRegistryDeps {
     /// optional). Drives the `place_call` agent tool.
     pub notifier: Option<Arc<NotificationOrchestrator>>,
     pub active_provider_id: String,
+    /// Live global security posture (`AppState::security.load().mode`),
+    /// snapshotted at registry-build time. The base assembler resolves
+    /// the per-arc effective mode (`security_mode_override` ⊕ this) and
+    /// hands it to the `FileGate` so out-of-workspace writes skip the
+    /// approval prompt under `Yolo`. See `resolve_security_mode_for_arc`.
+    pub global_security_mode: athen_core::config::SecurityMode,
 }
 
 /// Single source of truth for assembling the per-arc agent tool
@@ -704,12 +710,22 @@ pub(crate) async fn assemble_base_app_tool_registry(
     .await;
     registry = registry.with_active_profile_id(active_profile_id);
     if let Some(grants) = deps.grant_store.clone() {
+        // Resolve the arc's effective security posture (override ⊕ global)
+        // so the file gate can lower out-of-workspace write prompts under
+        // Yolo, mirroring the executor's per-action shell gate.
+        let security_mode = resolve_security_mode_for_arc(
+            deps.arc_store.as_ref(),
+            arc_id,
+            deps.global_security_mode,
+        )
+        .await;
         let mut gate = crate::file_gate::FileGate::new(
             arc_id.to_string(),
             grants,
             deps.pending_grants.clone(),
             app_handle,
-        );
+        )
+        .with_security_mode(security_mode);
         if let Some(ref sink) = deps.telegram_approval_sink {
             gate = gate.with_telegram_approval(sink.clone());
         }
@@ -1618,6 +1634,7 @@ impl AppState {
                 .try_lock()
                 .map(|g| g.clone())
                 .unwrap_or_default(),
+            global_security_mode: self.security.load().mode,
         }
     }
 

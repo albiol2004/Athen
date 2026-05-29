@@ -3812,12 +3812,16 @@ pub(crate) async fn execute_approved_task(
         registry = registry.with_attachments(astore.clone());
     }
     if let Some(ref store) = ctx.grant_store {
+        // Same per-arc security posture the executor's shell gate uses
+        // (resolved once at task creation) so the file gate lowers
+        // out-of-workspace write prompts under Yolo.
         let mut gate = crate::file_gate::FileGate::new(
             ctx.active_arc_id.clone(),
             store.clone(),
             ctx.pending_grants.clone(),
             Some(ctx.app_handle.clone()),
-        );
+        )
+        .with_security_mode(ctx.security_mode);
         if let Some(ref sink) = ctx.telegram_approval_sink {
             gate = gate.with_telegram_approval(sink.clone());
         }
@@ -4941,12 +4945,16 @@ pub(crate) async fn execute_dispatched_task(
         registry = registry.with_attachments(astore.clone());
     }
     if let Some(ref store) = ctx.grant_store {
+        // Same per-arc security posture the executor's shell gate uses
+        // (resolved once at task creation) so the file gate lowers
+        // out-of-workspace write prompts under Yolo.
         let mut gate = crate::file_gate::FileGate::new(
             arc_id.clone(),
             store.clone(),
             ctx.pending_grants.clone(),
             Some(ctx.app_handle.clone()),
-        );
+        )
+        .with_security_mode(ctx.security_mode);
         if let Some(ref sink) = ctx.telegram_approval_sink {
             gate = gate.with_telegram_approval(sink.clone());
         }
