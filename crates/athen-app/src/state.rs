@@ -292,8 +292,10 @@ pub struct AppState {
     /// Hot-swappable: `save_embedding_settings` rebuilds the embedding router
     /// from current config and swaps it under the lock, so an embedding-mode
     /// change applies without a restart. Read via `.read()` per use.
-    pub profile_embedder:
-        std::sync::RwLock<Arc<dyn athen_core::traits::embedding::EmbeddingProvider>>,
+    /// Shared hot-swappable embedder cell — see [`EmbedderCell`]. The memory
+    /// store holds a [`SwappableEmbedder`] over the *same* cell, so
+    /// `reload_embedder` updates both the profile path and memory at once.
+    pub profile_embedder: EmbedderCell,
     /// In-memory cache of embedded profile text, keyed by profile id and
     /// invalidated by the profile's `updated_at`. Populated lazily during
     /// routing — embedding 12 short strings is cheap, but caching makes
@@ -854,8 +856,16 @@ impl AppState {
         }
         let (active_arc_id, history) = restore_or_create_arc(&arc_store).await;
 
+        // Shared, hot-swappable embedder cell. Built once here and shared by
+        // both the memory store (via SwappableEmbedder) and the profile path,
+        // so `reload_embedder` / `start_embedder_warmup` updates every consumer
+        // with a single swap — no rebuild, no restart.
+        let initial_embedder: Arc<dyn athen_core::traits::embedding::EmbeddingProvider> =
+            Arc::new(build_embedding_router(&config.embeddings));
+        let embedder_cell: EmbedderCell = Arc::new(std::sync::RwLock::new(initial_embedder));
+
         // Build persistent memory (vector search + knowledge graph).
-        let memory = build_memory(&router, &config.embeddings).await;
+        let memory = build_memory(&router, embedder_cell.clone()).await;
 
         // Build the MCP registry and load persisted enabled state.
         // Pass the vault through so BYO `Process` MCPs can resolve
@@ -904,12 +914,10 @@ impl AppState {
         // sweeps stray .md files out of the tools dir on every refresh,
         // which would nuke a sibling endpoint catalogue.
         let cloud_apis_doc_path = ensure_data_dir().map(|d| d.join("cloud_apis.md"));
-        // Build an embedding router for profile routing. Same shape as the
-        // memory subsystem's embedder: real providers can be wired later
-        // from settings; until then it falls back to keyword embeddings,
-        // which still produce a usable cosine signal across short strings.
-        let profile_embedder: Arc<dyn athen_core::traits::embedding::EmbeddingProvider> =
-            Arc::new(build_embedding_router(&config.embeddings));
+        // Profile routing shares the same hot-swappable `embedder_cell` built
+        // above (so a settings/warmup swap reaches it too). Until a neural
+        // provider is wired, the cell holds the keyword fallback, which still
+        // produces a usable cosine signal across short strings.
         let profile_embedding_cache = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         let pending_grants = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let spawned_processes: athen_agent::SpawnedProcessMap =
@@ -990,7 +998,7 @@ impl AppState {
             skill_store,
             wakeup_store,
             wakeup_scheduler_shutdown: std::sync::Mutex::new(None),
-            profile_embedder: std::sync::RwLock::new(profile_embedder),
+            profile_embedder: embedder_cell,
             profile_embedding_cache,
             pending_grants,
             spawned_processes,
@@ -1948,6 +1956,127 @@ impl AppState {
             .profile_embedder
             .write()
             .expect("profile_embedder lock") = rebuilt;
+    }
+
+    /// Ensure a real (neural) embedder is available out of the box, so
+    /// memory "just works" for users who never touch the Embedding
+    /// settings. Spawns a background task that, when the effective mode
+    /// would otherwise leave us on the weak keyword fallback, downloads
+    /// the bundled Light tier (~270 MB, multilingual-e5-small) and then
+    /// hot-swaps the live embedder via `reload_embedder`.
+    ///
+    /// Trigger rules (evaluated against the *hydrated* config):
+    /// - `Automatic` with **no** cloud embedding api_key → ensure Light
+    ///   (the builtin fallback that sits below Ollama/cloud in the chain).
+    /// - `Bundled { tier }` → ensure that explicit tier is present, in
+    ///   case a Settings download was interrupted.
+    /// - `Off` / `Cloud` / `Specific` / `LocalOnly` → do nothing; the
+    ///   user has either disabled memory or picked a provider explicitly.
+    ///
+    /// Idempotent and cheap when the weights already exist (it just
+    /// returns). Network failures are non-fatal — we stay on keyword and
+    /// retry on the next launch. Runs after `app.manage()` so the task
+    /// can fetch the managed `AppState` to call `reload_embedder`.
+    pub fn start_embedder_warmup(&self, app_handle: tauri::AppHandle) {
+        let vault = self.vault.clone();
+        tauri::async_runtime::spawn(async move {
+            let mut cfg = crate::settings::load_main_config_public();
+            crate::vault_creds::hydrate_secrets_from_vault(vault.as_ref(), &mut cfg).await;
+
+            use athen_core::config::{BundledTier, EmbeddingMode};
+            let tier = match cfg.embeddings.mode {
+                EmbeddingMode::Off => None,
+                EmbeddingMode::Bundled { tier } => Some(tier),
+                EmbeddingMode::Automatic => {
+                    let has_cloud_key = cfg
+                        .embeddings
+                        .api_key
+                        .as_deref()
+                        .is_some_and(|s| !s.is_empty());
+                    if has_cloud_key {
+                        None
+                    } else {
+                        Some(BundledTier::Light)
+                    }
+                }
+                // Explicit provider modes — respect the user's choice.
+                EmbeddingMode::Cloud | EmbeddingMode::Specific | EmbeddingMode::LocalOnly => None,
+            };
+            let Some(tier) = tier else {
+                return;
+            };
+
+            let Some(data_dir) = athen_core::paths::athen_data_dir() else {
+                return;
+            };
+            let cache_dir = data_dir.join("embeddings");
+
+            #[cfg(feature = "bundled-embeddings")]
+            {
+                if crate::bundled_embeddings::is_tier_downloaded(&cache_dir, tier) {
+                    // Already present — the boot-time router build already
+                    // saw it (Automatic arm / Bundled arm), nothing to do.
+                    return;
+                }
+                use tauri::Emitter;
+                tracing::info!(
+                    tier = ?tier,
+                    "Embedder warmup: downloading bundled model so memory works out of the box"
+                );
+                let _ = app_handle.emit(
+                    "embedding-download-progress",
+                    serde_json::json!({
+                        "tier": tier,
+                        "phase": "starting",
+                        "message": "Setting up local memory…",
+                    }),
+                );
+                // fastembed exposes init only through embed() — a single
+                // warmup string triggers download + ONNX load and returns
+                // once both are done. The vector itself is discarded.
+                let provider =
+                    athen_llm::embeddings::bundled::BundledEmbedding::new(cache_dir, tier);
+                let result = {
+                    use athen_core::traits::embedding::EmbeddingProvider;
+                    provider.embed("warmup").await
+                };
+                match result {
+                    Ok(_) => {
+                        tracing::info!(
+                            "Embedder warmup: bundled model ready; hot-swapping live embedder"
+                        );
+                        let _ = app_handle.emit(
+                            "embedding-download-progress",
+                            serde_json::json!({
+                                "tier": tier,
+                                "phase": "complete",
+                                "message": "Local memory ready.",
+                            }),
+                        );
+                        use tauri::Manager;
+                        app_handle.state::<AppState>().reload_embedder().await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "Embedder warmup: download failed; staying on keyword fallback until next launch"
+                        );
+                        let _ = app_handle.emit(
+                            "embedding-download-progress",
+                            serde_json::json!({
+                                "tier": tier,
+                                "phase": "failed",
+                                "message": format!("Local memory setup failed: {e}"),
+                            }),
+                        );
+                    }
+                }
+            }
+            #[cfg(not(feature = "bundled-embeddings"))]
+            {
+                let _ = (cache_dir, tier);
+            }
+        });
     }
 
     /// Spawn the wake-up scheduler loop. Idempotent — does nothing if the
@@ -4570,6 +4699,57 @@ pub(crate) fn arc_router_for(
     Arc::new(tokio::sync::RwLock::new(router))
 }
 
+/// Shared, hot-swappable embedder cell whose inner provider is replaced
+/// atomically by `reload_embedder` / `start_embedder_warmup`. Every holder of a
+/// clone sees the new provider on its next call — no rebuild, no restart.
+pub(crate) type EmbedderCell =
+    Arc<std::sync::RwLock<Arc<dyn athen_core::traits::embedding::EmbeddingProvider>>>;
+
+/// `EmbeddingProvider` view over an [`EmbedderCell`]. The memory store holds one
+/// of these (boxed) while the profile path holds the cell directly, so a single
+/// swap of the cell updates both consumers at once. Reads clone the current
+/// provider `Arc` out from under the lock before awaiting, so the (sync) lock is
+/// never held across an `.await`.
+pub(crate) struct SwappableEmbedder {
+    cell: EmbedderCell,
+}
+
+impl SwappableEmbedder {
+    pub(crate) fn new(cell: EmbedderCell) -> Self {
+        Self { cell }
+    }
+
+    fn current(&self) -> Arc<dyn athen_core::traits::embedding::EmbeddingProvider> {
+        self.cell.read().expect("embedder cell lock").clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl athen_core::traits::embedding::EmbeddingProvider for SwappableEmbedder {
+    fn provider_id(&self) -> &str {
+        "swappable"
+    }
+
+    fn dimensions(&self) -> usize {
+        self.current().dimensions()
+    }
+
+    async fn embed(&self, text: &str) -> athen_core::error::Result<Vec<f32>> {
+        let provider = self.current();
+        provider.embed(text).await
+    }
+
+    async fn embed_batch(&self, texts: &[String]) -> athen_core::error::Result<Vec<Vec<f32>>> {
+        let provider = self.current();
+        provider.embed_batch(texts).await
+    }
+
+    async fn is_available(&self) -> bool {
+        let provider = self.current();
+        provider.is_available().await
+    }
+}
+
 /// Build an `EmbeddingRouter` from `config.embeddings`.
 ///
 /// Mode behaviour:
@@ -4581,9 +4761,10 @@ pub(crate) fn arc_router_for(
 ///   the user didn't override `base_url` / `model`.
 /// - `Specific` → uses `cfg.provider` to pick (`"ollama"` →
 ///   OllamaEmbedding, anything else → OpenAiEmbedding::compatible).
-/// - `Automatic` → opportunistic: build providers from any populated
-///   field, with Ollama probed first via `is_available`. If nothing
-///   configured, falls through to keyword.
+/// - `Automatic` → Ollama (if running) → cloud (if api_key) → bundled
+///   builtin (if its weights are on disk) → keyword. The disk-gated
+///   builtin push is what `start_embedder_warmup` populates in the
+///   background so memory works out of the box.
 fn build_embedding_router(
     cfg: &athen_core::config::EmbeddingConfig,
 ) -> athen_llm::embeddings::router::EmbeddingRouter {
@@ -4691,11 +4872,15 @@ fn build_embedding_router(
             }
         },
         EmbeddingMode::Automatic => {
-            // TODO(phase-3): once the bundled model has actually been
-            // downloaded to <data_dir>/embeddings/ (status check), the
-            // Automatic arm should prefer it over Ollama. For now,
-            // Automatic stays Ollama-first; users who want the bundled
-            // model pick `EmbeddingMode::Bundled { tier }` explicitly.
+            // Resolution order: Ollama (if running) → cloud (if an api_key
+            // is set) → bundled builtin (if its weights are already on
+            // disk) → keyword. The builtin arm is what makes memory "just
+            // work" for users who configure nothing: `start_embedder_warmup`
+            // downloads the Light tier in the background at startup, and
+            // once it lands this push has something to find (after a
+            // `reload_embedder`). Keyword stays the genuine last resort —
+            // it only wins when there's no Ollama, no key, and no
+            // downloaded model (e.g. a first run that's still offline).
 
             // Try Ollama at the default endpoint first. is_available()
             // pings /api/tags and returns false fast when nothing's
@@ -4714,9 +4899,30 @@ fn build_embedding_router(
                 }
                 providers.push(Box::new(p));
             }
+            // Bundled builtin fallback. Only pushed when the weights are
+            // already cached — BundledEmbedding::is_available() is always
+            // true, so pushing it before download would make the router
+            // pick it and then error offline instead of degrading to
+            // keyword. Disk-gating keeps keyword as the no-connection floor.
+            #[cfg(feature = "bundled-embeddings")]
+            {
+                if let Some(data_dir) = ensure_data_dir() {
+                    let cache_dir = data_dir.join("embeddings");
+                    let tier = athen_core::config::BundledTier::Light;
+                    if crate::bundled_embeddings::is_tier_downloaded(&cache_dir, tier) {
+                        info!(
+                            tier = ?tier,
+                            "Embeddings: Automatic — bundled builtin available as fallback"
+                        );
+                        providers.push(Box::new(
+                            athen_llm::embeddings::bundled::BundledEmbedding::new(cache_dir, tier),
+                        ));
+                    }
+                }
+            }
             info!(
                 provider_count = providers.len(),
-                "Embeddings: Automatic — Ollama first then keyword"
+                "Embeddings: Automatic — Ollama → cloud/builtin → keyword"
             );
         }
     }
@@ -5397,7 +5603,7 @@ async fn restore_enabled_mcps(registry: &Arc<McpRegistry>, store: &McpStore) -> 
 /// Returns `None` if the data directory or database cannot be opened.
 async fn build_memory(
     router: &Arc<RwLock<Arc<DefaultLlmRouter>>>,
-    embeddings: &athen_core::config::EmbeddingConfig,
+    embedder_cell: EmbedderCell,
 ) -> Option<Arc<Memory>> {
     use athen_memory::extractor::LlmEntityExtractor;
     use athen_memory::sqlite::{SqliteGraph, SqliteLexicalIndex, SqliteVectorIndex};
@@ -5450,11 +5656,10 @@ async fn build_memory(
         }
     };
 
-    // Build the embedding router from config — when no neural provider
-    // is configured this collapses to the keyword fallback inside
-    // `EmbeddingRouter::resolve`.
-    let embedding_router = build_embedding_router(embeddings);
-    // LLM entity extractor for automatic knowledge graph population.
+    // Embedder is the shared hot-swappable cell (see EmbedderCell): a
+    // `reload_embedder` / `start_embedder_warmup` swap reaches the memory store
+    // live, no rebuild. When no neural provider is configured the cell holds an
+    // EmbeddingRouter that collapses to the keyword fallback inside `resolve`.
     let extractor_router: Box<dyn LlmRouter> = Box::new(SharedRouter(Arc::clone(router)));
     let extractor = LlmEntityExtractor::new(extractor_router);
 
@@ -5462,7 +5667,7 @@ async fn build_memory(
     // The hybrid ranker fuses semantic + lexical (BM25) + graph + recency +
     // frequency; see athen_core::traits::memory::FusionWeights.
     let memory = Memory::new(Box::new(vector), Box::new(graph))
-        .with_embedder(Box::new(embedding_router))
+        .with_embedder(Box::new(SwappableEmbedder::new(embedder_cell)))
         .with_extractor(Box::new(extractor))
         .with_lexical(Box::new(lexical));
 

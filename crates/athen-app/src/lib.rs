@@ -386,6 +386,15 @@ pub fn run() {
             // so the Telegram poll loop and other background work keep
             // running. The tray menu provides a real Quit.
             let state_ref = app.state::<AppState>();
+
+            // Ensure memory has a real embedder out of the box: if nothing
+            // is configured (the default `Automatic` with no Ollama/cloud
+            // key), download the bundled Light model in the background and
+            // hot-swap it in, so non-technical users get semantic recall
+            // without touching Settings. No-op when already present or when
+            // the user picked a provider explicitly.
+            state_ref.start_embedder_warmup(app.handle().clone());
+
             let notifier_for_focus = state_ref.notifier.load_full();
             if let Some(window) = app.get_webview_window("main") {
                 let win_for_event = window.clone();
