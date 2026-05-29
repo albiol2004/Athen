@@ -1520,10 +1520,11 @@
         <div class="profile-modal">
             <div class="profile-modal-header">
                 <h2 id="profile-modal-title">New Profile</h2>
-                <button id="profile-modal-close" class="cal-modal-close-btn" type="button">&times;</button>
+                <button id="profile-modal-close" class="cal-modal-close-btn" type="button" aria-label="Close"><svg class="profile-modal-close-icon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
             </div>
             <div class="profile-modal-body">
                 <input type="hidden" id="profile-edit-id">
+                <div class="profile-modal-section">Identity</div>
                 <div class="cal-field">
                     <label for="profile-display-name">Display name</label>
                     <input type="text" id="profile-display-name" class="settings-input" placeholder="e.g. Cold Email Pro">
@@ -1536,10 +1537,12 @@
                     <label for="profile-description">Description</label>
                     <input type="text" id="profile-description" class="settings-input" placeholder="One-line summary shown in the agent picker.">
                 </div>
+                <div class="profile-modal-section">Behavior</div>
                 <div class="cal-field">
                     <label for="profile-persona">Persona instructions</label>
                     <textarea id="profile-persona" rows="6" class="settings-input" placeholder="How should this agent behave? Voice, mission, constraints..."></textarea>
                 </div>
+                <div class="profile-modal-section">Routing</div>
                 <div class="cal-field">
                     <label>Domains</label>
                     <div id="profile-domains" class="profile-chip-grid"></div>
@@ -1556,6 +1559,7 @@
                     <label>Avoid <span class="permissions-subnote">(task kinds this agent shouldn't be routed to)</span></label>
                     <div id="profile-avoid" class="profile-chip-grid"></div>
                 </div>
+                <div class="profile-modal-section">Integrations</div>
                 <div class="cal-field">
                     <label for="profile-model-hint">Model hint <span class="permissions-subnote">(optional — defaults to your active model)</span></label>
                     <input type="text" id="profile-model-hint" class="settings-input" placeholder="e.g. Smart">
@@ -1588,7 +1592,7 @@
         <div class="profile-modal">
             <div class="profile-modal-header">
                 <h2 id="identity-category-modal-title">New category</h2>
-                <button id="identity-category-modal-close" class="cal-modal-close-btn" type="button">&times;</button>
+                <button id="identity-category-modal-close" class="cal-modal-close-btn" type="button" aria-label="Close"><svg class="profile-modal-close-icon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
             </div>
             <div class="profile-modal-body">
                 <input type="hidden" id="identity-category-original-name">
@@ -1617,9 +1621,10 @@
         <div class="profile-modal cloud-api-modal">
             <div class="profile-modal-header">
                 <h2 id="cloud-api-modal-title">New endpoint</h2>
-                <button id="cloud-api-modal-close" class="cal-modal-close-btn" type="button">&times;</button>
+                <button id="cloud-api-modal-close" class="cal-modal-close-btn" type="button" aria-label="Close"><svg class="profile-modal-close-icon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
             </div>
             <div class="profile-modal-body">
+                <div class="profile-modal-section">Endpoint</div>
                 <div class="cal-field">
                     <label for="cloud-api-preset">Preset</label>
                     <select id="cloud-api-preset" class="settings-input"></select>
@@ -1637,6 +1642,7 @@
                     <label for="cloud-api-base-url">Base URL</label>
                     <input type="text" id="cloud-api-base-url" class="settings-input" placeholder="https://api.example.com/v1/">
                 </div>
+                <div class="profile-modal-section">Authentication</div>
                 <div class="cal-field">
                     <label for="cloud-api-auth-kind">Auth method</label>
                     <select id="cloud-api-auth-kind" class="settings-input">
@@ -1662,6 +1668,7 @@
                     <p class="setting-hint" id="cloud-api-auth-prefix-hint" hidden></p>
                     <p class="setting-hint">Stored encrypted in the OS keychain (or encrypted-file fallback). Never written to <code>config.toml</code>.</p>
                 </div>
+                <div class="profile-modal-section">Policy</div>
                 <div class="cal-field">
                     <label for="cloud-api-rate-limit">Rate limit (req/min, 0 = none)</label>
                     <input type="number" id="cloud-api-rate-limit" class="settings-input" min="0" max="10000" value="0">
@@ -1698,7 +1705,7 @@
         <div class="profile-modal mcp-server-modal">
             <div class="profile-modal-header">
                 <h2 id="mcp-server-modal-title">New MCP server</h2>
-                <button id="mcp-server-modal-close" class="cal-modal-close-btn" type="button">&times;</button>
+                <button id="mcp-server-modal-close" class="cal-modal-close-btn" type="button" aria-label="Close"><svg class="profile-modal-close-icon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
             </div>
             <div class="profile-modal-body">
                 <div class="cal-field">

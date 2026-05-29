@@ -6307,11 +6307,12 @@ option:hover {
 .profile-token-budget-body {
     display: flex;
     flex-direction: column;
-    gap: 6px;
-    padding: 10px 12px;
-    background: var(--surface-1);
+    gap: 7px;
+    padding: 12px 14px;
+    background: var(--surface-2);
     border: 1px solid var(--border);
     border-radius: var(--r-md);
+    box-shadow: var(--glass-shimmer);
     font-family: var(--mono);
     font-variant-numeric: tabular-nums;
     font-size: 12px;
@@ -6335,15 +6336,16 @@ option:hover {
 }
 .profile-token-row-bar {
     height: 6px;
-    background: var(--surface-2);
-    border-radius: 3px;
+    background: var(--surface-4);
+    border-radius: var(--r-pill);
     overflow: hidden;
 }
 .profile-token-row-bar > span {
     display: block;
     height: 100%;
-    background: var(--info, #7aa2f7);
-    opacity: 0.7;
+    border-radius: var(--r-pill);
+    background: var(--brand-grad);
+    transition: width var(--dur-slow) var(--ease);
 }
 .profile-token-row.total {
     margin-top: 4px;
@@ -6365,10 +6367,13 @@ option:hover {
 .profile-modal-overlay {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.7);
+    background: rgba(0, 0, 0, 0.55);
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
     display: grid;
     place-items: center;
     z-index: 220;
+    padding: 24px;
     animation: fade-in var(--dur) var(--ease);
 }
 .profile-modal-overlay.hidden { display: none; }
@@ -6385,39 +6390,94 @@ option:hover {
     animation: modal-in var(--dur-slow) var(--ease);
 }
 .profile-modal-header {
+    position: relative;
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 14px 18px;
+    padding: 16px 20px;
     border-bottom: 1px solid var(--border);
+}
+/* Subtle brand-tinted top accent so the header reads intentional. */
+.profile-modal-header::before {
+    content: "";
+    position: absolute;
+    inset: 0 0 auto 0;
+    height: 2px;
+    background: var(--brand-grad);
+    opacity: 0.9;
 }
 .profile-modal-header h2 {
     margin: 0;
-    font-size: 15px;
+    font-size: 16px;
     font-weight: 600;
+    letter-spacing: -0.01em;
     color: var(--text);
 }
 .profile-modal-body {
     overflow-y: auto;
-    padding: 16px 18px;
+    padding: 18px 20px;
     display: flex;
     flex-direction: column;
-    gap: 12px;
+    gap: 14px;
+}
+/* Section sub-headers group the long profile editor into Identity /
+   Behavior / Routing / Integrations bands. Additive markup only. */
+.profile-modal-section {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 6px 0 -2px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-3);
+}
+.profile-modal-section:first-child { margin-top: 0; }
+.profile-modal-section::after {
+    content: "";
+    flex: 1;
+    height: 1px;
+    background: var(--border);
 }
 .profile-modal-actions {
     display: flex;
     justify-content: flex-end;
     gap: 8px;
-    padding: 12px 18px;
+    padding: 14px 20px 18px;
     border-top: 1px solid var(--border);
     background: var(--surface-1);
 }
 .profile-modal-error {
-    color: var(--danger, #f7768e);
+    color: var(--danger);
     font-size: 12px;
     margin: 0;
+    padding: 8px 10px;
+    background: var(--danger-soft);
+    border-radius: var(--r-sm);
 }
 .profile-modal-error.hidden { display: none; }
+
+/* Close button — circular hover hit-area + focus ring, brand-aware. */
+.profile-modal-header .cal-modal-close-btn {
+    width: 30px;
+    height: 30px;
+    border-radius: var(--r-pill);
+    flex-shrink: 0;
+}
+.profile-modal-header .cal-modal-close-btn:hover {
+    background: var(--overlay-hover);
+    color: var(--text);
+}
+.profile-modal-header .cal-modal-close-btn:focus-visible {
+    outline: none;
+    box-shadow: var(--ring-focus);
+}
+.profile-modal-close-icon {
+    display: block;
+    pointer-events: none;
+}
+
 .profile-chip-grid {
     display: flex;
     flex-wrap: wrap;
@@ -6426,9 +6486,9 @@ option:hover {
 .profile-chip {
     display: inline-flex;
     align-items: center;
-    padding: 4px 10px;
+    padding: 5px 11px;
     border: 1px solid var(--border);
-    border-radius: 999px;
+    border-radius: var(--r-pill);
     font-size: 11px;
     color: var(--text-2);
     cursor: pointer;
@@ -6436,11 +6496,17 @@ option:hover {
     background: var(--surface-2);
     transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease), color var(--dur) var(--ease);
 }
-.profile-chip:hover { border-color: var(--border-strong); }
-.profile-chip.selected {
-    background: rgba(122, 162, 247, 0.18);
-    border-color: rgba(122, 162, 247, 0.5);
+.profile-chip:hover {
+    border-color: var(--brand-solid);
     color: var(--text);
+}
+.profile-chip.selected {
+    background: var(--brand-glow-strong);
+    border-color: var(--brand-solid);
+    color: var(--brand-warm);
+}
+.profile-chip.selected:hover {
+    color: var(--brand-warm);
 }
 
 /* ─── Identity panel ─── */
@@ -8318,7 +8384,7 @@ option:hover {
     align-items: center;
     gap: 4px;
     font-size: 12px;
-    color: var(--text-muted, #aaa);
+    color: var(--text-2);
     white-space: nowrap;
 }
 
@@ -8333,17 +8399,17 @@ option:hover {
 
 .mcp-server-test-result {
     margin-top: 8px;
-    font-family: monospace;
+    font-family: var(--mono);
     font-size: 12px;
     padding: 8px 10px;
-    border-radius: 4px;
+    border-radius: var(--r-sm);
     background: var(--overlay-hover);
     word-break: break-word;
     white-space: pre-wrap;
 }
 .mcp-server-test-result.mcp-server-test-ok { background: var(--success-soft); color: var(--success); }
 .mcp-server-test-result.mcp-server-test-fail { background: var(--danger-soft); color: var(--danger); }
-.mcp-server-test-result.mcp-server-test-pending { background: rgba(96, 165, 250, 0.12); color: #93c5fd; }
+.mcp-server-test-result.mcp-server-test-pending { background: var(--info-soft); color: var(--info); }
 
 /* ─── Calendar Sources (Settings → Connections) ─── */
 .calendar-sources-list {
