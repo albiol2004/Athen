@@ -47,18 +47,31 @@ pub fn apply_tool_selection(
     tools: &[athen_core::tool::ToolDefinition],
     selection: &ToolSelection,
 ) -> Vec<athen_core::tool::ToolDefinition> {
+    use athen_core::subagent::is_spawn_subagent_name;
     match selection {
         ToolSelection::All => tools.to_vec(),
+        // `spawn_subagent` is a universal capability: every profile can
+        // hand work to a specialist. A positive whitelist (`Groups` /
+        // `Explicit`) is about prompt-budget tiering, never about denying
+        // delegation — so force-include the subagent tool regardless of
+        // whether its group ("delegate") or name was listed. This is what
+        // lets the group-restricted `coder` profile delegate.
         ToolSelection::Groups(allowed) => tools
             .iter()
-            .filter(|t| allowed.iter().any(|g| g == group_for(&t.name)))
+            .filter(|t| {
+                is_spawn_subagent_name(&t.name)
+                    || allowed.iter().any(|g| g == group_for(&t.name))
+            })
             .cloned()
             .collect(),
         ToolSelection::Explicit(allowed) => tools
             .iter()
-            .filter(|t| allowed.iter().any(|n| n == &t.name))
+            .filter(|t| is_spawn_subagent_name(&t.name) || allowed.iter().any(|n| n == &t.name))
             .cloned()
             .collect(),
+        // `Deny` is an *explicit* blacklist — the user named the tool. We
+        // honor it as the deliberate opt-out: a profile that lists
+        // `spawn_subagent` (or the legacy alias) in `Deny` loses it.
         ToolSelection::Deny(denied) => tools
             .iter()
             .filter(|t| !denied.iter().any(|n| n == &t.name))
@@ -3767,6 +3780,38 @@ mod tests {
             apply_tool_selection(&tools, &ToolSelection::Deny(vec!["shell_execute".into()]));
         assert!(!denied.iter().any(|t| t.name == "shell_execute"));
         assert_eq!(denied.len(), tools.len() - 1);
+    }
+
+    /// `spawn_subagent` is force-included past positive whitelists (so the
+    /// group-restricted `coder` profile can delegate), but an explicit
+    /// `Deny` still removes it.
+    #[test]
+    fn spawn_subagent_survives_whitelists_but_honors_deny() {
+        use athen_core::agent_profile::ToolSelection;
+        let tools = vec![
+            tool_def("shell_execute", "s"),
+            tool_def("spawn_subagent", "d"),
+        ];
+
+        // Group whitelist that does NOT contain the "delegate" group still
+        // keeps the subagent tool (this is the coder-profile regression).
+        let groups = apply_tool_selection(&tools, &ToolSelection::Groups(vec!["shell".into()]));
+        assert!(groups.iter().any(|t| t.name == "spawn_subagent"));
+
+        // Explicit whitelist that does NOT name it still keeps it.
+        let explicit =
+            apply_tool_selection(&tools, &ToolSelection::Explicit(vec!["shell_execute".into()]));
+        assert!(explicit.iter().any(|t| t.name == "spawn_subagent"));
+
+        // The legacy alias is force-included too.
+        let alias_tools = vec![tool_def("delegate_to_agent", "d")];
+        let alias = apply_tool_selection(&alias_tools, &ToolSelection::Groups(vec!["files".into()]));
+        assert!(alias.iter().any(|t| t.name == "delegate_to_agent"));
+
+        // Explicit Deny is the deliberate opt-out.
+        let denied =
+            apply_tool_selection(&tools, &ToolSelection::Deny(vec!["spawn_subagent".into()]));
+        assert!(!denied.iter().any(|t| t.name == "spawn_subagent"));
     }
 
     /// Tool registry that records dispatch *order* and sleeps in each call so
