@@ -1264,7 +1264,10 @@ mod tests {
         // Yolo short-circuits to approved without touching the router.
         let gate = RouterToolboxApprovalGate::new(sinkless_router(), Some("arc_x".into()))
             .with_security_mode(SecurityMode::Yolo);
-        assert!(gate.confirm_install("python", "requests", "needed for HTTP").await);
+        assert!(
+            gate.confirm_install("python", "requests", "needed for HTTP")
+                .await
+        );
     }
 
     #[tokio::test]

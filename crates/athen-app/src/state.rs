@@ -601,12 +601,9 @@ pub(crate) async fn assemble_base_app_tool_registry(
     // approval gate (file/email/telegram/toolbox/telephony). Under Yolo
     // each gate skips its prompt and proceeds; HardBlock-equivalent
     // refusals stay upstream in the risk/coordinator gates.
-    let security_mode = resolve_security_mode_for_arc(
-        deps.arc_store.as_ref(),
-        arc_id,
-        deps.global_security_mode,
-    )
-    .await;
+    let security_mode =
+        resolve_security_mode_for_arc(deps.arc_store.as_ref(), arc_id, deps.global_security_mode)
+            .await;
     // TODO(plan-cake): wire UserNotifier impl that forwards a
     // Notification to the same plumbing proactive_hints.rs uses
     // (app_handle.emit("notification", ...) + NotificationOrchestrator)
@@ -639,12 +636,13 @@ pub(crate) async fn assemble_base_app_tool_registry(
             )
             .with_security_mode(security_mode),
         ));
-        let gate: Arc<dyn athen_agent::EmailSendApprovalGate> =
-            Arc::new(crate::email_gate::RouterEmailApprovalGate::new(
+        let gate: Arc<dyn athen_agent::EmailSendApprovalGate> = Arc::new(
+            crate::email_gate::RouterEmailApprovalGate::new(
                 router.clone(),
                 Some(arc_id.to_string()),
             )
-            .with_security_mode(security_mode));
+            .with_security_mode(security_mode),
+        );
         shell = shell.with_email_approval(gate);
         let tg_gate: Arc<dyn athen_agent::tools::TelegramSendApprovalGate> = Arc::new(
             crate::email_gate::RouterTelegramApprovalGate::new(router, Some(arc_id.to_string()))
