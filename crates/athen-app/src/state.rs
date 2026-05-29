@@ -795,17 +795,14 @@ pub(crate) fn build_delegation_context(
     arc_store: ArcStore,
     identity_store: Option<Arc<athen_persistence::identity::SqliteIdentityStore>>,
     skill_store: Option<Arc<athen_persistence::skills::SqliteSkillStore>>,
-    http_endpoint_store: Option<
-        Arc<athen_persistence::http_endpoints::SqliteHttpEndpointStore>,
-    >,
+    http_endpoint_store: Option<Arc<athen_persistence::http_endpoints::SqliteHttpEndpointStore>>,
     tool_doc_dir: Option<std::path::PathBuf>,
     llm_router: Arc<RwLock<Arc<DefaultLlmRouter>>>,
     parent_arc_id: String,
     app_handle: Option<tauri::AppHandle>,
     wakeup_restrictions: Option<crate::wakeup_registry::WakeupSubagentRestrictions>,
 ) -> crate::delegation::DelegationContext {
-    let (sub_registry_factory, sub_router_factory) =
-        build_subagent_factories(app_handle.as_ref());
+    let (sub_registry_factory, sub_router_factory) = build_subagent_factories(app_handle.as_ref());
     crate::delegation::DelegationContext {
         profile_store,
         identity_store,

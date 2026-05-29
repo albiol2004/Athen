@@ -59,8 +59,7 @@ pub fn apply_tool_selection(
         ToolSelection::Groups(allowed) => tools
             .iter()
             .filter(|t| {
-                is_spawn_subagent_name(&t.name)
-                    || allowed.iter().any(|g| g == group_for(&t.name))
+                is_spawn_subagent_name(&t.name) || allowed.iter().any(|g| g == group_for(&t.name))
             })
             .cloned()
             .collect(),
@@ -3799,13 +3798,16 @@ mod tests {
         assert!(groups.iter().any(|t| t.name == "spawn_subagent"));
 
         // Explicit whitelist that does NOT name it still keeps it.
-        let explicit =
-            apply_tool_selection(&tools, &ToolSelection::Explicit(vec!["shell_execute".into()]));
+        let explicit = apply_tool_selection(
+            &tools,
+            &ToolSelection::Explicit(vec!["shell_execute".into()]),
+        );
         assert!(explicit.iter().any(|t| t.name == "spawn_subagent"));
 
         // The legacy alias is force-included too.
         let alias_tools = vec![tool_def("delegate_to_agent", "d")];
-        let alias = apply_tool_selection(&alias_tools, &ToolSelection::Groups(vec!["files".into()]));
+        let alias =
+            apply_tool_selection(&alias_tools, &ToolSelection::Groups(vec!["files".into()]));
         assert!(alias.iter().any(|t| t.name == "delegate_to_agent"));
 
         // Explicit Deny is the deliberate opt-out.

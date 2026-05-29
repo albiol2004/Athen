@@ -67,9 +67,7 @@ pub type SubRouterFactory = Arc<
         ) -> Pin<
             Box<
                 dyn Future<
-                        Output = Arc<
-                            tokio::sync::RwLock<Arc<athen_llm::router::DefaultLlmRouter>>,
-                        >,
+                        Output = Arc<tokio::sync::RwLock<Arc<athen_llm::router::DefaultLlmRouter>>>,
                     > + Send,
             >,
         > + Send
@@ -1211,8 +1209,7 @@ mod tests {
                 base_risk: BaseImpact::Read,
             },
         ];
-        let filtered =
-            athen_agent::executor::apply_tool_selection(&tools, &coder.tool_selection);
+        let filtered = athen_agent::executor::apply_tool_selection(&tools, &coder.tool_selection);
         assert!(filtered.iter().any(|t| t.name == "spawn_subagent"));
     }
 }
