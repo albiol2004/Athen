@@ -33,9 +33,24 @@ Live today:
 - `build_router_for_bundle` (~line 4469): builds the global router from the active Bundle's tier picks; called on Bundle switch.
 - Unit-tested: `test_pinned_provider_lifecycle` and `test_pinned_provider_migration_on_legacy_db` in `arcs.rs`; `override_slug_collapses_every_tier_to_pinned_key` and `empty_override_slug_treated_as_none` in `state.rs`.
 
+Stale-slug guard (2026-05-29): the resolver now validates the pinned slug
+against live config before honouring it (`pinned_slug_still_configured` in
+`state.rs`). When an active Bundle is set, Bundles are authoritative — a
+pinned slug is honoured only if some Bundle tier still routes that
+connection to it; the Connection's legacy `default_model` / `tier_models`
+do **not** count. If the slug is gone, the provider pin is kept but the
+slug pin is dropped and the arc falls back to live tier resolution. This
+killed the "wake-up keeps using `minimax-m2.7` even though my Bundle only
+has deepseek" bug, where the stale model survived as the Connection's
+`default_model`. Additionally, a wake-up fire now clears any pre-existing
+arc pin before resolving (dispatch loop, `state.rs`) so a fire always
+re-pins from the current active Bundle — a fire is a *new task*, not a
+continuation (this supersedes the "honour the wake-up's choice → pin
+stays" rule in the lifecycle section below).
+
 Still pending (post-ship gaps):
 - UI surface (arc-card "pinned: X" badge, manual unpin in arc settings) — backend pin is silent today; no frontend indicator.
-- `pinned_slug` is captured and routing-effective, but the warn-on-slug-drift path (log + surface in UI when same `(provider, tier)` re-resolves to a different slug) is not yet wired.
+- Drift is logged (`warn!` when a stale slug is dropped) but not surfaced in the UI.
 - User-set durable `ArcSettings.preferred_provider_id` (the intent override, distinct from the protective pin) — not implemented.
 
 The design doc below remains the reference for lifecycle rules and edge-case decisions.
@@ -88,8 +103,11 @@ pub struct ArcRow {
 - New user message into an idle arc → new task → re-pin (may switch if user
   switched active in the meantime).
 - Approval coming back for a pending tool → same task → pin stays.
-- Wake-up fires inside the arc → same task → pin stays (the wake-up was
-  authored by the original provider's reasoning; honour its choice).
+- Wake-up fires inside the arc → **new task → re-pin fresh** (superseded
+  2026-05-29). Originally "pin stays, honour the wake-up's choice", but
+  that let a recurring wake-up keep using a model the user had since
+  removed from their Bundle. A fire now clears the arc pin first and
+  re-resolves from the current active Bundle.
 - Sense event routed into the arc → ambiguous; lean toward **new task**
   (provider may have been switched intentionally between events).
 

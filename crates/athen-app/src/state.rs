@@ -2554,6 +2554,23 @@ impl AppState {
                     } else {
                         None
                     };
+                    // A wake-up fire is the START of a fresh task (a
+                    // synthetic sense event with a clock trigger), so it
+                    // must not inherit a provider pin left behind by an
+                    // earlier task on this arc. Without this, a recurring
+                    // wake-up keeps using the model that was active when
+                    // it first fired — even after the user switched
+                    // Bundles or deleted that model — because the pin
+                    // column survived (e.g. a previous run was killed
+                    // before its clear, or the arc is long-lived).
+                    // Clearing here lets the resolve below install a
+                    // fresh pin from the current active Bundle. In-flight
+                    // protection is unaffected: any task already running
+                    // on this arc captured its router into its own ctx at
+                    // dispatch and never re-reads this column.
+                    if wakeup_id_opt.is_some() {
+                        crate::state::clear_provider_pin_for_arc(arc_store.as_ref(), &arc_id).await;
+                    }
                     // Resolve compaction budget per task. Re-reading the
                     // config TOML each dispatch is cheap (small file, only
                     // fires on user-driven sense events) and lets the user
@@ -4006,6 +4023,46 @@ pub(crate) struct EffectiveProviderTarget {
     pub pinned_slug: Option<String>,
 }
 
+/// Is `slug` still a model the user actually routes to for connection
+/// `connection_id`?
+///
+/// This is the guard against a *stale slug pin*: a pin freezes the
+/// concrete slug that resolved on a task's first LLM call, but the model
+/// the user routes to can change underneath it. When this returns false
+/// the resolver drops the slug pin and falls back to live tier
+/// resolution — the fix for "my wake-up still uses minimax even though
+/// my Bundle only has deepseek".
+///
+/// Authority follows the same precedence as routing itself:
+/// - **Active Bundle set** → Bundles are the single source of truth. A
+///   slug is live *only* if some Bundle tier points this connection at
+///   it. The Connection's legacy `default_model` / `tier_models` fields
+///   are deliberately ignored: a model sitting in `default_model` but in
+///   no Bundle is exactly the leak the user hit, and honouring it would
+///   re-introduce the bug.
+/// - **No active Bundle** (legacy / pre-Bundles config) → fall back to
+///   the Connection's own `default_model` + `tier_models`, since that's
+///   what routing uses in that mode.
+fn pinned_slug_still_configured(cfg: &AthenConfig, connection_id: &str, slug: &str) -> bool {
+    let has_active_bundle = cfg
+        .models
+        .assignments
+        .get(ACTIVE_BUNDLE_KEY)
+        .and_then(|id| cfg.models.bundles.get(id))
+        .is_some();
+    if has_active_bundle {
+        return cfg.models.bundles.values().any(|b| {
+            b.tiers
+                .values()
+                .any(|t| t.connection_id == connection_id && t.slug == slug)
+        });
+    }
+    cfg.models
+        .providers
+        .get(connection_id)
+        .is_some_and(|p| p.default_model == slug || p.tier_models.values().any(|s| s == slug))
+}
+
 /// Resolve the effective provider id (and pinned slug) for an arc-scoped
 /// LLM call, honouring an existing pin or installing one if none is
 /// present.
@@ -4077,7 +4134,30 @@ pub(crate) async fn resolve_effective_provider_for_arc_with_config(
             // OpenAI-captured slug to an Anthropic adapter would 4xx
             // immediately, and a missing slug column simply collapses
             // back to the provider's live tier_models map.
-            let pinned_slug = arc.pinned_slug.clone().filter(|s| !s.is_empty());
+            //
+            // It must ALSO still be a model the user has configured: a
+            // pin freezes the concrete slug from a task's first call,
+            // but the user can later delete that model from every
+            // Bundle while keeping the connection. Honouring a dead
+            // slug is what made wake-ups keep reaching for a model no
+            // longer in Bundles — drop it and fall back to the
+            // connection's live tier resolution instead.
+            let pinned_slug = arc
+                .pinned_slug
+                .clone()
+                .filter(|s| !s.is_empty())
+                .filter(|s| {
+                    let live = pinned_slug_still_configured(cfg, pinned, s);
+                    if !live {
+                        warn!(
+                            arc_id = %arc_id,
+                            pinned_provider_id = %pinned,
+                            stale_slug = %s,
+                            "pinned model no longer configured for connection; dropping slug pin and falling back to live tier resolution"
+                        );
+                    }
+                    live
+                });
             return EffectiveProviderTarget {
                 provider_id: pinned.to_string(),
                 pinned_slug,
@@ -4182,7 +4262,24 @@ fn resolve_from_active_bundle(cfg: &AthenConfig, tier: ModelProfile) -> Option<(
 /// sets Cheap is a valid config — every other tier collapses onto it.
 /// Local stays isolated (no cross-tier fallback) because Local routing
 /// is meaningfully different from cloud tiers.
+///
+/// For cloud tiers there is a final catch-all: if neither the strict
+/// ladder nor a sensible cross-tier order resolves, fall back to *any*
+/// cloud tier the Bundle does fill. This guarantees that as long as a
+/// Bundle has one cloud tier set, every cloud-tier request resolves to a
+/// model **from the Bundle** — never silently dropping through to the
+/// Connection's legacy `default_model` (the field that leaked
+/// `minimax-m2.7` into a deepseek-only Bundle). The Connection model
+/// field is bootstrap/test-only now; the active Bundle is authoritative.
 fn pick_bundle_tier(bundle: &Bundle, tier: ModelProfile) -> Option<(String, String)> {
+    // Local is deliberately isolated: never borrow a cloud tier for it,
+    // and never let it satisfy a cloud request.
+    if tier == ModelProfile::Local {
+        return bundle
+            .tiers
+            .get(&ModelProfile::Local)
+            .map(|bt| (bt.connection_id.clone(), bt.slug.clone()));
+    }
     let ladder: &[ModelProfile] = match tier {
         ModelProfile::Code => &[ModelProfile::Code, ModelProfile::Fast, ModelProfile::Cheap],
         ModelProfile::Powerful => &[
@@ -4192,10 +4289,23 @@ fn pick_bundle_tier(bundle: &Bundle, tier: ModelProfile) -> Option<(String, Stri
         ],
         ModelProfile::Fast => &[ModelProfile::Fast, ModelProfile::Cheap],
         ModelProfile::Cheap => &[ModelProfile::Cheap],
-        ModelProfile::Local => &[ModelProfile::Local],
+        ModelProfile::Local => unreachable!("Local handled above"),
     };
     for t in ladder {
         if let Some(bt) = bundle.tiers.get(t) {
+            return Some((bt.connection_id.clone(), bt.slug.clone()));
+        }
+    }
+    // Catch-all: any cloud tier the Bundle fills, in a sensible order, so
+    // a request for an unfilled tier still resolves inside the Bundle
+    // instead of falling back to the Connection default_model.
+    for t in [
+        ModelProfile::Powerful,
+        ModelProfile::Fast,
+        ModelProfile::Code,
+        ModelProfile::Cheap,
+    ] {
+        if let Some(bt) = bundle.tiers.get(&t) {
             return Some((bt.connection_id.clone(), bt.slug.clone()));
         }
     }
@@ -5871,8 +5981,11 @@ mod resolve_effective_provider_tests {
             .set_pinned_provider_if_unset("arc_p", "opencode_go", "minimax-m2.7")
             .await
             .unwrap();
+        // The pinned slug must still be a model the user has configured
+        // for the connection, otherwise the resolver now (correctly)
+        // drops the stale slug — so wire it as opencode_go's model here.
         let cfg = mk_config(&[
-            ("opencode_go", "deepseek-v4-flash"),
+            ("opencode_go", "minimax-m2.7"),
             ("deepseek", "deepseek-v4-flash"),
         ]);
 
@@ -5925,6 +6038,138 @@ mod resolve_effective_provider_tests {
             target,
             EffectiveProviderTarget {
                 provider_id: "deepseek".to_string(),
+                pinned_slug: None,
+            }
+        );
+    }
+
+    /// Arc pinned to a provider that still exists, but to a *model*
+    /// the user has since removed from every Bundle / tier: the
+    /// resolver keeps the provider pin (in-flight protection) but drops
+    /// the stale slug so the connection's live tier resolution takes
+    /// over. This is the wake-up "still reaching for a model I removed"
+    /// fix — the slug pin must not outlive the model's presence in
+    /// config.
+    #[tokio::test]
+    async fn pinned_slug_no_longer_configured_is_dropped() {
+        let store = setup_store().await;
+        store
+            .create_arc("arc_s", "t", ArcSource::UserInput)
+            .await
+            .unwrap();
+        store
+            .set_pinned_provider_if_unset("arc_s", "opencode_go", "minimax-m2.7")
+            .await
+            .unwrap();
+        // opencode_go survives, but its only configured model is now
+        // deepseek-v4-flash — minimax-m2.7 is gone from config.
+        let cfg = mk_config(&[("opencode_go", "deepseek-v4-flash")]);
+
+        let target = resolve_effective_provider_for_arc_with_config(
+            Some(&store),
+            "arc_s",
+            "opencode_go",
+            ModelProfile::Powerful,
+            &cfg,
+        )
+        .await;
+
+        assert_eq!(
+            target,
+            EffectiveProviderTarget {
+                provider_id: "opencode_go".to_string(),
+                pinned_slug: None,
+            }
+        );
+    }
+
+    /// A stale slug that's still referenced by a Bundle tier for the
+    /// same connection counts as live and is honoured — "removed" means
+    /// "in no Bundle", not "not the requested tier's pick".
+    #[tokio::test]
+    async fn pinned_slug_referenced_by_a_bundle_is_kept() {
+        let store = setup_store().await;
+        store
+            .create_arc("arc_b", "t", ArcSource::UserInput)
+            .await
+            .unwrap();
+        store
+            .set_pinned_provider_if_unset("arc_b", "opencode_go", "minimax-m2.7")
+            .await
+            .unwrap();
+        // Connection's default_model is something else, but the ACTIVE
+        // Bundle still points opencode_go at minimax-m2.7 → live.
+        let mut cfg = mk_config(&[("opencode_go", "deepseek-v4-flash")]);
+        install_active_bundle(
+            &mut cfg,
+            mk_bundle(
+                "b1",
+                &[(ModelProfile::Powerful, "opencode_go", "minimax-m2.7")],
+            ),
+        );
+
+        let target = resolve_effective_provider_for_arc_with_config(
+            Some(&store),
+            "arc_b",
+            "opencode_go",
+            ModelProfile::Powerful,
+            &cfg,
+        )
+        .await;
+
+        assert_eq!(
+            target,
+            EffectiveProviderTarget {
+                provider_id: "opencode_go".to_string(),
+                pinned_slug: Some("minimax-m2.7".to_string()),
+            }
+        );
+    }
+
+    /// The exact reported bug: same Connection (opencode_go) for both,
+    /// the active Bundle only has deepseek, but the Connection's
+    /// `default_model` is minimax-m2.7 (a testing default). A wake-up
+    /// arc pinned to minimax must NOT keep using it — Bundles are
+    /// authoritative, so the stale slug is dropped and live tier
+    /// resolution (deepseek) takes over.
+    #[tokio::test]
+    async fn pinned_slug_in_default_model_but_not_in_active_bundle_is_dropped() {
+        let store = setup_store().await;
+        store
+            .create_arc("arc_bug", "t", ArcSource::UserInput)
+            .await
+            .unwrap();
+        store
+            .set_pinned_provider_if_unset("arc_bug", "opencode_go", "minimax-m2.7")
+            .await
+            .unwrap();
+        // Connection default is minimax (testing default), but the
+        // active Bundle only routes opencode_go to deepseek.
+        let mut cfg = mk_config(&[("opencode_go", "minimax-m2.7")]);
+        install_active_bundle(
+            &mut cfg,
+            mk_bundle(
+                "main",
+                &[
+                    (ModelProfile::Powerful, "opencode_go", "deepseek-v4-pro"),
+                    (ModelProfile::Cheap, "opencode_go", "deepseek-v4-flash"),
+                ],
+            ),
+        );
+
+        let target = resolve_effective_provider_for_arc_with_config(
+            Some(&store),
+            "arc_bug",
+            "opencode_go",
+            ModelProfile::Powerful,
+            &cfg,
+        )
+        .await;
+
+        assert_eq!(
+            target,
+            EffectiveProviderTarget {
+                provider_id: "opencode_go".to_string(),
                 pinned_slug: None,
             }
         );

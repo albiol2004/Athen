@@ -8131,7 +8131,10 @@ function createProviderCard(provider) {
 
     const subtitle = document.createElement('span');
     subtitle.className = 'provider-subtitle';
-    subtitle.textContent = provider.model + ' \u00B7 ' + provider.base_url.replace(/^https?:\/\//, '');
+    // A Connection is credentials + endpoint; the model it routes to
+    // lives in Bundles, not here. Show the host, not a model name, so
+    // the card doesn't read as "this Connection = this model".
+    subtitle.textContent = provider.base_url.replace(/^https?:\/\//, '');
 
     titleArea.appendChild(dot);
     titleArea.appendChild(name);
@@ -8205,11 +8208,7 @@ function createProviderCard(provider) {
         <div class="provider-field">
             <label>Model family</label>
             <select class="provider-family">${familyOptions}</select>
-            <div class="field-hint">Picks the per-model quirks profile (tool-call format, reasoning surface, template strictness). Leave on Default if unsure — it reproduces the OpenAI-compat baseline. Selecting a family pre-fills the model slug below; you can edit the slug for dated or fine-tuned variants of the same family.</div>
-        </div>
-        <div class="provider-field">
-            <label>Model slug</label>
-            <input type="text" class="provider-model" value="${escapeHtml(provider.model)}" placeholder="model-name">
+            <div class="field-hint">Picks the per-model quirks profile (tool-call format, reasoning surface, template strictness). Leave on Default if unsure — it reproduces the OpenAI-compat baseline. Selecting a family pre-fills the fallback model slug under Advanced; the models Athen actually routes to are chosen per-tier in <strong>Bundles</strong>.</div>
         </div>
         ${!isLocal ? `
         <div class="provider-field">
@@ -8262,8 +8261,10 @@ function createProviderCard(provider) {
                 <input type="number" class="provider-temperature" min="0" max="2" step="0.05" value="${provider.temperature ?? ''}" placeholder="Adapter default (~0.7)">
                 <div class="field-hint">Lower = more deterministic. Leave blank for the provider's default (0.7 across most APIs). Try 0.0–0.3 for benchmarking, code, or strict tool-calling; 0.7+ for creative tasks.</div>
             </div>
-            <div class="provider-field provider-tier-models-note">
-                <div class="field-hint">Per-tier model picks now live in <strong>Bundles</strong> (above). One Connection can power multiple tiers in multiple Bundles — credentials here, routing there.</div>
+            <div class="provider-field">
+                <label>Fallback model slug</label>
+                <input type="text" class="provider-model" value="${escapeHtml(provider.model)}" placeholder="model-name">
+                <div class="field-hint">Per-tier model picks live in <strong>Bundles</strong> (above) — that's what Athen routes to. This slug is only used to test the connection and as a bootstrap default before any Bundle exists; with an active Bundle it never reaches the wire. Credentials here, routing there.</div>
             </div>
         </div>
         <div class="provider-card-actions">
