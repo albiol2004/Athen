@@ -432,8 +432,18 @@ pub async fn process_sense_event(
 
     if let Some(coord) = coordinator {
         if will_dispatch {
+            // Global security posture, snapshotted at event-processing (= task
+            // creation) time. Phase 6 wraps this with the per-arc override.
+            let security_mode = {
+                use tauri::Manager;
+                app_handle
+                    .state::<crate::state::AppState>()
+                    .security
+                    .load()
+                    .mode
+            };
             match coord
-                .process_event_authorized(event.clone(), AutonomyBand::SafeOnly)
+                .process_event_authorized(event.clone(), AutonomyBand::SafeOnly, security_mode)
                 .await
             {
                 Ok(decisions) => {

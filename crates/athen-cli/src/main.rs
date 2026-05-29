@@ -650,7 +650,7 @@ async fn main() {
 
         // Process through coordinator pipeline.
         let event = make_event(line);
-        let task_results = match coordinator.process_event(event).await {
+        let task_results = match coordinator.process_event(event, config.security.mode).await {
             Ok(ids) => ids,
             Err(e) => {
                 eprintln!("  Error: {e}");

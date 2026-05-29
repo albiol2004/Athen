@@ -11,6 +11,7 @@ pub mod router;
 use std::collections::HashMap;
 
 use athen_contacts::trust::TrustManager;
+use athen_core::config::SecurityMode;
 use athen_core::contact::{ContactId, IdentifierKind, TrustLevel};
 use athen_core::error::{AthenError, Result};
 use athen_core::event::{EventSource, SenderInfo, SenseEvent};
@@ -61,14 +62,7 @@ fn coerce_for_autonomy(decision: RiskDecision, autonomy: AutonomyBand) -> RiskDe
 ///
 /// `SilentApprove` and `HardBlock` are never moved here — read-only stays
 /// silent and critical stays blocked under every mode.
-// `allow(dead_code)`: wired into `process_event_inner` in the next step; kept
-// here with tests so the pure coercion lands and is verified on its own.
-#[allow(dead_code)]
-fn coerce_for_security_mode(
-    decision: RiskDecision,
-    mode: athen_core::config::SecurityMode,
-) -> RiskDecision {
-    use athen_core::config::SecurityMode;
+fn coerce_for_security_mode(decision: RiskDecision, mode: SecurityMode) -> RiskDecision {
     use RiskDecision::*;
     match (mode, decision) {
         (SecurityMode::Bunker, NotifyAndProceed) => HumanConfirm,
@@ -232,8 +226,12 @@ impl Coordinator {
     /// 4. Set status based on risk decision
     /// 5. Enqueue tasks that can proceed
     /// 6. Return created task IDs with their risk decisions
-    pub async fn process_event(&self, event: SenseEvent) -> Result<Vec<(TaskId, RiskDecision)>> {
-        self.process_event_inner(event, None).await
+    pub async fn process_event(
+        &self,
+        event: SenseEvent,
+        security_mode: SecurityMode,
+    ) -> Result<Vec<(TaskId, RiskDecision)>> {
+        self.process_event_inner(event, None, security_mode).await
     }
 
     /// Like [`Self::process_event`], but treats the event as a wake-up fire
@@ -244,14 +242,17 @@ impl Coordinator {
         &self,
         event: SenseEvent,
         autonomy: AutonomyBand,
+        security_mode: SecurityMode,
     ) -> Result<Vec<(TaskId, RiskDecision)>> {
-        self.process_event_inner(event, Some(autonomy)).await
+        self.process_event_inner(event, Some(autonomy), security_mode)
+            .await
     }
 
     async fn process_event_inner(
         &self,
         event: SenseEvent,
         autonomy_override: Option<AutonomyBand>,
+        security_mode: SecurityMode,
     ) -> Result<Vec<(TaskId, RiskDecision)>> {
         // Resolve trust level from the sender, if present and not a UserInput event.
         let (trust_level, contact_id) = match (&event.sender, &event.source) {
@@ -284,9 +285,15 @@ impl Coordinator {
             let score = self.risk_evaluator.evaluate(task, &context).await?;
             task.risk_score = Some(score);
 
+            // Global/per-arc security posture applies to every event. The
+            // wake-up `AutonomyBand` (when present) is applied *after* it, so a
+            // per-wake-up pre-approval re-loosens on top of the baseline —
+            // AutonomyBand wins for wake-ups, security mode stands alone for
+            // everything else.
+            let security_coerced = coerce_for_security_mode(raw_decision, security_mode);
             let decision = match autonomy_override {
-                Some(band) => coerce_for_autonomy(raw_decision, band),
-                None => raw_decision,
+                Some(band) => coerce_for_autonomy(security_coerced, band),
+                None => security_coerced,
             };
 
             match decision {
@@ -656,7 +663,7 @@ mod tests {
         let event = make_event(EventSource::System);
 
         let results = coordinator
-            .process_event_authorized(event, AutonomyBand::Auto)
+            .process_event_authorized(event, AutonomyBand::Auto, SecurityMode::Assistant)
             .await
             .unwrap();
 
@@ -672,7 +679,7 @@ mod tests {
         let event = make_event(EventSource::System);
 
         let results = coordinator
-            .process_event_authorized(event, AutonomyBand::SafeOnly)
+            .process_event_authorized(event, AutonomyBand::SafeOnly, SecurityMode::Assistant)
             .await
             .unwrap();
 
@@ -683,11 +690,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bunker_escalates_notify_band_to_approval() {
+        // Score 30 → Caution → NotifyAndProceed under Assistant.
+        let coordinator = Coordinator::new(Box::new(MockRiskEvaluator::new(30.0)));
+        let event = make_event(EventSource::Email);
+
+        let results = coordinator
+            .process_event(event, SecurityMode::Bunker)
+            .await
+            .unwrap();
+
+        assert_eq!(results[0].1, RiskDecision::HumanConfirm);
+        assert_eq!(coordinator.queue.pending_count().await.unwrap(), 0);
+        assert_eq!(coordinator.awaiting_approval.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn yolo_drops_human_confirm_to_pending() {
+        // Score 60 → Danger → HumanConfirm under Assistant.
+        let coordinator = Coordinator::new(Box::new(MockRiskEvaluator::new(60.0)));
+        let event = make_event(EventSource::Email);
+
+        let results = coordinator
+            .process_event(event, SecurityMode::Yolo)
+            .await
+            .unwrap();
+
+        assert_eq!(results[0].1, RiskDecision::NotifyAndProceed);
+        assert_eq!(coordinator.queue.pending_count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn yolo_still_blocks_critical() {
+        // Score 95 → Critical → HardBlock; Yolo never moves a HardBlock.
+        let coordinator = Coordinator::new(Box::new(MockRiskEvaluator::new(95.0)));
+        let event = make_event(EventSource::System);
+
+        let results = coordinator
+            .process_event(event, SecurityMode::Yolo)
+            .await
+            .unwrap();
+
+        assert_eq!(results[0].1, RiskDecision::HardBlock);
+        assert_eq!(coordinator.queue.pending_count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn autonomy_band_wins_over_security_mode_for_wakeups() {
+        // Score 30 → NotifyAndProceed. Bunker escalates to HumanConfirm, then
+        // the wake-up's Auto band re-loosens it back to NotifyAndProceed.
+        let coordinator = Coordinator::new(Box::new(MockRiskEvaluator::new(30.0)));
+        let event = make_event(EventSource::System);
+
+        let results = coordinator
+            .process_event_authorized(event, AutonomyBand::Auto, SecurityMode::Bunker)
+            .await
+            .unwrap();
+
+        assert_eq!(results[0].1, RiskDecision::NotifyAndProceed);
+        assert_eq!(coordinator.queue.pending_count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
     async fn test_process_event_low_risk() {
         let coordinator = Coordinator::new(Box::new(MockRiskEvaluator::new(5.0)));
 
         let event = make_event(EventSource::UserInput);
-        let results = coordinator.process_event(event).await.unwrap();
+        let results = coordinator.process_event(event, SecurityMode::Assistant).await.unwrap();
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].1, RiskDecision::SilentApprove);
@@ -700,7 +769,7 @@ mod tests {
         let coordinator = Coordinator::new(Box::new(MockRiskEvaluator::new(60.0)));
 
         let event = make_event(EventSource::Email);
-        let results = coordinator.process_event(event).await.unwrap();
+        let results = coordinator.process_event(event, SecurityMode::Assistant).await.unwrap();
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].1, RiskDecision::HumanConfirm);
@@ -713,7 +782,7 @@ mod tests {
         let coordinator = Coordinator::new(Box::new(MockRiskEvaluator::new(95.0)));
 
         let event = make_event(EventSource::System);
-        let results = coordinator.process_event(event).await.unwrap();
+        let results = coordinator.process_event(event, SecurityMode::Assistant).await.unwrap();
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].1, RiskDecision::HardBlock);
@@ -729,7 +798,7 @@ mod tests {
         coordinator.dispatcher.register_agent(agent_id).await;
 
         let event = make_event(EventSource::UserInput);
-        coordinator.process_event(event).await.unwrap();
+        coordinator.process_event(event, SecurityMode::Assistant).await.unwrap();
 
         let result = coordinator.dispatch_next().await.unwrap();
         assert!(result.is_some());
@@ -750,7 +819,7 @@ mod tests {
 
         let event = make_event(EventSource::UserInput);
         let event_id = event.id;
-        let routed = coordinator.process_event(event).await.unwrap();
+        let routed = coordinator.process_event(event, SecurityMode::Assistant).await.unwrap();
         let queued_task_id = routed[0].0;
 
         let result = coordinator.dispatch_next_with_task().await.unwrap();
@@ -776,7 +845,7 @@ mod tests {
         let coordinator = Coordinator::new(Box::new(MockRiskEvaluator::new(5.0)));
 
         let event = make_event(EventSource::UserInput);
-        coordinator.process_event(event).await.unwrap();
+        coordinator.process_event(event, SecurityMode::Assistant).await.unwrap();
 
         // No agents → returns None and re-enqueues.
         let result = coordinator.dispatch_next_with_task().await.unwrap();
@@ -789,7 +858,7 @@ mod tests {
         let coordinator = Coordinator::new(Box::new(MockRiskEvaluator::new(5.0)));
 
         let event = make_event(EventSource::UserInput);
-        coordinator.process_event(event).await.unwrap();
+        coordinator.process_event(event, SecurityMode::Assistant).await.unwrap();
 
         // No agents registered
         let result = coordinator.dispatch_next().await.unwrap();
@@ -820,8 +889,8 @@ mod tests {
         let event1 = make_event(EventSource::Calendar);
         let event2 = make_event(EventSource::Email);
 
-        coordinator.process_event(event1).await.unwrap();
-        coordinator.process_event(event2).await.unwrap();
+        coordinator.process_event(event1, SecurityMode::Assistant).await.unwrap();
+        coordinator.process_event(event2, SecurityMode::Assistant).await.unwrap();
 
         assert_eq!(coordinator.queue.pending_count().await.unwrap(), 2);
 
@@ -844,7 +913,7 @@ mod tests {
         let coordinator = Coordinator::new(Box::new(MockRiskEvaluator::new(5.0)));
 
         let event = make_event_with_sender(EventSource::Email, "alice@example.com");
-        let results = coordinator.process_event(event).await.unwrap();
+        let results = coordinator.process_event(event, SecurityMode::Assistant).await.unwrap();
 
         assert_eq!(results.len(), 1);
         assert_eq!(coordinator.queue.pending_count().await.unwrap(), 1);
@@ -857,7 +926,7 @@ mod tests {
             Coordinator::new(Box::new(MockRiskEvaluator::new(5.0))).with_trust_manager(tm);
 
         let event = make_event_with_sender(EventSource::Email, "new@example.com");
-        let results = coordinator.process_event(event).await.unwrap();
+        let results = coordinator.process_event(event, SecurityMode::Assistant).await.unwrap();
 
         assert_eq!(results.len(), 1);
         // Task should be tracked for trust feedback.
@@ -874,7 +943,7 @@ mod tests {
 
         // Even with a sender, UserInput should skip trust lookup.
         let event = make_event_with_sender(EventSource::UserInput, "user@local");
-        let results = coordinator.process_event(event).await.unwrap();
+        let results = coordinator.process_event(event, SecurityMode::Assistant).await.unwrap();
 
         assert_eq!(results.len(), 1);
         // No contact should be tracked for UserInput events.
@@ -892,7 +961,7 @@ mod tests {
         coordinator.dispatcher.register_agent(agent_id).await;
 
         let event = make_event_with_sender(EventSource::Email, "sender@example.com");
-        coordinator.process_event(event).await.unwrap();
+        coordinator.process_event(event, SecurityMode::Assistant).await.unwrap();
 
         let (task_id, _) = coordinator.dispatch_next().await.unwrap().unwrap();
         coordinator.complete_task(task_id).await.unwrap();
@@ -911,7 +980,7 @@ mod tests {
         coordinator.dispatcher.register_agent(agent_id).await;
 
         let event = make_event(EventSource::UserInput);
-        coordinator.process_event(event).await.unwrap();
+        coordinator.process_event(event, SecurityMode::Assistant).await.unwrap();
 
         let (task_id, _) = coordinator.dispatch_next().await.unwrap().unwrap();
         coordinator.complete_task(task_id).await.unwrap();

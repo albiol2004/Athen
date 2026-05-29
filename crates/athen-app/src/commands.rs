@@ -2293,9 +2293,12 @@ pub async fn send_message(
     // it — HardBlock demotes to HumanConfirm so the user always gets the
     // final say on their own input. Third-party senses (Telegram, email)
     // call plain `process_event` in sense_router.rs and keep HardBlock.
+    // Global security posture, snapshotted at task creation. Phase 6 wraps
+    // this with the per-arc override.
+    let security_mode = state.security.load().mode;
     let task_results = state
         .coordinator
-        .process_event_authorized(event, AutonomyBand::SafeOnly)
+        .process_event_authorized(event, AutonomyBand::SafeOnly, security_mode)
         .await
         .map_err(|e| {
             let raw = e.to_string();

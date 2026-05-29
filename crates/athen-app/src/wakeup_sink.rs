@@ -125,9 +125,19 @@ impl WakeupFireSink for CoordinatorWakeupSink {
             raw_id: None,
         };
 
+        // Global security posture (Assistant when headless / no AppHandle).
+        // Phase 6 wraps this with the per-arc override for `target_arc_id`.
+        let security_mode = self
+            .app_handle
+            .as_ref()
+            .map(|h| {
+                use tauri::Manager;
+                h.state::<crate::state::AppState>().security.load().mode
+            })
+            .unwrap_or(athen_core::config::SecurityMode::Assistant);
         let decisions = match self
             .coordinator
-            .process_event_authorized(event, wakeup.autonomy)
+            .process_event_authorized(event, wakeup.autonomy, security_mode)
             .await
         {
             Ok(d) => d,
