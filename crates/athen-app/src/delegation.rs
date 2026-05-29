@@ -275,16 +275,30 @@ impl ToolRegistry for DelegationToolRegistry {
         let elapsed_ms = started.elapsed().as_millis() as u64;
 
         match outcome {
-            Ok((sub_arc_id, content, success)) => Ok(ToolResult {
-                success,
-                output: json!({
-                    "sub_arc_id": sub_arc_id,
-                    "content": content,
-                    "success": success,
-                }),
-                error: None,
-                execution_time_ms: elapsed_ms,
-            }),
+            Ok((sub_arc_id, content, success, verified, note)) => {
+                // A run that succeeded but failed verification is reported as
+                // a failure to the parent, with the verifier's note as the
+                // error so the parent can re-brief or retry.
+                let effective_success = success && verified;
+                let error = if effective_success {
+                    None
+                } else {
+                    note.clone()
+                        .or_else(|| Some("sub-agent task did not succeed".to_string()))
+                };
+                Ok(ToolResult {
+                    success: effective_success,
+                    output: json!({
+                        "sub_arc_id": sub_arc_id,
+                        "content": content,
+                        "success": effective_success,
+                        "verified": verified,
+                        "verification_note": note,
+                    }),
+                    error,
+                    execution_time_ms: elapsed_ms,
+                })
+            }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: json!({ "error": e.to_string() }),
@@ -340,16 +354,88 @@ async fn propagate_parent_pins(
     }
 }
 
+/// Lightweight post-run check that the specialist's deliverable actually
+/// satisfies the brief, mirroring the executor's completion-judge envelope
+/// (one cheap-tier LLM call, low max_tokens, temperature 0, reasoning off,
+/// 30s timeout). Returns `(verified, note)`.
+///
+/// Bias is toward NOT punishing a good run: an empty deliverable short-
+/// circuits to `false` with no LLM call, a clear `CONTINUE` verdict flips to
+/// `false`, but any LLM error / timeout / ambiguous answer defaults to
+/// `true` so a flaky judge never hard-fails a legitimate result.
+async fn verify_deliverable(
+    router: &dyn LlmRouter,
+    brief: &str,
+    content: &str,
+) -> (bool, Option<String>) {
+    if content.trim().is_empty() {
+        return (
+            false,
+            Some("specialist returned an empty deliverable".to_string()),
+        );
+    }
+    let prompt = format!(
+        "A specialist sub-agent was given this brief:\n\n\
+         ---BRIEF---\n{}\n---END BRIEF---\n\n\
+         It returned this deliverable:\n\n\
+         ---DELIVERABLE---\n{}\n---END DELIVERABLE---\n\n\
+         Does the deliverable satisfy the brief? Reply with exactly one line:\n\
+         - `DONE` if it addresses the brief.\n\
+         - `CONTINUE: <one short reason>` if it is empty, off-topic, a refusal, \
+         or claims work it did not actually produce.",
+        truncate(brief, 2000),
+        truncate(content, 4000),
+    );
+    let request = athen_core::llm::LlmRequest {
+        messages: vec![athen_core::llm::ChatMessage {
+            role: athen_core::llm::Role::User,
+            content: athen_core::llm::MessageContent::Text(prompt),
+        }],
+        profile: athen_core::llm::ModelProfile::Cheap,
+        max_tokens: Some(64),
+        temperature: Some(0.0),
+        tools: None,
+        system_prompt: None,
+        reasoning_effort: athen_core::llm::ReasoningEffort::Off,
+    };
+    match tokio::time::timeout(Duration::from_secs(30), router.route(&request)).await {
+        Ok(Ok(resp)) => {
+            let answer = resp.content.trim();
+            if answer.to_uppercase().contains("CONTINUE") {
+                let reason = answer
+                    .split_once(':')
+                    .map(|(_, rest)| rest.trim())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("deliverable does not satisfy the brief")
+                    .chars()
+                    .take(200)
+                    .collect::<String>();
+                (false, Some(reason))
+            } else {
+                (true, None)
+            }
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("delegation: deliverable verifier LLM error: {e}; trusting result");
+            (true, None)
+        }
+        Err(_) => {
+            tracing::warn!("delegation: deliverable verifier timed out; trusting result");
+            (true, None)
+        }
+    }
+}
+
 /// The actual delegation run: resolve the target profile, create a sub-arc,
 /// build a fresh executor whose tool registry is the bare base (no
 /// delegation), and execute a synthetic task built from the brief.
 ///
-/// Returns `(sub_arc_id, content, success)` on success.
+/// Returns `(sub_arc_id, content, success, verified, verification_note)`.
 async fn run_delegation(
     base: Arc<dyn ToolRegistry>,
     ctx: DelegationContext,
     args: DelegateArgs,
-) -> Result<(String, String, bool)> {
+) -> Result<(String, String, bool, bool, Option<String>)> {
     use athen_core::traits::profile::ProfileStore;
 
     let started = Instant::now();
@@ -631,7 +717,31 @@ async fn run_delegation(
             }
         });
 
-    Ok((sub_arc_id, content, result.success))
+    // Post-run verification: confirm the deliverable actually satisfies the
+    // brief before we report success upward. Skipped when the run already
+    // failed (the failure carries its own signal). Reuses the sub-agent's
+    // router (same provider/model), so it's one cheap-tier call.
+    let (verified, verification_note) = if result.success {
+        let verify_router = crate::state::SharedRouter(Arc::clone(&sub_router_cell));
+        verify_deliverable(&verify_router, &args.brief, &content).await
+    } else {
+        (true, None)
+    };
+    if !verified {
+        tracing::warn!(
+            sub_arc_id = %sub_arc_id,
+            note = ?verification_note,
+            "delegate_to_agent: deliverable failed post-run verification"
+        );
+    }
+
+    Ok((
+        sub_arc_id,
+        content,
+        result.success,
+        verified,
+        verification_note,
+    ))
 }
 
 /// Recover from the OpenAI provider's `Value::String` wrapper fallback
