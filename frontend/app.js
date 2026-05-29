@@ -142,6 +142,10 @@ const ICON_PHOTO       = toolSvg('<rect x="3" y="3" width="18" height="18" rx="2
 const ICON_X           = toolSvg('<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>');
 // Alert circle: error toasts.
 const ICON_ALERT       = toolSvg('<circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>');
+// Robot/branch head: a sub-agent spawned by another agent (delegation).
+const ICON_SUBAGENT    = toolSvg('<rect x="4" y="8" width="16" height="11" rx="2"/><path d="M12 4v4"/><circle cx="12" cy="3" r="1"/><line x1="9" y1="13" x2="9" y2="14"/><line x1="15" y1="13" x2="15" y2="14"/><line x1="2" y1="13" x2="4" y2="13"/><line x1="20" y1="13" x2="22" y2="13"/>');
+// Small dot in a circle: catch-all "other" source glyph.
+const ICON_DOT         = toolSvg('<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.5" fill="currentColor" stroke="none"/>');
 
 // Maps a notification/toast urgency string to its semantic SVG icon. Low =
 // info, Medium = mail (the canonical "new event" glyph), High = warning
@@ -14848,14 +14852,18 @@ const agentControlView = document.getElementById('agent-control-view');
 const agentControlBtn = document.getElementById('agent-control-btn');
 const agentControlBack = document.getElementById('agent-control-back');
 
+// Per-source SVG glyphs for the active-agent cards + history rows. Each maps
+// to an inline-SVG from the shared icon system (24×24 stroke, currentColor),
+// injected via .innerHTML so the badge can be tinted with its --agent-src-*
+// accent. Keep keys in sync with agentSourceKey()/the CSS data-source hooks.
 const AGENT_SOURCE_ICONS = {
-    user_chat: '\u{1F464}',
-    telegram: '\u{1F4AC}',
-    email: '\u{2709}\u{FE0F}',
-    calendar: '\u{1F4C5}',
-    wakeup: '\u{23F0}',
-    subagent: '\u{1FAA8}',
-    other: '\u{2022}',
+    user_chat: ICON_USER,
+    telegram: ICON_PAPER_PLANE,
+    email: ICON_MAIL,
+    calendar: ICON_CALENDAR,
+    wakeup: ICON_ALARM,
+    subagent: ICON_SUBAGENT,
+    other: ICON_DOT,
 };
 
 function activeAgentsPillEl() {
@@ -14961,7 +14969,12 @@ function renderActiveAgentsPill() {
 function renderAgentControlRunningCount() {
     const el = document.getElementById('agent-control-running-count');
     const count = activeAgentsCache.length;
-    if (el) el.textContent = `${count} running`;
+    if (el) {
+        el.textContent = `${count} running`;
+        // Quieten the pill when nothing is running so the brand tint only
+        // signals genuine activity.
+        el.classList.toggle('idle', count === 0);
+    }
     // Mirror into the Active sub-tab badge so the count is visible even
     // when the user is on the History tab.
     const badge = document.getElementById('agent-tab-active-count');
@@ -15130,9 +15143,7 @@ function buildActiveAgentCard(agent) {
     const jumpBtn = arcId
         ? `<button class="agent-card-jump" type="button" data-jump-arc="${arcId}">Jump to arc</button>`
         : '';
-    const stopBtn = `<button class="agent-card-stop" type="button" title="Stop agent" aria-label="Stop agent" data-stop-task="${taskId}">
-        <svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
-    </button>`;
+    const stopBtn = `<button class="agent-card-stop" type="button" title="Stop agent" aria-label="Stop agent" data-stop-task="${taskId}">${ICON_STOP}</button>`;
     const card = document.createElement('article');
     card.className = 'agent-card';
     card.setAttribute('data-source', sourceKey);

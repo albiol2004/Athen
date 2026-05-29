@@ -7453,6 +7453,15 @@ option:hover {
     --agent-src-user_chat: var(--brand-warm);
     --agent-src-subagent: #6b7280;
     --agent-src-other:    #6b7280;
+    /* Soft tints for the icon badge backgrounds — keep the badge keyed to
+       the same accent as the card's coloured left border without shouting. */
+    --agent-src-telegram-soft: rgba(58, 169, 245, 0.14);
+    --agent-src-email-soft:    rgba(91, 141, 239, 0.14);
+    --agent-src-calendar-soft: rgba(164, 121, 216, 0.14);
+    --agent-src-wakeup-soft:   rgba(224, 166, 79, 0.14);
+    --agent-src-user_chat-soft: var(--brand-glow);
+    --agent-src-subagent-soft: rgba(107, 114, 128, 0.16);
+    --agent-src-other-soft:    rgba(107, 114, 128, 0.16);
 }
 
 .agent-control-view {
@@ -7496,17 +7505,45 @@ option:hover {
 .agents-running-pill {
     display: inline-flex;
     align-items: center;
+    gap: 7px;
     height: 26px;
-    padding: 0 10px;
+    padding: 0 11px;
     background: var(--brand-grad-soft);
     border: 1px solid var(--border-strong);
-    border-radius: var(--r-md);
+    border-radius: var(--r-pill);
     color: var(--text);
     font-size: 11px;
     font-weight: 600;
     letter-spacing: 0.04em;
     text-transform: uppercase;
     font-variant-numeric: tabular-nums;
+    transition: background var(--dur) var(--ease),
+                border-color var(--dur) var(--ease),
+                color var(--dur) var(--ease);
+}
+.agents-running-pill::before {
+    content: '';
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--brand-warm);
+    box-shadow: 0 0 0 0 var(--brand-glow-strong);
+    animation: agentRunningDot 1.8s var(--ease) infinite;
+}
+@keyframes agentRunningDot {
+    0%, 100% { box-shadow: 0 0 0 0 var(--brand-glow-strong); }
+    50%      { box-shadow: 0 0 0 4px transparent; }
+}
+/* Idle: nothing running — drop the brand tint + still the pulse dot. */
+.agents-running-pill.idle {
+    background: var(--surface-2);
+    border-color: var(--border);
+    color: var(--text-3);
+}
+.agents-running-pill.idle::before {
+    background: var(--text-3);
+    box-shadow: none;
+    animation: none;
 }
 
 .agent-control-body {
@@ -7556,6 +7593,10 @@ option:hover {
 .agent-control-tab:hover {
     background: var(--overlay-hover);
     color: var(--text);
+}
+.agent-control-tab:focus-visible {
+    outline: none;
+    box-shadow: var(--ring-focus);
 }
 
 .agent-control-tab.active {
@@ -7720,16 +7761,29 @@ option:hover {
     gap: 10px;
 }
 .agent-card-icon {
-    width: 28px;
-    height: 28px;
+    width: 30px;
+    height: 30px;
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    font-size: 16px;
-    border-radius: 50%;
-    background: var(--surface-2);
+    border-radius: var(--r-md);
+    /* Tinted to the source accent — defaults to "other", overridden per
+       data-source on the parent card below. */
+    background: var(--agent-src-other-soft);
+    color: var(--agent-src-other);
+    box-shadow: inset 0 0 0 1px var(--border);
     flex: 0 0 auto;
 }
+.agent-card-icon svg {
+    width: 16px;
+    height: 16px;
+}
+.agent-card[data-source="telegram"]  .agent-card-icon { background: var(--agent-src-telegram-soft);  color: var(--agent-src-telegram); }
+.agent-card[data-source="email"]     .agent-card-icon { background: var(--agent-src-email-soft);     color: var(--agent-src-email); }
+.agent-card[data-source="calendar"]  .agent-card-icon { background: var(--agent-src-calendar-soft);  color: var(--agent-src-calendar); }
+.agent-card[data-source="wakeup"]    .agent-card-icon { background: var(--agent-src-wakeup-soft);    color: var(--agent-src-wakeup); }
+.agent-card[data-source="user_chat"] .agent-card-icon { background: var(--agent-src-user_chat-soft); color: var(--agent-src-user_chat); }
+.agent-card[data-source="subagent"]  .agent-card-icon { background: var(--agent-src-subagent-soft);  color: var(--agent-src-subagent); }
 .agent-card-title {
     flex: 1;
     min-width: 0;
@@ -7809,6 +7863,11 @@ option:hover {
 .agent-card-jump:hover {
     background: var(--surface-3);
     color: var(--text);
+    border-color: var(--border-bright);
+}
+.agent-card-jump:focus-visible {
+    outline: none;
+    box-shadow: var(--ring-focus);
 }
 .agent-card-foot-actions {
     display: inline-flex;
@@ -7835,10 +7894,18 @@ option:hover {
         color var(--dur) var(--ease),
         border-color var(--dur) var(--ease);
 }
+.agent-card-stop svg {
+    width: 13px;
+    height: 13px;
+}
 .agent-card-stop:hover {
-    background: var(--brand-glow);
-    color: var(--brand-warm);
-    border-color: var(--brand-glow-strong);
+    background: var(--danger-soft);
+    color: var(--danger);
+    border-color: var(--danger);
+}
+.agent-card-stop:focus-visible {
+    outline: none;
+    box-shadow: var(--ring-focus);
 }
 .agent-card-stop:disabled {
     cursor: progress;
@@ -7916,15 +7983,26 @@ option:hover {
 .agent-history-row[data-source="subagent"]  { border-left-color: var(--agent-src-subagent); }
 
 .agent-history-icon {
-    width: 24px;
-    height: 24px;
+    width: 26px;
+    height: 26px;
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    border-radius: 50%;
-    background: var(--surface-2);
-    font-size: 14px;
+    border-radius: var(--r-sm);
+    background: var(--agent-src-other-soft);
+    color: var(--agent-src-other);
+    box-shadow: inset 0 0 0 1px var(--border);
 }
+.agent-history-icon svg {
+    width: 14px;
+    height: 14px;
+}
+.agent-history-item[data-source="telegram"]  .agent-history-icon { background: var(--agent-src-telegram-soft);  color: var(--agent-src-telegram); }
+.agent-history-item[data-source="email"]     .agent-history-icon { background: var(--agent-src-email-soft);     color: var(--agent-src-email); }
+.agent-history-item[data-source="calendar"]  .agent-history-icon { background: var(--agent-src-calendar-soft);  color: var(--agent-src-calendar); }
+.agent-history-item[data-source="wakeup"]    .agent-history-icon { background: var(--agent-src-wakeup-soft);    color: var(--agent-src-wakeup); }
+.agent-history-item[data-source="user_chat"] .agent-history-icon { background: var(--agent-src-user_chat-soft); color: var(--agent-src-user_chat); }
+.agent-history-item[data-source="subagent"]  .agent-history-icon { background: var(--agent-src-subagent-soft);  color: var(--agent-src-subagent); }
 .agent-history-title {
     color: var(--text);
     font-weight: 500;
@@ -7960,19 +8038,19 @@ option:hover {
     border: 1px solid transparent;
 }
 .agent-history-status[data-status="completed"] {
-    background: rgba(34, 197, 94, 0.12);
-    color: #4ade80;
-    border-color: rgba(34, 197, 94, 0.28);
+    background: var(--success-soft);
+    color: var(--success);
+    border-color: var(--success-soft);
 }
 .agent-history-status[data-status="failed"] {
-    background: rgba(239, 68, 68, 0.14);
-    color: #fca5a5;
-    border-color: rgba(239, 68, 68, 0.30);
+    background: var(--danger-soft);
+    color: var(--danger);
+    border-color: var(--danger-soft);
 }
 .agent-history-status[data-status="cancelled"] {
-    background: rgba(148, 163, 184, 0.14);
-    color: #cbd5e1;
-    border-color: rgba(148, 163, 184, 0.28);
+    background: var(--surface-3);
+    color: var(--text-3);
+    border-color: var(--border);
 }
 .agent-history-status[data-status="running"] {
     background: var(--brand-grad-soft);
@@ -8001,6 +8079,10 @@ option:hover {
     background: var(--surface-2);
     color: var(--text);
     border-color: var(--border-bright);
+}
+.agent-history-jump:focus-visible {
+    outline: none;
+    box-shadow: var(--ring-focus);
 }
 
 .agent-history-chevron {
