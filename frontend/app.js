@@ -146,6 +146,12 @@ const ICON_ALERT       = toolSvg('<circle cx="12" cy="12" r="10"/><line x1="12" 
 const ICON_SUBAGENT    = toolSvg('<rect x="4" y="8" width="16" height="11" rx="2"/><path d="M12 4v4"/><circle cx="12" cy="3" r="1"/><line x1="9" y1="13" x2="9" y2="14"/><line x1="15" y1="13" x2="15" y2="14"/><line x1="2" y1="13" x2="4" y2="13"/><line x1="20" y1="13" x2="22" y2="13"/>');
 // Small dot in a circle: catch-all "other" source glyph.
 const ICON_DOT         = toolSvg('<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.5" fill="currentColor" stroke="none"/>');
+// Pencil: edit a record inline.
+const ICON_PENCIL      = toolSvg('<path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/>');
+// Circle with a slash: block a contact.
+const ICON_BLOCK       = toolSvg('<circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/>');
+// Person silhouette in a dashed/soft frame: "select a contact" empty placeholder.
+const ICON_CONTACT_PLACEHOLDER = toolSvg('<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>', 56);
 
 // Maps a notification/toast urgency string to its semantic SVG icon. Low =
 // info, Medium = mail (the canonical "new event" glyph), High = warning
@@ -12006,9 +12012,12 @@ const contactsAzRailEl = document.getElementById('contacts-az-rail');
 // filters this in-memory rather than re-querying.
 let allContacts = [];
 let contactsSearchQuery = '';
-// Track which contact cards are expanded so a filter/reload re-render keeps
-// the open state instead of collapsing everything.
-const expandedContactIds = new Set();
+// Master–detail state: which contact's page is open on the right, and whether
+// that page is currently in edit mode (or create mode when no contact is set).
+let selectedContactId = null;
+// 'view' | 'edit' | 'create'. Drives what the detail pane renders.
+let contactDetailMode = 'view';
+const contactDetailEl = document.getElementById('contact-detail');
 
 function showContacts() {
     appView.style.display = 'none';
@@ -12023,10 +12032,12 @@ function showContacts() {
     if (timelineRefreshInterval) { clearInterval(timelineRefreshInterval); timelineRefreshInterval = null; }
     contactsView.classList.remove('hidden');
     closeSidebar();
-    // Fresh entry: clear any stale search query + expand state.
+    // Fresh entry: clear any stale search query + selection.
     contactsSearchQuery = '';
     if (contactsSearchEl) contactsSearchEl.value = '';
-    expandedContactIds.clear();
+    selectedContactId = null;
+    contactDetailMode = 'view';
+    renderContactDetail();
     loadContacts();
 }
 
@@ -12060,6 +12071,16 @@ async function loadContacts() {
         const contacts = await invoke('list_contacts');
         allContacts = Array.isArray(contacts) ? contacts : [];
         renderContacts();
+        // Keep the open detail pane in sync with freshly loaded data. If the
+        // selected contact vanished (deleted), fall back to the placeholder.
+        // While editing/creating we leave the pane alone so the user's
+        // in-progress input isn't blown away by a background reload.
+        if (contactDetailMode === 'view') {
+            if (selectedContactId && !allContacts.some(c => c.id === selectedContactId)) {
+                selectedContactId = null;
+            }
+            renderContactDetail();
+        }
     } catch (err) {
         console.error('Failed to load contacts:', err);
         showToast('Failed to load contacts: ' + err, 'error');
@@ -12115,15 +12136,6 @@ function buildContactAvatar(contact) {
         el.innerHTML = ICON_USER;
     }
     return el;
-}
-
-// Primary identifier to show as the row's subtitle: prefer Email, then Phone,
-// else the first identifier available.
-function primaryIdentifier(contact) {
-    const ids = contact.identifiers || [];
-    if (ids.length === 0) return null;
-    const byKind = (k) => ids.find(i => i.kind === k);
-    return byKind('Email') || byKind('Phone') || ids[0];
 }
 
 // Section letter: uppercased first alpha char of the name, else "#".
@@ -12206,7 +12218,7 @@ function renderContacts() {
         header.id = 'contact-section-' + sec.letter;
         header.textContent = sec.letter;
         frag.appendChild(header);
-        sec.contacts.forEach(contact => frag.appendChild(buildContactCard(contact)));
+        sec.contacts.forEach(contact => frag.appendChild(buildContactRow(contact)));
     });
 
     contactsListEl.innerHTML = '';
@@ -12219,20 +12231,17 @@ function renderContacts() {
     renderAzRail(sections, searching);
 }
 
-function buildContactCard(contact) {
-    const card = document.createElement('div');
-    card.className = 'contact-card' + (contact.blocked ? ' blocked' : '');
-    card.dataset.contactId = contact.id;
-    if (expandedContactIds.has(contact.id)) card.classList.add('expanded');
-
-    const trustClass = 'trust-' + (contact.trust_level || 'unknown').toLowerCase();
-    const trustLabel = contact.trust_level === 'AuthUser' ? 'Owner' : (contact.trust_level || 'Unknown');
-
-    // ── Row (clickable to expand) ──
+// Thin, selectable list row (iOS-style): small avatar + name + optional trust
+// pip. Clicking selects the contact and opens its page in the detail pane.
+function buildContactRow(contact) {
     const row = document.createElement('div');
-    row.className = 'contact-row';
+    row.className = 'contact-row' + (contact.blocked ? ' blocked' : '');
+    row.dataset.contactId = contact.id;
+    if (contact.id === selectedContactId) row.classList.add('active');
 
-    row.appendChild(buildContactAvatar(contact));
+    const avatar = buildContactAvatar(contact);
+    avatar.classList.add('contact-avatar-sm');
+    row.appendChild(avatar);
 
     const main = document.createElement('div');
     main.className = 'contact-row-main';
@@ -12240,111 +12249,312 @@ function buildContactCard(contact) {
     nameEl.className = 'contact-row-name';
     nameEl.textContent = contact.name || 'Unnamed';
     main.appendChild(nameEl);
-    const primary = primaryIdentifier(contact);
-    const subEl = document.createElement('div');
-    subEl.className = 'contact-row-sub';
-    if (primary) {
-        subEl.textContent = primary.value;
-    } else if (contact.interaction_count > 0) {
-        subEl.textContent = contact.interaction_count + ' interaction' + (contact.interaction_count !== 1 ? 's' : '');
-    } else {
-        subEl.textContent = 'No identifiers';
-    }
-    main.appendChild(subEl);
     row.appendChild(main);
 
-    const badges = document.createElement('div');
-    badges.className = 'contact-row-badges';
+    const trail = document.createElement('div');
+    trail.className = 'contact-row-trail';
     if (contact.blocked) {
-        badges.innerHTML = '<span class="contact-badge blocked-badge">Blocked</span>';
+        const b = document.createElement('span');
+        b.className = 'contact-badge blocked-badge';
+        b.textContent = 'Blocked';
+        trail.appendChild(b);
     }
-    badges.innerHTML += '<span class="contact-badge ' + trustClass + '">' + escapeHtml(trustLabel) + '</span>';
-    const chevron = document.createElement('span');
-    chevron.className = 'contact-row-chevron';
-    chevron.setAttribute('aria-hidden', 'true');
-    chevron.innerHTML = toolSvg('<polyline points="9 18 15 12 9 6"/>', 16);
-    badges.appendChild(chevron);
-    row.appendChild(badges);
+    const trustClass = 'trust-' + (contact.trust_level || 'unknown').toLowerCase();
+    const pip = document.createElement('span');
+    pip.className = 'contact-trust-pip ' + trustClass;
+    pip.title = contact.trust_level === 'AuthUser' ? 'Owner' : (contact.trust_level || 'Unknown');
+    trail.appendChild(pip);
+    row.appendChild(trail);
 
-    row.addEventListener('click', () => {
-        const nowExpanded = card.classList.toggle('expanded');
-        if (nowExpanded) expandedContactIds.add(contact.id);
-        else expandedContactIds.delete(contact.id);
+    row.addEventListener('click', () => selectContact(contact.id));
+    return row;
+}
+
+// ─── Detail pane (master–detail right side) ───
+
+// Open a contact's page in view mode and highlight its list row.
+function selectContact(id) {
+    selectedContactId = id;
+    contactDetailMode = 'view';
+    // Update list-row active highlight without a full re-render.
+    contactsListEl.querySelectorAll('.contact-row').forEach(r => {
+        r.classList.toggle('active', r.dataset.contactId === id);
     });
+    renderContactDetail();
+}
 
-    // ── Details (shown when expanded) ──
-    const detailsEl = document.createElement('div');
-    detailsEl.className = 'contact-details';
+// Open the detail pane in create mode (blank, no contact selected).
+function startNewContact() {
+    selectedContactId = null;
+    contactDetailMode = 'create';
+    contactsListEl.querySelectorAll('.contact-row.active').forEach(r => r.classList.remove('active'));
+    renderContactDetail();
+}
 
-    let identifiersHtml = '';
-    if (contact.identifiers && contact.identifiers.length > 0) {
-        identifiersHtml = '<div class="contact-identifiers">';
-        contact.identifiers.forEach(ident => {
-            identifiersHtml +=
+function selectedContact() {
+    return allContacts.find(c => c.id === selectedContactId) || null;
+}
+
+// Render whatever the detail pane should show right now based on
+// (selectedContactId, contactDetailMode). Always resets the pane's own
+// scrollTop — WebKitGTK retains scrollTop across an innerHTML swap and won't
+// re-clamp when the new (shorter) content is shorter than the old.
+function renderContactDetail() {
+    if (!contactDetailEl) return;
+    if (contactDetailMode === 'create') {
+        renderContactEdit(null);
+    } else {
+        const c = selectedContact();
+        if (!c) renderContactPlaceholder();
+        else if (contactDetailMode === 'edit') renderContactEdit(c);
+        else renderContactView(c);
+    }
+    contactDetailEl.scrollTop = 0;
+}
+
+function renderContactPlaceholder() {
+    contactDetailEl.className = 'contact-detail is-empty';
+    contactDetailEl.innerHTML =
+        '<div class="contact-detail-placeholder">' +
+        '<div class="contact-detail-placeholder-icon">' + ICON_CONTACT_PLACEHOLDER + '</div>' +
+        '<p>Select a contact</p>' +
+        '<p class="contact-detail-placeholder-hint">Pick someone from the list, or create a new contact.</p>' +
+        '</div>';
+}
+
+function renderContactView(contact) {
+    contactDetailEl.className = 'contact-detail';
+    const trustClass = 'trust-' + (contact.trust_level || 'unknown').toLowerCase();
+    const trustLabel = contact.trust_level === 'AuthUser' ? 'Owner' : (contact.trust_level || 'Unknown');
+    const isOwner = contact.trust_level === 'AuthUser';
+
+    contactDetailEl.innerHTML = '';
+
+    // ── Header: large avatar, name, badges ──
+    const head = document.createElement('div');
+    head.className = 'contact-detail-head';
+    const bigAvatar = buildContactAvatar(contact);
+    bigAvatar.classList.add('contact-avatar-lg');
+    head.appendChild(bigAvatar);
+
+    const headText = document.createElement('div');
+    headText.className = 'contact-detail-headtext';
+    const nameEl = document.createElement('h2');
+    nameEl.className = 'contact-detail-name';
+    nameEl.textContent = contact.name || 'Unnamed';
+    headText.appendChild(nameEl);
+    const badges = document.createElement('div');
+    badges.className = 'contact-detail-badges';
+    if (contact.blocked) badges.innerHTML += '<span class="contact-badge blocked-badge">Blocked</span>';
+    badges.innerHTML += '<span class="contact-badge ' + trustClass + '">' + escapeHtml(trustLabel) + '</span>';
+    if (contact.trust_manual_override) badges.innerHTML += '<span class="contact-badge trust-manual">Manual</span>';
+    headText.appendChild(badges);
+    head.appendChild(headText);
+    contactDetailEl.appendChild(head);
+
+    // ── Actions row ──
+    const actions = document.createElement('div');
+    actions.className = 'contact-detail-actions';
+    const editBtn = document.createElement('button');
+    editBtn.className = 'contact-detail-action';
+    editBtn.innerHTML = ICON_PENCIL + '<span>Edit</span>';
+    editBtn.addEventListener('click', () => { contactDetailMode = 'edit'; renderContactDetail(); });
+    actions.appendChild(editBtn);
+
+    const blockBtn = document.createElement('button');
+    blockBtn.className = 'contact-detail-action ' + (contact.blocked ? 'is-unblock' : 'is-block');
+    blockBtn.innerHTML = ICON_BLOCK + '<span>' + (contact.blocked ? 'Unblock' : 'Block') + '</span>';
+    blockBtn.addEventListener('click', () => toggleBlockContact(contact.id, !contact.blocked));
+    actions.appendChild(blockBtn);
+
+    const delBtn = document.createElement('button');
+    delBtn.className = 'contact-detail-action is-delete';
+    delBtn.innerHTML = ICON_TRASH + '<span>Delete</span>';
+    delBtn.addEventListener('click', () => deleteContact(contact.id));
+    actions.appendChild(delBtn);
+    contactDetailEl.appendChild(actions);
+
+    // ── Identifiers ──
+    const ids = contact.identifiers || [];
+    const idSection = document.createElement('div');
+    idSection.className = 'contact-detail-section';
+    let idHtml = '<div class="contact-detail-section-label">Identifiers</div>';
+    if (ids.length > 0) {
+        idHtml += '<div class="contact-identifiers">';
+        ids.forEach(ident => {
+            idHtml +=
                 '<div class="contact-identifier">' +
                 '<span class="contact-identifier-kind">' + escapeHtml(ident.kind) + '</span>' +
                 '<span class="contact-identifier-value">' + escapeHtml(ident.value) + '</span>' +
                 '</div>';
         });
-        identifiersHtml += '</div>';
+        idHtml += '</div>';
+    } else {
+        idHtml += '<div class="contact-detail-muted">No identifiers</div>';
+    }
+    idSection.innerHTML = idHtml;
+    contactDetailEl.appendChild(idSection);
+
+    // ── Notes ──
+    if (contact.notes && contact.notes.trim()) {
+        const notesSection = document.createElement('div');
+        notesSection.className = 'contact-detail-section';
+        const lbl = document.createElement('div');
+        lbl.className = 'contact-detail-section-label';
+        lbl.textContent = 'Notes';
+        const body = document.createElement('div');
+        body.className = 'contact-detail-notes';
+        body.textContent = contact.notes;
+        notesSection.appendChild(lbl);
+        notesSection.appendChild(body);
+        contactDetailEl.appendChild(notesSection);
     }
 
-    let metaHtml = '<div class="contact-meta">';
+    // ── Meta ──
+    const meta = document.createElement('div');
+    meta.className = 'contact-detail-meta';
+    let metaText = '';
+    const count = contact.interaction_count || 0;
+    metaText += count + ' interaction' + (count !== 1 ? 's' : '');
     if (contact.last_interaction) {
         const lastDate = new Date(contact.last_interaction);
-        metaHtml += 'Last interaction: ' + lastDate.toLocaleDateString() + ' ' + lastDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        metaText += ' · last ' + relativeTimeFrom(lastDate);
     } else {
-        metaHtml += 'No interactions yet';
+        metaText += ' · no interactions yet';
     }
-    if (contact.trust_manual_override) {
-        metaHtml += ' &middot; <em>Trust manually set</em>';
+    meta.textContent = metaText;
+    if (isOwner) {
+        const ownerNote = document.createElement('div');
+        ownerNote.className = 'contact-detail-muted';
+        ownerNote.style.marginTop = '6px';
+        ownerNote.textContent = 'This is you (owner). Trust level is fixed.';
+        meta.appendChild(ownerNote);
     }
-    metaHtml += '</div>';
+    contactDetailEl.appendChild(meta);
+}
 
-    let actionsHtml = '<div class="contact-actions">';
-    actionsHtml += '<select class="contact-trust-select" data-contact-id="' + escapeHtml(contact.id) + '">';
-    ['Unknown', 'Neutral', 'Known', 'Trusted'].forEach(level => {
-        const selected = contact.trust_level === level ? ' selected' : '';
-        actionsHtml += '<option value="' + level + '"' + selected + '>' + level + '</option>';
-    });
-    actionsHtml += '</select>';
-    actionsHtml += '<button class="contact-action-btn btn-edit" data-action="edit" data-contact-id="' + escapeHtml(contact.id) + '">Edit</button>';
-    if (contact.blocked) {
-        actionsHtml += '<button class="contact-action-btn btn-unblock" data-action="unblock" data-contact-id="' + escapeHtml(contact.id) + '">Unblock</button>';
+// Relative "x ago" for the meta line. Falls back to a locale date for old dates.
+function relativeTimeFrom(date) {
+    const sec = Math.round((Date.now() - date.getTime()) / 1000);
+    if (sec < 60) return 'just now';
+    const min = Math.round(sec / 60);
+    if (min < 60) return min + ' min ago';
+    const hr = Math.round(min / 60);
+    if (hr < 24) return hr + ' hr ago';
+    const day = Math.round(hr / 24);
+    if (day < 30) return day + ' day' + (day !== 1 ? 's' : '') + ' ago';
+    return date.toLocaleDateString();
+}
+
+// Edit / create form rendered inline in the detail pane. `contact` is null
+// when creating. Reuses the app form primitives for style consistency.
+function renderContactEdit(contact) {
+    const creating = !contact;
+    contactDetailEl.className = 'contact-detail';
+    contactDetailEl.innerHTML = '';
+
+    const head = document.createElement('div');
+    head.className = 'contact-detail-edithead';
+    const title = document.createElement('h2');
+    title.className = 'contact-detail-name';
+    title.textContent = creating ? 'New Contact' : 'Edit Contact';
+    head.appendChild(title);
+    contactDetailEl.appendChild(head);
+
+    const form = document.createElement('div');
+    form.className = 'contact-detail-form';
+
+    // Name
+    const nameField = document.createElement('div');
+    nameField.className = 'cal-field';
+    nameField.innerHTML = '<label>Name</label>';
+    const nameInput = document.createElement('input');
+    nameInput.type = 'text';
+    nameInput.id = 'contact-edit-name';
+    nameInput.placeholder = 'John Doe';
+    nameInput.value = contact ? (contact.name || '') : '';
+    nameField.appendChild(nameInput);
+    form.appendChild(nameField);
+
+    // Trust (owner shown read-only)
+    const isOwner = contact && contact.trust_level === 'AuthUser';
+    const trustField = document.createElement('div');
+    trustField.className = 'cal-field';
+    if (isOwner) {
+        trustField.innerHTML = '<label>Trust Level</label><div class="contact-detail-muted">Owner (read-only)</div>';
     } else {
-        actionsHtml += '<button class="contact-action-btn btn-block" data-action="block" data-contact-id="' + escapeHtml(contact.id) + '">Block</button>';
-    }
-    actionsHtml += '<button class="contact-action-btn btn-delete" data-action="delete" data-contact-id="' + escapeHtml(contact.id) + '">Delete</button>';
-    if (contact.trust_manual_override) {
-        actionsHtml += '<span class="contact-override-hint">Manual override active</span>';
-    }
-    actionsHtml += '</div>';
-
-    detailsEl.innerHTML = identifiersHtml + metaHtml + actionsHtml;
-
-    // Wire details controls (scoped to this card).
-    const trustSelect = detailsEl.querySelector('.contact-trust-select');
-    if (trustSelect) {
-        trustSelect.addEventListener('click', (e) => e.stopPropagation());
-        trustSelect.addEventListener('change', async (e) => {
-            await setContactTrust(e.target.dataset.contactId, e.target.value);
+        trustField.innerHTML = '<label>Trust Level</label>';
+        const trustSel = document.createElement('select');
+        trustSel.id = 'contact-edit-trust';
+        trustSel.className = 'contact-trust-select';
+        ['Unknown', 'Neutral', 'Known', 'Trusted'].forEach(level => {
+            const opt = document.createElement('option');
+            opt.value = level;
+            opt.textContent = level;
+            const current = contact ? contact.trust_level : 'Neutral';
+            if (level === (current || 'Neutral')) opt.selected = true;
+            trustSel.appendChild(opt);
         });
+        trustField.appendChild(trustSel);
     }
-    detailsEl.querySelectorAll('.contact-action-btn').forEach(btn => {
-        btn.addEventListener('click', async (e) => {
-            e.stopPropagation();
-            const id = btn.dataset.contactId;
-            const action = btn.dataset.action;
-            if (action === 'edit') showEditContactModal(contact);
-            else if (action === 'block') await toggleBlockContact(id, true);
-            else if (action === 'unblock') await toggleBlockContact(id, false);
-            else if (action === 'delete') await deleteContact(id);
-        });
+    form.appendChild(trustField);
+
+    // Identifiers
+    const idField = document.createElement('div');
+    idField.className = 'cal-field';
+    idField.innerHTML = '<label>Identifiers</label>';
+    const idList = document.createElement('div');
+    idList.id = 'contact-edit-identifiers';
+    idList.className = 'contact-edit-identifiers';
+    idField.appendChild(idList);
+    const addBtn = document.createElement('button');
+    addBtn.type = 'button';
+    addBtn.className = 'btn-secondary contact-add-field-btn';
+    addBtn.textContent = '+ Add field';
+    addBtn.addEventListener('click', () => addIdentifierRow());
+    idField.appendChild(addBtn);
+    form.appendChild(idField);
+
+    // Notes
+    const notesField = document.createElement('div');
+    notesField.className = 'cal-field';
+    notesField.innerHTML = '<label>Notes <span class="setting-hint" style="font-weight:normal;">(optional)</span></label>';
+    const notesArea = document.createElement('textarea');
+    notesArea.id = 'contact-edit-notes';
+    notesArea.rows = 3;
+    notesArea.placeholder = 'Anything Athen should remember about this contact';
+    notesArea.value = contact ? (contact.notes || '') : '';
+    notesField.appendChild(notesArea);
+    form.appendChild(notesField);
+
+    // Save / Cancel
+    const formActions = document.createElement('div');
+    formActions.className = 'contact-detail-formactions';
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'btn-secondary';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.addEventListener('click', () => {
+        if (creating) { contactDetailMode = 'view'; selectedContactId = null; }
+        else contactDetailMode = 'view';
+        renderContactDetail();
     });
+    const saveBtn = document.createElement('button');
+    saveBtn.className = 'btn-primary';
+    saveBtn.textContent = 'Save';
+    saveBtn.addEventListener('click', () => saveContact(contact ? contact.id : null));
+    formActions.appendChild(cancelBtn);
+    formActions.appendChild(saveBtn);
+    form.appendChild(formActions);
 
-    card.appendChild(row);
-    card.appendChild(detailsEl);
-    return card;
+    contactDetailEl.appendChild(form);
+
+    // Seed identifier rows.
+    if (contact && contact.identifiers && contact.identifiers.length > 0) {
+        contact.identifiers.forEach(ident => addIdentifierRow(ident.kind, ident.value));
+    } else {
+        addIdentifierRow();
+    }
+    nameInput.focus();
 }
 
 // Thin A–Z quick-jump rail on the right; click scrolls to that section.
@@ -12371,18 +12581,6 @@ function renderAzRail(sections, searching) {
         }
         contactsAzRailEl.appendChild(item);
     });
-}
-
-async function setContactTrust(id, level) {
-    if (!invoke) return;
-    try {
-        await invoke('set_contact_trust', { id, trustLevel: level });
-        showToast('Trust level updated', 'success');
-        await loadContacts();
-    } catch (err) {
-        console.error('Failed to set trust level:', err);
-        showToast('Failed to set trust level: ' + err, 'error');
-    }
 }
 
 async function toggleBlockContact(id, block) {
@@ -12438,7 +12636,8 @@ function getIdentifierPlaceholder(kind) {
 const identifierKinds = ['Email', 'Phone', 'Telegram', 'WhatsApp', 'IMessage', 'Signal', 'Discord', 'Slack', 'Twitter', 'Username', 'Other'];
 
 function addIdentifierRow(kind, value) {
-    const list = document.getElementById('contact-identifiers-list');
+    const list = document.getElementById('contact-edit-identifiers');
+    if (!list) return;
     const row = document.createElement('div');
     row.className = 'identifier-row';
 
@@ -12472,56 +12671,17 @@ function addIdentifierRow(kind, value) {
     list.appendChild(row);
 }
 
-function showNewContactModal() {
-    document.getElementById('contact-edit-id').value = '';
-    document.getElementById('contact-name').value = '';
-    document.getElementById('contact-trust-modal-select').value = 'Neutral';
-    document.getElementById('contact-identifiers-list').innerHTML = '';
-    const notesEl = document.getElementById('contact-notes');
-    if (notesEl) notesEl.value = '';
-    document.getElementById('contact-modal-title').textContent = 'New Contact';
-    addIdentifierRow();
-    document.getElementById('contact-modal-overlay').style.display = '';
-}
-
-function showEditContactModal(contact) {
-    document.getElementById('contact-edit-id').value = contact.id;
-    document.getElementById('contact-name').value = contact.name || '';
-    // Trust level select carries Unknown/Neutral/Known/Trusted; AuthUser
-    // contacts (the owner) have no matching option, so leave the select
-    // unset and `saveContact` will send an empty string the backend
-    // treats as "don't change".
-    const trustSel = document.getElementById('contact-trust-modal-select');
-    if (['Unknown', 'Neutral', 'Known', 'Trusted'].includes(contact.trust_level)) {
-        trustSel.value = contact.trust_level;
-    } else {
-        trustSel.value = '';
-    }
-    document.getElementById('contact-identifiers-list').innerHTML = '';
-    const notesEl = document.getElementById('contact-notes');
-    if (notesEl) notesEl.value = contact.notes || '';
-    document.getElementById('contact-modal-title').textContent = 'Edit Contact';
-
-    if (contact.identifiers && contact.identifiers.length > 0) {
-        contact.identifiers.forEach(ident => {
-            addIdentifierRow(ident.kind, ident.value);
-        });
-    } else {
-        addIdentifierRow();
-    }
-
-    document.getElementById('contact-modal-overlay').style.display = '';
-}
-
-function hideContactModal() {
-    document.getElementById('contact-modal-overlay').style.display = 'none';
-}
-
-async function saveContact() {
-    const id = document.getElementById('contact-edit-id').value;
-    const name = document.getElementById('contact-name').value.trim();
-    const trustLevel = document.getElementById('contact-trust-modal-select').value;
-    const notesEl = document.getElementById('contact-notes');
+// Save the inline detail-pane form. `id` is null when creating. Reads the
+// fields rendered by renderContactEdit. Backend contract unchanged:
+// camelCase write params (trustLevel, identifiers:[{kind,value}]).
+async function saveContact(id) {
+    const nameEl = document.getElementById('contact-edit-name');
+    const name = nameEl ? nameEl.value.trim() : '';
+    const trustEl = document.getElementById('contact-edit-trust');
+    // Owner (AuthUser) edit omits the trust <select>; sending '' means
+    // "don't change" to the backend.
+    const trustLevel = trustEl ? trustEl.value : '';
+    const notesEl = document.getElementById('contact-edit-notes');
     const notes = notesEl ? notesEl.value : '';
 
     if (!name) {
@@ -12529,7 +12689,7 @@ async function saveContact() {
         return;
     }
 
-    const rows = document.querySelectorAll('#contact-identifiers-list .identifier-row');
+    const rows = document.querySelectorAll('#contact-edit-identifiers .identifier-row');
     const identifiers = [];
     rows.forEach(row => {
         const kind = row.querySelector('select').value;
@@ -12551,10 +12711,14 @@ async function saveContact() {
             await invoke('update_contact', { id, name, trustLevel, identifiers, notes });
             showToast('Contact updated', 'success');
         } else {
-            await invoke('create_contact', { name, trustLevel, identifiers, notes });
+            const created = await invoke('create_contact', { name, trustLevel, identifiers, notes });
             showToast('Contact created', 'success');
+            // create_contact returns the full ContactInfo (snake_case); grab id.
+            if (created && created.id) selectedContactId = created.id;
         }
-        hideContactModal();
+        // Drop back to view mode; loadContacts re-renders the (now in-sync)
+        // pane via its contactDetailMode === 'view' branch.
+        contactDetailMode = 'view';
         await loadContacts();
     } catch (err) {
         console.error('Failed to save contact:', err);
@@ -12571,10 +12735,7 @@ if (contactsBack) {
     contactsBack.addEventListener('click', hideContacts);
 }
 
-// Close contact modal on overlay click
-document.getElementById('contact-modal-overlay')?.addEventListener('click', function(e) {
-    if (e.target === this) hideContactModal();
-});
+document.getElementById('new-contact-btn')?.addEventListener('click', startNewContact);
 
 // Live search: filter in-memory on input, debounced lightly.
 let contactsSearchDebounce = null;

@@ -4796,18 +4796,26 @@ option:hover {
     min-width: 0;
 }
 
-/* The content column hosts a sticky search bar, the scrolling list, and an
- * optional A–Z quick-jump rail pinned to the right. */
+/* Two-pane master–detail layout: a fixed-ish list column on the left and a
+ * flexible contact page on the right. */
 .contacts-content {
     flex: 1;
+    display: flex;
+    flex-direction: row;
+    min-height: 0;
+    gap: 0;
+}
+
+/* LEFT column: search bar + scrolling A–Z list + A–Z rail. */
+.contacts-list-col {
     position: relative;
     display: flex;
     flex-direction: column;
     min-height: 0;
-    padding: 16px 24px 0;
-    max-width: 920px;
-    width: 100%;
-    margin: 0 auto;
+    flex: 0 0 320px;
+    width: 320px;
+    padding: 16px 16px 0;
+    border-right: 1px solid var(--glass-border);
 }
 
 /* ── Search bar (sticky frosted field) ── */
@@ -4913,42 +4921,50 @@ option:hover {
 }
 .contact-section-header:first-child { margin-top: 0; }
 
-/* ── Contact card (iOS-style row + expandable detail) ── */
-.contact-card {
-    background: var(--surface-1);
-    border: 1px solid var(--border);
-    border-radius: var(--r-md);
-    margin: 6px 0;
-    overflow: hidden;
-    transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
-}
-.contact-card:hover { border-color: var(--border-strong); }
-.contact-card.expanded {
-    border-color: var(--border-strong);
-    box-shadow: var(--shadow-card);
-}
-.contact-card.blocked { opacity: 0.62; }
-
-.contact-row {
+/* ── Thin, selectable list row (iOS-style) ──
+ * Scoped under .contacts-list-col so it never collides with the chat
+ * tool-card `.contact-row` (renderContactsList et al.). */
+.contacts-list-col .contact-row {
     display: flex;
     align-items: center;
-    gap: 12px;
-    padding: 10px 12px;
+    gap: 11px;
+    height: 48px;
+    padding: 0 10px;
+    border-radius: var(--r-md);
     cursor: pointer;
+    transition: background var(--dur-fast) var(--ease);
 }
+.contacts-list-col .contact-row:hover { background: var(--surface-2); }
+.contacts-list-col .contact-row.active {
+    background: var(--brand-glow);
+    box-shadow: inset 0 0 0 1px var(--brand-glow-strong);
+}
+.contacts-list-col .contact-row.active .contact-row-name { color: var(--brand-warm); }
+.contacts-list-col .contact-row.blocked { opacity: 0.6; }
 
 .contact-avatar {
     flex-shrink: 0;
-    width: 40px;
-    height: 40px;
     border-radius: 50%;
     display: grid;
     place-items: center;
-    font-size: 14px;
     font-weight: 600;
     letter-spacing: 0.01em;
     user-select: none;
 }
+/* Small (list-row) avatar */
+.contact-avatar-sm {
+    width: 34px;
+    height: 34px;
+    font-size: 12.5px;
+}
+.contact-avatar-sm.contact-avatar-empty svg { width: 17px; height: 17px; }
+/* Large (detail-pane) avatar */
+.contact-avatar-lg {
+    width: 76px;
+    height: 76px;
+    font-size: 26px;
+}
+.contact-avatar-lg.contact-avatar-empty svg { width: 38px; height: 38px; }
 .contact-avatar-owner { box-shadow: 0 0 0 1px var(--brand-glow-strong); }
 .contact-avatar-empty svg { width: 20px; height: 20px; }
 
@@ -4957,37 +4973,34 @@ option:hover {
     min-width: 0;
     display: flex;
     flex-direction: column;
-    gap: 2px;
 }
 .contact-row-name {
-    font-size: 14px;
-    font-weight: 550;
+    font-size: 13.5px;
+    font-weight: 500;
     color: var(--text);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
 }
-.contact-row-sub {
-    font-size: 12px;
-    color: var(--text-3);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
 
-.contact-row-badges {
+.contact-row-trail {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 7px;
     flex-shrink: 0;
 }
-.contact-row-chevron {
-    display: grid;
-    place-items: center;
-    color: var(--text-3);
-    transition: transform var(--dur) var(--ease);
+/* Small trust dot on the list row (color carries the trust level). */
+.contact-trust-pip {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
 }
-.contact-card.expanded .contact-row-chevron { transform: rotate(90deg); }
+.contact-trust-pip.trust-unknown { background: var(--text-3); opacity: 0.5; }
+.contact-trust-pip.trust-neutral { background: var(--info); }
+.contact-trust-pip.trust-known   { background: var(--warning); }
+.contact-trust-pip.trust-trusted { background: var(--success); }
+.contact-trust-pip.trust-authuser { background: var(--brand-solid); }
 
 .contact-badge {
     padding: 3px 9px;
@@ -5004,29 +5017,133 @@ option:hover {
 .contact-badge.trust-trusted { background: var(--success-soft); color: var(--success); }
 .contact-badge.trust-authuser { background: var(--brand-glow-strong); color: var(--brand-warm); }
 .contact-badge.blocked-badge { background: var(--danger-soft); color: var(--danger); }
+.contact-badge.trust-manual { background: var(--surface-3); color: var(--text-2); }
 
-.contact-details {
-    display: none;
-    padding: 14px;
-    border-top: 1px solid var(--border);
-    background: var(--surface-2);
+/* ── Detail pane (right side: contact page, view + edit) ── */
+.contact-detail {
+    flex: 1;
+    min-width: 0;
+    overflow-y: auto;
+    padding: 32px 36px 40px;
+    scroll-behavior: smooth;
 }
-.contact-card.expanded .contact-details { display: block; }
+.contact-detail.is-empty {
+    display: grid;
+    place-items: center;
+    padding: 24px;
+}
+
+.contact-detail-placeholder {
+    text-align: center;
+    color: var(--text-2);
+    max-width: 320px;
+}
+.contact-detail-placeholder-icon {
+    display: flex;
+    justify-content: center;
+    color: var(--text-3);
+    opacity: 0.55;
+    margin-bottom: 16px;
+}
+.contact-detail-placeholder p { margin: 0 0 4px; font-size: 15px; font-weight: 550; color: var(--text); }
+.contact-detail-placeholder-hint {
+    font-size: 12.5px;
+    color: var(--text-3) !important;
+    font-weight: 400 !important;
+    margin-top: 4px !important;
+}
+
+/* View-mode header */
+.contact-detail-head {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    margin-bottom: 20px;
+}
+.contact-detail-headtext { min-width: 0; }
+.contact-detail-name {
+    margin: 0 0 8px;
+    font-size: 22px;
+    font-weight: 650;
+    color: var(--text);
+    overflow-wrap: anywhere;
+}
+.contact-detail-badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 7px;
+}
+
+/* View-mode actions row */
+.contact-detail-actions {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-bottom: 24px;
+}
+.contact-detail-action {
+    height: 34px;
+    padding: 0 14px;
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    background: var(--surface-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    font-size: 12.5px;
+    font-weight: 500;
+    transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+.contact-detail-action svg { width: 15px; height: 15px; }
+.contact-detail-action:hover { background: var(--surface-3); border-color: var(--border-strong); }
+.contact-detail-action.is-block:hover { color: var(--warning); border-color: var(--warning); background: var(--warning-soft); }
+.contact-detail-action.is-unblock:hover { color: var(--success); border-color: var(--success); background: var(--success-soft); }
+.contact-detail-action.is-delete { color: var(--danger); }
+.contact-detail-action.is-delete:hover { background: var(--danger-soft); border-color: var(--danger); }
+
+/* View-mode sections */
+.contact-detail-section { margin-bottom: 22px; }
+.contact-detail-section-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-3);
+    font-weight: 600;
+    margin-bottom: 9px;
+}
+.contact-detail-muted {
+    color: var(--text-3);
+    font-size: 12.5px;
+}
+.contact-detail-notes {
+    color: var(--text);
+    font-size: 13px;
+    line-height: 1.55;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+.contact-detail-meta {
+    color: var(--text-3);
+    font-size: 11.5px;
+    padding-top: 16px;
+    border-top: 1px solid var(--border);
+}
 
 .contact-identifiers {
     display: flex;
     flex-direction: column;
     gap: 6px;
-    margin-bottom: 12px;
 }
 .contact-identifier {
     display: flex;
     align-items: center;
     gap: 10px;
-    padding: 7px 11px;
-    background: var(--surface-3);
+    padding: 10px 13px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
     border-radius: var(--r-sm);
-    font-size: 12.5px;
+    font-size: 13px;
     color: var(--text);
 }
 .contact-identifier-kind {
@@ -5035,7 +5152,7 @@ option:hover {
     letter-spacing: 0.04em;
     color: var(--text-3);
     font-weight: 600;
-    min-width: 64px;
+    min-width: 72px;
     flex-shrink: 0;
 }
 .contact-identifier-value {
@@ -5044,17 +5161,32 @@ option:hover {
     white-space: nowrap;
 }
 
-.contact-meta {
-    color: var(--text-3);
-    font-size: 11.5px;
-    margin-bottom: 12px;
-}
-
-.contact-actions {
+/* Edit-mode form */
+.contact-detail-edithead { margin-bottom: 18px; }
+.contact-detail-form {
     display: flex;
+    flex-direction: column;
+    gap: 14px;
+    max-width: 560px;
+}
+.contact-detail-form .cal-field { margin: 0; }
+.contact-edit-identifiers {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 8px;
+}
+.contact-add-field-btn {
+    height: 32px;
+    padding: 0 12px;
+    font-size: 12px;
+    align-self: flex-start;
+}
+.contact-detail-formactions {
+    display: flex;
+    justify-content: flex-end;
     gap: 8px;
-    align-items: center;
-    flex-wrap: wrap;
+    margin-top: 4px;
 }
 
 /* ── A–Z quick-jump rail ── */
@@ -5095,72 +5227,21 @@ option:hover {
     cursor: default;
 }
 
+/* Trust <select> in the edit form: custom arrow (inherits .cal-field select
+ * box styling for height/border/background). */
 .contact-trust-select {
-    height: 30px;
-    padding: 0 28px 0 10px;
-    background: var(--surface-3);
-    color: var(--text);
-    border: 1px solid var(--border);
-    border-radius: var(--r-sm);
-    font-size: 12px;
     appearance: none;
     -webkit-appearance: none;
-    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10'><path fill='none' stroke='%23A8A2B0' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round' d='M2.5 4l2.5 2.5 2.5-2.5'/></svg>");
+    padding-right: 32px;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'><path fill='none' stroke='%23A8A2B0' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round' d='M3 4.5l3 3 3-3'/></svg>");
     background-repeat: no-repeat;
-    background-position: right 8px center;
+    background-position: right 10px center;
 }
-
-.contact-action-btn {
-    height: 30px;
-    padding: 0 10px;
-    background: var(--surface-3);
-    color: var(--text);
-    border: 1px solid var(--border);
-    border-radius: var(--r-sm);
-    font-size: 11.5px;
-    transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
-}
-.contact-action-btn:hover { background: var(--surface-4); }
-.contact-action-btn.btn-block { color: var(--warning); }
-.contact-action-btn.btn-block:hover { background: var(--warning-soft); border-color: var(--warning); }
-.contact-action-btn.btn-unblock { color: var(--success); }
-.contact-action-btn.btn-unblock:hover { background: var(--success-soft); border-color: var(--success); }
-.contact-action-btn.btn-delete { color: var(--danger); }
-.contact-action-btn.btn-delete:hover { background: var(--danger-soft); border-color: var(--danger); }
-.contact-action-btn.btn-edit:hover { background: var(--surface-4); border-color: var(--border-strong); }
-
-.contact-override-hint {
-    color: var(--text-3);
-    font-size: 11px;
-    margin-top: 6px;
-    font-style: italic;
-}
-
-.contact-modal { max-width: 440px; }
 
 #new-contact-btn {
     height: 30px;
     padding: 0 12px;
     font-size: 12px;
-}
-
-.contact-edit-btn {
-    height: 30px;
-    padding: 0 12px;
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    background: var(--surface-3);
-    color: var(--text);
-    border: 1px solid var(--border);
-    border-radius: var(--r-sm);
-    font-size: 12px;
-    font-weight: 500;
-    transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease);
-}
-.contact-edit-btn:hover {
-    background: var(--surface-4);
-    border-color: var(--border-strong);
 }
 
 .identifier-row {
@@ -5188,37 +5269,6 @@ option:hover {
 .identifier-row .remove-identifier-btn:hover {
     background: var(--danger-soft);
     color: var(--danger);
-}
-
-#contact-identifiers-section { margin-top: 4px; }
-#contact-identifiers-section > label {
-    display: block;
-    font-size: 12.5px;
-    color: var(--text-2);
-    margin-bottom: 6px;
-    font-weight: 500;
-}
-#contact-identifiers-section .btn-secondary {
-    height: 30px;
-    padding: 0 10px;
-    font-size: 12px;
-    margin-top: 6px;
-}
-
-#contact-trust-modal-select {
-    height: 36px;
-    padding: 0 32px 0 12px;
-    background: var(--surface-2);
-    color: var(--text);
-    border: 1px solid var(--border);
-    border-radius: var(--r-sm);
-    font-size: 13px;
-    appearance: none;
-    -webkit-appearance: none;
-    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'><path fill='none' stroke='%23A8A2B0' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round' d='M3 4.5l3 3 3-3'/></svg>");
-    background-repeat: no-repeat;
-    background-position: right 10px center;
-    width: 100%;
 }
 
 /* ─── Notifications ─── */
@@ -8990,8 +9040,7 @@ option:hover {
    re-inject the native dropdown arrow on top of the custom SVG. */
 :root[data-theme="light"] .settings-select,
 :root[data-theme="light"] .cal-view-select,
-:root[data-theme="light"] .contact-trust-select,
-:root[data-theme="light"] #contact-trust-modal-select {
+:root[data-theme="light"] .contact-trust-select {
     appearance: none;
     -webkit-appearance: none;
     background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'><path fill='none' stroke='%236B6360' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round' d='M3 4.5l3 3 3-3'/></svg>");
@@ -9257,9 +9306,7 @@ option:hover {
 :root[data-theme="light"] .cal-view-select:active,
 :root[data-theme="light"] .cal-view-select:focus,
 :root[data-theme="light"] .contact-trust-select:active,
-:root[data-theme="light"] .contact-trust-select:focus,
-:root[data-theme="light"] #contact-trust-modal-select:active,
-:root[data-theme="light"] #contact-trust-modal-select:focus {
+:root[data-theme="light"] .contact-trust-select:focus {
     background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'><path fill='none' stroke='%236B6360' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round' d='M3 4.5l3 3 3-3'/></svg>") !important;
     background-repeat: no-repeat !important;
     background-position: right 10px center !important;
@@ -9268,8 +9315,7 @@ option:hover {
 /* Suppress any native pseudo-element arrow injected by WebKitGTK. */
 :root[data-theme="light"] .settings-select::after,
 :root[data-theme="light"] .cal-view-select::after,
-:root[data-theme="light"] .contact-trust-select::after,
-:root[data-theme="light"] #contact-trust-modal-select::after {
+:root[data-theme="light"] .contact-trust-select::after {
     display: none !important;
     content: none !important;
 }
