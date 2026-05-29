@@ -784,6 +784,44 @@ pub(crate) fn build_subagent_factories(
     (Some(reg), Some(rt))
 }
 
+/// Single source of truth for building a [`crate::delegation::DelegationContext`].
+/// Every registry-build site (in-app, owner-Telegram, and the two commands.rs
+/// dispatch paths) goes through here, so the sub-agent factory wiring can't
+/// drift between them — adding a field to `DelegationContext` means editing
+/// this one function, not three call sites.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_delegation_context(
+    profile_store: Arc<athen_persistence::profiles::SqliteProfileStore>,
+    arc_store: ArcStore,
+    identity_store: Option<Arc<athen_persistence::identity::SqliteIdentityStore>>,
+    skill_store: Option<Arc<athen_persistence::skills::SqliteSkillStore>>,
+    http_endpoint_store: Option<
+        Arc<athen_persistence::http_endpoints::SqliteHttpEndpointStore>,
+    >,
+    tool_doc_dir: Option<std::path::PathBuf>,
+    llm_router: Arc<RwLock<Arc<DefaultLlmRouter>>>,
+    parent_arc_id: String,
+    app_handle: Option<tauri::AppHandle>,
+    wakeup_restrictions: Option<crate::wakeup_registry::WakeupSubagentRestrictions>,
+) -> crate::delegation::DelegationContext {
+    let (sub_registry_factory, sub_router_factory) =
+        build_subagent_factories(app_handle.as_ref());
+    crate::delegation::DelegationContext {
+        profile_store,
+        identity_store,
+        skill_store,
+        http_endpoint_store,
+        arc_store,
+        llm_router,
+        parent_arc_id,
+        tool_doc_dir,
+        app_handle,
+        wakeup_restrictions,
+        sub_registry_factory,
+        sub_router_factory,
+    }
+}
+
 /// Single source of truth for the per-arc tool registry handed to a
 /// top-level agent: the bare base (see [`assemble_base_app_tool_registry`])
 /// wrapped with the delegation layer (`spawn_subagent`) and the wake-up
@@ -810,22 +848,18 @@ pub(crate) async fn assemble_app_tool_registry(
 
     let with_delegation: Box<dyn athen_core::traits::tool::ToolRegistry> =
         if let (Some(profile_store), Some(arc_store)) = (profile_store, arc_store_for_delegation) {
-            let (sub_registry_factory, sub_router_factory) =
-                build_subagent_factories(app_handle.as_ref());
-            let ctx = crate::delegation::DelegationContext {
+            let ctx = build_delegation_context(
                 profile_store,
+                arc_store,
                 identity_store,
                 skill_store,
                 http_endpoint_store,
-                arc_store,
-                llm_router: router,
-                parent_arc_id: arc_id.to_string(),
                 tool_doc_dir,
+                router,
+                arc_id.to_string(),
                 app_handle,
-                wakeup_restrictions: None,
-                sub_registry_factory,
-                sub_router_factory,
-            };
+                None,
+            );
             Box::new(crate::delegation::DelegationToolRegistry::new(base, ctx))
         } else {
             Box::new(crate::delegation::ArcRegistryAdapter(base))
