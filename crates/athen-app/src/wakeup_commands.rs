@@ -453,8 +453,8 @@ fn tool_metadata(name: &str) -> Option<(&'static str, &'static str)> {
         "install_package" => ("Install package", "Toolbox"),
         "list_installed_packages" => ("List installed packages", "Toolbox"),
         "uninstall_package" => ("Uninstall package", "Toolbox"),
-        // Delegation
-        "delegate_to_agent" => ("Delegate to specialist agent", "Delegation"),
+        // Delegation (accept the new name + legacy alias)
+        "spawn_subagent" | "delegate_to_agent" => ("Spawn specialist subagent", "Delegation"),
         _ => return None,
     })
 }

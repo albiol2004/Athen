@@ -186,7 +186,7 @@ mod tests {
             def("identity_search"),
             def("read_attachment_full"),
             def("fetch_attachment"),
-            def("delegate_to_agent"),
+            def(athen_core::subagent::SPAWN_SUBAGENT_TOOL_NAME),
             def("create_wakeup"),
             def("update_wakeup"),
             def("delete_wakeup"),

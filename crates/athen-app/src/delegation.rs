@@ -1,4 +1,5 @@
-//! `delegate_to_agent` — the tool the main agent uses to spawn a specialist.
+//! `spawn_subagent` — the tool the main agent uses to spawn a specialist.
+//! (Accepts the legacy alias `delegate_to_agent` on the wire.)
 //!
 //! Mental model from the user (real-life analogy): your assistant calls
 //! someone else for a specific service. The specialist does the job and
@@ -7,8 +8,8 @@
 //!
 //! Implementation:
 //! - `DelegationToolRegistry` wraps a base `AppToolRegistry` and adds the
-//!   `delegate_to_agent` tool to its surface.
-//! - When the agent calls `delegate_to_agent`, this module builds a sub-
+//!   `spawn_subagent` tool to its surface.
+//! - When the agent calls `spawn_subagent`, this module builds a sub-
 //!   executor whose tool registry is the *bare* base registry (no
 //!   delegation tool) — so the sub-agent literally cannot delegate
 //!   further. Depth=1 is enforced by composition, not by a runtime flag.
@@ -34,13 +35,12 @@ use serde_json::json;
 use athen_agent::AgentBuilder;
 use athen_core::error::{AthenError, Result};
 use athen_core::risk::BaseImpact;
+use athen_core::subagent::{is_spawn_subagent_name, SPAWN_SUBAGENT_TOOL_NAME};
 use athen_core::task::{DomainType, Task, TaskPriority, TaskStatus};
 use athen_core::tool::{ToolBackend, ToolDefinition, ToolResult};
 use athen_core::traits::agent::AgentExecutor;
 use athen_core::traits::llm::LlmRouter;
 use athen_core::traits::tool::ToolRegistry;
-
-const DELEGATE_TOOL_NAME: &str = "delegate_to_agent";
 
 /// Everything the delegation tool needs to spin up a sub-agent. Cloneable
 /// (every field is `Arc` or owned/`Clone`) so the wrapper can capture it
@@ -127,7 +127,7 @@ impl DelegationToolRegistry {
 
     fn delegate_tool_definition() -> ToolDefinition {
         ToolDefinition {
-            name: DELEGATE_TOOL_NAME.to_string(),
+            name: SPAWN_SUBAGENT_TOOL_NAME.to_string(),
             description: "Spawn a sub-agent to handle a task in parallel. Use this when:\n\
                  - A task needs a different specialist profile (e.g. coder for code, \
                    researcher for web research, marketing for copy)\n\
@@ -174,7 +174,10 @@ impl ToolRegistry for DelegationToolRegistry {
     }
 
     async fn call_tool(&self, name: &str, args: serde_json::Value) -> Result<ToolResult> {
-        if name != DELEGATE_TOOL_NAME {
+        // Accept both the current name (`spawn_subagent`) and the legacy
+        // alias (`delegate_to_agent`) so older prompts / model habits still
+        // dispatch into delegation rather than falling through to the base.
+        if !is_spawn_subagent_name(name) {
             return self.base.call_tool(name, args).await;
         }
 
@@ -693,8 +696,11 @@ mod tests {
         // and definition surface — the heavier integration is exercised
         // through a manual smoke test once the UI ships.
         let def = DelegationToolRegistry::delegate_tool_definition();
-        assert_eq!(def.name, "delegate_to_agent");
+        assert_eq!(def.name, "spawn_subagent");
         assert!(def.description.contains("specialist"));
+        // The legacy alias must still route into delegation at call_tool.
+        assert!(is_spawn_subagent_name("delegate_to_agent"));
+        assert!(is_spawn_subagent_name("spawn_subagent"));
         // Required args present.
         let schema = &def.parameters;
         let required = schema.get("required").and_then(|v| v.as_array()).unwrap();
