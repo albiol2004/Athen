@@ -128,6 +128,32 @@ const ICON_IDENTITY    = toolSvg('<circle cx="12" cy="8" r="4"/><path d="M4 21v-
 const ICON_SKILL       = toolSvg('<path d="M3 5a2 2 0 0 1 2-2h5a2 2 0 0 1 2 2v15"/><path d="M21 5a2 2 0 0 0-2-2h-5a2 2 0 0 0-2 2v15"/><path d="M3 5v15h8"/><path d="M21 5v15h-8"/>');
 // Clipboard with checklist: communicates "submit a plan for review".
 const ICON_PLAN        = toolSvg('<rect x="5" y="2" width="14" height="20" rx="2"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="9" y1="12" x2="15" y2="12"/><line x1="9" y1="16" x2="13" y2="16"/>');
+// Warning triangle with exclamation: high-urgency notifications.
+const ICON_WARNING     = toolSvg('<path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>');
+// Bell/siren: critical-urgency notifications that should not be missed.
+const ICON_SIREN       = toolSvg('<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/>');
+// Lightbulb: proactive help hints.
+const ICON_LIGHTBULB   = toolSvg('<path d="M9 18h6"/><path d="M10 21h4"/><path d="M12 3a6 6 0 0 0-4 10.5c.5.5 1 1.2 1 2.5h6c0-1.3.5-2 1-2.5A6 6 0 0 0 12 3z"/>');
+// Paperclip: file attachments in chat messages.
+const ICON_PAPERCLIP   = toolSvg('<path d="M21.44 11.05 12.25 20.24a5 5 0 0 1-7.07-7.07l9.19-9.19a3.5 3.5 0 0 1 4.95 4.95l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>');
+// Photo/image glyph: image attachments in chat messages.
+const ICON_PHOTO       = toolSvg('<rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/>');
+// Small X: close button on toasts/hint cards.
+const ICON_X           = toolSvg('<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>');
+// Alert circle: error toasts.
+const ICON_ALERT       = toolSvg('<circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>');
+
+// Maps a notification/toast urgency string to its semantic SVG icon. Low =
+// info, Medium = mail (the canonical "new event" glyph), High = warning
+// triangle, Critical = siren. Used by both the toast and the list view so the
+// two surfaces stay in lockstep.
+const URGENCY_ICONS = {
+    Low:      ICON_INFO,
+    Medium:   ICON_MAIL,
+    High:     ICON_WARNING,
+    Critical: ICON_SIREN,
+};
+function urgencyIcon(urgency) { return URGENCY_ICONS[urgency] || ICON_MAIL; }
 
 const BUILTIN_TOOL_ICONS = {
     'read': ICON_FILE_TEXT, 'list_directory': ICON_FOLDER, 'grep': ICON_FILE_SEARCH,
@@ -1985,7 +2011,7 @@ function renderAttachmentChips(attachments) {
             const chip = document.createElement('span');
             chip.className = 'message-attachment-chip';
             if (att.purged) chip.classList.add('purged');
-            const icon = isImage ? '\u{1F5BC}️' : '\u{1F4CE}';
+            const icon = isImage ? ICON_PHOTO : ICON_PAPERCLIP;
             const sizeStr = formatAttachmentSize(att.size_bytes);
             chip.innerHTML =
                 `<span class="att-icon">${icon}</span>` +
@@ -8941,7 +8967,17 @@ function showToast(message, type) {
 
     const toast = document.createElement('div');
     toast.className = 'toast ' + (type || '');
-    toast.textContent = message;
+    const leadIcon = type === 'success' ? ICON_CHECK : (type === 'error' ? ICON_ALERT : '');
+    if (leadIcon) {
+        const iconSpan = document.createElement('span');
+        iconSpan.className = 'toast-icon';
+        iconSpan.innerHTML = leadIcon;
+        toast.appendChild(iconSpan);
+    }
+    const msgSpan = document.createElement('span');
+    msgSpan.className = 'toast-msg';
+    msgSpan.textContent = message;
+    toast.appendChild(msgSpan);
     document.body.appendChild(toast);
 
     setTimeout(() => {
@@ -8959,19 +8995,17 @@ function showNotificationToast(data) {
     const urgencyClass = 'urgency-' + (data.urgency || 'Medium').toLowerCase();
     toast.classList.add(urgencyClass);
 
-    const icons = { Low: '\u2139\uFE0F', Medium: '\uD83D\uDCEC', High: '\u26A0\uFE0F', Critical: '\uD83D\uDEA8' };
-    const icon = icons[data.urgency] || '\uD83D\uDCEC';
-
     const headerDiv = document.createElement('div');
     headerDiv.className = 'toast-header';
 
     const iconSpan = document.createElement('span');
     iconSpan.className = 'toast-icon';
-    iconSpan.textContent = icon;
+    iconSpan.innerHTML = urgencyIcon(data.urgency);
 
     const closeBtn = document.createElement('button');
     closeBtn.className = 'toast-close';
-    closeBtn.textContent = '\u00D7';
+    closeBtn.setAttribute('aria-label', 'Dismiss');
+    closeBtn.innerHTML = ICON_X;
     closeBtn.addEventListener('click', (e) => {
         e.stopPropagation();
         toast.remove();
@@ -9052,7 +9086,7 @@ function showProactiveHintCard(hint) {
 
     const icon = document.createElement('span');
     icon.className = 'toast-icon';
-    icon.textContent = '💡';
+    icon.innerHTML = ICON_LIGHTBULB;
 
     const title = document.createElement('span');
     title.className = 'toast-title';
@@ -9060,7 +9094,8 @@ function showProactiveHintCard(hint) {
 
     const closeBtn = document.createElement('button');
     closeBtn.className = 'toast-close';
-    closeBtn.textContent = '×';
+    closeBtn.setAttribute('aria-label', 'Dismiss');
+    closeBtn.innerHTML = ICON_X;
     closeBtn.addEventListener('click', (e) => {
         e.stopPropagation();
         card.remove();
@@ -11959,9 +11994,6 @@ function renderNotificationList(notifications) {
         item.className = 'notification-item' + (notif.is_read ? ' read' : ' unread');
         if (notif.urgency) item.setAttribute('data-urgency', notif.urgency);
 
-        const urgencyIcons = { Low: '\u2139\uFE0F', Medium: '\uD83D\uDCEC', High: '\u26A0\uFE0F', Critical: '\uD83D\uDEA8' };
-        const icon = urgencyIcons[notif.urgency] || '\uD83D\uDCEC';
-
         const timeAgo = formatTimelineTime(new Date(notif.created_at).getTime());
 
         // Build the item
@@ -11970,7 +12002,7 @@ function renderNotificationList(notifications) {
 
         const iconSpan = document.createElement('span');
         iconSpan.className = 'notif-icon';
-        iconSpan.textContent = icon;
+        iconSpan.innerHTML = urgencyIcon(notif.urgency);
 
         const textDiv = document.createElement('div');
         textDiv.className = 'notif-text';

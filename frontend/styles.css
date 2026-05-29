@@ -1289,7 +1289,12 @@ header h1 {
     opacity: 0.55;
     text-decoration: line-through;
 }
-.message-attachment-chip .att-icon { font-size: 13px; }
+.message-attachment-chip .att-icon {
+    display: inline-flex;
+    align-items: center;
+    color: var(--text-3);
+}
+.message-attachment-chip .att-icon svg { display: block; }
 .message-attachment-chip .att-name {
     overflow: hidden;
     text-overflow: ellipsis;
@@ -5190,11 +5195,27 @@ option:hover {
 
 .notification-item-header {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     gap: 10px;
     margin-bottom: 6px;
 }
-.notif-icon { font-size: 14px; }
+/* Rounded icon badge, tinted per urgency to match the toast surface. */
+.notif-icon {
+    flex-shrink: 0;
+    width: 28px;
+    height: 28px;
+    display: grid;
+    place-items: center;
+    border-radius: var(--r-sm);
+    background: var(--surface-3);
+    color: var(--text-3);
+    margin-top: 1px;
+}
+.notif-icon svg { display: block; }
+.notification-item[data-urgency="Low"]      .notif-icon { background: var(--surface-3);   color: var(--text-3); }
+.notification-item[data-urgency="Medium"]   .notif-icon { background: var(--info-soft);    color: var(--info); }
+.notification-item[data-urgency="High"]      .notif-icon { background: var(--warning-soft); color: var(--warning); }
+.notification-item[data-urgency="Critical"] .notif-icon { background: var(--danger-soft);  color: var(--danger); }
 .notif-text { flex: 1; min-width: 0; }
 .notif-title {
     font-size: 13px;
@@ -5257,35 +5278,92 @@ option:hover {
 .toast,
 .notification-toast {
     pointer-events: auto;
+    position: relative;
     min-width: 280px;
     max-width: 360px;
-    background: var(--surface-1);
-    border: 1px solid var(--border-strong);
+    background: var(--glass-bg);
+    backdrop-filter: var(--glass-blur);
+    -webkit-backdrop-filter: var(--glass-blur);
+    border: 1px solid var(--glass-border);
     border-radius: var(--r-md);
     box-shadow: var(--shadow-raised);
-    padding: 12px;
+    padding: 12px 14px;
+    overflow: hidden;
     animation: toast-in var(--dur-slow) var(--ease);
 }
-.toast.success { border-left: 3px solid var(--success); }
-.toast.error   { border-left: 3px solid var(--danger);  }
+
+/* Refined left accent stripe — a ::before pseudo keeps the rounded corner
+   clean and lets us tint the icon badge with the same semantic colour. */
+.toast::before,
+.notification-toast::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 3px;
+    background: var(--accent-stripe, var(--text-3));
+}
+
+/* Simple success/error toasts: leading icon + message, single line. */
+.toast {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+}
+.toast .toast-msg {
+    font-size: 12.5px;
+    color: var(--text);
+    line-height: 1.45;
+}
+.toast.success { --accent-stripe: var(--success); }
+.toast.error   { --accent-stripe: var(--danger);  }
+.toast.success .toast-icon { background: var(--success-soft); color: var(--success); }
+.toast.error   .toast-icon { background: var(--danger-soft);  color: var(--danger);  }
 
 @keyframes toast-in {
     from { opacity: 0; transform: translateX(8px); }
     to   { opacity: 1; transform: translateX(0); }
 }
 
-.notification-toast.urgency-low      { border-left: 3px solid var(--text-3); }
-.notification-toast.urgency-medium   { border-left: 3px solid var(--info); }
-.notification-toast.urgency-high     { border-left: 3px solid var(--warning); }
-.notification-toast.urgency-critical { border-left: 3px solid var(--danger); }
+/* Per-urgency: tint both the stripe and the icon badge from one variable. */
+.notification-toast.urgency-low      { --accent-stripe: var(--text-3); }
+.notification-toast.urgency-medium   { --accent-stripe: var(--info); }
+.notification-toast.urgency-high     { --accent-stripe: var(--warning); }
+.notification-toast.urgency-critical { --accent-stripe: var(--danger); }
+
+.notification-toast.urgency-low      .toast-icon { background: var(--surface-3); color: var(--text-3); }
+.notification-toast.urgency-medium   .toast-icon { background: var(--info-soft); color: var(--info); }
+.notification-toast.urgency-high     .toast-icon { background: var(--warning-soft); color: var(--warning); }
+.notification-toast.urgency-critical .toast-icon { background: var(--danger-soft); color: var(--danger); }
+
+/* Critical earns a soft glow edge so it reads as "don't miss this". */
+.notification-toast.urgency-critical {
+    border-color: var(--brand-glow-strong);
+    box-shadow: var(--shadow-raised), 0 0 18px var(--danger-soft);
+}
 
 .toast-header {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 9px;
     margin-bottom: 4px;
 }
-.toast-icon { font-size: 13px; }
+
+/* Shared rounded icon badge for both toast families. The SVG inherits
+   currentColor; the semantic tint is set by the urgency/type rules above. */
+.toast-icon {
+    flex-shrink: 0;
+    width: 26px;
+    height: 26px;
+    display: grid;
+    place-items: center;
+    border-radius: var(--r-sm);
+    background: var(--surface-3);
+    color: var(--text-3);
+}
+.toast-icon svg { display: block; }
+
 .toast-title {
     flex: 1;
     font-size: 12.5px;
@@ -5293,53 +5371,68 @@ option:hover {
     color: var(--text);
 }
 .toast-close {
-    width: 22px;
-    height: 22px;
+    flex-shrink: 0;
+    width: 24px;
+    height: 24px;
     display: grid;
     place-items: center;
     background: transparent;
     color: var(--text-3);
     border-radius: var(--r-xs);
-    font-size: 13px;
     transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
 }
-.toast-close:hover { background: rgba(255,255,255,0.06); color: var(--text); }
+.toast-close svg { display: block; }
+.toast-close:hover { background: var(--surface-3); color: var(--text); }
 .toast-body {
     font-size: 12px;
     color: var(--text-2);
     line-height: 1.5;
+    padding-left: 35px;
 }
 
 /* ─── Proactive hints ─── */
 .notification-toast.proactive-hint {
-    border-left: 3px solid var(--accent);
+    --accent-stripe: var(--brand-grad);
+}
+.notification-toast.proactive-hint .toast-icon {
+    background: var(--brand-glow);
+    color: var(--brand-warm);
 }
 .hint-actions {
     display: flex;
+    flex-wrap: wrap;
     gap: 8px;
-    margin-top: 8px;
+    margin-top: 10px;
+    padding-left: 35px;
 }
 .hint-action-btn {
-    font-size: 11px;
-    padding: 4px 10px;
-    border-radius: var(--r-xs);
+    height: 28px;
+    font-size: 11.5px;
+    font-weight: 500;
+    padding: 0 12px;
+    border-radius: var(--r-sm);
     cursor: pointer;
-    transition: background var(--dur) var(--ease);
+    transition: background var(--dur) var(--ease), color var(--dur) var(--ease),
+                border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
 }
+/* Primary: the brand-gradient "set it up" / "open settings" action. */
 .hint-setup {
-    background: var(--accent);
+    background: var(--brand-grad);
     color: #fff;
     border: none;
+    box-shadow: var(--shadow-glow);
 }
-.hint-setup:hover { filter: brightness(1.15); }
+.hint-setup:hover { filter: brightness(1.08); }
+/* Quiet tertiary: "Don't show again". */
 .hint-dismiss-permanent {
     background: transparent;
     color: var(--text-3);
     border: 1px solid var(--border);
 }
 .hint-dismiss-permanent:hover {
-    background: rgba(255,255,255,0.04);
+    background: var(--surface-3);
     color: var(--text-2);
+    border-color: var(--border-strong);
 }
 
 /* ─── Channel order ─── */
