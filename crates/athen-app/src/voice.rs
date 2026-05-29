@@ -407,6 +407,9 @@ pub async fn test_voice_setup(
         state.http_endpoint_store.clone(),
         state.notifier.load_full(),
         active_provider_id,
+        // Preflight never places a real call, so the gate never fires;
+        // pass the live global mode for parity with the real path.
+        state.security.load().mode,
     )
     .ok_or_else(|| {
         "Voice subsystem is not wired in this build (missing approval router, vault, or endpoint store)."

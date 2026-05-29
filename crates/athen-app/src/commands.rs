@@ -3767,19 +3767,22 @@ pub(crate) async fn execute_approved_task(
             crate::file_gate::RouterToolboxApprovalGate::new(
                 Arc::clone(router),
                 Some(ctx.active_arc_id.clone()),
-            ),
+            )
+            .with_security_mode(ctx.security_mode),
         ));
         let gate: Arc<dyn athen_agent::EmailSendApprovalGate> =
             Arc::new(crate::email_gate::RouterEmailApprovalGate::new(
                 Arc::clone(router),
                 Some(ctx.active_arc_id.clone()),
-            ));
+            )
+            .with_security_mode(ctx.security_mode));
         shell_registry = shell_registry.with_email_approval(gate);
         let tg_gate: Arc<dyn athen_agent::tools::TelegramSendApprovalGate> =
             Arc::new(crate::email_gate::RouterTelegramApprovalGate::new(
                 Arc::clone(router),
                 Some(ctx.active_arc_id.clone()),
-            ));
+            )
+            .with_security_mode(ctx.security_mode));
         shell_registry = shell_registry.with_telegram_approval(tg_gate);
     }
     let tg_recorder: Arc<dyn athen_agent::tools::TelegramOutboundRecorder> =
@@ -3803,6 +3806,7 @@ pub(crate) async fn execute_approved_task(
         ctx.http_endpoint_store.clone(),
         ctx.notifier.clone(),
         ctx.active_provider_id.clone(),
+        ctx.security_mode,
     ) {
         registry = registry
             .with_telephony(telephony)
@@ -4900,19 +4904,22 @@ pub(crate) async fn execute_dispatched_task(
             crate::file_gate::RouterToolboxApprovalGate::new(
                 Arc::clone(router),
                 Some(arc_id.clone()),
-            ),
+            )
+            .with_security_mode(ctx.security_mode),
         ));
         let gate: Arc<dyn athen_agent::EmailSendApprovalGate> =
             Arc::new(crate::email_gate::RouterEmailApprovalGate::new(
                 Arc::clone(router),
                 Some(arc_id.clone()),
-            ));
+            )
+            .with_security_mode(ctx.security_mode));
         shell_registry = shell_registry.with_email_approval(gate);
         let tg_gate: Arc<dyn athen_agent::tools::TelegramSendApprovalGate> =
             Arc::new(crate::email_gate::RouterTelegramApprovalGate::new(
                 Arc::clone(router),
                 Some(arc_id.clone()),
-            ));
+            )
+            .with_security_mode(ctx.security_mode));
         shell_registry = shell_registry.with_telegram_approval(tg_gate);
     }
     let tg_recorder: Arc<dyn athen_agent::tools::TelegramOutboundRecorder> =
@@ -4936,6 +4943,7 @@ pub(crate) async fn execute_dispatched_task(
         ctx.http_endpoint_store.clone(),
         ctx.notifier.clone(),
         ctx.active_provider_id.clone(),
+        ctx.security_mode,
     ) {
         registry = registry
             .with_telephony(telephony)

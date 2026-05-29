@@ -197,11 +197,30 @@ impl ShellExtraWritableProvider for ArcWritableProvider {
 pub struct RouterToolboxApprovalGate {
     router: Arc<crate::approval::ApprovalRouter>,
     arc_id: Option<String>,
+    /// Effective security posture for this arc (per-arc override ⊕ live
+    /// global). Under `Yolo`, `confirm_install` short-circuits to
+    /// approved without prompting or routing. Defaults to `Assistant`
+    /// (today's always-prompt behaviour). Mirrors
+    /// [`FileGate::with_security_mode`].
+    security_mode: SecurityMode,
 }
 
 impl RouterToolboxApprovalGate {
     pub fn new(router: Arc<crate::approval::ApprovalRouter>, arc_id: Option<String>) -> Self {
-        Self { router, arc_id }
+        Self {
+            router,
+            arc_id,
+            security_mode: SecurityMode::Assistant,
+        }
+    }
+
+    /// Set the effective security posture for this arc. Under `Yolo`,
+    /// `confirm_install` returns `true` without prompting; `Assistant` /
+    /// `Bunker` keep today's router round-trip. Mirrors
+    /// [`FileGate::with_security_mode`].
+    pub fn with_security_mode(mut self, mode: SecurityMode) -> Self {
+        self.security_mode = mode;
+        self
     }
 }
 
@@ -210,6 +229,17 @@ impl ToolboxApprovalGate for RouterToolboxApprovalGate {
     async fn confirm_install(&self, runtime: &str, package: &str, reason: &str) -> bool {
         use athen_core::approval::{ApprovalChoice, ApprovalQuestion};
         use athen_core::notification::{NotificationOrigin, NotificationUrgency};
+
+        // Yolo loosens only: installs proceed silently without a prompt.
+        if self.security_mode == SecurityMode::Yolo {
+            tracing::debug!(
+                runtime,
+                package,
+                arc = ?self.arc_id,
+                "toolbox install auto-approved under Yolo (no prompt)"
+            );
+            return true;
+        }
 
         let question = ApprovalQuestion {
             id: Uuid::new_v4(),
@@ -1175,6 +1205,41 @@ mod tests {
             approval_choice_to_grant_decision(answer, None),
             GrantDecision::Deny
         );
+    }
+
+    /// A router with no sinks: `ask_with_escalation` fails immediately
+    /// (no sink for the primary channel), so the non-Yolo path returns
+    /// `false` (deny) WITHOUT prompting/hanging.
+    fn sinkless_router() -> Arc<crate::approval::ApprovalRouter> {
+        Arc::new(crate::approval::ApprovalRouter::new(vec![]))
+    }
+
+    #[test]
+    fn toolbox_gate_defaults_to_assistant_mode() {
+        let gate = RouterToolboxApprovalGate::new(sinkless_router(), None);
+        assert_eq!(gate.security_mode, SecurityMode::Assistant);
+    }
+
+    #[tokio::test]
+    async fn toolbox_yolo_approves_install_without_prompting() {
+        // Yolo short-circuits to approved without touching the router.
+        let gate = RouterToolboxApprovalGate::new(sinkless_router(), Some("arc_x".into()))
+            .with_security_mode(SecurityMode::Yolo);
+        assert!(gate.confirm_install("python", "requests", "needed for HTTP").await);
+    }
+
+    #[tokio::test]
+    async fn toolbox_assistant_and_bunker_still_route() {
+        // Non-Yolo modes consult the router; with no sinks it fails closed
+        // to deny (`false`), proving no auto-approve short-circuit fired.
+        for mode in [SecurityMode::Assistant, SecurityMode::Bunker] {
+            let gate = RouterToolboxApprovalGate::new(sinkless_router(), Some("arc_x".into()))
+                .with_security_mode(mode);
+            assert!(
+                !gate.confirm_install("python", "requests", "needed").await,
+                "mode {mode:?} should route (and fail closed to deny), not auto-approve"
+            );
+        }
     }
 
     #[test]

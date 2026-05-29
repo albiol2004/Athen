@@ -18,16 +18,36 @@ use athen_agent::tools::{
 };
 use athen_agent::OwnerDestinationCheck;
 use athen_contacts::OwnerLookup;
+use athen_core::config::SecurityMode;
 use athen_persistence::telegram_chat_log::{TelegramChatLogStore, TelegramLogDirection};
 
 pub struct RouterEmailApprovalGate {
     router: Arc<crate::approval::ApprovalRouter>,
     arc_id: Option<String>,
+    /// Effective security posture for this arc (per-arc override ⊕ live
+    /// global). Under `Yolo`, `confirm_send` short-circuits to approved
+    /// without prompting or routing. Defaults to `Assistant` (today's
+    /// always-prompt-for-non-owner behaviour). Mirrors
+    /// `FileGate::with_security_mode`.
+    security_mode: SecurityMode,
 }
 
 impl RouterEmailApprovalGate {
     pub fn new(router: Arc<crate::approval::ApprovalRouter>, arc_id: Option<String>) -> Self {
-        Self { router, arc_id }
+        Self {
+            router,
+            arc_id,
+            security_mode: SecurityMode::Assistant,
+        }
+    }
+
+    /// Set the effective security posture for this arc. Under `Yolo`,
+    /// `confirm_send` returns approved without prompting; `Assistant` /
+    /// `Bunker` keep today's routing behaviour. Mirrors
+    /// `FileGate::with_security_mode`.
+    pub fn with_security_mode(mut self, mode: SecurityMode) -> Self {
+        self.security_mode = mode;
+        self
     }
 }
 
@@ -36,6 +56,17 @@ impl EmailSendApprovalGate for RouterEmailApprovalGate {
     async fn confirm_send(&self, summary: &EmailSendSummary) -> bool {
         use athen_core::approval::{ApprovalChoice, ApprovalQuestion};
         use athen_core::notification::{NotificationOrigin, NotificationUrgency};
+
+        // Yolo loosens only: a send that would otherwise prompt proceeds
+        // silently without any router round-trip. HardBlock-equivalent
+        // refusals live upstream in the risk/coordinator gates, not here.
+        if self.security_mode == SecurityMode::Yolo {
+            tracing::debug!(
+                arc = ?self.arc_id,
+                "email send approval auto-approved under Yolo (no prompt)"
+            );
+            return true;
+        }
 
         let to_line = summary.to.join(", ");
         let prompt = format!("Send email to {to_line}?");
@@ -85,11 +116,27 @@ impl EmailSendApprovalGate for RouterEmailApprovalGate {
 pub struct RouterTelegramApprovalGate {
     router: Arc<crate::approval::ApprovalRouter>,
     arc_id: Option<String>,
+    /// Effective security posture for this arc. Under `Yolo`,
+    /// `confirm_send` short-circuits to approved without prompting.
+    /// Defaults to `Assistant`. Mirrors `FileGate::with_security_mode`.
+    security_mode: SecurityMode,
 }
 
 impl RouterTelegramApprovalGate {
     pub fn new(router: Arc<crate::approval::ApprovalRouter>, arc_id: Option<String>) -> Self {
-        Self { router, arc_id }
+        Self {
+            router,
+            arc_id,
+            security_mode: SecurityMode::Assistant,
+        }
+    }
+
+    /// Set the effective security posture for this arc. Under `Yolo`,
+    /// `confirm_send` returns approved without prompting. Mirrors
+    /// `FileGate::with_security_mode`.
+    pub fn with_security_mode(mut self, mode: SecurityMode) -> Self {
+        self.security_mode = mode;
+        self
     }
 }
 
@@ -98,6 +145,17 @@ impl TelegramSendApprovalGate for RouterTelegramApprovalGate {
     async fn confirm_send(&self, summary: &TelegramSendSummary) -> bool {
         use athen_core::approval::{ApprovalChoice, ApprovalQuestion};
         use athen_core::notification::{NotificationOrigin, NotificationUrgency};
+
+        // Yolo loosens only: skip the prompt and proceed silently. The
+        // owner-chat fast-path already bypasses this gate upstream, so
+        // this short-circuit only relaxes the non-owner prompt.
+        if self.security_mode == SecurityMode::Yolo {
+            tracing::debug!(
+                arc = ?self.arc_id,
+                "telegram send approval auto-approved under Yolo (no prompt)"
+            );
+            return true;
+        }
 
         let att_count = summary.attachment_paths.len();
         let prompt = if att_count == 0 {
@@ -254,5 +312,110 @@ impl OwnerDestinationCheck for OwnerLookupAdapter {
         // The OwnerLookup normalizes scheme="email" values to lowercase,
         // so passing the caller-lowercased value through is correct.
         self.lookup.is_owner_identifier("email", email).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use athen_core::traits::telegram_sender::TelegramAttachmentKind;
+
+    /// A router with no sinks: any `ask_with_escalation` fails immediately
+    /// (no sink for the primary channel), so the non-Yolo path returns
+    /// `false` (deny) WITHOUT prompting/hanging — which is exactly what we
+    /// want to assert against (the gate didn't short-circuit to approve).
+    fn sinkless_router() -> Arc<crate::approval::ApprovalRouter> {
+        Arc::new(crate::approval::ApprovalRouter::new(vec![]))
+    }
+
+    fn sample_email() -> EmailSendSummary {
+        EmailSendSummary {
+            to: vec!["someone@example.com".into()],
+            cc: vec![],
+            bcc: vec![],
+            subject: "Hi".into(),
+            body_preview: "body".into(),
+            in_reply_to: None,
+        }
+    }
+
+    fn sample_telegram() -> TelegramSendSummary {
+        TelegramSendSummary {
+            chat_id: 42,
+            to_owner: false,
+            text_preview: "hello".into(),
+            attachment_paths: vec![],
+            attachment_kinds: vec![],
+        }
+    }
+
+    #[test]
+    fn email_gate_defaults_to_assistant_mode() {
+        let gate = RouterEmailApprovalGate::new(sinkless_router(), None);
+        assert_eq!(gate.security_mode, SecurityMode::Assistant);
+    }
+
+    #[test]
+    fn telegram_gate_defaults_to_assistant_mode() {
+        let gate = RouterTelegramApprovalGate::new(sinkless_router(), None);
+        assert_eq!(gate.security_mode, SecurityMode::Assistant);
+    }
+
+    #[tokio::test]
+    async fn email_yolo_approves_without_prompting() {
+        // Yolo short-circuits to approved without touching the router.
+        // The sinkless router would return deny if consulted, so a `true`
+        // here proves the prompt was skipped.
+        let gate = RouterEmailApprovalGate::new(sinkless_router(), Some("arc_x".into()))
+            .with_security_mode(SecurityMode::Yolo);
+        assert!(gate.confirm_send(&sample_email()).await);
+    }
+
+    #[tokio::test]
+    async fn email_assistant_and_bunker_still_route() {
+        // Non-Yolo modes consult the router. With no sinks the router
+        // fails closed to deny (`false`) — proving the gate did NOT
+        // short-circuit to approve and still went through the router.
+        for mode in [SecurityMode::Assistant, SecurityMode::Bunker] {
+            let gate = RouterEmailApprovalGate::new(sinkless_router(), Some("arc_x".into()))
+                .with_security_mode(mode);
+            assert!(
+                !gate.confirm_send(&sample_email()).await,
+                "mode {mode:?} should route (and fail closed to deny), not auto-approve"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn telegram_yolo_approves_without_prompting() {
+        let gate = RouterTelegramApprovalGate::new(sinkless_router(), Some("arc_x".into()))
+            .with_security_mode(SecurityMode::Yolo);
+        assert!(gate.confirm_send(&sample_telegram()).await);
+    }
+
+    #[tokio::test]
+    async fn telegram_yolo_approves_with_attachments() {
+        let mut summary = sample_telegram();
+        summary.attachment_paths = vec![std::path::PathBuf::from("/tmp/a.png")];
+        summary.attachment_kinds = vec![TelegramAttachmentKind::Photo];
+        let gate = RouterTelegramApprovalGate::new(sinkless_router(), Some("arc_x".into()))
+            .with_security_mode(SecurityMode::Yolo);
+        assert!(gate.confirm_send(&summary).await);
+    }
+
+    #[tokio::test]
+    async fn telegram_assistant_and_bunker_still_route() {
+        for mode in [SecurityMode::Assistant, SecurityMode::Bunker] {
+            let gate = RouterTelegramApprovalGate::new(sinkless_router(), Some("arc_x".into()))
+                .with_security_mode(mode);
+            assert!(
+                !gate.confirm_send(&sample_telegram()).await,
+                "mode {mode:?} should route (and fail closed to deny), not auto-approve"
+            );
+        }
     }
 }

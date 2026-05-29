@@ -550,6 +550,7 @@ pub(crate) fn build_telephony_deps(
     http_endpoint_store: Option<Arc<athen_persistence::http_endpoints::SqliteHttpEndpointStore>>,
     notifier: Option<Arc<crate::notifier::NotificationOrchestrator>>,
     active_provider_id: String,
+    security_mode: athen_core::config::SecurityMode,
 ) -> Option<crate::place_call::TelephonyDeps> {
     let (router, vault, store) = match (approval_router, vault, http_endpoint_store) {
         (Some(r), Some(v), Some(s)) => (r, v, s),
@@ -559,7 +560,8 @@ pub(crate) fn build_telephony_deps(
     let voice_config: athen_voice::VoiceConfig =
         serde_json::from_value(cfg.voice.clone()).unwrap_or_default();
     let gate: Arc<dyn athen_voice::TelephonyApprovalGate> = Arc::new(
-        crate::telephony_gate::RouterTelephonyApprovalGate::new(router, Some(arc_id.to_string())),
+        crate::telephony_gate::RouterTelephonyApprovalGate::new(router, Some(arc_id.to_string()))
+            .with_security_mode(security_mode),
     );
     Some(crate::place_call::TelephonyDeps {
         gate,
@@ -594,6 +596,17 @@ pub(crate) async fn assemble_base_app_tool_registry(
         arc_id,
     )
     .await;
+    // Resolve the arc's effective security posture (per-arc override ⊕
+    // live global) ONCE here, then thread it into every per-action
+    // approval gate (file/email/telegram/toolbox/telephony). Under Yolo
+    // each gate skips its prompt and proceeds; HardBlock-equivalent
+    // refusals stay upstream in the risk/coordinator gates.
+    let security_mode = resolve_security_mode_for_arc(
+        deps.arc_store.as_ref(),
+        arc_id,
+        deps.global_security_mode,
+    )
+    .await;
     // TODO(plan-cake): wire UserNotifier impl that forwards a
     // Notification to the same plumbing proactive_hints.rs uses
     // (app_handle.emit("notification", ...) + NotificationOrchestrator)
@@ -623,16 +636,19 @@ pub(crate) async fn assemble_base_app_tool_registry(
             crate::file_gate::RouterToolboxApprovalGate::new(
                 router.clone(),
                 Some(arc_id.to_string()),
-            ),
+            )
+            .with_security_mode(security_mode),
         ));
         let gate: Arc<dyn athen_agent::EmailSendApprovalGate> =
             Arc::new(crate::email_gate::RouterEmailApprovalGate::new(
                 router.clone(),
                 Some(arc_id.to_string()),
-            ));
+            )
+            .with_security_mode(security_mode));
         shell = shell.with_email_approval(gate);
         let tg_gate: Arc<dyn athen_agent::tools::TelegramSendApprovalGate> = Arc::new(
-            crate::email_gate::RouterTelegramApprovalGate::new(router, Some(arc_id.to_string())),
+            crate::email_gate::RouterTelegramApprovalGate::new(router, Some(arc_id.to_string()))
+                .with_security_mode(security_mode),
         );
         shell = shell.with_telegram_approval(tg_gate);
     }
@@ -696,6 +712,7 @@ pub(crate) async fn assemble_base_app_tool_registry(
             deps.http_endpoint_store.clone(),
             deps.notifier.clone(),
             deps.active_provider_id.clone(),
+            security_mode,
         ),
         app_handle.clone(),
     ) {
@@ -710,15 +727,9 @@ pub(crate) async fn assemble_base_app_tool_registry(
     .await;
     registry = registry.with_active_profile_id(active_profile_id);
     if let Some(grants) = deps.grant_store.clone() {
-        // Resolve the arc's effective security posture (override ⊕ global)
-        // so the file gate can lower out-of-workspace write prompts under
-        // Yolo, mirroring the executor's per-action shell gate.
-        let security_mode = resolve_security_mode_for_arc(
-            deps.arc_store.as_ref(),
-            arc_id,
-            deps.global_security_mode,
-        )
-        .await;
+        // `security_mode` (resolved once at the top of this fn) lets the
+        // file gate lower out-of-workspace write prompts under Yolo,
+        // mirroring the executor's per-action shell gate.
         let mut gate = crate::file_gate::FileGate::new(
             arc_id.to_string(),
             grants,
