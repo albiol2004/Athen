@@ -1123,12 +1123,25 @@
                 <button class="btn-primary" id="new-contact-btn" onclick="showNewContactModal()">+ New Contact</button>
             </header>
             <div class="contacts-content">
-                <div id="contacts-list"></div>
-                <div id="contacts-empty" class="contacts-empty hidden">
-                    <div class="contacts-empty-icon">&#128100;</div>
-                    <p>No contacts yet.</p>
-                    <p class="contacts-empty-hint">Contacts are automatically created when Athen receives messages from new senders.</p>
+                <div class="contacts-searchbar">
+                    <span class="contacts-search-icon" id="contacts-search-icon" aria-hidden="true"></span>
+                    <input type="text" id="contacts-search" class="contacts-search-input" placeholder="Search contacts" autocomplete="off" spellcheck="false">
+                    <button type="button" id="contacts-search-clear" class="contacts-search-clear hidden" title="Clear search" aria-label="Clear search"></button>
                 </div>
+                <div id="contacts-scroll" class="contacts-scroll">
+                    <div id="contacts-list"></div>
+                    <div id="contacts-empty" class="contacts-empty hidden">
+                        <div class="contacts-empty-icon" id="contacts-empty-icon" aria-hidden="true"></div>
+                        <p>No contacts yet.</p>
+                        <p class="contacts-empty-hint">Contacts are automatically created when Athen receives messages from new senders.</p>
+                    </div>
+                    <div id="contacts-no-matches" class="contacts-empty hidden">
+                        <div class="contacts-empty-icon" id="contacts-no-matches-icon" aria-hidden="true"></div>
+                        <p>No matches</p>
+                        <p class="contacts-empty-hint">No contacts match your search.</p>
+                    </div>
+                </div>
+                <div id="contacts-az-rail" class="contacts-az-rail" aria-hidden="true"></div>
             </div>
 
             <div id="contact-modal-overlay" class="cal-modal-overlay" style="display:none">

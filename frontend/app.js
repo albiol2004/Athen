@@ -11996,6 +11996,19 @@ const contactsBack = document.getElementById('contacts-back');
 const contactsListEl = document.getElementById('contacts-list');
 const contactsEmptyEl = document.getElementById('contacts-empty');
 const contactsTitle = document.getElementById('contacts-title');
+const contactsScrollEl = document.getElementById('contacts-scroll');
+const contactsNoMatchesEl = document.getElementById('contacts-no-matches');
+const contactsSearchEl = document.getElementById('contacts-search');
+const contactsSearchClearEl = document.getElementById('contacts-search-clear');
+const contactsAzRailEl = document.getElementById('contacts-az-rail');
+
+// Full contact list as last loaded from the backend; the search field
+// filters this in-memory rather than re-querying.
+let allContacts = [];
+let contactsSearchQuery = '';
+// Track which contact cards are expanded so a filter/reload re-render keeps
+// the open state instead of collapsing everything.
+const expandedContactIds = new Set();
 
 function showContacts() {
     appView.style.display = 'none';
@@ -12010,7 +12023,27 @@ function showContacts() {
     if (timelineRefreshInterval) { clearInterval(timelineRefreshInterval); timelineRefreshInterval = null; }
     contactsView.classList.remove('hidden');
     closeSidebar();
+    // Fresh entry: clear any stale search query + expand state.
+    contactsSearchQuery = '';
+    if (contactsSearchEl) contactsSearchEl.value = '';
+    expandedContactIds.clear();
     loadContacts();
+}
+
+// One-time injection of inline-SVG icons into the static contacts markup
+// (search field, clear button, empty-state glyphs). Runs lazily on first
+// contacts load so the ICON_* constants are guaranteed defined.
+let contactsIconsInjected = false;
+function injectContactsIcons() {
+    if (contactsIconsInjected) return;
+    contactsIconsInjected = true;
+    const searchIcon = document.getElementById('contacts-search-icon');
+    if (searchIcon) searchIcon.innerHTML = ICON_SEARCH;
+    if (contactsSearchClearEl) contactsSearchClearEl.innerHTML = ICON_X;
+    const emptyIcon = document.getElementById('contacts-empty-icon');
+    if (emptyIcon) emptyIcon.innerHTML = toolSvg('<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/>', 44);
+    const noMatchIcon = document.getElementById('contacts-no-matches-icon');
+    if (noMatchIcon) noMatchIcon.innerHTML = toolSvg('<circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>', 44);
 }
 
 function hideContacts() {
@@ -12022,151 +12055,321 @@ function hideContacts() {
 
 async function loadContacts() {
     if (!invoke) return;
+    injectContactsIcons();
     try {
         const contacts = await invoke('list_contacts');
-        renderContactList(contacts);
+        allContacts = Array.isArray(contacts) ? contacts : [];
+        renderContacts();
     } catch (err) {
         console.error('Failed to load contacts:', err);
         showToast('Failed to load contacts: ' + err, 'error');
     }
 }
 
-function renderContactList(contacts) {
-    if (!contacts || contacts.length === 0) {
+// ── Avatar helpers ──
+// Deterministic tinted avatar palette built on the app's semantic + brand
+// tokens (NOT random rainbow). Owner/AuthUser gets the coral brand gradient.
+const CONTACT_AVATAR_PALETTE = [
+    { bg: 'var(--brand-glow-strong)', fg: 'var(--brand-warm)' },
+    { bg: 'var(--info-soft)',         fg: 'var(--info)' },
+    { bg: 'var(--success-soft)',      fg: 'var(--success)' },
+    { bg: 'var(--warning-soft)',      fg: 'var(--warning)' },
+    { bg: 'var(--danger-soft)',       fg: 'var(--danger)' },
+];
+
+function contactInitials(name) {
+    const parts = (name || '').trim().split(/\s+/).filter(Boolean);
+    if (parts.length === 0) return '';
+    if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+    return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+}
+
+function contactPaletteIndex(name) {
+    let h = 0;
+    const s = name || '';
+    for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+    return h % CONTACT_AVATAR_PALETTE.length;
+}
+
+function buildContactAvatar(contact) {
+    const el = document.createElement('div');
+    el.className = 'contact-avatar';
+    const initials = contactInitials(contact.name);
+    const isOwner = contact.trust_level === 'AuthUser';
+    if (isOwner) {
+        el.classList.add('contact-avatar-owner');
+        el.style.background = 'var(--brand-grad)';
+        el.style.color = 'var(--text-inverse)';
+    } else if (initials) {
+        const pal = CONTACT_AVATAR_PALETTE[contactPaletteIndex(contact.name)];
+        el.style.background = pal.bg;
+        el.style.color = pal.fg;
+    } else {
+        el.style.background = 'var(--surface-3)';
+        el.style.color = 'var(--text-3)';
+    }
+    if (initials) {
+        el.textContent = initials;
+    } else {
+        el.classList.add('contact-avatar-empty');
+        el.innerHTML = ICON_USER;
+    }
+    return el;
+}
+
+// Primary identifier to show as the row's subtitle: prefer Email, then Phone,
+// else the first identifier available.
+function primaryIdentifier(contact) {
+    const ids = contact.identifiers || [];
+    if (ids.length === 0) return null;
+    const byKind = (k) => ids.find(i => i.kind === k);
+    return byKind('Email') || byKind('Phone') || ids[0];
+}
+
+// Section letter: uppercased first alpha char of the name, else "#".
+function contactSectionLetter(contact) {
+    const ch = (contact.name || '').trim().charAt(0).toUpperCase();
+    return /[A-Z]/.test(ch) ? ch : '#';
+}
+
+function contactMatchesQuery(contact, q) {
+    if (!q) return true;
+    if ((contact.name || '').toLowerCase().includes(q)) return true;
+    return (contact.identifiers || []).some(id => (id.value || '').toLowerCase().includes(q));
+}
+
+function renderContacts() {
+    const q = contactsSearchQuery.trim().toLowerCase();
+    const searching = q.length > 0;
+
+    // Toggle clear button + rail visibility on search state.
+    contactsSearchClearEl?.classList.toggle('hidden', !searching);
+    contactsAzRailEl?.classList.toggle('hidden', searching);
+
+    // All-empty state (no contacts at all).
+    if (!allContacts || allContacts.length === 0) {
         contactsListEl.innerHTML = '';
         contactsEmptyEl.classList.remove('hidden');
+        contactsNoMatchesEl.classList.add('hidden');
+        if (contactsAzRailEl) contactsAzRailEl.innerHTML = '';
         contactsTitle.textContent = 'Contacts';
         return;
     }
-
     contactsEmptyEl.classList.add('hidden');
-    contactsTitle.textContent = 'Contacts (' + contacts.length + ')';
-    contactsListEl.innerHTML = '';
+    contactsTitle.textContent = 'Contacts (' + allContacts.length + ')';
 
-    // Sort: blocked last, then by name
-    contacts.sort((a, b) => {
+    const filtered = allContacts.filter(c => contactMatchesQuery(c, q));
+
+    // No-matches state (have contacts, but filter emptied the list).
+    if (filtered.length === 0) {
+        contactsListEl.innerHTML = '';
+        contactsNoMatchesEl.classList.remove('hidden');
+        if (contactsAzRailEl) contactsAzRailEl.innerHTML = '';
+        // Shrinking a scrolled container: WebKitGTK retains scrollTop across
+        // an innerHTML swap and won't re-clamp until the next interaction.
+        if (contactsScrollEl) contactsScrollEl.scrollTop = 0;
+        return;
+    }
+    contactsNoMatchesEl.classList.add('hidden');
+
+    // Sort: blocked last, then by name (locale-aware, case-insensitive).
+    filtered.sort((a, b) => {
         if (a.blocked !== b.blocked) return a.blocked ? 1 : -1;
-        return a.name.localeCompare(b.name);
+        return (a.name || '').localeCompare(b.name || '', undefined, { sensitivity: 'base' });
     });
 
-    contacts.forEach(contact => {
-        const card = document.createElement('div');
-        card.className = 'contact-card' + (contact.blocked ? ' blocked' : '');
-        card.dataset.contactId = contact.id;
-
-        const trustClass = 'trust-' + contact.trust_level.toLowerCase();
-        const blockedBadge = contact.blocked ? '<span class="contact-badge blocked-badge">Blocked</span>' : '';
-
-        // Interactions text
-        const interactionsText = contact.interaction_count > 0
-            ? contact.interaction_count + ' interaction' + (contact.interaction_count !== 1 ? 's' : '')
-            : 'No interactions';
-
-        // Header (clickable to expand)
-        const headerEl = document.createElement('div');
-        headerEl.className = 'contact-card-header';
-        headerEl.innerHTML =
-            '<span class="contact-name">' + escapeHtml(contact.name) + '</span>' +
-            blockedBadge +
-            '<span class="contact-badge ' + trustClass + '">' + escapeHtml(contact.trust_level) + '</span>' +
-            '<span class="contact-interactions">' + interactionsText + '</span>' +
-            '<button class="contact-edit-btn" title="Edit contact"><span aria-hidden="true">&#9998;</span><span>Edit</span></button>';
-
-        headerEl.querySelector('.contact-edit-btn').addEventListener('click', (e) => {
-            e.stopPropagation();
-            showEditContactModal(contact);
-        });
-
-        headerEl.addEventListener('click', () => {
-            card.classList.toggle('expanded');
-        });
-
-        // Details (shown when expanded)
-        const detailsEl = document.createElement('div');
-        detailsEl.className = 'contact-details';
-
-        // Identifiers
-        let identifiersHtml = '';
-        if (contact.identifiers && contact.identifiers.length > 0) {
-            identifiersHtml = '<div class="contact-identifiers">';
-            contact.identifiers.forEach(ident => {
-                identifiersHtml +=
-                    '<div class="contact-identifier">' +
-                    '<span class="contact-identifier-kind">' + escapeHtml(ident.kind) + '</span>' +
-                    '<span>' + escapeHtml(ident.value) + '</span>' +
-                    '</div>';
-            });
-            identifiersHtml += '</div>';
+    // Group into alphabetical sections.
+    const sections = [];
+    const indexByLetter = new Map();
+    filtered.forEach(c => {
+        const letter = contactSectionLetter(c);
+        let sec = indexByLetter.get(letter);
+        if (!sec) {
+            sec = { letter, contacts: [] };
+            indexByLetter.set(letter, sec);
+            sections.push(sec);
         }
-
-        // Meta info
-        let metaHtml = '<div class="contact-meta">';
-        if (contact.last_interaction) {
-            const lastDate = new Date(contact.last_interaction);
-            metaHtml += 'Last interaction: ' + lastDate.toLocaleDateString() + ' ' + lastDate.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
-        } else {
-            metaHtml += 'No interactions yet';
-        }
-        if (contact.trust_manual_override) {
-            metaHtml += ' &middot; <em>Trust manually set</em>';
-        }
-        metaHtml += '</div>';
-
-        // Actions
-        let actionsHtml = '<div class="contact-actions">';
-
-        // Trust level dropdown (don't show AuthUser)
-        actionsHtml += '<select class="contact-trust-select" data-contact-id="' + contact.id + '">';
-        ['Unknown', 'Neutral', 'Known', 'Trusted'].forEach(level => {
-            const selected = contact.trust_level === level ? ' selected' : '';
-            actionsHtml += '<option value="' + level + '"' + selected + '>' + level + '</option>';
-        });
-        actionsHtml += '</select>';
-
-        // Block/Unblock button
-        if (contact.blocked) {
-            actionsHtml += '<button class="contact-action-btn btn-unblock" data-action="unblock" data-contact-id="' + contact.id + '">Unblock</button>';
-        } else {
-            actionsHtml += '<button class="contact-action-btn btn-block" data-action="block" data-contact-id="' + contact.id + '">Block</button>';
-        }
-
-        // Delete button
-        actionsHtml += '<button class="contact-action-btn btn-delete" data-action="delete" data-contact-id="' + contact.id + '">Delete</button>';
-
-        if (contact.trust_manual_override) {
-            actionsHtml += '<span class="contact-override-hint">Manual override active</span>';
-        }
-
-        actionsHtml += '</div>';
-
-        detailsEl.innerHTML = identifiersHtml + metaHtml + actionsHtml;
-
-        card.appendChild(headerEl);
-        card.appendChild(detailsEl);
-        contactsListEl.appendChild(card);
+        sec.contacts.push(c);
+    });
+    // "#" sorts after letters; otherwise alphabetical (filtered already sorted,
+    // but blocked-last reordering can interleave letters, so re-sort sections).
+    sections.sort((a, b) => {
+        if (a.letter === '#') return 1;
+        if (b.letter === '#') return -1;
+        return a.letter.localeCompare(b.letter);
     });
 
-    // Attach event listeners for actions within cards
-    contactsListEl.querySelectorAll('.contact-trust-select').forEach(select => {
-        select.addEventListener('change', async (e) => {
-            const contactId = e.target.dataset.contactId;
-            const level = e.target.value;
-            await setContactTrust(contactId, level);
-        });
+    const frag = document.createDocumentFragment();
+    sections.forEach(sec => {
+        const header = document.createElement('div');
+        header.className = 'contact-section-header';
+        header.id = 'contact-section-' + sec.letter;
+        header.textContent = sec.letter;
+        frag.appendChild(header);
+        sec.contacts.forEach(contact => frag.appendChild(buildContactCard(contact)));
     });
 
-    contactsListEl.querySelectorAll('.contact-action-btn').forEach(btn => {
+    contactsListEl.innerHTML = '';
+    contactsListEl.appendChild(frag);
+
+    // Swapped list contents — reset scrollTop so a previously deep scroll
+    // position doesn't strand the user above the (possibly shorter) new list.
+    if (contactsScrollEl) contactsScrollEl.scrollTop = 0;
+
+    renderAzRail(sections, searching);
+}
+
+function buildContactCard(contact) {
+    const card = document.createElement('div');
+    card.className = 'contact-card' + (contact.blocked ? ' blocked' : '');
+    card.dataset.contactId = contact.id;
+    if (expandedContactIds.has(contact.id)) card.classList.add('expanded');
+
+    const trustClass = 'trust-' + (contact.trust_level || 'unknown').toLowerCase();
+    const trustLabel = contact.trust_level === 'AuthUser' ? 'Owner' : (contact.trust_level || 'Unknown');
+
+    // ── Row (clickable to expand) ──
+    const row = document.createElement('div');
+    row.className = 'contact-row';
+
+    row.appendChild(buildContactAvatar(contact));
+
+    const main = document.createElement('div');
+    main.className = 'contact-row-main';
+    const nameEl = document.createElement('div');
+    nameEl.className = 'contact-row-name';
+    nameEl.textContent = contact.name || 'Unnamed';
+    main.appendChild(nameEl);
+    const primary = primaryIdentifier(contact);
+    const subEl = document.createElement('div');
+    subEl.className = 'contact-row-sub';
+    if (primary) {
+        subEl.textContent = primary.value;
+    } else if (contact.interaction_count > 0) {
+        subEl.textContent = contact.interaction_count + ' interaction' + (contact.interaction_count !== 1 ? 's' : '');
+    } else {
+        subEl.textContent = 'No identifiers';
+    }
+    main.appendChild(subEl);
+    row.appendChild(main);
+
+    const badges = document.createElement('div');
+    badges.className = 'contact-row-badges';
+    if (contact.blocked) {
+        badges.innerHTML = '<span class="contact-badge blocked-badge">Blocked</span>';
+    }
+    badges.innerHTML += '<span class="contact-badge ' + trustClass + '">' + escapeHtml(trustLabel) + '</span>';
+    const chevron = document.createElement('span');
+    chevron.className = 'contact-row-chevron';
+    chevron.setAttribute('aria-hidden', 'true');
+    chevron.innerHTML = toolSvg('<polyline points="9 18 15 12 9 6"/>', 16);
+    badges.appendChild(chevron);
+    row.appendChild(badges);
+
+    row.addEventListener('click', () => {
+        const nowExpanded = card.classList.toggle('expanded');
+        if (nowExpanded) expandedContactIds.add(contact.id);
+        else expandedContactIds.delete(contact.id);
+    });
+
+    // ── Details (shown when expanded) ──
+    const detailsEl = document.createElement('div');
+    detailsEl.className = 'contact-details';
+
+    let identifiersHtml = '';
+    if (contact.identifiers && contact.identifiers.length > 0) {
+        identifiersHtml = '<div class="contact-identifiers">';
+        contact.identifiers.forEach(ident => {
+            identifiersHtml +=
+                '<div class="contact-identifier">' +
+                '<span class="contact-identifier-kind">' + escapeHtml(ident.kind) + '</span>' +
+                '<span class="contact-identifier-value">' + escapeHtml(ident.value) + '</span>' +
+                '</div>';
+        });
+        identifiersHtml += '</div>';
+    }
+
+    let metaHtml = '<div class="contact-meta">';
+    if (contact.last_interaction) {
+        const lastDate = new Date(contact.last_interaction);
+        metaHtml += 'Last interaction: ' + lastDate.toLocaleDateString() + ' ' + lastDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    } else {
+        metaHtml += 'No interactions yet';
+    }
+    if (contact.trust_manual_override) {
+        metaHtml += ' &middot; <em>Trust manually set</em>';
+    }
+    metaHtml += '</div>';
+
+    let actionsHtml = '<div class="contact-actions">';
+    actionsHtml += '<select class="contact-trust-select" data-contact-id="' + escapeHtml(contact.id) + '">';
+    ['Unknown', 'Neutral', 'Known', 'Trusted'].forEach(level => {
+        const selected = contact.trust_level === level ? ' selected' : '';
+        actionsHtml += '<option value="' + level + '"' + selected + '>' + level + '</option>';
+    });
+    actionsHtml += '</select>';
+    actionsHtml += '<button class="contact-action-btn btn-edit" data-action="edit" data-contact-id="' + escapeHtml(contact.id) + '">Edit</button>';
+    if (contact.blocked) {
+        actionsHtml += '<button class="contact-action-btn btn-unblock" data-action="unblock" data-contact-id="' + escapeHtml(contact.id) + '">Unblock</button>';
+    } else {
+        actionsHtml += '<button class="contact-action-btn btn-block" data-action="block" data-contact-id="' + escapeHtml(contact.id) + '">Block</button>';
+    }
+    actionsHtml += '<button class="contact-action-btn btn-delete" data-action="delete" data-contact-id="' + escapeHtml(contact.id) + '">Delete</button>';
+    if (contact.trust_manual_override) {
+        actionsHtml += '<span class="contact-override-hint">Manual override active</span>';
+    }
+    actionsHtml += '</div>';
+
+    detailsEl.innerHTML = identifiersHtml + metaHtml + actionsHtml;
+
+    // Wire details controls (scoped to this card).
+    const trustSelect = detailsEl.querySelector('.contact-trust-select');
+    if (trustSelect) {
+        trustSelect.addEventListener('click', (e) => e.stopPropagation());
+        trustSelect.addEventListener('change', async (e) => {
+            await setContactTrust(e.target.dataset.contactId, e.target.value);
+        });
+    }
+    detailsEl.querySelectorAll('.contact-action-btn').forEach(btn => {
         btn.addEventListener('click', async (e) => {
-            const contactId = e.target.dataset.contactId;
-            const action = e.target.dataset.action;
-            if (action === 'block') {
-                await toggleBlockContact(contactId, true);
-            } else if (action === 'unblock') {
-                await toggleBlockContact(contactId, false);
-            } else if (action === 'delete') {
-                await deleteContact(contactId);
-            }
+            e.stopPropagation();
+            const id = btn.dataset.contactId;
+            const action = btn.dataset.action;
+            if (action === 'edit') showEditContactModal(contact);
+            else if (action === 'block') await toggleBlockContact(id, true);
+            else if (action === 'unblock') await toggleBlockContact(id, false);
+            else if (action === 'delete') await deleteContact(id);
         });
+    });
+
+    card.appendChild(row);
+    card.appendChild(detailsEl);
+    return card;
+}
+
+// Thin A–Z quick-jump rail on the right; click scrolls to that section.
+function renderAzRail(sections, searching) {
+    if (!contactsAzRailEl) return;
+    if (searching) { contactsAzRailEl.innerHTML = ''; return; }
+    const present = new Set(sections.map(s => s.letter));
+    const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
+    if (present.has('#')) letters.push('#');
+    contactsAzRailEl.innerHTML = '';
+    letters.forEach(letter => {
+        const item = document.createElement('button');
+        item.type = 'button';
+        item.className = 'contacts-az-item';
+        item.textContent = letter;
+        if (!present.has(letter)) {
+            item.classList.add('disabled');
+            item.disabled = true;
+        } else {
+            item.addEventListener('click', () => {
+                const target = document.getElementById('contact-section-' + letter);
+                if (target) target.scrollIntoView({ block: 'start', behavior: 'smooth' });
+            });
+        }
+        contactsAzRailEl.appendChild(item);
     });
 }
 
@@ -12372,6 +12575,24 @@ if (contactsBack) {
 document.getElementById('contact-modal-overlay')?.addEventListener('click', function(e) {
     if (e.target === this) hideContactModal();
 });
+
+// Live search: filter in-memory on input, debounced lightly.
+let contactsSearchDebounce = null;
+if (contactsSearchEl) {
+    contactsSearchEl.addEventListener('input', (e) => {
+        contactsSearchQuery = e.target.value;
+        if (contactsSearchDebounce) clearTimeout(contactsSearchDebounce);
+        contactsSearchDebounce = setTimeout(renderContacts, 80);
+    });
+}
+if (contactsSearchClearEl) {
+    contactsSearchClearEl.addEventListener('click', () => {
+        contactsSearchQuery = '';
+        if (contactsSearchEl) contactsSearchEl.value = '';
+        renderContacts();
+        contactsSearchEl?.focus();
+    });
+}
 
 // ─── Memory ───
 
