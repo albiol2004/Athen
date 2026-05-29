@@ -2690,9 +2690,9 @@ mod tests {
 
     #[test]
     fn yolo_still_refuses_force_confirm_commands() {
+        use crate::shell_classifier::{merge_shell_hint, ShellRiskHint};
         use athen_core::config::SecurityMode;
         use athen_core::risk::RiskDecision;
-        use crate::shell_classifier::{merge_shell_hint, ShellRiskHint};
         // Even under Yolo, a ForceHumanConfirm command (sudo / rm -rf / pipe)
         // merges up to HumanConfirm → the dispatch loop refuses it.
         let upstream = shell_upstream_for_mode(SecurityMode::Yolo);

@@ -119,7 +119,10 @@ async fn test_user_input_flows_to_coordinator() {
     assert_eq!(event.source, EventSource::UserInput);
 
     // 5. Process the event through the coordinator.
-    let results = coordinator.process_event(event, SecurityMode::Assistant).await.unwrap();
+    let results = coordinator
+        .process_event(event, SecurityMode::Assistant)
+        .await
+        .unwrap();
     assert_eq!(results.len(), 1, "expected exactly one task created");
 
     // 6. The task should be enqueued as Pending (benign input, low risk).
@@ -153,7 +156,10 @@ async fn test_dangerous_command_gets_blocked() {
     //   total = 90 * 2.0 * 1.0 + 0 = 180 -> HardBlock (>= 90)
     let event = make_event(EventSource::System, EventKind::Command, "sudo rm -rf /");
 
-    let results = coordinator.process_event(event, SecurityMode::Assistant).await.unwrap();
+    let results = coordinator
+        .process_event(event, SecurityMode::Assistant)
+        .await
+        .unwrap();
     assert_eq!(results.len(), 1);
 
     // The task should NOT be in the queue (it was blocked or held for approval).
@@ -181,7 +187,10 @@ async fn test_dispatch_assigns_to_agent() {
 
     // 2. Process a benign user input event.
     let event = make_event(EventSource::UserInput, EventKind::Command, "list my files");
-    coordinator.process_event(event, SecurityMode::Assistant).await.unwrap();
+    coordinator
+        .process_event(event, SecurityMode::Assistant)
+        .await
+        .unwrap();
 
     // 3. Dispatch the next task.
     let result = coordinator.dispatch_next().await.unwrap();
@@ -211,7 +220,10 @@ async fn test_dispatch_assigns_to_agent() {
 
     // Verify the agent can be assigned a new task.
     let event2 = make_event(EventSource::UserInput, EventKind::Command, "check my email");
-    coordinator.process_event(event2, SecurityMode::Assistant).await.unwrap();
+    coordinator
+        .process_event(event2, SecurityMode::Assistant)
+        .await
+        .unwrap();
 
     let result2 = coordinator.dispatch_next().await.unwrap();
     assert!(
@@ -240,7 +252,10 @@ async fn test_priority_ordering() {
         EventKind::NewMessage,
         "Meeting notes from today",
     );
-    let email_results = coordinator.process_event(email_event, SecurityMode::Assistant).await.unwrap();
+    let email_results = coordinator
+        .process_event(email_event, SecurityMode::Assistant)
+        .await
+        .unwrap();
     assert_eq!(email_results.len(), 1);
 
     // Process a user input event second (High priority).
@@ -249,7 +264,10 @@ async fn test_priority_ordering() {
         EventKind::Command,
         "summarize my day",
     );
-    let user_results = coordinator.process_event(user_event, SecurityMode::Assistant).await.unwrap();
+    let user_results = coordinator
+        .process_event(user_event, SecurityMode::Assistant)
+        .await
+        .unwrap();
     assert_eq!(user_results.len(), 1);
 
     // Both tasks should be in the queue.

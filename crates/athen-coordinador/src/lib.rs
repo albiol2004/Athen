@@ -756,7 +756,10 @@ mod tests {
         let coordinator = Coordinator::new(Box::new(MockRiskEvaluator::new(5.0)));
 
         let event = make_event(EventSource::UserInput);
-        let results = coordinator.process_event(event, SecurityMode::Assistant).await.unwrap();
+        let results = coordinator
+            .process_event(event, SecurityMode::Assistant)
+            .await
+            .unwrap();
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].1, RiskDecision::SilentApprove);
@@ -769,7 +772,10 @@ mod tests {
         let coordinator = Coordinator::new(Box::new(MockRiskEvaluator::new(60.0)));
 
         let event = make_event(EventSource::Email);
-        let results = coordinator.process_event(event, SecurityMode::Assistant).await.unwrap();
+        let results = coordinator
+            .process_event(event, SecurityMode::Assistant)
+            .await
+            .unwrap();
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].1, RiskDecision::HumanConfirm);
@@ -782,7 +788,10 @@ mod tests {
         let coordinator = Coordinator::new(Box::new(MockRiskEvaluator::new(95.0)));
 
         let event = make_event(EventSource::System);
-        let results = coordinator.process_event(event, SecurityMode::Assistant).await.unwrap();
+        let results = coordinator
+            .process_event(event, SecurityMode::Assistant)
+            .await
+            .unwrap();
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].1, RiskDecision::HardBlock);
@@ -798,7 +807,10 @@ mod tests {
         coordinator.dispatcher.register_agent(agent_id).await;
 
         let event = make_event(EventSource::UserInput);
-        coordinator.process_event(event, SecurityMode::Assistant).await.unwrap();
+        coordinator
+            .process_event(event, SecurityMode::Assistant)
+            .await
+            .unwrap();
 
         let result = coordinator.dispatch_next().await.unwrap();
         assert!(result.is_some());
@@ -819,7 +831,10 @@ mod tests {
 
         let event = make_event(EventSource::UserInput);
         let event_id = event.id;
-        let routed = coordinator.process_event(event, SecurityMode::Assistant).await.unwrap();
+        let routed = coordinator
+            .process_event(event, SecurityMode::Assistant)
+            .await
+            .unwrap();
         let queued_task_id = routed[0].0;
 
         let result = coordinator.dispatch_next_with_task().await.unwrap();
@@ -845,7 +860,10 @@ mod tests {
         let coordinator = Coordinator::new(Box::new(MockRiskEvaluator::new(5.0)));
 
         let event = make_event(EventSource::UserInput);
-        coordinator.process_event(event, SecurityMode::Assistant).await.unwrap();
+        coordinator
+            .process_event(event, SecurityMode::Assistant)
+            .await
+            .unwrap();
 
         // No agents → returns None and re-enqueues.
         let result = coordinator.dispatch_next_with_task().await.unwrap();
@@ -858,7 +876,10 @@ mod tests {
         let coordinator = Coordinator::new(Box::new(MockRiskEvaluator::new(5.0)));
 
         let event = make_event(EventSource::UserInput);
-        coordinator.process_event(event, SecurityMode::Assistant).await.unwrap();
+        coordinator
+            .process_event(event, SecurityMode::Assistant)
+            .await
+            .unwrap();
 
         // No agents registered
         let result = coordinator.dispatch_next().await.unwrap();
@@ -889,8 +910,14 @@ mod tests {
         let event1 = make_event(EventSource::Calendar);
         let event2 = make_event(EventSource::Email);
 
-        coordinator.process_event(event1, SecurityMode::Assistant).await.unwrap();
-        coordinator.process_event(event2, SecurityMode::Assistant).await.unwrap();
+        coordinator
+            .process_event(event1, SecurityMode::Assistant)
+            .await
+            .unwrap();
+        coordinator
+            .process_event(event2, SecurityMode::Assistant)
+            .await
+            .unwrap();
 
         assert_eq!(coordinator.queue.pending_count().await.unwrap(), 2);
 
@@ -913,7 +940,10 @@ mod tests {
         let coordinator = Coordinator::new(Box::new(MockRiskEvaluator::new(5.0)));
 
         let event = make_event_with_sender(EventSource::Email, "alice@example.com");
-        let results = coordinator.process_event(event, SecurityMode::Assistant).await.unwrap();
+        let results = coordinator
+            .process_event(event, SecurityMode::Assistant)
+            .await
+            .unwrap();
 
         assert_eq!(results.len(), 1);
         assert_eq!(coordinator.queue.pending_count().await.unwrap(), 1);
@@ -926,7 +956,10 @@ mod tests {
             Coordinator::new(Box::new(MockRiskEvaluator::new(5.0))).with_trust_manager(tm);
 
         let event = make_event_with_sender(EventSource::Email, "new@example.com");
-        let results = coordinator.process_event(event, SecurityMode::Assistant).await.unwrap();
+        let results = coordinator
+            .process_event(event, SecurityMode::Assistant)
+            .await
+            .unwrap();
 
         assert_eq!(results.len(), 1);
         // Task should be tracked for trust feedback.
@@ -943,7 +976,10 @@ mod tests {
 
         // Even with a sender, UserInput should skip trust lookup.
         let event = make_event_with_sender(EventSource::UserInput, "user@local");
-        let results = coordinator.process_event(event, SecurityMode::Assistant).await.unwrap();
+        let results = coordinator
+            .process_event(event, SecurityMode::Assistant)
+            .await
+            .unwrap();
 
         assert_eq!(results.len(), 1);
         // No contact should be tracked for UserInput events.
@@ -961,7 +997,10 @@ mod tests {
         coordinator.dispatcher.register_agent(agent_id).await;
 
         let event = make_event_with_sender(EventSource::Email, "sender@example.com");
-        coordinator.process_event(event, SecurityMode::Assistant).await.unwrap();
+        coordinator
+            .process_event(event, SecurityMode::Assistant)
+            .await
+            .unwrap();
 
         let (task_id, _) = coordinator.dispatch_next().await.unwrap().unwrap();
         coordinator.complete_task(task_id).await.unwrap();
@@ -980,7 +1019,10 @@ mod tests {
         coordinator.dispatcher.register_agent(agent_id).await;
 
         let event = make_event(EventSource::UserInput);
-        coordinator.process_event(event, SecurityMode::Assistant).await.unwrap();
+        coordinator
+            .process_event(event, SecurityMode::Assistant)
+            .await
+            .unwrap();
 
         let (task_id, _) = coordinator.dispatch_next().await.unwrap().unwrap();
         coordinator.complete_task(task_id).await.unwrap();

@@ -576,8 +576,14 @@ mod security_mode_tests {
     #[test]
     fn empty_and_default_map_to_assistant() {
         assert_eq!(SecurityMode::from_str(""), Ok(SecurityMode::Assistant));
-        assert_eq!(SecurityMode::from_str("default"), Ok(SecurityMode::Assistant));
-        assert_eq!(SecurityMode::from_str("  DEFAULT "), Ok(SecurityMode::Assistant));
+        assert_eq!(
+            SecurityMode::from_str("default"),
+            Ok(SecurityMode::Assistant)
+        );
+        assert_eq!(
+            SecurityMode::from_str("  DEFAULT "),
+            Ok(SecurityMode::Assistant)
+        );
     }
 
     #[test]

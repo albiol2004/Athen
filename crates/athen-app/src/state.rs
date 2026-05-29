@@ -6274,8 +6274,7 @@ mod resolve_security_mode_tests {
             .set_security_mode_override("a", Some("yolo"))
             .await
             .unwrap();
-        let mode =
-            resolve_security_mode_for_arc(Some(&store), "a", SecurityMode::Bunker).await;
+        let mode = resolve_security_mode_for_arc(Some(&store), "a", SecurityMode::Bunker).await;
         assert_eq!(mode, SecurityMode::Yolo);
     }
 
@@ -6286,8 +6285,7 @@ mod resolve_security_mode_tests {
             .create_arc("a", "t", ArcSource::UserInput)
             .await
             .unwrap();
-        let mode =
-            resolve_security_mode_for_arc(Some(&store), "a", SecurityMode::Bunker).await;
+        let mode = resolve_security_mode_for_arc(Some(&store), "a", SecurityMode::Bunker).await;
         assert_eq!(mode, SecurityMode::Bunker);
     }
 
