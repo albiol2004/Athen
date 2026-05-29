@@ -10270,6 +10270,15 @@ document.getElementById('save-embedding-btn')?.addEventListener('click', async f
     let mode = document.getElementById('embedding-mode')?.value || 'Automatic';
     if (advVisible && provider) {
         mode = 'Specific';
+    } else if (mode === 'Bundled') {
+        // The dropdown only knows "Bundled" — the tier lives in the Built-in
+        // sub-panel. Carry it explicitly as `Bundled:<tier>` so a plain Save
+        // never downgrades an applied tier back to Light.
+        const tier = bundledEmbState.selectedTier
+            || bundledEmbState.activeTier
+            || bundledEmbState.recommendedTier
+            || 'light';
+        mode = 'Bundled:' + tier;
     }
 
     try {

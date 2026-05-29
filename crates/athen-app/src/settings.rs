@@ -3094,12 +3094,21 @@ pub async fn save_embedding_settings(
     // `mode` accepts either a bare variant name (legacy) or the
     // bundled-tier shorthand `Bundled:<tier>` (light / standard /
     // high-quality). Unknown values fall through to Automatic.
+    //
+    // A bare `"Bundled"` carries no tier, so it preserves whatever tier
+    // is already configured — a plain Save must never silently downgrade
+    // an applied tier back to Light. Falls back to Light only when no
+    // bundled tier was configured before.
+    let prior_bundled_tier = match config.embeddings.mode {
+        EmbeddingMode::Bundled { tier } => Some(tier),
+        _ => None,
+    };
     config.embeddings.mode = match mode.as_str() {
         "Cloud" => EmbeddingMode::Cloud,
         "LocalOnly" => EmbeddingMode::LocalOnly,
         "Specific" => EmbeddingMode::Specific,
         "Off" => EmbeddingMode::Off,
-        "Bundled:light" | "Bundled" => EmbeddingMode::Bundled {
+        "Bundled:light" => EmbeddingMode::Bundled {
             tier: BundledTier::Light,
         },
         "Bundled:standard" => EmbeddingMode::Bundled {
@@ -3107,6 +3116,9 @@ pub async fn save_embedding_settings(
         },
         "Bundled:high-quality" | "Bundled:highquality" | "Bundled:hq" => EmbeddingMode::Bundled {
             tier: BundledTier::HighQuality,
+        },
+        "Bundled" => EmbeddingMode::Bundled {
+            tier: prior_bundled_tier.unwrap_or(BundledTier::Light),
         },
         _ => EmbeddingMode::Automatic,
     };
