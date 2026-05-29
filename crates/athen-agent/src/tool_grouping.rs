@@ -18,11 +18,16 @@ pub fn group_for(name: &str) -> &str {
     if let Some((prefix, _)) = name.split_once("__") {
         return prefix;
     }
-    // The built-in file primitives (`read`, `edit`, `write`, `grep`,
-    // `list_directory`) don't share a `<group>_<verb>` prefix the way
-    // `calendar_*` / `shell_*` do, but they belong in one group from the
-    // user's and the model's point of view.
-    if matches!(name, "read" | "edit" | "write" | "grep" | "list_directory") {
+    // The built-in file primitives (`read`, `edit`, `write`,
+    // `delete_file`, `grep`, `list_directory`) don't share a
+    // `<group>_<verb>` prefix the way `calendar_*` / `shell_*` do, but
+    // they belong in one group from the user's and the model's point of
+    // view. (`delete_file` would otherwise fall into a bogus "delete"
+    // group via the underscore split below.)
+    if matches!(
+        name,
+        "read" | "edit" | "write" | "delete_file" | "grep" | "list_directory"
+    ) {
         return "files";
     }
     // Built-in tools follow a "<group>_<verb>" convention. Single-word tools
@@ -100,7 +105,7 @@ fn group_one_liner(id: &str, tools: &[&ToolDefinition]) -> String {
         "calendar" => "create, list, update, delete calendar events".to_string(),
         "contacts" => "manage contacts and their identifiers".to_string(),
         "shell" => "execute shell commands".to_string(),
-        "files" => "read, edit, write, search and list files".to_string(),
+        "files" => "read, edit, write, delete, search and list files".to_string(),
         "web" => "search the web and fetch URLs as clean markdown".to_string(),
         "setup" => {
             "configure Athen's integrations (email, calendar, Telegram, identity, web search)"
@@ -164,6 +169,7 @@ pub fn is_always_revealed_for_profile(name: &str, primary_groups: &[String]) -> 
                 | "read"
                 | "edit"
                 | "write"
+                | "delete_file"
                 | "grep"
                 | "list_directory"
                 | "web_search"
@@ -217,6 +223,10 @@ mod tests {
         assert_eq!(group_for("write"), "files");
         assert_eq!(group_for("grep"), "files");
         assert_eq!(group_for("list_directory"), "files");
+        // delete_file would otherwise split into a bogus "delete" group.
+        assert_eq!(group_for("delete_file"), "files");
+        // And it's always-revealed in the default profile, like write/edit.
+        assert!(is_always_revealed("delete_file"));
     }
 
     #[test]

@@ -131,7 +131,7 @@ const ICON_PLAN        = toolSvg('<rect x="5" y="2" width="14" height="20" rx="2
 
 const BUILTIN_TOOL_ICONS = {
     'read': ICON_FILE_TEXT, 'list_directory': ICON_FOLDER, 'grep': ICON_FILE_SEARCH,
-    'write': ICON_PEN_DOC, 'edit': ICON_PEN_DOC,
+    'write': ICON_PEN_DOC, 'edit': ICON_PEN_DOC, 'delete_file': ICON_TRASH,
     'shell_execute': ICON_TERMINAL, 'shell_spawn': ICON_TERMINAL,
     'shell_kill': ICON_STOP, 'shell_logs': ICON_LOGS,
     'web_search': ICON_SEARCH, 'web_fetch': ICON_GLOBE,
@@ -172,7 +172,7 @@ const BUILTIN_TOOL_ICONS = {
 
 const BUILTIN_TOOL_LABELS = {
     'read': 'Read', 'list_directory': 'List', 'grep': 'Search files',
-    'write': 'Write', 'edit': 'Edit',
+    'write': 'Write', 'edit': 'Edit', 'delete_file': 'Delete',
     'shell_execute': 'Run', 'shell_spawn': 'Spawn',
     'shell_kill': 'Stop', 'shell_logs': 'Logs',
     'web_search': 'Search web', 'web_fetch': 'Fetch',
@@ -3620,6 +3620,7 @@ function renderToolBody(meta) {
         case 'edit':            main = renderEditDiff(args, result); break;
         case 'read':            main = renderReadContent(args, result); break;
         case 'write':           main = renderWriteContent(args, result); break;
+        case 'delete_file':     main = renderDeleteFile(args, result); break;
         case 'list_directory':  main = renderListDirectory(args, result); break;
         case 'grep':            main = renderGrep(args, result); break;
         case 'web_fetch':       main = renderWebFetch(args, result); break;
@@ -3778,6 +3779,21 @@ function renderWriteContent(args, result) {
     pre.className = 'tool-body-code';
     pre.innerHTML = _hl(content, _detectLang(path));
     wrap.appendChild(pre);
+    return wrap;
+}
+
+// Minimal body for a delete_file call: the deleted path plus whether it
+// was a file or directory. Revertibility lives in the Changes rail (the
+// pre-delete snapshot), so this body just confirms what was removed.
+function renderDeleteFile(args, result) {
+    const path = typeof args.path === 'string' ? args.path : '';
+    if (!path) return null;
+    const wrap = document.createElement('div');
+    const head = document.createElement('div');
+    head.className = 'tool-body-path';
+    const kind = (result && typeof result.kind === 'string') ? result.kind : 'file';
+    head.textContent = `Deleted ${kind}: ${path}`;
+    wrap.appendChild(head);
     return wrap;
 }
 

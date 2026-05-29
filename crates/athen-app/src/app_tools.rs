@@ -3274,8 +3274,8 @@ mod tests {
         let tools = registry.list_tools().await.unwrap();
         assert_eq!(
             tools.len(),
-            23,
-            "Expected 18 shell + 4 calendar + 1 athen_docs tools"
+            24,
+            "Expected 19 shell + 4 calendar + 1 athen_docs tools"
         );
 
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
@@ -3292,8 +3292,8 @@ mod tests {
         let tools = registry.list_tools().await.unwrap();
         assert_eq!(
             tools.len(),
-            19,
-            "Expected 18 shell/web/memory/toolbox/email/telegram + 1 athen_docs tools when calendar is None"
+            20,
+            "Expected 19 shell/web/memory/toolbox/email/telegram + 1 athen_docs tools when calendar is None"
         );
 
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
@@ -3707,8 +3707,8 @@ mod tests {
         assert!(names.contains(&"contacts_create"));
         assert!(names.contains(&"contacts_update"));
         assert!(names.contains(&"contacts_delete"));
-        // 18 shell + 5 contact = 23
-        assert_eq!(tools.len(), 24);
+        // 19 shell + 5 contact + 1 athen_docs = 25
+        assert_eq!(tools.len(), 25);
     }
 
     // 17. list_tools_with_all_stores
@@ -3716,8 +3716,8 @@ mod tests {
     async fn list_tools_with_all_stores() {
         let (_db, registry) = setup_with_all().await;
         let tools = registry.list_tools().await.unwrap();
-        // 18 shell + 4 calendar + 5 contact = 27
-        assert_eq!(tools.len(), 28);
+        // 19 shell + 4 calendar + 5 contact = 28
+        assert_eq!(tools.len(), 29);
     }
 
     // 18. contacts_create_basic

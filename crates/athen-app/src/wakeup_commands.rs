@@ -420,6 +420,7 @@ fn tool_metadata(name: &str) -> Option<(&'static str, &'static str)> {
         "read" => ("Read file", "Filesystem"),
         "edit" => ("Edit file", "Filesystem"),
         "write" => ("Write file", "Filesystem"),
+        "delete_file" => ("Delete file", "Filesystem"),
         "grep" => ("Search file contents", "Filesystem"),
         "list_directory" => ("List directory", "Filesystem"),
         // Shell

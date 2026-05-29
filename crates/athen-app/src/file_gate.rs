@@ -338,7 +338,10 @@ impl FileGate {
     /// Returns true when this tool name is a file-touching operation the
     /// gate must intercept.
     pub fn is_file_tool(name: &str) -> bool {
-        matches!(name, "read" | "edit" | "write" | "grep" | "list_directory")
+        matches!(
+            name,
+            "read" | "edit" | "write" | "delete_file" | "grep" | "list_directory"
+        )
     }
 
     /// Map a tool name to the access kind it needs, for risk classification.
@@ -571,11 +574,11 @@ impl FileGate {
             }
         }
 
-        // `read`/`edit`/`write`/`grep` carry stateful read-state in the
-        // inner registry, so they must be routed through the dispatch
-        // closure. `list_directory` is stateless and runs directly via
-        // tokio::fs.
-        if matches!(name, "read" | "edit" | "write" | "grep") {
+        // `read`/`edit`/`write`/`delete_file`/`grep` carry stateful
+        // read-state and/or the checkpoint snapshot hook in the inner
+        // registry, so they must be routed through the dispatch closure.
+        // `list_directory` is stateless and runs directly via tokio::fs.
+        if matches!(name, "read" | "edit" | "write" | "delete_file" | "grep") {
             return dispatch_inner(args).await;
         }
 
@@ -853,6 +856,9 @@ mod tests {
         assert_eq!(FileGate::access_for("list_directory"), PathAccess::Read);
         assert_eq!(FileGate::access_for("write"), PathAccess::Write);
         assert_eq!(FileGate::access_for("edit"), PathAccess::Write);
+        // delete_file is a destructive write-class op; it must classify
+        // as Write so it picks up path-risk + the Yolo lowering.
+        assert_eq!(FileGate::access_for("delete_file"), PathAccess::Write);
     }
 
     #[test]
@@ -860,6 +866,7 @@ mod tests {
         assert!(FileGate::is_file_tool("read"));
         assert!(FileGate::is_file_tool("edit"));
         assert!(FileGate::is_file_tool("write"));
+        assert!(FileGate::is_file_tool("delete_file"));
         assert!(FileGate::is_file_tool("grep"));
         assert!(FileGate::is_file_tool("list_directory"));
         assert!(!FileGate::is_file_tool("shell_execute"));
@@ -990,6 +997,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(dec, RiskDecision::HumanConfirm);
+    }
+
+    #[tokio::test]
+    async fn delete_out_of_workspace_prompts_under_assistant_proceeds_under_yolo() {
+        // A delete is routed as a write-class access (access_for ==
+        // Write), so an out-of-workspace target classifies as a
+        // HumanConfirm prompt under Assistant — and the same Yolo
+        // lowering write/edit get applies, demoting it to a silent
+        // notify-and-proceed. Mirrors the executor shell gate.
+        let grants = fresh_grants().await;
+        let pending = pending();
+        let gate = FileGate::new("arc_test_del".into(), grants, pending, None);
+        let home = paths::home_dir().expect("home");
+        let target = home.join("phaseB_delete_me.txt");
+
+        // delete_file classifies as a write access.
+        assert_eq!(FileGate::access_for("delete_file"), PathAccess::Write);
+
+        let raw = gate
+            .evaluate_all(std::slice::from_ref(&target), PathAccess::Write)
+            .await
+            .unwrap();
+        // Under Assistant (default), an out-of-workspace delete prompts.
+        assert_eq!(
+            file_write_decision_for_mode(raw, SecurityMode::Assistant),
+            RiskDecision::HumanConfirm,
+        );
+        // Under Yolo, the same delete proceeds silently (notify only).
+        assert_eq!(
+            file_write_decision_for_mode(raw, SecurityMode::Yolo),
+            RiskDecision::NotifyAndProceed,
+        );
     }
 
     #[tokio::test]

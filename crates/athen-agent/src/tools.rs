@@ -1203,6 +1203,24 @@ impl ShellToolRegistry {
         })
     }
 
+    /// Build the JSON Schema for the `delete_file` tool parameters.
+    fn delete_file_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Absolute path to the file or directory to delete"
+                },
+                "recursive": {
+                    "type": "boolean",
+                    "description": "Allow deleting a non-empty directory and its contents (default false). A plain file or empty directory deletes without it."
+                }
+            },
+            "required": ["path"]
+        })
+    }
+
     /// Build the JSON Schema for the `grep` tool parameters.
     fn grep_schema() -> serde_json::Value {
         json!({
@@ -1670,6 +1688,15 @@ impl ShellToolRegistry {
         self.read_state.lock().await.insert(key, hash);
     }
 
+    /// Drop any recorded read-state hash for `path`. Called after a
+    /// `delete_file` removes the path so a subsequent re-creation via
+    /// `write` isn't tripped by the read-before-write guard comparing
+    /// against the deleted file's stale hash.
+    pub async fn forget_hash(&self, path: &Path) {
+        let key = Self::canonical_key(path);
+        self.read_state.lock().await.remove(&key);
+    }
+
     /// Verify that `current` matches the stored hash for `path`. Returns
     /// a clear error when the file was never read or has been modified
     /// externally since the last read.
@@ -1980,6 +2007,93 @@ impl ShellToolRegistry {
         let mut output = json!({
             "path": path,
             "bytes_written": content.len(),
+        });
+        if let Some(id) = snapshot_action_id {
+            output["_snapshot_action_id"] = serde_json::Value::String(id);
+        }
+        Ok(ToolResult {
+            success: true,
+            output,
+            error: None,
+            execution_time_ms: elapsed_ms,
+        })
+    }
+
+    /// Hard-delete a file or directory from disk. Revertibility comes
+    /// from the checkpoint snapshot taken before the unlink (mirrors how
+    /// `write`/`edit` capture pre-state), NOT from a move-to-trash. A
+    /// plain file or empty directory deletes without `recursive`; a
+    /// non-empty directory requires `recursive=true`.
+    async fn do_delete_file(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let mut owned = serde_json::Value::Null;
+        let args = coerce_args(args, &mut owned);
+        let path_arg = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AthenError::Other("missing 'path' parameter".to_string()))?;
+        let recursive = args
+            .get("recursive")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let resolved = paths::resolve_in_workspace(Path::new(path_arg));
+        let path = resolved.to_string_lossy().to_string();
+        let path = path.as_str();
+
+        tracing::info!(tool = "delete_file", path, recursive, "Deleting path");
+        let start = Instant::now();
+        let p = resolved.as_path();
+
+        let meta = tokio::fs::symlink_metadata(p)
+            .await
+            .map_err(|e| AthenError::Other(format!("cannot delete '{path}': {e}")))?;
+
+        // Snapshot pre-delete state so "Revert this action" can recreate
+        // the file. Mirrors the write/edit hook exactly — the checkpoint
+        // store records the file's current content keyed to this action,
+        // and revert restores it. (Directory snapshots fall back to
+        // whatever the store supports; the unlink still proceeds.)
+        let snapshot_action_id = self
+            .maybe_snapshot(
+                "delete_file",
+                &format!("delete {path}"),
+                std::slice::from_ref(&resolved),
+            )
+            .await;
+
+        let is_dir = meta.is_dir();
+        let result = if is_dir {
+            if recursive {
+                tokio::fs::remove_dir_all(p).await
+            } else {
+                // Plain `remove_dir` only succeeds on an empty directory;
+                // a non-empty one returns an OS error we translate into a
+                // clear hint to pass recursive=true.
+                tokio::fs::remove_dir(p).await
+            }
+        } else {
+            tokio::fs::remove_file(p).await
+        };
+
+        if let Err(e) = result {
+            if is_dir && !recursive {
+                return Err(AthenError::Other(format!(
+                    "'{path}' is a non-empty directory; pass recursive=true to delete it and its contents"
+                )));
+            }
+            return Err(AthenError::Other(format!("cannot delete '{path}': {e}")));
+        }
+
+        // The path is gone — drop any stale read-state hash so a later
+        // re-creation via write isn't blocked by the read-before-write
+        // guard comparing against the deleted file's old hash.
+        self.forget_hash(p).await;
+
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        let mut output = json!({
+            "path": path,
+            "kind": if is_dir { "directory" } else { "file" },
+            "deleted": true,
         });
         if let Some(id) = snapshot_action_id {
             output["_snapshot_action_id"] = serde_json::Value::String(id);
@@ -3495,8 +3609,18 @@ impl ToolRegistry for ShellToolRegistry {
             },
             ToolDefinition {
                 name: "write".to_string(),
-                description: "Overwrite or create a file. For partial changes prefer edit. Existing files require a prior read.".to_string(),
+                description: "Overwrite or create a file. For partial changes prefer edit. To delete a file use delete_file (never `rm`). Existing files require a prior read.".to_string(),
                 parameters: Self::write_schema(),
+                backend: ToolBackend::Shell {
+                    command: String::new(),
+                    native: false,
+                },
+                base_risk: BaseImpact::WritePersist,
+            },
+            ToolDefinition {
+                name: "delete_file".to_string(),
+                description: "Delete a file or directory from disk. ALWAYS use this instead of `rm` via shell_execute — the shell classifier refuses `rm`/`rm -rf`, so deletions must go through this tool. The pre-delete content is snapshotted first, so the action is revertable. A plain file or empty directory deletes directly; pass recursive=true to delete a non-empty directory and everything under it.".to_string(),
+                parameters: Self::delete_file_schema(),
                 backend: ToolBackend::Shell {
                     command: String::new(),
                     native: false,
@@ -3655,6 +3779,7 @@ impl ToolRegistry for ShellToolRegistry {
             "read" => self.do_read(&args).await,
             "edit" => self.do_edit(&args).await,
             "write" => self.do_write(&args).await,
+            "delete_file" => self.do_delete_file(&args).await,
             "grep" => self.do_grep(&args).await,
             "list_directory" => self.do_list_directory(&args).await,
             "memory_store" => self.do_memory_store(&args).await,
@@ -3837,10 +3962,10 @@ mod tests {
         let tools = registry.list_tools().await.unwrap();
 
         // shell_execute, shell_spawn, shell_kill, shell_logs, read, edit,
-        // write, grep, list_directory, memory_store, memory_recall,
-        // web_search, web_fetch, email_send, send_telegram,
+        // write, delete_file, grep, list_directory, memory_store,
+        // memory_recall, web_search, web_fetch, email_send, send_telegram,
         // install_package, list_installed_packages, uninstall_package
-        assert_eq!(tools.len(), 18);
+        assert_eq!(tools.len(), 19);
 
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"shell_execute"));
@@ -3850,6 +3975,7 @@ mod tests {
         assert!(names.contains(&"read"));
         assert!(names.contains(&"edit"));
         assert!(names.contains(&"write"));
+        assert!(names.contains(&"delete_file"));
         assert!(names.contains(&"grep"));
         assert!(names.contains(&"list_directory"));
         assert!(names.contains(&"memory_store"));
@@ -4217,6 +4343,153 @@ mod tests {
         assert!(result.success);
         let content = tokio::fs::read_to_string(&path).await.unwrap();
         assert_eq!(content, "overwritten");
+    }
+
+    #[tokio::test]
+    async fn test_delete_file_removes_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("doomed.txt");
+        std::fs::write(&path, "bye").unwrap();
+        assert!(path.exists());
+
+        let registry = ShellToolRegistry::new().await;
+        let result = registry
+            .call_tool("delete_file", json!({"path": path.to_str().unwrap()}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert_eq!(result.output["deleted"], json!(true));
+        assert_eq!(result.output["kind"], json!("file"));
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_delete_file_nonexistent_errors_no_panic() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("never_existed.txt");
+
+        let registry = ShellToolRegistry::new().await;
+        let result = registry
+            .call_tool("delete_file", json!({"path": path.to_str().unwrap()}))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("cannot delete"));
+    }
+
+    #[tokio::test]
+    async fn test_delete_empty_dir_ok_nonempty_needs_recursive() {
+        let dir = TempDir::new().unwrap();
+        let registry = ShellToolRegistry::new().await;
+
+        // Empty directory deletes without recursive.
+        let empty = dir.path().join("empty_dir");
+        std::fs::create_dir(&empty).unwrap();
+        let r = registry
+            .call_tool("delete_file", json!({"path": empty.to_str().unwrap()}))
+            .await
+            .unwrap();
+        assert!(r.success);
+        assert_eq!(r.output["kind"], json!("directory"));
+        assert!(!empty.exists());
+
+        // Non-empty directory without recursive errors with a clear hint.
+        let full = dir.path().join("full_dir");
+        std::fs::create_dir(&full).unwrap();
+        std::fs::write(full.join("child.txt"), "x").unwrap();
+        let err = registry
+            .call_tool("delete_file", json!({"path": full.to_str().unwrap()}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("recursive=true"), "got: {err}");
+        assert!(full.exists());
+
+        // With recursive=true it deletes the whole tree.
+        let r = registry
+            .call_tool(
+                "delete_file",
+                json!({"path": full.to_str().unwrap(), "recursive": true}),
+            )
+            .await
+            .unwrap();
+        assert!(r.success);
+        assert!(!full.exists());
+    }
+
+    /// Records the most recent `snapshot_paths` call so a test can assert
+    /// the checkpoint hook fired before a destructive op. Only the two
+    /// methods `do_delete_file` needs are meaningful; the rest are no-ops.
+    #[derive(Default)]
+    struct RecordingCheckpointStore {
+        last: tokio::sync::Mutex<Option<(String, Vec<PathBuf>)>>,
+    }
+
+    #[async_trait]
+    impl CheckpointStore for RecordingCheckpointStore {
+        async fn snapshot_paths(
+            &self,
+            _arc_id: &str,
+            entry_id: &str,
+            _turn_id: Option<&str>,
+            tool_name: &str,
+            _args_summary: &str,
+            paths: &[PathBuf],
+        ) -> Result<Option<String>> {
+            *self.last.lock().await = Some((tool_name.to_string(), paths.to_vec()));
+            Ok(Some(entry_id.to_string()))
+        }
+        async fn revert_action(
+            &self,
+            _entry_id: &str,
+        ) -> Result<athen_core::traits::checkpoint::RevertOutcome> {
+            Ok(Default::default())
+        }
+        async fn rewind_to_before(
+            &self,
+            _arc_id: &str,
+            _entry_id: &str,
+        ) -> Result<athen_core::traits::checkpoint::RevertOutcome> {
+            Ok(Default::default())
+        }
+        async fn list_actions(
+            &self,
+            _arc_id: &str,
+        ) -> Result<Vec<athen_core::traits::checkpoint::ActionRecord>> {
+            Ok(Vec::new())
+        }
+        async fn forget_arc(&self, _arc_id: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_delete_file_snapshots_pre_delete_state() {
+        // A delete must snapshot the file's pre-state before unlinking so
+        // "Revert this action" can recreate it — mirrors write/edit.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("snap_me.txt");
+        std::fs::write(&path, "precious").unwrap();
+
+        let store = Arc::new(RecordingCheckpointStore::default());
+        let registry = ShellToolRegistry::new()
+            .await
+            .with_checkpoint_store(store.clone() as Arc<dyn CheckpointStore>)
+            .with_checkpoint_arc_id("arc_delete_snap");
+
+        let result = registry
+            .call_tool("delete_file", json!({"path": path.to_str().unwrap()}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        // The action id from the snapshot is surfaced for the auditor.
+        assert!(result.output.get("_snapshot_action_id").is_some());
+
+        // The snapshot fired for this exact path under the delete tool.
+        let recorded = store.last.lock().await.clone().expect("snapshot recorded");
+        assert_eq!(recorded.0, "delete_file");
+        assert_eq!(recorded.1, vec![path.clone()]);
+        // And the file is actually gone afterwards.
+        assert!(!path.exists());
     }
 
     #[tokio::test]
