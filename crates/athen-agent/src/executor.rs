@@ -221,6 +221,30 @@ fn clean_model_response(text: &str) -> String {
     }
 }
 
+/// Baseline per-call `shell_execute` stance derived from the security posture,
+/// before the shell classifier refines it via `merge_shell_hint`.
+///
+/// - `Yolo` => `SilentApprove`: ordinary commands run silently. The
+///   classifier's `ForceHumanConfirm` (sudo / `rm -rf` / pipe-to-sh) still
+///   upgrades to a refusal, so "only critical actions need approval" holds.
+/// - `Assistant` => `NotifyAndProceed`: the historical behaviour.
+/// - `Bunker` => `NotifyAndProceed` too, for now. Mapping it to `HumanConfirm`
+///   here would *refuse* every non-safelisted command outright — there is no
+///   mid-run shell approval routing yet, so a `HumanConfirm` short-circuits
+///   into a hard refusal. Bunker's teeth live at the coordinator triage gate;
+///   flip this to `HumanConfirm` once shell approval routing lands and it will
+///   prompt instead of refuse.
+fn shell_upstream_for_mode(
+    mode: athen_core::config::SecurityMode,
+) -> athen_core::risk::RiskDecision {
+    use athen_core::config::SecurityMode;
+    use athen_core::risk::RiskDecision;
+    match mode {
+        SecurityMode::Yolo => RiskDecision::SilentApprove,
+        SecurityMode::Assistant | SecurityMode::Bunker => RiskDecision::NotifyAndProceed,
+    }
+}
+
 /// LLM-driven executor that runs a task through iterative LLM calls,
 /// invoking tools as requested by the model until the task is complete.
 pub struct DefaultExecutor {
@@ -370,6 +394,10 @@ pub struct DefaultExecutor {
     /// helpers keep their own hardcoded tiers (Cheap / Fast) regardless
     /// of this field — they're cheap by design.
     default_tier: athen_core::llm::ModelProfile,
+    /// Security posture snapshotted at task creation (the host resolves
+    /// global ⊕ per-arc override). Drives the per-action shell gate below.
+    /// `Assistant` = today's behaviour.
+    security_mode: athen_core::config::SecurityMode,
     /// Optional grant-lookup port used to decide whether the
     /// `shell_execute` cwd is covered by a write-grant. When set, the
     /// executor calls `shell_classifier::classify` before dispatching
@@ -423,6 +451,7 @@ impl DefaultExecutor {
             auto_reminders: false,
             default_reasoning_effort: athen_core::llm::ReasoningEffort::Default,
             default_tier: athen_core::llm::ModelProfile::Fast,
+            security_mode: athen_core::config::SecurityMode::Assistant,
             grant_lookup: None,
             arc_uuid: None,
         }
@@ -521,6 +550,11 @@ impl DefaultExecutor {
     /// `docs/REASONING_EFFORT.md` for the mapping table.
     pub fn set_default_reasoning_effort(&mut self, effort: athen_core::llm::ReasoningEffort) {
         self.default_reasoning_effort = effort;
+    }
+
+    /// Set the security posture that drives the per-action shell gate.
+    pub fn set_security_mode(&mut self, mode: athen_core::config::SecurityMode) {
+        self.security_mode = mode;
     }
 
     /// Set the `ModelProfile` the main loop stamps on its `LlmRequest`.
@@ -2333,15 +2367,11 @@ impl AgentExecutor for DefaultExecutor {
                 };
                 let cwd_in_grant = self.compute_cwd_in_grant(&tc.arguments).await;
                 let hint = crate::shell_classifier::classify(command, cwd_in_grant);
-                // Treat the per-call upstream as NotifyAndProceed today:
-                // there is no per-tool-call risk evaluator in the
-                // executor (sense-level RiskDecision applies once at
-                // event triage). NotifyAndProceed is the implicit
-                // "tool can run" stance the dispatch loop has used
-                // historically. The merge then lets ForceHumanConfirm
-                // upgrade to a prompt-style refusal and LowerToSilent
-                // drop to SilentApprove (logged but otherwise pass-through).
-                let upstream = athen_core::risk::RiskDecision::NotifyAndProceed;
+                // Per-call upstream stance, derived from the security posture
+                // (there is no per-tool-call risk *evaluator* here — sense-level
+                // RiskDecision applies once at event triage). The shell
+                // classifier then refines it. See `shell_upstream_for_mode`.
+                let upstream = shell_upstream_for_mode(self.security_mode);
                 let merged = crate::shell_classifier::merge_shell_hint(upstream, hint);
                 match merged {
                     athen_core::risk::RiskDecision::HumanConfirm => {
@@ -2638,6 +2668,45 @@ mod tests {
     use athen_core::tool::{ToolDefinition, ToolResult as CoreToolResult};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn shell_upstream_stance_per_security_mode() {
+        use athen_core::config::SecurityMode;
+        use athen_core::risk::RiskDecision;
+        // Yolo loosens the baseline; Assistant/Bunker keep today's stance.
+        assert_eq!(
+            shell_upstream_for_mode(SecurityMode::Yolo),
+            RiskDecision::SilentApprove
+        );
+        assert_eq!(
+            shell_upstream_for_mode(SecurityMode::Assistant),
+            RiskDecision::NotifyAndProceed
+        );
+        assert_eq!(
+            shell_upstream_for_mode(SecurityMode::Bunker),
+            RiskDecision::NotifyAndProceed
+        );
+    }
+
+    #[test]
+    fn yolo_still_refuses_force_confirm_commands() {
+        use athen_core::config::SecurityMode;
+        use athen_core::risk::RiskDecision;
+        use crate::shell_classifier::{merge_shell_hint, ShellRiskHint};
+        // Even under Yolo, a ForceHumanConfirm command (sudo / rm -rf / pipe)
+        // merges up to HumanConfirm → the dispatch loop refuses it.
+        let upstream = shell_upstream_for_mode(SecurityMode::Yolo);
+        assert_eq!(
+            merge_shell_hint(upstream, ShellRiskHint::ForceHumanConfirm),
+            RiskDecision::HumanConfirm
+        );
+        // A benign command (KeepHumanConfirm hint) under Yolo stays silent —
+        // no short-circuit, it runs.
+        assert_eq!(
+            merge_shell_hint(upstream, ShellRiskHint::KeepHumanConfirm),
+            RiskDecision::SilentApprove
+        );
+    }
 
     // --- Mock LLM Router ---
 

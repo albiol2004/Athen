@@ -70,6 +70,7 @@ pub struct AgentBuilder {
     auto_reminders: bool,
     default_reasoning_effort: athen_core::llm::ReasoningEffort,
     default_tier: athen_core::llm::ModelProfile,
+    security_mode: athen_core::config::SecurityMode,
     grant_lookup: Option<Arc<dyn athen_risk::path_eval::GrantLookup>>,
     arc_uuid: Option<uuid::Uuid>,
 }
@@ -108,6 +109,7 @@ impl AgentBuilder {
             auto_reminders: false,
             default_reasoning_effort: athen_core::llm::ReasoningEffort::Default,
             default_tier: athen_core::llm::ModelProfile::Fast,
+            security_mode: athen_core::config::SecurityMode::Assistant,
             grant_lookup: None,
             arc_uuid: None,
         }
@@ -243,6 +245,14 @@ impl AgentBuilder {
     /// pure waste.
     pub fn default_reasoning_effort(mut self, effort: athen_core::llm::ReasoningEffort) -> Self {
         self.default_reasoning_effort = effort;
+        self
+    }
+
+    /// Set the security posture for this executor. Drives the per-action
+    /// shell gate (see `Executor::set_security_mode`). Defaults to
+    /// `Assistant` (today's behaviour) when unset.
+    pub fn security_mode(mut self, mode: athen_core::config::SecurityMode) -> Self {
+        self.security_mode = mode;
         self
     }
 
@@ -487,6 +497,7 @@ impl AgentBuilder {
 
         executor.set_default_reasoning_effort(self.default_reasoning_effort);
         executor.set_default_tier(self.default_tier);
+        executor.set_security_mode(self.security_mode);
 
         if let Some(lookup) = self.grant_lookup {
             executor.set_grant_lookup(lookup);
