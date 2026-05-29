@@ -28,6 +28,32 @@ pub enum Security {
     None,
 }
 
+impl Security {
+    /// Map an SMTP `(port, tls_on)` pair to the transport security the
+    /// server actually speaks. The 587/465 split is the load-bearing bit:
+    ///
+    /// - **465** is the implicit-TLS submission port (SMTPS): the socket is
+    ///   TLS-wrapped from the first byte → [`Security::Ssl`].
+    /// - **587** (and legacy **25**) is the cleartext submission port that
+    ///   upgrades in-band via the `STARTTLS` verb → [`Security::StartTls`].
+    ///
+    /// Athen's `EmailConfig` only carries a single `smtp_use_tls` boolean
+    /// with no STARTTLS-vs-implicit distinction, so when TLS is on we infer
+    /// the mode from the port. Treating `use_tls=true` as implicit TLS on
+    /// 587 (lettre's `relay`/Wrapper) makes the handshake fail/hang and no
+    /// mail is ever sent. When `tls_on` is false we stay cleartext
+    /// regardless of port.
+    pub fn for_smtp_port(port: u16, tls_on: bool) -> Self {
+        if !tls_on {
+            return Security::None;
+        }
+        match port {
+            465 => Security::Ssl,
+            _ => Security::StartTls,
+        }
+    }
+}
+
 /// A single server endpoint — host + port + transport security.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ServerHint {

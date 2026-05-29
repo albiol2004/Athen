@@ -8,6 +8,7 @@ use lettre::transport::smtp::PoolConfig;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
 use athen_core::config::EmailConfig;
+use athen_core::email_provider::Security;
 use athen_core::error::{AthenError, Result};
 use athen_core::traits::email_sender::{EmailSender, OutboundEmail, SentEmail};
 
@@ -19,8 +20,10 @@ pub struct SmtpSettings {
     pub port: u16,
     pub username: String,
     pub password: String,
-    /// `true` = implicit TLS (port 465); `false` = STARTTLS (587).
-    pub use_implicit_tls: bool,
+    /// Transport security the server speaks. Derived from `(port, use_tls)`
+    /// via [`Security::for_smtp_port`] so port 587 gets STARTTLS and port
+    /// 465 gets implicit TLS — see that fn for the 587/465 rationale.
+    pub security: Security,
     pub from_address: String,
 }
 
@@ -31,7 +34,10 @@ impl SmtpSettings {
             port: cfg.smtp_port,
             username: cfg.smtp_username.clone(),
             password: cfg.smtp_password.clone(),
-            use_implicit_tls: cfg.smtp_use_tls,
+            // `smtp_use_tls` is a single boolean with no STARTTLS-vs-implicit
+            // distinction, so let the port decide the mode (465 ⇒ implicit,
+            // 587/25 ⇒ STARTTLS) when TLS is on.
+            security: Security::for_smtp_port(cfg.smtp_port, cfg.smtp_use_tls),
             from_address: cfg.from_address.clone(),
         }
     }
@@ -56,12 +62,21 @@ impl LettreSmtpSender {
         let creds = Credentials::new(settings.username.clone(), settings.password.clone());
         let pool = PoolConfig::new();
 
-        let builder = if settings.use_implicit_tls {
-            AsyncSmtpTransport::<Tokio1Executor>::relay(&settings.server)
-                .map_err(|e| AthenError::Other(format!("SMTP relay setup: {e}")))?
-        } else {
-            AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&settings.server)
-                .map_err(|e| AthenError::Other(format!("SMTP STARTTLS relay setup: {e}")))?
+        // Port 465 = implicit TLS (SMTPS, wrapped from byte 0) → `relay`.
+        // Port 587/25 = STARTTLS (cleartext then in-band upgrade) →
+        // `starttls_relay`. Mixing these up (implicit TLS on 587) hangs the
+        // handshake and silently drops mail. `Security` is already derived
+        // from the port in `SmtpSettings::from_email_config`.
+        let builder = match settings.security {
+            Security::Ssl => AsyncSmtpTransport::<Tokio1Executor>::relay(&settings.server)
+                .map_err(|e| AthenError::Other(format!("SMTP relay setup: {e}")))?,
+            Security::StartTls => {
+                AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&settings.server)
+                    .map_err(|e| AthenError::Other(format!("SMTP STARTTLS relay setup: {e}")))?
+            }
+            Security::None => {
+                AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&settings.server)
+            }
         };
 
         let transport = builder
@@ -220,7 +235,7 @@ mod tests {
             port: 587,
             username: "user".to_string(),
             password: "pass".to_string(),
-            use_implicit_tls: false,
+            security: Security::StartTls,
             from_address: "Athen <athen@example.com>".to_string(),
         }
     }
@@ -288,6 +303,46 @@ mod tests {
         assert_eq!(envelope_to.len(), 2);
         assert!(envelope_to.iter().any(|a| a == "alice@example.com"));
         assert!(envelope_to.iter().any(|a| a == "bob@example.com"));
+    }
+
+    #[test]
+    fn port_587_with_tls_selects_starttls() {
+        // The bug: smtp_use_tls=true on 587 used to mean implicit TLS,
+        // which hangs the handshake. Must be STARTTLS instead.
+        let cfg = EmailConfig {
+            smtp_server: "smtp.example.com".to_string(),
+            smtp_port: 587,
+            smtp_use_tls: true,
+            from_address: "a@example.com".to_string(),
+            ..Default::default()
+        };
+        let s = SmtpSettings::from_email_config(&cfg);
+        assert_eq!(s.security, Security::StartTls);
+    }
+
+    #[test]
+    fn port_465_with_tls_selects_implicit() {
+        let cfg = EmailConfig {
+            smtp_server: "smtp.example.com".to_string(),
+            smtp_port: 465,
+            smtp_use_tls: true,
+            from_address: "a@example.com".to_string(),
+            ..Default::default()
+        };
+        let s = SmtpSettings::from_email_config(&cfg);
+        assert_eq!(s.security, Security::Ssl);
+    }
+
+    #[test]
+    fn tls_off_selects_plaintext_regardless_of_port() {
+        for port in [25u16, 465, 587, 2525] {
+            assert_eq!(Security::for_smtp_port(port, false), Security::None);
+        }
+    }
+
+    #[test]
+    fn unknown_port_with_tls_defaults_to_starttls() {
+        assert_eq!(Security::for_smtp_port(2525, true), Security::StartTls);
     }
 
     #[test]

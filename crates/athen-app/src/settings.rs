@@ -2325,10 +2325,12 @@ pub async fn test_smtp_connection(
 
     let settings = SmtpSettings {
         server: smtp_server,
+        // Same port-derived TLS selection as the live send path
+        // (465 ⇒ implicit, 587/25 ⇒ STARTTLS) so test and send never drift.
+        security: athen_core::email_provider::Security::for_smtp_port(smtp_port, smtp_use_tls),
         port: smtp_port,
         username: smtp_username,
         password: smtp_password,
-        use_implicit_tls: smtp_use_tls,
         from_address,
     };
     let sender = match LettreSmtpSender::new(settings) {

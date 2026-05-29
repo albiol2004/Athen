@@ -207,9 +207,13 @@ async fn test_smtp(config: &EmailTestConfig, password: &str) -> StageResult {
     // SMTP banner — try the user's choice first, then fall back to the
     // port-implied choice if the failure smells like a TLS-record
     // mismatch. Auth / DNS / refused-connection errors are NOT retried.
+    // Share the 465-implicit / 587-STARTTLS mapping with the real send path
+    // (`athen-sentidos::email_send` → `Security::for_smtp_port`) so the test
+    // wizard and the live sender can never disagree about which TLS mode a
+    // port wants. For ports we don't have an opinion on, keep the user's
+    // checkbox choice rather than forcing STARTTLS.
     let port_implied_security = match config.smtp_port {
-        465 => Security::Ssl,
-        587 | 25 => Security::StartTls,
+        465 | 587 | 25 => Security::for_smtp_port(config.smtp_port, true),
         _ => config.smtp_security,
     };
 
