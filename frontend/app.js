@@ -639,17 +639,13 @@ function registerTauriEventListeners() {
         // pending queue — see `pendingApprovalQuestionsByArc`).
         if (q.arc_id && q.arc_id !== activeArcId) {
             stashApprovalQuestionForArc(q);
-            showSenseNotification(
-                'approval',
-                'Athen',
-                q.prompt || 'Approval needed',
-                q.description || '',
-                'high',
-                'Athen needs your approval to continue',
-                'urgent',
-                q.arc_id,
-                false,
-            );
+            showNotificationToast({
+                id: q.id,
+                urgency: 'High',
+                title: 'Approval needed',
+                body: q.prompt || q.description || 'Athen needs your approval to continue',
+                arc_id: q.arc_id,
+            });
             return;
         }
         addApprovalQuestionDialog(q);
@@ -662,38 +658,23 @@ function registerTauriEventListeners() {
     });
 
     // Wake-up fired: a scheduled trigger just produced a Task and (likely)
-    // dispatched it. Refresh the arc list so the freshly-created wake-up
-    // arc appears in the sidebar, and surface a sense-event-style toast
-    // so the user knows their wake-up actually ran.
-    window.__TAURI__.event.listen('wakeup-fired', (event) => {
-        const p = event.payload || {};
+    // dispatched it. Refresh the arc list so the freshly-created wake-up arc
+    // appears in the sidebar. The wake-up's outcome surfaces via the
+    // out-of-arc notification toast (emitted independently through the
+    // `notification` event); we no longer inject an informational card into
+    // the active arc's chat.
+    window.__TAURI__.event.listen('wakeup-fired', () => {
         loadArcs();
-        const decisionLabel = ({
-            silent_approve: 'running',
-            notify_and_proceed: 'running',
-            human_confirm: 'awaiting approval',
-            hard_block: 'blocked',
-            no_decision: 'no decision',
-        })[p.decision] || p.decision || '';
-        showSenseNotification(
-            'wake-up',
-            'Scheduled',
-            (p.instruction || '').slice(0, 80),
-            decisionLabel,
-            'medium',
-            `Autonomy ${p.autonomy || 'safe_only'} — ${decisionLabel}`,
-            'read',
-            p.arc_id,
-            p.decision === 'silent_approve' || p.decision === 'notify_and_proceed',
-        );
     });
 
-    // Listen for sense events (email, calendar, messaging, etc.)
-    window.__TAURI__.event.listen('sense-event', (event) => {
-        const { source, from, subject, body_preview,
-                relevance, reason, suggested_action, arc_id, dispatched } = event.payload;
-        showSenseNotification(source, from, subject, body_preview,
-                              relevance, reason, suggested_action, arc_id, dispatched);
+    // Listen for sense events (email, calendar, messaging, etc.).
+    // A new sense may have spun up a fresh arc, so refresh the sidebar arc
+    // list (and its unread dots). The event itself is surfaced to the user
+    // via the out-of-arc notification toast (emitted independently by the
+    // backend notifier through the `notification` event) — we no longer
+    // inject an informational card into the active arc's chat.
+    window.__TAURI__.event.listen('sense-event', () => {
+        loadArcs();
     });
 
     // Reload the calendar grid whenever a sync pass lands new/changed
@@ -1843,120 +1824,6 @@ function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
-}
-
-// ─── Sense Notifications ───
-
-function showSenseNotification(source, from, subject, bodyPreview,
-                                relevance, reason, suggestedAction, arcId, dispatched) {
-    const container = document.getElementById('messages');
-    if (!container) return;
-
-    const welcome = container.querySelector('.welcome-message');
-    if (welcome) welcome.remove();
-
-    const card = document.createElement('div');
-    const urgencyClass = relevance === 'high' ? 'email-high' : 'email-medium';
-    card.className = 'email-card ' + urgencyClass;
-
-    const preview = bodyPreview
-        ? '<div class="email-card-body">' + escapeHtml(bodyPreview) + '</div>'
-        : '';
-
-    const relevanceBadge = relevance === 'high'
-        ? '<span class="email-badge email-badge-high">Urgent</span>'
-        : '<span class="email-badge email-badge-medium">Important</span>';
-
-    const sourceIcon = source === 'email' ? '\u{1f4e7}' :
-                       source === 'calendar' ? '\u{1f4c5}' :
-                       source === 'message' ? '\u{1f4ac}' : '\u{2699}\u{fe0f}';
-    const sourceLabel = source.charAt(0).toUpperCase() + source.slice(1);
-
-    const reasonHtml = reason
-        ? '<div class="email-card-reason">' + escapeHtml(reason) + '</div>'
-        : '';
-
-    // Build action buttons based on source and suggested_action.
-    // When `dispatched` is true the agent is already working on this event —
-    // showing user-action prompts (Draft Reply / Summarize / Add to Calendar)
-    // would be misleading. Show a status badge + Open Arc instead.
-    let actionsHtml = '';
-
-    if (dispatched) {
-        actionsHtml += '<span class="email-action-status">Athen is on it…</span>';
-    } else if (source === 'calendar') {
-        // Calendar-specific actions
-        actionsHtml += '<button class="email-action-btn email-action-primary" onclick="askAboutSenseEvent(this, \'prepare\')">What should I prepare?</button>';
-    } else {
-        // Email / messaging actions
-        actionsHtml += '<button class="email-action-btn" onclick="askAboutSenseEvent(this, \'summarize\')">Summarize</button>';
-        if (suggestedAction === 'reply' || suggestedAction === 'urgent') {
-            actionsHtml += '<button class="email-action-btn email-action-primary" onclick="askAboutSenseEvent(this, \'reply\')">Draft Reply</button>';
-        }
-        if (suggestedAction === 'calendar') {
-            actionsHtml += '<button class="email-action-btn" onclick="askAboutSenseEvent(this, \'calendar\')">Add to Calendar</button>';
-        }
-    }
-
-    // Open Arc button — always present, switches context to the event's arc
-    if (arcId) {
-        actionsHtml += '<button class="email-action-btn" onclick="handleSwitchArc(\'' + escapeHtml(arcId) + '\')">Open Arc</button>';
-    }
-
-    card.innerHTML =
-        '<div class="email-card-header">' +
-            '<span class="email-card-icon">' + sourceIcon + '</span>' +
-            relevanceBadge +
-            '<span class="email-card-label">' + sourceLabel + '</span>' +
-            '<span class="email-card-time">' + formatTime(new Date()) + '</span>' +
-        '</div>' +
-        '<div class="email-card-from">' + escapeHtml(from) + '</div>' +
-        '<div class="email-card-subject">' + escapeHtml(subject) + '</div>' +
-        reasonHtml +
-        preview +
-        '<div class="email-card-actions">' + actionsHtml + '</div>';
-
-    container.appendChild(card);
-
-    scrollChatIfPinned(container.parentElement);
-
-    // Refresh the arc list since a new arc may have been created.
-    loadArcs();
-}
-
-// Handle sense event action buttons — sends a message to the agent.
-async function askAboutSenseEvent(btn, action) {
-    const card = btn.closest('.email-card');
-    if (!card) return;
-    const from = card.querySelector('.email-card-from')?.textContent || '';
-    const subject = card.querySelector('.email-card-subject')?.textContent || '';
-    const body = card.querySelector('.email-card-body')?.textContent || '';
-
-    // Find the arc_id from the Open Arc button in the same card.
-    const arcBtn = card.querySelector('.email-action-btn[onclick*="handleSwitchArc"]');
-    const arcIdMatch = arcBtn?.getAttribute('onclick')?.match(/handleSwitchArc\('([^']+)'\)/);
-    const arcId = arcIdMatch ? arcIdMatch[1] : null;
-
-    // Switch to the event's Arc first so the agent has full context.
-    if (arcId && arcId !== activeArcId) {
-        await handleSwitchArc(arcId);
-    }
-
-    let prompt;
-    if (action === 'summarize') {
-        prompt = 'Summarize this for me briefly.';
-    } else if (action === 'reply') {
-        prompt = 'Draft a professional reply to this.';
-    } else if (action === 'calendar') {
-        prompt = 'Extract the event details and tell me what to add to my calendar.';
-    } else if (action === 'prepare') {
-        prompt = 'What should I prepare or know about for this upcoming event?';
-    }
-
-    if (prompt && inputEl) {
-        inputEl.value = prompt;
-        formEl.requestSubmit();
-    }
 }
 
 // ─── Time Formatting ───
