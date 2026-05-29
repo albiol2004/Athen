@@ -2195,6 +2195,7 @@ mod tests {
                 goal_status: None,
                 goal_blocked_reason: None,
                 plan: None,
+                security_mode_override: None,
             },
             ArcMeta {
                 id: "arc_recent".into(),
@@ -2219,6 +2220,7 @@ mod tests {
                 goal_status: None,
                 goal_blocked_reason: None,
                 plan: None,
+                security_mode_override: None,
             },
         ];
 

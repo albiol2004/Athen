@@ -175,6 +175,13 @@ pub struct ArcMeta {
     /// distinct from the first-call-wins `pinned_*` columns because this
     /// is a durable user preference, not an in-flight snapshot.
     pub tier_override: Option<String>,
+    /// User-set per-arc security-mode override. Stored as the lowercase
+    /// wire string (`"bunker"` / `"assistant"` / `"yolo"`) so adding modes
+    /// later doesn't require a type migration. `None` falls through to the
+    /// live global `SecurityConfig.mode`. Same last-write-wins semantics as
+    /// the other `*_override` columns — a durable user preference, not an
+    /// in-flight snapshot.
+    pub security_mode_override: Option<String>,
     /// Mini-plan drafted by the triage LLM call (same call that evaluates
     /// risk + complexity — see `RiskScore.plan`). Captured once at task
     /// creation, then survives compaction as arc-level metadata. The
@@ -451,6 +458,18 @@ impl ArcStore {
                     .map_err(|e| AthenError::Other(format!("Add tier_override: {e}")))?;
             }
 
+            // Column-level migration: `security_mode_override` lets a user
+            // force a security posture (bunker / assistant / yolo) for an
+            // arc, overriding the global mode. Stored as the lowercase wire
+            // string so adding modes later is a no-op for the schema.
+            if !cols.contains("security_mode_override") {
+                conn.execute(
+                    "ALTER TABLE arcs ADD COLUMN security_mode_override TEXT",
+                    [],
+                )
+                .map_err(|e| AthenError::Other(format!("Add security_mode_override: {e}")))?;
+            }
+
             // Column-level migration: `triage_plan_acceptance` +
             // `triage_plan_scope` hold the mini-plan drafted by the LLM
             // risk-evaluation call at task triage. Two columns rather
@@ -568,7 +587,7 @@ impl ArcStore {
                             a.triage_plan_acceptance, a.triage_plan_scope, \
                             a.user_goal, a.user_goal_criteria, \
                             a.goal_status, a.goal_blocked_reason, \
-                            a.plan_json \
+                            a.plan_json, a.security_mode_override \
                      FROM arcs a \
                      LEFT JOIN ( \
                          SELECT arc_id, COUNT(*) AS cnt \
@@ -605,6 +624,7 @@ impl ArcStore {
                         plan: row
                             .get::<_, Option<String>>(22)?
                             .and_then(|s| serde_json::from_str(&s).ok()),
+                        security_mode_override: row.get(23)?,
                     })
                 })
                 .map_err(|e| AthenError::Other(format!("Query get arc: {e}")))?;
@@ -657,7 +677,7 @@ impl ArcStore {
                         a.triage_plan_acceptance, a.triage_plan_scope, \
                         a.user_goal, a.user_goal_criteria, \
                         a.goal_status, a.goal_blocked_reason, \
-                        a.plan_json \
+                        a.plan_json, a.security_mode_override \
                  FROM arcs a \
                  LEFT JOIN ( \
                      SELECT arc_id, COUNT(*) AS cnt \
@@ -697,6 +717,7 @@ impl ArcStore {
                         plan: row
                             .get::<_, Option<String>>(22)?
                             .and_then(|s| serde_json::from_str(&s).ok()),
+                        security_mode_override: row.get(23)?,
                     })
                 })
                 .map_err(|e| AthenError::Other(format!("Query list arcs: {e}")))?;
@@ -1086,6 +1107,28 @@ impl ArcStore {
                 params![value, id],
             )
             .map_err(|e| AthenError::Other(format!("Set tier_override: {e}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
+    /// Set (or clear) the per-arc security-mode override. Last-write-wins.
+    /// Pass `None` to clear (the arc falls back to the global mode); pass
+    /// `Some(wire_str)` where `wire_str` is the lowercase wire form
+    /// (`"bunker"`, `"assistant"`, `"yolo"`). Validation of the wire form
+    /// happens upstream in the Tauri command — this setter trusts its caller.
+    pub async fn set_security_mode_override(&self, id: &str, value: Option<&str>) -> Result<()> {
+        let conn = self.conn.clone();
+        let id = id.to_string();
+        let value = value.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE arcs SET security_mode_override = ?1 WHERE id = ?2",
+                params![value, id],
+            )
+            .map_err(|e| AthenError::Other(format!("Set security_mode_override: {e}")))?;
             Ok(())
         })
         .await
@@ -1729,7 +1772,8 @@ CREATE TABLE IF NOT EXISTS arcs (
     user_goal_criteria TEXT,
     goal_status TEXT,
     goal_blocked_reason TEXT,
-    plan_json TEXT
+    plan_json TEXT,
+    security_mode_override TEXT
 );
 
 CREATE TABLE IF NOT EXISTS arc_entries (
@@ -3157,6 +3201,48 @@ mod tests {
         store.set_tier_override("arc_t", None).await.unwrap();
         let meta = store.get_arc("arc_t").await.unwrap().expect("arc present");
         assert_eq!(meta.tier_override, None);
+    }
+
+    /// Per-arc security-mode override: defaults to None, last-write-wins,
+    /// and round-trips through both `get_arc` and `list_arcs`.
+    #[tokio::test]
+    async fn test_security_mode_override_set_get_clear() {
+        let store = setup_arc_store().await;
+        store
+            .create_arc("arc_s", "Security arc", ArcSource::UserInput)
+            .await
+            .unwrap();
+
+        let meta = store.get_arc("arc_s").await.unwrap().expect("arc present");
+        assert_eq!(meta.security_mode_override, None);
+
+        store
+            .set_security_mode_override("arc_s", Some("bunker"))
+            .await
+            .unwrap();
+        let meta = store.get_arc("arc_s").await.unwrap().expect("arc present");
+        assert_eq!(meta.security_mode_override.as_deref(), Some("bunker"));
+
+        // Last-write-wins.
+        store
+            .set_security_mode_override("arc_s", Some("yolo"))
+            .await
+            .unwrap();
+        let meta = store.get_arc("arc_s").await.unwrap().expect("arc present");
+        assert_eq!(meta.security_mode_override.as_deref(), Some("yolo"));
+
+        // list_arcs surfaces the same value.
+        let listed = store.list_arcs().await.unwrap();
+        let row = listed.iter().find(|a| a.id == "arc_s").unwrap();
+        assert_eq!(row.security_mode_override.as_deref(), Some("yolo"));
+
+        // Clear restores None.
+        store
+            .set_security_mode_override("arc_s", None)
+            .await
+            .unwrap();
+        let meta = store.get_arc("arc_s").await.unwrap().expect("arc present");
+        assert_eq!(meta.security_mode_override, None);
     }
 
     /// Triage plan round-trip: defaults to None, both columns are
