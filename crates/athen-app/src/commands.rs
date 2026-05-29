@@ -234,6 +234,12 @@ fn spawn_router_approval(
             &bg_ctx.active_arc_id,
         )
         .await;
+        let security_mode = crate::state::resolve_security_mode_for_arc(
+            bg_ctx.arc_store.as_ref(),
+            &bg_ctx.active_arc_id,
+            cfg_for_resolvers.security.mode,
+        )
+        .await;
         // Per-arc router build: keeps the global router when no pin is
         // in force, swaps in a slug-locked router when the arc has
         // captured `(provider, slug)`. See `crate::state::arc_router_for`.
@@ -293,6 +299,7 @@ fn spawn_router_approval(
             compaction_target_tokens,
             sampling_temperature,
             reasoning_effort,
+            security_mode,
             // Bg path drives Telegram-originated approvals; composer
             // uploads live on the desktop side, so this turn never has
             // an upload event_id to thread through. Same rationale as
@@ -2293,9 +2300,14 @@ pub async fn send_message(
     // it — HardBlock demotes to HumanConfirm so the user always gets the
     // final say on their own input. Third-party senses (Telegram, email)
     // call plain `process_event` in sense_router.rs and keep HardBlock.
-    // Global security posture, snapshotted at task creation. Phase 6 wraps
-    // this with the per-arc override.
-    let security_mode = state.security.load().mode;
+    // Effective security posture, snapshotted at task creation: per-arc
+    // override ⊕ live global.
+    let security_mode = crate::state::resolve_security_mode_for_arc(
+        state.arc_store.as_ref(),
+        &active_arc,
+        state.security.load().mode,
+    )
+    .await;
     let task_results = state
         .coordinator
         .process_event_authorized(event, AutonomyBand::SafeOnly, security_mode)
@@ -2726,6 +2738,12 @@ pub async fn send_message(
                 &active_arc,
             )
             .await;
+            let security_mode = crate::state::resolve_security_mode_for_arc(
+                state.arc_store.as_ref(),
+                &active_arc,
+                state.security.load().mode,
+            )
+            .await;
             // Lightweight tier classification: ask the Cheap-tier LLM to
             // classify complexity + is_code_task so Auto routing can pick
             // the Code or Powerful tier when warranted. The classifier
@@ -2776,7 +2794,8 @@ pub async fn send_message(
                 .enable_default_reminders(true)
                 .default_temperature(sampling_temperature)
                 .default_reasoning_effort(reasoning_effort)
-                .default_tier(default_tier);
+                .default_tier(default_tier)
+                .security_mode(security_mode);
             // Per-call shell classifier — see executor.rs
             // `compute_cwd_in_grant`. Without the grant lookup the
             // classifier still runs but `LowerToSilent` never fires.
@@ -3115,6 +3134,12 @@ pub async fn approve_task(
         crate::compaction::resolve_provider_temperature(&cfg_for_resolvers, &effective_provider_id);
     let reasoning_effort =
         crate::state::resolve_reasoning_effort_for_arc(state.arc_store.as_ref(), &active_arc).await;
+    let security_mode = crate::state::resolve_security_mode_for_arc(
+        state.arc_store.as_ref(),
+        &active_arc,
+        state.security.load().mode,
+    )
+    .await;
     // Per-arc router build: keeps the global router when no pin is in
     // force, swaps in a slug-locked router otherwise. See
     // `crate::state::arc_router_for` and `docs/PROVIDER_PINNING.md`.
@@ -3178,6 +3203,7 @@ pub async fn approve_task(
         compaction_target_tokens,
         sampling_temperature,
         reasoning_effort,
+        security_mode,
         upload_event_id,
         // User-driven approved-task path; wake-up directives don't apply.
         wakeup: None,
@@ -3364,6 +3390,11 @@ pub(crate) struct ApprovedTaskCtx {
     /// the wire" — providers apply their built-in defaults. See
     /// `crate::state::resolve_reasoning_effort_for_arc`.
     pub reasoning_effort: athen_core::llm::ReasoningEffort,
+    /// Security posture for this task, resolved once at task creation:
+    /// the arc's `security_mode_override` ⊕ the live global
+    /// `SecurityConfig.mode`. Drives the executor's per-action shell gate.
+    /// See `crate::state::resolve_security_mode_for_arc`.
+    pub security_mode: athen_core::config::SecurityMode,
     /// Synthesized `event_id` for composer uploads carried into this
     /// approved-task turn. Stamped onto the user-message arc entry so
     /// reload-time thumbnail hydration works after an approval round-
@@ -4042,7 +4073,8 @@ pub(crate) async fn execute_approved_task(
         .enable_default_reminders(true)
         .default_temperature(ctx.sampling_temperature)
         .default_reasoning_effort(ctx.reasoning_effort)
-        .default_tier(default_tier);
+        .default_tier(default_tier)
+        .security_mode(ctx.security_mode);
     // Per-call shell classifier — see executor.rs `compute_cwd_in_grant`.
     if let Some(store) = ctx.grant_store.clone() {
         builder = builder
@@ -5165,7 +5197,8 @@ pub(crate) async fn execute_dispatched_task(
         .enable_default_reminders(true)
         .default_temperature(ctx.sampling_temperature)
         .default_reasoning_effort(ctx.reasoning_effort)
-        .default_tier(default_tier);
+        .default_tier(default_tier)
+        .security_mode(ctx.security_mode);
     // Per-call shell classifier — see executor.rs `compute_cwd_in_grant`.
     if let Some(store) = ctx.grant_store.clone() {
         builder = builder

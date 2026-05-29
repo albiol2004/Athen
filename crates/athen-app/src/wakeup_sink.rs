@@ -125,9 +125,10 @@ impl WakeupFireSink for CoordinatorWakeupSink {
             raw_id: None,
         };
 
-        // Global security posture (Assistant when headless / no AppHandle).
-        // Phase 6 wraps this with the per-arc override for `target_arc_id`.
-        let security_mode = self
+        // Effective security posture: per-arc override ⊕ live global
+        // (Assistant when headless / no AppHandle). `target_arc_id` is
+        // `None` for headless fires — the resolver then returns the global.
+        let global_security_mode = self
             .app_handle
             .as_ref()
             .map(|h| {
@@ -135,6 +136,12 @@ impl WakeupFireSink for CoordinatorWakeupSink {
                 h.state::<crate::state::AppState>().security.load().mode
             })
             .unwrap_or(athen_core::config::SecurityMode::Assistant);
+        let security_mode = crate::state::resolve_security_mode_for_arc(
+            self.arc_store.as_ref(),
+            target_arc_id.as_deref().unwrap_or(""),
+            global_security_mode,
+        )
+        .await;
         let decisions = match self
             .coordinator
             .process_event_authorized(event, wakeup.autonomy, security_mode)

@@ -2849,6 +2849,12 @@ impl AppState {
                     let reasoning_effort =
                         crate::state::resolve_reasoning_effort_for_arc(arc_store.as_ref(), &arc_id)
                             .await;
+                    let security_mode = crate::state::resolve_security_mode_for_arc(
+                        arc_store.as_ref(),
+                        &arc_id,
+                        cfg_for_resolvers.security.mode,
+                    )
+                    .await;
                     // Per-arc router build: keeps the global router when
                     // no pin is in force, swaps in a slug-locked router
                     // when the arc has captured `(provider, slug)`. See
@@ -2900,6 +2906,7 @@ impl AppState {
                         compaction_target_tokens,
                         sampling_temperature,
                         reasoning_effort,
+                        security_mode,
                         wakeup: wakeup_for_ctx,
                         // Sense-originated tasks don't carry composer
                         // uploads; the surfacing path uses the original
@@ -4608,9 +4615,6 @@ pub(crate) async fn resolve_reasoning_effort_for_arc(
 /// (snapshot of `AppState::security.load().mode`). Missing arc / missing
 /// override / parse failure / store error all fall through to the global.
 /// Resolve this once at task/arc creation (new-arcs-only contract).
-// `allow(dead_code)`: call sites are wired in the next step (ctx snapshot +
-// coordinator call sites swap from the bare global to this resolver).
-#[allow(dead_code)]
 pub(crate) async fn resolve_security_mode_for_arc(
     arc_store: Option<&ArcStore>,
     arc_id: &str,
@@ -6240,6 +6244,66 @@ mod resolve_effective_tier_tests {
         )
         .await;
         assert_eq!(tier, ModelProfile::Powerful);
+    }
+}
+
+#[cfg(test)]
+mod resolve_security_mode_tests {
+    use super::resolve_security_mode_for_arc;
+    use athen_core::config::SecurityMode;
+    use athen_persistence::arcs::{ArcSource, ArcStore};
+    use rusqlite::Connection;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    async fn setup_store() -> ArcStore {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        let store = ArcStore::new(Arc::new(Mutex::new(conn)));
+        store.init_schema().await.expect("init arc schema");
+        store
+    }
+
+    #[tokio::test]
+    async fn override_wins_over_global() {
+        let store = setup_store().await;
+        store
+            .create_arc("a", "t", ArcSource::UserInput)
+            .await
+            .unwrap();
+        store
+            .set_security_mode_override("a", Some("yolo"))
+            .await
+            .unwrap();
+        let mode =
+            resolve_security_mode_for_arc(Some(&store), "a", SecurityMode::Bunker).await;
+        assert_eq!(mode, SecurityMode::Yolo);
+    }
+
+    #[tokio::test]
+    async fn no_override_falls_through_to_global() {
+        let store = setup_store().await;
+        store
+            .create_arc("a", "t", ArcSource::UserInput)
+            .await
+            .unwrap();
+        let mode =
+            resolve_security_mode_for_arc(Some(&store), "a", SecurityMode::Bunker).await;
+        assert_eq!(mode, SecurityMode::Bunker);
+    }
+
+    #[tokio::test]
+    async fn missing_arc_and_no_store_fall_through() {
+        let store = setup_store().await;
+        // Unknown arc id → global.
+        assert_eq!(
+            resolve_security_mode_for_arc(Some(&store), "nope", SecurityMode::Yolo).await,
+            SecurityMode::Yolo
+        );
+        // No store at all → global.
+        assert_eq!(
+            resolve_security_mode_for_arc(None, "a", SecurityMode::Assistant).await,
+            SecurityMode::Assistant
+        );
     }
 }
 
