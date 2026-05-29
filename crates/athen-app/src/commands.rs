@@ -112,7 +112,7 @@ fn spawn_router_approval(
         active_arc_id: arc_id.clone().unwrap_or_default(),
         inflight: state.inflight_approvals.clone(),
         approval_router: state.approval_router.clone(),
-        notifier: state.notifier.clone(),
+        notifier: state.notifier.load_full(),
         compactor: state.compactor.clone(),
         web_search: state.web_search.read().expect("web_search lock").clone(),
         email_sender: state.email_sender.read().expect("email_sender lock").clone(),
@@ -2315,7 +2315,7 @@ pub async fn send_message(
     // notification mid-turn.
     for (task_id, decision) in &task_results {
         if matches!(decision, RiskDecision::NotifyAndProceed) {
-            if let Some(ref notifier) = state.notifier {
+            if let Some(notifier) = state.notifier.load_full() {
                 let notification = Notification {
                     id: Uuid::new_v4(),
                     urgency: NotificationUrgency::Medium,
@@ -3136,7 +3136,7 @@ pub async fn approve_task(
         turn_id: turn_id.clone(),
         message_override,
         approval_router: state.approval_router.clone(),
-        notifier: state.notifier.clone(),
+        notifier: state.notifier.load_full(),
         compactor: state.compactor.clone(),
         web_search: state.web_search.read().expect("web_search lock").clone(),
         email_sender: state.email_sender.read().expect("email_sender lock").clone(),
@@ -6367,7 +6367,7 @@ pub async fn switch_arc(
         *state.active_arc_id.lock().await = arc_id.clone();
 
         // Mark any pending notifications for this arc as read.
-        if let Some(ref notifier) = state.notifier {
+        if let Some(notifier) = state.notifier.load_full() {
             notifier.mark_arc_read(&arc_id).await;
         }
 
@@ -7429,7 +7429,7 @@ pub async fn mark_notification_seen(
 ) -> std::result::Result<(), String> {
     let uuid = Uuid::parse_str(&id).map_err(|e| format!("Invalid notification ID: {e}"))?;
 
-    if let Some(ref notifier) = state.notifier {
+    if let Some(notifier) = state.notifier.load_full() {
         notifier.mark_seen(uuid).await;
     }
     Ok(())
@@ -7440,7 +7440,7 @@ pub async fn mark_notification_seen(
 pub async fn list_notifications(
     state: State<'_, AppState>,
 ) -> std::result::Result<Vec<NotificationInfo>, String> {
-    if let Some(ref notifier) = state.notifier {
+    if let Some(notifier) = state.notifier.load_full() {
         Ok(notifier.list_notifications().await)
     } else {
         Ok(vec![])
@@ -7454,7 +7454,7 @@ pub async fn mark_notification_read(
     id: String,
 ) -> std::result::Result<(), String> {
     let uuid = Uuid::parse_str(&id).map_err(|e| format!("Invalid notification ID: {e}"))?;
-    if let Some(ref notifier) = state.notifier {
+    if let Some(notifier) = state.notifier.load_full() {
         notifier.mark_read(uuid).await;
     }
     Ok(())
@@ -7465,7 +7465,7 @@ pub async fn mark_notification_read(
 pub async fn mark_all_notifications_read(
     state: State<'_, AppState>,
 ) -> std::result::Result<(), String> {
-    if let Some(ref notifier) = state.notifier {
+    if let Some(notifier) = state.notifier.load_full() {
         notifier.mark_all_read().await;
     }
     Ok(())
@@ -7478,7 +7478,7 @@ pub async fn delete_notification(
     id: String,
 ) -> std::result::Result<(), String> {
     let uuid = Uuid::parse_str(&id).map_err(|e| format!("Invalid notification ID: {e}"))?;
-    if let Some(ref notifier) = state.notifier {
+    if let Some(notifier) = state.notifier.load_full() {
         notifier.delete_notification(uuid).await;
     }
     Ok(())
@@ -7489,7 +7489,7 @@ pub async fn delete_notification(
 pub async fn delete_read_notifications(
     state: State<'_, AppState>,
 ) -> std::result::Result<usize, String> {
-    if let Some(ref notifier) = state.notifier {
+    if let Some(notifier) = state.notifier.load_full() {
         Ok(notifier.delete_read_notifications().await)
     } else {
         Ok(0)

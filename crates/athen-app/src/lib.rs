@@ -386,7 +386,7 @@ pub fn run() {
             // so the Telegram poll loop and other background work keep
             // running. The tray menu provides a real Quit.
             let state_ref = app.state::<AppState>();
-            let notifier_for_focus = state_ref.notifier.clone();
+            let notifier_for_focus = state_ref.notifier.load_full();
             if let Some(window) = app.get_webview_window("main") {
                 let win_for_event = window.clone();
                 window.on_window_event(move |event| match event {

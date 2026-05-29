@@ -350,6 +350,7 @@ dependencies = [
 name = "athen-app"
 version = "0.3.1"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "athen-agent",
  "athen-caldav",

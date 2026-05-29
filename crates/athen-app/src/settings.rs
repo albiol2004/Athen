@@ -3007,7 +3007,8 @@ pub async fn get_notification_settings(
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn save_notification_settings(
-    _state: State<'_, AppState>,
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
     preferred_channels: Vec<String>,
     escalation_timeout_secs: u64,
     quiet_hours_enabled: bool,
@@ -3052,7 +3053,10 @@ pub async fn save_notification_settings(
     };
 
     save_main_config(&config)?;
-    Ok("Notification settings saved. Restart to apply.".to_string())
+    // Hot-swap the live notification orchestrator so channel order, quiet
+    // hours, and escalation timeout apply without a restart.
+    state.reload_notifier(app_handle).await;
+    Ok("Notification settings saved and applied.".to_string())
 }
 
 // ---------------------------------------------------------------------------

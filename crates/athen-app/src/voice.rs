@@ -405,7 +405,7 @@ pub async fn test_voice_setup(
         state.approval_router.clone(),
         state.vault.clone(),
         state.http_endpoint_store.clone(),
-        state.notifier.clone(),
+        state.notifier.load_full(),
         active_provider_id,
     )
     .ok_or_else(|| {

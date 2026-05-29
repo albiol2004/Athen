@@ -199,7 +199,13 @@ pub struct AppState {
     /// Notification orchestrator for delivering notifications through the
     /// best available channel (in-app, Telegram, etc.) with quiet-hours
     /// support and escalation.  Initialized after setup via `init_notifier`.
-    pub notifier: Option<Arc<NotificationOrchestrator>>,
+    /// Hot-swappable: `save_notification_settings` rebuilds it (channels +
+    /// preferred order + quiet hours) and stores it so the change applies
+    /// without a restart. `ArcSwapOption` (not `RwLock`) because it's a
+    /// concrete type read at many `if let Some(..)` sites inside async fns —
+    /// `.load_full()` hands back an owned `Option<Arc<_>>` with no guard to
+    /// hold across `.await`.
+    pub notifier: arc_swap::ArcSwapOption<NotificationOrchestrator>,
     /// Approval router for routing approve/deny questions to the user
     /// across reply channels (InApp + Telegram), with escalation when
     /// the primary channel doesn't answer in time.
@@ -951,7 +957,7 @@ impl AppState {
             calendar_shutdown: None,
             calendar_sync_shutdown: None,
             attachment_purger_shutdown: None,
-            notifier: None,
+            notifier: arc_swap::ArcSwapOption::empty(),
             approval_router: None,
             inapp_approval_sink: None,
             telegram_approval_sink: None,
@@ -1450,7 +1456,7 @@ impl AppState {
                 .wakeup_store
                 .clone()
                 .map(|s| s as Arc<dyn athen_core::traits::wakeup::WakeupStore>),
-            notifier: self.notifier.clone(),
+            notifier: self.notifier.load_full(),
             active_provider_id: self
                 .active_provider_id
                 .try_lock()
@@ -1480,6 +1486,21 @@ impl AppState {
     /// Telegram is added only if the bot is configured with an owner.
     pub fn init_notifier(&mut self, app_handle: tauri::AppHandle) {
         let config = self.load_hydrated_config_sync();
+        let notifier = Arc::new(self.build_notifier(&config, app_handle));
+        // Load persisted notifications from a previous session.
+        tauri::async_runtime::block_on(notifier.load_persisted());
+        self.notifier.store(Some(notifier));
+    }
+
+    /// Build (but do not persist-load or store) a `NotificationOrchestrator`
+    /// from `config`. Shared by `init_notifier` (boot) and `reload_notifier`
+    /// (live Settings save) so the channel set, preferred order, quiet hours,
+    /// and escalation timeout are assembled identically in both paths.
+    fn build_notifier(
+        &self,
+        config: &athen_core::config::AthenConfig,
+        app_handle: tauri::AppHandle,
+    ) -> NotificationOrchestrator {
         let mut channels: Vec<Box<dyn NotificationChannel>> = Vec::new();
 
         // InApp is always available.
@@ -1521,12 +1542,20 @@ impl AppState {
             orchestrator = orchestrator.with_store(db.notification_store());
         }
 
-        let notifier = Arc::new(orchestrator);
+        orchestrator
+    }
 
-        // Load persisted notifications from a previous session.
-        tauri::async_runtime::block_on(notifier.load_persisted());
-
-        self.notifier = Some(notifier);
+    /// Rebuild the notification orchestrator from current (vault-hydrated)
+    /// config and hot-swap it in. Called by `save_notification_settings` so
+    /// preferred-channel order, quiet hours, and escalation timeout apply
+    /// without a restart. Re-loads persisted history from the store so the
+    /// swap doesn't drop the notification list.
+    pub(crate) async fn reload_notifier(&self, app_handle: tauri::AppHandle) {
+        let mut config = crate::settings::load_main_config_public();
+        crate::vault_creds::hydrate_secrets_from_vault(self.vault.as_ref(), &mut config).await;
+        let notifier = Arc::new(self.build_notifier(&config, app_handle));
+        notifier.load_persisted().await;
+        self.notifier.store(Some(notifier));
     }
 
     /// Initialize the approval router and its sinks.
@@ -1651,7 +1680,7 @@ impl AppState {
             tracing::debug!("No hint_dismissal_store wired; skipping hint checker");
             return;
         };
-        let notifier = self.notifier.clone();
+        let notifier = self.notifier.load_full();
         let config_snapshot = self.load_hydrated_config_sync();
         let active_id = self.active_provider_id.blocking_lock().clone();
         let cal_source_store = self.calendar_source_store();
@@ -1732,7 +1761,7 @@ impl AppState {
         let profile_store_ref = self.profile_store.clone();
         let profile_embedder_ref = self.profile_embedder.read().expect("profile_embedder lock").clone();
         let profile_embedding_cache_ref = Arc::clone(&self.profile_embedding_cache);
-        let notifier = self.notifier.clone();
+        let notifier = self.notifier.load_full();
         let coordinator_ref = Arc::clone(&self.coordinator);
         let task_arc_map_ref = Arc::clone(&self.task_arc_map);
         let pending_email_marks_ref = Arc::clone(&self.pending_email_marks);
@@ -2004,7 +2033,7 @@ impl AppState {
         let profile_store_ref = self.profile_store.clone();
         let profile_embedder_ref = self.profile_embedder.read().expect("profile_embedder lock").clone();
         let profile_embedding_cache_ref = Arc::clone(&self.profile_embedding_cache);
-        let notifier = self.notifier.clone();
+        let notifier = self.notifier.load_full();
         let coordinator_ref = Arc::clone(&self.coordinator);
         let task_arc_map_ref = Arc::clone(&self.task_arc_map);
         let pending_email_marks_ref = Arc::clone(&self.pending_email_marks);
@@ -2120,7 +2149,7 @@ impl AppState {
         let profile_embedder_ref = self.profile_embedder.read().expect("profile_embedder lock").clone();
         let profile_embedding_cache_ref = Arc::clone(&self.profile_embedding_cache);
         let contact_store_ref = self.contact_store.clone();
-        let notifier = self.notifier.clone();
+        let notifier = self.notifier.load_full();
         let telegram_approval_sink = self.telegram_approval_sink.clone();
         let approval_router_ref = self.approval_router.clone();
         let coordinator_ref = Arc::clone(&self.coordinator);
@@ -2344,7 +2373,7 @@ impl AppState {
         let spawn_persistence = self.spawn_persistence.clone();
         let telegram_approval_sink = self.telegram_approval_sink.clone();
         let approval_router = self.approval_router.clone();
-        let notifier = self.notifier.clone();
+        let notifier = self.notifier.load_full();
         let compactor = self.compactor.clone();
         let web_search = self.web_search.read().expect("web_search lock").clone();
         let email_sender = self.email_sender.read().expect("email_sender lock").clone();
