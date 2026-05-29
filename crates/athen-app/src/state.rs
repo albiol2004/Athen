@@ -1784,7 +1784,11 @@ impl AppState {
         let attachment_store_ref = self._database.as_ref().map(|db| db.attachment_store());
         let contact_store_ref = self.contact_store.clone();
         let profile_store_ref = self.profile_store.clone();
-        let profile_embedder_ref = self.profile_embedder.read().expect("profile_embedder lock").clone();
+        let profile_embedder_ref = self
+            .profile_embedder
+            .read()
+            .expect("profile_embedder lock")
+            .clone();
         let profile_embedding_cache_ref = Arc::clone(&self.profile_embedding_cache);
         let notifier = self.notifier.load_full();
         let coordinator_ref = Arc::clone(&self.coordinator);
@@ -1940,7 +1944,10 @@ impl AppState {
         crate::vault_creds::hydrate_secrets_from_vault(self.vault.as_ref(), &mut cfg).await;
         let rebuilt: Arc<dyn athen_core::traits::embedding::EmbeddingProvider> =
             Arc::new(build_embedding_router(&cfg.embeddings));
-        *self.profile_embedder.write().expect("profile_embedder lock") = rebuilt;
+        *self
+            .profile_embedder
+            .write()
+            .expect("profile_embedder lock") = rebuilt;
     }
 
     /// Spawn the wake-up scheduler loop. Idempotent — does nothing if the
@@ -2073,7 +2080,11 @@ impl AppState {
         let attachment_store_ref = self._database.as_ref().map(|db| db.attachment_store());
         let contact_store_ref = self.contact_store.clone();
         let profile_store_ref = self.profile_store.clone();
-        let profile_embedder_ref = self.profile_embedder.read().expect("profile_embedder lock").clone();
+        let profile_embedder_ref = self
+            .profile_embedder
+            .read()
+            .expect("profile_embedder lock")
+            .clone();
         let profile_embedding_cache_ref = Arc::clone(&self.profile_embedding_cache);
         let notifier = self.notifier.load_full();
         let coordinator_ref = Arc::clone(&self.coordinator);
@@ -2173,7 +2184,10 @@ impl AppState {
         }
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-        *self.telegram_shutdown.lock().expect("telegram_shutdown lock") = Some(shutdown_tx);
+        *self
+            .telegram_shutdown
+            .lock()
+            .expect("telegram_shutdown lock") = Some(shutdown_tx);
 
         let mut monitor = TelegramMonitor::new(config.telegram.clone());
         if let Some(lookup) = self.owner_lookup() {
@@ -2188,7 +2202,11 @@ impl AppState {
         // needs at the outer scope. Everything else the owner-Telegram
         // executor wants lives in `tool_registry_deps_ref` below.
         let profile_store_ref = self.profile_store.clone();
-        let profile_embedder_ref = self.profile_embedder.read().expect("profile_embedder lock").clone();
+        let profile_embedder_ref = self
+            .profile_embedder
+            .read()
+            .expect("profile_embedder lock")
+            .clone();
         let profile_embedding_cache_ref = Arc::clone(&self.profile_embedding_cache);
         let contact_store_ref = self.contact_store.clone();
         let notifier = self.notifier.load_full();

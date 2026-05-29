@@ -115,7 +115,11 @@ fn spawn_router_approval(
         notifier: state.notifier.load_full(),
         compactor: state.compactor.clone(),
         web_search: state.web_search.read().expect("web_search lock").clone(),
-        email_sender: state.email_sender.read().expect("email_sender lock").clone(),
+        email_sender: state
+            .email_sender
+            .read()
+            .expect("email_sender lock")
+            .clone(),
         telegram_sender: state
             .telegram_sender
             .read()
@@ -3139,7 +3143,11 @@ pub async fn approve_task(
         notifier: state.notifier.load_full(),
         compactor: state.compactor.clone(),
         web_search: state.web_search.read().expect("web_search lock").clone(),
-        email_sender: state.email_sender.read().expect("email_sender lock").clone(),
+        email_sender: state
+            .email_sender
+            .read()
+            .expect("email_sender lock")
+            .clone(),
         telegram_sender: state
             .telegram_sender
             .read()
