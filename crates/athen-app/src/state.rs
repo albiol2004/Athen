@@ -265,7 +265,11 @@ pub struct AppState {
     /// provider is available, so the per-call code path can assume `Some`.
     /// Wrapped in `Arc` so background tasks (e.g. sense_router) can hold a
     /// reference for the lifetime of an async task.
-    pub profile_embedder: Arc<dyn athen_core::traits::embedding::EmbeddingProvider>,
+    /// Hot-swappable: `save_embedding_settings` rebuilds the embedding router
+    /// from current config and swaps it under the lock, so an embedding-mode
+    /// change applies without a restart. Read via `.read()` per use.
+    pub profile_embedder:
+        std::sync::RwLock<Arc<dyn athen_core::traits::embedding::EmbeddingProvider>>,
     /// In-memory cache of embedded profile text, keyed by profile id and
     /// invalidated by the profile's `updated_at`. Populated lazily during
     /// routing — embedding 12 short strings is cheap, but caching makes
@@ -355,7 +359,10 @@ pub struct AppState {
     /// (`refresh_tools_doc`, `build_tool_registry`, owner-Telegram exec)
     /// stay consistent. The chain prefers Brave → Tavily → DDG; cooldowns
     /// for keyed providers are tracked inside the `MultiSearchProvider`.
-    pub web_search: Arc<dyn WebSearchProvider>,
+    /// Hot-swappable: `save_web_search_settings` rebuilds the provider chain
+    /// (Brave → Tavily → DDG …) from current config and swaps it under the
+    /// lock, so a key change applies without a restart. Read via `.read()`.
+    pub web_search: std::sync::RwLock<Arc<dyn WebSearchProvider>>,
     /// SMTP outbound. Built from `config.email` when SMTP fields are
     /// populated. `None` means the `email_send` tool will refuse with a
     /// "not configured" error until the user wires SMTP via Settings.
@@ -958,7 +965,7 @@ impl AppState {
             skill_store,
             wakeup_store,
             wakeup_scheduler_shutdown: std::sync::Mutex::new(None),
-            profile_embedder,
+            profile_embedder: std::sync::RwLock::new(profile_embedder),
             profile_embedding_cache,
             pending_grants,
             spawned_processes,
@@ -973,7 +980,7 @@ impl AppState {
             dispatch_signal: Arc::new(tokio::sync::Notify::new()),
             dispatch_loop_shutdown: None,
             compactor,
-            web_search,
+            web_search: std::sync::RwLock::new(web_search),
             email_sender: std::sync::RwLock::new(email_sender),
             telegram_sender: std::sync::RwLock::new(telegram_sender),
             vault,
@@ -1236,7 +1243,7 @@ impl AppState {
             .await
             .with_spawned_processes(self.spawned_processes.clone())
             .with_spawn_persistence_hook_opt(self.spawn_persistence.clone())
-            .with_web_search(self.web_search.clone())
+            .with_web_search(self.web_search.read().expect("web_search lock").clone())
             .with_email_sender_opt(self.email_sender.read().expect("email_sender lock").clone())
             .with_telegram_sender_opt(
                 self.telegram_sender
@@ -1401,7 +1408,7 @@ impl AppState {
         ToolRegistryDeps {
             spawned_processes: self.spawned_processes.clone(),
             spawn_persistence: self.spawn_persistence.clone(),
-            web_search: self.web_search.clone(),
+            web_search: self.web_search.read().expect("web_search lock").clone(),
             email_sender: self.email_sender.read().expect("email_sender lock").clone(),
             telegram_sender: self
                 .telegram_sender
@@ -1723,7 +1730,7 @@ impl AppState {
         let attachment_store_ref = self._database.as_ref().map(|db| db.attachment_store());
         let contact_store_ref = self.contact_store.clone();
         let profile_store_ref = self.profile_store.clone();
-        let profile_embedder_ref = Arc::clone(&self.profile_embedder);
+        let profile_embedder_ref = self.profile_embedder.read().expect("profile_embedder lock").clone();
         let profile_embedding_cache_ref = Arc::clone(&self.profile_embedding_cache);
         let notifier = self.notifier.clone();
         let coordinator_ref = Arc::clone(&self.coordinator);
@@ -1841,6 +1848,28 @@ impl AppState {
             resolve_owner_telegram_chat_id(self.contact_store.as_ref()).await;
         let rebuilt = build_telegram_sender(&cfg.telegram, owner_chat_id_override);
         *self.telegram_sender.write().expect("telegram_sender lock") = rebuilt;
+    }
+
+    /// Rebuild the web-search provider chain from current (vault-hydrated)
+    /// config and hot-swap it in. Called by `save_web_search_settings`.
+    pub(crate) async fn reload_web_search(&self) {
+        let mut cfg = crate::settings::load_main_config_public();
+        crate::vault_creds::hydrate_secrets_from_vault(self.vault.as_ref(), &mut cfg).await;
+        let rebuilt = build_web_search_provider(&cfg.web_search);
+        *self.web_search.write().expect("web_search lock") = rebuilt;
+    }
+
+    /// Rebuild the embedding router from current (vault-hydrated) config and
+    /// hot-swap it in. Called by `save_embedding_settings` so an embedding-mode
+    /// change applies without a restart. Note: bundled-tier models that need a
+    /// download will fall back to keyword search until the model is present
+    /// (same as the boot path), so the swap never blocks on a download.
+    pub(crate) async fn reload_embedder(&self) {
+        let mut cfg = crate::settings::load_main_config_public();
+        crate::vault_creds::hydrate_secrets_from_vault(self.vault.as_ref(), &mut cfg).await;
+        let rebuilt: Arc<dyn athen_core::traits::embedding::EmbeddingProvider> =
+            Arc::new(build_embedding_router(&cfg.embeddings));
+        *self.profile_embedder.write().expect("profile_embedder lock") = rebuilt;
     }
 
     /// Spawn the wake-up scheduler loop. Idempotent — does nothing if the
@@ -1973,7 +2002,7 @@ impl AppState {
         let attachment_store_ref = self._database.as_ref().map(|db| db.attachment_store());
         let contact_store_ref = self.contact_store.clone();
         let profile_store_ref = self.profile_store.clone();
-        let profile_embedder_ref = Arc::clone(&self.profile_embedder);
+        let profile_embedder_ref = self.profile_embedder.read().expect("profile_embedder lock").clone();
         let profile_embedding_cache_ref = Arc::clone(&self.profile_embedding_cache);
         let notifier = self.notifier.clone();
         let coordinator_ref = Arc::clone(&self.coordinator);
@@ -2088,7 +2117,7 @@ impl AppState {
         // needs at the outer scope. Everything else the owner-Telegram
         // executor wants lives in `tool_registry_deps_ref` below.
         let profile_store_ref = self.profile_store.clone();
-        let profile_embedder_ref = Arc::clone(&self.profile_embedder);
+        let profile_embedder_ref = self.profile_embedder.read().expect("profile_embedder lock").clone();
         let profile_embedding_cache_ref = Arc::clone(&self.profile_embedding_cache);
         let contact_store_ref = self.contact_store.clone();
         let notifier = self.notifier.clone();
@@ -2317,7 +2346,7 @@ impl AppState {
         let approval_router = self.approval_router.clone();
         let notifier = self.notifier.clone();
         let compactor = self.compactor.clone();
-        let web_search = Arc::clone(&self.web_search);
+        let web_search = self.web_search.read().expect("web_search lock").clone();
         let email_sender = self.email_sender.read().expect("email_sender lock").clone();
         let telegram_sender_dispatch = self
             .telegram_sender

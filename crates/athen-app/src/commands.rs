@@ -114,7 +114,7 @@ fn spawn_router_approval(
         approval_router: state.approval_router.clone(),
         notifier: state.notifier.clone(),
         compactor: state.compactor.clone(),
-        web_search: Arc::clone(&state.web_search),
+        web_search: state.web_search.read().expect("web_search lock").clone(),
         email_sender: state.email_sender.read().expect("email_sender lock").clone(),
         telegram_sender: state
             .telegram_sender
@@ -3138,7 +3138,7 @@ pub async fn approve_task(
         approval_router: state.approval_router.clone(),
         notifier: state.notifier.clone(),
         compactor: state.compactor.clone(),
-        web_search: Arc::clone(&state.web_search),
+        web_search: state.web_search.read().expect("web_search lock").clone(),
         email_sender: state.email_sender.read().expect("email_sender lock").clone(),
         telegram_sender: state
             .telegram_sender

@@ -2538,7 +2538,9 @@ pub async fn save_web_search_settings(
     .await?;
 
     save_main_config(&config)?;
-    Ok("Web search settings saved. Restart to apply.".to_string())
+    // Hot-swap the live web-search provider chain so new keys apply at once.
+    state.reload_web_search().await;
+    Ok("Web search settings saved and applied.".to_string())
 }
 
 /// Shared logic for `save_web_search_settings`. Treats:
@@ -3139,7 +3141,11 @@ pub async fn save_embedding_settings(
     }
 
     save_main_config(&config)?;
-    Ok("Embedding settings saved. Restart to apply.".to_string())
+    // Hot-swap the live embedding router so the mode/provider change applies
+    // without a restart. Bundled tiers needing a download fall back to keyword
+    // until present, identical to the boot path — the swap never blocks.
+    state.reload_embedder().await;
+    Ok("Embedding settings saved and applied.".to_string())
 }
 
 /// Test connectivity to an embedding provider.
