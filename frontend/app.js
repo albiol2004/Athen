@@ -1373,6 +1373,19 @@ async function handleSwitchArc(arcId) {
         clearChatUI();
         renderEntries(entries);
 
+        // Arc switch is a force-scroll point (see scrollChatIfPinned
+        // notes): a loaded chat lands at its most-recent message. An empty
+        // arc keeps the welcome at the top (clearChatUI reset scrollTop to
+        // 0). Set twice — once now and once after layout settles — since
+        // scrollHeight isn't final until late-loading content reflows.
+        if (arcHasMessages) {
+            const scroller = messagesEl.parentElement;
+            if (scroller) {
+                scroller.scrollTop = scroller.scrollHeight;
+                requestAnimationFrame(() => { scroller.scrollTop = scroller.scrollHeight; });
+            }
+        }
+
         // Load goal state for the newly active arc.
         try {
             const goalState = await invoke('get_arc_goal');
@@ -1526,6 +1539,16 @@ function clearChatUI() {
     streamingBubble = null;
     streamingText = '';
     didReceiveStreamChunks = false;
+    // Reset the scroll offset to the top. The scroller (#chat-container)
+    // retains its scrollTop across an innerHTML swap, so switching from a
+    // long, scrolled-down chat to the short welcome would leave the
+    // welcome (and its suggestion chips) scrolled out of view above the
+    // viewport — and an empty chat can't be scrolled back up. WebKitGTK
+    // doesn't re-clamp the offset until the next user interaction, so do
+    // it explicitly. Callers that then render real entries
+    // (renderEntries) and want the bottom scroll there themselves.
+    const scroller = messagesEl.parentElement;
+    if (scroller) scroller.scrollTop = 0;
 }
 
 // Delegated click handler for welcome suggestion chips. Fills the composer
