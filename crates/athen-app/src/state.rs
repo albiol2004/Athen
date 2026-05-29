@@ -4603,6 +4603,33 @@ pub(crate) async fn resolve_reasoning_effort_for_arc(
     }
 }
 
+/// Resolve the effective `SecurityMode` for an arc: the per-arc
+/// `security_mode_override` wins over the passed live `global_default`
+/// (snapshot of `AppState::security.load().mode`). Missing arc / missing
+/// override / parse failure / store error all fall through to the global.
+/// Resolve this once at task/arc creation (new-arcs-only contract).
+// `allow(dead_code)`: call sites are wired in the next step (ctx snapshot +
+// coordinator call sites swap from the bare global to this resolver).
+#[allow(dead_code)]
+pub(crate) async fn resolve_security_mode_for_arc(
+    arc_store: Option<&ArcStore>,
+    arc_id: &str,
+    global_default: athen_core::config::SecurityMode,
+) -> athen_core::config::SecurityMode {
+    use std::str::FromStr;
+    let Some(store) = arc_store else {
+        return global_default;
+    };
+    match store.get_arc(arc_id).await {
+        Ok(Some(arc)) => arc
+            .security_mode_override
+            .as_deref()
+            .and_then(|s| athen_core::config::SecurityMode::from_str(s).ok())
+            .unwrap_or(global_default),
+        _ => global_default,
+    }
+}
+
 /// Parse the wire form (`ModelProfile` variant name) of a stored tier
 /// override into a `ModelProfile`. Returns `None` for unknown strings so
 /// the resolver can warn and fall through rather than silently

@@ -6791,6 +6791,37 @@ pub async fn set_arc_tier(
         .map_err(|e| e.to_string())
 }
 
+/// Set (or clear) the per-arc security-mode override. `None` / `""` /
+/// `"default"` / `"global"` clears it, so the arc falls back to the live
+/// global `SecurityConfig.mode`. Valid wire values: `"bunker"`,
+/// `"assistant"`, `"yolo"`. We parse to `SecurityMode` first for
+/// validation, then persist the canonical lowercase wire form — a
+/// malformed value can never land in the DB and trip the resolver's
+/// fallthrough.
+#[tauri::command]
+pub async fn set_arc_security_mode(
+    arc_id: String,
+    mode: Option<String>,
+    state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    use std::str::FromStr;
+    let Some(arc_store) = state.arc_store.as_ref() else {
+        return Err("Arc store not available".into());
+    };
+    let normalized: Option<String> = match mode.as_deref() {
+        None | Some("") | Some("default") | Some("global") => None,
+        Some(s) => {
+            let parsed = athen_core::config::SecurityMode::from_str(s)
+                .map_err(|_| format!("unknown security_mode value: {s:?}"))?;
+            Some(parsed.to_wire_str().to_string())
+        }
+    };
+    arc_store
+        .set_security_mode_override(&arc_id, normalized.as_deref())
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Inputs the manager UI sends when creating or updating a user-authored
 /// profile. Mirrors `AgentProfile` minus the server-managed fields
 /// (`builtin`, `created_at`, `updated_at`) and the unused-yet

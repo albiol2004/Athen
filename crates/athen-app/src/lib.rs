@@ -221,6 +221,7 @@ pub fn run() {
             commands::set_arc_profile,
             commands::set_arc_reasoning_effort,
             commands::set_arc_tier,
+            commands::set_arc_security_mode,
             commands::create_agent_profile,
             commands::update_agent_profile,
             commands::delete_agent_profile,
