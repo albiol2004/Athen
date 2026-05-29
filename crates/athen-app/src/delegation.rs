@@ -1047,4 +1047,172 @@ mod tests {
         assert!(hint.contains("wrong_field"));
         assert!(hint.contains("another"));
     }
+
+    /// A canned `LlmRouter` for verifier tests: `Some(text)` replies with that
+    /// content; `None` errors (to exercise the trust-on-error path).
+    struct FakeRouter {
+        reply: Option<String>,
+    }
+
+    #[async_trait]
+    impl athen_core::traits::llm::LlmRouter for FakeRouter {
+        async fn route(
+            &self,
+            _req: &athen_core::llm::LlmRequest,
+        ) -> Result<athen_core::llm::LlmResponse> {
+            match &self.reply {
+                Some(text) => Ok(athen_core::llm::LlmResponse {
+                    content: text.clone(),
+                    reasoning_content: None,
+                    model_used: "fake".into(),
+                    provider: "fake".into(),
+                    usage: Default::default(),
+                    tool_calls: vec![],
+                    finish_reason: athen_core::llm::FinishReason::Stop,
+                }),
+                None => Err(AthenError::Other("router boom".into())),
+            }
+        }
+        async fn budget_remaining(&self) -> Result<athen_core::llm::BudgetStatus> {
+            Ok(athen_core::llm::BudgetStatus {
+                daily_limit_usd: None,
+                spent_today_usd: 0.0,
+                remaining_usd: None,
+                tokens_used_today: 0,
+            })
+        }
+    }
+
+    /// An empty deliverable fails verification without spending an LLM call.
+    #[tokio::test]
+    async fn verify_deliverable_empty_short_circuits() {
+        let router = FakeRouter {
+            reply: Some("DONE".into()),
+        };
+        let (verified, note) = verify_deliverable(&router, "brief", "   \n\t ").await;
+        assert!(!verified);
+        assert!(note.is_some());
+    }
+
+    /// A `CONTINUE: <reason>` verdict flips verification to false and carries
+    /// the reason.
+    #[tokio::test]
+    async fn verify_deliverable_continue_flips_false() {
+        let router = FakeRouter {
+            reply: Some("CONTINUE: off-topic".into()),
+        };
+        let (verified, note) = verify_deliverable(&router, "brief", "some content").await;
+        assert!(!verified);
+        assert_eq!(note.as_deref(), Some("off-topic"));
+    }
+
+    /// `DONE` passes verification.
+    #[tokio::test]
+    async fn verify_deliverable_done_passes() {
+        let router = FakeRouter {
+            reply: Some("DONE".into()),
+        };
+        let (verified, note) = verify_deliverable(&router, "brief", "real content").await;
+        assert!(verified);
+        assert!(note.is_none());
+    }
+
+    /// An LLM error during verification trusts the result (never hard-fails a
+    /// good run on a flaky judge).
+    #[tokio::test]
+    async fn verify_deliverable_router_error_trusts_result() {
+        let router = FakeRouter { reply: None };
+        let (verified, _note) = verify_deliverable(&router, "brief", "content").await;
+        assert!(verified);
+    }
+
+    /// `propagate_parent_pins` copies the parent arc's provider pin, slug,
+    /// tier, and reasoning effort onto a fresh sub-arc; a later per-call
+    /// effort write (mirroring run_delegation's per-call block) still wins.
+    #[tokio::test]
+    async fn propagate_parent_pins_copies_runtime_context() {
+        use athen_persistence::arcs::{ArcSource, ArcStore};
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let store = ArcStore::new(Arc::new(tokio::sync::Mutex::new(conn)));
+        store.init_schema().await.unwrap();
+
+        store
+            .create_arc("parent", "p", ArcSource::UserInput)
+            .await
+            .unwrap();
+        store
+            .set_pinned_provider_if_unset("parent", "deepseek", "deepseek-chat")
+            .await
+            .unwrap();
+        store
+            .set_tier_override("parent", Some("code"))
+            .await
+            .unwrap();
+        store
+            .set_reasoning_effort_override("parent", Some("high"))
+            .await
+            .unwrap();
+        store
+            .create_arc_with_parent("sub", "s", ArcSource::System, "parent")
+            .await
+            .unwrap();
+
+        propagate_parent_pins(&store, "parent", "sub").await;
+
+        let sub = store.get_arc("sub").await.unwrap().unwrap();
+        assert_eq!(sub.pinned_provider_id.as_deref(), Some("deepseek"));
+        assert_eq!(sub.pinned_slug.as_deref(), Some("deepseek-chat"));
+        assert_eq!(sub.tier_override.as_deref(), Some("code"));
+        assert_eq!(sub.reasoning_effort_override.as_deref(), Some("high"));
+
+        // Per-call delegate effort overrides the inherited one.
+        store
+            .set_reasoning_effort_override("sub", Some("low"))
+            .await
+            .unwrap();
+        let sub = store.get_arc("sub").await.unwrap().unwrap();
+        assert_eq!(sub.reasoning_effort_override.as_deref(), Some("low"));
+    }
+
+    /// The group-restricted `coder` builtin profile must expose
+    /// `spawn_subagent` after `apply_tool_selection`, even though its group
+    /// whitelist does not contain the "delegate" group. This is the headline
+    /// regression #175 targets.
+    #[test]
+    fn coder_profile_exposes_spawn_subagent() {
+        let coder = athen_persistence::profiles::canonical_builtin_profile("coder")
+            .expect("coder builtin profile exists");
+        // Sanity: coder really is group-restricted and does NOT list delegate.
+        match &coder.tool_selection {
+            athen_core::agent_profile::ToolSelection::Groups(groups) => {
+                assert!(!groups.iter().any(|g| g == "delegate"));
+            }
+            other => panic!("coder expected ToolSelection::Groups, got {other:?}"),
+        }
+        let tools = vec![
+            ToolDefinition {
+                name: "spawn_subagent".to_string(),
+                description: "x".to_string(),
+                parameters: json!({}),
+                backend: ToolBackend::Shell {
+                    command: String::new(),
+                    native: false,
+                },
+                base_risk: BaseImpact::WritePersist,
+            },
+            ToolDefinition {
+                name: "shell_execute".to_string(),
+                description: "x".to_string(),
+                parameters: json!({}),
+                backend: ToolBackend::Shell {
+                    command: String::new(),
+                    native: false,
+                },
+                base_risk: BaseImpact::Read,
+            },
+        ];
+        let filtered =
+            athen_agent::executor::apply_tool_selection(&tools, &coder.tool_selection);
+        assert!(filtered.iter().any(|t| t.name == "spawn_subagent"));
+    }
 }
