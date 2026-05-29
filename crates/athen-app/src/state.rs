@@ -145,17 +145,17 @@ pub struct AppState {
     /// Live security posture (mode + thresholds), hot-swappable so a
     /// Settings → General save applies without a restart.
     ///
-    /// NOTE: as of this writing the risk pipeline does NOT yet read this —
-    /// auto-approval is gated by per-arc `AutonomyBand` + risk-score
-    /// thresholds in the coordinator, not by `SecurityMode`. The swap
-    /// plumbing exists so that when risk gating is wired to honour it, the
-    /// setting already applies on save with no further refactor.
-    ///
-    /// Contract for the future consumer: snapshot `security.load_full()` at
-    /// **arc/task creation** (the same boundary where `ToolRegistryDeps` /
-    /// `ApprovedTaskCtx` snapshot the other live components) so a running
-    /// arc keeps the posture it started with — new-arcs-only semantics.
-    // TODO(security-enforcement): wire this into the risk evaluator.
+    /// Enforcement (task #312): `SecurityMode` is read at task creation via
+    /// `resolve_security_mode_for_arc` (the live `.mode` here ⊕ the arc's
+    /// `security_mode_override`), then drives two gates —
+    /// `coerce_for_security_mode` at the coordinator triage decision and the
+    /// per-action shell gate in the executor (`shell_upstream_for_mode`).
+    /// New-arcs-only: the effective mode is snapshotted at creation (the same
+    /// boundary where `ToolRegistryDeps` / `ApprovedTaskCtx` snapshot the
+    /// other live components), so a running arc keeps the posture it started
+    /// with. The `auto_approve_below` / `max_steps_per_task` /
+    /// `max_task_duration_minutes` thresholds in `SecurityConfig` remain
+    /// unwired — only `mode` is load-bearing today.
     pub security: arc_swap::ArcSwap<athen_core::config::SecurityConfig>,
     /// The LLM router, wrapped in `RwLock` so it can be swapped at runtime
     /// when the user switches active provider.

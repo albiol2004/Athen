@@ -81,7 +81,7 @@
   - `quote_arg` implements full CommandLineToArgvW backslash-doubling rule. Live-execution tests are `#[cfg(target_os = "windows")] #[ignore]` since they need a real Windows kernel; cross-typechecked via `cargo check --target x86_64-pc-windows-gnu`.
 - `lib.rs`: `UnifiedSandbox` facade -- auto-detects capabilities, selects best sandbox per level (bwrap > landlock > macos > windows for OsNative; podman > docker for Container).
 
-### athen-coordinador (5 source files, 48 tests)
+### athen-coordinador (5 source files, 51 tests)
 **Status**: Complete -- full coordinator orchestration with persistence, trust, and approval management.
 - `router.rs`: `DefaultRouter` implementing `EventRouter`. Maps EventSource->DomainType (Email/Messaging->Communication, Calendar->Agenda, UserInput/System->Base). Priority: UserInput/Calendar=High, Messaging/Email=Normal, System=Low.
 - `queue.rs`: `PriorityTaskQueue` implementing `TaskQueue`. Uses `BinaryHeap<PrioritizedTask>` -- higher priority first, FIFO within same priority (oldest first).
@@ -95,6 +95,7 @@
   - **Approval management**: `awaiting_approval: Mutex<HashMap<TaskId, Task>>` holds tasks pending human decision. `get_awaiting_approval()` returns the first pending task. `approve_task(id)` moves task to Pending and enqueues. `deny_task(id)` sets status to Cancelled and persists.
   - `infer_identifier_kind()` helper -- infers `IdentifierKind` (Email/Phone/Other) from sender identifier strings.
   - `task_contacts: Mutex<HashMap<TaskId, ContactId>>` -- maps task IDs to resolved contact IDs for trust feedback on completion.
+  - **SecurityMode enforcement (#312)**: `process_event` / `process_event_authorized` / `process_event_inner` take a `SecurityMode` (the effective posture the app resolved: live global ⊕ per-arc `security_mode_override`). `coerce_for_security_mode(decision, mode)` is applied to the raw decision FIRST, then `coerce_for_autonomy` LAST so a wake-up's `AutonomyBand` re-loosens on top of the security baseline (AutonomyBand wins for wake-ups; security stands alone otherwise). Semantics match the Settings → Security hints: Bunker escalates `NotifyAndProceed → HumanConfirm`; Yolo de-escalates `HumanConfirm → NotifyAndProceed`; `SilentApprove`/`HardBlock` never moved. This is one of two gates — the other is the executor's per-action shell gate (`shell_upstream_for_mode` in athen-agent; Bunker held at Assistant parity there until mid-run shell approval routing exists). Per-arc override resolved via `state::resolve_security_mode_for_arc`; set through the UI-only `set_arc_security_mode` Tauri command + chat-header Security picker (no agent tool — an agent must not loosen its own posture).
 
 ### athen-memory (5 source files, 59 tests)
 **Status**: Complete -- vector search + knowledge graph with SQLite persistence + real embeddings + LLM entity extraction + hybrid retrieval + UI management methods.
