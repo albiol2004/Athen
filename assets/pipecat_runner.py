@@ -56,13 +56,21 @@ _AGENT_LAST_MSG = ""
 
 
 def emit(event: str, **fields: Any) -> None:
-    """Emit one JSON event on stdout, flushed immediately."""
+    """Emit one JSON event on stdout, flushed immediately.
+
+    Also mirror the event name to stderr so the per-call runner log (which
+    only captures stderr) shows the lifecycle — without it, a log can't
+    tell whether `answered`/`result` ever fired.
+    """
     payload = {"event": event, **fields}
     try:
         print(json.dumps(payload, ensure_ascii=False), flush=True)
     except (BrokenPipeError, ValueError):
         # Parent vanished; nothing useful to do.
         pass
+    with contextlib.suppress(Exception):
+        detail = {k: v for k, v in fields.items() if k != "transcript"}
+        print(f"[event] {event} {detail}", file=sys.stderr, flush=True)
 
 
 def log(msg: str) -> None:
