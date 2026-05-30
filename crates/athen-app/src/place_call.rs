@@ -327,6 +327,26 @@ fn resolve_llm(deps: &TelephonyDeps) -> Result<ResolvedLlm> {
         .or_else(|| {
             let preset = crate::settings::default_base_url(&connection_id);
             (!preset.is_empty()).then(|| preset.to_string())
+        })
+        // Athen stores OpenAI-compatible base URLs WITHOUT the version
+        // segment and `athen-llm` appends `/v1/chat/completions` itself
+        // (e.g. opencode_go → https://opencode.ai/zen/go/v1/chat/completions).
+        // Pipecat's OpenAILLMService uses the OpenAI SDK, which appends only
+        // `/chat/completions`, so its base_url must already include `/v1` —
+        // otherwise the request hits the provider's website and 404s. Match
+        // the working chat path by appending `/v1` (idempotently) for the
+        // openai-compatible kind only; Anthropic/Google SDKs manage their own.
+        .map(|b| {
+            if kind == PipecatLlmKind::OpenAiCompat {
+                let trimmed = b.trim_end_matches('/');
+                if trimmed.ends_with("/v1") {
+                    trimmed.to_string()
+                } else {
+                    format!("{trimmed}/v1")
+                }
+            } else {
+                b
+            }
         });
     let label_prefix = display_connection_label(&connection_id);
     Ok(ResolvedLlm {
