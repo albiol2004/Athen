@@ -325,6 +325,22 @@ pub fn ensure_runner_extracted(app_handle: &AppHandle) -> std::result::Result<Pa
                 .ok()
                 .filter(|p| p.exists())
         })
+        // Dev fallback: `cargo run` has no bundled resource dir, so the
+        // Resource probes above miss. Look in the source tree relative to
+        // this crate's manifest (`crates/athen-app` -> `../../assets`), and
+        // honour an explicit override for non-standard layouts. Harmless in
+        // production — the Resource path wins there.
+        .or_else(|| {
+            std::env::var_os("ATHEN_PIPECAT_RUNNER")
+                .map(PathBuf::from)
+                .filter(|p| p.exists())
+        })
+        .or_else(|| {
+            let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../assets")
+                .join(PIPECAT_RUNNER_NAME);
+            dev.exists().then_some(dev)
+        })
         .ok_or_else(|| format!("bundled {PIPECAT_RUNNER_NAME} not found in app resources"))?;
 
     let toolbox = athen_core::paths::athen_toolbox_dir()
