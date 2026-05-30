@@ -438,6 +438,8 @@ class CallState:
     ended: bool = False
     end_reason: str | None = None
     twilio_call_sid: str | None = None
+    twiml_fetched: bool = False
+    twilio_status: str | None = None
     started_at: float = field(default_factory=time.time)
 
 
@@ -472,7 +474,14 @@ async def run_call(cfg: CallConfig) -> dict[str, Any]:
     async def twiml(_req: Any = None) -> Any:  # noqa: ANN401
         # Returned to Twilio after the call is answered. Tells Twilio to
         # open a bidirectional Media Stream back to our WebSocket.
+        # Twilio only fetches this AFTER the callee picks up, so a hit here is
+        # proof the call was answered AND the public tunnel is reachable from
+        # Twilio's edge — the key signal that disambiguates "no answer" from
+        # "answered but the wss media-stream leg never connected".
         from fastapi.responses import Response  # type: ignore
+        if not state.twiml_fetched:
+            state.twiml_fetched = True
+            emit("twiml_fetched")
         public_ws = state.public_ws_url  # set just below
         body = (
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
@@ -551,6 +560,9 @@ async def run_call(cfg: CallConfig) -> dict[str, Any]:
                     fetched = await asyncio.to_thread(
                         twilio_client.calls(state.twilio_call_sid).fetch
                     )
+                    if fetched.status != state.twilio_status:
+                        state.twilio_status = fetched.status
+                        log(f"twilio call status: {fetched.status}")
                     if fetched.status in ("completed", "failed", "no-answer", "canceled", "busy"):
                         state.ended = True
                         state.end_reason = state.end_reason or fetched.status
@@ -780,6 +792,15 @@ def _build_result(cfg: CallConfig, state: CallState) -> dict[str, Any]:
         "duration_s": duration_s,
         "cost_estimate_usd": _cost_estimate(duration_s),
         "summary": summary,
+        # Raw signals for diagnosing connected-but-no-audio calls:
+        #   twilio_status == "completed" + answered=False + twiml_fetched=True
+        #     → callee picked up, tunnel reachable, but the wss media-stream
+        #       leg never opened (the leg that 31920 used to kill on ngrok).
+        #   twiml_fetched=False → Twilio never reached our tunnel (DNS/edge)
+        #       OR the call was never answered at all.
+        "answered": state.answered,
+        "twiml_fetched": state.twiml_fetched,
+        "twilio_status": state.twilio_status,
     }
 
 
