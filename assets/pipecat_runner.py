@@ -223,6 +223,14 @@ def _pick_free_port() -> int:
 class TunnelHandle:
     public_url: str
     teardown: Any = None  # callable or None
+    # Set once the tunnel provider confirms the public endpoint is live at
+    # the edge (e.g. cloudflared "Registered tunnel connection"). This is
+    # DNS-independent — it does NOT depend on the LOCAL machine being able
+    # to resolve the hostname, which matters when a local VPN/resolver
+    # (NordVPN) mangles DNS for dynamic trycloudflare names. Twilio resolves
+    # via public DNS, so edge registration is the signal that matters.
+    # None when the provider gives no such signal (ngrok / static URL).
+    registered: Any = None  # threading.Event | None
 
 
 def _find_cloudflared() -> str | None:
@@ -269,6 +277,7 @@ def _cloudflared_tunnel(binary: str, local_port: int) -> TunnelHandle:
 
     url: str | None = None
     pat = re.compile(r"https://[-a-z0-9]+\.trycloudflare\.com")
+    registered = threading.Event()
     deadline = time.time() + 30
     assert proc.stderr is not None
     while time.time() < deadline:
@@ -278,6 +287,8 @@ def _cloudflared_tunnel(binary: str, local_port: int) -> TunnelHandle:
                 break
             continue
         log(f"cloudflared: {line.rstrip()}")
+        if "Registered tunnel connection" in line:
+            registered.set()
         m = pat.search(line)
         if m:
             url = m.group(0)
@@ -290,11 +301,15 @@ def _cloudflared_tunnel(binary: str, local_port: int) -> TunnelHandle:
             "cloudflared did not report a tunnel URL within 30s — check the runner log"
         )
 
-    # Drain remaining stderr in the background so the pipe never blocks.
+    # Drain remaining stderr in the background so the pipe never blocks —
+    # and keep watching for the edge-registration line (it usually arrives
+    # right after the URL banner).
     def _drain() -> None:
         with contextlib.suppress(Exception):
             for line in proc.stderr:  # type: ignore[union-attr]
                 log(f"cloudflared: {line.rstrip()}")
+                if "Registered tunnel connection" in line:
+                    registered.set()
 
     threading.Thread(target=_drain, daemon=True).start()
 
@@ -304,17 +319,41 @@ def _cloudflared_tunnel(binary: str, local_port: int) -> TunnelHandle:
         with contextlib.suppress(Exception):
             proc.wait(timeout=5)
 
-    return TunnelHandle(public_url=url.rstrip("/"), teardown=teardown)
+    return TunnelHandle(public_url=url.rstrip("/"), teardown=teardown, registered=registered)
 
 
-async def _await_tunnel_ready(health_url: str, timeout_s: float = 25.0) -> None:
-    """Poll `health_url` until it returns 200, or `timeout_s` elapses.
+async def _await_tunnel_ready(
+    tunnel: "TunnelHandle", health_url: str, timeout_s: float = 25.0
+) -> None:
+    """Block until the tunnel is reachable from the public internet.
 
-    Best-effort: a tunnel that never becomes reachable still falls through
-    to the call attempt (which will then fail loudly), rather than hanging
-    forever. Logs each attempt so the runner log shows how long the tunnel
-    took to come up.
+    Two strategies, in order of reliability:
+
+    1. If the provider exposes an edge-registration signal
+       (`tunnel.registered`, set by cloudflared's "Registered tunnel
+       connection"), wait on THAT. It's the correct signal because Twilio
+       reaches the tunnel via the edge + public DNS — NOT via this
+       machine's resolver. A local VPN/resolver (NordVPN) can leave the
+       LOCAL box unable to resolve the hostname while the edge + Twilio
+       resolve it fine, so a local HTTP probe gives false negatives.
+    2. Otherwise (ngrok / static URL), fall back to polling `health_url`
+       locally until it answers.
+
+    Best-effort throughout: on timeout we proceed to the call rather than
+    hang, and log what happened so the runner log is diagnostic.
     """
+    registered = getattr(tunnel, "registered", None)
+    if registered is not None:
+        ok = await asyncio.to_thread(registered.wait, timeout_s)
+        if ok:
+            # Edge has the tunnel. Give DNS a brief head start to propagate
+            # to Twilio's resolvers, but don't gate on LOCAL resolution.
+            log("tunnel registered at edge — proceeding (local DNS not required)")
+            await asyncio.sleep(3.0)
+        else:
+            log(f"tunnel edge registration not seen after {timeout_s:.0f}s — placing call anyway")
+        return
+
     import urllib.request
 
     deadline = time.time() + timeout_s
@@ -476,7 +515,7 @@ async def run_call(cfg: CallConfig) -> dict[str, Any]:
         # before the edge can reach us; calling Twilio too early makes its
         # TwiML fetch hit a dead tunnel → instant hangup. Poll /health
         # through the PUBLIC url until it answers (or give up after ~25s).
-        await _await_tunnel_ready(public_https + "/health")
+        await _await_tunnel_ready(tunnel, public_https + "/health")
 
         # Place the call via Twilio REST.
         from twilio.rest import Client as TwilioClient  # type: ignore
