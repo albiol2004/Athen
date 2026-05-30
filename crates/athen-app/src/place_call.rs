@@ -486,6 +486,9 @@ struct RunOutcome {
     transcript: Vec<TranscriptEntry>,
     result_event: Option<Value>,
     stderr_tail: Vec<String>,
+    /// Path to the per-call stderr log file, if one was opened. Surfaced
+    /// in the tool result so a failed call points the user at the log.
+    log_path: Option<PathBuf>,
 }
 
 async fn run_pipecat(
@@ -520,16 +523,56 @@ async fn run_pipecat(
         .take()
         .ok_or_else(|| "pipecat_runner: no stderr pipe".to_string())?;
 
-    // stderr drain — buffer the tail so we can include it on failure.
+    // Persist the full runner stderr to a per-call log file so a failed
+    // call is diagnosable after the fact — the in-memory tail below is
+    // capped, and tracing only surfaces at debug. The path is logged at
+    // info and returned in the outcome so the UI/tool result can point at
+    // it. Best-effort: a log-file failure never blocks the call.
+    let log_path = athen_core::paths::athen_data_dir().map(|d| {
+        d.join("voice-logs")
+            .join(format!("call-{}.log", arc_id.replace(['/', '\\'], "_")))
+    });
+    // Keep a copy for the outcome — `log_path` itself is moved into the
+    // drain task below.
+    let outcome_log_path = log_path.clone();
+    let mut log_file = match &log_path {
+        Some(p) => {
+            if let Some(parent) = p.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            match tokio::fs::File::create(p).await {
+                Ok(f) => {
+                    tracing::info!(path = %p.display(), "place_call: writing runner log");
+                    Some(f)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, path = %p.display(), "place_call: could not open runner log file");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+
+    // stderr drain — buffer the tail so we can include it on failure AND
+    // stream every line into the per-call log file.
     let stderr_task = tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
         let mut lines = BufReader::new(stderr).lines();
         let mut buf: Vec<String> = Vec::new();
         while let Ok(Some(line)) = lines.next_line().await {
             tracing::debug!(target = "place_call.stderr", "{line}");
+            if let Some(f) = log_file.as_mut() {
+                let _ = f.write_all(line.as_bytes()).await;
+                let _ = f.write_all(b"\n").await;
+            }
             buf.push(line);
             if buf.len() > 2000 {
                 buf.drain(..1000);
             }
+        }
+        if let Some(f) = log_file.as_mut() {
+            let _ = f.flush().await;
         }
         buf
     });
@@ -551,9 +594,10 @@ async fn run_pipecat(
             let _ = child.wait().await;
             let stderr_buf = stderr_task.await.unwrap_or_default();
             return Err(format!(
-                "place_call: hard timeout after {}s — killed runner. Last stderr line: {}",
+                "place_call: hard timeout after {}s — killed runner. Last stderr line: {}{}",
                 max_duration_s as u64 + GRACE_SECS,
-                stderr_buf.last().cloned().unwrap_or_default()
+                stderr_buf.last().cloned().unwrap_or_default(),
+                log_path_suffix(&outcome_log_path)
             ));
         };
         match tokio::time::timeout(remaining, lines.next_line()).await {
@@ -569,6 +613,13 @@ async fn run_pipecat(
                     }
                 };
                 let event = parsed.get("event").and_then(|v| v.as_str()).unwrap_or("");
+                // Lifecycle events are low-volume and decisive for triage —
+                // e.g. an instant hangup shows up as `ringing` with no
+                // `answered`, meaning Twilio never bridged the media stream
+                // back to us (TwiML/tunnel/serializer problem, not the bot).
+                if matches!(event, "starting" | "ringing" | "answered" | "result") {
+                    tracing::info!(target = "place_call", event, "{}", line);
+                }
                 emit_progress(app_handle, arc_id, &parsed);
                 match event {
                     "transcript" => {
@@ -601,9 +652,10 @@ async fn run_pipecat(
                 let _ = child.wait().await;
                 let stderr_buf = stderr_task.await.unwrap_or_default();
                 return Err(format!(
-                    "place_call: hard timeout after {}s — killed runner. Last stderr line: {}",
+                    "place_call: hard timeout after {}s — killed runner. Last stderr line: {}{}",
                     max_duration_s as u64 + GRACE_SECS,
-                    stderr_buf.last().cloned().unwrap_or_default()
+                    stderr_buf.last().cloned().unwrap_or_default(),
+                    log_path_suffix(&outcome_log_path)
                 ));
             }
         }
@@ -618,7 +670,17 @@ async fn run_pipecat(
         transcript,
         result_event,
         stderr_tail,
+        log_path: outcome_log_path,
     })
+}
+
+/// Render a " (full log: <path>)" suffix for error messages, or empty
+/// when no log file was opened.
+fn log_path_suffix(path: &Option<PathBuf>) -> String {
+    match path {
+        Some(p) => format!(" (full runner log: {})", p.display()),
+        None => String::new(),
+    }
 }
 
 fn emit_progress(app: &AppHandle, arc_id: &str, event: &Value) {
@@ -902,6 +964,11 @@ pub async fn do_place_call(
         transcript_json.push(row);
     }
 
+    let log_file_str = outcome
+        .log_path
+        .as_ref()
+        .map(|p| p.display().to_string());
+
     if let Some(result_event) = outcome.result_event {
         let outcome_str = result_event
             .get("outcome")
@@ -932,6 +999,19 @@ pub async fn do_place_call(
             fire_notification(n, arc_id, &title, &summary).await;
         }
 
+        // A "successful" call that produced NO transcript almost always
+        // means Twilio connected but the media stream never bridged (instant
+        // hangup / answering machine / one-way audio). Point the agent at the
+        // runner log so the next step isn't blind.
+        let diagnostic = if success && transcript_json.is_empty() {
+            Some(format!(
+                "Call connected but produced no transcript — the audio bridge likely never opened. See runner log: {}",
+                log_file_str.as_deref().unwrap_or("(no log)")
+            ))
+        } else {
+            None
+        };
+
         return Ok(ToolResult {
             success,
             output: json!({
@@ -942,6 +1022,8 @@ pub async fn do_place_call(
                 "cost_estimate_usd": cost,
                 "summary": summary,
                 "transcript": transcript_json,
+                "log_file": log_file_str,
+                "diagnostic": diagnostic,
             }),
             error: None,
             execution_time_ms: elapsed_ms,
@@ -969,8 +1051,12 @@ pub async fn do_place_call(
             "summary": "Call ended without a result event.",
             "transcript": transcript_json,
             "stderr_tail": stderr_tail,
+            "log_file": log_file_str,
         }),
-        error: Some("Call ended without a final result event.".into()),
+        error: Some(format!(
+            "Call ended without a final result event.{}",
+            log_path_suffix(&outcome.log_path)
+        )),
         execution_time_ms: elapsed_ms,
     })
 }
