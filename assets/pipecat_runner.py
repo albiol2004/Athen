@@ -729,7 +729,13 @@ async def _run_pipeline(
                 log(f"transcript tap error: {e}")
             await self.push_frame(frame, direction)
 
-    tap = TranscriptTap()
+    # Two SEPARATE tap instances — a FrameProcessor may occupy only one
+    # position in a pipeline. Reusing one instance twice wires it as a diamond
+    # (STT→tap→LLM *and* TTS→tap→output), which breaks StartFrame propagation:
+    # the tap rejects every frame ("StartFrame not received yet"), StartFrame
+    # never reaches the LLM/TTS/output, and the agent never speaks.
+    tap_user = TranscriptTap()   # captures user STT (TranscriptionFrame)
+    tap_agent = TranscriptTap()  # captures agent TTS text (TextFrame)
     messages = [{"role": "system", "content": system_prompt}]
 
     # Pipeline shape: phone audio → STT → tap → LLM → TTS → tap → phone audio
@@ -737,10 +743,10 @@ async def _run_pipeline(
         [
             transport.input(),
             stt,
-            tap,
+            tap_user,
             llm,
             tts,
-            tap,
+            tap_agent,
             transport.output(),
         ]
     )
