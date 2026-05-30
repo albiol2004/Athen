@@ -677,7 +677,34 @@ async def _run_pipeline(
         state.end_reason = "error"
         raise
 
-    serializer = TwilioFrameSerializer(stream_sid="")  # populated when Twilio sends `start`
+    # Twilio Media Streams sends a "connected" frame then a "start" frame
+    # before any audio. The "start" frame carries the real streamSid — which
+    # the serializer MUST use to tag outbound media, or Twilio silently drops
+    # the agent's voice. Read the preamble here (the transport picks up from
+    # the first "media" frame onward).
+    stream_sid = ""
+    call_sid = state.twilio_call_sid
+    try:
+        for _ in range(8):
+            preamble = json.loads(await asyncio.wait_for(websocket.receive_text(), timeout=8))
+            event = preamble.get("event")
+            if event == "start":
+                start = preamble.get("start", {})
+                stream_sid = start.get("streamSid", "") or ""
+                call_sid = start.get("callSid", call_sid)
+                break
+            log(f"twilio stream preamble: {event}")
+    except Exception as e:  # noqa: BLE001
+        log(f"failed to read Twilio stream start frame: {e!r}")
+    log(f"twilio media stream started: streamSid={stream_sid!r} callSid={call_sid!r}")
+
+    # auto_hang_up=False: the runner already owns call teardown via the Twilio
+    # status poll, so the serializer doesn't need REST credentials to hang up.
+    serializer = TwilioFrameSerializer(
+        stream_sid=stream_sid,
+        call_sid=call_sid,
+        params=TwilioFrameSerializer.InputParams(auto_hang_up=False),
+    )
     transport = FastAPIWebsocketTransport(
         websocket=websocket,
         params=FastAPIWebsocketParams(
