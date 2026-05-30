@@ -40,6 +40,7 @@ import os
 import signal
 import socket
 import sys
+import threading
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -224,18 +225,111 @@ class TunnelHandle:
     teardown: Any = None  # callable or None
 
 
+def _find_cloudflared() -> str | None:
+    """Locate a cloudflared binary. Checks PATH and the usual install dirs."""
+    import shutil
+    found = shutil.which("cloudflared")
+    if found:
+        return found
+    home = os.path.expanduser("~")
+    for cand in (
+        os.path.join(home, ".local", "bin", "cloudflared"),
+        os.path.join(home, ".athen", "toolbox", "runtimes", "cloudflared", "cloudflared"),
+        "/usr/local/bin/cloudflared",
+        "/usr/bin/cloudflared",
+    ):
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+def _cloudflared_tunnel(binary: str, local_port: int) -> TunnelHandle:
+    """Start a cloudflared quick tunnel to http://127.0.0.1:<port>.
+
+    Quick tunnels need no account/token and handle WebSocket upgrades
+    cleanly (unlike the ngrok free tier, which fails Twilio's Media
+    Streams handshake with error 31920). The public URL is scraped from
+    cloudflared's stderr banner.
+    """
+    import re
+    import subprocess
+
+    proc = subprocess.Popen(
+        [
+            binary,
+            "tunnel",
+            "--no-autoupdate",
+            "--url",
+            f"http://127.0.0.1:{local_port}",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    url: str | None = None
+    pat = re.compile(r"https://[-a-z0-9]+\.trycloudflare\.com")
+    deadline = time.time() + 30
+    assert proc.stderr is not None
+    while time.time() < deadline:
+        line = proc.stderr.readline()
+        if not line:
+            if proc.poll() is not None:
+                break
+            continue
+        log(f"cloudflared: {line.rstrip()}")
+        m = pat.search(line)
+        if m:
+            url = m.group(0)
+            break
+
+    if not url:
+        with contextlib.suppress(Exception):
+            proc.terminate()
+        raise RuntimeError(
+            "cloudflared did not report a tunnel URL within 30s — check the runner log"
+        )
+
+    # Drain remaining stderr in the background so the pipe never blocks.
+    def _drain() -> None:
+        with contextlib.suppress(Exception):
+            for line in proc.stderr:  # type: ignore[union-attr]
+                log(f"cloudflared: {line.rstrip()}")
+
+    threading.Thread(target=_drain, daemon=True).start()
+
+    def teardown() -> None:
+        with contextlib.suppress(Exception):
+            proc.terminate()
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=5)
+
+    return TunnelHandle(public_url=url.rstrip("/"), teardown=teardown)
+
+
 def acquire_public_url(cfg: CallConfig, local_port: int) -> TunnelHandle:
     """Return a public URL routing to ws://127.0.0.1:<local_port>.
 
-    Priority: explicit cfg.public_url > pyngrok with auth token.
-    Raises RuntimeError with a user-facing message if neither works.
+    Priority: explicit cfg.public_url > cloudflared quick tunnel >
+    pyngrok with auth token. cloudflared is preferred over ngrok because
+    the ngrok free tier fails Twilio's Media Streams WebSocket handshake
+    (error 31920) even though plain HTTP traverses it fine.
+    Raises RuntimeError with a user-facing message if none work.
     """
     if cfg.public_url:
         return TunnelHandle(public_url=cfg.public_url.rstrip("/"), teardown=None)
+
+    cloudflared = _find_cloudflared()
+    if cloudflared:
+        log(f"using cloudflared quick tunnel ({cloudflared})")
+        return _cloudflared_tunnel(cloudflared, local_port)
+
     if not cfg.ngrok_authtoken:
         raise RuntimeError(
-            "no public URL available — set public_url or ngrok_authtoken in voice config"
+            "no public URL available — install cloudflared, or set public_url "
+            "or ngrok_authtoken in voice config"
         )
+    log("cloudflared not found — falling back to ngrok (WebSocket handshake may fail on free tier)")
     try:
         from pyngrok import conf, ngrok  # type: ignore
     except ImportError as e:
