@@ -521,41 +521,38 @@ async def run_call(cfg: CallConfig) -> dict[str, Any]:
         emit("answered")
         await _run_pipeline(websocket, llm, stt, tts, system_prompt, state, pipeline_task_holder)
 
-    @app.websocket("/ws")
-    async def ws_endpoint(websocket: WebSocket) -> None:
-        await _bridge(websocket, "/ws")
+    # NOTE: we deliberately do NOT register the media-stream WebSocket as a
+    # FastAPI route. Twilio's wss upgrade reaches uvicorn fine, but FastAPI's
+    # per-request machinery (dependency resolution / exit-stack / validation
+    # in routing.py) closes it BEFORE the endpoint runs → uvicorn renders that
+    # pre-accept close as HTTP 403, and the call drops with no audio. The exact
+    # trigger is environment-fragile (a plain websockets client is accepted; a
+    # no-arg endpoint is enough to repro), so instead of fighting it we bypass
+    # FastAPI routing entirely for websockets (see _asgi_entry below) and drive
+    # the bridge straight off the raw ASGI channels via a Starlette WebSocket —
+    # which is exactly the object Pipecat's FastAPIWebsocketTransport wants.
+    # HTTP (/health, /twiml) still flows through FastAPI as normal.
 
-    # Catch-all: Twilio's media-stream wss upgrade was reaching uvicorn but
-    # NOT matching the exact "/ws" route (Starlette closed it pre-accept → 403),
-    # so the real request target must differ subtly. This route matches any
-    # path, logs what Twilio actually sent, and bridges anyway so the call
-    # still connects regardless of the path quirk.
-    @app.websocket("/{rest:path}")
-    async def ws_catch_all(websocket: WebSocket, rest: str) -> None:
-        await _bridge(websocket, f"/{rest} (catch-all)")
-
-    # Raw ASGI wrapper that logs the FULL websocket scope (path + every
-    # header + subprotocols) BEFORE FastAPI routing/validation runs — so even
-    # when FastAPI rejects Twilio's upgrade pre-accept (403), we still see
-    # exactly what cloudflared delivered to the origin. This is the layer that
-    # finally disambiguates a path quirk from a header quirk.
-    async def _asgi_with_scope_log(scope: Any, receive: Any, send: Any) -> None:
+    async def _asgi_entry(scope: Any, receive: Any, send: Any) -> None:
         if scope.get("type") == "websocket":
             try:
                 hdrs = [(k.decode("latin-1"), v.decode("latin-1"))
                         for k, v in scope.get("headers", [])]
-                log(f"RAW ws scope: path={scope.get('path')!r} "
-                    f"raw_path={scope.get('raw_path')!r} "
+                log(f"ws upgrade: path={scope.get('path')!r} "
                     f"subprotocols={scope.get('subprotocols')} "
                     f"http_version={scope.get('http_version')} headers={hdrs}")
             except Exception as e:  # noqa: BLE001
                 log(f"scope-log failed: {e!r}")
+            # Bypass FastAPI routing/DI — build the WebSocket directly.
+            websocket = WebSocket(scope, receive=receive, send=send)
+            await _bridge(websocket, scope.get("path") or "/ws")
+            return
         await app(scope, receive, send)
 
     # Spin up server, then ngrok, then place call.
     emit("installing_check", detail="validating providers")
     server_config = uvicorn.Config(
-        _asgi_with_scope_log, host="127.0.0.1", port=local_port,
+        _asgi_entry, host="127.0.0.1", port=local_port,
         log_level="info", access_log=True,
     )
     server = uvicorn.Server(server_config)
