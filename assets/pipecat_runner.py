@@ -275,6 +275,13 @@ def _cloudflared_tunnel(binary: str, local_port: int) -> TunnelHandle:
             binary,
             "tunnel",
             "--no-autoupdate",
+            # Force the HTTP/2 edge transport instead of the default QUIC.
+            # QUIC-fronted quick tunnels complete a normal WebSocket upgrade
+            # fine, but Twilio Media Streams' stricter wss handshake gets
+            # rejected at the edge (error 31920) over QUIC; http2 is the
+            # documented remedy for WebSocket-through-cloudflared.
+            "--protocol",
+            "http2",
             "--url",
             f"http://127.0.0.1:{local_port}",
         ],
