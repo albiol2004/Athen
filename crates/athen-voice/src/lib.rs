@@ -141,6 +141,7 @@ pub struct VoiceConfig {
     ///     expose (own tunnel, reverse proxy). Takes priority.
     ///   * `ngrok_authtoken` — free token from ngrok.com; the runner spins
     ///     up an ngrok tunnel per call. Easiest path for most users.
+    ///
     /// Without either, the runner aborts with "no public URL available".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_url: Option<String>,

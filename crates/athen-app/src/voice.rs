@@ -426,6 +426,7 @@ pub async fn test_voice_setup(
         // Preflight never places a real call, so the gate never fires;
         // pass the live global mode for parity with the real path.
         state.security.load().mode,
+        state.identity_store.clone(),
     )
     .await
     .ok_or_else(|| {

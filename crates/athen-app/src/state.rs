@@ -543,6 +543,7 @@ pub(crate) struct ToolRegistryDeps {
 /// sense-event registries silently drop `place_call` even when in-app
 /// chat advertises it — the kind of registry drift the
 /// `feedback_owner_telegram_registry_drift` memory was filed against.
+#[allow(clippy::too_many_arguments)] // mirrors the per-arc registry deps; a struct wrapper would churn all 4 call sites
 pub(crate) async fn build_telephony_deps(
     arc_id: &str,
     approval_router: Option<Arc<crate::approval::ApprovalRouter>>,
@@ -551,6 +552,7 @@ pub(crate) async fn build_telephony_deps(
     notifier: Option<Arc<crate::notifier::NotificationOrchestrator>>,
     active_provider_id: String,
     security_mode: athen_core::config::SecurityMode,
+    identity_store: Option<Arc<athen_persistence::identity::SqliteIdentityStore>>,
 ) -> Option<crate::place_call::TelephonyDeps> {
     let (router, vault, store) = match (approval_router, vault, http_endpoint_store) {
         (Some(r), Some(v), Some(s)) => (r, v, s),
@@ -584,6 +586,7 @@ pub(crate) async fn build_telephony_deps(
         active_provider_id,
         voice_config,
         config: cfg,
+        identity_store,
     })
 }
 
@@ -724,6 +727,7 @@ pub(crate) async fn assemble_base_app_tool_registry(
             deps.notifier.clone(),
             deps.active_provider_id.clone(),
             security_mode,
+            deps.identity_store.clone(),
         )
         .await,
         app_handle.clone(),

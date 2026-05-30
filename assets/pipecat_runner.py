@@ -183,6 +183,72 @@ def build_llm_service(cfg: CallConfig):
     raise ValueError(f"unsupported llm.type: {kind!r}")
 
 
+def _warm_llm_blocking(cfg: CallConfig) -> None:
+    """Fire a 1-token throwaway completion so the first real turn isn't cold.
+
+    Provider-side model load/routing plus the TLS handshake dominate first-
+    response latency — in testing the first reply took ~9s while later turns
+    took ~2s. Priming the endpoint while the call is still ringing hides most
+    of that. Best-effort: any failure is swallowed (a warmup must never block
+    or fail a real call). Only the openai-compatible path is warmed; the
+    Anthropic/Google SDKs use different request shapes and warm naturally.
+    """
+    if cfg.llm.get("type", "openai_compat").lower() != "openai_compat":
+        return
+    api_key = cfg.llm.get("api_key", "")
+    if not api_key:
+        return
+    base_url = (cfg.llm.get("base_url") or "https://api.openai.com/v1").rstrip("/")
+    model = cfg.llm.get("model") or "gpt-4o-mini"
+    import urllib.request
+    body = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 1,
+        "stream": False,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base_url}/chat/completions",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            # Default urllib UA ("Python-urllib/3.x") is 403'd by Cloudflare-
+            # fronted endpoints (e.g. opencode.ai) as bot traffic; the in-call
+            # OpenAI SDK works because httpx sends a normal UA. Mirror that.
+            "User-Agent": "athen-voice/1.0",
+        },
+        method="POST",
+    )
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            resp.read()
+        log(f"llm warmup ok ({time.time() - t0:.1f}s)")
+    except Exception as e:  # noqa: BLE001
+        log(f"llm warmup skipped: {e}")
+
+
+def _pipecat_language(code: str | None):
+    """Map a BCP-47 / ISO code (e.g. 'es', 'es-ES', 'en') to Pipecat's
+    Language enum. Returns None if unmappable (caller then omits the param
+    and the service falls back to its own default)."""
+    if not code:
+        return None
+    try:
+        from pipecat.transcriptions.language import Language  # type: ignore
+    except ImportError:
+        return None
+    code = code.strip()
+    # Language is a StrEnum, so Language("es") works when the value matches.
+    for candidate in (code, code.replace("_", "-"), code.split("-")[0].split("_")[0]):
+        try:
+            return Language(candidate)
+        except ValueError:
+            continue
+    return None
+
+
 def build_stt_service(cfg: CallConfig):
     kind = cfg.stt.get("type", "deepgram").lower()
     api_key = cfg.stt.get("api_key", "")
@@ -205,11 +271,20 @@ def build_tts_service(cfg: CallConfig):
     voice_id = cfg.tts.get("voice_id", "")
     if not api_key or not voice_id:
         raise ValueError("tts.api_key and tts.voice_id are required")
+    lang = _pipecat_language(cfg.tts.get("language"))
     if kind == "elevenlabs":
         from pipecat.services.elevenlabs import ElevenLabsTTSService  # type: ignore
+        # ElevenLabs picks language from the (multilingual) model + text;
+        # no per-call language knob wired here.
         return ElevenLabsTTSService(api_key=api_key, voice_id=voice_id)
     if kind == "cartesia":
         from pipecat.services.cartesia import CartesiaTTSService  # type: ignore
+        if lang is not None:
+            return CartesiaTTSService(
+                api_key=api_key,
+                voice_id=voice_id,
+                params=CartesiaTTSService.InputParams(language=lang),
+            )
         return CartesiaTTSService(api_key=api_key, voice_id=voice_id)
     raise ValueError(f"unsupported tts.type: {kind!r}")
 
@@ -463,6 +538,10 @@ async def run_call(cfg: CallConfig) -> dict[str, Any]:
     system_prompt = build_system_prompt(cfg)
     state = CallState()
 
+    # Prime the LLM while the call is still being set up (tunnel + ring time)
+    # so the first turn after the caller speaks doesn't pay cold-start latency.
+    asyncio.create_task(asyncio.to_thread(_warm_llm_blocking, cfg))
+
     # FastAPI server that hosts the Twilio Media Streams WebSocket.
     app = FastAPI()
     local_port = _pick_free_port()
@@ -664,13 +743,12 @@ async def _run_pipeline(
             FastAPIWebsocketTransport,
         )
         from pipecat.serializers.twilio import TwilioFrameSerializer  # type: ignore
-        from pipecat.frames.frames import (  # type: ignore
-            LLMMessagesFrame,
-            TextFrame,
-            TranscriptionFrame,
-            EndFrame,
+        from pipecat.frames.frames import EndFrame  # type: ignore
+        from pipecat.processors.transcript_processor import TranscriptProcessor  # type: ignore
+        from pipecat.processors.aggregators.openai_llm_context import (  # type: ignore
+            OpenAILLMContext,
+            OpenAILLMContextFrame,
         )
-        from pipecat.processors.frame_processor import FrameDirection, FrameProcessor  # type: ignore
     except ImportError as e:
         log(f"pipecat import failed: {e}")
         state.ended = True
@@ -715,51 +793,59 @@ async def _run_pipeline(
         ),
     )
 
-    # Transcript tap — intercepts user STT + agent TTS frames and emits.
-    class TranscriptTap(FrameProcessor):
-        async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
-            # MUST call super().process_frame first: that's what handles the
-            # StartFrame (sets the processor's internal `started` flag). Without
-            # it, push_frame's _check_started gate drops EVERY frame — including
-            # StartFrame — so nothing downstream of the tap ever runs.
-            await super().process_frame(frame, direction)
-            try:
-                if isinstance(frame, TranscriptionFrame) and getattr(frame, "text", None):
-                    emit_transcript("user", frame.text)
-                elif isinstance(frame, TextFrame) and direction == FrameDirection.DOWNSTREAM:
-                    txt = getattr(frame, "text", "") or ""
-                    if txt.strip():
-                        emit_transcript("agent", txt)
-            except Exception as e:  # noqa: BLE001
-                log(f"transcript tap error: {e}")
-            await self.push_frame(frame, direction)
+    # Clean, role-tagged transcript via Pipecat's built-in TranscriptProcessor.
+    # The earlier hand-rolled tap matched EVERY downstream TextFrame, so it
+    # captured the agent's speech twice — once as sentence-level LLMTextFrames
+    # and again as word-level TTSTextFrames (the "word-by-word" spam in the
+    # log). The built-in processor aggregates per turn and emits exactly one
+    # message per completed turn, already normalised to role=user/assistant.
+    transcript = TranscriptProcessor()
 
-    # Two SEPARATE tap instances — a FrameProcessor may occupy only one
-    # position in a pipeline. Reusing one instance twice wires it as a diamond
-    # (STT→tap→LLM *and* TTS→tap→output), which breaks StartFrame propagation:
-    # the tap rejects every frame ("StartFrame not received yet"), StartFrame
-    # never reaches the LLM/TTS/output, and the agent never speaks.
-    tap_user = TranscriptTap()   # captures user STT (TranscriptionFrame)
-    tap_agent = TranscriptTap()  # captures agent TTS text (TextFrame)
+    @transcript.event_handler("on_transcript_update")
+    async def _on_transcript(_proc: Any, frame: Any) -> None:  # noqa: ANN401
+        for msg in getattr(frame, "messages", []) or []:
+            text = (getattr(msg, "content", "") or "").strip()
+            if not text:
+                continue
+            # Our wire protocol uses "agent"/"user"; the processor uses
+            # the LLM-standard "assistant"/"user".
+            speaker = "agent" if getattr(msg, "role", "") == "assistant" else "user"
+            emit_transcript(speaker, text)
+
     messages = [{"role": "system", "content": system_prompt}]
 
-    # Pipeline shape: phone audio → STT → tap → LLM → TTS → tap → phone audio
+    # The context aggregator is what makes this a CONVERSATION rather than a
+    # single greeting. `.user()` (placed after STT) accumulates the caller's
+    # TranscriptionFrames and, on end-of-turn, pushes the full context to the
+    # LLM to generate a reply; `.assistant()` (at the very tail) records the
+    # bot's own spoken text back into that context so the next turn has history.
+    # Without it the LLM fires exactly once on the kickoff frame and then goes
+    # deaf — which is exactly the "spoke once, never heard me" symptom.
+    context = OpenAILLMContext(messages)
+    context_aggregator = llm.create_context_aggregator(context)
+
+    # Pipeline shape:
+    #   phone audio → STT → user-transcript → user-agg → LLM → TTS
+    #     → output → assistant-transcript → assistant-agg
     pipeline = Pipeline(
         [
             transport.input(),
             stt,
-            tap_user,
+            transcript.user(),
+            context_aggregator.user(),
             llm,
             tts,
-            tap_agent,
             transport.output(),
+            transcript.assistant(),
+            context_aggregator.assistant(),
         ]
     )
     task = PipelineTask(pipeline)
     holder["task"] = task
 
-    # Seed the LLM with the system prompt + an opening hint to start talking.
-    await task.queue_frame(LLMMessagesFrame(messages))
+    # Kick off by pushing the context (system prompt) through the aggregator so
+    # the bot opens the call. Every later turn is driven by the user aggregator.
+    await task.queue_frame(OpenAILLMContextFrame(context))
 
     runner = PipelineRunner(handle_sigint=False)
     holder["runner"] = runner
@@ -832,6 +918,9 @@ def _post_call_judge_sync(cfg: CallConfig, transcript_text: str) -> tuple[str, s
                 headers={
                     "Authorization": f"Bearer {cfg.llm['api_key']}",
                     "Content-Type": "application/json",
+                    # See _warm_llm_blocking: default urllib UA is 403'd by
+                    # Cloudflare-fronted providers; send a normal one.
+                    "User-Agent": "athen-voice/1.0",
                 },
                 method="POST",
             )

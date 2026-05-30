@@ -68,6 +68,11 @@ pub struct TelephonyDeps {
     /// Full config — needed to resolve the LLM connection (api_key,
     /// base_url, family) from `models.providers`.
     pub config: AthenConfig,
+    /// Identity store — rendered into the voice agent's system prompt so
+    /// the caller speaks AS Athen (persona + known facts), the same block
+    /// the chat executor injects. `None` ⇒ falls back to the generic
+    /// "polite assistant" persona.
+    pub identity_store: Option<Arc<athen_persistence::identity::SqliteIdentityStore>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -85,6 +90,14 @@ pub fn place_call_schema() -> Value {
             "objective": {
                 "type": "string",
                 "description": "What to accomplish on the call. Be specific (e.g. 'Book a table for 4 at 8pm tomorrow under the name Alex')."
+            },
+            "language": {
+                "type": "string",
+                "description": "REQUIRED. Language the call will be conducted in, as a BCP-47 / ISO code (e.g. 'en', 'es', 'es-ES', 'fr', 'de'). Drives both speech-to-text and text-to-speech, so set it to the language the called party actually speaks — mismatches produce garbled transcription."
+            },
+            "context": {
+                "type": "string",
+                "description": "Optional briefing for the call agent: anything it should know going in that isn't in the objective — relevant facts about the called party, the user's preferences, background from earlier in the conversation, or a role to adopt (e.g. for a sales/outreach call). You already have this context; summarize what matters for THIS call. Appended to the agent's persona."
             },
             "called_party": {
                 "type": "string",
@@ -104,7 +117,7 @@ pub fn place_call_schema() -> Value {
                 "description": "Hard cap on call length in seconds."
             }
         },
-        "required": ["number", "objective"]
+        "required": ["number", "objective", "language"]
     })
 }
 
@@ -121,6 +134,8 @@ struct ParsedArgs {
     called_party: CalledParty,
     voice_id_override: Option<String>,
     max_duration_s: u32,
+    language: String,
+    context: Option<String>,
 }
 
 fn parse_args(args: &Value) -> Result<ParsedArgs> {
@@ -153,6 +168,23 @@ fn parse_args(args: &Value) -> Result<ParsedArgs> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+    let language = args
+        .get("language")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            AthenError::Other(
+                "place_call: 'language' is required — pass a BCP-47 code like 'en' or 'es'.".into(),
+            )
+        })?
+        .to_string();
+    let context = args
+        .get("context")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
 
     // Duration: default 600, clamp to VoiceConfig::HARD_MAX_DURATION_S.
     let raw_dur = args
@@ -167,6 +199,8 @@ fn parse_args(args: &Value) -> Result<ParsedArgs> {
         called_party,
         voice_id_override,
         max_duration_s,
+        language,
+        context,
     })
 }
 
@@ -858,6 +892,27 @@ pub async fn do_place_call(
                 .insert("base_url".into(), json!(base));
         }
     }
+    // Voice persona: the call agent speaks AS Athen, carrying the same
+    // identity block the chat executor injects, plus an optional per-call
+    // briefing the calling agent supplies (it already holds the user's
+    // identity + memory + arc history, so it curates what matters here).
+    // Empty identity + no briefing ⇒ the runner falls back to its generic
+    // "polite assistant" persona.
+    let identity_block =
+        crate::identity_render::render_identity_block(deps.identity_store.as_ref(), "default")
+            .await;
+    let mut voice_persona_prefix = String::from(
+        "You are Athen, the user's AI assistant, placing this phone call on their behalf. Speak naturally, as yourself.",
+    );
+    if let Some(block) = &identity_block {
+        voice_persona_prefix.push_str("\n\n# Who you are and what you know\n");
+        voice_persona_prefix.push_str(block);
+    }
+    if let Some(ctx) = &parsed.context {
+        voice_persona_prefix.push_str("\n\n# Briefing for this call\n");
+        voice_persona_prefix.push_str(ctx);
+    }
+
     let mut config_blob = json!({
         "number": destination,
         "objective": parsed.objective,
@@ -865,16 +920,18 @@ pub async fn do_place_call(
             CalledParty::User => "user",
             CalledParty::Other => "other",
         },
-        "voice_persona_prefix": "",
+        "voice_persona_prefix": voice_persona_prefix,
         "llm": llm_block,
         "stt": {
             "type": stack.stt_kind,
             "api_key": stack.stt_api_key,
+            "language": parsed.language,
         },
         "tts": {
             "type": stack.tts_kind,
             "api_key": stack.tts_api_key,
             "voice_id": voice_id_for_runner,
+            "language": parsed.language,
         },
         "phone": {
             "type": "twilio",
@@ -1236,6 +1293,7 @@ mod tests {
             active_provider_id: "deepseek".into(),
             voice_config: voice,
             config: cfg,
+            identity_store: None,
         }
     }
 
@@ -1268,7 +1326,7 @@ mod tests {
         .await;
         let err = preflight(
             &deps,
-            &json!({"number": "not-a-number", "objective": "test"}),
+            &json!({"number": "not-a-number", "objective": "test", "language": "en"}),
         )
         .unwrap_err();
         let msg = format!("{err}");
@@ -1287,7 +1345,7 @@ mod tests {
         let deps = mk_deps(Arc::new(ApproveGate), voice, ModelFamily::Default).await;
         let err = preflight(
             &deps,
-            &json!({"number": "+14155551234", "objective": "test"}),
+            &json!({"number": "+14155551234", "objective": "test", "language": "en"}),
         )
         .unwrap_err();
         let msg = format!("{err}");
@@ -1310,7 +1368,8 @@ mod tests {
             &json!({
                 "number": "+15555550000",  // should be IGNORED for user party
                 "objective": "reminder",
-                "called_party": "user"
+                "called_party": "user",
+                "language": "en"
             }),
         )
         .unwrap();
@@ -1328,7 +1387,8 @@ mod tests {
             &json!({
                 "number": "+15555550000",
                 "objective": "reminder",
-                "called_party": "user"
+                "called_party": "user",
+                "language": "en"
             }),
         )
         .unwrap_err();
@@ -1349,7 +1409,8 @@ mod tests {
             &json!({
                 "number": "+14155551234",
                 "objective": "x",
-                "max_duration_s": 999_999
+                "max_duration_s": 999_999,
+                "language": "en"
             }),
         )
         .unwrap();
@@ -1364,8 +1425,34 @@ mod tests {
             ModelFamily::ClaudeOpus47,
         )
         .await;
-        let req = preflight(&deps, &json!({"number": "+14155551234", "objective": "x"})).unwrap();
+        let req = preflight(
+            &deps,
+            &json!({"number": "+14155551234", "objective": "x", "language": "en"}),
+        )
+        .unwrap();
         assert!(req.llm_label.contains("deepseek-chat"));
+    }
+
+    #[test]
+    fn parse_args_requires_language() {
+        let err = parse_args(&json!({"number": "+14155551234", "objective": "x"})).unwrap_err();
+        assert!(format!("{err}").contains("language"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_args_accepts_language_and_context() {
+        let p = parse_args(&json!({
+            "number": "+14155551234",
+            "objective": "x",
+            "language": "es-ES",
+            "context": "Caller is a long-time customer; be warm."
+        }))
+        .unwrap();
+        assert_eq!(p.language, "es-ES");
+        assert_eq!(
+            p.context.as_deref(),
+            Some("Caller is a long-time customer; be warm.")
+        );
     }
 
     #[test]

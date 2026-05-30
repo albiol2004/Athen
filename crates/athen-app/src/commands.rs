@@ -3809,6 +3809,7 @@ pub(crate) async fn execute_approved_task(
         ctx.notifier.clone(),
         ctx.active_provider_id.clone(),
         ctx.security_mode,
+        ctx.identity_store.clone(),
     )
     .await
     {
@@ -4950,6 +4951,7 @@ pub(crate) async fn execute_dispatched_task(
         ctx.notifier.clone(),
         ctx.active_provider_id.clone(),
         ctx.security_mode,
+        ctx.identity_store.clone(),
     )
     .await
     {
