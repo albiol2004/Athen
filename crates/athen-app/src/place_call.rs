@@ -776,7 +776,7 @@ pub async fn do_place_call(
                 .insert("base_url".into(), json!(base));
         }
     }
-    let config_blob = json!({
+    let mut config_blob = json!({
         "number": destination,
         "objective": parsed.objective,
         "called_party": match parsed.called_party {
@@ -802,6 +802,30 @@ pub async fn do_place_call(
         },
         "max_duration_s": parsed.max_duration_s,
     });
+    // Public-URL reachability for Twilio Media Streams. The runner needs
+    // one of these or it aborts with "no public URL available". Only inject
+    // when set so the runner's own priority (public_url > ngrok) holds.
+    {
+        let obj = config_blob.as_object_mut().expect("config_blob is object");
+        if let Some(url) = deps
+            .voice_config
+            .public_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            obj.insert("public_url".into(), json!(url));
+        }
+        if let Some(tok) = deps
+            .voice_config
+            .ngrok_authtoken
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            obj.insert("ngrok_authtoken".into(), json!(tok));
+        }
+    }
 
     // 10. Persist to a NamedTempFile so the file is auto-deleted on drop.
     //     We hold it alive until after the child exits.

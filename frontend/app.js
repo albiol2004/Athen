@@ -17358,6 +17358,10 @@ function renderVoicePanel() {
     if (userEl) userEl.value = cfg.userNumber || '';
     const maxEl = document.getElementById('voice-max-duration');
     if (maxEl) maxEl.value = cfg.maxCallDurationS || 600;
+    const ngrokEl = document.getElementById('voice-ngrok-authtoken');
+    if (ngrokEl) ngrokEl.value = cfg.ngrokAuthtoken || '';
+    const pubUrlEl = document.getElementById('voice-public-url');
+    if (pubUrlEl) pubUrlEl.value = cfg.publicUrl || '';
 }
 
 function collectVoiceForm() {
@@ -17369,6 +17373,8 @@ function collectVoiceForm() {
     const user = document.getElementById('voice-user-number');
     const llm = document.getElementById('voice-llm-override');
     const dur = document.getElementById('voice-max-duration');
+    const ngrok = document.getElementById('voice-ngrok-authtoken');
+    const pubUrl = document.getElementById('voice-public-url');
 
     const blank = (v) => (typeof v === 'string' && v.trim()) ? v.trim() : null;
 
@@ -17395,6 +17401,8 @@ function collectVoiceForm() {
         llmOverrideConnectionId: overrideConnection,
         llmOverrideSlug: overrideSlug,
         maxCallDurationS: parsedDuration,
+        ngrokAuthtoken: blank(ngrok && ngrok.value),
+        publicUrl: blank(pubUrl && pubUrl.value),
     };
 }
 

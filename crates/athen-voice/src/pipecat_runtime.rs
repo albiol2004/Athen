@@ -128,7 +128,12 @@ const PIPECAT_SPEC: &str =
 
 /// Extra runtime deps Pipecat doesn't pull in on its own but the
 /// `pipecat_runner.py` server side needs.
-const EXTRA_DEPS: &[&str] = &["pyngrok", "fastapi", "uvicorn"];
+///
+/// `twilio`: `pipecat-ai[twilio]` only ships Pipecat's Media-Streams frame
+/// serializer, NOT the Twilio REST SDK. The runner calls
+/// `from twilio.rest import Client` to actually place the outbound call, so
+/// the standalone `twilio` package must be installed explicitly.
+const EXTRA_DEPS: &[&str] = &["pyngrok", "fastapi", "uvicorn", "twilio"];
 
 /// Human-readable extras list captured into the marker so a future
 /// "what did we install" debug dump can replay the exact spec.
