@@ -440,6 +440,7 @@ class CallState:
     twilio_call_sid: str | None = None
     twiml_fetched: bool = False
     twilio_status: str | None = None
+    public_ws_url: str | None = None
     started_at: float = field(default_factory=time.time)
 
 
@@ -482,20 +483,27 @@ async def run_call(cfg: CallConfig) -> dict[str, Any]:
         if not state.twiml_fetched:
             state.twiml_fetched = True
             emit("twiml_fetched")
-        public_ws = state.public_ws_url  # set just below
+        public_ws = state.public_ws_url  # set before the call is placed
         body = (
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
             "<Response><Connect>"
             f"<Stream url=\"{public_ws}\"/>"
             "</Connect></Response>"
         )
+        log(f"served TwiML, stream url = {public_ws}")
         return Response(content=body, media_type="application/xml")
 
     @app.websocket("/ws")
     async def ws_endpoint(websocket: WebSocket) -> None:
         # Twilio dialled our number — we now wire its Media Stream into a
-        # Pipecat pipeline.
-        await websocket.accept()
+        # Pipecat pipeline. Log BEFORE accept so we can tell apart "Twilio's
+        # wss upgrade never reached us" from "reached us but accept failed".
+        log("/ws upgrade incoming (Twilio media stream)")
+        try:
+            await websocket.accept()
+        except Exception as e:  # noqa: BLE001
+            log(f"/ws accept failed: {e!r}")
+            raise
         state.answered = True
         emit("answered")
         await _run_pipeline(websocket, llm, stt, tts, system_prompt, state, pipeline_task_holder)
@@ -503,7 +511,7 @@ async def run_call(cfg: CallConfig) -> dict[str, Any]:
     # Spin up server, then ngrok, then place call.
     emit("installing_check", detail="validating providers")
     server_config = uvicorn.Config(
-        app, host="127.0.0.1", port=local_port, log_level="warning", access_log=False
+        app, host="127.0.0.1", port=local_port, log_level="info", access_log=True
     )
     server = uvicorn.Server(server_config)
     server_task = asyncio.create_task(server.serve())
@@ -524,7 +532,7 @@ async def run_call(cfg: CallConfig) -> dict[str, Any]:
             public_wss = "ws://" + public_https[len("http://"):]
         else:
             public_wss = public_https
-        state.public_ws_url = public_wss + "/ws"  # type: ignore[attr-defined]
+        state.public_ws_url = public_wss + "/ws"
         twiml_url = public_https + "/twiml"
 
         # Wait for the public tunnel to actually route to our server before
