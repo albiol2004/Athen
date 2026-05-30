@@ -3809,7 +3809,9 @@ pub(crate) async fn execute_approved_task(
         ctx.notifier.clone(),
         ctx.active_provider_id.clone(),
         ctx.security_mode,
-    ) {
+    )
+    .await
+    {
         registry = registry
             .with_telephony(telephony)
             .with_app_handle(ctx.app_handle.clone());
@@ -4948,7 +4950,9 @@ pub(crate) async fn execute_dispatched_task(
         ctx.notifier.clone(),
         ctx.active_provider_id.clone(),
         ctx.security_mode,
-    ) {
+    )
+    .await
+    {
         registry = registry
             .with_telephony(telephony)
             .with_app_handle(ctx.app_handle.clone());

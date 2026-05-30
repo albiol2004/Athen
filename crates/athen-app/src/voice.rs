@@ -411,6 +411,7 @@ pub async fn test_voice_setup(
         // pass the live global mode for parity with the real path.
         state.security.load().mode,
     )
+    .await
     .ok_or_else(|| {
         "Voice subsystem is not wired in this build (missing approval router, vault, or endpoint store)."
             .to_string()

@@ -314,7 +314,20 @@ fn resolve_llm(deps: &TelephonyDeps) -> Result<ResolvedLlm> {
     } else {
         slug
     };
-    let base_url = provider.endpoint.clone();
+    // Prefer the per-connection endpoint override; otherwise fall back to
+    // the preset default base URL for this provider id. Preset providers
+    // (e.g. opencode_go → https://opencode.ai/zen/go) leave `endpoint`
+    // empty in config — the in-process router fills it from this same
+    // table, but Pipecat runs out-of-process and needs the URL spelled
+    // out, or it defaults to api.openai.com and the call fails.
+    let base_url = provider
+        .endpoint
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            let preset = crate::settings::default_base_url(&connection_id);
+            (!preset.is_empty()).then(|| preset.to_string())
+        });
     let label_prefix = display_connection_label(&connection_id);
     Ok(ResolvedLlm {
         kind,

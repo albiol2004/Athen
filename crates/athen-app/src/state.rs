@@ -543,7 +543,7 @@ pub(crate) struct ToolRegistryDeps {
 /// sense-event registries silently drop `place_call` even when in-app
 /// chat advertises it — the kind of registry drift the
 /// `feedback_owner_telegram_registry_drift` memory was filed against.
-pub(crate) fn build_telephony_deps(
+pub(crate) async fn build_telephony_deps(
     arc_id: &str,
     approval_router: Option<Arc<crate::approval::ApprovalRouter>>,
     vault: Option<Arc<dyn athen_core::traits::vault::Vault>>,
@@ -556,7 +556,20 @@ pub(crate) fn build_telephony_deps(
         (Some(r), Some(v), Some(s)) => (r, v, s),
         _ => return None,
     };
-    let cfg = crate::settings::load_main_config_public();
+    // Use the full merged loader (config.toml + models.toml) — NOT
+    // load_main_config_public(), which reads config.toml only and leaves
+    // models.providers / models.bundles empty. Voice LLM resolution
+    // (pick_voice_llm) needs the populated Bundle + providers, exactly like
+    // a normal chat arc. `cfg.voice` is still sourced from config.toml here,
+    // so the voice blob is preserved.
+    let mut cfg = load_config();
+    // Hydrate provider api_keys from the vault (OS keychain). On-disk
+    // models.toml blanks each key to `auth = "None"` post-migration — the
+    // live secret only exists in the vault. Without this, a provider whose
+    // key lives solely in the keychain (e.g. opencode_go) resolves to an
+    // empty api_key and `resolve_llm` wrongly rejects it. Mirrors the
+    // startup hydrate in `AppState::new`.
+    crate::vault_creds::hydrate_models_from_vault(Some(&vault), &mut cfg.models).await;
     let voice_config: athen_voice::VoiceConfig =
         serde_json::from_value(cfg.voice.clone()).unwrap_or_default();
     let gate: Arc<dyn athen_voice::TelephonyApprovalGate> = Arc::new(
@@ -711,7 +724,8 @@ pub(crate) async fn assemble_base_app_tool_registry(
             deps.notifier.clone(),
             deps.active_provider_id.clone(),
             security_mode,
-        ),
+        )
+        .await,
         app_handle.clone(),
     ) {
         registry = registry.with_telephony(telephony).with_app_handle(handle);
