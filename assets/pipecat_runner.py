@@ -718,6 +718,11 @@ async def _run_pipeline(
     # Transcript tap — intercepts user STT + agent TTS frames and emits.
     class TranscriptTap(FrameProcessor):
         async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
+            # MUST call super().process_frame first: that's what handles the
+            # StartFrame (sets the processor's internal `started` flag). Without
+            # it, push_frame's _check_started gate drops EVERY frame — including
+            # StartFrame — so nothing downstream of the tap ever runs.
+            await super().process_frame(frame, direction)
             try:
                 if isinstance(frame, TranscriptionFrame) and getattr(frame, "text", None):
                     emit_transcript("user", frame.text)
