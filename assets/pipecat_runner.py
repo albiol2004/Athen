@@ -500,12 +500,18 @@ async def run_call(cfg: CallConfig) -> dict[str, Any]:
         log(f"served TwiML, stream url = {public_ws}")
         return Response(content=body, media_type="application/xml")
 
-    @app.websocket("/ws")
-    async def ws_endpoint(websocket: WebSocket) -> None:
+    async def _bridge(websocket: WebSocket, matched: str) -> None:
         # Twilio dialled our number — we now wire its Media Stream into a
         # Pipecat pipeline. Log BEFORE accept so we can tell apart "Twilio's
         # wss upgrade never reached us" from "reached us but accept failed".
-        log("/ws upgrade incoming (Twilio media stream)")
+        hdrs = {k.decode("latin-1").lower(): v.decode("latin-1")
+                for k, v in websocket.scope.get("headers", [])}
+        interesting = {k: hdrs.get(k) for k in
+                       ("host", "origin", "user-agent", "upgrade", "connection",
+                        "sec-websocket-version", "sec-websocket-protocol")}
+        log(f"/ws upgrade incoming (route={matched!r}) "
+            f"scope_path={websocket.scope.get('path')!r} "
+            f"subprotocols={websocket.scope.get('subprotocols')} headers={interesting}")
         try:
             await websocket.accept()
         except Exception as e:  # noqa: BLE001
@@ -514,6 +520,19 @@ async def run_call(cfg: CallConfig) -> dict[str, Any]:
         state.answered = True
         emit("answered")
         await _run_pipeline(websocket, llm, stt, tts, system_prompt, state, pipeline_task_holder)
+
+    @app.websocket("/ws")
+    async def ws_endpoint(websocket: WebSocket) -> None:
+        await _bridge(websocket, "/ws")
+
+    # Catch-all: Twilio's media-stream wss upgrade was reaching uvicorn but
+    # NOT matching the exact "/ws" route (Starlette closed it pre-accept → 403),
+    # so the real request target must differ subtly. This route matches any
+    # path, logs what Twilio actually sent, and bridges anyway so the call
+    # still connects regardless of the path quirk.
+    @app.websocket("/{rest:path}")
+    async def ws_catch_all(websocket: WebSocket, rest: str) -> None:
+        await _bridge(websocket, f"/{rest} (catch-all)")
 
     # Spin up server, then ngrok, then place call.
     emit("installing_check", detail="validating providers")
