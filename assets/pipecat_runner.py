@@ -307,6 +307,37 @@ def _cloudflared_tunnel(binary: str, local_port: int) -> TunnelHandle:
     return TunnelHandle(public_url=url.rstrip("/"), teardown=teardown)
 
 
+async def _await_tunnel_ready(health_url: str, timeout_s: float = 25.0) -> None:
+    """Poll `health_url` until it returns 200, or `timeout_s` elapses.
+
+    Best-effort: a tunnel that never becomes reachable still falls through
+    to the call attempt (which will then fail loudly), rather than hanging
+    forever. Logs each attempt so the runner log shows how long the tunnel
+    took to come up.
+    """
+    import urllib.request
+
+    deadline = time.time() + timeout_s
+    attempt = 0
+    while time.time() < deadline:
+        attempt += 1
+        try:
+            def _probe() -> int:
+                req = urllib.request.Request(health_url, method="GET")
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    return resp.status
+
+            status = await asyncio.to_thread(_probe)
+            if 200 <= status < 400:
+                log(f"tunnel ready after {attempt} probe(s) (HTTP {status})")
+                return
+            log(f"tunnel probe {attempt}: HTTP {status}")
+        except Exception as e:  # noqa: BLE001
+            log(f"tunnel probe {attempt} not ready: {e}")
+        await asyncio.sleep(1.0)
+    log(f"tunnel not confirmed ready after {timeout_s:.0f}s — placing call anyway")
+
+
 def acquire_public_url(cfg: CallConfig, local_port: int) -> TunnelHandle:
     """Return a public URL routing to ws://127.0.0.1:<local_port>.
 
@@ -380,6 +411,16 @@ async def run_call(cfg: CallConfig) -> dict[str, Any]:
     local_port = _pick_free_port()
     pipeline_task_holder: dict[str, Any] = {"task": None, "runner": None}
 
+    @app.get("/health")
+    async def health() -> Any:  # noqa: ANN401
+        # Cheap liveness endpoint used to confirm the public tunnel is
+        # actually routable BEFORE we place the Twilio call. trycloudflare
+        # tunnels warn "it may take some time to be reachable" — placing
+        # the call before then makes Twilio's TwiML fetch hit a dead tunnel
+        # and the call drops in seconds.
+        from fastapi.responses import Response  # type: ignore
+        return Response(content="ok", media_type="text/plain")
+
     @app.post("/twiml")
     async def twiml(_req: Any = None) -> Any:  # noqa: ANN401
         # Returned to Twilio after the call is answered. Tells Twilio to
@@ -429,6 +470,13 @@ async def run_call(cfg: CallConfig) -> dict[str, Any]:
             public_wss = public_https
         state.public_ws_url = public_wss + "/ws"  # type: ignore[attr-defined]
         twiml_url = public_https + "/twiml"
+
+        # Wait for the public tunnel to actually route to our server before
+        # dialling. A freshly-created trycloudflare tunnel returns its URL
+        # before the edge can reach us; calling Twilio too early makes its
+        # TwiML fetch hit a dead tunnel → instant hangup. Poll /health
+        # through the PUBLIC url until it answers (or give up after ~25s).
+        await _await_tunnel_ready(public_https + "/health")
 
         # Place the call via Twilio REST.
         from twilio.rest import Client as TwilioClient  # type: ignore

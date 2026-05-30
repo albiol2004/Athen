@@ -964,10 +964,7 @@ pub async fn do_place_call(
         transcript_json.push(row);
     }
 
-    let log_file_str = outcome
-        .log_path
-        .as_ref()
-        .map(|p| p.display().to_string());
+    let log_file_str = outcome.log_path.as_ref().map(|p| p.display().to_string());
 
     if let Some(result_event) = outcome.result_event {
         let outcome_str = result_event
