@@ -534,10 +534,29 @@ async def run_call(cfg: CallConfig) -> dict[str, Any]:
     async def ws_catch_all(websocket: WebSocket, rest: str) -> None:
         await _bridge(websocket, f"/{rest} (catch-all)")
 
+    # Raw ASGI wrapper that logs the FULL websocket scope (path + every
+    # header + subprotocols) BEFORE FastAPI routing/validation runs — so even
+    # when FastAPI rejects Twilio's upgrade pre-accept (403), we still see
+    # exactly what cloudflared delivered to the origin. This is the layer that
+    # finally disambiguates a path quirk from a header quirk.
+    async def _asgi_with_scope_log(scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") == "websocket":
+            try:
+                hdrs = [(k.decode("latin-1"), v.decode("latin-1"))
+                        for k, v in scope.get("headers", [])]
+                log(f"RAW ws scope: path={scope.get('path')!r} "
+                    f"raw_path={scope.get('raw_path')!r} "
+                    f"subprotocols={scope.get('subprotocols')} "
+                    f"http_version={scope.get('http_version')} headers={hdrs}")
+            except Exception as e:  # noqa: BLE001
+                log(f"scope-log failed: {e!r}")
+        await app(scope, receive, send)
+
     # Spin up server, then ngrok, then place call.
     emit("installing_check", detail="validating providers")
     server_config = uvicorn.Config(
-        app, host="127.0.0.1", port=local_port, log_level="info", access_log=True
+        _asgi_with_scope_log, host="127.0.0.1", port=local_port,
+        log_level="info", access_log=True,
     )
     server = uvicorn.Server(server_config)
     server_task = asyncio.create_task(server.serve())
