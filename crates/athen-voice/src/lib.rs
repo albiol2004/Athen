@@ -134,6 +134,20 @@ pub struct VoiceConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm_override_slug: Option<String>,
 
+    /// Public URL Twilio Media Streams connects back to. Twilio must reach
+    /// the local Pipecat WebSocket from the internet, so one of these is
+    /// REQUIRED for any call to complete:
+    ///   * `public_url` — a static `https://`/`wss://` base you already
+    ///     expose (own tunnel, reverse proxy). Takes priority.
+    ///   * `ngrok_authtoken` — free token from ngrok.com; the runner spins
+    ///     up an ngrok tunnel per call. Easiest path for most users.
+    ///
+    /// Without either, the runner aborts with "no public URL available".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ngrok_authtoken: Option<String>,
+
     /// Hard cap on call length, seconds. Default 600; enforced cap 1800.
     pub max_call_duration_s: u32,
 }

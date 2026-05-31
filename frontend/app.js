@@ -7928,7 +7928,7 @@ function createBundleCard(bundle, providers) {
         const modelSelect = row.querySelector('.bundle-tier-model');
         const slugInput = row.querySelector('.bundle-tier-slug');
 
-        connSelect.addEventListener('change', () => {
+        connSelect.addEventListener('change', async () => {
             const newProviderId = connSelect.value;
             // Carry the typed slug across so the user doesn't lose it
             // when toggling Connections; rebuild will preserve it as
@@ -7936,21 +7936,31 @@ function createBundleCard(bundle, providers) {
             const carried = (modelSelect.value === BUNDLE_CUSTOM_SLUG_SENTINEL)
                 ? (slugInput.value || '')
                 : (modelSelect.value || '');
-            rebuildTierModelSelect(row, newProviderId, carried);
+            // Await the rebuild so the slug input is settled before we
+            // snapshot the row — otherwise auto-save could capture a
+            // half-rebuilt (connection-but-no-slug) state.
+            await rebuildTierModelSelect(row, newProviderId, carried);
+            autoSaveBundle(card, bundle.id);
         });
 
         modelSelect.addEventListener('change', () => {
             if (modelSelect.value === BUNDLE_CUSTOM_SLUG_SENTINEL) {
                 slugInput.style.display = '';
                 slugInput.focus();
-            } else {
-                // Mirror the picked slug into the hidden input so save
-                // can read a single source for "the picked slug" without
-                // branching on display state.
-                slugInput.value = modelSelect.value;
-                slugInput.style.display = 'none';
+                // Defer persisting until the custom slug is actually typed
+                // (the slugInput 'change' handler below fires the save).
+                return;
             }
+            // Mirror the picked slug into the hidden input so save can read
+            // a single source for "the picked slug" without branching on
+            // display state.
+            slugInput.value = modelSelect.value;
+            slugInput.style.display = 'none';
+            autoSaveBundle(card, bundle.id);
         });
+
+        // Custom-slug text entry: persist on commit (blur / Enter).
+        slugInput.addEventListener('change', () => autoSaveBundle(card, bundle.id));
     }
     body.appendChild(tierRows);
 
@@ -7973,25 +7983,80 @@ function createBundleCard(bundle, providers) {
     return card;
 }
 
-async function handleSaveBundle(card, id) {
-    if (!invoke) return;
-    const name = (card.querySelector('.bundle-name')?.value || '').trim();
+// Snapshot the four tier slots from a bundle card's DOM into the
+// `{tier: {connection_id, slug} | null}` shape `update_bundle` expects.
+// A tier counts as "set" only if BOTH connection and slug are filled;
+// half-filled tiers become null and the backend sparse-fallback ladder
+// handles them.
+function collectBundleTiers(card) {
     const tiers = {};
     for (const t of BUNDLE_TIERS) {
         const row = card.querySelector(`.bundle-tier-row[data-tier="${t}"]`);
-        if (!row) continue;
+        if (!row) { tiers[t] = null; continue; }
         const conn = (row.querySelector('.bundle-tier-connection')?.value || '').trim();
         const slug = (row.querySelector('.bundle-tier-slug')?.value || '').trim();
-        // A tier counts as "set" only if BOTH connection and slug are
-        // filled. Half-filled tiers silently become unset — let the
-        // sparse-fallback ladder handle them.
         tiers[t] = (conn && slug) ? { connection_id: conn, slug } : null;
     }
+    return tiers;
+}
+
+// Keep the collapsed-header subtitle in sync with what's stored, so the
+// card reflects the persisted state without a full re-render.
+function refreshBundleSubtitle(card, tiers) {
+    const sub = card.querySelector('.provider-subtitle');
+    if (!sub) return;
+    sub.textContent = BUNDLE_TIERS
+        .map((t) => tiers[t])
+        .filter(Boolean)
+        .map((t) => t.slug)
+        .join(' · ') || '(no tiers set)';
+}
+
+// Persist the bundle card's current DOM state to disk + rebuild the live
+// router (the backend does that for the active bundle). Single source of
+// truth for both the explicit Save button and per-tier auto-save.
+async function persistBundle(card, id) {
+    const name = (card.querySelector('.bundle-name')?.value || '').trim();
+    const tiers = collectBundleTiers(card);
+    await invoke('update_bundle', { id, name: name || null, tiers });
+    refreshBundleSubtitle(card, tiers);
+    return tiers;
+}
+
+// Auto-save on a per-tier dropdown change. This is the fix for the
+// silent-revert bug: previously a tier edit lived only in the DOM until
+// the user clicked Save, so any settings re-render (e.g. switching the
+// active-bundle dropdown, which calls loadSettings()) discarded it and
+// routing kept using the old connection. Persisting on change closes
+// that window. Deliberately does NOT call loadSettings() — that would
+// rebuild the card mid-edit and steal focus; refreshBundleSubtitle keeps
+// the visible summary honest instead.
+async function autoSaveBundle(card, id) {
+    if (!invoke) return;
+    const flash = card.querySelector('.test-result');
+    try {
+        await persistBundle(card, id);
+        if (flash) {
+            flash.textContent = 'Applied ✓';
+            flash.className = 'test-result success';
+        }
+    } catch (err) {
+        if (flash) {
+            flash.textContent = 'Failed to apply: ' + err;
+            flash.className = 'test-result error';
+        } else {
+            showToast('Failed to apply Bundle change: ' + err, 'error');
+        }
+    }
+}
+
+async function handleSaveBundle(card, id) {
+    if (!invoke) return;
     const saveBtn = card.querySelector('.bundle-save-btn');
     saveBtn.disabled = true;
     saveBtn.textContent = 'Saving...';
     try {
-        await invoke('update_bundle', { id, name: name || null, tiers });
+        await persistBundle(card, id);
         showToast('Bundle saved', 'success');
         await loadSettings();
     } catch (err) {
@@ -17358,6 +17423,10 @@ function renderVoicePanel() {
     if (userEl) userEl.value = cfg.userNumber || '';
     const maxEl = document.getElementById('voice-max-duration');
     if (maxEl) maxEl.value = cfg.maxCallDurationS || 600;
+    const ngrokEl = document.getElementById('voice-ngrok-authtoken');
+    if (ngrokEl) ngrokEl.value = cfg.ngrokAuthtoken || '';
+    const pubUrlEl = document.getElementById('voice-public-url');
+    if (pubUrlEl) pubUrlEl.value = cfg.publicUrl || '';
 }
 
 function collectVoiceForm() {
@@ -17369,6 +17438,8 @@ function collectVoiceForm() {
     const user = document.getElementById('voice-user-number');
     const llm = document.getElementById('voice-llm-override');
     const dur = document.getElementById('voice-max-duration');
+    const ngrok = document.getElementById('voice-ngrok-authtoken');
+    const pubUrl = document.getElementById('voice-public-url');
 
     const blank = (v) => (typeof v === 'string' && v.trim()) ? v.trim() : null;
 
@@ -17395,6 +17466,8 @@ function collectVoiceForm() {
         llmOverrideConnectionId: overrideConnection,
         llmOverrideSlug: overrideSlug,
         maxCallDurationS: parsedDuration,
+        ngrokAuthtoken: blank(ngrok && ngrok.value),
+        publicUrl: blank(pubUrl && pubUrl.value),
     };
 }
 

@@ -68,6 +68,11 @@ pub struct TelephonyDeps {
     /// Full config — needed to resolve the LLM connection (api_key,
     /// base_url, family) from `models.providers`.
     pub config: AthenConfig,
+    /// Identity store — rendered into the voice agent's system prompt so
+    /// the caller speaks AS Athen (persona + known facts), the same block
+    /// the chat executor injects. `None` ⇒ falls back to the generic
+    /// "polite assistant" persona.
+    pub identity_store: Option<Arc<athen_persistence::identity::SqliteIdentityStore>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -85,6 +90,14 @@ pub fn place_call_schema() -> Value {
             "objective": {
                 "type": "string",
                 "description": "What to accomplish on the call. Be specific (e.g. 'Book a table for 4 at 8pm tomorrow under the name Alex')."
+            },
+            "language": {
+                "type": "string",
+                "description": "REQUIRED. Language the call will be conducted in, as a BCP-47 / ISO code (e.g. 'en', 'es', 'es-ES', 'fr', 'de'). Drives both speech-to-text and text-to-speech, so set it to the language the called party actually speaks — mismatches produce garbled transcription."
+            },
+            "context": {
+                "type": "string",
+                "description": "Optional briefing for the call agent: anything it should know going in that isn't in the objective — relevant facts about the called party, the user's preferences, background from earlier in the conversation, or a role to adopt (e.g. for a sales/outreach call). You already have this context; summarize what matters for THIS call. Appended to the agent's persona."
             },
             "called_party": {
                 "type": "string",
@@ -104,7 +117,7 @@ pub fn place_call_schema() -> Value {
                 "description": "Hard cap on call length in seconds."
             }
         },
-        "required": ["number", "objective"]
+        "required": ["number", "objective", "language"]
     })
 }
 
@@ -121,6 +134,8 @@ struct ParsedArgs {
     called_party: CalledParty,
     voice_id_override: Option<String>,
     max_duration_s: u32,
+    language: String,
+    context: Option<String>,
 }
 
 fn parse_args(args: &Value) -> Result<ParsedArgs> {
@@ -153,6 +168,23 @@ fn parse_args(args: &Value) -> Result<ParsedArgs> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+    let language = args
+        .get("language")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            AthenError::Other(
+                "place_call: 'language' is required — pass a BCP-47 code like 'en' or 'es'.".into(),
+            )
+        })?
+        .to_string();
+    let context = args
+        .get("context")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
 
     // Duration: default 600, clamp to VoiceConfig::HARD_MAX_DURATION_S.
     let raw_dur = args
@@ -167,6 +199,8 @@ fn parse_args(args: &Value) -> Result<ParsedArgs> {
         called_party,
         voice_id_override,
         max_duration_s,
+        language,
+        context,
     })
 }
 
@@ -314,7 +348,40 @@ fn resolve_llm(deps: &TelephonyDeps) -> Result<ResolvedLlm> {
     } else {
         slug
     };
-    let base_url = provider.endpoint.clone();
+    // Prefer the per-connection endpoint override; otherwise fall back to
+    // the preset default base URL for this provider id. Preset providers
+    // (e.g. opencode_go → https://opencode.ai/zen/go) leave `endpoint`
+    // empty in config — the in-process router fills it from this same
+    // table, but Pipecat runs out-of-process and needs the URL spelled
+    // out, or it defaults to api.openai.com and the call fails.
+    let base_url = provider
+        .endpoint
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            let preset = crate::settings::default_base_url(&connection_id);
+            (!preset.is_empty()).then(|| preset.to_string())
+        })
+        // Athen stores OpenAI-compatible base URLs WITHOUT the version
+        // segment and `athen-llm` appends `/v1/chat/completions` itself
+        // (e.g. opencode_go → https://opencode.ai/zen/go/v1/chat/completions).
+        // Pipecat's OpenAILLMService uses the OpenAI SDK, which appends only
+        // `/chat/completions`, so its base_url must already include `/v1` —
+        // otherwise the request hits the provider's website and 404s. Match
+        // the working chat path by appending `/v1` (idempotently) for the
+        // openai-compatible kind only; Anthropic/Google SDKs manage their own.
+        .map(|b| {
+            if kind == PipecatLlmKind::OpenAiCompat {
+                let trimmed = b.trim_end_matches('/');
+                if trimmed.ends_with("/v1") {
+                    trimmed.to_string()
+                } else {
+                    format!("{trimmed}/v1")
+                }
+            } else {
+                b
+            }
+        });
     let label_prefix = display_connection_label(&connection_id);
     Ok(ResolvedLlm {
         kind,
@@ -473,6 +540,9 @@ struct RunOutcome {
     transcript: Vec<TranscriptEntry>,
     result_event: Option<Value>,
     stderr_tail: Vec<String>,
+    /// Path to the per-call stderr log file, if one was opened. Surfaced
+    /// in the tool result so a failed call points the user at the log.
+    log_path: Option<PathBuf>,
 }
 
 async fn run_pipecat(
@@ -507,16 +577,56 @@ async fn run_pipecat(
         .take()
         .ok_or_else(|| "pipecat_runner: no stderr pipe".to_string())?;
 
-    // stderr drain — buffer the tail so we can include it on failure.
+    // Persist the full runner stderr to a per-call log file so a failed
+    // call is diagnosable after the fact — the in-memory tail below is
+    // capped, and tracing only surfaces at debug. The path is logged at
+    // info and returned in the outcome so the UI/tool result can point at
+    // it. Best-effort: a log-file failure never blocks the call.
+    let log_path = athen_core::paths::athen_data_dir().map(|d| {
+        d.join("voice-logs")
+            .join(format!("call-{}.log", arc_id.replace(['/', '\\'], "_")))
+    });
+    // Keep a copy for the outcome — `log_path` itself is moved into the
+    // drain task below.
+    let outcome_log_path = log_path.clone();
+    let mut log_file = match &log_path {
+        Some(p) => {
+            if let Some(parent) = p.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            match tokio::fs::File::create(p).await {
+                Ok(f) => {
+                    tracing::info!(path = %p.display(), "place_call: writing runner log");
+                    Some(f)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, path = %p.display(), "place_call: could not open runner log file");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+
+    // stderr drain — buffer the tail so we can include it on failure AND
+    // stream every line into the per-call log file.
     let stderr_task = tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
         let mut lines = BufReader::new(stderr).lines();
         let mut buf: Vec<String> = Vec::new();
         while let Ok(Some(line)) = lines.next_line().await {
             tracing::debug!(target = "place_call.stderr", "{line}");
+            if let Some(f) = log_file.as_mut() {
+                let _ = f.write_all(line.as_bytes()).await;
+                let _ = f.write_all(b"\n").await;
+            }
             buf.push(line);
             if buf.len() > 2000 {
                 buf.drain(..1000);
             }
+        }
+        if let Some(f) = log_file.as_mut() {
+            let _ = f.flush().await;
         }
         buf
     });
@@ -538,9 +648,10 @@ async fn run_pipecat(
             let _ = child.wait().await;
             let stderr_buf = stderr_task.await.unwrap_or_default();
             return Err(format!(
-                "place_call: hard timeout after {}s — killed runner. Last stderr line: {}",
+                "place_call: hard timeout after {}s — killed runner. Last stderr line: {}{}",
                 max_duration_s as u64 + GRACE_SECS,
-                stderr_buf.last().cloned().unwrap_or_default()
+                stderr_buf.last().cloned().unwrap_or_default(),
+                log_path_suffix(&outcome_log_path)
             ));
         };
         match tokio::time::timeout(remaining, lines.next_line()).await {
@@ -556,6 +667,13 @@ async fn run_pipecat(
                     }
                 };
                 let event = parsed.get("event").and_then(|v| v.as_str()).unwrap_or("");
+                // Lifecycle events are low-volume and decisive for triage —
+                // e.g. an instant hangup shows up as `ringing` with no
+                // `answered`, meaning Twilio never bridged the media stream
+                // back to us (TwiML/tunnel/serializer problem, not the bot).
+                if matches!(event, "starting" | "ringing" | "answered" | "result") {
+                    tracing::info!(target = "place_call", event, "{}", line);
+                }
                 emit_progress(app_handle, arc_id, &parsed);
                 match event {
                     "transcript" => {
@@ -588,9 +706,10 @@ async fn run_pipecat(
                 let _ = child.wait().await;
                 let stderr_buf = stderr_task.await.unwrap_or_default();
                 return Err(format!(
-                    "place_call: hard timeout after {}s — killed runner. Last stderr line: {}",
+                    "place_call: hard timeout after {}s — killed runner. Last stderr line: {}{}",
                     max_duration_s as u64 + GRACE_SECS,
-                    stderr_buf.last().cloned().unwrap_or_default()
+                    stderr_buf.last().cloned().unwrap_or_default(),
+                    log_path_suffix(&outcome_log_path)
                 ));
             }
         }
@@ -605,7 +724,17 @@ async fn run_pipecat(
         transcript,
         result_event,
         stderr_tail,
+        log_path: outcome_log_path,
     })
+}
+
+/// Render a " (full log: <path>)" suffix for error messages, or empty
+/// when no log file was opened.
+fn log_path_suffix(path: &Option<PathBuf>) -> String {
+    match path {
+        Some(p) => format!(" (full runner log: {})", p.display()),
+        None => String::new(),
+    }
 }
 
 fn emit_progress(app: &AppHandle, arc_id: &str, event: &Value) {
@@ -763,23 +892,46 @@ pub async fn do_place_call(
                 .insert("base_url".into(), json!(base));
         }
     }
-    let config_blob = json!({
+    // Voice persona: the call agent speaks AS Athen, carrying the same
+    // identity block the chat executor injects, plus an optional per-call
+    // briefing the calling agent supplies (it already holds the user's
+    // identity + memory + arc history, so it curates what matters here).
+    // Empty identity + no briefing ⇒ the runner falls back to its generic
+    // "polite assistant" persona.
+    let identity_block =
+        crate::identity_render::render_identity_block(deps.identity_store.as_ref(), "default")
+            .await;
+    let mut voice_persona_prefix = String::from(
+        "You are Athen, the user's AI assistant, placing this phone call on their behalf. Speak naturally, as yourself.",
+    );
+    if let Some(block) = &identity_block {
+        voice_persona_prefix.push_str("\n\n# Who you are and what you know\n");
+        voice_persona_prefix.push_str(block);
+    }
+    if let Some(ctx) = &parsed.context {
+        voice_persona_prefix.push_str("\n\n# Briefing for this call\n");
+        voice_persona_prefix.push_str(ctx);
+    }
+
+    let mut config_blob = json!({
         "number": destination,
         "objective": parsed.objective,
         "called_party": match parsed.called_party {
             CalledParty::User => "user",
             CalledParty::Other => "other",
         },
-        "voice_persona_prefix": "",
+        "voice_persona_prefix": voice_persona_prefix,
         "llm": llm_block,
         "stt": {
             "type": stack.stt_kind,
             "api_key": stack.stt_api_key,
+            "language": parsed.language,
         },
         "tts": {
             "type": stack.tts_kind,
             "api_key": stack.tts_api_key,
             "voice_id": voice_id_for_runner,
+            "language": parsed.language,
         },
         "phone": {
             "type": "twilio",
@@ -789,6 +941,30 @@ pub async fn do_place_call(
         },
         "max_duration_s": parsed.max_duration_s,
     });
+    // Public-URL reachability for Twilio Media Streams. The runner needs
+    // one of these or it aborts with "no public URL available". Only inject
+    // when set so the runner's own priority (public_url > ngrok) holds.
+    {
+        let obj = config_blob.as_object_mut().expect("config_blob is object");
+        if let Some(url) = deps
+            .voice_config
+            .public_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            obj.insert("public_url".into(), json!(url));
+        }
+        if let Some(tok) = deps
+            .voice_config
+            .ngrok_authtoken
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            obj.insert("ngrok_authtoken".into(), json!(tok));
+        }
+    }
 
     // 10. Persist to a NamedTempFile so the file is auto-deleted on drop.
     //     We hold it alive until after the child exits.
@@ -865,6 +1041,8 @@ pub async fn do_place_call(
         transcript_json.push(row);
     }
 
+    let log_file_str = outcome.log_path.as_ref().map(|p| p.display().to_string());
+
     if let Some(result_event) = outcome.result_event {
         let outcome_str = result_event
             .get("outcome")
@@ -895,6 +1073,19 @@ pub async fn do_place_call(
             fire_notification(n, arc_id, &title, &summary).await;
         }
 
+        // A "successful" call that produced NO transcript almost always
+        // means Twilio connected but the media stream never bridged (instant
+        // hangup / answering machine / one-way audio). Point the agent at the
+        // runner log so the next step isn't blind.
+        let diagnostic = if success && transcript_json.is_empty() {
+            Some(format!(
+                "Call connected but produced no transcript — the audio bridge likely never opened. See runner log: {}",
+                log_file_str.as_deref().unwrap_or("(no log)")
+            ))
+        } else {
+            None
+        };
+
         return Ok(ToolResult {
             success,
             output: json!({
@@ -905,6 +1096,8 @@ pub async fn do_place_call(
                 "cost_estimate_usd": cost,
                 "summary": summary,
                 "transcript": transcript_json,
+                "log_file": log_file_str,
+                "diagnostic": diagnostic,
             }),
             error: None,
             execution_time_ms: elapsed_ms,
@@ -932,8 +1125,12 @@ pub async fn do_place_call(
             "summary": "Call ended without a result event.",
             "transcript": transcript_json,
             "stderr_tail": stderr_tail,
+            "log_file": log_file_str,
         }),
-        error: Some("Call ended without a final result event.".into()),
+        error: Some(format!(
+            "Call ended without a final result event.{}",
+            log_path_suffix(&outcome.log_path)
+        )),
         execution_time_ms: elapsed_ms,
     })
 }
@@ -1096,6 +1293,7 @@ mod tests {
             active_provider_id: "deepseek".into(),
             voice_config: voice,
             config: cfg,
+            identity_store: None,
         }
     }
 
@@ -1128,7 +1326,7 @@ mod tests {
         .await;
         let err = preflight(
             &deps,
-            &json!({"number": "not-a-number", "objective": "test"}),
+            &json!({"number": "not-a-number", "objective": "test", "language": "en"}),
         )
         .unwrap_err();
         let msg = format!("{err}");
@@ -1147,7 +1345,7 @@ mod tests {
         let deps = mk_deps(Arc::new(ApproveGate), voice, ModelFamily::Default).await;
         let err = preflight(
             &deps,
-            &json!({"number": "+14155551234", "objective": "test"}),
+            &json!({"number": "+14155551234", "objective": "test", "language": "en"}),
         )
         .unwrap_err();
         let msg = format!("{err}");
@@ -1170,7 +1368,8 @@ mod tests {
             &json!({
                 "number": "+15555550000",  // should be IGNORED for user party
                 "objective": "reminder",
-                "called_party": "user"
+                "called_party": "user",
+                "language": "en"
             }),
         )
         .unwrap();
@@ -1188,7 +1387,8 @@ mod tests {
             &json!({
                 "number": "+15555550000",
                 "objective": "reminder",
-                "called_party": "user"
+                "called_party": "user",
+                "language": "en"
             }),
         )
         .unwrap_err();
@@ -1209,7 +1409,8 @@ mod tests {
             &json!({
                 "number": "+14155551234",
                 "objective": "x",
-                "max_duration_s": 999_999
+                "max_duration_s": 999_999,
+                "language": "en"
             }),
         )
         .unwrap();
@@ -1224,8 +1425,34 @@ mod tests {
             ModelFamily::ClaudeOpus47,
         )
         .await;
-        let req = preflight(&deps, &json!({"number": "+14155551234", "objective": "x"})).unwrap();
+        let req = preflight(
+            &deps,
+            &json!({"number": "+14155551234", "objective": "x", "language": "en"}),
+        )
+        .unwrap();
         assert!(req.llm_label.contains("deepseek-chat"));
+    }
+
+    #[test]
+    fn parse_args_requires_language() {
+        let err = parse_args(&json!({"number": "+14155551234", "objective": "x"})).unwrap_err();
+        assert!(format!("{err}").contains("language"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_args_accepts_language_and_context() {
+        let p = parse_args(&json!({
+            "number": "+14155551234",
+            "objective": "x",
+            "language": "es-ES",
+            "context": "Caller is a long-time customer; be warm."
+        }))
+        .unwrap();
+        assert_eq!(p.language, "es-ES");
+        assert_eq!(
+            p.context.as_deref(),
+            Some("Caller is a long-time customer; be warm.")
+        );
     }
 
     #[test]

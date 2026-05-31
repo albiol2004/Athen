@@ -1068,6 +1068,32 @@ impl ArcStore {
         .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
     }
 
+    /// Clear EVERY arc's provider pin. Called once at app startup: a pin
+    /// is task-scoped (set on a task's first LLM call, cleared at task
+    /// end), so any pin still on disk at boot is stale — it leaked from a
+    /// task that was killed/crashed before it could clear, and would
+    /// otherwise be inherited by the next task on that arc
+    /// (`set_pinned_provider_if_unset` only writes when unset), silently
+    /// freezing the arc to an old provider across a Bundle switch. Nothing
+    /// can be in-flight at boot, so wiping all pins is always safe here.
+    /// Returns the number of arcs that had a pin cleared.
+    pub async fn clear_all_provider_pins(&self) -> Result<usize> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let n = conn
+                .execute(
+                    "UPDATE arcs SET pinned_provider_id = NULL, pinned_slug = NULL \
+                     WHERE pinned_provider_id IS NOT NULL OR pinned_slug IS NOT NULL",
+                    [],
+                )
+                .map_err(|e| AthenError::Other(format!("Clear all provider pins: {e}")))?;
+            Ok(n)
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
     /// Set (or clear) the per-arc reasoning-effort override. Last-write-wins:
     /// a user toggling effort mid-task takes effect on the next LLM call.
     /// Pass `None` to clear; pass `Some(wire_str)` where `wire_str` is the
@@ -3009,6 +3035,41 @@ mod tests {
         let row = listed.iter().find(|a| a.id == "arc_p").unwrap();
         assert_eq!(row.pinned_provider_id.as_deref(), Some("anthropic"));
         assert_eq!(row.pinned_slug.as_deref(), Some("claude-sonnet-4-6"));
+    }
+
+    /// Startup sweep clears every arc's pin in one shot and reports the
+    /// count, leaving unpinned arcs untouched.
+    #[tokio::test]
+    async fn test_clear_all_provider_pins() {
+        let store = setup_arc_store().await;
+        for id in ["arc_a", "arc_b", "arc_c"] {
+            store
+                .create_arc(id, "arc", ArcSource::UserInput)
+                .await
+                .unwrap();
+        }
+        store
+            .set_pinned_provider_if_unset("arc_a", "opencode_go", "deepseek-v4-pro")
+            .await
+            .unwrap();
+        store
+            .set_pinned_provider_if_unset("arc_b", "deepseek", "deepseek-v4-flash")
+            .await
+            .unwrap();
+        // arc_c left unpinned.
+
+        let cleared = store.clear_all_provider_pins().await.unwrap();
+        assert_eq!(cleared, 2, "only the two pinned arcs count");
+
+        for id in ["arc_a", "arc_b", "arc_c"] {
+            let meta = store.get_arc(id).await.unwrap().expect("arc present");
+            assert_eq!(meta.pinned_provider_id, None);
+            assert_eq!(meta.pinned_slug, None);
+        }
+
+        // Idempotent: a second sweep clears nothing.
+        let again = store.clear_all_provider_pins().await.unwrap();
+        assert_eq!(again, 0);
     }
 
     /// `init_schema` must add `pinned_provider_id` + `pinned_slug` to a

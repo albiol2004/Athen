@@ -870,6 +870,16 @@
                             <label for="voice-max-duration">Max call duration (seconds)</label>
                             <input id="voice-max-duration" type="number" class="settings-input" min="30" max="1800" step="30" value="600" />
                         </div>
+                        <div class="voice-row">
+                            <label for="voice-ngrok-authtoken">ngrok auth token</label>
+                            <input id="voice-ngrok-authtoken" type="password" class="settings-input" placeholder="2abcDEF..." autocomplete="off" />
+                            <p class="setting-hint">Required for calls: Twilio streams call audio back to this machine over a public URL. Get a free token at <a href="https://dashboard.ngrok.com/get-started/your-authtoken">dashboard.ngrok.com</a>. Leave the URL below blank to use ngrok.</p>
+                        </div>
+                        <div class="voice-row">
+                            <label for="voice-public-url">Public URL (advanced)</label>
+                            <input id="voice-public-url" type="url" class="settings-input" placeholder="https://voice.example.com" />
+                            <p class="setting-hint">Only if you already expose a public endpoint (own tunnel / reverse proxy). Takes priority over ngrok. Most users leave this blank.</p>
+                        </div>
                     </details>
 
                     <details class="voice-setup" id="voice-setup-details">

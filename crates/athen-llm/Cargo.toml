@@ -15,7 +15,14 @@ chrono = { workspace = true }
 reqwest = { workspace = true }
 futures = { workspace = true }
 uuid = { workspace = true }
-fastembed = { version = "5", optional = true }
+# default features pull native-tls (ort-download-binaries-native-tls + hf-hub-native-tls)
+# which drags in openssl-sys and breaks rustls-only builds (COPR mock has no openssl-devel).
+# Force the rustls variants to keep the no-OpenSSL invariant.
+fastembed = { version = "5", optional = true, default-features = false, features = [
+    "ort-download-binaries-rustls-tls",
+    "hf-hub-rustls-tls",
+    "image-models",
+] }
 
 [features]
 # Bundled local embeddings via fastembed-rs (ONNX). When enabled, a

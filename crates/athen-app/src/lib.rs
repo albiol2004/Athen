@@ -286,6 +286,24 @@ pub fn run() {
             // Build the application state asynchronously (loads config, opens database).
             let mut state = tauri::async_runtime::block_on(AppState::new());
 
+            // Sweep stale provider pins. Pins are task-scoped (set on a
+            // task's first LLM call, cleared at task end), so anything left
+            // on disk at boot leaked from a task killed before it cleared.
+            // Left in place it would be inherited by the next task on that
+            // arc and silently freeze it to an old provider across a Bundle
+            // switch. Nothing is in-flight at boot, so this is always safe.
+            if let Some(arc_store) = state.arc_store.clone() {
+                tauri::async_runtime::block_on(async move {
+                    match arc_store.clear_all_provider_pins().await {
+                        Ok(n) if n > 0 => {
+                            tracing::info!(count = n, "Swept stale provider pins at startup")
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "Failed to sweep stale provider pins"),
+                    }
+                });
+            }
+
             // Reap orphaned `shell_spawn`'d processes from a previous run
             // BEFORE any monitor can start firing new wake-ups (which can
             // themselves shell_spawn). The pidfile is the only durable

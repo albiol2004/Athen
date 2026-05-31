@@ -40,6 +40,7 @@ import os
 import signal
 import socket
 import sys
+import threading
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -55,13 +56,21 @@ _AGENT_LAST_MSG = ""
 
 
 def emit(event: str, **fields: Any) -> None:
-    """Emit one JSON event on stdout, flushed immediately."""
+    """Emit one JSON event on stdout, flushed immediately.
+
+    Also mirror the event name to stderr so the per-call runner log (which
+    only captures stderr) shows the lifecycle — without it, a log can't
+    tell whether `answered`/`result` ever fired.
+    """
     payload = {"event": event, **fields}
     try:
         print(json.dumps(payload, ensure_ascii=False), flush=True)
     except (BrokenPipeError, ValueError):
         # Parent vanished; nothing useful to do.
         pass
+    with contextlib.suppress(Exception):
+        detail = {k: v for k, v in fields.items() if k != "transcript"}
+        print(f"[event] {event} {detail}", file=sys.stderr, flush=True)
 
 
 def log(msg: str) -> None:
@@ -174,6 +183,72 @@ def build_llm_service(cfg: CallConfig):
     raise ValueError(f"unsupported llm.type: {kind!r}")
 
 
+def _warm_llm_blocking(cfg: CallConfig) -> None:
+    """Fire a 1-token throwaway completion so the first real turn isn't cold.
+
+    Provider-side model load/routing plus the TLS handshake dominate first-
+    response latency — in testing the first reply took ~9s while later turns
+    took ~2s. Priming the endpoint while the call is still ringing hides most
+    of that. Best-effort: any failure is swallowed (a warmup must never block
+    or fail a real call). Only the openai-compatible path is warmed; the
+    Anthropic/Google SDKs use different request shapes and warm naturally.
+    """
+    if cfg.llm.get("type", "openai_compat").lower() != "openai_compat":
+        return
+    api_key = cfg.llm.get("api_key", "")
+    if not api_key:
+        return
+    base_url = (cfg.llm.get("base_url") or "https://api.openai.com/v1").rstrip("/")
+    model = cfg.llm.get("model") or "gpt-4o-mini"
+    import urllib.request
+    body = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 1,
+        "stream": False,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base_url}/chat/completions",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            # Default urllib UA ("Python-urllib/3.x") is 403'd by Cloudflare-
+            # fronted endpoints (e.g. opencode.ai) as bot traffic; the in-call
+            # OpenAI SDK works because httpx sends a normal UA. Mirror that.
+            "User-Agent": "athen-voice/1.0",
+        },
+        method="POST",
+    )
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            resp.read()
+        log(f"llm warmup ok ({time.time() - t0:.1f}s)")
+    except Exception as e:  # noqa: BLE001
+        log(f"llm warmup skipped: {e}")
+
+
+def _pipecat_language(code: str | None):
+    """Map a BCP-47 / ISO code (e.g. 'es', 'es-ES', 'en') to Pipecat's
+    Language enum. Returns None if unmappable (caller then omits the param
+    and the service falls back to its own default)."""
+    if not code:
+        return None
+    try:
+        from pipecat.transcriptions.language import Language  # type: ignore
+    except ImportError:
+        return None
+    code = code.strip()
+    # Language is a StrEnum, so Language("es") works when the value matches.
+    for candidate in (code, code.replace("_", "-"), code.split("-")[0].split("_")[0]):
+        try:
+            return Language(candidate)
+        except ValueError:
+            continue
+    return None
+
+
 def build_stt_service(cfg: CallConfig):
     kind = cfg.stt.get("type", "deepgram").lower()
     api_key = cfg.stt.get("api_key", "")
@@ -196,11 +271,20 @@ def build_tts_service(cfg: CallConfig):
     voice_id = cfg.tts.get("voice_id", "")
     if not api_key or not voice_id:
         raise ValueError("tts.api_key and tts.voice_id are required")
+    lang = _pipecat_language(cfg.tts.get("language"))
     if kind == "elevenlabs":
         from pipecat.services.elevenlabs import ElevenLabsTTSService  # type: ignore
+        # ElevenLabs picks language from the (multilingual) model + text;
+        # no per-call language knob wired here.
         return ElevenLabsTTSService(api_key=api_key, voice_id=voice_id)
     if kind == "cartesia":
         from pipecat.services.cartesia import CartesiaTTSService  # type: ignore
+        if lang is not None:
+            return CartesiaTTSService(
+                api_key=api_key,
+                voice_id=voice_id,
+                params=CartesiaTTSService.InputParams(language=lang),
+            )
         return CartesiaTTSService(api_key=api_key, voice_id=voice_id)
     raise ValueError(f"unsupported tts.type: {kind!r}")
 
@@ -222,20 +306,190 @@ def _pick_free_port() -> int:
 class TunnelHandle:
     public_url: str
     teardown: Any = None  # callable or None
+    # Set once the tunnel provider confirms the public endpoint is live at
+    # the edge (e.g. cloudflared "Registered tunnel connection"). This is
+    # DNS-independent — it does NOT depend on the LOCAL machine being able
+    # to resolve the hostname, which matters when a local VPN/resolver
+    # (NordVPN) mangles DNS for dynamic trycloudflare names. Twilio resolves
+    # via public DNS, so edge registration is the signal that matters.
+    # None when the provider gives no such signal (ngrok / static URL).
+    registered: Any = None  # threading.Event | None
+
+
+def _find_cloudflared() -> str | None:
+    """Locate a cloudflared binary. Checks PATH and the usual install dirs."""
+    import shutil
+    found = shutil.which("cloudflared")
+    if found:
+        return found
+    home = os.path.expanduser("~")
+    for cand in (
+        os.path.join(home, ".local", "bin", "cloudflared"),
+        os.path.join(home, ".athen", "toolbox", "runtimes", "cloudflared", "cloudflared"),
+        "/usr/local/bin/cloudflared",
+        "/usr/bin/cloudflared",
+    ):
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+def _cloudflared_tunnel(binary: str, local_port: int) -> TunnelHandle:
+    """Start a cloudflared quick tunnel to http://127.0.0.1:<port>.
+
+    Quick tunnels need no account/token and handle WebSocket upgrades
+    cleanly (unlike the ngrok free tier, which fails Twilio's Media
+    Streams handshake with error 31920). The public URL is scraped from
+    cloudflared's stderr banner.
+    """
+    import re
+    import subprocess
+
+    proc = subprocess.Popen(
+        [
+            binary,
+            "tunnel",
+            "--no-autoupdate",
+            # Force the HTTP/2 edge transport instead of the default QUIC.
+            # QUIC-fronted quick tunnels complete a normal WebSocket upgrade
+            # fine, but Twilio Media Streams' stricter wss handshake gets
+            # rejected at the edge (error 31920) over QUIC; http2 is the
+            # documented remedy for WebSocket-through-cloudflared.
+            "--protocol",
+            "http2",
+            "--url",
+            f"http://127.0.0.1:{local_port}",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    url: str | None = None
+    pat = re.compile(r"https://[-a-z0-9]+\.trycloudflare\.com")
+    registered = threading.Event()
+    deadline = time.time() + 30
+    assert proc.stderr is not None
+    while time.time() < deadline:
+        line = proc.stderr.readline()
+        if not line:
+            if proc.poll() is not None:
+                break
+            continue
+        log(f"cloudflared: {line.rstrip()}")
+        if "Registered tunnel connection" in line:
+            registered.set()
+        m = pat.search(line)
+        if m:
+            url = m.group(0)
+            break
+
+    if not url:
+        with contextlib.suppress(Exception):
+            proc.terminate()
+        raise RuntimeError(
+            "cloudflared did not report a tunnel URL within 30s — check the runner log"
+        )
+
+    # Drain remaining stderr in the background so the pipe never blocks —
+    # and keep watching for the edge-registration line (it usually arrives
+    # right after the URL banner).
+    def _drain() -> None:
+        with contextlib.suppress(Exception):
+            for line in proc.stderr:  # type: ignore[union-attr]
+                log(f"cloudflared: {line.rstrip()}")
+                if "Registered tunnel connection" in line:
+                    registered.set()
+
+    threading.Thread(target=_drain, daemon=True).start()
+
+    def teardown() -> None:
+        with contextlib.suppress(Exception):
+            proc.terminate()
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=5)
+
+    return TunnelHandle(public_url=url.rstrip("/"), teardown=teardown, registered=registered)
+
+
+async def _await_tunnel_ready(
+    tunnel: "TunnelHandle", health_url: str, timeout_s: float = 25.0
+) -> None:
+    """Block until the tunnel is reachable from the public internet.
+
+    Two strategies, in order of reliability:
+
+    1. If the provider exposes an edge-registration signal
+       (`tunnel.registered`, set by cloudflared's "Registered tunnel
+       connection"), wait on THAT. It's the correct signal because Twilio
+       reaches the tunnel via the edge + public DNS — NOT via this
+       machine's resolver. A local VPN/resolver (NordVPN) can leave the
+       LOCAL box unable to resolve the hostname while the edge + Twilio
+       resolve it fine, so a local HTTP probe gives false negatives.
+    2. Otherwise (ngrok / static URL), fall back to polling `health_url`
+       locally until it answers.
+
+    Best-effort throughout: on timeout we proceed to the call rather than
+    hang, and log what happened so the runner log is diagnostic.
+    """
+    registered = getattr(tunnel, "registered", None)
+    if registered is not None:
+        ok = await asyncio.to_thread(registered.wait, timeout_s)
+        if ok:
+            # Edge has the tunnel. Give DNS a brief head start to propagate
+            # to Twilio's resolvers, but don't gate on LOCAL resolution.
+            log("tunnel registered at edge — proceeding (local DNS not required)")
+            await asyncio.sleep(3.0)
+        else:
+            log(f"tunnel edge registration not seen after {timeout_s:.0f}s — placing call anyway")
+        return
+
+    import urllib.request
+
+    deadline = time.time() + timeout_s
+    attempt = 0
+    while time.time() < deadline:
+        attempt += 1
+        try:
+            def _probe() -> int:
+                req = urllib.request.Request(health_url, method="GET")
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    return resp.status
+
+            status = await asyncio.to_thread(_probe)
+            if 200 <= status < 400:
+                log(f"tunnel ready after {attempt} probe(s) (HTTP {status})")
+                return
+            log(f"tunnel probe {attempt}: HTTP {status}")
+        except Exception as e:  # noqa: BLE001
+            log(f"tunnel probe {attempt} not ready: {e}")
+        await asyncio.sleep(1.0)
+    log(f"tunnel not confirmed ready after {timeout_s:.0f}s — placing call anyway")
 
 
 def acquire_public_url(cfg: CallConfig, local_port: int) -> TunnelHandle:
     """Return a public URL routing to ws://127.0.0.1:<local_port>.
 
-    Priority: explicit cfg.public_url > pyngrok with auth token.
-    Raises RuntimeError with a user-facing message if neither works.
+    Priority: explicit cfg.public_url > cloudflared quick tunnel >
+    pyngrok with auth token. cloudflared is preferred over ngrok because
+    the ngrok free tier fails Twilio's Media Streams WebSocket handshake
+    (error 31920) even though plain HTTP traverses it fine.
+    Raises RuntimeError with a user-facing message if none work.
     """
     if cfg.public_url:
         return TunnelHandle(public_url=cfg.public_url.rstrip("/"), teardown=None)
+
+    cloudflared = _find_cloudflared()
+    if cloudflared:
+        log(f"using cloudflared quick tunnel ({cloudflared})")
+        return _cloudflared_tunnel(cloudflared, local_port)
+
     if not cfg.ngrok_authtoken:
         raise RuntimeError(
-            "no public URL available — set public_url or ngrok_authtoken in voice config"
+            "no public URL available — install cloudflared, or set public_url "
+            "or ngrok_authtoken in voice config"
         )
+    log("cloudflared not found — falling back to ngrok (WebSocket handshake may fail on free tier)")
     try:
         from pyngrok import conf, ngrok  # type: ignore
     except ImportError as e:
@@ -266,6 +520,9 @@ class CallState:
     ended: bool = False
     end_reason: str | None = None
     twilio_call_sid: str | None = None
+    twiml_fetched: bool = False
+    twilio_status: str | None = None
+    public_ws_url: str | None = None
     started_at: float = field(default_factory=time.time)
 
 
@@ -281,38 +538,101 @@ async def run_call(cfg: CallConfig) -> dict[str, Any]:
     system_prompt = build_system_prompt(cfg)
     state = CallState()
 
+    # Prime the LLM while the call is still being set up (tunnel + ring time)
+    # so the first turn after the caller speaks doesn't pay cold-start latency.
+    asyncio.create_task(asyncio.to_thread(_warm_llm_blocking, cfg))
+
     # FastAPI server that hosts the Twilio Media Streams WebSocket.
     app = FastAPI()
     local_port = _pick_free_port()
     pipeline_task_holder: dict[str, Any] = {"task": None, "runner": None}
 
+    @app.get("/health")
+    async def health() -> Any:  # noqa: ANN401
+        # Cheap liveness endpoint used to confirm the public tunnel is
+        # actually routable BEFORE we place the Twilio call. trycloudflare
+        # tunnels warn "it may take some time to be reachable" — placing
+        # the call before then makes Twilio's TwiML fetch hit a dead tunnel
+        # and the call drops in seconds.
+        from fastapi.responses import Response  # type: ignore
+        return Response(content="ok", media_type="text/plain")
+
     @app.post("/twiml")
     async def twiml(_req: Any = None) -> Any:  # noqa: ANN401
         # Returned to Twilio after the call is answered. Tells Twilio to
         # open a bidirectional Media Stream back to our WebSocket.
+        # Twilio only fetches this AFTER the callee picks up, so a hit here is
+        # proof the call was answered AND the public tunnel is reachable from
+        # Twilio's edge — the key signal that disambiguates "no answer" from
+        # "answered but the wss media-stream leg never connected".
         from fastapi.responses import Response  # type: ignore
-        public_ws = state.public_ws_url  # set just below
+        if not state.twiml_fetched:
+            state.twiml_fetched = True
+            emit("twiml_fetched")
+        public_ws = state.public_ws_url  # set before the call is placed
         body = (
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
             "<Response><Connect>"
             f"<Stream url=\"{public_ws}\"/>"
             "</Connect></Response>"
         )
+        log(f"served TwiML, stream url = {public_ws}")
         return Response(content=body, media_type="application/xml")
 
-    @app.websocket("/ws")
-    async def ws_endpoint(websocket: WebSocket) -> None:
+    async def _bridge(websocket: WebSocket, matched: str) -> None:
         # Twilio dialled our number — we now wire its Media Stream into a
-        # Pipecat pipeline.
-        await websocket.accept()
+        # Pipecat pipeline. Log BEFORE accept so we can tell apart "Twilio's
+        # wss upgrade never reached us" from "reached us but accept failed".
+        hdrs = {k.decode("latin-1").lower(): v.decode("latin-1")
+                for k, v in websocket.scope.get("headers", [])}
+        interesting = {k: hdrs.get(k) for k in
+                       ("host", "origin", "user-agent", "upgrade", "connection",
+                        "sec-websocket-version", "sec-websocket-protocol")}
+        log(f"/ws upgrade incoming (route={matched!r}) "
+            f"scope_path={websocket.scope.get('path')!r} "
+            f"subprotocols={websocket.scope.get('subprotocols')} headers={interesting}")
+        try:
+            await websocket.accept()
+        except Exception as e:  # noqa: BLE001
+            log(f"/ws accept failed: {e!r}")
+            raise
         state.answered = True
         emit("answered")
         await _run_pipeline(websocket, llm, stt, tts, system_prompt, state, pipeline_task_holder)
 
+    # NOTE: we deliberately do NOT register the media-stream WebSocket as a
+    # FastAPI route. Twilio's wss upgrade reaches uvicorn fine, but FastAPI's
+    # per-request machinery (dependency resolution / exit-stack / validation
+    # in routing.py) closes it BEFORE the endpoint runs → uvicorn renders that
+    # pre-accept close as HTTP 403, and the call drops with no audio. The exact
+    # trigger is environment-fragile (a plain websockets client is accepted; a
+    # no-arg endpoint is enough to repro), so instead of fighting it we bypass
+    # FastAPI routing entirely for websockets (see _asgi_entry below) and drive
+    # the bridge straight off the raw ASGI channels via a Starlette WebSocket —
+    # which is exactly the object Pipecat's FastAPIWebsocketTransport wants.
+    # HTTP (/health, /twiml) still flows through FastAPI as normal.
+
+    async def _asgi_entry(scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") == "websocket":
+            try:
+                hdrs = [(k.decode("latin-1"), v.decode("latin-1"))
+                        for k, v in scope.get("headers", [])]
+                log(f"ws upgrade: path={scope.get('path')!r} "
+                    f"subprotocols={scope.get('subprotocols')} "
+                    f"http_version={scope.get('http_version')} headers={hdrs}")
+            except Exception as e:  # noqa: BLE001
+                log(f"scope-log failed: {e!r}")
+            # Bypass FastAPI routing/DI — build the WebSocket directly.
+            websocket = WebSocket(scope, receive=receive, send=send)
+            await _bridge(websocket, scope.get("path") or "/ws")
+            return
+        await app(scope, receive, send)
+
     # Spin up server, then ngrok, then place call.
     emit("installing_check", detail="validating providers")
     server_config = uvicorn.Config(
-        app, host="127.0.0.1", port=local_port, log_level="warning", access_log=False
+        _asgi_entry, host="127.0.0.1", port=local_port,
+        log_level="info", access_log=True,
     )
     server = uvicorn.Server(server_config)
     server_task = asyncio.create_task(server.serve())
@@ -333,8 +653,15 @@ async def run_call(cfg: CallConfig) -> dict[str, Any]:
             public_wss = "ws://" + public_https[len("http://"):]
         else:
             public_wss = public_https
-        state.public_ws_url = public_wss + "/ws"  # type: ignore[attr-defined]
+        state.public_ws_url = public_wss + "/ws"
         twiml_url = public_https + "/twiml"
+
+        # Wait for the public tunnel to actually route to our server before
+        # dialling. A freshly-created trycloudflare tunnel returns its URL
+        # before the edge can reach us; calling Twilio too early makes its
+        # TwiML fetch hit a dead tunnel → instant hangup. Poll /health
+        # through the PUBLIC url until it answers (or give up after ~25s).
+        await _await_tunnel_ready(tunnel, public_https + "/health")
 
         # Place the call via Twilio REST.
         from twilio.rest import Client as TwilioClient  # type: ignore
@@ -362,6 +689,9 @@ async def run_call(cfg: CallConfig) -> dict[str, Any]:
                     fetched = await asyncio.to_thread(
                         twilio_client.calls(state.twilio_call_sid).fetch
                     )
+                    if fetched.status != state.twilio_status:
+                        state.twilio_status = fetched.status
+                        log(f"twilio call status: {fetched.status}")
                     if fetched.status in ("completed", "failed", "no-answer", "canceled", "busy"):
                         state.ended = True
                         state.end_reason = state.end_reason or fetched.status
@@ -413,20 +743,46 @@ async def _run_pipeline(
             FastAPIWebsocketTransport,
         )
         from pipecat.serializers.twilio import TwilioFrameSerializer  # type: ignore
-        from pipecat.frames.frames import (  # type: ignore
-            LLMMessagesFrame,
-            TextFrame,
-            TranscriptionFrame,
-            EndFrame,
+        from pipecat.frames.frames import EndFrame  # type: ignore
+        from pipecat.processors.transcript_processor import TranscriptProcessor  # type: ignore
+        from pipecat.processors.aggregators.openai_llm_context import (  # type: ignore
+            OpenAILLMContext,
+            OpenAILLMContextFrame,
         )
-        from pipecat.processors.frame_processor import FrameDirection, FrameProcessor  # type: ignore
     except ImportError as e:
         log(f"pipecat import failed: {e}")
         state.ended = True
         state.end_reason = "error"
         raise
 
-    serializer = TwilioFrameSerializer(stream_sid="")  # populated when Twilio sends `start`
+    # Twilio Media Streams sends a "connected" frame then a "start" frame
+    # before any audio. The "start" frame carries the real streamSid — which
+    # the serializer MUST use to tag outbound media, or Twilio silently drops
+    # the agent's voice. Read the preamble here (the transport picks up from
+    # the first "media" frame onward).
+    stream_sid = ""
+    call_sid = state.twilio_call_sid
+    try:
+        for _ in range(8):
+            preamble = json.loads(await asyncio.wait_for(websocket.receive_text(), timeout=8))
+            event = preamble.get("event")
+            if event == "start":
+                start = preamble.get("start", {})
+                stream_sid = start.get("streamSid", "") or ""
+                call_sid = start.get("callSid", call_sid)
+                break
+            log(f"twilio stream preamble: {event}")
+    except Exception as e:  # noqa: BLE001
+        log(f"failed to read Twilio stream start frame: {e!r}")
+    log(f"twilio media stream started: streamSid={stream_sid!r} callSid={call_sid!r}")
+
+    # auto_hang_up=False: the runner already owns call teardown via the Twilio
+    # status poll, so the serializer doesn't need REST credentials to hang up.
+    serializer = TwilioFrameSerializer(
+        stream_sid=stream_sid,
+        call_sid=call_sid,
+        params=TwilioFrameSerializer.InputParams(auto_hang_up=False),
+    )
     transport = FastAPIWebsocketTransport(
         websocket=websocket,
         params=FastAPIWebsocketParams(
@@ -437,40 +793,59 @@ async def _run_pipeline(
         ),
     )
 
-    # Transcript tap — intercepts user STT + agent TTS frames and emits.
-    class TranscriptTap(FrameProcessor):
-        async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
-            try:
-                if isinstance(frame, TranscriptionFrame) and getattr(frame, "text", None):
-                    emit_transcript("user", frame.text)
-                elif isinstance(frame, TextFrame) and direction == FrameDirection.DOWNSTREAM:
-                    txt = getattr(frame, "text", "") or ""
-                    if txt.strip():
-                        emit_transcript("agent", txt)
-            except Exception as e:  # noqa: BLE001
-                log(f"transcript tap error: {e}")
-            await self.push_frame(frame, direction)
+    # Clean, role-tagged transcript via Pipecat's built-in TranscriptProcessor.
+    # The earlier hand-rolled tap matched EVERY downstream TextFrame, so it
+    # captured the agent's speech twice — once as sentence-level LLMTextFrames
+    # and again as word-level TTSTextFrames (the "word-by-word" spam in the
+    # log). The built-in processor aggregates per turn and emits exactly one
+    # message per completed turn, already normalised to role=user/assistant.
+    transcript = TranscriptProcessor()
 
-    tap = TranscriptTap()
+    @transcript.event_handler("on_transcript_update")
+    async def _on_transcript(_proc: Any, frame: Any) -> None:  # noqa: ANN401
+        for msg in getattr(frame, "messages", []) or []:
+            text = (getattr(msg, "content", "") or "").strip()
+            if not text:
+                continue
+            # Our wire protocol uses "agent"/"user"; the processor uses
+            # the LLM-standard "assistant"/"user".
+            speaker = "agent" if getattr(msg, "role", "") == "assistant" else "user"
+            emit_transcript(speaker, text)
+
     messages = [{"role": "system", "content": system_prompt}]
 
-    # Pipeline shape: phone audio → STT → tap → LLM → TTS → tap → phone audio
+    # The context aggregator is what makes this a CONVERSATION rather than a
+    # single greeting. `.user()` (placed after STT) accumulates the caller's
+    # TranscriptionFrames and, on end-of-turn, pushes the full context to the
+    # LLM to generate a reply; `.assistant()` (at the very tail) records the
+    # bot's own spoken text back into that context so the next turn has history.
+    # Without it the LLM fires exactly once on the kickoff frame and then goes
+    # deaf — which is exactly the "spoke once, never heard me" symptom.
+    context = OpenAILLMContext(messages)
+    context_aggregator = llm.create_context_aggregator(context)
+
+    # Pipeline shape:
+    #   phone audio → STT → user-transcript → user-agg → LLM → TTS
+    #     → output → assistant-transcript → assistant-agg
     pipeline = Pipeline(
         [
             transport.input(),
             stt,
-            tap,
+            transcript.user(),
+            context_aggregator.user(),
             llm,
             tts,
-            tap,
             transport.output(),
+            transcript.assistant(),
+            context_aggregator.assistant(),
         ]
     )
     task = PipelineTask(pipeline)
     holder["task"] = task
 
-    # Seed the LLM with the system prompt + an opening hint to start talking.
-    await task.queue_frame(LLMMessagesFrame(messages))
+    # Kick off by pushing the context (system prompt) through the aggregator so
+    # the bot opens the call. Every later turn is driven by the user aggregator.
+    await task.queue_frame(OpenAILLMContextFrame(context))
 
     runner = PipelineRunner(handle_sigint=False)
     holder["runner"] = runner
@@ -543,6 +918,9 @@ def _post_call_judge_sync(cfg: CallConfig, transcript_text: str) -> tuple[str, s
                 headers={
                     "Authorization": f"Bearer {cfg.llm['api_key']}",
                     "Content-Type": "application/json",
+                    # See _warm_llm_blocking: default urllib UA is 403'd by
+                    # Cloudflare-fronted providers; send a normal one.
+                    "User-Agent": "athen-voice/1.0",
                 },
                 method="POST",
             )
@@ -591,6 +969,15 @@ def _build_result(cfg: CallConfig, state: CallState) -> dict[str, Any]:
         "duration_s": duration_s,
         "cost_estimate_usd": _cost_estimate(duration_s),
         "summary": summary,
+        # Raw signals for diagnosing connected-but-no-audio calls:
+        #   twilio_status == "completed" + answered=False + twiml_fetched=True
+        #     → callee picked up, tunnel reachable, but the wss media-stream
+        #       leg never opened (the leg that 31920 used to kill on ngrok).
+        #   twiml_fetched=False → Twilio never reached our tunnel (DNS/edge)
+        #       OR the call was never answered at all.
+        "answered": state.answered,
+        "twiml_fetched": state.twiml_fetched,
+        "twilio_status": state.twilio_status,
     }
 
 
