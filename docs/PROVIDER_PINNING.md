@@ -25,6 +25,10 @@ provider." Breaking in-flight arcs is collateral damage, not the goal.
 
 **Status:** SHIPPED end-to-end (2026-05-23). Pin store + resolver + per-arc router all load-bearing. Earlier landing (2026-05-19) only plumbed the pin into compaction/temperature lookups — actual per-arc routing wasn't load-bearing until the 2026-05-23 fix.
 
+**2026-05-31 fixes (two pinning bugs found via a mixed-provider Bundle):**
+- **Keyless per-arc router.** `arc_router_for`'s slow path rebuilt a router from `load_config()`, which is NOT vault-hydrated, so any vault-backed provider (deepseek, anthropic, google, keyed opencode_go) was built with `auth = None` → every call 4xx'd with "Missing API key". The global Bundle router was unaffected because it's built from hydrated providers. Fix: `arc_router_for` is now `async` and takes `vault`; the slow path hydrates the single target provider via `vault_creds::hydrate_one_provider_from_vault` before building. Bit users only once the active/primary provider diverged from a pinned arc's provider (e.g. a mixed Bundle where Fast=deepseek but an existing arc was pinned to opencode_go).
+- **Stale pin leak → behaves "persistent".** Pins are task-scoped (set on first LLM call, cleared at task end on every success/error path), but a task killed/crashed before clearing strands the pin on the arc row, and the next task *inherits* it (`set_pinned_provider_if_unset` only writes when unset) — silently freezing the arc to an old provider across a Bundle switch. Fix: `ArcStore::clear_all_provider_pins` swept once at app startup (`lib.rs` setup, right after `AppState::new`) — nothing is in-flight at boot, so any pin at rest is stale by definition.
+
 Live today:
 - `ArcMeta.pinned_provider_id` + `ArcMeta.pinned_slug` columns at `crates/athen-persistence/src/arcs.rs` (~lines 115/123), with `init_schema` migration that `ALTER TABLE`-adds them to legacy DBs (~lines 342-348).
 - Lifecycle methods `set_pinned_provider_if_unset` (~line 690, idempotent on first call) and `clear_pinned_provider` (~line 719).

@@ -804,11 +804,12 @@ pub(crate) fn build_subagent_factories(
             // Snapshot the global router + arc store, drop the State borrow,
             // then resolve the sub-arc's effective provider and build its
             // per-arc router (honoring the pin propagated by delegation).
-            let (global_router, arc_store) = {
+            let (global_router, arc_store, vault) = {
                 let state = h.state::<AppState>();
                 (
                     Arc::clone(&state.router),
                     state._database.as_ref().map(|db| db.arc_store()),
+                    state.vault.clone(),
                 )
             };
             let cfg = load_config();
@@ -821,7 +822,7 @@ pub(crate) fn build_subagent_factories(
                 &cfg,
             )
             .await;
-            arc_router_for(&global_router, &target, &active_id, &cfg)
+            arc_router_for(&global_router, &target, &active_id, &cfg, vault.as_ref()).await
         })
     });
     (Some(reg), Some(rt))
@@ -2922,7 +2923,9 @@ impl AppState {
                         &effective_target,
                         &active_id_now,
                         &cfg_for_resolvers,
-                    );
+                        vault_snapshot.as_ref(),
+                    )
+                    .await;
                     let ctx = crate::commands::ApprovedTaskCtx {
                         coordinator: Arc::clone(&coordinator),
                         router: arc_router,
@@ -4889,25 +4892,49 @@ fn build_router_for_provider_from_config_with_pinned_slug(
 /// the duration of the executor run; once the task completes and
 /// `clear_provider_pin_for_arc` fires, the next dispatch on the same arc
 /// resolves back to the global router via the no-pin branch.
-pub(crate) fn arc_router_for(
+pub(crate) async fn arc_router_for(
     global_router: &Arc<tokio::sync::RwLock<Arc<DefaultLlmRouter>>>,
     target: &EffectiveProviderTarget,
     active_provider_id: &str,
     config: &AthenConfig,
+    vault: Option<&Arc<dyn athen_core::traits::vault::Vault>>,
 ) -> Arc<tokio::sync::RwLock<Arc<DefaultLlmRouter>>> {
     // No pin in force AND no provider switch ⇒ keep using the shared
     // global router. This is the fast path on the very first call of an
     // arc (resolver returns `pinned_slug: None` immediately after
     // installing the pin — see `resolve_effective_provider_for_arc`)
-    // and on every call of an arc that was never pinned.
+    // and on every call of an arc that was never pinned. The global
+    // router is built with vault-hydrated credentials, so no vault touch
+    // here.
     if target.pinned_slug.is_none() && target.provider_id == active_provider_id {
         return Arc::clone(global_router);
     }
-    let (router, _model) = build_router_for_provider_from_config_with_pinned_slug(
-        &target.provider_id,
-        config,
-        target.pinned_slug.as_deref(),
-    );
+    // Per-arc (slow) path. `config` here comes from `load_config()`, which
+    // is NOT vault-hydrated — vault-backed providers carry `auth = None`.
+    // Hydrate the single provider we're about to build for, otherwise the
+    // rebuilt router is keyless and every call fails with "Missing API
+    // key" (the global router above does not have this problem because it
+    // was built from hydrated providers). See `docs/PROVIDER_PINNING.md`.
+    let (router, _model) = if vault.is_some() {
+        let mut cfg = config.clone();
+        crate::vault_creds::hydrate_one_provider_from_vault(
+            vault,
+            &mut cfg.models,
+            &target.provider_id,
+        )
+        .await;
+        build_router_for_provider_from_config_with_pinned_slug(
+            &target.provider_id,
+            &cfg,
+            target.pinned_slug.as_deref(),
+        )
+    } else {
+        build_router_for_provider_from_config_with_pinned_slug(
+            &target.provider_id,
+            config,
+            target.pinned_slug.as_deref(),
+        )
+    };
     Arc::new(tokio::sync::RwLock::new(router))
 }
 

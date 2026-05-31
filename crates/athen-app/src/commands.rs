@@ -248,7 +248,9 @@ fn spawn_router_approval(
             &effective_target,
             &bg_ctx.active_provider_id_snapshot,
             &cfg_for_resolvers,
-        );
+            bg_ctx.vault.as_ref(),
+        )
+        .await;
 
         let ctx = ApprovedTaskCtx {
             coordinator: bg_ctx.coordinator,
@@ -2585,7 +2587,9 @@ pub async fn send_message(
                 &effective_target,
                 &active_id_for_router,
                 &cfg_for_arc_router,
-            );
+                state.vault.as_ref(),
+            )
+            .await;
 
             // Build executor with real tool execution (same as athen-cli).
             let exec_router: Box<dyn LlmRouter> =
@@ -3148,7 +3152,9 @@ pub async fn approve_task(
         &effective_target,
         &active_provider_id_snapshot,
         &cfg_for_resolvers,
-    );
+        state.vault.as_ref(),
+    )
+    .await;
 
     let ctx = ApprovedTaskCtx {
         coordinator: Arc::clone(&state.coordinator),

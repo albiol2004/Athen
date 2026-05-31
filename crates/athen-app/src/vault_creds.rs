@@ -105,6 +105,33 @@ pub async fn hydrate_secrets_from_vault(
     hydrate_models_from_vault(Some(v), &mut config.models).await;
 }
 
+/// Patch a *single* provider's api_key from the vault.
+///
+/// The targeted counterpart to [`hydrate_models_from_vault`]: the per-arc
+/// router build path (`state::arc_router_for`) rebuilds a router for one
+/// provider from a non-hydrated `load_config()`, so without this the
+/// rebuilt router is keyless and every call 4xxs with "Missing API key"
+/// for vault-backed providers. Only the one provider we're about to build
+/// is touched — no point paying N keychain reads for a one-provider
+/// rebuild.
+pub async fn hydrate_one_provider_from_vault(
+    vault: Option<&Arc<dyn Vault>>,
+    models: &mut athen_core::config::ModelsConfig,
+    provider_id: &str,
+) {
+    let Some(v) = vault else {
+        return;
+    };
+    let scope = provider_scope(provider_id);
+    if let Ok(Some(key)) = v.get(&scope, KEY_API_KEY).await {
+        if !key.is_empty() {
+            if let Some(p) = models.providers.get_mut(provider_id) {
+                p.auth = athen_core::config::AuthType::ApiKey(key);
+            }
+        }
+    }
+}
+
 /// Patch each provider's api_key from the vault.
 ///
 /// Equivalent to the provider loop in [`hydrate_secrets_from_vault`] but
