@@ -9,6 +9,9 @@ Source0:        %{url}/archive/refs/tags/v%{version}.tar.gz#/%{name}-%{version}.
 
 BuildRequires:  rust >= 1.77
 BuildRequires:  cargo
+# C++ toolchain: fastembed -> tokenizers -> esaxx-rs compiles esaxx.cpp via cc,
+# which links libstdc++. Without this the link fails with "cannot find -lstdc++".
+BuildRequires:  gcc-c++
 BuildRequires:  pkgconf-pkg-config
 BuildRequires:  webkit2gtk4.1-devel
 BuildRequires:  gtk3-devel
