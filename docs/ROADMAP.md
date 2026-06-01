@@ -28,6 +28,8 @@ Things being built right now.
 
 - **Calendar sources & bidirectional sync.** [SHIPPED 2026-05-15] CalDAV adapter syncs remote calendars (iCloud, Google-via-CalDAV, Fastmail, Nextcloud, Yandex, on-prem Exchange) into local store. Agent calendar_create/update/delete now push back to remote (2026-05-17). Settings → Connections → Calendar Sources panel for add/remove/pick-calendars. CardDAV (contacts) deferred.
 
+- **Athen makes phone calls.** [SHIPPED 2026-05-30] The `place_call` agent tool dials a real phone number (Twilio Programmable Voice) and holds a multi-turn spoken conversation toward an objective — STT/TTS via Deepgram + Cartesia, orchestrated by an auto-installed Pipecat runtime, with persona/context injection, live transcript, cost estimate, and an always-on confirmation gate. See `athen-voice` + `crates/athen-app/src/place_call.rs`. Inbound calls and in-app voice dictation are separate, still-exploring features (below).
+
 ## Next
 
 What we're planning to do after Now lands.
@@ -46,7 +48,7 @@ Ideas we like but aren't committed to yet. Feedback here matters most.
 - **Standing instructions for the coordinator.** Tell Athen "for the next 4 hours, reply on Telegram and don't auto-send any emails — just draft them for me to approve when I'm back" once, and every subsequent decision (channel, risk gate, notification routing) honors that until the window expires. The coordinator becomes an agent in its own right with persistent memory, not just a deterministic router. Design captured alongside multi-intent in [docs/MULTI_INTENT_ROUTING.md](MULTI_INTENT_ROUTING.md#adjacent-idea-coordinator-as-agent-with-standing-instructions).
 - **Cloud-hosted Athen.** A managed option for people who don't want their PC running 24/7. You'd still own your data, still bring your own LLM keys; we'd just run the headless instance on a European server so your assistant keeps working when your laptop is closed. Self-hosting stays free and supported regardless.
 - **Google Calendar (read + write).** Pending OAuth verification with Google — a multi-week paperwork process we'll start once Athen has a public homepage and privacy policy live. Read-only via iCal subscription is a possible interim step.
-- **Voice input.** Whisper-based dictation, local or via API.
+- **Voice input (dictation) & inbound calls.** Outbound calling shipped (see *Now*); still exploring the reverse direction — Whisper-based in-app dictation (local or via API) and answering inbound calls.
 - **Local file watching.** Treat your Downloads or Documents folder as a sense — Athen notices when something arrives and offers to act on it.
 - **Matrix and other open chat protocols.** Same model as Telegram: Athen is a participant in your chats, not a hosted service.
 - **Mobile companion app.** Telegram already covers most of this, but a real mobile app would unlock richer notifications and inline approvals.

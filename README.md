@@ -23,7 +23,7 @@ a single native binary you double-click, with a tray icon and a clean
 window — but underneath, a hexagonal Rust core, a real risk model, MCP
 support, and a tool surface you can extend.
 
-> ⚠️ **Status: alpha (v0.2.4) — early but moving fast.** Core agent loop,
+> ⚠️ **Status: alpha (v0.3.3) — early but moving fast.** Core agent loop,
 > tools, risk system, senses, MCP runtime, and infrastructure are working
 > and well-tested. The surface is small on purpose and the UI is being
 > polished release by release. Pre-built binaries are **unsigned** today —
@@ -84,6 +84,7 @@ Chromium fork, no Node runtime, no React-on-Windows quirks.
 | **MCP runtime** — spawn and route any Model Context Protocol server (stdio JSON-RPC) | ✅ |
 | **Senses** — Email (IMAP), Calendar, Telegram, generic User input | ✅ |
 | **Risk system** — regex rules + LLM fallback, base-impact × trust-multiplier scoring | ✅ |
+| **Security modes** — per-arc Bunker / Assistant / Yolo posture, enforced at every approval gate | ✅ |
 | **Sandbox** — OS-native (bwrap/Landlock/sandbox-exec/Job Objects) + Podman/Docker tier | ✅ |
 | **LLM provider routing** — failover, circuit breakers, budget tracker | ✅ |
 | **Auto-update** — minisign-signed in-app updates from GitHub Releases | ✅ |
@@ -93,7 +94,8 @@ Chromium fork, no Node runtime, no React-on-Windows quirks.
 | **Wake-ups / proactive scheduling** — one-shot + recurring agent-triggered or user-scheduled actions, with autonomy-band controls | ✅ |
 | **Generic HTTP tool + 15 cloud API presets** — Jina, Firecrawl, Brave, SerpAPI, DeepL, ElevenLabs, OpenRouter, Groq, ... | ✅ |
 | **Encrypted credential vault** — OS keychain backend + ChaCha20-Poly1305 file fallback | ✅ |
-| **Voice (STT/TTS)** | ❌ planned |
+| **Voice phone calls** — agent-placed outbound calls (`place_call`) via Twilio + Pipecat, STT/TTS, multi-turn, live transcript | ✅ |
+| **Delegation / sub-agents** — `spawn_subagent` runs a scoped task on its own arc with inherited model pin + budget | ✅ |
 | **Headless server mode** — daemon binary for always-on hosts | ❌ planned |
 
 ---
@@ -189,7 +191,7 @@ A built-in tool surface that covers shell, files, memory, web, calendar,
 contacts, email, scheduling, and arbitrary HTTP — plus anything you expose
 through MCP.
 
-- **Shell & files:** `shell_execute`, `shell_spawn` / `kill` / `logs`, `read`, `edit`, `write`, `grep`, `list_directory`
+- **Shell & files:** `shell_execute`, `shell_spawn` / `kill` / `logs`, `read`, `edit`, `write`, `delete_file` (checkpoint-snapshotted, revertable), `grep`, `list_directory`
 - **Memory:** `memory_store`, `memory_recall` (semantic, persistent; dedup at recall + store)
 - **Identity:** `identity_add` — agent can write to your personality / rules / knowledge / team store
 - **Web:** `web_search`, `web_fetch` (static → Jina Reader → Wayback fallback chain)
@@ -199,8 +201,10 @@ through MCP.
 - **Cloud APIs:** `http_request` against any endpoint you register — 15 presets out of the box (Jina, Firecrawl, Brave, SerpAPI, Hunter, Apollo, PDL, DeepL, NewsAPI, Open-Meteo, Frankfurter, OpenCage, ElevenLabs, OpenRouter, Groq); vault-backed credentials, per-endpoint rate limiting
 - **Wake-ups:** `create_wakeup` — agent can schedule one-shot or recurring proactive triggers (reminders, follow-ups, digests), each with its own autonomy band and tool allowlist
 - **Telegram:** `send_telegram` — agent-initiated outbound messages to your Telegram chat
-- **Delegation:** `delegate_to_agent` — spawn a sub-agent with a scoped task, budget, and tool allowlist
+- **Voice:** `place_call` — place an outbound phone call (Twilio + Pipecat); agent converses in a chosen language toward an objective and returns a transcript. Always confirmation-gated
+- **Delegation:** `spawn_subagent` (formerly `delegate_to_agent`, alias kept) — spawn a sub-agent on its own arc with a scoped task, budget, and tool allowlist; inherits the parent's model pin and reasoning effort, deliverable verified before returning
 - **Skills:** `load_skill` — load a user-authored playbook (SKILL.md folder) on demand; listed in the static prefix at startup
+- **Self-support:** `athen_docs` — agent reads Athen's own built-in setup / config / troubleshooting guides
 - **MCP:** any tool from any spawned MCP server, namespaced `<mcp_id>__<tool>`
 
 Full reference in [`docs/TOOLS_AND_SENSES.md`](docs/TOOLS_AND_SENSES.md).
@@ -236,6 +240,11 @@ Athen is built so you don't have to fork it to make it do new things.
 - **Risk system before action.** Every tool call carries a base impact
   (Read / WritePersist) multiplied by contact trust. High-risk actions
   prompt you or require pre-grant.
+- **Security modes you control.** A per-arc **Bunker / Assistant / Yolo**
+  posture sits on top of the risk system: Bunker escalates borderline
+  actions to a confirmation, Assistant is the balanced default, Yolo lets
+  everything short of a hard block run unattended. Set it from the chat
+  header; an agent can never loosen its own posture.
 - **Sandboxed shell.** `shell_execute` is gated by a regex+LLM rule
   engine, then runs in a writable-only-where-allowed sandbox.
 - **Bring your own keys, or none at all.** The local Ollama/llama.cpp
@@ -292,14 +301,19 @@ For a deeper read see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Roadmap
 
-**v0.2.x (current — ongoing polish):**
+**Shipped since v0.2.x:**
+- ✅ Voice phone calls (`place_call` — Twilio + Pipecat, multi-turn, live transcript)
+- ✅ Per-arc security modes (Bunker / Assistant / Yolo)
+- ✅ Provider Bundles + per-arc provider pinning, reasoning-effort control
+- ✅ Hybrid memory (semantic + lexical + graph), sub-agent delegation deep-pass
+
+**v0.3.x (current — ongoing polish):**
 - Code signing (macOS notarization, Windows Trusted Signing)
 - Screenshot tool + screen-capture sense
 - Prompt-cache wiring across providers (Anthropic `cache_control`, Gemini implicit cache, DeepSeek cost UI)
 
-**v0.3:**
+**Next:**
 - `athend` headless server mode (systemd unit, Docker image)
-- Voice (STT / TTS)
 - More senses (Slack, Discord, RSS, generic webhook)
 
 **Bigger picture:**
