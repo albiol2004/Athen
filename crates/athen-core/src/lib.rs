@@ -15,6 +15,7 @@ pub mod llm;
 pub mod notification;
 pub mod paths;
 pub mod profile_routing;
+pub mod redaction;
 pub mod risk;
 pub mod sandbox;
 pub mod skill;
