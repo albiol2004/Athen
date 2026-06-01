@@ -12059,6 +12059,13 @@ if (notificationsBack) {
     notificationsBack.addEventListener('click', hideNotifications);
 }
 
+// Wired here (not inline onclick) so the buttons survive the WebView CSP
+// `script-src 'self'`, which forbids inline event handlers.
+document.getElementById('notifications-mark-all')
+    ?.addEventListener('click', markAllNotificationsRead);
+document.getElementById('notifications-clear-read')
+    ?.addEventListener('click', deleteReadNotifications);
+
 // ─── Contacts ───
 
 const contactsView = document.getElementById('contacts-view');
@@ -12862,6 +12869,27 @@ async function loadMemories() {
 
 function renderMemories(items) {
     const container = document.getElementById('memories-list');
+    if (!container) return;
+    // Delegated click handling, attached once. The per-card Edit/Delete
+    // buttons can't use inline onclick under the WebView CSP (`script-src
+    // 'self'` forbids inline handlers), and the container is re-rendered via
+    // innerHTML, so delegation on the persistent parent is the robust fix.
+    if (!container.dataset.delegated) {
+        container.dataset.delegated = '1';
+        container.addEventListener('click', (ev) => {
+            const editBtn = ev.target.closest('.memory-edit-btn');
+            if (editBtn) {
+                const card = editBtn.closest('.memory-card');
+                if (card) editMemory(card.dataset.id, editBtn);
+                return;
+            }
+            const delBtn = ev.target.closest('.memory-delete-btn');
+            if (delBtn) {
+                const card = delBtn.closest('.memory-card');
+                if (card) deleteMemory(card.dataset.id);
+            }
+        });
+    }
     if (!items || items.length === 0) {
         container.innerHTML = '<div class="empty-state">No memories stored yet. The agent will remember important information from your conversations.</div>';
         return;
@@ -12877,8 +12905,8 @@ function renderMemories(items) {
             '</div>' +
             '<div class="memory-content">' + escapeHtml(item.content) + '</div>' +
             '<div class="memory-actions">' +
-                '<button class="memory-edit-btn" onclick="editMemory(\'' + escapeHtml(item.id) + '\', this)">Edit</button>' +
-                '<button class="memory-delete-btn" onclick="deleteMemory(\'' + escapeHtml(item.id) + '\')">Delete</button>' +
+                '<button class="memory-edit-btn">Edit</button>' +
+                '<button class="memory-delete-btn">Delete</button>' +
             '</div>' +
         '</div>';
     }).join('');
@@ -12932,6 +12960,21 @@ async function loadEntities() {
 
 function renderEntities(entities) {
     const container = document.getElementById('entities-list');
+    if (!container) return;
+    // Delegated click, attached once. CSP forbids the inline onclick the
+    // per-entity delete button used to carry; preventDefault keeps the parent
+    // <details> from toggling when the × is clicked.
+    if (!container.dataset.delegated) {
+        container.dataset.delegated = '1';
+        container.addEventListener('click', (ev) => {
+            const delBtn = ev.target.closest('.entity-delete-btn');
+            if (delBtn) {
+                ev.preventDefault();
+                const card = delBtn.closest('.entity-card');
+                if (card) deleteEntity(card.dataset.id);
+            }
+        });
+    }
     if (!entities || entities.length === 0) {
         container.innerHTML = '<div class="empty-state">No entities discovered yet. The agent extracts people, organizations, and concepts from your conversations.</div>';
         return;
@@ -12978,7 +13021,7 @@ function renderEntities(entities) {
                 (e.relations && e.relations.length > 0
                     ? '<span class="entity-rel-count">' + e.relations.length + ' rel</span>'
                     : '') +
-                '<button class="entity-delete-btn" onclick="event.preventDefault(); deleteEntity(\'' + escapeHtml(e.id) + '\')">×</button>' +
+                '<button class="entity-delete-btn">×</button>' +
             '</summary>' +
             detailsHtml +
         '</details>';
