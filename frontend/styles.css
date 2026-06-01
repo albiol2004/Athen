@@ -77,6 +77,10 @@
 
     /* glass */
     --glass-bg:      rgba(19, 18, 18, 0.50);
+    /* Stronger variant for free-floating surfaces (toasts, slide-out rails)
+       that sit over arbitrary app content — keeps the blur but raises opacity
+       so text stays legible regardless of what's behind them. */
+    --glass-bg-strong: rgba(19, 18, 18, 0.92);
     --glass-blur:    blur(16px) saturate(1.4);
     --glass-border:  rgba(255, 255, 255, 0.06);
     --glass-shimmer: rgba(255, 255, 255, 0.04) 0px 1px 0px 0px inset;
@@ -132,6 +136,7 @@
 
     /* glass */
     --glass-bg:      rgba(255, 255, 255, 0.55);
+    --glass-bg-strong: rgba(255, 255, 255, 0.95);
     --glass-blur:    blur(24px) saturate(1.6);
     --glass-border:  rgba(0, 0, 0, 0.06);
     --glass-shimmer: rgba(255, 255, 255, 0.9) 0px 1px 0px 0px inset;
@@ -5424,7 +5429,7 @@ option:hover {
     position: relative;
     min-width: 280px;
     max-width: 360px;
-    background: var(--glass-bg);
+    background: var(--glass-bg-strong);
     backdrop-filter: var(--glass-blur);
     -webkit-backdrop-filter: var(--glass-blur);
     border: 1px solid var(--glass-border);
@@ -8782,7 +8787,7 @@ option:hover {
     bottom: 0;
     width: 360px;
     max-width: 92vw;
-    background: var(--glass-bg);
+    background: var(--glass-bg-strong);
     backdrop-filter: var(--glass-blur);
     -webkit-backdrop-filter: var(--glass-blur);
     border-left: 1px solid var(--glass-border);
@@ -9830,4 +9835,111 @@ option:hover {
     color: var(--text);
     white-space: pre-wrap;
     word-break: break-word;
+}
+
+/* ---- place_call card v2: polished header, meta, transcript ---------- *
+ * Appended (not edited inline) so we stay clear of concurrently-edited
+ * rules earlier in this file. These come last in the cascade, so they
+ * refine / win over the base .place-call-* rules above. */
+
+/* Header: rounded brand-tinted icon chip + eyebrow/callee stack + pill. */
+.place-call-card .place-call-header {
+    align-items: flex-start;
+    gap: 10px;
+}
+.place-call-icon {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    border-radius: var(--r-sm, 8px);
+    color: var(--brand-warm, var(--brand-solid));
+    background: var(--brand-grad-soft);
+    border: 1px solid var(--brand-glow-strong);
+    box-shadow: var(--glass-shimmer);
+}
+.place-call-icon svg { width: 16px; height: 16px; }
+.place-call-headtext {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+    flex: 1 1 auto;
+}
+.place-call-eyebrow {
+    font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    font-weight: 600;
+    color: var(--text-3);
+}
+.place-call-callee {
+    font-family: var(--mono);
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text);
+    word-break: break-all;
+}
+
+/* Live status pill: pulsing dot + lozenge, aligned to the header top. */
+.place-call-pill {
+    flex: 0 0 auto;
+    gap: 6px;
+    margin-top: 1px;
+}
+.place-call-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 999px;
+    background: currentColor;
+    box-shadow: 0 0 0 0 currentColor;
+    animation: place-call-pulse 1.4s ease-out infinite;
+}
+@keyframes place-call-pulse {
+    0%   { box-shadow: 0 0 0 0 rgba(132, 179, 214, 0.45); opacity: 1; }
+    70%  { box-shadow: 0 0 0 5px rgba(132, 179, 214, 0); opacity: 0.7; }
+    100% { box-shadow: 0 0 0 0 rgba(132, 179, 214, 0); opacity: 1; }
+}
+
+/* Metadata grid (objective / language / duration / cost / briefing). */
+.place-call-fields {
+    margin: 2px 0 0;
+}
+
+/* Empty-transcript hint. */
+.place-call-empty {
+    font-size: 12px;
+    color: var(--text-3);
+    font-style: italic;
+    padding: 2px 2px;
+}
+
+/* "athen is speaking" typing indicator while the call is live. */
+.place-call-typing .place-call-typing-dots {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    height: 14px;
+    padding: 2px 0;
+}
+.place-call-typing-dots span {
+    width: 5px;
+    height: 5px;
+    border-radius: 999px;
+    background: var(--text-3);
+    animation: place-call-typing 1.2s ease-in-out infinite;
+}
+.place-call-typing-dots span:nth-child(2) { animation-delay: 0.18s; }
+.place-call-typing-dots span:nth-child(3) { animation-delay: 0.36s; }
+@keyframes place-call-typing {
+    0%, 60%, 100% { opacity: 0.25; transform: translateY(0); }
+    30%           { opacity: 0.9;  transform: translateY(-2px); }
+}
+
+/* Honor reduced-motion: drop the pulse + typing animations. */
+@media (prefers-reduced-motion: reduce) {
+    .place-call-dot,
+    .place-call-typing-dots span { animation: none; }
 }

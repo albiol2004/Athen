@@ -348,7 +348,7 @@ dependencies = [
 
 [[package]]
 name = "athen-app"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "arc-swap",
  "async-trait",

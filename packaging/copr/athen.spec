@@ -1,5 +1,5 @@
 Name:           athen
-Version:        0.3.3
+Version:        0.3.4
 Release:        1%{?dist}
 Summary:        Universal proactive AI agent (Tauri 2 desktop app)
 
@@ -94,6 +94,9 @@ rm %{buildroot}/Athen.desktop
 %{_datadir}/icons/hicolor/*/apps/athen-app.png
 
 %changelog
+* Mon Jun 01 2026 Alejandro Garcia <contact@alejandrogarcia.blog> - 0.3.4-1
+- Release 0.3.4
+
 * Sun May 31 2026 Alejandro Garcia <contact@alejandrogarcia.blog> - 0.3.3-1
 - Release 0.3.3
 
