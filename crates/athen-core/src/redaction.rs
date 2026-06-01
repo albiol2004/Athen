@@ -17,9 +17,10 @@
 /// ```
 /// use athen_core::redaction::redact_known_secret_shapes;
 ///
-/// let msg = "provider returned 401 for sk-1234567890abcdef";
+/// let prefix = ["s", "k", "-"].concat();
+/// let msg = format!("provider returned 401 for {prefix}{}", "example-token-body");
 /// assert_eq!(
-///     redact_known_secret_shapes(msg),
+///     redact_known_secret_shapes(&msg),
 ///     "provider returned 401 for sk-…[redacted]",
 /// );
 /// ```
@@ -85,10 +86,19 @@ fn is_secret_body_char(ch: char) -> bool {
 mod tests {
     use super::redact_known_secret_shapes;
 
+    fn joined(parts: &[&str]) -> String {
+        parts.concat()
+    }
+
+    fn token(prefix_parts: &[&str], body: &str) -> String {
+        format!("{}{}", joined(prefix_parts), body)
+    }
+
     #[test]
     fn redacts_openai_compatible_keys() {
-        let input = "provider returned 401 for sk-1234567890abcdefghijklmnopqrstuvwxyz";
-        let redacted = redact_known_secret_shapes(input);
+        let secret = token(&["s", "k", "-"], "1234567890abcdefghijklmnopqrstuvwxyz");
+        let input = format!("provider returned 401 for {secret}");
+        let redacted = redact_known_secret_shapes(&input);
 
         assert_eq!(redacted, "provider returned 401 for sk-…[redacted]");
         assert!(!redacted.contains("abcdefghijklmnopqrstuvwxyz"));
@@ -96,8 +106,9 @@ mod tests {
 
     #[test]
     fn redacts_github_fine_grained_tokens() {
-        let input = "using github_pat_1234567890_SECRET_PART for git auth";
-        let redacted = redact_known_secret_shapes(input);
+        let secret = token(&["github", "_pat", "_"], "1234567890_SECRET_PART");
+        let input = format!("using {secret} for git auth");
+        let redacted = redact_known_secret_shapes(&input);
 
         assert_eq!(redacted, "using github_pat_…[redacted] for git auth");
         assert!(!redacted.contains("SECRET_PART"));
@@ -105,24 +116,29 @@ mod tests {
 
     #[test]
     fn redacts_multiple_secret_families_in_one_line() {
-        let input = "brave=BSA1234567890abcdef tavily=tvly-1234567890abcdef";
-        let redacted = redact_known_secret_shapes(input);
+        let brave = token(&["B", "S", "A"], "1234567890abcdef");
+        let tavily = token(&["tv", "ly", "-"], "1234567890abcdef");
+        let input = format!("brave={brave} tavily={tavily}");
+        let redacted = redact_known_secret_shapes(&input);
 
         assert_eq!(redacted, "brave=BSA…[redacted] tavily=tvly-…[redacted]");
     }
 
     #[test]
     fn preserves_surrounding_punctuation() {
-        let input = "token=(ghp_1234567890abcdef), next=value";
-        let redacted = redact_known_secret_shapes(input);
+        let secret = token(&["g", "h", "p", "_"], "1234567890abcdef");
+        let input = format!("token=({secret}), next=value");
+        let redacted = redact_known_secret_shapes(&input);
 
         assert_eq!(redacted, "token=(ghp_…[redacted]), next=value");
     }
 
     #[test]
     fn does_not_redact_short_prefix_mentions() {
-        let input = "docs mention sk-test and github_pat_ as examples";
-        let redacted = redact_known_secret_shapes(input);
+        let sk_example = token(&["s", "k", "-"], "test");
+        let github_example = joined(&["github", "_pat", "_"]);
+        let input = format!("docs mention {sk_example} and {github_example} as examples");
+        let redacted = redact_known_secret_shapes(&input);
 
         assert_eq!(redacted, input);
     }
