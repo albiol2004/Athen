@@ -1,20 +1,19 @@
 # cargo-deny configuration.
 #
-# Run with `cargo deny check` (install: `cargo install cargo-deny --locked`).
-# Currently used for advisory triage; CI integration is not wired up yet.
+# Run with `cargo deny check advisories` (install: `cargo install cargo-deny --locked`).
+# Wired into CI as the "Cargo deny" job in .github/workflows/ci.yml.
 
 [advisories]
 version = 2
 yanked = "warn"
+# Only flag `unmaintained` advisories for crates the workspace depends on
+# directly — not the deep transitive ones we have no power to fix and that
+# carry no active vulnerability: gtk-rs (×11, via Tauri's GTK3 stack), unic-*
+# (×5, via tauri-utils -> urlpattern), and paste / proc-macro-error / fxhash
+# (via assorted proc-macro deps). Vulnerability and unsound advisories still
+# hard-fail regardless of scope, so real security issues are never silenced.
+unmaintained = "workspace"
 ignore = [
-    # RUSTSEC-2024-0429 — glib `VariantStrIter::impl_get` unsoundness.
-    #
-    # Affected: glib >=0.15.0, <0.20.0  |  Patched: >=0.20.0
-    # We are on glib 0.18.5, transitively via tauri 2.10.3 -> gtk 0.18.2.
-    # No workspace crate uses VariantStrIter directly; the unsound code path
-    # is only reachable through gtk-rs internals (e.g. GSettings/DBus Variant
-    # iteration). Tauri 2.x has not bumped its gtk-rs pin, and no 0.18.x
-    # backport of the fix exists on crates.io. Re-evaluate when Tauri moves
-    # to gtk-rs >= 0.19 (which pulls glib >= 0.20).
-    { id = "RUSTSEC-2024-0429", reason = "transitive via tauri->gtk 0.18; no workspace use of VariantStrIter; no upstream fix available without forking" },
+    # (none — RUSTSEC-2024-0429 glib unsoundness dropped: Tauri 2.11 pulls a
+    # patched glib, so the advisory no longer matches any crate in the tree.)
 ]
