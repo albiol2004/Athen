@@ -25,17 +25,17 @@
 /// ```
 pub fn redact_known_secret_shapes(input: &str) -> String {
     const PREFIXES: &[&str] = &[
-        "sk-",          // OpenAI-compatible providers
-        "github_pat_",  // GitHub fine-grained PATs
-        "ghp_",         // GitHub classic PATs
-        "gho_",         // GitHub OAuth tokens
-        "ghu_",         // GitHub user-to-server tokens
-        "ghs_",         // GitHub server-to-server tokens
-        "ghr_",         // GitHub refresh tokens
-        "xoxb-",        // Slack bot tokens
-        "xoxp-",        // Slack user tokens
-        "BSA",          // Brave Search API keys
-        "tvly-",        // Tavily API keys
+        "sk-",         // OpenAI-compatible providers
+        "github_pat_", // GitHub fine-grained PATs
+        "ghp_",        // GitHub classic PATs
+        "gho_",        // GitHub OAuth tokens
+        "ghu_",        // GitHub user-to-server tokens
+        "ghs_",        // GitHub server-to-server tokens
+        "ghr_",        // GitHub refresh tokens
+        "xoxb-",       // Slack bot tokens
+        "xoxp-",       // Slack user tokens
+        "BSA",         // Brave Search API keys
+        "tvly-",       // Tavily API keys
     ];
 
     let mut redacted = input.to_owned();
