@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use crate::ui_bridge::UiBridge;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 use uuid::Uuid;
@@ -172,7 +172,7 @@ impl ProactiveHintChecker {
     pub async fn check_and_emit(
         &self,
         ctx: HintContext,
-        app_handle: &AppHandle,
+        app_handle: &UiBridge,
         notifier: Option<&Arc<crate::notifier::NotificationOrchestrator>>,
     ) {
         let permanent = match self.store.list_permanent().await {
@@ -211,7 +211,7 @@ impl ProactiveHintChecker {
         info!(hint_id = %hint.hint_id, "Emitting proactive hint");
 
         // Emit as a Tauri event so the frontend renders a hint card.
-        let _ = app_handle.emit("proactive-hint", hint);
+        app_handle.emit("proactive-hint", hint);
 
         // Also deliver through the notifier for Telegram-away delivery.
         if let Some(notifier) = notifier {

@@ -41,6 +41,7 @@ pub(crate) mod skills_render;
 pub(crate) mod spawn_pidfile;
 pub(crate) mod state;
 pub(crate) mod telegram_progress;
+pub(crate) mod ui_bridge;
 pub(crate) mod telephony_gate;
 pub(crate) mod vault_creds;
 pub(crate) mod voice;
@@ -334,19 +335,21 @@ pub fn run() {
                     .await;
             });
 
-            // Initialize the notification orchestrator (needs AppHandle for InApp channel).
-            state.init_notifier(app.handle().clone());
+            // Initialize the notification orchestrator (InApp channel is
+            // wired because we have a real Tauri handle here).
+            let ui = crate::ui_bridge::UiBridge::Tauri(app.handle().clone());
+            state.init_notifier(ui.clone());
 
             // Initialize the live agent registry. Needs AppHandle for the
             // `agents-changed` event the FE listens to. Wired here (between
             // notifier and approval_router) so every executor entry point
             // sees a Some(registry) on the AppState by the time it runs.
-            state.init_agent_registry(app.handle().clone());
+            state.init_agent_registry(ui.clone());
 
             // Initialize the approval router (InApp + Telegram sinks). Must
             // come before start_telegram_monitor so the poll loop can pick
             // up the Telegram sink for callback resolution.
-            state.init_approval_router(app.handle().clone());
+            state.init_approval_router(ui.clone());
 
             // Migrate the legacy TelegramConfig::owner_user_id into the
             // unified contact store BEFORE any sense monitor starts —
@@ -367,10 +370,10 @@ pub fn run() {
             }
 
             // Start background monitor tasks before managing state.
-            state.start_email_monitor(app.handle().clone());
-            state.start_calendar_monitor(app.handle().clone());
+            state.start_email_monitor(ui.clone());
+            state.start_calendar_monitor(ui.clone());
             state.start_calendar_sync(Some(app.handle().clone()));
-            state.start_telegram_monitor(app.handle().clone());
+            state.start_telegram_monitor(ui.clone());
 
             // Sweep attachment bytes past the policy TTL. Cheap, runs
             // hourly, only deletes the bytes — extracted-text sidecars
@@ -381,13 +384,13 @@ pub fn run() {
             // after the agent has been registered with the coordinator's
             // dispatcher (above), otherwise dispatch_next_with_task
             // can't assign anything.
-            state.start_dispatch_loop(app.handle().clone());
+            state.start_dispatch_loop(ui.clone());
 
             // Spawn the wake-up scheduler loop. Phase 3a uses a logging
             // sink that persists a system arc entry on each fire — Phase
             // 3b will swap in a coordinator-backed sink that turns fires
             // into Tasks.
-            state.start_wakeup_scheduler(app.handle().clone());
+            state.start_wakeup_scheduler(ui.clone());
 
             // Sweep finalized agent_runs older than 30 days. Cheap; runs
             // once at startup and then every 6 hours.
@@ -395,7 +398,7 @@ pub fn run() {
 
             // Start proactive help hint checker. Runs 60s after startup
             // then every 15 min; rate-limits to 1 hint per hour.
-            state.start_proactive_hint_checker(app.handle().clone());
+            state.start_proactive_hint_checker(ui.clone());
 
             app.manage(state);
 
@@ -413,7 +416,7 @@ pub fn run() {
             // hot-swap it in, so non-technical users get semantic recall
             // without touching Settings. No-op when already present or when
             // the user picked a provider explicitly.
-            state_ref.start_embedder_warmup(app.handle().clone());
+            state_ref.start_embedder_warmup(crate::ui_bridge::UiBridge::Tauri(app.handle().clone()));
 
             let notifier_for_focus = state_ref.notifier.load_full();
             if let Some(window) = app.get_webview_window("main") {

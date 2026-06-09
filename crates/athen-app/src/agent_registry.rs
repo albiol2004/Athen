@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
+use crate::ui_bridge::UiBridge;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -99,17 +99,17 @@ struct AgentEntry {
     cancel_flag: Arc<AtomicBool>,
 }
 
-/// Live registry. Constructed once during app startup with an
-/// [`AppHandle`] for emitting change events and an optional store for
+/// Live registry. Constructed once during app startup with a
+/// [`UiBridge`] for emitting change events and an optional store for
 /// persisting historical runs.
 pub struct AgentRegistry {
-    app: AppHandle,
+    app: UiBridge,
     inner: RwLock<HashMap<Uuid, AgentEntry>>,
     store: Option<Arc<SqliteAgentRunStore>>,
 }
 
 impl AgentRegistry {
-    pub fn new(app: AppHandle, store: Option<Arc<SqliteAgentRunStore>>) -> Arc<Self> {
+    pub fn new(app: UiBridge, store: Option<Arc<SqliteAgentRunStore>>) -> Arc<Self> {
         Arc::new(Self {
             app,
             inner: RwLock::new(HashMap::new()),
@@ -281,7 +281,7 @@ impl AgentRegistry {
         // Bare pulse — the FE re-fetches via `list_active_agents` so the
         // payload schema stays decoupled from this event. Failures here
         // don't matter (no listener attached, or webview is down).
-        let _ = self.app.emit("agents-changed", ());
+        self.app.emit("agents-changed", ());
     }
 }
 

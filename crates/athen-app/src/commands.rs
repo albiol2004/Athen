@@ -11,6 +11,8 @@ use async_trait::async_trait;
 use chrono::Utc;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
+
+use crate::ui_bridge::UiBridge;
 use uuid::Uuid;
 
 use tracing::warn;
@@ -273,7 +275,7 @@ fn spawn_router_approval(
             cancel_flag: bg_ctx.cancel_flag,
             active_arc_id: bg_ctx.active_arc_id,
             inflight: bg_ctx.inflight,
-            app_handle: app_handle.clone(),
+            ui: UiBridge::Tauri(app_handle.clone()),
             turn_id,
             // Bg path doesn't have access to the stashed pending_message
             // (that lives on `&AppState` and only the IPC handler can take
@@ -1440,7 +1442,7 @@ pub(crate) fn new_tool_log() -> ToolLog {
 /// the assistant message that owns them.
 pub(crate) struct TauriAuditor {
     inner: InMemoryAuditor,
-    app_handle: AppHandle,
+    ui: UiBridge,
     arc_store: Option<arcs::ArcStore>,
     arc_id: String,
     turn_id: String,
@@ -1466,7 +1468,7 @@ pub(crate) struct TauriAuditor {
 
 impl TauriAuditor {
     pub(crate) fn new(
-        app_handle: AppHandle,
+        ui: UiBridge,
         arc_store: Option<arcs::ArcStore>,
         arc_id: String,
         turn_id: String,
@@ -1474,7 +1476,7 @@ impl TauriAuditor {
     ) -> Self {
         Self {
             inner: InMemoryAuditor::new(),
-            app_handle,
+            ui,
             arc_store,
             arc_id,
             turn_id,
@@ -1491,7 +1493,7 @@ impl TauriAuditor {
     /// the frontend can render them inline later — but the parent UI's live
     /// progress feed isn't polluted with the sub-agent's intermediate steps.
     pub(crate) fn new_silent(
-        app_handle: AppHandle,
+        ui: UiBridge,
         arc_store: Option<arcs::ArcStore>,
         arc_id: String,
         turn_id: String,
@@ -1499,7 +1501,7 @@ impl TauriAuditor {
     ) -> Self {
         Self {
             inner: InMemoryAuditor::new(),
-            app_handle,
+            ui,
             arc_store,
             arc_id,
             turn_id,
@@ -1823,7 +1825,7 @@ impl StepAuditor for TauriAuditor {
                 ),
                 None => (None, None, None),
             };
-            let _ = self.app_handle.emit(
+            self.ui.emit(
                 "agent-progress",
                 AgentProgress {
                     step: step.index + 1,
@@ -1947,11 +1949,11 @@ impl StepAuditor for TauriAuditor {
 /// Returns the sender half of the channel that should be passed to
 /// `AgentBuilder::stream_sender()`.
 pub(crate) fn spawn_stream_forwarder(
-    app_handle: &AppHandle,
+    ui: &UiBridge,
     arc_id: Option<String>,
 ) -> tokio::sync::mpsc::UnboundedSender<String> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let handle = app_handle.clone();
+    let handle = ui.clone();
     tokio::spawn(async move {
         while let Some(delta) = rx.recv().await {
             // Check for STX prefix (\x02) which marks thinking/reasoning content.
@@ -1960,14 +1962,14 @@ pub(crate) fn spawn_stream_forwarder(
             } else {
                 (delta, false)
             };
-            let _ = handle.emit(
+            handle.emit(
                 "agent-stream",
                 serde_json::json!({ "delta": actual_delta, "is_final": false, "arc_id": arc_id, "is_thinking": is_thinking }),
             );
         }
         // Channel closed -- emit a final marker so the frontend knows
         // the stream is complete.
-        let _ = handle.emit(
+        handle.emit(
             "agent-stream",
             serde_json::json!({ "delta": "", "is_final": true, "arc_id": arc_id, "is_thinking": false }),
         );
@@ -2595,7 +2597,7 @@ pub async fn send_message(
             let exec_router: Box<dyn LlmRouter> =
                 Box::new(SharedRouter(Arc::clone(&arc_router_handle)));
             let registry = state
-                .build_tool_registry(&active_arc, Some(app_handle.clone()))
+                .build_tool_registry(&active_arc, Some(UiBridge::Tauri(app_handle.clone())))
                 .await;
 
             // Pre-allocate the task id so we can register it with the
@@ -2655,7 +2657,7 @@ pub async fn send_message(
             };
 
             let mut auditor = TauriAuditor::new(
-                app_handle.clone(),
+                UiBridge::Tauri(app_handle.clone()),
                 state.arc_store.clone(),
                 active_arc.clone(),
                 turn_id.clone(),
@@ -2669,7 +2671,7 @@ pub async fn send_message(
             // in real time via Tauri events, tagged with the active arc
             // snapshotted at command entry (re-reading would race with a
             // concurrent `switch_arc`).
-            let stream_tx = spawn_stream_forwarder(&app_handle, Some(active_arc.clone()));
+            let stream_tx = spawn_stream_forwarder(&UiBridge::Tauri(app_handle.clone()), Some(active_arc.clone()));
 
             // Per-run cancel flag freshly minted by the registry guard.
             // Each agent has its own — the global `cancel_task` flips
@@ -3177,7 +3179,7 @@ pub async fn approve_task(
         cancel_flag: Arc::clone(&state.cancel_flag),
         active_arc_id: active_arc,
         inflight: state.inflight_approvals.clone(),
-        app_handle: app_handle.clone(),
+        ui: UiBridge::Tauri(app_handle.clone()),
         turn_id: turn_id.clone(),
         message_override,
         approval_router: state.approval_router.clone(),
@@ -3312,7 +3314,7 @@ pub(crate) struct ApprovedTaskCtx {
     pub cancel_flag: Arc<std::sync::atomic::AtomicBool>,
     pub active_arc_id: String,
     pub inflight: crate::state::InflightApprovals,
-    pub app_handle: AppHandle,
+    pub ui: UiBridge,
     pub turn_id: String,
     /// User message override (typically the stashed `pending_message`); the
     /// helper falls back to the coordinator task description when None.
@@ -3819,9 +3821,10 @@ pub(crate) async fn execute_approved_task(
     )
     .await
     {
-        registry = registry
-            .with_telephony(telephony)
-            .with_app_handle(ctx.app_handle.clone());
+        registry = registry.with_telephony(telephony);
+        if let Some(h) = ctx.ui.tauri_handle() {
+            registry = registry.with_app_handle(h.clone());
+        }
     }
     if let Some(ref astore) = ctx.attachment_store {
         registry = registry.with_attachments(astore.clone());
@@ -3834,7 +3837,7 @@ pub(crate) async fn execute_approved_task(
             ctx.active_arc_id.clone(),
             store.clone(),
             ctx.pending_grants.clone(),
-            Some(ctx.app_handle.clone()),
+            ctx.ui.tauri_handle().cloned(),
         )
         .with_security_mode(ctx.security_mode);
         if let Some(ref sink) = ctx.telegram_approval_sink {
@@ -3897,7 +3900,7 @@ pub(crate) async fn execute_approved_task(
                     ctx.tool_doc_dir.clone(),
                     Arc::clone(&ctx.router),
                     ctx.active_arc_id.clone(),
-                    Some(ctx.app_handle.clone()),
+                    Some(ctx.ui.clone()),
                     subagent_restrictions,
                 );
                 Box::new(crate::delegation::DelegationToolRegistry::new(
@@ -3985,7 +3988,7 @@ pub(crate) async fn execute_approved_task(
     };
 
     let mut auditor = TauriAuditor::new(
-        ctx.app_handle.clone(),
+        ctx.ui.clone(),
         ctx.arc_store.clone(),
         ctx.active_arc_id.clone(),
         ctx.turn_id.clone(),
@@ -3994,7 +3997,7 @@ pub(crate) async fn execute_approved_task(
     if let Some(reg) = ctx.agent_registry.as_ref() {
         auditor = auditor.with_agent_tracking(Arc::clone(reg), task_id_for_run);
     }
-    let stream_tx = spawn_stream_forwarder(&ctx.app_handle, Some(ctx.active_arc_id.clone()));
+    let stream_tx = spawn_stream_forwarder(&ctx.ui, Some(ctx.active_arc_id.clone()));
 
     // Per-run cancel flag from the registry guard. The legacy
     // `ctx.cancel_flag` (still threaded in for backwards compat) is no
@@ -4202,7 +4205,7 @@ pub(crate) async fn execute_approved_task(
             {
                 tracing::warn!(arc = %ctx.active_arc_id, error = %e, "set_goal_blocked failed");
             }
-            let _ = ctx.app_handle.emit(
+            ctx.ui.emit(
                 "arc-updated",
                 serde_json::json!({ "arc_id": ctx.active_arc_id }),
             );
@@ -4210,7 +4213,7 @@ pub(crate) async fn execute_approved_task(
             if let Err(e) = arc_store.clear_user_goal(&ctx.active_arc_id).await {
                 tracing::warn!(arc = %ctx.active_arc_id, error = %e, "clear_user_goal on completion failed");
             }
-            let _ = ctx.app_handle.emit(
+            ctx.ui.emit(
                 "arc-updated",
                 serde_json::json!({ "arc_id": ctx.active_arc_id }),
             );
@@ -4319,7 +4322,7 @@ pub(crate) async fn execute_approved_task(
 
     // Notify the frontend so the sidebar refreshes (mirrors the Telegram
     // owner-message handler — relevant when the bg path drives this).
-    let _ = ctx.app_handle.emit(
+    ctx.ui.emit(
         "arc-updated",
         serde_json::json!({ "arc_id": ctx.active_arc_id }),
     );
@@ -4961,9 +4964,10 @@ pub(crate) async fn execute_dispatched_task(
     )
     .await
     {
-        registry = registry
-            .with_telephony(telephony)
-            .with_app_handle(ctx.app_handle.clone());
+        registry = registry.with_telephony(telephony);
+        if let Some(h) = ctx.ui.tauri_handle() {
+            registry = registry.with_app_handle(h.clone());
+        }
     }
     if let Some(ref astore) = ctx.attachment_store {
         registry = registry.with_attachments(astore.clone());
@@ -4976,7 +4980,7 @@ pub(crate) async fn execute_dispatched_task(
             arc_id.clone(),
             store.clone(),
             ctx.pending_grants.clone(),
-            Some(ctx.app_handle.clone()),
+            ctx.ui.tauri_handle().cloned(),
         )
         .with_security_mode(ctx.security_mode);
         if let Some(ref sink) = ctx.telegram_approval_sink {
@@ -5029,7 +5033,7 @@ pub(crate) async fn execute_dispatched_task(
                     ctx.tool_doc_dir.clone(),
                     Arc::clone(&ctx.router),
                     arc_id.clone(),
-                    Some(ctx.app_handle.clone()),
+                    Some(ctx.ui.clone()),
                     subagent_restrictions,
                 );
                 Box::new(crate::delegation::DelegationToolRegistry::new(
@@ -5135,7 +5139,7 @@ pub(crate) async fn execute_dispatched_task(
     };
 
     let mut auditor = TauriAuditor::new(
-        ctx.app_handle.clone(),
+        ctx.ui.clone(),
         ctx.arc_store.clone(),
         arc_id.clone(),
         ctx.turn_id.clone(),
@@ -5144,7 +5148,7 @@ pub(crate) async fn execute_dispatched_task(
     if let Some(reg) = ctx.agent_registry.as_ref() {
         auditor = auditor.with_agent_tracking(Arc::clone(reg), task_id_for_run);
     }
-    let stream_tx = spawn_stream_forwarder(&ctx.app_handle, Some(arc_id.clone()));
+    let stream_tx = spawn_stream_forwarder(&ctx.ui, Some(arc_id.clone()));
 
     // Per-run cancel flag from the registry guard (see execute_approved_task
     // for the full rationale on legacy ctx.cancel_flag fallback).
@@ -5335,16 +5339,12 @@ pub(crate) async fn execute_dispatched_task(
             if let Err(e) = arc_store.set_goal_blocked(&arc_id, &reason).await {
                 tracing::warn!(arc = %arc_id, error = %e, "set_goal_blocked failed");
             }
-            let _ = ctx
-                .app_handle
-                .emit("arc-updated", serde_json::json!({ "arc_id": arc_id }));
+            ctx.ui.emit("arc-updated", serde_json::json!({ "arc_id": arc_id }));
         } else if goal_active {
             if let Err(e) = arc_store.clear_user_goal(&arc_id).await {
                 tracing::warn!(arc = %arc_id, error = %e, "clear_user_goal on completion failed");
             }
-            let _ = ctx
-                .app_handle
-                .emit("arc-updated", serde_json::json!({ "arc_id": arc_id }));
+            ctx.ui.emit("arc-updated", serde_json::json!({ "arc_id": arc_id }));
         }
     }
 
@@ -5448,9 +5448,7 @@ pub(crate) async fn execute_dispatched_task(
     let _ = ctx.coordinator.complete_task(coord_task_id).await;
     crate::state::clear_provider_pin_for_arc(ctx.arc_store.as_ref(), &arc_id).await;
 
-    let _ = ctx
-        .app_handle
-        .emit("arc-updated", serde_json::json!({ "arc_id": arc_id }));
+    ctx.ui.emit("arc-updated", serde_json::json!({ "arc_id": arc_id }));
 
     // Completion ping. Only fires on success — early-return error branches
     // above already surfaced their own assistant entry into the arc, and
@@ -7148,7 +7146,7 @@ pub async fn estimate_profile_tokens(
     //    the listed names + schemas are the same either way.
     let arc_id = state.active_arc_id.lock().await.clone();
     let registry = state
-        .build_tool_registry(&arc_id, Some(app_handle.clone()))
+        .build_tool_registry(&arc_id, Some(UiBridge::Tauri(app_handle.clone())))
         .await;
     let tools = registry.list_tools().await.unwrap_or_default();
 

@@ -2126,7 +2126,7 @@ pub async fn save_email_settings(
     save_main_config(&config)?;
     // Stop + respawn the IMAP monitor so server/credential/interval/enabled
     // changes apply without a restart.
-    state.restart_email_monitor(app_handle);
+    state.restart_email_monitor(crate::ui_bridge::UiBridge::Tauri(app_handle));
     Ok("Email settings saved and applied.".to_string())
 }
 
@@ -2448,7 +2448,7 @@ pub async fn save_telegram_settings(
     // respawn the inbound monitor (token/allowlist/interval/enabled), so the
     // whole Telegram subsystem applies without a restart.
     state.reload_telegram_sender().await;
-    state.restart_telegram_monitor(app_handle);
+    state.restart_telegram_monitor(crate::ui_bridge::UiBridge::Tauri(app_handle));
     Ok("Telegram settings saved and applied.".to_string())
 }
 
@@ -3072,7 +3072,7 @@ pub async fn save_notification_settings(
     save_main_config(&config)?;
     // Hot-swap the live notification orchestrator so channel order, quiet
     // hours, and escalation timeout apply without a restart.
-    state.reload_notifier(app_handle).await;
+    state.reload_notifier(crate::ui_bridge::UiBridge::Tauri(app_handle)).await;
     Ok("Notification settings saved and applied.".to_string())
 }
 

@@ -600,7 +600,7 @@ pub(crate) async fn build_telephony_deps(
 pub(crate) async fn assemble_base_app_tool_registry(
     deps: ToolRegistryDeps,
     arc_id: &str,
-    app_handle: Option<tauri::AppHandle>,
+    ui: Option<crate::ui_bridge::UiBridge>,
 ) -> Arc<dyn athen_core::traits::tool::ToolRegistry> {
     // Resolve the active profile's GitHub identity once at registry
     // build time so every shell_execute in this arc uses the same
@@ -730,7 +730,7 @@ pub(crate) async fn assemble_base_app_tool_registry(
             deps.identity_store.clone(),
         )
         .await,
-        app_handle.clone(),
+        ui.as_ref().and_then(|u| u.tauri_handle()).cloned(),
     ) {
         registry = registry.with_telephony(telephony).with_app_handle(handle);
     }
@@ -750,7 +750,7 @@ pub(crate) async fn assemble_base_app_tool_registry(
             arc_id.to_string(),
             grants,
             deps.pending_grants.clone(),
-            app_handle,
+            ui.as_ref().and_then(|u| u.tauri_handle()).cloned(),
         )
         .with_security_mode(security_mode);
         if let Some(ref sink) = deps.telegram_approval_sink {
@@ -763,49 +763,44 @@ pub(crate) async fn assemble_base_app_tool_registry(
 }
 
 /// Build a sub-agent's registry + router factories from the live `AppState`
-/// (reached through the Tauri `AppHandle`). Returns `(None, None)` when no
-/// handle is available (CLI / tests) so delegation falls back to reusing the
-/// parent's base registry + shared router. The factories let the delegation
-/// tool build a registry/router scoped to the sub-agent's own arc + profile.
+/// (reached through the [`crate::ui_bridge::UiBridge`] — Tauri managed state
+/// on desktop, the published headless singleton in daemon mode). Returns
+/// `(None, None)` when no bridge is available (CLI / tests) so delegation
+/// falls back to reusing the parent's base registry + shared router.
 ///
 /// Cost note: the router factory rebuilds a provider router only when the
 /// sub-arc carries a pin that differs from the global active provider
 /// (`arc_router_for`'s fast path returns the shared global cell otherwise).
 /// Delegation is rare, so one build per pinned delegation is acceptable.
 pub(crate) fn build_subagent_factories(
-    app_handle: Option<&tauri::AppHandle>,
+    ui: Option<&crate::ui_bridge::UiBridge>,
 ) -> (
     Option<crate::delegation::SubRegistryFactory>,
     Option<crate::delegation::SubRouterFactory>,
 ) {
-    let Some(handle) = app_handle else {
+    let Some(bridge) = ui else {
         return (None, None);
     };
-    let h_reg = handle.clone();
+    let ui_reg = bridge.clone();
     let reg: crate::delegation::SubRegistryFactory = Arc::new(move |sub_arc, _sub_profile_id| {
-        let h = h_reg.clone();
+        let ui = ui_reg.clone();
         Box::pin(async move {
-            use tauri::Manager;
-            // Snapshot deps and drop the State borrow before awaiting.
-            let deps = {
-                let state = h.state::<AppState>();
-                state.tool_registry_deps()
-            };
-            let base = assemble_base_app_tool_registry(deps, &sub_arc, Some(h.clone())).await;
+            // Snapshot deps and drop the state borrow before awaiting.
+            let deps = ui.app_state().tool_registry_deps();
+            let base = assemble_base_app_tool_registry(deps, &sub_arc, Some(ui.clone())).await;
             Box::new(crate::delegation::ArcRegistryAdapter(base))
                 as Box<dyn athen_core::traits::tool::ToolRegistry>
         })
     });
-    let h_rt = handle.clone();
+    let ui_rt = bridge.clone();
     let rt: crate::delegation::SubRouterFactory = Arc::new(move |sub_arc: String| {
-        let h = h_rt.clone();
+        let ui = ui_rt.clone();
         Box::pin(async move {
-            use tauri::Manager;
-            // Snapshot the global router + arc store, drop the State borrow,
+            // Snapshot the global router + arc store, drop the state borrow,
             // then resolve the sub-arc's effective provider and build its
             // per-arc router (honoring the pin propagated by delegation).
             let (global_router, arc_store, vault) = {
-                let state = h.state::<AppState>();
+                let state = ui.app_state();
                 (
                     Arc::clone(&state.router),
                     state._database.as_ref().map(|db| db.arc_store()),
@@ -843,10 +838,10 @@ pub(crate) fn build_delegation_context(
     tool_doc_dir: Option<std::path::PathBuf>,
     llm_router: Arc<RwLock<Arc<DefaultLlmRouter>>>,
     parent_arc_id: String,
-    app_handle: Option<tauri::AppHandle>,
+    ui: Option<crate::ui_bridge::UiBridge>,
     wakeup_restrictions: Option<crate::wakeup_registry::WakeupSubagentRestrictions>,
 ) -> crate::delegation::DelegationContext {
-    let (sub_registry_factory, sub_router_factory) = build_subagent_factories(app_handle.as_ref());
+    let (sub_registry_factory, sub_router_factory) = build_subagent_factories(ui.as_ref());
     crate::delegation::DelegationContext {
         profile_store,
         identity_store,
@@ -856,7 +851,7 @@ pub(crate) fn build_delegation_context(
         llm_router,
         parent_arc_id,
         tool_doc_dir,
-        app_handle,
+        ui,
         wakeup_restrictions,
         sub_registry_factory,
         sub_router_factory,
@@ -871,7 +866,7 @@ pub(crate) fn build_delegation_context(
 pub(crate) async fn assemble_app_tool_registry(
     deps: ToolRegistryDeps,
     arc_id: &str,
-    app_handle: Option<tauri::AppHandle>,
+    ui: Option<crate::ui_bridge::UiBridge>,
 ) -> Box<dyn athen_core::traits::tool::ToolRegistry> {
     // Clone the bits the delegation + wake-up wrappers need before `deps` is
     // moved into the base assembler.
@@ -885,7 +880,7 @@ pub(crate) async fn assemble_app_tool_registry(
     let wakeup_store = deps.wakeup_store.clone();
     let approval_router = deps.approval_router.clone();
 
-    let base = assemble_base_app_tool_registry(deps, arc_id, app_handle.clone()).await;
+    let base = assemble_base_app_tool_registry(deps, arc_id, ui.clone()).await;
 
     let with_delegation: Box<dyn athen_core::traits::tool::ToolRegistry> =
         if let (Some(profile_store), Some(arc_store)) = (profile_store, arc_store_for_delegation) {
@@ -898,7 +893,7 @@ pub(crate) async fn assemble_app_tool_registry(
                 tool_doc_dir,
                 router,
                 arc_id.to_string(),
-                app_handle,
+                ui,
                 None,
             );
             Box::new(crate::delegation::DelegationToolRegistry::new(base, ctx))
@@ -1688,20 +1683,21 @@ impl AppState {
     pub async fn build_tool_registry(
         &self,
         arc_id: &str,
-        app_handle: Option<tauri::AppHandle>,
+        ui: Option<crate::ui_bridge::UiBridge>,
     ) -> Box<dyn athen_core::traits::tool::ToolRegistry> {
-        assemble_app_tool_registry(self.tool_registry_deps(), arc_id, app_handle).await
+        assemble_app_tool_registry(self.tool_registry_deps(), arc_id, ui).await
     }
 
     /// Initialize the notification orchestrator.
     ///
-    /// Must be called after `AppState::new()` but before `app.manage()`,
-    /// because it needs the Tauri `AppHandle` to create the `InAppChannel`.
-    /// Channels are built from the current config: InApp is always added,
-    /// Telegram is added only if the bot is configured with an owner.
-    pub fn init_notifier(&mut self, app_handle: tauri::AppHandle) {
+    /// Must be called after `AppState::new()` but before `app.manage()`.
+    /// Channels are built from the current config: InApp is added when a
+    /// Tauri handle exists (desktop mode), Telegram is added only if the
+    /// bot is configured with an owner. Headless mode therefore gets a
+    /// Telegram-only (or empty) channel set.
+    pub fn init_notifier(&mut self, ui: crate::ui_bridge::UiBridge) {
         let config = self.load_hydrated_config_sync();
-        let notifier = Arc::new(self.build_notifier(&config, app_handle));
+        let notifier = Arc::new(self.build_notifier(&config, &ui));
         // Load persisted notifications from a previous session.
         tauri::async_runtime::block_on(notifier.load_persisted());
         self.notifier.store(Some(notifier));
@@ -1714,12 +1710,14 @@ impl AppState {
     fn build_notifier(
         &self,
         config: &athen_core::config::AthenConfig,
-        app_handle: tauri::AppHandle,
+        ui: &crate::ui_bridge::UiBridge,
     ) -> NotificationOrchestrator {
         let mut channels: Vec<Box<dyn NotificationChannel>> = Vec::new();
 
-        // InApp is always available.
-        channels.push(Box::new(InAppChannel::new(app_handle)));
+        // InApp needs a WebView to render into — desktop mode only.
+        if let Some(handle) = ui.tauri_handle() {
+            channels.push(Box::new(InAppChannel::new(handle.clone())));
+        }
 
         // Add Telegram channel if the bot is configured and has an owner.
         if config.telegram.enabled {
@@ -1765,29 +1763,35 @@ impl AppState {
     /// preferred-channel order, quiet hours, and escalation timeout apply
     /// without a restart. Re-loads persisted history from the store so the
     /// swap doesn't drop the notification list.
-    pub(crate) async fn reload_notifier(&self, app_handle: tauri::AppHandle) {
+    pub(crate) async fn reload_notifier(&self, ui: crate::ui_bridge::UiBridge) {
         let mut config = crate::settings::load_main_config_public();
         crate::vault_creds::hydrate_secrets_from_vault(self.vault.as_ref(), &mut config).await;
-        let notifier = Arc::new(self.build_notifier(&config, app_handle));
+        let notifier = Arc::new(self.build_notifier(&config, &ui));
         notifier.load_persisted().await;
         self.notifier.store(Some(notifier));
     }
 
     /// Initialize the approval router and its sinks.
     ///
-    /// Must be called after `AppState::new()` but before `app.manage()`,
-    /// because it needs the Tauri `AppHandle` to create the `InApp`
-    /// sink. The router is wired against the existing arc store so it
-    /// can pick the right channel based on each arc's
+    /// Must be called after `AppState::new()` but before `app.manage()`.
+    /// The InApp sink is created only in desktop mode (it parks a oneshot
+    /// that only the WebView can resolve — wiring it headless would hang
+    /// every approval). The router is wired against the existing arc store
+    /// so it can pick the right channel based on each arc's
     /// `primary_reply_channel` (or its source as a fallback).
-    pub fn init_approval_router(&mut self, app_handle: tauri::AppHandle) {
+    pub fn init_approval_router(&mut self, ui: crate::ui_bridge::UiBridge) {
         use crate::approval::{ApprovalRouter, InAppApprovalSink, TelegramApprovalSink};
         use athen_core::traits::approval::ApprovalSink;
 
         let config = self.load_hydrated_config_sync();
 
-        let inapp = Arc::new(InAppApprovalSink::new(app_handle));
-        let mut sinks: Vec<Arc<dyn ApprovalSink>> = vec![inapp.clone() as Arc<dyn ApprovalSink>];
+        let inapp = ui
+            .tauri_handle()
+            .map(|h| Arc::new(InAppApprovalSink::new(h.clone())));
+        let mut sinks: Vec<Arc<dyn ApprovalSink>> = Vec::new();
+        if let Some(ref s) = inapp {
+            sinks.push(s.clone() as Arc<dyn ApprovalSink>);
+        }
 
         let mut telegram_sink: Option<Arc<TelegramApprovalSink>> = None;
         if config.telegram.enabled {
@@ -1836,7 +1840,7 @@ impl AppState {
         }
 
         self.approval_router = Some(Arc::new(router));
-        self.inapp_approval_sink = Some(inapp);
+        self.inapp_approval_sink = inapp;
         self.telegram_approval_sink = telegram_sink;
 
         info!(
@@ -1849,9 +1853,9 @@ impl AppState {
     /// but before `app.manage()` because it needs an `AppHandle` to emit
     /// `agents-changed` events. Idempotent — re-init replaces the previous
     /// registry, which is fine since live state is also empty at startup.
-    pub fn init_agent_registry(&mut self, app_handle: tauri::AppHandle) {
+    pub fn init_agent_registry(&mut self, ui: crate::ui_bridge::UiBridge) {
         let registry =
-            crate::agent_registry::AgentRegistry::new(app_handle, self.agent_run_store.clone());
+            crate::agent_registry::AgentRegistry::new(ui, self.agent_run_store.clone());
         self.agent_registry = Some(registry);
     }
 
@@ -1890,7 +1894,7 @@ impl AppState {
     /// Runs 60 seconds after startup (to let monitors settle), then every
     /// 15 minutes. Rate-limited internally to at most 1 hint per hour.
     /// Emits a `proactive-hint` Tauri event for the frontend to render.
-    pub fn start_proactive_hint_checker(&self, app_handle: tauri::AppHandle) {
+    pub fn start_proactive_hint_checker(&self, ui: crate::ui_bridge::UiBridge) {
         let Some(store) = self.hint_dismissal_store.clone() else {
             tracing::debug!("No hint_dismissal_store wired; skipping hint checker");
             return;
@@ -1930,7 +1934,7 @@ impl AppState {
                 };
 
                 checker
-                    .check_and_emit(ctx, &app_handle, notifier.as_ref())
+                    .check_and_emit(ctx, &ui, notifier.as_ref())
                     .await;
             }
         });
@@ -1946,7 +1950,7 @@ impl AppState {
     /// LLM for relevance triage.  Only emails classified as `medium` or
     /// `high` relevance are forwarded to the frontend as actionable cards.
     /// Spam and irrelevant messages are silently logged and discarded.
-    pub fn start_email_monitor(&self, app_handle: tauri::AppHandle) {
+    pub fn start_email_monitor(&self, ui: crate::ui_bridge::UiBridge) {
         use athen_core::traits::sense::SenseMonitor;
         use athen_sentidos::email::EmailMonitor;
 
@@ -2009,7 +2013,7 @@ impl AppState {
                                 &profile_store_ref,
                                 &profile_embedder_ref,
                                 &profile_embedding_cache_ref,
-                                &app_handle,
+                                &ui,
                                 notifier.as_ref(),
                                 Some(&coordinator_ref),
                                 Some(&task_arc_map_ref),
@@ -2052,7 +2056,7 @@ impl AppState {
     /// interval/enabled changes apply without an app restart. When the panel
     /// disables email, the old loop is signalled to stop and `start_email_monitor`
     /// returns early — leaving no monitor running.
-    pub fn restart_email_monitor(&self, app_handle: tauri::AppHandle) {
+    pub fn restart_email_monitor(&self, ui: crate::ui_bridge::UiBridge) {
         if let Some(tx) = self
             .email_shutdown
             .lock()
@@ -2061,7 +2065,7 @@ impl AppState {
         {
             let _ = tx.send(());
         }
-        self.start_email_monitor(app_handle);
+        self.start_email_monitor(ui);
     }
 
     /// Start the calendar monitor background task.
@@ -2159,7 +2163,7 @@ impl AppState {
     /// returns). Network failures are non-fatal — we stay on keyword and
     /// retry on the next launch. Runs after `app.manage()` so the task
     /// can fetch the managed `AppState` to call `reload_embedder`.
-    pub fn start_embedder_warmup(&self, app_handle: tauri::AppHandle) {
+    pub fn start_embedder_warmup(&self, ui: crate::ui_bridge::UiBridge) {
         let vault = self.vault.clone();
         tauri::async_runtime::spawn(async move {
             let mut cfg = crate::settings::load_main_config_public();
@@ -2200,12 +2204,11 @@ impl AppState {
                     // saw it (Automatic arm / Bundled arm), nothing to do.
                     return;
                 }
-                use tauri::Emitter;
                 tracing::info!(
                     tier = ?tier,
                     "Embedder warmup: downloading bundled model so memory works out of the box"
                 );
-                let _ = app_handle.emit(
+                ui.emit(
                     "embedding-download-progress",
                     serde_json::json!({
                         "tier": tier,
@@ -2227,7 +2230,7 @@ impl AppState {
                         tracing::info!(
                             "Embedder warmup: bundled model ready; hot-swapping live embedder"
                         );
-                        let _ = app_handle.emit(
+                        ui.emit(
                             "embedding-download-progress",
                             serde_json::json!({
                                 "tier": tier,
@@ -2235,15 +2238,14 @@ impl AppState {
                                 "message": "Local memory ready.",
                             }),
                         );
-                        use tauri::Manager;
-                        app_handle.state::<AppState>().reload_embedder().await;
+                        ui.app_state().reload_embedder().await;
                     }
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
                             "Embedder warmup: download failed; staying on keyword fallback until next launch"
                         );
-                        let _ = app_handle.emit(
+                        ui.emit(
                             "embedding-download-progress",
                             serde_json::json!({
                                 "tier": tier,
@@ -2265,7 +2267,7 @@ impl AppState {
     /// store isn't wired or the loop is already running. Calls
     /// `arm_unscheduled(now)` first so freshly-created rows that lack a
     /// `next_fire_at` get armed before the first tick.
-    pub fn start_wakeup_scheduler(&mut self, app_handle: tauri::AppHandle) {
+    pub fn start_wakeup_scheduler(&mut self, ui: crate::ui_bridge::UiBridge) {
         let Some(store) = self.wakeup_store.clone() else {
             tracing::debug!("No wake-up store wired; skipping scheduler");
             return;
@@ -2292,7 +2294,7 @@ impl AppState {
                 Arc::clone(&self.task_arc_map),
                 Arc::clone(&self.task_wakeup_map),
                 Arc::clone(&self.dispatch_signal),
-                Some(app_handle),
+                Some(ui),
             ));
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         if let Ok(mut guard) = self.wakeup_scheduler_shutdown.lock() {
@@ -2380,7 +2382,7 @@ impl AppState {
         });
     }
 
-    pub fn start_calendar_monitor(&mut self, app_handle: tauri::AppHandle) {
+    pub fn start_calendar_monitor(&mut self, ui: crate::ui_bridge::UiBridge) {
         use athen_core::traits::sense::SenseMonitor;
         use athen_sentidos::calendar::CalendarMonitor;
 
@@ -2443,7 +2445,7 @@ impl AppState {
                                 &profile_store_ref,
                                 &profile_embedder_ref,
                                 &profile_embedding_cache_ref,
-                                &app_handle,
+                                &ui,
                                 notifier.as_ref(),
                                 Some(&coordinator_ref),
                                 Some(&task_arc_map_ref),
@@ -2479,7 +2481,7 @@ impl AppState {
     /// executed through the agent — exactly as if the user typed them in
     /// the chat UI.  Non-owner messages continue through the standard
     /// sense router triage only.
-    pub fn start_telegram_monitor(&self, app_handle: tauri::AppHandle) {
+    pub fn start_telegram_monitor(&self, ui: crate::ui_bridge::UiBridge) {
         use athen_core::traits::sense::SenseMonitor;
         use athen_sentidos::telegram::TelegramMonitor;
 
@@ -2595,7 +2597,7 @@ impl AppState {
                                     // the agent finished some other way.
                                     let text_owned = text.to_string();
                                     let bot_token_c = bot_token.clone();
-                                    let app_handle_c = app_handle.clone();
+                                    let ui_c = ui.clone();
                                     let notifier_c = notifier.clone();
                                     let profile_embedder_c = Arc::clone(&profile_embedder_ref);
                                     let profile_embedding_cache_c =
@@ -2611,7 +2613,7 @@ impl AppState {
                                             &bot_token_c,
                                             event_id,
                                             &attachments_owned,
-                                            &app_handle_c,
+                                            &ui_c,
                                             notifier_c.as_ref(),
                                             &profile_embedder_c,
                                             &profile_embedding_cache_c,
@@ -2633,7 +2635,7 @@ impl AppState {
                                     &profile_store_ref,
                                     &profile_embedder_ref,
                                     &profile_embedding_cache_ref,
-                                    &app_handle,
+                                    &ui,
                                     notifier.as_ref(),
                                     Some(&coordinator_ref),
                                     Some(&task_arc_map_ref),
@@ -2701,7 +2703,7 @@ impl AppState {
     /// current config. Called by `save_telegram_settings` so token/allowlist/
     /// interval/enabled changes apply without an app restart. The outbound
     /// sender is hot-swapped separately by `reload_telegram_sender`.
-    pub fn restart_telegram_monitor(&self, app_handle: tauri::AppHandle) {
+    pub fn restart_telegram_monitor(&self, ui: crate::ui_bridge::UiBridge) {
         if let Some(tx) = self
             .telegram_shutdown
             .lock()
@@ -2710,7 +2712,7 @@ impl AppState {
         {
             let _ = tx.send(());
         }
-        self.start_telegram_monitor(app_handle);
+        self.start_telegram_monitor(ui);
     }
 
     /// Spawn the autonomous-execution dispatch loop.
@@ -2731,7 +2733,7 @@ impl AppState {
     /// Must be called AFTER `state.coordinator` is fully wired and
     /// AFTER the agent has been registered with the dispatcher,
     /// otherwise `dispatch_next_with_task` will keep returning `None`.
-    pub fn start_dispatch_loop(&mut self, app_handle: tauri::AppHandle) {
+    pub fn start_dispatch_loop(&mut self, ui: crate::ui_bridge::UiBridge) {
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
         self.dispatch_loop_shutdown = Some(shutdown_tx);
 
@@ -2947,7 +2949,7 @@ impl AppState {
                         cancel_flag: Arc::new(AtomicBool::new(false)),
                         active_arc_id: arc_id.clone(),
                         inflight: Arc::clone(&inflight),
-                        app_handle: app_handle.clone(),
+                        ui: ui.clone(),
                         turn_id: uuid::Uuid::new_v4().to_string(),
                         message_override: None,
                         approval_router: approval_router.clone(),
@@ -3096,7 +3098,7 @@ async fn execute_owner_telegram_message(
     bot_token: &str,
     event_id: uuid::Uuid,
     attachments: &[athen_core::event::Attachment],
-    app_handle: &tauri::AppHandle,
+    ui: &crate::ui_bridge::UiBridge,
     notifier: Option<&Arc<NotificationOrchestrator>>,
     profile_embedder: &Arc<dyn athen_core::traits::embedding::EmbeddingProvider>,
     profile_embedding_cache: &ProfileEmbeddingCache,
@@ -3109,7 +3111,6 @@ async fn execute_owner_telegram_message(
     use athen_agent::AgentBuilder;
     use athen_core::task::{DomainType, Task, TaskPriority, TaskStatus};
     use athen_core::traits::agent::AgentExecutor;
-    use tauri::Emitter;
 
     // Local aliases so the body keeps reading like the original — every
     // collaborator reaches into `deps` so the registry build below uses
@@ -3541,7 +3542,7 @@ async fn execute_owner_telegram_message(
     let registry = assemble_app_tool_registry(
         deps.clone(),
         target_arc_id.as_deref().unwrap_or(""),
-        Some(app_handle.clone()),
+        Some(ui.clone()),
     )
     .await;
     // Shared list of successful tool names; the auditor appends as steps
@@ -3590,7 +3591,7 @@ async fn execute_owner_telegram_message(
     };
 
     let mut auditor = TauriAuditor::new(
-        app_handle.clone(),
+        ui.clone(),
         arc_store.clone(),
         target_arc_id.clone().unwrap_or_default(),
         turn_id.clone(),
@@ -3600,7 +3601,7 @@ async fn execute_owner_telegram_message(
     if let Some(reg) = agent_registry {
         auditor = auditor.with_agent_tracking(Arc::clone(reg), task_id_for_run);
     }
-    let stream_tx = spawn_stream_forwarder(app_handle, target_arc_id.clone());
+    let stream_tx = spawn_stream_forwarder(ui, target_arc_id.clone());
     // Per-run cancel flag: prefer the one minted by the registry guard
     // so a Telegram-driven run can also be stopped from the desktop
     // Agent Control panel. Falls back to a freshly-allocated flag when
@@ -3702,7 +3703,7 @@ async fn execute_owner_telegram_message(
     // Skip when we have no arc — the event would land in whatever arc
     // the user is viewing, which is exactly the bug arc_id guards against.
     if let Some(ref arc_id) = target_arc_id {
-        let _ = app_handle.emit(
+        ui.emit(
             "agent-progress",
             AgentProgress {
                 step: 0,
@@ -3850,7 +3851,7 @@ async fn execute_owner_telegram_message(
 
     // Notify the frontend so the sidebar refreshes.
     if let Some(ref arc_id) = target_arc_id {
-        let _ = app_handle.emit("arc-updated", serde_json::json!({ "arc_id": arc_id }));
+        ui.emit("arc-updated", serde_json::json!({ "arc_id": arc_id }));
     }
 
     // Replace the live status message with the final response, plus
