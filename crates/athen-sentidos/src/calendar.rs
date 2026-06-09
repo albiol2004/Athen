@@ -81,31 +81,14 @@ impl Default for CalendarMonitor {
     }
 }
 
-/// Resolve the default database path: `~/.athen/athen.db`.
+/// Resolve the default database path: `<athen_data_dir>/athen.db`.
+/// Honors `ATHEN_DATA_DIR` so headless / containerized instances read
+/// their own calendar instead of silently reaching into `~/.athen`.
 fn default_db_path() -> Option<String> {
-    dirs_path().map(|mut p| {
+    athen_core::paths::athen_data_dir().map(|mut p| {
         p.push("athen.db");
         p.to_string_lossy().to_string()
     })
-}
-
-/// Return `~/.athen/` as a `PathBuf`, or `None` if the home directory cannot be determined.
-fn dirs_path() -> Option<std::path::PathBuf> {
-    home_dir().map(|h| h.join(".athen"))
-}
-
-/// Cross-platform home directory lookup.
-fn home_dir() -> Option<std::path::PathBuf> {
-    #[cfg(target_os = "windows")]
-    {
-        std::env::var("USERPROFILE")
-            .ok()
-            .map(std::path::PathBuf::from)
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        std::env::var("HOME").ok().map(std::path::PathBuf::from)
-    }
 }
 
 /// Open the calendar database and query for events that might need a

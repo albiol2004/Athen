@@ -33,16 +33,12 @@ pub enum UiBridge {
     /// Desktop mode: a real Tauri app with a WebView frontend.
     Tauri(tauri::AppHandle),
     /// Daemon mode: no GUI; Telegram is the user surface.
-    // TODO(headless): constructed by the headless composition root —
-    // remove the allow when it lands.
-    #[allow(dead_code)]
     Headless,
 }
 
 impl UiBridge {
     /// Publish the headless `AppState` singleton. Must be called exactly
     /// once, by the headless composition root only.
-    #[allow(dead_code)] // TODO(headless): used by the headless composition root.
     pub fn publish_headless_state(state: Arc<AppState>) {
         if HEADLESS_STATE.set(state).is_err() {
             tracing::error!("publish_headless_state called twice; keeping the first");

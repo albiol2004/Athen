@@ -24,6 +24,7 @@ pub(crate) mod endpoints_render;
 pub(crate) mod env_creds;
 pub(crate) mod file_gate;
 pub(crate) mod github_identity;
+pub(crate) mod headless;
 pub(crate) mod http_presets;
 pub(crate) mod http_rate_limiter;
 pub(crate) mod identity_render;
@@ -51,6 +52,8 @@ pub(crate) mod wakeup_sink;
 pub(crate) mod wakeup_tool;
 
 use state::AppState;
+
+pub use headless::run_headless;
 
 /// Build and run the Tauri application.
 pub fn run() {

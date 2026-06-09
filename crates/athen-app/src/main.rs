@@ -1,6 +1,18 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
+    // Headless daemon mode: full autonomous stack, no GUI. Selected via
+    // flag or env so containers can bake it into the image. Checked
+    // before any GTK/WebKit touchpoints — none of them exist headless.
+    let headless = std::env::args().any(|a| a == "--headless")
+        || std::env::var("ATHEN_HEADLESS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+    if headless {
+        athen_app::run_headless();
+        return;
+    }
+
     // GTK derives the Wayland app_id from the program name (or argv[0]
     // basename), and Wayland compositors look up `<app_id>.desktop` to
     // find the icon shown in Alt+Tab, the dock, etc. Set it explicitly

@@ -509,10 +509,20 @@ impl ApprovalRouter {
         }
 
         // Step 3: arc-source heuristic, finally InApp.
-        match arc_meta.map(|m| m.source) {
+        let kind = match arc_meta.map(|m| m.source) {
             Some(ArcSource::Messaging) => ReplyChannelKind::Telegram,
             _ => ReplyChannelKind::InApp,
+        };
+        if self.find(kind).is_some() {
+            return kind;
         }
+        // Heuristic picked a channel with no sink (headless builds have
+        // no InApp sink) — fall back to whatever IS wired rather than
+        // erroring out of ask_with_escalation before asking anyone.
+        self.sinks
+            .first()
+            .map(|s| s.channel_kind())
+            .unwrap_or(kind)
     }
 
     /// Ask the question on the primary channel, escalating to the
