@@ -21,6 +21,7 @@ pub(crate) mod email_gate;
 pub(crate) mod email_test;
 pub mod embedding_hardware;
 pub(crate) mod endpoints_render;
+pub(crate) mod env_creds;
 pub(crate) mod file_gate;
 pub(crate) mod github_identity;
 pub(crate) mod http_presets;
