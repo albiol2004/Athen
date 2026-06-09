@@ -451,6 +451,7 @@ dependencies = [
  "athen-risk",
  "athen-sentidos",
  "athen-shell",
+ "athen-vault",
  "chrono",
  "serde_json",
  "tokio",
