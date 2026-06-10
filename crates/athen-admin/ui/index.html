@@ -7,7 +7,93 @@
   <link rel="stylesheet" href="/panel.css">
 </head>
 <body>
-  <div id="app">Loading…</div>
+  <!-- Login -->
+  <div id="view-login" class="login-wrap hidden">
+    <form id="login-form" class="login-card glass">
+      <div class="brand">
+        <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l9 18H3z"/><path d="M12 9v5"/><circle cx="12" cy="17.2" r="0.4"/></svg>
+        <span>Athen <em>Admin</em></span>
+      </div>
+      <label>Username <input id="login-user" autocomplete="username" required></label>
+      <label>Password <input id="login-pass" type="password" autocomplete="current-password" required></label>
+      <button class="btn primary" type="submit">Sign in</button>
+      <div id="login-error" class="form-error hidden"></div>
+    </form>
+  </div>
+
+  <!-- App shell -->
+  <div id="view-app" class="app hidden">
+    <header class="topbar glass">
+      <div class="brand">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l9 18H3z"/><path d="M12 9v5"/><circle cx="12" cy="17.2" r="0.4"/></svg>
+        <span>Athen <em>Admin</em></span>
+      </div>
+      <nav id="nav-tabs">
+        <button class="tab active" data-tab="instances">Instances</button>
+        <button class="tab admin-only" data-tab="users">Users</button>
+      </nav>
+      <div class="topbar-right">
+        <span id="who" class="who"></span>
+        <button id="btn-password" class="icon-btn" title="Change password">
+          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.6 7.6a5.5 5.5 0 1 1-7.8 7.8 5.5 5.5 0 0 1 7.8-7.8zm0 0L19 4m-3.5 3.5L17 9"/></svg>
+        </button>
+        <button id="btn-logout" class="icon-btn" title="Sign out">
+          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <main>
+      <!-- Instances -->
+      <section id="tab-instances">
+        <div class="section-head">
+          <h2>Instances</h2>
+          <button id="btn-new-instance" class="btn primary admin-only">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+            New instance
+          </button>
+        </div>
+        <div id="instances-grid" class="grid"></div>
+        <div id="instances-empty" class="empty hidden">No instances yet.</div>
+      </section>
+
+      <!-- Users -->
+      <section id="tab-users" class="hidden">
+        <div class="section-head">
+          <h2>Users</h2>
+          <button id="btn-new-user" class="btn primary">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+            New user
+          </button>
+        </div>
+        <div class="glass table-card">
+          <table id="users-table">
+            <thead><tr><th>Username</th><th>Role</th><th>Instances</th><th>Created</th><th></th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Logs drawer -->
+  <div id="logs-drawer" class="drawer hidden">
+    <div class="drawer-head">
+      <h3 id="logs-title">Logs</h3>
+      <button id="logs-close" class="icon-btn" title="Close">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <pre id="logs-body"></pre>
+  </div>
+
+  <!-- Modal host -->
+  <div id="modal-overlay" class="modal-overlay hidden">
+    <div id="modal" class="modal glass"></div>
+  </div>
+
+  <div id="toast-host"></div>
+
   <script src="/panel.js"></script>
 </body>
 </html>
