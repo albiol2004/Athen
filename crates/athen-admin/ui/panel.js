@@ -82,12 +82,15 @@ function switchTab(tab) {
   document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t.dataset.tab === tab));
   $('#tab-instances').classList.toggle('hidden', tab !== 'instances');
   $('#tab-users').classList.toggle('hidden', tab !== 'users');
+  $('#tab-audit').classList.toggle('hidden', tab !== 'audit');
   stopRefresh();
   if (tab === 'instances') {
     loadInstances();
     refreshTimer = setInterval(loadInstances, 5000);
-  } else {
+  } else if (tab === 'users') {
     loadUsers();
+  } else {
+    loadAudit();
   }
 }
 
@@ -129,6 +132,9 @@ function instanceCard(i) {
     <div class="card-meta">
       <span><code>${esc(i.container_name)}</code></span>
       <span>${esc(i.status)}</span>
+      ${i.memory_mb || i.cpus
+        ? `<span>${[i.memory_mb && `${i.memory_mb} MB`, i.cpus && `${i.cpus} CPU`].filter(Boolean).join(' · ')}</span>`
+        : ''}
     </div>
     <div class="card-actions">${actions.join('')}</div>
   </div>`;
@@ -209,6 +215,11 @@ async function openNewInstanceModal() {
       <label>Name <input id="ni-name" required placeholder="alice"></label>
       <label>Environment variables <textarea id="ni-env" placeholder="ATHEN_PROVIDER_DEEPSEEK_API_KEY=sk-...&#10;ATHEN_TELEGRAM_BOT_TOKEN=..."></textarea></label>
       <div class="hint">One KEY=VALUE per line. Secrets go here (never into the config files below).</div>
+      <div class="row">
+        <label>Memory limit (MB) <input id="ni-mem" type="number" min="64" step="64" placeholder="unlimited"></label>
+        <label>CPU limit (cores) <input id="ni-cpus" type="number" min="0.1" step="0.1" placeholder="unlimited"></label>
+      </div>
+      <div class="hint">Hard cgroup limits — a runaway instance gets OOM-killed and restarted instead of starving the host.</div>
       <details>
         <summary>Seed config files (optional)</summary>
         <label>config.toml <textarea id="ni-config" placeholder="[telegram]&#10;enabled = false"></textarea></label>
@@ -238,6 +249,8 @@ async function openNewInstanceModal() {
       config_toml: $('#ni-config').value.trim() || null,
       models_toml: $('#ni-models').value.trim() || null,
       user_ids: grantValues(),
+      memory_mb: $('#ni-mem').value ? Number($('#ni-mem').value) : null,
+      cpus: $('#ni-cpus').value ? Number($('#ni-cpus').value) : null,
     };
     const btn = $('#ni-submit');
     btn.disabled = true;
@@ -371,6 +384,50 @@ async function openNewUserModal() {
   });
 }
 
+// --------------------------------------------------------------- audit --
+
+async function loadAudit() {
+  if (ME.role !== 'admin') return;
+  let rows;
+  try { rows = await api('/panel/audit?limit=300'); } catch (e) { toast(e.message, 'error'); return; }
+  $('#audit-table tbody').innerHTML = rows.map((r) => `<tr>
+      <td>${esc(r.at.slice(0, 19).replace('T', ' '))}</td>
+      <td>${esc(r.username)}</td>
+      <td><code>${esc(r.action)}</code></td>
+      <td>${esc(r.target || '—')}</td>
+      <td>${esc(r.detail || '')}</td>
+    </tr>`).join('');
+}
+
+// ------------------------------------------------------- notifications --
+
+function openNotifyModal() {
+  openModal(`<h3>Push notifications</h3>
+    <p>When an instance you have access to needs an approval (or raises an
+    urgent notification), the panel POSTs it to this webhook — works out
+    of the box with an <a href="https://ntfy.sh" target="_blank" rel="noreferrer">ntfy</a>
+    topic on your phone.</p>
+    <form id="form-notify">
+      <label>Webhook URL <input id="nf-url" type="url" placeholder="https://ntfy.sh/my-secret-topic" value="${esc(ME.notify_url || '')}"></label>
+      <div class="hint">Pick an unguessable topic name — anyone who knows it can read your pushes. Leave empty to disable.</div>
+      <div class="modal-actions">
+        <button type="button" class="btn" id="modal-cancel">Cancel</button>
+        <button type="submit" class="btn primary">Save</button>
+      </div>
+    </form>`);
+  $('#modal-cancel').addEventListener('click', closeModal);
+  $('#form-notify').addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const url = $('#nf-url').value.trim();
+    try {
+      await api('/panel/notify', { method: 'POST', body: { url } });
+      ME.notify_url = url;
+      toast(url ? 'Notifications enabled' : 'Notifications disabled');
+      closeModal();
+    } catch (e) { toast(e.message, 'error'); }
+  });
+}
+
 function openPasswordModal() {
   openModal(`<h3>Change password</h3>
     <form id="form-password">
@@ -420,6 +477,7 @@ $('#btn-logout').addEventListener('click', async () => {
   showLogin();
 });
 $('#btn-password').addEventListener('click', openPasswordModal);
+$('#btn-notify').addEventListener('click', openNotifyModal);
 $('#btn-new-instance').addEventListener('click', openNewInstanceModal);
 $('#btn-new-user').addEventListener('click', openNewUserModal);
 $('#logs-close').addEventListener('click', closeLogs);

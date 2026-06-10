@@ -31,9 +31,13 @@
       <nav id="nav-tabs">
         <button class="tab active" data-tab="instances">Instances</button>
         <button class="tab admin-only" data-tab="users">Users</button>
+        <button class="tab admin-only" data-tab="audit">Audit</button>
       </nav>
       <div class="topbar-right">
         <span id="who" class="who"></span>
+        <button id="btn-notify" class="icon-btn" title="Push notifications">
+          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg>
+        </button>
         <button id="btn-password" class="icon-btn" title="Change password">
           <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.6 7.6a5.5 5.5 0 1 1-7.8 7.8 5.5 5.5 0 0 1 7.8-7.8zm0 0L19 4m-3.5 3.5L17 9"/></svg>
         </button>
@@ -69,6 +73,19 @@
         <div class="glass table-card">
           <table id="users-table">
             <thead><tr><th>Username</th><th>Role</th><th>Instances</th><th>Created</th><th></th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Audit log -->
+      <section id="tab-audit" class="hidden">
+        <div class="section-head">
+          <h2>Audit log</h2>
+        </div>
+        <div class="glass table-card">
+          <table id="audit-table">
+            <thead><tr><th>When</th><th>User</th><th>Action</th><th>Target</th><th>Detail</th></tr></thead>
             <tbody></tbody>
           </table>
         </div>
