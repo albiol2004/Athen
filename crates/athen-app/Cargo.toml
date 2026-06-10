@@ -54,6 +54,9 @@ tempfile = "3"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
 tokio-stream = { workspace = true, features = ["sync"] }
+# Web UI (web/dist, built with `npm run build` in web/ and committed)
+# embedded into the binary and served by http_api.rs.
+rust-embed = "8"
 
 [features]
 # Phase 2c flipped this default-ON. Released binaries now include

@@ -10,6 +10,9 @@ for servers, containers, and (later) the hosted/cloud offering.
 A second user surface is the **HTTP API** (`ATHEN_HTTP_ADDR`): REST +
 Server-Sent Events for remote clients — a React web dashboard or a React
 Native companion app. See [HTTP API](#http-api-remote-clients) below.
+The same listener also serves the **embedded web UI** (`web/`, a React
+chat client compiled into the binary): point a browser at the instance,
+paste the token, chat. See [Web UI](#web-ui-embedded) below.
 
 > Audience note: desktop Athen keeps its "all config via UI, never config
 > files" rule — that rule exists for non-technical users. Headless mode is
@@ -193,6 +196,48 @@ error to the agent instead of parking forever.
 
 With Telegram *and* HTTP configured, approval prompts race both channels
 (same as desktop + Telegram today): first answer wins.
+
+## Web UI (embedded)
+
+The reference chat client for the HTTP API ships **inside the binary**:
+`web/` is a React + TypeScript app (Vite), built to `web/dist` and
+embedded via rust-embed; `http_api.rs` serves it as the fallback for
+every non-`/api/*` path on the same listener. A single-instance user
+gets a remote browser UI with zero extra moving parts:
+
+```
+http://<host>:8787/  →  login screen  →  paste the http_token  →  chat
+```
+
+- **Auth:** the login screen asks for the API token (stored in
+  `localStorage`; REST uses the `Authorization` header, `EventSource`
+  uses `?token=`). The app shell itself is public by design — every
+  byte of user data stays behind the token-gated `/api/*` routes.
+- **Scope (phase 1):** arcs sidebar (switch / new / unread dots),
+  streaming chat with collapsible thinking blocks, tool chips,
+  markdown rendering (react-markdown — React elements, no innerHTML),
+  approval-question cards, risk-gate (`pending_approval`) cards,
+  file-grant cards (including `AllowProjectRoot`), queue-while-busy
+  composer, cancel, notifications bell. Settings panels are desktop-only
+  for now.
+- **Build workflow:** `cd web && npm run build`, then `cargo build`.
+  `web/dist` is **committed**, so cargo (and the Dockerfile's
+  `COPY . .`) never needs Node. Debug builds read `web/dist` from disk
+  at runtime (edit → `npm run build` → refresh, no recompile); release
+  builds embed the bytes. Hashed `assets/*` get immutable cache
+  headers; `index.html` is `no-cache`.
+- **UI development:** `npm run dev` (Vite on :5173) against any running
+  instance — open the login screen's *Server* field and point it at
+  e.g. `http://127.0.0.1:8787` (instance CORS is permissive; auth is
+  the token, not the origin).
+- **React Native path:** `web/src/api/` (typed client + SSE handler
+  interface) is deliberately DOM-free — lift it into the RN app and
+  swap `EventSource` for an SSE polyfill behind the same interface.
+- **Wire-shape footnote:** the long-poll `POST /api/messages` response
+  carries the final text in `content` (the `ChatResponse` shape), not
+  `reply`. The SSE `agent-stream` final event can be a bare
+  `{is_final: true}` with no delta — clients must not treat that as
+  "streamed content was rendered".
 
 ## What's intentionally absent headless
 

@@ -23,3 +23,6 @@
 # Python bytecode
 __pycache__/
 *.pyc
+
+# Web UI (web/dist IS committed — the binary embeds it via rust-embed)
+web/node_modules/

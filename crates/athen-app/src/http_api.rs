@@ -22,6 +22,13 @@
 //! interface, or put a TLS-terminating reverse proxy in front for
 //! anything reachable from the internet. The token gates access; it
 //! does not encrypt the wire.
+//!
+//! The same listener also serves the embedded web UI (the React app in
+//! `web/`, built to `web/dist` and compiled into the binary via
+//! rust-embed): any non-`/api/*` path falls back to the SPA. The app
+//! shell is public by design — every byte of user data still sits
+//! behind the token-gated `/api/*` routes; the login screen just asks
+//! for that token.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -144,6 +151,9 @@ pub async fn serve(cfg: HttpApiConfig, ui: UiBridge) -> std::io::Result<()> {
         .route("/api/notifications", get(notifications_list))
         .route("/api/notifications/read-all", post(notifications_read_all))
         .route("/api/notifications/{id}/read", post(notification_read))
+        // The embedded web UI rides every non-/api path (SPA fallback);
+        // require_token skips it — only /api/* carries user data.
+        .fallback(static_asset)
         .layer(axum::middleware::from_fn_with_state(
             api.clone(),
             require_token,
@@ -184,7 +194,10 @@ async fn require_token(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    if req.uri().path() == "/api/health" {
+    let path = req.uri().path();
+    // Health is the readiness probe; non-/api paths are the embedded
+    // web UI shell (static assets, no user data).
+    if path == "/api/health" || !path.starts_with("/api/") {
         return next.run(req).await;
     }
     let headers = req.headers();
@@ -208,6 +221,69 @@ async fn require_token(
         )
             .into_response(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Embedded web UI
+// ---------------------------------------------------------------------------
+
+/// The React app from `web/`, built to `web/dist` (`npm run build`) and
+/// committed so `cargo build` never needs Node. Debug builds read the
+/// folder from disk (edit → rebuild dist → refresh); release builds
+/// embed the bytes.
+#[derive(rust_embed::Embed)]
+#[folder = "../../web/dist"]
+struct WebAssets;
+
+fn content_type_for(path: &str) -> &'static str {
+    match path.rsplit('.').next() {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") => "text/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("json") => "application/json",
+        Some("png") => "image/png",
+        Some("ico") => "image/x-icon",
+        Some("woff2") => "font/woff2",
+        Some("map") => "application/json",
+        Some("txt") => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Serve the embedded SPA: exact asset match first, otherwise
+/// `index.html` (client-side routing). Vite emits content-hashed
+/// filenames under `assets/`, so those get an immutable cache; the
+/// HTML shell must revalidate so a new binary's hashes are picked up.
+async fn static_asset(uri: axum::http::Uri) -> Response {
+    let path = uri.path().trim_start_matches('/');
+    let path = if path.is_empty() { "index.html" } else { path };
+    let (file, name) = match WebAssets::get(path) {
+        Some(f) => (f, path),
+        None => match WebAssets::get("index.html") {
+            Some(f) => (f, "index.html"),
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    "web UI not bundled in this build (web/dist was empty)",
+                )
+                    .into_response();
+            }
+        },
+    };
+    let cache = if name.starts_with("assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, content_type_for(name)),
+            (axum::http::header::CACHE_CONTROL, cache),
+        ],
+        file.data,
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
