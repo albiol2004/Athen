@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Athen — Chat</title>
+<style>
+  /* Minimal chat client over the panel proxy — proof of the exact path a
+     React / React Native app will use (session cookie → proxy → instance). */
+  :root {
+    --bg: #161110; --text: #efe7e0; --dim: #a89d94; --coral: #e8745a;
+    --glass: rgba(255,255,255,.045); --border: rgba(255,255,255,.09);
+    --green: #7fc8a4; --red: #e07a6e; --amber: #d9b06c;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; font: 14px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+    color: var(--text);
+    background: var(--bg) radial-gradient(1100px 600px at 70% -10%, #2a1c17 0%, #161110 55%) no-repeat fixed;
+    display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; align-items: center; gap: 10px; padding: 11px 18px;
+    border-bottom: 1px solid var(--border); background: rgba(22,17,16,.8);
+    backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+    position: sticky; top: 0; z-index: 5;
+  }
+  header a { color: var(--dim); text-decoration: none; font-size: 13px; }
+  header a:hover { color: var(--text); }
+  header .title { font-weight: 600; }
+  header .title em { font-style: normal; color: var(--coral); }
+  #status { margin-left: auto; font-size: 12px; color: var(--dim); }
+  #status.live { color: var(--green); }
+  #status.err { color: var(--red); }
+
+  main { flex: 1; overflow-y: auto; padding: 22px 0 12px; }
+  .col { max-width: 760px; margin: 0 auto; padding: 0 18px; display: flex; flex-direction: column; gap: 10px; }
+  .msg { max-width: 84%; padding: 9px 14px; border-radius: 14px; white-space: pre-wrap; word-break: break-word; }
+  .msg.user { align-self: flex-end; background: var(--coral); color: #20120d; border-bottom-right-radius: 5px; }
+  .msg.agent { align-self: flex-start; background: var(--glass); border: 1px solid var(--border); border-bottom-left-radius: 5px; }
+  .msg.system { align-self: center; color: var(--dim); font-size: 12px; background: none; }
+  .chip {
+    align-self: flex-start; display: inline-flex; gap: 7px; align-items: center;
+    font-size: 12px; color: var(--dim); padding: 4px 11px;
+    border: 1px solid var(--border); border-radius: 99px; background: rgba(255,255,255,.03);
+  }
+  .chip .dot { width: 7px; height: 7px; border-radius: 99px; background: var(--amber); }
+  .chip.done .dot { background: var(--green); }
+  .chip.error .dot { background: var(--red); }
+  .thinking { align-self: flex-start; color: var(--dim); font-size: 12.5px; font-style: italic; }
+
+  .card {
+    align-self: stretch; border: 1px solid rgba(224,122,110,.4); border-radius: 14px;
+    padding: 13px 16px; background: rgba(224,122,110,.07);
+  }
+  .card h4 { margin: 0 0 6px; font-size: 13.5px; }
+  .card p { margin: 0 0 10px; font-size: 13px; color: var(--dim); }
+  .card .actions { display: flex; gap: 8px; }
+  .card button {
+    font: inherit; font-size: 13px; padding: 6px 14px; border-radius: 9px; cursor: pointer;
+    border: 1px solid var(--border); background: rgba(255,255,255,.06); color: var(--text);
+  }
+  .card button.approve { background: var(--coral); border-color: transparent; color: #20120d; font-weight: 600; }
+  .card button:disabled { opacity: .5; cursor: default; }
+  .card .resolved { color: var(--dim); font-size: 12.5px; }
+
+  footer { padding: 12px 18px 18px; }
+  form {
+    max-width: 760px; margin: 0 auto; display: flex; gap: 9px;
+    background: var(--glass); border: 1px solid var(--border); border-radius: 16px;
+    padding: 8px; backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+  }
+  textarea {
+    flex: 1; resize: none; border: none; outline: none; background: none;
+    color: var(--text); font: inherit; padding: 6px 8px; max-height: 140px;
+  }
+  form button {
+    align-self: flex-end; border: none; border-radius: 11px; cursor: pointer;
+    background: var(--coral); color: #20120d; font: inherit; font-weight: 600; padding: 8px 17px;
+  }
+  form button:disabled { opacity: .5; cursor: default; }
+</style>
+</head>
+<body>
+  <header>
+    <a href="/">&larr; Panel</a>
+    <span class="title">Athen <em>Chat</em></span>
+    <span id="status">connecting…</span>
+  </header>
+  <main><div class="col" id="messages"></div></main>
+  <footer>
+    <form id="composer">
+      <textarea id="input" rows="1" placeholder="Message Athen…" autofocus></textarea>
+      <button id="send" type="submit">Send</button>
+    </form>
+  </footer>
+
+<script>
+'use strict';
+// Instance id from /i/<id>/chat — every API call goes through the panel
+// proxy at /i/<id>/api/* with the session cookie.
+const INSTANCE = location.pathname.split('/')[2];
+const BASE = `/i/${INSTANCE}/api`;
+
+const messagesEl = document.getElementById('messages');
+const statusEl = document.getElementById('status');
+const inputEl = document.getElementById('input');
+const sendBtn = document.getElementById('send');
+
+let streamBubble = null;   // open assistant bubble for agent-stream deltas
+let thinkingEl = null;
+const toolChips = new Map(); // step → chip element
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+function pinned() {
+  const m = document.querySelector('main');
+  return m.scrollTop + m.clientHeight >= m.scrollHeight - 80;
+}
+function scrollDown(force) {
+  const m = document.querySelector('main');
+  if (force || pinned()) m.scrollTop = m.scrollHeight;
+}
+function addMsg(cls, text, force) {
+  const wasPinned = pinned();
+  const e = el('div', `msg ${cls}`, text);
+  messagesEl.appendChild(e);
+  scrollDown(force || wasPinned);
+  return e;
+}
+
+async function api(path, body) {
+  const resp = await fetch(BASE + path, body === undefined ? {} : {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  let data = null;
+  try { data = await resp.json(); } catch { /* empty */ }
+  if (!resp.ok) throw new Error((data && data.error) || `HTTP ${resp.status}`);
+  return data;
+}
+
+// ---- history ----
+async function loadHistory() {
+  try {
+    const cur = await api('/arcs/current');
+    if (!cur || !cur.arc_id) return;
+    const entries = await api(`/arcs/${cur.arc_id}/entries`);
+    for (const e of entries) {
+      if (e.entry_type === 'message') {
+        addMsg(e.source === 'user' ? 'user' : 'agent', e.content, true);
+      } else if (e.entry_type === 'tool_call') {
+        const chip = el('div', 'chip done');
+        chip.appendChild(el('span', 'dot'));
+        chip.appendChild(el('span', null, e.content.slice(0, 120)));
+        messagesEl.appendChild(chip);
+      }
+    }
+    scrollDown(true);
+  } catch (e) {
+    addMsg('system', `history unavailable: ${e.message}`, true);
+  }
+}
+
+// ---- live events ----
+function connectEvents() {
+  const es = new EventSource(`${BASE}/events`);
+  es.onopen = () => { statusEl.textContent = 'live'; statusEl.className = 'live'; };
+  es.onerror = () => { statusEl.textContent = 'reconnecting…'; statusEl.className = 'err'; };
+
+  es.addEventListener('agent-stream', (ev) => {
+    const p = JSON.parse(ev.data);
+    if (p.is_thinking) {
+      if (!thinkingEl) { thinkingEl = addMsg('thinking', 'thinking…'); thinkingEl.classList.remove('msg'); }
+      return;
+    }
+    if (thinkingEl) { thinkingEl.remove(); thinkingEl = null; }
+    if (!streamBubble) streamBubble = addMsg('agent', '');
+    const wasPinned = pinned();
+    streamBubble.textContent += p.delta || '';
+    scrollDown(wasPinned);
+    if (p.is_final) { streamBubble = null; toolChips.clear(); }
+  });
+
+  es.addEventListener('agent-progress', (ev) => {
+    const p = JSON.parse(ev.data);
+    const key = `${p.step}-${p.tool_name}`;
+    let chip = toolChips.get(key);
+    if (!chip) {
+      chip = el('div', 'chip');
+      chip.appendChild(el('span', 'dot'));
+      chip.appendChild(el('span', 'label', ''));
+      const wasPinned = pinned();
+      messagesEl.appendChild(chip);
+      toolChips.set(key, chip);
+      scrollDown(wasPinned);
+      // Tool output means the open stream bubble is from a previous
+      // segment; the next delta starts a new one.
+      streamBubble = null;
+    }
+    chip.querySelector('.label').textContent = `${p.tool_name} — ${p.status}`;
+    if (p.status === 'completed' || p.status === 'done') chip.classList.add('done');
+    if (p.status === 'error' || p.error) chip.classList.add('error');
+  });
+
+  es.addEventListener('approval-question', (ev) => {
+    const q = JSON.parse(ev.data);
+    addQuestionCard(q);
+  });
+
+  es.addEventListener('approval-resolved', (ev) => {
+    const p = JSON.parse(ev.data);
+    const card = document.getElementById(`task-${p.task_id}`);
+    if (card) resolveCard(card, p.approved ? 'Approved' : 'Denied');
+  });
+
+  es.addEventListener('lagged', () => {
+    addMsg('system', 'event stream lagged — some output may be missing');
+  });
+}
+
+// ---- approval cards ----
+function resolveCard(card, label) {
+  const actions = card.querySelector('.actions');
+  if (actions) actions.replaceWith(el('div', 'resolved', label));
+}
+
+function addTaskCard(p) {
+  const card = el('div', 'card');
+  card.id = `task-${p.task_id}`;
+  card.appendChild(el('h4', null, `Approval needed (risk: ${p.risk_level || '?'}${p.risk_score != null ? ` ${p.risk_score}` : ''})`));
+  card.appendChild(el('p', null, p.description || p.summary || 'Athen wants to run a risky task.'));
+  const actions = el('div', 'actions');
+  for (const [label, approved] of [['Approve', true], ['Deny', false]]) {
+    const b = el('button', approved ? 'approve' : null, label);
+    b.addEventListener('click', async () => {
+      actions.querySelectorAll('button').forEach((x) => { x.disabled = true; });
+      try {
+        await api('/approvals/task', { task_id: p.task_id, approved });
+        resolveCard(card, approved ? 'Approved' : 'Denied');
+      } catch (e) {
+        addMsg('system', `approval failed: ${e.message}`);
+        actions.querySelectorAll('button').forEach((x) => { x.disabled = false; });
+      }
+    });
+    actions.appendChild(b);
+  }
+  card.appendChild(actions);
+  messagesEl.appendChild(card);
+  scrollDown(true);
+}
+
+function addQuestionCard(q) {
+  if (!q || !q.id || document.getElementById(`q-${q.id}`)) return;
+  const card = el('div', 'card');
+  card.id = `q-${q.id}`;
+  card.appendChild(el('h4', null, q.prompt || 'Approval needed'));
+  if (q.description) card.appendChild(el('p', null, q.description));
+  const actions = el('div', 'actions');
+  const choices = (Array.isArray(q.choices) && q.choices.length)
+    ? q.choices
+    : [{ key: 'approve', label: 'Approve', kind: 'approve' }, { key: 'deny', label: 'Deny', kind: 'deny' }];
+  for (const c of choices) {
+    const b = el('button', c.kind === 'approve' ? 'approve' : null, c.label || c.key);
+    b.addEventListener('click', async () => {
+      actions.querySelectorAll('button').forEach((x) => { x.disabled = true; });
+      try {
+        await api('/approvals/question', { question_id: q.id, choice_key: c.key });
+        resolveCard(card, c.label || c.key);
+      } catch (e) {
+        addMsg('system', `answer failed: ${e.message}`);
+        actions.querySelectorAll('button').forEach((x) => { x.disabled = false; });
+      }
+    });
+    actions.appendChild(b);
+  }
+  card.appendChild(actions);
+  messagesEl.appendChild(card);
+  scrollDown(true);
+}
+
+// ---- composer ----
+document.getElementById('composer').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const text = inputEl.value.trim();
+  if (!text) return;
+  inputEl.value = '';
+  addMsg('user', text, true);
+  sendBtn.disabled = true;
+  try {
+    // Long-poll: resolves when the turn finishes. Rendering happens from
+    // the SSE stream meanwhile; this response only matters for the
+    // pending_approval (risk gate) case and as a no-stream fallback.
+    const resp = await api('/messages', { message: text });
+    if (resp && resp.pending_approval) addTaskCard(resp.pending_approval);
+    else if (resp && resp.reply && !messagesEl.lastElementChild?.classList.contains('agent')) {
+      addMsg('agent', resp.reply);
+    }
+  } catch (e) {
+    addMsg('system', `send failed: ${e.message}`);
+  } finally {
+    sendBtn.disabled = false;
+    inputEl.focus();
+  }
+});
+
+inputEl.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Enter' && !ev.shiftKey) {
+    ev.preventDefault();
+    document.getElementById('composer').requestSubmit();
+  }
+});
+
+loadHistory().then(connectEvents);
+</script>
+</body>
+</html>

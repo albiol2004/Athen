@@ -50,6 +50,7 @@ pub fn router(state: Arc<PanelState>) -> Router {
     // Session-gated proxy to instances (access check inside).
     let instances_proxy = Router::new()
         .route("/i/{instance}/api/{*path}", any(proxy::handle))
+        .route("/i/{instance}/chat", get(ui::chat_page))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_session,
