@@ -264,6 +264,11 @@ impl DockerCtl {
             let mut header = tar::Header::new_gnu();
             header.set_size(bytes.len() as u64);
             header.set_mode(0o600);
+            // The athen image runs as uid/gid 1000 (`useradd --uid 1000
+            // athen` in the Dockerfile); without this the files extract
+            // as root:root 0600 and the daemon can't read its own config.
+            header.set_uid(1000);
+            header.set_gid(1000);
             header.set_cksum();
             builder.append_data(&mut header, name, bytes)?;
         }
