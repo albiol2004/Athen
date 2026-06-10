@@ -132,3 +132,99 @@ pub fn random_token() -> String {
         uuid::Uuid::new_v4().simple()
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth;
+
+    fn temp_db() -> (tempfile::TempDir, Db) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("panel.db")).unwrap();
+        (dir, db)
+    }
+
+    #[test]
+    fn random_token_is_64_hex() {
+        let t = random_token();
+        assert_eq!(t.len(), 64);
+        assert!(t.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(t, random_token());
+    }
+
+    #[tokio::test]
+    async fn user_roundtrip_and_password_verify() {
+        let (_dir, db) = temp_db();
+        let created = auth::create_user(&db, "alice", "s3cret-pw", "user")
+            .await
+            .unwrap();
+        assert!(!created.is_admin());
+        let found = auth::user_by_name(&db, "alice").await.unwrap().unwrap();
+        assert_eq!(found.id, created.id);
+        assert!(auth::verify_password("s3cret-pw".into(), found.password_hash.clone()).await);
+        assert!(!auth::verify_password("wrong".into(), found.password_hash).await);
+        assert!(auth::user_by_name(&db, "nobody").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn session_create_resolve_delete() {
+        let (_dir, db) = temp_db();
+        let user = auth::create_user(&db, "bob", "password1", "admin")
+            .await
+            .unwrap();
+        let sid = auth::new_session(&db, &user.id).await.unwrap();
+        let resolved = auth::user_for_session(&db, &sid).await.unwrap().unwrap();
+        assert_eq!(resolved.id, user.id);
+        auth::delete_session(&db, &sid).await.unwrap();
+        assert!(auth::user_for_session(&db, &sid).await.unwrap().is_none());
+        assert!(auth::user_for_session(&db, "bogus")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn grants_gate_non_admins_only() {
+        let (_dir, db) = temp_db();
+        let admin = auth::create_user(&db, "root", "password1", "admin")
+            .await
+            .unwrap();
+        let user = auth::create_user(&db, "carol", "password1", "user")
+            .await
+            .unwrap();
+        db.call(|c| {
+            c.execute(
+                "INSERT INTO instances (id, name, container_name, volume_name, http_token, internal_url, created_at) \
+                 VALUES ('i1','x','athen-x','athen-x-data','tok','http://athen-x:8787','now')",
+                [],
+            )
+        })
+        .await
+        .unwrap();
+        assert!(auth::user_can_access(&db, &admin, "i1").await.unwrap());
+        assert!(!auth::user_can_access(&db, &user, "i1").await.unwrap());
+        crate::instances::set_grants(&db, "i1", &[user.id.clone()])
+            .await
+            .unwrap();
+        assert!(auth::user_can_access(&db, &user, "i1").await.unwrap());
+        crate::instances::set_grants(&db, "i1", &[]).await.unwrap();
+        assert!(!auth::user_can_access(&db, &user, "i1").await.unwrap());
+    }
+
+    #[test]
+    fn session_cookie_parsing() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            format!("foo=bar; {}=abc123; x=y", auth::SESSION_COOKIE)
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            auth::session_cookie_value(&headers).as_deref(),
+            Some("abc123")
+        );
+        headers.clear();
+        assert!(auth::session_cookie_value(&headers).is_none());
+    }
+}

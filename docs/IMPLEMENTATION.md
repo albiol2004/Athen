@@ -536,7 +536,7 @@
 
 **Voice tool wiring (in athen-app)**: `place_call.rs` is the production handler — voice-config + minimal-configuration check, E.164 validation + duration clamp, per-arc-pin-aware LLM resolution (with optional override), STT/TTS/Phone credential extraction from registered HTTP endpoints (vault-backed), cost estimate + approval-gate prompt, idempotent Pipecat install, subprocess spawn with streaming jsonl stdout, and live `place-call-progress` Tauri events for the UI. `voice.rs` holds the Settings → Voice panel commands; `telephony_gate.rs` routes the confirmation through the `ApprovalRouter`.
 
-### athen-admin (7 source files + embedded UI, 3 tests)
+### athen-admin (7 source files + embedded UI, 5 tests)
 **Status**: SHIPPED (2026-06-10) -- admin panel + gateway for hosting multiple Athen instances (one Docker container per user). Standalone axum binary with ZERO internal athen deps — drives instances purely via the Docker API + each instance's HTTP API. See `docs/ADMIN_PANEL.md` for architecture, security model, and deployment.
 - `main.rs`: composition root. `PanelConfig` from env (`ATHEN_ADMIN_ADDR`/`_DATA_DIR`/`_PASSWORD`/`_IMAGE`/`_NETWORK`), `PanelState { db, docker, http (no-timeout reqwest for the proxy), cfg }`, graceful ctrl-c shutdown.
 - `db.rs`: rusqlite behind `std::sync::Mutex` + `spawn_blocking` `call()` helper. Tables: `users`, `sessions` (opaque ids), `instances` (incl. `http_token`, serde-skip on serialization), `user_instances` grants. `random_token()` = two UUIDv4s (same construction as athen-app's http_token).
