@@ -1785,9 +1785,14 @@ impl AppState {
 
         let config = self.load_hydrated_config_sync();
 
-        let inapp = ui
-            .tauri_handle()
-            .map(|h| Arc::new(InAppApprovalSink::new(h.clone())));
+        // The "in-app" surface is the WebView in desktop mode, or a
+        // remote HTTP client consuming the SSE event stream in headless
+        // mode (event bus active). With neither, skip the sink — an
+        // unanswerable question parked here would just burn the
+        // escalation timeout before Telegram gets a shot.
+        let inapp = (ui.tauri_handle().is_some()
+            || crate::ui_bridge::UiBridge::event_bus_active())
+        .then(|| Arc::new(InAppApprovalSink::new(ui.clone())));
         let mut sinks: Vec<Arc<dyn ApprovalSink>> = Vec::new();
         if let Some(ref s) = inapp {
             sinks.push(s.clone() as Arc<dyn ApprovalSink>);
