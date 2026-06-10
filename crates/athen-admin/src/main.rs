@@ -19,7 +19,9 @@
 //! | `ATHEN_ADMIN_IMAGE` | image for new instances | `athen` |
 //! | `ATHEN_ADMIN_NETWORK` | internal Docker network name | `athen-net` |
 //! | `ATHEN_ADMIN_AUDIT_RETENTION_DAYS` | prune audit rows older than this (0 = keep forever) | `90` |
-//! | `DOCKER_HOST` | honored by bollard (unix socket default; point at a rootless Docker or Podman socket to de-privilege the panel) | unset |
+//! | `ATHEN_ADMIN_DISK_ENFORCE` | `warn` = never stop over-quota instances (default escalates warn → stop) | `stop` |
+//! | `ATHEN_ADMIN_DISK_SWEEP_SECS` | disk sweep interval (min 5; also the warn→stop grace period) | `300` |
+//! | `DOCKER_HOST` | honored by bollard (unix socket default; point at a rootless Docker or Podman socket to de-privilege the panel — rootful sockets get a startup warning + audit row + dashboard banner) | unset |
 
 mod api;
 mod auth;
@@ -50,6 +52,11 @@ pub struct PanelState {
     pub buckets: ratelimit::UserBuckets,
     /// instance id → data-volume bytes, refreshed by the disk sweep.
     pub disk_usage: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    /// Whether the Docker socket is rootless, probed once at startup
+    /// (`None` = probe failed / daemon was down). Rootful is surfaced as
+    /// a startup warning, an audit row and a dashboard banner — it means
+    /// this panel is root-equivalent on the host.
+    pub socket_rootless: Option<bool>,
 }
 
 #[derive(Clone)]
@@ -138,6 +145,32 @@ async fn main() -> anyhow::Result<()> {
 
     let docker = docker::DockerCtl::connect().context("connecting to Docker daemon")?;
 
+    // Probe socket posture once. A rootful socket makes this panel
+    // root-equivalent on the host; we run anyway (single-operator rootful
+    // setups are legitimate) but say so everywhere an operator looks.
+    let socket_rootless = match docker.socket_rootless().await {
+        Ok(r) => Some(r),
+        Err(e) => {
+            tracing::warn!(error = format!("{e:#}"), "could not probe docker socket posture");
+            None
+        }
+    };
+    if socket_rootless == Some(false) {
+        tracing::warn!(
+            "panel is driving a ROOTFUL Docker socket — anyone who compromises this \
+             process is root on the host. Point DOCKER_HOST at a rootless Docker or \
+             Podman socket (e.g. unix:///run/user/<uid>/podman/podman.sock)."
+        );
+        db::audit(
+            &db,
+            "system",
+            "rootful_socket",
+            "",
+            "panel started against a root-equivalent Docker socket",
+        )
+        .await;
+    }
+
     let state = Arc::new(PanelState {
         db,
         docker,
@@ -148,12 +181,13 @@ async fn main() -> anyhow::Result<()> {
         login_throttle: ratelimit::LoginThrottle::default(),
         buckets: ratelimit::UserBuckets::default(),
         disk_usage: std::sync::Mutex::new(std::collections::HashMap::new()),
+        socket_rootless,
     });
 
     // Forward approval-questions / urgent notifications from running
     // instances to users' notify webhooks (phones).
     notify::spawn(state.clone());
-    // Measure data-volume usage + warn on soft disk quota crossings.
+    // Measure data-volume usage + enforce disk quotas (warn, then stop).
     disk::spawn(state.clone());
     // Audit retention: the log is append-only, so prune old rows daily.
     spawn_audit_retention(state.db.clone());

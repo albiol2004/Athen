@@ -58,6 +58,8 @@ ATHEN_ADMIN_ADDR=127.0.0.1:8800 ./target/release/athen-admin
 | `ATHEN_ADMIN_IMAGE` | image for new instances | `athen` |
 | `ATHEN_ADMIN_NETWORK` | shared bridge network | `athen-net` |
 | `ATHEN_ADMIN_AUDIT_RETENTION_DAYS` | prune audit rows older than this, daily (`0` = keep forever) | `90` |
+| `ATHEN_ADMIN_DISK_ENFORCE` | `warn` = never stop over-quota instances (default escalates warn → stop) | `stop` |
+| `ATHEN_ADMIN_DISK_SWEEP_SECS` | disk sweep interval, min 5 (also the warn→stop grace period) | `300` |
 | `DOCKER_HOST` | honored by bollard | unix socket |
 
 First start with no users creates `admin` (password from env or printed
@@ -89,13 +91,31 @@ preference:
 Either way: keep the panel the only internet-facing thing holding the
 socket, and front it with TLS.
 
+The panel **probes the socket's posture at startup** (`docker info`
+security options): a rootful socket gets a startup warning, a
+`rootful_socket` audit row, and a persistent red banner on the admin
+dashboard (`socket_rootless` in `GET /panel/me`, admins only — plain
+users don't get host-posture intel). It still runs — single-operator
+rootful setups are legitimate — it just never lets you forget.
+
+Independently of socket posture, every instance container is
+**privilege-hardened at create**: `cap_drop: ALL` + `no-new-privileges`
+(the image runs as uid 1000 with the daemon as direct entrypoint, so it
+needs no capabilities and must never gain any — verified live:
+`CapEff: 0`, `NoNewPrivs: 1`, daemon + embedder + HTTP API all work)
+and `pids_limit: 2048` as a fork-bomb backstop. This shrinks what a
+compromised instance can attempt regardless of which socket the panel
+holds.
+
 ## Surfaces
 
 - **`GET /`** — embedded panel UI (plain HTML/CSS/JS, warm-dark glass).
-  Admin: instance cards (state badge, quota + disk-usage line,
-  start/stop/logs/access/delete), provision modal (env vars + memory/CPU
-  quotas + soft disk limit + optional `config.toml`/`models.toml` seeds +
-  user grants), users table (role chip + promote/demote + delete), audit
+  Admin: rootful-socket warning banner (when applicable), instance cards
+  (state badge, quota + disk-usage line,
+  start/stop/logs/access/quota/delete), provision modal (env vars +
+  memory/CPU quotas + enforced disk quota + optional
+  `config.toml`/`models.toml` seeds + user grants), per-instance disk
+  quota modal, users table (role chip + promote/demote + delete), audit
   log tab. Non-admin users: their granted instances with an *Open chat*
   button. Everyone: a bell modal to set their push webhook.
 - **`GET /i/{instance}/chat`** — minimal built-in chat client running the
@@ -108,7 +128,7 @@ socket, and front it with TLS.
   `/panel/logout`, `GET /panel/me`, `POST /panel/password`,
   `POST /panel/notify` (own push webhook), `GET /panel/audit` (admin),
   `GET|POST /panel/instances` (admin for POST),
-  `POST /panel/instances/{id}/start|stop|delete|grants` (admin),
+  `POST /panel/instances/{id}/start|stop|delete|grants|disk_limit` (admin),
   `GET /panel/instances/{id}/logs?tail&follow` (admin, SSE),
   `GET|POST /panel/users`, `POST /panel/users/{id}/delete` (admin),
   `POST /panel/users/{id}/role` (admin; promote/demote).
@@ -193,22 +213,31 @@ regex-only risk triage still appears to work.
   reconnects transparently) and CPU (`nano_cpus`). Give a real instance
   **≥ 2 GB**: the daemon + bundled embedder + an agent turn peak past
   1 GB (the 1024 MB e2e instance was memcg-OOM-killed mid-turn).
-- **Disk quotas (soft)**: optional per-instance `disk_limit_mb`. A
-  5-minute `docker system df` sweep (volumes only) measures each data
-  volume; the dashboard shows `disk used / limit` (red when over), and
-  crossing the limit writes a `disk_quota_exceeded` audit row + pushes a
-  webhook warning to granted users — once per crossing, re-armed after
-  usage falls back under 90% of the limit. Soft by necessity: Docker's
-  hard quota (`storage_opt: size=`) only works on xfs-with-pquota
-  backing filesystems and fails container creation everywhere else.
-  Nothing is blocked at the limit — the operator decides.
+- **Disk quotas (sweep-enforced)**: optional per-instance
+  `disk_limit_mb`. A `docker system df` sweep (default every 5 min,
+  `ATHEN_ADMIN_DISK_SWEEP_SECS`) measures each data volume; the
+  dashboard shows `disk used / limit` (red when over). Crossing the
+  limit escalates: first sweep over → `disk_quota_exceeded` audit row +
+  webhook warning; still over on the next sweep → the container is
+  **stopped** (`disk_quota_stopped` audit row + push). Starting it back
+  up while still over grants one fresh sweep of cleanup grace, then it
+  is stopped again — the way out is shrinking the volume or raising the
+  quota (`POST /panel/instances/{id}/disk_limit`, also in the card's
+  Quota modal; the sweep reads the row fresh each pass). Warnings fire
+  once per crossing, re-armed under 90% of the limit.
+  `ATHEN_ADMIN_DISK_ENFORCE=warn` restores warn-only behavior.
+  Sweep-enforced rather than kernel-enforced by necessity: Docker's hard
+  quota (`storage_opt: size=`) only works on xfs-with-pquota backing
+  filesystems and fails container creation everywhere else.
 - Operator holds user secrets — inherent to hosting an agent that acts on
   the user's behalf (vault encrypts at rest; host root can read keys).
   Be explicit about this with hosted users.
 - Remaining gaps, deliberate: admins are fully trusted peers (no scoped
-  admin tier), disk quotas warn but don't block, and the Docker socket
-  stays root-equivalent on rootful daemons (see *The Docker socket*
-  above for the rootless mitigation).
+  admin tier), the disk sweep can lag a write burst by up to one
+  interval (it's measurement-based, not kernel-enforced), and a rootful
+  socket — while detected, audited, and bannered — is still
+  root-equivalent if the operator chooses to keep one (see *The Docker
+  socket* above).
 
 ## Push notifications (panel-side)
 
@@ -308,3 +337,35 @@ a 64 MB soft limit: warn log + `disk_quota_exceeded` audit row + webhook
 push + red `disk 545 / 64 MB` on the dashboard card. Rootless — the
 panel ran against `podman.socket` via `DOCKER_HOST` (health, login,
 status sweep, df sweep all clean).
+
+## Enforcement round (2026-06-10): quotas block, sockets confess
+
+Closed the last two deliberate softnesses from the round above:
+
+- **Disk quotas now enforce** (warn → stop escalation, restart grace,
+  `disk_limit` endpoint + Quota modal as the way out, warn-only via
+  `ATHEN_ADMIN_DISK_ENFORCE=warn`) — see *Disk quotas* in the security
+  section. The escalation is a pure tested state machine
+  (`disk.rs::quota_step`); a failed stop call stays in Warned so the
+  next sweep retries.
+- **Rootful sockets are detected and surfaced** (startup warn +
+  `rootful_socket` audit row + dashboard banner + `socket_rootless` in
+  `/panel/me` for admins), and instance containers are
+  privilege-hardened regardless (`cap_drop: ALL`, `no-new-privileges`,
+  `pids_limit: 2048`) — see *The Docker socket*.
+
+E2E (live, rootful Docker + rootless Podman): startup against the
+rootful socket produced the warn log, audit row, and
+`socket_rootless: false` in `/panel/me` (banner condition), while
+non-admin `me` omitted the field; the same binary against
+`podman.socket` reported `socket_rootless: true` with zero rootful
+artifacts. A 64 MB-quota instance booted clean under full hardening
+(`CapDrop=[ALL]`, `NoNewPrivs: 1`, `CapEff: 0` in `/proc`, embedder
+warmup + HTTP API through the proxy all fine), crossed quota → warn
+push to the granted user's webhook → stopped one sweep later
+(`disk_quota_stopped` audit + "Stopped: disk quota" push, container
+`exited`); a panel Start while still over ran exactly one grace sweep
+and was stopped again with a second audit row; raising the quota to
+1024 MB via `POST .../disk_limit` (validated: `<64` → 400, non-admin →
+403, `disk_limit_set` audit row) let it start and survive three sweeps
+at `565 / 1024 MB` on the dashboard.

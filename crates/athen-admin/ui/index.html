@@ -48,6 +48,13 @@
     </header>
 
     <main>
+      <!-- Rootful-socket warning (admins only; filled by panel.js) -->
+      <div id="rootful-banner" class="banner-warn hidden">
+        The panel is driving a <strong>rootful Docker socket</strong> — root-equivalent on this
+        host. Point <code>DOCKER_HOST</code> at a rootless Docker or Podman socket
+        (e.g. <code>unix:///run/user/&lt;uid&gt;/podman/podman.sock</code>).
+      </div>
+
       <!-- Instances -->
       <section id="tab-instances">
         <div class="section-head">

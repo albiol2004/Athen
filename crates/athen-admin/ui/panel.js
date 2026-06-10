@@ -45,6 +45,7 @@ function svg(name) {
     logs: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M9 13h6M9 17h6"/>',
     trash: '<path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/>',
     users: '<path d="M17 21v-2a4 4 0 0 0-4-4H7a4 4 0 0 0-4 4v2"/><circle cx="10" cy="7" r="4"/><path d="M21 21v-2a4 4 0 0 0-3-3.87"/>',
+    disk: '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4 3 9 3s9-1.34 9-3"/>',
     chat: '<path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 8.6 8.6 0 0 1-3.7-.84L3 20l1-4.9A8.4 8.4 0 0 1 3 11.5a8.4 8.4 0 0 1 9-8.4 8.4 8.4 0 0 1 9 8.4z"/>',
   };
   return `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">${icons[name] || ''}</svg>`;
@@ -75,6 +76,12 @@ function showApp() {
   $('#who').textContent = `${ME.username} · ${ME.role}`;
   document.querySelectorAll('.admin-only')
     .forEach((el) => el.classList.toggle('hidden', ME.role !== 'admin'));
+  // socket_rootless: true = rootless (fine), false = rootful (warn),
+  // absent/null = probe failed or non-admin (stay quiet).
+  $('#rootful-banner').classList.toggle(
+    'hidden',
+    !(ME.role === 'admin' && ME.socket_rootless === false),
+  );
   switchTab('instances');
 }
 
@@ -107,7 +114,7 @@ async function loadInstances() {
   $('#instances-empty').classList.toggle('hidden', list.length > 0);
   grid.innerHTML = list.map(instanceCard).join('');
   grid.querySelectorAll('[data-action]').forEach((btn) => {
-    btn.addEventListener('click', () => instanceAction(btn.dataset.action, btn.dataset.id, btn.dataset.name));
+    btn.addEventListener('click', () => instanceAction(btn.dataset.action, btn.dataset.id, btn.dataset.name, btn.dataset));
   });
 }
 
@@ -122,6 +129,7 @@ function instanceCard(i) {
       : `<button class="btn small" data-action="start" data-id="${i.id}" data-name="${esc(i.name)}">${svg('play')} Start</button>`);
     actions.push(`<button class="btn small" data-action="logs" data-id="${i.id}" data-name="${esc(i.name)}">${svg('logs')} Logs</button>`);
     actions.push(`<button class="btn small" data-action="grants" data-id="${i.id}" data-name="${esc(i.name)}">${svg('users')} Access</button>`);
+    actions.push(`<button class="btn small" data-action="disk" data-id="${i.id}" data-name="${esc(i.name)}" data-limit="${i.disk_limit_mb ?? ''}">${svg('disk')} Quota</button>`);
     actions.push(`<button class="btn small danger" data-action="delete" data-id="${i.id}" data-name="${esc(i.name)}">${svg('trash')}</button>`);
   }
   return `<div class="card">
@@ -142,8 +150,8 @@ function instanceCard(i) {
 }
 
 // Disk usage chip: "disk 312 MB" / "disk 312 / 1024 MB"; red when over
-// the soft quota. Usage comes from the panel's periodic docker-df sweep,
-// so it's absent for the first few minutes after a panel restart.
+// quota. Usage comes from the panel's periodic docker-df sweep, so it's
+// absent for the first few minutes after a panel restart.
 function diskMeta(i) {
   if (i.disk_used_mb == null && !i.disk_limit_mb) return '';
   const used = i.disk_used_mb != null ? `${i.disk_used_mb}` : '?';
@@ -152,7 +160,7 @@ function diskMeta(i) {
   return `<span${over ? ' class="disk-over"' : ''}>disk ${used}${limit} MB</span>`;
 }
 
-async function instanceAction(action, id, name) {
+async function instanceAction(action, id, name, data = {}) {
   if (action === 'start' || action === 'stop') {
     try {
       await api(`/panel/instances/${id}/${action}`, { method: 'POST' });
@@ -163,9 +171,40 @@ async function instanceAction(action, id, name) {
     openLogs(id, name);
   } else if (action === 'grants') {
     openGrantsModal(id, name);
+  } else if (action === 'disk') {
+    openDiskModal(id, name, data.limit);
   } else if (action === 'delete') {
     openDeleteModal(id, name);
   }
+}
+
+// Quota edit — also the way out of an enforced quota stop: raise the
+// limit (or clear it), then Start the instance again.
+function openDiskModal(id, name, current) {
+  openModal(`<h3>Disk quota — ${esc(name)}</h3>
+    <form id="form-disk">
+      <label>Limit (MB) <input id="dq-mb" type="number" min="64" step="64" value="${esc(current || '')}" placeholder="no quota"></label>
+      <div class="hint">Crossing the limit warns; still over a sweep later, the
+      instance is stopped. Leave empty to remove the quota.</div>
+      <div class="modal-actions">
+        <button type="button" class="btn" id="modal-cancel">Cancel</button>
+        <button type="submit" class="btn primary">Save</button>
+      </div>
+    </form>`);
+  $('#modal-cancel').addEventListener('click', closeModal);
+  $('#form-disk').addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const v = $('#dq-mb').value.trim();
+    try {
+      await api(`/panel/instances/${id}/disk_limit`, {
+        method: 'POST',
+        body: { disk_limit_mb: v ? Number(v) : null },
+      });
+      toast(v ? `Quota set: ${v} MB` : 'Quota removed');
+      closeModal();
+      loadInstances();
+    } catch (e) { toast(e.message, 'error'); }
+  });
 }
 
 // ---- logs drawer ----
@@ -230,9 +269,9 @@ async function openNewInstanceModal() {
       <div class="row">
         <label>Memory limit (MB) <input id="ni-mem" type="number" min="64" step="64" placeholder="unlimited"></label>
         <label>CPU limit (cores) <input id="ni-cpus" type="number" min="0.1" step="0.1" placeholder="unlimited"></label>
-        <label>Disk warning (MB) <input id="ni-disk" type="number" min="64" step="64" placeholder="no warning"></label>
+        <label>Disk quota (MB) <input id="ni-disk" type="number" min="64" step="64" placeholder="no quota"></label>
       </div>
-      <div class="hint">Memory/CPU are hard cgroup limits — a runaway instance gets OOM-killed and restarted instead of starving the host. Disk is a soft quota: crossing it audits + pushes a warning, nothing is blocked.</div>
+      <div class="hint">Memory/CPU are hard cgroup limits — a runaway instance gets OOM-killed and restarted instead of starving the host. Disk is sweep-enforced: crossing the quota warns (audit + push); still over a sweep later, the instance is stopped until cleaned up or the quota is raised.</div>
       <details>
         <summary>Seed config files (optional)</summary>
         <label>config.toml <textarea id="ni-config" placeholder="[telegram]&#10;enabled = false"></textarea></label>

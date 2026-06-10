@@ -70,7 +70,8 @@ pub struct CreateSpec {
     pub memory_mb: Option<u64>,
     /// Hard CPU limit in fractional cores; `None` = unlimited.
     pub cpus: Option<f64>,
-    /// Soft disk quota on the data volume; `None` = no threshold.
+    /// Disk quota on the data volume (sweep-enforced: warn, then stop);
+    /// `None` = no threshold.
     pub disk_limit_mb: Option<u64>,
 }
 
@@ -193,6 +194,24 @@ pub async fn delete(
         .call(move |c| c.execute("DELETE FROM instances WHERE id = ?1", [iid]))
         .await?;
     Ok(())
+}
+
+/// Change the disk quota after create (`None` clears it). DB-only — the
+/// sweep picks it up next pass. This is the way out of an enforced
+/// quota stop without deleting the instance.
+pub async fn set_disk_limit(
+    db: &Db,
+    instance_id: &str,
+    disk_limit_mb: Option<u64>,
+) -> anyhow::Result<usize> {
+    let iid = instance_id.to_string();
+    db.call(move |c| {
+        c.execute(
+            "UPDATE instances SET disk_limit_mb = ?1 WHERE id = ?2",
+            rusqlite::params![disk_limit_mb, iid],
+        )
+    })
+    .await
 }
 
 /// Replace the set of users who may reach `instance_id`.

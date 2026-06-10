@@ -41,6 +41,10 @@ pub fn router(state: Arc<PanelState>) -> Router {
         .route("/panel/instances/{id}/stop", post(instance_stop))
         .route("/panel/instances/{id}/delete", post(instance_delete))
         .route("/panel/instances/{id}/grants", post(instance_grants))
+        .route(
+            "/panel/instances/{id}/disk_limit",
+            post(instance_disk_limit),
+        )
         .route("/panel/instances/{id}/logs", get(instance_logs))
         .route("/panel/users", get(users_list).post(users_create))
         .route("/panel/users/{id}/delete", post(users_delete))
@@ -158,13 +162,22 @@ async fn logout(
         .into_response()
 }
 
-async fn me(Extension(CurrentUser(user)): Extension<CurrentUser>) -> Json<serde_json::Value> {
-    Json(json!({
+async fn me(
+    State(state): State<Arc<PanelState>>,
+    Extension(CurrentUser(user)): Extension<CurrentUser>,
+) -> Json<serde_json::Value> {
+    let mut out = json!({
         "id": user.id,
         "username": user.username,
         "role": user.role,
         "notify_url": user.notify_url,
-    }))
+    });
+    // Operators should see (and fix) a root-equivalent socket; plain
+    // users can't act on it, so don't advertise host posture to them.
+    if user.is_admin() {
+        out["socket_rootless"] = json!(state.socket_rootless);
+    }
+    Json(out)
 }
 
 #[derive(serde::Deserialize)]
@@ -475,6 +488,52 @@ async fn instance_grants(
                 "grants_set",
                 &instance.name,
                 &format!("{} user(s)", body.user_ids.len()),
+            )
+            .await;
+            Json(json!({ "ok": true })).into_response()
+        }
+        Err(e) => internal(e),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct DiskLimitBody {
+    /// New soft quota in MB; `null` clears it (and un-stops nothing —
+    /// the operator starts the instance back up explicitly).
+    disk_limit_mb: Option<u64>,
+}
+
+/// Adjust an instance's disk quota after create. The enforcement sweep
+/// reads the row fresh each pass, so raising the limit is how an
+/// over-quota stopped instance becomes startable again.
+async fn instance_disk_limit(
+    State(state): State<Arc<PanelState>>,
+    Extension(CurrentUser(user)): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    Json(body): Json<DiskLimitBody>,
+) -> impl IntoResponse {
+    if let Some(resp) = require_admin(&user) {
+        return resp;
+    }
+    if body.disk_limit_mb.is_some_and(|m| m < 64) {
+        return err(StatusCode::BAD_REQUEST, "disk_limit_mb must be >= 64");
+    }
+    let instance = match must_instance(&state, &id).await {
+        Ok(i) => i,
+        Err(resp) => return resp,
+    };
+    match instances::set_disk_limit(&state.db, &id, body.disk_limit_mb).await {
+        Ok(_) => {
+            let detail = match body.disk_limit_mb {
+                Some(mb) => format!("{mb} MB"),
+                None => "cleared".into(),
+            };
+            db::audit(
+                &state.db,
+                &user.username,
+                "disk_limit_set",
+                &instance.name,
+                &detail,
             )
             .await;
             Json(json!({ "ok": true })).into_response()

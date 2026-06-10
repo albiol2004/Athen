@@ -43,6 +43,19 @@ impl DockerCtl {
         Ok(Self { docker })
     }
 
+    /// Whether the daemon behind the socket runs rootless (Docker rootless
+    /// mode or rootless Podman). A rootful socket is root-equivalent on
+    /// the host — the caller surfaces that loudly rather than refusing to
+    /// run, because single-operator rootful setups are still legitimate.
+    pub async fn socket_rootless(&self) -> anyhow::Result<bool> {
+        let info = self.docker.info().await.context("docker info")?;
+        Ok(info
+            .security_options
+            .unwrap_or_default()
+            .iter()
+            .any(|o| o.contains("rootless")))
+    }
+
     /// Create the shared bridge network if it doesn't exist (idempotent).
     ///
     /// Created with inter-container communication (ICC) disabled: the
@@ -143,6 +156,16 @@ impl DockerCtl {
                 // grinding the whole host into swap death.
                 memory_swap: memory_mb.map(|mb| (mb * 1024 * 1024) as i64),
                 nano_cpus: cpus.map(|c| (c * 1e9) as i64),
+                // Privilege hardening: the image runs as uid 1000 with the
+                // daemon binary as direct entrypoint, so it needs no
+                // capabilities and must never gain any (setuid binaries
+                // included). Shrinks what a compromised instance can do —
+                // especially relevant when the panel drives a rootful
+                // socket. pids_limit is a fork-bomb backstop, sized well
+                // above the daemon + portable-Python subprocess peak.
+                cap_drop: Some(vec!["ALL".to_string()]),
+                security_opt: Some(vec!["no-new-privileges:true".to_string()]),
+                pids_limit: Some(2048),
                 ..Default::default()
             }),
             ..Default::default()
