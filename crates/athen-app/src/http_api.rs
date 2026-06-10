@@ -136,6 +136,8 @@ pub async fn serve(cfg: HttpApiConfig, ui: UiBridge) -> std::io::Result<()> {
         .route("/api/messages/queue", post(messages_queue))
         .route("/api/approvals/task", post(approvals_task))
         .route("/api/approvals/question", post(approvals_question))
+        .route("/api/grants/pending", get(grants_pending))
+        .route("/api/grants/{id}", post(grant_resolve))
         .route("/api/cancel", post(cancel_all))
         .route("/api/agents", get(agents_list))
         .route("/api/agents/{task_id}/cancel", post(agent_cancel))
@@ -383,6 +385,36 @@ async fn approvals_question(
         commands::submit_approval_core(body.question_id, body.choice_key, api.ui.app_state())
             .await
             .map(|resolved| json!({"resolved": resolved})),
+    )
+}
+
+/// File-permission prompts currently parked on this instance. Each entry
+/// mirrors the `grant-requested` SSE event payload; answer with
+/// `POST /api/grants/{id}`.
+async fn grants_pending(State(api): State<ApiState>) -> Response {
+    json_result(commands::list_pending_grants_core(api.ui.app_state()).await)
+}
+
+#[derive(Deserialize)]
+struct GrantResolveBody {
+    /// `"Allow"`, `"AllowAlways"`, `"Deny"`, or
+    /// `{"AllowProjectRoot": "/abs/path"}` (serde externally-tagged —
+    /// same wire shape the desktop frontend sends).
+    decision: crate::file_gate::GrantDecision,
+}
+
+/// Answer a parked file-permission prompt — the remote-client analogue
+/// of the desktop `resolve_pending_grant` command, and the missing piece
+/// that used to leave headless agents hung on out-of-workspace writes.
+async fn grant_resolve(
+    State(api): State<ApiState>,
+    UrlPath(id): UrlPath<String>,
+    Json(body): Json<GrantResolveBody>,
+) -> Response {
+    json_result(
+        commands::resolve_pending_grant_core(api.ui.app_state(), id, body.decision)
+            .await
+            .map(|()| json!({"resolved": true})),
     )
 }
 

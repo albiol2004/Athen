@@ -750,7 +750,7 @@ pub(crate) async fn assemble_base_app_tool_registry(
             arc_id.to_string(),
             grants,
             deps.pending_grants.clone(),
-            ui.as_ref().and_then(|u| u.tauri_handle()).cloned(),
+            ui.clone(),
         )
         .with_security_mode(security_mode);
         if let Some(ref sink) = deps.telegram_approval_sink {

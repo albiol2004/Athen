@@ -13,7 +13,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::Serialize;
 use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter};
 use tokio::sync::{oneshot, Mutex};
 use uuid::Uuid;
 
@@ -276,7 +275,12 @@ pub struct FileGate {
     evaluator: PathRiskEvaluator<GrantStoreLookup>,
     grants: Arc<GrantStore>,
     pending: PendingGrants,
-    app_handle: Option<AppHandle>,
+    /// UI seam for the `grant-requested` prompt event. `Tauri` reaches
+    /// the WebView (and the HTTP event bus when live); `Headless`
+    /// reaches the event bus only — which is exactly how remote clients
+    /// and the admin panel's watcher see the prompt. `None` (CLI /
+    /// tests) parks silently and is resolved through `pending` directly.
+    ui: Option<crate::ui_bridge::UiBridge>,
     /// Optional Telegram approval sink. When set, `ask_user` races the
     /// in-app `grant-requested` event against a Telegram inline-keyboard
     /// question so the user can also answer from Telegram if they're
@@ -296,7 +300,7 @@ impl FileGate {
         arc_id_str: String,
         grants: Arc<GrantStore>,
         pending: PendingGrants,
-        app_handle: Option<AppHandle>,
+        ui: Option<crate::ui_bridge::UiBridge>,
     ) -> Self {
         let arc_uuid = arc_uuid(&arc_id_str);
         let evaluator = PathRiskEvaluator::new(GrantStoreLookup::new(grants.clone()));
@@ -306,7 +310,7 @@ impl FileGate {
             evaluator,
             grants,
             pending,
-            app_handle,
+            ui,
             telegram_approval_sink: None,
             security_mode: SecurityMode::Assistant,
         }
@@ -425,6 +429,31 @@ impl FileGate {
         tool: &str,
         detected_root: Option<DetectedRoot>,
     ) -> Result<GrantDecision> {
+        // A parked prompt is only useful if some surface can deliver it.
+        // Tauri always can (WebView); headless can when the HTTP API's
+        // event bus is live (remote clients and the admin-panel watcher
+        // see `grant-requested` and answer via `POST /api/grants/{id}`).
+        // With no deliverable in-app surface and no Telegram sink,
+        // parking would hang the agent forever — fail closed instead.
+        // `None` (CLI / tests) keeps the legacy parking behaviour: those
+        // harnesses resolve through `pending` directly.
+        let inapp_deliverable = match &self.ui {
+            Some(crate::ui_bridge::UiBridge::Tauri(_)) => true,
+            Some(crate::ui_bridge::UiBridge::Headless) => {
+                crate::ui_bridge::UiBridge::event_bus_active()
+            }
+            None => true,
+        };
+        if !inapp_deliverable && self.telegram_approval_sink.is_none() {
+            return Err(AthenError::Other(format!(
+                "No approval surface can deliver the permission prompt for {} access to {} — \
+                 denying. Grant the path in advance, or enable the HTTP API / Telegram so \
+                 permission prompts are answerable.",
+                access_label(access),
+                display_paths(&paths_in),
+            )));
+        }
+
         let (tx, rx) = oneshot::channel();
         let req = PendingGrantRequest {
             arc_id: self.arc_id_str.clone(),
@@ -438,8 +467,8 @@ impl FileGate {
         let summary = req.summary(id);
         self.pending.lock().await.insert(id, req);
 
-        if let Some(handle) = &self.app_handle {
-            let _ = handle.emit("grant-requested", &summary);
+        if let Some(ui) = &self.ui {
+            ui.emit("grant-requested", &summary);
         }
 
         // Without Telegram, the in-app event channel is the only path.
@@ -463,7 +492,7 @@ impl FileGate {
         let q_id = question.id;
 
         let pending_for_cleanup = self.pending.clone();
-        let app_handle_for_cancel = self.app_handle.clone();
+        let ui_for_cancel = self.ui.clone();
 
         tokio::select! {
             // In-app answered first.
@@ -478,8 +507,8 @@ impl FileGate {
                 // dropped (returning a "cancelled" error if anyone awaits
                 // it later) and tell the frontend to dismiss the prompt.
                 pending_for_cleanup.lock().await.remove(&id);
-                if let Some(handle) = app_handle_for_cancel {
-                    let _ = handle.emit("grant-resolved-elsewhere", id.to_string());
+                if let Some(ui) = ui_for_cancel {
+                    ui.emit("grant-resolved-elsewhere", id.to_string());
                 }
                 tg.map(|ans| approval_choice_to_grant_decision(ans, detected_root.as_ref()))
             }
