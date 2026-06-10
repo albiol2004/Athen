@@ -68,10 +68,11 @@ only internet-facing thing with it.
 ## Surfaces
 
 - **`GET /`** — embedded panel UI (plain HTML/CSS/JS, warm-dark glass).
-  Admin: instance cards (state badge, start/stop/logs/access/delete),
-  provision modal (env vars + optional `config.toml`/`models.toml` seeds +
-  user grants), users table. Non-admin users: their granted instances
-  with an *Open chat* button.
+  Admin: instance cards (state badge, quota line, start/stop/logs/access/
+  delete), provision modal (env vars + memory/CPU quotas + optional
+  `config.toml`/`models.toml` seeds + user grants), users table, audit
+  log tab. Non-admin users: their granted instances with an *Open chat*
+  button. Everyone: a bell modal to set their push webhook.
 - **`GET /i/{instance}/chat`** — minimal built-in chat client running the
   exact contract a React/RN app will use: history via proxied
   `/arcs/.../entries`, live `EventSource` on `/events` (stream deltas,
@@ -80,6 +81,7 @@ only internet-facing thing with it.
 - **`/i/{instance}/api/{*}`** — the session-gated reverse proxy (below).
 - **Panel REST** (session; admin-only where noted): `POST /panel/login`,
   `/panel/logout`, `GET /panel/me`, `POST /panel/password`,
+  `POST /panel/notify` (own push webhook), `GET /panel/audit` (admin),
   `GET|POST /panel/instances` (admin for POST),
   `POST /panel/instances/{id}/start|stop|delete|grants` (admin),
   `GET /panel/instances/{id}/logs?tail&follow` (admin, SSE),
@@ -114,6 +116,12 @@ the data volume unless `delete_data: true`.
 Note: the env-overlay only patches **providers that exist in
 `models.toml`** — seeding a `models.toml` (keys blanked, `auth = "None"`)
 is the normal way to give a new instance its provider/bundle layout.
+Two seed footguns found live: (1) sanitize BOTH key shapes — inline
+`api_key = "…"` *and* the table form `[providers.X.auth]\nApiKey = "…"`;
+(2) inject the key for the provider the **active bundle** routes to, not
+the one you assume — `ATHEN_PROVIDER_<ID>_API_KEY` for the wrong `<ID>`
+yields "Authentication failed" at the first real LLM call while
+regex-only risk triage still appears to work.
 
 ## Security model & hardening notes
 
@@ -122,16 +130,65 @@ is the normal way to give a new instance its provider/bundle layout.
   the fronting proxy's job and localhost/VPN deployments are first-class.
 - Login burns an argon2 verify on unknown usernames (no timing oracle);
   generated bootstrap password goes to stdout once, never the log file.
+- **Brute-force throttle**: per-username consecutive-failure lockout
+  (5 free tries, then 30s doubling per failure, capped at 1h; cleared on
+  success) plus a global 30 attempts/min cap. 429 + `Retry-After`,
+  rejected before any argon2 work. Keyed by username, not client IP —
+  the panel sits behind a proxy and unconfigured `X-Forwarded-For` trust
+  is worse than no IPs.
+- **Per-user request buckets** on every session-gated route (burst 300,
+  refill 5/s → 429). Generous by design: it stops runaway scripts, not
+  normal chat (SSE/long-poll connections cost one token each).
+- **Audit log**: append-only `audit_log` table recording login (+failed/
+  throttled), logout, password/notify changes, instance create/start/
+  stop/delete, grants, user create/delete. `GET /panel/audit` + Audit
+  tab (admin). No retention policy yet — rows accrue.
+- **Tenant isolation on the bridge**: the network is created with
+  `com.docker.network.bridge.enable_icc=false`, so instances cannot
+  reach each other's :8787 (verified live: container→container blocked
+  both directions; host→container and internet egress unaffected).
+  Network options are immutable — a pre-ICC `athen-net` keeps working
+  but logs a warning; recreate it once (`docker network rm athen-net`
+  with no instances running) to get isolation.
+- **Resource quotas**: optional per-instance memory (hard cgroup limit,
+  swap disabled — a runaway instance is OOM-killed and auto-restarted by
+  the `unless-stopped` policy, and the proxy's per-request IP resolve
+  reconnects transparently) and CPU (`nano_cpus`). Give a real instance
+  **≥ 2 GB**: the daemon + bundled embedder + an agent turn peak past
+  1 GB (the 1024 MB e2e instance was memcg-OOM-killed mid-turn).
 - Operator holds user secrets — inherent to hosting an agent that acts on
   the user's behalf (vault encrypts at rest; host root can read keys).
   Be explicit about this with hosted users.
-- Instances on the shared bridge can reach *each other's* :8787 (each is
-  token-gated). Acceptable v1; per-instance networks would be stricter.
-- v1 gaps, deliberate: no per-user rate limits, no audit log, no
-  instance resource quotas (`HostConfig` memory/cpu fields are the hook),
-  no panel-side push notifications (subscribe to instance
-  `approval-question` events server-side + FCM/APNs is the natural
-  follow-up), single-admin trust model.
+- Remaining gaps, deliberate: single-admin trust model, no audit
+  retention, no per-instance disk quotas (volumes are unbounded), panel
+  needs the Docker socket (root-equivalent — keep it the only
+  internet-facing thing with it).
+
+## Push notifications (panel-side)
+
+Instances can't reach a backgrounded phone; the panel can. A supervisor
+(`notify.rs`) keeps one SSE connection per *running* instance
+(`/api/events`, instance bearer, container IP re-resolved per connect;
+re-sweeps every 10s so stop/start/restart self-heals — verified across a
+live OOM restart). Forwarded to every **granted** user with a webhook
+configured (admins are not implicitly included — grant them explicitly):
+
+- every `approval-question` (agent blocked on a human), and
+- `notification` events with `requires_response` or urgency
+  High/Critical. Routine notifications stay in-app.
+
+Delivery is a plain-text POST to `users.notify_url` with `Title` /
+`Priority` / `X-Athen-Instance` headers — an [ntfy](https://ntfy.sh)
+topic works out of the box (install the app, pick an unguessable topic,
+paste `https://ntfy.sh/<topic>` into the panel's bell modal), and any
+endpoint accepting plain POSTs (Gotify shim, home-automation hook) works
+too. FCM/APNs for a future React Native app slots in behind the same
+`deliver()` seam. Recently forwarded event ids are deduped per watcher.
+
+Note: the *coordinator* risk gate (`pending_approval`) rides the
+long-poll `POST /messages` response, not the event bus — clients holding
+that request already have the card. The push path covers the events a
+disconnected user would otherwise miss.
 
 ## E2E verification (2026-06-10)
 
@@ -143,3 +200,24 @@ message through panel→proxy→instance→LLM→tool→reply with SSE deltas
 captured → risk-gate card denied through the proxy → logs SSE → stop →
 delete with volume. Findings fixed during the run: seed-file uid (above)
 and the image needing a rebuild to include the HTTP API.
+
+Hardening round, same day, two live instances: login throttle (5 wrong
+passwords → 429 + `Retry-After`, correct password also throttled during
+lockout, success clears state); request bucket (400 parallel `/panel/me`
+→ ~300×200 then 306×429); audit rows for every step, admin-only read;
+quotas exact in `docker inspect` AND enforced for real — the 1024 MB
+instance was memcg-OOM-killed mid-turn, `unless-stopped` restarted it,
+the watcher + proxy reconnected without intervention; ICC: container→
+container :8787 blocked both directions while host→container and
+internet egress kept working; push: agent `install_package` →
+`approval-question` SSE → panel watcher → ntfy-style POST on the test
+webhook (Title/Priority/X-Athen-Instance + body), answered with "deny"
+via the proxied `/approvals/question`.
+
+Bug found in the *instance* during the run (headless gap, not panel):
+file-path grant prompts (`grant-requested`) bypass the ApprovalRouter and
+are emitted only through the FileGate's `app_handle` — which headless
+doesn't wire — so an out-of-workspace `write` parks the agent silently
+with no event and no HTTP endpoint to answer. Follow-up: wire the
+UiBridge into the FileGate in headless + expose a grant-answer route +
+forward `grant-requested` in the panel watcher.

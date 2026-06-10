@@ -225,9 +225,10 @@ async fn deliver(state: &Arc<PanelState>, instance: &Instance, push: &Push) {
         }
     };
     for user in users {
-        // Headers must be latin-1-safe; full UTF-8 rides in the body.
+        // Headers must be ASCII-safe (the separator too — a unicode dash
+        // here mojibakes on ntfy); full UTF-8 rides in the body.
         let title = format!(
-            "{} — {}",
+            "{} - {}",
             sanitize_header(&push.title),
             sanitize_header(&instance.name)
         );
