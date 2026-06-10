@@ -174,6 +174,13 @@ pub async fn create_wakeup(
     req: CreateWakeupReq,
     state: State<'_, AppState>,
 ) -> std::result::Result<WakeupView, String> {
+    create_wakeup_core(req, &state).await
+}
+
+pub(crate) async fn create_wakeup_core(
+    req: CreateWakeupReq,
+    state: &AppState,
+) -> std::result::Result<WakeupView, String> {
     let store = state
         .wakeup_store
         .clone()
@@ -244,6 +251,14 @@ pub async fn update_wakeup(
     id: String,
     req: CreateWakeupReq,
     state: State<'_, AppState>,
+) -> std::result::Result<WakeupView, String> {
+    update_wakeup_core(id, req, &state).await
+}
+
+pub(crate) async fn update_wakeup_core(
+    id: String,
+    req: CreateWakeupReq,
+    state: &AppState,
 ) -> std::result::Result<WakeupView, String> {
     let store = state
         .wakeup_store
@@ -317,6 +332,12 @@ pub async fn update_wakeup(
 pub async fn list_wakeups(
     state: State<'_, AppState>,
 ) -> std::result::Result<Vec<WakeupView>, String> {
+    list_wakeups_core(&state).await
+}
+
+pub(crate) async fn list_wakeups_core(
+    state: &AppState,
+) -> std::result::Result<Vec<WakeupView>, String> {
     let store: Arc<_> = state
         .wakeup_store
         .clone()
@@ -332,6 +353,13 @@ pub async fn list_wakeups(
 pub async fn delete_wakeup(
     id: String,
     state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    delete_wakeup_core(id, &state).await
+}
+
+pub(crate) async fn delete_wakeup_core(
+    id: String,
+    state: &AppState,
 ) -> std::result::Result<(), String> {
     let store = state
         .wakeup_store
@@ -487,6 +515,12 @@ fn humanize(name: &str) -> String {
 pub async fn list_available_tools(
     state: State<'_, AppState>,
 ) -> std::result::Result<Vec<ToolInventoryItem>, String> {
+    list_available_tools_core(&state).await
+}
+
+pub(crate) async fn list_available_tools_core(
+    state: &AppState,
+) -> std::result::Result<Vec<ToolInventoryItem>, String> {
     let arc_id_opt = state.active_arc_id.try_lock().map(|g| g.clone()).ok();
     let arc_id = arc_id_opt.unwrap_or_else(|| "wakeup-tool-inventory".to_string());
     let registry = state.build_tool_registry(&arc_id, None).await;
@@ -539,6 +573,14 @@ pub async fn set_wakeup_enabled(
     id: String,
     enabled: bool,
     state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    set_wakeup_enabled_core(id, enabled, &state).await
+}
+
+pub(crate) async fn set_wakeup_enabled_core(
+    id: String,
+    enabled: bool,
+    state: &AppState,
 ) -> std::result::Result<(), String> {
     let store = state
         .wakeup_store

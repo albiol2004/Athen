@@ -1172,6 +1172,12 @@ pub async fn list_model_families() -> std::result::Result<Vec<ModelFamilyEntry>,
 pub async fn get_settings(
     state: State<'_, AppState>,
 ) -> std::result::Result<SettingsResponse, String> {
+    get_settings_core(&state).await
+}
+
+pub(crate) async fn get_settings_core(
+    state: &AppState,
+) -> std::result::Result<SettingsResponse, String> {
     let models = load_models_config_hydrated(state.vault.as_ref()).await;
     let main_config = load_main_config_hydrated(state.vault.as_ref()).await;
 
@@ -1398,12 +1404,46 @@ pub async fn save_provider(
     compaction_trigger_pct: Option<u8>,
     compaction_target_pct: Option<u8>,
     temperature: Option<f32>,
+    tier_models: Option<HashMap<String, String>>,
+    state: State<'_, AppState>,
+) -> std::result::Result<String, String> {
+    save_provider_core(
+        id,
+        base_url,
+        model,
+        api_key,
+        supports_vision,
+        supports_documents,
+        family,
+        context_window_tokens,
+        compaction_trigger_pct,
+        compaction_target_pct,
+        temperature,
+        tier_models,
+        &state,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn save_provider_core(
+    id: String,
+    base_url: String,
+    model: String,
+    api_key: Option<String>,
+    supports_vision: Option<bool>,
+    supports_documents: Option<bool>,
+    family: Option<String>,
+    context_window_tokens: Option<u32>,
+    compaction_trigger_pct: Option<u8>,
+    compaction_target_pct: Option<u8>,
+    temperature: Option<f32>,
     // Wire-string keys: "Cheap" | "Fast" | "Code" | "Powerful". Frontend
     // posts a flat object; we parse each key into the typed enum. Missing
     // keys are treated as "fall back to default_model"; empty strings are
     // also skipped so a cleared input behaves identically.
     tier_models: Option<HashMap<String, String>>,
-    state: State<'_, AppState>,
+    state: &AppState,
 ) -> std::result::Result<String, String> {
     let mut models = load_models_config();
 
@@ -1670,6 +1710,13 @@ pub async fn delete_provider(
     id: String,
     state: State<'_, AppState>,
 ) -> std::result::Result<String, String> {
+    delete_provider_core(id, &state).await
+}
+
+pub(crate) async fn delete_provider_core(
+    id: String,
+    state: &AppState,
+) -> std::result::Result<String, String> {
     let mut models = load_models_config();
 
     if !models.providers.contains_key(&id) {
@@ -1806,6 +1853,16 @@ pub async fn test_provider(
     api_key: Option<String>,
     state: State<'_, AppState>,
 ) -> std::result::Result<TestResult, String> {
+    test_provider_core(id, base_url, model, api_key, &state).await
+}
+
+pub(crate) async fn test_provider_core(
+    id: String,
+    base_url: String,
+    model: String,
+    api_key: Option<String>,
+    state: &AppState,
+) -> std::result::Result<TestResult, String> {
     // For local providers, just check if the endpoint responds.
     let url = if base_url.is_empty() {
         default_base_url(&id).to_string()
@@ -1883,6 +1940,13 @@ pub async fn test_provider(
 pub async fn set_active_provider(
     id: String,
     state: State<'_, AppState>,
+) -> std::result::Result<String, String> {
+    set_active_provider_core(id, &state).await
+}
+
+pub(crate) async fn set_active_provider_core(
+    id: String,
+    state: &AppState,
 ) -> std::result::Result<String, String> {
     let mut models = load_models_config_hydrated(state.vault.as_ref()).await;
     let provider_cfg = models
@@ -2011,6 +2075,13 @@ pub async fn save_settings(
     security_mode: String,
     state: State<'_, AppState>,
 ) -> std::result::Result<String, String> {
+    save_settings_core(security_mode, &state).await
+}
+
+pub(crate) async fn save_settings_core(
+    security_mode: String,
+    state: &AppState,
+) -> std::result::Result<String, String> {
     let mut config = load_main_config();
 
     config.security.mode = match security_mode.to_lowercase().as_str() {
@@ -2049,6 +2120,36 @@ pub async fn save_email_settings(
     lookback_hours: u32,
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
+) -> std::result::Result<String, String> {
+    save_email_settings_core(
+        enabled,
+        imap_server,
+        imap_port,
+        username,
+        password,
+        use_tls,
+        folders,
+        poll_interval_secs,
+        lookback_hours,
+        &state,
+        &crate::ui_bridge::UiBridge::Tauri(app_handle),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn save_email_settings_core(
+    enabled: bool,
+    imap_server: String,
+    imap_port: u16,
+    username: String,
+    password: Option<String>,
+    use_tls: bool,
+    folders: String,
+    poll_interval_secs: u64,
+    lookback_hours: u32,
+    state: &AppState,
+    ui: &crate::ui_bridge::UiBridge,
 ) -> std::result::Result<String, String> {
     let mut config = load_main_config();
 
@@ -2126,7 +2227,7 @@ pub async fn save_email_settings(
     save_main_config(&config)?;
     // Stop + respawn the IMAP monitor so server/credential/interval/enabled
     // changes apply without a restart.
-    state.restart_email_monitor(crate::ui_bridge::UiBridge::Tauri(app_handle));
+    state.restart_email_monitor(ui.clone());
     Ok("Email settings saved and applied.".to_string())
 }
 
@@ -2226,6 +2327,28 @@ pub async fn save_smtp_settings(
     smtp_use_tls: bool,
     from_address: String,
     state: State<'_, AppState>,
+) -> std::result::Result<String, String> {
+    save_smtp_settings_core(
+        smtp_server,
+        smtp_port,
+        smtp_username,
+        smtp_password,
+        smtp_use_tls,
+        from_address,
+        &state,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn save_smtp_settings_core(
+    smtp_server: String,
+    smtp_port: u16,
+    smtp_username: String,
+    smtp_password: Option<String>,
+    smtp_use_tls: bool,
+    from_address: String,
+    state: &AppState,
 ) -> std::result::Result<String, String> {
     let mut config = load_main_config();
     config.email.smtp_server = smtp_server;
@@ -2368,6 +2491,25 @@ pub async fn save_telegram_settings(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> std::result::Result<String, String> {
+    save_telegram_settings_core(
+        enabled,
+        bot_token,
+        allowed_chat_ids,
+        poll_interval_secs,
+        &state,
+        &crate::ui_bridge::UiBridge::Tauri(app_handle),
+    )
+    .await
+}
+
+pub(crate) async fn save_telegram_settings_core(
+    enabled: bool,
+    bot_token: Option<String>,
+    allowed_chat_ids: Vec<i64>,
+    poll_interval_secs: Option<u64>,
+    state: &AppState,
+    ui: &crate::ui_bridge::UiBridge,
+) -> std::result::Result<String, String> {
     let mut config = load_main_config();
 
     config.telegram.enabled = enabled;
@@ -2448,7 +2590,7 @@ pub async fn save_telegram_settings(
     // respawn the inbound monitor (token/allowlist/interval/enabled), so the
     // whole Telegram subsystem applies without a restart.
     state.reload_telegram_sender().await;
-    state.restart_telegram_monitor(crate::ui_bridge::UiBridge::Tauri(app_handle));
+    state.restart_telegram_monitor(ui.clone());
     Ok("Telegram settings saved and applied.".to_string())
 }
 
@@ -2534,6 +2676,14 @@ pub async fn save_web_search_settings(
     brave_api_key: Option<String>,
     tavily_api_key: Option<String>,
     state: State<'_, AppState>,
+) -> std::result::Result<String, String> {
+    save_web_search_settings_core(brave_api_key, tavily_api_key, &state).await
+}
+
+pub(crate) async fn save_web_search_settings_core(
+    brave_api_key: Option<String>,
+    tavily_api_key: Option<String>,
+    state: &AppState,
 ) -> std::result::Result<String, String> {
     let mut config = load_main_config();
 
@@ -2921,6 +3071,12 @@ async fn test_openai_compatible(
 pub async fn get_calendar_prompt(
     _state: State<'_, AppState>,
 ) -> std::result::Result<String, String> {
+    get_calendar_prompt_core(&_state).await
+}
+
+pub(crate) async fn get_calendar_prompt_core(
+    _state: &AppState,
+) -> std::result::Result<String, String> {
     Ok(load_main_config().calendar.agent_prompt)
 }
 
@@ -2930,6 +3086,13 @@ pub async fn get_calendar_prompt(
 #[tauri::command]
 pub async fn save_calendar_prompt(
     _state: State<'_, AppState>,
+    prompt: String,
+) -> std::result::Result<(), String> {
+    save_calendar_prompt_core(&_state, prompt).await
+}
+
+pub(crate) async fn save_calendar_prompt_core(
+    _state: &AppState,
     prompt: String,
 ) -> std::result::Result<(), String> {
     let mut config = load_main_config();
@@ -2954,6 +3117,12 @@ pub struct CalendarAgentDefault {
 pub async fn get_agent_default_calendar(
     _state: State<'_, AppState>,
 ) -> std::result::Result<CalendarAgentDefault, String> {
+    get_agent_default_calendar_core(&_state).await
+}
+
+pub(crate) async fn get_agent_default_calendar_core(
+    _state: &AppState,
+) -> std::result::Result<CalendarAgentDefault, String> {
     let c = load_main_config().calendar;
     Ok(CalendarAgentDefault {
         source_id: c.agent_default_source_id,
@@ -2967,6 +3136,15 @@ pub async fn get_agent_default_calendar(
 #[tauri::command]
 pub async fn save_agent_default_calendar(
     _state: State<'_, AppState>,
+    source_id: Option<String>,
+    calendar_id: Option<String>,
+    calendar_name: Option<String>,
+) -> std::result::Result<(), String> {
+    save_agent_default_calendar_core(&_state, source_id, calendar_id, calendar_name).await
+}
+
+pub(crate) async fn save_agent_default_calendar_core(
+    _state: &AppState,
     source_id: Option<String>,
     calendar_id: Option<String>,
     calendar_name: Option<String>,
@@ -2987,6 +3165,12 @@ pub async fn save_agent_default_calendar(
 #[tauri::command]
 pub async fn get_notification_settings(
     _state: State<'_, AppState>,
+) -> std::result::Result<NotificationSettingsInfo, String> {
+    get_notification_settings_core(&_state).await
+}
+
+pub(crate) async fn get_notification_settings_core(
+    _state: &AppState,
 ) -> std::result::Result<NotificationSettingsInfo, String> {
     let main_config = load_main_config();
     let nc = &main_config.notifications;
@@ -3035,6 +3219,34 @@ pub async fn save_notification_settings(
     quiet_end_minute: Option<u32>,
     quiet_allow_critical: Option<bool>,
 ) -> std::result::Result<String, String> {
+    save_notification_settings_core(
+        &state,
+        &crate::ui_bridge::UiBridge::Tauri(app_handle),
+        preferred_channels,
+        escalation_timeout_secs,
+        quiet_hours_enabled,
+        quiet_start_hour,
+        quiet_start_minute,
+        quiet_end_hour,
+        quiet_end_minute,
+        quiet_allow_critical,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn save_notification_settings_core(
+    state: &AppState,
+    ui: &crate::ui_bridge::UiBridge,
+    preferred_channels: Vec<String>,
+    escalation_timeout_secs: u64,
+    quiet_hours_enabled: bool,
+    quiet_start_hour: Option<u32>,
+    quiet_start_minute: Option<u32>,
+    quiet_end_hour: Option<u32>,
+    quiet_end_minute: Option<u32>,
+    quiet_allow_critical: Option<bool>,
+) -> std::result::Result<String, String> {
     let mut config = load_main_config();
 
     let channels: Vec<NotificationChannelKind> = preferred_channels
@@ -3072,9 +3284,7 @@ pub async fn save_notification_settings(
     save_main_config(&config)?;
     // Hot-swap the live notification orchestrator so channel order, quiet
     // hours, and escalation timeout apply without a restart.
-    state
-        .reload_notifier(crate::ui_bridge::UiBridge::Tauri(app_handle))
-        .await;
+    state.reload_notifier(ui.clone()).await;
     Ok("Notification settings saved and applied.".to_string())
 }
 
@@ -3086,6 +3296,17 @@ pub async fn save_notification_settings(
 #[tauri::command]
 pub async fn save_embedding_settings(
     state: State<'_, AppState>,
+    mode: String,
+    provider: Option<String>,
+    model: Option<String>,
+    base_url: Option<String>,
+    api_key: Option<String>,
+) -> std::result::Result<String, String> {
+    save_embedding_settings_core(&state, mode, provider, model, base_url, api_key).await
+}
+
+pub(crate) async fn save_embedding_settings_core(
+    state: &AppState,
     mode: String,
     provider: Option<String>,
     model: Option<String>,
@@ -3187,6 +3408,16 @@ pub async fn save_embedding_settings(
 #[tauri::command]
 pub async fn test_embedding_provider(
     _state: State<'_, AppState>,
+    provider: String,
+    model: Option<String>,
+    base_url: Option<String>,
+    api_key: Option<String>,
+) -> std::result::Result<TestResult, String> {
+    test_embedding_provider_core(&_state, provider, model, base_url, api_key).await
+}
+
+pub(crate) async fn test_embedding_provider_core(
+    _state: &AppState,
     provider: String,
     model: Option<String>,
     base_url: Option<String>,
@@ -3501,6 +3732,12 @@ async fn load_one_identity(
 pub async fn get_github_identities(
     state: State<'_, AppState>,
 ) -> std::result::Result<GithubIdentitiesSnapshot, String> {
+    get_github_identities_core(&state).await
+}
+
+pub(crate) async fn get_github_identities_core(
+    state: &AppState,
+) -> std::result::Result<GithubIdentitiesSnapshot, String> {
     let Some(vault) = state.vault.as_ref() else {
         return Ok(GithubIdentitiesSnapshot {
             bot: GithubIdentitySettings {
@@ -3532,6 +3769,16 @@ pub async fn save_github_identity(
     user_name: String,
     user_email: String,
     state: State<'_, AppState>,
+) -> std::result::Result<String, String> {
+    save_github_identity_core(identity, token, user_name, user_email, &state).await
+}
+
+pub(crate) async fn save_github_identity_core(
+    identity: String,
+    token: Option<String>,
+    user_name: String,
+    user_email: String,
+    state: &AppState,
 ) -> std::result::Result<String, String> {
     let scope = which_scope(&identity)?;
     let Some(vault) = state.vault.as_ref() else {

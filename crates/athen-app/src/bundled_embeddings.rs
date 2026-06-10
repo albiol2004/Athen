@@ -82,6 +82,12 @@ pub async fn recommend_embedding_tier() -> std::result::Result<SystemSummary, St
 pub async fn get_bundled_embedding_status(
     _state: State<'_, AppState>,
 ) -> std::result::Result<BundledEmbeddingStatus, String> {
+    get_bundled_embedding_status_core(&_state).await
+}
+
+pub(crate) async fn get_bundled_embedding_status_core(
+    _state: &AppState,
+) -> std::result::Result<BundledEmbeddingStatus, String> {
     let cache_dir =
         bundled_cache_dir().ok_or_else(|| "no Athen data dir resolvable".to_string())?;
 
@@ -223,6 +229,13 @@ pub async fn set_embedding_mode_bundled(
     tier: BundledTier,
     state: State<'_, AppState>,
 ) -> std::result::Result<(), String> {
+    set_embedding_mode_bundled_core(tier, &state).await
+}
+
+pub(crate) async fn set_embedding_mode_bundled_core(
+    tier: BundledTier,
+    state: &AppState,
+) -> std::result::Result<(), String> {
     let mode_str = match tier {
         BundledTier::Light => "Bundled:light",
         BundledTier::Standard => "Bundled:standard",
@@ -230,9 +243,16 @@ pub async fn set_embedding_mode_bundled(
     };
     // TODO: when AppState gains a `rebuild_embedding_router` hook,
     // call it here so the change applies without a restart.
-    crate::settings::save_embedding_settings(state, mode_str.to_string(), None, None, None, None)
-        .await
-        .map(|_| ())
+    crate::settings::save_embedding_settings_core(
+        state,
+        mode_str.to_string(),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .map(|_| ())
 }
 
 // ---------------------------------------------------------------------------

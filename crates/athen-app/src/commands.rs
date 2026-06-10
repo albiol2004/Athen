@@ -5635,6 +5635,12 @@ pub(crate) async fn queue_user_input_core(
 pub async fn vault_smoke_test(
     state: State<'_, AppState>,
 ) -> std::result::Result<serde_json::Value, String> {
+    vault_smoke_test_core(&state).await
+}
+
+pub(crate) async fn vault_smoke_test_core(
+    state: &AppState,
+) -> std::result::Result<serde_json::Value, String> {
     use serde_json::json;
     let Some(vault) = state.vault.clone() else {
         return Ok(json!({
@@ -5740,6 +5746,12 @@ async fn endpoint_has_credential(
 pub async fn list_http_endpoints(
     state: State<'_, AppState>,
 ) -> std::result::Result<Vec<EndpointWire>, String> {
+    list_http_endpoints_core(&state).await
+}
+
+pub(crate) async fn list_http_endpoints_core(
+    state: &AppState,
+) -> std::result::Result<Vec<EndpointWire>, String> {
     use athen_core::traits::http_endpoint::HttpEndpointStore;
     let Some(store) = state.http_endpoint_store.as_ref() else {
         return Ok(Vec::new());
@@ -5801,6 +5813,13 @@ fn default_true() -> bool {
 pub async fn upsert_http_endpoint(
     input: EndpointInput,
     state: State<'_, AppState>,
+) -> std::result::Result<EndpointWire, String> {
+    upsert_http_endpoint_core(input, &state).await
+}
+
+pub(crate) async fn upsert_http_endpoint_core(
+    input: EndpointInput,
+    state: &AppState,
 ) -> std::result::Result<EndpointWire, String> {
     use athen_core::http_endpoint::{EndpointRisk, RateLimit, RegisteredEndpoint};
     use athen_core::traits::http_endpoint::HttpEndpointStore;
@@ -5888,6 +5907,13 @@ pub async fn delete_http_endpoint(
     id: String,
     state: State<'_, AppState>,
 ) -> std::result::Result<(), String> {
+    delete_http_endpoint_core(id, &state).await
+}
+
+pub(crate) async fn delete_http_endpoint_core(
+    id: String,
+    state: &AppState,
+) -> std::result::Result<(), String> {
     use athen_core::traits::http_endpoint::HttpEndpointStore;
     let Some(store) = state.http_endpoint_store.as_ref() else {
         return Err("HTTP endpoint store not available".into());
@@ -5914,6 +5940,14 @@ pub async fn set_http_endpoint_enabled(
     enabled: bool,
     state: State<'_, AppState>,
 ) -> std::result::Result<(), String> {
+    set_http_endpoint_enabled_core(id, enabled, &state).await
+}
+
+pub(crate) async fn set_http_endpoint_enabled_core(
+    id: String,
+    enabled: bool,
+    state: &AppState,
+) -> std::result::Result<(), String> {
     use athen_core::traits::http_endpoint::HttpEndpointStore;
     let Some(store) = state.http_endpoint_store.as_ref() else {
         return Err("HTTP endpoint store not available".into());
@@ -5936,6 +5970,14 @@ pub async fn test_http_endpoint(
     id: String,
     path: Option<String>,
     state: State<'_, AppState>,
+) -> std::result::Result<serde_json::Value, String> {
+    test_http_endpoint_core(id, path, &state).await
+}
+
+pub(crate) async fn test_http_endpoint_core(
+    id: String,
+    path: Option<String>,
+    state: &AppState,
 ) -> std::result::Result<serde_json::Value, String> {
     use athen_core::http_endpoint::AuthMethod;
     use athen_core::traits::http_endpoint::HttpEndpointStore;
@@ -6089,6 +6131,13 @@ pub async fn list_arc_snapshots(
     state: State<'_, AppState>,
     arc_id: String,
 ) -> std::result::Result<Vec<athen_core::traits::checkpoint::ActionRecord>, String> {
+    list_arc_snapshots_core(&state, arc_id).await
+}
+
+pub(crate) async fn list_arc_snapshots_core(
+    state: &AppState,
+    arc_id: String,
+) -> std::result::Result<Vec<athen_core::traits::checkpoint::ActionRecord>, String> {
     let store = state
         .checkpoint_store
         .as_ref()
@@ -6104,6 +6153,13 @@ pub async fn list_arc_snapshots(
 #[tauri::command]
 pub async fn revert_snapshot(
     state: State<'_, AppState>,
+    action_id: String,
+) -> std::result::Result<athen_core::traits::checkpoint::RevertOutcome, String> {
+    revert_snapshot_core(&state, action_id).await
+}
+
+pub(crate) async fn revert_snapshot_core(
+    state: &AppState,
     action_id: String,
 ) -> std::result::Result<athen_core::traits::checkpoint::RevertOutcome, String> {
     let store = state
@@ -6126,6 +6182,14 @@ pub async fn revert_snapshot(
 #[tauri::command]
 pub async fn rewind_changes(
     state: State<'_, AppState>,
+    arc_id: String,
+    action_id: String,
+) -> std::result::Result<athen_core::traits::checkpoint::RevertOutcome, String> {
+    rewind_changes_core(&state, arc_id, action_id).await
+}
+
+pub(crate) async fn rewind_changes_core(
+    state: &AppState,
     arc_id: String,
     action_id: String,
 ) -> std::result::Result<athen_core::traits::checkpoint::RevertOutcome, String> {
@@ -6243,6 +6307,13 @@ pub async fn list_recent_agent_runs(
     state: State<'_, AppState>,
     limit: Option<u32>,
 ) -> std::result::Result<Vec<athen_persistence::agent_runs::AgentRunRecord>, String> {
+    list_recent_agent_runs_core(&state, limit).await
+}
+
+pub(crate) async fn list_recent_agent_runs_core(
+    state: &AppState,
+    limit: Option<u32>,
+) -> std::result::Result<Vec<athen_persistence::agent_runs::AgentRunRecord>, String> {
     let store = state
         .agent_run_store
         .as_ref()
@@ -6290,6 +6361,12 @@ pub(crate) async fn submit_approval_core(
 /// Return basic status information.
 #[tauri::command]
 pub async fn get_status(state: State<'_, AppState>) -> std::result::Result<StatusResponse, String> {
+    get_status_core(&state).await
+}
+
+pub(crate) async fn get_status_core(
+    state: &AppState,
+) -> std::result::Result<StatusResponse, String> {
     Ok(StatusResponse {
         connected: true,
         model: state.model_name.lock().await.clone(),
@@ -6441,6 +6518,13 @@ pub async fn compact_arc(
     arc_id: String,
     state: State<'_, AppState>,
 ) -> std::result::Result<CompactArcResponse, String> {
+    compact_arc_core(arc_id, &state).await
+}
+
+pub(crate) async fn compact_arc_core(
+    arc_id: String,
+    state: &AppState,
+) -> std::result::Result<CompactArcResponse, String> {
     let Some(ref compactor) = state.compactor else {
         return Err("Compactor not wired (no arc store).".into());
     };
@@ -6567,6 +6651,14 @@ pub async fn rename_arc(
     name: String,
     state: State<'_, AppState>,
 ) -> std::result::Result<(), String> {
+    rename_arc_core(arc_id, name, &state).await
+}
+
+pub(crate) async fn rename_arc_core(
+    arc_id: String,
+    name: String,
+    state: &AppState,
+) -> std::result::Result<(), String> {
     if let Some(ref store) = state.arc_store {
         store
             .rename_arc(&arc_id, &name)
@@ -6585,6 +6677,13 @@ pub async fn rename_arc(
 pub async fn delete_arc(
     arc_id: String,
     state: State<'_, AppState>,
+) -> std::result::Result<String, String> {
+    delete_arc_core(arc_id, &state).await
+}
+
+pub(crate) async fn delete_arc_core(
+    arc_id: String,
+    state: &AppState,
 ) -> std::result::Result<String, String> {
     if let Some(ref store) = state.arc_store {
         store.delete_arc(&arc_id).await.map_err(|e| e.to_string())?;
@@ -6640,6 +6739,15 @@ pub async fn branch_arc(
     name: String,
     up_to_entry_id: i64,
     state: State<'_, AppState>,
+) -> std::result::Result<String, String> {
+    branch_arc_core(parent_arc_id, name, up_to_entry_id, &state).await
+}
+
+pub(crate) async fn branch_arc_core(
+    parent_arc_id: String,
+    name: String,
+    up_to_entry_id: i64,
+    state: &AppState,
 ) -> std::result::Result<String, String> {
     let new_id = chrono::Utc::now().format("arc_%Y%m%d_%H%M%S").to_string();
     if let Some(ref store) = state.arc_store {
@@ -6858,6 +6966,12 @@ pub async fn merge_arcs(
 pub async fn list_agent_profiles(
     state: State<'_, AppState>,
 ) -> std::result::Result<Vec<athen_core::agent_profile::AgentProfile>, String> {
+    list_agent_profiles_core(&state).await
+}
+
+pub(crate) async fn list_agent_profiles_core(
+    state: &AppState,
+) -> std::result::Result<Vec<athen_core::agent_profile::AgentProfile>, String> {
     use athen_core::traits::profile::ProfileStore;
     let Some(store) = state.profile_store.as_ref() else {
         return Ok(Vec::new());
@@ -6876,6 +6990,14 @@ pub async fn set_arc_profile(
     profile_id: Option<String>,
     state: State<'_, AppState>,
 ) -> std::result::Result<(), String> {
+    set_arc_profile_core(arc_id, profile_id, &state).await
+}
+
+pub(crate) async fn set_arc_profile_core(
+    arc_id: String,
+    profile_id: Option<String>,
+    state: &AppState,
+) -> std::result::Result<(), String> {
     let Some(arc_store) = state.arc_store.as_ref() else {
         return Err("Arc store not available".into());
     };
@@ -6893,6 +7015,14 @@ pub async fn set_arc_reasoning_effort(
     arc_id: String,
     effort: Option<String>,
     state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    set_arc_reasoning_effort_core(arc_id, effort, &state).await
+}
+
+pub(crate) async fn set_arc_reasoning_effort_core(
+    arc_id: String,
+    effort: Option<String>,
+    state: &AppState,
 ) -> std::result::Result<(), String> {
     let Some(arc_store) = state.arc_store.as_ref() else {
         return Err("Arc store not available".into());
@@ -6924,6 +7054,14 @@ pub async fn set_arc_tier(
     arc_id: String,
     tier: Option<String>,
     state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    set_arc_tier_core(arc_id, tier, &state).await
+}
+
+pub(crate) async fn set_arc_tier_core(
+    arc_id: String,
+    tier: Option<String>,
+    state: &AppState,
 ) -> std::result::Result<(), String> {
     let Some(arc_store) = state.arc_store.as_ref() else {
         return Err("Arc store not available".into());
@@ -6959,6 +7097,14 @@ pub async fn set_arc_security_mode(
     arc_id: String,
     mode: Option<String>,
     state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    set_arc_security_mode_core(arc_id, mode, &state).await
+}
+
+pub(crate) async fn set_arc_security_mode_core(
+    arc_id: String,
+    mode: Option<String>,
+    state: &AppState,
 ) -> std::result::Result<(), String> {
     use std::str::FromStr;
     let Some(arc_store) = state.arc_store.as_ref() else {
@@ -7041,6 +7187,13 @@ pub async fn create_agent_profile(
     input: AgentProfileInput,
     state: State<'_, AppState>,
 ) -> std::result::Result<athen_core::agent_profile::AgentProfile, String> {
+    create_agent_profile_core(input, &state).await
+}
+
+pub(crate) async fn create_agent_profile_core(
+    input: AgentProfileInput,
+    state: &AppState,
+) -> std::result::Result<athen_core::agent_profile::AgentProfile, String> {
     use athen_core::traits::profile::ProfileStore;
     let Some(store) = state.profile_store.as_ref() else {
         return Err("Profile store not available".into());
@@ -7076,6 +7229,13 @@ pub async fn update_agent_profile(
     input: AgentProfileInput,
     state: State<'_, AppState>,
 ) -> std::result::Result<athen_core::agent_profile::AgentProfile, String> {
+    update_agent_profile_core(input, &state).await
+}
+
+pub(crate) async fn update_agent_profile_core(
+    input: AgentProfileInput,
+    state: &AppState,
+) -> std::result::Result<athen_core::agent_profile::AgentProfile, String> {
     use athen_core::traits::profile::ProfileStore;
     let Some(store) = state.profile_store.as_ref() else {
         return Err("Profile store not available".into());
@@ -7110,6 +7270,13 @@ pub async fn delete_agent_profile(
     profile_id: String,
     state: State<'_, AppState>,
 ) -> std::result::Result<(), String> {
+    delete_agent_profile_core(profile_id, &state).await
+}
+
+pub(crate) async fn delete_agent_profile_core(
+    profile_id: String,
+    state: &AppState,
+) -> std::result::Result<(), String> {
     use athen_core::traits::profile::ProfileStore;
     let Some(store) = state.profile_store.as_ref() else {
         return Err("Profile store not available".into());
@@ -7128,6 +7295,13 @@ pub async fn delete_agent_profile(
 pub async fn restore_agent_profile(
     profile_id: String,
     state: State<'_, AppState>,
+) -> std::result::Result<athen_core::agent_profile::AgentProfile, String> {
+    restore_agent_profile_core(profile_id, &state).await
+}
+
+pub(crate) async fn restore_agent_profile_core(
+    profile_id: String,
+    state: &AppState,
 ) -> std::result::Result<athen_core::agent_profile::AgentProfile, String> {
     let Some(store) = state.profile_store.as_ref() else {
         return Err("Profile store not available".into());
@@ -7175,6 +7349,19 @@ pub struct ProfileTokenEstimate {
 pub async fn estimate_profile_tokens(
     state: State<'_, AppState>,
     app_handle: AppHandle,
+    profile_id: String,
+) -> std::result::Result<ProfileTokenEstimate, String> {
+    estimate_profile_tokens_core(
+        &state,
+        &crate::ui_bridge::UiBridge::Tauri(app_handle),
+        profile_id,
+    )
+    .await
+}
+
+pub(crate) async fn estimate_profile_tokens_core(
+    state: &AppState,
+    ui: &UiBridge,
     profile_id: String,
 ) -> std::result::Result<ProfileTokenEstimate, String> {
     use athen_core::traits::profile::ProfileStore;
@@ -7238,9 +7425,7 @@ pub async fn estimate_profile_tokens(
     //    Per-arc differences are permission-shaped, not tool-shaped, so
     //    the listed names + schemas are the same either way.
     let arc_id = state.active_arc_id.lock().await.clone();
-    let registry = state
-        .build_tool_registry(&arc_id, Some(UiBridge::Tauri(app_handle.clone())))
-        .await;
+    let registry = state.build_tool_registry(&arc_id, Some(ui.clone())).await;
     let tools = registry.list_tools().await.unwrap_or_default();
 
     // 5. Run the estimator with the same shell + toolbox info the
@@ -7336,6 +7521,12 @@ pub struct IdentityTotalEstimate {
 pub async fn estimate_identity_total(
     state: State<'_, AppState>,
 ) -> std::result::Result<IdentityTotalEstimate, String> {
+    estimate_identity_total_core(&state).await
+}
+
+pub(crate) async fn estimate_identity_total_core(
+    state: &AppState,
+) -> std::result::Result<IdentityTotalEstimate, String> {
     use athen_core::traits::identity::IdentityStore;
     let zero = IdentityTotalEstimate {
         entry_count: 0,
@@ -7396,6 +7587,14 @@ pub async fn list_calendar_events(
     end: String,
     state: State<'_, AppState>,
 ) -> std::result::Result<Vec<CalendarEvent>, String> {
+    list_calendar_events_core(start, end, &state).await
+}
+
+pub(crate) async fn list_calendar_events_core(
+    start: String,
+    end: String,
+    state: &AppState,
+) -> std::result::Result<Vec<CalendarEvent>, String> {
     if let Some(ref store) = state.calendar_store {
         store
             .list_events(&start, &end)
@@ -7420,6 +7619,15 @@ pub async fn create_calendar_event(
     target_calendar_id: Option<String>,
     state: State<'_, AppState>,
 ) -> std::result::Result<CalendarEvent, String> {
+    create_calendar_event_core(event, target_source_id, target_calendar_id, &state).await
+}
+
+pub(crate) async fn create_calendar_event_core(
+    event: CalendarEvent,
+    target_source_id: Option<String>,
+    target_calendar_id: Option<String>,
+    state: &AppState,
+) -> std::result::Result<CalendarEvent, String> {
     let mut event = event;
     let Some(ref store) = state.calendar_store else {
         return Ok(event);
@@ -7430,7 +7638,7 @@ pub async fn create_calendar_event(
     // next sync pass recognises it as already-synced.
     let pushed_remote = try_push_create(
         &event,
-        &state,
+        state,
         target_source_id.as_deref(),
         target_calendar_id.as_deref(),
     )
@@ -7531,6 +7739,13 @@ pub async fn update_calendar_event(
     event: CalendarEvent,
     state: State<'_, AppState>,
 ) -> std::result::Result<(), String> {
+    update_calendar_event_core(event, &state).await
+}
+
+pub(crate) async fn update_calendar_event_core(
+    event: CalendarEvent,
+    state: &AppState,
+) -> std::result::Result<(), String> {
     let mut event = event;
     let Some(ref store) = state.calendar_store else {
         return Ok(());
@@ -7539,7 +7754,7 @@ pub async fn update_calendar_event(
     if let (Some(_source_id), Some(_remote_id)) =
         (event.source_id.as_ref(), event.remote_id.as_ref())
     {
-        match try_push_update(&event, &state).await {
+        match try_push_update(&event, state).await {
             Ok(Some(new_etag)) => {
                 event.remote_etag = new_etag;
             }
@@ -7590,6 +7805,13 @@ pub async fn delete_calendar_event(
     id: String,
     state: State<'_, AppState>,
 ) -> std::result::Result<(), String> {
+    delete_calendar_event_core(id, &state).await
+}
+
+pub(crate) async fn delete_calendar_event_core(
+    id: String,
+    state: &AppState,
+) -> std::result::Result<(), String> {
     let Some(ref store) = state.calendar_store else {
         return Ok(());
     };
@@ -7597,7 +7819,7 @@ pub async fn delete_calendar_event(
     let existing = store.get_event(&id).await.map_err(|e| e.to_string())?;
     if let Some(ev) = existing.as_ref() {
         if ev.source_id.is_some() && ev.remote_id.is_some() {
-            if let Err(e) = try_push_delete(ev, &state).await {
+            if let Err(e) = try_push_delete(ev, state).await {
                 tracing::warn!(error = %e, "Calendar event remote delete failed");
                 // Surface to the user — silently keeping a row that's
                 // still on the phone would be worse than the error.
@@ -7644,6 +7866,13 @@ async fn try_push_delete(
 #[tauri::command]
 pub async fn mark_notification_seen(
     state: State<'_, AppState>,
+    id: String,
+) -> std::result::Result<(), String> {
+    mark_notification_seen_core(&state, id).await
+}
+
+pub(crate) async fn mark_notification_seen_core(
+    state: &AppState,
     id: String,
 ) -> std::result::Result<(), String> {
     let uuid = Uuid::parse_str(&id).map_err(|e| format!("Invalid notification ID: {e}"))?;
@@ -7715,6 +7944,13 @@ pub async fn delete_notification(
     state: State<'_, AppState>,
     id: String,
 ) -> std::result::Result<(), String> {
+    delete_notification_core(&state, id).await
+}
+
+pub(crate) async fn delete_notification_core(
+    state: &AppState,
+    id: String,
+) -> std::result::Result<(), String> {
     let uuid = Uuid::parse_str(&id).map_err(|e| format!("Invalid notification ID: {e}"))?;
     if let Some(notifier) = state.notifier.load_full() {
         notifier.delete_notification(uuid).await;
@@ -7726,6 +7962,12 @@ pub async fn delete_notification(
 #[tauri::command]
 pub async fn delete_read_notifications(
     state: State<'_, AppState>,
+) -> std::result::Result<usize, String> {
+    delete_read_notifications_core(&state).await
+}
+
+pub(crate) async fn delete_read_notifications_core(
+    state: &AppState,
 ) -> std::result::Result<usize, String> {
     if let Some(notifier) = state.notifier.load_full() {
         Ok(notifier.delete_read_notifications().await)
@@ -7781,6 +8023,12 @@ pub struct RelationInfo {
 pub async fn list_memories(
     state: State<'_, AppState>,
 ) -> std::result::Result<Vec<MemoryInfo>, String> {
+    list_memories_core(&state).await
+}
+
+pub(crate) async fn list_memories_core(
+    state: &AppState,
+) -> std::result::Result<Vec<MemoryInfo>, String> {
     let memory = state.memory.as_ref().ok_or("Memory not initialized")?;
     let items = memory.list_all().await.map_err(|e| e.to_string())?;
     Ok(items
@@ -7816,6 +8064,14 @@ pub async fn update_memory(
     id: String,
     content: String,
 ) -> std::result::Result<(), String> {
+    update_memory_core(&state, id, content).await
+}
+
+pub(crate) async fn update_memory_core(
+    state: &AppState,
+    id: String,
+    content: String,
+) -> std::result::Result<(), String> {
     let memory = state.memory.as_ref().ok_or("Memory not initialized")?;
     memory
         .update(&id, &content)
@@ -7829,6 +8085,13 @@ pub async fn delete_memory(
     state: State<'_, AppState>,
     id: String,
 ) -> std::result::Result<(), String> {
+    delete_memory_core(&state, id).await
+}
+
+pub(crate) async fn delete_memory_core(
+    state: &AppState,
+    id: String,
+) -> std::result::Result<(), String> {
     let memory = state.memory.as_ref().ok_or("Memory not initialized")?;
     memory.forget(&id).await.map_err(|e| e.to_string())
 }
@@ -7837,6 +8100,12 @@ pub async fn delete_memory(
 #[tauri::command]
 pub async fn list_entities(
     state: State<'_, AppState>,
+) -> std::result::Result<Vec<EntityInfo>, String> {
+    list_entities_core(&state).await
+}
+
+pub(crate) async fn list_entities_core(
+    state: &AppState,
 ) -> std::result::Result<Vec<EntityInfo>, String> {
     let memory = state.memory.as_ref().ok_or("Memory not initialized")?;
     let entities = memory.list_entities().await.map_err(|e| e.to_string())?;
@@ -7886,6 +8155,12 @@ pub async fn list_entities(
 pub async fn list_relations(
     state: State<'_, AppState>,
 ) -> std::result::Result<Vec<RelationInfo>, String> {
+    list_relations_core(&state).await
+}
+
+pub(crate) async fn list_relations_core(
+    state: &AppState,
+) -> std::result::Result<Vec<RelationInfo>, String> {
     let memory = state.memory.as_ref().ok_or("Memory not initialized")?;
     let relations = memory.list_relations().await.map_err(|e| e.to_string())?;
     Ok(relations
@@ -7906,6 +8181,15 @@ pub async fn list_relations(
 #[tauri::command]
 pub async fn update_entity(
     state: State<'_, AppState>,
+    id: String,
+    name: Option<String>,
+    entity_type: Option<String>,
+) -> std::result::Result<(), String> {
+    update_entity_core(&state, id, name, entity_type).await
+}
+
+pub(crate) async fn update_entity_core(
+    state: &AppState,
     id: String,
     name: Option<String>,
     entity_type: Option<String>,
@@ -7932,6 +8216,13 @@ pub async fn delete_entity(
     state: State<'_, AppState>,
     id: String,
 ) -> std::result::Result<(), String> {
+    delete_entity_core(&state, id).await
+}
+
+pub(crate) async fn delete_entity_core(
+    state: &AppState,
+    id: String,
+) -> std::result::Result<(), String> {
     let memory = state.memory.as_ref().ok_or("Memory not initialized")?;
     let entity_id = Uuid::parse_str(&id).map_err(|e| format!("Invalid entity ID: {e}"))?;
     memory
@@ -7944,6 +8235,15 @@ pub async fn delete_entity(
 #[tauri::command]
 pub async fn delete_relation(
     state: State<'_, AppState>,
+    from_id: String,
+    to_id: String,
+    relation: String,
+) -> std::result::Result<(), String> {
+    delete_relation_core(&state, from_id, to_id, relation).await
+}
+
+pub(crate) async fn delete_relation_core(
+    state: &AppState,
     from_id: String,
     to_id: String,
     relation: String,
@@ -7973,6 +8273,12 @@ pub struct CatalogEntryView {
 #[tauri::command]
 pub async fn list_mcp_catalog(
     state: State<'_, AppState>,
+) -> std::result::Result<Vec<CatalogEntryView>, String> {
+    list_mcp_catalog_core(&state).await
+}
+
+pub(crate) async fn list_mcp_catalog_core(
+    state: &AppState,
 ) -> std::result::Result<Vec<CatalogEntryView>, String> {
     let enabled_ids: std::collections::HashSet<String> =
         state.mcp.enabled_ids().await.into_iter().collect();
@@ -8009,6 +8315,14 @@ pub async fn enable_mcp(
     mcp_id: String,
     config: serde_json::Value,
 ) -> std::result::Result<(), String> {
+    enable_mcp_core(&state, mcp_id, config).await
+}
+
+pub(crate) async fn enable_mcp_core(
+    state: &AppState,
+    mcp_id: String,
+    config: serde_json::Value,
+) -> std::result::Result<(), String> {
     state
         .mcp
         .enable(&mcp_id, config.clone())
@@ -8029,6 +8343,13 @@ pub async fn enable_mcp(
 #[tauri::command]
 pub async fn disable_mcp(
     state: State<'_, AppState>,
+    mcp_id: String,
+) -> std::result::Result<(), String> {
+    disable_mcp_core(&state, mcp_id).await
+}
+
+pub(crate) async fn disable_mcp_core(
+    state: &AppState,
     mcp_id: String,
 ) -> std::result::Result<(), String> {
     state.mcp.disable(&mcp_id).await;
@@ -8068,6 +8389,12 @@ pub struct EnabledMcpView {
 pub async fn mcp_list_custom(
     state: State<'_, AppState>,
 ) -> std::result::Result<Vec<athen_core::traits::mcp::McpCatalogEntry>, String> {
+    mcp_list_custom_core(&state).await
+}
+
+pub(crate) async fn mcp_list_custom_core(
+    state: &AppState,
+) -> std::result::Result<Vec<athen_core::traits::mcp::McpCatalogEntry>, String> {
     let Some(store) = &state.mcp_store else {
         return Ok(Vec::new());
     };
@@ -8077,6 +8404,12 @@ pub async fn mcp_list_custom(
 #[tauri::command]
 pub async fn mcp_list_enabled(
     state: State<'_, AppState>,
+) -> std::result::Result<Vec<EnabledMcpView>, String> {
+    mcp_list_enabled_core(&state).await
+}
+
+pub(crate) async fn mcp_list_enabled_core(
+    state: &AppState,
 ) -> std::result::Result<Vec<EnabledMcpView>, String> {
     let entries = state.mcp.enabled_entries().await;
     let mut out = Vec::with_capacity(entries.len());
@@ -8120,6 +8453,15 @@ pub async fn mcp_add_custom(
     env_secrets: std::collections::HashMap<String, String>,
     enable_now: bool,
     state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    mcp_add_custom_core(entry, env_secrets, enable_now, &state).await
+}
+
+pub(crate) async fn mcp_add_custom_core(
+    entry: athen_core::traits::mcp::McpCatalogEntry,
+    env_secrets: std::collections::HashMap<String, String>,
+    enable_now: bool,
+    state: &AppState,
 ) -> std::result::Result<(), String> {
     let Some(store) = &state.mcp_store else {
         return Err("MCP persistence not available".into());
@@ -8181,6 +8523,13 @@ pub async fn mcp_remove_custom(
     id: String,
     state: State<'_, AppState>,
 ) -> std::result::Result<(), String> {
+    mcp_remove_custom_core(id, &state).await
+}
+
+pub(crate) async fn mcp_remove_custom_core(
+    id: String,
+    state: &AppState,
+) -> std::result::Result<(), String> {
     let Some(store) = &state.mcp_store else {
         return Err("MCP persistence not available".into());
     };
@@ -8223,6 +8572,14 @@ pub async fn mcp_set_enabled(
     id: String,
     enable: bool,
     state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    mcp_set_enabled_core(id, enable, &state).await
+}
+
+pub(crate) async fn mcp_set_enabled_core(
+    id: String,
+    enable: bool,
+    state: &AppState,
 ) -> std::result::Result<(), String> {
     let Some(store) = &state.mcp_store else {
         return Err("MCP persistence not available".into());
@@ -8277,6 +8634,14 @@ pub async fn mcp_test_spawn(
     entry: athen_core::traits::mcp::McpCatalogEntry,
     env_secrets: std::collections::HashMap<String, String>,
     state: State<'_, AppState>,
+) -> std::result::Result<McpTestSpawnResult, String> {
+    mcp_test_spawn_core(entry, env_secrets, &state).await
+}
+
+pub(crate) async fn mcp_test_spawn_core(
+    entry: athen_core::traits::mcp::McpCatalogEntry,
+    env_secrets: std::collections::HashMap<String, String>,
+    state: &AppState,
 ) -> std::result::Result<McpTestSpawnResult, String> {
     use athen_core::traits::mcp::{EnvBinding, EnvValue, McpSource};
 
@@ -8364,6 +8729,13 @@ pub async fn mcp_list_tools_for(
     id: String,
     state: State<'_, AppState>,
 ) -> std::result::Result<Vec<McpToolView>, String> {
+    mcp_list_tools_for_core(id, &state).await
+}
+
+pub(crate) async fn mcp_list_tools_for_core(
+    id: String,
+    state: &AppState,
+) -> std::result::Result<Vec<McpToolView>, String> {
     let tools = state
         .mcp
         .list_tools_for(&id)
@@ -8397,6 +8769,15 @@ pub async fn mcp_set_risks(
     default_risk: athen_core::risk::BaseImpact,
     tool_overrides: std::collections::HashMap<String, athen_core::risk::BaseImpact>,
     state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    mcp_set_risks_core(id, default_risk, tool_overrides, &state).await
+}
+
+pub(crate) async fn mcp_set_risks_core(
+    id: String,
+    default_risk: athen_core::risk::BaseImpact,
+    tool_overrides: std::collections::HashMap<String, athen_core::risk::BaseImpact>,
+    state: &AppState,
 ) -> std::result::Result<(), String> {
     let Some(store) = &state.mcp_store else {
         return Err("MCP persistence not available".into());
@@ -8515,6 +8896,13 @@ pub async fn list_arc_grants(
     state: State<'_, AppState>,
     arc_id: String,
 ) -> std::result::Result<Vec<DirectoryGrantSummary>, String> {
+    list_arc_grants_core(&state, arc_id).await
+}
+
+pub(crate) async fn list_arc_grants_core(
+    state: &AppState,
+    arc_id: String,
+) -> std::result::Result<Vec<DirectoryGrantSummary>, String> {
     let store = state
         .grant_store
         .as_ref()
@@ -8528,6 +8916,12 @@ pub async fn list_arc_grants(
 pub async fn list_global_grants(
     state: State<'_, AppState>,
 ) -> std::result::Result<Vec<DirectoryGrantSummary>, String> {
+    list_global_grants_core(&state).await
+}
+
+pub(crate) async fn list_global_grants_core(
+    state: &AppState,
+) -> std::result::Result<Vec<DirectoryGrantSummary>, String> {
     let store = state
         .grant_store
         .as_ref()
@@ -8539,6 +8933,14 @@ pub async fn list_global_grants(
 #[tauri::command]
 pub async fn add_global_grant(
     state: State<'_, AppState>,
+    path: String,
+    access: String,
+) -> std::result::Result<(), String> {
+    add_global_grant_core(&state, path, access).await
+}
+
+pub(crate) async fn add_global_grant_core(
+    state: &AppState,
     path: String,
     access: String,
 ) -> std::result::Result<(), String> {
@@ -8563,6 +8965,13 @@ pub async fn revoke_arc_grant(
     state: State<'_, AppState>,
     id: i64,
 ) -> std::result::Result<(), String> {
+    revoke_arc_grant_core(&state, id).await
+}
+
+pub(crate) async fn revoke_arc_grant_core(
+    state: &AppState,
+    id: i64,
+) -> std::result::Result<(), String> {
     let store = state
         .grant_store
         .as_ref()
@@ -8577,6 +8986,13 @@ pub async fn revoke_arc_grant(
 #[tauri::command]
 pub async fn revoke_global_grant(
     state: State<'_, AppState>,
+    id: i64,
+) -> std::result::Result<(), String> {
+    revoke_global_grant_core(&state, id).await
+}
+
+pub(crate) async fn revoke_global_grant_core(
+    state: &AppState,
     id: i64,
 ) -> std::result::Result<(), String> {
     let store = state
@@ -8897,6 +9313,14 @@ pub async fn email_translate_error(
     raw_error: String,
     domain: Option<String>,
 ) -> std::result::Result<Option<crate::email_errors::TranslatedError>, String> {
+    email_translate_error_core(&state, raw_error, domain).await
+}
+
+pub(crate) async fn email_translate_error_core(
+    state: &AppState,
+    raw_error: String,
+    domain: Option<String>,
+) -> std::result::Result<Option<crate::email_errors::TranslatedError>, String> {
     // Tier 1 first — synchronous, no allocs beyond the lowercased copy.
     if let Some(hit) = crate::email_errors::translate(&raw_error, domain.as_deref()) {
         return Ok(Some(hit));
@@ -9002,6 +9426,12 @@ mod key_term_tests {
 pub async fn list_identity_categories(
     state: State<'_, AppState>,
 ) -> std::result::Result<Vec<athen_core::identity::IdentityCategory>, String> {
+    list_identity_categories_core(&state).await
+}
+
+pub(crate) async fn list_identity_categories_core(
+    state: &AppState,
+) -> std::result::Result<Vec<athen_core::identity::IdentityCategory>, String> {
     use athen_core::traits::identity::IdentityStore;
     let Some(store) = state.identity_store.as_ref() else {
         return Ok(Vec::new());
@@ -9031,6 +9461,13 @@ pub struct IdentityCategoryInput {
 pub async fn upsert_identity_category(
     input: IdentityCategoryInput,
     state: State<'_, AppState>,
+) -> std::result::Result<athen_core::identity::IdentityCategory, String> {
+    upsert_identity_category_core(input, &state).await
+}
+
+pub(crate) async fn upsert_identity_category_core(
+    input: IdentityCategoryInput,
+    state: &AppState,
 ) -> std::result::Result<athen_core::identity::IdentityCategory, String> {
     use athen_core::traits::identity::IdentityStore;
     let Some(store) = state.identity_store.as_ref() else {
@@ -9070,6 +9507,13 @@ pub async fn delete_identity_category(
     name: String,
     state: State<'_, AppState>,
 ) -> std::result::Result<(), String> {
+    delete_identity_category_core(name, &state).await
+}
+
+pub(crate) async fn delete_identity_category_core(
+    name: String,
+    state: &AppState,
+) -> std::result::Result<(), String> {
     use athen_core::traits::identity::IdentityStore;
     let Some(store) = state.identity_store.as_ref() else {
         return Err("Identity store not available".into());
@@ -9086,6 +9530,13 @@ pub async fn delete_identity_category(
 pub async fn list_identity_entries(
     category: Option<String>,
     state: State<'_, AppState>,
+) -> std::result::Result<Vec<athen_core::identity::IdentityEntry>, String> {
+    list_identity_entries_core(category, &state).await
+}
+
+pub(crate) async fn list_identity_entries_core(
+    category: Option<String>,
+    state: &AppState,
 ) -> std::result::Result<Vec<athen_core::identity::IdentityEntry>, String> {
     use athen_core::traits::identity::IdentityStore;
     let Some(store) = state.identity_store.as_ref() else {
@@ -9119,6 +9570,13 @@ pub struct IdentityEntryInput {
 pub async fn upsert_identity_entry(
     input: IdentityEntryInput,
     state: State<'_, AppState>,
+) -> std::result::Result<athen_core::identity::IdentityEntry, String> {
+    upsert_identity_entry_core(input, &state).await
+}
+
+pub(crate) async fn upsert_identity_entry_core(
+    input: IdentityEntryInput,
+    state: &AppState,
 ) -> std::result::Result<athen_core::identity::IdentityEntry, String> {
     use athen_core::traits::identity::IdentityStore;
     let Some(store) = state.identity_store.as_ref() else {
@@ -9159,6 +9617,13 @@ pub async fn delete_identity_entry(
     id: String,
     state: State<'_, AppState>,
 ) -> std::result::Result<(), String> {
+    delete_identity_entry_core(id, &state).await
+}
+
+pub(crate) async fn delete_identity_entry_core(
+    id: String,
+    state: &AppState,
+) -> std::result::Result<(), String> {
     use athen_core::traits::identity::IdentityStore;
     let Some(store) = state.identity_store.as_ref() else {
         return Err("Identity store not available".into());
@@ -9174,6 +9639,13 @@ pub async fn delete_identity_entry(
 pub async fn dismiss_identity_entry(
     id: String,
     state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    dismiss_identity_entry_core(id, &state).await
+}
+
+pub(crate) async fn dismiss_identity_entry_core(
+    id: String,
+    state: &AppState,
 ) -> std::result::Result<(), String> {
     use athen_core::traits::identity::IdentityStore;
     let Some(store) = state.identity_store.as_ref() else {
@@ -9195,6 +9667,12 @@ pub async fn dismiss_identity_entry(
 #[tauri::command]
 pub async fn list_skills(
     state: State<'_, AppState>,
+) -> std::result::Result<Vec<athen_core::skill::Skill>, String> {
+    list_skills_core(&state).await
+}
+
+pub(crate) async fn list_skills_core(
+    state: &AppState,
 ) -> std::result::Result<Vec<athen_core::skill::Skill>, String> {
     use athen_core::traits::skill::SkillStore;
     let Some(store) = state.skill_store.as_ref() else {
@@ -9224,6 +9702,13 @@ pub struct SkillDetail {
 pub async fn get_skill(
     slug: String,
     state: State<'_, AppState>,
+) -> std::result::Result<Option<SkillDetail>, String> {
+    get_skill_core(slug, &state).await
+}
+
+pub(crate) async fn get_skill_core(
+    slug: String,
+    state: &AppState,
 ) -> std::result::Result<Option<SkillDetail>, String> {
     use athen_core::traits::skill::SkillStore;
     let Some(store) = state.skill_store.as_ref() else {
@@ -9265,6 +9750,13 @@ pub struct SkillInput {
 pub async fn upsert_skill(
     input: SkillInput,
     state: State<'_, AppState>,
+) -> std::result::Result<SkillDetail, String> {
+    upsert_skill_core(input, &state).await
+}
+
+pub(crate) async fn upsert_skill_core(
+    input: SkillInput,
+    state: &AppState,
 ) -> std::result::Result<SkillDetail, String> {
     use athen_core::traits::skill::SkillStore;
     let Some(store) = state.skill_store.as_ref() else {
@@ -9320,6 +9812,13 @@ pub async fn delete_skill(
     slug: String,
     state: State<'_, AppState>,
 ) -> std::result::Result<(), String> {
+    delete_skill_core(slug, &state).await
+}
+
+pub(crate) async fn delete_skill_core(
+    slug: String,
+    state: &AppState,
+) -> std::result::Result<(), String> {
     use athen_core::traits::skill::SkillStore;
     let Some(store) = state.skill_store.as_ref() else {
         return Err("Skill store not available".into());
@@ -9334,6 +9833,12 @@ pub async fn delete_skill(
 #[tauri::command]
 pub async fn sync_skills(
     state: State<'_, AppState>,
+) -> std::result::Result<athen_core::traits::skill::SyncReport, String> {
+    sync_skills_core(&state).await
+}
+
+pub(crate) async fn sync_skills_core(
+    state: &AppState,
 ) -> std::result::Result<athen_core::traits::skill::SyncReport, String> {
     use athen_core::traits::skill::SkillStore;
     let Some(store) = state.skill_store.as_ref() else {
@@ -9358,6 +9863,13 @@ pub struct SkillInjection {
 pub async fn inject_skill(
     slug: String,
     state: State<'_, AppState>,
+) -> std::result::Result<SkillInjection, String> {
+    inject_skill_core(slug, &state).await
+}
+
+pub(crate) async fn inject_skill_core(
+    slug: String,
+    state: &AppState,
 ) -> std::result::Result<SkillInjection, String> {
     use athen_core::traits::skill::SkillStore;
 
@@ -9425,6 +9937,14 @@ pub async fn set_arc_goal(
     criteria: Option<String>,
     state: State<'_, AppState>,
 ) -> std::result::Result<GoalState, String> {
+    set_arc_goal_core(goal, criteria, &state).await
+}
+
+pub(crate) async fn set_arc_goal_core(
+    goal: String,
+    criteria: Option<String>,
+    state: &AppState,
+) -> std::result::Result<GoalState, String> {
     let goal = goal.trim().to_string();
     if goal.is_empty() {
         return Err("Goal cannot be empty".to_string());
@@ -9461,6 +9981,12 @@ pub async fn set_arc_goal(
 pub async fn get_arc_goal(
     state: State<'_, AppState>,
 ) -> std::result::Result<Option<GoalState>, String> {
+    get_arc_goal_core(&state).await
+}
+
+pub(crate) async fn get_arc_goal_core(
+    state: &AppState,
+) -> std::result::Result<Option<GoalState>, String> {
     let arc_store = state
         .arc_store
         .as_ref()
@@ -9490,6 +10016,10 @@ pub async fn get_arc_goal(
 /// Remove the goal from the active arc.
 #[tauri::command]
 pub async fn clear_arc_goal(state: State<'_, AppState>) -> std::result::Result<(), String> {
+    clear_arc_goal_core(&state).await
+}
+
+pub(crate) async fn clear_arc_goal_core(state: &AppState) -> std::result::Result<(), String> {
     let arc_store = state
         .arc_store
         .as_ref()
@@ -9517,6 +10047,19 @@ pub async fn start_plan(
     state: State<'_, AppState>,
     app_handle: AppHandle,
 ) -> std::result::Result<ChatResponse, String> {
+    start_plan_core(
+        description,
+        &state,
+        &crate::ui_bridge::UiBridge::Tauri(app_handle),
+    )
+    .await
+}
+
+pub(crate) async fn start_plan_core(
+    description: String,
+    state: &AppState,
+    ui: &UiBridge,
+) -> std::result::Result<ChatResponse, String> {
     let plan_instructions = "\
          First, explore and analyze the problem using your read-only tools (read, list, \
          grep, web_search). Understand what needs to happen before committing to a plan.\n\
@@ -9543,13 +10086,17 @@ pub async fn start_plan(
         format!("The user wants you to plan: {description}\n\n{plan_instructions}")
     };
     // Reuse send_message internally
-    send_message(plan_prompt, None, None, state, app_handle).await
+    send_message_core(plan_prompt, None, None, ui, state).await
 }
 
 /// Approve a plan that is in Drafting state: transition it to Executing,
 /// mark the first step as InProgress, and set the arc goal from the plan.
 #[tauri::command]
 pub async fn approve_plan(state: State<'_, AppState>) -> std::result::Result<GoalState, String> {
+    approve_plan_core(&state).await
+}
+
+pub(crate) async fn approve_plan_core(state: &AppState) -> std::result::Result<GoalState, String> {
     let arc_store = state
         .arc_store
         .as_ref()
@@ -9617,6 +10164,13 @@ pub async fn update_plan_draft(
     update: PlanDraftUpdate,
     state: State<'_, AppState>,
 ) -> std::result::Result<(), String> {
+    update_plan_draft_core(update, &state).await
+}
+
+pub(crate) async fn update_plan_draft_core(
+    update: PlanDraftUpdate,
+    state: &AppState,
+) -> std::result::Result<(), String> {
     let arc_store = state
         .arc_store
         .as_ref()
@@ -9660,6 +10214,12 @@ pub async fn update_plan_draft(
 pub async fn get_plan(
     state: State<'_, AppState>,
 ) -> std::result::Result<Option<arcs::ArcPlan>, String> {
+    get_plan_core(&state).await
+}
+
+pub(crate) async fn get_plan_core(
+    state: &AppState,
+) -> std::result::Result<Option<arcs::ArcPlan>, String> {
     let arc_store = state
         .arc_store
         .as_ref()
@@ -9679,6 +10239,10 @@ pub async fn get_plan(
 /// from the plan.
 #[tauri::command]
 pub async fn clear_plan(state: State<'_, AppState>) -> std::result::Result<(), String> {
+    clear_plan_core(&state).await
+}
+
+pub(crate) async fn clear_plan_core(state: &AppState) -> std::result::Result<(), String> {
     let arc_store = state
         .arc_store
         .as_ref()
@@ -9726,6 +10290,13 @@ pub struct AttachmentThumbnail {
 pub async fn list_attachments_for_event(
     event_id: String,
     state: State<'_, AppState>,
+) -> std::result::Result<Vec<AttachmentThumbnail>, String> {
+    list_attachments_for_event_core(event_id, &state).await
+}
+
+pub(crate) async fn list_attachments_for_event_core(
+    event_id: String,
+    state: &AppState,
 ) -> std::result::Result<Vec<AttachmentThumbnail>, String> {
     use base64::Engine;
 

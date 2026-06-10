@@ -129,6 +129,10 @@ fn normalize_email_address(raw: &str) -> String {
 /// Return all contacts for the contacts list view.
 #[tauri::command]
 pub async fn list_contacts(state: State<'_, AppState>) -> Result<Vec<ContactInfo>, String> {
+    list_contacts_core(&state).await
+}
+
+pub(crate) async fn list_contacts_core(state: &AppState) -> Result<Vec<ContactInfo>, String> {
     let tm = state
         .trust_manager
         .as_ref()
@@ -146,6 +150,13 @@ pub async fn list_contacts(state: State<'_, AppState>) -> Result<Vec<ContactInfo
 #[tauri::command]
 pub async fn get_contact(
     state: State<'_, AppState>,
+    id: String,
+) -> Result<Option<ContactInfo>, String> {
+    get_contact_core(&state, id).await
+}
+
+pub(crate) async fn get_contact_core(
+    state: &AppState,
     id: String,
 ) -> Result<Option<ContactInfo>, String> {
     let tm = state
@@ -197,6 +208,14 @@ pub async fn set_contact_trust(
     id: String,
     trust_level: String,
 ) -> Result<(), String> {
+    set_contact_trust_core(&state, id, trust_level).await
+}
+
+pub(crate) async fn set_contact_trust_core(
+    state: &AppState,
+    id: String,
+    trust_level: String,
+) -> Result<(), String> {
     let tm = state
         .trust_manager
         .as_ref()
@@ -215,6 +234,10 @@ pub async fn set_contact_trust(
 /// Block a contact so all their actions receive maximum risk multiplier.
 #[tauri::command]
 pub async fn block_contact(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    block_contact_core(&state, id).await
+}
+
+pub(crate) async fn block_contact_core(state: &AppState, id: String) -> Result<(), String> {
     let tm = state
         .trust_manager
         .as_ref()
@@ -235,6 +258,10 @@ pub async fn block_contact(state: State<'_, AppState>, id: String) -> Result<(),
 /// shared contact store directly to load, mutate, and save the contact.
 #[tauri::command]
 pub async fn unblock_contact(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    unblock_contact_core(&state, id).await
+}
+
+pub(crate) async fn unblock_contact_core(state: &AppState, id: String) -> Result<(), String> {
     use athen_contacts::ContactStore as _;
 
     let store = state
@@ -263,6 +290,10 @@ pub async fn unblock_contact(state: State<'_, AppState>, id: String) -> Result<(
 /// Delete a contact from the store.
 #[tauri::command]
 pub async fn delete_contact(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    delete_contact_core(&state, id).await
+}
+
+pub(crate) async fn delete_contact_core(state: &AppState, id: String) -> Result<(), String> {
     use athen_contacts::ContactStore as _;
 
     let store = state
@@ -287,6 +318,16 @@ pub async fn delete_contact(state: State<'_, AppState>, id: String) -> Result<()
 #[tauri::command]
 pub async fn create_contact(
     state: State<'_, AppState>,
+    name: String,
+    trust_level: Option<String>,
+    identifiers: Vec<IdentifierInput>,
+    notes: Option<String>,
+) -> Result<ContactInfo, String> {
+    create_contact_core(&state, name, trust_level, identifiers, notes).await
+}
+
+pub(crate) async fn create_contact_core(
+    state: &AppState,
     name: String,
     trust_level: Option<String>,
     identifiers: Vec<IdentifierInput>,
@@ -346,6 +387,17 @@ pub async fn create_contact(
 #[tauri::command]
 pub async fn update_contact(
     state: State<'_, AppState>,
+    id: String,
+    name: Option<String>,
+    trust_level: Option<String>,
+    identifiers: Option<Vec<IdentifierInput>>,
+    notes: Option<String>,
+) -> Result<ContactInfo, String> {
+    update_contact_core(&state, id, name, trust_level, identifiers, notes).await
+}
+
+pub(crate) async fn update_contact_core(
+    state: &AppState,
     id: String,
     name: Option<String>,
     trust_level: Option<String>,
@@ -457,6 +509,12 @@ fn contact_to_view(c: &Contact) -> ContactView {
 /// Return the current owner contact, or `None` when no owner is set.
 #[tauri::command]
 pub async fn get_owner_contact(state: State<'_, AppState>) -> Result<Option<ContactView>, String> {
+    get_owner_contact_core(&state).await
+}
+
+pub(crate) async fn get_owner_contact_core(
+    state: &AppState,
+) -> Result<Option<ContactView>, String> {
     use athen_contacts::ContactStore as _;
 
     let store = state
@@ -487,6 +545,14 @@ pub async fn get_owner_contact(state: State<'_, AppState>) -> Result<Option<Cont
 #[tauri::command]
 pub async fn save_owner_contact(
     state: State<'_, AppState>,
+    name: String,
+    identifiers: Vec<IdentifierInput>,
+) -> Result<ContactView, String> {
+    save_owner_contact_core(&state, name, identifiers).await
+}
+
+pub(crate) async fn save_owner_contact_core(
+    state: &AppState,
     name: String,
     identifiers: Vec<IdentifierInput>,
 ) -> Result<ContactView, String> {
@@ -522,7 +588,7 @@ pub async fn save_owner_contact(
         .map(|i| (identifier_kind_scheme(i.kind).to_string(), i.value.clone()))
         .collect();
 
-    let athen_idents = collect_athen_side_identifiers(&state).await;
+    let athen_idents = collect_athen_side_identifiers(state).await;
     if !candidates.is_empty() && !athen_idents.is_empty() {
         if let Err(conflicts) =
             athen_contacts::assert_disjoint_from_owner(&athen_idents, &candidates)
@@ -600,6 +666,10 @@ pub async fn save_owner_contact(
 /// "ex-owner" record cluttering the contacts list.
 #[tauri::command]
 pub async fn clear_owner_contact(state: State<'_, AppState>) -> Result<(), String> {
+    clear_owner_contact_core(&state).await
+}
+
+pub(crate) async fn clear_owner_contact_core(state: &AppState) -> Result<(), String> {
     use athen_contacts::ContactStore as _;
 
     let store = state
