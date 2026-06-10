@@ -70,6 +70,18 @@ export class AthenClient {
     return data as T;
   }
 
+  // ---- generic verbs (full command surface; see http_api.rs
+  // full_surface_router for the route map) ----
+  get<T = unknown>(path: string): Promise<T> {
+    return this.req(path);
+  }
+  post<T = unknown>(path: string, body?: unknown): Promise<T> {
+    return this.req(path, body, 'POST');
+  }
+  del<T = unknown>(path: string): Promise<T> {
+    return this.req(path, undefined, 'DELETE');
+  }
+
   // ---- arcs ----
   listArcs(): Promise<ArcMeta[]> {
     return this.req('/arcs');
@@ -90,8 +102,13 @@ export class AthenClient {
 
   // ---- chat ----
   /** Long-poll: resolves when the agent turn finishes (or parks on pending_approval). */
-  sendMessage(message: string, arcId?: string): Promise<SendResult> {
-    return this.req('/messages', { message, arc_id: arcId });
+  sendMessage(
+    message: string,
+    arcId?: string,
+    images?: { mime_type: string; data: { kind: 'base64'; data: string } }[],
+    attachments?: { name: string; mime_type: string; base64: string }[],
+  ): Promise<SendResult> {
+    return this.req('/messages', { message, arc_id: arcId, images, attachments });
   }
   /** Queue input for the running turn on `arcId` (composer while busy). */
   queueMessage(arcId: string, text: string): Promise<{ queued: boolean }> {

@@ -1,16 +1,23 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 import { ApiError, AthenClient } from '../api/client';
 import { connectEvents, type ConnectionStatus } from '../api/events';
-import type { NotificationInfo } from '../api/types';
+import type { ArcMeta, NotificationInfo } from '../api/types';
 import { chatReducer, initialChat } from '../chat/reducer';
+import { SettingsModal } from '../settings/SettingsModal';
+import { AgentsPanel } from './AgentsPanel';
+import { ArcPickers } from './ArcPickers';
 import { Bell } from './Bell';
-import { Chat } from './Chat';
+import { ChangesRail } from './ChangesRail';
+import { Chat, type OutgoingFile, type OutgoingImage } from './Chat';
+import { GoalBanner, type GoalState, type PlanState } from './PlanGoal';
 import { Sidebar } from './Sidebar';
-import type { ArcMeta } from '../api/types';
+import { Wakeups } from './Wakeups';
 
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
+
+type Drawer = 'none' | 'agents' | 'changes' | 'wakeups';
 
 export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () => void }) {
   const [arcs, setArcs] = useState<ArcMeta[]>([]);
@@ -21,9 +28,12 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
   const [notifications, setNotifications] = useState<NotificationInfo[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [chat, dispatch] = useReducer(chatReducer, initialChat);
+  const [goal, setGoal] = useState<GoalState | null>(null);
+  const [plan, setPlan] = useState<PlanState | null>(null);
+  const [drawer, setDrawer] = useState<Drawer>('none');
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [changesKey, setChangesKey] = useState(0);
 
-  // Refs mirror state the SSE handlers need — the subscription outlives
-  // any single render, so closures must not capture stale values.
   const activeArcRef = useRef<string | null>(null);
   activeArcRef.current = activeArc;
   const busyRef = useRef(false);
@@ -48,7 +58,20 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
     }
   }, [client, bail]);
 
-  // ---- boot: arcs + active history + parked grants + notifications ----
+  const refreshGoalPlan = useCallback(async () => {
+    try {
+      const [g, p] = await Promise.all([
+        client.get<GoalState | null>('/goal'),
+        client.get<PlanState | null>('/plan'),
+      ]);
+      setGoal(g && g.goal ? g : null);
+      setPlan(p);
+    } catch {
+      /* non-critical */
+    }
+  }, [client]);
+
+  // ---- boot ----
   useEffect(() => {
     let gone = false;
     (async () => {
@@ -62,13 +85,11 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
           if (gone) return;
           dispatch({ type: 'reset', entries });
         }
-        const [grants, notifs] = await Promise.all([
-          client.pendingGrants(),
-          client.listNotifications(),
-        ]);
+        const [grants, notifs] = await Promise.all([client.pendingGrants(), client.listNotifications()]);
         if (gone) return;
         for (const g of grants) dispatch({ type: 'grant', g });
         setNotifications(notifs);
+        void refreshGoalPlan();
       } catch (e) {
         if (!bail(e)) dispatch({ type: 'system', text: `Couldn't load: ${errMsg(e)}` });
       }
@@ -76,7 +97,7 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
     return () => {
       gone = true;
     };
-  }, [client, bail]);
+  }, [client, bail, refreshGoalPlan]);
 
   // ---- live events ----
   useEffect(
@@ -84,8 +105,6 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
       connectEvents(client, {
         onStatus: setStatus,
         onStream: (e) => {
-          // Background-arc output marks the arc unread instead of
-          // rendering into whatever is on screen (desktop rule).
           const active = activeArcRef.current;
           if (e.arc_id && active && e.arc_id !== active) {
             if (e.is_final) {
@@ -94,9 +113,8 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
             }
             return;
           }
-          // Only real content counts — the executor emits a bare
-          // is_final (no delta) at end of non-streamed turns, and that
-          // must not suppress the long-poll reply fallback.
+          // Only real content counts — a bare is_final (no delta) must
+          // not suppress the long-poll reply fallback.
           if (!e.is_thinking && e.delta) streamSeenRef.current = true;
           dispatch({ type: 'stream', e });
         },
@@ -104,9 +122,10 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
           const active = activeArcRef.current;
           if (e.arc_id && active && e.arc_id !== active) return;
           dispatch({ type: 'progress', e });
+          if (e.status === 'Completed' && (e.tool_name === 'edit' || e.tool_name === 'write')) {
+            setChangesKey((k) => k + 1);
+          }
         },
-        // Approval cards render regardless of arc — the user must always
-        // be able to answer a blocked agent from wherever they are.
         onQuestion: (q) => dispatch({ type: 'question', q }),
         onApprovalResolved: (p) => {
           if (p.task_id)
@@ -120,7 +139,10 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
         onGrant: (g) => dispatch({ type: 'grant', g }),
         onGrantResolvedElsewhere: (id) =>
           dispatch({ type: 'resolve', card: 'grant', refId: String(id), label: 'Resolved elsewhere' }),
-        onArcUpdated: () => void refreshArcs(),
+        onArcUpdated: () => {
+          void refreshArcs();
+          void refreshGoalPlan();
+        },
         onNotification: (n) => setNotifications((l) => [n, ...l]),
         onLagged: () => {
           dispatch({ type: 'system', text: 'Event stream lagged — some output may be missing.' });
@@ -133,10 +155,10 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
           }
         },
       }),
-    [client, refreshArcs],
+    [client, refreshArcs, refreshGoalPlan],
   );
 
-  // ---- actions ----
+  // ---- arc actions ----
   const switchArc = useCallback(
     async (id: string) => {
       try {
@@ -150,11 +172,13 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
           return n;
         });
         setSidebarOpen(false);
+        void refreshGoalPlan();
+        void refreshArcs();
       } catch (e) {
         if (!bail(e)) dispatch({ type: 'system', text: `Couldn't switch: ${errMsg(e)}` });
       }
     },
-    [client, bail],
+    [client, bail, refreshGoalPlan, refreshArcs],
   );
 
   const createArc = useCallback(async () => {
@@ -168,12 +192,15 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
   }, [client, refreshArcs, switchArc, bail]);
 
   const send = useCallback(
-    async (text: string) => {
-      dispatch({ type: 'user', text });
+    async (text: string, images: OutgoingImage[], files: OutgoingFile[]) => {
+      const label =
+        text ||
+        [...images.map((i) => i.name), ...files.map((f) => f.name)].join(', ') ||
+        '(attachment)';
+      dispatch({ type: 'user', text: label });
       const arcId = activeArcRef.current ?? undefined;
 
       if (busyRef.current) {
-        // A turn is running: queue the input into it.
         if (!arcId) return;
         try {
           await client.queueMessage(arcId, text);
@@ -187,10 +214,14 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
       setBusy(true);
       streamSeenRef.current = false;
       try {
-        // Long-poll: resolves at end of turn. Streaming renders via SSE
-        // meanwhile; the response matters for the risk-gate card and as
-        // a no-stream fallback.
-        const resp = await client.sendMessage(text, arcId);
+        const resp = await client.sendMessage(
+          text,
+          arcId,
+          images.length
+            ? images.map((i) => ({ mime_type: i.mime_type, data: { kind: 'base64' as const, data: i.base64 } }))
+            : undefined,
+          files.length ? files : undefined,
+        );
         if (resp?.pending_approval) dispatch({ type: 'task', t: resp.pending_approval });
         else if (resp?.content && !streamSeenRef.current) dispatch({ type: 'agent', text: resp.content });
         if (!arcId) {
@@ -198,6 +229,7 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
           if (cur.arc_id) setActiveArc(cur.arc_id);
         }
         void refreshArcs();
+        void refreshGoalPlan();
       } catch (e) {
         if (!bail(e)) dispatch({ type: 'system', text: `Send failed: ${errMsg(e)}` });
       } finally {
@@ -205,7 +237,7 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
         setBusy(false);
       }
     },
-    [client, refreshArcs, bail],
+    [client, refreshArcs, refreshGoalPlan, bail],
   );
 
   const cancel = useCallback(() => {
@@ -232,9 +264,26 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
         activeArc={activeArc}
         unread={unread}
         open={sidebarOpen}
-        onSelect={(id) => void switchArc(id)}
-        onNew={() => void createArc()}
         onClose={() => setSidebarOpen(false)}
+        actions={{
+          onSelect: (id) => void switchArc(id),
+          onNew: () => void createArc(),
+          onRename: (id, name) =>
+            void client.post(`/arcs/${encodeURIComponent(id)}/rename`, { name }).then(refreshArcs, () => {}),
+          onCompact: (id) =>
+            void client
+              .post(`/arcs/${encodeURIComponent(id)}/compact`)
+              .then(() => dispatch({ type: 'system', text: 'Conversation compacted.' }))
+              .catch((e) => dispatch({ type: 'system', text: `Compact failed: ${errMsg(e)}` })),
+          onDelete: (id) =>
+            void client
+              .post<{ active_arc_id: string }>(`/arcs/${encodeURIComponent(id)}/delete`)
+              .then(async (r) => {
+                await refreshArcs();
+                if (id === activeArcRef.current) await switchArc(r.active_arc_id);
+              })
+              .catch((e) => dispatch({ type: 'system', text: `Delete failed: ${errMsg(e)}` })),
+        }}
       />
       <div className="main">
         <header className="topbar">
@@ -245,12 +294,63 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
           </button>
           <span className="arc-title">{activeMeta?.name || 'Athen'}</span>
           <span className={`conn ${status}`} title={`Event stream: ${status}`} />
+          {activeMeta && <ArcPickers client={client} arc={activeMeta} onChanged={() => void refreshArcs()} />}
           <div className="topbar-right">
+            <button
+              className="icon-btn"
+              title="Active agents"
+              onClick={() => setDrawer((d) => (d === 'agents' ? 'none' : 'agents'))}
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <circle cx="12" cy="12" r="3" stroke="currentColor" strokeWidth="1.8" />
+                <path
+                  d="M12 5V3M12 21v-2M5 12H3m18 0h-2M6.3 6.3 4.9 4.9m14.2 14.2-1.4-1.4M6.3 17.7l-1.4 1.4M19.1 4.9l-1.4 1.4"
+                  stroke="currentColor"
+                  strokeWidth="1.8"
+                  strokeLinecap="round"
+                />
+              </svg>
+            </button>
+            <button
+              className="icon-btn"
+              title="File changes (revert)"
+              onClick={() => setDrawer((d) => (d === 'changes' ? 'none' : 'changes'))}
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path
+                  d="M3 12a9 9 0 1 0 3-6.7M3 4v5h5"
+                  stroke="currentColor"
+                  strokeWidth="1.8"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
+            </button>
+            <button
+              className="icon-btn"
+              title="Scheduled wake-ups"
+              onClick={() => setDrawer((d) => (d === 'wakeups' ? 'none' : 'wakeups'))}
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <circle cx="12" cy="13" r="7" stroke="currentColor" strokeWidth="1.8" />
+                <path d="M12 10v3l2 2M5 4 3 6m16-2 2 2" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+              </svg>
+            </button>
             <Bell
               notifications={notifications}
               onMarkAllRead={() => void markAllRead()}
               onOpenArc={(id) => void switchArc(id)}
             />
+            <button className="icon-btn" title="Settings" onClick={() => setSettingsOpen(true)}>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <circle cx="12" cy="12" r="3" stroke="currentColor" strokeWidth="1.8" />
+                <path
+                  d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.55-1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34h.01a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87v.01a1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.55 1Z"
+                  stroke="currentColor"
+                  strokeWidth="1.5"
+                />
+              </svg>
+            </button>
             <button className="icon-btn" onClick={onLogout} title="Disconnect">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
                 <path
@@ -264,12 +364,20 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
             </button>
           </div>
         </header>
+        {goal && (
+          <GoalBanner
+            goal={goal}
+            onClear={() => void client.del('/goal').then(() => setGoal(null), () => {})}
+          />
+        )}
         <Chat
           items={chat.items}
           busy={busy}
           arcKey={activeArc}
+          plan={plan}
+          client={client}
           cb={{
-            onSend: (t) => void send(t),
+            onSend: (t, imgs, fls) => void send(t, imgs, fls),
             onCancel: cancel,
             onAnswerQuestion: async (q, c) => {
               await client.answerQuestion(q.id, c.key);
@@ -288,9 +396,35 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
               await client.resolveGrant(g.id, decision);
               dispatch({ type: 'resolve', card: 'grant', refId: g.id, label });
             },
+            onApprovePlan: async () => {
+              await client.post('/plan/approve');
+              await refreshGoalPlan();
+              void send('Execute the plan step by step.', [], []);
+            },
+            onDiscardPlan: async () => {
+              await client.post('/plan/clear');
+              setPlan(null);
+            },
           }}
         />
       </div>
+      {drawer === 'agents' && (
+        <AgentsPanel client={client} onClose={() => setDrawer('none')} onOpenArc={(id) => void switchArc(id)} />
+      )}
+      {drawer === 'changes' && activeArc && (
+        <ChangesRail
+          client={client}
+          arcId={activeArc}
+          refreshKey={changesKey}
+          onClose={() => setDrawer('none')}
+          onReverted={() => {
+            setChangesKey((k) => k + 1);
+            void switchArc(activeArc);
+          }}
+        />
+      )}
+      {drawer === 'wakeups' && <Wakeups client={client} onClose={() => setDrawer('none')} />}
+      {settingsOpen && <SettingsModal client={client} onClose={() => setSettingsOpen(false)} />}
     </div>
   );
 }

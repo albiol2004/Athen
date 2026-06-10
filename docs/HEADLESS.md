@@ -172,6 +172,19 @@ add nothing when auth is a bearer token.
 | `GET /api/notifications` | — | `NotificationInfo[]` |
 | `POST /api/notifications/{id}/read` · `/read-all` | — | `{ok}` |
 
+…plus the **full command surface** (~110 more routes, added 2026-06-10
+for web-UI parity): arcs rename/delete/compact/branch, goal + plan,
+agent profiles + per-arc pickers, checkpoint snapshots + rewind,
+calendar events + sources, memory/entities/relations, MCP catalog +
+custom servers, directory grants, registered HTTP endpoints, identity,
+skills, contacts, wake-ups, and every Settings save/test. Each handler
+is a thin shim over the same `*_core` function the matching Tauri
+command delegates to — see `full_surface_router()` in
+`crates/athen-app/src/http_api.rs` for the route map and the
+`#[derive(Deserialize)]` body structs above each handler for exact
+request shapes. NOT exposed (admin/desktop-only): updater + runtime
+installs, bundled-model download/delete, Voice/Pipecat setup.
+
 **Events.** `GET /api/events` streams every UI event with the SSE `event:`
 field set to the Tauri event name and `data:` carrying the exact payload
 the WebView gets — `agent-stream` (token deltas: `{delta, is_final,
@@ -213,13 +226,25 @@ http://<host>:8787/  →  login screen  →  paste the http_token  →  chat
   `localStorage`; REST uses the `Authorization` header, `EventSource`
   uses `?token=`). The app shell itself is public by design — every
   byte of user data stays behind the token-gated `/api/*` routes.
-- **Scope (phase 1):** arcs sidebar (switch / new / unread dots),
-  streaming chat with collapsible thinking blocks, tool chips,
-  markdown rendering (react-markdown — React elements, no innerHTML),
-  approval-question cards, risk-gate (`pending_approval`) cards,
-  file-grant cards (including `AllowProjectRoot`), queue-while-busy
-  composer, cancel, notifications bell. Settings panels are desktop-only
-  for now.
+- **Scope (parity round, 2026-06-10):** the full desktop chat surface —
+  arcs sidebar (switch / new / unread dots / rename / compact / delete
+  via per-row menu), streaming chat with collapsible thinking blocks,
+  expandable tool cards (args/result bodies, edit diffs, shell output)
+  grouped into collapsible tool groups, delegation sub-arc inline
+  expansion, goal banner + plan card, markdown rendering
+  (react-markdown — React elements, no innerHTML), approval-question /
+  risk-gate / file-grant cards, image+file attachments
+  (paste/drag/picker), per-arc pickers (profile / reasoning effort /
+  model tier / security mode), active-agents drawer, Changes rail with
+  point-in-time revert, wake-ups drawer (list/create/toggle/delete),
+  queue-while-busy composer, cancel, notifications bell — **plus a full
+  Settings modal** (Models: connections/bundles/embeddings; Agents &
+  Tools: profiles/skills/identity/MCP; Connections: owner contact/
+  email/telegram/GitHub/calendar sources/web search/Cloud APIs;
+  Security: mode/attachment policy/notification prefs/global grants;
+  Contacts; Memory). Deliberately absent (server-admin / desktop-
+  native): updater + runtime installs, bundled-model download/delete,
+  Voice/Pipecat setup, onboarding wizard, theme toggle, timeline view.
 - **Build workflow:** `cd web && npm run build`, then `cargo build`.
   `web/dist` is **committed**, so cargo (and the Dockerfile's
   `COPY . .`) never needs Node. Debug builds read `web/dist` from disk

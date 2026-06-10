@@ -15,7 +15,20 @@ import type {
 export type ChatItem =
   | { kind: 'msg'; id: number; role: 'user' | 'agent' | 'system'; content: string; streaming?: boolean }
   | { kind: 'thinking'; id: number; content: string; done: boolean }
-  | { kind: 'tool'; id: number; key: string; name: string; status: string; detail?: string; failed?: boolean }
+  | {
+      kind: 'tool';
+      id: number;
+      key: string;
+      name: string;
+      status: string;
+      detail?: string;
+      failed?: boolean;
+      args?: unknown;
+      result?: unknown;
+      error?: string | null;
+      /** Created by a live agent-progress event (group renders open). */
+      live?: boolean;
+    }
   | { kind: 'question'; id: number; q: ApprovalQuestion; resolved?: string }
   | { kind: 'task'; id: number; t: PendingApproval; resolved?: string }
   | { kind: 'grant'; id: number; g: GrantRequest; resolved?: string };
@@ -65,15 +78,31 @@ function fromEntries(entries: ArcEntry[], startId: number): { items: ChatItem[];
       const role = e.source === 'user' ? 'user' : e.source === 'assistant' ? 'agent' : 'system';
       if (e.content) items.push({ kind: 'msg', id: id++, role, content: e.content });
     } else if (e.entry_type === 'tool_call') {
-      const name =
-        (e.metadata && typeof e.metadata['tool'] === 'string' && (e.metadata['tool'] as string)) || 'tool';
+      // Metadata is the persisted card: {tool, status, summary, args,
+      // result, error} — same shape the desktop rehydrates.
+      let meta: Record<string, unknown> = {};
+      const raw = e.metadata as unknown;
+      if (raw && typeof raw === 'object') meta = raw as Record<string, unknown>;
+      else if (typeof raw === 'string') {
+        try {
+          meta = JSON.parse(raw) as Record<string, unknown>;
+        } catch {
+          /* legacy plain-text metadata */
+        }
+      }
+      const name = (typeof meta.tool === 'string' && meta.tool) || e.content || 'tool';
+      const status = (typeof meta.status === 'string' && meta.status) || 'Completed';
       items.push({
         kind: 'tool',
         id: id++,
         key: `hist-${e.id}`,
         name,
-        status: 'Completed',
-        detail: e.content,
+        status,
+        detail: (typeof meta.summary === 'string' && meta.summary) || e.content,
+        args: meta.args ?? undefined,
+        result: meta.result ?? undefined,
+        error: typeof meta.error === 'string' ? meta.error : null,
+        failed: status === 'Failed' || Boolean(meta.error),
       });
     }
     // Other entry types (summaries, sense payloads, …) are internal.
@@ -136,7 +165,7 @@ export function chatReducer(state: ChatState, a: ChatAction): ChatState {
     }
 
     case 'progress': {
-      const { step, tool_name, status, detail, error } = a.e;
+      const { step, tool_name, status, detail, error, args, result } = a.e;
       // Step 0 is risk triage / lifecycle noise, same skip as the desktop.
       if (step === 0 || tool_name === 'Task completed') return state;
       const key = `${step}-${tool_name}`;
@@ -151,6 +180,10 @@ export function chatReducer(state: ChatState, a: ChatAction): ChatState {
             status,
             detail: detail || existing.detail,
             failed: failed || existing.failed,
+            // The auditor enriches terminal events with full args+result.
+            args: args ?? existing.args,
+            result: result ?? existing.result,
+            error: error ?? existing.error,
           }),
         };
       }
@@ -158,7 +191,19 @@ export function chatReducer(state: ChatState, a: ChatAction): ChatState {
       return {
         items: [
           ...sealOpen(state.items),
-          { kind: 'tool', id: state.nextId, key, name: tool_name, status, detail, failed },
+          {
+            kind: 'tool',
+            id: state.nextId,
+            key,
+            name: tool_name,
+            status,
+            detail,
+            failed,
+            args,
+            result,
+            error,
+            live: true,
+          },
         ],
         nextId: state.nextId + 1,
       };
