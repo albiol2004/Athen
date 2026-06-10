@@ -24,6 +24,7 @@ mod api;
 mod auth;
 mod db;
 mod docker;
+mod instances;
 mod proxy;
 mod ui;
 

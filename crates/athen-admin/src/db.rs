@@ -81,7 +81,6 @@ pub struct User {
 }
 
 impl User {
-    #[allow(dead_code)] // TODO: consumed by the Docker-lifecycle + proxy tasks
     pub fn is_admin(&self) -> bool {
         self.role == "admin"
     }
@@ -98,7 +97,6 @@ impl User {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-#[allow(dead_code)] // TODO: consumed by the Docker-lifecycle task
 pub struct Instance {
     pub id: String,
     pub name: String,
@@ -111,7 +109,6 @@ pub struct Instance {
 }
 
 impl Instance {
-    #[allow(dead_code)] // TODO: consumed by the Docker-lifecycle task
     pub fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
             id: row.get("id")?,

@@ -24,6 +24,7 @@ reqwest = { workspace = true }
 rusqlite = { version = "0.32", features = ["bundled"] }
 argon2 = "0.5"
 bollard = "0.19"
+tar = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
