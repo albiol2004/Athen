@@ -214,7 +214,6 @@ pub async fn require_session(
 
 /// Can `user` reach `instance_id`? Admins reach everything; users need a
 /// `user_instances` grant.
-#[allow(dead_code)] // TODO: consumed by the proxy task
 pub async fn user_can_access(db: &Db, user: &User, instance_id: &str) -> anyhow::Result<bool> {
     if user.is_admin() {
         return Ok(true);
