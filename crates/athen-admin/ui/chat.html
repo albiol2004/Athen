@@ -220,6 +220,16 @@ function connectEvents() {
     if (card) resolveCard(card, p.approved ? 'Approved' : 'Denied');
   });
 
+  es.addEventListener('grant-requested', (ev) => {
+    addGrantCard(JSON.parse(ev.data));
+  });
+
+  es.addEventListener('grant-resolved-elsewhere', (ev) => {
+    // Payload is the bare grant id (answered via Telegram or another client).
+    const card = document.getElementById(`g-${JSON.parse(ev.data)}`);
+    if (card) resolveCard(card, 'Resolved elsewhere');
+  });
+
   es.addEventListener('lagged', () => {
     addMsg('system', 'event stream lagged — some output may be missing');
   });
@@ -273,6 +283,47 @@ function addQuestionCard(q) {
       try {
         await api('/approvals/question', { question_id: q.id, choice_key: c.key });
         resolveCard(card, c.label || c.key);
+      } catch (e) {
+        addMsg('system', `answer failed: ${e.message}`);
+        actions.querySelectorAll('button').forEach((x) => { x.disabled = false; });
+      }
+    });
+    actions.appendChild(b);
+  }
+  card.appendChild(actions);
+  messagesEl.appendChild(card);
+  scrollDown(true);
+}
+
+// File-permission prompt (FileGate `grant-requested`). Decisions use the
+// same externally-tagged serde shape the desktop frontend sends.
+function addGrantCard(g) {
+  if (!g || !g.id || document.getElementById(`g-${g.id}`)) return;
+  const card = el('div', 'card');
+  card.id = `g-${g.id}`;
+  card.appendChild(el('h4', null, `File permission: ${g.access} via ${g.tool}`));
+  card.appendChild(el('p', null, (g.paths || []).join(', ')));
+  const actions = el('div', 'actions');
+  const choices = [];
+  if (g.detected_root) {
+    choices.push([
+      `Allow ${g.detected_root.pathDisplay} (${g.detected_root.marker})`,
+      { AllowProjectRoot: g.detected_root.path },
+      true,
+    ]);
+  }
+  choices.push(
+    ['Allow once', 'Allow', !g.detected_root],
+    ['Allow always', 'AllowAlways', false],
+    ['Deny', 'Deny', false],
+  );
+  for (const [label, decision, primary] of choices) {
+    const b = el('button', primary ? 'approve' : null, label);
+    b.addEventListener('click', async () => {
+      actions.querySelectorAll('button').forEach((x) => { x.disabled = true; });
+      try {
+        await api(`/grants/${g.id}`, { decision });
+        resolveCard(card, label);
       } catch (e) {
         addMsg('system', `answer failed: ${e.message}`);
         actions.querySelectorAll('button').forEach((x) => { x.disabled = false; });

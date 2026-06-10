@@ -90,6 +90,10 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
         // Resource quotas applied at container create.
         "ALTER TABLE instances ADD COLUMN memory_mb INTEGER",
         "ALTER TABLE instances ADD COLUMN cpus REAL",
+        // Soft disk quota (volume usage warning threshold). Soft because
+        // hard Docker storage quotas (`storage_opt`) only work on
+        // xfs+pquota backing filesystems — see docker.rs.
+        "ALTER TABLE instances ADD COLUMN disk_limit_mb INTEGER",
     ];
     for stmt in COLUMNS {
         match conn.execute(stmt, []) {
@@ -144,6 +148,8 @@ pub struct Instance {
     pub memory_mb: Option<u64>,
     /// Container CPU limit (fractional cores); `None` = unlimited.
     pub cpus: Option<f64>,
+    /// Soft disk quota on the data volume; `None` = no warning threshold.
+    pub disk_limit_mb: Option<u64>,
 }
 
 impl Instance {
@@ -158,6 +164,7 @@ impl Instance {
             created_at: row.get("created_at")?,
             memory_mb: row.get("memory_mb")?,
             cpus: row.get("cpus")?,
+            disk_limit_mb: row.get("disk_limit_mb")?,
         })
     }
 }
@@ -193,6 +200,13 @@ pub async fn audit(db: &Db, username: &str, action: &str, target: &str, detail: 
     if let Err(e) = res {
         tracing::error!(error = %e, action, "audit write failed");
     }
+}
+
+/// Delete audit rows older than `cutoff` (RFC 3339 UTC — lexicographic
+/// comparison is chronological for this format). Returns rows deleted.
+pub async fn audit_prune_before(db: &Db, cutoff: String) -> anyhow::Result<usize> {
+    db.call(move |c| c.execute("DELETE FROM audit_log WHERE at < ?1", [cutoff]))
+        .await
 }
 
 /// Most recent audit rows, newest first.

@@ -260,6 +260,32 @@ impl DockerCtl {
         Ok(out)
     }
 
+    /// Volume name → used bytes, from one `docker system df` sweep scoped
+    /// to volumes. Only the `local` driver reports sizes; volumes with an
+    /// unknown size (-1) are omitted. Used by the disk-quota sweep — disk
+    /// quotas are SOFT (measure + warn) because Docker's hard quota
+    /// (`storage_opt: size=`) only works on xfs-with-pquota backing
+    /// filesystems and fails container creation everywhere else.
+    pub async fn volume_usage_bytes(&self) -> anyhow::Result<HashMap<String, u64>> {
+        // No `type=volume` filter: bollard can't URL-encode the Vec
+        // filter param ("Unable to URLEncode" on every daemon), so we
+        // take the full df payload and read just the volumes section.
+        let usage = self
+            .docker
+            .df(None::<bollard::query_parameters::DataUsageOptions>)
+            .await
+            .context("docker df")?;
+        let mut out = HashMap::new();
+        for v in usage.volumes.unwrap_or_default() {
+            if let Some(u) = v.usage_data {
+                if u.size >= 0 {
+                    out.insert(v.name, u.size as u64);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Resolve the container's IP on `network`. Looked up per proxy
     /// request rather than stored: container IPs change across restarts,
     /// and the panel (running on the host) can't use Docker DNS names.

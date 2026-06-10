@@ -18,11 +18,13 @@
 //! | `ATHEN_ADMIN_PASSWORD` | bootstrap admin password (else generated + printed once) | unset |
 //! | `ATHEN_ADMIN_IMAGE` | image for new instances | `athen` |
 //! | `ATHEN_ADMIN_NETWORK` | internal Docker network name | `athen-net` |
-//! | `DOCKER_HOST` | honored by bollard (unix socket default) | unset |
+//! | `ATHEN_ADMIN_AUDIT_RETENTION_DAYS` | prune audit rows older than this (0 = keep forever) | `90` |
+//! | `DOCKER_HOST` | honored by bollard (unix socket default; point at a rootless Docker or Podman socket to de-privilege the panel) | unset |
 
 mod api;
 mod auth;
 mod db;
+mod disk;
 mod docker;
 mod instances;
 mod notify;
@@ -46,6 +48,8 @@ pub struct PanelState {
     pub cfg: PanelConfig,
     pub login_throttle: ratelimit::LoginThrottle,
     pub buckets: ratelimit::UserBuckets,
+    /// instance id → data-volume bytes, refreshed by the disk sweep.
+    pub disk_usage: std::sync::Mutex<std::collections::HashMap<String, u64>>,
 }
 
 #[derive(Clone)]
@@ -81,6 +85,41 @@ fn dirs_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Daily prune of audit rows older than `ATHEN_ADMIN_AUDIT_RETENTION_DAYS`
+/// (default 90; `0` keeps everything forever). Each prune that removes
+/// rows leaves its own audit entry, so the trail records its truncation.
+fn spawn_audit_retention(db: db::Db) {
+    let days: u32 = std::env::var("ATHEN_ADMIN_AUDIT_RETENTION_DAYS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(90);
+    if days == 0 {
+        tracing::info!("audit retention disabled (keep forever)");
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            let cutoff = (chrono::Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
+            match db::audit_prune_before(&db, cutoff).await {
+                Ok(0) => {}
+                Ok(n) => {
+                    tracing::info!(rows = n, days, "audit log pruned");
+                    db::audit(
+                        &db,
+                        "system",
+                        "audit_prune",
+                        "",
+                        &format!("{n} rows older than {days} days"),
+                    )
+                    .await;
+                }
+                Err(e) => tracing::warn!(error = %e, "audit prune failed"),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(24 * 3600)).await;
+        }
+    });
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -108,11 +147,16 @@ async fn main() -> anyhow::Result<()> {
         cfg: cfg.clone(),
         login_throttle: ratelimit::LoginThrottle::default(),
         buckets: ratelimit::UserBuckets::default(),
+        disk_usage: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
 
     // Forward approval-questions / urgent notifications from running
     // instances to users' notify webhooks (phones).
     notify::spawn(state.clone());
+    // Measure data-volume usage + warn on soft disk quota crossings.
+    disk::spawn(state.clone());
+    // Audit retention: the log is append-only, so prune old rows daily.
+    spawn_audit_retention(state.db.clone());
 
     let app = api::router(state.clone());
 

@@ -14,7 +14,10 @@
 //! same `deliver()` seam.
 //!
 //! What gets forwarded:
-//! - every `approval-question` (the agent is blocked on the user), and
+//! - every `approval-question` (the agent is blocked on the user),
+//! - every `grant-requested` (file-permission prompt — the agent is
+//!   parked until someone answers via the chat page or
+//!   `POST /api/grants/{id}`), and
 //! - `notification` events that demand attention (`requires_response`,
 //!   or urgency High/Critical) — routine notifications stay in-app.
 //!
@@ -190,6 +193,26 @@ pub fn pushworthy(event: &str, data: &str) -> Option<Push> {
             priority: "high",
             dedup_id: v.get("id").and_then(|x| x.as_str()).map(String::from),
         }),
+        // File-permission prompt (FileGate). The agent is parked until
+        // answered — same urgency as an approval question.
+        "grant-requested" => {
+            let paths = v
+                .get("paths")
+                .and_then(|x| x.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|p| p.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            Some(Push {
+                title: "Athen needs file access".into(),
+                body: format!("{} access via {}: {}", s("access"), s("tool"), paths),
+                priority: "high",
+                dedup_id: v.get("id").and_then(|x| x.as_str()).map(String::from),
+            })
+        }
         "notification" => {
             let urgency = s("urgency");
             let requires_response = v
@@ -215,8 +238,10 @@ pub fn pushworthy(event: &str, data: &str) -> Option<Push> {
 }
 
 /// POST the push to every granted user's webhook. Failures are logged per
-/// user and never abort the watcher.
-async fn deliver(state: &Arc<PanelState>, instance: &Instance, push: &Push) {
+/// user and never abort the caller. Also used by the disk-quota sweep —
+/// any panel-side condition that warrants a phone push funnels through
+/// here.
+pub async fn deliver(state: &Arc<PanelState>, instance: &Instance, push: &Push) {
     let users = match users_with_webhooks(&state.db, &instance.id).await {
         Ok(u) => u,
         Err(e) => {
@@ -321,6 +346,19 @@ mod tests {
         assert!(p.body.contains("Send this email?"));
         assert!(p.body.contains("bob@x.com"));
         assert_eq!(p.dedup_id.as_deref(), Some("q1"));
+    }
+
+    #[test]
+    fn grant_requests_always_push() {
+        let p = pushworthy(
+            "grant-requested",
+            r#"{"id":"g1","arc_id":"arc_x","paths":["/home/u/report.md"],"access":"write","tool":"write"}"#,
+        )
+        .expect("grant request pushes");
+        assert_eq!(p.priority, "high");
+        assert!(p.body.contains("write access"));
+        assert!(p.body.contains("/home/u/report.md"));
+        assert_eq!(p.dedup_id.as_deref(), Some("g1"));
     }
 
     #[test]

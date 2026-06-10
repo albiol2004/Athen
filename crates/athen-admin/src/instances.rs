@@ -70,6 +70,8 @@ pub struct CreateSpec {
     pub memory_mb: Option<u64>,
     /// Hard CPU limit in fractional cores; `None` = unlimited.
     pub cpus: Option<f64>,
+    /// Soft disk quota on the data volume; `None` = no threshold.
+    pub disk_limit_mb: Option<u64>,
 }
 
 /// Full provisioning flow. On Docker failure after the row insert, the row
@@ -87,6 +89,7 @@ pub async fn create(state: &PanelState, spec: CreateSpec) -> anyhow::Result<Inst
         created_at: Utc::now().to_rfc3339(),
         memory_mb: spec.memory_mb,
         cpus: spec.cpus,
+        disk_limit_mb: spec.disk_limit_mb,
     };
 
     let row = instance.clone();
@@ -94,8 +97,8 @@ pub async fn create(state: &PanelState, spec: CreateSpec) -> anyhow::Result<Inst
         .db
         .call(move |c| {
             c.execute(
-                "INSERT INTO instances (id, name, container_name, volume_name, http_token, internal_url, created_at, memory_mb, cpus) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                "INSERT INTO instances (id, name, container_name, volume_name, http_token, internal_url, created_at, memory_mb, cpus, disk_limit_mb) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
                 rusqlite::params![
                     row.id,
                     row.name,
@@ -105,7 +108,8 @@ pub async fn create(state: &PanelState, spec: CreateSpec) -> anyhow::Result<Inst
                     row.internal_url,
                     row.created_at,
                     row.memory_mb,
-                    row.cpus
+                    row.cpus,
+                    row.disk_limit_mb
                 ],
             )
         })

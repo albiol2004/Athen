@@ -44,6 +44,7 @@ pub fn router(state: Arc<PanelState>) -> Router {
         .route("/panel/instances/{id}/logs", get(instance_logs))
         .route("/panel/users", get(users_list).post(users_create))
         .route("/panel/users/{id}/delete", post(users_delete))
+        .route("/panel/users/{id}/role", post(users_set_role))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_session,
@@ -285,6 +286,11 @@ async fn instances_list(
     } else {
         HashMap::new()
     };
+    let disk = state
+        .disk_usage
+        .lock()
+        .expect("disk usage mutex poisoned")
+        .clone();
     let out: Vec<_> = list
         .into_iter()
         .map(|i| {
@@ -301,6 +307,11 @@ async fn instances_list(
                 "status": detail,
                 "memory_mb": i.memory_mb,
                 "cpus": i.cpus,
+                "disk_limit_mb": i.disk_limit_mb,
+                // From the periodic sweep; absent until the first sweep
+                // after panel start (or when the volume driver can't
+                // report sizes).
+                "disk_used_mb": disk.get(&i.id).map(|b| b / (1024 * 1024)),
                 "user_ids": grants.get(&i.id).cloned().unwrap_or_default(),
             })
         })
@@ -323,6 +334,8 @@ struct CreateInstanceBody {
     memory_mb: Option<u64>,
     #[serde(default)]
     cpus: Option<f64>,
+    #[serde(default)]
+    disk_limit_mb: Option<u64>,
 }
 
 async fn instances_create(
@@ -338,10 +351,11 @@ async fn instances_create(
     }
     if body.cpus.is_some_and(|c| !c.is_finite() || c <= 0.0)
         || body.memory_mb.is_some_and(|m| m < 64)
+        || body.disk_limit_mb.is_some_and(|m| m < 64)
     {
         return err(
             StatusCode::BAD_REQUEST,
-            "cpus must be > 0; memory_mb must be >= 64",
+            "cpus must be > 0; memory_mb and disk_limit_mb must be >= 64",
         );
     }
     match instances::create(
@@ -354,6 +368,7 @@ async fn instances_create(
             user_ids: body.user_ids,
             memory_mb: body.memory_mb,
             cpus: body.cpus,
+            disk_limit_mb: body.disk_limit_mb,
         },
     )
     .await
@@ -589,6 +604,90 @@ async fn users_create(
     )
     .await;
     Json(json!({ "id": created.id, "username": created.username })).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct RoleBody {
+    role: String,
+}
+
+/// Promote / demote a user (multi-admin support). Two invariants keep
+/// the panel administrable: the last admin can never be demoted, and a
+/// no-op change is rejected so the audit trail only records real
+/// transitions. Self-demotion is allowed when another admin exists —
+/// the role is re-read from the DB on every request, so it takes effect
+/// on the demoted admin's very next call.
+async fn users_set_role(
+    State(state): State<Arc<PanelState>>,
+    Extension(CurrentUser(user)): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    Json(body): Json<RoleBody>,
+) -> impl IntoResponse {
+    if let Some(resp) = require_admin(&user) {
+        return resp;
+    }
+    if !matches!(body.role.as_str(), "admin" | "user") {
+        return err(StatusCode::BAD_REQUEST, "role must be admin or user");
+    }
+    let target_id = id.clone();
+    let target: anyhow::Result<Option<User>> = state
+        .db
+        .call(move |c| {
+            c.query_row("SELECT * FROM users WHERE id = ?1", [target_id], User::from_row)
+                .map(Some)
+                .or_else(|e| match e {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                    e => Err(e),
+                })
+        })
+        .await;
+    let target = match target {
+        Ok(Some(t)) => t,
+        Ok(None) => return err(StatusCode::NOT_FOUND, "no such user"),
+        Err(e) => return internal(e),
+    };
+    if target.role == body.role {
+        return err(StatusCode::BAD_REQUEST, "user already has that role");
+    }
+    if target.is_admin() {
+        let admins: anyhow::Result<i64> = state
+            .db
+            .call(|c| {
+                c.query_row("SELECT COUNT(*) FROM users WHERE role = 'admin'", [], |r| {
+                    r.get(0)
+                })
+            })
+            .await;
+        match admins {
+            Ok(n) if n <= 1 => {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    "cannot demote the last admin — promote someone else first",
+                )
+            }
+            Ok(_) => {}
+            Err(e) => return internal(e),
+        }
+    }
+    let (uid, role) = (id, body.role.clone());
+    match state
+        .db
+        .call(move |c| c.execute("UPDATE users SET role = ?1 WHERE id = ?2", [role, uid]))
+        .await
+    {
+        Ok(_) => {
+            db::audit(
+                &state.db,
+                &user.username,
+                "user_role",
+                &target.username,
+                &format!("{} -> {}", target.role, body.role),
+            )
+            .await;
+            Json(json!({ "ok": true })).into_response()
+        }
+        Err(e) => internal(e),
+    }
 }
 
 async fn users_delete(

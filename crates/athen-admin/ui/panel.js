@@ -135,9 +135,21 @@ function instanceCard(i) {
       ${i.memory_mb || i.cpus
         ? `<span>${[i.memory_mb && `${i.memory_mb} MB`, i.cpus && `${i.cpus} CPU`].filter(Boolean).join(' · ')}</span>`
         : ''}
+      ${diskMeta(i)}
     </div>
     <div class="card-actions">${actions.join('')}</div>
   </div>`;
+}
+
+// Disk usage chip: "disk 312 MB" / "disk 312 / 1024 MB"; red when over
+// the soft quota. Usage comes from the panel's periodic docker-df sweep,
+// so it's absent for the first few minutes after a panel restart.
+function diskMeta(i) {
+  if (i.disk_used_mb == null && !i.disk_limit_mb) return '';
+  const used = i.disk_used_mb != null ? `${i.disk_used_mb}` : '?';
+  const limit = i.disk_limit_mb ? ` / ${i.disk_limit_mb}` : '';
+  const over = i.disk_limit_mb && i.disk_used_mb != null && i.disk_used_mb > i.disk_limit_mb;
+  return `<span${over ? ' class="disk-over"' : ''}>disk ${used}${limit} MB</span>`;
 }
 
 async function instanceAction(action, id, name) {
@@ -218,8 +230,9 @@ async function openNewInstanceModal() {
       <div class="row">
         <label>Memory limit (MB) <input id="ni-mem" type="number" min="64" step="64" placeholder="unlimited"></label>
         <label>CPU limit (cores) <input id="ni-cpus" type="number" min="0.1" step="0.1" placeholder="unlimited"></label>
+        <label>Disk warning (MB) <input id="ni-disk" type="number" min="64" step="64" placeholder="no warning"></label>
       </div>
-      <div class="hint">Hard cgroup limits — a runaway instance gets OOM-killed and restarted instead of starving the host.</div>
+      <div class="hint">Memory/CPU are hard cgroup limits — a runaway instance gets OOM-killed and restarted instead of starving the host. Disk is a soft quota: crossing it audits + pushes a warning, nothing is blocked.</div>
       <details>
         <summary>Seed config files (optional)</summary>
         <label>config.toml <textarea id="ni-config" placeholder="[telegram]&#10;enabled = false"></textarea></label>
@@ -251,6 +264,7 @@ async function openNewInstanceModal() {
       user_ids: grantValues(),
       memory_mb: $('#ni-mem').value ? Number($('#ni-mem').value) : null,
       cpus: $('#ni-cpus').value ? Number($('#ni-cpus').value) : null,
+      disk_limit_mb: $('#ni-disk').value ? Number($('#ni-disk').value) : null,
     };
     const btn = $('#ni-submit');
     btn.disabled = true;
@@ -330,7 +344,10 @@ async function loadUsers() {
       <td><span class="role-chip ${u.role}">${esc(u.role)}</span></td>
       <td>${u.role === 'admin' ? 'all' : esc((byUser[u.id] || []).join(', ') || '—')}</td>
       <td>${esc(u.created_at.slice(0, 10))}</td>
-      <td>${u.id === ME.id ? '' : `<button class="btn small danger" data-del-user="${u.id}" data-name="${esc(u.username)}">${svg('trash')}</button>`}</td>
+      <td>
+        <button class="btn small" data-role-user="${u.id}" data-name="${esc(u.username)}" data-to="${u.role === 'admin' ? 'user' : 'admin'}">${u.role === 'admin' ? 'Demote' : 'Make admin'}</button>
+        ${u.id === ME.id ? '' : `<button class="btn small danger" data-del-user="${u.id}" data-name="${esc(u.username)}">${svg('trash')}</button>`}
+      </td>
     </tr>`).join('');
   tbody.querySelectorAll('[data-del-user]').forEach((btn) => {
     btn.addEventListener('click', async () => {
@@ -339,6 +356,22 @@ async function loadUsers() {
         await api(`/panel/users/${btn.dataset.delUser}/delete`, { method: 'POST' });
         toast('User deleted');
         loadUsers();
+      } catch (e) { toast(e.message, 'error'); }
+    });
+  });
+  tbody.querySelectorAll('[data-role-user]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const { name, to, roleUser } = btn.dataset;
+      const warning = roleUser === ME.id && to === 'user'
+        ? `Demote YOURSELF (${name}) to user? You lose panel admin rights immediately.`
+        : `Change ${name}'s role to ${to}?`;
+      if (!confirm(warning)) return;
+      try {
+        await api(`/panel/users/${roleUser}/role`, { method: 'POST', body: { role: to } });
+        toast(`${name} is now ${to}`);
+        // Self-demotion: the next API call already sees the new role.
+        if (roleUser === ME.id) location.reload();
+        else loadUsers();
       } catch (e) { toast(e.message, 'error'); }
     });
   });
