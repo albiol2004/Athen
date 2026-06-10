@@ -44,22 +44,49 @@ impl DockerCtl {
     }
 
     /// Create the shared bridge network if it doesn't exist (idempotent).
+    ///
+    /// Created with inter-container communication (ICC) disabled: the
+    /// bridge only exists so the panel (host) can reach instances and
+    /// instances can reach the internet — one tenant's container must not
+    /// be able to probe another's :8787. ICC=false drops bridge-internal
+    /// forwarding while leaving host→container and NAT egress untouched.
     pub async fn ensure_network(&self, name: &str) -> anyhow::Result<()> {
-        if self
+        if let Ok(existing) = self
             .docker
             .inspect_network(
                 name,
                 None::<bollard::query_parameters::InspectNetworkOptions>,
             )
             .await
-            .is_ok()
         {
+            // Network options are immutable after create — a pre-ICC
+            // network keeps working but without tenant isolation. Warn
+            // loudly; the fix is a one-time recreate while no instance
+            // containers are running.
+            let icc_disabled = existing
+                .options
+                .as_ref()
+                .and_then(|o| o.get("com.docker.network.bridge.enable_icc"))
+                .map(|v| v == "false")
+                .unwrap_or(false);
+            if !icc_disabled {
+                tracing::warn!(
+                    network = name,
+                    "network predates ICC isolation — instances can reach each other's \
+                     token-gated ports. To fix: stop all instances, `docker network rm {name}`, \
+                     restart the panel (it recreates the network with ICC disabled)."
+                );
+            }
             return Ok(());
         }
         self.docker
             .create_network(NetworkCreateRequest {
                 name: name.to_string(),
                 driver: Some("bridge".to_string()),
+                options: Some(HashMap::from([(
+                    "com.docker.network.bridge.enable_icc".to_string(),
+                    "false".to_string(),
+                )])),
                 ..Default::default()
             })
             .await
@@ -69,7 +96,9 @@ impl DockerCtl {
 
     /// Create volume + container for a new instance. `env` is the full
     /// environment (token, addr, operator-provided secrets). The container
-    /// is created but not started.
+    /// is created but not started. `memory_mb`/`cpus` become hard cgroup
+    /// limits (`None` = unlimited).
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_instance(
         &self,
         instance_id: &str,
@@ -78,6 +107,8 @@ impl DockerCtl {
         image: &str,
         network: &str,
         env: Vec<String>,
+        memory_mb: Option<u64>,
+        cpus: Option<f64>,
     ) -> anyhow::Result<()> {
         self.ensure_network(network).await?;
         self.docker
@@ -106,6 +137,12 @@ impl DockerCtl {
                     name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
                     maximum_retry_count: None,
                 }),
+                memory: memory_mb.map(|mb| (mb * 1024 * 1024) as i64),
+                // swap == memory disables swap: a runaway instance gets
+                // OOM-killed (and restarted by the policy) instead of
+                // grinding the whole host into swap death.
+                memory_swap: memory_mb.map(|mb| (mb * 1024 * 1024) as i64),
+                nano_cpus: cpus.map(|c| (c * 1e9) as i64),
                 ..Default::default()
             }),
             ..Default::default()

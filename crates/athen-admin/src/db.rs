@@ -20,6 +20,7 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Self(Arc::new(Mutex::new(conn))))
     }
 
@@ -68,7 +69,37 @@ CREATE TABLE IF NOT EXISTS user_instances (
     instance_id TEXT NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
     PRIMARY KEY (user_id, instance_id)
 );
+CREATE TABLE IF NOT EXISTS audit_log (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    at       TEXT NOT NULL,
+    username TEXT NOT NULL,
+    action   TEXT NOT NULL,
+    target   TEXT NOT NULL DEFAULT '',
+    detail   TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_audit_at ON audit_log (at DESC);
 "#;
+
+/// Column additions for DBs created before the column existed. `ALTER
+/// TABLE ADD COLUMN` has no IF NOT EXISTS in SQLite, so "duplicate column
+/// name" errors are the idempotency mechanism — anything else propagates.
+fn migrate(conn: &Connection) -> anyhow::Result<()> {
+    const COLUMNS: &[&str] = &[
+        // Per-user push webhook (ntfy topic URL or any plain-POST sink).
+        "ALTER TABLE users ADD COLUMN notify_url TEXT NOT NULL DEFAULT ''",
+        // Resource quotas applied at container create.
+        "ALTER TABLE instances ADD COLUMN memory_mb INTEGER",
+        "ALTER TABLE instances ADD COLUMN cpus REAL",
+    ];
+    for stmt in COLUMNS {
+        match conn.execute(stmt, []) {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("duplicate column name") => {}
+            Err(e) => return Err(e).with_context(|| format!("migration failed: {stmt}")),
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct User {
@@ -78,6 +109,8 @@ pub struct User {
     pub password_hash: String,
     pub role: String,
     pub created_at: String,
+    /// Push webhook URL; empty = notifications off for this user.
+    pub notify_url: String,
 }
 
 impl User {
@@ -92,6 +125,7 @@ impl User {
             password_hash: row.get("password_hash")?,
             role: row.get("role")?,
             created_at: row.get("created_at")?,
+            notify_url: row.get("notify_url")?,
         })
     }
 }
@@ -106,6 +140,10 @@ pub struct Instance {
     pub http_token: String,
     pub internal_url: String,
     pub created_at: String,
+    /// Container memory limit; `None` = unlimited.
+    pub memory_mb: Option<u64>,
+    /// Container CPU limit (fractional cores); `None` = unlimited.
+    pub cpus: Option<f64>,
 }
 
 impl Instance {
@@ -118,8 +156,65 @@ impl Instance {
             http_token: row.get("http_token")?,
             internal_url: row.get("internal_url")?,
             created_at: row.get("created_at")?,
+            memory_mb: row.get("memory_mb")?,
+            cpus: row.get("cpus")?,
         })
     }
+}
+
+/// One audit-trail row. Append-only; admins read it via `GET /panel/audit`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AuditEntry {
+    pub id: i64,
+    pub at: String,
+    pub username: String,
+    pub action: String,
+    pub target: String,
+    pub detail: String,
+}
+
+/// Record a panel action. Fire-and-forget: an audit write must never fail
+/// the operation it describes, so errors are logged and swallowed.
+pub async fn audit(db: &Db, username: &str, action: &str, target: &str, detail: &str) {
+    let (u, a, t, d) = (
+        username.to_string(),
+        action.to_string(),
+        target.to_string(),
+        detail.to_string(),
+    );
+    let res = db
+        .call(move |c| {
+            c.execute(
+                "INSERT INTO audit_log (at, username, action, target, detail) VALUES (?1,?2,?3,?4,?5)",
+                rusqlite::params![chrono::Utc::now().to_rfc3339(), u, a, t, d],
+            )
+        })
+        .await;
+    if let Err(e) = res {
+        tracing::error!(error = %e, action, "audit write failed");
+    }
+}
+
+/// Most recent audit rows, newest first.
+pub async fn audit_recent(db: &Db, limit: u32) -> anyhow::Result<Vec<AuditEntry>> {
+    db.call(move |c| {
+        let mut stmt = c.prepare(
+            "SELECT id, at, username, action, target, detail FROM audit_log \
+             ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit], |r| {
+            Ok(AuditEntry {
+                id: r.get(0)?,
+                at: r.get(1)?,
+                username: r.get(2)?,
+                action: r.get(3)?,
+                target: r.get(4)?,
+                detail: r.get(5)?,
+            })
+        })?;
+        rows.collect()
+    })
+    .await
 }
 
 /// 64 hex chars of OS randomness (two UUIDv4s) — same construction as the

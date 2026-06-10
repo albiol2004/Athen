@@ -25,7 +25,9 @@ mod auth;
 mod db;
 mod docker;
 mod instances;
+mod notify;
 mod proxy;
+mod ratelimit;
 mod ui;
 
 use std::net::SocketAddr;
@@ -42,6 +44,8 @@ pub struct PanelState {
     /// chat endpoint long-polls for the duration of an agent turn).
     pub http: reqwest::Client,
     pub cfg: PanelConfig,
+    pub login_throttle: ratelimit::LoginThrottle,
+    pub buckets: ratelimit::UserBuckets,
 }
 
 #[derive(Clone)]
@@ -102,7 +106,13 @@ async fn main() -> anyhow::Result<()> {
             .build()
             .context("building proxy http client")?,
         cfg: cfg.clone(),
+        login_throttle: ratelimit::LoginThrottle::default(),
+        buckets: ratelimit::UserBuckets::default(),
     });
+
+    // Forward approval-questions / urgent notifications from running
+    // instances to users' notify webhooks (phones).
+    notify::spawn(state.clone());
 
     let app = api::router(state.clone());
 

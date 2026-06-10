@@ -92,6 +92,7 @@ pub async fn create_user(
         password_hash: hash_password(password.to_string()).await?,
         role: role.to_string(),
         created_at: Utc::now().to_rfc3339(),
+        notify_url: String::new(),
     };
     let u = user.clone();
     db.call(move |c| {
@@ -201,6 +202,10 @@ pub async fn require_session(
     };
     match user_for_session(&state.db, &sid).await {
         Ok(Some(user)) => {
+            // Per-user request budget — stops runaway clients/scripts.
+            if !state.buckets.allow(&user.id, std::time::Instant::now()) {
+                return Err(StatusCode::TOO_MANY_REQUESTS);
+            }
             req.extensions_mut().insert(CurrentUser(user));
             Ok(next.run(req).await)
         }

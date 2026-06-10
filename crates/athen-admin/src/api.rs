@@ -22,7 +22,7 @@ use futures::StreamExt;
 use serde_json::json;
 
 use crate::auth::{self, CurrentUser};
-use crate::db::User;
+use crate::db::{self, User};
 use crate::{instances, proxy, ui, PanelState};
 
 pub fn router(state: Arc<PanelState>) -> Router {
@@ -31,6 +31,8 @@ pub fn router(state: Arc<PanelState>) -> Router {
         .route("/panel/me", get(me))
         .route("/panel/logout", post(logout))
         .route("/panel/password", post(change_password))
+        .route("/panel/notify", post(set_notify_url))
+        .route("/panel/audit", get(audit_list))
         .route(
             "/panel/instances",
             get(instances_list).post(instances_create),
@@ -88,23 +90,47 @@ async fn login(
     State(state): State<Arc<PanelState>>,
     Json(body): Json<LoginBody>,
 ) -> impl IntoResponse {
+    // Brute-force throttle BEFORE any argon2 work: locked-out names and
+    // a blown global budget are rejected for free.
+    if let Err(retry) = state
+        .login_throttle
+        .check(&body.username, std::time::Instant::now())
+    {
+        db::audit(&state.db, &body.username, "login_throttled", "", "").await;
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, retry.as_secs().max(1).to_string())],
+            Json(json!({ "error": "too many attempts, retry later" })),
+        )
+            .into_response();
+    }
     let user = match auth::user_by_name(&state.db, &body.username).await {
         Ok(Some(u)) => u,
         Ok(None) => {
             // Burn the same time as a real verify so login timing doesn't
             // reveal which usernames exist.
             let _ = auth::verify_password(body.password, DUMMY_HASH.to_string()).await;
+            state
+                .login_throttle
+                .record_failure(&body.username, std::time::Instant::now());
+            db::audit(&state.db, &body.username, "login_failed", "", "unknown user").await;
             return err(StatusCode::UNAUTHORIZED, "invalid credentials");
         }
         Err(e) => return internal(e),
     };
     if !auth::verify_password(body.password, user.password_hash.clone()).await {
+        state
+            .login_throttle
+            .record_failure(&body.username, std::time::Instant::now());
+        db::audit(&state.db, &body.username, "login_failed", "", "wrong password").await;
         return err(StatusCode::UNAUTHORIZED, "invalid credentials");
     }
+    state.login_throttle.record_success(&body.username);
     let session = match auth::new_session(&state.db, &user.id).await {
         Ok(s) => s,
         Err(e) => return internal(e),
     };
+    db::audit(&state.db, &user.username, "login", "", "").await;
     (
         StatusCode::OK,
         [(header::SET_COOKIE, auth::set_session_cookie(&session))],
@@ -118,6 +144,9 @@ async fn logout(
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     if let Some(sid) = auth::session_cookie_value(&headers) {
+        if let Ok(Some(user)) = auth::user_for_session(&state.db, &sid).await {
+            db::audit(&state.db, &user.username, "logout", "", "").await;
+        }
         let _ = auth::delete_session(&state.db, &sid).await;
     }
     (
@@ -129,7 +158,68 @@ async fn logout(
 }
 
 async fn me(Extension(CurrentUser(user)): Extension<CurrentUser>) -> Json<serde_json::Value> {
-    Json(json!({ "id": user.id, "username": user.username, "role": user.role }))
+    Json(json!({
+        "id": user.id,
+        "username": user.username,
+        "role": user.role,
+        "notify_url": user.notify_url,
+    }))
+}
+
+#[derive(serde::Deserialize)]
+struct NotifyBody {
+    /// Webhook URL (ntfy topic or any plain-POST sink); empty disables.
+    url: String,
+}
+
+/// Set the caller's own push webhook.
+async fn set_notify_url(
+    State(state): State<Arc<PanelState>>,
+    Extension(CurrentUser(user)): Extension<CurrentUser>,
+    Json(body): Json<NotifyBody>,
+) -> impl IntoResponse {
+    let url = body.url.trim().to_string();
+    if !(url.is_empty() || url.starts_with("http://") || url.starts_with("https://")) {
+        return err(StatusCode::BAD_REQUEST, "url must be http(s) or empty");
+    }
+    let (uid, u) = (user.id.clone(), url.clone());
+    match state
+        .db
+        .call(move |c| c.execute("UPDATE users SET notify_url = ?1 WHERE id = ?2", [u, uid]))
+        .await
+    {
+        Ok(_) => {
+            let detail = if url.is_empty() { "cleared" } else { "set" };
+            db::audit(&state.db, &user.username, "notify_url", "", detail).await;
+            Json(json!({ "ok": true })).into_response()
+        }
+        Err(e) => internal(e),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct AuditQuery {
+    #[serde(default = "default_audit_limit")]
+    limit: u32,
+}
+
+fn default_audit_limit() -> u32 {
+    200
+}
+
+/// Recent audit-trail rows, newest first (admin only).
+async fn audit_list(
+    State(state): State<Arc<PanelState>>,
+    Extension(CurrentUser(user)): Extension<CurrentUser>,
+    Query(q): Query<AuditQuery>,
+) -> impl IntoResponse {
+    if let Some(resp) = require_admin(&user) {
+        return resp;
+    }
+    match db::audit_recent(&state.db, q.limit.min(1000)).await {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => internal(e),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -164,7 +254,10 @@ async fn change_password(
         })
         .await
     {
-        Ok(_) => Json(json!({ "ok": true })).into_response(),
+        Ok(_) => {
+            db::audit(&state.db, &user.username, "password_changed", "", "").await;
+            Json(json!({ "ok": true })).into_response()
+        }
         Err(e) => internal(e),
     }
 }
@@ -206,6 +299,8 @@ async fn instances_list(
                 "created_at": i.created_at,
                 "state": s,
                 "status": detail,
+                "memory_mb": i.memory_mb,
+                "cpus": i.cpus,
                 "user_ids": grants.get(&i.id).cloned().unwrap_or_default(),
             })
         })
@@ -224,6 +319,10 @@ struct CreateInstanceBody {
     models_toml: Option<String>,
     #[serde(default)]
     user_ids: Vec<String>,
+    #[serde(default)]
+    memory_mb: Option<u64>,
+    #[serde(default)]
+    cpus: Option<f64>,
 }
 
 async fn instances_create(
@@ -237,6 +336,14 @@ async fn instances_create(
     if body.name.trim().is_empty() {
         return err(StatusCode::BAD_REQUEST, "name is required");
     }
+    if body.cpus.is_some_and(|c| !c.is_finite() || c <= 0.0)
+        || body.memory_mb.is_some_and(|m| m < 64)
+    {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "cpus must be > 0; memory_mb must be >= 64",
+        );
+    }
     match instances::create(
         &state,
         instances::CreateSpec {
@@ -245,11 +352,16 @@ async fn instances_create(
             config_toml: body.config_toml,
             models_toml: body.models_toml,
             user_ids: body.user_ids,
+            memory_mb: body.memory_mb,
+            cpus: body.cpus,
         },
     )
     .await
     {
-        Ok(i) => Json(json!({ "id": i.id, "container_name": i.container_name })).into_response(),
+        Ok(i) => {
+            db::audit(&state.db, &user.username, "instance_create", &i.name, "").await;
+            Json(json!({ "id": i.id, "container_name": i.container_name })).into_response()
+        }
         Err(e) => {
             tracing::error!(error = %e, "instance provisioning failed");
             err(
@@ -265,7 +377,7 @@ async fn instance_start(
     Extension(CurrentUser(user)): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    instance_action(&state, &user, &id, |st, i| async move {
+    instance_action(&state, &user, &id, "instance_start", |st, i| async move {
         st.docker.start(&i.container_name).await
     })
     .await
@@ -276,7 +388,7 @@ async fn instance_stop(
     Extension(CurrentUser(user)): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    instance_action(&state, &user, &id, |st, i| async move {
+    instance_action(&state, &user, &id, "instance_stop", |st, i| async move {
         st.docker.stop(&i.container_name).await
     })
     .await
@@ -302,7 +414,22 @@ async fn instance_delete(
         Err(resp) => return resp,
     };
     match instances::delete(&state, &instance, body.delete_data).await {
-        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Ok(()) => {
+            let detail = if body.delete_data {
+                "with data volume"
+            } else {
+                "data volume kept"
+            };
+            db::audit(
+                &state.db,
+                &user.username,
+                "instance_delete",
+                &instance.name,
+                detail,
+            )
+            .await;
+            Json(json!({ "ok": true })).into_response()
+        }
         Err(e) => internal(e),
     }
 }
@@ -321,11 +448,22 @@ async fn instance_grants(
     if let Some(resp) = require_admin(&user) {
         return resp;
     }
-    if let Err(resp) = must_instance(&state, &id).await {
-        return resp;
-    }
+    let instance = match must_instance(&state, &id).await {
+        Ok(i) => i,
+        Err(resp) => return resp,
+    };
     match instances::set_grants(&state.db, &id, &body.user_ids).await {
-        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Ok(()) => {
+            db::audit(
+                &state.db,
+                &user.username,
+                "grants_set",
+                &instance.name,
+                &format!("{} user(s)", body.user_ids.len()),
+            )
+            .await;
+            Json(json!({ "ok": true })).into_response()
+        }
         Err(e) => internal(e),
     }
 }
@@ -442,6 +580,14 @@ async fn users_create(
             })
             .await;
     }
+    db::audit(
+        &state.db,
+        &user.username,
+        "user_create",
+        &created.username,
+        &format!("role {}", created.role),
+    )
+    .await;
     Json(json!({ "id": created.id, "username": created.username })).into_response()
 }
 
@@ -456,12 +602,16 @@ async fn users_delete(
     if id == user.id {
         return err(StatusCode::BAD_REQUEST, "refusing to delete yourself");
     }
+    let target = id.clone();
     match state
         .db
         .call(move |c| c.execute("DELETE FROM users WHERE id = ?1", [id]))
         .await
     {
-        Ok(n) if n > 0 => Json(json!({ "ok": true })).into_response(),
+        Ok(n) if n > 0 => {
+            db::audit(&state.db, &user.username, "user_delete", &target, "").await;
+            Json(json!({ "ok": true })).into_response()
+        }
         Ok(_) => err(StatusCode::NOT_FOUND, "no such user"),
         Err(e) => internal(e),
     }
@@ -469,11 +619,13 @@ async fn users_delete(
 
 // ------------------------------------------------------------- helpers --
 
-/// Shared shape for start/stop: admin-only, resolve instance, run action.
+/// Shared shape for start/stop: admin-only, resolve instance, run action,
+/// audit on success.
 async fn instance_action<F, Fut>(
     state: &Arc<PanelState>,
     user: &User,
     id: &str,
+    audit_as: &str,
     action: F,
 ) -> axum::response::Response
 where
@@ -487,8 +639,12 @@ where
         Ok(i) => i,
         Err(resp) => return resp,
     };
+    let name = instance.name.clone();
     match action(state.clone(), instance).await {
-        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Ok(()) => {
+            db::audit(&state.db, &user.username, audit_as, &name, "").await;
+            Json(json!({ "ok": true })).into_response()
+        }
         Err(e) => err(StatusCode::BAD_GATEWAY, &format!("{e:#}")),
     }
 }

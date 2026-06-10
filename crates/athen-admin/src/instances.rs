@@ -66,6 +66,10 @@ pub struct CreateSpec {
     pub models_toml: Option<String>,
     /// Users granted access right away.
     pub user_ids: Vec<String>,
+    /// Hard memory limit (cgroup, swap disabled); `None` = unlimited.
+    pub memory_mb: Option<u64>,
+    /// Hard CPU limit in fractional cores; `None` = unlimited.
+    pub cpus: Option<f64>,
 }
 
 /// Full provisioning flow. On Docker failure after the row insert, the row
@@ -81,6 +85,8 @@ pub async fn create(state: &PanelState, spec: CreateSpec) -> anyhow::Result<Inst
         http_token: random_token(),
         internal_url: format!("http://athen-{short}:{INSTANCE_PORT}"),
         created_at: Utc::now().to_rfc3339(),
+        memory_mb: spec.memory_mb,
+        cpus: spec.cpus,
     };
 
     let row = instance.clone();
@@ -88,8 +94,8 @@ pub async fn create(state: &PanelState, spec: CreateSpec) -> anyhow::Result<Inst
         .db
         .call(move |c| {
             c.execute(
-                "INSERT INTO instances (id, name, container_name, volume_name, http_token, internal_url, created_at) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                "INSERT INTO instances (id, name, container_name, volume_name, http_token, internal_url, created_at, memory_mb, cpus) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
                 rusqlite::params![
                     row.id,
                     row.name,
@@ -97,7 +103,9 @@ pub async fn create(state: &PanelState, spec: CreateSpec) -> anyhow::Result<Inst
                     row.volume_name,
                     row.http_token,
                     row.internal_url,
-                    row.created_at
+                    row.created_at,
+                    row.memory_mb,
+                    row.cpus
                 ],
             )
         })
@@ -124,6 +132,8 @@ pub async fn create(state: &PanelState, spec: CreateSpec) -> anyhow::Result<Inst
                 &state.cfg.instance_image,
                 &state.cfg.network,
                 env,
+                spec.memory_mb,
+                spec.cpus,
             )
             .await?;
         let mut seed: Vec<(String, String)> = Vec::new();
