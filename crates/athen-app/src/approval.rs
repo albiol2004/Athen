@@ -518,10 +518,7 @@ impl ApprovalRouter {
         // Heuristic picked a channel with no sink (headless builds have
         // no InApp sink) — fall back to whatever IS wired rather than
         // erroring out of ask_with_escalation before asking anyone.
-        self.sinks
-            .first()
-            .map(|s| s.channel_kind())
-            .unwrap_or(kind)
+        self.sinks.first().map(|s| s.channel_kind()).unwrap_or(kind)
     }
 
     /// Ask the question on the primary channel, escalating to the

@@ -7,14 +7,20 @@
 //!
 //! - `Tauri(handle)` — desktop mode; `emit` forwards to the WebView,
 //!   `app_state` resolves through Tauri's managed state.
-//! - `Headless` — daemon mode; `emit` drops the event at DEBUG (the GUI is
-//!   the only consumer of those events), `app_state` resolves through a
+//! - `Headless` — daemon mode; `app_state` resolves through a
 //!   process-global set once by the headless composition root.
 //!
+//! In both modes, `emit` additionally fans out to the process-global
+//! event bus when the HTTP API is enabled (`http_api::serve` → SSE for
+//! remote React / React Native clients); a headless emit with no bus is
+//! dropped at DEBUG.
+//!
 //! Components that are *inherently* GUI-bound (InApp notification channel,
-//! InApp approval sink, `place_call`'s resource-dir lookup) still take the
-//! real `AppHandle`; the bridge exposes it via [`UiBridge::tauri_handle`]
-//! and those components are simply not constructed in headless mode.
+//! `place_call`'s resource-dir lookup) still take the real `AppHandle`;
+//! the bridge exposes it via [`UiBridge::tauri_handle`] and those
+//! components are simply not constructed in headless mode. The InApp
+//! approval sink is the exception: it speaks UiBridge and is constructed
+//! whenever a WebView *or* a live event bus can deliver its questions.
 
 use std::sync::{Arc, OnceLock};
 
@@ -65,16 +71,12 @@ impl UiBridge {
     /// bus subscribers (the HTTP API's SSE stream). Idempotent; called
     /// by whichever composition root enables the HTTP API, before any
     /// background loop starts emitting.
-    // TODO(http-api): allow removed when http_api.rs lands and consumes these.
-    #[allow(dead_code)]
     pub fn init_event_bus() {
         let _ = EVENT_BUS.get_or_init(|| tokio::sync::broadcast::channel(1024).0);
     }
 
     /// Subscribe to the event bus. `None` until [`Self::init_event_bus`]
     /// has run (i.e. the HTTP API is disabled).
-    // TODO(http-api): allow removed when http_api.rs lands and consumes these.
-    #[allow(dead_code)]
     pub fn subscribe_events() -> Option<tokio::sync::broadcast::Receiver<BusEvent>> {
         EVENT_BUS.get().map(|tx| tx.subscribe())
     }

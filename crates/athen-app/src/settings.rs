@@ -3072,7 +3072,9 @@ pub async fn save_notification_settings(
     save_main_config(&config)?;
     // Hot-swap the live notification orchestrator so channel order, quiet
     // hours, and escalation timeout apply without a restart.
-    state.reload_notifier(crate::ui_bridge::UiBridge::Tauri(app_handle)).await;
+    state
+        .reload_notifier(crate::ui_bridge::UiBridge::Tauri(app_handle))
+        .await;
     Ok("Notification settings saved and applied.".to_string())
 }
 

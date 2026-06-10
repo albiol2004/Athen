@@ -15,9 +15,9 @@
 
 use std::sync::Arc;
 
+use crate::ui_bridge::UiBridge;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use crate::ui_bridge::UiBridge;
 use tracing::{info, warn};
 use uuid::Uuid;
 

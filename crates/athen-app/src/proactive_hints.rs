@@ -8,9 +8,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::ui_bridge::UiBridge;
 use chrono::Utc;
 use serde::Serialize;
-use crate::ui_bridge::UiBridge;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 use uuid::Uuid;

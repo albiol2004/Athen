@@ -25,6 +25,7 @@ pub(crate) mod env_creds;
 pub(crate) mod file_gate;
 pub(crate) mod github_identity;
 pub(crate) mod headless;
+pub(crate) mod http_api;
 pub(crate) mod http_presets;
 pub(crate) mod http_rate_limiter;
 pub(crate) mod identity_render;
@@ -42,8 +43,8 @@ pub(crate) mod skills_render;
 pub(crate) mod spawn_pidfile;
 pub(crate) mod state;
 pub(crate) mod telegram_progress;
-pub(crate) mod ui_bridge;
 pub(crate) mod telephony_gate;
+pub(crate) mod ui_bridge;
 pub(crate) mod vault_creds;
 pub(crate) mod voice;
 mod wakeup_commands;
@@ -338,6 +339,18 @@ pub fn run() {
                     .await;
             });
 
+            // Resolve the HTTP API config (remote React / React Native
+            // clients) before the approval router: a live event bus is
+            // part of what init_approval_router considers an in-app
+            // surface, and emit() only fans out once the bus exists.
+            let http_api_cfg = crate::http_api::HttpApiConfig::from_env(
+                &athen_core::paths::athen_data_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from(".")),
+            );
+            if http_api_cfg.is_some() {
+                crate::ui_bridge::UiBridge::init_event_bus();
+            }
+
             // Initialize the notification orchestrator (InApp channel is
             // wired because we have a real Tauri handle here).
             let ui = crate::ui_bridge::UiBridge::Tauri(app.handle().clone());
@@ -405,6 +418,19 @@ pub fn run() {
 
             app.manage(state);
 
+            // HTTP API for remote clients. Spawned only after
+            // app.manage(state) so request handlers can always resolve
+            // the managed AppState through the bridge.
+            if let Some(cfg) = http_api_cfg {
+                tracing::info!(addr = %cfg.addr, "HTTP API enabled (remote clients + SSE events)");
+                let ui_for_http = crate::ui_bridge::UiBridge::Tauri(app.handle().clone());
+                tauri::async_runtime::spawn(async move {
+                    if let Err(e) = crate::http_api::serve(cfg, ui_for_http).await {
+                        tracing::error!(error = %e, "HTTP API server exited");
+                    }
+                });
+            }
+
             // Track window focus state for the notification orchestrator.
             // When the window loses focus, the orchestrator routes notifications
             // to external channels (Telegram) instead of in-app.
@@ -419,7 +445,8 @@ pub fn run() {
             // hot-swap it in, so non-technical users get semantic recall
             // without touching Settings. No-op when already present or when
             // the user picked a provider explicitly.
-            state_ref.start_embedder_warmup(crate::ui_bridge::UiBridge::Tauri(app.handle().clone()));
+            state_ref
+                .start_embedder_warmup(crate::ui_bridge::UiBridge::Tauri(app.handle().clone()));
 
             let notifier_for_focus = state_ref.notifier.load_full();
             if let Some(window) = app.get_webview_window("main") {

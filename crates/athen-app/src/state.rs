@@ -1790,9 +1790,8 @@ impl AppState {
         // mode (event bus active). With neither, skip the sink — an
         // unanswerable question parked here would just burn the
         // escalation timeout before Telegram gets a shot.
-        let inapp = (ui.tauri_handle().is_some()
-            || crate::ui_bridge::UiBridge::event_bus_active())
-        .then(|| Arc::new(InAppApprovalSink::new(ui.clone())));
+        let inapp = (ui.tauri_handle().is_some() || crate::ui_bridge::UiBridge::event_bus_active())
+            .then(|| Arc::new(InAppApprovalSink::new(ui.clone())));
         let mut sinks: Vec<Arc<dyn ApprovalSink>> = Vec::new();
         if let Some(ref s) = inapp {
             sinks.push(s.clone() as Arc<dyn ApprovalSink>);
@@ -1859,8 +1858,7 @@ impl AppState {
     /// `agents-changed` events. Idempotent — re-init replaces the previous
     /// registry, which is fine since live state is also empty at startup.
     pub fn init_agent_registry(&mut self, ui: crate::ui_bridge::UiBridge) {
-        let registry =
-            crate::agent_registry::AgentRegistry::new(ui, self.agent_run_store.clone());
+        let registry = crate::agent_registry::AgentRegistry::new(ui, self.agent_run_store.clone());
         self.agent_registry = Some(registry);
     }
 
@@ -1938,9 +1936,7 @@ impl AppState {
                     is_local_provider: is_local,
                 };
 
-                checker
-                    .check_and_emit(ctx, &ui, notifier.as_ref())
-                    .await;
+                checker.check_and_emit(ctx, &ui, notifier.as_ref()).await;
             }
         });
     }

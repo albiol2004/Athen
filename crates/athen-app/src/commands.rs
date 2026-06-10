@@ -5368,12 +5368,14 @@ pub(crate) async fn execute_dispatched_task(
             if let Err(e) = arc_store.set_goal_blocked(&arc_id, &reason).await {
                 tracing::warn!(arc = %arc_id, error = %e, "set_goal_blocked failed");
             }
-            ctx.ui.emit("arc-updated", serde_json::json!({ "arc_id": arc_id }));
+            ctx.ui
+                .emit("arc-updated", serde_json::json!({ "arc_id": arc_id }));
         } else if goal_active {
             if let Err(e) = arc_store.clear_user_goal(&arc_id).await {
                 tracing::warn!(arc = %arc_id, error = %e, "clear_user_goal on completion failed");
             }
-            ctx.ui.emit("arc-updated", serde_json::json!({ "arc_id": arc_id }));
+            ctx.ui
+                .emit("arc-updated", serde_json::json!({ "arc_id": arc_id }));
         }
     }
 
@@ -5477,7 +5479,8 @@ pub(crate) async fn execute_dispatched_task(
     let _ = ctx.coordinator.complete_task(coord_task_id).await;
     crate::state::clear_provider_pin_for_arc(ctx.arc_store.as_ref(), &arc_id).await;
 
-    ctx.ui.emit("arc-updated", serde_json::json!({ "arc_id": arc_id }));
+    ctx.ui
+        .emit("arc-updated", serde_json::json!({ "arc_id": arc_id }));
 
     // Completion ping. Only fires on success — early-return error branches
     // above already surfaced their own assistant entry into the arc, and

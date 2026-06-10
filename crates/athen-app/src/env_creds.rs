@@ -29,7 +29,10 @@ use athen_core::config::{AthenConfig, AuthType, ModelsConfig};
 
 /// Inner form taking the env reader explicitly so tests never mutate
 /// process env (parallel test runs race on `set_var`).
-fn lookup_env_secret(name: &str, env: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+pub(crate) fn lookup_env_secret(
+    name: &str,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
     if let Some(v) = env(name) {
         if !v.is_empty() {
             return Some(v);
@@ -161,11 +164,11 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let f = td.path().join("secret");
         std::fs::write(&f, "from-file\n").unwrap();
-        let env = env_of(&[
-            ("ATHEN_X", "direct"),
-            ("ATHEN_X_FILE", f.to_str().unwrap()),
-        ]);
-        assert_eq!(lookup_env_secret("ATHEN_X", &env).as_deref(), Some("direct"));
+        let env = env_of(&[("ATHEN_X", "direct"), ("ATHEN_X_FILE", f.to_str().unwrap())]);
+        assert_eq!(
+            lookup_env_secret("ATHEN_X", &env).as_deref(),
+            Some("direct")
+        );
     }
 
     #[test]

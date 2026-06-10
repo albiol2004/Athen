@@ -13,6 +13,8 @@
 //! - `ATHEN_DATA_DIR` — private data tree (config, vault, SQLite, workspace)
 //! - `ATHEN_VAULT_BACKEND=file` — skip the OS keychain entirely
 //! - `ATHEN_*` secret env vars / `*_FILE` variants — see `env_creds`
+//! - `ATHEN_HTTP_ADDR` — opt-in HTTP API for remote clients (REST + SSE,
+//!   token-gated) — see `http_api`
 //!
 //! Setup mirrors `lib.rs`'s Tauri `setup()` hook step for step; if you add
 //! a background loop there, add it here (or consciously skip it and note
@@ -77,8 +79,22 @@ pub fn run_headless() {
     // Register an agent so tasks can be dispatched.
     let agent_id = uuid::Uuid::new_v4();
     tauri::async_runtime::block_on(async {
-        state.coordinator.dispatcher().register_agent(agent_id).await;
+        state
+            .coordinator
+            .dispatcher()
+            .register_agent(agent_id)
+            .await;
     });
+
+    // Resolve the HTTP API config before the approval router: a live
+    // event bus is what makes init_approval_router construct the InApp
+    // sink (remote clients answer approval questions over HTTP).
+    let data_dir =
+        athen_core::paths::athen_data_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let http_cfg = crate::http_api::HttpApiConfig::from_env(&data_dir);
+    if http_cfg.is_some() {
+        UiBridge::init_event_bus();
+    }
 
     state.init_notifier(ui.clone());
     state.init_agent_registry(ui.clone());
@@ -93,6 +109,12 @@ pub fn run_headless() {
         && cfg.telegram.owner_user_id.is_some();
     if telegram_ready {
         tracing::info!("Headless user surface: Telegram (notifications + approvals + owner chat)");
+    } else if http_cfg.is_some() {
+        tracing::warn!(
+            "Headless mode without a configured Telegram bot: approval questions reach \
+             only connected HTTP clients (SSE `approval-question` events). Unattended \
+             HumanConfirm tasks will stall until a client answers."
+        );
     } else {
         tracing::warn!(
             "Headless mode without a configured Telegram bot: no notification or approval \
@@ -133,6 +155,18 @@ pub fn run_headless() {
     let state = Arc::new(state);
     UiBridge::publish_headless_state(state.clone());
     state.start_embedder_warmup(ui);
+
+    // HTTP API for remote clients (React / React Native). Spawned after
+    // the state singleton is published so request handlers never block
+    // on the OnceLock.
+    if let Some(cfg) = http_cfg {
+        tracing::info!(addr = %cfg.addr, "HTTP API enabled (remote clients + SSE events)");
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = crate::http_api::serve(cfg, UiBridge::Headless).await {
+                tracing::error!(error = %e, "HTTP API server exited");
+            }
+        });
+    }
 
     tracing::info!("Athen headless daemon running (SIGINT/SIGTERM to stop)");
 

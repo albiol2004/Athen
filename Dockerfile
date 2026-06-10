@@ -12,10 +12,15 @@
 # *_FILE-mounted secrets (see docs/HEADLESS.md).
 #
 #   docker build -t athen .
-#   docker run -d -v athen-data:/data \
+#   docker run -d -v athen-data:/data -p 8787:8787 \
 #     -e ATHEN_TELEGRAM_BOT_TOKEN=... \
 #     -e ATHEN_PROVIDER_DEEPSEEK_API_KEY=... \
 #     athen
+#
+# The HTTP API (REST + SSE for remote React/React Native clients) binds
+# 0.0.0.0:8787 inside the container; it is reachable only when the port
+# is published. Auth token: ATHEN_HTTP_TOKEN(_FILE) env, or the
+# auto-generated /data/http_token. Unset ATHEN_HTTP_ADDR to disable.
 
 # trixie: the prebuilt onnxruntime (ort_sys, via bundled embeddings)
 # requires glibc >= 2.38 (__isoc23_* symbols); bookworm's 2.36 fails to link.
@@ -63,8 +68,10 @@ USER athen
 ENV ATHEN_DATA_DIR=/data \
     ATHEN_VAULT_BACKEND=file \
     ATHEN_HEADLESS=1 \
+    ATHEN_HTTP_ADDR=0.0.0.0:8787 \
     RUST_LOG=info
 
+EXPOSE 8787
 VOLUME /data
 
 ENTRYPOINT ["/usr/local/bin/athen-app"]

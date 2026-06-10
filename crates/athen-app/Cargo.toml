@@ -50,6 +50,10 @@ url = { workspace = true }
 quick-xml = { workspace = true }
 lettre = { workspace = true }
 tempfile = "3"
+# HTTP API for remote clients (React / React Native) — see http_api.rs.
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+tokio-stream = { workspace = true, features = ["sync"] }
 
 [features]
 # Phase 2c flipped this default-ON. Released binaries now include
