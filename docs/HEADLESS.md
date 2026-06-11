@@ -161,6 +161,8 @@ add nothing when auth is a bearer token.
 | `POST /api/messages/queue` | `{arc_id, text}` | steer a *running* task mid-flight |
 | `POST /api/approvals/task` | `{task_id, approved}` | `ChatResponse` (risk-gate card answer) |
 | `POST /api/approvals/question` | `{question_id, choice_key}` | `{resolved}` (`approval-question` answer) |
+| `GET /api/grants/pending` | — | parked file-permission prompts (`grant-requested` payloads) |
+| `POST /api/grants/{id}` | `{decision}` — `"Allow"` \| `"AllowAlways"` \| `"Deny"` \| `{"AllowProjectRoot": "/path"}` | `{resolved}` (unparks the agent) |
 | `POST /api/cancel` | — | cancel all running agents |
 | `GET /api/agents` | — | `ActiveAgent[]` (watch-agents panel) |
 | `POST /api/agents/{task_id}/cancel` | — | `{cancelled}` |
@@ -183,7 +185,11 @@ the query param there.
 /api/messages` (don't await it for rendering; paint from `agent-stream` /
 `agent-progress`) → if the response carries `pending_approval`, render a
 card and answer via `/api/approvals/task` → on `approval-question` events
-(mid-task risk prompts), answer via `/api/approvals/question`.
+(mid-task risk prompts), answer via `/api/approvals/question` → on
+`grant-requested` events (file-permission prompts; the agent is parked),
+answer via `/api/grants/{id}`. If nothing can deliver a grant prompt
+(HTTP API disabled *and* no Telegram), the FileGate fails closed with an
+error to the agent instead of parking forever.
 
 With Telegram *and* HTTP configured, approval prompts race both channels
 (same as desktop + Telegram today): first answer wins.

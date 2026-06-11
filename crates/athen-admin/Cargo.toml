@@ -1,0 +1,30 @@
+[package]
+name = "athen-admin"
+version = "0.1.0"
+edition = "2021"
+description = "Athen admin panel + gateway: multi-instance provisioning, user auth, reverse proxy"
+
+# Standalone control-plane binary. Deliberately depends on NO internal
+# athen crates: it manages Athen instances purely through the Docker API
+# and each instance's HTTP API (token-gated REST + SSE).
+
+[dependencies]
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+axum = "0.8"
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true }
+rusqlite = { version = "0.32", features = ["bundled"] }
+argon2 = "0.5"
+bollard = "0.19"
+tar = "0.4"
+
+[dev-dependencies]
+tempfile = "3"

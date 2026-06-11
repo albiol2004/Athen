@@ -3866,7 +3866,7 @@ pub(crate) async fn execute_approved_task(
             ctx.active_arc_id.clone(),
             store.clone(),
             ctx.pending_grants.clone(),
-            ctx.ui.tauri_handle().cloned(),
+            Some(ctx.ui.clone()),
         )
         .with_security_mode(ctx.security_mode);
         if let Some(ref sink) = ctx.telegram_approval_sink {
@@ -5009,7 +5009,7 @@ pub(crate) async fn execute_dispatched_task(
             arc_id.clone(),
             store.clone(),
             ctx.pending_grants.clone(),
-            ctx.ui.tauri_handle().cloned(),
+            Some(ctx.ui.clone()),
         )
         .with_security_mode(ctx.security_mode);
         if let Some(ref sink) = ctx.telegram_approval_sink {
@@ -8468,17 +8468,18 @@ fn grant_to_summary(g: athen_persistence::grants::DirectoryGrant) -> DirectoryGr
     }
 }
 
-#[tauri::command]
-pub async fn list_pending_grants(
-    state: State<'_, AppState>,
+/// Shared core behind the Tauri command and `GET /api/grants/pending`.
+pub async fn list_pending_grants_core(
+    state: &AppState,
 ) -> std::result::Result<Vec<PendingGrantSummary>, String> {
     let map = state.pending_grants.lock().await;
     Ok(map.iter().map(|(id, req)| req.summary(*id)).collect())
 }
 
-#[tauri::command]
-pub async fn resolve_pending_grant(
-    state: State<'_, AppState>,
+/// Shared core behind the Tauri command and `POST /api/grants/{id}` —
+/// the headless answer path for file-permission prompts.
+pub async fn resolve_pending_grant_core(
+    state: &AppState,
     id: String,
     decision: GrantDecision,
 ) -> std::result::Result<(), String> {
@@ -8491,6 +8492,22 @@ pub async fn resolve_pending_grant(
     req.responder
         .send(decision)
         .map_err(|_| "Pending grant already resolved".to_string())
+}
+
+#[tauri::command]
+pub async fn list_pending_grants(
+    state: State<'_, AppState>,
+) -> std::result::Result<Vec<PendingGrantSummary>, String> {
+    list_pending_grants_core(state.inner()).await
+}
+
+#[tauri::command]
+pub async fn resolve_pending_grant(
+    state: State<'_, AppState>,
+    id: String,
+    decision: GrantDecision,
+) -> std::result::Result<(), String> {
+    resolve_pending_grant_core(state.inner(), id, decision).await
 }
 
 #[tauri::command]
