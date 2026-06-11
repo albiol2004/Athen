@@ -218,6 +218,15 @@ pub async fn update_bundle(
     tiers: Option<BundleTiersView>,
     state: State<'_, AppState>,
 ) -> std::result::Result<BundleView, String> {
+    update_bundle_core(id, name, tiers, &state).await
+}
+
+pub(crate) async fn update_bundle_core(
+    id: String,
+    name: Option<String>,
+    tiers: Option<BundleTiersView>,
+    state: &AppState,
+) -> std::result::Result<BundleView, String> {
     let mut models = crate::settings::load_models_config();
     let active = active_id_of(&models);
     let Some(bundle) = models.bundles.get(&id).cloned() else {
@@ -291,6 +300,13 @@ pub async fn delete_bundle(id: String) -> std::result::Result<(), String> {
 pub async fn set_active_bundle(
     id: String,
     state: State<'_, AppState>,
+) -> std::result::Result<String, String> {
+    set_active_bundle_core(id, &state).await
+}
+
+pub(crate) async fn set_active_bundle_core(
+    id: String,
+    state: &AppState,
 ) -> std::result::Result<String, String> {
     let mut models = crate::settings::load_models_config();
     let Some(bundle) = models.bundles.get(&id).cloned() else {

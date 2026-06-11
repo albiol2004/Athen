@@ -83,7 +83,13 @@ pub struct SyncResult {
 pub async fn list_calendar_sources(
     state: State<'_, AppState>,
 ) -> std::result::Result<Vec<CalendarSourceView>, String> {
-    let store = source_store(&state)?;
+    list_calendar_sources_core(&state).await
+}
+
+pub(crate) async fn list_calendar_sources_core(
+    state: &AppState,
+) -> std::result::Result<Vec<CalendarSourceView>, String> {
+    let store = source_store(state)?;
     let configs = store.list().await.map_err(|e| e.to_string())?;
     Ok(configs.into_iter().map(CalendarSourceView::from).collect())
 }
@@ -96,6 +102,16 @@ pub async fn add_caldav_source(
     password: String,
     state: State<'_, AppState>,
 ) -> std::result::Result<CalendarSourceView, String> {
+    add_caldav_source_core(display_name, base_url, username, password, &state).await
+}
+
+pub(crate) async fn add_caldav_source_core(
+    display_name: String,
+    base_url: String,
+    username: String,
+    password: String,
+    state: &AppState,
+) -> std::result::Result<CalendarSourceView, String> {
     if password.trim().is_empty() {
         return Err("Password required".to_string());
     }
@@ -103,7 +119,7 @@ pub async fn add_caldav_source(
         .vault
         .clone()
         .ok_or_else(|| "Credential vault unavailable".to_string())?;
-    let store = source_store(&state)?;
+    let store = source_store(state)?;
 
     let cfg = CalendarSourceConfig::new_caldav(display_name, base_url, username);
     vault
@@ -124,8 +140,15 @@ pub async fn delete_calendar_source(
     id: String,
     state: State<'_, AppState>,
 ) -> std::result::Result<(), String> {
+    delete_calendar_source_core(id, &state).await
+}
+
+pub(crate) async fn delete_calendar_source_core(
+    id: String,
+    state: &AppState,
+) -> std::result::Result<(), String> {
     let uuid = Uuid::parse_str(&id).map_err(|e| format!("Bad id: {e}"))?;
-    let store = source_store(&state)?;
+    let store = source_store(state)?;
     // Read first to learn the vault scope so we can also delete the
     // password — order matters: row + vault both gone, no orphan secret.
     if let Some(existing) = store.get(uuid).await.map_err(|e| e.to_string())? {
@@ -145,8 +168,16 @@ pub async fn set_calendar_source_enabled(
     enabled: bool,
     state: State<'_, AppState>,
 ) -> std::result::Result<(), String> {
+    set_calendar_source_enabled_core(id, enabled, &state).await
+}
+
+pub(crate) async fn set_calendar_source_enabled_core(
+    id: String,
+    enabled: bool,
+    state: &AppState,
+) -> std::result::Result<(), String> {
     let uuid = Uuid::parse_str(&id).map_err(|e| format!("Bad id: {e}"))?;
-    source_store(&state)?
+    source_store(state)?
         .set_enabled(uuid, enabled)
         .await
         .map_err(|e| e.to_string())
@@ -158,8 +189,16 @@ pub async fn set_calendar_source_selected_calendars(
     calendar_ids: Vec<String>,
     state: State<'_, AppState>,
 ) -> std::result::Result<(), String> {
+    set_calendar_source_selected_calendars_core(id, calendar_ids, &state).await
+}
+
+pub(crate) async fn set_calendar_source_selected_calendars_core(
+    id: String,
+    calendar_ids: Vec<String>,
+    state: &AppState,
+) -> std::result::Result<(), String> {
     let uuid = Uuid::parse_str(&id).map_err(|e| format!("Bad id: {e}"))?;
-    source_store(&state)?
+    source_store(state)?
         .set_selected_calendars(uuid, &calendar_ids)
         .await
         .map_err(|e| e.to_string())
@@ -171,7 +210,14 @@ pub async fn test_calendar_source_connection(
     id: String,
     state: State<'_, AppState>,
 ) -> std::result::Result<SyncResult, String> {
-    let source = build_live_source(&id, &state).await?;
+    test_calendar_source_connection_core(id, &state).await
+}
+
+pub(crate) async fn test_calendar_source_connection_core(
+    id: String,
+    state: &AppState,
+) -> std::result::Result<SyncResult, String> {
+    let source = build_live_source(&id, state).await?;
     match source.test_connection().await {
         Ok(()) => Ok(SyncResult {
             success: true,
@@ -191,7 +237,14 @@ pub async fn list_remote_calendars(
     id: String,
     state: State<'_, AppState>,
 ) -> std::result::Result<Vec<RemoteCalendarView>, String> {
-    let source = build_live_source(&id, &state).await?;
+    list_remote_calendars_core(id, &state).await
+}
+
+pub(crate) async fn list_remote_calendars_core(
+    id: String,
+    state: &AppState,
+) -> std::result::Result<Vec<RemoteCalendarView>, String> {
+    let source = build_live_source(&id, state).await?;
     let cals = source.list_calendars().await.map_err(|e| e.to_string())?;
     Ok(cals
         .into_iter()
@@ -212,10 +265,18 @@ pub async fn sync_calendar_source_now(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> std::result::Result<SyncResult, String> {
+    sync_calendar_source_now_core(id, &state, &crate::ui_bridge::UiBridge::Tauri(app_handle)).await
+}
+
+pub(crate) async fn sync_calendar_source_now_core(
+    id: String,
+    state: &AppState,
+    ui: &crate::ui_bridge::UiBridge,
+) -> std::result::Result<SyncResult, String> {
     use std::sync::Arc as StdArc;
 
     let uuid = Uuid::parse_str(&id).map_err(|e| format!("Bad id: {e}"))?;
-    let store_concrete = source_store(&state)?;
+    let store_concrete = source_store(state)?;
     let cfg = store_concrete
         .get(uuid)
         .await
@@ -233,7 +294,7 @@ pub async fn sync_calendar_source_now(
 
     match crate::calendar_sources::sync_one(&cfg, &vault, &calendar_store, &cfg_store).await {
         Ok(stats) => {
-            emit_sync_completed(&app_handle, &cfg.id.to_string(), &cfg.display_name, stats);
+            emit_sync_completed(ui, &cfg.id.to_string(), &cfg.display_name, stats);
             Ok(SyncResult {
                 success: true,
                 message: format!(
@@ -271,7 +332,13 @@ pub struct WritableCalendarView {
 pub async fn list_writable_calendars(
     state: State<'_, AppState>,
 ) -> std::result::Result<Vec<WritableCalendarView>, String> {
-    let store_concrete = source_store(&state)?;
+    list_writable_calendars_core(&state).await
+}
+
+pub(crate) async fn list_writable_calendars_core(
+    state: &AppState,
+) -> std::result::Result<Vec<WritableCalendarView>, String> {
+    let store_concrete = source_store(state)?;
     let sources = store_concrete.list().await.map_err(|e| e.to_string())?;
     let vault = state
         .vault
@@ -339,9 +406,17 @@ pub async fn sync_all_calendar_sources_now(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> std::result::Result<SyncAllResult, String> {
+    sync_all_calendar_sources_now_core(&state, &crate::ui_bridge::UiBridge::Tauri(app_handle))
+        .await
+}
+
+pub(crate) async fn sync_all_calendar_sources_now_core(
+    state: &AppState,
+    ui: &crate::ui_bridge::UiBridge,
+) -> std::result::Result<SyncAllResult, String> {
     use std::sync::Arc as StdArc;
 
-    let store_concrete = source_store(&state)?;
+    let store_concrete = source_store(state)?;
     let sources = store_concrete.list().await.map_err(|e| e.to_string())?;
     let vault = state
         .vault
@@ -364,7 +439,7 @@ pub async fn sync_all_calendar_sources_now(
                 totals.inserted += stats.inserted;
                 totals.updated += stats.updated;
                 totals.deleted += stats.deleted;
-                emit_sync_completed(&app_handle, &cfg.id.to_string(), &cfg.display_name, stats);
+                emit_sync_completed(ui, &cfg.id.to_string(), &cfg.display_name, stats);
             }
             Err(e) => {
                 totals.errors.push(format!("{}: {}", cfg.display_name, e));
@@ -375,12 +450,11 @@ pub async fn sync_all_calendar_sources_now(
 }
 
 fn emit_sync_completed(
-    handle: &tauri::AppHandle,
+    ui: &crate::ui_bridge::UiBridge,
     source_id: &str,
     source_name: &str,
     stats: crate::calendar_sources::SyncStats,
 ) {
-    use tauri::Emitter as _;
     let payload = serde_json::json!({
         "source_id": source_id,
         "source_name": source_name,
@@ -388,9 +462,7 @@ fn emit_sync_completed(
         "updated": stats.updated,
         "deleted": stats.deleted,
     });
-    if let Err(e) = handle.emit("calendar-sync-completed", payload) {
-        tracing::debug!(error = %e, "Failed to emit calendar-sync-completed");
-    }
+    ui.emit("calendar-sync-completed", payload);
 }
 
 #[derive(Debug, Default, Clone, Serialize)]
