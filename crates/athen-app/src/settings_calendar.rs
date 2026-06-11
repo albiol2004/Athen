@@ -406,8 +406,7 @@ pub async fn sync_all_calendar_sources_now(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> std::result::Result<SyncAllResult, String> {
-    sync_all_calendar_sources_now_core(&state, &crate::ui_bridge::UiBridge::Tauri(app_handle))
-        .await
+    sync_all_calendar_sources_now_core(&state, &crate::ui_bridge::UiBridge::Tauri(app_handle)).await
 }
 
 pub(crate) async fn sync_all_calendar_sources_now_core(

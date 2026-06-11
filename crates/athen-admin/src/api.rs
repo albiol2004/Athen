@@ -118,7 +118,14 @@ async fn login(
             state
                 .login_throttle
                 .record_failure(&body.username, std::time::Instant::now());
-            db::audit(&state.db, &body.username, "login_failed", "", "unknown user").await;
+            db::audit(
+                &state.db,
+                &body.username,
+                "login_failed",
+                "",
+                "unknown user",
+            )
+            .await;
             return err(StatusCode::UNAUTHORIZED, "invalid credentials");
         }
         Err(e) => return internal(e),
@@ -127,7 +134,14 @@ async fn login(
         state
             .login_throttle
             .record_failure(&body.username, std::time::Instant::now());
-        db::audit(&state.db, &body.username, "login_failed", "", "wrong password").await;
+        db::audit(
+            &state.db,
+            &body.username,
+            "login_failed",
+            "",
+            "wrong password",
+        )
+        .await;
         return err(StatusCode::UNAUTHORIZED, "invalid credentials");
     }
     state.login_throttle.record_success(&body.username);
@@ -692,12 +706,16 @@ async fn users_set_role(
     let target: anyhow::Result<Option<User>> = state
         .db
         .call(move |c| {
-            c.query_row("SELECT * FROM users WHERE id = ?1", [target_id], User::from_row)
-                .map(Some)
-                .or_else(|e| match e {
-                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                    e => Err(e),
-                })
+            c.query_row(
+                "SELECT * FROM users WHERE id = ?1",
+                [target_id],
+                User::from_row,
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                e => Err(e),
+            })
         })
         .await;
     let target = match target {

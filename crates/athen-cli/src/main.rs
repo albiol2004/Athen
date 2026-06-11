@@ -227,10 +227,14 @@ async fn run_vault(sub_args: &[String]) -> std::result::Result<(), (i32, String)
     // Resolve data dir.
     let data_dir = athen_core::paths::athen_data_dir().ok_or((
         1,
-        "Error: cannot resolve Athen data directory (no $HOME / ATHEN_DATA_DIR not set).".to_string(),
+        "Error: cannot resolve Athen data directory (no $HOME / ATHEN_DATA_DIR not set)."
+            .to_string(),
     ))?;
     if let Err(e) = std::fs::create_dir_all(&data_dir) {
-        return Err((1, format!("Error: failed to create {}: {e}", data_dir.display())));
+        return Err((
+            1,
+            format!("Error: failed to create {}: {e}", data_dir.display()),
+        ));
     }
 
     // Backend selection.
@@ -240,7 +244,10 @@ async fn run_vault(sub_args: &[String]) -> std::result::Result<(), (i32, String)
         athen_vault::VaultBackend::Keyring => "keyring",
         athen_vault::VaultBackend::Auto => "auto",
     };
-    eprintln!("vault backend: {backend_label} (data dir: {})", data_dir.display());
+    eprintln!(
+        "vault backend: {backend_label} (data dir: {})",
+        data_dir.display()
+    );
 
     let vault = athen_vault::open_vault_with(&data_dir, "athen", backend)
         .await
@@ -264,7 +271,10 @@ async fn run_vault(sub_args: &[String]) -> std::result::Result<(), (i32, String)
                 let _ = std::io::stderr().flush();
             }
             let mut line = String::new();
-            stdin.lock().read_line(&mut line).map_err(|e| (1, format!("Error reading stdin: {e}")))?;
+            stdin
+                .lock()
+                .read_line(&mut line)
+                .map_err(|e| (1, format!("Error reading stdin: {e}")))?;
             if line.is_empty() {
                 return Err((1, "Error: no value provided (empty stdin).".to_string()));
             }
@@ -322,7 +332,8 @@ async fn run_vault(sub_args: &[String]) -> std::result::Result<(), (i32, String)
                         2,
                         "Error: vault list requires a <scope> argument.\n\
                          The vault trait does not support listing all scopes.\n\
-                         Usage: athen-cli vault list <scope>".to_string(),
+                         Usage: athen-cli vault list <scope>"
+                            .to_string(),
                     ));
                 }
             }
@@ -363,7 +374,9 @@ fn print_vault_usage() {
     println!("Athen CLI — vault subcommand");
     println!();
     println!("USAGE:");
-    println!("    athen-cli vault set <scope> <key>         Store a secret (value read from stdin)");
+    println!(
+        "    athen-cli vault set <scope> <key>         Store a secret (value read from stdin)"
+    );
     println!("    athen-cli vault get <scope> <key>         Print secret value to stdout");
     println!("    athen-cli vault list <scope>              List keys in a scope (no values)");
     println!("    athen-cli vault delete <scope> <key>      Remove a secret");

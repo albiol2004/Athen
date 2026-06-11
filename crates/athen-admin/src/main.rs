@@ -151,7 +151,10 @@ async fn main() -> anyhow::Result<()> {
     let socket_rootless = match docker.socket_rootless().await {
         Ok(r) => Some(r),
         Err(e) => {
-            tracing::warn!(error = format!("{e:#}"), "could not probe docker socket posture");
+            tracing::warn!(
+                error = format!("{e:#}"),
+                "could not probe docker socket posture"
+            );
             None
         }
     };

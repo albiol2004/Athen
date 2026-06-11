@@ -76,9 +76,7 @@ impl LoginThrottle {
         st.consecutive += 1;
         if st.consecutive >= FAIL_THRESHOLD {
             let exp = (st.consecutive - FAIL_THRESHOLD).min(7); // 30s … capped
-            let lockout = LOCKOUT_BASE
-                .saturating_mul(1 << exp)
-                .min(LOCKOUT_MAX);
+            let lockout = LOCKOUT_BASE.saturating_mul(1 << exp).min(LOCKOUT_MAX);
             st.locked_until = Some(now + lockout);
         }
     }
@@ -149,7 +147,9 @@ mod tests {
         let retry = t.check("alice", now).expect_err("locked at threshold");
         assert!(retry >= LOCKOUT_BASE - Duration::from_secs(1));
         // Lockout expires with time…
-        assert!(t.check("alice", now + LOCKOUT_BASE + Duration::from_secs(1)).is_ok());
+        assert!(t
+            .check("alice", now + LOCKOUT_BASE + Duration::from_secs(1))
+            .is_ok());
         // …and success clears everything immediately.
         t.record_failure("alice", now);
         t.record_success("alice");
@@ -180,9 +180,7 @@ mod tests {
         }
         assert!(t.check("one-more", now).is_err(), "global cap reached");
         // New window after 60s.
-        assert!(t
-            .check("one-more", now + Duration::from_secs(61))
-            .is_ok());
+        assert!(t.check("one-more", now + Duration::from_secs(61)).is_ok());
     }
 
     #[test]

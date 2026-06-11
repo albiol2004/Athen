@@ -84,7 +84,10 @@ async fn sweep(
             if let Err(e) = watch_instance(&state, &instance).await {
                 tracing::debug!(instance = %instance.name, error = %e, "event watch ended");
             }
-            watching.lock().expect("notify watching poisoned").remove(&id);
+            watching
+                .lock()
+                .expect("notify watching poisoned")
+                .remove(&id);
         });
     }
     Ok(())
@@ -269,7 +272,9 @@ pub async fn deliver(state: &Arc<PanelState>, instance: &Instance, push: &Push) 
             .await
             .and_then(|r| r.error_for_status());
         match res {
-            Ok(_) => tracing::info!(user = %user.username, instance = %instance.name, "push delivered"),
+            Ok(_) => {
+                tracing::info!(user = %user.username, instance = %instance.name, "push delivered")
+            }
             Err(e) => {
                 tracing::warn!(user = %user.username, error = %e, "push delivery failed")
             }
@@ -295,7 +300,13 @@ async fn users_with_webhooks(db: &Db, instance_id: &str) -> anyhow::Result<Vec<U
 
 fn sanitize_header(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '?' })
+        .map(|c| {
+            if c.is_ascii_graphic() || c == ' ' {
+                c
+            } else {
+                '?'
+            }
+        })
         .take(120)
         .collect()
 }
@@ -309,7 +320,9 @@ mod tests {
         let mut buf = String::new();
         buf.push_str("event: approval-question\ndata: {\"id\":");
         assert!(drain_sse_frames(&mut buf).is_empty(), "partial frame held");
-        buf.push_str("\"q1\"}\n\n:keep-alive\n\nevent: agent-stream\ndata: {}\n\nevent: x\ndata: par");
+        buf.push_str(
+            "\"q1\"}\n\n:keep-alive\n\nevent: agent-stream\ndata: {}\n\nevent: x\ndata: par",
+        );
         let frames = drain_sse_frames(&mut buf);
         assert_eq!(
             frames,
@@ -363,12 +376,18 @@ mod tests {
 
     #[test]
     fn notifications_filtered_by_urgency_and_response() {
-        let routine = r#"{"id":"n1","urgency":"Medium","title":"FYI","body":"b","requires_response":false}"#;
+        let routine =
+            r#"{"id":"n1","urgency":"Medium","title":"FYI","body":"b","requires_response":false}"#;
         assert!(pushworthy("notification", routine).is_none());
-        let needs_reply = r#"{"id":"n2","urgency":"Low","title":"Q","body":"b","requires_response":true}"#;
+        let needs_reply =
+            r#"{"id":"n2","urgency":"Low","title":"Q","body":"b","requires_response":true}"#;
         assert!(pushworthy("notification", needs_reply).is_some());
-        let critical = r#"{"id":"n3","urgency":"Critical","title":"!","body":"b","requires_response":false}"#;
-        assert_eq!(pushworthy("notification", critical).unwrap().priority, "max");
+        let critical =
+            r#"{"id":"n3","urgency":"Critical","title":"!","body":"b","requires_response":false}"#;
+        assert_eq!(
+            pushworthy("notification", critical).unwrap().priority,
+            "max"
+        );
         // Other event types never push.
         assert!(pushworthy("agent-stream", "{}").is_none());
     }

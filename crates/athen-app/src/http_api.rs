@@ -583,9 +583,14 @@ struct BranchBody {
 }
 async fn h_arc_branch(State(api): State<ApiState>, Json(b): Json<BranchBody>) -> Response {
     json_result(
-        commands::branch_arc_core(b.parent_arc_id, b.name, b.up_to_entry_id, api.ui.app_state())
-            .await
-            .map(|id| json!({"arc_id": id})),
+        commands::branch_arc_core(
+            b.parent_arc_id,
+            b.name,
+            b.up_to_entry_id,
+            api.ui.app_state(),
+        )
+        .await
+        .map(|id| json!({"arc_id": id})),
     )
 }
 async fn h_status(State(api): State<ApiState>) -> Response {
@@ -702,7 +707,10 @@ async fn h_arc_set_security(
 }
 
 // checkpoints / changes rail
-async fn h_arc_snapshots(State(api): State<ApiState>, UrlPath(arc_id): UrlPath<String>) -> Response {
+async fn h_arc_snapshots(
+    State(api): State<ApiState>,
+    UrlPath(arc_id): UrlPath<String>,
+) -> Response {
     json_result(commands::list_arc_snapshots_core(api.ui.app_state(), arc_id).await)
 }
 async fn h_snapshot_revert(
@@ -863,7 +871,10 @@ async fn h_mcp_add_custom(State(api): State<ApiState>, Json(b): Json<McpAddBody>
             .await,
     )
 }
-async fn h_mcp_remove_custom(State(api): State<ApiState>, UrlPath(id): UrlPath<String>) -> Response {
+async fn h_mcp_remove_custom(
+    State(api): State<ApiState>,
+    UrlPath(id): UrlPath<String>,
+) -> Response {
     json_result(commands::mcp_remove_custom_core(id, api.ui.app_state()).await)
 }
 #[derive(Deserialize)]
@@ -1091,7 +1102,9 @@ async fn h_contact_trust(
     UrlPath(id): UrlPath<String>,
     Json(b): Json<TrustBody>,
 ) -> Response {
-    json_result(crate::contacts::set_contact_trust_core(api.ui.app_state(), id, b.trust_level).await)
+    json_result(
+        crate::contacts::set_contact_trust_core(api.ui.app_state(), id, b.trust_level).await,
+    )
 }
 async fn h_contact_block(State(api): State<ApiState>, UrlPath(id): UrlPath<String>) -> Response {
     json_result(crate::contacts::block_contact_core(api.ui.app_state(), id).await)
@@ -1221,14 +1234,23 @@ struct ProviderTestBody {
 }
 async fn h_provider_test(State(api): State<ApiState>, Json(b): Json<ProviderTestBody>) -> Response {
     json_result(
-        crate::settings::test_provider_core(b.id, b.base_url, b.model, b.api_key, api.ui.app_state())
-            .await,
+        crate::settings::test_provider_core(
+            b.id,
+            b.base_url,
+            b.model,
+            b.api_key,
+            api.ui.app_state(),
+        )
+        .await,
     )
 }
 async fn h_provider_delete(State(api): State<ApiState>, UrlPath(id): UrlPath<String>) -> Response {
     json_result(crate::settings::delete_provider_core(id, api.ui.app_state()).await)
 }
-async fn h_provider_activate(State(api): State<ApiState>, UrlPath(id): UrlPath<String>) -> Response {
+async fn h_provider_activate(
+    State(api): State<ApiState>,
+    UrlPath(id): UrlPath<String>,
+) -> Response {
     json_result(crate::settings::set_active_provider_core(id, api.ui.app_state()).await)
 }
 
@@ -1399,7 +1421,10 @@ async fn h_telegram_save(State(api): State<ApiState>, Json(b): Json<TelegramSave
 struct TelegramTestBody {
     bot_token: String,
 }
-async fn h_telegram_test(State(_api): State<ApiState>, Json(b): Json<TelegramTestBody>) -> Response {
+async fn h_telegram_test(
+    State(_api): State<ApiState>,
+    Json(b): Json<TelegramTestBody>,
+) -> Response {
     json_result(crate::settings::test_telegram_connection(b.bot_token).await)
 }
 
@@ -1544,7 +1569,9 @@ async fn h_embeddings_test(
     )
 }
 async fn h_embeddings_bundled_status(State(api): State<ApiState>) -> Response {
-    json_result(crate::bundled_embeddings::get_bundled_embedding_status_core(api.ui.app_state()).await)
+    json_result(
+        crate::bundled_embeddings::get_bundled_embedding_status_core(api.ui.app_state()).await,
+    )
 }
 #[derive(Deserialize)]
 struct BundledModeBody {
@@ -1617,7 +1644,10 @@ async fn h_cal_source_add(State(api): State<ApiState>, Json(b): Json<CalDavAddBo
         .await,
     )
 }
-async fn h_cal_source_delete(State(api): State<ApiState>, UrlPath(id): UrlPath<String>) -> Response {
+async fn h_cal_source_delete(
+    State(api): State<ApiState>,
+    UrlPath(id): UrlPath<String>,
+) -> Response {
     json_result(crate::settings_calendar::delete_calendar_source_core(id, api.ui.app_state()).await)
 }
 async fn h_cal_source_enabled(
@@ -1658,7 +1688,10 @@ async fn h_cal_source_test(State(api): State<ApiState>, UrlPath(id): UrlPath<Str
             .await,
     )
 }
-async fn h_cal_source_remote(State(api): State<ApiState>, UrlPath(id): UrlPath<String>) -> Response {
+async fn h_cal_source_remote(
+    State(api): State<ApiState>,
+    UrlPath(id): UrlPath<String>,
+) -> Response {
     json_result(crate::settings_calendar::list_remote_calendars_core(id, api.ui.app_state()).await)
 }
 async fn h_cal_source_sync(State(api): State<ApiState>, UrlPath(id): UrlPath<String>) -> Response {
@@ -1695,7 +1728,10 @@ struct CalDefaultBody {
     calendar_id: Option<String>,
     calendar_name: Option<String>,
 }
-async fn h_cal_default_save(State(api): State<ApiState>, Json(b): Json<CalDefaultBody>) -> Response {
+async fn h_cal_default_save(
+    State(api): State<ApiState>,
+    Json(b): Json<CalDefaultBody>,
+) -> Response {
     json_result(
         crate::settings::save_agent_default_calendar_core(
             api.ui.app_state(),
@@ -1718,7 +1754,10 @@ fn full_surface_router() -> Router<ApiState> {
         .route("/api/agent-runs", get(h_agent_runs))
         .route("/api/attachments/{event_id}", get(h_attachments_for_event))
         // goal + plan (active-arc scoped, like the desktop)
-        .route("/api/goal", get(h_goal_get).post(h_goal_set).delete(h_goal_clear))
+        .route(
+            "/api/goal",
+            get(h_goal_get).post(h_goal_set).delete(h_goal_clear),
+        )
         .route("/api/plan", get(h_plan_get))
         .route("/api/plan/start", post(h_plan_start))
         .route("/api/plan/approve", post(h_plan_approve))
@@ -1739,7 +1778,10 @@ fn full_surface_router() -> Router<ApiState> {
         .route("/api/snapshots/{action_id}/revert", post(h_snapshot_revert))
         .route("/api/arcs/{arc_id}/rewind", post(h_arc_rewind))
         // calendar events
-        .route("/api/calendar/events", get(h_cal_events).post(h_cal_event_create))
+        .route(
+            "/api/calendar/events",
+            get(h_cal_events).post(h_cal_event_create),
+        )
         .route("/api/calendar/events/update", post(h_cal_event_update))
         .route("/api/calendar/events/{id}/delete", post(h_cal_event_delete))
         // notifications extra
@@ -1769,21 +1811,42 @@ fn full_surface_router() -> Router<ApiState> {
         // directory grants
         .route("/api/grants/arc/{arc_id}", get(h_grants_arc))
         .route("/api/grants/arc/{id}/revoke", post(h_grant_arc_revoke))
-        .route("/api/grants/global", get(h_grants_global).post(h_grant_global_add))
-        .route("/api/grants/global/{id}/revoke", post(h_grant_global_revoke))
+        .route(
+            "/api/grants/global",
+            get(h_grants_global).post(h_grant_global_add),
+        )
+        .route(
+            "/api/grants/global/{id}/revoke",
+            post(h_grant_global_revoke),
+        )
         // registered HTTP endpoints (Cloud APIs)
-        .route("/api/endpoints", get(h_endpoints_list).post(h_endpoint_upsert))
+        .route(
+            "/api/endpoints",
+            get(h_endpoints_list).post(h_endpoint_upsert),
+        )
         .route("/api/endpoints/presets", get(h_endpoint_presets))
         .route("/api/endpoints/{id}/delete", post(h_endpoint_delete))
         .route("/api/endpoints/{id}/enabled", post(h_endpoint_enabled))
         .route("/api/endpoints/{id}/test", post(h_endpoint_test))
         .route("/api/vault/smoke", get(h_vault_smoke))
         // identity
-        .route("/api/identity/categories", get(h_id_cats).post(h_id_cat_upsert))
-        .route("/api/identity/categories/{name}/delete", post(h_id_cat_delete))
-        .route("/api/identity/entries", get(h_id_entries).post(h_id_entry_upsert))
+        .route(
+            "/api/identity/categories",
+            get(h_id_cats).post(h_id_cat_upsert),
+        )
+        .route(
+            "/api/identity/categories/{name}/delete",
+            post(h_id_cat_delete),
+        )
+        .route(
+            "/api/identity/entries",
+            get(h_id_entries).post(h_id_entry_upsert),
+        )
         .route("/api/identity/entries/{id}/delete", post(h_id_entry_delete))
-        .route("/api/identity/entries/{id}/dismiss", post(h_id_entry_dismiss))
+        .route(
+            "/api/identity/entries/{id}/dismiss",
+            post(h_id_entry_dismiss),
+        )
         .route("/api/identity/estimate", get(h_id_estimate))
         // skills
         .route("/api/skills", get(h_skills_list).post(h_skill_upsert))
@@ -1795,7 +1858,10 @@ fn full_surface_router() -> Router<ApiState> {
         .route("/api/contacts", get(h_contacts_list).post(h_contact_create))
         .route("/api/contacts/owner", get(h_owner_get).post(h_owner_save))
         .route("/api/contacts/owner/clear", post(h_owner_clear))
-        .route("/api/contacts/{id}", get(h_contact_get).post(h_contact_update))
+        .route(
+            "/api/contacts/{id}",
+            get(h_contact_get).post(h_contact_update),
+        )
         .route("/api/contacts/{id}/delete", post(h_contact_delete))
         .route("/api/contacts/{id}/trust", post(h_contact_trust))
         .route("/api/contacts/{id}/block", post(h_contact_block))
@@ -1814,13 +1880,28 @@ fn full_surface_router() -> Router<ApiState> {
         .route("/api/settings/model-families", get(h_model_families))
         .route("/api/settings/providers", post(h_provider_save))
         .route("/api/settings/providers/test", post(h_provider_test))
-        .route("/api/settings/providers/{id}/delete", post(h_provider_delete))
-        .route("/api/settings/providers/{id}/activate", post(h_provider_activate))
-        .route("/api/settings/bundles", get(h_bundles_list).post(h_bundle_create))
+        .route(
+            "/api/settings/providers/{id}/delete",
+            post(h_provider_delete),
+        )
+        .route(
+            "/api/settings/providers/{id}/activate",
+            post(h_provider_activate),
+        )
+        .route(
+            "/api/settings/bundles",
+            get(h_bundles_list).post(h_bundle_create),
+        )
         .route("/api/settings/bundles/{id}", post(h_bundle_update))
         .route("/api/settings/bundles/{id}/delete", post(h_bundle_delete))
-        .route("/api/settings/bundles/{id}/activate", post(h_bundle_activate))
-        .route("/api/settings/bundles/{id}/duplicate", post(h_bundle_duplicate))
+        .route(
+            "/api/settings/bundles/{id}/activate",
+            post(h_bundle_activate),
+        )
+        .route(
+            "/api/settings/bundles/{id}/duplicate",
+            post(h_bundle_duplicate),
+        )
         .route("/api/settings/email", post(h_email_save))
         .route("/api/settings/email/test", post(h_email_test))
         .route("/api/settings/email/detect", post(h_email_detect))
@@ -1830,26 +1911,77 @@ fn full_surface_router() -> Router<ApiState> {
         .route("/api/settings/telegram/test", post(h_telegram_test))
         .route("/api/settings/websearch", post(h_websearch_save))
         .route("/api/settings/websearch/test", post(h_websearch_test))
-        .route("/api/settings/attachments", get(h_attach_policy_get).post(h_attach_policy_save))
-        .route("/api/settings/notifications", get(h_notif_settings_get).post(h_notif_settings_save))
+        .route(
+            "/api/settings/attachments",
+            get(h_attach_policy_get).post(h_attach_policy_save),
+        )
+        .route(
+            "/api/settings/notifications",
+            get(h_notif_settings_get).post(h_notif_settings_save),
+        )
         .route("/api/settings/embeddings", post(h_embeddings_save))
         .route("/api/settings/embeddings/test", post(h_embeddings_test))
-        .route("/api/settings/embeddings/bundled-status", get(h_embeddings_bundled_status))
-        .route("/api/settings/embeddings/bundled-mode", post(h_embeddings_bundled_mode))
-        .route("/api/settings/embeddings/recommend", get(h_embeddings_recommend))
-        .route("/api/settings/github", get(h_github_get).post(h_github_save))
+        .route(
+            "/api/settings/embeddings/bundled-status",
+            get(h_embeddings_bundled_status),
+        )
+        .route(
+            "/api/settings/embeddings/bundled-mode",
+            post(h_embeddings_bundled_mode),
+        )
+        .route(
+            "/api/settings/embeddings/recommend",
+            get(h_embeddings_recommend),
+        )
+        .route(
+            "/api/settings/github",
+            get(h_github_get).post(h_github_save),
+        )
         .route("/api/settings/github/test", post(h_github_test))
-        .route("/api/settings/calendar-sources", get(h_cal_sources).post(h_cal_source_add))
-        .route("/api/settings/calendar-sources/sync-all", post(h_cal_sync_all))
-        .route("/api/settings/calendar-sources/writable", get(h_cal_writable))
-        .route("/api/settings/calendar-sources/{id}/delete", post(h_cal_source_delete))
-        .route("/api/settings/calendar-sources/{id}/enabled", post(h_cal_source_enabled))
-        .route("/api/settings/calendar-sources/{id}/calendars", post(h_cal_source_calendars))
-        .route("/api/settings/calendar-sources/{id}/test", post(h_cal_source_test))
-        .route("/api/settings/calendar-sources/{id}/remote", get(h_cal_source_remote))
-        .route("/api/settings/calendar-sources/{id}/sync", post(h_cal_source_sync))
-        .route("/api/settings/calendar-prompt", get(h_cal_prompt_get).post(h_cal_prompt_save))
-        .route("/api/settings/calendar-default", get(h_cal_default_get).post(h_cal_default_save))
+        .route(
+            "/api/settings/calendar-sources",
+            get(h_cal_sources).post(h_cal_source_add),
+        )
+        .route(
+            "/api/settings/calendar-sources/sync-all",
+            post(h_cal_sync_all),
+        )
+        .route(
+            "/api/settings/calendar-sources/writable",
+            get(h_cal_writable),
+        )
+        .route(
+            "/api/settings/calendar-sources/{id}/delete",
+            post(h_cal_source_delete),
+        )
+        .route(
+            "/api/settings/calendar-sources/{id}/enabled",
+            post(h_cal_source_enabled),
+        )
+        .route(
+            "/api/settings/calendar-sources/{id}/calendars",
+            post(h_cal_source_calendars),
+        )
+        .route(
+            "/api/settings/calendar-sources/{id}/test",
+            post(h_cal_source_test),
+        )
+        .route(
+            "/api/settings/calendar-sources/{id}/remote",
+            get(h_cal_source_remote),
+        )
+        .route(
+            "/api/settings/calendar-sources/{id}/sync",
+            post(h_cal_source_sync),
+        )
+        .route(
+            "/api/settings/calendar-prompt",
+            get(h_cal_prompt_get).post(h_cal_prompt_save),
+        )
+        .route(
+            "/api/settings/calendar-default",
+            get(h_cal_default_get).post(h_cal_default_save),
+        )
 }
 
 #[cfg(test)]

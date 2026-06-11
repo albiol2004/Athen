@@ -135,10 +135,7 @@ async fn sweep(
             .is_some_and(|(s, _)| s == "running");
         apply_quota(state, &instance, bytes, running, enforce, flags).await;
     }
-    *state
-        .disk_usage
-        .lock()
-        .expect("disk usage mutex poisoned") = snapshot;
+    *state.disk_usage.lock().expect("disk usage mutex poisoned") = snapshot;
     Ok(())
 }
 
@@ -158,7 +155,13 @@ async fn apply_quota(
     let used_mb = used_bytes / (1024 * 1024);
     let over = used_bytes > limit_bytes;
     let rearmed = (used_bytes as f64) < limit_bytes as f64 * REARM_FRACTION;
-    let (next, action) = quota_step(flags.get(&instance.id).copied(), over, rearmed, running, enforce);
+    let (next, action) = quota_step(
+        flags.get(&instance.id).copied(),
+        over,
+        rearmed,
+        running,
+        enforce,
+    );
     match next {
         Some(s) => {
             flags.insert(instance.id.clone(), s);
