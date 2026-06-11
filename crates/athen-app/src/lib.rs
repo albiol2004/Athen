@@ -21,8 +21,11 @@ pub(crate) mod email_gate;
 pub(crate) mod email_test;
 pub mod embedding_hardware;
 pub(crate) mod endpoints_render;
+pub(crate) mod env_creds;
 pub(crate) mod file_gate;
 pub(crate) mod github_identity;
+pub(crate) mod headless;
+pub(crate) mod http_api;
 pub(crate) mod http_presets;
 pub(crate) mod http_rate_limiter;
 pub(crate) mod identity_render;
@@ -41,6 +44,7 @@ pub(crate) mod spawn_pidfile;
 pub(crate) mod state;
 pub(crate) mod telegram_progress;
 pub(crate) mod telephony_gate;
+pub(crate) mod ui_bridge;
 pub(crate) mod vault_creds;
 pub(crate) mod voice;
 mod wakeup_commands;
@@ -49,6 +53,8 @@ pub(crate) mod wakeup_sink;
 pub(crate) mod wakeup_tool;
 
 use state::AppState;
+
+pub use headless::run_headless;
 
 /// Build and run the Tauri application.
 pub fn run() {
@@ -333,19 +339,33 @@ pub fn run() {
                     .await;
             });
 
-            // Initialize the notification orchestrator (needs AppHandle for InApp channel).
-            state.init_notifier(app.handle().clone());
+            // Resolve the HTTP API config (remote React / React Native
+            // clients) before the approval router: a live event bus is
+            // part of what init_approval_router considers an in-app
+            // surface, and emit() only fans out once the bus exists.
+            let http_api_cfg = crate::http_api::HttpApiConfig::from_env(
+                &athen_core::paths::athen_data_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from(".")),
+            );
+            if http_api_cfg.is_some() {
+                crate::ui_bridge::UiBridge::init_event_bus();
+            }
+
+            // Initialize the notification orchestrator (InApp channel is
+            // wired because we have a real Tauri handle here).
+            let ui = crate::ui_bridge::UiBridge::Tauri(app.handle().clone());
+            state.init_notifier(ui.clone());
 
             // Initialize the live agent registry. Needs AppHandle for the
             // `agents-changed` event the FE listens to. Wired here (between
             // notifier and approval_router) so every executor entry point
             // sees a Some(registry) on the AppState by the time it runs.
-            state.init_agent_registry(app.handle().clone());
+            state.init_agent_registry(ui.clone());
 
             // Initialize the approval router (InApp + Telegram sinks). Must
             // come before start_telegram_monitor so the poll loop can pick
             // up the Telegram sink for callback resolution.
-            state.init_approval_router(app.handle().clone());
+            state.init_approval_router(ui.clone());
 
             // Migrate the legacy TelegramConfig::owner_user_id into the
             // unified contact store BEFORE any sense monitor starts —
@@ -366,10 +386,10 @@ pub fn run() {
             }
 
             // Start background monitor tasks before managing state.
-            state.start_email_monitor(app.handle().clone());
-            state.start_calendar_monitor(app.handle().clone());
+            state.start_email_monitor(ui.clone());
+            state.start_calendar_monitor(ui.clone());
             state.start_calendar_sync(Some(app.handle().clone()));
-            state.start_telegram_monitor(app.handle().clone());
+            state.start_telegram_monitor(ui.clone());
 
             // Sweep attachment bytes past the policy TTL. Cheap, runs
             // hourly, only deletes the bytes — extracted-text sidecars
@@ -380,13 +400,13 @@ pub fn run() {
             // after the agent has been registered with the coordinator's
             // dispatcher (above), otherwise dispatch_next_with_task
             // can't assign anything.
-            state.start_dispatch_loop(app.handle().clone());
+            state.start_dispatch_loop(ui.clone());
 
             // Spawn the wake-up scheduler loop. Phase 3a uses a logging
             // sink that persists a system arc entry on each fire — Phase
             // 3b will swap in a coordinator-backed sink that turns fires
             // into Tasks.
-            state.start_wakeup_scheduler(app.handle().clone());
+            state.start_wakeup_scheduler(ui.clone());
 
             // Sweep finalized agent_runs older than 30 days. Cheap; runs
             // once at startup and then every 6 hours.
@@ -394,9 +414,22 @@ pub fn run() {
 
             // Start proactive help hint checker. Runs 60s after startup
             // then every 15 min; rate-limits to 1 hint per hour.
-            state.start_proactive_hint_checker(app.handle().clone());
+            state.start_proactive_hint_checker(ui.clone());
 
             app.manage(state);
+
+            // HTTP API for remote clients. Spawned only after
+            // app.manage(state) so request handlers can always resolve
+            // the managed AppState through the bridge.
+            if let Some(cfg) = http_api_cfg {
+                tracing::info!(addr = %cfg.addr, "HTTP API enabled (remote clients + SSE events)");
+                let ui_for_http = crate::ui_bridge::UiBridge::Tauri(app.handle().clone());
+                tauri::async_runtime::spawn(async move {
+                    if let Err(e) = crate::http_api::serve(cfg, ui_for_http).await {
+                        tracing::error!(error = %e, "HTTP API server exited");
+                    }
+                });
+            }
 
             // Track window focus state for the notification orchestrator.
             // When the window loses focus, the orchestrator routes notifications
@@ -412,7 +445,8 @@ pub fn run() {
             // hot-swap it in, so non-technical users get semantic recall
             // without touching Settings. No-op when already present or when
             // the user picked a provider explicitly.
-            state_ref.start_embedder_warmup(app.handle().clone());
+            state_ref
+                .start_embedder_warmup(crate::ui_bridge::UiBridge::Tauri(app.handle().clone()));
 
             let notifier_for_focus = state_ref.notifier.load_full();
             if let Some(window) = app.get_webview_window("main") {

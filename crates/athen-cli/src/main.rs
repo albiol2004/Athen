@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{BufRead, Write as _};
+use std::io::{BufRead, IsTerminal, Write as _};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -210,6 +210,203 @@ fn build_openai_compat_router(
     Arc::new(DefaultLlmRouter::new(providers, profiles, budget))
 }
 
+// ---------------------------------------------------------------------------
+// Vault subcommand
+// ---------------------------------------------------------------------------
+
+/// Handle `athen-cli vault <sub> [args…]`.
+///
+/// Returns `Ok(())` on success, `Err((exit_code, message))` on error.
+async fn run_vault(sub_args: &[String]) -> std::result::Result<(), (i32, String)> {
+    let subcmd = sub_args.first().map(|s| s.as_str()).unwrap_or("");
+    if subcmd.is_empty() || subcmd == "--help" || subcmd == "-h" {
+        print_vault_usage();
+        return Ok(());
+    }
+
+    // Resolve data dir.
+    let data_dir = athen_core::paths::athen_data_dir().ok_or((
+        1,
+        "Error: cannot resolve Athen data directory (no $HOME / ATHEN_DATA_DIR not set).".to_string(),
+    ))?;
+    if let Err(e) = std::fs::create_dir_all(&data_dir) {
+        return Err((1, format!("Error: failed to create {}: {e}", data_dir.display())));
+    }
+
+    // Backend selection.
+    let backend = athen_vault::VaultBackend::from_env();
+    let backend_label = match backend {
+        athen_vault::VaultBackend::File => "file",
+        athen_vault::VaultBackend::Keyring => "keyring",
+        athen_vault::VaultBackend::Auto => "auto",
+    };
+    eprintln!("vault backend: {backend_label} (data dir: {})", data_dir.display());
+
+    let vault = athen_vault::open_vault_with(&data_dir, "athen", backend)
+        .await
+        .map_err(|e| (1, format!("Error: failed to open vault: {e}")))?;
+
+    match subcmd {
+        "set" => {
+            let scope = sub_args.get(1).ok_or((
+                2,
+                "Error: vault set requires <scope> <key>.\nUsage: athen-cli vault set <scope> <key>".to_string(),
+            ))?;
+            let key = sub_args.get(2).ok_or((
+                2,
+                "Error: vault set requires <scope> <key>.\nUsage: athen-cli vault set <scope> <key>".to_string(),
+            ))?;
+
+            // Read value from stdin. If stdin is a TTY, prompt on stderr.
+            let stdin = std::io::stdin();
+            if stdin.is_terminal() {
+                eprint!("Enter value: ");
+                let _ = std::io::stderr().flush();
+            }
+            let mut line = String::new();
+            stdin.lock().read_line(&mut line).map_err(|e| (1, format!("Error reading stdin: {e}")))?;
+            if line.is_empty() {
+                return Err((1, "Error: no value provided (empty stdin).".to_string()));
+            }
+            // Trim a single trailing newline (supports both LF and CRLF).
+            let value = line.trim_end_matches('\n').trim_end_matches('\r');
+
+            vault
+                .set(scope, key, value)
+                .await
+                .map_err(|e| (1, format!("Error: vault set failed: {e}")))?;
+            eprintln!("ok: set {scope}/{key}");
+        }
+
+        "get" => {
+            let scope = sub_args.get(1).ok_or((
+                2,
+                "Error: vault get requires <scope> <key>.\nUsage: athen-cli vault get <scope> <key>".to_string(),
+            ))?;
+            let key = sub_args.get(2).ok_or((
+                2,
+                "Error: vault get requires <scope> <key>.\nUsage: athen-cli vault get <scope> <key>".to_string(),
+            ))?;
+
+            match vault.get(scope, key).await {
+                Ok(Some(value)) => println!("{value}"),
+                Ok(None) => {
+                    return Err((1, format!("Error: no entry found for {scope}/{key}")));
+                }
+                Err(e) => return Err((1, format!("Error: vault get failed: {e}"))),
+            }
+        }
+
+        "list" => {
+            // Optional scope filter. Without it, we can't enumerate all scopes
+            // (the Vault trait doesn't provide that); print a helpful message.
+            let scope_opt = sub_args.get(1).map(|s| s.as_str());
+            match scope_opt {
+                Some(scope) => {
+                    let keys = vault
+                        .list(scope)
+                        .await
+                        .map_err(|e| (1, format!("Error: vault list failed: {e}")))?;
+                    if keys.is_empty() {
+                        eprintln!("(no entries in scope '{scope}')");
+                    } else {
+                        let mut sorted = keys;
+                        sorted.sort();
+                        for k in sorted {
+                            println!("{scope}/{k}");
+                        }
+                    }
+                }
+                None => {
+                    return Err((
+                        2,
+                        "Error: vault list requires a <scope> argument.\n\
+                         The vault trait does not support listing all scopes.\n\
+                         Usage: athen-cli vault list <scope>".to_string(),
+                    ));
+                }
+            }
+        }
+
+        "delete" => {
+            let scope = sub_args.get(1).ok_or((
+                2,
+                "Error: vault delete requires <scope> <key>.\nUsage: athen-cli vault delete <scope> <key>".to_string(),
+            ))?;
+            let key = sub_args.get(2).ok_or((
+                2,
+                "Error: vault delete requires <scope> <key>.\nUsage: athen-cli vault delete <scope> <key>".to_string(),
+            ))?;
+
+            vault
+                .delete(scope, key)
+                .await
+                .map_err(|e| (1, format!("Error: vault delete failed: {e}")))?;
+            eprintln!("ok: deleted {scope}/{key}");
+        }
+
+        other => {
+            return Err((
+                2,
+                format!(
+                    "Error: unknown vault subcommand '{other}'.\n\
+                     Run 'athen-cli vault --help' for usage."
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn print_vault_usage() {
+    println!("Athen CLI — vault subcommand");
+    println!();
+    println!("USAGE:");
+    println!("    athen-cli vault set <scope> <key>         Store a secret (value read from stdin)");
+    println!("    athen-cli vault get <scope> <key>         Print secret value to stdout");
+    println!("    athen-cli vault list <scope>              List keys in a scope (no values)");
+    println!("    athen-cli vault delete <scope> <key>      Remove a secret");
+    println!("    athen-cli vault --help                    Show this help");
+    println!();
+    println!("SCOPE/KEY CONVENTIONS:");
+    println!("    provider:<id>     api_key       e.g. vault set provider:deepseek api_key");
+    println!("    telegram          bot_token     e.g. vault set telegram bot_token");
+    println!("    email:imap        password      e.g. vault set email:imap password");
+    println!("    email:smtp        password      e.g. vault set email:smtp password");
+    println!("    websearch:brave   api_key");
+    println!("    websearch:tavily  api_key");
+    println!("    embedding         api_key");
+    println!("    endpoint:<uuid>   token|password|value   Registered HTTP endpoints (key depends on auth method)");
+    println!();
+    println!("ENV VARS:");
+    println!("    ATHEN_DATA_DIR          Override data directory (default: ~/.athen)");
+    println!("    ATHEN_VAULT_BACKEND     auto | file | keyring  (default: auto)");
+    println!();
+    println!("NOTES:");
+    println!("    For headless/container deployments use ATHEN_VAULT_BACKEND=file so");
+    println!("    secrets are stored in the encrypted file rather than the OS keyring.");
+    println!("    IMPORTANT: the desktop app and CLI must use the same backend — if you");
+    println!("    seed with ATHEN_VAULT_BACKEND=file but the app opens the keyring backend,");
+    println!("    the secrets will not be found. The CLI prints which backend was opened.");
+    println!();
+    println!("EXAMPLES:");
+    println!("    # Pipe a key in (no prompt):");
+    println!("    echo $DEEPSEEK_KEY | athen-cli vault set provider:deepseek api_key");
+    println!();
+    println!("    # Interactive entry (TTY prompt on stderr):");
+    println!("    athen-cli vault set telegram bot_token");
+    println!();
+    println!("    # Read back:");
+    println!("    athen-cli vault get provider:deepseek api_key");
+    println!();
+    println!("    # List all keys in a scope:");
+    println!("    athen-cli vault list provider:deepseek");
+    println!();
+    println!("    # Remove:");
+    println!("    athen-cli vault delete provider:deepseek api_key");
+}
+
 fn print_usage() {
     println!("Athen CLI — Universal AI Agent");
     println!();
@@ -223,6 +420,7 @@ fn print_usage() {
     println!(
         "    athen-cli --profile <ID> --prompt <STR>    Headless mode with a seeded agent profile"
     );
+    println!("    athen-cli vault <sub> [args…]              Manage encrypted credential vault");
     println!("    athen-cli --help                           Show this help");
     println!();
     println!("FLAGS:");
@@ -241,6 +439,17 @@ fn print_usage() {
     println!("                       Overrides ATHEN_TEMPERATURE. Not clamped.");
     println!("    --max-steps <N>    Per-task iteration cap (default 50). Use 0 for unlimited.");
     println!("                       The 600s timeout still applies. Overrides ATHEN_MAX_STEPS.");
+    println!();
+    println!("VAULT SUBCOMMANDS (run 'athen-cli vault --help' for details):");
+    println!("    vault set <scope> <key>      Seed a credential (value from stdin)");
+    println!("    vault get <scope> <key>      Read a credential to stdout");
+    println!("    vault list <scope>           List keys in a scope (no values)");
+    println!("    vault delete <scope> <key>   Remove a credential");
+    println!();
+    println!("COMMON ENV VARS:");
+    println!("    ATHEN_DATA_DIR          Override data directory (default: ~/.athen)");
+    println!("    ATHEN_VAULT_BACKEND     Vault backend: auto | file | keyring (default: auto)");
+    println!("                            Use 'file' for headless/container deployments.");
     println!();
     println!("HEADLESS MODE ENV VARS:");
     println!("    ATHEN_BASE_URL    (required)  e.g. http://localhost:8000/v1");
@@ -460,6 +669,20 @@ async fn main() {
     //
     // `--profile` without `--prompt` is silently ignored (REPL stays as-is).
     let args: Vec<String> = std::env::args().collect();
+
+    // `vault` subcommand — handle before flag parsing so `--help` routes to
+    // vault-specific help when `vault --help` is given.
+    if args.get(1).map(|s| s.as_str()) == Some("vault") {
+        let sub_args: Vec<String> = args[2..].to_vec();
+        match run_vault(&sub_args).await {
+            Ok(()) => std::process::exit(0),
+            Err((code, msg)) => {
+                eprintln!("{msg}");
+                std::process::exit(code);
+            }
+        }
+    }
+
     if args.iter().any(|a| a == "--help" || a == "-h") {
         print_usage();
         return;

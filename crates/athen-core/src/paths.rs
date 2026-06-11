@@ -13,9 +13,23 @@ pub fn home_dir() -> Option<PathBuf> {
 
 /// Athen's per-user data directory.
 ///
+/// - `ATHEN_DATA_DIR` env var (if set & non-empty) takes precedence — used
+///   by headless / containerized deployments so each instance gets an
+///   isolated tree (config, vault, SQLite, workspace all live under it).
 /// - Unix: `~/.athen`
 /// - Windows: `%APPDATA%\Athen`
 pub fn athen_data_dir() -> Option<PathBuf> {
+    athen_data_dir_with(std::env::var("ATHEN_DATA_DIR").ok().as_deref())
+}
+
+/// Inner form of [`athen_data_dir`] taking the `ATHEN_DATA_DIR` value
+/// explicitly so it can be tested without mutating process env.
+fn athen_data_dir_with(env_override: Option<&str>) -> Option<PathBuf> {
+    if let Some(s) = env_override {
+        if !s.is_empty() {
+            return Some(PathBuf::from(s));
+        }
+    }
     #[cfg(target_os = "windows")]
     {
         dirs::data_dir().map(|d| d.join("Athen"))
@@ -481,6 +495,20 @@ mod tests {
         assert_eq!(normalize(Path::new("/a/./b")), PathBuf::from("/a/b"));
         assert_eq!(normalize(Path::new("a/b/../../c")), PathBuf::from("c"));
         assert_eq!(normalize(Path::new("./.")), PathBuf::from("."));
+    }
+
+    #[test]
+    fn data_dir_env_override_wins() {
+        let got = athen_data_dir_with(Some("/srv/athen-instance-7")).unwrap();
+        assert_eq!(got, PathBuf::from("/srv/athen-instance-7"));
+    }
+
+    #[test]
+    fn data_dir_empty_override_falls_back_to_default() {
+        let with_empty = athen_data_dir_with(Some(""));
+        let default = athen_data_dir_with(None);
+        assert_eq!(with_empty, default);
+        assert!(default.is_some());
     }
 
     #[test]

@@ -15,9 +15,9 @@
 
 use std::sync::Arc;
 
+use crate::ui_bridge::UiBridge;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use tauri::{AppHandle, Emitter};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -40,10 +40,10 @@ pub struct CoordinatorWakeupSink {
     task_arc_map: TaskArcMap,
     task_wakeup_map: TaskWakeupMap,
     dispatch_signal: Arc<tokio::sync::Notify>,
-    /// `None` in tests / non-Tauri builds. When `Some`, the sink emits a
-    /// `wakeup-fired` event so the frontend can refresh its arc list and
-    /// surface a toast.
-    app_handle: Option<AppHandle>,
+    /// `None` in tests. When `Some`, the sink resolves live security mode
+    /// through the bridge and emits a `wakeup-fired` event (dropped in
+    /// headless mode) so the frontend can refresh its arc list.
+    ui: Option<UiBridge>,
 }
 
 impl CoordinatorWakeupSink {
@@ -53,7 +53,7 @@ impl CoordinatorWakeupSink {
         task_arc_map: TaskArcMap,
         task_wakeup_map: TaskWakeupMap,
         dispatch_signal: Arc<tokio::sync::Notify>,
-        app_handle: Option<AppHandle>,
+        ui: Option<UiBridge>,
     ) -> Self {
         Self {
             coordinator,
@@ -61,7 +61,7 @@ impl CoordinatorWakeupSink {
             task_arc_map,
             task_wakeup_map,
             dispatch_signal,
-            app_handle,
+            ui,
         }
     }
 }
@@ -126,15 +126,12 @@ impl WakeupFireSink for CoordinatorWakeupSink {
         };
 
         // Effective security posture: per-arc override ⊕ live global
-        // (Assistant when headless / no AppHandle). `target_arc_id` is
-        // `None` for headless fires — the resolver then returns the global.
+        // (Assistant in tests with no bridge). `target_arc_id` is `None`
+        // for store-less fires — the resolver then returns the global.
         let global_security_mode = self
-            .app_handle
+            .ui
             .as_ref()
-            .map(|h| {
-                use tauri::Manager;
-                h.state::<crate::state::AppState>().security.load().mode
-            })
+            .map(|ui| ui.app_state().security.load().mode)
             .unwrap_or(athen_core::config::SecurityMode::Assistant);
         let security_mode = crate::state::resolve_security_mode_for_arc(
             self.arc_store.as_ref(),
@@ -246,7 +243,7 @@ impl WakeupFireSink for CoordinatorWakeupSink {
         //   - surface a toast / sense-event-style notification linking
         //     to the arc.
         // Best-effort: emit failures don't invalidate the fire.
-        if let Some(app) = &self.app_handle {
+        if let Some(ui) = &self.ui {
             let payload = serde_json::json!({
                 "wakeup_id": wakeup.id.to_string(),
                 "arc_id": target_arc_id,
@@ -255,19 +252,15 @@ impl WakeupFireSink for CoordinatorWakeupSink {
                 "decision": decision_label,
                 "autonomy": wakeup.autonomy.as_str(),
             });
-            match app.emit("wakeup-fired", payload) {
-                Ok(()) => info!(
-                    wakeup_id = %wakeup.id,
-                    arc_id = ?target_arc_id,
-                    decision = %decision_label,
-                    "wakeup-fired event emitted to frontend"
-                ),
-                Err(e) => {
-                    warn!(wakeup_id = %wakeup.id, error = %e, "Failed to emit wakeup-fired event")
-                }
-            }
+            ui.emit("wakeup-fired", payload);
+            info!(
+                wakeup_id = %wakeup.id,
+                arc_id = ?target_arc_id,
+                decision = %decision_label,
+                "wakeup-fired event emitted"
+            );
         } else {
-            info!(wakeup_id = %wakeup.id, "Sink has no AppHandle; not emitting wakeup-fired");
+            info!(wakeup_id = %wakeup.id, "Sink has no UiBridge; not emitting wakeup-fired");
         }
 
         Ok(())

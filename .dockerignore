@@ -1,0 +1,7 @@
+# Keep the build context lean. NOTE: frontend/ must stay included — the
+# WebView assets are embedded into the binary at compile time.
+target/
+.git/
+*.log
+docs/
+crates/athen-app/binaries/nu-*

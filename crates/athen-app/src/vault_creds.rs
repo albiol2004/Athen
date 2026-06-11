@@ -56,7 +56,20 @@ pub fn endpoint_scope(endpoint_id: uuid::Uuid) -> String {
 /// Call once, right after `open_vault` returns, before anything that
 /// builds clients off `config` (router, email_sender, web_search,
 /// telegram launcher, …).
+///
+/// After the vault pass, the env-var overlay (`env_creds`) runs
+/// unconditionally — orchestrator-injected secrets win over vault values
+/// in headless / containerized deployments, and apply even when no vault
+/// could be opened at all.
 pub async fn hydrate_secrets_from_vault(
+    vault: Option<&Arc<dyn Vault>>,
+    config: &mut athen_core::config::AthenConfig,
+) {
+    hydrate_secrets_from_vault_only(vault, config).await;
+    crate::env_creds::overlay_secrets_from_env(config);
+}
+
+async fn hydrate_secrets_from_vault_only(
     vault: Option<&Arc<dyn Vault>>,
     config: &mut athen_core::config::AthenConfig,
 ) {
@@ -119,17 +132,17 @@ pub async fn hydrate_one_provider_from_vault(
     models: &mut athen_core::config::ModelsConfig,
     provider_id: &str,
 ) {
-    let Some(v) = vault else {
-        return;
-    };
-    let scope = provider_scope(provider_id);
-    if let Ok(Some(key)) = v.get(&scope, KEY_API_KEY).await {
-        if !key.is_empty() {
-            if let Some(p) = models.providers.get_mut(provider_id) {
-                p.auth = athen_core::config::AuthType::ApiKey(key);
+    if let Some(v) = vault {
+        let scope = provider_scope(provider_id);
+        if let Ok(Some(key)) = v.get(&scope, KEY_API_KEY).await {
+            if !key.is_empty() {
+                if let Some(p) = models.providers.get_mut(provider_id) {
+                    p.auth = athen_core::config::AuthType::ApiKey(key);
+                }
             }
         }
     }
+    crate::env_creds::overlay_one_provider_from_env(models, provider_id);
 }
 
 /// Patch each provider's api_key from the vault.
@@ -143,18 +156,18 @@ pub async fn hydrate_models_from_vault(
     vault: Option<&Arc<dyn Vault>>,
     models: &mut athen_core::config::ModelsConfig,
 ) {
-    let Some(v) = vault else {
-        return;
-    };
-    let provider_ids: Vec<String> = models.providers.keys().cloned().collect();
-    for id in provider_ids {
-        let scope = provider_scope(&id);
-        if let Ok(Some(key)) = v.get(&scope, KEY_API_KEY).await {
-            if !key.is_empty() {
-                if let Some(p) = models.providers.get_mut(&id) {
-                    p.auth = athen_core::config::AuthType::ApiKey(key);
+    if let Some(v) = vault {
+        let provider_ids: Vec<String> = models.providers.keys().cloned().collect();
+        for id in provider_ids {
+            let scope = provider_scope(&id);
+            if let Ok(Some(key)) = v.get(&scope, KEY_API_KEY).await {
+                if !key.is_empty() {
+                    if let Some(p) = models.providers.get_mut(&id) {
+                        p.auth = athen_core::config::AuthType::ApiKey(key);
+                    }
                 }
             }
         }
     }
+    crate::env_creds::overlay_models_from_env(models);
 }

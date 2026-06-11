@@ -103,11 +103,11 @@ pub struct DelegationContext {
     pub parent_arc_id: String,
     /// Tool documentation directory passed to the sub-agent's executor.
     pub tool_doc_dir: Option<std::path::PathBuf>,
-    /// Tauri handle used to wire a silent auditor on the sub-executor so
+    /// UI bridge used to wire a silent auditor on the sub-executor so
     /// the sub-agent's tool calls are persisted under `sub_arc_id`. None
-    /// means "no UI handle available" — sub-agent runs without persistence
+    /// means "no bridge available" — sub-agent runs without persistence
     /// (CLI / test paths).
-    pub app_handle: Option<tauri::AppHandle>,
+    pub ui: Option<crate::ui_bridge::UiBridge>,
     /// When `Some`, the spawned sub-agent's tool registry is wrapped with
     /// a `WakeupRestrictedRegistry` carrying these restrictions — i.e. the
     /// wake-up's tool/contact allowlist + autonomy band propagate to the
@@ -641,11 +641,11 @@ async fn run_delegation(
     // `delegate_to_agent` row. We deliberately skip `agent-progress` events
     // (silent) and don't pass a stream sender — both would surface in the
     // parent's UI as if the parent took those steps.
-    if let Some(ref handle) = ctx.app_handle {
+    if let Some(ref ui) = ctx.ui {
         let sub_turn_id = uuid::Uuid::new_v4().to_string();
         let sub_tool_log = crate::commands::new_tool_log();
         let sub_auditor = crate::commands::TauriAuditor::new_silent(
-            handle.clone(),
+            ui.clone(),
             Some(ctx.arc_store.clone()),
             sub_arc_id.clone(),
             sub_turn_id,

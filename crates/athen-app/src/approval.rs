@@ -21,7 +21,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
 use tokio::sync::{oneshot, Mutex};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -77,28 +76,30 @@ type Pending = Arc<Mutex<HashMap<Uuid, oneshot::Sender<ApprovalAnswer>>>>;
 // InApp sink
 // ---------------------------------------------------------------------------
 
-/// In-app approval sink: emits a Tauri event so the frontend renders a
-/// prompt, and resolves the parked oneshot when the frontend calls
-/// [`InAppApprovalSink::resolve`].
+/// In-app approval sink: emits an `approval-question` event so the
+/// frontend (WebView, or a remote client on the HTTP API's SSE stream)
+/// renders a prompt, and resolves the parked oneshot when the client
+/// answers via [`InAppApprovalSink::resolve`] (the `submit_approval`
+/// Tauri command or `POST /api/approvals/question`).
 pub struct InAppApprovalSink {
-    app_handle: Option<AppHandle>,
+    ui: Option<crate::ui_bridge::UiBridge>,
     pending: Pending,
 }
 
 impl InAppApprovalSink {
-    pub fn new(app_handle: AppHandle) -> Self {
+    pub fn new(ui: crate::ui_bridge::UiBridge) -> Self {
         Self {
-            app_handle: Some(app_handle),
+            ui: Some(ui),
             pending: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// Construct without an AppHandle, for unit tests that exercise the
+    /// Construct without a UiBridge, for unit tests that exercise the
     /// pending-map flow without going through Tauri.
     #[cfg(test)]
     pub fn new_for_test() -> Self {
         Self {
-            app_handle: None,
+            ui: None,
             pending: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -130,7 +131,7 @@ impl ApprovalSink for InAppApprovalSink {
             map.insert(question.id, tx);
         }
 
-        if let Some(app) = &self.app_handle {
+        if let Some(ui) = &self.ui {
             let event = ApprovalQuestionEvent {
                 id: question.id.to_string(),
                 prompt: question.prompt.clone(),
@@ -138,9 +139,7 @@ impl ApprovalSink for InAppApprovalSink {
                 choices: question.choices.iter().map(Into::into).collect(),
                 arc_id: question.arc_id.clone(),
             };
-            if let Err(e) = app.emit("approval-question", event) {
-                warn!("Failed to emit approval-question event: {e}");
-            }
+            ui.emit("approval-question", event);
         }
 
         rx.await
@@ -150,8 +149,8 @@ impl ApprovalSink for InAppApprovalSink {
     async fn cancel(&self, question_id: Uuid) -> Result<()> {
         let mut map = self.pending.lock().await;
         map.remove(&question_id);
-        if let Some(app) = &self.app_handle {
-            let _ = app.emit("approval-cancel", question_id.to_string());
+        if let Some(ui) = &self.ui {
+            ui.emit("approval-cancel", question_id.to_string());
         }
         Ok(())
     }
@@ -509,10 +508,17 @@ impl ApprovalRouter {
         }
 
         // Step 3: arc-source heuristic, finally InApp.
-        match arc_meta.map(|m| m.source) {
+        let kind = match arc_meta.map(|m| m.source) {
             Some(ArcSource::Messaging) => ReplyChannelKind::Telegram,
             _ => ReplyChannelKind::InApp,
+        };
+        if self.find(kind).is_some() {
+            return kind;
         }
+        // Heuristic picked a channel with no sink (headless builds have
+        // no InApp sink) — fall back to whatever IS wired rather than
+        // erroring out of ask_with_escalation before asking anyone.
+        self.sinks.first().map(|s| s.channel_kind()).unwrap_or(kind)
     }
 
     /// Ask the question on the primary channel, escalating to the

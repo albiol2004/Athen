@@ -11,6 +11,8 @@ use async_trait::async_trait;
 use chrono::Utc;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
+
+use crate::ui_bridge::UiBridge;
 use uuid::Uuid;
 
 use tracing::warn;
@@ -54,8 +56,8 @@ pub struct UploadedAttachment {
 /// react to. Whichever channel responds first wins; the existing
 /// `approve_task` Tauri command stays the canonical execution path.
 fn spawn_router_approval(
-    state: &State<'_, AppState>,
-    app_handle: &AppHandle,
+    state: &AppState,
+    ui: &UiBridge,
     task_id: Uuid,
     description: String,
     risk_score: f64,
@@ -76,7 +78,7 @@ fn spawn_router_approval(
     };
 
     let arc_id = state.active_arc_id.try_lock().map(|g| g.clone()).ok();
-    let app_handle = app_handle.clone();
+    let ui = ui.clone();
 
     // Snapshot the active provider id; the effective provider (honouring
     // any existing arc pin) is resolved later inside the spawned async
@@ -175,7 +177,7 @@ fn spawn_router_approval(
         let approved = answer.choice_key == "approve";
         // Emit an event the frontend can listen to (e.g. to update the
         // pending-approval card or auto-trigger approve_task).
-        let _ = app_handle.emit(
+        ui.emit(
             "approval-resolved",
             serde_json::json!({
                 "task_id": task_id.to_string(),
@@ -273,7 +275,7 @@ fn spawn_router_approval(
             cancel_flag: bg_ctx.cancel_flag,
             active_arc_id: bg_ctx.active_arc_id,
             inflight: bg_ctx.inflight,
-            app_handle: app_handle.clone(),
+            ui: ui.clone(),
             turn_id,
             // Bg path doesn't have access to the stashed pending_message
             // (that lives on `&AppState` and only the IPC handler can take
@@ -1440,7 +1442,7 @@ pub(crate) fn new_tool_log() -> ToolLog {
 /// the assistant message that owns them.
 pub(crate) struct TauriAuditor {
     inner: InMemoryAuditor,
-    app_handle: AppHandle,
+    ui: UiBridge,
     arc_store: Option<arcs::ArcStore>,
     arc_id: String,
     turn_id: String,
@@ -1466,7 +1468,7 @@ pub(crate) struct TauriAuditor {
 
 impl TauriAuditor {
     pub(crate) fn new(
-        app_handle: AppHandle,
+        ui: UiBridge,
         arc_store: Option<arcs::ArcStore>,
         arc_id: String,
         turn_id: String,
@@ -1474,7 +1476,7 @@ impl TauriAuditor {
     ) -> Self {
         Self {
             inner: InMemoryAuditor::new(),
-            app_handle,
+            ui,
             arc_store,
             arc_id,
             turn_id,
@@ -1491,7 +1493,7 @@ impl TauriAuditor {
     /// the frontend can render them inline later — but the parent UI's live
     /// progress feed isn't polluted with the sub-agent's intermediate steps.
     pub(crate) fn new_silent(
-        app_handle: AppHandle,
+        ui: UiBridge,
         arc_store: Option<arcs::ArcStore>,
         arc_id: String,
         turn_id: String,
@@ -1499,7 +1501,7 @@ impl TauriAuditor {
     ) -> Self {
         Self {
             inner: InMemoryAuditor::new(),
-            app_handle,
+            ui,
             arc_store,
             arc_id,
             turn_id,
@@ -1823,7 +1825,7 @@ impl StepAuditor for TauriAuditor {
                 ),
                 None => (None, None, None),
             };
-            let _ = self.app_handle.emit(
+            self.ui.emit(
                 "agent-progress",
                 AgentProgress {
                     step: step.index + 1,
@@ -1947,11 +1949,11 @@ impl StepAuditor for TauriAuditor {
 /// Returns the sender half of the channel that should be passed to
 /// `AgentBuilder::stream_sender()`.
 pub(crate) fn spawn_stream_forwarder(
-    app_handle: &AppHandle,
+    ui: &UiBridge,
     arc_id: Option<String>,
 ) -> tokio::sync::mpsc::UnboundedSender<String> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let handle = app_handle.clone();
+    let handle = ui.clone();
     tokio::spawn(async move {
         while let Some(delta) = rx.recv().await {
             // Check for STX prefix (\x02) which marks thinking/reasoning content.
@@ -1960,14 +1962,14 @@ pub(crate) fn spawn_stream_forwarder(
             } else {
                 (delta, false)
             };
-            let _ = handle.emit(
+            handle.emit(
                 "agent-stream",
                 serde_json::json!({ "delta": actual_delta, "is_final": false, "arc_id": arc_id, "is_thinking": is_thinking }),
             );
         }
         // Channel closed -- emit a final marker so the frontend knows
         // the stream is complete.
-        let _ = handle.emit(
+        handle.emit(
             "agent-stream",
             serde_json::json!({ "delta": "", "is_final": true, "arc_id": arc_id, "is_thinking": false }),
         );
@@ -2120,6 +2122,26 @@ pub async fn send_message(
     attachments: Option<Vec<UploadedAttachment>>,
     state: State<'_, AppState>,
     app_handle: AppHandle,
+) -> std::result::Result<ChatResponse, String> {
+    send_message_core(
+        message,
+        images,
+        attachments,
+        &UiBridge::Tauri(app_handle),
+        &state,
+    )
+    .await
+}
+
+/// UiBridge-native body of [`send_message`], shared with the HTTP API
+/// (`POST /api/messages`). Identical semantics in both modes; only the
+/// event transport differs (WebView emit vs SSE bus).
+pub(crate) async fn send_message_core(
+    message: String,
+    images: Option<Vec<athen_core::llm::ImageInput>>,
+    attachments: Option<Vec<UploadedAttachment>>,
+    ui: &UiBridge,
+    state: &AppState,
 ) -> std::result::Result<ChatResponse, String> {
     let images = images.unwrap_or_default();
     let attachments = attachments.unwrap_or_default();
@@ -2282,7 +2304,7 @@ pub async fn send_message(
     };
 
     // Emit status for risk evaluation phase.
-    let _ = app_handle.emit(
+    ui.emit(
         "agent-progress",
         AgentProgress {
             step: 0,
@@ -2388,8 +2410,8 @@ pub async fn send_message(
         // not at the UI. The in-app card is still shown so the user can
         // also answer there; whichever channel responds first wins.
         spawn_router_approval(
-            &state,
-            &app_handle,
+            state,
+            ui,
             awaiting_task.id,
             awaiting_task.description.clone(),
             risk_score,
@@ -2505,7 +2527,7 @@ pub async fn send_message(
                 })
             });
             persist_entry(
-                &state,
+                state,
                 &active_arc,
                 "user",
                 &message,
@@ -2595,7 +2617,7 @@ pub async fn send_message(
             let exec_router: Box<dyn LlmRouter> =
                 Box::new(SharedRouter(Arc::clone(&arc_router_handle)));
             let registry = state
-                .build_tool_registry(&active_arc, Some(app_handle.clone()))
+                .build_tool_registry(&active_arc, Some(ui.clone()))
                 .await;
 
             // Pre-allocate the task id so we can register it with the
@@ -2655,7 +2677,7 @@ pub async fn send_message(
             };
 
             let mut auditor = TauriAuditor::new(
-                app_handle.clone(),
+                ui.clone(),
                 state.arc_store.clone(),
                 active_arc.clone(),
                 turn_id.clone(),
@@ -2669,7 +2691,7 @@ pub async fn send_message(
             // in real time via Tauri events, tagged with the active arc
             // snapshotted at command entry (re-reading would race with a
             // concurrent `switch_arc`).
-            let stream_tx = spawn_stream_forwarder(&app_handle, Some(active_arc.clone()));
+            let stream_tx = spawn_stream_forwarder(ui, Some(active_arc.clone()));
 
             // Per-run cancel flag freshly minted by the registry guard.
             // Each agent has its own — the global `cancel_task` flips
@@ -2883,7 +2905,7 @@ pub async fn send_message(
                     drop(history);
                     // User msg was already persisted before the executor ran.
                     persist_entry(
-                        &state,
+                        state,
                         &active_arc,
                         "assistant",
                         &msg,
@@ -2918,15 +2940,13 @@ pub async fn send_message(
                     if let Err(e) = arc_store.set_goal_blocked(&active_arc, &reason).await {
                         tracing::warn!(arc = %active_arc, error = %e, "set_goal_blocked failed");
                     }
-                    let _ =
-                        app_handle.emit("arc-updated", serde_json::json!({ "arc_id": active_arc }));
+                    ui.emit("arc-updated", serde_json::json!({ "arc_id": active_arc }));
                 } else if goal_active {
                     // Goal was active and executor completed without blocking — mark done.
                     if let Err(e) = arc_store.clear_user_goal(&active_arc).await {
                         tracing::warn!(arc = %active_arc, error = %e, "clear_user_goal on completion failed");
                     }
-                    let _ =
-                        app_handle.emit("arc-updated", serde_json::json!({ "arc_id": active_arc }));
+                    ui.emit("arc-updated", serde_json::json!({ "arc_id": active_arc }));
                 }
             }
 
@@ -2979,7 +2999,7 @@ pub async fn send_message(
             }
             // User msg was already persisted before the executor ran.
             persist_entry(
-                &state,
+                state,
                 &active_arc,
                 "assistant",
                 &content,
@@ -3077,6 +3097,17 @@ pub async fn approve_task(
     state: State<'_, AppState>,
     app_handle: AppHandle,
 ) -> std::result::Result<ChatResponse, String> {
+    approve_task_core(task_id, approved, &UiBridge::Tauri(app_handle), &state).await
+}
+
+/// UiBridge-native body of [`approve_task`], shared with the HTTP API
+/// (`POST /api/approvals/task`).
+pub(crate) async fn approve_task_core(
+    task_id: String,
+    approved: bool,
+    ui: &UiBridge,
+    state: &AppState,
+) -> std::result::Result<ChatResponse, String> {
     // Stable id for the user/tool/assistant entries this approval will produce.
     let turn_id = Uuid::new_v4().to_string();
 
@@ -3098,7 +3129,7 @@ pub async fn approve_task(
 
         // Notify the frontend that the resolution happened in-app, so
         // any router-driven Telegram waiter can be cancelled.
-        let _ = app_handle.emit(
+        ui.emit(
             "approval-resolved",
             serde_json::json!({
                 "task_id": task_uuid.to_string(),
@@ -3177,7 +3208,7 @@ pub async fn approve_task(
         cancel_flag: Arc::clone(&state.cancel_flag),
         active_arc_id: active_arc,
         inflight: state.inflight_approvals.clone(),
-        app_handle: app_handle.clone(),
+        ui: ui.clone(),
         turn_id: turn_id.clone(),
         message_override,
         approval_router: state.approval_router.clone(),
@@ -3312,7 +3343,7 @@ pub(crate) struct ApprovedTaskCtx {
     pub cancel_flag: Arc<std::sync::atomic::AtomicBool>,
     pub active_arc_id: String,
     pub inflight: crate::state::InflightApprovals,
-    pub app_handle: AppHandle,
+    pub ui: UiBridge,
     pub turn_id: String,
     /// User message override (typically the stashed `pending_message`); the
     /// helper falls back to the coordinator task description when None.
@@ -3819,9 +3850,10 @@ pub(crate) async fn execute_approved_task(
     )
     .await
     {
-        registry = registry
-            .with_telephony(telephony)
-            .with_app_handle(ctx.app_handle.clone());
+        registry = registry.with_telephony(telephony);
+        if let Some(h) = ctx.ui.tauri_handle() {
+            registry = registry.with_app_handle(h.clone());
+        }
     }
     if let Some(ref astore) = ctx.attachment_store {
         registry = registry.with_attachments(astore.clone());
@@ -3834,7 +3866,7 @@ pub(crate) async fn execute_approved_task(
             ctx.active_arc_id.clone(),
             store.clone(),
             ctx.pending_grants.clone(),
-            Some(ctx.app_handle.clone()),
+            ctx.ui.tauri_handle().cloned(),
         )
         .with_security_mode(ctx.security_mode);
         if let Some(ref sink) = ctx.telegram_approval_sink {
@@ -3897,7 +3929,7 @@ pub(crate) async fn execute_approved_task(
                     ctx.tool_doc_dir.clone(),
                     Arc::clone(&ctx.router),
                     ctx.active_arc_id.clone(),
-                    Some(ctx.app_handle.clone()),
+                    Some(ctx.ui.clone()),
                     subagent_restrictions,
                 );
                 Box::new(crate::delegation::DelegationToolRegistry::new(
@@ -3985,7 +4017,7 @@ pub(crate) async fn execute_approved_task(
     };
 
     let mut auditor = TauriAuditor::new(
-        ctx.app_handle.clone(),
+        ctx.ui.clone(),
         ctx.arc_store.clone(),
         ctx.active_arc_id.clone(),
         ctx.turn_id.clone(),
@@ -3994,7 +4026,7 @@ pub(crate) async fn execute_approved_task(
     if let Some(reg) = ctx.agent_registry.as_ref() {
         auditor = auditor.with_agent_tracking(Arc::clone(reg), task_id_for_run);
     }
-    let stream_tx = spawn_stream_forwarder(&ctx.app_handle, Some(ctx.active_arc_id.clone()));
+    let stream_tx = spawn_stream_forwarder(&ctx.ui, Some(ctx.active_arc_id.clone()));
 
     // Per-run cancel flag from the registry guard. The legacy
     // `ctx.cancel_flag` (still threaded in for backwards compat) is no
@@ -4202,7 +4234,7 @@ pub(crate) async fn execute_approved_task(
             {
                 tracing::warn!(arc = %ctx.active_arc_id, error = %e, "set_goal_blocked failed");
             }
-            let _ = ctx.app_handle.emit(
+            ctx.ui.emit(
                 "arc-updated",
                 serde_json::json!({ "arc_id": ctx.active_arc_id }),
             );
@@ -4210,7 +4242,7 @@ pub(crate) async fn execute_approved_task(
             if let Err(e) = arc_store.clear_user_goal(&ctx.active_arc_id).await {
                 tracing::warn!(arc = %ctx.active_arc_id, error = %e, "clear_user_goal on completion failed");
             }
-            let _ = ctx.app_handle.emit(
+            ctx.ui.emit(
                 "arc-updated",
                 serde_json::json!({ "arc_id": ctx.active_arc_id }),
             );
@@ -4319,7 +4351,7 @@ pub(crate) async fn execute_approved_task(
 
     // Notify the frontend so the sidebar refreshes (mirrors the Telegram
     // owner-message handler — relevant when the bg path drives this).
-    let _ = ctx.app_handle.emit(
+    ctx.ui.emit(
         "arc-updated",
         serde_json::json!({ "arc_id": ctx.active_arc_id }),
     );
@@ -4961,9 +4993,10 @@ pub(crate) async fn execute_dispatched_task(
     )
     .await
     {
-        registry = registry
-            .with_telephony(telephony)
-            .with_app_handle(ctx.app_handle.clone());
+        registry = registry.with_telephony(telephony);
+        if let Some(h) = ctx.ui.tauri_handle() {
+            registry = registry.with_app_handle(h.clone());
+        }
     }
     if let Some(ref astore) = ctx.attachment_store {
         registry = registry.with_attachments(astore.clone());
@@ -4976,7 +5009,7 @@ pub(crate) async fn execute_dispatched_task(
             arc_id.clone(),
             store.clone(),
             ctx.pending_grants.clone(),
-            Some(ctx.app_handle.clone()),
+            ctx.ui.tauri_handle().cloned(),
         )
         .with_security_mode(ctx.security_mode);
         if let Some(ref sink) = ctx.telegram_approval_sink {
@@ -5029,7 +5062,7 @@ pub(crate) async fn execute_dispatched_task(
                     ctx.tool_doc_dir.clone(),
                     Arc::clone(&ctx.router),
                     arc_id.clone(),
-                    Some(ctx.app_handle.clone()),
+                    Some(ctx.ui.clone()),
                     subagent_restrictions,
                 );
                 Box::new(crate::delegation::DelegationToolRegistry::new(
@@ -5135,7 +5168,7 @@ pub(crate) async fn execute_dispatched_task(
     };
 
     let mut auditor = TauriAuditor::new(
-        ctx.app_handle.clone(),
+        ctx.ui.clone(),
         ctx.arc_store.clone(),
         arc_id.clone(),
         ctx.turn_id.clone(),
@@ -5144,7 +5177,7 @@ pub(crate) async fn execute_dispatched_task(
     if let Some(reg) = ctx.agent_registry.as_ref() {
         auditor = auditor.with_agent_tracking(Arc::clone(reg), task_id_for_run);
     }
-    let stream_tx = spawn_stream_forwarder(&ctx.app_handle, Some(arc_id.clone()));
+    let stream_tx = spawn_stream_forwarder(&ctx.ui, Some(arc_id.clone()));
 
     // Per-run cancel flag from the registry guard (see execute_approved_task
     // for the full rationale on legacy ctx.cancel_flag fallback).
@@ -5335,15 +5368,13 @@ pub(crate) async fn execute_dispatched_task(
             if let Err(e) = arc_store.set_goal_blocked(&arc_id, &reason).await {
                 tracing::warn!(arc = %arc_id, error = %e, "set_goal_blocked failed");
             }
-            let _ = ctx
-                .app_handle
+            ctx.ui
                 .emit("arc-updated", serde_json::json!({ "arc_id": arc_id }));
         } else if goal_active {
             if let Err(e) = arc_store.clear_user_goal(&arc_id).await {
                 tracing::warn!(arc = %arc_id, error = %e, "clear_user_goal on completion failed");
             }
-            let _ = ctx
-                .app_handle
+            ctx.ui
                 .emit("arc-updated", serde_json::json!({ "arc_id": arc_id }));
         }
     }
@@ -5448,8 +5479,7 @@ pub(crate) async fn execute_dispatched_task(
     let _ = ctx.coordinator.complete_task(coord_task_id).await;
     crate::state::clear_provider_pin_for_arc(ctx.arc_store.as_ref(), &arc_id).await;
 
-    let _ = ctx
-        .app_handle
+    ctx.ui
         .emit("arc-updated", serde_json::json!({ "arc_id": arc_id }));
 
     // Completion ping. Only fires on success — early-return error branches
@@ -5517,6 +5547,10 @@ pub(crate) async fn execute_dispatched_task(
 /// behaviour for any future caller that still hands it to the builder.
 #[tauri::command]
 pub async fn cancel_task(state: State<'_, AppState>) -> std::result::Result<(), String> {
+    cancel_task_core(&state).await
+}
+
+pub(crate) async fn cancel_task_core(state: &AppState) -> std::result::Result<(), String> {
     state.cancel_flag.store(true, Ordering::Relaxed);
     if let Some(reg) = state.agent_registry.as_ref() {
         let n = reg.cancel_all().await;
@@ -5534,6 +5568,13 @@ pub async fn cancel_task(state: State<'_, AppState>) -> std::result::Result<(), 
 #[tauri::command]
 pub async fn cancel_agent(
     state: State<'_, AppState>,
+    task_id: String,
+) -> std::result::Result<bool, String> {
+    cancel_agent_core(&state, task_id).await
+}
+
+pub(crate) async fn cancel_agent_core(
+    state: &AppState,
     task_id: String,
 ) -> std::result::Result<bool, String> {
     let reg = state
@@ -5555,6 +5596,14 @@ pub async fn queue_user_input(
     arc_id: String,
     text: String,
     state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    queue_user_input_core(arc_id, text, &state).await
+}
+
+pub(crate) async fn queue_user_input_core(
+    arc_id: String,
+    text: String,
+    state: &AppState,
 ) -> std::result::Result<(), String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -6015,6 +6064,12 @@ pub async fn list_http_endpoint_presets(
 pub async fn list_active_agents(
     state: State<'_, AppState>,
 ) -> std::result::Result<Vec<crate::agent_registry::ActiveAgent>, String> {
+    list_active_agents_core(&state).await
+}
+
+pub(crate) async fn list_active_agents_core(
+    state: &AppState,
+) -> std::result::Result<Vec<crate::agent_registry::ActiveAgent>, String> {
     let reg = state
         .agent_registry
         .as_ref()
@@ -6209,6 +6264,14 @@ pub async fn submit_approval(
     choice_key: String,
     state: State<'_, AppState>,
 ) -> std::result::Result<bool, String> {
+    submit_approval_core(question_id, choice_key, &state).await
+}
+
+pub(crate) async fn submit_approval_core(
+    question_id: String,
+    choice_key: String,
+    state: &AppState,
+) -> std::result::Result<bool, String> {
     use athen_core::approval::ApprovalAnswer;
 
     let q_id = Uuid::parse_str(&question_id).map_err(|e| format!("Invalid question_id: {e}"))?;
@@ -6240,6 +6303,10 @@ pub async fn get_status(state: State<'_, AppState>) -> std::result::Result<Statu
 /// Returns the new Arc ID so the frontend can update the sidebar.
 #[tauri::command]
 pub async fn new_arc(state: State<'_, AppState>) -> std::result::Result<String, String> {
+    new_arc_core(&state).await
+}
+
+pub(crate) async fn new_arc_core(state: &AppState) -> std::result::Result<String, String> {
     *state.history.lock().await = Vec::new();
     let new_id = chrono::Utc::now().format("arc_%Y%m%d_%H%M%S").to_string();
     *state.active_arc_id.lock().await = new_id.clone();
@@ -6330,6 +6397,13 @@ pub async fn get_arc_entries(
     arc_id: String,
     state: State<'_, AppState>,
 ) -> std::result::Result<Vec<ArcEntryResponse>, String> {
+    get_arc_entries_core(arc_id, &state).await
+}
+
+pub(crate) async fn get_arc_entries_core(
+    arc_id: String,
+    state: &AppState,
+) -> std::result::Result<Vec<ArcEntryResponse>, String> {
     if let Some(ref store) = state.arc_store {
         let entries = store
             .load_entries(&arc_id)
@@ -6391,6 +6465,12 @@ pub async fn compact_arc(
 pub async fn list_arcs(
     state: State<'_, AppState>,
 ) -> std::result::Result<Vec<arcs::ArcMeta>, String> {
+    list_arcs_core(&state).await
+}
+
+pub(crate) async fn list_arcs_core(
+    state: &AppState,
+) -> std::result::Result<Vec<arcs::ArcMeta>, String> {
     if let Some(ref store) = state.arc_store {
         store.list_root_arcs().await.map_err(|e| e.to_string())
     } else {
@@ -6437,6 +6517,13 @@ pub async fn get_timeline_data(
 pub async fn switch_arc(
     arc_id: String,
     state: State<'_, AppState>,
+) -> std::result::Result<Vec<ArcEntryResponse>, String> {
+    switch_arc_core(arc_id, &state).await
+}
+
+pub(crate) async fn switch_arc_core(
+    arc_id: String,
+    state: &AppState,
 ) -> std::result::Result<Vec<ArcEntryResponse>, String> {
     if let Some(ref store) = state.arc_store {
         let entries = store
@@ -6535,6 +6622,10 @@ pub async fn delete_arc(
 /// Return the current active arc ID.
 #[tauri::command]
 pub async fn get_current_arc(state: State<'_, AppState>) -> std::result::Result<String, String> {
+    get_current_arc_core(&state).await
+}
+
+pub(crate) async fn get_current_arc_core(state: &AppState) -> std::result::Result<String, String> {
     Ok(state.active_arc_id.lock().await.clone())
 }
 
@@ -7148,7 +7239,7 @@ pub async fn estimate_profile_tokens(
     //    the listed names + schemas are the same either way.
     let arc_id = state.active_arc_id.lock().await.clone();
     let registry = state
-        .build_tool_registry(&arc_id, Some(app_handle.clone()))
+        .build_tool_registry(&arc_id, Some(UiBridge::Tauri(app_handle.clone())))
         .await;
     let tools = registry.list_tools().await.unwrap_or_default();
 
@@ -7568,6 +7659,12 @@ pub async fn mark_notification_seen(
 pub async fn list_notifications(
     state: State<'_, AppState>,
 ) -> std::result::Result<Vec<NotificationInfo>, String> {
+    list_notifications_core(&state).await
+}
+
+pub(crate) async fn list_notifications_core(
+    state: &AppState,
+) -> std::result::Result<Vec<NotificationInfo>, String> {
     if let Some(notifier) = state.notifier.load_full() {
         Ok(notifier.list_notifications().await)
     } else {
@@ -7581,6 +7678,13 @@ pub async fn mark_notification_read(
     state: State<'_, AppState>,
     id: String,
 ) -> std::result::Result<(), String> {
+    mark_notification_read_core(&state, id).await
+}
+
+pub(crate) async fn mark_notification_read_core(
+    state: &AppState,
+    id: String,
+) -> std::result::Result<(), String> {
     let uuid = Uuid::parse_str(&id).map_err(|e| format!("Invalid notification ID: {e}"))?;
     if let Some(notifier) = state.notifier.load_full() {
         notifier.mark_read(uuid).await;
@@ -7592,6 +7696,12 @@ pub async fn mark_notification_read(
 #[tauri::command]
 pub async fn mark_all_notifications_read(
     state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    mark_all_notifications_read_core(&state).await
+}
+
+pub(crate) async fn mark_all_notifications_read_core(
+    state: &AppState,
 ) -> std::result::Result<(), String> {
     if let Some(notifier) = state.notifier.load_full() {
         notifier.mark_all_read().await;

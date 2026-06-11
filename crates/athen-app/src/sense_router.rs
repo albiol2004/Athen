@@ -6,8 +6,8 @@
 
 use std::sync::Arc;
 
+use crate::ui_bridge::UiBridge;
 use chrono::Utc;
-use tauri::{AppHandle, Emitter};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -65,7 +65,7 @@ pub async fn process_sense_event(
     profile_store: &Option<Arc<athen_persistence::profiles::SqliteProfileStore>>,
     profile_embedder: &Arc<dyn athen_core::traits::embedding::EmbeddingProvider>,
     profile_embedding_cache: &crate::state::ProfileEmbeddingCache,
-    app_handle: &AppHandle,
+    ui: &UiBridge,
     notifier: Option<&Arc<NotificationOrchestrator>>,
     coordinator: Option<&Arc<athen_coordinador::Coordinator>>,
     task_arc_map: Option<&crate::state::TaskArcMap>,
@@ -434,14 +434,7 @@ pub async fn process_sense_event(
         if will_dispatch {
             // Effective security posture, snapshotted at event-processing
             // (= task creation) time: per-arc override ⊕ live global.
-            let global_security_mode = {
-                use tauri::Manager;
-                app_handle
-                    .state::<crate::state::AppState>()
-                    .security
-                    .load()
-                    .mode
-            };
+            let global_security_mode = ui.app_state().security.load().mode;
             let security_mode = crate::state::resolve_security_mode_for_arc(
                 arc_store.as_ref(),
                 &arc_id,
@@ -516,7 +509,7 @@ pub async fn process_sense_event(
     // frontend can future-render an "Awaiting your approval" state for
     // HumanConfirm; today's UI just keys off `dispatched`.
     let decision_str = final_decision.as_ref().map(decision_label);
-    let _ = app_handle.emit(
+    ui.emit(
         "sense-event",
         serde_json::json!({
             "source": source_name,
