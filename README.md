@@ -23,7 +23,7 @@ a single native binary you double-click, with a tray icon and a clean
 window — but underneath, a hexagonal Rust core, a real risk model, MCP
 support, and a tool surface you can extend.
 
-> ⚠️ **Status: alpha (v0.3.3) — early but moving fast.** Core agent loop,
+> ⚠️ **Status: alpha (v0.3.4) — early but moving fast.** Core agent loop,
 > tools, risk system, senses, MCP runtime, and infrastructure are working
 > and well-tested. The surface is small on purpose and the UI is being
 > polished release by release. Pre-built binaries are **unsigned** today —
@@ -59,8 +59,9 @@ Athen sits in the middle: a **native desktop app** that runs on
 **your machine**, with **your keys** (or no keys at all), agnostic about
 which LLM you point it at, MIT-licensed, no telemetry, no lock-in.
 It's also **designed to run continuously** — it sits in the tray and keeps
-sensing, even when the window is closed. Same binary will eventually run
-headless on a server.
+sensing, even when the window is closed. The same binary also runs
+**headless on a server** (`athen --headless`), with Telegram and a
+built-in web UI as the user surfaces.
 
 ### Why Rust + Tauri (and not Electron)
 
@@ -96,7 +97,9 @@ Chromium fork, no Node runtime, no React-on-Windows quirks.
 | **Encrypted credential vault** — OS keychain backend + ChaCha20-Poly1305 file fallback | ✅ |
 | **Voice phone calls** — agent-placed outbound calls (`place_call`) via Twilio + Pipecat, STT/TTS, multi-turn, live transcript | ✅ |
 | **Delegation / sub-agents** — `spawn_subagent` runs a scoped task on its own arc with inherited model pin + budget | ✅ |
-| **Headless server mode** — daemon binary for always-on hosts | ❌ planned |
+| **Headless server mode** — `athen --headless` daemon for always-on hosts, Telegram as the user surface, Dockerfile included | ✅ |
+| **HTTP API + embedded web UI** — token-gated REST + SSE on `ATHEN_HTTP_ADDR`, serving a full-parity React chat client (tool cards, plans, settings, revert) straight from the binary | ✅ |
+| **Admin panel & gateway** (`athen-admin`) — host multiple isolated Athen instances behind one panel: Docker provisioning, per-user auth, quotas, audit log, push notifications | ✅ |
 
 ---
 
@@ -224,9 +227,20 @@ Athen is built so you don't have to fork it to make it do new things.
 - **Custom senses** — implement `SenseMonitor` in `athen-sentidos`. The
   monitor runs in its own process and feeds normalized `SenseEvent`s back
   over IPC. Good for hooking up an RSS feed, a webhook, a webcam, etc.
-- **Headless mode** — `cargo run -p athen-cli --release` gives you a REPL
-  against the same agent core. A proper `athend` daemon for always-on
-  server hosting is planned for a future release.
+- **Headless mode** — `athen --headless` runs the full autonomous stack
+  (senses, coordinator, risk gates, wake-ups) with no GUI: Telegram,
+  the HTTP API, and the embedded web UI are the user surfaces. Config
+  comes from files + env vars; a Dockerfile ships in the repo. See
+  [`docs/HEADLESS.md`](docs/HEADLESS.md).
+- **HTTP API** — every instance (desktop or headless) can expose a
+  token-gated REST + SSE surface on `ATHEN_HTTP_ADDR` for your own
+  clients; the same listener serves the built-in React web UI.
+- **Self-hosting for others** — `athen-admin` is a standalone panel +
+  gateway that provisions one Docker container per user, with auth,
+  quotas, audit, and push notifications. See
+  [`docs/ADMIN_PANEL.md`](docs/ADMIN_PANEL.md).
+- **CLI REPL** — `cargo run -p athen-cli --release` for a quick
+  terminal session against the same agent core.
 
 ---
 
@@ -291,8 +305,14 @@ crates/
   athen-contacts/     # Trust model
   athen-sandbox/      # OS-native + container sandboxing
   athen-shell/        # Nushell + native shell
+  athen-vault/        # Encrypted credential vault (keychain + file)
+  athen-caldav/       # CalDAV calendar adapter
+  athen-checkpoint/   # Gix-backed action snapshots (revert/undo)
+  athen-scheduler/    # Wake-up scheduler
+  athen-admin/        # Multi-instance admin panel + gateway
   athen-cli/          # CLI / REPL
-  athen-app/          # Tauri 2 desktop app — the composition root
+  athen-app/          # Tauri 2 desktop app + headless daemon — the composition root
+web/                  # Embedded React web UI (served by the HTTP API)
 ```
 
 For a deeper read see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
@@ -306,6 +326,9 @@ For a deeper read see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 - ✅ Per-arc security modes (Bunker / Assistant / Yolo)
 - ✅ Provider Bundles + per-arc provider pinning, reasoning-effort control
 - ✅ Hybrid memory (semantic + lexical + graph), sub-agent delegation deep-pass
+- ✅ Headless server mode (`athen --headless` — Telegram surface, Dockerfile)
+- ✅ HTTP API (REST + SSE) + embedded web UI with full desktop parity
+- ✅ Admin panel & gateway (`athen-admin`) for hosting multiple instances
 
 **v0.3.x (current — ongoing polish):**
 - Code signing (macOS notarization, Windows Trusted Signing)
@@ -313,13 +336,12 @@ For a deeper read see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 - Prompt-cache wiring across providers (Anthropic `cache_control`, Gemini implicit cache, DeepSeek cost UI)
 
 **Next:**
-- `athend` headless server mode (systemd unit, Docker image)
 - More senses (Slack, Discord, RSS, generic webhook)
+- React Native mobile companion (the web UI's API layer is already DOM-free for this)
 
 **Bigger picture:**
 - Plugin marketplace beyond MCP
 - Federated multi-device sync (CRDT, end-to-end encrypted)
-- Mobile companion
 
 ---
 

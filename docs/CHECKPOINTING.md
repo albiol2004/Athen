@@ -5,8 +5,9 @@ Hidden git backend that lets the user roll back destructive things Athen did
 layer — it just calls `write`, `edit`, `shell_execute` as usual; the
 checkpoint hook fires before each call and records pre-state.
 
-Status: **design + phase 1 in flight** (2026-05-19). Phase 1 = structured-tool
-snapshots (`write`/`edit`) via `gix`. Shell snapshotting + UI come later.
+Status: **phase 1 SHIPPED** — `athen-checkpoint` crate is live: structured-tool
+snapshots (`write`/`edit`) via `gix`, Changes side panel + point-in-time revert
+in both the desktop UI and the web UI. Shell snapshotting comes later.
 
 ## Why git, hidden under the hood
 
