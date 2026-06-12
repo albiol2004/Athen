@@ -312,7 +312,7 @@ mod tests {
         .unwrap();
         assert!(auth::user_can_access(&db, &admin, "i1").await.unwrap());
         assert!(!auth::user_can_access(&db, &user, "i1").await.unwrap());
-        crate::instances::set_grants(&db, "i1", &[user.id.clone()])
+        crate::instances::set_grants(&db, "i1", std::slice::from_ref(&user.id))
             .await
             .unwrap();
         assert!(auth::user_can_access(&db, &user, "i1").await.unwrap());
