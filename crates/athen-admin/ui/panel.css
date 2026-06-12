@@ -161,6 +161,9 @@ textarea { resize: vertical; min-height: 64px; font-family: ui-monospace, monosp
 .check-list input { width: auto; }
 details { margin-bottom: 11px; }
 details summary { cursor: pointer; color: var(--text-dim); font-size: 12.5px; margin-bottom: 8px; }
+/* Provider seed fieldset inside the provision modal */
+fieldset { border: 1px solid var(--glass-border); border-radius: 10px; padding: 12px 14px 6px; margin-bottom: 14px; }
+fieldset legend { font-size: 12px; color: var(--text-dim); padding: 0 6px; text-transform: uppercase; letter-spacing: .04em; }
 
 /* ---- logs drawer ---- */
 .drawer {

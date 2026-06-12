@@ -16,6 +16,12 @@ pub async fn index() -> Html<&'static str> {
     Html(include_str!("../ui/index.html"))
 }
 
+/// `/i/{instance}` → `/i/{instance}/` — the embedded web UI is built with
+/// relative asset paths, so it must be served under the trailing slash.
+pub async fn ui_slash_redirect(Path(instance_id): Path<String>) -> Response {
+    axum::response::Redirect::temporary(&format!("/i/{instance_id}/")).into_response()
+}
+
 /// Minimal chat client for one instance — the same session→proxy→SSE path
 /// a future React / React Native app uses. Session-gated by the router;
 /// access to the specific instance checked here.

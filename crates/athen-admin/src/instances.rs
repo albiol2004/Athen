@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use chrono::Utc;
 
 use crate::db::{random_token, Db, Instance};
+use crate::seed::{self, LlmSeed};
 use crate::PanelState;
 
 /// HTTP port instances listen on inside the network (never published).
@@ -62,8 +63,14 @@ pub struct CreateSpec {
     /// `ATHEN_TELEGRAM_BOT_TOKEN`, …). Operator-provided.
     pub env: HashMap<String, String>,
     /// Optional file contents seeded into `/data` before first start.
+    /// Mutually exclusive with `llm_seed` for `models_toml` — if both are
+    /// set, `create` returns an error (ambiguous).
     pub config_toml: Option<String>,
     pub models_toml: Option<String>,
+    /// Structured LLM provider seed. When present, the panel generates a
+    /// `models.toml` automatically and injects the API key into the
+    /// container env. Mutually exclusive with a raw `models_toml` string.
+    pub llm_seed: Option<LlmSeed>,
     /// Users granted access right away.
     pub user_ids: Vec<String>,
     /// Hard memory limit (cgroup, swap disabled); `None` = unlimited.
@@ -77,7 +84,25 @@ pub struct CreateSpec {
 
 /// Full provisioning flow. On Docker failure after the row insert, the row
 /// is removed again so a retry doesn't hit UNIQUE constraints.
+///
+/// Validation rules applied before any Docker interaction:
+/// - Raw `models_toml` and `llm_seed` are mutually exclusive.
+/// - When `llm_seed` is present, it must pass `LlmSeed::validate()`.
 pub async fn create(state: &PanelState, spec: CreateSpec) -> anyhow::Result<Instance> {
+    // ── Reject ambiguous seed ──────────────────────────────────────────────
+    if spec.models_toml.is_some() && spec.llm_seed.is_some() {
+        anyhow::bail!(
+            "models_toml and llm_seed are mutually exclusive — \
+             set one or the other, not both"
+        );
+    }
+
+    // ── Validate structured seed (before any side effects) ────────────────
+    if let Some(ref s) = spec.llm_seed {
+        s.validate()
+            .map_err(|e| anyhow::anyhow!("invalid llm_seed: {e}"))?;
+    }
+
     let id = uuid::Uuid::new_v4().to_string();
     let short = &id[..8];
     let instance = Instance {
@@ -127,6 +152,27 @@ pub async fn create(state: &PanelState, spec: CreateSpec) -> anyhow::Result<Inst
         env.push(format!("{k}={v}"));
     }
 
+    // Inject the API key from llm_seed into the container env (never the file).
+    let generated_models_toml: Option<String> = if let Some(ref s) = spec.llm_seed {
+        if !s.api_key.is_empty() {
+            let var_name = seed::provider_env_var(&s.provider_id);
+            tracing::info!(
+                provider = %s.provider_id,
+                key_len = s.api_key.len(),
+                var = %var_name,
+                "injecting provider api_key into instance env"
+            );
+            env.push(format!("{var_name}={}", s.api_key));
+        }
+        Some(seed::generate_models_toml(s, Utc::now()))
+    } else {
+        None
+    };
+
+    let effective_models_toml = generated_models_toml
+        .as_deref()
+        .or(spec.models_toml.as_deref());
+
     let provisioned: anyhow::Result<()> = async {
         state
             .docker
@@ -141,17 +187,17 @@ pub async fn create(state: &PanelState, spec: CreateSpec) -> anyhow::Result<Inst
                 spec.cpus,
             )
             .await?;
-        let mut seed: Vec<(String, String)> = Vec::new();
+        let mut file_seeds: Vec<(String, String)> = Vec::new();
         if let Some(c) = &spec.config_toml {
-            seed.push(("config.toml".into(), c.clone()));
+            file_seeds.push(("config.toml".into(), c.clone()));
         }
-        if let Some(m) = &spec.models_toml {
-            seed.push(("models.toml".into(), m.clone()));
+        if let Some(m) = effective_models_toml {
+            file_seeds.push(("models.toml".into(), m.to_string()));
         }
-        if !seed.is_empty() {
+        if !file_seeds.is_empty() {
             state
                 .docker
-                .upload_files(&instance.container_name, "/data", &seed)
+                .upload_files(&instance.container_name, "/data", &file_seeds)
                 .await?;
         }
         state.docker.start(&instance.container_name).await?;

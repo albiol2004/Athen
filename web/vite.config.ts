@@ -9,6 +9,9 @@ import react from '@vitejs/plugin-react';
 //   permissive; auth is the token, not the origin).
 export default defineConfig({
   plugins: [react()],
+  // Relative asset paths: the same dist is served at `/` by the instance
+  // and at `/i/{id}/` through the admin-panel gateway passthrough.
+  base: './',
   build: {
     outDir: 'dist',
     assetsDir: 'assets',

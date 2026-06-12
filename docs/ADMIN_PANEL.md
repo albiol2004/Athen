@@ -50,20 +50,85 @@ cargo build --release -p athen-admin
 ATHEN_ADMIN_ADDR=127.0.0.1:8800 ./target/release/athen-admin
 ```
 
+### Panel configuration reference
+
+All read once at startup (the disk sweep reads its two vars when the
+sweep loop spawns). The panel has no config file — env is the interface.
+
 | Env var | Meaning | Default |
 |---|---|---|
-| `ATHEN_ADMIN_ADDR` | listen address | `127.0.0.1:8800` |
-| `ATHEN_ADMIN_DATA_DIR` | panel DB (`panel.db`) | `~/.athen-admin` |
-| `ATHEN_ADMIN_PASSWORD` | bootstrap admin password | generated, printed once to stdout |
-| `ATHEN_ADMIN_IMAGE` | image for new instances | `athen` |
-| `ATHEN_ADMIN_NETWORK` | shared bridge network | `athen-net` |
-| `ATHEN_ADMIN_AUDIT_RETENTION_DAYS` | prune audit rows older than this, daily (`0` = keep forever) | `90` |
-| `ATHEN_ADMIN_DISK_ENFORCE` | `warn` = never stop over-quota instances (default escalates warn → stop) | `stop` |
-| `ATHEN_ADMIN_DISK_SWEEP_SECS` | disk sweep interval, min 5 (also the warn→stop grace period) | `300` |
-| `DOCKER_HOST` | honored by bollard | unix socket |
+| `ATHEN_ADMIN_ADDR` | listen socket address; unparseable = startup error | `127.0.0.1:8800` |
+| `ATHEN_ADMIN_PASSWORD` | bootstrap `admin` password — used only on first start when the users table is empty, ignored afterwards | generated, printed once to stdout |
+| `ATHEN_ADMIN_DATA_DIR` | panel state dir (`panel.db`); empty = default | `~/.athen-admin` |
+| `ATHEN_ADMIN_IMAGE` | Docker image for new instances | `athen` |
+| `ATHEN_ADMIN_NETWORK` | shared bridge network name (created ICC-disabled if missing) | `athen-net` |
+| `ATHEN_ADMIN_AUDIT_RETENTION_DAYS` | daily prune of audit rows older than N days; `0` = keep forever; unparseable = default | `90` |
+| `ATHEN_ADMIN_DISK_ENFORCE` | `warn` (case-insensitive) = never stop over-quota instances; any other value (or unset) = warn → stop escalation | enforce |
+| `ATHEN_ADMIN_DISK_SWEEP_SECS` | disk sweep interval in seconds, clamped to ≥ 5 (also the warn→stop grace period); unparseable = default | `300` |
+| `DOCKER_HOST` | honored by bollard (`connect_with_defaults`); point at a rootless Docker/Podman socket to de-privilege the panel — rootful sockets get a startup warning, audit row, and dashboard banner | local unix socket |
+| `RUST_LOG` | standard tracing `EnvFilter` | `info` |
 
 First start with no users creates `admin` (password from env or printed
 once).
+
+### Configuring instances from the panel
+
+Instance containers get their environment **at provisioning time** — env
+is part of `docker create`, so changing it means recreate, not restart.
+Three layers compose:
+
+1. **Baked into the image** (repo `Dockerfile`): `ATHEN_DATA_DIR=/data`,
+   `ATHEN_VAULT_BACKEND=file`, `ATHEN_HEADLESS=1`,
+   `ATHEN_HTTP_ADDR=0.0.0.0:8787`, `RUST_LOG=info`.
+2. **Set by the panel itself** on every create (`instances.rs`):
+   `ATHEN_HTTP_ADDR=0.0.0.0:8787` and the panel-generated
+   `ATHEN_HTTP_TOKEN` (stored in `panel.db`, never handed to clients).
+3. **Operator extras** via the provision modal / `POST /panel/instances`
+   `env` map — any instance-level var from the
+   [HEADLESS.md environment variable reference](HEADLESS.md#environment-variable-reference)
+   layers in here: `ATHEN_PROVIDER_<ID>_API_KEY`,
+   `ATHEN_TELEGRAM_BOT_TOKEN`, `ATHEN_IMAP_PASSWORD`, the `_FILE`
+   variants, `ATHEN_LLM_VERBOSE_ROUTING`, … (names are validated:
+   non-empty, no `=`).
+
+#### Structured seed path (recommended — the "Model provider" form)
+
+The provision modal's **"Model provider"** section lets operators skip
+hand-writing `models.toml`. Select a provider preset (DeepSeek / OpenAI /
+Anthropic / Google / Mistral / OpenRouter / Custom), fill in the slug and
+API key, and the panel:
+
+1. Generates a `models.toml` with the correct provider entry, an active
+   Bundle, and all four tiers (`Fast`/`Cheap`/`Code`/`Powerful`) pointing
+   at the chosen `(provider_id, slug)` pair.
+2. Seeds it into `/data` as uid/gid 1000 before container start.
+3. Injects `ATHEN_PROVIDER_<ID>_API_KEY` into the container env — the key
+   **never appears in the file** (`auth = "None"` on disk; the env-overlay
+   patches it at runtime).
+
+The env var name follows the same mangling as `env_creds::provider_env_var`:
+uppercase the provider id, replace every non-alphanumeric char with `_`,
+wrap as `ATHEN_PROVIDER_<ID>_API_KEY` (e.g. `deepseek` →
+`ATHEN_PROVIDER_DEEPSEEK_API_KEY`, `opencode_go` →
+`ATHEN_PROVIDER_OPENCODE_GO_API_KEY`).
+
+**Preset catalog** (`GET /panel/instance_presets`, session-gated): the UI
+fetches this on modal open; operators can also call it from the API. Each
+row has `id`, `label`, `default_slug`, `family`, `context_window_tokens`,
+`key_page_url`, and `custom` (the last row, `Custom…`, prompts free-text
+inputs for provider_id, family, and slug).
+
+**Mutual exclusion**: the structured seed (`llm_seed.provider_id` non-empty)
+and a raw `models_toml` string are mutually exclusive — the server returns
+`400 Bad Request` if both are present. The raw `models_toml` textarea lives
+under the "Advanced: raw config files" collapse so it stays out of the way.
+
+#### Raw seed path (escape hatch)
+
+The "Advanced: raw config files" `<details>` block accepts a hand-written
+`models.toml` string exactly as before. Use this when your provider needs
+a non-standard `endpoint`, `temperature`, or `tier_models` setup that the
+structured form doesn't expose. Secrets still go in `env`, not the file.
 
 ### The Docker socket (and how to de-privilege it)
 
@@ -123,6 +188,23 @@ holds.
   `/arcs/.../entries`, live `EventSource` on `/events` (stream deltas,
   tool chips, approval cards, file-permission grant cards), long-poll
   `POST /messages`, `pending_approval` risk card with Approve/Deny.
+- **`/i/{instance}/`** — passthrough to the instance's embedded web UI
+  (the full React client from `web/`, **Settings modal included**), so
+  admins manage instance settings the same way the desktop does, without
+  ever holding the instance token. The web client detects the `/i/{id}`
+  prefix, probes `/api/arcs/current`, and skips its token login — the
+  panel session is the auth, the proxy injects the bearer. No session →
+  redirect to `/?next=<path>` so a shared deep link survives the login
+  round-trip (the panel JS validates `next` as a same-origin `/i/…` path
+  before following it — open-redirect guard); bare `/i/{instance}` →
+  trailing-slash redirect (the dist uses relative asset paths). Panel
+  dashboard renders an *Open UI* button per instance next to *Chat*.
+- **The dashboard doubles as the user-facing instance picker**: plain
+  users see only their granted instances (cards stripped of operator
+  metadata — no container name, Docker status, or quota chips) with
+  *Open UI* / *Chat* as the only actions. Sending a customer
+  `/i/{id}/` directly also works: login → bounced straight into their
+  instance via `next`.
 - **`/i/{instance}/api/{*}`** — the session-gated reverse proxy (below).
 - **Panel REST** (session; admin-only where noted): `POST /panel/login`,
   `/panel/logout`, `GET /panel/me`, `POST /panel/password`,

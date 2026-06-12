@@ -47,6 +47,7 @@ function svg(name) {
     users: '<path d="M17 21v-2a4 4 0 0 0-4-4H7a4 4 0 0 0-4 4v2"/><circle cx="10" cy="7" r="4"/><path d="M21 21v-2a4 4 0 0 0-3-3.87"/>',
     disk: '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4 3 9 3s9-1.34 9-3"/>',
     chat: '<path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 8.6 8.6 0 0 1-3.7-.84L3 20l1-4.9A8.4 8.4 0 0 1 3 11.5a8.4 8.4 0 0 1 9-8.4 8.4 8.4 0 0 1 9 8.4z"/>',
+    app: '<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 21V9"/>',
   };
   return `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">${icons[name] || ''}</svg>`;
 }
@@ -70,7 +71,18 @@ function showLogin() {
   $('#login-user').focus();
 }
 
+// Deep-link return-to: the gateway redirects unauthenticated browsers from
+// /i/{id}/… to /?next=<path>, so a shared instance link survives the login
+// round-trip. Only same-origin instance paths are honored (open-redirect
+// guard); location.replace keeps the login page out of Back history.
+function consumeNextParam() {
+  const next = new URLSearchParams(location.search).get('next');
+  return next && /^\/i\/[A-Za-z0-9-]+(\/.*)?$/.test(next) ? next : null;
+}
+
 function showApp() {
+  const next = consumeNextParam();
+  if (next) { location.replace(next); return; }
   $('#view-login').classList.add('hidden');
   $('#view-app').classList.remove('hidden');
   $('#who').textContent = `${ME.username} · ${ME.role}`;
@@ -122,7 +134,8 @@ function instanceCard(i) {
   const admin = ME.role === 'admin';
   const running = i.state === 'running';
   const actions = [];
-  actions.push(`<a class="btn small primary" href="/i/${i.id}/chat">${svg('chat')} Open chat</a>`);
+  actions.push(`<a class="btn small primary" href="/i/${i.id}/">${svg('app')} Open UI</a>`);
+  actions.push(`<a class="btn small" href="/i/${i.id}/chat">${svg('chat')} Chat</a>`);
   if (admin) {
     actions.push(running
       ? `<button class="btn small" data-action="stop" data-id="${i.id}" data-name="${esc(i.name)}">${svg('stop')} Stop</button>`
@@ -132,19 +145,25 @@ function instanceCard(i) {
     actions.push(`<button class="btn small" data-action="disk" data-id="${i.id}" data-name="${esc(i.name)}" data-limit="${i.disk_limit_mb ?? ''}">${svg('disk')} Quota</button>`);
     actions.push(`<button class="btn small danger" data-action="delete" data-id="${i.id}" data-name="${esc(i.name)}">${svg('trash')}</button>`);
   }
-  return `<div class="card">
-    <div class="card-top">
-      <span class="card-name">${esc(i.name)}</span>
-      <span class="badge ${esc(i.state)}">${esc(i.state)}</span>
-    </div>
-    <div class="card-meta">
+  // Operator metadata (container name, raw Docker status, quota chips) is
+  // admin-only: plain users get a clean "my instance" card that doesn't
+  // leak infra naming or quota policy.
+  const meta = admin
+    ? `<div class="card-meta">
       <span><code>${esc(i.container_name)}</code></span>
       <span>${esc(i.status)}</span>
       ${i.memory_mb || i.cpus
         ? `<span>${[i.memory_mb && `${i.memory_mb} MB`, i.cpus && `${i.cpus} CPU`].filter(Boolean).join(' · ')}</span>`
         : ''}
       ${diskMeta(i)}
+    </div>`
+    : '';
+  return `<div class="card">
+    <div class="card-top">
+      <span class="card-name">${esc(i.name)}</span>
+      <span class="badge ${esc(i.state)}">${esc(i.state)}</span>
     </div>
+    ${meta}
     <div class="card-actions">${actions.join('')}</div>
   </div>`;
 }
@@ -259,21 +278,64 @@ function grantValues() {
   return [...document.querySelectorAll('input[name="grant"]:checked')].map((c) => c.value);
 }
 
+// --------------------------------------------------------- presets cache --
+
+let PRESETS = null; // loaded once per page
+
+async function ensurePresets() {
+  if (PRESETS) return PRESETS;
+  try { PRESETS = await api('/panel/instance_presets'); } catch { PRESETS = []; }
+  return PRESETS;
+}
+
+// -------------------------------------------------------- new-instance modal --
+
+function buildPresetOptions(presets) {
+  return presets.map((p) =>
+    `<option value="${esc(p.id)}" data-slug="${esc(p.default_slug)}" data-family="${esc(p.family)}" data-ctx="${esc(p.context_window_tokens)}" data-key-page="${esc(p.key_page_url)}" data-custom="${p.custom}">${esc(p.label)}</option>`
+  ).join('');
+}
+
 async function openNewInstanceModal() {
   await ensureUsers();
+  const presets = await ensurePresets();
+
   openModal(`<h3>New instance</h3>
     <form id="form-new-instance">
       <label>Name <input id="ni-name" required placeholder="alice"></label>
-      <label>Environment variables <textarea id="ni-env" placeholder="ATHEN_PROVIDER_DEEPSEEK_API_KEY=sk-...&#10;ATHEN_TELEGRAM_BOT_TOKEN=..."></textarea></label>
-      <div class="hint">One KEY=VALUE per line. Secrets go here (never into the config files below).</div>
+
+      <fieldset id="ni-provider-section">
+        <legend>Model provider</legend>
+        <label>Provider
+          <select id="ni-preset">
+            <option value="" data-custom="false">— none / configure later —</option>
+            ${buildPresetOptions(presets)}
+          </select>
+        </label>
+        <div id="ni-provider-fields" class="hidden">
+          <div id="ni-custom-fields" class="hidden">
+            <label>Provider ID <input id="ni-provider-id" placeholder="e.g. deepseek"></label>
+            <label>Family <input id="ni-family" placeholder="e.g. DeepSeekV4Chat"></label>
+          </div>
+          <label>Model slug <input id="ni-slug" placeholder="e.g. deepseek-v4-flash"></label>
+          <label>API key <input id="ni-apikey" type="password" autocomplete="off" placeholder="sk-..."></label>
+          <div id="ni-key-hint" class="hint hidden"></div>
+          <label>Context window (tokens) <input id="ni-ctx" type="number" min="1024" step="1024" placeholder="128000"></label>
+        </div>
+        <div id="ni-provider-none-hint" class="hint">Select a provider to pre-configure the instance's LLM routing. You can also leave this blank and configure it later from the instance's Settings page.</div>
+      </fieldset>
+
+      <label>Extra environment variables <textarea id="ni-env" placeholder="ATHEN_TELEGRAM_BOT_TOKEN=...&#10;ATHEN_IMAP_PASSWORD=..."></textarea></label>
+      <div class="hint">One KEY=VALUE per line. The API key above is injected automatically — don't duplicate it here.</div>
       <div class="row">
         <label>Memory limit (MB) <input id="ni-mem" type="number" min="64" step="64" placeholder="unlimited"></label>
         <label>CPU limit (cores) <input id="ni-cpus" type="number" min="0.1" step="0.1" placeholder="unlimited"></label>
         <label>Disk quota (MB) <input id="ni-disk" type="number" min="64" step="64" placeholder="no quota"></label>
       </div>
       <div class="hint">Memory/CPU are hard cgroup limits — a runaway instance gets OOM-killed and restarted instead of starving the host. Disk is sweep-enforced: crossing the quota warns (audit + push); still over a sweep later, the instance is stopped until cleaned up or the quota is raised.</div>
-      <details>
-        <summary>Seed config files (optional)</summary>
+      <details id="ni-advanced">
+        <summary>Advanced: raw config files</summary>
+        <div class="hint">Hand-written TOML seeds — use only when the provider form above can't express what you need. If you fill in a raw <code>models.toml</code> here, leave the provider form above blank (they are mutually exclusive).</div>
         <label>config.toml <textarea id="ni-config" placeholder="[telegram]&#10;enabled = false"></textarea></label>
         <label>models.toml <textarea id="ni-models" placeholder="[providers.deepseek]&#10;auth = &quot;None&quot; ..."></textarea></label>
       </details>
@@ -284,9 +346,63 @@ async function openNewInstanceModal() {
         <button type="submit" class="btn primary" id="ni-submit">Create &amp; start</button>
       </div>
     </form>`);
+
   $('#modal-cancel').addEventListener('click', closeModal);
+
+  // ── Preset dropdown wiring ─────────────────────────────────────────────
+  const presetSel = $('#ni-preset');
+  const providerFields = $('#ni-provider-fields');
+  const customFields = $('#ni-custom-fields');
+  const noneHint = $('#ni-provider-none-hint');
+  const keyHint = $('#ni-key-hint');
+
+  function applyPreset() {
+    const opt = presetSel.options[presetSel.selectedIndex];
+    const isNone = !opt.value && opt.dataset.custom !== 'true';
+    const isCustom = opt.dataset.custom === 'true';
+
+    providerFields.classList.toggle('hidden', isNone);
+    customFields.classList.toggle('hidden', !isCustom);
+    noneHint.classList.toggle('hidden', !isNone);
+
+    if (!isNone && !isCustom) {
+      // Pre-fill from preset data attributes.
+      $('#ni-slug').value = opt.dataset.slug || '';
+      $('#ni-ctx').value = opt.dataset.ctx || '128000';
+      const kp = opt.dataset.keyPage;
+      if (kp) {
+        keyHint.textContent = `Get your API key at ${kp}`;
+        keyHint.classList.remove('hidden');
+      } else {
+        keyHint.classList.add('hidden');
+      }
+    } else if (isCustom) {
+      $('#ni-slug').value = '';
+      $('#ni-ctx').value = '128000';
+      keyHint.classList.add('hidden');
+    }
+  }
+
+  presetSel.addEventListener('change', applyPreset);
+  applyPreset(); // run once on open
+
+  // ── Submit ─────────────────────────────────────────────────────────────
   $('#form-new-instance').addEventListener('submit', async (ev) => {
     ev.preventDefault();
+
+    const rawModels = $('#ni-models').value.trim();
+    const presetOpt = presetSel.options[presetSel.selectedIndex];
+    const isCustom = presetOpt.dataset.custom === 'true';
+    const providerIdValue = isCustom
+      ? $('#ni-provider-id').value.trim()
+      : presetOpt.value;
+
+    // Ambiguity guard: provider form + raw models_toml are mutually exclusive.
+    if (providerIdValue && rawModels) {
+      toast('Cannot use both the provider form and a raw models.toml — clear one of them.', 'error');
+      return;
+    }
+
     const env = {};
     for (const line of $('#ni-env').value.split('\n')) {
       const t = line.trim();
@@ -295,11 +411,28 @@ async function openNewInstanceModal() {
       if (eq <= 0) { toast(`bad env line: ${t}`, 'error'); return; }
       env[t.slice(0, eq).trim()] = t.slice(eq + 1).trim();
     }
+
+    // Build llm_seed only when the provider form was filled in.
+    let llm_seed = null;
+    if (providerIdValue) {
+      const familyValue = isCustom
+        ? $('#ni-family').value.trim()
+        : presetOpt.dataset.family;
+      llm_seed = {
+        provider_id: providerIdValue,
+        slug: $('#ni-slug').value.trim(),
+        api_key: $('#ni-apikey').value,
+        family: familyValue || 'Default',
+        context_window_tokens: $('#ni-ctx').value ? Number($('#ni-ctx').value) : null,
+      };
+    }
+
     const body = {
       name: $('#ni-name').value.trim(),
       env,
       config_toml: $('#ni-config').value.trim() || null,
-      models_toml: $('#ni-models').value.trim() || null,
+      models_toml: rawModels || null,
+      llm_seed,
       user_ids: grantValues(),
       memory_mb: $('#ni-mem').value ? Number($('#ni-mem').value) : null,
       cpus: $('#ni-cpus').value ? Number($('#ni-cpus').value) : null,

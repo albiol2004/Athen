@@ -32,6 +32,7 @@ mod instances;
 mod notify;
 mod proxy;
 mod ratelimit;
+mod seed;
 mod ui;
 
 use std::net::SocketAddr;

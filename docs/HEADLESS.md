@@ -35,24 +35,97 @@ graceful shutdown coordinator as the desktop Quit path (monitors drained,
 live agent runs finalized as cancelled, spawned processes killed, WAL
 checkpointed), so `docker stop` is clean.
 
-## Per-instance isolation
+## Environment variable reference
 
 Everything an instance owns lives under one directory, so containers /
-multi-tenant hosts isolate by pointing each instance at its own tree:
+multi-tenant hosts isolate by pointing each instance at its own tree.
+Two read models: **boot** vars are read once at process start; **overlay**
+vars are re-applied after vault hydration on every config (re)read
+(including per-arc router rebuilds) and win over the vault. Every overlay
+var — plus `ATHEN_HTTP_TOKEN` — also accepts a `NAME_FILE` variant whose
+value is a path to a mounted secret file (trailing newline trimmed, so
+Docker secrets work out of the box); the direct var wins when both are
+set, and empty values are ignored.
+
+### Identity & paths (boot)
 
 | Env var | Meaning | Default |
 |---|---|---|
-| `ATHEN_DATA_DIR` | Data tree root: `config.toml`, `models.toml`, vault, SQLite, workspace, skills, snapshots | `~/.athen` |
-| `ATHEN_WORKSPACE_DIR` | Where relative paths in file/shell tools resolve | `<data_dir>/workspace` |
-| `ATHEN_VAULT_BACKEND` | `file` \| `keyring` \| `auto` | `auto` |
-| `ATHEN_HEADLESS` | `1`/`true` = same as `--headless` | unset |
-| `ATHEN_HTTP_ADDR` | Enable the HTTP API on this socket (e.g. `0.0.0.0:8787`) | unset (disabled) |
-| `ATHEN_HTTP_TOKEN` | API bearer token (`_FILE` variant accepted) | auto-generated at `<data_dir>/http_token` |
+| `ATHEN_DATA_DIR` | Data tree root: `config.toml`, `models.toml`, vault, SQLite, workspace, skills, snapshots. Also honored by `athen-cli`. | `~/.athen` (Windows: `%APPDATA%\Athen`) |
+| `ATHEN_WORKSPACE_DIR` | Where relative paths in file/shell tools resolve (benchmark harnesses point this at the task dir) | `<data_dir>/workspace` |
+| `ATHEN_VAULT_BACKEND` | `auto` \| `file` \| `keyring`, case-insensitive (unknown values warn and mean `auto`) | `auto` |
+| `ATHEN_HEADLESS` | `1`/`true` = same as `--headless`, checked before any GTK/WebKit touchpoint | unset |
 
 Set `ATHEN_VAULT_BACKEND=file` in containers: there is no secret-service
 daemon, and forcing the encrypted-file backend skips the D-Bus probe
 entirely (in `auto` mode the fallback still engages, just noisier and, with
 a present-but-locked keyring daemon, potentially slow).
+
+### HTTP API (boot; desktop honors these too)
+
+| Env var | Meaning | Default |
+|---|---|---|
+| `ATHEN_HTTP_ADDR` | Enable the HTTP API + embedded web UI on this socket (e.g. `0.0.0.0:8787`). Unset, empty, or unparseable (warns) = disabled. | unset (disabled) |
+| `ATHEN_HTTP_TOKEN` | API bearer token (`_FILE` accepted). Precedence: env → persisted `<data_dir>/http_token` → freshly generated (mode 0600). | auto-generated |
+
+### Credential seeding (env overlay; all accept `_FILE`)
+
+| Variable | Target |
+|---|---|
+| `ATHEN_PROVIDER_<ID>_API_KEY` | LLM provider api_key — `<ID>` = provider id uppercased, non-alphanumerics → `_` (`opencode_go` → `OPENCODE_GO`, `my-relay.v2` → `MY_RELAY_V2`). Only patches providers that already exist in `models.toml`. |
+| `ATHEN_EMBEDDING_API_KEY` | cloud embedding provider key |
+
+### Sense credentials (env overlay; all accept `_FILE`)
+
+| Variable | Target |
+|---|---|
+| `ATHEN_TELEGRAM_BOT_TOKEN` | Telegram bot token |
+| `ATHEN_IMAP_PASSWORD` | email IMAP password |
+| `ATHEN_SMTP_PASSWORD` | email SMTP password |
+
+### Web search (env overlay; all accept `_FILE`)
+
+| Variable | Target |
+|---|---|
+| `ATHEN_WEBSEARCH_BRAVE_API_KEY` | Brave web-search key |
+| `ATHEN_WEBSEARCH_TAVILY_API_KEY` | Tavily web-search key |
+
+### Tuning & debug
+
+| Env var | Meaning | Default |
+|---|---|---|
+| `ATHEN_DISABLE_RISK_GATE` | Any value except empty/`0`/`false` skips the rule-engine risk gate in `shell_execute`/`shell_spawn` (checked per command). Sandboxed benchmark harnesses only — never set in production. | unset (gate on) |
+| `ATHEN_LLM_VERBOSE_ROUTING` | `1`/`true` makes the LLM profile-routing classifier also return a reasoning field (costs tokens + latency) | off |
+| `RUST_LOG` | standard tracing `EnvFilter` | `info` |
+
+### Voice (desktop only)
+
+| Env var | Meaning | Default |
+|---|---|---|
+| `ATHEN_PIPECAT_RUNNER` | Path override for the Pipecat voice runner (dev fallback when the Tauri resource dir is missing; used only if the path exists). Headless has no voice. | bundled resource |
+
+### athen-cli (REPL / one-shot) — not read by the daemon
+
+These configure `athen-cli --prompt` (the stateless benchmark/CI path)
+only; `athen-app` ignores them. `ATHEN_DATA_DIR`/`ATHEN_VAULT_BACKEND`
+above additionally apply to `athen-cli vault` and `--profile` resolution.
+
+| Env var | Meaning | Default |
+|---|---|---|
+| `ATHEN_BASE_URL` | OpenAI-compatible endpoint (required) | — |
+| `ATHEN_MODEL` | model slug (required) | — |
+| `ATHEN_API_KEY` | bearer token, if the backend needs one | unset |
+| `ATHEN_FAMILY` | model-family wire id for per-model quirks; `--family` wins; unknown ids exit 2 | `Default` |
+| `ATHEN_TEMPERATURE` | sampling temperature, unclamped float; `--temperature` wins | executor default (0.7) |
+| `ATHEN_TASK_TIMEOUT_SECS` | per-task overall timeout (seconds) | `1800` |
+
+(`ATHEN_MAX_STEPS` appears in `athen-cli --help` but is not read by any
+code today.)
+
+> Build-time only, not operator-facing: `ATHEN_TARGET_TRIPLE` (stamped by
+> `athen-shell`'s build script to locate the bundled `nu` binary).
+> `ATHEN_CALDAV_URL/USER/PASSWORD` exist only in the `athen-caldav` smoke
+> example — the app takes CalDAV credentials via Settings / the vault.
 
 ## Credential separation
 
@@ -76,19 +149,10 @@ Three layers, later wins:
    serve with the same `ATHEN_DATA_DIR` + `ATHEN_VAULT_BACKEND`.)
 3. **Env-var overlay** — orchestrator-injected secrets, the Docker/K8s
    native path. Applied after vault hydration on every config (re)read, so
-   they also survive per-arc router rebuilds:
-
-   | Variable | Target |
-   |---|---|
-   | `ATHEN_PROVIDER_<ID>_API_KEY` | provider api_key (`<ID>` = provider id uppercased, non-alphanumerics → `_`; e.g. `opencode_go` → `OPENCODE_GO`) |
-   | `ATHEN_TELEGRAM_BOT_TOKEN` | Telegram bot token |
-   | `ATHEN_IMAP_PASSWORD` / `ATHEN_SMTP_PASSWORD` | email credentials |
-   | `ATHEN_WEBSEARCH_BRAVE_API_KEY` / `ATHEN_WEBSEARCH_TAVILY_API_KEY` | web search |
-   | `ATHEN_EMBEDDING_API_KEY` | cloud embeddings |
-
-   Every variable also accepts a `_FILE` suffix form whose value is a path
-   to a mounted secret file (`ATHEN_TELEGRAM_BOT_TOKEN_FILE=/run/secrets/bot_token`),
-   trailing newline trimmed — i.e. Docker secrets work out of the box.
+   they also survive per-arc router rebuilds. The full variable list lives
+   in the [reference above](#environment-variable-reference); every one
+   accepts the `_FILE` suffix form
+   (`ATHEN_TELEGRAM_BOT_TOKEN_FILE=/run/secrets/bot_token`).
 
 Secrets never need to be baked into images or written into the mounted
 config files; the on-disk `config.toml`/`models.toml` can keep blanked
@@ -226,6 +290,13 @@ http://<host>:8787/  →  login screen  →  paste the http_token  →  chat
   `localStorage`; REST uses the `Authorization` header, `EventSource`
   uses `?token=`). The app shell itself is public by design — every
   byte of user data stays behind the token-gated `/api/*` routes.
+- **Gateway mode (admin panel):** served through `athen-admin` at
+  `/i/{instance}/`, the client detects the path prefix, probes
+  `/api/arcs/current`, and skips the login screen entirely — the panel
+  session cookie is the auth and the proxy injects the instance bearer.
+  The Vite build uses `base: './'` (relative asset paths) so the same
+  committed `dist` works at `/` and under the prefix. See
+  ADMIN_PANEL.md § route map.
 - **Scope (parity round, 2026-06-10):** the full desktop chat surface —
   arcs sidebar (switch / new / unread dots / rename / compact / delete
   via per-row menu), streaming chat with collapsible thinking blocks,

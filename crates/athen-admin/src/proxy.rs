@@ -1,4 +1,7 @@
-//! Reverse proxy `/i/{instance}/api/*` → the instance's HTTP API.
+//! Reverse proxy `/i/{instance}/api/*` → the instance's HTTP API, and
+//! `/i/{instance}/` → the instance's embedded web UI (static shell +
+//! SPA routes), so admins get the full client — Settings modal included —
+//! without ever holding the instance token.
 //!
 //! The browser/mobile client authenticates to the panel with its session
 //! cookie; the proxy swaps that for the instance's bearer token, which
@@ -41,10 +44,43 @@ const STRIP: &[header::HeaderName] = &[
     header::UPGRADE,
 ];
 
+/// `/i/{instance}/api/{*path}` — the instance HTTP API.
 pub async fn handle(
     State(state): State<Arc<PanelState>>,
     Extension(CurrentUser(user)): Extension<CurrentUser>,
     Path((instance_id, path)): Path<(String, String)>,
+    req: Request,
+) -> Response {
+    forward(state, user, instance_id, format!("api/{path}"), req).await
+}
+
+/// `/i/{instance}/{*path}` — the instance's embedded web UI (static
+/// assets + SPA routes). The instance serves these without a token, but
+/// the bearer is injected anyway so the path split stays in one place.
+pub async fn handle_ui(
+    State(state): State<Arc<PanelState>>,
+    Extension(CurrentUser(user)): Extension<CurrentUser>,
+    Path((instance_id, path)): Path<(String, String)>,
+    req: Request,
+) -> Response {
+    forward(state, user, instance_id, path, req).await
+}
+
+/// `/i/{instance}/` — the web UI shell (index.html).
+pub async fn handle_ui_root(
+    State(state): State<Arc<PanelState>>,
+    Extension(CurrentUser(user)): Extension<CurrentUser>,
+    Path(instance_id): Path<String>,
+    req: Request,
+) -> Response {
+    forward(state, user, instance_id, String::new(), req).await
+}
+
+async fn forward(
+    state: Arc<PanelState>,
+    user: crate::db::User,
+    instance_id: String,
+    upstream_path: String,
     req: Request,
 ) -> Response {
     // Access: admins reach every instance, users need a grant. 404 (not
@@ -82,7 +118,10 @@ pub async fn handle(
         .query()
         .map(|q| format!("?{q}"))
         .unwrap_or_default();
-    let url = format!("http://{ip}:{}/api/{path}{query}", instances::INSTANCE_PORT);
+    let url = format!(
+        "http://{ip}:{}/{upstream_path}{query}",
+        instances::INSTANCE_PORT
+    );
 
     let method = match reqwest::Method::from_bytes(req.method().as_str().as_bytes()) {
         Ok(m) => m,

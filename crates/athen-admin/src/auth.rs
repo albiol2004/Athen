@@ -14,7 +14,7 @@ use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use axum::extract::{Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::Next;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use chrono::{Duration, Utc};
 use std::sync::Arc;
 
@@ -191,6 +191,49 @@ pub fn clear_session_cookie() -> String {
 #[derive(Clone)]
 pub struct CurrentUser(pub User);
 
+/// Like [`require_session`], but a browser without a session is sent to
+/// the panel login page instead of getting a bare 401. For the web-UI
+/// passthrough routes (`/i/{instance}/`), where the client is a human in
+/// a browser, not a fetch call that can render an error.
+pub async fn require_session_or_login(
+    State(state): State<Arc<PanelState>>,
+    req: Request,
+    next: Next,
+) -> Result<Response, Response> {
+    let to_login = req.method() == axum::http::Method::GET;
+    // Carry the requested path through the login round-trip so deep links
+    // (`/i/{id}/…` shared with a user) land back where they pointed. The
+    // panel JS validates `next` as a same-origin `/i/…` path before using it.
+    let wanted = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_default();
+    match require_session(State(state), req, next).await {
+        Ok(resp) => Ok(resp),
+        Err(StatusCode::UNAUTHORIZED) if to_login => {
+            let to = format!("/?next={}", percent_encode_query(&wanted));
+            Ok(axum::response::Redirect::temporary(&to).into_response())
+        }
+        Err(code) => Err(code.into_response()),
+    }
+}
+
+/// Minimal percent-encoding for a query-param value: keeps unreserved
+/// chars and `/`, encodes everything else (incl. `&`, `=`, `?`, `#`).
+fn percent_encode_query(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// Middleware: every route behind this requires a live session.
 pub async fn require_session(
     State(state): State<Arc<PanelState>>,
@@ -234,4 +277,19 @@ pub async fn user_can_access(db: &Db, user: &User, instance_id: &str) -> anyhow:
         })
         .await?;
     Ok(n > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::percent_encode_query;
+
+    #[test]
+    fn percent_encode_keeps_paths_and_escapes_delimiters() {
+        assert_eq!(percent_encode_query("/i/abc-123/"), "/i/abc-123/");
+        assert_eq!(
+            percent_encode_query("/i/x/?a=1&b=2#f"),
+            "/i/x/%3Fa%3D1%26b%3D2%23f"
+        );
+        assert_eq!(percent_encode_query("a b"), "a%20b");
+    }
 }

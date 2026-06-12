@@ -8,6 +8,8 @@
 //! - everything else under `/panel/*` — session-gated panel REST
 //!   (admin-only checks per handler)
 //! - `/i/{instance}/api/*` — session-gated reverse proxy to the instance
+//! - `/i/{instance}/` — session-gated passthrough to the instance's
+//!   embedded web UI (full client incl. Settings; no session → login)
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,7 +25,7 @@ use serde_json::json;
 
 use crate::auth::{self, CurrentUser};
 use crate::db::{self, User};
-use crate::{instances, proxy, ui, PanelState};
+use crate::{instances, proxy, seed, ui, PanelState};
 
 pub fn router(state: Arc<PanelState>) -> Router {
     // Session-gated panel API (admin checks happen per-handler).
@@ -33,6 +35,7 @@ pub fn router(state: Arc<PanelState>) -> Router {
         .route("/panel/password", post(change_password))
         .route("/panel/notify", post(set_notify_url))
         .route("/panel/audit", get(audit_list))
+        .route("/panel/instance_presets", get(instance_presets_list))
         .route(
             "/panel/instances",
             get(instances_list).post(instances_create),
@@ -63,6 +66,19 @@ pub fn router(state: Arc<PanelState>) -> Router {
             auth::require_session,
         ));
 
+    // Web-UI passthrough: the instance's embedded React client (Settings
+    // modal included) at /i/{instance}/. Browser-facing, so a missing
+    // session redirects to the panel login instead of a bare 401. The
+    // static `api`/`chat` segments above win over the wildcard.
+    let instances_ui = Router::new()
+        .route("/i/{instance}", get(ui::ui_slash_redirect))
+        .route("/i/{instance}/", any(proxy::handle_ui_root))
+        .route("/i/{instance}/{*path}", any(proxy::handle_ui))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_session_or_login,
+        ));
+
     Router::new()
         .route("/", get(ui::index))
         .route("/panel.css", get(ui::styles))
@@ -71,6 +87,7 @@ pub fn router(state: Arc<PanelState>) -> Router {
         .route("/panel/login", post(login))
         .merge(panel)
         .merge(instances_proxy)
+        .merge(instances_ui)
         .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024))
         .with_state(state)
 }
@@ -81,6 +98,18 @@ async fn health() -> Json<serde_json::Value> {
         "name": "athen-admin",
         "version": env!("CARGO_PKG_VERSION"),
     }))
+}
+
+/// Return the LLM provider preset catalog (session-gated).
+///
+/// Used by the provision modal to populate the "Model provider" dropdown so
+/// operators don't have to hand-write provider IDs, family strings, and
+/// context windows. The "Custom…" entry (last row, `custom: true`) signals
+/// the UI to display free-form text inputs instead of pre-filled values.
+async fn instance_presets_list(
+    Extension(CurrentUser(_user)): Extension<CurrentUser>,
+) -> Json<serde_json::Value> {
+    Json(serde_json::to_value(seed::PRESETS).unwrap_or(json!([])))
 }
 
 // ---------------------------------------------------------------- auth --
@@ -346,6 +375,29 @@ async fn instances_list(
     Json(out).into_response()
 }
 
+/// Structured LLM seed from the provision modal. All fields optional so the
+/// caller can send a partial object or omit the field entirely (in which case
+/// the structured seed path is skipped). When `provider_id` is non-empty, all
+/// required fields must be present.
+#[derive(serde::Deserialize, Default)]
+struct LlmSeedBody {
+    /// Provider id, e.g. `"deepseek"`. Empty or absent = skip structured seed.
+    #[serde(default)]
+    provider_id: String,
+    /// Model slug, e.g. `"deepseek-v4-flash"`.
+    #[serde(default)]
+    slug: String,
+    /// API key. Injected into the container env; never written to the file.
+    #[serde(default)]
+    api_key: String,
+    /// `ModelFamily::wire_id()` string, e.g. `"DeepSeekV4Chat"`.
+    #[serde(default)]
+    family: String,
+    /// Authoritative context window. `null` or absent → preset default (128k).
+    #[serde(default)]
+    context_window_tokens: Option<u32>,
+}
+
 #[derive(serde::Deserialize)]
 struct CreateInstanceBody {
     name: String,
@@ -355,6 +407,12 @@ struct CreateInstanceBody {
     config_toml: Option<String>,
     #[serde(default)]
     models_toml: Option<String>,
+    /// Structured LLM seed. Mutually exclusive with `models_toml`.
+    /// When `provider_id` is empty or the whole field is absent, the
+    /// structured seed path is skipped and behaviour is identical to the
+    /// existing raw `models_toml` path.
+    #[serde(default)]
+    llm_seed: Option<LlmSeedBody>,
     #[serde(default)]
     user_ids: Vec<String>,
     #[serde(default)]
@@ -385,6 +443,36 @@ async fn instances_create(
             "cpus must be > 0; memory_mb and disk_limit_mb must be >= 64",
         );
     }
+
+    // Reject the ambiguous case before touching Docker.
+    if body.models_toml.is_some()
+        && body
+            .llm_seed
+            .as_ref()
+            .is_some_and(|s| !s.provider_id.is_empty())
+    {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "models_toml and llm_seed are mutually exclusive — set one or the other",
+        );
+    }
+
+    // Translate the optional LlmSeedBody into an Option<LlmSeed> (non-empty
+    // provider_id is the sentinel that the form was filled in).
+    let llm_seed = body.llm_seed.and_then(|s| {
+        if s.provider_id.is_empty() {
+            None
+        } else {
+            Some(seed::LlmSeed {
+                provider_id: s.provider_id,
+                slug: s.slug,
+                api_key: s.api_key,
+                family: s.family,
+                context_window_tokens: s.context_window_tokens,
+            })
+        }
+    });
+
     match instances::create(
         &state,
         instances::CreateSpec {
@@ -392,6 +480,7 @@ async fn instances_create(
             env: body.env,
             config_toml: body.config_toml,
             models_toml: body.models_toml,
+            llm_seed,
             user_ids: body.user_ids,
             memory_mb: body.memory_mb,
             cpus: body.cpus,
@@ -406,10 +495,19 @@ async fn instances_create(
         }
         Err(e) => {
             tracing::error!(error = %e, "instance provisioning failed");
-            err(
-                StatusCode::BAD_GATEWAY,
-                &format!("provisioning failed: {e:#}"),
-            )
+            // Map our validation errors (ambiguous seed, invalid provider_id)
+            // to 400 Bad Request rather than the generic 502 Bad Gateway.
+            let (status, msg) = if e.to_string().contains("mutually exclusive")
+                || e.to_string().contains("invalid llm_seed")
+            {
+                (StatusCode::BAD_REQUEST, format!("{e:#}"))
+            } else {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    format!("provisioning failed: {e:#}"),
+                )
+            };
+            err(status, &msg)
         }
     }
 }
