@@ -41,6 +41,11 @@ CREATE TABLE IF NOT EXISTS project_arc_folds (
     last_folded_entry_id INTEGER NOT NULL,
     PRIMARY KEY (project_id, arc_id)
 );
+
+CREATE TABLE IF NOT EXISTS project_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 "#;
 
 /// A Project: a context-scope above arcs that groups many arcs around common
@@ -396,6 +401,48 @@ impl ProjectStore {
                 params![project_id, arc_id, last_folded_entry_id],
             )
             .map_err(|e| AthenError::Other(format!("Set fold watermark: {e}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
+    /// Read a project-scoped key-value setting. `None` if the key is unset.
+    /// Used for durable project-feature settings (e.g. `summary_mode`) that
+    /// must survive restarts rather than live only in memory.
+    pub async fn get_meta(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.conn.clone();
+        let key = key.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.query_row(
+                "SELECT value FROM project_meta WHERE key = ?1",
+                params![key],
+                |row| row.get::<_, String>(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(AthenError::Other(format!("Get project meta: {other}"))),
+            })
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
+    /// Upsert a project-scoped key-value setting.
+    pub async fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.conn.clone();
+        let key = key.to_string();
+        let value = value.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "INSERT INTO project_meta (key, value) VALUES (?1, ?2) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )
+            .map_err(|e| AthenError::Other(format!("Set project meta: {e}")))?;
             Ok(())
         })
         .await

@@ -10018,6 +10018,12 @@ pub(crate) async fn set_project_summary_mode_core(
             "Invalid project_summary_mode '{mode}' (expected auto|manual|off)"
         ));
     }
+    if let Some(ref ps) = state.project_store {
+        // Persist so the choice survives restarts (hydrated in AppState::new).
+        if let Err(e) = ps.set_meta("summary_mode", &normalized).await {
+            tracing::warn!("failed to persist project_summary_mode: {e}");
+        }
+    }
     *state.project_summary_mode.lock().await = normalized;
     Ok(())
 }

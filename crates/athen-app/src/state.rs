@@ -1109,6 +1109,18 @@ impl AppState {
         if let Err(e) = athen_core::paths::seed_workspace_skeleton() {
             tracing::warn!("failed to seed workspace skeleton: {e}");
         }
+        // Hydrate the persisted project-summary compaction mode so a user's
+        // choice (e.g. "off" to avoid token spend on local models) survives
+        // restarts instead of silently resetting to "auto".
+        let project_summary_mode_init = match project_store.as_ref() {
+            Some(ps) => ps
+                .get_meta("summary_mode")
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "auto".to_string()),
+            None => "auto".to_string(),
+        };
         // Skill store: bodies live under <data_dir>/skills/. Construction is
         // gated on a known data_dir so an in-memory / data_dir-less boot
         // still works (skills just won't be available, same as identity).
@@ -1195,7 +1207,7 @@ impl AppState {
             model_name: Mutex::new(model_name),
             active_arc_id: Mutex::new(active_arc_id),
             active_project_id: Mutex::new(None),
-            project_summary_mode: Mutex::new("auto".to_string()),
+            project_summary_mode: Mutex::new(project_summary_mode_init),
             arc_store,
             calendar_store,
             trust_manager: contact_store

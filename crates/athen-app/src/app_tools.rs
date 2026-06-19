@@ -3497,8 +3497,8 @@ mod tests {
         let tools = registry.list_tools().await.unwrap();
         assert_eq!(
             tools.len(),
-            24,
-            "Expected 19 shell + 4 calendar + 1 athen_docs tools"
+            25,
+            "Expected 19 shell + 4 calendar + 1 athen_docs + 1 save_file tools"
         );
 
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
@@ -3515,13 +3515,15 @@ mod tests {
         let tools = registry.list_tools().await.unwrap();
         assert_eq!(
             tools.len(),
-            20,
-            "Expected 19 shell/web/memory/toolbox/email/telegram + 1 athen_docs tools when calendar is None"
+            21,
+            "Expected 19 shell/web/memory/toolbox/email/telegram + 1 athen_docs + 1 save_file tools when calendar is None"
         );
 
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(!names.contains(&"calendar_list"));
         assert!(!names.contains(&"calendar_create"));
+        // save_file is always advertised, independent of calendar/store wiring.
+        assert!(names.contains(&"save_file"));
     }
 
     // 3. shell_tools_still_work
@@ -3930,8 +3932,8 @@ mod tests {
         assert!(names.contains(&"contacts_create"));
         assert!(names.contains(&"contacts_update"));
         assert!(names.contains(&"contacts_delete"));
-        // 19 shell + 5 contact + 1 athen_docs = 25
-        assert_eq!(tools.len(), 25);
+        // 19 shell + 5 contact + 1 athen_docs + 1 save_file = 26
+        assert_eq!(tools.len(), 26);
     }
 
     // 17. list_tools_with_all_stores
@@ -3939,8 +3941,8 @@ mod tests {
     async fn list_tools_with_all_stores() {
         let (_db, registry) = setup_with_all().await;
         let tools = registry.list_tools().await.unwrap();
-        // 19 shell + 4 calendar + 5 contact = 28
-        assert_eq!(tools.len(), 29);
+        // 19 shell + 4 calendar + 5 contact + 1 save_file = 29 (+1 athen_docs = 30)
+        assert_eq!(tools.len(), 30);
     }
 
     // 18. contacts_create_basic
