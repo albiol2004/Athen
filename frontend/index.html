@@ -271,6 +271,7 @@
             <nav class="settings-tabs" role="tablist">
                 <button class="settings-tab active" data-settings-tab="models" role="tab" aria-selected="true">Models</button>
                 <button class="settings-tab" data-settings-tab="agents" role="tab" aria-selected="false">Agents &amp; Tools</button>
+                <button class="settings-tab" data-settings-tab="projects" role="tab" aria-selected="false">Projects</button>
                 <button class="settings-tab" data-settings-tab="connections" role="tab" aria-selected="false">Connections</button>
                 <button class="settings-tab" data-settings-tab="security" role="tab" aria-selected="false">Security &amp; Access</button>
             </nav>
@@ -459,6 +460,29 @@
                 <div id="toolbox-list" class="toolbox-list"></div>
                 <div class="setting-actions">
                     <button id="clear-toolbox-btn" class="btn-secondary">Clear toolbox</button>
+                </div>
+            </section>
+            </div>
+
+            <div class="settings-tab-pane" data-settings-pane="projects">
+            <section class="settings-section">
+                <h2>Projects</h2>
+                <p class="settings-description">Projects group many arcs around a shared body of work, like a ChatGPT/Claude project. Each project has a workspace folder, optional standing instructions injected into every arc inside it, and a maintained summary of work done so far. Assign an arc to a project from its <strong>⋯</strong> menu in the sidebar.</p>
+
+                <div class="setting-row">
+                    <label for="project-summary-mode">Project summary updates</label>
+                    <select id="project-summary-mode" class="settings-select">
+                        <option value="auto">Auto (refresh as arcs change)</option>
+                        <option value="manual">Manual (only when I ask)</option>
+                        <option value="off">Off (no summaries)</option>
+                    </select>
+                    <p class="setting-hint">Summaries fold each arc's work into a project-wide overview. Auto keeps it fresh in the background; Manual updates only via the per-project button below.</p>
+                </div>
+
+                <div id="projects-list" class="projects-list"></div>
+
+                <div class="setting-actions">
+                    <button id="project-new-btn" class="btn-primary" type="button">+ New Project</button>
                 </div>
             </section>
             </div>

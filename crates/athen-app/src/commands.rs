@@ -504,6 +504,82 @@ async fn resolve_active_project(
     ps.get_project(&pid).await.ok().flatten()
 }
 
+/// Project-scoped recall boost (context layer 3): stable-partition recalled
+/// memories so those tagged with the active project's id come first, preserving
+/// relative order within each group and the total set / cap. When the arc has
+/// no active project this is a no-op (`project_id` is `None`), so behavior is
+/// byte-identical to pre-Projects recall. A memory matches when its
+/// `metadata["project_id"]` string equals `project_id`.
+fn boost_project_memories(
+    items: &mut [athen_core::traits::memory::MemoryItem],
+    project_id: Option<&str>,
+) {
+    let Some(pid) = project_id else { return };
+    // `sort_by_key` is stable, so memories keep their fused-rank order within
+    // each group; only the cross-group partition (in-project before the rest)
+    // is imposed. `false < true`, so negate to lift matches to the front.
+    items.sort_by_key(|m| {
+        let in_project = m
+            .metadata
+            .get("project_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s == pid)
+            .unwrap_or(false);
+        !in_project
+    });
+}
+
+#[cfg(test)]
+mod boost_project_memories_tests {
+    use super::boost_project_memories;
+    use athen_core::traits::memory::MemoryItem;
+
+    fn mem(id: &str, project_id: Option<&str>) -> MemoryItem {
+        let metadata = match project_id {
+            Some(p) => serde_json::json!({ "project_id": p }),
+            None => serde_json::json!({ "source": "conversation" }),
+        };
+        MemoryItem {
+            id: id.into(),
+            content: id.into(),
+            metadata,
+        }
+    }
+
+    fn ids(items: &[MemoryItem]) -> Vec<&str> {
+        items.iter().map(|m| m.id.as_str()).collect()
+    }
+
+    #[test]
+    fn no_active_project_leaves_order_untouched() {
+        let mut items = vec![mem("a", Some("p1")), mem("b", None), mem("c", Some("p2"))];
+        boost_project_memories(&mut items, None);
+        assert_eq!(ids(&items), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn matching_project_memories_move_to_front_stably() {
+        let mut items = vec![
+            mem("a", None),
+            mem("b", Some("p1")),
+            mem("c", None),
+            mem("d", Some("p1")),
+            mem("e", Some("p2")),
+        ];
+        boost_project_memories(&mut items, Some("p1"));
+        // Matches (b, d) lifted, keeping their relative order; non-matches
+        // (a, c, e) keep theirs. Total set + count unchanged.
+        assert_eq!(ids(&items), ["b", "d", "a", "c", "e"]);
+    }
+
+    #[test]
+    fn no_matches_leaves_order_untouched() {
+        let mut items = vec![mem("a", Some("p2")), mem("b", None), mem("c", Some("p3"))];
+        boost_project_memories(&mut items, Some("p1"));
+        assert_eq!(ids(&items), ["a", "b", "c"]);
+    }
+}
+
 /// Render the VOLATILE project context block (Layers 2 + 4) appended to the
 /// system suffix at the end of the prompt body — never the cached static
 /// prefix. Carries the maintained project summary (if any) and a shallow,
@@ -2541,6 +2617,19 @@ pub(crate) async fn send_message_core(
                             }
                         }
                     }
+                    // Context layer 3: prefer memories tagged with this arc's
+                    // active project. No-op (untouched order) when the arc has
+                    // no project ⇒ byte-identical to pre-Projects recall.
+                    let recall_project = resolve_active_project(
+                        state.project_store.as_ref(),
+                        state.arc_store.as_ref(),
+                        &active_arc,
+                    )
+                    .await;
+                    boost_project_memories(
+                        &mut all_items,
+                        recall_project.as_ref().map(|p| p.id.as_str()),
+                    );
                     // Genuine recall → record the consult so recency/frequency
                     // signals and linked-entity reinforcement climb. Not called
                     // from write-time dedup recalls (would inflate frequency).
@@ -3110,6 +3199,9 @@ pub(crate) async fn send_message_core(
                 let msg_clone = message.clone();
                 let content_clone = content.clone();
                 let memory_clone = Arc::clone(memory);
+                // Context layer 3: tag memories with the arc's active project.
+                // None when the arc has no project ⇒ key omitted, unchanged.
+                let project_id = active_project.as_ref().map(|p| p.id.clone());
 
                 // Fire-and-forget in background so it doesn't block the response.
                 tokio::spawn(async move {
@@ -3123,14 +3215,20 @@ pub(crate) async fn send_message_core(
                     {
                         Some(summary) => {
                             tracing::info!("Memory judge: worth remembering");
+                            let mut metadata = serde_json::json!({
+                                "source": "conversation",
+                                "arc_id": arc_id,
+                                "timestamp": chrono::Utc::now().to_rfc3339(),
+                            });
+                            if let (Some(pid), Some(map)) =
+                                (&project_id, metadata.as_object_mut())
+                            {
+                                map.insert("project_id".into(), pid.clone().into());
+                            }
                             let item = athen_core::traits::memory::MemoryItem {
                                 id: uuid::Uuid::new_v4().to_string(),
                                 content: summary,
-                                metadata: serde_json::json!({
-                                    "source": "conversation",
-                                    "arc_id": arc_id,
-                                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                                }),
+                                metadata,
                             };
                             if let Err(e) = memory_clone.remember(item).await {
                                 tracing::warn!("Failed to remember interaction: {e}");
@@ -3721,6 +3819,18 @@ pub(crate) async fn execute_approved_task(
                     }
                 }
             }
+            // Context layer 3: prefer this arc's active-project memories.
+            // No-op when the arc has no project ⇒ unchanged order.
+            let recall_project = resolve_active_project(
+                ctx.project_store.as_ref(),
+                ctx.arc_store.as_ref(),
+                &ctx.active_arc_id,
+            )
+            .await;
+            boost_project_memories(
+                &mut all_items,
+                recall_project.as_ref().map(|p| p.id.as_str()),
+            );
             // Genuine recall → record the consult so recency/frequency signals
             // and linked-entity reinforcement climb. Not called from write-time
             // dedup recalls (which would inflate the frequency signal).
@@ -4431,6 +4541,8 @@ pub(crate) async fn execute_approved_task(
         let msg_clone = message.clone();
         let content_clone = content.clone();
         let memory_clone = Arc::clone(memory);
+        // Context layer 3: tag with the arc's active project (None ⇒ omitted).
+        let project_id = active_project.as_ref().map(|p| p.id.clone());
         tokio::spawn(async move {
             match judge_worth_remembering(
                 &router,
@@ -4442,14 +4554,18 @@ pub(crate) async fn execute_approved_task(
             {
                 Some(summary) => {
                     tracing::info!("Memory judge: worth remembering (approved task)");
+                    let mut metadata = serde_json::json!({
+                        "source": "conversation",
+                        "arc_id": arc_id,
+                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                    });
+                    if let (Some(pid), Some(map)) = (&project_id, metadata.as_object_mut()) {
+                        map.insert("project_id".into(), pid.clone().into());
+                    }
                     let item = athen_core::traits::memory::MemoryItem {
                         id: uuid::Uuid::new_v4().to_string(),
                         content: summary,
-                        metadata: serde_json::json!({
-                            "source": "conversation",
-                            "arc_id": arc_id,
-                            "timestamp": chrono::Utc::now().to_rfc3339(),
-                        }),
+                        metadata,
                     };
                     if let Err(e) = memory_clone.remember(item).await {
                         tracing::warn!("Failed to remember interaction: {e}");
@@ -4907,6 +5023,18 @@ pub(crate) async fn execute_dispatched_task(
                     }
                 }
             }
+            // Context layer 3: prefer this arc's active-project memories.
+            // No-op when the arc has no project ⇒ unchanged order.
+            let recall_project = resolve_active_project(
+                ctx.project_store.as_ref(),
+                ctx.arc_store.as_ref(),
+                &arc_id,
+            )
+            .await;
+            boost_project_memories(
+                &mut all_items,
+                recall_project.as_ref().map(|p| p.id.as_str()),
+            );
             // Genuine recall → record the consult so recency/frequency signals
             // and linked-entity reinforcement climb. Not called from write-time
             // dedup recalls (which would inflate the frequency signal).
@@ -5578,6 +5706,8 @@ pub(crate) async fn execute_dispatched_task(
         let msg_clone = message.clone();
         let content_clone = content.clone();
         let memory_clone = Arc::clone(memory);
+        // Context layer 3: tag with the arc's active project (None ⇒ omitted).
+        let project_id = active_project.as_ref().map(|p| p.id.clone());
         tokio::spawn(async move {
             match judge_worth_remembering(
                 &router,
@@ -5589,14 +5719,18 @@ pub(crate) async fn execute_dispatched_task(
             {
                 Some(summary) => {
                     tracing::info!("Memory judge: worth remembering (dispatched task)");
+                    let mut metadata = serde_json::json!({
+                        "source": "conversation",
+                        "arc_id": arc_id_clone,
+                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                    });
+                    if let (Some(pid), Some(map)) = (&project_id, metadata.as_object_mut()) {
+                        map.insert("project_id".into(), pid.clone().into());
+                    }
                     let item = athen_core::traits::memory::MemoryItem {
                         id: uuid::Uuid::new_v4().to_string(),
                         content: summary,
-                        metadata: serde_json::json!({
-                            "source": "conversation",
-                            "arc_id": arc_id_clone,
-                            "timestamp": chrono::Utc::now().to_rfc3339(),
-                        }),
+                        metadata,
                     };
                     if let Err(e) = memory_clone.remember(item).await {
                         tracing::warn!("Failed to remember interaction: {e}");

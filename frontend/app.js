@@ -859,6 +859,9 @@ function startInitialDataLoads() {
     }).finally(() => {
         // Profile list is non-critical — defer so the chat UI paints first.
         scheduleIdle(() => loadAgentProfiles());
+        // Warm the project cache so the per-arc "Assign to project" menu can
+        // render its picker without an IPC round-trip on first open.
+        scheduleIdle(() => loadProjectsManager());
         performance.mark('athen-init-done');
         try {
             const t0 = performance.getEntriesByName('athen-init-start')[0];
@@ -1277,6 +1280,29 @@ function toggleArcMenu(anchorEl, arc, itemEl) {
         handleCompactArc(arc.id, null);
     }));
     menu.appendChild(mkItem('Branch', '&#x21B3;', () => branchFromArc(arc.id, arc.name)));
+    // Assign to project: clicking swaps the menu body for a project picker
+    // (None + each project). Kept in-place so the overflow menu stays the
+    // single arc-action surface rather than spawning a nested popup. Built
+    // without mkItem because mkItem closes the menu on click, which would
+    // tear down the picker before it renders.
+    {
+        const assignBtn = document.createElement('button');
+        assignBtn.className = 'arc-menu-item';
+        assignBtn.setAttribute('role', 'menuitem');
+        const ic = document.createElement('span');
+        ic.className = 'arc-menu-icon';
+        ic.innerHTML = '&#x1F4C1;';
+        const lb = document.createElement('span');
+        lb.className = 'arc-menu-label';
+        lb.textContent = 'Assign to project';
+        assignBtn.appendChild(ic);
+        assignBtn.appendChild(lb);
+        assignBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            renderArcProjectPicker(menu, arc);
+        });
+        menu.appendChild(assignBtn);
+    }
 
     const sep = document.createElement('div');
     sep.className = 'arc-menu-sep';
@@ -1318,6 +1344,90 @@ function toggleArcMenu(anchorEl, arc, itemEl) {
         sessionListEl.removeEventListener('scroll', onScrollOrResize, true);
         window.removeEventListener('resize', onScrollOrResize);
     };
+}
+
+// Swap the open arc menu's body for a project picker: a "← Back" header,
+// "None (unassigned)", then one row per project. Picking a project calls
+// assign_arc_to_project AND set_active_project so freshly-created arcs
+// inherit the same project. Reuses the cached projectsList warmed at init.
+function renderArcProjectPicker(menu, arc) {
+    menu.innerHTML = '';
+
+    const back = document.createElement('button');
+    back.className = 'arc-menu-item';
+    back.setAttribute('role', 'menuitem');
+    back.innerHTML =
+        '<span class="arc-menu-icon">&#8592;</span>' +
+        '<span class="arc-menu-label">Back</span>';
+    back.addEventListener('click', (e) => {
+        e.stopPropagation();
+        closeArcMenu();
+    });
+    menu.appendChild(back);
+
+    const sep = document.createElement('div');
+    sep.className = 'arc-menu-sep';
+    menu.appendChild(sep);
+
+    const currentProjectId = arc.project_id || null;
+
+    const mkPick = (label, projectId) => {
+        const btn = document.createElement('button');
+        btn.className = 'arc-menu-item';
+        btn.setAttribute('role', 'menuitem');
+        const check = document.createElement('span');
+        check.className = 'arc-menu-icon';
+        check.innerHTML = currentProjectId === projectId ? '&#10003;' : '';
+        const lbl = document.createElement('span');
+        lbl.className = 'arc-menu-label';
+        lbl.textContent = label;
+        btn.appendChild(check);
+        btn.appendChild(lbl);
+        btn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            closeArcMenu();
+            try {
+                await invoke('assign_arc_to_project', { arcId: arc.id, projectId });
+                await invoke('set_active_project', { projectId });
+                showToast(
+                    projectId ? `Assigned to “${label}”` : 'Removed from project',
+                    'success'
+                );
+                await loadArcs();
+            } catch (err) {
+                showToast('Assign failed: ' + err, 'error');
+            }
+        });
+        return btn;
+    };
+
+    menu.appendChild(mkPick('None (unassigned)', null));
+
+    if (projectsList.length === 0) {
+        const hint = document.createElement('div');
+        hint.className = 'arc-menu-empty';
+        hint.textContent = 'No projects yet — create one in Settings → Projects.';
+        menu.appendChild(hint);
+    } else {
+        for (const project of projectsList) {
+            menu.appendChild(mkPick(project.name, project.id));
+        }
+    }
+
+    // Reposition: the picker may be taller/shorter than the action menu.
+    if (openArcMenuTrigger) {
+        const r = openArcMenuTrigger.getBoundingClientRect();
+        const menuW = menu.offsetWidth;
+        const menuH = menu.offsetHeight;
+        let left = r.right - menuW;
+        if (left < 8) left = 8;
+        if (left + menuW > window.innerWidth - 8) left = window.innerWidth - menuW - 8;
+        let top = r.bottom + 4;
+        if (top + menuH > window.innerHeight - 8) top = r.top - menuH - 4;
+        if (top < 8) top = 8;
+        menu.style.left = `${Math.round(left)}px`;
+        menu.style.top = `${Math.round(top)}px`;
+    }
 }
 
 // Render the arc sidebar. The first ARC_EAGER_COUNT visible arcs are
@@ -6169,6 +6279,7 @@ async function loadSettings() {
         await loadProfileManager();
         await loadIdentityManager();
         await loadSkillsManager();
+        await loadProjectsManager();
         await loadCloudApis();
         loadVoicePanel();
         await loadAttachmentPolicySettings();
@@ -7486,6 +7597,250 @@ function updateSkillsTokenFooter() {
                 invalidateProfileTokenCache();
             } catch (err) {
                 showToast('Rescan failed: ' + err, 'error');
+            }
+        });
+    }
+})();
+
+// ─── Projects ─────────────────────────────────────────────────────────
+
+// Cached project list. Loaded by loadProjectsManager() and reused by the
+// per-arc "Assign to project" picker so the sidebar menu doesn't need a
+// second IPC round-trip every time it opens.
+let projectsList = [];
+// Tracks which project rows are expanded into edit mode, plus the "+ New"
+// draft pseudo-row, so a re-render after save/delete keeps the user's place.
+let projectEditingId = null;   // project id currently in edit mode, or '__new__', or null
+
+async function loadProjectsManager() {
+    if (!invoke) return;
+    try {
+        projectsList = (await invoke('list_projects')) || [];
+        renderProjectsList();
+        try {
+            const mode = await invoke('get_project_summary_mode');
+            const sel = document.getElementById('project-summary-mode');
+            if (sel && mode) sel.value = mode;
+        } catch (err) {
+            console.warn('[athen] get_project_summary_mode failed:', err);
+        }
+    } catch (err) {
+        console.error('Failed to load projects:', err);
+        showToast('Failed to load projects: ' + err, 'error');
+    }
+}
+
+function renderProjectsList() {
+    const listEl = document.getElementById('projects-list');
+    if (!listEl) return;
+    listEl.innerHTML = '';
+
+    if (projectsList.length === 0 && projectEditingId !== '__new__') {
+        const empty = document.createElement('div');
+        empty.className = 'projects-empty setting-hint';
+        empty.textContent = 'No projects yet. Click + New Project to create one.';
+        listEl.appendChild(empty);
+        return;
+    }
+
+    for (const project of projectsList) {
+        if (projectEditingId === project.id) {
+            listEl.appendChild(buildProjectEditCard(project));
+        } else {
+            listEl.appendChild(buildProjectRow(project));
+        }
+    }
+
+    if (projectEditingId === '__new__') {
+        listEl.appendChild(buildProjectEditCard(null));
+    }
+}
+
+// A read-only row for one project: name + instructions snippet + summary age,
+// with Edit / Update summary / Delete actions.
+function buildProjectRow(project) {
+    const card = document.createElement('div');
+    card.className = 'project-card';
+
+    const head = document.createElement('div');
+    head.className = 'project-card-head';
+
+    const nameEl = document.createElement('div');
+    nameEl.className = 'project-card-name';
+    nameEl.textContent = project.name;
+    head.appendChild(nameEl);
+
+    if (project.summary_updated_at) {
+        const stamp = document.createElement('span');
+        stamp.className = 'project-card-stamp';
+        stamp.textContent = 'summary updated ' + formatRelativeTime(project.summary_updated_at);
+        head.appendChild(stamp);
+    }
+    card.appendChild(head);
+
+    if (project.instructions && project.instructions.trim()) {
+        const snip = document.createElement('div');
+        snip.className = 'project-card-snippet';
+        const text = project.instructions.trim();
+        snip.textContent = text.length > 160 ? text.slice(0, 160) + '…' : text;
+        card.appendChild(snip);
+    }
+
+    const actions = document.createElement('div');
+    actions.className = 'project-card-actions';
+
+    const editBtn = document.createElement('button');
+    editBtn.className = 'btn-secondary';
+    editBtn.type = 'button';
+    editBtn.textContent = 'Edit';
+    editBtn.addEventListener('click', () => {
+        projectEditingId = project.id;
+        renderProjectsList();
+    });
+    actions.appendChild(editBtn);
+
+    const summaryBtn = document.createElement('button');
+    summaryBtn.className = 'btn-secondary';
+    summaryBtn.type = 'button';
+    summaryBtn.textContent = 'Update summary now';
+    summaryBtn.addEventListener('click', async () => {
+        summaryBtn.disabled = true;
+        const original = summaryBtn.textContent;
+        summaryBtn.textContent = 'Updating…';
+        showToast('Updating project summary…', '');
+        try {
+            await invoke('update_project_summary', { projectId: project.id });
+            showToast('Project summary updated', 'success');
+            await loadProjectsManager();
+        } catch (err) {
+            showToast('Summary update failed: ' + err, 'error');
+            summaryBtn.disabled = false;
+            summaryBtn.textContent = original;
+        }
+    });
+    actions.appendChild(summaryBtn);
+
+    const deleteBtn = document.createElement('button');
+    deleteBtn.className = 'btn-secondary danger';
+    deleteBtn.type = 'button';
+    deleteBtn.textContent = 'Delete';
+    deleteBtn.addEventListener('click', async () => {
+        const ok = window.confirm(
+            `Delete project "${project.name}"?\n\n` +
+            'Arcs in this project will be un-assigned but kept, and the workspace folder on disk is preserved. This only removes the project grouping.'
+        );
+        if (!ok) return;
+        try {
+            await invoke('delete_project', { id: project.id });
+            showToast('Project deleted', 'success');
+            if (projectEditingId === project.id) projectEditingId = null;
+            await loadProjectsManager();
+        } catch (err) {
+            showToast('Delete failed: ' + err, 'error');
+        }
+    });
+    actions.appendChild(deleteBtn);
+
+    card.appendChild(actions);
+    return card;
+}
+
+// An editable card for creating (project === null) or editing a project.
+function buildProjectEditCard(project) {
+    const isNew = project === null;
+    const card = document.createElement('div');
+    card.className = 'project-card project-card-editing';
+
+    const nameRow = document.createElement('div');
+    nameRow.className = 'setting-row';
+    const nameLabel = document.createElement('label');
+    nameLabel.textContent = 'Name';
+    const nameInput = document.createElement('input');
+    nameInput.className = 'settings-input';
+    nameInput.placeholder = 'e.g. Acme launch';
+    nameInput.value = isNew ? '' : (project.name || '');
+    nameRow.appendChild(nameLabel);
+    nameRow.appendChild(nameInput);
+    card.appendChild(nameRow);
+
+    const instrLabel = document.createElement('label');
+    instrLabel.textContent = 'Instructions';
+    instrLabel.style.display = 'block';
+    instrLabel.style.margin = '8px 0 4px';
+    card.appendChild(instrLabel);
+
+    const instrInput = document.createElement('textarea');
+    instrInput.className = 'settings-input';
+    instrInput.rows = 4;
+    instrInput.placeholder = 'Standing instructions injected into every arc in this project (optional).';
+    instrInput.value = isNew ? '' : (project.instructions || '');
+    card.appendChild(instrInput);
+
+    const actions = document.createElement('div');
+    actions.className = 'project-card-actions';
+
+    const saveBtn = document.createElement('button');
+    saveBtn.className = 'btn-primary';
+    saveBtn.type = 'button';
+    saveBtn.textContent = isNew ? 'Create' : 'Save';
+    saveBtn.addEventListener('click', async () => {
+        const name = nameInput.value.trim();
+        if (!name) {
+            showToast('Project name is required', 'error');
+            return;
+        }
+        const instructions = instrInput.value;
+        saveBtn.disabled = true;
+        try {
+            if (isNew) {
+                await invoke('create_project', { name, instructions });
+                showToast('Project created', 'success');
+            } else {
+                await invoke('update_project', { id: project.id, name, instructions });
+                showToast('Project saved', 'success');
+            }
+            projectEditingId = null;
+            await loadProjectsManager();
+        } catch (err) {
+            showToast('Save failed: ' + err, 'error');
+            saveBtn.disabled = false;
+        }
+    });
+    actions.appendChild(saveBtn);
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'btn-secondary';
+    cancelBtn.type = 'button';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.addEventListener('click', () => {
+        projectEditingId = null;
+        renderProjectsList();
+    });
+    actions.appendChild(cancelBtn);
+
+    card.appendChild(actions);
+    return card;
+}
+
+// One-time wiring for the "+ New Project" button and the summary-mode select.
+// Both live in the Settings DOM at boot, so a single pass is enough.
+(function wireProjectsControls() {
+    const newBtn = document.getElementById('project-new-btn');
+    if (newBtn) {
+        newBtn.addEventListener('click', () => {
+            projectEditingId = '__new__';
+            renderProjectsList();
+        });
+    }
+    const modeSel = document.getElementById('project-summary-mode');
+    if (modeSel) {
+        modeSel.addEventListener('change', async () => {
+            const mode = modeSel.value;
+            try {
+                await invoke('set_project_summary_mode', { mode });
+                showToast('Summary mode: ' + mode, 'success');
+            } catch (err) {
+                showToast('Failed to set summary mode: ' + err, 'error');
             }
         });
     }

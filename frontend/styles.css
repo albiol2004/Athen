@@ -827,6 +827,69 @@ header h1 {
     background: var(--border);
 }
 
+.arc-menu-empty {
+    padding: 6px 12px 8px;
+    font-size: 12px;
+    color: var(--text-dim, var(--text));
+    opacity: 0.7;
+    max-width: 220px;
+    line-height: 1.4;
+}
+
+/* ─── Projects settings panel ─── */
+.projects-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin: 12px 0 4px;
+}
+
+.project-card {
+    background: var(--surface-2, var(--surface-3));
+    border: 1px solid var(--border);
+    border-radius: var(--r-md, 10px);
+    padding: 12px 14px;
+}
+
+.project-card-editing {
+    border-color: var(--brand-solid);
+}
+
+.project-card-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+}
+
+.project-card-name {
+    font-weight: 600;
+    font-size: 14px;
+    color: var(--text);
+}
+
+.project-card-stamp {
+    font-size: 11px;
+    color: var(--text-dim, var(--text));
+    opacity: 0.65;
+    white-space: nowrap;
+}
+
+.project-card-snippet {
+    margin-top: 6px;
+    font-size: 12.5px;
+    color: var(--text-dim, var(--text));
+    opacity: 0.85;
+    line-height: 1.45;
+}
+
+.project-card-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 12px;
+}
+
 .session-rename-input {
     width: 100%;
     background: var(--surface-3);
@@ -2970,6 +3033,14 @@ footer {
     color: var(--text-3);
     cursor: not-allowed;
     opacity: 0.6;
+}
+.btn-secondary.danger {
+    color: var(--danger);
+    border-color: var(--danger-soft, var(--border));
+}
+.btn-secondary.danger:hover {
+    background: var(--danger-soft);
+    border-color: var(--danger);
 }
 
 .btn-danger {

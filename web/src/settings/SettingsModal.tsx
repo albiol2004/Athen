@@ -12,8 +12,9 @@ import { PanelConnections } from './PanelConnections';
 import { PanelSecurity } from './PanelSecurity';
 import { PanelContacts } from './PanelContacts';
 import { PanelMemory } from './PanelMemory';
+import { PanelProjects } from './PanelProjects';
 
-type TabId = 'models' | 'agents' | 'connections' | 'security' | 'contacts' | 'memory';
+type TabId = 'models' | 'agents' | 'connections' | 'security' | 'contacts' | 'memory' | 'projects';
 
 const stroke = { stroke: 'currentColor', strokeWidth: 1.7, strokeLinecap: 'round', strokeLinejoin: 'round', fill: 'none' } as const;
 
@@ -54,6 +55,11 @@ const ICONS: Record<TabId, JSX.Element> = {
       <path {...stroke} d="M15.5 5.5a3.4 3.4 0 0 1 3 1.5 3.4 3.4 0 0 1 1.1 5.3 3.4 3.4 0 0 1-1.6 5.8 3 3 0 1 1-6-.4" />
     </svg>
   ),
+  projects: (
+    <svg width="15" height="15" viewBox="0 0 24 24" aria-hidden="true">
+      <path {...stroke} d="M3.5 7.5a2 2 0 0 1 2-2h3l2 2h6a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2h-11a2 2 0 0 1-2-2V7.5Z" />
+    </svg>
+  ),
 };
 
 const TABS: { id: TabId; label: string }[] = [
@@ -63,6 +69,7 @@ const TABS: { id: TabId; label: string }[] = [
   { id: 'security', label: 'Security' },
   { id: 'contacts', label: 'Contacts' },
   { id: 'memory', label: 'Memory' },
+  { id: 'projects', label: 'Projects' },
 ];
 
 export function SettingsModal({
@@ -136,6 +143,7 @@ export function SettingsModal({
             {tab === 'security' && <PanelSecurity client={client} />}
             {tab === 'contacts' && <PanelContacts client={client} />}
             {tab === 'memory' && <PanelMemory client={client} />}
+            {tab === 'projects' && <PanelProjects client={client} />}
           </div>
         </div>
       </div>
