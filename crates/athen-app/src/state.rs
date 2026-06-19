@@ -193,6 +193,12 @@ pub struct AppState {
     /// active arc is not scoped to a Project. Mirrors `active_arc_id`'s
     /// `Mutex` type (tokio). Part of the Projects feature substrate.
     pub active_project_id: Mutex<Option<String>>,
+    /// Project-summary compaction mode: `"auto"` (fold on arc-leave),
+    /// `"manual"` (only the "Update summary now" button folds), or
+    /// `"off"` (never fold). Read by the `maybe_fold_leaving_arc` gate and
+    /// the `update_project_summary` command. Surfaced to the UI via the
+    /// `get_project_summary_mode` / `set_project_summary_mode` commands.
+    pub project_summary_mode: Mutex<String>,
     /// Persistent Arc storage backed by SQLite.
     pub arc_store: Option<ArcStore>,
     /// Persistent calendar event storage backed by SQLite.
@@ -766,6 +772,24 @@ pub(crate) async fn assemble_base_app_tool_registry(
     )
     .await;
     registry = registry.with_active_profile_id(active_profile_id);
+    // Resolve the arc's active project folder slug (if any) so `save_file`
+    // defaults writes into the project workspace. None when the arc has no
+    // project or the store is absent ⇒ inert.
+    if let (Some(ps), Some(ar)) = (deps.project_store.as_ref(), deps.arc_store.as_ref()) {
+        let project_slug = match ar.get_arc(arc_id).await.ok().flatten().and_then(|m| m.project_id)
+        {
+            Some(pid) => ps
+                .get_project(&pid)
+                .await
+                .ok()
+                .flatten()
+                .map(|p| p.folder_slug),
+            None => None,
+        };
+        if project_slug.is_some() {
+            registry = registry.with_active_project(project_slug);
+        }
+    }
     if let Some(grants) = deps.grant_store.clone() {
         // `security_mode` (resolved once at the top of this fn) lets the
         // file gate lower out-of-workspace write prompts under Yolo,
@@ -1171,6 +1195,7 @@ impl AppState {
             model_name: Mutex::new(model_name),
             active_arc_id: Mutex::new(active_arc_id),
             active_project_id: Mutex::new(None),
+            project_summary_mode: Mutex::new("auto".to_string()),
             arc_store,
             calendar_store,
             trust_manager: contact_store
@@ -2831,6 +2856,9 @@ impl AppState {
         // hydrate the IMAP password from it (the password lives in the
         // vault for installs that have re-saved their email settings).
         let vault_snapshot = self.vault.clone();
+        // Snapshot the projects store so the dispatch loop can inject project
+        // context into each autonomous task's prompt + registry.
+        let project_store_dispatch = self.project_store.clone();
         // Cheap handle on the cached parsed config. The per-task resolvers
         // `.load()` it lock-free instead of re-reading + re-parsing the TOML
         // off disk every dispatched task. Live Settings saves swap a freshly
@@ -3039,6 +3067,7 @@ impl AppState {
                         agent_registry: agent_registry_loop.clone(),
                         vault: vault_snapshot.clone(),
                         active_provider_id: effective_provider_id.clone(),
+                        project_store: project_store_dispatch.clone(),
                     };
 
                     let task_arc_map_clone = Arc::clone(&task_arc_map);

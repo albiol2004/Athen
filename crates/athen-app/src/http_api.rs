@@ -1013,6 +1013,90 @@ async fn h_id_estimate(State(api): State<ApiState>) -> Response {
     json_result(commands::estimate_identity_total_core(api.ui.app_state()).await)
 }
 
+// projects
+async fn h_projects_list(State(api): State<ApiState>) -> Response {
+    json_result(commands::list_projects_core(api.ui.app_state()).await)
+}
+#[derive(Deserialize)]
+struct ProjectCreateBody {
+    name: String,
+    instructions: Option<String>,
+}
+async fn h_project_create(
+    State(api): State<ApiState>,
+    Json(body): Json<ProjectCreateBody>,
+) -> Response {
+    json_result(
+        commands::create_project_core(body.name, body.instructions, api.ui.app_state()).await,
+    )
+}
+#[derive(Deserialize)]
+struct ProjectUpdateBody {
+    name: Option<String>,
+    instructions: Option<String>,
+    // When true, clears instructions to NULL. When false/absent and
+    // `instructions` is absent, instructions are left untouched. When
+    // `instructions` is present, it is set to that value.
+    clear_instructions: Option<bool>,
+}
+async fn h_project_update(
+    State(api): State<ApiState>,
+    UrlPath(id): UrlPath<String>,
+    Json(body): Json<ProjectUpdateBody>,
+) -> Response {
+    // Translate the flat body into the `Option<Option<String>>` the core fn wants:
+    //   None              -> leave instructions untouched
+    //   Some(None)        -> clear instructions
+    //   Some(Some(value)) -> set instructions to value
+    let instructions = if let Some(value) = body.instructions {
+        Some(Some(value))
+    } else if body.clear_instructions.unwrap_or(false) {
+        Some(None)
+    } else {
+        None
+    };
+    json_result(
+        commands::update_project_core(id, body.name, instructions, api.ui.app_state()).await,
+    )
+}
+async fn h_project_delete(State(api): State<ApiState>, UrlPath(id): UrlPath<String>) -> Response {
+    json_result(commands::delete_project_core(id, api.ui.app_state()).await)
+}
+async fn h_project_summary_update(
+    State(api): State<ApiState>,
+    UrlPath(id): UrlPath<String>,
+) -> Response {
+    json_result(commands::update_project_summary_core(id, api.ui.app_state()).await)
+}
+async fn h_arc_assign_project(
+    State(api): State<ApiState>,
+    UrlPath(id): UrlPath<String>,
+    Json(body): Json<OptStringBody>,
+) -> Response {
+    json_result(
+        commands::assign_arc_to_project_core(id, body.value, api.ui.app_state()).await,
+    )
+}
+async fn h_set_active_project(
+    State(api): State<ApiState>,
+    Json(body): Json<OptStringBody>,
+) -> Response {
+    json_result(commands::set_active_project_core(body.value, api.ui.app_state()).await)
+}
+async fn h_project_summary_mode_get(State(api): State<ApiState>) -> Response {
+    json_result(commands::get_project_summary_mode_core(api.ui.app_state()).await)
+}
+#[derive(Deserialize)]
+struct SummaryModeBody {
+    mode: String,
+}
+async fn h_project_summary_mode_set(
+    State(api): State<ApiState>,
+    Json(body): Json<SummaryModeBody>,
+) -> Response {
+    json_result(commands::set_project_summary_mode_core(body.mode, api.ui.app_state()).await)
+}
+
 // skills
 async fn h_skills_list(State(api): State<ApiState>) -> Response {
     json_result(commands::list_skills_core(api.ui.app_state()).await)
@@ -1848,6 +1932,14 @@ fn full_surface_router() -> Router<ApiState> {
             post(h_id_entry_dismiss),
         )
         .route("/api/identity/estimate", get(h_id_estimate))
+        // projects
+        .route("/api/projects", get(h_projects_list).post(h_project_create))
+        .route("/api/projects/summary-mode", get(h_project_summary_mode_get).post(h_project_summary_mode_set))
+        .route("/api/projects/{id}", post(h_project_update))
+        .route("/api/projects/{id}/delete", post(h_project_delete))
+        .route("/api/projects/{id}/summary", post(h_project_summary_update))
+        .route("/api/arcs/{id}/project", post(h_arc_assign_project))
+        .route("/api/active-project", post(h_set_active_project))
         // skills
         .route("/api/skills", get(h_skills_list).post(h_skill_upsert))
         .route("/api/skills/sync", post(h_skills_sync))

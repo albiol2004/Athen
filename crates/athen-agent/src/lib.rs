@@ -64,6 +64,7 @@ pub struct AgentBuilder {
     skills_block: Option<String>,
     endpoints_block: Option<String>,
     mission_block: Option<String>,
+    project_block: Option<String>,
     acceptance_criteria: Option<String>,
     goal_mode: bool,
     reminder_builder: Option<Arc<dyn SystemReminderBuilder>>,
@@ -103,6 +104,7 @@ impl AgentBuilder {
             skills_block: None,
             endpoints_block: None,
             mission_block: None,
+            project_block: None,
             acceptance_criteria: None,
             goal_mode: false,
             reminder_builder: None,
@@ -205,6 +207,17 @@ impl AgentBuilder {
     /// plan).
     pub fn mission_block(mut self, block: Option<String>) -> Self {
         self.mission_block = block.filter(|s| !s.trim().is_empty());
+        self
+    }
+
+    /// Inject the arc's parent-Project custom-instructions block into the
+    /// cached static system header (rendered right after the mission
+    /// section by the executor). Mirrors `mission_block`'s storage
+    /// contract: empty / whitespace-only / `None` reproduces today's
+    /// prompt byte-for-byte (arcs with no project, or a project that set
+    /// no instructions). Cache-stable within an arc.
+    pub fn project_block(mut self, block: Option<String>) -> Self {
+        self.project_block = block.filter(|s| !s.trim().is_empty());
         self
     }
 
@@ -477,6 +490,10 @@ impl AgentBuilder {
 
         if self.mission_block.is_some() {
             executor.set_mission_block(self.mission_block);
+        }
+
+        if self.project_block.is_some() {
+            executor = executor.project_block(self.project_block);
         }
 
         if self.acceptance_criteria.is_some() {

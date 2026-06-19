@@ -140,6 +140,7 @@ fn spawn_router_approval(
             .map(|s| s as Arc<dyn athen_core::traits::wakeup::WakeupStore>),
         agent_registry: state.agent_registry.clone(),
         vault: state.vault.clone(),
+        project_store: state.project_store.clone(),
     };
 
     tauri::async_runtime::spawn(async move {
@@ -316,6 +317,7 @@ fn spawn_router_approval(
             agent_registry: bg_ctx.agent_registry.clone(),
             vault: bg_ctx.vault.clone(),
             active_provider_id: effective_provider_id.clone(),
+            project_store: bg_ctx.project_store.clone(),
         };
 
         let outcome = match execute_approved_task(task_id, ctx).await {
@@ -430,6 +432,9 @@ struct ApprovedTaskBgCtx {
     /// Vault snapshot ferried into `ApprovedTaskCtx` so `place_call` can
     /// dispatch under the same telephony deps used by in-app chat.
     vault: Option<Arc<dyn athen_core::traits::vault::Vault>>,
+    /// Projects store, ferried into `ApprovedTaskCtx` so the bg approval
+    /// flow injects project context + defaults `save_file` like in-app chat.
+    project_store: Option<Arc<athen_persistence::projects::ProjectStore>>,
 }
 
 /// Resolve the agent profile that should drive execution for a given arc.
@@ -480,6 +485,69 @@ async fn resolve_active_profile(
         profile,
         persona_templates: templates,
     })
+}
+
+/// Resolve the [`athen_persistence::projects::Project`] the arc belongs to,
+/// if any. Returns `None` when either store is absent, the arc carries no
+/// `project_id`, or the lookup fails — every error path is swallowed so a
+/// missing project is byte-identical to pre-Projects behavior. Reused for all
+/// three Projects prompt wirings (instructions → static prefix, file listing +
+/// summary → volatile system suffix).
+async fn resolve_active_project(
+    project_store: Option<&Arc<athen_persistence::projects::ProjectStore>>,
+    arc_store: Option<&athen_persistence::arcs::ArcStore>,
+    arc_id: &str,
+) -> Option<athen_persistence::projects::Project> {
+    let ps = project_store?;
+    let ar = arc_store?;
+    let pid = ar.get_arc(arc_id).await.ok().flatten().and_then(|m| m.project_id)?;
+    ps.get_project(&pid).await.ok().flatten()
+}
+
+/// Render the VOLATILE project context block (Layers 2 + 4) appended to the
+/// system suffix at the end of the prompt body — never the cached static
+/// prefix. Carries the maintained project summary (if any) and a shallow,
+/// names-only listing of the project workspace folder (read on demand by the
+/// agent, never inlined here). Best-effort: a `read_dir` error degrades to the
+/// summary alone (or just the header).
+fn render_project_volatile_block(project: &athen_persistence::projects::Project) -> String {
+    use std::fmt::Write as _;
+
+    let mut block = format!("--- PROJECT: {} ---\n", project.name);
+    if let Some(summary) = project.summary.as_deref() {
+        if !summary.trim().is_empty() {
+            let _ = writeln!(block, "{summary}\n");
+        }
+    }
+
+    let dir = athen_core::paths::resolve_in_workspace(std::path::Path::new(&format!(
+        "Projects/{}",
+        project.folder_slug
+    )));
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        let mut names: Vec<String> = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // Skip the maintained README — its content is the summary above.
+            if name.eq_ignore_ascii_case("README.md") {
+                continue;
+            }
+            names.push(name);
+        }
+        names.sort();
+        if !names.is_empty() {
+            block.push_str("Files in this project (read on demand):\n");
+            const CAP: usize = 50;
+            for name in names.iter().take(CAP) {
+                let _ = writeln!(block, "- {name}");
+            }
+            if names.len() > CAP {
+                let _ = writeln!(block, "(+{} more)", names.len() - CAP);
+            }
+        }
+    }
+    block.push('\n');
+    block
 }
 
 /// Convert a raw technical error string into a user-friendly message.
@@ -2738,6 +2806,25 @@ pub(crate) async fn send_message_core(
             let mission_block =
                 crate::mission_render::render_mission_block(state.arc_store.as_ref(), &active_arc)
                     .await;
+            // Resolve the arc's active Project once. Drives three prompt
+            // wirings below — Layer 1 (instructions → cached static prefix
+            // via .project_block), Layers 2+4 (file listing + summary →
+            // volatile system_suffix). None when the arc has no project or
+            // the store is absent ⇒ byte-identical to pre-Projects behavior.
+            let active_project =
+                resolve_active_project(state.project_store.as_ref(), state.arc_store.as_ref(), &active_arc)
+                    .await;
+            // Layers 2+4 — file listing + project summary ride the VOLATILE
+            // system_suffix (end of body), appended after memory recall /
+            // attachment surfacing so they sit in the cache-safe tail. Never
+            // the cached static prefix.
+            if let Some(ref proj) = active_project {
+                let block = render_project_volatile_block(proj);
+                if !system_suffix.is_empty() && !system_suffix.ends_with("\n\n") {
+                    system_suffix.push_str("\n\n");
+                }
+                system_suffix.push_str(&block);
+            }
             let acceptance_criteria = crate::mission_render::read_acceptance_criteria(
                 state.arc_store.as_ref(),
                 &active_arc,
@@ -2815,6 +2902,7 @@ pub(crate) async fn send_message_core(
                 .endpoints_block(endpoints_block)
                 .skills_block(skills_block)
                 .mission_block(mission_block)
+                .project_block(active_project.as_ref().and_then(|p| p.instructions.clone()))
                 .acceptance_criteria(acceptance_criteria)
                 .goal_mode(goal_active)
                 .enable_default_reminders(true)
@@ -3251,6 +3339,7 @@ pub(crate) async fn approve_task_core(
         agent_registry: state.agent_registry.clone(),
         vault: state.vault.clone(),
         active_provider_id: effective_provider_id.clone(),
+        project_store: state.project_store.clone(),
     };
 
     let outcome = match execute_approved_task(task_uuid, ctx).await {
@@ -3464,6 +3553,12 @@ pub(crate) struct ApprovedTaskCtx {
     /// for the voice subprocess. Empty string acceptable — telephony
     /// then falls back to the active-bundle Fast tier.
     pub active_provider_id: String,
+    /// Projects store. When wired (and the arc carries a `project_id`), the
+    /// executor injects the project's instructions into the cached static
+    /// prefix and its summary + file listing into the volatile system
+    /// suffix, and defaults `save_file` writes into the project workspace.
+    /// `None` in CLI/test builds ⇒ Projects wiring is inert.
+    pub project_store: Option<Arc<athen_persistence::projects::ProjectStore>>,
 }
 
 /// Drive a risk-flagged task all the way through approval, dispatch,
@@ -3831,13 +3926,33 @@ pub(crate) async fn execute_approved_task(
             ctx.telegram_chat_log.clone(),
         ));
     shell_registry = shell_registry.with_telegram_outbound_recorder(tg_recorder);
+    // Resolve the arc's active Project once. Slug defaults `save_file` writes
+    // into the project workspace; the Project is reused below for the prompt
+    // wirings (instructions → static prefix, summary + files → suffix).
+    let active_project = resolve_active_project(
+        ctx.project_store.as_ref(),
+        ctx.arc_store.as_ref(),
+        &ctx.active_arc_id,
+    )
+    .await;
+    // Layers 2+4 — project summary + file listing ride the VOLATILE
+    // system_suffix (end of body), after the wakeup directive. Never the
+    // cached static prefix.
+    if let Some(ref proj) = active_project {
+        let block = render_project_volatile_block(proj);
+        if !system_suffix.is_empty() && !system_suffix.ends_with("\n\n") {
+            system_suffix.push_str("\n\n");
+        }
+        system_suffix.push_str(&block);
+    }
     let mut registry = crate::app_tools::AppToolRegistry::new(
         shell_registry,
         ctx.calendar_store.clone(),
         ctx.contact_store.clone(),
         ctx.memory.clone(),
     )
-    .with_mcp(ctx.mcp.clone() as Arc<dyn athen_core::traits::mcp::McpClient>);
+    .with_mcp(ctx.mcp.clone() as Arc<dyn athen_core::traits::mcp::McpClient>)
+    .with_active_project(active_project.as_ref().map(|p| p.folder_slug.clone()));
     if let Some(telephony) = crate::state::build_telephony_deps(
         &ctx.active_arc_id,
         ctx.approval_router.clone(),
@@ -4119,6 +4234,7 @@ pub(crate) async fn execute_approved_task(
         .endpoints_block(endpoints_block)
         .skills_block(skills_block)
         .mission_block(mission_block)
+        .project_block(active_project.as_ref().and_then(|p| p.instructions.clone()))
         .acceptance_criteria(acceptance_criteria)
         .goal_mode(goal_active)
         .enable_default_reminders(true)
@@ -4974,13 +5090,27 @@ pub(crate) async fn execute_dispatched_task(
             ctx.telegram_chat_log.clone(),
         ));
     shell_registry = shell_registry.with_telegram_outbound_recorder(tg_recorder);
+    // Resolve the arc's active Project once. Slug defaults `save_file` writes;
+    // reused below for the volatile prompt block + .project_block.
+    let active_project =
+        resolve_active_project(ctx.project_store.as_ref(), ctx.arc_store.as_ref(), &arc_id).await;
+    // Layers 2+4 — summary + file listing ride the VOLATILE system_suffix
+    // (end of body), after the wakeup directive. Never the cached prefix.
+    if let Some(ref proj) = active_project {
+        let block = render_project_volatile_block(proj);
+        if !system_suffix.is_empty() && !system_suffix.ends_with("\n\n") {
+            system_suffix.push_str("\n\n");
+        }
+        system_suffix.push_str(&block);
+    }
     let mut registry = crate::app_tools::AppToolRegistry::new(
         shell_registry,
         ctx.calendar_store.clone(),
         ctx.contact_store.clone(),
         ctx.memory.clone(),
     )
-    .with_mcp(ctx.mcp.clone() as Arc<dyn athen_core::traits::mcp::McpClient>);
+    .with_mcp(ctx.mcp.clone() as Arc<dyn athen_core::traits::mcp::McpClient>)
+    .with_active_project(active_project.as_ref().map(|p| p.folder_slug.clone()));
     if let Some(telephony) = crate::state::build_telephony_deps(
         &arc_id,
         ctx.approval_router.clone(),
@@ -5219,6 +5349,8 @@ pub(crate) async fn execute_dispatched_task(
     }
     let mission_block =
         crate::mission_render::render_mission_block(ctx.arc_store.as_ref(), &arc_id).await;
+    // `active_project` already resolved at the registry-build site above;
+    // reused here for the .project_block static-prefix wiring.
     let acceptance_criteria =
         crate::mission_render::read_acceptance_criteria(ctx.arc_store.as_ref(), &arc_id).await;
     let goal_active = crate::mission_render::read_goal_status(ctx.arc_store.as_ref(), &arc_id)
@@ -5257,6 +5389,7 @@ pub(crate) async fn execute_dispatched_task(
         .endpoints_block(endpoints_block)
         .skills_block(skills_block)
         .mission_block(mission_block)
+        .project_block(active_project.as_ref().and_then(|p| p.instructions.clone()))
         .acceptance_criteria(acceptance_criteria)
         .goal_mode(goal_active)
         .enable_default_reminders(true)
@@ -6386,15 +6519,39 @@ pub async fn new_arc(state: State<'_, AppState>) -> std::result::Result<String, 
 pub(crate) async fn new_arc_core(state: &AppState) -> std::result::Result<String, String> {
     *state.history.lock().await = Vec::new();
     let new_id = chrono::Utc::now().format("arc_%Y%m%d_%H%M%S").to_string();
+
+    // Capture the previous active arc BEFORE overwriting so we can fold it
+    // into its project summary on the way out (best-effort, non-blocking).
+    let previous_arc_id = state.active_arc_id.lock().await.clone();
+
     *state.active_arc_id.lock().await = new_id.clone();
 
+    // New user arcs inherit the active project, if any.
+    let active_project = state.active_project_id.lock().await.clone();
+
     if let Some(ref store) = state.arc_store {
-        if let Err(e) = store
-            .create_arc(&new_id, "New Arc", arcs::ArcSource::UserInput)
-            .await
-        {
+        let created = if active_project.is_some() {
+            store
+                .create_arc_in_project(
+                    &new_id,
+                    "New Arc",
+                    arcs::ArcSource::UserInput,
+                    active_project.as_deref(),
+                )
+                .await
+        } else {
+            store
+                .create_arc(&new_id, "New Arc", arcs::ArcSource::UserInput)
+                .await
+        };
+        if let Err(e) = created {
             warn!("Failed to create arc: {e}");
         }
+    }
+
+    // Fold the arc we just left into its project summary.
+    if previous_arc_id != new_id {
+        maybe_fold_leaving_arc(state, &previous_arc_id).await;
     }
 
     Ok(new_id)
@@ -6631,12 +6788,21 @@ pub(crate) async fn switch_arc_core(
             })
             .collect();
 
+        // Capture the OLD active arc before the switch so we can fold it
+        // into its project summary on the way out.
+        let previous_arc_id = state.active_arc_id.lock().await.clone();
+
         *state.history.lock().await = history;
         *state.active_arc_id.lock().await = arc_id.clone();
 
         // Mark any pending notifications for this arc as read.
         if let Some(notifier) = state.notifier.load_full() {
             notifier.mark_arc_read(&arc_id).await;
+        }
+
+        // Best-effort, non-blocking fold of the arc we just left.
+        if previous_arc_id != arc_id {
+            maybe_fold_leaving_arc(state, &previous_arc_id).await;
         }
 
         return Ok(entries.into_iter().map(Into::into).collect());
@@ -6764,6 +6930,10 @@ pub(crate) async fn branch_arc_core(
         }
     }
 
+    // Capture the OLD active arc before switching to the new branch so we can
+    // fold it into its project summary on the way out (best-effort).
+    let previous_arc_id = state.active_arc_id.lock().await.clone();
+
     // Switch to the new branch and rebuild in-memory history from
     // the copied entries so the executor has full context.
     *state.active_arc_id.lock().await = new_id.clone();
@@ -6793,6 +6963,11 @@ pub(crate) async fn branch_arc_core(
         }
     } else {
         *state.history.lock().await = Vec::new();
+    }
+
+    // Best-effort, non-blocking fold of the arc we just left.
+    if previous_arc_id != new_id {
+        maybe_fold_leaving_arc(state, &previous_arc_id).await;
     }
 
     Ok(new_id)
@@ -9410,6 +9585,349 @@ mod key_term_tests {
         let terms = extract_key_terms("the and or but not for with");
         assert!(terms.is_empty());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Projects commands
+// ---------------------------------------------------------------------------
+//
+// A Project is a context-scope ABOVE arcs: many arcs grouped around common
+// work, with a workspace folder (`Projects/<folder_slug>/`), shared
+// instructions, and a maintained cross-arc summary. These commands mirror the
+// identity command/_core/registration pattern: a thin `#[tauri::command]`
+// wrapper delegating to a `pub(crate)` `_core` that takes `&AppState`.
+//
+// All fs operations are best-effort: a filesystem failure never fails the
+// command (the entity is the source of truth), but it is always logged.
+
+/// List every Project. Empty when no project store is wired.
+#[tauri::command]
+pub async fn list_projects(
+    state: State<'_, AppState>,
+) -> std::result::Result<Vec<athen_persistence::projects::Project>, String> {
+    list_projects_core(&state).await
+}
+
+pub(crate) async fn list_projects_core(
+    state: &AppState,
+) -> std::result::Result<Vec<athen_persistence::projects::Project>, String> {
+    let Some(store) = state.project_store.as_ref() else {
+        return Ok(Vec::new());
+    };
+    store.list_projects().await.map_err(|e| e.to_string())
+}
+
+/// Create a Project and its workspace folder under `Projects/<folder_slug>/`.
+#[tauri::command]
+pub async fn create_project(
+    name: String,
+    instructions: Option<String>,
+    state: State<'_, AppState>,
+) -> std::result::Result<athen_persistence::projects::Project, String> {
+    create_project_core(name, instructions, &state).await
+}
+
+pub(crate) async fn create_project_core(
+    name: String,
+    instructions: Option<String>,
+    state: &AppState,
+) -> std::result::Result<athen_persistence::projects::Project, String> {
+    let Some(store) = state.project_store.as_ref() else {
+        return Err("Project store not available".into());
+    };
+    let project = store
+        .create_project(&name, instructions.as_deref())
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Best-effort: create the workspace folder. Never fail the command on fs error.
+    let rel = std::path::PathBuf::from(format!("Projects/{}", project.folder_slug));
+    let dir = athen_core::paths::resolve_in_workspace(&rel);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        warn!("Failed to create project workspace folder {dir:?}: {e}");
+    }
+
+    Ok(project)
+}
+
+/// Update a Project's name and/or instructions. A rename recomputes the
+/// `folder_slug`; when it changes, the workspace folder is renamed on disk
+/// (skipped if the target already exists, to avoid clobbering).
+#[tauri::command]
+pub async fn update_project(
+    id: String,
+    name: Option<String>,
+    instructions: Option<Option<String>>,
+    state: State<'_, AppState>,
+) -> std::result::Result<athen_persistence::projects::Project, String> {
+    update_project_core(id, name, instructions, &state).await
+}
+
+pub(crate) async fn update_project_core(
+    id: String,
+    name: Option<String>,
+    instructions: Option<Option<String>>,
+    state: &AppState,
+) -> std::result::Result<athen_persistence::projects::Project, String> {
+    let Some(store) = state.project_store.as_ref() else {
+        return Err("Project store not available".into());
+    };
+
+    // Capture the OLD slug before the update so we can rename the folder.
+    let old_slug = store
+        .get_project(&id)
+        .await
+        .map_err(|e| e.to_string())?
+        .map(|p| p.folder_slug);
+
+    let name_ref = name.as_deref();
+    let instructions_ref = instructions
+        .as_ref()
+        .map(|opt| opt.as_deref());
+    let project = store
+        .update_project(&id, name_ref, instructions_ref)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Best-effort folder rename when the slug changed.
+    if let Some(old_slug) = old_slug {
+        if old_slug != project.folder_slug {
+            let from =
+                athen_core::paths::resolve_in_workspace(&std::path::PathBuf::from(format!(
+                    "Projects/{old_slug}"
+                )));
+            let to = athen_core::paths::resolve_in_workspace(&std::path::PathBuf::from(format!(
+                "Projects/{}",
+                project.folder_slug
+            )));
+            if to.exists() {
+                warn!(
+                    "Skipping project folder rename: target {to:?} already exists (would clobber)"
+                );
+            } else if from.exists() {
+                if let Err(e) = std::fs::rename(&from, &to) {
+                    warn!("Failed to rename project folder {from:?} -> {to:?}: {e}");
+                }
+            }
+        }
+    }
+
+    Ok(project)
+}
+
+/// Delete a Project entity and null out the `project_id` on its member arcs.
+/// The workspace folder on disk is intentionally PRESERVED — deleting files is
+/// destructive, so we only unlink the entity and detach its arcs.
+#[tauri::command]
+pub async fn delete_project(
+    id: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    delete_project_core(id, &state).await
+}
+
+pub(crate) async fn delete_project_core(
+    id: String,
+    state: &AppState,
+) -> std::result::Result<(), String> {
+    let Some(store) = state.project_store.as_ref() else {
+        return Ok(());
+    };
+
+    // Detach member arcs first so they don't dangle on a deleted project id.
+    if let Some(ref arc_store) = state.arc_store {
+        match store.member_arcs(&id).await {
+            Ok(arcs) => {
+                for arc_id in arcs {
+                    if let Err(e) = arc_store.set_arc_project(&arc_id, None).await {
+                        warn!("Failed to detach arc {arc_id} from project {id}: {e}");
+                    }
+                }
+            }
+            Err(e) => warn!("Failed to list member arcs for project {id}: {e}"),
+        }
+    }
+
+    store.delete_project(&id).await.map_err(|e| e.to_string())?;
+
+    // Clear the active project if it was the one just deleted.
+    {
+        let mut active = state.active_project_id.lock().await;
+        if active.as_deref() == Some(id.as_str()) {
+            *active = None;
+        }
+    }
+
+    // NOTE: the `Projects/<folder_slug>/` workspace folder is left on disk on
+    // purpose — file deletion is destructive and out of scope for an entity
+    // unlink. The user can remove it manually.
+    Ok(())
+}
+
+/// Assign (or clear) an arc's Project membership. When assigning to a project,
+/// that project also becomes the active project.
+#[tauri::command]
+pub async fn assign_arc_to_project(
+    arc_id: String,
+    project_id: Option<String>,
+    state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    assign_arc_to_project_core(arc_id, project_id, &state).await
+}
+
+pub(crate) async fn assign_arc_to_project_core(
+    arc_id: String,
+    project_id: Option<String>,
+    state: &AppState,
+) -> std::result::Result<(), String> {
+    let Some(ref arc_store) = state.arc_store else {
+        return Ok(());
+    };
+    arc_store
+        .set_arc_project(&arc_id, project_id.as_deref())
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if project_id.is_some() {
+        *state.active_project_id.lock().await = project_id;
+    }
+    Ok(())
+}
+
+/// Set (or clear) the active Project. New user arcs inherit this project.
+#[tauri::command]
+pub async fn set_active_project(
+    project_id: Option<String>,
+    state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    set_active_project_core(project_id, &state).await
+}
+
+pub(crate) async fn set_active_project_core(
+    project_id: Option<String>,
+    state: &AppState,
+) -> std::result::Result<(), String> {
+    *state.active_project_id.lock().await = project_id;
+    Ok(())
+}
+
+/// Manually fold every member arc of a Project into its durable summary —
+/// the "Update summary now" button. Best-effort: individual arc failures are
+/// logged and skipped so one bad arc doesn't abort the whole refresh.
+#[tauri::command]
+pub async fn update_project_summary(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    update_project_summary_core(project_id, &state).await
+}
+
+pub(crate) async fn update_project_summary_core(
+    project_id: String,
+    state: &AppState,
+) -> std::result::Result<(), String> {
+    let (Some(arc_store), Some(project_store)) =
+        (state.arc_store.as_ref(), state.project_store.as_ref())
+    else {
+        return Ok(());
+    };
+
+    let compactor = crate::compaction::LlmProjectCompactor::new(
+        arc_store.clone(),
+        project_store.clone(),
+        state.router.clone(),
+    );
+
+    let arcs = project_store
+        .member_arcs(&project_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    for arc_id in arcs {
+        if let Err(e) = compactor.fold_arc_into_project(&project_id, &arc_id).await {
+            warn!("update_project_summary: fold arc {arc_id} into {project_id} failed: {e}");
+        }
+    }
+    Ok(())
+}
+
+/// Read the project-summary compaction mode (`"auto"` | `"manual"` | `"off"`).
+#[tauri::command]
+pub async fn get_project_summary_mode(
+    state: State<'_, AppState>,
+) -> std::result::Result<String, String> {
+    get_project_summary_mode_core(&state).await
+}
+
+pub(crate) async fn get_project_summary_mode_core(
+    state: &AppState,
+) -> std::result::Result<String, String> {
+    Ok(state.project_summary_mode.lock().await.clone())
+}
+
+/// Set the project-summary compaction mode. Accepts `"auto"`, `"manual"`, or
+/// `"off"` (case-insensitive); anything else is rejected.
+#[tauri::command]
+pub async fn set_project_summary_mode(
+    mode: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    set_project_summary_mode_core(mode, &state).await
+}
+
+pub(crate) async fn set_project_summary_mode_core(
+    mode: String,
+    state: &AppState,
+) -> std::result::Result<(), String> {
+    let normalized = mode.trim().to_lowercase();
+    if !matches!(normalized.as_str(), "auto" | "manual" | "off") {
+        return Err(format!(
+            "Invalid project_summary_mode '{mode}' (expected auto|manual|off)"
+        ));
+    }
+    *state.project_summary_mode.lock().await = normalized;
+    Ok(())
+}
+
+/// Best-effort, non-blocking project-summary fold of the arc being left. Gated
+/// on the `project_summary_mode` setting (only fires in `"auto"`). Resolves the
+/// arc's project membership, then spawns the fold so the UI switch is never
+/// blocked. Folding a deleted arc is pointless, so `delete_arc` does NOT call
+/// this — only switch/new-arc transitions do.
+async fn maybe_fold_leaving_arc(state: &AppState, leaving_arc_id: &str) {
+    // Gate: only auto mode folds on arc-leave.
+    if state.project_summary_mode.lock().await.as_str() != "auto" {
+        return;
+    }
+
+    let (Some(arc_store), Some(project_store)) =
+        (state.arc_store.as_ref(), state.project_store.as_ref())
+    else {
+        return;
+    };
+
+    let meta = match arc_store.get_arc(leaving_arc_id).await {
+        Ok(Some(m)) => m,
+        Ok(None) => return,
+        Err(e) => {
+            warn!("maybe_fold_leaving_arc: get_arc({leaving_arc_id}) failed: {e}");
+            return;
+        }
+    };
+    let Some(project_id) = meta.project_id else {
+        return;
+    };
+
+    let compactor = crate::compaction::LlmProjectCompactor::new(
+        arc_store.clone(),
+        project_store.clone(),
+        state.router.clone(),
+    );
+    let leaving = leaving_arc_id.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = compactor.fold_arc_into_project(&project_id, &leaving).await {
+            warn!("maybe_fold_leaving_arc: fold {leaving} into {project_id} failed: {e}");
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
