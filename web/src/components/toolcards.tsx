@@ -2,7 +2,7 @@
 // collapsible groups, and delegation sub-arc inline expansion. Visual
 // + behavioral port of the desktop's buildToolCardBlock / tool groups.
 
-import { useState } from 'react';
+import { memo, useState } from 'react';
 import type { AthenClient } from '../api/client';
 import type { ChatItem } from '../chat/reducer';
 
@@ -162,7 +162,11 @@ function DelegationSteps({ it, client }: { it: ToolItem; client: AthenClient }) 
   );
 }
 
-export function ToolCard({ it, client }: { it: ToolItem; client: AthenClient }) {
+// memo'd: a completed tool item keeps its object reference across renders
+// (reducer.patch only replaces the one item that changed), so finished
+// cards skip re-render while a later tool/message streams. `client` is a
+// stable singleton passed straight down from Shell.
+export const ToolCard = memo(function ToolCard({ it, client }: { it: ToolItem; client: AthenClient }) {
   const [open, setOpen] = useState(false);
   const done =
     it.status === 'Completed' || it.status === 'completed' || it.status === 'done';
@@ -183,10 +187,10 @@ export function ToolCard({ it, client }: { it: ToolItem; client: AthenClient }) 
       {open && <ToolBody it={it} client={client} />}
     </div>
   );
-}
+});
 
 /** Collapsible container for consecutive tool calls (one agent segment). */
-export function ToolGroup({ items, client }: { items: ToolItem[]; client: AthenClient }) {
+export const ToolGroup = memo(function ToolGroup({ items, client }: { items: ToolItem[]; client: AthenClient }) {
   // Live groups (still receiving events) render open; rehydrated history
   // collapses to a one-line strip, same as the desktop.
   const live = items.some((t) => t.live);
@@ -208,4 +212,4 @@ export function ToolGroup({ items, client }: { items: ToolItem[]; client: AthenC
       </div>
     </details>
   );
-}
+});

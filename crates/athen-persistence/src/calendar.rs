@@ -406,6 +406,81 @@ impl CalendarStore {
         .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
     }
 
+    /// Find a single event by its `(source_id, remote_id)` reconciliation key.
+    ///
+    /// Uses the `idx_calendar_events_source(source_id, remote_id)` composite
+    /// index, so this is an indexed lookup rather than a full table scan. Used
+    /// by the calendar sync loop once per pulled remote event.
+    pub async fn find_by_remote(
+        &self,
+        source_id: &str,
+        remote_id: &str,
+    ) -> Result<Option<CalendarEvent>> {
+        let conn = self.conn.clone();
+        let source_id = source_id.to_string();
+        let remote_id = remote_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, title, description, start_time, end_time, all_day, \
+                     location, recurrence, reminder_minutes, color, category, \
+                     created_by, arc_id, created_at, updated_at, \
+                     source_id, remote_id, remote_etag, ical_uid \
+                     FROM calendar_events \
+                     WHERE source_id = ?1 AND remote_id = ?2 LIMIT 1",
+                )
+                .map_err(|e| AthenError::Other(format!("Prepare find by remote: {e}")))?;
+
+            let mut rows = stmt
+                .query_map(params![source_id, remote_id], row_to_event)
+                .map_err(|e| AthenError::Other(format!("Query find by remote: {e}")))?;
+
+            match rows.next() {
+                Some(Ok(event)) => Ok(Some(event)),
+                Some(Err(e)) => Err(AthenError::Other(format!("Read event row: {e}"))),
+                None => Ok(None),
+            }
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
+    /// List all events owned by a single remote source, ordered by start_time.
+    ///
+    /// Scoped to `source_id` so the `idx_calendar_events_source` composite
+    /// index turns this into an indexed range over one source's rows rather
+    /// than a full scan of every source's events. Used by the sync loop's
+    /// delete reconciliation.
+    pub async fn list_by_source(&self, source_id: &str) -> Result<Vec<CalendarEvent>> {
+        let conn = self.conn.clone();
+        let source_id = source_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, title, description, start_time, end_time, all_day, \
+                     location, recurrence, reminder_minutes, color, category, \
+                     created_by, arc_id, created_at, updated_at, \
+                     source_id, remote_id, remote_etag, ical_uid \
+                     FROM calendar_events WHERE source_id = ?1 ORDER BY start_time ASC",
+                )
+                .map_err(|e| AthenError::Other(format!("Prepare list by source: {e}")))?;
+
+            let rows = stmt
+                .query_map(params![source_id], row_to_event)
+                .map_err(|e| AthenError::Other(format!("Query list by source: {e}")))?;
+
+            let mut events = Vec::new();
+            for row in rows {
+                events.push(row.map_err(|e| AthenError::Other(format!("Read event row: {e}")))?);
+            }
+            Ok(events)
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
     /// List all events ordered by start_time.
     pub async fn list_all_events(&self) -> Result<Vec<CalendarEvent>> {
         let conn = self.conn.clone();

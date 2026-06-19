@@ -864,7 +864,16 @@ impl SenseMonitor for TelegramMonitor {
         // production without dumping every reqwest builder field.
         let base = self.api_url("getUpdates");
         let allowed_updates_param = urlencode_param("[\"message\",\"callback_query\"]");
-        let mut url = format!("{base}?timeout=0&allowed_updates={allowed_updates_param}");
+        // Long-poll: ask Telegram to hold the connection open for up to
+        // ~25s and return the moment an update arrives. This gives
+        // near-instant message latency AND collapses the idle cost from
+        // one full HTTPS round-trip every ~5s down to a single held
+        // request. The reqwest request timeout below MUST be strictly
+        // longer than this server-side hold (35 > 25) or reqwest would
+        // abort the connection mid-long-poll on every idle cycle.
+        const LONG_POLL_SECS: u64 = 25;
+        let mut url =
+            format!("{base}?timeout={LONG_POLL_SECS}&allowed_updates={allowed_updates_param}");
         if let Some(off) = offset {
             url.push_str(&format!("&offset={off}"));
         }
@@ -873,7 +882,9 @@ impl SenseMonitor for TelegramMonitor {
         let resp = self
             .client
             .get(&url)
-            .timeout(Duration::from_secs(15))
+            // Must exceed LONG_POLL_SECS (25s) plus network margin so the
+            // held long-poll isn't aborted client-side while idle.
+            .timeout(Duration::from_secs(LONG_POLL_SECS + 10))
             .send()
             .await
             .map_err(|e| AthenError::Other(format!("Telegram getUpdates failed: {e}")))?;

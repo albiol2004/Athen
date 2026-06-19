@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { AthenClient } from '../api/client';
 import type {
   ApprovalChoice,
@@ -57,7 +57,11 @@ function toRenderUnits(items: ChatItem[]): RenderUnit[] {
   return units;
 }
 
-function Item({ it, cb, client }: { it: ChatItem; cb: ChatCallbacks; client: AthenClient }) {
+// memo'd: finished items keep their object identity across renders (the
+// reducer's immutable index-replace only swaps the one live item), and
+// `cb` + `client` are stabilized by Shell, so only the streaming item
+// re-renders per delta. Sealed bubbles / completed tools skip entirely.
+const Item = memo(function Item({ it, cb, client }: { it: ChatItem; cb: ChatCallbacks; client: AthenClient }) {
   switch (it.kind) {
     case 'msg':
       if (it.role === 'system') return <div className="msg system">{it.content}</div>;
@@ -78,7 +82,7 @@ function Item({ it, cb, client }: { it: ChatItem; cb: ChatCallbacks; client: Ath
     case 'grant':
       return <GrantCard g={it.g} resolved={it.resolved} onDecide={(d, l) => cb.onDecideGrant(it.g, d, l)} />;
   }
-}
+});
 
 const IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
 
@@ -165,7 +169,10 @@ export function Chat({
     inputRef.current?.focus();
   };
 
-  const units = toRenderUnits(items);
+  // Recompute render units only when the timeline actually changes. The
+  // unit arrays (and their grouped tool slices) then keep their reference
+  // identity across streaming renders, so memo'd children below stay put.
+  const units = useMemo(() => toRenderUnits(items), [items]);
 
   return (
     <div className="chat">

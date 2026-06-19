@@ -44,7 +44,20 @@ pub fn run_headless() {
     // Plain tokio runtime, registered as the Tauri async runtime so every
     // `tauri::async_runtime::spawn`/`block_on` in the shared code paths
     // works unchanged without a Tauri app.
-    let rt = tokio::runtime::Runtime::new().expect("failed to build tokio runtime");
+    //
+    // Cap worker threads: Athen's workload is overwhelmingly I/O-bound (sense
+    // polling, LLM HTTP), not CPU-parallel, so `Runtime::new()`'s default of
+    // one worker per core just spawns mostly-idle threads on a high-core box.
+    // clamp(2, 4) leaves modest machines untouched while capping the rest.
+    let worker_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .clamp(2, 4);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
     tauri::async_runtime::set(rt.handle().clone());
 
     let ui = UiBridge::Headless;

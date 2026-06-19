@@ -29,5 +29,28 @@ fn main() {
     #[cfg(target_os = "linux")]
     std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
 
+    // Cap tokio worker threads. Tauri's default global runtime spawns one
+    // worker per CPU core, but Athen's workload is overwhelmingly I/O-bound
+    // (sense polling, LLM HTTP), not CPU-parallel — so a high-core box would
+    // get many mostly-idle worker threads + their stacks. clamp(2, 4) leaves
+    // modest machines untouched (they already have few cores) while stopping
+    // a 16-core box from spawning 16 idle workers. Registered BEFORE the
+    // Tauri builder runs (and before any async_runtime block_on/spawn), since
+    // `set` panics if the runtime is already initialized. `rt` is bound here
+    // so it lives for the whole program — dropping it shuts the runtime down.
+    let worker_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .clamp(2, 4);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+    tauri::async_runtime::set(rt.handle().clone());
+
     athen_app::run();
+
+    // Keep the runtime alive until the Tauri app loop returns.
+    drop(rt);
 }

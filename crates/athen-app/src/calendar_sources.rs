@@ -542,20 +542,19 @@ fn etag_present(etag: &Option<String>) -> bool {
     etag.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
 }
 
-/// Linear scan over the source's rows to find a matching remote_id.
-/// Cheap in practice — sources typically have ≤ a few hundred events
-/// in the pull window — and we avoid adding a dedicated query method
-/// just for the sync loop. If this ever shows up in a profile we add
-/// `CalendarStore::find_by_remote_id`.
+/// Find the local row matching this `(source_id, remote_id)` key.
+///
+/// Backed by `CalendarStore::find_by_remote`, which uses the
+/// `idx_calendar_events_source(source_id, remote_id)` composite index — an
+/// indexed lookup, not the old full-table scan + Rust filter. This is called
+/// once per pulled remote event, so on a wide first-sync pull the old
+/// `list_all_events()` path was O(N²) full table scans.
 async fn find_by_remote_id(
     store: &CalendarStore,
     source_id: &str,
     remote_id: &str,
 ) -> Result<Option<CalendarEvent>> {
-    let all = store.list_all_events().await?;
-    Ok(all.into_iter().find(|e| {
-        e.source_id.as_deref() == Some(source_id) && e.remote_id.as_deref() == Some(remote_id)
-    }))
+    store.find_by_remote(source_id, remote_id).await
 }
 
 fn remote_to_local_event(
@@ -622,9 +621,16 @@ async fn reconcile_deletes(
     window_start: DateTime<Utc>,
     window_end: DateTime<Utc>,
 ) -> Result<usize> {
-    let all = store.list_all_events().await?;
+    // Source-scoped query (indexed via idx_calendar_events_source's leading
+    // column) instead of loading every source's events. Local-only events
+    // (source_id IS NULL) are never returned here, so they can never be
+    // deleted — the reconciliation key stays (source_id, remote_id).
+    let rows = store.list_by_source(source_id).await?;
     let mut deleted = 0usize;
-    for ev in all {
+    for ev in rows {
+        // Belt-and-suspenders: the query already filters by source_id, but
+        // keep the guard so local-only events stay protected if this ever
+        // changes.
         if ev.source_id.as_deref() != Some(source_id) {
             continue;
         }

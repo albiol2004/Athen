@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { ApiError, AthenClient } from '../api/client';
 import { connectEvents, type ConnectionStatus } from '../api/events';
 import type { ArcMeta, NotificationInfo } from '../api/types';
@@ -8,7 +8,7 @@ import { AgentsPanel } from './AgentsPanel';
 import { ArcPickers } from './ArcPickers';
 import { Bell } from './Bell';
 import { ChangesRail } from './ChangesRail';
-import { Chat, type OutgoingFile, type OutgoingImage } from './Chat';
+import { Chat, type ChatCallbacks, type OutgoingFile, type OutgoingImage } from './Chat';
 import { GoalBanner, type GoalState, type PlanState } from './PlanGoal';
 import { Sidebar } from './Sidebar';
 import { Wakeups } from './Wakeups';
@@ -255,7 +255,64 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
     }
   }, [client, bail]);
 
-  const activeMeta = arcs.find((a) => a.id === activeArc);
+  // ---- chat callbacks (stabilized so the memo'd timeline doesn't churn) ----
+  // Every handler below closes only over stable values: `client` (singleton),
+  // `dispatch` (stable from useReducer), and already-memoized callbacks
+  // (`send`, `cancel`, `refreshGoalPlan`). `setPlan` is a stable state setter.
+  const onSend = useCallback(
+    (t: string, imgs: OutgoingImage[], fls: OutgoingFile[]) => void send(t, imgs, fls),
+    [send],
+  );
+  const onAnswerQuestion = useCallback<ChatCallbacks['onAnswerQuestion']>(
+    async (q, c) => {
+      await client.answerQuestion(q.id, c.key);
+      dispatch({ type: 'resolve', card: 'question', refId: q.id, label: c.label || c.key });
+    },
+    [client],
+  );
+  const onDecideTask = useCallback<ChatCallbacks['onDecideTask']>(
+    async (t, approved) => {
+      await client.approveTask(t.task_id, approved);
+      dispatch({
+        type: 'resolve',
+        card: 'task',
+        refId: t.task_id,
+        label: approved ? 'Approved' : 'Denied',
+      });
+    },
+    [client],
+  );
+  const onDecideGrant = useCallback<ChatCallbacks['onDecideGrant']>(
+    async (g, decision, label) => {
+      await client.resolveGrant(g.id, decision);
+      dispatch({ type: 'resolve', card: 'grant', refId: g.id, label });
+    },
+    [client],
+  );
+  const onApprovePlan = useCallback<ChatCallbacks['onApprovePlan']>(async () => {
+    await client.post('/plan/approve');
+    await refreshGoalPlan();
+    void send('Execute the plan step by step.', [], []);
+  }, [client, refreshGoalPlan, send]);
+  const onDiscardPlan = useCallback<ChatCallbacks['onDiscardPlan']>(async () => {
+    await client.post('/plan/clear');
+    setPlan(null);
+  }, [client]);
+
+  const cb = useMemo<ChatCallbacks>(
+    () => ({
+      onSend,
+      onCancel: cancel,
+      onAnswerQuestion,
+      onDecideTask,
+      onDecideGrant,
+      onApprovePlan,
+      onDiscardPlan,
+    }),
+    [onSend, cancel, onAnswerQuestion, onDecideTask, onDecideGrant, onApprovePlan, onDiscardPlan],
+  );
+
+  const activeMeta = useMemo(() => arcs.find((a) => a.id === activeArc), [arcs, activeArc]);
 
   return (
     <div className="shell">
@@ -376,36 +433,7 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
           arcKey={activeArc}
           plan={plan}
           client={client}
-          cb={{
-            onSend: (t, imgs, fls) => void send(t, imgs, fls),
-            onCancel: cancel,
-            onAnswerQuestion: async (q, c) => {
-              await client.answerQuestion(q.id, c.key);
-              dispatch({ type: 'resolve', card: 'question', refId: q.id, label: c.label || c.key });
-            },
-            onDecideTask: async (t, approved) => {
-              await client.approveTask(t.task_id, approved);
-              dispatch({
-                type: 'resolve',
-                card: 'task',
-                refId: t.task_id,
-                label: approved ? 'Approved' : 'Denied',
-              });
-            },
-            onDecideGrant: async (g, decision, label) => {
-              await client.resolveGrant(g.id, decision);
-              dispatch({ type: 'resolve', card: 'grant', refId: g.id, label });
-            },
-            onApprovePlan: async () => {
-              await client.post('/plan/approve');
-              await refreshGoalPlan();
-              void send('Execute the plan step by step.', [], []);
-            },
-            onDiscardPlan: async () => {
-              await client.post('/plan/clear');
-              setPlan(null);
-            },
-          }}
+          cb={cb}
         />
       </div>
       {drawer === 'agents' && (

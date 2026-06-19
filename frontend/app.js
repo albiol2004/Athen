@@ -17,6 +17,14 @@ let streamingBubble = null;
 let streamingText = '';
 // Whether we received any streaming chunks for the current request.
 let didReceiveStreamChunks = false;
+// rAF coalescing for the streaming auto-scroll hot path. During a burst of
+// `agent-stream` deltas we schedule at most one rAF per frame; the pin-state
+// snapshot for that frame is captured once (the first delta) and the scroll
+// happens inside the single rAF, avoiding a forced synchronous layout per
+// delta. `streamScrollScheduled` is cleared inside the rAF callback.
+let streamScrollScheduled = false;
+let streamScrollWasPinned = false;
+let streamScrollEl = null;
 // Whether a request is currently being processed by the agent.
 let isProcessing = false;
 // Tracks the thinking/reasoning block for thinking models.
@@ -454,7 +462,17 @@ function registerTauriEventListeners() {
         // Creating a thinking block or streaming bubble adds height and
         // can push the measured distance past the 80px threshold, falsely
         // un-pinning the user.
-        const wasPinned = isScrollPinned(messagesEl.parentElement);
+        //
+        // To avoid a forced synchronous layout on EVERY delta, the geometry
+        // read is taken at most once per animation frame: only when no
+        // stream-scroll rAF is already pending (i.e. the first delta of the
+        // current frame). Subsequent deltas in the same frame reuse that
+        // snapshot. `scheduleStreamScroll` performs the actual scroll inside
+        // the single coalesced rAF. The <80px pinned-only semantics are
+        // unchanged — only the read frequency drops.
+        const wasPinned = streamScrollScheduled
+            ? streamScrollWasPinned
+            : isScrollPinned(messagesEl.parentElement);
 
         didReceiveStreamChunks = true;
 
@@ -511,7 +529,12 @@ function registerTauriEventListeners() {
                 wrap.appendChild(thinkingBlock);
             }
 
-            thinkingContent.textContent = thinkingText;
+            // Same O(n²) guard as the streaming bubble below: append only
+            // the new delta as a text node instead of re-writing the whole
+            // accumulated `thinkingText` each chunk. `thinkingText` is still
+            // kept for the is_final pass (line ~401) which re-sets
+            // textContent once from the full string.
+            thinkingContent.appendChild(document.createTextNode(delta));
         } else {
             streamingText += delta;
 
@@ -547,10 +570,17 @@ function registerTauriEventListeners() {
                 wrap.appendChild(streamingBubble);
             }
 
-            streamingBubble.textContent = streamingText;
+            // Append ONLY the new delta as a text node instead of
+            // re-writing the entire accumulated string into textContent
+            // every chunk (which is O(n²) over the message length). The
+            // running `streamingText` is still maintained above for the
+            // final markdown render at is_final; mid-stream the bubble
+            // shows raw appended text, so appending preserves the same
+            // visible content while reading/writing only the new delta.
+            streamingBubble.appendChild(document.createTextNode(delta));
         }
 
-        scrollChatIfPinned(messagesEl.parentElement, 'auto', wasPinned);
+        scheduleStreamScroll(messagesEl.parentElement, wasPinned);
     });
 
     // Listen for arc updates (e.g. Telegram auto-execution, goal state changes).
@@ -905,6 +935,30 @@ function scrollChatIfPinned(scrollEl, behavior, wasPinned) {
         scrollEl.scrollTo({
             top: scrollEl.scrollHeight,
             behavior: behavior || 'smooth',
+        });
+    });
+}
+
+// Streaming hot-path auto-scroll. Unlike `scrollChatIfPinned` (which can be
+// invoked once per delta and would force a layout each time), this coalesces
+// a burst of deltas into a SINGLE rAF per frame: the first delta of the frame
+// schedules the rAF and records the pre-mutation pin snapshot; later deltas in
+// the same frame are no-ops here (they only refresh the target element). The
+// geometry read for the scroll target happens once, inside the rAF. Pinned-only
+// semantics are identical to `scrollChatIfPinned`: scroll only when the user
+// was pinned within 80px of the bottom BEFORE this frame's DOM mutations.
+function scheduleStreamScroll(scrollEl, wasPinned) {
+    if (!scrollEl) return;
+    streamScrollEl = scrollEl;
+    if (streamScrollScheduled) return;
+    streamScrollScheduled = true;
+    streamScrollWasPinned = wasPinned;
+    requestAnimationFrame(() => {
+        streamScrollScheduled = false;
+        if (!streamScrollWasPinned || !streamScrollEl) return;
+        streamScrollEl.scrollTo({
+            top: streamScrollEl.scrollHeight,
+            behavior: 'auto',
         });
     });
 }
