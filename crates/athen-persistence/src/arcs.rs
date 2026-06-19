@@ -182,6 +182,10 @@ pub struct ArcMeta {
     /// the other `*_override` columns — a durable user preference, not an
     /// in-flight snapshot.
     pub security_mode_override: Option<String>,
+    /// Optional Project this arc belongs to (`projects.id`). `None` means the
+    /// arc is not part of any project. Sub-arcs inherit the parent arc's
+    /// `project_id` at creation. See `docs/PROJECTS.md`.
+    pub project_id: Option<String>,
     /// Mini-plan drafted by the triage LLM call (same call that evaluates
     /// risk + complexity — see `RiskScore.plan`). Captured once at task
     /// creation, then survives compaction as arc-level metadata. The
@@ -513,6 +517,15 @@ impl ArcStore {
                     .map_err(|e| AthenError::Other(format!("Add plan_json: {e}")))?;
             }
 
+            // Column-level migration: `project_id` lets an arc belong to a
+            // Project (the ChatGPT/Claude-style container that groups many
+            // arcs around common work). NULL means the arc is not part of
+            // any project. See `docs/PROJECTS.md`.
+            if !cols.contains("project_id") {
+                conn.execute("ALTER TABLE arcs ADD COLUMN project_id TEXT", [])
+                    .map_err(|e| AthenError::Other(format!("Add project_id: {e}")))?;
+            }
+
             Ok(())
         })
         .await
@@ -540,7 +553,39 @@ impl ArcStore {
         .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
     }
 
-    /// Create a new Arc branched from a parent Arc.
+    /// Create a new Arc with Active status, optionally belonging to a Project.
+    /// Pass `None` for `project_id` to create an arc with no project (identical
+    /// to [`Self::create_arc`]).
+    pub async fn create_arc_in_project(
+        &self,
+        id: &str,
+        name: &str,
+        source: ArcSource,
+        project_id: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.clone();
+        let id = id.to_string();
+        let name = name.to_string();
+        let source_str = source.as_str().to_string();
+        let project_id = project_id.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let now = Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT INTO arcs (id, name, source, status, created_at, updated_at, project_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![id, name, source_str, "active", now, now, project_id],
+            )
+            .map_err(|e| AthenError::Other(format!("Create arc in project: {e}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
+    /// Create a new Arc branched from a parent Arc. The child inherits the
+    /// parent arc's `project_id` so a delegation sub-arc stays within the same
+    /// Project as the arc that spawned it.
     pub async fn create_arc_with_parent(
         &self,
         id: &str,
@@ -556,10 +601,19 @@ impl ArcStore {
         tokio::task::spawn_blocking(move || {
             let conn = conn.blocking_lock();
             let now = Utc::now().to_rfc3339();
+            // Inherit the parent's project_id (if any) so the child arc lands
+            // in the same Project as the arc it branched from.
+            let parent_project_id: Option<String> = conn
+                .query_row(
+                    "SELECT project_id FROM arcs WHERE id = ?1",
+                    params![parent_arc_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .map_err(|e| AthenError::Other(format!("Lookup parent project_id: {e}")))?;
             conn.execute(
-                "INSERT INTO arcs (id, name, source, status, parent_arc_id, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![id, name, source_str, "active", parent_arc_id, now, now],
+                "INSERT INTO arcs (id, name, source, status, parent_arc_id, created_at, updated_at, project_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![id, name, source_str, "active", parent_arc_id, now, now, parent_project_id],
             )
             .map_err(|e| AthenError::Other(format!("Create arc with parent: {e}")))?;
             Ok(())
@@ -587,7 +641,8 @@ impl ArcStore {
                             a.triage_plan_acceptance, a.triage_plan_scope, \
                             a.user_goal, a.user_goal_criteria, \
                             a.goal_status, a.goal_blocked_reason, \
-                            a.plan_json, a.security_mode_override \
+                            a.plan_json, a.security_mode_override, \
+                            a.project_id \
                      FROM arcs a \
                      LEFT JOIN ( \
                          SELECT arc_id, COUNT(*) AS cnt \
@@ -625,6 +680,7 @@ impl ArcStore {
                             .get::<_, Option<String>>(22)?
                             .and_then(|s| serde_json::from_str(&s).ok()),
                         security_mode_override: row.get(23)?,
+                        project_id: row.get::<_, Option<String>>(24)?,
                     })
                 })
                 .map_err(|e| AthenError::Other(format!("Query get arc: {e}")))?;
@@ -677,7 +733,8 @@ impl ArcStore {
                         a.triage_plan_acceptance, a.triage_plan_scope, \
                         a.user_goal, a.user_goal_criteria, \
                         a.goal_status, a.goal_blocked_reason, \
-                        a.plan_json, a.security_mode_override \
+                        a.plan_json, a.security_mode_override, \
+                        a.project_id \
                  FROM arcs a \
                  LEFT JOIN ( \
                      SELECT arc_id, COUNT(*) AS cnt \
@@ -718,6 +775,7 @@ impl ArcStore {
                             .get::<_, Option<String>>(22)?
                             .and_then(|s| serde_json::from_str(&s).ok()),
                         security_mode_override: row.get(23)?,
+                        project_id: row.get::<_, Option<String>>(24)?,
                     })
                 })
                 .map_err(|e| AthenError::Other(format!("Query list arcs: {e}")))?;
@@ -1155,6 +1213,26 @@ impl ArcStore {
                 params![value, id],
             )
             .map_err(|e| AthenError::Other(format!("Set security_mode_override: {e}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
+    /// Set (or clear) the Project this arc belongs to. Last-write-wins. Pass
+    /// `None` to remove the arc from its project; pass `Some(project_id)` to
+    /// move it into (or between) Projects. See `docs/PROJECTS.md`.
+    pub async fn set_arc_project(&self, arc_id: &str, project_id: Option<&str>) -> Result<()> {
+        let conn = self.conn.clone();
+        let arc_id = arc_id.to_string();
+        let project_id = project_id.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE arcs SET project_id = ?1 WHERE id = ?2",
+                params![project_id, arc_id],
+            )
+            .map_err(|e| AthenError::Other(format!("Set project_id: {e}")))?;
             Ok(())
         })
         .await
@@ -1799,7 +1877,8 @@ CREATE TABLE IF NOT EXISTS arcs (
     goal_status TEXT,
     goal_blocked_reason TEXT,
     plan_json TEXT,
-    security_mode_override TEXT
+    security_mode_override TEXT,
+    project_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS arc_entries (
@@ -3429,5 +3508,83 @@ mod tests {
             meta.triage_plan.is_none(),
             "half-plan must collapse to None on read"
         );
+    }
+
+    /// `project_id` round-trip: an arc created in a project carries it,
+    /// a plain arc has `None`, `set_arc_project` updates it (and clears it),
+    /// and a child arc branched from a parent inherits the parent's project.
+    #[tokio::test]
+    async fn test_project_id_round_trip() {
+        let store = setup_arc_store().await;
+
+        // Created in a project -> get_arc returns it (and list_arcs too).
+        store
+            .create_arc_in_project("arc_proj", "In project", ArcSource::UserInput, Some("proj_1"))
+            .await
+            .unwrap();
+        let meta = store
+            .get_arc("arc_proj")
+            .await
+            .unwrap()
+            .expect("arc present");
+        assert_eq!(meta.project_id.as_deref(), Some("proj_1"));
+        let listed = store.list_arcs().await.unwrap();
+        let row = listed.iter().find(|a| a.id == "arc_proj").unwrap();
+        assert_eq!(row.project_id.as_deref(), Some("proj_1"));
+
+        // Plain create yields None.
+        store
+            .create_arc("arc_plain", "No project", ArcSource::UserInput)
+            .await
+            .unwrap();
+        let meta = store
+            .get_arc("arc_plain")
+            .await
+            .unwrap()
+            .expect("arc present");
+        assert_eq!(meta.project_id, None);
+
+        // set_arc_project moves the plain arc into a project, then clears it.
+        store
+            .set_arc_project("arc_plain", Some("proj_2"))
+            .await
+            .unwrap();
+        let meta = store
+            .get_arc("arc_plain")
+            .await
+            .unwrap()
+            .expect("arc present");
+        assert_eq!(meta.project_id.as_deref(), Some("proj_2"));
+        store.set_arc_project("arc_plain", None).await.unwrap();
+        let meta = store
+            .get_arc("arc_plain")
+            .await
+            .unwrap()
+            .expect("arc present");
+        assert_eq!(meta.project_id, None);
+
+        // A child branched from a parent inherits the parent's project_id.
+        store
+            .create_arc_with_parent("arc_child", "Child", ArcSource::UserInput, "arc_proj")
+            .await
+            .unwrap();
+        let meta = store
+            .get_arc("arc_child")
+            .await
+            .unwrap()
+            .expect("arc present");
+        assert_eq!(meta.project_id.as_deref(), Some("proj_1"));
+
+        // A child of a project-less parent inherits None.
+        store
+            .create_arc_with_parent("arc_child2", "Child 2", ArcSource::UserInput, "arc_plain")
+            .await
+            .unwrap();
+        let meta = store
+            .get_arc("arc_child2")
+            .await
+            .unwrap()
+            .expect("arc present");
+        assert_eq!(meta.project_id, None);
     }
 }

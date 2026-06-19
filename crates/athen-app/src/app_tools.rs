@@ -92,6 +92,11 @@ pub struct AppToolRegistry {
     /// events. Optional so non-Tauri builds (CLI / tests) just see no
     /// progress events instead of failing to compile.
     app_handle: Option<tauri::AppHandle>,
+    /// Folder slug of the active project, if any. When set, `save_file`
+    /// with `category="project"` and no explicit `project` arg files into
+    /// `Projects/<slug>/`. Wired in a separate slice from the arc's
+    /// `project_id`; `None` means the agent must pass `project` explicitly.
+    active_project_slug: Option<String>,
 }
 
 impl AppToolRegistry {
@@ -124,6 +129,7 @@ impl AppToolRegistry {
             loaded_skills: std::sync::Mutex::new(std::collections::HashSet::new()),
             telephony: None,
             app_handle: None,
+            active_project_slug: None,
         }
     }
 
@@ -145,6 +151,19 @@ impl AppToolRegistry {
 
     pub fn with_active_profile_id(mut self, id: Option<String>) -> Self {
         self.active_profile_id = id;
+        self
+    }
+
+    /// Attach the active project's folder slug so `save_file` with
+    /// `category="project"` (and no explicit `project` arg) files into
+    /// `Projects/<slug>/`. Resolved from the arc's `project_id` by the
+    /// composition root in a separate slice; `None` keeps the explicit
+    /// `project` arg path working.
+    // The call site (arc project_id → folder_slug) lands in a separate
+    // slice; allow until then so this slice stays warning-clean.
+    #[allow(dead_code)]
+    pub fn with_active_project(mut self, slug: Option<String>) -> Self {
+        self.active_project_slug = slug;
         self
     }
 
@@ -1615,6 +1634,138 @@ impl AppToolRegistry {
         })
     }
 
+    fn save_file_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "category": {
+                    "type": "string",
+                    "enum": ["user_info", "download", "project", "note", "output"],
+                    "description": "Semantic bucket the file belongs in. user_info = durable facts/documents about the user; download = fetched files; project = multi-file work (set `project` to the project name); note = freeform notes; output = generated deliverables.",
+                },
+                "project": {
+                    "type": "string",
+                    "description": "The project name. Used/required only when category=='project'.",
+                },
+                "filename": {
+                    "type": "string",
+                    "description": "The file name, e.g. 'contract.pdf' or 'notes.md'. Just the name — no directory path.",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "The file contents.",
+                },
+            },
+            "required": ["category", "filename", "content"]
+        })
+    }
+
+    /// Pure mapping from a semantic category + filename to the relative
+    /// workspace path the `write` tool should receive. Kept free of `self`
+    /// so the bucket/slug/sanitization logic is unit-testable.
+    ///
+    /// `active_slug` is the folder slug of the active project (if any),
+    /// used as the fallback when `category=="project"` and no explicit
+    /// `project` name was given. Returns the relative path string on
+    /// success, or a human-readable error message.
+    fn resolve_save_path(
+        category: &str,
+        project: Option<&str>,
+        active_slug: Option<&str>,
+        filename: &str,
+    ) -> std::result::Result<String, String> {
+        // Sanitize the filename: take only the final path component so the
+        // agent can't escape the bucket via separators or `..`.
+        let safe_name = std::path::Path::new(filename)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| {
+                "save_file: 'filename' must be a plain file name, not a path".to_string()
+            })?;
+        if safe_name != filename {
+            return Err(
+                "save_file: 'filename' must be a plain file name without path separators or '..'"
+                    .to_string(),
+            );
+        }
+
+        let bucket: String = match category {
+            "user_info" => "UserInfo".to_string(),
+            "download" => "Downloads".to_string(),
+            "note" => "Notes".to_string(),
+            "output" => "Outputs".to_string(),
+            "project" => {
+                let slug = match project.map(str::trim).filter(|s| !s.is_empty()) {
+                    Some(name) => athen_persistence::projects::slugify(name),
+                    None => match active_slug.map(str::trim).filter(|s| !s.is_empty()) {
+                        Some(s) => s.to_string(),
+                        None => {
+                            return Err("save_file with category=project requires a `project` name (or an active project)".to_string());
+                        }
+                    },
+                };
+                format!("Projects/{slug}")
+            }
+            other => {
+                return Err(format!(
+                    "save_file: unknown category '{other}' (expected one of user_info, download, project, note, output)"
+                ));
+            }
+        };
+
+        Ok(format!("{bucket}/{safe_name}"))
+    }
+
+    async fn do_save_file(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let category = args
+            .get("category")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| AthenError::Other("save_file: 'category' is required".to_string()))?;
+
+        let filename = args
+            .get("filename")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| AthenError::Other("save_file: 'filename' is required".to_string()))?;
+
+        let content = args
+            .get("content")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AthenError::Other("save_file: 'content' is required".to_string()))?;
+
+        let project = args.get("project").and_then(|v| v.as_str());
+
+        let rel_path = match Self::resolve_save_path(
+            category,
+            project,
+            self.active_project_slug.as_deref(),
+            filename,
+        ) {
+            Ok(p) => p,
+            Err(msg) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: json!({ "error": msg }),
+                    error: Some(msg),
+                    execution_time_ms: 0,
+                });
+            }
+        };
+
+        // Delegate to the low-level `write` tool so checkpoint/snapshot/hash
+        // behaviour is inherited. The relative path is resolved against the
+        // workspace by `write` itself (via `resolve_in_workspace`).
+        self.inner
+            .call_tool(
+                "write",
+                json!({ "path": rel_path, "content": content }),
+            )
+            .await
+    }
+
     fn identity_add_schema() -> serde_json::Value {
         json!({
             "type": "object",
@@ -3020,6 +3171,21 @@ impl ToolRegistry for AppToolRegistry {
             base_risk: BaseImpact::Read,
         });
 
+        // save_file: always advertised. Category-driven convenience wrapper
+        // over `write` — resolves a semantic bucket to a workspace path in
+        // code, then delegates so checkpoint/snapshot/hash all happen in
+        // `write`. Augments write/edit, never replaces them.
+        tools.push(ToolDefinition {
+            name: "save_file".to_string(),
+            description: "Save a file into the agent's workspace under a semantic category, so it's filed in the right place automatically. Categories: user_info (durable facts/documents about the user), download (fetched files), project (multi-file work — set `project` to the project name), note (freeform notes), output (generated deliverables). Prefer this over composing workspace paths by hand.".to_string(),
+            parameters: Self::save_file_schema(),
+            backend: ToolBackend::Shell {
+                command: String::new(),
+                native: false,
+            },
+            base_risk: BaseImpact::WritePersist,
+        });
+
         if self.identity.is_some() {
             tools.push(ToolDefinition {
                 name: "identity_add".to_string(),
@@ -3200,6 +3366,7 @@ impl ToolRegistry for AppToolRegistry {
             "read_attachment_full" => self.do_read_attachment_full(&args).await,
             "fetch_attachment" => self.do_fetch_attachment(&args).await,
             "identity_add" => self.do_identity_add(&args).await,
+            "save_file" => self.do_save_file(&args).await,
             "load_skill" => self.do_load_skill(&args).await,
             "athen_docs" => self.do_athen_docs(&args),
             "http_request" => self.do_http_request(&args).await,
@@ -3226,6 +3393,62 @@ mod tests {
     use athen_persistence::calendar::EventCreator;
     use athen_persistence::Database;
     use serde_json::json;
+
+    #[test]
+    fn save_file_resolves_project_with_explicit_name() {
+        let path =
+            AppToolRegistry::resolve_save_path("project", Some("My Big Plan"), None, "notes.md")
+                .unwrap();
+        assert_eq!(path, "Projects/my-big-plan/notes.md");
+    }
+
+    #[test]
+    fn save_file_resolves_project_from_active_slug() {
+        let path =
+            AppToolRegistry::resolve_save_path("project", None, Some("acme-rebrand"), "draft.txt")
+                .unwrap();
+        assert_eq!(path, "Projects/acme-rebrand/draft.txt");
+    }
+
+    #[test]
+    fn save_file_resolves_simple_buckets() {
+        assert_eq!(
+            AppToolRegistry::resolve_save_path("user_info", None, None, "passport.pdf").unwrap(),
+            "UserInfo/passport.pdf"
+        );
+        assert_eq!(
+            AppToolRegistry::resolve_save_path("download", None, None, "file.zip").unwrap(),
+            "Downloads/file.zip"
+        );
+        assert_eq!(
+            AppToolRegistry::resolve_save_path("note", None, None, "todo.md").unwrap(),
+            "Notes/todo.md"
+        );
+        assert_eq!(
+            AppToolRegistry::resolve_save_path("output", None, None, "report.md").unwrap(),
+            "Outputs/report.md"
+        );
+    }
+
+    #[test]
+    fn save_file_project_without_name_or_active_errors() {
+        let err = AppToolRegistry::resolve_save_path("project", None, None, "x.md").unwrap_err();
+        assert!(err.contains("requires a `project` name"));
+    }
+
+    #[test]
+    fn save_file_unknown_category_errors() {
+        let err = AppToolRegistry::resolve_save_path("bogus", None, None, "x.md").unwrap_err();
+        assert!(err.contains("unknown category"));
+    }
+
+    #[test]
+    fn save_file_rejects_path_traversal_in_filename() {
+        assert!(AppToolRegistry::resolve_save_path("note", None, None, "../escape.md").is_err());
+        assert!(
+            AppToolRegistry::resolve_save_path("note", None, None, "sub/dir/file.md").is_err()
+        );
+    }
 
     /// Helper: create an in-memory DB + CalendarStore + AppToolRegistry.
     /// Returns the database (must be kept alive) and the registry.

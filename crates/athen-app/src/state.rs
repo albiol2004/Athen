@@ -189,6 +189,10 @@ pub struct AppState {
     pub model_name: Mutex<String>,
     /// Current active Arc identifier (format: `arc_YYYYMMDD_HHMMSS`).
     pub active_arc_id: Mutex<String>,
+    /// Currently active Project identifier, if any. `None` means the
+    /// active arc is not scoped to a Project. Mirrors `active_arc_id`'s
+    /// `Mutex` type (tokio). Part of the Projects feature substrate.
+    pub active_project_id: Mutex<Option<String>>,
     /// Persistent Arc storage backed by SQLite.
     pub arc_store: Option<ArcStore>,
     /// Persistent calendar event storage backed by SQLite.
@@ -274,6 +278,11 @@ pub struct AppState {
     /// categories). Read at prompt-build time and folded into the static
     /// system header so every agent shares the same "who Athen is".
     pub identity_store: Option<Arc<athen_persistence::identity::SqliteIdentityStore>>,
+    /// SQLite-backed project store. Holds the user's Projects (the
+    /// ChatGPT/Claude-style containers that group many arcs around common
+    /// work). Built from `database` like `identity_store`. Part of the
+    /// Projects feature substrate; see `docs/PROJECTS.md`.
+    pub project_store: Option<Arc<athen_persistence::projects::ProjectStore>>,
     /// Filesystem + SQLite skill store. Bodies live on disk under
     /// `<data_dir>/skills/<slug>/SKILL.md`; the index is in SQLite. Read at
     /// prompt-build time to inject the SKILLS listing (name+description per
@@ -507,6 +516,10 @@ pub(crate) struct ToolRegistryDeps {
     pub mcp: Arc<McpRegistry>,
     pub attachment_store: Option<athen_persistence::attachments::AttachmentStore>,
     pub identity_store: Option<Arc<athen_persistence::identity::SqliteIdentityStore>>,
+    /// Project store, plumbed alongside `identity_store` so the per-arc
+    /// registry build can later resolve an arc's project folder. Wiring of
+    /// the actual save/slug resolution is a separate Projects slice.
+    pub project_store: Option<Arc<athen_persistence::projects::ProjectStore>>,
     pub skill_store: Option<Arc<athen_persistence::skills::SqliteSkillStore>>,
     pub http_endpoint_store:
         Option<Arc<athen_persistence::http_endpoints::SqliteHttpEndpointStore>>,
@@ -1065,6 +1078,13 @@ impl AppState {
         let grant_store = database.as_ref().map(|db| Arc::new(db.grant_store()));
         let profile_store = database.as_ref().map(|db| Arc::new(db.profile_store()));
         let identity_store = database.as_ref().map(|db| Arc::new(db.identity_store()));
+        let project_store = database.as_ref().map(|db| Arc::new(db.project_store()));
+        // Seed the opinionated workspace folder skeleton
+        // (UserInfo/Downloads/Projects/...) on boot. Best-effort and purely
+        // additive — never fail construction on it. See `docs/PROJECTS.md`.
+        if let Err(e) = athen_core::paths::seed_workspace_skeleton() {
+            tracing::warn!("failed to seed workspace skeleton: {e}");
+        }
         // Skill store: bodies live under <data_dir>/skills/. Construction is
         // gated on a known data_dir so an in-memory / data_dir-less boot
         // still works (skills just won't be available, same as identity).
@@ -1150,6 +1170,7 @@ impl AppState {
             pending_upload_event_id: Mutex::new(None),
             model_name: Mutex::new(model_name),
             active_arc_id: Mutex::new(active_arc_id),
+            active_project_id: Mutex::new(None),
             arc_store,
             calendar_store,
             trust_manager: contact_store
@@ -1175,6 +1196,7 @@ impl AppState {
             grant_store,
             profile_store,
             identity_store,
+            project_store,
             skill_store,
             wakeup_store,
             wakeup_scheduler_shutdown: std::sync::Mutex::new(None),
@@ -1672,6 +1694,7 @@ impl AppState {
             mcp: self.mcp.clone(),
             attachment_store: self.attachment_store(),
             identity_store: self.identity_store.clone(),
+            project_store: self.project_store.clone(),
             skill_store: self.skill_store.clone(),
             http_endpoint_store: self.http_endpoint_store.clone(),
             vault: self.vault.clone(),

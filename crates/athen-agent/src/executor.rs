@@ -355,6 +355,14 @@ pub struct DefaultExecutor {
     /// write-once on the arc — so within a task the block stays
     /// cache-stable.
     mission_block: Option<String>,
+    /// Custom instructions carried by the arc's parent Project, rendered
+    /// in the static prefix right after the mission section. Unlike
+    /// `mission_block` (about THIS task), this describes the standing
+    /// context/rules of the Project the arc belongs to. It changes only
+    /// when the user edits the Project, so — like identity and mission —
+    /// it stays cache-stable within an arc. `None` (the default)
+    /// reproduces today's prompt byte-for-byte for arcs with no project.
+    project_block: Option<String>,
     /// Raw acceptance-criteria string (the same `TriagePlan` field that
     /// went into `mission_block`) — fed to the completion judge so it
     /// can flag "agent declared victory but the criterion clearly
@@ -445,6 +453,7 @@ impl DefaultExecutor {
             endpoints_block: None,
             skills_block: None,
             mission_block: None,
+            project_block: None,
             acceptance_criteria: None,
             goal_mode: false,
             reminder_builder: None,
@@ -611,6 +620,19 @@ impl DefaultExecutor {
         self.mission_block = block.filter(|s| !s.trim().is_empty());
     }
 
+    /// Inject the arc's parent-Project custom-instructions block into the
+    /// static system header, rendered right after the mission section.
+    ///
+    /// Fluent builder mirroring `mission_block`'s storage contract: empty
+    /// / whitespace-only / `None` clears the section — arcs with no
+    /// project, or a project that set no instructions, get today's prompt
+    /// byte-for-byte. Cache-stable within an arc (changes only when the
+    /// user edits the Project).
+    pub fn project_block(mut self, block: Option<String>) -> Self {
+        self.project_block = block.filter(|s| !s.trim().is_empty());
+        self
+    }
+
     /// Store the raw `acceptance_criteria` for the completion judge.
     /// The same string already flows into the prompt via `mission_block`;
     /// this slot exists separately because the judge needs the line
@@ -757,6 +779,7 @@ impl DefaultExecutor {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -784,6 +807,7 @@ impl DefaultExecutor {
         endpoints_block: Option<&str>,
         skills_block: Option<&str>,
         mission_block: Option<&str>,
+        project_block: Option<&str>,
     ) -> String {
         let mut prompt = String::new();
         if autonomous {
@@ -806,6 +830,10 @@ impl DefaultExecutor {
         // identity. Profile-filtered upstream isn't needed: the plan is
         // about THIS task, not about the agent's permanent persona.
         prompt.push_str(&Self::build_mission_section(mission_block));
+        // Project context sits right after mission: standing instructions
+        // for the Project this arc belongs to. Same caching contract as
+        // mission/identity — changes only on user edit of the Project.
+        prompt.push_str(&Self::build_project_section(project_block));
         prompt.push_str(&Self::build_workspace_rules(has_context));
         prompt.push_str(&Self::build_shell_env_section(shell_kind));
         prompt.push_str(&Self::build_toolbox_section(toolbox_info));
@@ -1070,6 +1098,23 @@ impl DefaultExecutor {
         section
     }
 
+    /// Render the parent-Project custom-instructions block. Mirrors
+    /// `build_mission_section`'s framing: a labeled `--- PROJECT ---`
+    /// block wrapping the user-authored instructions verbatim. Empty /
+    /// whitespace-only / `None` emits zero bytes, so arcs with no project
+    /// reproduce today's prompt byte-for-byte.
+    fn build_project_section(block: Option<&str>) -> String {
+        let body = match block {
+            Some(b) if !b.trim().is_empty() => b.trim(),
+            _ => return String::new(),
+        };
+        format!(
+            "--- PROJECT (standing context for the project this work belongs to) ---\n\
+             {body}\n\
+             --- END PROJECT ---\n\n"
+        )
+    }
+
     /// Slot 2.55: registered HTTP endpoints. Pinned in the static
     /// prefix so the agent always knows what cloud APIs are
     /// pre-configured (with credentials in the vault) — without this,
@@ -1212,10 +1257,17 @@ impl DefaultExecutor {
             "Your workspace directory: {workspace}\n\
              This is YOUR folder. Anything you create — test files, scratch scripts, \
              HTML servers, etc. — goes here unless the user explicitly names a different \
-             location. Do NOT invent paths under the user's home or assume the existence \
-             of a 'project' directory: if the user wants a file somewhere else, they will \
-             tell you the exact path. Relative paths in file tools and shell commands \
-             already resolve against the workspace, so prefer them.\n\
+             location. Relative paths in file tools and shell commands already resolve \
+             against the workspace, so prefer them. Do NOT invent paths under the user's \
+             home: if the user wants a file somewhere else, they will tell you the exact path.\n\
+             The workspace has a known layout, seeded at boot:\n\
+             UserInfo/   — durable facts/documents about the user (contracts, IDs, accounts)\n\
+             Downloads/  — files fetched from web or messages\n\
+             Projects/<name>/ — multi-file work grouped around one goal\n\
+             Notes/      — freeform notes\n\
+             Outputs/    — generated deliverables\n\
+             Prefer the `save_file` tool with a `category` (and `project` for project work) \
+             over composing these paths by hand — it files things in the right place for you.\n\
              For paths the user explicitly hands you (absolute paths outside the \
              workspace), the first touch may prompt for approval; once granted, \
              subsequent operations on the same directory are silent.\n\n",
@@ -1838,6 +1890,7 @@ impl AgentExecutor for DefaultExecutor {
                 self.endpoints_block.as_deref(),
                 self.skills_block.as_deref(),
                 self.mission_block.as_deref(),
+                self.project_block.as_deref(),
             );
             // Volatile content (current time, host memory recall,
             // attachment summaries, compaction state) used to be appended
@@ -3269,10 +3322,10 @@ mod tests {
         let tools = vec![tool_def("memory_store", "store a memory")];
         let revealed = HashSet::new();
         let interactive = DefaultExecutor::build_system_prompt_with_mode(
-            &tools, &revealed, false, None, None, None, None, false, None, None, None, None,
+            &tools, &revealed, false, None, None, None, None, false, None, None, None, None, None,
         );
         let autonomous = DefaultExecutor::build_system_prompt_with_mode(
-            &tools, &revealed, false, None, None, None, None, true, None, None, None, None,
+            &tools, &revealed, false, None, None, None, None, true, None, None, None, None, None,
         );
 
         assert_ne!(
@@ -3399,7 +3452,7 @@ mod tests {
         let tools = vec![tool_def("memory_store", "store a memory")];
         let revealed = HashSet::new();
         let with_none = DefaultExecutor::build_system_prompt_with_mode(
-            &tools, &revealed, false, None, None, None, None, false, None, None, None, None,
+            &tools, &revealed, false, None, None, None, None, false, None, None, None, None, None,
         );
         let with_empty = DefaultExecutor::build_system_prompt_with_mode(
             &tools,
@@ -3411,6 +3464,7 @@ mod tests {
             None,
             false,
             Some("   \n\n  "),
+            None,
             None,
             None,
             None,
@@ -3439,6 +3493,7 @@ mod tests {
             None,
             false,
             Some(block),
+            None,
             None,
             None,
             None,
@@ -3526,7 +3581,7 @@ mod tests {
         let tools = vec![tool_def("memory_store", "store a memory")];
         let revealed = HashSet::new();
         let with_none = DefaultExecutor::build_system_prompt_with_mode(
-            &tools, &revealed, false, None, None, None, None, false, None, None, None, None,
+            &tools, &revealed, false, None, None, None, None, false, None, None, None, None, None,
         );
         let with_empty = DefaultExecutor::build_system_prompt_with_mode(
             &tools,
@@ -3541,6 +3596,7 @@ mod tests {
             None,
             None,
             Some("   \n\n  "),
+            None,
         );
         assert_eq!(with_none, with_empty);
         assert!(!with_none.contains("--- MISSION"));
@@ -3569,6 +3625,7 @@ mod tests {
             None,
             None,
             Some(mission),
+            None,
         );
         assert!(prompt.contains("--- MISSION (this task) ---"));
         assert!(prompt.contains("--- END MISSION ---"));
@@ -3641,6 +3698,7 @@ mod tests {
             false,
             None,
             Some(block),
+            None,
             None,
             None,
         );

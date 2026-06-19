@@ -110,6 +110,11 @@ pub fn estimate_static_prompt_chars(
         endpoints_block,
         skills_block,
         mission_block,
+        // project_block: not yet surfaced to the static-prefix estimator
+        // (UI token chip). Threading a real param would change this fn's
+        // public signature + every external caller; the chip is a
+        // fresh-start hint, so `None` is acceptable until that lands.
+        None,
     );
     let system_prompt_chars = system_prompt.len();
 

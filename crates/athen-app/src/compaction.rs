@@ -639,6 +639,177 @@ impl LlmArcCompactor {
     }
 }
 
+/// Minimum number of new arc entries (past the project's fold watermark for
+/// that arc) required before we spend an LLM call folding the arc into the
+/// project summary. Mirrors `LlmArcCompactor`'s "< 4 entries → skip"
+/// heuristic so trivial arc switches (a single ack, a quick "thanks") cost
+/// zero tokens.
+const PROJECT_FOLD_MIN_DELTA_ENTRIES: i64 = 4;
+
+/// LLM-driven project-wide compactor.
+///
+/// Maintains a single durable cross-conversation summary per Project by
+/// incrementally folding the *delta* of a just-left arc into the existing
+/// summary. The fold is cheap by construction: it operates on the arc's
+/// already-existing compaction summary plus the small tail of entries past
+/// the project's per-arc watermark — never the raw transcript — and only
+/// fires once enough new entries have accrued (`PROJECT_FOLD_MIN_DELTA_ENTRIES`).
+///
+/// This is the per-switch step of the incremental hierarchical compaction
+/// described in `docs/PROJECTS.md` §"project summary". Call-site wiring
+/// (firing on arc-switch) lives in a separate slice — this type only exposes
+/// the fold primitive.
+#[derive(Clone)]
+pub struct LlmProjectCompactor {
+    arc_store: ArcStore,
+    project_store: Arc<athen_persistence::projects::ProjectStore>,
+    router: Arc<RwLock<Arc<athen_llm::router::DefaultLlmRouter>>>,
+}
+
+impl LlmProjectCompactor {
+    pub fn new(
+        arc_store: ArcStore,
+        project_store: Arc<athen_persistence::projects::ProjectStore>,
+        router: Arc<RwLock<Arc<athen_llm::router::DefaultLlmRouter>>>,
+    ) -> Self {
+        Self {
+            arc_store,
+            project_store,
+            router,
+        }
+    }
+
+    /// The static header for the project-fold call. Instructs the model to
+    /// fold a new delta into the existing durable summary while preserving
+    /// the load-bearing facts a future arc would need.
+    fn project_summary_system_prompt() -> &'static str {
+        "You maintain a concise, durable cross-conversation summary of a \
+Project. Fold the new delta into the existing summary. Preserve decisions, \
+facts about the user, deliverables, and open threads. Stay terse; do not \
+repeat boilerplate. Output only the updated summary."
+    }
+
+    /// Render the delta text for the just-left arc: its already-existing
+    /// compaction summary (if any) followed by the entries past the
+    /// project's watermark for this arc, each as one compact `source: content`
+    /// line with long contents truncated. Folding summaries-plus-tail (not the
+    /// raw transcript) keeps the call cheap.
+    fn build_delta_text(arc_summary: Option<&str>, tail: &[ArcEntry]) -> String {
+        let mut out = String::with_capacity(tail.len() * 80 + 256);
+        if let Some(s) = arc_summary {
+            let s = s.trim();
+            if !s.is_empty() {
+                out.push_str("ARC SUMMARY SO FAR:\n");
+                out.push_str(s);
+                out.push_str("\n\n");
+            }
+        }
+        if !tail.is_empty() {
+            out.push_str("RECENT ENTRIES:\n");
+            for e in tail {
+                let content = one_line(&serde_json::Value::String(e.content.clone()), 400);
+                if content.is_empty() {
+                    continue;
+                }
+                out.push_str("- ");
+                out.push_str(&e.source);
+                out.push_str(": ");
+                out.push_str(&content);
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    /// Fold the just-left arc's delta into the project summary. Incremental
+    /// and best-effort. Returns `Ok(false)` if the min-delta gate skipped it
+    /// (no LLM call), `Ok(true)` if the summary was updated.
+    pub async fn fold_arc_into_project(&self, project_id: &str, arc_id: &str) -> Result<bool> {
+        // 1. Determine the arc's latest entry id. `load_entries_after(.., 0)`
+        //    returns every entry in id-ascending order; the last is the max id.
+        let all = self.arc_store.load_entries_after(arc_id, 0).await?;
+        let Some(latest_id) = all.last().map(|e| e.id) else {
+            // Arc has no entries — nothing to fold.
+            return Ok(false);
+        };
+
+        // 2. Where did we last fold up to for this (project, arc)?
+        let watermark = self
+            .project_store
+            .get_fold_watermark(project_id, arc_id)
+            .await?
+            .unwrap_or(0);
+
+        // 3. Min-delta gate — bail before any LLM call if too little is new.
+        if latest_id - watermark < PROJECT_FOLD_MIN_DELTA_ENTRIES {
+            return Ok(false);
+        }
+
+        // 4. Build the delta from the arc's existing compaction summary plus
+        //    the entries past the watermark (cheap — summaries, not transcript).
+        let arc_summary = self.arc_store.load_latest_summary(arc_id).await?;
+        let tail = self.arc_store.load_entries_after(arc_id, watermark).await?;
+        let delta = Self::build_delta_text(
+            arc_summary.as_ref().map(|s| s.content.as_str()),
+            &tail,
+        );
+
+        // 5. Current project summary, if any.
+        let existing_summary = self
+            .project_store
+            .get_project(project_id)
+            .await?
+            .and_then(|p| p.summary);
+
+        // 6. Assemble the fold prompt.
+        let mut prompt_body = String::new();
+        prompt_body.push_str("[PROJECT_SUMMARY]\n");
+        prompt_body.push_str(existing_summary.as_deref().unwrap_or("(none yet)"));
+        prompt_body.push_str("\n\n[DELTA FROM ARC ");
+        prompt_body.push_str(arc_id);
+        prompt_body.push_str("]\n");
+        prompt_body.push_str(&delta);
+
+        // 7. Cheap-tier LLM call — mirrors `LlmArcCompactor::compact`.
+        let request = LlmRequest {
+            profile: ModelProfile::Fast,
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: MessageContent::Text(prompt_body),
+            }],
+            max_tokens: Some(2048),
+            temperature: Some(0.0),
+            tools: None,
+            system_prompt: Some(Self::project_summary_system_prompt().to_string()),
+            reasoning_effort: athen_core::llm::ReasoningEffort::default(),
+        };
+
+        let router = self.router.read().await.clone();
+        let response = router.route(&request).await.map_err(|e| {
+            AthenError::Other(format!(
+                "Project fold LLM call failed for project {project_id} arc {arc_id}: {e}"
+            ))
+        })?;
+        let summary_text = response.content.trim();
+        if summary_text.is_empty() {
+            return Err(AthenError::Other(format!(
+                "Project fold LLM returned empty summary for project {project_id} arc {arc_id}"
+            )));
+        }
+
+        // 8. Persist the updated summary and advance the watermark.
+        self.project_store
+            .set_summary(project_id, summary_text)
+            .await?;
+        self.project_store
+            .set_fold_watermark(project_id, arc_id, latest_id)
+            .await?;
+
+        // 9. Done — summary updated.
+        Ok(true)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -650,6 +821,141 @@ mod tests {
         let store = ArcStore::new(StdArc::new(TMutex::new(conn)));
         store.init_schema().await.unwrap();
         store
+    }
+
+    /// Build an `ArcStore` + `ProjectStore` sharing one in-memory connection,
+    /// so the arc's entries and the project's fold state live in the same DB.
+    async fn arc_and_project_stores() -> (ArcStore, StdArc<athen_persistence::projects::ProjectStore>)
+    {
+        let conn = StdArc::new(TMutex::new(rusqlite::Connection::open_in_memory().unwrap()));
+        let arc_store = ArcStore::new(conn.clone());
+        arc_store.init_schema().await.unwrap();
+        let project_store = athen_persistence::projects::ProjectStore::new(conn);
+        project_store.init_schema().await.unwrap();
+        (arc_store, StdArc::new(project_store))
+    }
+
+    fn stub_router() -> Arc<RwLock<Arc<athen_llm::router::DefaultLlmRouter>>> {
+        let router = athen_llm::router::DefaultLlmRouter::new(
+            Default::default(),
+            Default::default(),
+            athen_llm::budget::BudgetTracker::new(None),
+        );
+        StdArc::new(tokio::sync::RwLock::new(StdArc::new(router)))
+    }
+
+    /// The min-delta gate: an arc with fewer than
+    /// `PROJECT_FOLD_MIN_DELTA_ENTRIES` new entries past the watermark must
+    /// skip the fold entirely — return `Ok(false)`, make no LLM call, and
+    /// leave the project summary untouched. The router stub here has no
+    /// providers, so if the gate failed to short-circuit, `route` would error
+    /// and the test would fail loudly.
+    #[tokio::test]
+    async fn fold_skips_below_min_delta() {
+        let (arc_store, project_store) = arc_and_project_stores().await;
+        let project = project_store
+            .create_project("Proj", None)
+            .await
+            .unwrap();
+        arc_store
+            .create_arc("arc1", "Arc 1", athen_persistence::arcs::ArcSource::UserInput)
+            .await
+            .unwrap();
+        // Three entries (< MIN_DELTA of 4) past the implicit watermark of 0.
+        for i in 0..3 {
+            arc_store
+                .add_entry("arc1", EntryType::Message, "user", &format!("m{i}"), None, None)
+                .await
+                .unwrap();
+        }
+
+        let compactor =
+            LlmProjectCompactor::new(arc_store.clone(), project_store.clone(), stub_router());
+        let folded = compactor
+            .fold_arc_into_project(&project.id, "arc1")
+            .await
+            .unwrap();
+
+        assert!(!folded, "fold must be skipped below the min-delta gate");
+        // Summary stays None — no LLM call, no write.
+        let got = project_store.get_project(&project.id).await.unwrap().unwrap();
+        assert!(got.summary.is_none(), "summary must remain unset");
+        // Watermark untouched.
+        assert!(project_store
+            .get_fold_watermark(&project.id, "arc1")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// An arc with no entries returns `Ok(false)` without touching the router
+    /// or the project summary.
+    #[tokio::test]
+    async fn fold_skips_empty_arc() {
+        let (arc_store, project_store) = arc_and_project_stores().await;
+        let project = project_store.create_project("Proj", None).await.unwrap();
+        arc_store
+            .create_arc("empty", "Empty", athen_persistence::arcs::ArcSource::UserInput)
+            .await
+            .unwrap();
+
+        let compactor =
+            LlmProjectCompactor::new(arc_store.clone(), project_store.clone(), stub_router());
+        let folded = compactor
+            .fold_arc_into_project(&project.id, "empty")
+            .await
+            .unwrap();
+        assert!(!folded);
+        let got = project_store.get_project(&project.id).await.unwrap().unwrap();
+        assert!(got.summary.is_none());
+    }
+
+    /// The fold prompt assembles the delta from the arc's existing summary plus
+    /// its recent entries, one compact `source: content` line each, with long
+    /// contents truncated. This exercises the cheap "fold summaries, not raw
+    /// transcript" path without needing a live router.
+    #[test]
+    fn build_delta_text_renders_summary_and_tail() {
+        let now = chrono::Utc::now().to_rfc3339();
+        let store_entries = vec![
+            ArcEntry {
+                id: 5,
+                arc_id: "arc1".into(),
+                entry_type: EntryType::Message,
+                source: "user".into(),
+                content: "do the thing".into(),
+                metadata: None,
+                created_at: now.clone(),
+                turn_id: None,
+            },
+            ArcEntry {
+                id: 6,
+                arc_id: "arc1".into(),
+                entry_type: EntryType::Message,
+                source: "assistant".into(),
+                content: "x".repeat(1000),
+                metadata: None,
+                created_at: now,
+                turn_id: None,
+            },
+        ];
+        let delta = LlmProjectCompactor::build_delta_text(Some("prior arc summary"), &store_entries);
+        assert!(delta.contains("ARC SUMMARY SO FAR:"));
+        assert!(delta.contains("prior arc summary"));
+        assert!(delta.contains("RECENT ENTRIES:"));
+        assert!(delta.contains("- user: do the thing"));
+        // Long content is truncated (400-char cap + ellipsis marker).
+        assert!(delta.contains("…(truncated)"), "got: {delta}");
+    }
+
+    /// The project-fold system prompt carries the load-bearing instructions:
+    /// fold the delta in, preserve durable facts, output only the summary.
+    #[test]
+    fn project_summary_system_prompt_has_fold_contract() {
+        let sys = LlmProjectCompactor::project_summary_system_prompt();
+        assert!(sys.contains("durable"));
+        assert!(sys.contains("Fold the new delta"));
+        assert!(sys.contains("Output only the updated summary"));
     }
 
     #[test]

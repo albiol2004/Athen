@@ -184,6 +184,64 @@ pub fn resolve_in_workspace(p: &Path) -> PathBuf {
     base.join(p)
 }
 
+/// Seed the opinionated workspace folder skeleton under `athen_workspace_dir()`.
+/// Idempotent: creates each bucket dir if missing and writes a short per-folder
+/// README.md ONLY if absent (never overwrites — the READMEs double as in-context
+/// hints when the agent lists the workspace, and users/the agent may edit them).
+/// Best-effort at the call site; returns the io::Result so the caller can log.
+///
+/// Unlike its neighbours this function does filesystem IO (mkdir + conditional
+/// write). It's the one path helper that touches disk.
+pub fn seed_workspace_skeleton() -> std::io::Result<()> {
+    match athen_workspace_dir() {
+        Some(root) => seed_workspace_skeleton_at(&root),
+        None => Ok(()),
+    }
+}
+
+/// Inner form of [`seed_workspace_skeleton`] taking the workspace root
+/// explicitly so it can be tested without mutating process env. Propagates the
+/// first io error via `?`; the public wrapper's caller treats it as best-effort.
+fn seed_workspace_skeleton_at(root: &Path) -> std::io::Result<()> {
+    /// `(bucket dir name, README.md body)` for each top-level workspace folder.
+    const BUCKETS: &[(&str, &str)] = &[
+        (
+            "UserInfo",
+            "Durable facts and documents about the user (contracts, IDs, account \
+             details, preferences). Put files here when the user shares info about \
+             themselves.\n",
+        ),
+        (
+            "Downloads",
+            "Files fetched or downloaded from the web or messages.\n",
+        ),
+        (
+            "Projects",
+            "One subfolder per Project (`Projects/<project-name>/`). Multi-file work \
+             grouped around a common goal lives here.\n",
+        ),
+        (
+            "Notes",
+            "Freeform notes and scratch writing not tied to a specific project.\n",
+        ),
+        (
+            "Outputs",
+            "Generated deliverables and artifacts produced for the user.\n",
+        ),
+    ];
+
+    std::fs::create_dir_all(root)?;
+    for (name, body) in BUCKETS {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir)?;
+        let readme = dir.join("README.md");
+        if !readme.exists() {
+            std::fs::write(&readme, body)?;
+        }
+    }
+    Ok(())
+}
+
 /// OS-specific list of read-only system roots.
 pub fn system_readonly_paths() -> Vec<PathBuf> {
     #[cfg(target_os = "linux")]
@@ -718,5 +776,37 @@ mod tests {
             assert!(seen.insert(l), "duplicate label: {}", l);
             assert!(!l.is_empty());
         }
+    }
+
+    // -------- seed_workspace_skeleton --------
+
+    #[test]
+    fn seed_creates_all_buckets_and_readmes() {
+        let td = tempdir().unwrap();
+        let root = td.path();
+        seed_workspace_skeleton_at(root).expect("seed should succeed");
+
+        for bucket in ["UserInfo", "Downloads", "Projects", "Notes", "Outputs"] {
+            let dir = root.join(bucket);
+            assert!(dir.is_dir(), "missing bucket dir: {bucket}");
+            let readme = dir.join("README.md");
+            assert!(readme.is_file(), "missing README.md in: {bucket}");
+        }
+    }
+
+    #[test]
+    fn seed_is_idempotent_and_never_overwrites_readme() {
+        let td = tempdir().unwrap();
+        let root = td.path();
+        seed_workspace_skeleton_at(root).expect("first seed");
+
+        // User/agent edits a README.
+        let edited = root.join("Notes").join("README.md");
+        let custom = "my own notes folder description\n";
+        fs::write(&edited, custom).unwrap();
+
+        // Re-seeding must not clobber the edited body and must not error.
+        seed_workspace_skeleton_at(root).expect("second seed");
+        assert_eq!(fs::read_to_string(&edited).unwrap(), custom);
     }
 }

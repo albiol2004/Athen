@@ -17,6 +17,7 @@ pub mod identity;
 pub mod mcp;
 pub mod notifications;
 pub mod profiles;
+pub mod projects;
 pub mod skills;
 pub mod store;
 pub mod telegram_chat_log;
@@ -44,6 +45,7 @@ use crate::identity::SqliteIdentityStore;
 use crate::mcp::McpStore;
 use crate::notifications::NotificationStore;
 use crate::profiles::SqliteProfileStore;
+use crate::projects::ProjectStore;
 use crate::skills::SqliteSkillStore;
 use crate::store::SqliteStore;
 use crate::wakeups::SqliteWakeupStore;
@@ -139,6 +141,8 @@ impl Database {
         tg_log.init_schema().await?;
         let hints = self.hint_dismissal_store();
         hints.init_schema().await?;
+        let projects = self.project_store();
+        projects.init_schema().await?;
         profiles.seed_builtins_if_empty().await
     }
 
@@ -234,6 +238,11 @@ impl Database {
 
     pub fn hint_dismissal_store(&self) -> HintDismissalStore {
         HintDismissalStore::new(self.conn.clone())
+    }
+
+    /// Create a `ProjectStore` backed by this database's connection.
+    pub fn project_store(&self) -> ProjectStore {
+        ProjectStore::new(self.conn.clone())
     }
 
     /// Force-checkpoint the WAL and truncate it. Called from the graceful
