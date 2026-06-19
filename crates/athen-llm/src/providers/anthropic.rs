@@ -122,12 +122,50 @@ impl AnthropicProvider {
             })
             .collect();
 
+        // System prompt rides as a single cacheable text block. The breakpoint
+        // on it caches `tools` + `system` together (Anthropic render order is
+        // tools → system → messages), so the ~4-6k-token static prefix bills at
+        // cache-read rates (~0.1x) on every turn after the first instead of full
+        // price. Below the per-model minimum (2048 Sonnet / 4096 Opus) the API
+        // silently skips caching — no error.
+        let system = request
+            .system_prompt
+            .as_ref()
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                vec![AnthropicSystemBlock {
+                    block_type: "text",
+                    text: s.clone(),
+                    cache_control: Some(CacheControl::EPHEMERAL),
+                }]
+            });
+
+        // Native tool definitions. Without this field Claude cannot emit
+        // structured `tool_use` blocks at all — the response parser and the
+        // assistant/​tool history round-trip already speak tool_use/tool_result,
+        // so this completes the path. `input_schema` is our `parameters` JSON
+        // Schema verbatim.
+        let tools = request
+            .tools
+            .as_ref()
+            .map(|defs| {
+                defs.iter()
+                    .map(|td| AnthropicTool {
+                        name: td.name.clone(),
+                        description: td.description.clone(),
+                        input_schema: td.parameters.clone(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| !v.is_empty());
+
         AnthropicRequest {
             model: self.default_model.clone(),
             messages,
             max_tokens: request.max_tokens.unwrap_or(4096),
             temperature: request.temperature,
-            system: request.system_prompt.clone(),
+            system,
+            tools,
             stream: false,
             thinking: map_reasoning_effort(self.family, request.reasoning_effort),
         }
@@ -235,16 +273,26 @@ impl LlmProvider for AnthropicProvider {
             _ => FinishReason::Stop,
         };
 
+        let cache_read = api_response.usage.cache_read_input_tokens.unwrap_or(0);
+        let cache_creation = api_response.usage.cache_creation_input_tokens.unwrap_or(0);
         let usage = TokenUsage {
             prompt_tokens: api_response.usage.input_tokens,
             completion_tokens: api_response.usage.output_tokens,
-            total_tokens: api_response.usage.input_tokens + api_response.usage.output_tokens,
+            // True total includes the cached portion, which Anthropic reports
+            // separately from `input_tokens`.
+            total_tokens: api_response.usage.input_tokens
+                + cache_read
+                + cache_creation
+                + api_response.usage.output_tokens,
             estimated_cost_usd: Some(estimate_anthropic_cost(
                 &api_response.model,
                 api_response.usage.input_tokens,
                 api_response.usage.output_tokens,
+                cache_read,
+                cache_creation,
             )),
-            ..TokenUsage::default()
+            cached_tokens: api_response.usage.cache_read_input_tokens,
+            cache_creation_tokens: api_response.usage.cache_creation_input_tokens,
         };
 
         let mut response = LlmResponse {
@@ -542,7 +590,13 @@ fn parse_sse_chunks(text: &str) -> Vec<Result<LlmChunk>> {
 
 /// Rough cost estimation for Anthropic models (per 1M tokens pricing as
 /// of 2025; this is approximate and should be kept up to date).
-fn estimate_anthropic_cost(model: &str, input_tokens: u32, output_tokens: u32) -> f64 {
+fn estimate_anthropic_cost(
+    model: &str,
+    input_tokens: u32,
+    output_tokens: u32,
+    cache_read_tokens: u32,
+    cache_creation_tokens: u32,
+) -> f64 {
     let (input_per_m, output_per_m) = if model.contains("opus") {
         (15.0, 75.0)
     } else if model.contains("sonnet") {
@@ -556,7 +610,10 @@ fn estimate_anthropic_cost(model: &str, input_tokens: u32, output_tokens: u32) -
 
     let input_cost = (input_tokens as f64 / 1_000_000.0) * input_per_m;
     let output_cost = (output_tokens as f64 / 1_000_000.0) * output_per_m;
-    input_cost + output_cost
+    // Cache reads bill at ~0.1x the input rate; 5-minute cache writes at ~1.25x.
+    let cache_read_cost = (cache_read_tokens as f64 / 1_000_000.0) * input_per_m * 0.1;
+    let cache_write_cost = (cache_creation_tokens as f64 / 1_000_000.0) * input_per_m * 1.25;
+    input_cost + output_cost + cache_read_cost + cache_write_cost
 }
 
 // ---------------------------------------------------------------------------
@@ -571,10 +628,47 @@ struct AnthropicRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<String>,
+    system: Option<Vec<AnthropicSystemBlock>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<AnthropicTool>>,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<AnthropicThinking>,
+}
+
+/// A `system` content block. Anthropic accepts `system` as a bare string or an
+/// array of typed blocks; the array form is required to attach `cache_control`.
+#[derive(Debug, Serialize)]
+struct AnthropicSystemBlock {
+    #[serde(rename = "type")]
+    block_type: &'static str,
+    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
+}
+
+/// A native tool definition. `input_schema` is the JSON Schema for the tool's
+/// arguments (our `ToolDefinition.parameters`).
+#[derive(Debug, Serialize)]
+struct AnthropicTool {
+    name: String,
+    description: String,
+    input_schema: serde_json::Value,
+}
+
+/// `cache_control: {"type": "ephemeral"}` marker (5-minute TTL). Placed on the
+/// last system block to cache the tools+system prefix; max 4 such breakpoints
+/// per request (we use one).
+#[derive(Debug, Serialize, Clone, Copy)]
+struct CacheControl {
+    #[serde(rename = "type")]
+    cache_type: &'static str,
+}
+
+impl CacheControl {
+    const EPHEMERAL: CacheControl = CacheControl {
+        cache_type: "ephemeral",
+    };
 }
 
 /// Anthropic's `thinking` knob. Sonnet/Haiku take `{ type: "enabled",
@@ -671,6 +765,15 @@ struct ContentBlock {
 struct AnthropicUsage {
     input_tokens: u32,
     output_tokens: u32,
+    /// Tokens served from the prompt cache (~0.1x input price). Present only
+    /// when a `cache_control` breakpoint hit on this request. Note Anthropic's
+    /// `input_tokens` is the *uncached* remainder — true prompt size is
+    /// `input + cache_read + cache_creation`.
+    #[serde(default)]
+    cache_read_input_tokens: Option<u32>,
+    /// Tokens written to the prompt cache this request (~1.25x input price).
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u32>,
 }
 
 #[cfg(test)]
@@ -836,5 +939,100 @@ mod tests {
             let body = serialize_body_with(ModelFamily::ClaudeOpus47, eff);
             assert!(body.get("thinking").is_none(), "for {eff:?}: {body}");
         }
+    }
+
+    /// Build a request body value with the given tools + system prompt.
+    fn body_with(
+        tools: Option<Vec<athen_core::tool::ToolDefinition>>,
+        system_prompt: Option<String>,
+    ) -> serde_json::Value {
+        let provider = AnthropicProvider::new("k".into(), "claude-sonnet-4-6".into());
+        let req = LlmRequest {
+            profile: ModelProfile::Powerful,
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: MessageContent::Text("hi".into()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            tools,
+            system_prompt,
+            reasoning_effort: ReasoningEffort::default(),
+        };
+        serde_json::to_value(provider.build_request_body(&req)).expect("serializes")
+    }
+
+    fn sample_tool() -> athen_core::tool::ToolDefinition {
+        athen_core::tool::ToolDefinition {
+            name: "get_weather".into(),
+            description: "Get weather".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+            backend: athen_core::tool::ToolBackend::Shell {
+                command: "echo".into(),
+                native: true,
+            },
+            base_risk: athen_core::risk::BaseImpact::Read,
+        }
+    }
+
+    #[test]
+    fn tools_serialize_with_input_schema() {
+        let body = body_with(Some(vec![sample_tool()]), Some("You are helpful.".into()));
+        let tools = body["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "get_weather");
+        assert_eq!(tools[0]["description"], "Get weather");
+        assert_eq!(tools[0]["input_schema"]["type"], "object");
+    }
+
+    #[test]
+    fn system_prompt_is_cacheable_block() {
+        let body = body_with(None, Some("static prefix".into()));
+        let sys = body["system"].as_array().expect("system as array");
+        assert_eq!(sys.len(), 1);
+        assert_eq!(sys[0]["type"], "text");
+        assert_eq!(sys[0]["text"], "static prefix");
+        assert_eq!(sys[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn empty_tools_and_system_are_omitted() {
+        let body = body_with(Some(vec![]), Some(String::new()));
+        assert!(body.get("tools").is_none(), "empty tools omitted: {body}");
+        assert!(body.get("system").is_none(), "empty system omitted: {body}");
+        // None likewise omits both.
+        let body = body_with(None, None);
+        assert!(body.get("tools").is_none());
+        assert!(body.get("system").is_none());
+    }
+
+    #[test]
+    fn usage_parses_cache_tokens() {
+        let json = serde_json::json!({
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cache_read_input_tokens": 4000,
+            "cache_creation_input_tokens": 0
+        });
+        let usage: AnthropicUsage = serde_json::from_value(json).unwrap();
+        assert_eq!(usage.cache_read_input_tokens, Some(4000));
+        assert_eq!(usage.cache_creation_input_tokens, Some(0));
+
+        // Backwards-compat: absent cache fields default to None (don't 400 on
+        // responses that predate caching).
+        let bare = serde_json::json!({"input_tokens": 10, "output_tokens": 5});
+        let usage: AnthropicUsage = serde_json::from_value(bare).unwrap();
+        assert_eq!(usage.cache_read_input_tokens, None);
+        assert_eq!(usage.cache_creation_input_tokens, None);
+    }
+
+    #[test]
+    fn cost_discounts_cache_reads() {
+        // 1M cached read tokens on sonnet ($3/M input) bills at 0.1x = $0.30.
+        let cost = estimate_anthropic_cost("claude-sonnet-4-6", 0, 0, 1_000_000, 0);
+        assert!((cost - 0.30).abs() < 1e-9, "cache read cost: {cost}");
+        // 1M cache-write tokens bills at 1.25x = $3.75.
+        let cost = estimate_anthropic_cost("claude-sonnet-4-6", 0, 0, 0, 1_000_000);
+        assert!((cost - 3.75).abs() < 1e-9, "cache write cost: {cost}");
     }
 }
