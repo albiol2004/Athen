@@ -1,10 +1,25 @@
 # Projects (Design Doc)
 
-**Status (2026-06-19):** Design only — not yet implemented. Captures the
-Project-as-scope model so we don't re-derive it later. One piece is
-recommended to ship *early and standalone* (the workspace folder layout +
-forward-compatible `project_id` on arcs); the rest is deliberately future
-work.
+**Status (2026-06-20):** SHIPPED — §7 steps 1–3 (workspace folder layout,
+Project entity, project-wide compaction). Only step 4 (sense auto-routing)
+remains deferred. Two decisions diverged from the original design during
+implementation: project instructions live in a dedicated `instructions` column
+on the projects row (not the `ProfileTag::Project` Identity reuse §1 sketched —
+that axis is orthogonal to projects and cost ~8–10 files for no gain), and
+renaming a project **renames its workspace folder** to match (folder_slug tracks
+the name). End-to-end verified via the headless HTTP API (CRUD, folder
+create/rename-moves-folder, summary-mode persistence across restart, arc
+assignment). Code is authoritative; the sections below remain the conceptual
+reference.
+
+Implementation map: `ProjectStore` (`crates/athen-persistence/src/projects.rs`:
+projects + project_arc_folds + project_meta tables, CRUD, slug, summary +
+watermark + meta helpers); `arcs.project_id` column + `create_arc_in_project` /
+`set_arc_project` (`arcs.rs`); `seed_workspace_skeleton` (`athen-core/paths.rs`);
+`save_file` category tool (`app_tools.rs`); `LlmProjectCompactor.fold_arc_into_
+project` (`compaction.rs`) fired best-effort at arc transitions; context layers
+1–4 + project CRUD `*_core` commands + `maybe_fold_leaving_arc` (`commands.rs`);
+HTTP routes (`http_api.rs`); desktop panel (`frontend/`) + web `PanelProjects.tsx`.
 
 A **Project** is a named, durable container that groups *many arcs* around a
 common piece of work and shares context across them — the feature users love
