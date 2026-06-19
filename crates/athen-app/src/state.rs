@@ -157,6 +157,17 @@ pub struct AppState {
     /// `max_task_duration_minutes` thresholds in `SecurityConfig` remain
     /// unwired — only `mode` is load-bearing today.
     pub security: arc_swap::ArcSwap<athen_core::config::SecurityConfig>,
+    /// Cached parsed `AthenConfig` (the plain, NON-vault-hydrated
+    /// `load_config()` result), so the autonomous dispatch hot path doesn't
+    /// re-read + re-parse + re-migrate the TOML from disk on every dispatched
+    /// task. Wrapped in `Arc<ArcSwap<_>>` so the dispatch loop (which can't
+    /// borrow `self`) can clone a cheap handle and `.load()` it lock-free per
+    /// task, while live Settings saves swap a freshly-loaded config in via
+    /// [`Self::reload_config_cache`]. Holds the plain (un-hydrated) config to
+    /// exactly match what the old per-task `load_config()` returned; consumers
+    /// that need vault secrets (e.g. the email-mark-seen branch) still hydrate
+    /// an owned clone locally.
+    pub config_cache: Arc<arc_swap::ArcSwap<AthenConfig>>,
     /// The LLM router, wrapped in `RwLock` so it can be swapped at runtime
     /// when the user switches active provider.
     pub router: Arc<RwLock<Arc<DefaultLlmRouter>>>,
@@ -937,6 +948,12 @@ impl AppState {
     /// `DEEPSEEK_API_KEY` env var always takes precedence over config file values.
     pub async fn new() -> Self {
         let mut config = load_config();
+        // Snapshot the plain, NON-vault-hydrated config for the dispatch-hot-path
+        // cache BEFORE the in-memory `config` is hydrated with vault secrets
+        // below. The dispatch loop's per-task resolvers historically read a plain
+        // `load_config()`, so the cache must hold that same shape to preserve
+        // behavior exactly.
+        let config_cache = Arc::new(arc_swap::ArcSwap::from_pointee(config.clone()));
 
         // Open the credential vault FIRST so secrets stored there can hydrate
         // the in-memory config before any consumer (router, email, web search,
@@ -1125,6 +1142,7 @@ impl AppState {
         let state = Self {
             coordinator: Arc::new(coordinator),
             security: arc_swap::ArcSwap::from_pointee(config.security.clone()),
+            config_cache,
             router,
             active_provider_id: Mutex::new(active_id),
             history: Mutex::new(history),
@@ -1441,6 +1459,15 @@ impl AppState {
             };
         }
         config
+    }
+
+    /// Re-read the plain config from disk and swap it into [`Self::config_cache`].
+    /// Call this at the END of any runtime path that persists config to disk
+    /// (Settings save handlers) so the autonomous dispatch loop observes the
+    /// change without a restart, while still avoiding a per-task disk read +
+    /// TOML parse + legacy-id migration. Cheap and lock-free for readers.
+    pub fn reload_config_cache(&self) {
+        self.config_cache.store(Arc::new(load_config()));
     }
 
     /// Generate per-group markdown schema files into `tool_doc_dir`. Called
@@ -2781,10 +2808,13 @@ impl AppState {
         // hydrate the IMAP password from it (the password lives in the
         // vault for installs that have re-saved their email settings).
         let vault_snapshot = self.vault.clone();
-        // Re-read the active provider id off `load_config()` per dispatched
-        // task instead of cloning a one-shot snapshot here. New tasks see
-        // a mid-session active-provider switch; in-flight arcs ride their
-        // existing pin (see `docs/PROVIDER_PINNING.md`).
+        // Cheap handle on the cached parsed config. The per-task resolvers
+        // `.load()` it lock-free instead of re-reading + re-parsing the TOML
+        // off disk every dispatched task. Live Settings saves swap a freshly
+        // loaded config in via `reload_config_cache`, so a mid-session
+        // active-provider switch is still observed by new tasks; in-flight arcs
+        // ride their existing pin (see `docs/PROVIDER_PINNING.md`).
+        let config_cache = Arc::clone(&self.config_cache);
         let attachment_store_loop = self.attachment_store();
         let inflight = Arc::clone(&self.inflight_approvals);
         let agent_registry_loop = self.agent_registry.clone();
@@ -2885,12 +2915,15 @@ impl AppState {
                     if wakeup_id_opt.is_some() {
                         crate::state::clear_provider_pin_for_arc(arc_store.as_ref(), &arc_id).await;
                     }
-                    // Resolve compaction budget per task. Re-reading the
-                    // config TOML each dispatch is cheap (small file, only
-                    // fires on user-driven sense events) and lets the user
-                    // tune compaction without restarting the loop.
-                    let cfg_for_resolvers = crate::state::load_config();
-                    let active_id_now = crate::state::resolve_active_provider(&cfg_for_resolvers);
+                    // Resolve compaction budget per task. Reads the cached
+                    // parsed config (lock-free `ArcSwap::load`) instead of
+                    // re-reading + re-parsing the TOML off disk each dispatch;
+                    // live Settings saves swap in a fresh config via
+                    // `reload_config_cache`, so the user can still tune
+                    // compaction / switch the active provider without a restart.
+                    let cfg_arc = config_cache.load_full();
+                    let cfg_for_resolvers: &AthenConfig = &cfg_arc;
+                    let active_id_now = crate::state::resolve_active_provider(cfg_for_resolvers);
                     let effective_target = crate::state::resolve_effective_provider_for_arc(
                         arc_store.as_ref(),
                         &arc_id,
@@ -2901,11 +2934,11 @@ impl AppState {
                     let effective_provider_id = effective_target.provider_id.clone();
                     let (compaction_trigger_tokens, compaction_target_tokens) =
                         crate::compaction::resolve_compaction_budget(
-                            &cfg_for_resolvers,
+                            cfg_for_resolvers,
                             &effective_provider_id,
                         );
                     let sampling_temperature = crate::compaction::resolve_provider_temperature(
-                        &cfg_for_resolvers,
+                        cfg_for_resolvers,
                         &effective_provider_id,
                     );
                     let reasoning_effort =
@@ -2925,7 +2958,7 @@ impl AppState {
                         &router,
                         &effective_target,
                         &active_id_now,
-                        &cfg_for_resolvers,
+                        cfg_for_resolvers,
                         vault_snapshot.as_ref(),
                     )
                     .await;
@@ -2989,6 +3022,7 @@ impl AppState {
                     let task_wakeup_map_clone = Arc::clone(&task_wakeup_map);
                     let pending_email_marks_clone = Arc::clone(&pending_email_marks);
                     let vault_snapshot = vault_snapshot.clone();
+                    let config_cache = Arc::clone(&config_cache);
                     tauri::async_runtime::spawn(async move {
                         let outcome =
                             crate::commands::execute_dispatched_task(task, arc_id.clone(), ctx)
@@ -3033,7 +3067,10 @@ impl AppState {
                         let mark_info = pending_email_marks_clone.write().await.remove(&task_id);
                         if let Some(info) = mark_info {
                             if succeeded {
-                                let mut config = load_config();
+                                // Clone the cached parsed config into an owned
+                                // value for local mutation (vault hydration)
+                                // instead of re-reading + re-parsing the TOML.
+                                let mut config = (*config_cache.load_full()).clone();
                                 crate::vault_creds::hydrate_secrets_from_vault(
                                     vault_snapshot.as_ref(),
                                     &mut config,
@@ -4260,7 +4297,7 @@ fn build_email_sender(
 pub(crate) fn load_config() -> AthenConfig {
     match find_config_dir() {
         Some(dir) => {
-            info!("Loading config from: {}", dir.display());
+            tracing::debug!("Loading config from: {}", dir.display());
             match config_loader::load_config_dir(&dir) {
                 Ok(mut c) => {
                     // load_config_dir already ran the migration, but we
@@ -5181,6 +5218,8 @@ fn default_base_url_for(id: &str) -> &str {
         "opencode_go" => "https://opencode.ai/zen/go",
         "minimax" => "https://api.minimax.io",
         "minimax_anthropic" => "https://api.minimax.io/anthropic",
+        "kimi" => "https://api.moonshot.ai",
+        "kimi_code" => "https://api.kimi.com/coding",
         "ollama" => "http://localhost:11434",
         "llamacpp" => "http://localhost:8080",
         _ => "http://localhost:8080",
@@ -5198,6 +5237,8 @@ fn default_model_for(id: &str) -> &str {
         "google" => "gemini-3.1-flash-lite-preview",
         "opencode_go" => "deepseek-v4-flash",
         "minimax" | "minimax_anthropic" => "MiniMax-M2.7",
+        "kimi" => "kimi-k2.7-code",
+        "kimi_code" => "kimi-for-coding",
         "ollama" => "llama3",
         "llamacpp" => "default",
         _ => "default",
@@ -5561,11 +5602,12 @@ fn build_provider_instance(
             }
             Box::new(p)
         }
-        "anthropic" | "minimax_anthropic" => {
-            // minimax_anthropic routes through AnthropicProvider for the
-            // /v1/messages wire format. MiniMax Token Plan exposes it at
-            // api.minimax.io/anthropic (with prompt-cache). Provider
-            // adapter is identical; only the base URL differs.
+        "anthropic" | "minimax_anthropic" | "kimi_code" => {
+            // minimax_anthropic and kimi_code route through
+            // AnthropicProvider for the /v1/messages wire format. MiniMax
+            // Token Plan exposes it at api.minimax.io/anthropic (with
+            // prompt-cache); Kimi Code Plan at api.kimi.com/coding.
+            // Provider adapter is identical; only the base URL differs.
             let key = api_key.unwrap_or_default().to_string();
             // MiniMax slugs go on the wire lowercase regardless of the
             // casing the user picked / persisted. Native Anthropic models
@@ -5858,8 +5900,20 @@ async fn build_memory(
     // from multiple connections to the same file safely.
     let conn = match rusqlite::Connection::open(&db_path) {
         Ok(c) => {
-            // Enable WAL mode for better concurrent access.
-            let _ = c.execute_batch("PRAGMA journal_mode=WAL;");
+            // WAL + the same performance pragma block the persistence layer
+            // sets: NORMAL sync (durable under WAL, far fewer fsyncs), a
+            // busy_timeout so concurrent writers retry instead of erroring,
+            // a larger page cache, mmap-backed reads, and in-memory temp
+            // tables. `execute_batch` (not `execute`) because `journal_mode`
+            // returns a row.
+            let _ = c.execute_batch(
+                "PRAGMA journal_mode=WAL;\n\
+                 PRAGMA synchronous=NORMAL;\n\
+                 PRAGMA busy_timeout=5000;\n\
+                 PRAGMA cache_size=-16000;\n\
+                 PRAGMA mmap_size=134217728;\n\
+                 PRAGMA temp_store=MEMORY;",
+            );
             c
         }
         Err(e) => {

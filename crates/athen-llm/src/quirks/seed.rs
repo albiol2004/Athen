@@ -35,6 +35,7 @@ pub fn default_slug_for_family(family: ModelFamily) -> &'static str {
         ModelFamily::Qwen36Local => "qwen3.6-27b-instruct",
         ModelFamily::Gemma4Local => "gemma-4-27b-it",
         ModelFamily::KimiK26Cloud => "kimi-k2-6",
+        ModelFamily::KimiK27Code => "kimi-k2.7-code",
         ModelFamily::MiniMaxM25Cloud => "minimax-m2-5",
         ModelFamily::MiniMaxM27Cloud => "minimax-m2.7",
         ModelFamily::Llama32Instruct => "llama-3.2-90b-vision-instruct",
@@ -155,6 +156,16 @@ pub fn quirks_for_family(family: ModelFamily) -> ModelQuirks {
         // Kimi K2.6 cloud: reasoning_content separate field.
         ModelFamily::KimiK26Cloud => ModelQuirks {
             reasoning_surface: ReasoningSurface::SeparateField,
+            ..ModelQuirks::default()
+        },
+
+        // Kimi K2.7 Code cloud: thinking is forced server-side (the API
+        // errors if disabled) and surfaces as a separate `reasoning_content`
+        // field; `preserve_thinking` means the prior turn's reasoning must
+        // ride back on tool turns, same as DeepSeek-R1.
+        ModelFamily::KimiK27Code => ModelQuirks {
+            reasoning_surface: ReasoningSurface::SeparateField,
+            echo_reasoning_on_tool_turn: true,
             ..ModelQuirks::default()
         },
 
@@ -294,6 +305,12 @@ const BUILTIN_SLUG_QUIRKS: &[(&str, &str, ModelFamily)] = &[
         "minimax-m2*",
         ModelFamily::MiniMaxM25Cloud,
     ),
+    // Kimi (Moonshot platform): K2.7 Code before the K2* wildcard
+    // (first-match-wins).
+    ("kimi", "kimi-k2.7*", ModelFamily::KimiK27Code),
+    ("kimi", "kimi-k2*", ModelFamily::KimiK26Cloud),
+    // Kimi Code Plan relay: one plan-routed slug, K2.7 Code under the hood.
+    ("kimi_code", "kimi-for-coding*", ModelFamily::KimiK27Code),
     // --- OpenCode Go relay (per-slug wire dispatch) ------------------------
     // The provider adapter is selected by `is_minimax_slug` in
     // `build_provider_instance`; the family below drives apply_to_response
@@ -305,6 +322,8 @@ const BUILTIN_SLUG_QUIRKS: &[(&str, &str, ModelFamily)] = &[
     ),
     ("opencode_go", "deepseek-v4-pro", ModelFamily::DeepSeekV4Pro),
     ("opencode_go", "deepseek-chat", ModelFamily::DeepSeekV4Chat),
+    // K2.7 Code before the K2* wildcard (first-match-wins).
+    ("opencode_go", "kimi-k2.7*", ModelFamily::KimiK27Code),
     ("opencode_go", "kimi-k2*", ModelFamily::KimiK26Cloud),
     ("opencode_go", "qwen3-coder*", ModelFamily::Qwen3CoderNext),
     // M2.7 before the M2.5 wildcard (first-match-wins).
@@ -475,6 +494,34 @@ mod tests {
             }
             other => panic!("expected vendor-tagged XML, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn kimi_k27_code_echoes_reasoning_on_tool_turns() {
+        // Forced thinking + preserve_thinking: separate reasoning field
+        // that must round-trip on tool turns.
+        let q = quirks_for_family(ModelFamily::KimiK27Code);
+        assert_eq!(q.reasoning_surface, ReasoningSurface::SeparateField);
+        assert!(q.echo_reasoning_on_tool_turn);
+        assert_eq!(q.tool_extraction, ToolExtractionStrategy::Structured);
+    }
+
+    #[test]
+    fn slug_lookup_kimi_k27_before_k2_wildcard() {
+        // Direct Moonshot platform connection: K2.7 Code resolves to its
+        // own family, everything else K2-shaped stays on K2.6.
+        let q = lookup_slug_quirks("kimi", "kimi-k2.7-code").unwrap();
+        assert_eq!(q.family, ModelFamily::KimiK27Code);
+        let q = lookup_slug_quirks("kimi", "kimi-k2.6").unwrap();
+        assert_eq!(q.family, ModelFamily::KimiK26Cloud);
+        let q = lookup_slug_quirks("kimi", "kimi-k2-thinking").unwrap();
+        assert_eq!(q.family, ModelFamily::KimiK26Cloud);
+        // Code Plan relay slug.
+        let q = lookup_slug_quirks("kimi_code", "kimi-for-coding").unwrap();
+        assert_eq!(q.family, ModelFamily::KimiK27Code);
+        // OpenCode Go relay gets the same split.
+        let q = lookup_slug_quirks("opencode_go", "kimi-k2.7-code").unwrap();
+        assert_eq!(q.family, ModelFamily::KimiK27Code);
     }
 
     #[test]

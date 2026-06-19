@@ -388,9 +388,10 @@ a:hover { color: var(--brand-warm); }
     flex-direction: column;
     min-width: 0;
     min-height: 0;
-    background: var(--glass-bg);
-    backdrop-filter: var(--glass-blur);
-    -webkit-backdrop-filter: var(--glass-blur);
+    /* Opaque background (no backdrop-filter): #app wraps the opaque scrolling
+       chat, so the blur was never visible but re-rasterized every scroll/stream
+       frame — a top cause of WebKitGTK jank on modest AMD GPUs. */
+    background: var(--surface-1);
     border: 1px solid var(--glass-border);
     border-radius: var(--r-xl);
     overflow: hidden;
@@ -966,11 +967,9 @@ header h1 {
     pointer-events: none;
     z-index: 0;
     transform-origin: center;
-    animation: orb-breath 14s ease-in-out infinite;
-}
-@keyframes orb-breath {
-    0%, 100% { opacity: 0.05; transform: scale(1.00); }
-    50%      { opacity: 0.09; transform: scale(1.04); }
+    /* Static: the orb-breath infinite animation forced a continuous full-frame
+       repaint of a 600px blur(120px) surface forever — removed to stop the
+       endless WebKitGTK repaint. Keeps the static ambient glow. */
 }
 
 #messages {
@@ -1198,13 +1197,16 @@ header h1 {
     box-shadow: 2px 0 12px var(--brand-glow);
 }
 
-/* While streaming, breathe the left gradient bar so the message feels alive. */
+/* While streaming, breathe the left gradient bar so the message feels alive.
+   Animates opacity only (GPU-composited, cheap) instead of box-shadow blur
+   radius (paint-bound, re-rasterized every frame during every response). The
+   static box-shadow from the base ::before rule is kept. */
 .message-row.assistant .message-bubble.streaming::before {
     animation: assistant-bar-breath 1.8s ease-in-out infinite;
 }
 @keyframes assistant-bar-breath {
-    0%, 100% { opacity: 0.5; box-shadow: 2px 0 8px var(--brand-glow); }
-    50%      { opacity: 1.0; box-shadow: 2px 0 16px var(--brand-glow-strong); }
+    0%, 100% { opacity: 0.5; }
+    50%      { opacity: 1.0; }
 }
 
 /* Streaming caret — coral block that blinks at the end of the in-flight

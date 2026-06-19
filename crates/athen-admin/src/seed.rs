@@ -114,6 +114,26 @@ pub const PRESETS: &[ProviderPreset] = &[
         key_page_url: "https://openrouter.ai/keys",
         custom: false,
     },
+    ProviderPreset {
+        id: "kimi",
+        label: "Kimi (Moonshot platform)",
+        default_slug: "kimi-k2.7-code",
+        // Source: ModelFamily::KimiK27Code wire_id in athen-core/src/llm.rs
+        family: "KimiK27Code",
+        context_window_tokens: 262_144,
+        key_page_url: "https://platform.moonshot.ai/console/api-keys",
+        custom: false,
+    },
+    ProviderPreset {
+        id: "kimi_code",
+        label: "Kimi Code Plan (subscription)",
+        default_slug: "kimi-for-coding",
+        // Source: ModelFamily::KimiK27Code wire_id in athen-core/src/llm.rs
+        family: "KimiK27Code",
+        context_window_tokens: 262_144,
+        key_page_url: "https://www.kimi.com/code",
+        custom: false,
+    },
     // Custom escape-hatch: user types everything manually.
     ProviderPreset {
         id: "",

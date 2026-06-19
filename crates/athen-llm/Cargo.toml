@@ -21,7 +21,6 @@ uuid = { workspace = true }
 fastembed = { version = "5", optional = true, default-features = false, features = [
     "ort-download-binaries-rustls-tls",
     "hf-hub-rustls-tls",
-    "image-models",
 ] }
 
 [features]

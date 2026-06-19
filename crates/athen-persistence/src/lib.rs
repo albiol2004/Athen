@@ -58,7 +58,24 @@ impl Database {
     pub async fn new(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let conn = tokio::task::spawn_blocking(move || {
-            Connection::open(&path).map_err(|e| AthenError::Other(format!("Open database: {e}")))
+            let conn = Connection::open(&path)
+                .map_err(|e| AthenError::Other(format!("Open database: {e}")))?;
+            // Performance pragmas, applied before migrations run.
+            // WAL + NORMAL sync is the high-throughput, crash-safe default;
+            // busy_timeout lets writers wait on the shared lock instead of
+            // erroring immediately; the cache/mmap/temp tuning keeps hot pages
+            // and scratch space in memory. journal_mode=WAL returns a row, so
+            // execute_batch (which ignores result rows) is required here.
+            conn.execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA synchronous=NORMAL;
+                 PRAGMA busy_timeout=5000;
+                 PRAGMA cache_size=-16000;
+                 PRAGMA mmap_size=134217728;
+                 PRAGMA temp_store=MEMORY;",
+            )
+            .map_err(|e| AthenError::Other(format!("Set pragmas: {e}")))?;
+            Ok::<_, AthenError>(conn)
         })
         .await
         .map_err(|e| AthenError::Other(format!("Spawn blocking: {e}")))??;

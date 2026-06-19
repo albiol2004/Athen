@@ -533,6 +533,13 @@ pub(crate) fn default_base_url(id: &str) -> &str {
         "opencode_go" => "https://opencode.ai/zen/go",
         "minimax" => "https://api.minimax.io",
         "minimax_anthropic" => "https://api.minimax.io/anthropic",
+        // Moonshot Open Platform (pay-per-token). The adapter appends
+        // `/v1/chat/completions`.
+        "kimi" => "https://api.moonshot.ai",
+        // Kimi Code Plan subscription relay. Anthropic-compat wire — the
+        // adapter appends `/v1/messages`, yielding the documented
+        // `api.kimi.com/coding/v1/messages`.
+        "kimi_code" => "https://api.kimi.com/coding",
         "ollama" => "http://localhost:11434",
         "llamacpp" => "http://localhost:8080",
         _ => "",
@@ -560,6 +567,11 @@ pub(crate) fn default_model(id: &str) -> &str {
         // MiniMax Token Plan: M2.7 is the newest flagship; Starter tier
         // exposes only this model, higher tiers add the full lineup.
         "minimax" | "minimax_anthropic" => "minimax-m2.7",
+        // Kimi K2.7 Code is the June 2026 coding flagship (256K ctx,
+        // forced thinking) — the right default for an agent loop.
+        "kimi" => "kimi-k2.7-code",
+        // Code Plan keys only route the plan slug.
+        "kimi_code" => "kimi-for-coding",
         "ollama" => "llama3",
         "llamacpp" => "default",
         _ => "",
@@ -578,6 +590,8 @@ fn display_name(id: &str) -> &str {
         "opencode_go" => "OpenCode Go (DeepSeek / Kimi / Qwen / MiniMax / GLM / MiMo)",
         "minimax" => "MiniMax Token Plan (OpenAI-compat)",
         "minimax_anthropic" => "MiniMax Token Plan (Anthropic-compat + prompt cache)",
+        "kimi" => "Kimi (Moonshot platform)",
+        "kimi_code" => "Kimi Code Plan (subscription, Anthropic-compat)",
         "ollama" => "Ollama",
         "llamacpp" => "llama.cpp",
         _ => id,
@@ -621,6 +635,10 @@ fn default_family(id: &str) -> &str {
         // tool-call extraction shape). User can switch in the family
         // dropdown if a more specific profile lands later.
         "minimax" | "minimax_anthropic" => "MiniMaxM25Cloud",
+        // Both Kimi entries default to the K2.7 Code profile (forced
+        // thinking, reasoning echo). Other platform slugs (kimi-k2.6,
+        // kimi-k2-thinking) resolve per-slug via the quirks registry.
+        "kimi" | "kimi_code" => "KimiK27Code",
         _ => "Default",
     }
 }
@@ -697,6 +715,16 @@ fn default_tier_slugs(id: &str) -> (&'static str, &'static str, &'static str, &'
             "minimax-m2.7",
             "minimax-m2.7",
             "minimax-m2.7",
+        ),
+        // Moonshot platform: K2.6 covers the cheap/fast tiers; K2.7 Code
+        // is the coding/agentic flagship for Code + Powerful.
+        "kimi" => ("kimi-k2.6", "kimi-k2.6", "kimi-k2.7-code", "kimi-k2.7-code"),
+        // Code Plan exposes exactly one plan-routed slug.
+        "kimi_code" => (
+            "kimi-for-coding",
+            "kimi-for-coding",
+            "kimi-for-coding",
+            "kimi-for-coding",
         ),
         // Local providers leave tiers empty by default — the user only
         // has one model loaded most of the time.
@@ -776,6 +804,13 @@ pub(crate) fn curated_models(id: &str) -> &'static [(&'static str, &'static str)
             ("minimax-m2.7", "MiniMax M2.7"),
             ("minimax-m2.5", "MiniMax M2.5 (legacy)"),
         ],
+        "kimi" => &[
+            ("kimi-k2.7-code", "Kimi K2.7 Code"),
+            ("kimi-k2.6", "Kimi K2.6"),
+            ("kimi-k2-thinking", "Kimi K2 Thinking"),
+            ("kimi-k2-turbo-preview", "Kimi K2 Turbo"),
+        ],
+        "kimi_code" => &[("kimi-for-coding", "Kimi for Coding (plan-routed)")],
         // Local providers: user picks whatever they pulled. The text input
         // remains the only path.
         _ => &[],
@@ -816,7 +851,7 @@ fn api_key_hint(id: &str) -> &str {
         // MiniMax Token Plan issues coding-plan keys with the `sk-cp-` prefix
         // (distinct from their standard API keys, which are JWT-shaped).
         "minimax" | "minimax_anthropic" => "sk-cp-...",
-        "deepseek" | "openai" | "mistral" | "opencode_go" => "sk-...",
+        "deepseek" | "openai" | "mistral" | "opencode_go" | "kimi" | "kimi_code" => "sk-...",
         _ => "",
     }
 }
@@ -831,6 +866,8 @@ fn dashboard_url(id: &str) -> &'static str {
         "openrouter" => "https://openrouter.ai/keys",
         "opencode_go" => "https://opencode.ai/",
         "minimax" | "minimax_anthropic" => "https://platform.minimaxi.com/",
+        "kimi" => "https://platform.moonshot.ai/console/api-keys",
+        "kimi_code" => "https://www.kimi.com/code",
         "ollama" => "https://ollama.com/",
         "llamacpp" => "https://github.com/ggml-org/llama.cpp",
         _ => "",
@@ -847,6 +884,8 @@ fn cost_note(id: &str) -> &'static str {
         "openrouter" => "Aggregator — prices vary by model. Some models are free.",
         "opencode_go" => "Relay service with own pricing — check their dashboard.",
         "minimax" | "minimax_anthropic" => "Token plan — check MiniMax pricing page.",
+        "kimi" => "Pay-as-you-go — K2.7 Code pricing on the Moonshot platform page.",
+        "kimi_code" => "Kimi Code Plan subscription — usage included up to plan quota.",
         "ollama" | "llamacpp" => "Free — runs on your hardware.",
         _ => "",
     }
@@ -862,6 +901,8 @@ fn key_format_hint(id: &str) -> &'static str {
         "openrouter" => "Starts with \"sk-or-\", about 60 characters.",
         "opencode_go" => "Check OpenCode dashboard for format.",
         "minimax" | "minimax_anthropic" => "Starts with \"sk-cp-\" (Token Plan coding key).",
+        "kimi" => "Starts with \"sk-\" (Moonshot platform key).",
+        "kimi_code" => "Created in the Kimi Code Console — shown once at creation.",
         _ => "",
     }
 }
@@ -902,6 +943,18 @@ fn setup_steps(id: &str) -> &'static [&'static str] {
             "Go to openrouter.ai and sign up or log in.",
             "Navigate to Keys from your dashboard.",
             "Click \"Create Key\" and copy it.",
+            "Paste the key into Athen's API Key field.",
+        ],
+        "kimi" => &[
+            "Go to platform.moonshot.ai and sign up or log in.",
+            "Open Console → API Keys.",
+            "Click \"Create API Key\" and copy it.",
+            "Paste the key into Athen's API Key field.",
+        ],
+        "kimi_code" => &[
+            "Subscribe to a Kimi Code plan at kimi.com/code.",
+            "Open the Kimi Code Console and click \"Create API Key\".",
+            "Copy the key — it is shown only once.",
             "Paste the key into Athen's API Key field.",
         ],
         "ollama" => &[
@@ -979,6 +1032,8 @@ const PROVIDER_IDS: &[&str] = &[
     "opencode_go",
     "minimax",
     "minimax_anthropic",
+    "kimi",
+    "kimi_code",
     "ollama",
     "llamacpp",
 ];
@@ -1640,6 +1695,9 @@ pub(crate) async fn save_provider_core(
 
     models.providers.insert(id.clone(), provider);
     save_models_config(&models)?;
+    // Refresh the dispatch-hot-path config cache so the autonomous loop sees
+    // this change without re-reading the TOML per task.
+    state.reload_config_cache();
 
     // Hot-reload if saving the currently active provider.
     let active_id = state.active_provider_id.lock().await.clone();
@@ -1745,6 +1803,8 @@ pub(crate) async fn delete_provider_core(
 
     models.providers.remove(&id);
     save_models_config(&models)?;
+    // Refresh the dispatch-hot-path config cache after removing the provider.
+    state.reload_config_cache();
 
     // Drop the deleted provider's vault entry so we don't leak it for the
     // lifetime of the OS keychain. Best-effort: a NoEntry is fine.
@@ -1831,6 +1891,8 @@ pub(crate) async fn delete_provider_core(
         if let Err(e) = save_models_config(&persisted) {
             warn!("Failed to persist active provider after delete: {e}");
         }
+        // Refresh again now that the active-provider fallback is written.
+        state.reload_config_cache();
 
         let fallback_name = display_name(&fallback_id);
         info!("Deleted provider '{}', switched to {}", id, fallback_name);
@@ -2044,6 +2106,9 @@ pub(crate) async fn set_active_provider_core(
         .assignments
         .insert("active_provider".to_string(), id.clone());
     save_models_config(&models)?;
+    // Refresh the dispatch-hot-path config cache so new tasks observe the
+    // active-provider switch without re-reading the TOML per task.
+    state.reload_config_cache();
 
     // Rebuild the global router from the Bundle. Hydrate again to
     // resolve any vault-backed credential we just persisted.
@@ -2091,6 +2156,7 @@ pub(crate) async fn save_settings_core(
     };
 
     save_main_config(&config)?;
+    state.reload_config_cache();
     // Hot-swap the live security posture. The risk pipeline doesn't read it
     // yet (see AppState::security TODO(security-enforcement)), but the swap
     // keeps the live value current so it applies on save the day it's wired —
@@ -2225,6 +2291,7 @@ pub(crate) async fn save_email_settings_core(
     }
 
     save_main_config(&config)?;
+    state.reload_config_cache();
     // Stop + respawn the IMAP monitor so server/credential/interval/enabled
     // changes apply without a restart.
     state.restart_email_monitor(ui.clone());
@@ -2414,6 +2481,7 @@ pub(crate) async fn save_smtp_settings_core(
     }
 
     save_main_config(&config)?;
+    state.reload_config_cache();
     // Hot-swap the live SMTP sender so the change applies without a restart.
     state.reload_email_sender().await;
     Ok("SMTP settings saved and applied.".to_string())
@@ -2586,6 +2654,7 @@ pub(crate) async fn save_telegram_settings_core(
     }
 
     save_main_config(&config)?;
+    state.reload_config_cache();
     // Hot-swap the live outbound Telegram sender (token/owner) and stop +
     // respawn the inbound monitor (token/allowlist/interval/enabled), so the
     // whole Telegram subsystem applies without a restart.
@@ -2705,6 +2774,7 @@ pub(crate) async fn save_web_search_settings_core(
     .await?;
 
     save_main_config(&config)?;
+    state.reload_config_cache();
     // Hot-swap the live web-search provider chain so new keys apply at once.
     state.reload_web_search().await;
     Ok("Web search settings saved and applied.".to_string())
@@ -3085,19 +3155,20 @@ pub(crate) async fn get_calendar_prompt_core(
 /// `build_context_message` reads it via `load_main_config_public()`.
 #[tauri::command]
 pub async fn save_calendar_prompt(
-    _state: State<'_, AppState>,
+    state: State<'_, AppState>,
     prompt: String,
 ) -> std::result::Result<(), String> {
-    save_calendar_prompt_core(&_state, prompt).await
+    save_calendar_prompt_core(&state, prompt).await
 }
 
 pub(crate) async fn save_calendar_prompt_core(
-    _state: &AppState,
+    state: &AppState,
     prompt: String,
 ) -> std::result::Result<(), String> {
     let mut config = load_main_config();
     config.calendar.agent_prompt = prompt;
     save_main_config(&config)?;
+    state.reload_config_cache();
     Ok(())
 }
 
@@ -3135,16 +3206,16 @@ pub(crate) async fn get_agent_default_calendar_core(
 /// to clear (reverts to auto-pick).
 #[tauri::command]
 pub async fn save_agent_default_calendar(
-    _state: State<'_, AppState>,
+    state: State<'_, AppState>,
     source_id: Option<String>,
     calendar_id: Option<String>,
     calendar_name: Option<String>,
 ) -> std::result::Result<(), String> {
-    save_agent_default_calendar_core(&_state, source_id, calendar_id, calendar_name).await
+    save_agent_default_calendar_core(&state, source_id, calendar_id, calendar_name).await
 }
 
 pub(crate) async fn save_agent_default_calendar_core(
-    _state: &AppState,
+    state: &AppState,
     source_id: Option<String>,
     calendar_id: Option<String>,
     calendar_name: Option<String>,
@@ -3154,6 +3225,7 @@ pub(crate) async fn save_agent_default_calendar_core(
     config.calendar.agent_default_calendar_id = calendar_id;
     config.calendar.agent_default_calendar_name = calendar_name;
     save_main_config(&config)?;
+    state.reload_config_cache();
     Ok(())
 }
 
@@ -3282,6 +3354,7 @@ pub(crate) async fn save_notification_settings_core(
     };
 
     save_main_config(&config)?;
+    state.reload_config_cache();
     // Hot-swap the live notification orchestrator so channel order, quiet
     // hours, and escalation timeout apply without a restart.
     state.reload_notifier(ui.clone()).await;
@@ -3397,6 +3470,7 @@ pub(crate) async fn save_embedding_settings_core(
     }
 
     save_main_config(&config)?;
+    state.reload_config_cache();
     // Hot-swap the live embedding router so the mode/provider change applies
     // without a restart. Bundled tiers needing a download fall back to keyword
     // until present, identical to the boot path — the swap never blocks.

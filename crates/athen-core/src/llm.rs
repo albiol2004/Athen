@@ -242,6 +242,10 @@ pub enum ModelFamily {
     Qwen36Local,
     Gemma4Local,
     KimiK26Cloud,
+    /// Kimi K2.7 Code (Moonshot, June 2026). Coding-agent model with forced
+    /// thinking (`reasoning_content` separate field) that must be echoed
+    /// back on tool turns (`preserve_thinking`).
+    KimiK27Code,
     MiniMaxM25Cloud,
     MiniMaxM27Cloud,
     Llama32Instruct,
@@ -281,6 +285,7 @@ impl ModelFamily {
             ModelFamily::Qwen36Local => "Qwen 3.6 (local)",
             ModelFamily::Gemma4Local => "Gemma 4 (local)",
             ModelFamily::KimiK26Cloud => "Kimi K2.6 cloud",
+            ModelFamily::KimiK27Code => "Kimi K2.7 Code cloud",
             ModelFamily::MiniMaxM25Cloud => "MiniMax M2.5 cloud",
             ModelFamily::MiniMaxM27Cloud => "MiniMax M2.7 cloud",
             ModelFamily::Llama32Instruct => "Llama 3.2 instruct (Vision / 70B class)",
@@ -314,6 +319,7 @@ impl ModelFamily {
             ModelFamily::Qwen36Local => "Qwen36Local",
             ModelFamily::Gemma4Local => "Gemma4Local",
             ModelFamily::KimiK26Cloud => "KimiK26Cloud",
+            ModelFamily::KimiK27Code => "KimiK27Code",
             ModelFamily::MiniMaxM25Cloud => "MiniMaxM25Cloud",
             ModelFamily::MiniMaxM27Cloud => "MiniMaxM27Cloud",
             ModelFamily::Llama32Instruct => "Llama32Instruct",
@@ -352,6 +358,7 @@ impl ModelFamily {
             ModelFamily::Qwen36Local,
             ModelFamily::Gemma4Local,
             ModelFamily::KimiK26Cloud,
+            ModelFamily::KimiK27Code,
             ModelFamily::MiniMaxM25Cloud,
             ModelFamily::MiniMaxM27Cloud,
             ModelFamily::Llama32Instruct,
