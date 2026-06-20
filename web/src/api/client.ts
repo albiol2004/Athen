@@ -8,8 +8,12 @@ import type {
   ArcMeta,
   GrantDecision,
   GrantRequest,
+  MemoryInfo,
   NotificationInfo,
+  Project,
+  ProjectFileInfo,
   SendResult,
+  SummaryMode,
 } from './types';
 
 export interface ClientConfig {
@@ -130,6 +134,56 @@ export class AthenClient {
   }
   resolveGrant(id: string, decision: GrantDecision): Promise<{ resolved: boolean }> {
     return this.req(`/grants/${encodeURIComponent(id)}`, { decision });
+  }
+
+  // ---- projects ----
+  // Wire shapes match athen-app/src/http_api.rs project handlers. The
+  // instructions/active-project/assign routes use the flat bodies the
+  // Settings → Projects panel already speaks.
+  listProjects(): Promise<Project[]> {
+    return this.req('/projects');
+  }
+  createProject(name: string, instructions?: string): Promise<Project> {
+    return this.req('/projects', { name, instructions: instructions || undefined });
+  }
+  /** `instructions: ''` clears; `undefined` leaves untouched (mirrors PanelProjects). */
+  updateProject(
+    id: string,
+    body: { name?: string; instructions?: string },
+  ): Promise<Project> {
+    const wire: { name?: string; instructions?: string; clear_instructions?: boolean } = {};
+    if (body.name !== undefined) wire.name = body.name;
+    if (body.instructions !== undefined) {
+      if (body.instructions.trim()) wire.instructions = body.instructions;
+      else wire.clear_instructions = true;
+    }
+    return this.req(`/projects/${encodeURIComponent(id)}`, wire);
+  }
+  deleteProject(id: string): Promise<unknown> {
+    return this.req(`/projects/${encodeURIComponent(id)}/delete`, undefined, 'POST');
+  }
+  updateProjectSummary(id: string): Promise<unknown> {
+    return this.req(`/projects/${encodeURIComponent(id)}/summary`, undefined, 'POST');
+  }
+  projectFiles(id: string): Promise<ProjectFileInfo[]> {
+    return this.req(`/projects/${encodeURIComponent(id)}/files`);
+  }
+  projectMemories(id: string): Promise<MemoryInfo[]> {
+    return this.req(`/projects/${encodeURIComponent(id)}/memories`);
+  }
+  summaryMode(): Promise<SummaryMode> {
+    return this.req('/projects/summary-mode');
+  }
+  setSummaryMode(mode: SummaryMode): Promise<unknown> {
+    return this.req('/projects/summary-mode', { mode });
+  }
+  /** Assign an arc to a project, or detach (`value: null`). */
+  assignArcToProject(arcId: string, value: string | null): Promise<unknown> {
+    return this.req(`/arcs/${encodeURIComponent(arcId)}/project`, { value });
+  }
+  /** Set the active project so new arcs inherit it (`value: null` clears). */
+  setActiveProject(value: string | null): Promise<unknown> {
+    return this.req('/active-project', { value });
   }
 
   // ---- notifications ----

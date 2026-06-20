@@ -29,6 +29,18 @@
     </div>
     <div id="app-layout">
         <aside id="sidebar" class="sidebar">
+            <div class="projects-strip">
+                <div class="projects-strip-header">
+                    <h2>Projects</h2>
+                    <button id="project-new-sidebar-btn" title="New Project" aria-label="New Project">
+                        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                    </button>
+                </div>
+                <div id="project-new-inline" class="project-new-inline hidden">
+                    <input type="text" id="project-new-inline-input" placeholder="Project name…" autocomplete="off" />
+                </div>
+                <div id="projects-strip-list" class="projects-strip-list"></div>
+            </div>
             <div class="sidebar-header">
                 <h2>Arcs</h2>
                 <div class="sidebar-header-buttons">
@@ -1520,6 +1532,69 @@
             <div id="entities-panel" class="memory-panel" style="display: none;">
                 <div id="entities-list" class="entities-list">
                 </div>
+            </div>
+        </div>
+
+        <div id="project-view" class="project-view hidden">
+            <header class="memory-header">
+                <div class="header-left">
+                    <button id="project-back" class="settings-back-btn" title="Back">
+                        <span>&#8592;</span> Back
+                    </button>
+                </div>
+                <h2 id="project-view-title">Project</h2>
+                <div class="project-view-actions">
+                    <button id="project-new-arc-btn" class="btn-secondary" type="button">New arc</button>
+                    <button id="project-rename-btn" class="btn-secondary" type="button">Rename</button>
+                    <button id="project-delete-btn" class="btn-secondary danger" type="button">Delete</button>
+                </div>
+            </header>
+
+            <div class="memory-tabs project-tabs">
+                <button class="memory-tab project-tab active" data-ptab="overview">Overview</button>
+                <button class="memory-tab project-tab" data-ptab="arcs">Arcs</button>
+                <button class="memory-tab project-tab" data-ptab="files">Files</button>
+                <button class="memory-tab project-tab" data-ptab="memories">Memories</button>
+            </div>
+
+            <div id="project-panel-overview" class="memory-panel project-panel">
+                <div class="project-section">
+                    <label class="project-field-label" for="project-instructions-input">Instructions</label>
+                    <div class="setting-hint">Always-on guidance prepended to every agent working in this project.</div>
+                    <textarea id="project-instructions-input" class="project-instructions" rows="6" placeholder="e.g. Reply in a formal tone. Always CC alex@example.com on outbound mail."></textarea>
+                    <div class="project-section-actions">
+                        <button id="project-instructions-save" class="btn-primary" type="button">Save instructions</button>
+                    </div>
+                </div>
+
+                <div class="project-section">
+                    <label class="project-field-label">Summary</label>
+                    <div id="project-summary-stamp" class="project-card-stamp"></div>
+                    <div id="project-summary-text" class="project-summary-text"></div>
+                    <div class="project-section-actions">
+                        <button id="project-summary-update" class="btn-secondary" type="button">Update summary now</button>
+                        <label class="project-summary-mode-wrap">
+                            <span>Summary mode (global):</span>
+                            <select id="project-view-summary-mode" class="profile-picker">
+                                <option value="auto">Auto</option>
+                                <option value="manual">Manual</option>
+                                <option value="off">Off</option>
+                            </select>
+                        </label>
+                    </div>
+                </div>
+            </div>
+
+            <div id="project-panel-arcs" class="memory-panel project-panel" style="display: none;">
+                <div id="project-arcs-list" class="project-arcs-list"></div>
+            </div>
+
+            <div id="project-panel-files" class="memory-panel project-panel" style="display: none;">
+                <div id="project-files-list" class="project-files-list"></div>
+            </div>
+
+            <div id="project-panel-memories" class="memory-panel project-panel" style="display: none;">
+                <div id="project-memories-list" class="memories-list"></div>
             </div>
         </div>
     </div>

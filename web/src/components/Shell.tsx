@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { ApiError, AthenClient } from '../api/client';
 import { connectEvents, type ConnectionStatus } from '../api/events';
-import type { ArcMeta, NotificationInfo } from '../api/types';
+import type { ArcMeta, NotificationInfo, Project } from '../api/types';
 import { chatReducer, initialChat } from '../chat/reducer';
 import { SettingsModal } from '../settings/SettingsModal';
 import { AgentsPanel } from './AgentsPanel';
@@ -10,6 +10,7 @@ import { Bell } from './Bell';
 import { ChangesRail } from './ChangesRail';
 import { Chat, type ChatCallbacks, type OutgoingFile, type OutgoingImage } from './Chat';
 import { GoalBanner, type GoalState, type PlanState } from './PlanGoal';
+import { ProjectPage } from './ProjectPage';
 import { Sidebar } from './Sidebar';
 import { Wakeups } from './Wakeups';
 
@@ -33,6 +34,9 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
   const [drawer, setDrawer] = useState<Drawer>('none');
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [changesKey, setChangesKey] = useState(0);
+  const [projects, setProjects] = useState<Project[]>([]);
+  // null = chat surface; a project id = the Project page for that project.
+  const [openProject, setOpenProject] = useState<string | null>(null);
 
   const activeArcRef = useRef<string | null>(null);
   activeArcRef.current = activeArc;
@@ -53,6 +57,14 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
   const refreshArcs = useCallback(async () => {
     try {
       setArcs(await client.listArcs());
+    } catch (e) {
+      bail(e);
+    }
+  }, [client, bail]);
+
+  const refreshProjects = useCallback(async () => {
+    try {
+      setProjects(await client.listProjects());
     } catch (e) {
       bail(e);
     }
@@ -85,10 +97,15 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
           if (gone) return;
           dispatch({ type: 'reset', entries });
         }
-        const [grants, notifs] = await Promise.all([client.pendingGrants(), client.listNotifications()]);
+        const [grants, notifs, projs] = await Promise.all([
+          client.pendingGrants(),
+          client.listNotifications(),
+          client.listProjects().catch(() => [] as Project[]),
+        ]);
         if (gone) return;
         for (const g of grants) dispatch({ type: 'grant', g });
         setNotifications(notifs);
+        setProjects(projs);
         void refreshGoalPlan();
       } catch (e) {
         if (!bail(e)) dispatch({ type: 'system', text: `Couldn't load: ${errMsg(e)}` });
@@ -190,6 +207,44 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
       if (!bail(e)) dispatch({ type: 'system', text: `Couldn't create arc: ${errMsg(e)}` });
     }
   }, [client, refreshArcs, switchArc, bail]);
+
+  // ---- project actions ----
+  const createProject = useCallback(
+    async (name: string) => {
+      try {
+        const p = await client.createProject(name);
+        await refreshProjects();
+        setOpenProject(p.id);
+      } catch (e) {
+        if (!bail(e)) dispatch({ type: 'system', text: `Couldn't create project: ${errMsg(e)}` });
+      }
+    },
+    [client, refreshProjects, bail],
+  );
+
+  // Open one of a project's arcs in the chat surface (leaves the project page).
+  const openArcFromProject = useCallback(
+    (arcId: string) => {
+      setOpenProject(null);
+      void switchArc(arcId);
+    },
+    [switchArc],
+  );
+
+  // Create a fresh arc that inherits the given project, then drop into chat.
+  // Set the active project first so newArc()'s arc picks it up server-side.
+  const newArcInProject = useCallback(
+    async (projectId: string) => {
+      try {
+        await client.setActiveProject(projectId);
+        setOpenProject(null);
+        await createArc();
+      } catch (e) {
+        if (!bail(e)) dispatch({ type: 'system', text: `Couldn't start arc: ${errMsg(e)}` });
+      }
+    },
+    [client, createArc, bail],
+  );
 
   const send = useCallback(
     async (text: string, images: OutgoingImage[], files: OutgoingFile[]) => {
@@ -313,6 +368,14 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
   );
 
   const activeMeta = useMemo(() => arcs.find((a) => a.id === activeArc), [arcs, activeArc]);
+  const openProjectMeta = useMemo(
+    () => projects.find((p) => p.id === openProject) ?? null,
+    [projects, openProject],
+  );
+  // A project that was open but then deleted/vanished: fall back to chat.
+  useEffect(() => {
+    if (openProject && !openProjectMeta) setOpenProject(null);
+  }, [openProject, openProjectMeta]);
 
   return (
     <div className="shell">
@@ -322,9 +385,24 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
         unread={unread}
         open={sidebarOpen}
         onClose={() => setSidebarOpen(false)}
+        projects={projects}
+        activeProject={openProject}
+        projectActions={{
+          onSelect: (id) => {
+            setOpenProject(id);
+            setSidebarOpen(false);
+          },
+          onCreate: (name) => void createProject(name),
+        }}
         actions={{
-          onSelect: (id) => void switchArc(id),
-          onNew: () => void createArc(),
+          onSelect: (id) => {
+            setOpenProject(null);
+            void switchArc(id);
+          },
+          onNew: () => {
+            setOpenProject(null);
+            void createArc();
+          },
           onRename: (id, name) =>
             void client.post(`/arcs/${encodeURIComponent(id)}/rename`, { name }).then(refreshArcs, () => {}),
           onCompact: (id) =>
@@ -349,9 +427,13 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
               <path d="M4 7h16M4 12h16M4 17h16" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
             </svg>
           </button>
-          <span className="arc-title">{activeMeta?.name || 'Athen'}</span>
+          <span className="arc-title">
+            {openProjectMeta ? openProjectMeta.name : activeMeta?.name || 'Athen'}
+          </span>
           <span className={`conn ${status}`} title={`Event stream: ${status}`} />
-          {activeMeta && <ArcPickers client={client} arc={activeMeta} onChanged={() => void refreshArcs()} />}
+          {!openProjectMeta && activeMeta && (
+            <ArcPickers client={client} arc={activeMeta} onChanged={() => void refreshArcs()} />
+          )}
           <div className="topbar-right">
             <button
               className="icon-btn"
@@ -421,20 +503,33 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
             </button>
           </div>
         </header>
-        {goal && (
-          <GoalBanner
-            goal={goal}
-            onClear={() => void client.del('/goal').then(() => setGoal(null), () => {})}
+        {openProjectMeta ? (
+          <ProjectPage
+            client={client}
+            project={openProjectMeta}
+            onBack={() => setOpenProject(null)}
+            onChanged={() => void refreshProjects()}
+            onOpenArc={openArcFromProject}
+            onNewArcInProject={(id) => void newArcInProject(id)}
           />
+        ) : (
+          <>
+            {goal && (
+              <GoalBanner
+                goal={goal}
+                onClear={() => void client.del('/goal').then(() => setGoal(null), () => {})}
+              />
+            )}
+            <Chat
+              items={chat.items}
+              busy={busy}
+              arcKey={activeArc}
+              plan={plan}
+              client={client}
+              cb={cb}
+            />
+          </>
         )}
-        <Chat
-          items={chat.items}
-          busy={busy}
-          arcKey={activeArc}
-          plan={plan}
-          client={client}
-          cb={cb}
-        />
       </div>
       {drawer === 'agents' && (
         <AgentsPanel client={client} onClose={() => setDrawer('none')} onOpenArc={(id) => void switchArc(id)} />

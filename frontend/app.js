@@ -6101,6 +6101,7 @@ function showSettings() {
     contactsView?.classList.add('hidden');
     notificationsView?.classList.add('hidden');
     document.getElementById('memory-view')?.classList.add('hidden');
+    document.getElementById('project-view')?.classList.add('hidden');
     document.getElementById('sidebar').style.display = '';
     if (timelineRefreshInterval) { clearInterval(timelineRefreshInterval); timelineRefreshInterval = null; }
     settingsView.classList.remove('hidden');
@@ -6117,6 +6118,7 @@ function showChat() {
     contactsView?.classList.add('hidden');
     notificationsView?.classList.add('hidden');
     document.getElementById('memory-view')?.classList.add('hidden');
+    document.getElementById('project-view')?.classList.add('hidden');
     document.getElementById('sidebar').style.display = '';
     if (timelineRefreshInterval) { clearInterval(timelineRefreshInterval); timelineRefreshInterval = null; }
     appView.style.display = 'flex';
@@ -6127,7 +6129,7 @@ function showChat() {
 function isOnSubView() {
     const ids = ['settings-view', 'timeline-view', 'calendar-view',
                  'contacts-view', 'notifications-view', 'memory-view',
-                 'wakeups-view', 'agent-control-view'];
+                 'wakeups-view', 'agent-control-view', 'project-view'];
     return ids.some((id) => {
         const el = document.getElementById(id);
         return el && !el.classList.contains('hidden');
@@ -7617,6 +7619,8 @@ async function loadProjectsManager() {
     try {
         projectsList = (await invoke('list_projects')) || [];
         renderProjectsList();
+        // Keep the main-UI sidebar strip in sync with the same cache.
+        if (typeof renderProjectsStrip === 'function') renderProjectsStrip();
         try {
             const mode = await invoke('get_project_summary_mode');
             const sel = document.getElementById('project-summary-mode');
@@ -11210,6 +11214,7 @@ function showTimeline() {
     contactsView?.classList.add('hidden');
     notificationsView?.classList.add('hidden');
     document.getElementById('memory-view')?.classList.add('hidden');
+    document.getElementById('project-view')?.classList.add('hidden');
     document.getElementById('sidebar').style.display = 'none';
     timelineView.classList.remove('hidden');
     renderTimeline();
@@ -11496,6 +11501,7 @@ function showCalendar() {
     contactsView?.classList.add('hidden');
     notificationsView?.classList.add('hidden');
     document.getElementById('memory-view')?.classList.add('hidden');
+    document.getElementById('project-view')?.classList.add('hidden');
     document.getElementById('wakeups-view')?.classList.add('hidden');
     document.getElementById('agent-control-view')?.classList.add('hidden');
     document.getElementById('sidebar').style.display = '';
@@ -12393,6 +12399,7 @@ function showNotifications() {
     document.getElementById('agent-control-view')?.classList.add('hidden');
     contactsView?.classList.add('hidden');
     document.getElementById('memory-view')?.classList.add('hidden');
+    document.getElementById('project-view')?.classList.add('hidden');
     document.getElementById('sidebar').style.display = '';
     if (timelineRefreshInterval) { clearInterval(timelineRefreshInterval); timelineRefreshInterval = null; }
     notificationsView.classList.remove('hidden');
@@ -12596,6 +12603,7 @@ function showContacts() {
     document.getElementById('agent-control-view')?.classList.add('hidden');
     notificationsView?.classList.add('hidden');
     document.getElementById('memory-view')?.classList.add('hidden');
+    document.getElementById('project-view')?.classList.add('hidden');
     document.getElementById('sidebar').style.display = '';
     if (timelineRefreshInterval) { clearInterval(timelineRefreshInterval); timelineRefreshInterval = null; }
     contactsView.classList.remove('hidden');
@@ -13338,6 +13346,7 @@ function showMemory() {
     document.getElementById('agent-control-view')?.classList.add('hidden');
     notificationsView?.classList.add('hidden');
     contactsView?.classList.add('hidden');
+    document.getElementById('project-view')?.classList.add('hidden');
     document.getElementById('sidebar').style.display = '';
     if (timelineRefreshInterval) { clearInterval(timelineRefreshInterval); timelineRefreshInterval = null; }
     memoryView.classList.remove('hidden');
@@ -13348,6 +13357,7 @@ function showMemory() {
 
 function hideMemory() {
     memoryView.classList.add('hidden');
+    document.getElementById('project-view')?.classList.add('hidden');
     document.getElementById('sidebar').style.display = '';
     appView.style.display = 'flex';
     inputEl.focus();
@@ -13546,10 +13556,11 @@ function filterMemories(query) {
     });
 }
 
-// Memory tab switching
-document.querySelectorAll('.memory-tab').forEach(tab => {
+// Memory tab switching. Scoped to #memory-view so it doesn't pick up the
+// project-page tabs (which also carry .memory-tab for styling parity).
+document.querySelectorAll('#memory-view .memory-tab').forEach(tab => {
     tab.addEventListener('click', () => {
-        document.querySelectorAll('.memory-tab').forEach(t => t.classList.remove('active'));
+        document.querySelectorAll('#memory-view .memory-tab').forEach(t => t.classList.remove('active'));
         tab.classList.add('active');
         const target = tab.dataset.tab;
         document.getElementById('memories-panel').style.display = target === 'memories' ? '' : 'none';
@@ -13570,6 +13581,479 @@ if (memoryBtn) {
 if (memoryBack) {
     memoryBack.addEventListener('click', hideMemory);
 }
+
+// ─── Projects (main-UI: sidebar strip + full project page) ───
+//
+// The Settings → Projects tab (loadProjectsManager / renderProjectsList) and
+// the shared `projectsList` cache already exist above. This block adds the
+// ChatGPT-style main-UI surface: a compact strip at the top of the sidebar and
+// a full-screen #project-view page reached by clicking a strip row.
+
+// The project currently open in #project-view (object), or null.
+let openProjectId = null;
+// Which project sub-tab is active (overview|arcs|files|memories).
+let projectActiveTab = 'overview';
+
+function formatFileSize(bytes) {
+    if (bytes == null) return '';
+    if (bytes < 1024) return bytes + ' B';
+    const units = ['KB', 'MB', 'GB', 'TB'];
+    let v = bytes / 1024;
+    let i = 0;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return (v < 10 ? v.toFixed(1) : Math.round(v)) + ' ' + units[i];
+}
+
+// Render the compact sidebar strip from the shared projectsList cache.
+function renderProjectsStrip() {
+    const listEl = document.getElementById('projects-strip-list');
+    if (!listEl) return;
+
+    // Delegated row click — the list is re-rendered via innerHTML, so the
+    // handler lives on the persistent parent (CSP forbids inline onclick).
+    if (!listEl.dataset.delegated) {
+        listEl.dataset.delegated = '1';
+        listEl.addEventListener('click', (ev) => {
+            const row = ev.target.closest('.project-strip-row');
+            if (!row) return;
+            const id = row.dataset.id;
+            if (id) showProjectPage(id);
+        });
+    }
+
+    if (!projectsList || projectsList.length === 0) {
+        listEl.innerHTML = '<div class="projects-strip-empty">No projects yet</div>';
+        return;
+    }
+
+    listEl.innerHTML = projectsList.map((p) => {
+        return '<div class="project-strip-row" data-id="' + escapeHtml(p.id) + '" title="' + escapeHtml(p.name) + '">' +
+            '<span class="project-strip-icon" aria-hidden="true">' +
+                '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>' +
+            '</span>' +
+            '<span class="project-strip-name">' + escapeHtml(p.name) + '</span>' +
+        '</div>';
+    }).join('');
+}
+
+// Inline create row in the sidebar strip header (no prompt()/alert() — those
+// may be no-ops under the WebView).
+function toggleProjectInlineCreate(show) {
+    const wrap = document.getElementById('project-new-inline');
+    const input = document.getElementById('project-new-inline-input');
+    if (!wrap || !input) return;
+    if (show) {
+        wrap.classList.remove('hidden');
+        input.value = '';
+        input.focus();
+    } else {
+        wrap.classList.add('hidden');
+        input.value = '';
+    }
+}
+
+async function createProjectFromName(name) {
+    if (!invoke) return null;
+    const trimmed = (name || '').trim();
+    if (!trimmed) return null;
+    try {
+        const project = await invoke('create_project', { name: trimmed, instructions: null });
+        // Refresh both surfaces from the authoritative list.
+        await loadProjectsManager();
+        renderProjectsStrip();
+        showToast('Project created', 'success');
+        return project;
+    } catch (err) {
+        console.error('create_project failed:', err);
+        showToast('Failed to create project: ' + err, 'error');
+        return null;
+    }
+}
+
+// ─── Full project page ───
+
+function setProjectTab(tab) {
+    projectActiveTab = tab;
+    document.querySelectorAll('#project-view .project-tab').forEach((t) => {
+        t.classList.toggle('active', t.dataset.ptab === tab);
+    });
+    const panels = {
+        overview: 'project-panel-overview',
+        arcs: 'project-panel-arcs',
+        files: 'project-panel-files',
+        memories: 'project-panel-memories',
+    };
+    for (const [key, id] of Object.entries(panels)) {
+        const el = document.getElementById(id);
+        if (el) {
+            el.style.display = key === tab ? '' : 'none';
+            // WebKitGTK retains scrollTop across an innerHTML/visibility swap;
+            // reset when the panel becomes visible so fresh content starts top.
+            if (key === tab) el.scrollTop = 0;
+        }
+    }
+    // Lazy-load the data for whichever tab the user lands on.
+    if (!openProjectId) return;
+    if (tab === 'arcs') loadProjectArcs(openProjectId);
+    else if (tab === 'files') loadProjectFiles(openProjectId);
+    else if (tab === 'memories') loadProjectMemories(openProjectId);
+}
+
+async function showProjectPage(projectId) {
+    const view = document.getElementById('project-view');
+    if (!view || !invoke) return;
+
+    // Resolve the project from the cache, refreshing if it's stale/missing.
+    let project = projectsList.find((p) => p.id === projectId);
+    if (!project) {
+        await loadProjectsManager();
+        project = projectsList.find((p) => p.id === projectId);
+    }
+    if (!project) {
+        showToast('Project not found', 'error');
+        return;
+    }
+    openProjectId = projectId;
+
+    // Hide every other top-level view (mirror of showMemory's hide-list).
+    appView.style.display = 'none';
+    settingsView?.classList.add('hidden');
+    timelineView?.classList.add('hidden');
+    calendarView?.classList.add('hidden');
+    document.getElementById('wakeups-view')?.classList.add('hidden');
+    document.getElementById('agent-control-view')?.classList.add('hidden');
+    notificationsView?.classList.add('hidden');
+    contactsView?.classList.add('hidden');
+    memoryView?.classList.add('hidden');
+    document.getElementById('sidebar').style.display = '';
+    if (timelineRefreshInterval) { clearInterval(timelineRefreshInterval); timelineRefreshInterval = null; }
+    view.classList.remove('hidden');
+    closeSidebar();
+
+    // Header + overview content.
+    const titleEl = document.getElementById('project-view-title');
+    if (titleEl) titleEl.textContent = project.name;
+    const instrEl = document.getElementById('project-instructions-input');
+    if (instrEl) instrEl.value = project.instructions || '';
+    const summaryEl = document.getElementById('project-summary-text');
+    if (summaryEl) {
+        summaryEl.textContent = (project.summary && project.summary.trim())
+            ? project.summary
+            : 'No summary yet. It builds up automatically as arcs in this project finish, or click “Update summary now”.';
+    }
+    const stampEl = document.getElementById('project-summary-stamp');
+    if (stampEl) {
+        stampEl.textContent = project.summary_updated_at
+            ? 'Updated ' + formatRelativeTime(project.summary_updated_at)
+            : '';
+    }
+    // Reflect the global summary-mode setting.
+    try {
+        const mode = await invoke('get_project_summary_mode');
+        const sel = document.getElementById('project-view-summary-mode');
+        if (sel && mode) sel.value = mode;
+    } catch (err) {
+        console.warn('[athen] get_project_summary_mode failed:', err);
+    }
+
+    setProjectTab('overview');
+}
+
+function hideProjectPage() {
+    document.getElementById('project-view')?.classList.add('hidden');
+    document.getElementById('sidebar').style.display = '';
+    appView.style.display = 'flex';
+    openProjectId = null;
+    inputEl.focus();
+}
+
+async function loadProjectArcs(projectId) {
+    const listEl = document.getElementById('project-arcs-list');
+    if (!listEl || !invoke) return;
+
+    if (!listEl.dataset.delegated) {
+        listEl.dataset.delegated = '1';
+        listEl.addEventListener('click', (ev) => {
+            const row = ev.target.closest('.project-arc-row');
+            if (!row) return;
+            const arcId = row.dataset.arcId;
+            if (!arcId) return;
+            hideProjectPage();
+            handleSwitchArc(arcId);
+        });
+    }
+
+    try {
+        const arcs = (await invoke('list_arcs')) || [];
+        const mine = arcs.filter((a) => a.project_id === projectId && a.status !== 'Merged');
+        if (mine.length === 0) {
+            listEl.innerHTML = '<div class="empty-state">No arcs in this project yet. Use “New arc” above to start one.</div>';
+            return;
+        }
+        listEl.innerHTML = mine.map((a) => {
+            const name = a.name || a.title || 'Untitled arc';
+            const when = a.updated_at || a.last_active_at || a.created_at;
+            const stamp = when ? formatRelativeTime(when) : '';
+            return '<div class="project-arc-row" data-arc-id="' + escapeHtml(a.id) + '">' +
+                '<span class="project-arc-name">' + escapeHtml(name) + '</span>' +
+                (stamp ? '<span class="project-arc-stamp">' + escapeHtml(stamp) + '</span>' : '') +
+            '</div>';
+        }).join('');
+    } catch (err) {
+        console.error('list_arcs (project arcs) failed:', err);
+        listEl.innerHTML = '<div class="empty-state">Failed to load arcs.</div>';
+    }
+}
+
+async function loadProjectFiles(projectId) {
+    const listEl = document.getElementById('project-files-list');
+    if (!listEl || !invoke) return;
+    try {
+        const files = (await invoke('list_project_files', { projectId })) || [];
+        if (files.length === 0) {
+            listEl.innerHTML = '<div class="empty-state">No files yet. Files saved into this project\'s workspace folder appear here.</div>';
+            return;
+        }
+        const folderIcon = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>';
+        const fileIcon = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>';
+        listEl.innerHTML = files.map((f) => {
+            const icon = f.is_dir ? folderIcon : fileIcon;
+            const meta = [];
+            if (!f.is_dir) meta.push(formatFileSize(f.size_bytes));
+            if (f.modified) meta.push(formatRelativeTime(f.modified));
+            return '<div class="project-file-row">' +
+                '<span class="project-file-icon" aria-hidden="true">' + icon + '</span>' +
+                '<span class="project-file-name">' + escapeHtml(f.name) + '</span>' +
+                (meta.length ? '<span class="project-file-meta">' + escapeHtml(meta.join(' · ')) + '</span>' : '') +
+            '</div>';
+        }).join('');
+        listEl.scrollTop = 0;
+    } catch (err) {
+        console.error('list_project_files failed:', err);
+        listEl.innerHTML = '<div class="empty-state">Failed to load files.</div>';
+    }
+}
+
+async function loadProjectMemories(projectId) {
+    const listEl = document.getElementById('project-memories-list');
+    if (!listEl || !invoke) return;
+    try {
+        const items = (await invoke('list_project_memories', { projectId })) || [];
+        if (items.length === 0) {
+            listEl.innerHTML = '<div class="empty-state">No project-scoped memories yet.</div>';
+            return;
+        }
+        listEl.innerHTML = items.map((item) => {
+            const timeAgo = item.timestamp ? formatRelativeTime(item.timestamp) : '';
+            return '<div class="memory-card">' +
+                '<div class="memory-card-header">' +
+                    '<span class="memory-type-badge ' + escapeHtml(item.memory_type || '') + '">' + escapeHtml(item.memory_type || '') + '</span>' +
+                    '<span class="memory-source">' + escapeHtml(item.source || '') + '</span>' +
+                    '<span class="memory-time">' + escapeHtml(timeAgo) + '</span>' +
+                '</div>' +
+                '<div class="memory-content">' + escapeHtml(item.content || '') + '</div>' +
+            '</div>';
+        }).join('');
+        listEl.scrollTop = 0;
+    } catch (err) {
+        console.error('list_project_memories failed:', err);
+        listEl.innerHTML = '<div class="empty-state">Failed to load memories.</div>';
+    }
+}
+
+// ─── Project page wiring ───
+
+(function wireProjectsMainUi() {
+    // Sidebar "+" → inline create row.
+    const newBtn = document.getElementById('project-new-sidebar-btn');
+    if (newBtn) {
+        newBtn.addEventListener('click', () => {
+            const wrap = document.getElementById('project-new-inline');
+            const hidden = !wrap || wrap.classList.contains('hidden');
+            toggleProjectInlineCreate(hidden);
+        });
+    }
+    const inlineInput = document.getElementById('project-new-inline-input');
+    if (inlineInput) {
+        inlineInput.addEventListener('keydown', async (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                const name = inlineInput.value;
+                const project = await createProjectFromName(name);
+                toggleProjectInlineCreate(false);
+                if (project && project.id) showProjectPage(project.id);
+            } else if (e.key === 'Escape') {
+                toggleProjectInlineCreate(false);
+            }
+        });
+        inlineInput.addEventListener('blur', () => {
+            // Defer so an Enter-driven create isn't cancelled by the blur.
+            setTimeout(() => toggleProjectInlineCreate(false), 150);
+        });
+    }
+
+    // Back button.
+    document.getElementById('project-back')?.addEventListener('click', hideProjectPage);
+
+    // Sub-tab strip.
+    document.querySelectorAll('#project-view .project-tab').forEach((tab) => {
+        tab.addEventListener('click', () => setProjectTab(tab.dataset.ptab));
+    });
+
+    // Save instructions.
+    document.getElementById('project-instructions-save')?.addEventListener('click', async () => {
+        if (!invoke || !openProjectId) return;
+        const instrEl = document.getElementById('project-instructions-input');
+        const value = instrEl ? instrEl.value : '';
+        try {
+            const updated = await invoke('update_project', {
+                id: openProjectId,
+                name: null,
+                instructions: value.trim() ? value : null,
+            });
+            // Keep the cache in sync.
+            const idx = projectsList.findIndex((p) => p.id === openProjectId);
+            if (idx >= 0 && updated) projectsList[idx] = updated;
+            showToast('Instructions saved', 'success');
+        } catch (err) {
+            console.error('update_project (instructions) failed:', err);
+            showToast('Failed to save instructions: ' + err, 'error');
+        }
+    });
+
+    // Update summary now.
+    document.getElementById('project-summary-update')?.addEventListener('click', async (ev) => {
+        if (!invoke || !openProjectId) return;
+        const btn = ev.currentTarget;
+        btn.disabled = true;
+        const original = btn.textContent;
+        btn.textContent = 'Updating…';
+        try {
+            await invoke('update_project_summary', { projectId: openProjectId });
+            await loadProjectsManager();
+            const project = projectsList.find((p) => p.id === openProjectId);
+            const summaryEl = document.getElementById('project-summary-text');
+            const stampEl = document.getElementById('project-summary-stamp');
+            if (project && summaryEl) {
+                summaryEl.textContent = (project.summary && project.summary.trim())
+                    ? project.summary
+                    : 'No summary yet.';
+            }
+            if (project && stampEl) {
+                stampEl.textContent = project.summary_updated_at
+                    ? 'Updated ' + formatRelativeTime(project.summary_updated_at)
+                    : '';
+            }
+            showToast('Project summary updated', 'success');
+        } catch (err) {
+            console.error('update_project_summary failed:', err);
+            showToast('Summary update failed: ' + err, 'error');
+        } finally {
+            btn.disabled = false;
+            btn.textContent = original;
+        }
+    });
+
+    // Summary mode (global).
+    document.getElementById('project-view-summary-mode')?.addEventListener('change', async (e) => {
+        if (!invoke) return;
+        try {
+            await invoke('set_project_summary_mode', { mode: e.target.value });
+            // Mirror into the Settings panel dropdown if present.
+            const settingsSel = document.getElementById('project-summary-mode');
+            if (settingsSel) settingsSel.value = e.target.value;
+        } catch (err) {
+            console.error('set_project_summary_mode failed:', err);
+            showToast('Failed to set summary mode: ' + err, 'error');
+        }
+    });
+
+    // Rename (inline edit of the title).
+    document.getElementById('project-rename-btn')?.addEventListener('click', () => {
+        if (!openProjectId) return;
+        const titleEl = document.getElementById('project-view-title');
+        if (!titleEl || titleEl.querySelector('input')) return;
+        const current = titleEl.textContent;
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'project-rename-input';
+        input.value = current;
+        titleEl.textContent = '';
+        titleEl.appendChild(input);
+        input.focus();
+        input.select();
+
+        const finish = async (save) => {
+            const newName = input.value.trim();
+            if (save && newName && newName !== current) {
+                try {
+                    const updated = await invoke('update_project', {
+                        id: openProjectId, name: newName, instructions: null,
+                    });
+                    titleEl.textContent = newName;
+                    const idx = projectsList.findIndex((p) => p.id === openProjectId);
+                    if (idx >= 0 && updated) projectsList[idx] = updated;
+                    renderProjectsStrip();
+                    await loadProjectsManager();
+                } catch (err) {
+                    console.error('update_project (rename) failed:', err);
+                    showToast('Rename failed: ' + err, 'error');
+                    titleEl.textContent = current;
+                }
+            } else {
+                titleEl.textContent = current;
+            }
+        };
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+            else if (e.key === 'Escape') { finish(false); }
+        });
+        input.addEventListener('blur', () => finish(true));
+    });
+
+    // Delete (with confirm).
+    document.getElementById('project-delete-btn')?.addEventListener('click', async () => {
+        if (!invoke || !openProjectId) return;
+        const project = projectsList.find((p) => p.id === openProjectId);
+        const label = project ? project.name : 'this project';
+        if (!confirm('Delete “' + label + '”? Member arcs are detached, not deleted.')) return;
+        try {
+            await invoke('delete_project', { id: openProjectId });
+            showToast('Project deleted', 'success');
+            hideProjectPage();
+            await loadProjectsManager();
+            renderProjectsStrip();
+        } catch (err) {
+            console.error('delete_project failed:', err);
+            showToast('Failed to delete project: ' + err, 'error');
+        }
+    });
+
+    // New arc in this project: pin the project active, create a fresh arc
+    // (newArc() reads active project on the backend), then assign defensively.
+    document.getElementById('project-new-arc-btn')?.addEventListener('click', async () => {
+        if (!invoke || !openProjectId) return;
+        const projectId = openProjectId;
+        try {
+            await invoke('set_active_project', { projectId });
+        } catch (err) {
+            console.warn('[athen] set_active_project failed:', err);
+        }
+        hideProjectPage();
+        await newArc();
+        // Ensure the new arc is bound to the project even if the backend
+        // new-arc path doesn't auto-inherit the active project.
+        if (activeArcId) {
+            try {
+                await invoke('assign_arc_to_project', { arcId: activeArcId, projectId });
+                const meta = arcMetaById.get(activeArcId);
+                if (meta) meta.project_id = projectId;
+            } catch (err) {
+                console.warn('[athen] assign_arc_to_project failed:', err);
+            }
+        }
+    });
+})();
 
 // ─── Path-Grant Modal & Permissions Settings ───
 
@@ -14614,6 +15098,7 @@ function showWakeups() {
     notificationsView?.classList.add('hidden');
     contactsView?.classList.add('hidden');
     memoryView?.classList.add('hidden');
+    document.getElementById('project-view')?.classList.add('hidden');
     document.getElementById('sidebar').style.display = '';
     if (typeof timelineRefreshInterval !== 'undefined' && timelineRefreshInterval) {
         clearInterval(timelineRefreshInterval);
@@ -16387,6 +16872,7 @@ function showAgentControl() {
     notificationsView?.classList.add('hidden');
     contactsView?.classList.add('hidden');
     memoryView?.classList.add('hidden');
+    document.getElementById('project-view')?.classList.add('hidden');
     document.getElementById('sidebar').style.display = '';
     if (typeof timelineRefreshInterval !== 'undefined' && timelineRefreshInterval) {
         clearInterval(timelineRefreshInterval);

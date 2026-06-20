@@ -1096,6 +1096,12 @@ async fn h_project_summary_mode_set(
 ) -> Response {
     json_result(commands::set_project_summary_mode_core(body.mode, api.ui.app_state()).await)
 }
+async fn h_project_files(State(api): State<ApiState>, UrlPath(id): UrlPath<String>) -> Response {
+    json_result(commands::list_project_files_core(api.ui.app_state(), id).await)
+}
+async fn h_project_memories(State(api): State<ApiState>, UrlPath(id): UrlPath<String>) -> Response {
+    json_result(commands::list_project_memories_core(api.ui.app_state(), id).await)
+}
 
 // skills
 async fn h_skills_list(State(api): State<ApiState>) -> Response {
@@ -1938,6 +1944,8 @@ fn full_surface_router() -> Router<ApiState> {
         .route("/api/projects/{id}", post(h_project_update))
         .route("/api/projects/{id}/delete", post(h_project_delete))
         .route("/api/projects/{id}/summary", post(h_project_summary_update))
+        .route("/api/projects/{id}/files", get(h_project_files))
+        .route("/api/projects/{id}/memories", get(h_project_memories))
         .route("/api/arcs/{id}/project", post(h_arc_assign_project))
         .route("/api/active-project", post(h_set_active_project))
         // skills

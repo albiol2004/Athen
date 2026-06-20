@@ -243,6 +243,8 @@ pub fn run() {
             commands::update_project_summary,
             commands::get_project_summary_mode,
             commands::set_project_summary_mode,
+            commands::list_project_files,
+            commands::list_project_memories,
             commands::list_identity_categories,
             commands::upsert_identity_category,
             commands::delete_identity_category,

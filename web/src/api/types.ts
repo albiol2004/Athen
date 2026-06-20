@@ -16,6 +16,8 @@ export interface ArcMeta {
   active_profile_id?: string | null;
   pinned_provider_id?: string | null;
   pinned_slug?: string | null;
+  /** Project membership, or null when the arc belongs to no project. */
+  project_id?: string | null;
 }
 
 /** One persisted timeline row — `GET /api/arcs/{id}/entries`. */
@@ -29,6 +31,39 @@ export interface ArcEntry {
   metadata: Record<string, unknown> | null;
   created_at: string;
   turn_id: string | null;
+}
+
+/** A Project — `GET /api/projects` (persistence `Project`, snake_case). */
+export interface Project {
+  id: string;
+  name: string;
+  folder_slug: string;
+  instructions: string | null;
+  summary: string | null;
+  summary_updated_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Global project-summary maintenance mode. */
+export type SummaryMode = 'auto' | 'manual' | 'off';
+
+/** One top-level entry in a project's workspace folder — `GET /api/projects/{id}/files`. */
+export interface ProjectFileInfo {
+  name: string;
+  is_dir: boolean;
+  size_bytes: number;
+  /** RFC3339 UTC string, or null when the timestamp couldn't be read. */
+  modified: string | null;
+}
+
+/** One project-scoped memory — `GET /api/projects/{id}/memories`. */
+export interface MemoryInfo {
+  id: string;
+  content: string;
+  source: string;
+  timestamp: string;
+  memory_type: string;
 }
 
 export interface NotificationInfo {

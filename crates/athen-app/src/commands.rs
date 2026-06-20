@@ -8340,30 +8340,34 @@ pub(crate) async fn list_memories_core(
 ) -> std::result::Result<Vec<MemoryInfo>, String> {
     let memory = state.memory.as_ref().ok_or("Memory not initialized")?;
     let items = memory.list_all().await.map_err(|e| e.to_string())?;
-    Ok(items
-        .into_iter()
-        .map(|item| MemoryInfo {
-            id: item.id,
-            content: item.content,
-            source: item
-                .metadata
-                .get("source")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string(),
-            timestamp: item
-                .metadata
-                .get("timestamp")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            memory_type: if item.metadata.get("key").is_some() {
-                "keyword".to_string()
-            } else {
-                "semantic".to_string()
-            },
-        })
-        .collect())
+    Ok(items.into_iter().map(memory_item_to_info).collect())
+}
+
+/// Map a stored `MemoryItem` to the frontend-facing `MemoryInfo`. Shared by
+/// `list_memories_core` and `list_project_memories_core` so the field mapping
+/// stays in one place.
+fn memory_item_to_info(item: athen_core::traits::memory::MemoryItem) -> MemoryInfo {
+    MemoryInfo {
+        id: item.id,
+        content: item.content,
+        source: item
+            .metadata
+            .get("source")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        timestamp: item
+            .metadata
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        memory_type: if item.metadata.get("key").is_some() {
+            "keyword".to_string()
+        } else {
+            "semantic".to_string()
+        },
+    }
 }
 
 /// Update a memory item's content.
@@ -10026,6 +10030,111 @@ pub(crate) async fn set_project_summary_mode_core(
     }
     *state.project_summary_mode.lock().await = normalized;
     Ok(())
+}
+
+/// A file or folder living at the top level of a Project's workspace folder.
+#[derive(serde::Serialize)]
+pub struct ProjectFileInfo {
+    pub name: String,
+    pub is_dir: bool,
+    pub size_bytes: u64,           // 0 for dirs
+    pub modified: Option<String>, // RFC3339 UTC from metadata.modified(), None on error
+}
+
+/// List the top-level files and folders in a Project's workspace folder
+/// (`Projects/<folder_slug>/`). Non-recursive. Returns an empty list when the
+/// store is absent, the project is not found, or the folder doesn't exist yet.
+#[tauri::command]
+pub async fn list_project_files(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<Vec<ProjectFileInfo>, String> {
+    list_project_files_core(&state, project_id).await
+}
+
+pub(crate) async fn list_project_files_core(
+    state: &AppState,
+    project_id: String,
+) -> std::result::Result<Vec<ProjectFileInfo>, String> {
+    let Some(store) = state.project_store.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let Some(project) = store.get_project(&project_id).await.map_err(|e| e.to_string())? else {
+        return Ok(Vec::new());
+    };
+
+    let dir = athen_core::paths::resolve_in_workspace(&std::path::PathBuf::from(format!(
+        "Projects/{}",
+        project.folder_slug
+    )));
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let entries = std::fs::read_dir(&dir).map_err(|e| e.to_string())?;
+    let mut files: Vec<ProjectFileInfo> = Vec::new();
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) else {
+            continue; // skip names that aren't valid UTF-8
+        };
+        let metadata = entry.metadata().ok();
+        let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+        let size_bytes = if is_dir {
+            0
+        } else {
+            metadata.as_ref().map(|m| m.len()).unwrap_or(0)
+        };
+        let modified = metadata
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .map(|systime| chrono::DateTime::<chrono::Utc>::from(systime).to_rfc3339());
+        files.push(ProjectFileInfo {
+            name,
+            is_dir,
+            size_bytes,
+            modified,
+        });
+    }
+
+    // Directories first, then files; within each group case-insensitive by name.
+    files.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+
+    Ok(files)
+}
+
+/// List the memories scoped to a given Project (those whose
+/// `metadata["project_id"]` equals `project_id`). Returns an empty list when
+/// the memory store is absent.
+#[tauri::command]
+pub async fn list_project_memories(
+    project_id: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<Vec<MemoryInfo>, String> {
+    list_project_memories_core(&state, project_id).await
+}
+
+pub(crate) async fn list_project_memories_core(
+    state: &AppState,
+    project_id: String,
+) -> std::result::Result<Vec<MemoryInfo>, String> {
+    let Some(memory) = state.memory.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let items = memory.list_all().await.map_err(|e| e.to_string())?;
+    Ok(items
+        .into_iter()
+        .filter(|item| {
+            item.metadata
+                .get("project_id")
+                .and_then(|v| v.as_str())
+                == Some(project_id.as_str())
+        })
+        .map(memory_item_to_info)
+        .collect())
 }
 
 /// Best-effort, non-blocking project-summary fold of the arc being left. Gated
