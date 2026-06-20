@@ -3519,7 +3519,12 @@ mod tests {
 
         // Created in a project -> get_arc returns it (and list_arcs too).
         store
-            .create_arc_in_project("arc_proj", "In project", ArcSource::UserInput, Some("proj_1"))
+            .create_arc_in_project(
+                "arc_proj",
+                "In project",
+                ArcSource::UserInput,
+                Some("proj_1"),
+            )
             .await
             .unwrap();
         let meta = store

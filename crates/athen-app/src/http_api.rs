@@ -1073,9 +1073,7 @@ async fn h_arc_assign_project(
     UrlPath(id): UrlPath<String>,
     Json(body): Json<OptStringBody>,
 ) -> Response {
-    json_result(
-        commands::assign_arc_to_project_core(id, body.value, api.ui.app_state()).await,
-    )
+    json_result(commands::assign_arc_to_project_core(id, body.value, api.ui.app_state()).await)
 }
 async fn h_set_active_project(
     State(api): State<ApiState>,
@@ -1940,7 +1938,10 @@ fn full_surface_router() -> Router<ApiState> {
         .route("/api/identity/estimate", get(h_id_estimate))
         // projects
         .route("/api/projects", get(h_projects_list).post(h_project_create))
-        .route("/api/projects/summary-mode", get(h_project_summary_mode_get).post(h_project_summary_mode_set))
+        .route(
+            "/api/projects/summary-mode",
+            get(h_project_summary_mode_get).post(h_project_summary_mode_set),
+        )
         .route("/api/projects/{id}", post(h_project_update))
         .route("/api/projects/{id}/delete", post(h_project_delete))
         .route("/api/projects/{id}/summary", post(h_project_summary_update))

@@ -500,7 +500,12 @@ async fn resolve_active_project(
 ) -> Option<athen_persistence::projects::Project> {
     let ps = project_store?;
     let ar = arc_store?;
-    let pid = ar.get_arc(arc_id).await.ok().flatten().and_then(|m| m.project_id)?;
+    let pid = ar
+        .get_arc(arc_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|m| m.project_id)?;
     ps.get_project(&pid).await.ok().flatten()
 }
 
@@ -2900,9 +2905,12 @@ pub(crate) async fn send_message_core(
             // via .project_block), Layers 2+4 (file listing + summary →
             // volatile system_suffix). None when the arc has no project or
             // the store is absent ⇒ byte-identical to pre-Projects behavior.
-            let active_project =
-                resolve_active_project(state.project_store.as_ref(), state.arc_store.as_ref(), &active_arc)
-                    .await;
+            let active_project = resolve_active_project(
+                state.project_store.as_ref(),
+                state.arc_store.as_ref(),
+                &active_arc,
+            )
+            .await;
             // Layers 2+4 — file listing + project summary ride the VOLATILE
             // system_suffix (end of body), appended after memory recall /
             // attachment surfacing so they sit in the cache-safe tail. Never
@@ -3220,8 +3228,7 @@ pub(crate) async fn send_message_core(
                                 "arc_id": arc_id,
                                 "timestamp": chrono::Utc::now().to_rfc3339(),
                             });
-                            if let (Some(pid), Some(map)) =
-                                (&project_id, metadata.as_object_mut())
+                            if let (Some(pid), Some(map)) = (&project_id, metadata.as_object_mut())
                             {
                                 map.insert("project_id".into(), pid.clone().into());
                             }
@@ -5025,12 +5032,9 @@ pub(crate) async fn execute_dispatched_task(
             }
             // Context layer 3: prefer this arc's active-project memories.
             // No-op when the arc has no project ⇒ unchanged order.
-            let recall_project = resolve_active_project(
-                ctx.project_store.as_ref(),
-                ctx.arc_store.as_ref(),
-                &arc_id,
-            )
-            .await;
+            let recall_project =
+                resolve_active_project(ctx.project_store.as_ref(), ctx.arc_store.as_ref(), &arc_id)
+                    .await;
             boost_project_memories(
                 &mut all_items,
                 recall_project.as_ref().map(|p| p.id.as_str()),
@@ -9819,9 +9823,7 @@ pub(crate) async fn update_project_core(
         .map(|p| p.folder_slug);
 
     let name_ref = name.as_deref();
-    let instructions_ref = instructions
-        .as_ref()
-        .map(|opt| opt.as_deref());
+    let instructions_ref = instructions.as_ref().map(|opt| opt.as_deref());
     let project = store
         .update_project(&id, name_ref, instructions_ref)
         .await
@@ -9830,10 +9832,9 @@ pub(crate) async fn update_project_core(
     // Best-effort folder rename when the slug changed.
     if let Some(old_slug) = old_slug {
         if old_slug != project.folder_slug {
-            let from =
-                athen_core::paths::resolve_in_workspace(&std::path::PathBuf::from(format!(
-                    "Projects/{old_slug}"
-                )));
+            let from = athen_core::paths::resolve_in_workspace(&std::path::PathBuf::from(format!(
+                "Projects/{old_slug}"
+            )));
             let to = athen_core::paths::resolve_in_workspace(&std::path::PathBuf::from(format!(
                 "Projects/{}",
                 project.folder_slug
@@ -10037,7 +10038,7 @@ pub(crate) async fn set_project_summary_mode_core(
 pub struct ProjectFileInfo {
     pub name: String,
     pub is_dir: bool,
-    pub size_bytes: u64,           // 0 for dirs
+    pub size_bytes: u64,          // 0 for dirs
     pub modified: Option<String>, // RFC3339 UTC from metadata.modified(), None on error
 }
 
@@ -10059,7 +10060,11 @@ pub(crate) async fn list_project_files_core(
     let Some(store) = state.project_store.as_ref() else {
         return Ok(Vec::new());
     };
-    let Some(project) = store.get_project(&project_id).await.map_err(|e| e.to_string())? else {
+    let Some(project) = store
+        .get_project(&project_id)
+        .await
+        .map_err(|e| e.to_string())?
+    else {
         return Ok(Vec::new());
     };
 
@@ -10128,10 +10133,7 @@ pub(crate) async fn list_project_memories_core(
     Ok(items
         .into_iter()
         .filter(|item| {
-            item.metadata
-                .get("project_id")
-                .and_then(|v| v.as_str())
-                == Some(project_id.as_str())
+            item.metadata.get("project_id").and_then(|v| v.as_str()) == Some(project_id.as_str())
         })
         .map(memory_item_to_info)
         .collect())

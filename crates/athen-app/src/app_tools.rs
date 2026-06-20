@@ -1759,10 +1759,7 @@ impl AppToolRegistry {
         // behaviour is inherited. The relative path is resolved against the
         // workspace by `write` itself (via `resolve_in_workspace`).
         self.inner
-            .call_tool(
-                "write",
-                json!({ "path": rel_path, "content": content }),
-            )
+            .call_tool("write", json!({ "path": rel_path, "content": content }))
             .await
     }
 
@@ -3445,9 +3442,7 @@ mod tests {
     #[test]
     fn save_file_rejects_path_traversal_in_filename() {
         assert!(AppToolRegistry::resolve_save_path("note", None, None, "../escape.md").is_err());
-        assert!(
-            AppToolRegistry::resolve_save_path("note", None, None, "sub/dir/file.md").is_err()
-        );
+        assert!(AppToolRegistry::resolve_save_path("note", None, None, "sub/dir/file.md").is_err());
     }
 
     /// Helper: create an in-memory DB + CalendarStore + AppToolRegistry.

@@ -776,7 +776,12 @@ pub(crate) async fn assemble_base_app_tool_registry(
     // defaults writes into the project workspace. None when the arc has no
     // project or the store is absent ⇒ inert.
     if let (Some(ps), Some(ar)) = (deps.project_store.as_ref(), deps.arc_store.as_ref()) {
-        let project_slug = match ar.get_arc(arc_id).await.ok().flatten().and_then(|m| m.project_id)
+        let project_slug = match ar
+            .get_arc(arc_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|m| m.project_id)
         {
             Some(pid) => ps
                 .get_project(&pid)

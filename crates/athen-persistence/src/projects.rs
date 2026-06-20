@@ -137,11 +137,7 @@ impl ProjectStore {
 
     /// Create a new project. Derives a unique `folder_slug` from `name`
     /// (appending `-2`, `-3`… on collision) and returns the created row.
-    pub async fn create_project(
-        &self,
-        name: &str,
-        instructions: Option<&str>,
-    ) -> Result<Project> {
+    pub async fn create_project(&self, name: &str, instructions: Option<&str>) -> Result<Project> {
         let conn = self.conn.clone();
         let id = Uuid::new_v4().to_string();
         let name = name.to_string();
@@ -355,11 +351,7 @@ impl ProjectStore {
 
     /// Read the fold watermark (largest folded `arc_entries.id`) for an arc
     /// within a project. `None` means the arc has never been folded.
-    pub async fn get_fold_watermark(
-        &self,
-        project_id: &str,
-        arc_id: &str,
-    ) -> Result<Option<i64>> {
+    pub async fn get_fold_watermark(&self, project_id: &str, arc_id: &str) -> Result<Option<i64>> {
         let conn = self.conn.clone();
         let project_id = project_id.to_string();
         let arc_id = arc_id.to_string();
@@ -456,11 +448,7 @@ impl ProjectStore {
 ///
 /// Runs synchronously under an already-held connection lock (callers are
 /// inside a `spawn_blocking` closure).
-fn unique_slug(
-    conn: &Connection,
-    name: &str,
-    exclude_id: Option<&str>,
-) -> Result<String> {
+fn unique_slug(conn: &Connection, name: &str, exclude_id: Option<&str>) -> Result<String> {
     let base = slugify(name);
     let mut candidate = base.clone();
     let mut n: u32 = 1;
@@ -598,10 +586,7 @@ mod tests {
         assert_eq!(u.folder_slug, "p");
 
         // Clear instructions.
-        let u2 = store
-            .update_project(&p.id, None, Some(None))
-            .await
-            .unwrap();
+        let u2 = store.update_project(&p.id, None, Some(None)).await.unwrap();
         assert!(u2.instructions.is_none());
 
         // None leaves them untouched (still None after the clear).
@@ -615,7 +600,10 @@ mod tests {
         let p = store.create_project("P", None).await.unwrap();
         assert!(p.summary.is_none());
 
-        store.set_summary(&p.id, "the rolling summary").await.unwrap();
+        store
+            .set_summary(&p.id, "the rolling summary")
+            .await
+            .unwrap();
         let got = store.get_project(&p.id).await.unwrap().unwrap();
         assert_eq!(got.summary.as_deref(), Some("the rolling summary"));
         assert!(got.summary_updated_at.is_some());

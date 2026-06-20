@@ -749,10 +749,7 @@ repeat boilerplate. Output only the updated summary."
         //    the entries past the watermark (cheap — summaries, not transcript).
         let arc_summary = self.arc_store.load_latest_summary(arc_id).await?;
         let tail = self.arc_store.load_entries_after(arc_id, watermark).await?;
-        let delta = Self::build_delta_text(
-            arc_summary.as_ref().map(|s| s.content.as_str()),
-            &tail,
-        );
+        let delta = Self::build_delta_text(arc_summary.as_ref().map(|s| s.content.as_str()), &tail);
 
         // 5. Current project summary, if any.
         let existing_summary = self
@@ -825,8 +822,8 @@ mod tests {
 
     /// Build an `ArcStore` + `ProjectStore` sharing one in-memory connection,
     /// so the arc's entries and the project's fold state live in the same DB.
-    async fn arc_and_project_stores() -> (ArcStore, StdArc<athen_persistence::projects::ProjectStore>)
-    {
+    async fn arc_and_project_stores(
+    ) -> (ArcStore, StdArc<athen_persistence::projects::ProjectStore>) {
         let conn = StdArc::new(TMutex::new(rusqlite::Connection::open_in_memory().unwrap()));
         let arc_store = ArcStore::new(conn.clone());
         arc_store.init_schema().await.unwrap();
@@ -853,18 +850,26 @@ mod tests {
     #[tokio::test]
     async fn fold_skips_below_min_delta() {
         let (arc_store, project_store) = arc_and_project_stores().await;
-        let project = project_store
-            .create_project("Proj", None)
-            .await
-            .unwrap();
+        let project = project_store.create_project("Proj", None).await.unwrap();
         arc_store
-            .create_arc("arc1", "Arc 1", athen_persistence::arcs::ArcSource::UserInput)
+            .create_arc(
+                "arc1",
+                "Arc 1",
+                athen_persistence::arcs::ArcSource::UserInput,
+            )
             .await
             .unwrap();
         // Three entries (< MIN_DELTA of 4) past the implicit watermark of 0.
         for i in 0..3 {
             arc_store
-                .add_entry("arc1", EntryType::Message, "user", &format!("m{i}"), None, None)
+                .add_entry(
+                    "arc1",
+                    EntryType::Message,
+                    "user",
+                    &format!("m{i}"),
+                    None,
+                    None,
+                )
                 .await
                 .unwrap();
         }
@@ -878,7 +883,11 @@ mod tests {
 
         assert!(!folded, "fold must be skipped below the min-delta gate");
         // Summary stays None — no LLM call, no write.
-        let got = project_store.get_project(&project.id).await.unwrap().unwrap();
+        let got = project_store
+            .get_project(&project.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(got.summary.is_none(), "summary must remain unset");
         // Watermark untouched.
         assert!(project_store
@@ -895,7 +904,11 @@ mod tests {
         let (arc_store, project_store) = arc_and_project_stores().await;
         let project = project_store.create_project("Proj", None).await.unwrap();
         arc_store
-            .create_arc("empty", "Empty", athen_persistence::arcs::ArcSource::UserInput)
+            .create_arc(
+                "empty",
+                "Empty",
+                athen_persistence::arcs::ArcSource::UserInput,
+            )
             .await
             .unwrap();
 
@@ -906,7 +919,11 @@ mod tests {
             .await
             .unwrap();
         assert!(!folded);
-        let got = project_store.get_project(&project.id).await.unwrap().unwrap();
+        let got = project_store
+            .get_project(&project.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(got.summary.is_none());
     }
 
@@ -939,7 +956,8 @@ mod tests {
                 turn_id: None,
             },
         ];
-        let delta = LlmProjectCompactor::build_delta_text(Some("prior arc summary"), &store_entries);
+        let delta =
+            LlmProjectCompactor::build_delta_text(Some("prior arc summary"), &store_entries);
         assert!(delta.contains("ARC SUMMARY SO FAR:"));
         assert!(delta.contains("prior arc summary"));
         assert!(delta.contains("RECENT ENTRIES:"));
