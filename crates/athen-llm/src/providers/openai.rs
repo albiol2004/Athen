@@ -1161,10 +1161,7 @@ pub fn parse_stream_usage(usage: Option<&serde_json::Value>) -> Option<TokenUsag
         .get("prompt_tokens_details")
         .and_then(|d| d.get("cached_tokens"))
         .and_then(|v| v.as_u64())
-        .or_else(|| {
-            u.get("prompt_cache_hit_tokens")
-                .and_then(|v| v.as_u64())
-        })
+        .or_else(|| u.get("prompt_cache_hit_tokens").and_then(|v| v.as_u64()))
         .map(|v| v as u32);
     // A usage object with everything zero is the "no usage reported" shape
     // some compat servers send — don't manufacture a spurious record.
@@ -1952,11 +1949,7 @@ data: [DONE]
     #[test]
     fn test_map_error_server_error_is_transient() {
         let provider = make_provider();
-        let err = provider.map_error(
-            reqwest::StatusCode::SERVICE_UNAVAILABLE,
-            "overloaded",
-            None,
-        );
+        let err = provider.map_error(reqwest::StatusCode::SERVICE_UNAVAILABLE, "overloaded", None);
         assert!(err.is_retryable());
         assert!(matches!(err, AthenError::LlmTransient { .. }));
     }

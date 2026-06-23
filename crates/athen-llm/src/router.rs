@@ -1071,7 +1071,12 @@ mod tests {
         providers.insert(
             "always_429".into(),
             // Always transient-fails → exhausts MAX_ATTEMPTS_PER_PROVIDER.
-            Box::new(FlakyProvider::new("always_429", u32::MAX, true, counter_a.clone())),
+            Box::new(FlakyProvider::new(
+                "always_429",
+                u32::MAX,
+                true,
+                counter_a.clone(),
+            )),
         );
         providers.insert(
             "backup".into(),
@@ -1087,10 +1092,7 @@ mod tests {
         let response = router.route(&make_request()).await.unwrap();
         assert_eq!(response.provider, "backup");
         // First provider was retried up to the per-provider attempt cap...
-        assert_eq!(
-            counter_a.load(Ordering::Relaxed),
-            MAX_ATTEMPTS_PER_PROVIDER
-        );
+        assert_eq!(counter_a.load(Ordering::Relaxed), MAX_ATTEMPTS_PER_PROVIDER);
         // ...then failover advanced to the backup, which succeeded first try.
         assert_eq!(counter_b.load(Ordering::Relaxed), 1);
     }

@@ -849,7 +849,10 @@ async fn spawn_supervised<F, Fut, S>(
 {
     loop {
         if should_stop() {
-            info!(monitor = name, "Supervised monitor stop requested; not respawning");
+            info!(
+                monitor = name,
+                "Supervised monitor stop requested; not respawning"
+            );
             return;
         }
 
@@ -875,7 +878,10 @@ async fn spawn_supervised<F, Fut, S>(
                 // (runtime shutting down) must not be respawned.
                 if let tauri::Error::JoinError(ref je) = join_err {
                     if je.is_cancelled() {
-                        info!(monitor = name, "Supervised monitor task cancelled; not respawning");
+                        info!(
+                            monitor = name,
+                            "Supervised monitor task cancelled; not respawning"
+                        );
                         return;
                     }
                 }
@@ -888,7 +894,10 @@ async fn spawn_supervised<F, Fut, S>(
         }
 
         if should_stop() {
-            info!(monitor = name, "Supervised monitor stop requested after exit; not respawning");
+            info!(
+                monitor = name,
+                "Supervised monitor stop requested after exit; not respawning"
+            );
             return;
         }
         tokio::time::sleep(backoff).await;
@@ -2215,8 +2224,8 @@ impl AppState {
                                     // Contain a panic in the inline dispatch
                                     // per-event: log it and move on so one bad
                                     // message can't kill the email sense.
-                                    let res = AssertUnwindSafe(
-                                        crate::sense_router::process_sense_event(
+                                    let res =
+                                        AssertUnwindSafe(crate::sense_router::process_sense_event(
                                             &event,
                                             &router,
                                             &arc_store_ref,
@@ -2233,10 +2242,9 @@ impl AppState {
                                             attachment_store_ref.as_ref(),
                                             contact_store_ref.as_ref(),
                                             None,
-                                        ),
-                                    )
-                                    .catch_unwind()
-                                    .await;
+                                        ))
+                                        .catch_unwind()
+                                        .await;
                                     if res.is_err() {
                                         tracing::error!(
                                             sense = "email",
@@ -2732,8 +2740,8 @@ impl AppState {
                                 info!("Calendar monitor: {} reminder(s)", events.len());
                                 for event in events {
                                     // Per-event panic containment (see email monitor).
-                                    let res = AssertUnwindSafe(
-                                        crate::sense_router::process_sense_event(
+                                    let res =
+                                        AssertUnwindSafe(crate::sense_router::process_sense_event(
                                             &event,
                                             &router,
                                             &arc_store_ref,
@@ -2750,10 +2758,9 @@ impl AppState {
                                             attachment_store_ref.as_ref(),
                                             contact_store_ref.as_ref(),
                                             None,
-                                        ),
-                                    )
-                                    .catch_unwind()
-                                    .await;
+                                        ))
+                                        .catch_unwind()
+                                        .await;
                                     if res.is_err() {
                                         tracing::error!(
                                             sense = "calendar",
@@ -2877,185 +2884,193 @@ impl AppState {
                 let stopped = Arc::clone(&stopped);
 
                 async move {
-            if let Err(e) = monitor.init(&telegram_config).await {
-                tracing::error!("Failed to initialize Telegram monitor: {e}");
-                return;
-            }
+                    if let Err(e) = monitor.init(&telegram_config).await {
+                        tracing::error!("Failed to initialize Telegram monitor: {e}");
+                        return;
+                    }
 
-            let poll_interval = monitor.poll_interval();
-            info!(
-                "Telegram monitor started, polling every {:?}",
-                poll_interval
-            );
+                    let poll_interval = monitor.poll_interval();
+                    info!(
+                        "Telegram monitor started, polling every {:?}",
+                        poll_interval
+                    );
 
-            loop {
-                match monitor.poll().await {
-                    Ok(events) if !events.is_empty() => {
-                        info!("Telegram monitor received {} new event(s)", events.len());
-                        for event in &events {
-                            let is_owner = event.source_risk == athen_core::risk::RiskLevel::Safe;
+                    loop {
+                        match monitor.poll().await {
+                            Ok(events) if !events.is_empty() => {
+                                info!("Telegram monitor received {} new event(s)", events.len());
+                                for event in &events {
+                                    let is_owner =
+                                        event.source_risk == athen_core::risk::RiskLevel::Safe;
 
-                            if is_owner {
-                                // Owner messages skip triage/notification and go
-                                // straight to agent execution (like typing in the
-                                // chat).  Arc creation is handled inside.
-                                let text = event
-                                    .content
-                                    .body
-                                    .get("text")
-                                    .and_then(|v| v.as_str())
-                                    .filter(|s| !s.is_empty())
-                                    .or_else(|| {
-                                        event.content.summary.as_deref().filter(|s| !s.is_empty())
-                                    })
-                                    .unwrap_or("");
+                                    if is_owner {
+                                        // Owner messages skip triage/notification and go
+                                        // straight to agent execution (like typing in the
+                                        // chat).  Arc creation is handled inside.
+                                        let text = event
+                                            .content
+                                            .body
+                                            .get("text")
+                                            .and_then(|v| v.as_str())
+                                            .filter(|s| !s.is_empty())
+                                            .or_else(|| {
+                                                event
+                                                    .content
+                                                    .summary
+                                                    .as_deref()
+                                                    .filter(|s| !s.is_empty())
+                                            })
+                                            .unwrap_or("");
 
-                                let chat_id = event
-                                    .content
-                                    .body
-                                    .get("chat_id")
-                                    .and_then(|v| v.as_i64())
-                                    .unwrap_or(0);
+                                        let chat_id = event
+                                            .content
+                                            .body
+                                            .get("chat_id")
+                                            .and_then(|v| v.as_i64())
+                                            .unwrap_or(0);
 
-                                // Treat a message as actionable if it has either
-                                // text OR attachments. A bare photo (caption-less)
-                                // arrives with text="[photo]" anyway, but a future
-                                // change that sends only attachments still needs
-                                // to reach the executor.
-                                let has_payload =
-                                    !text.is_empty() || !event.content.attachments.is_empty();
-                                if has_payload && chat_id != 0 {
-                                    // Spawn the handler so the poll loop keeps
-                                    // ticking. If we awaited inline, callbacks
-                                    // (Telegram inline-keyboard taps) would
-                                    // pile up at Telegram while this message's
-                                    // approval sat blocked — the user would
-                                    // tap Approve and see no response until
-                                    // the agent finished some other way.
-                                    let text_owned = text.to_string();
-                                    let bot_token_c = bot_token.clone();
-                                    let ui_c = ui.clone();
-                                    let notifier_c = notifier.clone();
-                                    let profile_embedder_c = Arc::clone(&profile_embedder_ref);
-                                    let profile_embedding_cache_c =
-                                        Arc::clone(&profile_embedding_cache_ref);
-                                    let agent_registry_c = agent_registry_ref.clone();
-                                    let deps_c = tool_registry_deps_ref.clone();
-                                    let event_id = event.id;
-                                    let attachments_owned = event.content.attachments.clone();
-                                    tauri::async_runtime::spawn(async move {
-                                        // Contain a panic in the owner-message
-                                        // executor so it can't silently abort
-                                        // this handler task with no trace.
+                                        // Treat a message as actionable if it has either
+                                        // text OR attachments. A bare photo (caption-less)
+                                        // arrives with text="[photo]" anyway, but a future
+                                        // change that sends only attachments still needs
+                                        // to reach the executor.
+                                        let has_payload = !text.is_empty()
+                                            || !event.content.attachments.is_empty();
+                                        if has_payload && chat_id != 0 {
+                                            // Spawn the handler so the poll loop keeps
+                                            // ticking. If we awaited inline, callbacks
+                                            // (Telegram inline-keyboard taps) would
+                                            // pile up at Telegram while this message's
+                                            // approval sat blocked — the user would
+                                            // tap Approve and see no response until
+                                            // the agent finished some other way.
+                                            let text_owned = text.to_string();
+                                            let bot_token_c = bot_token.clone();
+                                            let ui_c = ui.clone();
+                                            let notifier_c = notifier.clone();
+                                            let profile_embedder_c =
+                                                Arc::clone(&profile_embedder_ref);
+                                            let profile_embedding_cache_c =
+                                                Arc::clone(&profile_embedding_cache_ref);
+                                            let agent_registry_c = agent_registry_ref.clone();
+                                            let deps_c = tool_registry_deps_ref.clone();
+                                            let event_id = event.id;
+                                            let attachments_owned =
+                                                event.content.attachments.clone();
+                                            tauri::async_runtime::spawn(async move {
+                                                // Contain a panic in the owner-message
+                                                // executor so it can't silently abort
+                                                // this handler task with no trace.
+                                                let res = AssertUnwindSafe(
+                                                    execute_owner_telegram_message(
+                                                        &text_owned,
+                                                        chat_id,
+                                                        &bot_token_c,
+                                                        event_id,
+                                                        &attachments_owned,
+                                                        &ui_c,
+                                                        notifier_c.as_ref(),
+                                                        &profile_embedder_c,
+                                                        &profile_embedding_cache_c,
+                                                        agent_registry_c.as_ref(),
+                                                        deps_c,
+                                                    ),
+                                                )
+                                                .catch_unwind()
+                                                .await;
+                                                if res.is_err() {
+                                                    tracing::error!(
+                                                sense = "telegram",
+                                                "execute_owner_telegram_message PANICKED; message dropped, monitor unaffected"
+                                            );
+                                                }
+                                            });
+                                        }
+                                    } else {
+                                        // Non-owner messages go through the full sense
+                                        // router: LLM triage, arc creation, notification,
+                                        // and (when triage says it's action-worthy) hand
+                                        // off to the coordinator for autonomous execution.
+                                        // Per-event panic containment (see email monitor).
                                         let res = AssertUnwindSafe(
-                                            execute_owner_telegram_message(
-                                                &text_owned,
-                                                chat_id,
-                                                &bot_token_c,
-                                                event_id,
-                                                &attachments_owned,
-                                                &ui_c,
-                                                notifier_c.as_ref(),
-                                                &profile_embedder_c,
-                                                &profile_embedding_cache_c,
-                                                agent_registry_c.as_ref(),
-                                                deps_c,
+                                            crate::sense_router::process_sense_event(
+                                                event,
+                                                &router,
+                                                &arc_store_ref,
+                                                &profile_store_ref,
+                                                &profile_embedder_ref,
+                                                &profile_embedding_cache_ref,
+                                                &ui,
+                                                notifier.as_ref(),
+                                                Some(&coordinator_ref),
+                                                Some(&task_arc_map_ref),
+                                                Some(&dispatch_signal_ref),
+                                                approval_router_ref.as_ref(),
+                                                Some(&pending_email_marks_ref),
+                                                attachment_store_ref.as_ref(),
+                                                contact_store_ref.as_ref(),
+                                                telegram_chat_log_ref.as_ref(),
                                             ),
                                         )
                                         .catch_unwind()
                                         .await;
                                         if res.is_err() {
                                             tracing::error!(
-                                                sense = "telegram",
-                                                "execute_owner_telegram_message PANICKED; message dropped, monitor unaffected"
-                                            );
-                                        }
-                                    });
-                                }
-                            } else {
-                                // Non-owner messages go through the full sense
-                                // router: LLM triage, arc creation, notification,
-                                // and (when triage says it's action-worthy) hand
-                                // off to the coordinator for autonomous execution.
-                                // Per-event panic containment (see email monitor).
-                                let res = AssertUnwindSafe(
-                                    crate::sense_router::process_sense_event(
-                                        event,
-                                        &router,
-                                        &arc_store_ref,
-                                        &profile_store_ref,
-                                        &profile_embedder_ref,
-                                        &profile_embedding_cache_ref,
-                                        &ui,
-                                        notifier.as_ref(),
-                                        Some(&coordinator_ref),
-                                        Some(&task_arc_map_ref),
-                                        Some(&dispatch_signal_ref),
-                                        approval_router_ref.as_ref(),
-                                        Some(&pending_email_marks_ref),
-                                        attachment_store_ref.as_ref(),
-                                        contact_store_ref.as_ref(),
-                                        telegram_chat_log_ref.as_ref(),
-                                    ),
-                                )
-                                .catch_unwind()
-                                .await;
-                                if res.is_err() {
-                                    tracing::error!(
                                         sense = "telegram",
                                         "process_sense_event PANICKED; skipping event, monitor continues"
                                     );
+                                        }
+                                    }
                                 }
+                            }
+                            Ok(_) => {
+                                tracing::debug!("Telegram poll: no new messages");
+                            }
+                            Err(e) => {
+                                warn!("Telegram poll error: {e}");
+                            }
+                        }
+
+                        // Drain any inline-keyboard taps captured during this
+                        // poll and forward them to the approval sink. Done
+                        // *after* poll() so a tap is resolved on the same
+                        // iteration it arrives, not the next one.
+                        let callbacks = monitor.take_callbacks();
+                        if !callbacks.is_empty() {
+                            info!(count = callbacks.len(), "Draining Telegram callback events");
+                            if let Some(ref sink) = telegram_approval_sink {
+                                for cb in callbacks {
+                                    let resolved =
+                                        sink.resolve_callback(&cb.callback_id, &cb.data).await;
+                                    info!(
+                                        callback_id = %cb.callback_id,
+                                        data = %cb.data,
+                                        resolved,
+                                        "Telegram callback dispatched"
+                                    );
+                                }
+                            } else {
+                                warn!(
+                                    count = callbacks.len(),
+                                    "Telegram callbacks dropped — no approval sink configured"
+                                );
+                            }
+                        }
+
+                        tokio::select! {
+                            _ = tokio::time::sleep(poll_interval) => {}
+                            _ = shutdown.recv() => {
+                                info!("Telegram monitor shutdown signal received");
+                                stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+                                break;
                             }
                         }
                     }
-                    Ok(_) => {
-                        tracing::debug!("Telegram poll: no new messages");
-                    }
-                    Err(e) => {
-                        warn!("Telegram poll error: {e}");
-                    }
-                }
 
-                // Drain any inline-keyboard taps captured during this
-                // poll and forward them to the approval sink. Done
-                // *after* poll() so a tap is resolved on the same
-                // iteration it arrives, not the next one.
-                let callbacks = monitor.take_callbacks();
-                if !callbacks.is_empty() {
-                    info!(count = callbacks.len(), "Draining Telegram callback events");
-                    if let Some(ref sink) = telegram_approval_sink {
-                        for cb in callbacks {
-                            let resolved = sink.resolve_callback(&cb.callback_id, &cb.data).await;
-                            info!(
-                                callback_id = %cb.callback_id,
-                                data = %cb.data,
-                                resolved,
-                                "Telegram callback dispatched"
-                            );
-                        }
-                    } else {
-                        warn!(
-                            count = callbacks.len(),
-                            "Telegram callbacks dropped — no approval sink configured"
-                        );
+                    if let Err(e) = monitor.shutdown().await {
+                        warn!("Telegram monitor shutdown error: {e}");
                     }
-                }
-
-                tokio::select! {
-                    _ = tokio::time::sleep(poll_interval) => {}
-                    _ = shutdown.recv() => {
-                        info!("Telegram monitor shutdown signal received");
-                        stopped.store(true, std::sync::atomic::Ordering::Relaxed);
-                        break;
-                    }
-                }
-            }
-
-            if let Err(e) = monitor.shutdown().await {
-                warn!("Telegram monitor shutdown error: {e}");
-            }
-            info!("Telegram monitor stopped");
+                    info!("Telegram monitor stopped");
                 }
             },
         ));

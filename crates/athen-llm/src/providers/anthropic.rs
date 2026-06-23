@@ -755,10 +755,9 @@ fn parse_sse_chunks(
                             // keyed and accumulated. Text/thinking blocks are
                             // ignored here.
                             let block = event.get("content_block");
-                            let is_tool_use = block
-                                .and_then(|b| b.get("type"))
-                                .and_then(|t| t.as_str())
-                                == Some("tool_use");
+                            let is_tool_use =
+                                block.and_then(|b| b.get("type")).and_then(|t| t.as_str())
+                                    == Some("tool_use");
                             if is_tool_use {
                                 let id = block
                                     .and_then(|b| b.get("id"))
@@ -792,9 +791,8 @@ fn parse_sse_chunks(
                                 }
                                 // Plain assistant text.
                                 _ => {
-                                    if let Some(text_delta) = delta
-                                        .and_then(|d| d.get("text"))
-                                        .and_then(|t| t.as_str())
+                                    if let Some(text_delta) =
+                                        delta.and_then(|d| d.get("text")).and_then(|t| t.as_str())
                                     {
                                         chunks.push(Ok(LlmChunk {
                                             delta: text_delta.to_string(),
@@ -1347,10 +1345,11 @@ mod tests {
         let mut buffer = sse.as_bytes().to_vec();
         let mut acc = ToolUseAccumulator::default();
         let mut usage_acc = StreamUsageAcc::default();
-        let chunks: Vec<LlmChunk> = drain_complete_sse_events(&mut buffer, &mut acc, &mut usage_acc)
-            .into_iter()
-            .map(|r| r.expect("chunk ok"))
-            .collect();
+        let chunks: Vec<LlmChunk> =
+            drain_complete_sse_events(&mut buffer, &mut acc, &mut usage_acc)
+                .into_iter()
+                .map(|r| r.expect("chunk ok"))
+                .collect();
 
         // Text delta survived.
         let text: String = chunks.iter().map(|c| c.delta.as_str()).collect();
@@ -1436,10 +1435,11 @@ mod tests {
         let mut buffer = sse.as_bytes().to_vec();
         let mut acc = ToolUseAccumulator::default();
         let mut usage_acc = StreamUsageAcc::default();
-        let chunks: Vec<LlmChunk> = drain_complete_sse_events(&mut buffer, &mut acc, &mut usage_acc)
-            .into_iter()
-            .map(|r| r.expect("chunk ok"))
-            .collect();
+        let chunks: Vec<LlmChunk> =
+            drain_complete_sse_events(&mut buffer, &mut acc, &mut usage_acc)
+                .into_iter()
+                .map(|r| r.expect("chunk ok"))
+                .collect();
         let calls: Vec<&ToolCall> = chunks.iter().flat_map(|c| c.tool_calls.iter()).collect();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "get_time");

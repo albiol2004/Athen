@@ -2998,10 +2998,7 @@ mod tests {
             async fn route(&self, r: &LlmRequest) -> Result<LlmResponse> {
                 self.0.route(r).await
             }
-            async fn route_streaming(
-                &self,
-                r: &LlmRequest,
-            ) -> Result<athen_core::llm::LlmStream> {
+            async fn route_streaming(&self, r: &LlmRequest) -> Result<athen_core::llm::LlmStream> {
                 self.0.route_streaming(r).await
             }
             async fn budget_remaining(&self) -> Result<BudgetStatus> {
