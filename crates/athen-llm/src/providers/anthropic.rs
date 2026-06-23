@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::time::Duration;
 use tracing::{debug, warn};
 
@@ -349,19 +350,22 @@ impl LlmProvider for AnthropicProvider {
         // silently dropping the text delta — causing intermittent tool-call
         // extraction failures for inline-format models (MiniMax M2.7).
         let raw_chunks = byte_stream
-            .scan(Vec::<u8>::new(), |buffer, result| {
-                let emitted: Vec<Result<LlmChunk>> = match result {
-                    Ok(bytes) => {
-                        buffer.extend_from_slice(&bytes);
-                        drain_complete_sse_events(buffer)
-                    }
-                    Err(e) => vec![Err(AthenError::LlmProvider {
-                        provider: "anthropic".into(),
-                        message: format!("stream error: {}", e),
-                    })],
-                };
-                futures::future::ready(Some(emitted))
-            })
+            .scan(
+                (Vec::<u8>::new(), ToolUseAccumulator::default()),
+                |(buffer, acc), result| {
+                    let emitted: Vec<Result<LlmChunk>> = match result {
+                        Ok(bytes) => {
+                            buffer.extend_from_slice(&bytes);
+                            drain_complete_sse_events(buffer, acc)
+                        }
+                        Err(e) => vec![Err(AthenError::LlmProvider {
+                            provider: "anthropic".into(),
+                            message: format!("stream error: {}", e),
+                        })],
+                    };
+                    futures::future::ready(Some(emitted))
+                },
+            )
             .flat_map(futures::stream::iter);
 
         // Wrap the raw SSE stream for inline tool-call extraction.
@@ -518,19 +522,103 @@ fn anthropic_multimodal_blocks(text: &str, images: &[ImageInput]) -> serde_json:
 /// in the buffer for the next TCP chunk to complete. This prevents the
 /// per-chunk parsing bug where a JSON payload split across two TCP
 /// segments yields two fragments that both fail `serde_json::from_str`.
-fn drain_complete_sse_events(buffer: &mut Vec<u8>) -> Vec<Result<LlmChunk>> {
+fn drain_complete_sse_events(
+    buffer: &mut Vec<u8>,
+    acc: &mut ToolUseAccumulator,
+) -> Vec<Result<LlmChunk>> {
     let mut out = Vec::new();
     while let Some(end) = buffer.windows(2).position(|w| w == b"\n\n") {
         let event_bytes: Vec<u8> = buffer.drain(..end).collect();
         buffer.drain(..2); // drop the `\n\n` terminator
         let event_text = String::from_utf8_lossy(&event_bytes);
-        out.extend(parse_sse_chunks(&event_text));
+        out.extend(parse_sse_chunks(&event_text, acc));
     }
     out
 }
 
+/// Accumulates a native Claude `tool_use` block across the SSE events that
+/// carry it. A single tool call streams as `content_block_start`
+/// (`{type:"tool_use", id, name}`), then a run of `content_block_delta`
+/// events whose `delta.partial_json` fragments concatenate into the
+/// arguments JSON, terminated by `content_block_stop`. The events are keyed
+/// by the top-level `index`, so we collect fragments per index and finalize
+/// on stop. Mirrors the OpenAI `ToolCallAccumulator` shape.
+#[derive(Debug, Default)]
+struct ToolUseAccumulator {
+    parts: BTreeMap<u64, PartialToolUse>,
+}
+
+#[derive(Debug, Default)]
+struct PartialToolUse {
+    id: String,
+    name: String,
+    partial_json: String,
+}
+
+impl ToolUseAccumulator {
+    /// Record a `content_block_start` for a `tool_use` block at `index`.
+    fn start(&mut self, index: u64, id: String, name: String) {
+        let entry = self.parts.entry(index).or_default();
+        entry.id = id;
+        entry.name = name;
+        entry.partial_json.clear();
+    }
+
+    /// Append an `input_json_delta.partial_json` fragment to the block at
+    /// `index`. Deltas for content blocks we never saw a tool_use
+    /// `content_block_start` for (e.g. text blocks) never reach here.
+    fn push_partial(&mut self, index: u64, fragment: &str) {
+        if let Some(entry) = self.parts.get_mut(&index) {
+            entry.partial_json.push_str(fragment);
+        }
+    }
+
+    /// Finalize and remove the block at `index`, if present and named.
+    fn finalize(&mut self, index: u64) -> Option<ToolCall> {
+        self.parts.remove(&index).and_then(finalize_part)
+    }
+
+    /// Finalize every remaining block (defensive: a `message_stop` without
+    /// a preceding `content_block_stop`).
+    fn drain(&mut self) -> Vec<ToolCall> {
+        std::mem::take(&mut self.parts)
+            .into_values()
+            .filter_map(finalize_part)
+            .collect()
+    }
+}
+
+/// Convert an accumulated partial tool_use into a finished [`ToolCall`].
+/// Unnamed blocks are dropped (incomplete); empty `partial_json` (a tool
+/// that takes no arguments) becomes `{}`. A `partial_json` that fails to
+/// parse also falls back to `{}` rather than dropping the call.
+fn finalize_part(p: PartialToolUse) -> Option<ToolCall> {
+    if p.name.is_empty() {
+        return None;
+    }
+    let arguments = if p.partial_json.trim().is_empty() {
+        serde_json::Value::Object(serde_json::Map::new())
+    } else {
+        serde_json::from_str(&p.partial_json)
+            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()))
+    };
+    Some(ToolCall {
+        id: p.id,
+        name: p.name,
+        arguments,
+        thought_signature: None,
+    })
+}
+
 /// Parse SSE text into LlmChunk results.
-fn parse_sse_chunks(text: &str) -> Vec<Result<LlmChunk>> {
+///
+/// `acc` persists across SSE events (and TCP chunks) so a native Claude
+/// `tool_use` block — split across `content_block_start`, many
+/// `input_json_delta` deltas, and `content_block_stop` — is reassembled
+/// into a single [`ToolCall`]. Emitting a tool call also flags the chunk's
+/// `tool_calls` as non-empty, which the streaming wrapper reads to set
+/// `saw_structured` and suppress the inline-text extractor.
+fn parse_sse_chunks(text: &str, acc: &mut ToolUseAccumulator) -> Vec<Result<LlmChunk>> {
     let mut chunks = Vec::new();
 
     for line in text.lines() {
@@ -541,26 +629,84 @@ fn parse_sse_chunks(text: &str) -> Vec<Result<LlmChunk>> {
                     delta: String::new(),
                     is_final: true,
                     is_thinking: false,
-                    tool_calls: vec![],
+                    tool_calls: acc.drain(),
                 }));
                 continue;
             }
             match serde_json::from_str::<serde_json::Value>(data) {
                 Ok(event) => {
                     let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    let index = event.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
 
                     match event_type {
-                        "content_block_delta" => {
-                            if let Some(delta) = event
-                                .get("delta")
-                                .and_then(|d| d.get("text"))
+                        "content_block_start" => {
+                            // Capture the id+name of a native tool_use block so
+                            // its forthcoming input_json_delta fragments can be
+                            // keyed and accumulated. Text/thinking blocks are
+                            // ignored here.
+                            let block = event.get("content_block");
+                            let is_tool_use = block
+                                .and_then(|b| b.get("type"))
                                 .and_then(|t| t.as_str())
-                            {
+                                == Some("tool_use");
+                            if is_tool_use {
+                                let id = block
+                                    .and_then(|b| b.get("id"))
+                                    .and_then(|i| i.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let name = block
+                                    .and_then(|b| b.get("name"))
+                                    .and_then(|n| n.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                acc.start(index, id, name);
+                            }
+                        }
+                        "content_block_delta" => {
+                            let delta = event.get("delta");
+                            let delta_type = delta
+                                .and_then(|d| d.get("type"))
+                                .and_then(|t| t.as_str())
+                                .unwrap_or("");
+                            match delta_type {
+                                // Tool-call arguments arrive as a stream of
+                                // partial_json fragments to concatenate.
+                                "input_json_delta" => {
+                                    if let Some(frag) = delta
+                                        .and_then(|d| d.get("partial_json"))
+                                        .and_then(|p| p.as_str())
+                                    {
+                                        acc.push_partial(index, frag);
+                                    }
+                                }
+                                // Plain assistant text.
+                                _ => {
+                                    if let Some(text_delta) = delta
+                                        .and_then(|d| d.get("text"))
+                                        .and_then(|t| t.as_str())
+                                    {
+                                        chunks.push(Ok(LlmChunk {
+                                            delta: text_delta.to_string(),
+                                            is_final: false,
+                                            is_thinking: false,
+                                            tool_calls: vec![],
+                                        }));
+                                    }
+                                }
+                            }
+                        }
+                        "content_block_stop" => {
+                            // Finalize a completed tool_use block (no-op for
+                            // text/thinking blocks — they aren't in the
+                            // accumulator). Emit it as a non-text chunk so the
+                            // wrapper sets `saw_structured`.
+                            if let Some(call) = acc.finalize(index) {
                                 chunks.push(Ok(LlmChunk {
-                                    delta: delta.to_string(),
+                                    delta: String::new(),
                                     is_final: false,
                                     is_thinking: false,
-                                    tool_calls: vec![],
+                                    tool_calls: vec![call],
                                 }));
                             }
                         }
@@ -569,11 +715,14 @@ fn parse_sse_chunks(text: &str) -> Vec<Result<LlmChunk>> {
                                 delta: String::new(),
                                 is_final: true,
                                 is_thinking: false,
-                                tool_calls: vec![],
+                                // Defensive: flush any block that never saw a
+                                // content_block_stop.
+                                tool_calls: acc.drain(),
                             }));
                         }
                         _ => {
-                            // Ignore other event types (message_start, content_block_start, etc.)
+                            // Ignore other event types (message_start,
+                            // message_delta, ping, etc.)
                         }
                     }
                 }
@@ -1024,6 +1173,101 @@ mod tests {
         let usage: AnthropicUsage = serde_json::from_value(bare).unwrap();
         assert_eq!(usage.cache_read_input_tokens, None);
         assert_eq!(usage.cache_creation_input_tokens, None);
+    }
+
+    /// A representative Anthropic streaming sequence for a turn that emits a
+    /// sentence of prose AND a native `tool_use` block: text delta →
+    /// content_block_start(tool_use) → input_json_delta fragments →
+    /// content_block_stop → message_stop. Feeds it through the same
+    /// `drain_complete_sse_events` path the live stream uses (events split on
+    /// `\n\n`) and asserts both the text and a fully-parsed tool call survive.
+    #[test]
+    fn streaming_parses_native_tool_use_alongside_text() {
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}\n",
+            "\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n",
+            "\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Let me read that file.\"}}\n",
+            "\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n",
+            "\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_abc\",\"name\":\"read_file\",\"input\":{}}}\n",
+            "\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\"}}\n",
+            "\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"/tmp/x.txt\\\"}\"}}\n",
+            "\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n",
+            "\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n",
+            "\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n",
+            "\n",
+        );
+
+        let mut buffer = sse.as_bytes().to_vec();
+        let mut acc = ToolUseAccumulator::default();
+        let chunks: Vec<LlmChunk> = drain_complete_sse_events(&mut buffer, &mut acc)
+            .into_iter()
+            .map(|r| r.expect("chunk ok"))
+            .collect();
+
+        // Text delta survived.
+        let text: String = chunks.iter().map(|c| c.delta.as_str()).collect();
+        assert_eq!(text, "Let me read that file.");
+
+        // Exactly one tool call, with id, name, and parsed args.
+        let calls: Vec<&ToolCall> = chunks.iter().flat_map(|c| c.tool_calls.iter()).collect();
+        assert_eq!(calls.len(), 1, "expected one tool call, got {:?}", calls);
+        assert_eq!(calls[0].id, "toolu_abc");
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments["path"], "/tmp/x.txt");
+
+        // A chunk carrying a tool call is what the wrapper reads to set
+        // `saw_structured`, suppressing the inline-text extractor.
+        assert!(
+            chunks.iter().any(|c| !c.tool_calls.is_empty()),
+            "a chunk must carry the structured tool call"
+        );
+
+        // Final chunk is the terminator.
+        assert!(chunks.last().expect("a chunk").is_final);
+    }
+
+    /// A tool_use block with no arguments (empty input) finalizes to `{}`
+    /// rather than dropping the call.
+    #[test]
+    fn streaming_tool_use_with_no_args_becomes_empty_object() {
+        let sse = concat!(
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_z\",\"name\":\"get_time\",\"input\":{}}}\n",
+            "\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n",
+            "\n",
+            "data: {\"type\":\"message_stop\"}\n",
+            "\n",
+        );
+        let mut buffer = sse.as_bytes().to_vec();
+        let mut acc = ToolUseAccumulator::default();
+        let chunks: Vec<LlmChunk> = drain_complete_sse_events(&mut buffer, &mut acc)
+            .into_iter()
+            .map(|r| r.expect("chunk ok"))
+            .collect();
+        let calls: Vec<&ToolCall> = chunks.iter().flat_map(|c| c.tool_calls.iter()).collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_time");
+        assert!(calls[0].arguments.is_object());
+        assert_eq!(calls[0].arguments.as_object().unwrap().len(), 0);
     }
 
     #[test]
