@@ -252,10 +252,26 @@ impl DeepSeekProvider {
     }
 
     /// Map HTTP error responses to `AthenError`.
-    fn map_error(&self, status: reqwest::StatusCode, body: &str) -> AthenError {
-        let message = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            format!("rate_limit: {}", body)
-        } else if status == reqwest::StatusCode::UNAUTHORIZED {
+    fn map_error(
+        &self,
+        status: reqwest::StatusCode,
+        body: &str,
+        retry_after_secs: Option<u64>,
+    ) -> AthenError {
+        if crate::providers::is_transient_status(status) {
+            let message = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                format!("rate_limit: {}", body)
+            } else {
+                format!("server overloaded ({}): {}", status, body)
+            };
+            return AthenError::LlmTransient {
+                provider: "deepseek".into(),
+                message,
+                retry_after_secs,
+            };
+        }
+
+        let message = if status == reqwest::StatusCode::UNAUTHORIZED {
             format!("auth error: {}", body)
         } else {
             format!("HTTP {}: {}", status, body)
@@ -289,21 +305,13 @@ impl LlmProvider for DeepSeekProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    AthenError::Timeout(Duration::from_secs(120))
-                } else {
-                    AthenError::LlmProvider {
-                        provider: "deepseek".into(),
-                        message: format!("request failed: {}", e),
-                    }
-                }
-            })?;
+            .map_err(|e| crate::providers::map_send_error("deepseek", "request failed", e))?;
 
         let status = http_response.status();
         if !status.is_success() {
+            let retry_after = crate::providers::parse_retry_after(http_response.headers());
             let error_body = http_response.text().await.unwrap_or_default();
-            return Err(self.map_error(status, &error_body));
+            return Err(self.map_error(status, &error_body, retry_after));
         }
 
         let api_response: OpenAiResponse =
@@ -403,20 +411,14 @@ impl LlmProvider for DeepSeekProvider {
             .send()
             .await
             .map_err(|e| {
-                if e.is_timeout() {
-                    AthenError::Timeout(Duration::from_secs(120))
-                } else {
-                    AthenError::LlmProvider {
-                        provider: "deepseek".into(),
-                        message: format!("streaming request failed: {}", e),
-                    }
-                }
+                crate::providers::map_send_error("deepseek", "streaming request failed", e)
             })?;
 
         let status = http_response.status();
         if !status.is_success() {
+            let retry_after = crate::providers::parse_retry_after(http_response.headers());
             let error_body = http_response.text().await.unwrap_or_default();
-            return Err(self.map_error(status, &error_body));
+            return Err(self.map_error(status, &error_body, retry_after));
         }
 
         let byte_stream = http_response.bytes_stream();

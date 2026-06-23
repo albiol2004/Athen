@@ -172,16 +172,30 @@ impl AnthropicProvider {
         }
     }
 
-    /// Map Anthropic API errors to AthenError.
-    fn map_error(&self, status: reqwest::StatusCode, body: &str) -> AthenError {
-        let message = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            format!("rate limited: {}", body)
-        } else if status == reqwest::StatusCode::UNAUTHORIZED {
+    /// Map Anthropic API errors to AthenError. Transient statuses (429 / 5xx)
+    /// become [`AthenError::LlmTransient`] (retryable, carrying any
+    /// `Retry-After` hint); permanent statuses stay [`AthenError::LlmProvider`].
+    fn map_error(
+        &self,
+        status: reqwest::StatusCode,
+        body: &str,
+        retry_after_secs: Option<u64>,
+    ) -> AthenError {
+        if crate::providers::is_transient_status(status) {
+            let message = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                format!("rate limited: {}", body)
+            } else {
+                format!("server overloaded ({}): {}", status, body)
+            };
+            return AthenError::LlmTransient {
+                provider: "anthropic".into(),
+                message,
+                retry_after_secs,
+            };
+        }
+
+        let message = if status == reqwest::StatusCode::UNAUTHORIZED {
             format!("authentication failed: {}", body)
-        } else if status == reqwest::StatusCode::INTERNAL_SERVER_ERROR
-            || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-        {
-            format!("server overloaded ({}): {}", status, body)
         } else {
             format!("HTTP {}: {}", status, body)
         };
@@ -214,21 +228,13 @@ impl LlmProvider for AnthropicProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    AthenError::Timeout(Duration::from_secs(120))
-                } else {
-                    AthenError::LlmProvider {
-                        provider: "anthropic".into(),
-                        message: format!("request failed: {}", e),
-                    }
-                }
-            })?;
+            .map_err(|e| crate::providers::map_send_error("anthropic", "request failed", e))?;
 
         let status = http_response.status();
         if !status.is_success() {
+            let retry_after = crate::providers::parse_retry_after(http_response.headers());
             let error_body = http_response.text().await.unwrap_or_default();
-            return Err(self.map_error(status, &error_body));
+            return Err(self.map_error(status, &error_body, retry_after));
         }
 
         let api_response: AnthropicResponse =
@@ -326,20 +332,14 @@ impl LlmProvider for AnthropicProvider {
             .send()
             .await
             .map_err(|e| {
-                if e.is_timeout() {
-                    AthenError::Timeout(Duration::from_secs(120))
-                } else {
-                    AthenError::LlmProvider {
-                        provider: "anthropic".into(),
-                        message: format!("streaming request failed: {}", e),
-                    }
-                }
+                crate::providers::map_send_error("anthropic", "streaming request failed", e)
             })?;
 
         let status = http_response.status();
         if !status.is_success() {
+            let retry_after = crate::providers::parse_retry_after(http_response.headers());
             let error_body = http_response.text().await.unwrap_or_default();
-            return Err(self.map_error(status, &error_body));
+            return Err(self.map_error(status, &error_body, retry_after));
         }
 
         let byte_stream = http_response.bytes_stream();
@@ -1414,8 +1414,8 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 1000);
         // Cumulative output from message_delta wins over the initial value.
         assert_eq!(usage.completion_tokens, 57);
-        // total = input + cache_read + cache_creation + output.
-        assert_eq!(usage.total_tokens, 1000 + 4000 + 0 + 57);
+        // total = input + cache_read + cache_creation(0) + output.
+        assert_eq!(usage.total_tokens, 1000 + 4000 + 57);
         assert_eq!(usage.cached_tokens, Some(4000));
         assert_eq!(usage.cache_creation_tokens, None);
         assert!(usage.estimated_cost_usd.is_none());

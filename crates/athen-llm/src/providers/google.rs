@@ -295,22 +295,35 @@ impl GoogleProvider {
 
     /// Map HTTP errors to `AthenError`, lifting Gemini's `error.message` field
     /// out of the body when present so the user sees a useful one-liner.
-    fn map_error(&self, status: reqwest::StatusCode, body: &str) -> AthenError {
+    fn map_error(
+        &self,
+        status: reqwest::StatusCode,
+        body: &str,
+        retry_after_secs: Option<u64>,
+    ) -> AthenError {
         let detail = serde_json::from_str::<GeminiErrorBody>(body)
             .ok()
             .map(|e| e.error.message)
             .filter(|m| !m.is_empty())
             .unwrap_or_else(|| body.to_string());
-        let message = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            format!("rate limited: {}", detail)
-        } else if status == reqwest::StatusCode::UNAUTHORIZED
+
+        if crate::providers::is_transient_status(status) {
+            let message = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                format!("rate limited: {}", detail)
+            } else {
+                format!("server overloaded ({}): {}", status, detail)
+            };
+            return AthenError::LlmTransient {
+                provider: "google".into(),
+                message,
+                retry_after_secs,
+            };
+        }
+
+        let message = if status == reqwest::StatusCode::UNAUTHORIZED
             || status == reqwest::StatusCode::FORBIDDEN
         {
             format!("authentication failed: {}", detail)
-        } else if status == reqwest::StatusCode::INTERNAL_SERVER_ERROR
-            || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-        {
-            format!("server overloaded ({}): {}", status, detail)
         } else {
             format!("HTTP {}: {}", status, detail)
         };
@@ -436,21 +449,13 @@ impl LlmProvider for GoogleProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    AthenError::Timeout(Duration::from_secs(120))
-                } else {
-                    AthenError::LlmProvider {
-                        provider: "google".into(),
-                        message: format!("request failed: {}", e),
-                    }
-                }
-            })?;
+            .map_err(|e| crate::providers::map_send_error("google", "request failed", e))?;
 
         let status = http_response.status();
         if !status.is_success() {
+            let retry_after = crate::providers::parse_retry_after(http_response.headers());
             let error_body = http_response.text().await.unwrap_or_default();
-            return Err(self.map_error(status, &error_body));
+            return Err(self.map_error(status, &error_body, retry_after));
         }
 
         let api_response: GeminiResponse =
@@ -483,20 +488,14 @@ impl LlmProvider for GoogleProvider {
             .send()
             .await
             .map_err(|e| {
-                if e.is_timeout() {
-                    AthenError::Timeout(Duration::from_secs(120))
-                } else {
-                    AthenError::LlmProvider {
-                        provider: "google".into(),
-                        message: format!("streaming request failed: {}", e),
-                    }
-                }
+                crate::providers::map_send_error("google", "streaming request failed", e)
             })?;
 
         let status = http_response.status();
         if !status.is_success() {
+            let retry_after = crate::providers::parse_retry_after(http_response.headers());
             let error_body = http_response.text().await.unwrap_or_default();
-            return Err(self.map_error(status, &error_body));
+            return Err(self.map_error(status, &error_body, retry_after));
         }
 
         let byte_stream = http_response.bytes_stream();

@@ -302,11 +302,30 @@ impl OpenAiCompatibleProvider {
         }
     }
 
-    /// Map HTTP error responses to `AthenError`.
-    fn map_error(&self, status: reqwest::StatusCode, body: &str) -> AthenError {
-        let message = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            format!("rate_limit: {}", body)
-        } else if status == reqwest::StatusCode::UNAUTHORIZED {
+    /// Map HTTP error responses to `AthenError`. Transient statuses
+    /// (429 / 5xx) become [`AthenError::LlmTransient`] (retryable, carrying
+    /// any `Retry-After` hint); permanent statuses stay
+    /// [`AthenError::LlmProvider`].
+    fn map_error(
+        &self,
+        status: reqwest::StatusCode,
+        body: &str,
+        retry_after_secs: Option<u64>,
+    ) -> AthenError {
+        if crate::providers::is_transient_status(status) {
+            let message = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                format!("rate_limit: {}", body)
+            } else {
+                format!("server overloaded ({}): {}", status, body)
+            };
+            return AthenError::LlmTransient {
+                provider: self.provider_id.clone(),
+                message,
+                retry_after_secs,
+            };
+        }
+
+        let message = if status == reqwest::StatusCode::UNAUTHORIZED {
             format!("auth error: {}", body)
         } else {
             format!("HTTP {}: {}", status, body)
@@ -355,20 +374,14 @@ impl LlmProvider for OpenAiCompatibleProvider {
             .send()
             .await
             .map_err(|e| {
-                if e.is_timeout() {
-                    AthenError::Timeout(Duration::from_secs(120))
-                } else {
-                    AthenError::LlmProvider {
-                        provider: self.provider_id.clone(),
-                        message: format!("request failed: {}", e),
-                    }
-                }
+                crate::providers::map_send_error(&self.provider_id, "request failed", e)
             })?;
 
         let status = http_response.status();
         if !status.is_success() {
+            let retry_after = crate::providers::parse_retry_after(http_response.headers());
             let error_body = http_response.text().await.unwrap_or_default();
-            return Err(self.map_error(status, &error_body));
+            return Err(self.map_error(status, &error_body, retry_after));
         }
 
         let api_response: OpenAiResponse =
@@ -511,20 +524,14 @@ impl LlmProvider for OpenAiCompatibleProvider {
             .send()
             .await
             .map_err(|e| {
-                if e.is_timeout() {
-                    AthenError::Timeout(Duration::from_secs(120))
-                } else {
-                    AthenError::LlmProvider {
-                        provider: self.provider_id.clone(),
-                        message: format!("streaming request failed: {}", e),
-                    }
-                }
+                crate::providers::map_send_error(&self.provider_id, "streaming request failed", e)
             })?;
 
         let status = http_response.status();
         if !status.is_success() {
+            let retry_after = crate::providers::parse_retry_after(http_response.headers());
             let error_body = http_response.text().await.unwrap_or_default();
-            return Err(self.map_error(status, &error_body));
+            return Err(self.map_error(status, &error_body, retry_after));
         }
 
         let byte_stream = http_response.bytes_stream();
@@ -1923,20 +1930,43 @@ data: [DONE]
     #[test]
     fn test_map_error_rate_limit() {
         let provider = make_provider();
-        let err = provider.map_error(reqwest::StatusCode::TOO_MANY_REQUESTS, "slow down");
+        // A 429 is transient and retryable, carrying any Retry-After hint.
+        let err = provider.map_error(reqwest::StatusCode::TOO_MANY_REQUESTS, "slow down", Some(7));
         match err {
-            AthenError::LlmProvider { provider, message } => {
+            AthenError::LlmTransient {
+                provider,
+                message,
+                retry_after_secs,
+            } => {
                 assert_eq!(provider, "openai");
                 assert!(message.contains("rate_limit"));
+                assert_eq!(retry_after_secs, Some(7));
             }
             _ => panic!("unexpected error variant"),
         }
+        assert!(provider
+            .map_error(reqwest::StatusCode::TOO_MANY_REQUESTS, "slow down", None)
+            .is_retryable());
+    }
+
+    #[test]
+    fn test_map_error_server_error_is_transient() {
+        let provider = make_provider();
+        let err = provider.map_error(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "overloaded",
+            None,
+        );
+        assert!(err.is_retryable());
+        assert!(matches!(err, AthenError::LlmTransient { .. }));
     }
 
     #[test]
     fn test_map_error_auth() {
         let provider = make_provider();
-        let err = provider.map_error(reqwest::StatusCode::UNAUTHORIZED, "bad key");
+        // Auth is a permanent failure: NOT retryable.
+        let err = provider.map_error(reqwest::StatusCode::UNAUTHORIZED, "bad key", None);
+        assert!(!err.is_retryable());
         match err {
             AthenError::LlmProvider { provider, message } => {
                 assert_eq!(provider, "openai");

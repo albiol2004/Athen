@@ -19,6 +19,22 @@ pub enum AthenError {
     #[error("LLM provider error: {provider}: {message}")]
     LlmProvider { provider: String, message: String },
 
+    /// A *transient* LLM provider failure that is safe to retry: HTTP 429
+    /// (rate limit), 5xx (server overloaded / gateway), or a connection
+    /// reset / dropped socket. Distinct from [`AthenError::LlmProvider`],
+    /// which carries permanent failures (auth, bad request, unknown model,
+    /// context-length, content filter) that must NOT be retried.
+    ///
+    /// `retry_after_secs` carries a provider-supplied `Retry-After` hint
+    /// (parsed from the header on a 429/503) when present; the router caps
+    /// it to a sane maximum before honoring it.
+    #[error("LLM provider transient error: {provider}: {message}")]
+    LlmTransient {
+        provider: String,
+        message: String,
+        retry_after_secs: Option<u64>,
+    },
+
     #[error("Risk threshold exceeded: score {score}")]
     RiskThresholdExceeded { score: f64 },
 
@@ -50,6 +66,31 @@ impl AthenError {
     /// safe default for UI, Telegram, email, and other external surfaces.
     pub fn user_safe_message(&self) -> String {
         redact_known_secret_shapes(&self.to_string())
+    }
+
+    /// Whether this error represents a *transient* failure that is safe to
+    /// retry with backoff. True for [`AthenError::LlmTransient`] (429 / 5xx /
+    /// connection reset) and [`AthenError::Timeout`]. False for everything
+    /// else — in particular auth, bad-request, unknown-model, and
+    /// context-length failures (carried as [`AthenError::LlmProvider`]) must
+    /// fail fast: retrying them wastes time and money.
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            AthenError::LlmTransient { .. } | AthenError::Timeout(_)
+        )
+    }
+
+    /// Provider-supplied `Retry-After` hint in whole seconds, if this error
+    /// carries one (only [`AthenError::LlmTransient`] does). The router treats
+    /// this as advisory and caps it before sleeping.
+    pub fn retry_after_secs(&self) -> Option<u64> {
+        match self {
+            AthenError::LlmTransient {
+                retry_after_secs, ..
+            } => *retry_after_secs,
+            _ => None,
+        }
     }
 }
 
@@ -90,6 +131,33 @@ mod tests {
 
         assert!(rendered.contains("github_pat_…[redacted]"));
         assert!(!rendered.contains("SECRET_PART"));
+    }
+
+    #[test]
+    fn is_retryable_classifies_transient_and_timeout_only() {
+        let transient = AthenError::LlmTransient {
+            provider: "openai".into(),
+            message: "rate limited".into(),
+            retry_after_secs: Some(3),
+        };
+        assert!(transient.is_retryable());
+        assert_eq!(transient.retry_after_secs(), Some(3));
+
+        let timeout = AthenError::Timeout(std::time::Duration::from_secs(120));
+        assert!(timeout.is_retryable());
+        assert_eq!(timeout.retry_after_secs(), None);
+
+        // Permanent provider errors (auth, bad request, unknown model) are
+        // carried as LlmProvider and must NOT be retried.
+        let permanent = AthenError::LlmProvider {
+            provider: "openai".into(),
+            message: "auth error: bad key".into(),
+        };
+        assert!(!permanent.is_retryable());
+        assert_eq!(permanent.retry_after_secs(), None);
+
+        let other = AthenError::Config("nope".into());
+        assert!(!other.is_retryable());
     }
 
     #[test]

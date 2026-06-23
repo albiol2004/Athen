@@ -15,6 +15,72 @@ use athen_core::traits::llm::{LlmProvider, LlmRouter};
 use crate::budget::BudgetTracker;
 
 // ---------------------------------------------------------------------------
+// Retry / backoff policy
+// ---------------------------------------------------------------------------
+
+/// Maximum number of attempts against a *single* provider before failover
+/// advances to the next provider/tier. `1` would disable retries; `3` means
+/// the original try plus up to two retries on a transient error.
+const MAX_ATTEMPTS_PER_PROVIDER: u32 = 3;
+
+/// Base delay for the first backoff (attempt 1 → ~`BASE`, attempt 2 → ~`2*BASE`).
+const BACKOFF_BASE: Duration = Duration::from_millis(500);
+
+/// Hard cap on a single computed backoff delay, before jitter. Keeps the
+/// exponential growth bounded.
+const BACKOFF_CAP: Duration = Duration::from_secs(8);
+
+/// Hard cap on a provider-supplied `Retry-After` hint. A hostile or buggy
+/// header (e.g. `Retry-After: 86400`) must never hang the agent — we honor
+/// the hint only up to this ceiling.
+const RETRY_AFTER_CAP: Duration = Duration::from_secs(30);
+
+/// Cheap jitter source in `[0.0, 1.0)` without pulling in the `rand` crate.
+/// Seeds an xorshift from the current nanosecond clock — good enough to
+/// decorrelate retry timing across callers (full-jitter's only goal); this is
+/// not used for anything security-sensitive.
+fn jitter01() -> f64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let mut x = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E3779B97F4A7C15)
+        | 1;
+    // xorshift64
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    // Map to [0, 1) using the high 53 bits.
+    ((x >> 11) as f64) / ((1u64 << 53) as f64)
+}
+
+/// Compute the backoff delay before the *next* attempt.
+///
+/// * `attempt` is the number of the attempt that just failed (1-based): the
+///   first failure schedules the delay before attempt 2.
+/// * `retry_after` is a provider-supplied `Retry-After` hint (already in
+///   seconds); when present it takes precedence (capped at [`RETRY_AFTER_CAP`]),
+///   because the provider knows better than our exponential schedule.
+/// * Otherwise we use full-jitter exponential backoff: the deterministic
+///   ceiling is `min(BASE * 2^(attempt-1), CAP)`, and the actual delay is a
+///   uniform random value in `[0, ceiling]`. Full jitter avoids the
+///   thundering-herd retry-synchronization problem.
+///
+/// `rand01` is the jitter source in `[0.0, 1.0)` — injected so the schedule is
+/// deterministically testable; production passes [`jitter01`].
+fn backoff_delay(attempt: u32, retry_after: Option<Duration>, rand01: f64) -> Duration {
+    if let Some(ra) = retry_after {
+        return ra.min(RETRY_AFTER_CAP);
+    }
+    let exp = attempt.saturating_sub(1).min(16);
+    let ceiling_ms = (BACKOFF_BASE.as_millis() as u64)
+        .saturating_mul(1u64 << exp)
+        .min(BACKOFF_CAP.as_millis() as u64);
+    let jittered = (ceiling_ms as f64) * rand01.clamp(0.0, 1.0);
+    Duration::from_millis(jittered as u64)
+}
+
+// ---------------------------------------------------------------------------
 // Circuit breaker
 // ---------------------------------------------------------------------------
 
@@ -374,7 +440,36 @@ impl DefaultLlmRouter {
                 }
             };
 
-            match provider.complete_streaming(request).await {
+            // Retry only the CONNECTION attempt on a transient error — you
+            // can't retry mid-stream (the BreakerStream wrapper records a
+            // mid-stream failure and the executor falls back to non-streaming).
+            // This mirrors the non-streaming retry loop.
+            let mut attempt: u32 = 0;
+            let connect_outcome = loop {
+                attempt += 1;
+                match provider.complete_streaming(request).await {
+                    Ok(stream) => break Ok(stream),
+                    Err(e) => {
+                        let retryable = e.is_retryable();
+                        if retryable && attempt < MAX_ATTEMPTS_PER_PROVIDER {
+                            let retry_after = e.retry_after_secs().map(Duration::from_secs);
+                            let delay = backoff_delay(attempt, retry_after, jitter01());
+                            warn!(
+                                provider = %provider_id,
+                                attempt,
+                                delay_ms = delay.as_millis() as u64,
+                                error = %e,
+                                "transient streaming-connect error, retrying after backoff"
+                            );
+                            tokio::time::sleep(delay).await;
+                            continue;
+                        }
+                        break Err(e);
+                    }
+                }
+            };
+
+            match connect_outcome {
                 Ok(stream) => {
                     // Connecting (HTTP 200) is NOT yet a success: a provider can
                     // return 200 then immediately reset the byte stream. Recording
@@ -485,7 +580,39 @@ impl DefaultLlmRouter {
                 }
             };
 
-            match provider.complete(request).await {
+            // Retry the SAME provider a bounded number of times on a transient
+            // error (429 / 5xx / connection reset) before failover advances.
+            // Permanent errors (auth, bad request, unknown model) break out
+            // immediately — retrying them only wastes time and money. The
+            // circuit breaker records a single failure only after retries are
+            // exhausted, so a brief blip that recovers on retry doesn't push the
+            // breaker toward open.
+            let mut attempt: u32 = 0;
+            let provider_outcome = loop {
+                attempt += 1;
+                match provider.complete(request).await {
+                    Ok(response) => break Ok(response),
+                    Err(e) => {
+                        let retryable = e.is_retryable();
+                        if retryable && attempt < MAX_ATTEMPTS_PER_PROVIDER {
+                            let retry_after = e.retry_after_secs().map(Duration::from_secs);
+                            let delay = backoff_delay(attempt, retry_after, jitter01());
+                            warn!(
+                                provider = %provider_id,
+                                attempt,
+                                delay_ms = delay.as_millis() as u64,
+                                error = %e,
+                                "transient provider error, retrying after backoff"
+                            );
+                            tokio::time::sleep(delay).await;
+                            continue;
+                        }
+                        break Err(e);
+                    }
+                }
+            };
+
+            match provider_outcome {
                 Ok(response) => {
                     // Record success in circuit breaker
                     {
@@ -502,9 +629,10 @@ impl DefaultLlmRouter {
                     warn!(
                         provider = %provider_id,
                         error = %e,
-                        "provider call failed, trying next"
+                        "provider call failed (retries exhausted or permanent), trying next"
                     );
-                    // Record failure in circuit breaker
+                    // Record a single failure in the circuit breaker — after
+                    // retries, not per intermediate attempt.
                     {
                         let mut breakers = self.circuit_breakers.lock().unwrap();
                         if let Some(breaker) = breakers.get_mut(provider_id) {
@@ -631,6 +759,79 @@ mod tests {
 
         async fn is_available(&self) -> bool {
             !self.should_fail
+        }
+    }
+
+    /// Provider that fails the first `fail_times` calls with a chosen error,
+    /// then succeeds. Used to exercise the router retry/backoff path:
+    /// `transient = true` yields a retryable `LlmTransient`; `transient = false`
+    /// yields a permanent `LlmProvider` that must fail fast (no retry).
+    struct FlakyProvider {
+        id: String,
+        fail_times: u32,
+        transient: bool,
+        call_count: Arc<AtomicU32>,
+    }
+
+    impl FlakyProvider {
+        fn new(id: &str, fail_times: u32, transient: bool, counter: Arc<AtomicU32>) -> Self {
+            Self {
+                id: id.to_string(),
+                fail_times,
+                transient,
+                call_count: counter,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for FlakyProvider {
+        fn provider_id(&self) -> &str {
+            &self.id
+        }
+
+        async fn complete(&self, _request: &LlmRequest) -> Result<LlmResponse> {
+            let n = self.call_count.fetch_add(1, Ordering::Relaxed);
+            if n < self.fail_times {
+                return Err(if self.transient {
+                    AthenError::LlmTransient {
+                        provider: self.id.clone(),
+                        message: "rate limited (mock)".into(),
+                        retry_after_secs: None,
+                    }
+                } else {
+                    AthenError::LlmProvider {
+                        provider: self.id.clone(),
+                        message: "auth error (mock, permanent)".into(),
+                    }
+                });
+            }
+            Ok(LlmResponse {
+                content: format!("response from {}", self.id),
+                reasoning_content: None,
+                model_used: "mock-model".into(),
+                provider: self.id.clone(),
+                usage: TokenUsage {
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                    total_tokens: 15,
+                    estimated_cost_usd: Some(0.001),
+                    ..TokenUsage::default()
+                },
+                tool_calls: vec![],
+                finish_reason: FinishReason::Stop,
+            })
+        }
+
+        async fn complete_streaming(&self, _request: &LlmRequest) -> Result<LlmStream> {
+            Err(AthenError::LlmProvider {
+                provider: self.id.clone(),
+                message: "streaming not supported in mock".into(),
+            })
+        }
+
+        async fn is_available(&self) -> bool {
+            true
         }
     }
 
@@ -781,6 +982,117 @@ mod tests {
         let router = DefaultLlmRouter::new(providers, profiles, BudgetTracker::new(None));
         let result = router.route(&make_request()).await;
         assert!(result.is_err());
+    }
+
+    // ---- Retry / backoff tests ----
+
+    /// Pure backoff schedule: full-jitter exponential, bounded, with
+    /// `Retry-After` taking precedence and capped.
+    #[test]
+    fn test_backoff_delay_bounded_and_jittered() {
+        // rand01 = 0.0 → zero delay; rand01 = 1.0 → the full ceiling.
+        assert_eq!(backoff_delay(1, None, 0.0), Duration::from_millis(0));
+        assert_eq!(backoff_delay(1, None, 1.0), BACKOFF_BASE); // 500ms ceiling
+        assert_eq!(
+            backoff_delay(2, None, 1.0),
+            Duration::from_millis(BACKOFF_BASE.as_millis() as u64 * 2)
+        );
+
+        // Exponential growth is capped at BACKOFF_CAP no matter the attempt.
+        assert_eq!(backoff_delay(20, None, 1.0), BACKOFF_CAP);
+
+        // Mid-jitter stays within [0, ceiling].
+        let d = backoff_delay(3, None, 0.5);
+        assert!(d <= Duration::from_millis(BACKOFF_BASE.as_millis() as u64 * 4));
+
+        // Retry-After wins and is honored (under the cap)...
+        assert_eq!(
+            backoff_delay(1, Some(Duration::from_secs(5)), 1.0),
+            Duration::from_secs(5)
+        );
+        // ...but a hostile Retry-After is capped.
+        assert_eq!(
+            backoff_delay(1, Some(Duration::from_secs(99999)), 1.0),
+            RETRY_AFTER_CAP
+        );
+    }
+
+    /// A provider that fails transiently twice then succeeds: the router must
+    /// retry the SAME provider and ultimately return success (not failover).
+    #[tokio::test]
+    async fn test_transient_error_retried_then_succeeds() {
+        let counter = Arc::new(AtomicU32::new(0));
+        let mut providers: HashMap<String, Box<dyn LlmProvider>> = HashMap::new();
+        providers.insert(
+            "flaky".into(),
+            Box::new(FlakyProvider::new("flaky", 2, true, counter.clone())),
+        );
+        let mut profiles = HashMap::new();
+        profiles.insert(ModelProfile::Powerful, make_profile(vec!["flaky"]));
+
+        let router = DefaultLlmRouter::new(providers, profiles, BudgetTracker::new(None));
+        let response = router.route(&make_request()).await.unwrap();
+        assert_eq!(response.provider, "flaky");
+        // 2 transient failures + 1 success = 3 calls to the same provider.
+        assert_eq!(counter.load(Ordering::Relaxed), 3);
+        // The breaker saw a SUCCESS (not opened) — retries recovered.
+        assert_eq!(router.breaker_state("flaky"), Some(CircuitState::Closed));
+    }
+
+    /// A permanent error (e.g. auth) must NOT be retried — exactly one call,
+    /// then fail fast.
+    #[tokio::test]
+    async fn test_permanent_error_not_retried() {
+        let counter = Arc::new(AtomicU32::new(0));
+        let mut providers: HashMap<String, Box<dyn LlmProvider>> = HashMap::new();
+        providers.insert(
+            "auth_fail".into(),
+            // fail_times huge, but permanent → must not retry at all.
+            Box::new(FlakyProvider::new("auth_fail", 99, false, counter.clone())),
+        );
+        let mut profiles = HashMap::new();
+        profiles.insert(ModelProfile::Powerful, make_profile(vec!["auth_fail"]));
+
+        let router = DefaultLlmRouter::new(providers, profiles, BudgetTracker::new(None));
+        let result = router.route(&make_request()).await;
+        assert!(result.is_err());
+        assert!(!result.unwrap_err().is_retryable());
+        // Exactly one call — no retry on a permanent error.
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+    }
+
+    /// Retries exhausted on the first provider (always-transient) must advance
+    /// failover to the next provider.
+    #[tokio::test]
+    async fn test_retries_exhausted_then_failover_advances() {
+        let counter_a = Arc::new(AtomicU32::new(0));
+        let counter_b = Arc::new(AtomicU32::new(0));
+        let mut providers: HashMap<String, Box<dyn LlmProvider>> = HashMap::new();
+        providers.insert(
+            "always_429".into(),
+            // Always transient-fails → exhausts MAX_ATTEMPTS_PER_PROVIDER.
+            Box::new(FlakyProvider::new("always_429", u32::MAX, true, counter_a.clone())),
+        );
+        providers.insert(
+            "backup".into(),
+            Box::new(FlakyProvider::new("backup", 0, true, counter_b.clone())),
+        );
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            ModelProfile::Powerful,
+            make_profile(vec!["always_429", "backup"]),
+        );
+
+        let router = DefaultLlmRouter::new(providers, profiles, BudgetTracker::new(None));
+        let response = router.route(&make_request()).await.unwrap();
+        assert_eq!(response.provider, "backup");
+        // First provider was retried up to the per-provider attempt cap...
+        assert_eq!(
+            counter_a.load(Ordering::Relaxed),
+            MAX_ATTEMPTS_PER_PROVIDER
+        );
+        // ...then failover advanced to the backup, which succeeded first try.
+        assert_eq!(counter_b.load(Ordering::Relaxed), 1);
     }
 
     // ---- Streaming mid-stream-error tests ----
