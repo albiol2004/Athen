@@ -346,7 +346,7 @@ dependencies = [
 
 [[package]]
 name = "athen-app"
-version = "0.3.4"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -635,6 +635,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "cron",
+ "futures",
  "tokio",
  "tracing",
  "uuid",

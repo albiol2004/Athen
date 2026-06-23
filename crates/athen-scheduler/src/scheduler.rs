@@ -11,9 +11,11 @@
 //! - A sink error is logged and the wake-up is still marked fired. The
 //!   alternative (re-fire next tick) would busy-loop on a broken sink.
 
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use futures::FutureExt;
 use tokio::sync::oneshot;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
@@ -60,12 +62,25 @@ impl<S: WakeupStore + ?Sized, K: WakeupFireSink + ?Sized> WakeupScheduler<S, K> 
             let next = compute_next_fire(&w.schedule, now);
 
             // Sink first; mark_fired even if the sink errors (avoids
-            // busy-loop).
-            let sink_result = self.sink.fire(&w, now).await;
-            let sink_ok = sink_result.is_ok();
-            if let Err(e) = sink_result {
-                error!(wakeup_id = %w.id, error = %e, "Wakeup sink failed; marking fired anyway");
-            }
+            // busy-loop). The sink runs the full coordinator/executor stack
+            // inline — a panic in there must NOT abort the scheduler loop and
+            // silently kill all future wake-ups. `catch_unwind` contains the
+            // panic per-fire, logs it, and treats it like a sink error (the
+            // wake-up is still marked fired so we don't busy-loop on it).
+            let sink_ok = match AssertUnwindSafe(self.sink.fire(&w, now))
+                .catch_unwind()
+                .await
+            {
+                Ok(Ok(())) => true,
+                Ok(Err(e)) => {
+                    error!(wakeup_id = %w.id, error = %e, "Wakeup sink failed; marking fired anyway");
+                    false
+                }
+                Err(_panic) => {
+                    error!(wakeup_id = %w.id, "Wakeup sink PANICKED; marking fired anyway, loop continues");
+                    false
+                }
+            };
 
             if let Err(e) = self.store.mark_fired(w.id, now, next).await {
                 // mark_fired failed — likely the row was deleted between
@@ -269,6 +284,17 @@ mod tests {
         }
     }
 
+    /// Always panics — used to verify the scheduler loop survives a panic in
+    /// the (inline) coordinator/executor stack and still marks fired.
+    struct PanickingSink;
+
+    #[async_trait]
+    impl WakeupFireSink for PanickingSink {
+        async fn fire(&self, _wakeup: &Wakeup, _fired_at: DateTime<Utc>) -> Result<()> {
+            panic!("intentional sink panic");
+        }
+    }
+
     fn mk_oneshot(at: DateTime<Utc>) -> Wakeup {
         Wakeup {
             id: Uuid::new_v4(),
@@ -393,6 +419,35 @@ mod tests {
         let after = store.get(w.id).await.unwrap().unwrap();
         assert!(after.last_fired_at.is_some());
         assert!(after.next_fire_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn tick_survives_panicking_sink_and_marks_fired() {
+        // A panic in the inline sink (coordinator/executor stack) must be
+        // contained per-fire: the tick returns normally, the wake-up is
+        // marked fired (no busy-loop), and a second due wake-up in the same
+        // tick still fires.
+        let store = Arc::new(MockStore::default());
+        let sink = Arc::new(PanickingSink);
+        let sched = WakeupScheduler::new(store.clone(), sink);
+
+        let now = Utc::now();
+        let w1 = mk_oneshot(now - Duration::minutes(2));
+        let w2 = mk_oneshot(now - Duration::minutes(1));
+        store.create(&w1).await.unwrap();
+        store.create(&w2).await.unwrap();
+
+        // The panic is caught; the tick itself does not panic/unwind.
+        let report = sched.tick(now).await.unwrap();
+        // Both treated as sink errors (panic == fire failure), still marked.
+        assert!(report.fired.is_empty());
+        assert_eq!(report.fired_with_sink_error.len(), 2);
+
+        for id in [w1.id, w2.id] {
+            let after = store.get(id).await.unwrap().unwrap();
+            assert!(after.last_fired_at.is_some());
+            assert!(after.next_fire_at.is_none());
+        }
     }
 
     #[tokio::test]

@@ -6,12 +6,14 @@
 //! with environment variable overrides.
 
 use std::collections::{HashMap, HashSet};
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use uuid::Uuid;
 
 use async_trait::async_trait;
+use futures::FutureExt;
 use serde::Serialize;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
@@ -813,6 +815,84 @@ pub(crate) async fn assemble_base_app_tool_registry(
     }
 
     Arc::new(registry)
+}
+
+/// Lightweight panic supervisor for a long-lived background monitor loop.
+///
+/// Each "attempt" runs `factory()` (the full monitor loop) as its own spawned
+/// task and awaits its `JoinHandle`. If the task **panics** (`JoinError`) or
+/// returns unexpectedly while shutdown has NOT been requested, the supervisor
+/// logs the cause and respawns the loop after `backoff` (so a tight crash-loop
+/// can't peg the CPU). A clean stop — signalled via `should_stop()` returning
+/// `true`, or the JoinHandle being cancelled — ends the supervisor without a
+/// respawn.
+///
+/// This is the *outer* safety net. The dominant panic risk (the inline
+/// per-iteration work: `process_sense_event`, `process_updates_with_owner`,
+/// the wake-up `sink.fire`) is contained *inside* each loop with
+/// `catch_unwind`, so the loop normally survives a panic without ever falling
+/// through to the supervisor. The supervisor only fires for panics outside the
+/// guarded iteration body (loop scaffolding, `monitor.poll`, etc.).
+///
+/// `factory` is `FnMut` so it can be called once per attempt to rebuild a
+/// fresh loop future (each monitor re-subscribes its broadcast shutdown
+/// receiver and re-clones its deps inside the closure).
+async fn spawn_supervised<F, Fut, S>(
+    name: &'static str,
+    backoff: std::time::Duration,
+    mut should_stop: S,
+    mut factory: F,
+) where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+    S: FnMut() -> bool + Send + 'static,
+{
+    loop {
+        if should_stop() {
+            info!(monitor = name, "Supervised monitor stop requested; not respawning");
+            return;
+        }
+
+        let handle = tauri::async_runtime::spawn(factory());
+        match handle.await {
+            Ok(()) => {
+                // The loop returned. For our monitors a clean return only
+                // happens on a shutdown signal — but be defensive: if the
+                // loop exits while no stop was requested, treat it as an
+                // unexpected exit and respawn.
+                if should_stop() {
+                    info!(monitor = name, "Supervised monitor exited cleanly");
+                    return;
+                }
+                warn!(
+                    monitor = name,
+                    "Supervised monitor returned unexpectedly (no shutdown requested); respawning after backoff"
+                );
+            }
+            Err(join_err) => {
+                // `tauri::async_runtime::spawn` surfaces the underlying tokio
+                // JoinError as `tauri::Error::JoinError`. A cancelled task
+                // (runtime shutting down) must not be respawned.
+                if let tauri::Error::JoinError(ref je) = join_err {
+                    if je.is_cancelled() {
+                        info!(monitor = name, "Supervised monitor task cancelled; not respawning");
+                        return;
+                    }
+                }
+                tracing::error!(
+                    monitor = name,
+                    error = %join_err,
+                    "Supervised monitor task PANICKED at top level; respawning after backoff"
+                );
+            }
+        }
+
+        if should_stop() {
+            info!(monitor = name, "Supervised monitor stop requested after exit; not respawning");
+            return;
+        }
+        tokio::time::sleep(backoff).await;
+    }
 }
 
 /// Build a sub-agent's registry + router factories from the live `AppState`
@@ -2058,13 +2138,14 @@ impl AppState {
             return;
         }
 
-        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-        *self.email_shutdown.lock().expect("email_shutdown lock") = Some(shutdown_tx);
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+        *self.email_shutdown.lock().expect("email_shutdown lock") = Some(shutdown_tx.clone());
 
-        let mut monitor = EmailMonitor::new();
-        if let Some(lookup) = self.owner_lookup() {
-            monitor = monitor.with_owner_lookup(lookup);
-        }
+        // Deps captured by the factory closure. They are all `Arc`/`Clone`, so
+        // each supervised respawn re-clones a fresh set and re-subscribes a
+        // new broadcast receiver — the monitor self-heals after a top-level
+        // panic without a full app restart.
+        let owner_lookup = self.owner_lookup();
         let email_config = config.clone();
         let router = Arc::clone(&self.router);
         let arc_store_ref = self._database.as_ref().map(|db| db.arc_store());
@@ -2084,64 +2165,111 @@ impl AppState {
         let dispatch_signal_ref = Arc::clone(&self.dispatch_signal);
         let approval_router_ref = self.approval_router.clone();
 
-        tauri::async_runtime::spawn(async move {
-            if let Err(e) = monitor.init(&email_config).await {
-                tracing::error!("Failed to initialize email monitor: {e}");
-                return;
-            }
+        // Set once when the loop observes a real shutdown signal. The
+        // supervisor reads it to distinguish a clean stop (no respawn) from a
+        // panic / unexpected exit (respawn).
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stopped_for_check = Arc::clone(&stopped);
 
-            let poll_interval = monitor.poll_interval();
-            info!("Email monitor started, polling every {:?}", poll_interval);
+        tauri::async_runtime::spawn(spawn_supervised(
+            "email",
+            std::time::Duration::from_secs(5),
+            move || stopped_for_check.load(std::sync::atomic::Ordering::Relaxed),
+            move || {
+                let mut monitor = EmailMonitor::new();
+                if let Some(lookup) = owner_lookup.clone() {
+                    monitor = monitor.with_owner_lookup(lookup);
+                }
+                let email_config = email_config.clone();
+                let router = Arc::clone(&router);
+                let arc_store_ref = arc_store_ref.clone();
+                let attachment_store_ref = attachment_store_ref.clone();
+                let contact_store_ref = contact_store_ref.clone();
+                let profile_store_ref = profile_store_ref.clone();
+                let profile_embedder_ref = Arc::clone(&profile_embedder_ref);
+                let profile_embedding_cache_ref = Arc::clone(&profile_embedding_cache_ref);
+                let notifier = notifier.clone();
+                let coordinator_ref = Arc::clone(&coordinator_ref);
+                let task_arc_map_ref = Arc::clone(&task_arc_map_ref);
+                let pending_email_marks_ref = Arc::clone(&pending_email_marks_ref);
+                let dispatch_signal_ref = Arc::clone(&dispatch_signal_ref);
+                let approval_router_ref = approval_router_ref.clone();
+                let ui = ui.clone();
+                let mut shutdown = shutdown_tx.subscribe();
+                let stopped = Arc::clone(&stopped);
 
-            let mut shutdown = shutdown_rx;
-            loop {
-                match monitor.poll().await {
-                    Ok(events) if !events.is_empty() => {
-                        info!("Email monitor received {} new event(s)", events.len());
-                        for event in events {
-                            crate::sense_router::process_sense_event(
-                                &event,
-                                &router,
-                                &arc_store_ref,
-                                &profile_store_ref,
-                                &profile_embedder_ref,
-                                &profile_embedding_cache_ref,
-                                &ui,
-                                notifier.as_ref(),
-                                Some(&coordinator_ref),
-                                Some(&task_arc_map_ref),
-                                Some(&dispatch_signal_ref),
-                                approval_router_ref.as_ref(),
-                                Some(&pending_email_marks_ref),
-                                attachment_store_ref.as_ref(),
-                                contact_store_ref.as_ref(),
-                                None,
-                            )
-                            .await;
+                async move {
+                    if let Err(e) = monitor.init(&email_config).await {
+                        tracing::error!("Failed to initialize email monitor: {e}");
+                        return;
+                    }
+
+                    let poll_interval = monitor.poll_interval();
+                    info!("Email monitor started, polling every {:?}", poll_interval);
+
+                    loop {
+                        match monitor.poll().await {
+                            Ok(events) if !events.is_empty() => {
+                                info!("Email monitor received {} new event(s)", events.len());
+                                for event in events {
+                                    // Contain a panic in the inline dispatch
+                                    // per-event: log it and move on so one bad
+                                    // message can't kill the email sense.
+                                    let res = AssertUnwindSafe(
+                                        crate::sense_router::process_sense_event(
+                                            &event,
+                                            &router,
+                                            &arc_store_ref,
+                                            &profile_store_ref,
+                                            &profile_embedder_ref,
+                                            &profile_embedding_cache_ref,
+                                            &ui,
+                                            notifier.as_ref(),
+                                            Some(&coordinator_ref),
+                                            Some(&task_arc_map_ref),
+                                            Some(&dispatch_signal_ref),
+                                            approval_router_ref.as_ref(),
+                                            Some(&pending_email_marks_ref),
+                                            attachment_store_ref.as_ref(),
+                                            contact_store_ref.as_ref(),
+                                            None,
+                                        ),
+                                    )
+                                    .catch_unwind()
+                                    .await;
+                                    if res.is_err() {
+                                        tracing::error!(
+                                            sense = "email",
+                                            "process_sense_event PANICKED; skipping event, monitor continues"
+                                        );
+                                    }
+                                }
+                            }
+                            Ok(_) => {
+                                tracing::debug!("Email poll: no new messages");
+                            }
+                            Err(e) => {
+                                warn!("Email poll error: {e}");
+                            }
+                        }
+
+                        tokio::select! {
+                            _ = tokio::time::sleep(poll_interval) => {}
+                            _ = shutdown.recv() => {
+                                info!("Email monitor shutdown signal received");
+                                stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+                                break;
+                            }
                         }
                     }
-                    Ok(_) => {
-                        tracing::debug!("Email poll: no new messages");
-                    }
-                    Err(e) => {
-                        warn!("Email poll error: {e}");
-                    }
-                }
 
-                tokio::select! {
-                    _ = tokio::time::sleep(poll_interval) => {}
-                    _ = shutdown.recv() => {
-                        info!("Email monitor shutdown signal received");
-                        break;
+                    if let Err(e) = monitor.shutdown().await {
+                        warn!("Email monitor shutdown error: {e}");
                     }
+                    info!("Email monitor stopped");
                 }
-            }
-
-            if let Err(e) = monitor.shutdown().await {
-                warn!("Email monitor shutdown error: {e}");
-            }
-            info!("Email monitor stopped");
-        });
+            },
+        ));
     }
 
     /// Stop the running email monitor (if any) and start a fresh one from
@@ -2389,9 +2517,36 @@ impl AppState {
                 Arc::clone(&self.dispatch_signal),
                 Some(ui),
             ));
-        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        // The public shutdown API is a oneshot (see `wakeup_scheduler_shutdown`
+        // + `shutdown_scheduler`). `WakeupScheduler::run` consumes a oneshot rx
+        // exactly once, but the supervisor may respawn `run` several times. We
+        // bridge the two: the public oneshot, when fired, sets `stopped` and
+        // fires whichever per-attempt oneshot is currently parked, so the
+        // running attempt unblocks and the supervisor sees a clean stop.
+        let (public_tx, public_rx) = tokio::sync::oneshot::channel::<()>();
         if let Ok(mut guard) = self.wakeup_scheduler_shutdown.lock() {
-            *guard = Some(tx);
+            *guard = Some(public_tx);
+        }
+
+        let stopped = Arc::new(AtomicBool::new(false));
+        // Holds the current attempt's run() shutdown sender so the public
+        // shutdown can unblock the in-flight `run`.
+        let attempt_shutdown: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>> =
+            Arc::new(Mutex::new(None));
+
+        // Forward the single public shutdown into `stopped` + the parked
+        // per-attempt sender.
+        {
+            let stopped = Arc::clone(&stopped);
+            let attempt_shutdown = Arc::clone(&attempt_shutdown);
+            tauri::async_runtime::spawn(async move {
+                if public_rx.await.is_ok() {
+                    stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+                    if let Some(tx) = attempt_shutdown.lock().await.take() {
+                        let _ = tx.send(());
+                    }
+                }
+            });
         }
 
         // Tick every 5 seconds. Fast enough that "remind me in 30 seconds"
@@ -2399,22 +2554,41 @@ impl AppState {
         // Production-grade scheduling would key off the earliest
         // next_fire_at; for v1 a coarse poll is fine.
         let period = std::time::Duration::from_secs(5);
+        let armed_once = Arc::new(AtomicBool::new(false));
+        let stopped_for_check = Arc::clone(&stopped);
+
         // Tauri's setup hook is synchronous; use the Tauri-managed async
         // runtime for the same reason the email/calendar/telegram monitors
         // do — `tokio::spawn` here panics because no reactor is running on
-        // this thread.
-        tauri::async_runtime::spawn(async move {
-            let scheduler = athen_scheduler::WakeupScheduler::new(store, sink);
-            // Arm any rows that lack next_fire_at (created via Tauri
-            // command without pre-computing the time).
-            match scheduler.arm_unscheduled(chrono::Utc::now()).await {
-                Ok(0) => {}
-                Ok(n) => tracing::info!("Armed {n} fresh wake-up(s)"),
-                Err(e) => tracing::warn!("Failed to arm fresh wake-ups: {e}"),
-            }
-            scheduler.run(period, rx).await;
-            tracing::info!("Wake-up scheduler loop exited");
-        });
+        // this thread. The supervisor restarts `run` if it ever panics at a
+        // level above the per-tick `catch_unwind` already inside the scheduler.
+        tauri::async_runtime::spawn(spawn_supervised(
+            "wakeup-scheduler",
+            std::time::Duration::from_secs(5),
+            move || stopped_for_check.load(std::sync::atomic::Ordering::Relaxed),
+            move || {
+                let store = store.clone();
+                let sink = Arc::clone(&sink);
+                let attempt_shutdown = Arc::clone(&attempt_shutdown);
+                let armed_once = Arc::clone(&armed_once);
+                async move {
+                    let scheduler = athen_scheduler::WakeupScheduler::new(store, sink);
+                    // Arm fresh rows once (first attempt only); a respawn must
+                    // not re-arm rows the running scheduler already advanced.
+                    if !armed_once.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        match scheduler.arm_unscheduled(chrono::Utc::now()).await {
+                            Ok(0) => {}
+                            Ok(n) => tracing::info!("Armed {n} fresh wake-up(s)"),
+                            Err(e) => tracing::warn!("Failed to arm fresh wake-ups: {e}"),
+                        }
+                    }
+                    let (attempt_tx, attempt_rx) = tokio::sync::oneshot::channel::<()>();
+                    *attempt_shutdown.lock().await = Some(attempt_tx);
+                    scheduler.run(period, attempt_rx).await;
+                    tracing::info!("Wake-up scheduler loop exited");
+                }
+            },
+        ));
     }
 
     /// Spawn one background sync task per configured remote calendar source.
@@ -2479,7 +2653,6 @@ impl AppState {
         use athen_core::traits::sense::SenseMonitor;
         use athen_sentidos::calendar::CalendarMonitor;
 
-        let mut monitor = CalendarMonitor::new();
         let config = load_config();
         let router = Arc::clone(&self.router);
         let arc_store_ref = self._database.as_ref().map(|db| db.arc_store());
@@ -2499,67 +2672,106 @@ impl AppState {
         let dispatch_signal_ref = Arc::clone(&self.dispatch_signal);
         let approval_router_ref = self.approval_router.clone();
 
-        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
-        self.calendar_shutdown = Some(shutdown_tx);
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+        self.calendar_shutdown = Some(shutdown_tx.clone());
 
-        tauri::async_runtime::spawn(async move {
-            if let Err(e) = monitor.init(&config).await {
-                tracing::error!("Failed to initialize calendar monitor: {e}");
-                return;
-            }
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stopped_for_check = Arc::clone(&stopped);
 
-            let poll_interval = monitor.poll_interval();
-            info!(
-                "Calendar monitor started, polling every {:?}",
-                poll_interval
-            );
+        tauri::async_runtime::spawn(spawn_supervised(
+            "calendar",
+            std::time::Duration::from_secs(5),
+            move || stopped_for_check.load(std::sync::atomic::Ordering::Relaxed),
+            move || {
+                let mut monitor = CalendarMonitor::new();
+                let config = config.clone();
+                let router = Arc::clone(&router);
+                let arc_store_ref = arc_store_ref.clone();
+                let attachment_store_ref = attachment_store_ref.clone();
+                let contact_store_ref = contact_store_ref.clone();
+                let profile_store_ref = profile_store_ref.clone();
+                let profile_embedder_ref = Arc::clone(&profile_embedder_ref);
+                let profile_embedding_cache_ref = Arc::clone(&profile_embedding_cache_ref);
+                let notifier = notifier.clone();
+                let coordinator_ref = Arc::clone(&coordinator_ref);
+                let task_arc_map_ref = Arc::clone(&task_arc_map_ref);
+                let pending_email_marks_ref = Arc::clone(&pending_email_marks_ref);
+                let dispatch_signal_ref = Arc::clone(&dispatch_signal_ref);
+                let approval_router_ref = approval_router_ref.clone();
+                let ui = ui.clone();
+                let mut shutdown = shutdown_tx.subscribe();
+                let stopped = Arc::clone(&stopped);
 
-            let mut shutdown = shutdown_rx;
-            loop {
-                // Select the sleep so a shutdown signal during the sleep
-                // unblocks immediately. The poll itself isn't interruptible
-                // here — if it ever became slow we'd want to wrap it too.
-                tokio::select! {
-                    _ = shutdown.recv() => {
-                        info!("Calendar monitor shutdown signal received");
-                        break;
+                async move {
+                    if let Err(e) = monitor.init(&config).await {
+                        tracing::error!("Failed to initialize calendar monitor: {e}");
+                        return;
                     }
-                    _ = tokio::time::sleep(poll_interval) => {}
-                }
 
-                match monitor.poll().await {
-                    Ok(events) if !events.is_empty() => {
-                        info!("Calendar monitor: {} reminder(s)", events.len());
-                        for event in events {
-                            crate::sense_router::process_sense_event(
-                                &event,
-                                &router,
-                                &arc_store_ref,
-                                &profile_store_ref,
-                                &profile_embedder_ref,
-                                &profile_embedding_cache_ref,
-                                &ui,
-                                notifier.as_ref(),
-                                Some(&coordinator_ref),
-                                Some(&task_arc_map_ref),
-                                Some(&dispatch_signal_ref),
-                                approval_router_ref.as_ref(),
-                                Some(&pending_email_marks_ref),
-                                attachment_store_ref.as_ref(),
-                                contact_store_ref.as_ref(),
-                                None,
-                            )
-                            .await;
+                    let poll_interval = monitor.poll_interval();
+                    info!(
+                        "Calendar monitor started, polling every {:?}",
+                        poll_interval
+                    );
+
+                    loop {
+                        // Select the sleep so a shutdown signal during the sleep
+                        // unblocks immediately. The poll itself isn't interruptible
+                        // here — if it ever became slow we'd want to wrap it too.
+                        tokio::select! {
+                            _ = shutdown.recv() => {
+                                info!("Calendar monitor shutdown signal received");
+                                stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+                                break;
+                            }
+                            _ = tokio::time::sleep(poll_interval) => {}
+                        }
+
+                        match monitor.poll().await {
+                            Ok(events) if !events.is_empty() => {
+                                info!("Calendar monitor: {} reminder(s)", events.len());
+                                for event in events {
+                                    // Per-event panic containment (see email monitor).
+                                    let res = AssertUnwindSafe(
+                                        crate::sense_router::process_sense_event(
+                                            &event,
+                                            &router,
+                                            &arc_store_ref,
+                                            &profile_store_ref,
+                                            &profile_embedder_ref,
+                                            &profile_embedding_cache_ref,
+                                            &ui,
+                                            notifier.as_ref(),
+                                            Some(&coordinator_ref),
+                                            Some(&task_arc_map_ref),
+                                            Some(&dispatch_signal_ref),
+                                            approval_router_ref.as_ref(),
+                                            Some(&pending_email_marks_ref),
+                                            attachment_store_ref.as_ref(),
+                                            contact_store_ref.as_ref(),
+                                            None,
+                                        ),
+                                    )
+                                    .catch_unwind()
+                                    .await;
+                                    if res.is_err() {
+                                        tracing::error!(
+                                            sense = "calendar",
+                                            "process_sense_event PANICKED; skipping event, monitor continues"
+                                        );
+                                    }
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                warn!("Calendar poll error: {e}");
+                            }
                         }
                     }
-                    Ok(_) => {}
-                    Err(e) => {
-                        warn!("Calendar poll error: {e}");
-                    }
+                    info!("Calendar monitor stopped");
                 }
-            }
-            info!("Calendar monitor stopped");
-        });
+            },
+        ));
     }
 
     /// Start the Telegram bot monitor background polling task.
@@ -2589,16 +2801,14 @@ impl AppState {
             return;
         }
 
-        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
         *self
             .telegram_shutdown
             .lock()
-            .expect("telegram_shutdown lock") = Some(shutdown_tx);
+            .expect("telegram_shutdown lock") = Some(shutdown_tx.clone());
 
-        let mut monitor = TelegramMonitor::new(config.telegram.clone());
-        if let Some(lookup) = self.owner_lookup() {
-            monitor = monitor.with_owner_lookup(lookup);
-        }
+        let owner_lookup = self.owner_lookup();
+        let telegram_settings = config.telegram.clone();
         let bot_token = config.telegram.bot_token.clone();
         let telegram_config = config.clone();
         let router = Arc::clone(&self.router);
@@ -2631,7 +2841,42 @@ impl AppState {
         // produces for the in-app flow.
         let tool_registry_deps_ref = self.tool_registry_deps();
 
-        tauri::async_runtime::spawn(async move {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stopped_for_check = Arc::clone(&stopped);
+
+        tauri::async_runtime::spawn(spawn_supervised(
+            "telegram",
+            std::time::Duration::from_secs(5),
+            move || stopped_for_check.load(std::sync::atomic::Ordering::Relaxed),
+            move || {
+                let mut monitor = TelegramMonitor::new(telegram_settings.clone());
+                if let Some(lookup) = owner_lookup.clone() {
+                    monitor = monitor.with_owner_lookup(lookup);
+                }
+                let bot_token = bot_token.clone();
+                let telegram_config = telegram_config.clone();
+                let router = Arc::clone(&router);
+                let arc_store_ref = arc_store_ref.clone();
+                let attachment_store_ref = attachment_store_ref.clone();
+                let profile_store_ref = profile_store_ref.clone();
+                let profile_embedder_ref = Arc::clone(&profile_embedder_ref);
+                let profile_embedding_cache_ref = Arc::clone(&profile_embedding_cache_ref);
+                let contact_store_ref = contact_store_ref.clone();
+                let notifier = notifier.clone();
+                let telegram_approval_sink = telegram_approval_sink.clone();
+                let approval_router_ref = approval_router_ref.clone();
+                let coordinator_ref = Arc::clone(&coordinator_ref);
+                let task_arc_map_ref = Arc::clone(&task_arc_map_ref);
+                let pending_email_marks_ref = Arc::clone(&pending_email_marks_ref);
+                let dispatch_signal_ref = Arc::clone(&dispatch_signal_ref);
+                let telegram_chat_log_ref = telegram_chat_log_ref.clone();
+                let agent_registry_ref = agent_registry_ref.clone();
+                let tool_registry_deps_ref = tool_registry_deps_ref.clone();
+                let ui = ui.clone();
+                let mut shutdown = shutdown_tx.subscribe();
+                let stopped = Arc::clone(&stopped);
+
+                async move {
             if let Err(e) = monitor.init(&telegram_config).await {
                 tracing::error!("Failed to initialize Telegram monitor: {e}");
                 return;
@@ -2643,7 +2888,6 @@ impl AppState {
                 poll_interval
             );
 
-            let mut shutdown = shutdown_rx;
             loop {
                 match monitor.poll().await {
                     Ok(events) if !events.is_empty() => {
@@ -2700,20 +2944,32 @@ impl AppState {
                                     let event_id = event.id;
                                     let attachments_owned = event.content.attachments.clone();
                                     tauri::async_runtime::spawn(async move {
-                                        execute_owner_telegram_message(
-                                            &text_owned,
-                                            chat_id,
-                                            &bot_token_c,
-                                            event_id,
-                                            &attachments_owned,
-                                            &ui_c,
-                                            notifier_c.as_ref(),
-                                            &profile_embedder_c,
-                                            &profile_embedding_cache_c,
-                                            agent_registry_c.as_ref(),
-                                            deps_c,
+                                        // Contain a panic in the owner-message
+                                        // executor so it can't silently abort
+                                        // this handler task with no trace.
+                                        let res = AssertUnwindSafe(
+                                            execute_owner_telegram_message(
+                                                &text_owned,
+                                                chat_id,
+                                                &bot_token_c,
+                                                event_id,
+                                                &attachments_owned,
+                                                &ui_c,
+                                                notifier_c.as_ref(),
+                                                &profile_embedder_c,
+                                                &profile_embedding_cache_c,
+                                                agent_registry_c.as_ref(),
+                                                deps_c,
+                                            ),
                                         )
+                                        .catch_unwind()
                                         .await;
+                                        if res.is_err() {
+                                            tracing::error!(
+                                                sense = "telegram",
+                                                "execute_owner_telegram_message PANICKED; message dropped, monitor unaffected"
+                                            );
+                                        }
                                     });
                                 }
                             } else {
@@ -2721,25 +2977,35 @@ impl AppState {
                                 // router: LLM triage, arc creation, notification,
                                 // and (when triage says it's action-worthy) hand
                                 // off to the coordinator for autonomous execution.
-                                crate::sense_router::process_sense_event(
-                                    event,
-                                    &router,
-                                    &arc_store_ref,
-                                    &profile_store_ref,
-                                    &profile_embedder_ref,
-                                    &profile_embedding_cache_ref,
-                                    &ui,
-                                    notifier.as_ref(),
-                                    Some(&coordinator_ref),
-                                    Some(&task_arc_map_ref),
-                                    Some(&dispatch_signal_ref),
-                                    approval_router_ref.as_ref(),
-                                    Some(&pending_email_marks_ref),
-                                    attachment_store_ref.as_ref(),
-                                    contact_store_ref.as_ref(),
-                                    telegram_chat_log_ref.as_ref(),
+                                // Per-event panic containment (see email monitor).
+                                let res = AssertUnwindSafe(
+                                    crate::sense_router::process_sense_event(
+                                        event,
+                                        &router,
+                                        &arc_store_ref,
+                                        &profile_store_ref,
+                                        &profile_embedder_ref,
+                                        &profile_embedding_cache_ref,
+                                        &ui,
+                                        notifier.as_ref(),
+                                        Some(&coordinator_ref),
+                                        Some(&task_arc_map_ref),
+                                        Some(&dispatch_signal_ref),
+                                        approval_router_ref.as_ref(),
+                                        Some(&pending_email_marks_ref),
+                                        attachment_store_ref.as_ref(),
+                                        contact_store_ref.as_ref(),
+                                        telegram_chat_log_ref.as_ref(),
+                                    ),
                                 )
+                                .catch_unwind()
                                 .await;
+                                if res.is_err() {
+                                    tracing::error!(
+                                        sense = "telegram",
+                                        "process_sense_event PANICKED; skipping event, monitor continues"
+                                    );
+                                }
                             }
                         }
                     }
@@ -2780,6 +3046,7 @@ impl AppState {
                     _ = tokio::time::sleep(poll_interval) => {}
                     _ = shutdown.recv() => {
                         info!("Telegram monitor shutdown signal received");
+                        stopped.store(true, std::sync::atomic::Ordering::Relaxed);
                         break;
                     }
                 }
@@ -2789,7 +3056,9 @@ impl AppState {
                 warn!("Telegram monitor shutdown error: {e}");
             }
             info!("Telegram monitor stopped");
-        });
+                }
+            },
+        ));
     }
 
     /// Stop the running Telegram monitor (if any) and start a fresh one from
@@ -6228,6 +6497,69 @@ fn render_endpoint_detail(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod supervisor_tests {
+    use super::spawn_supervised;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn respawns_after_a_panicking_attempt_then_stops_cleanly() {
+        // Attempt 1 panics (top-level panic in the spawned task). The
+        // supervisor must catch it (as a JoinError), respawn, and on attempt 2
+        // the factory runs cleanly; `should_stop` then ends the supervisor.
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_factory = Arc::clone(&attempts);
+        let attempts_stop = Arc::clone(&attempts);
+
+        spawn_supervised(
+            "test-monitor",
+            std::time::Duration::from_millis(1),
+            // Stop once the second attempt has completed (>= 2 runs).
+            move || attempts_stop.load(Ordering::SeqCst) >= 2,
+            move || {
+                let n = attempts_factory.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n == 0 {
+                        panic!("intentional first-attempt panic");
+                    }
+                    // Second attempt: return cleanly.
+                }
+            },
+        )
+        .await;
+
+        // Factory was invoked at least twice: once (panicked) + a respawn.
+        assert!(
+            attempts.load(Ordering::SeqCst) >= 2,
+            "supervisor should have respawned after the panicking attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn does_not_spawn_when_stop_already_requested() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_factory = Arc::clone(&attempts);
+
+        spawn_supervised(
+            "test-monitor",
+            std::time::Duration::from_millis(1),
+            || true, // already stopped
+            move || {
+                attempts_factory.fetch_add(1, Ordering::SeqCst);
+                async move {}
+            },
+        )
+        .await;
+
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            0,
+            "factory must not run when stop is requested up front"
+        );
+    }
 }
 
 #[cfg(test)]
