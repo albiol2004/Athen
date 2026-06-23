@@ -1,7 +1,7 @@
 //! Profile-based routing with failover and budget enforcement.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -150,6 +150,84 @@ impl Default for CircuitBreaker {
 }
 
 // ---------------------------------------------------------------------------
+// Stream wrapper that updates the circuit breaker on terminal events
+// ---------------------------------------------------------------------------
+
+/// Wraps a provider [`LlmStream`] so the provider's circuit breaker records the
+/// real outcome of the byte stream, not just the HTTP-200 connection:
+///
+/// * the first `Err` chunk records a FAILURE (so a provider that returns 200 and
+///   then resets is counted toward opening the breaker), and
+/// * a clean end-of-stream (poll returns `None` having seen no error) records a
+///   SUCCESS.
+///
+/// Recording happens at most once per stream (`recorded`), so a consumer that
+/// keeps polling past the terminal item does not double-count.
+struct BreakerStream {
+    inner: LlmStream,
+    breakers: Arc<Mutex<HashMap<String, CircuitBreaker>>>,
+    provider_id: String,
+    saw_error: bool,
+    recorded: bool,
+}
+
+impl BreakerStream {
+    fn record_failure(&mut self) {
+        if self.recorded {
+            return;
+        }
+        self.recorded = true;
+        let mut bs = self.breakers.lock().unwrap();
+        if let Some(b) = bs.get_mut(&self.provider_id) {
+            b.record_failure();
+        }
+        warn!(
+            provider = %self.provider_id,
+            "streaming provider errored mid-stream; recorded breaker failure"
+        );
+    }
+
+    fn record_success(&mut self) {
+        if self.recorded {
+            return;
+        }
+        self.recorded = true;
+        let mut bs = self.breakers.lock().unwrap();
+        if let Some(b) = bs.get_mut(&self.provider_id) {
+            b.record_success();
+        }
+    }
+}
+
+impl futures::Stream for BreakerStream {
+    type Item = Result<athen_core::llm::LlmChunk>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+        let this = self.get_mut();
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => Poll::Ready(Some(Ok(chunk))),
+            Poll::Ready(Some(Err(e))) => {
+                this.saw_error = true;
+                this.record_failure();
+                Poll::Ready(Some(Err(e)))
+            }
+            Poll::Ready(None) => {
+                // End of stream. Clean end with no error → success.
+                if !this.saw_error {
+                    this.record_success();
+                }
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
@@ -159,7 +237,7 @@ pub struct DefaultLlmRouter {
     providers: HashMap<String, Box<dyn LlmProvider>>,
     profiles: HashMap<ModelProfile, ProfileConfig>,
     budget_tracker: BudgetTracker,
-    circuit_breakers: Mutex<HashMap<String, CircuitBreaker>>,
+    circuit_breakers: Arc<Mutex<HashMap<String, CircuitBreaker>>>,
 }
 
 impl DefaultLlmRouter {
@@ -181,7 +259,7 @@ impl DefaultLlmRouter {
             providers,
             profiles,
             budget_tracker,
-            circuit_breakers: Mutex::new(breaker_map),
+            circuit_breakers: Arc::new(Mutex::new(breaker_map)),
         }
     }
 
@@ -209,6 +287,17 @@ impl DefaultLlmRouter {
             .get(&profile)
             .map(|c| c.priority.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// Current circuit-breaker state for a provider id, if registered. Used by
+    /// tests to assert that a mid-stream failure was actually recorded.
+    #[cfg(test)]
+    pub(crate) fn breaker_state(&self, provider_id: &str) -> Option<CircuitState> {
+        self.circuit_breakers
+            .lock()
+            .unwrap()
+            .get(provider_id)
+            .map(|b| b.state())
     }
 
     /// True if any registered provider supports native document/PDF input
@@ -258,16 +347,22 @@ impl DefaultLlmRouter {
 
             match provider.complete_streaming(request).await {
                 Ok(stream) => {
-                    // Record success — note: for streaming we record success
-                    // at connection time. Individual chunk errors are handled
-                    // by the consumer of the stream.
-                    {
-                        let mut breakers = self.circuit_breakers.lock().unwrap();
-                        if let Some(breaker) = breakers.get_mut(provider_id) {
-                            breaker.record_success();
-                        }
-                    }
-                    return Ok(stream);
+                    // Connecting (HTTP 200) is NOT yet a success: a provider can
+                    // return 200 then immediately reset the byte stream. Recording
+                    // success here would keep the circuit breaker closed forever
+                    // even on a provider that always resets mid-stream, and
+                    // failover would never advance. Instead, wrap the stream so the
+                    // breaker is updated on TERMINAL events:
+                    //   * first `Err` chunk  -> record_failure (counts toward the
+                    //     breaker; the executor's stream consumer also bails on it
+                    //     so the partial result is never served as final)
+                    //   * clean end-of-stream -> record_success
+                    // This mirrors how `route_with_failover` records success only
+                    // after a complete non-streaming response.
+                    let breakers = Arc::clone(&self.circuit_breakers);
+                    let provider_id = provider_id.clone();
+                    let wrapped = Self::wrap_stream_for_breaker(stream, breakers, provider_id);
+                    return Ok(wrapped);
                 }
                 Err(e) => {
                     warn!(
@@ -293,6 +388,33 @@ impl DefaultLlmRouter {
                 request.profile
             ),
         }))
+    }
+
+    /// Wrap a provider stream so the provider's circuit breaker is updated on
+    /// terminal events: a chunk-level error records a failure (and the breaker
+    /// counts it toward opening the circuit), while a clean end-of-stream records
+    /// a success. Success is recorded at most once per stream.
+    ///
+    /// Note on failover scope: once the byte stream is handed back to the caller
+    /// we can no longer transparently switch to the next provider for *this*
+    /// stream — the executor's consumer bails on the first chunk error and falls
+    /// back to a non-streaming `route()` call, which re-enters the router. Because
+    /// the mid-stream error is now recorded as a breaker failure, repeated resets
+    /// trip the breaker open and that non-streaming retry (and subsequent
+    /// streaming attempts) route around the failing provider — i.e. failover does
+    /// advance, just on the next call rather than mid-stream.
+    fn wrap_stream_for_breaker(
+        stream: LlmStream,
+        breakers: Arc<Mutex<HashMap<String, CircuitBreaker>>>,
+        provider_id: String,
+    ) -> LlmStream {
+        Box::pin(BreakerStream {
+            inner: stream,
+            breakers,
+            provider_id,
+            saw_error: false,
+            recorded: false,
+        })
     }
 
     /// Try each provider in the priority list for the requested profile.
@@ -478,6 +600,73 @@ mod tests {
         }
     }
 
+    /// Provider whose streaming call connects (HTTP-200 equivalent) but then,
+    /// depending on `error_mid_stream`, either ends cleanly or yields an `Err`
+    /// chunk after some text — i.e. it models a stream that resets mid-flight.
+    struct StreamingMockProvider {
+        id: String,
+        error_mid_stream: bool,
+    }
+
+    #[async_trait]
+    impl LlmProvider for StreamingMockProvider {
+        fn provider_id(&self) -> &str {
+            &self.id
+        }
+
+        async fn complete(&self, _request: &LlmRequest) -> Result<LlmResponse> {
+            Ok(LlmResponse {
+                content: format!("nonstream from {}", self.id),
+                reasoning_content: None,
+                model_used: "mock-model".into(),
+                provider: self.id.clone(),
+                usage: TokenUsage::default(),
+                tool_calls: vec![],
+                finish_reason: FinishReason::Stop,
+            })
+        }
+
+        async fn complete_streaming(&self, _request: &LlmRequest) -> Result<LlmStream> {
+            let id = self.id.clone();
+            let error_mid_stream = self.error_mid_stream;
+            // Yield one text chunk, then either an error (reset) or a clean end.
+            let items: Vec<Result<LlmChunk>> = if error_mid_stream {
+                vec![
+                    Ok(LlmChunk {
+                        delta: "partial ".into(),
+                        is_final: false,
+                        is_thinking: false,
+                        tool_calls: vec![],
+                    }),
+                    Err(AthenError::LlmProvider {
+                        provider: id,
+                        message: "stream error: connection reset".into(),
+                    }),
+                ]
+            } else {
+                vec![
+                    Ok(LlmChunk {
+                        delta: "complete ".into(),
+                        is_final: false,
+                        is_thinking: false,
+                        tool_calls: vec![],
+                    }),
+                    Ok(LlmChunk {
+                        delta: "answer".into(),
+                        is_final: true,
+                        is_thinking: false,
+                        tool_calls: vec![],
+                    }),
+                ]
+            };
+            Ok(Box::pin(futures::stream::iter(items)))
+        }
+
+        async fn is_available(&self) -> bool {
+            true
+        }
+    }
+
     fn make_request() -> LlmRequest {
         LlmRequest {
             profile: ModelProfile::Powerful,
@@ -547,6 +736,105 @@ mod tests {
         let router = DefaultLlmRouter::new(providers, profiles, BudgetTracker::new(None));
         let result = router.route(&make_request()).await;
         assert!(result.is_err());
+    }
+
+    // ---- Streaming mid-stream-error tests ----
+
+    /// A stream that yields text then an `Err` chunk must NOT be treated as a
+    /// clean success: the breaker records a FAILURE, and after enough such
+    /// failures the circuit opens — which is what makes failover advance on the
+    /// next (non-streaming fallback or streaming) call.
+    #[tokio::test]
+    async fn test_streaming_mid_stream_error_records_failure_and_opens_breaker() {
+        use futures::StreamExt;
+
+        let mut providers: HashMap<String, Box<dyn LlmProvider>> = HashMap::new();
+        providers.insert(
+            "stream_a".into(),
+            Box::new(StreamingMockProvider {
+                id: "stream_a".into(),
+                error_mid_stream: true,
+            }),
+        );
+        let mut profiles = HashMap::new();
+        profiles.insert(ModelProfile::Powerful, make_profile(vec!["stream_a"]));
+
+        // Low failure threshold so a few mid-stream errors trip the breaker open.
+        let mut breakers = HashMap::new();
+        breakers.insert(
+            "stream_a".to_string(),
+            CircuitBreaker::with_thresholds(2, 2, Duration::from_secs(60)),
+        );
+        let router = DefaultLlmRouter::new(providers, profiles, BudgetTracker::new(None))
+            .with_circuit_breakers(breakers);
+
+        // Drive two streams to completion; each yields a partial chunk then errors.
+        for _ in 0..2 {
+            let mut stream = router.route_streaming(&make_request()).await.unwrap();
+            let mut saw_err = false;
+            while let Some(item) = stream.next().await {
+                if item.is_err() {
+                    saw_err = true;
+                }
+            }
+            assert!(saw_err, "mock stream should surface an Err chunk");
+        }
+
+        // Two mid-stream failures → breaker is OPEN. A connection-time success
+        // (the old bug) would have left it Closed forever.
+        assert_eq!(
+            router.breaker_state("stream_a"),
+            Some(CircuitState::Open),
+            "mid-stream errors must count as breaker failures so failover advances"
+        );
+    }
+
+    /// A cleanly-terminating stream records a SUCCESS — the genuine success path
+    /// is preserved exactly.
+    #[tokio::test]
+    async fn test_streaming_clean_end_records_success() {
+        use futures::StreamExt;
+
+        let mut providers: HashMap<String, Box<dyn LlmProvider>> = HashMap::new();
+        providers.insert(
+            "stream_ok".into(),
+            Box::new(StreamingMockProvider {
+                id: "stream_ok".into(),
+                error_mid_stream: false,
+            }),
+        );
+        let mut profiles = HashMap::new();
+        profiles.insert(ModelProfile::Powerful, make_profile(vec!["stream_ok"]));
+
+        // Start in half-open: a recorded success should close the breaker.
+        let mut breakers = HashMap::new();
+        let mut cb = CircuitBreaker::with_thresholds(2, 1, Duration::from_millis(1));
+        cb.record_failure();
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open);
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(cb.allows_request()); // -> HalfOpen
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+        breakers.insert("stream_ok".to_string(), cb);
+
+        let router = DefaultLlmRouter::new(providers, profiles, BudgetTracker::new(None))
+            .with_circuit_breakers(breakers);
+
+        let mut stream = router.route_streaming(&make_request()).await.unwrap();
+        let mut collected = String::new();
+        while let Some(item) = stream.next().await {
+            if let Ok(chunk) = item {
+                collected.push_str(&chunk.delta);
+            }
+        }
+        assert_eq!(collected, "complete answer");
+
+        // Clean end recorded success (success_threshold 1) → breaker closed.
+        assert_eq!(
+            router.breaker_state("stream_ok"),
+            Some(CircuitState::Closed),
+            "a clean stream end must record success and recover the breaker"
+        );
     }
 
     // ---- Circuit breaker tests ----

@@ -1641,7 +1641,24 @@ impl DefaultExecutor {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "error in LLM stream chunk, ignoring");
+                    // The stream errored partway through (connection reset,
+                    // provider stream-error chunk, dropped socket). The text
+                    // collected so far is INCOMPLETE — it must NOT be served as
+                    // a clean, successful turn. Return `Err` so the caller's
+                    // fallback/retry path runs instead of accepting truncated
+                    // content. Any partial text already forwarded to the UI is
+                    // cosmetic; the authoritative arc entry comes from the
+                    // non-streaming fallback, so no corrupted/duplicated arc
+                    // entry is produced.
+                    tracing::warn!(
+                        error = %e,
+                        collected_len = collected.len(),
+                        thinking_len = thinking.len(),
+                        tool_calls = tool_calls_collected.len(),
+                        "LLM stream errored mid-flight; discarding partial result \
+                         and surfacing failure for fallback/retry"
+                    );
+                    return Err(e);
                 }
             }
         }
@@ -2886,6 +2903,130 @@ mod tests {
         assert!(result.success);
         // 1 tool call step + 1 completion step
         assert_eq!(result.steps_completed, 2);
+    }
+
+    // --- Mock router whose stream errors mid-flight ---
+
+    /// `route_streaming` yields one text chunk then an `Err` chunk (a stream
+    /// that resets mid-flight). `route` (non-streaming) returns a distinct,
+    /// complete response. Lets us assert the executor recovers via the
+    /// non-streaming fallback rather than serving the truncated partial text.
+    struct MidStreamErrorRouter {
+        route_calls: AtomicUsize,
+        stream_calls: AtomicUsize,
+    }
+
+    impl MidStreamErrorRouter {
+        fn new() -> Self {
+            Self {
+                route_calls: AtomicUsize::new(0),
+                stream_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmRouter for MidStreamErrorRouter {
+        async fn route(&self, _request: &LlmRequest) -> Result<LlmResponse> {
+            self.route_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(MockLlmRouter::make_response(
+                "COMPLETE non-streaming answer.",
+                vec![],
+            ))
+        }
+
+        async fn route_streaming(
+            &self,
+            _request: &LlmRequest,
+        ) -> Result<athen_core::llm::LlmStream> {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            let items: Vec<Result<athen_core::llm::LlmChunk>> = vec![
+                Ok(athen_core::llm::LlmChunk {
+                    delta: "PARTIAL truncated".into(),
+                    is_final: false,
+                    is_thinking: false,
+                    tool_calls: vec![],
+                }),
+                Err(athen_core::error::AthenError::LlmProvider {
+                    provider: "mock".into(),
+                    message: "stream error: connection reset".into(),
+                }),
+            ];
+            Ok(Box::pin(futures::stream::iter(items)))
+        }
+
+        async fn budget_remaining(&self) -> Result<BudgetStatus> {
+            Ok(BudgetStatus {
+                daily_limit_usd: None,
+                spent_today_usd: 0.0,
+                remaining_usd: None,
+                tokens_used_today: 0,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mid_stream_error_falls_back_to_non_streaming() {
+        // A stream that yields text then errors must NOT be accepted as a clean
+        // successful turn. The executor must fall back to the non-streaming
+        // path and use that complete response — never the truncated partial.
+        let router = Arc::new(MidStreamErrorRouter::new());
+        let router_for_assert = Arc::clone(&router);
+
+        // Wrap the Arc in a thin LlmRouter forwarder so the executor can own
+        // its Box<dyn LlmRouter> while the test keeps a handle for assertions.
+        struct ArcRouter(Arc<MidStreamErrorRouter>);
+        #[async_trait]
+        impl LlmRouter for ArcRouter {
+            async fn route(&self, r: &LlmRequest) -> Result<LlmResponse> {
+                self.0.route(r).await
+            }
+            async fn route_streaming(
+                &self,
+                r: &LlmRequest,
+            ) -> Result<athen_core::llm::LlmStream> {
+                self.0.route_streaming(r).await
+            }
+            async fn budget_remaining(&self) -> Result<BudgetStatus> {
+                self.0.budget_remaining().await
+            }
+        }
+
+        let mut executor = DefaultExecutor::new(
+            Box::new(ArcRouter(Arc::clone(&router))),
+            Box::new(MockToolRegistry::empty()),
+            Box::new(InMemoryAuditor::new()),
+            Duration::from_secs(60),
+            vec![],
+        );
+        // Enable streaming so the stream path is taken.
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        executor.set_stream_sender(tx);
+
+        let task = make_task("answer me");
+        let result = executor.execute(task).await.unwrap();
+
+        // The stream was attempted, then the non-streaming fallback ran.
+        assert!(
+            router_for_assert.stream_calls.load(Ordering::SeqCst) >= 1,
+            "streaming should have been attempted"
+        );
+        assert!(
+            router_for_assert.route_calls.load(Ordering::SeqCst) >= 1,
+            "mid-stream error must trigger the non-streaming fallback"
+        );
+
+        // The final output must reflect the COMPLETE non-streaming answer, not
+        // the truncated partial that streamed before the error.
+        let output = result.output.unwrap_or_default().to_string();
+        assert!(
+            output.contains("COMPLETE non-streaming answer"),
+            "expected the complete fallback answer in output, got: {output}"
+        );
+        assert!(
+            !output.contains("PARTIAL truncated"),
+            "the truncated partial text must NOT be served as the final turn: {output}"
+        );
     }
 
     #[tokio::test]
