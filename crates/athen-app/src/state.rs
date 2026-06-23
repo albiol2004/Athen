@@ -3194,6 +3194,16 @@ impl AppState {
                     let Some(arc_id) = arc_id else {
                         // Re-enqueue and bail: this task belongs to a
                         // different code path (e.g. user send_message).
+                        // CRITICAL: `dispatch_next_with_task` already pulled
+                        // an agent out of the pool for this task. Hand it
+                        // back before re-enqueueing — otherwise the (size-1)
+                        // pool drains on the first foreign task and every
+                        // later autonomous dispatch returns `None` forever,
+                        // silently wedging proactivity until a user message
+                        // happens to trigger `force_release_all`.
+                        if let Err(e) = coordinator.dispatcher().release_agent(task.id).await {
+                            tracing::debug!(task_id = %task.id, error = %e, "release_agent on foreign task (already released?)");
+                        }
                         // Track foreign_seen so we eventually stop if
                         // the queue is dominated by non-sense tasks —
                         // otherwise we'd burn CPU recycling them.

@@ -4935,10 +4935,21 @@ pub(crate) async fn execute_dispatched_task(
     {
         let mut inflight = ctx.inflight.lock().await;
         if !inflight.insert(coord_task_id) {
+            drop(inflight);
             tracing::debug!(
                 task_id = %coord_task_id,
                 "Skipping dispatched-task execution: already running on another channel"
             );
+            // The dispatch loop already assigned an agent to this task
+            // before spawning us; the channel that won the inflight race
+            // owns the run. Release our agent back to the (size-1) pool
+            // instead of orphaning it in `assigned` — otherwise the pool
+            // drains and autonomous dispatch stalls.
+            let _ = ctx
+                .coordinator
+                .dispatcher()
+                .release_agent(coord_task_id)
+                .await;
             return Ok(None);
         }
     }
