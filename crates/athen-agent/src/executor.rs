@@ -10,15 +10,14 @@ use tokio_stream::StreamExt;
 use uuid::Uuid;
 
 use athen_core::agent_profile::{ResolvedAgentProfile, ToolSelection};
-use athen_core::error::{AthenError, Result};
+use athen_core::error::Result;
 use athen_core::llm::{ChatMessage, LlmRequest, MessageContent, ModelProfile, Role};
 use athen_core::task::{StepStatus, TaskStep};
-use athen_core::traits::agent::{AgentExecutor, StepAuditor, TaskResult, TimeoutGuard};
+use athen_core::traits::agent::{AgentExecutor, StepAuditor, TaskResult};
 use athen_core::traits::llm::LlmRouter;
 use athen_core::traits::reminder::{ReminderContext, SystemReminderBuilder};
 use athen_core::traits::tool::ToolRegistry;
 
-use crate::timeout::DefaultTimeoutGuard;
 use crate::tool_grouping::{group_for, is_always_revealed_for_profile, summarize_groups};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -77,48 +76,6 @@ pub fn apply_tool_selection(
             .cloned()
             .collect(),
     }
-}
-
-/// Clamp a shell tool's `timeout_ms` argument to the executor's remaining
-/// budget (minus a 500ms buffer so the executor's own timeout always fires
-/// first with a clean message rather than racing the shell timeout).
-///
-/// Mutates `args` in place to inject the clamped value. Returns
-/// `Some(ToolResult)` to short-circuit the dispatch when there's effectively
-/// no budget left (< 1 second after the buffer); the caller should return
-/// that result instead of dispatching the tool.
-fn clamp_shell_timeout(
-    args: &mut serde_json::Value,
-    executor_remaining_ms: u64,
-) -> Option<athen_core::tool::ToolResult> {
-    const BUFFER_MS: u64 = 500;
-    const FLOOR_MS: u64 = 1000;
-
-    let requested_ms = args
-        .get("timeout_ms")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(60_000);
-
-    let budget_ms = executor_remaining_ms.saturating_sub(BUFFER_MS);
-    let clamped = requested_ms.min(budget_ms);
-
-    if clamped < FLOOR_MS {
-        return Some(athen_core::tool::ToolResult {
-            success: false,
-            output: serde_json::json!({
-                "error": "executor budget exhausted, cannot start command",
-                "executor_remaining_ms": executor_remaining_ms,
-                "requested_timeout_ms": requested_ms,
-            }),
-            error: Some("executor budget exhausted, cannot start command".to_string()),
-            execution_time_ms: 0,
-        });
-    }
-
-    if let Some(obj) = args.as_object_mut() {
-        obj.insert("timeout_ms".to_string(), serde_json::Value::from(clamped));
-    }
-    None
 }
 
 /// Check if a text response is an empty JSON blob (e.g. `{"response": ""}`).
@@ -251,6 +208,10 @@ pub struct DefaultExecutor {
     llm_router: Box<dyn LlmRouter>,
     tool_registry: Box<dyn ToolRegistry>,
     auditor: Box<dyn StepAuditor>,
+    /// Configured wall-clock budget from the builder. No longer enforced as a
+    /// kill: a run only ends on cancellation, completion, or error. Retained
+    /// for the builder API and as the anchor for a future token budget.
+    #[allow(dead_code)]
     timeout: Duration,
     context_messages: Vec<ChatMessage>,
     stream_sender: Option<tokio::sync::mpsc::UnboundedSender<String>>,
@@ -1725,7 +1686,6 @@ impl DefaultExecutor {
 #[async_trait]
 impl AgentExecutor for DefaultExecutor {
     async fn execute(&self, task: athen_core::task::Task) -> Result<TaskResult> {
-        let timeout_guard = DefaultTimeoutGuard::new(self.timeout);
         let task_id = task.id;
         let mut steps_completed: u32 = 0;
         let mut has_been_judged = false;
@@ -1923,11 +1883,10 @@ impl AgentExecutor for DefaultExecutor {
                 }
             }
 
-            // Check timeout
-            if timeout_guard.is_expired() {
-                tracing::warn!(task_id = %task_id, "Task execution timed out");
-                return Err(AthenError::Timeout(self.timeout));
-            }
+            // NOTE: There is intentionally no wall-clock timeout here. An agent
+            // run is only ever ended by user cancellation, normal completion,
+            // or an error — never because elapsed time exceeded a deadline.
+            // (A token-budget limit is planned future work.)
 
             // ── System-reminder injection ──
             // Append a `<system-reminder>` user message at the cadence
@@ -2397,12 +2356,6 @@ impl AgentExecutor for DefaultExecutor {
                 }
             }
 
-            // Snapshot of executor budget at dispatch time. Shell tools
-            // that take a `timeout_ms` clamp to this so the executor's own
-            // timeout always fires first with a clean error rather than
-            // racing the shell's internal timeout.
-            let executor_remaining_ms = timeout_guard.remaining().as_millis() as u64;
-
             // Per-call shell-classifier short-circuits. Computed
             // up-front (the lookup is async — can't run inside the
             // per-dispatch closure cleanly) so each shell_execute call
@@ -2481,18 +2434,11 @@ impl AgentExecutor for DefaultExecutor {
 
             let dispatches = response.tool_calls.iter().enumerate().map(|(idx, tc)| {
                 let name = tc.name.clone();
-                let mut args = tc.arguments.clone();
+                let args = tc.arguments.clone();
                 let started_at = Utc::now();
                 let loop_guarded = should_loop_guard[idx];
                 let dedup_of = dedup_target[idx];
                 let classifier_refusal = classifier_short_circuit[idx].take();
-
-                // Clamp timeout_ms for shell tools that accept it.
-                let clamped_short_circuit = if name == "shell_execute" || name == "shell_spawn" {
-                    clamp_shell_timeout(&mut args, executor_remaining_ms)
-                } else {
-                    None
-                };
 
                 async move {
                     if let Some(refusal) = classifier_refusal {
@@ -2533,9 +2479,6 @@ impl AgentExecutor for DefaultExecutor {
                                 execution_time_ms: 0,
                             }),
                         );
-                    }
-                    if let Some(short) = clamped_short_circuit {
-                        return (started_at, Ok(short));
                     }
                     let result = registry.call_tool(&name, args).await;
                     (started_at, result)
@@ -2946,38 +2889,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_executor_timeout() {
-        // Use a zero-duration timeout so it expires immediately
+    async fn test_zero_wall_clock_does_not_abort_run() {
+        // A zero-duration wall-clock budget must NOT terminate a run. Elapsed
+        // time is no longer a kill condition — only cancellation, completion,
+        // or an error ends a run. (Token budgets are future work.)
         let tool_call = ToolCall {
             id: "call_1".to_string(),
-            name: "slow_tool".to_string(),
+            name: "search".to_string(),
             arguments: serde_json::json!({}),
             thought_signature: None,
         };
 
-        let responses = vec![MockLlmRouter::make_response(
-            "Calling tool.",
-            vec![tool_call],
-        )];
+        let responses = vec![
+            // First response: request a tool call
+            MockLlmRouter::make_response("Calling tool.", vec![tool_call]),
+            // Second response: done, no more tool calls
+            MockLlmRouter::make_response("Done.", vec![]),
+        ];
+
+        let tool_result = CoreToolResult {
+            success: true,
+            output: serde_json::json!({"ok": true}),
+            error: None,
+            execution_time_ms: 0,
+        };
 
         let executor = DefaultExecutor::new(
             Box::new(MockLlmRouter::new(responses)),
-            Box::new(MockToolRegistry::empty()),
+            Box::new(MockToolRegistry::new(vec![], vec![tool_result])),
             Box::new(InMemoryAuditor::new()),
-            Duration::ZERO, // instant timeout
+            Duration::ZERO, // would have expired instantly under the old guard
             vec![],
         );
 
-        let task = make_task("Should timeout");
-        // Sleep briefly so the timeout guard expires
-        tokio::time::sleep(Duration::from_millis(1)).await;
+        let task = make_task("Should NOT time out");
+        // Sleep so any old deadline would be well past.
+        tokio::time::sleep(Duration::from_millis(5)).await;
         let result = executor.execute(task).await;
 
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            AthenError::Timeout(_) => {} // expected
-            other => panic!("Expected Timeout error, got: {:?}", other),
-        }
+        // The run completes rather than returning AthenError::Timeout.
+        let result = result.expect("run must not be aborted by elapsed wall-clock time");
+        assert!(result.success);
     }
 
     #[tokio::test]
