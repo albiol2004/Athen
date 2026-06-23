@@ -380,6 +380,326 @@ fn parse_m27_flag_args(input: &str) -> serde_json::Map<String, Value> {
     map
 }
 
+/// Liquid LFM2.5 pythonic tool calls, delimited by special tokens:
+/// `<|tool_call_start|>[func(arg='v', n=5, flag=True)]<|tool_call_end|>`.
+///
+/// The interior is a Python list of one or more calls. Arguments use Python
+/// literals (`True`/`False`/`None`, single-quoted strings) that are *not* valid
+/// JSON — we normalize them so downstream `ToolArgRepair` and tool dispatch see
+/// the same shape as a native `tool_calls` payload.
+///
+/// Only the delimited form is recognized (conservative, like the other
+/// extractors): when llama.cpp lacks the LFM tool parser it surfaces the
+/// special tokens as literal text, so the delimiters are present. vLLM and
+/// recent llama.cpp parse the calls server-side into structured `tool_calls`,
+/// in which case this extractor never runs.
+///
+/// Returns the prose with every `<|tool_call_start|>...<|tool_call_end|>` block
+/// removed and a `Vec<ToolCall>` of everything that parsed.
+pub fn extract_lfm_pythonic(content: &str) -> (String, Vec<ToolCall>) {
+    const OPEN: &str = "<|tool_call_start|>";
+    const CLOSE: &str = "<|tool_call_end|>";
+    let mut calls = Vec::new();
+    let mut stripped = String::with_capacity(content.len());
+    let mut cursor = 0;
+
+    while cursor < content.len() {
+        let remaining = &content[cursor..];
+        let Some(open) = remaining.find(OPEN) else {
+            stripped.push_str(remaining);
+            break;
+        };
+        // Append prose up to the open marker.
+        stripped.push_str(&remaining[..open]);
+        let body_start = cursor + open + OPEN.len();
+        let after_open = &content[body_start..];
+        let Some(close_rel) = after_open.find(CLOSE) else {
+            // Unclosed block — preserve from the open marker so the signal
+            // isn't silently dropped.
+            stripped.push_str(&content[cursor + open..]);
+            break;
+        };
+        let body = &after_open[..close_rel];
+        let after_close = body_start + close_rel + CLOSE.len();
+        calls.extend(parse_lfm_call_list(body));
+        cursor = after_close;
+    }
+
+    (stripped.trim().to_string(), calls)
+}
+
+/// Parse the interior of an LFM tool-call block: a Python list of calls,
+/// `[func1(a=1), func2(b='x')]`. The surrounding `[` `]` are optional (a single
+/// bare call is also accepted).
+fn parse_lfm_call_list(body: &str) -> Vec<ToolCall> {
+    let trimmed = body.trim();
+    let inner = trimmed
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(trimmed)
+        .trim();
+    if inner.is_empty() {
+        return Vec::new();
+    }
+    split_top_level(inner, ',')
+        .into_iter()
+        .filter_map(|seg| parse_lfm_call(seg.trim()))
+        .collect()
+}
+
+/// Parse a single pythonic call `name(k=v, ...)`.
+fn parse_lfm_call(seg: &str) -> Option<ToolCall> {
+    let paren = seg.find('(')?;
+    let name = seg[..paren].trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let after = &seg[paren + 1..];
+    // Args run up to the matching close paren (trailing `)` of the call).
+    let args_str = after.strip_suffix(')').unwrap_or(after);
+
+    let mut map = serde_json::Map::new();
+    for pair in split_top_level(args_str, ',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let Some(eq) = find_top_level_eq(pair) else {
+            continue; // positional arg without a name — skip (we key by name)
+        };
+        let key = pair[..eq].trim().to_string();
+        let raw_val = pair[eq + 1..].trim();
+        if key.is_empty() {
+            continue;
+        }
+        map.insert(key, parse_python_value(raw_val));
+    }
+
+    Some(ToolCall {
+        id: synth_call_id(),
+        name,
+        arguments: Value::Object(map),
+        thought_signature: None,
+    })
+}
+
+/// Split `s` on `delim` characters that sit at bracket-depth 0 and outside any
+/// quoted string. Quotes may be single or double; backslash escapes the next
+/// char inside a quote.
+fn split_top_level(s: &str, delim: char) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth: i32 = 0;
+    let mut quote: Option<char> = None;
+    let mut escape = false;
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if let Some(q) = quote {
+            if c == '\\' {
+                escape = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' => quote = Some(c),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            _ if c == delim && depth == 0 => {
+                out.push(&s[start..i]);
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    out.push(&s[start..]);
+    out
+}
+
+/// Index of the first kwarg-separator `=` at bracket-depth 0 outside quotes.
+/// Skips comparison operators (`==`, `!=`, `>=`, `<=`) so they aren't mistaken
+/// for the separator.
+fn find_top_level_eq(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth: i32 = 0;
+    let mut quote: Option<char> = None;
+    let mut escape = false;
+    for (i, c) in s.char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if let Some(q) = quote {
+            if c == '\\' {
+                escape = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' => quote = Some(c),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            '=' if depth == 0 => {
+                let prev = if i > 0 { bytes[i - 1] } else { b' ' };
+                let next = bytes.get(i + 1).copied().unwrap_or(b' ');
+                if next != b'=' && !matches!(prev, b'=' | b'!' | b'<' | b'>') {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Convert a single Python literal argument value into a JSON `Value`.
+/// Scalars are typed directly; nested lists/dicts go through a best-effort
+/// Python→JSON normalization. Anything that fails to parse is kept as a string
+/// so the value is never lost.
+fn parse_python_value(raw: &str) -> Value {
+    let v = raw.trim();
+    if v.is_empty() {
+        return Value::String(String::new());
+    }
+    // Quoted string (single or double).
+    if v.len() >= 2
+        && ((v.starts_with('\'') && v.ends_with('\'')) || (v.starts_with('"') && v.ends_with('"')))
+    {
+        return Value::String(unescape_python_string(&v[1..v.len() - 1]));
+    }
+    // Python keyword literals.
+    match v {
+        "True" => return Value::Bool(true),
+        "False" => return Value::Bool(false),
+        "None" => return Value::Null,
+        _ => {}
+    }
+    // Numbers.
+    if let Ok(i) = v.parse::<i64>() {
+        return Value::from(i);
+    }
+    if let Ok(f) = v.parse::<f64>() {
+        if let Some(n) = serde_json::Number::from_f64(f) {
+            return Value::Number(n);
+        }
+    }
+    // Nested list / dict — normalize Python literals to JSON, best-effort.
+    if (v.starts_with('[') && v.ends_with(']')) || (v.starts_with('{') && v.ends_with('}')) {
+        if let Some(parsed) = pythonish_to_json(v) {
+            return parsed;
+        }
+    }
+    // Bare word or anything unrecognized — keep as a string.
+    Value::String(v.to_string())
+}
+
+/// Minimal Python string-escape unescaping (`\'`, `\"`, `\\`, `\n`, `\t`, `\r`).
+fn unescape_python_string(s: &str) -> String {
+    if !s.contains('\\') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some('\'') => out.push('\''),
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Best-effort conversion of a Python list/dict literal into JSON, then parse.
+/// Single-quoted strings become double-quoted and `True`/`False`/`None` become
+/// `true`/`false`/`null`. Returns `None` if the result still isn't valid JSON,
+/// letting the caller fall back to a plain string.
+fn pythonish_to_json(s: &str) -> Option<Value> {
+    let mut out = String::with_capacity(s.len() + 8);
+    let mut quote: Option<char> = None;
+    let mut escape = false;
+    let mut word = String::new();
+
+    fn flush_word(word: &mut String, out: &mut String) {
+        if word.is_empty() {
+            return;
+        }
+        match word.as_str() {
+            "True" => out.push_str("true"),
+            "False" => out.push_str("false"),
+            "None" => out.push_str("null"),
+            other => out.push_str(other),
+        }
+        word.clear();
+    }
+
+    for c in s.chars() {
+        if let Some(q) = quote {
+            if escape {
+                match c {
+                    '\'' => out.push('\''),
+                    '"' => out.push_str("\\\""),
+                    '\\' => out.push_str("\\\\"),
+                    'n' => out.push_str("\\n"),
+                    't' => out.push_str("\\t"),
+                    'r' => out.push_str("\\r"),
+                    other => {
+                        out.push('\\');
+                        out.push(other);
+                    }
+                }
+                escape = false;
+                continue;
+            }
+            if c == '\\' {
+                escape = true;
+            } else if c == q {
+                out.push('"');
+                quote = None;
+            } else if c == '"' {
+                // A double quote inside a single-quoted string must be escaped
+                // once we re-emit with double quotes.
+                out.push_str("\\\"");
+            } else {
+                out.push(c);
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' => {
+                flush_word(&mut word, &mut out);
+                quote = Some(c);
+                out.push('"');
+            }
+            c if c.is_alphanumeric() || matches!(c, '_' | '.' | '-' | '+') => word.push(c),
+            other => {
+                flush_word(&mut word, &mut out);
+                out.push(other);
+            }
+        }
+    }
+    flush_word(&mut word, &mut out);
+    serde_json::from_str(&out).ok()
+}
+
 /// Strip a single leading `<think>...</think>` block from `content`, plus any
 /// trailing whitespace after the closing tag. No-op when the content does not
 /// open with a think tag, or when the tag is malformed (we emit as-is rather
@@ -609,5 +929,100 @@ Then [TOOL_CALL] {tool => "write_file", args => {
         assert_eq!(calls.len(), 2);
         assert_ne!(calls[0].id, calls[1].id);
         assert!(calls[0].id.starts_with("call_"));
+    }
+
+    // -----------------------------------------------------------------------
+    // LFM2.5 pythonic extractor
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_lfm_single_call_observed_sample() {
+        let content = "Let me check.<|tool_call_start|>[web_search(query='current temperature in Mexico City', numResults=5)]<|tool_call_end|>";
+        let (stripped, calls) = extract_lfm_pythonic(content);
+        assert_eq!(stripped, "Let me check.");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "web_search");
+        assert_eq!(
+            calls[0].arguments["query"],
+            "current temperature in Mexico City"
+        );
+        // Comma inside the quoted string must not split the args.
+        assert_eq!(calls[0].arguments["numResults"], 5);
+    }
+
+    #[test]
+    fn extract_lfm_python_literals_become_json() {
+        let content =
+            r#"<|tool_call_start|>[do_thing(isRegexp=True, dry=False, ttl=None)]<|tool_call_end|>"#;
+        let (_, calls) = extract_lfm_pythonic(content);
+        assert_eq!(calls.len(), 1);
+        // True/False/None are not valid JSON — they must be normalized.
+        assert_eq!(calls[0].arguments["isRegexp"], true);
+        assert_eq!(calls[0].arguments["dry"], false);
+        assert_eq!(calls[0].arguments["ttl"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn extract_lfm_double_quoted_args() {
+        let content =
+            r#"<|tool_call_start|>[get_candidate_status(candidate_id="12345")]<|tool_call_end|>"#;
+        let (_, calls) = extract_lfm_pythonic(content);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["candidate_id"], "12345");
+    }
+
+    #[test]
+    fn extract_lfm_parallel_calls_in_one_block() {
+        let content = r#"<|tool_call_start|>[read_file(path='a.rs'), write_file(path='b.rs', content='x')]<|tool_call_end|>"#;
+        let (_, calls) = extract_lfm_pythonic(content);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments["path"], "a.rs");
+        assert_eq!(calls[1].name, "write_file");
+        assert_eq!(calls[1].arguments["content"], "x");
+    }
+
+    #[test]
+    fn extract_lfm_nested_list_arg() {
+        let content = r#"<|tool_call_start|>[tag(items=['a', 'b'], keep=True)]<|tool_call_end|>"#;
+        let (_, calls) = extract_lfm_pythonic(content);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["items"][0], "a");
+        assert_eq!(calls[0].arguments["items"][1], "b");
+        assert_eq!(calls[0].arguments["keep"], true);
+    }
+
+    #[test]
+    fn extract_lfm_no_marker_passes_through() {
+        let content = "Just prose with a [list, not, a, call] and no markers.";
+        let (stripped, calls) = extract_lfm_pythonic(content);
+        assert!(calls.is_empty());
+        assert_eq!(stripped, content);
+    }
+
+    #[test]
+    fn extract_lfm_unclosed_marker_preserved() {
+        let content = "Plan: <|tool_call_start|>[foo(x=1)";
+        let (stripped, calls) = extract_lfm_pythonic(content);
+        assert!(calls.is_empty());
+        assert!(stripped.contains("<|tool_call_start|>"));
+    }
+
+    #[test]
+    fn extract_lfm_synthetic_ids_unique() {
+        let content = r#"<|tool_call_start|>[a(), b()]<|tool_call_end|>"#;
+        let (_, calls) = extract_lfm_pythonic(content);
+        assert_eq!(calls.len(), 2);
+        assert_ne!(calls[0].id, calls[1].id);
+        assert!(calls[0].id.starts_with("call_"));
+    }
+
+    #[test]
+    fn extract_lfm_numeric_typing() {
+        let content = r#"<|tool_call_start|>[m(n=42, ratio=0.5, name='hi')]<|tool_call_end|>"#;
+        let (_, calls) = extract_lfm_pythonic(content);
+        assert_eq!(calls[0].arguments["n"], 42);
+        assert_eq!(calls[0].arguments["ratio"], 0.5);
+        assert_eq!(calls[0].arguments["name"], "hi");
     }
 }

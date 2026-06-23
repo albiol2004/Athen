@@ -47,6 +47,7 @@ pub fn default_slug_for_family(family: ModelFamily) -> &'static str {
         ModelFamily::DeepSeekV4Pro => "deepseek-v4-pro",
         ModelFamily::Qwen3CoderNext => "Qwen/Qwen3-Coder-Next",
         ModelFamily::Grok4 => "grok-4",
+        ModelFamily::Lfm25Local => "LiquidAI/LFM2.5-8B-A1B",
     }
 }
 
@@ -226,6 +227,20 @@ pub fn quirks_for_family(family: ModelFamily) -> ModelQuirks {
         // calls, no reasoning surface, lenient template, 1M ctx. No
         // wire-level quirks vs the OpenAI-compat baseline.
         ModelFamily::Grok4 => ModelQuirks::default(),
+
+        // Liquid LFM2.5-8B-A1B (on-device MoE, May 2026). Reasoning-only —
+        // always emits `<think>` blocks (inline tags). Tool calls are
+        // pythonic, delimited by `<|tool_call_start|>[...]<|tool_call_end|>`;
+        // we extract them only when the server didn't parse them itself
+        // (vLLM / recent llama.cpp do — older builds surface the special
+        // tokens as text). Native system role; system-first template. No
+        // reasoning echo-back required (unlike DeepSeek-R1 / Kimi K2.7).
+        ModelFamily::Lfm25Local => ModelQuirks {
+            tool_extraction: ToolExtractionStrategy::InlinePythonicLfm,
+            reasoning_surface: ReasoningSurface::InlineThinkTags,
+            template_strictness: TemplateStrictness::SystemMustBeFirst,
+            ..ModelQuirks::default()
+        },
     }
 }
 
@@ -345,6 +360,12 @@ const BUILTIN_SLUG_QUIRKS: &[(&str, &str, ModelFamily)] = &[
     ("*", "gemini-3-pro*", ModelFamily::Gemini3Pro),
     ("*", "gemini-3-flash*", ModelFamily::Gemini3Flash),
     ("*", "gpt-5*", ModelFamily::Gpt5),
+    // Liquid LFM2.5 served locally — match the friendly slug, the no-dot
+    // GGUF-filename form (`lfm25-8b-...`), and the HF repo id form so it
+    // auto-profiles even if the user doesn't pick the family.
+    ("*", "lfm2.5*", ModelFamily::Lfm25Local),
+    ("*", "lfm25*", ModelFamily::Lfm25Local),
+    ("*", "liquidai/lfm2.5*", ModelFamily::Lfm25Local),
 ];
 
 /// Look up per-slug quirks. Returns `None` when no row matches — callers

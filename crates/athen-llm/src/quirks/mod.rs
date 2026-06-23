@@ -55,6 +55,12 @@ pub enum ToolExtractionStrategy {
     InlineJsonLlama,
     /// Llama 1B/3B pythonic form: `[func(p=v, q=w)]`.
     InlinePythonicLlama,
+    /// Liquid LFM2.5 pythonic form, delimited by special tokens:
+    /// `<|tool_call_start|>[func(arg='v', n=5, flag=True)]<|tool_call_end|>`.
+    /// The interior is a Python list of calls using Python literals
+    /// (`True`/`False`/`None`, single-quoted strings) which we normalize to
+    /// JSON. Only fires when the server didn't parse the calls itself.
+    InlinePythonicLfm,
     /// Mistral local: `[TOOL_CALLS]` (or another fixed token) followed by
     /// JSON. The `&'static str` is the literal token.
     SpecialTokenBlock(&'static str),
@@ -234,6 +240,24 @@ pub fn apply_to_response(quirks: &ModelQuirks, response: &mut LlmResponse) {
                 // No reasoning_content fallback needed — M2.7 doesn't route
                 // tool calls through reasoning_content.
             }
+            ToolExtractionStrategy::InlinePythonicLfm => {
+                let (stripped, calls) = extractors::extract_lfm_pythonic(&response.content);
+                if !calls.is_empty() {
+                    response.content = stripped;
+                    response.tool_calls = calls;
+                    response.finish_reason = athen_core::llm::FinishReason::ToolUse;
+                } else if let Some(reasoning) = response.reasoning_content.as_ref() {
+                    // Fallback: a `--reasoning-format` server can route the
+                    // post-`<think>` text (with the call) into reasoning_content.
+                    let (reasoning_stripped, reasoning_calls) =
+                        extractors::extract_lfm_pythonic(reasoning);
+                    if !reasoning_calls.is_empty() {
+                        response.reasoning_content = Some(reasoning_stripped);
+                        response.tool_calls = reasoning_calls;
+                        response.finish_reason = athen_core::llm::FinishReason::ToolUse;
+                    }
+                }
+            }
             // Other inline strategies land in later slices.
             ToolExtractionStrategy::InlineXmlVendorTagged(_)
             | ToolExtractionStrategy::InlineJsonLlama
@@ -314,6 +338,9 @@ pub fn extract_streaming_tail(
         }
         ToolExtractionStrategy::MiniMaxM27Bracket => {
             extractors::extract_minimax_m27_bracket(buffered_content)
+        }
+        ToolExtractionStrategy::InlinePythonicLfm => {
+            extractors::extract_lfm_pythonic(buffered_content)
         }
         // Other inline strategies land in later slices.
         _ => return None,

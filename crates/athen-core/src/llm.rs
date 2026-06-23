@@ -277,6 +277,14 @@ pub enum ModelFamily {
     /// xAI Grok 4 (Grok 4.3 lineage). 1M context, OpenAI-compat structured
     /// tool calls, lenient template.
     Grok4,
+    /// Liquid AI LFM2.5-8B-A1B (on-device MoE, May 2026). Reasoning-only
+    /// (`<think>` blocks) with *pythonic* tool calls delimited by
+    /// `<|tool_call_start|>[func(arg='v', flag=True)]<|tool_call_end|>`.
+    /// vLLM and recent llama.cpp parse the calls server-side (Structured
+    /// path); older llama.cpp surfaces them as text, so we extract inline.
+    /// No reasoning echo-back required (unlike DeepSeek-R1). Native system
+    /// role; recommended sampling temp 0.2.
+    Lfm25Local,
 }
 
 impl ModelFamily {
@@ -309,6 +317,7 @@ impl ModelFamily {
             ModelFamily::DeepSeekV4Pro => "DeepSeek V4 Pro",
             ModelFamily::Qwen3CoderNext => "Qwen3-Coder Next",
             ModelFamily::Grok4 => "xAI Grok 4",
+            ModelFamily::Lfm25Local => "Liquid LFM2.5-8B-A1B (local)",
         }
     }
 
@@ -343,6 +352,7 @@ impl ModelFamily {
             ModelFamily::DeepSeekV4Pro => "DeepSeekV4Pro",
             ModelFamily::Qwen3CoderNext => "Qwen3CoderNext",
             ModelFamily::Grok4 => "Grok4",
+            ModelFamily::Lfm25Local => "Lfm25Local",
         }
     }
 
@@ -382,6 +392,7 @@ impl ModelFamily {
             ModelFamily::DeepSeekV4Pro,
             ModelFamily::Qwen3CoderNext,
             ModelFamily::Grok4,
+            ModelFamily::Lfm25Local,
         ]
     }
 }
