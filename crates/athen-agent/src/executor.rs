@@ -1432,6 +1432,11 @@ struct StreamResult {
     #[allow(dead_code)]
     thinking: String,
     tool_calls: Vec<athen_core::llm::ToolCall>,
+    /// Real token usage for the streamed turn, collected from the terminal
+    /// usage-bearing chunk (`LlmChunk.usage`). `None` if the provider stream
+    /// never reported usage; the synthetic `LlmResponse` then carries
+    /// `TokenUsage::default()` as before.
+    usage: Option<athen_core::llm::TokenUsage>,
 }
 
 impl DefaultExecutor {
@@ -1615,10 +1620,16 @@ impl DefaultExecutor {
         let mut collected = String::new();
         let mut thinking = String::new();
         let mut tool_calls_collected: Vec<athen_core::llm::ToolCall> = Vec::new();
+        let mut usage_collected: Option<athen_core::llm::TokenUsage> = None;
 
         while let Some(chunk_result) = stream.next().await {
             match chunk_result {
                 Ok(chunk) => {
+                    // Capture the terminal usage-bearing chunk's usage so the
+                    // synthetic LlmResponse reports real token counts/cost.
+                    if let Some(usage) = chunk.usage {
+                        usage_collected = Some(usage);
+                    }
                     if !chunk.delta.is_empty() {
                         if chunk.is_thinking {
                             // Prefix with STX to mark as thinking content for the
@@ -1696,6 +1707,7 @@ impl DefaultExecutor {
             content: final_content,
             thinking,
             tool_calls: tool_calls_collected,
+            usage: usage_collected,
         })
     }
 }
@@ -2000,7 +2012,11 @@ impl AgentExecutor for DefaultExecutor {
                             },
                             model_used: String::new(),
                             provider: String::new(),
-                            usage: athen_core::llm::TokenUsage::default(),
+                            // Real usage collected from the stream's terminal
+                            // usage chunk; the router already recorded it
+                            // against the budget on clean completion, so this
+                            // is purely for telemetry/UI on the response.
+                            usage: result.usage.unwrap_or_default(),
                             tool_calls: result.tool_calls,
                             finish_reason,
                         }
@@ -2946,6 +2962,7 @@ mod tests {
                     is_final: false,
                     is_thinking: false,
                     tool_calls: vec![],
+                    usage: None,
                 }),
                 Err(athen_core::error::AthenError::LlmProvider {
                     provider: "mock".into(),

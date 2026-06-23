@@ -5,6 +5,7 @@
 //! and any other compatible endpoint.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -49,7 +50,11 @@ pub struct OpenAiCompatibleProvider {
     client: Client,
     base_url: String,
     provider_id: String,
-    cost_estimator: Box<dyn CostEstimator>,
+    /// `Arc` (not `Box`) so the streaming path can share the estimator into
+    /// the `'static` chunk stream and fill `estimated_cost_usd` on the
+    /// terminal usage chunk. The public `with_cost_estimator(Box::new(..))`
+    /// API is unchanged — the setter converts `Box` → `Arc`.
+    cost_estimator: Arc<dyn CostEstimator>,
     supports_vision: bool,
     supports_documents: bool,
     /// Resolved at construction from the user-selected `ModelFamily`.
@@ -79,7 +84,7 @@ impl OpenAiCompatibleProvider {
                 .expect("reqwest Client should build with timeout"),
             base_url,
             provider_id: "openai".to_string(),
-            cost_estimator: Box::new(OpenAiCostEstimator),
+            cost_estimator: Arc::new(OpenAiCostEstimator),
             supports_vision: false,
             supports_documents: false,
             quirks: ModelQuirks::default(),
@@ -137,7 +142,7 @@ impl OpenAiCompatibleProvider {
 
     /// Override the cost estimator (e.g. zero-cost for local providers).
     pub fn with_cost_estimator(mut self, estimator: Box<dyn CostEstimator>) -> Self {
-        self.cost_estimator = estimator;
+        self.cost_estimator = Arc::from(estimator);
         self
     }
 
@@ -292,6 +297,7 @@ impl OpenAiCompatibleProvider {
             temperature: request.temperature.unwrap_or(0.7),
             tools,
             stream: false,
+            stream_options: None,
             extra: map_reasoning_effort(&self.provider_id, self.family, request.reasoning_effort),
         }
     }
@@ -487,6 +493,11 @@ impl LlmProvider for OpenAiCompatibleProvider {
     async fn complete_streaming(&self, request: &LlmRequest) -> Result<LlmStream> {
         let mut body = self.build_request_body(request);
         body.stream = true;
+        // Opt into the terminal usage-only SSE chunk so streamed turns report
+        // real token counts (otherwise the budget is never decremented).
+        body.stream_options = Some(StreamOptions {
+            include_usage: true,
+        });
         let url = format!("{}/v1/chat/completions", self.base_url);
 
         debug!(
@@ -584,6 +595,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
                                     is_final: true,
                                     is_thinking: false,
                                     tool_calls,
+                                    usage: None,
                                 }));
                             }
                         }
@@ -605,6 +617,27 @@ impl LlmProvider for OpenAiCompatibleProvider {
             },
         )
         .flatten();
+
+        // Fill `estimated_cost_usd` on the usage-bearing chunk using this
+        // provider's cost model — mirrors the non-streaming `complete()`
+        // path so budget spend is identical whether or not we stream.
+        let estimator = Arc::clone(&self.cost_estimator);
+        let model = self.default_model.clone();
+        let chunk_stream = chunk_stream.map(move |item| match item {
+            Ok(mut chunk) => {
+                if let Some(usage) = chunk.usage.as_mut() {
+                    if usage.estimated_cost_usd.is_none() {
+                        usage.estimated_cost_usd = Some(estimator.estimate(
+                            &model,
+                            usage.prompt_tokens,
+                            usage.completion_tokens,
+                        ));
+                    }
+                }
+                Ok(chunk)
+            }
+            err => err,
+        });
 
         Ok(Box::pin(chunk_stream))
     }
@@ -980,6 +1013,7 @@ pub fn parse_sse_chunks(
                 is_final: true,
                 is_thinking: false,
                 tool_calls,
+                usage: None,
             }));
             continue;
         }
@@ -1012,6 +1046,7 @@ pub fn parse_sse_chunks(
                     is_final: false,
                     is_thinking: true,
                     tool_calls: vec![],
+                    usage: None,
                 }));
             }
         }
@@ -1026,6 +1061,7 @@ pub fn parse_sse_chunks(
                 is_final: false,
                 is_thinking: false,
                 tool_calls: vec![],
+                usage: None,
             }));
         }
 
@@ -1054,8 +1090,24 @@ pub fn parse_sse_chunks(
                     is_final: true,
                     is_thinking: false,
                     tool_calls,
+                    usage: None,
                 }));
             }
+        }
+
+        // Terminal usage-only SSE event (emitted when the request set
+        // `stream_options.include_usage = true`). It arrives after the
+        // finish_reason chunk, typically with empty `choices` and a
+        // top-level `usage` object. Surface it on its own usage-bearing
+        // final chunk so the executor/router can record real spend.
+        if let Some(usage) = parse_stream_usage(event.get("usage")) {
+            chunks.push(Ok(LlmChunk {
+                delta: String::new(),
+                is_final: true,
+                is_thinking: false,
+                tool_calls: vec![],
+                usage: Some(usage),
+            }));
         }
     }
 
@@ -1068,6 +1120,58 @@ pub fn parse_sse_chunks(
     let _ = acc.is_empty();
 
     chunks
+}
+
+/// Parse an OpenAI-compatible `usage` object (from a streaming usage-only
+/// chunk or any event carrying it) into a [`TokenUsage`]. Returns `None`
+/// when the field is absent or not an object. `estimated_cost_usd` is left
+/// `None` here — the per-provider streaming method fills it using the
+/// provider's own cost model and model id, exactly mirroring how the
+/// non-streaming `complete()` path estimates cost.
+///
+/// Cached-token mapping: prefers OpenAI's `prompt_tokens_details.cached_tokens`,
+/// then DeepSeek's `prompt_cache_hit_tokens` (the OpenAI-compatible relays
+/// DeepSeek streams behind use the same wire). `total_tokens` falls back to
+/// `prompt + completion` when the server omits it.
+///
+/// Public so the DeepSeek adapter (which reuses [`parse_sse_chunks`]) shares
+/// the exact same field mapping.
+pub fn parse_stream_usage(usage: Option<&serde_json::Value>) -> Option<TokenUsage> {
+    let u = usage?.as_object()?;
+    let prompt_tokens = u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let completion_tokens = u
+        .get("completion_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    let total_tokens = u
+        .get("total_tokens")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32)
+        .unwrap_or(prompt_tokens + completion_tokens);
+    // OpenAI: usage.prompt_tokens_details.cached_tokens
+    // DeepSeek: usage.prompt_cache_hit_tokens
+    let cached_tokens = u
+        .get("prompt_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(|v| v.as_u64())
+        .or_else(|| {
+            u.get("prompt_cache_hit_tokens")
+                .and_then(|v| v.as_u64())
+        })
+        .map(|v| v as u32);
+    // A usage object with everything zero is the "no usage reported" shape
+    // some compat servers send — don't manufacture a spurious record.
+    if prompt_tokens == 0 && completion_tokens == 0 && total_tokens == 0 {
+        return None;
+    }
+    Some(TokenUsage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        estimated_cost_usd: None,
+        cached_tokens,
+        cache_creation_tokens: None,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1252,10 +1356,21 @@ struct OpenAiRequestOut {
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<OpenAiTool>>,
     stream: bool,
+    /// Ask the API to emit a terminal usage-only SSE chunk while streaming.
+    /// Without `include_usage: true` the OpenAI-compatible wire never sends
+    /// token counts on a streamed turn, so the budget can't be decremented.
+    /// Omitted from the wire for non-streaming requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
     /// Extra fields merged into the top-level request body.
     /// Used for provider-specific parameters like Qwen's `enable_thinking`.
     #[serde(flatten)]
     extra: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1603,6 +1718,50 @@ data: [DONE]
         let chunks = parse_sse_chunks(sse, "test", &mut acc);
         assert_eq!(chunks.len(), 1);
         assert!(chunks[0].as_ref().unwrap().is_final);
+    }
+
+    /// With `stream_options.include_usage`, the API sends a terminal
+    /// usage-only SSE event (empty `choices`, top-level `usage`). It must
+    /// surface as a final chunk carrying `Some(usage)`.
+    #[test]
+    fn test_parse_sse_chunks_final_usage_chunk() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{},\"index\":0,\"finish_reason\":\"stop\"}]}\n",
+            "\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":120,\"completion_tokens\":48,",
+            "\"total_tokens\":168,\"prompt_tokens_details\":{\"cached_tokens\":64}}}\n",
+            "\n",
+            "data: [DONE]\n",
+        );
+        let mut acc = ToolCallAccumulator::default();
+        let chunks = parse_sse_chunks(sse, "test", &mut acc);
+        let usage = chunks
+            .iter()
+            .filter_map(|c| c.as_ref().ok())
+            .find_map(|c| c.usage.clone())
+            .expect("a chunk must carry usage");
+        assert_eq!(usage.prompt_tokens, 120);
+        assert_eq!(usage.completion_tokens, 48);
+        assert_eq!(usage.total_tokens, 168);
+        assert_eq!(usage.cached_tokens, Some(64));
+        // Cost is filled by the provider streaming method, not the parser.
+        assert!(usage.estimated_cost_usd.is_none());
+    }
+
+    /// DeepSeek (OpenAI-compatible) reports its cache hit under
+    /// `prompt_cache_hit_tokens` — the shared parser maps it to
+    /// `cached_tokens`.
+    #[test]
+    fn test_parse_stream_usage_maps_deepseek_cache_field() {
+        let usage = serde_json::json!({
+            "prompt_tokens": 200,
+            "completion_tokens": 30,
+            "total_tokens": 230,
+            "prompt_cache_hit_tokens": 192
+        });
+        let u = parse_stream_usage(Some(&usage)).expect("usage parsed");
+        assert_eq!(u.prompt_tokens, 200);
+        assert_eq!(u.cached_tokens, Some(192));
     }
 
     #[test]

@@ -169,6 +169,17 @@ struct BreakerStream {
     provider_id: String,
     saw_error: bool,
     recorded: bool,
+    /// Budget tracker, shared with the router. Streamed usage rides on the
+    /// terminal usage-bearing chunk (`LlmChunk.usage`), which we stash here
+    /// as it flows past and record against the budget on CLEAN completion.
+    /// Mirrors how `route_with_failover` calls `record_usage` for the
+    /// non-streaming path.
+    budget_tracker: Arc<BudgetTracker>,
+    /// Last `Some(usage)` observed on the stream. Recorded only on a clean
+    /// end-of-stream — a stream that errored returns `Err` and the executor
+    /// falls back to a non-streaming `route()` that records its own usage, so
+    /// recording here too would double-count.
+    pending_usage: Option<athen_core::llm::TokenUsage>,
 }
 
 impl BreakerStream {
@@ -192,9 +203,18 @@ impl BreakerStream {
             return;
         }
         self.recorded = true;
-        let mut bs = self.breakers.lock().unwrap();
-        if let Some(b) = bs.get_mut(&self.provider_id) {
-            b.record_success();
+        {
+            let mut bs = self.breakers.lock().unwrap();
+            if let Some(b) = bs.get_mut(&self.provider_id) {
+                b.record_success();
+            }
+        }
+        // Record streamed token usage against the budget — but only here, on
+        // a clean completion. A mid-stream error takes the `record_failure`
+        // path and never reaches this, so the executor's non-streaming
+        // fallback owns the spend and we don't double-count.
+        if let Some(usage) = self.pending_usage.take() {
+            self.budget_tracker.record_usage(&usage);
         }
     }
 }
@@ -209,7 +229,13 @@ impl futures::Stream for BreakerStream {
         use std::task::Poll;
         let this = self.get_mut();
         match this.inner.as_mut().poll_next(cx) {
-            Poll::Ready(Some(Ok(chunk))) => Poll::Ready(Some(Ok(chunk))),
+            Poll::Ready(Some(Ok(chunk))) => {
+                // Stash the usage-bearing chunk's usage; recorded on clean end.
+                if let Some(usage) = chunk.usage.clone() {
+                    this.pending_usage = Some(usage);
+                }
+                Poll::Ready(Some(Ok(chunk)))
+            }
             Poll::Ready(Some(Err(e))) => {
                 this.saw_error = true;
                 this.record_failure();
@@ -236,7 +262,10 @@ impl futures::Stream for BreakerStream {
 pub struct DefaultLlmRouter {
     providers: HashMap<String, Box<dyn LlmProvider>>,
     profiles: HashMap<ModelProfile, ProfileConfig>,
-    budget_tracker: BudgetTracker,
+    /// `Arc` so the streaming `BreakerStream` wrapper can record streamed
+    /// usage against the same budget on clean completion. The public
+    /// constructor still takes a `BudgetTracker` by value and wraps it.
+    budget_tracker: Arc<BudgetTracker>,
     circuit_breakers: Arc<Mutex<HashMap<String, CircuitBreaker>>>,
 }
 
@@ -258,7 +287,7 @@ impl DefaultLlmRouter {
         Self {
             providers,
             profiles,
-            budget_tracker,
+            budget_tracker: Arc::new(budget_tracker),
             circuit_breakers: Arc::new(Mutex::new(breaker_map)),
         }
     }
@@ -361,7 +390,9 @@ impl DefaultLlmRouter {
                     // after a complete non-streaming response.
                     let breakers = Arc::clone(&self.circuit_breakers);
                     let provider_id = provider_id.clone();
-                    let wrapped = Self::wrap_stream_for_breaker(stream, breakers, provider_id);
+                    let budget = Arc::clone(&self.budget_tracker);
+                    let wrapped =
+                        Self::wrap_stream_for_breaker(stream, breakers, provider_id, budget);
                     return Ok(wrapped);
                 }
                 Err(e) => {
@@ -407,6 +438,7 @@ impl DefaultLlmRouter {
         stream: LlmStream,
         breakers: Arc<Mutex<HashMap<String, CircuitBreaker>>>,
         provider_id: String,
+        budget_tracker: Arc<BudgetTracker>,
     ) -> LlmStream {
         Box::pin(BreakerStream {
             inner: stream,
@@ -414,6 +446,8 @@ impl DefaultLlmRouter {
             provider_id,
             saw_error: false,
             recorded: false,
+            budget_tracker,
+            pending_usage: None,
         })
     }
 
@@ -637,6 +671,7 @@ mod tests {
                         is_final: false,
                         is_thinking: false,
                         tool_calls: vec![],
+                        usage: None,
                     }),
                     Err(AthenError::LlmProvider {
                         provider: id,
@@ -650,12 +685,22 @@ mod tests {
                         is_final: false,
                         is_thinking: false,
                         tool_calls: vec![],
+                        usage: None,
                     }),
                     Ok(LlmChunk {
                         delta: "answer".into(),
                         is_final: true,
                         is_thinking: false,
                         tool_calls: vec![],
+                        // Terminal usage-bearing chunk, as a real provider
+                        // streaming parser emits.
+                        usage: Some(TokenUsage {
+                            prompt_tokens: 120,
+                            completion_tokens: 48,
+                            total_tokens: 168,
+                            estimated_cost_usd: Some(0.002),
+                            ..TokenUsage::default()
+                        }),
                     }),
                 ]
             };
@@ -834,6 +879,78 @@ mod tests {
             router.breaker_state("stream_ok"),
             Some(CircuitState::Closed),
             "a clean stream end must record success and recover the breaker"
+        );
+    }
+
+    /// A clean streamed turn must decrement the budget by the usage carried on
+    /// the terminal chunk — the regression this whole change fixes (streamed
+    /// turns previously reported zero usage, so the budget never moved).
+    #[tokio::test]
+    async fn test_streaming_clean_end_records_usage_against_budget() {
+        use futures::StreamExt;
+
+        let mut providers: HashMap<String, Box<dyn LlmProvider>> = HashMap::new();
+        providers.insert(
+            "stream_ok".into(),
+            Box::new(StreamingMockProvider {
+                id: "stream_ok".into(),
+                error_mid_stream: false,
+            }),
+        );
+        let mut profiles = HashMap::new();
+        profiles.insert(ModelProfile::Powerful, make_profile(vec!["stream_ok"]));
+
+        let router = DefaultLlmRouter::new(providers, profiles, BudgetTracker::new(Some(10.0)));
+
+        // Before consuming: nothing spent.
+        let before = router.budget_remaining().await.unwrap();
+        assert_eq!(before.tokens_used_today, 0);
+        assert!((before.spent_today_usd).abs() < f64::EPSILON);
+
+        // Fully drain the stream (clean end).
+        let mut stream = router.route_streaming(&make_request()).await.unwrap();
+        while stream.next().await.is_some() {}
+
+        // The terminal chunk's usage (168 tokens / $0.002) must be recorded.
+        let after = router.budget_remaining().await.unwrap();
+        assert_eq!(
+            after.tokens_used_today, 168,
+            "streamed turn must record its token usage"
+        );
+        assert!(
+            (after.spent_today_usd - 0.002).abs() < 1e-9,
+            "streamed turn must record its cost, got {}",
+            after.spent_today_usd
+        );
+    }
+
+    /// A mid-stream error must NOT record usage — the executor falls back to a
+    /// non-streaming `route()` that records its own spend, so recording the
+    /// failed stream too would double-count.
+    #[tokio::test]
+    async fn test_streaming_mid_stream_error_records_no_usage() {
+        use futures::StreamExt;
+
+        let mut providers: HashMap<String, Box<dyn LlmProvider>> = HashMap::new();
+        providers.insert(
+            "stream_err".into(),
+            Box::new(StreamingMockProvider {
+                id: "stream_err".into(),
+                error_mid_stream: true,
+            }),
+        );
+        let mut profiles = HashMap::new();
+        profiles.insert(ModelProfile::Powerful, make_profile(vec!["stream_err"]));
+
+        let router = DefaultLlmRouter::new(providers, profiles, BudgetTracker::new(Some(10.0)));
+
+        let mut stream = router.route_streaming(&make_request()).await.unwrap();
+        while stream.next().await.is_some() {}
+
+        let after = router.budget_remaining().await.unwrap();
+        assert_eq!(
+            after.tokens_used_today, 0,
+            "a failed stream must not record usage (fallback owns the spend)"
         );
     }
 

@@ -332,6 +332,7 @@ pub fn extract_streaming_tail(
         is_final: true,
         is_thinking: false,
         tool_calls,
+        usage: None,
     })
 }
 

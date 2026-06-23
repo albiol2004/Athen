@@ -57,6 +57,7 @@ pub trait LlmRouter: Send + Sync {
             is_final: true,
             is_thinking: false,
             tool_calls: vec![],
+            usage: None,
         };
         Ok(Box::pin(tokio_stream::once(Ok(chunk))))
     }

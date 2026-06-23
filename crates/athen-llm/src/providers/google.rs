@@ -516,6 +516,26 @@ impl LlmProvider for GoogleProvider {
             })
             .flat_map(futures::stream::iter);
 
+        // Fallback cost fill: if the streamed event omitted `modelVersion`
+        // the parser couldn't price the usage, so estimate it here from the
+        // configured model — mirrors the non-streaming `complete()` path.
+        let model = self.default_model.clone();
+        let chunk_stream = chunk_stream.map(move |item| match item {
+            Ok(mut chunk) => {
+                if let Some(usage) = chunk.usage.as_mut() {
+                    if usage.estimated_cost_usd.is_none() {
+                        usage.estimated_cost_usd = Some(estimate_google_cost(
+                            &model,
+                            usage.prompt_tokens,
+                            usage.completion_tokens,
+                        ));
+                    }
+                }
+                Ok(chunk)
+            }
+            err => err,
+        });
+
         Ok(Box::pin(chunk_stream))
     }
 
@@ -624,7 +644,7 @@ fn parse_sse_event(event_text: &str) -> Vec<Result<LlmChunk>> {
         return Vec::new();
     }
 
-    let event: GeminiResponse = match serde_json::from_str(&data) {
+    let mut event: GeminiResponse = match serde_json::from_str(&data) {
         Ok(e) => e,
         Err(err) => {
             // A complete `data:` line that still fails JSON parse means
@@ -641,6 +661,14 @@ fn parse_sse_event(event_text: &str) -> Vec<Result<LlmChunk>> {
     };
 
     let mut chunks = Vec::new();
+
+    // Capture usage + model before `event.candidates` is consumed below.
+    // Gemini reports `usageMetadata` on the final streamed chunk (the one
+    // carrying `finishReason`); `cachedContentTokenCount` maps to the
+    // discounted cached-prefix portion. Cost is computed here when the model
+    // version is present, else left `None` for the streaming method to fill.
+    let usage_metadata = event.usage_metadata.take();
+    let model_version = event.model_version.clone();
 
     // Safety block surfaced mid-stream — emit a single error chunk so the
     // consumer sees the reason rather than a silent end-of-stream.
@@ -675,6 +703,7 @@ fn parse_sse_event(event_text: &str) -> Vec<Result<LlmChunk>> {
                         is_final: false,
                         is_thinking: part.thought.unwrap_or(false),
                         tool_calls: vec![],
+                        usage: None,
                     }));
                 }
             }
@@ -692,17 +721,37 @@ fn parse_sse_event(event_text: &str) -> Vec<Result<LlmChunk>> {
                         arguments: call.args.unwrap_or(serde_json::Value::Null),
                         thought_signature: part.thought_signature,
                     }],
+                    usage: None,
                 }));
             }
         }
     }
 
     if has_finish {
+        let usage = usage_metadata.map(|u| {
+            let prompt = u.prompt_token_count.unwrap_or(0);
+            let completion = u.candidates_token_count.unwrap_or(0);
+            let total = u.total_token_count.unwrap_or(prompt + completion);
+            // Cost only when we know the model; otherwise the streaming
+            // method fills it from `self.default_model`.
+            let estimated_cost_usd = model_version
+                .as_deref()
+                .map(|m| estimate_google_cost(m, prompt, completion));
+            TokenUsage {
+                prompt_tokens: prompt,
+                completion_tokens: completion,
+                total_tokens: total,
+                estimated_cost_usd,
+                cached_tokens: u.cached_content_token_count.filter(|&c| c > 0),
+                cache_creation_tokens: None,
+            }
+        });
         chunks.push(Ok(LlmChunk {
             delta: String::new(),
             is_final: true,
             is_thinking: false,
             tool_calls: vec![],
+            usage,
         }));
     }
 
@@ -1029,6 +1078,11 @@ struct GeminiUsageMetadata {
     candidates_token_count: Option<u32>,
     #[serde(rename = "totalTokenCount", default)]
     total_token_count: Option<u32>,
+    /// Portion of `promptTokenCount` served from Gemini's context cache.
+    /// Surfaced into `TokenUsage.cached_tokens`. Absent on responses without
+    /// caching, hence `default`.
+    #[serde(rename = "cachedContentTokenCount", default)]
+    cached_content_token_count: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]

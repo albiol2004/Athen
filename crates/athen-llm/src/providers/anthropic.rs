@@ -351,12 +351,16 @@ impl LlmProvider for AnthropicProvider {
         // extraction failures for inline-format models (MiniMax M2.7).
         let raw_chunks = byte_stream
             .scan(
-                (Vec::<u8>::new(), ToolUseAccumulator::default()),
-                |(buffer, acc), result| {
+                (
+                    Vec::<u8>::new(),
+                    ToolUseAccumulator::default(),
+                    StreamUsageAcc::default(),
+                ),
+                |(buffer, acc, usage), result| {
                     let emitted: Vec<Result<LlmChunk>> = match result {
                         Ok(bytes) => {
                             buffer.extend_from_slice(&bytes);
-                            drain_complete_sse_events(buffer, acc)
+                            drain_complete_sse_events(buffer, acc, usage)
                         }
                         Err(e) => vec![Err(AthenError::LlmProvider {
                             provider: "anthropic".into(),
@@ -411,6 +415,32 @@ impl LlmProvider for AnthropicProvider {
             },
         )
         .flatten();
+
+        // Fill `estimated_cost_usd` on the usage-bearing chunk, billing the
+        // cache read/creation portions at Anthropic's discounted/premium
+        // rates — mirrors the non-streaming `complete()` path. The streaming
+        // request always uses `self.default_model`, so that's the correct
+        // model for pricing.
+        let model = self.default_model.clone();
+        let chunk_stream = chunk_stream.map(move |item| match item {
+            Ok(mut chunk) => {
+                if let Some(usage) = chunk.usage.as_mut() {
+                    if usage.estimated_cost_usd.is_none() {
+                        let cache_read = usage.cached_tokens.unwrap_or(0);
+                        let cache_creation = usage.cache_creation_tokens.unwrap_or(0);
+                        usage.estimated_cost_usd = Some(estimate_anthropic_cost(
+                            &model,
+                            usage.prompt_tokens,
+                            usage.completion_tokens,
+                            cache_read,
+                            cache_creation,
+                        ));
+                    }
+                }
+                Ok(chunk)
+            }
+            err => err,
+        });
 
         Ok(Box::pin(chunk_stream))
     }
@@ -525,15 +555,90 @@ fn anthropic_multimodal_blocks(text: &str, images: &[ImageInput]) -> serde_json:
 fn drain_complete_sse_events(
     buffer: &mut Vec<u8>,
     acc: &mut ToolUseAccumulator,
+    usage: &mut StreamUsageAcc,
 ) -> Vec<Result<LlmChunk>> {
     let mut out = Vec::new();
     while let Some(end) = buffer.windows(2).position(|w| w == b"\n\n") {
         let event_bytes: Vec<u8> = buffer.drain(..end).collect();
         buffer.drain(..2); // drop the `\n\n` terminator
         let event_text = String::from_utf8_lossy(&event_bytes);
-        out.extend(parse_sse_chunks(&event_text, acc));
+        out.extend(parse_sse_chunks(&event_text, acc, usage));
     }
     out
+}
+
+/// Accumulates Anthropic streaming usage across the events that carry it.
+/// `message_start.message.usage` reports `input_tokens`, the cache
+/// read/creation split, and the initial `output_tokens`; later
+/// `message_delta.usage.output_tokens` reports the cumulative output count.
+/// The accumulated [`TokenUsage`] is emitted on the terminal `message_stop`
+/// chunk (cost left `None` — the streaming method fills it).
+#[derive(Debug, Default)]
+struct StreamUsageAcc {
+    input_tokens: u32,
+    output_tokens: u32,
+    cache_read_tokens: u32,
+    cache_creation_tokens: u32,
+    /// Set once any usage field is observed, so we only emit a usage chunk
+    /// when the stream actually reported counts.
+    seen: bool,
+}
+
+impl StreamUsageAcc {
+    /// Merge an Anthropic `usage` JSON object (from `message_start.message`
+    /// or `message_delta`). Fields are last-write-wins for `output_tokens`
+    /// (cumulative across deltas) and first-seen-wins for the input/cache
+    /// counts (only `message_start` reports them).
+    fn merge(&mut self, usage: &serde_json::Value) {
+        let mut touched = false;
+        if let Some(v) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
+            self.input_tokens = v as u32;
+            touched = true;
+        }
+        if let Some(v) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
+            self.output_tokens = v as u32;
+            touched = true;
+        }
+        if let Some(v) = usage
+            .get("cache_read_input_tokens")
+            .and_then(|v| v.as_u64())
+        {
+            self.cache_read_tokens = v as u32;
+            touched = true;
+        }
+        if let Some(v) = usage
+            .get("cache_creation_input_tokens")
+            .and_then(|v| v.as_u64())
+        {
+            self.cache_creation_tokens = v as u32;
+            touched = true;
+        }
+        if touched {
+            self.seen = true;
+        }
+    }
+
+    /// Build the final [`TokenUsage`] if any usage was observed. `prompt_tokens`
+    /// is the uncached input; `total_tokens` adds the cached read/creation
+    /// portions Anthropic reports separately, matching the non-streaming
+    /// parser. Cost is left `None`; the streaming method fills it.
+    fn to_token_usage(&self) -> Option<TokenUsage> {
+        if !self.seen {
+            return None;
+        }
+        Some(TokenUsage {
+            prompt_tokens: self.input_tokens,
+            completion_tokens: self.output_tokens,
+            total_tokens: self.input_tokens
+                + self.cache_read_tokens
+                + self.cache_creation_tokens
+                + self.output_tokens,
+            estimated_cost_usd: None,
+            cached_tokens: (self.cache_read_tokens > 0).then_some(self.cache_read_tokens),
+            cache_creation_tokens: (self.cache_creation_tokens > 0)
+                .then_some(self.cache_creation_tokens),
+        })
+    }
 }
 
 /// Accumulates a native Claude `tool_use` block across the SSE events that
@@ -618,7 +723,11 @@ fn finalize_part(p: PartialToolUse) -> Option<ToolCall> {
 /// into a single [`ToolCall`]. Emitting a tool call also flags the chunk's
 /// `tool_calls` as non-empty, which the streaming wrapper reads to set
 /// `saw_structured` and suppress the inline-text extractor.
-fn parse_sse_chunks(text: &str, acc: &mut ToolUseAccumulator) -> Vec<Result<LlmChunk>> {
+fn parse_sse_chunks(
+    text: &str,
+    acc: &mut ToolUseAccumulator,
+    usage_acc: &mut StreamUsageAcc,
+) -> Vec<Result<LlmChunk>> {
     let mut chunks = Vec::new();
 
     for line in text.lines() {
@@ -630,6 +739,7 @@ fn parse_sse_chunks(text: &str, acc: &mut ToolUseAccumulator) -> Vec<Result<LlmC
                     is_final: true,
                     is_thinking: false,
                     tool_calls: acc.drain(),
+                    usage: usage_acc.to_token_usage(),
                 }));
                 continue;
             }
@@ -691,6 +801,7 @@ fn parse_sse_chunks(text: &str, acc: &mut ToolUseAccumulator) -> Vec<Result<LlmC
                                             is_final: false,
                                             is_thinking: false,
                                             tool_calls: vec![],
+                                            usage: None,
                                         }));
                                     }
                                 }
@@ -707,6 +818,7 @@ fn parse_sse_chunks(text: &str, acc: &mut ToolUseAccumulator) -> Vec<Result<LlmC
                                     is_final: false,
                                     is_thinking: false,
                                     tool_calls: vec![call],
+                                    usage: None,
                                 }));
                             }
                         }
@@ -718,11 +830,27 @@ fn parse_sse_chunks(text: &str, acc: &mut ToolUseAccumulator) -> Vec<Result<LlmC
                                 // Defensive: flush any block that never saw a
                                 // content_block_stop.
                                 tool_calls: acc.drain(),
+                                // Final usage for the whole turn.
+                                usage: usage_acc.to_token_usage(),
                             }));
                         }
+                        // `message_start` carries `message.usage` (input +
+                        // cache split + initial output); `message_delta`
+                        // carries cumulative `usage.output_tokens`. Merge both
+                        // so the terminal `message_stop` chunk reports the
+                        // full turn's token counts.
+                        "message_start" => {
+                            if let Some(u) = event.get("message").and_then(|m| m.get("usage")) {
+                                usage_acc.merge(u);
+                            }
+                        }
+                        "message_delta" => {
+                            if let Some(u) = event.get("usage") {
+                                usage_acc.merge(u);
+                            }
+                        }
                         _ => {
-                            // Ignore other event types (message_start,
-                            // message_delta, ping, etc.)
+                            // Ignore other event types (ping, etc.)
                         }
                     }
                 }
@@ -1218,7 +1346,8 @@ mod tests {
 
         let mut buffer = sse.as_bytes().to_vec();
         let mut acc = ToolUseAccumulator::default();
-        let chunks: Vec<LlmChunk> = drain_complete_sse_events(&mut buffer, &mut acc)
+        let mut usage_acc = StreamUsageAcc::default();
+        let chunks: Vec<LlmChunk> = drain_complete_sse_events(&mut buffer, &mut acc, &mut usage_acc)
             .into_iter()
             .map(|r| r.expect("chunk ok"))
             .collect();
@@ -1245,6 +1374,53 @@ mod tests {
         assert!(chunks.last().expect("a chunk").is_final);
     }
 
+    /// A representative streamed turn: `message_start` carries the input +
+    /// cache split, `message_delta` carries the final output count, and
+    /// `message_stop` terminates. The terminal chunk must carry `Some(usage)`
+    /// with input/output/cache mapped correctly (matching the non-streaming
+    /// parser). Cost is left `None` — the streaming method fills it.
+    #[test]
+    fn streaming_collects_usage_from_message_start_and_delta() {
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-6\",",
+            "\"usage\":{\"input_tokens\":1000,\"output_tokens\":2,",
+            "\"cache_read_input_tokens\":4000,\"cache_creation_input_tokens\":0}}}\n",
+            "\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi.\"}}\n",
+            "\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":57}}\n",
+            "\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n",
+            "\n",
+        );
+
+        let mut buffer = sse.as_bytes().to_vec();
+        let mut acc = ToolUseAccumulator::default();
+        let mut usage_acc = StreamUsageAcc::default();
+        let chunks: Vec<LlmChunk> =
+            drain_complete_sse_events(&mut buffer, &mut acc, &mut usage_acc)
+                .into_iter()
+                .map(|r| r.expect("chunk ok"))
+                .collect();
+
+        let usage = chunks
+            .iter()
+            .find_map(|c| c.usage.clone())
+            .expect("terminal chunk carries usage");
+        assert_eq!(usage.prompt_tokens, 1000);
+        // Cumulative output from message_delta wins over the initial value.
+        assert_eq!(usage.completion_tokens, 57);
+        // total = input + cache_read + cache_creation + output.
+        assert_eq!(usage.total_tokens, 1000 + 4000 + 0 + 57);
+        assert_eq!(usage.cached_tokens, Some(4000));
+        assert_eq!(usage.cache_creation_tokens, None);
+        assert!(usage.estimated_cost_usd.is_none());
+    }
+
     /// A tool_use block with no arguments (empty input) finalizes to `{}`
     /// rather than dropping the call.
     #[test]
@@ -1259,7 +1435,8 @@ mod tests {
         );
         let mut buffer = sse.as_bytes().to_vec();
         let mut acc = ToolUseAccumulator::default();
-        let chunks: Vec<LlmChunk> = drain_complete_sse_events(&mut buffer, &mut acc)
+        let mut usage_acc = StreamUsageAcc::default();
+        let chunks: Vec<LlmChunk> = drain_complete_sse_events(&mut buffer, &mut acc, &mut usage_acc)
             .into_iter()
             .map(|r| r.expect("chunk ok"))
             .collect();

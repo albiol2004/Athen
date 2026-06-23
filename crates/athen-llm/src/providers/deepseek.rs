@@ -245,6 +245,7 @@ impl DeepSeekProvider {
             temperature: request.temperature.unwrap_or(0.7),
             tools,
             stream: false,
+            stream_options: None,
             reasoning_effort,
             thinking,
         }
@@ -386,6 +387,9 @@ impl LlmProvider for DeepSeekProvider {
         crate::providers::reject_multimodal("deepseek", request)?;
         let mut body = self.build_request_body(request);
         body.stream = true;
+        body.stream_options = Some(StreamOptions {
+            include_usage: true,
+        });
         let url = format!("{}/v1/chat/completions", self.base_url);
 
         debug!(model = %body.model, "sending DeepSeek streaming request");
@@ -475,6 +479,7 @@ impl LlmProvider for DeepSeekProvider {
                                     is_final: true,
                                     is_thinking: false,
                                     tool_calls,
+                                    usage: None,
                                 }));
                             }
                         }
@@ -492,6 +497,29 @@ impl LlmProvider for DeepSeekProvider {
             },
         )
         .flatten();
+
+        // Fill `estimated_cost_usd` on the usage-bearing chunk, billing the
+        // cached prefix at DeepSeek's discounted rate — mirrors the
+        // non-streaming `complete()` path. `parse_stream_usage` (shared with
+        // OpenAI) already mapped `prompt_cache_hit_tokens` → `cached_tokens`.
+        let model = self.default_model.clone();
+        let chunk_stream = chunk_stream.map(move |item| match item {
+            Ok(mut chunk) => {
+                if let Some(usage) = chunk.usage.as_mut() {
+                    if usage.estimated_cost_usd.is_none() {
+                        let cache_hit = usage.cached_tokens.unwrap_or(0);
+                        usage.estimated_cost_usd = Some(estimate_deepseek_cost(
+                            &model,
+                            usage.prompt_tokens,
+                            usage.completion_tokens,
+                            cache_hit,
+                        ));
+                    }
+                }
+                Ok(chunk)
+            }
+            err => err,
+        });
 
         Ok(Box::pin(chunk_stream))
     }
@@ -595,12 +623,22 @@ struct OpenAiRequestOut {
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<OpenAiTool>>,
     stream: bool,
+    /// Opt into the terminal usage-only SSE chunk while streaming (DeepSeek
+    /// is OpenAI-compatible). Without it the streamed turn reports no token
+    /// counts and the budget never decrements. Omitted for non-streaming.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'static str>,
     /// V4 Flash defaults to thinking-on. Send `{"type": "disabled"}` to
     /// get a clean non-thinking response. Omitted when `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamOptions {
+    include_usage: bool,
 }
 
 /// DeepSeek V4 chat exposes `reasoning_effort` with only two valid

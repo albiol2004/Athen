@@ -191,7 +191,7 @@ pub enum FinishReason {
     Error,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LlmChunk {
     pub delta: String,
     pub is_final: bool,
@@ -199,6 +199,18 @@ pub struct LlmChunk {
     /// Tool calls extracted from streaming SSE chunks.
     #[serde(default)]
     pub tool_calls: Vec<ToolCall>,
+    /// Token usage for the whole streamed turn, populated only on the
+    /// terminal usage-bearing chunk (the provider emits a single chunk
+    /// carrying `Some(usage)` when the wire delivers final usage —
+    /// OpenAI/DeepSeek's usage-only SSE event, Anthropic's combined
+    /// `message_start` + `message_delta`, Gemini's final `usageMetadata`).
+    /// Every other chunk leaves this `None`. The executor collects the
+    /// last `Some(usage)` to build the synthetic `LlmResponse`, and the
+    /// router's stream wrapper records it against the budget on clean
+    /// completion. Omitted from the wire when `None` so existing chunk
+    /// JSON stays byte-identical and old payloads still deserialize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -416,6 +428,63 @@ mod model_family_tests {
         assert_eq!(ModelFamily::from_wire_id("nope"), None);
         // case-sensitive — wire ids match enum variant names exactly
         assert_eq!(ModelFamily::from_wire_id("default"), None);
+    }
+}
+
+#[cfg(test)]
+mod llm_chunk_tests {
+    use super::*;
+
+    #[test]
+    fn chunk_without_usage_round_trips_and_omits_field() {
+        let chunk = LlmChunk {
+            delta: "hi".into(),
+            is_final: false,
+            is_thinking: false,
+            tool_calls: vec![],
+            usage: None,
+        };
+        let json = serde_json::to_value(&chunk).unwrap();
+        // `usage: None` is skipped on the wire, keeping old payloads identical.
+        assert!(json.get("usage").is_none(), "usage must be omitted: {json}");
+        let back: LlmChunk = serde_json::from_value(json).unwrap();
+        assert!(back.usage.is_none());
+        assert_eq!(back.delta, "hi");
+    }
+
+    #[test]
+    fn chunk_with_usage_round_trips() {
+        let chunk = LlmChunk {
+            delta: String::new(),
+            is_final: true,
+            is_thinking: false,
+            tool_calls: vec![],
+            usage: Some(TokenUsage {
+                prompt_tokens: 100,
+                completion_tokens: 40,
+                total_tokens: 140,
+                estimated_cost_usd: Some(0.0021),
+                cached_tokens: Some(64),
+                cache_creation_tokens: None,
+            }),
+        };
+        let json = serde_json::to_string(&chunk).unwrap();
+        let back: LlmChunk = serde_json::from_str(&json).unwrap();
+        let u = back.usage.expect("usage present");
+        assert_eq!(u.prompt_tokens, 100);
+        assert_eq!(u.completion_tokens, 40);
+        assert_eq!(u.total_tokens, 140);
+        assert_eq!(u.cached_tokens, Some(64));
+        assert!(back.is_final);
+    }
+
+    #[test]
+    fn old_chunk_json_without_usage_still_deserializes() {
+        // A chunk payload from before the `usage` field existed.
+        let legacy = r#"{"delta":"x","is_final":true,"is_thinking":false,"tool_calls":[]}"#;
+        let back: LlmChunk = serde_json::from_str(legacy).unwrap();
+        assert!(back.usage.is_none());
+        assert_eq!(back.delta, "x");
     }
 }
 
