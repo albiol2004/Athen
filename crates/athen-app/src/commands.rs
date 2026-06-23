@@ -636,7 +636,14 @@ fn render_project_volatile_block(project: &athen_persistence::projects::Project)
 /// Technical details are intentionally stripped — they are already logged
 /// via `tracing` and available in console output for debugging.
 fn format_user_error(err: &str) -> String {
-    if err.contains("Timeout") {
+    // No AI provider configured yet (fresh install / skipped onboarding):
+    // the router exhausts every tier because no Connection/Bundle exists.
+    // Surface an actionable message the frontend can detect (it keys off
+    // "Connections" + "API key") to render an "Open Settings" button.
+    if err.contains("providers exhausted") || err.contains("no providers configured") {
+        "No AI provider is set up yet. Open Settings \u{2192} Connections and add an API key to start chatting."
+            .into()
+    } else if err.contains("Timeout") {
         "The request took too long. Try a simpler question or check your internet connection."
             .into()
     } else if err.contains("request failed") || err.contains("Connection") {

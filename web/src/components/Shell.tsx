@@ -33,6 +33,7 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
   const [plan, setPlan] = useState<PlanState | null>(null);
   const [drawer, setDrawer] = useState<Drawer>('none');
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<string | undefined>(undefined);
   const [changesKey, setChangesKey] = useState(0);
   const [projects, setProjects] = useState<Project[]>([]);
   // null = chat surface; a project id = the Project page for that project.
@@ -354,6 +355,11 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
     setPlan(null);
   }, [client]);
 
+  const openSettings = useCallback((tab?: string) => {
+    setSettingsTab(tab);
+    setSettingsOpen(true);
+  }, []);
+
   const cb = useMemo<ChatCallbacks>(
     () => ({
       onSend,
@@ -363,8 +369,9 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
       onDecideGrant,
       onApprovePlan,
       onDiscardPlan,
+      onOpenSettings: openSettings,
     }),
-    [onSend, cancel, onAnswerQuestion, onDecideTask, onDecideGrant, onApprovePlan, onDiscardPlan],
+    [onSend, cancel, onAnswerQuestion, onDecideTask, onDecideGrant, onApprovePlan, onDiscardPlan, openSettings],
   );
 
   const activeMeta = useMemo(() => arcs.find((a) => a.id === activeArc), [arcs, activeArc]);
@@ -547,7 +554,16 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
         />
       )}
       {drawer === 'wakeups' && <Wakeups client={client} onClose={() => setDrawer('none')} />}
-      {settingsOpen && <SettingsModal client={client} onClose={() => setSettingsOpen(false)} />}
+      {settingsOpen && (
+        <SettingsModal
+          client={client}
+          initialTab={settingsTab}
+          onClose={() => {
+            setSettingsOpen(false);
+            setSettingsTab(undefined);
+          }}
+        />
+      )}
     </div>
   );
 }

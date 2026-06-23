@@ -1749,6 +1749,43 @@ function clearChatUI() {
     if (scroller) scroller.scrollTop = 0;
 }
 
+// First-run recovery empty-state. When the user skipped onboarding and has
+// no AI provider configured, the generic "just type below" welcome is a
+// trap — the first message errors out. Replace it (only on an empty chat)
+// with a CTA that routes to Settings → Connections. Best-effort: any IPC
+// failure leaves the normal welcome untouched.
+async function maybeShowNoProviderEmptyState() {
+    // Only meaningful on an empty chat that's still showing the welcome.
+    if (arcHasMessages) return;
+    const welcome = messagesEl.querySelector('.welcome-message');
+    if (!welcome) return;
+    let skipped = false;
+    try {
+        skipped = await invoke('was_onboarding_skipped');
+    } catch (_) {
+        return;
+    }
+    if (!skipped) return;
+    // Re-check the chat is still empty (await may have raced an incoming msg).
+    if (arcHasMessages) return;
+    const stillWelcome = messagesEl.querySelector('.welcome-message');
+    if (!stillWelcome) return;
+
+    const wrap = document.createElement('div');
+    wrap.className = 'welcome-message onboarding-needed';
+    wrap.innerHTML =
+        `<img class="welcome-icon" src="assets/logo.svg" alt="">`
+        + `<h2 class="welcome-headline">One quick step to get started</h2>`
+        + `<p class="welcome-sub">No AI provider is set up yet. Add an API key and Athen is ready to chat.</p>`;
+    const cta = document.createElement('button');
+    cta.type = 'button';
+    cta.className = 'welcome-setup-cta';
+    cta.textContent = 'Open Settings → Connections';
+    cta.addEventListener('click', () => openConnectionsSettings());
+    wrap.appendChild(cta);
+    stillWelcome.replaceWith(wrap);
+}
+
 // Delegated click handler for welcome suggestion chips. Fills the composer
 // with the chip's prompt and focuses it — does NOT auto-submit, so the user
 // can edit before sending.
@@ -2142,6 +2179,9 @@ function addMessage(role, content, meta, entryId) {
             || errorStr.includes('try again');
         const isAuthError = errorStr.includes('api key')
             || errorStr.includes('authentication');
+        // No provider configured yet (fresh install / skipped onboarding).
+        // Backend message: "No AI provider is set up yet. Open Settings → Connections…"
+        const isNoProviderError = errorStr.includes('no ai provider is set up');
 
         if (isRetryable && lastMessage) {
             const retryBtn = document.createElement('button');
@@ -2153,13 +2193,12 @@ function addMessage(role, content, meta, entryId) {
             bubble.appendChild(retryBtn);
         }
 
-        if (isAuthError) {
+        if (isAuthError || isNoProviderError) {
             const settingsLink = document.createElement('button');
             settingsLink.className = 'error-settings-link';
-            settingsLink.textContent = 'Open Settings';
+            settingsLink.textContent = isNoProviderError ? 'Open Settings → Connections' : 'Open Settings';
             settingsLink.addEventListener('click', () => {
-                const settingsBtn = document.getElementById('settings-btn');
-                if (settingsBtn) settingsBtn.click();
+                openConnectionsSettings();
             });
             bubble.appendChild(settingsLink);
         }
@@ -6107,6 +6146,25 @@ function showSettings() {
     settingsView.classList.remove('hidden');
     closeSidebar();
     loadSettings();
+}
+
+// Open Settings and jump straight to the Connections section (where API
+// keys are added). Used by the no-provider recovery CTA so a stranded
+// first-run user lands exactly where they need to be. The Connections
+// section lives inside the "models" tab; its id is assigned by
+// buildSettingsRails() from the <h2>Connections</h2> heading.
+function openConnectionsSettings() {
+    showSettings();
+    try {
+        setSettingsTab('models');
+        const pane = document.querySelector('.settings-tab-pane[data-settings-pane="models"]');
+        const section = document.getElementById('settings-section-connections');
+        if (pane && section) {
+            setSettingsSection(pane, 'settings-section-connections');
+        }
+    } catch (e) {
+        console.warn('[athen] openConnectionsSettings navigation failed:', e);
+    }
 }
 
 function showChat() {
@@ -14446,6 +14504,23 @@ async function finishOnboarding() {
     if (overlay) overlay.style.display = 'none';
 }
 
+// "Skip for now" path. Deliberately does NOT mark onboarding permanently
+// complete — it writes a lighter "skipped" marker (see settings.rs) that
+// suppresses the auto-popping wizard but leaves recovery alive: the chat
+// shows an empty-state CTA pointing to setup, and the no-provider send
+// error renders an "Open Settings → Connections" button.
+async function skipOnboarding() {
+    try {
+        await invoke('skip_onboarding');
+    } catch (e) {
+        console.warn('[athen] skip_onboarding failed:', e);
+    }
+    const overlay = document.getElementById('onboarding-overlay');
+    if (overlay) overlay.style.display = 'none';
+    // Surface the recovery CTA immediately on the empty chat.
+    try { await maybeShowNoProviderEmptyState(); } catch (_) {}
+}
+
 async function finishOnboardingInteractive() {
     try {
         await invoke('complete_onboarding');
@@ -14520,8 +14595,8 @@ function wireOnboardingButtons() {
         onbManualMode = true;
         showOnboardingStep('pick');
     });
-    document.getElementById('onb-skip-1')?.addEventListener('click', finishOnboarding);
-    document.getElementById('onb-skip-2')?.addEventListener('click', finishOnboarding);
+    document.getElementById('onb-skip-1')?.addEventListener('click', skipOnboarding);
+    document.getElementById('onb-skip-2')?.addEventListener('click', skipOnboarding);
     document.getElementById('onb-back-2')?.addEventListener('click', () => showOnboardingStep('welcome'));
     document.getElementById('onb-back-3')?.addEventListener('click', () => showOnboardingStep('pick'));
     document.getElementById('onb-back-4')?.addEventListener('click', () => showOnboardingStep('pick'));
@@ -15048,7 +15123,13 @@ async function maybeRunOnboarding() {
         console.warn('[athen] is_first_launch failed, skipping onboarding:', e);
         return;
     }
-    if (!isFirst) return;
+    if (!isFirst) {
+        // Not a fresh install (or the user skipped). If they skipped without
+        // configuring a provider, surface the recovery CTA on the empty chat
+        // so the first message doesn't dead-end on "all providers exhausted".
+        try { await maybeShowNoProviderEmptyState(); } catch (_) {}
+        return;
+    }
     const overlay = document.getElementById('onboarding-overlay');
     if (!overlay) return;
     overlay.style.display = 'flex';

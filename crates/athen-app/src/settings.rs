@@ -352,6 +352,14 @@ pub(crate) fn save_main_config(config: &AthenConfig) -> Result<(), String> {
 /// Sentinel file name marking onboarding as completed.
 const ONBOARDED_SENTINEL: &str = ".onboarded";
 
+/// Marker file written when the user explicitly *skipped* onboarding without
+/// configuring a provider. It suppresses the wizard from auto-popping on every
+/// launch (we respect the user's choice) but is deliberately distinct from the
+/// `.onboarded` sentinel: a user who skipped still has no AI provider, so the
+/// chat surface shows a recovery CTA pointing back to setup instead of leaving
+/// them stranded on the generic "all providers exhausted" error.
+const SKIPPED_MARKER: &str = ".onboarding_skipped";
+
 /// Pure predicate against an explicit Athen directory. Returns `true` only
 /// when we are confident this is a fresh install. All ambiguous states (I/O
 /// errors, malformed config, partial install) resolve to `false` so we
@@ -359,6 +367,14 @@ const ONBOARDED_SENTINEL: &str = ".onboarded";
 fn is_first_launch_in(athen_dir: &std::path::Path) -> bool {
     // Sentinel takes priority — if onboarding was ever completed, never again.
     if athen_dir.join(ONBOARDED_SENTINEL).exists() {
+        return false;
+    }
+
+    // An explicit "skip" suppresses the auto-popping wizard too — we respect
+    // the user's choice not to be walked through setup. Recovery is still
+    // available: the chat surface detects the missing provider and offers a
+    // CTA back to Settings (see `was_onboarding_skipped`).
+    if athen_dir.join(SKIPPED_MARKER).exists() {
         return false;
     }
 
@@ -426,13 +442,65 @@ pub async fn is_first_launch() -> std::result::Result<bool, String> {
     Ok(is_first_launch_in(&dir))
 }
 
+/// Write the "onboarding skipped" marker. Idempotent. Distinct from the
+/// `.onboarded` sentinel — see [`SKIPPED_MARKER`].
+fn mark_skipped_in(athen_dir: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(athen_dir)
+        .map_err(|e| format!("Failed to create {}: {e}", athen_dir.display()))?;
+    let marker = athen_dir.join(SKIPPED_MARKER);
+    if marker.exists() {
+        return Ok(());
+    }
+    std::fs::write(&marker, b"")
+        .map_err(|e| format!("Failed to write onboarding-skipped marker: {e}"))?;
+    info!("Marked onboarding skipped: {}", marker.display());
+    Ok(())
+}
+
+/// Pure predicate: did the user skip onboarding without configuring a
+/// provider? True only when the skip marker exists AND no `.onboarded`
+/// sentinel was later written (configuring a provider promotes the user to
+/// fully onboarded and clears the recovery CTA).
+fn was_onboarding_skipped_in(athen_dir: &std::path::Path) -> bool {
+    if athen_dir.join(ONBOARDED_SENTINEL).exists() {
+        return false;
+    }
+    athen_dir.join(SKIPPED_MARKER).exists()
+}
+
 /// Mark onboarding as complete. Should be called by the frontend wizard's
-/// "Done" handler after the user has either configured a provider or
-/// explicitly chosen to skip. Idempotent.
+/// terminating handlers *after* the user has successfully configured a
+/// provider. Writing this also clears the lighter "skipped" marker so a
+/// recovered user no longer sees the setup CTA. Idempotent.
 #[tauri::command]
 pub async fn complete_onboarding() -> std::result::Result<(), String> {
     let dir = ensure_athen_dir()?;
+    // A user who previously skipped and is now fully set up should not keep
+    // the recovery marker — remove it best-effort.
+    let _ = std::fs::remove_file(dir.join(SKIPPED_MARKER));
     mark_onboarded_in(&dir)
+}
+
+/// Record that the user explicitly *skipped* onboarding. Unlike
+/// [`complete_onboarding`], this does NOT write the permanent `.onboarded`
+/// sentinel — it writes a lighter marker that suppresses the auto-popping
+/// wizard while leaving the in-chat recovery affordance live. Idempotent.
+#[tauri::command]
+pub async fn skip_onboarding() -> std::result::Result<(), String> {
+    let dir = ensure_athen_dir()?;
+    mark_skipped_in(&dir)
+}
+
+/// Returns `true` when the user skipped onboarding and still has no provider
+/// configured. The frontend uses this to render the empty-state setup CTA
+/// instead of the generic welcome, and to know the chat will error on send.
+#[tauri::command]
+pub async fn was_onboarding_skipped() -> std::result::Result<bool, String> {
+    let dir = match ensure_athen_dir() {
+        Ok(d) => d,
+        Err(_) => return Ok(false),
+    };
+    Ok(was_onboarding_skipped_in(&dir))
 }
 
 // ---------------------------------------------------------------------------

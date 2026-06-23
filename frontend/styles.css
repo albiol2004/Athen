@@ -2546,6 +2546,21 @@ mark.grep-match {
 .error-retry-btn:hover,
 .error-settings-link:hover { background: var(--surface-3); }
 
+/* First-run recovery CTA on an empty chat with no provider configured. */
+.welcome-setup-cta {
+    margin-top: 16px;
+    padding: 10px 20px;
+    background: var(--brand, var(--surface-3));
+    color: #fff;
+    border: none;
+    border-radius: var(--r-md, 10px);
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: filter var(--dur) var(--ease);
+}
+.welcome-setup-cta:hover { filter: brightness(1.08); }
+
 .approval-bubble {
     border: 1px solid var(--border-strong);
     background: var(--surface-1);

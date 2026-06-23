@@ -32,6 +32,8 @@ export interface ChatCallbacks {
   onDecideGrant: (g: GrantRequest, decision: GrantDecision, label: string) => Promise<void>;
   onApprovePlan: () => Promise<void>;
   onDiscardPlan: () => Promise<void>;
+  /** Open Settings, optionally on a specific tab (used by the no-provider CTA). */
+  onOpenSettings: (tab?: string) => void;
 }
 
 type ToolItem = Extract<ChatItem, { kind: 'tool' }>;
@@ -63,7 +65,22 @@ function toRenderUnits(items: ChatItem[]): RenderUnit[] {
 // re-renders per delta. Sealed bubbles / completed tools skip entirely.
 const Item = memo(function Item({ it, cb, client }: { it: ChatItem; cb: ChatCallbacks; client: AthenClient }) {
   switch (it.kind) {
-    case 'msg':
+    case 'msg': {
+      // No-provider recovery: the backend formats the "all providers
+      // exhausted" failure into a friendly message containing this phrase.
+      // Detect it (in agent or system bubbles) and offer a CTA to setup so
+      // the user isn't stranded on a cryptic error with no recourse.
+      const noProvider = /no ai provider is set up/i.test(it.content);
+      if (noProvider) {
+        return (
+          <div className={`msg ${it.role === 'system' ? 'system' : 'agent'} no-provider`}>
+            <div>{it.content}</div>
+            <button className="no-provider-cta" onClick={() => cb.onOpenSettings('models')}>
+              Open Settings → Connections
+            </button>
+          </div>
+        );
+      }
       if (it.role === 'system') return <div className="msg system">{it.content}</div>;
       if (it.role === 'user') return <div className="msg user">{it.content}</div>;
       return (
@@ -71,6 +88,7 @@ const Item = memo(function Item({ it, cb, client }: { it: ChatItem; cb: ChatCall
           {it.streaming ? it.content : <Markdown text={it.content} />}
         </div>
       );
+    }
     case 'thinking':
       return <ThinkingBlock content={it.content} done={it.done} />;
     case 'tool':

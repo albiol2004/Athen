@@ -129,6 +129,8 @@ pub fn run() {
             bundle_settings::duplicate_bundle,
             settings::is_first_launch,
             settings::complete_onboarding,
+            settings::skip_onboarding,
+            settings::was_onboarding_skipped,
             settings::detect_device_capabilities,
             settings::list_provider_catalog,
             settings::list_curated_models,

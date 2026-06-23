@@ -14,7 +14,7 @@ import { PanelContacts } from './PanelContacts';
 import { PanelMemory } from './PanelMemory';
 import { PanelProjects } from './PanelProjects';
 
-type TabId = 'models' | 'agents' | 'connections' | 'security' | 'contacts' | 'memory' | 'projects';
+export type TabId = 'models' | 'agents' | 'connections' | 'security' | 'contacts' | 'memory' | 'projects';
 
 const stroke = { stroke: 'currentColor', strokeWidth: 1.7, strokeLinecap: 'round', strokeLinejoin: 'round', fill: 'none' } as const;
 
@@ -75,11 +75,16 @@ const TABS: { id: TabId; label: string }[] = [
 export function SettingsModal({
   client,
   onClose,
+  initialTab,
 }: {
   client: AthenClient;
   onClose: () => void;
+  initialTab?: string;
 }): JSX.Element {
-  const [tab, setTab] = useState<TabId>('models');
+  const isTabId = (t: string | undefined): t is TabId =>
+    t === 'models' || t === 'agents' || t === 'connections' || t === 'security'
+    || t === 'contacts' || t === 'memory' || t === 'projects';
+  const [tab, setTab] = useState<TabId>(isTabId(initialTab) ? initialTab : 'models');
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
