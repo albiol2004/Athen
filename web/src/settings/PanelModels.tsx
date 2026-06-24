@@ -98,11 +98,19 @@ interface BundledStatus {
 
 const TIERS = ['cheap', 'fast', 'code', 'powerful'] as const;
 type TierKey = (typeof TIERS)[number];
+// "Judges" is the display name for the Cheap tier (wire key stays
+// "cheap"): it runs triage/judges/classifiers/extractors, not tasks.
 const TIER_LABEL: Record<TierKey, string> = {
-  cheap: 'Cheap',
+  cheap: 'Judges',
   fast: 'Fast',
   code: 'Code',
   powerful: 'Powerful',
+};
+const TIER_HINT: Record<TierKey, string> = {
+  cheap: 'Triage, judges, classifiers, fact extraction — high-volume, parallel. Use a cheap/fast model (external API ideal).',
+  fast: 'The actual task work — the agent doing your request. Point at your main / local model.',
+  code: 'Optional coding-task specialist. Falls back to Fast.',
+  powerful: 'Optional upgrade for hard tasks. Falls back to Fast.',
 };
 
 interface ProviderForm {
@@ -509,7 +517,7 @@ function BundlesSection({
               const conn = cur?.connection_id ?? '';
               return (
                 <div key={tier} className="st-tier-row">
-                  <span className="st-tier-label">{TIER_LABEL[tier]}</span>
+                  <span className="st-tier-label" title={TIER_HINT[tier]}>{TIER_LABEL[tier]}</span>
                   <select
                     value={conn}
                     onChange={(e) => {

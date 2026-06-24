@@ -8258,10 +8258,18 @@ async function handleSaveMcpConfig(card, entry) {
 
 const BUNDLE_TIERS = ['cheap', 'fast', 'code', 'powerful'];
 const BUNDLE_TIER_LABELS = {
-    cheap: 'Cheap',
+    // "Judges" is the display name for the Cheap tier (wire key stays
+    // "cheap"): it runs triage/judges/classifiers/extractors, not tasks.
+    cheap: 'Judges',
     fast: 'Fast',
     code: 'Code',
     powerful: 'Powerful',
+};
+const BUNDLE_TIER_HINTS = {
+    cheap: 'Triage, judges, classifiers, fact extraction — high-volume, parallel. Use a cheap/fast model (external API ideal).',
+    fast: 'The actual task work — the agent doing your request. Point at your main / local model.',
+    code: 'Optional coding-task specialist. Falls back to Fast.',
+    powerful: 'Optional upgrade for hard tasks. Falls back to Fast.',
 };
 
 // Sentinel value in the model-select dropdown signalling "user wants to
@@ -8462,7 +8470,7 @@ function createBundleCard(bundle, providers) {
     tierRows.className = 'provider-field';
     tierRows.innerHTML = `
         <label>Tier picks</label>
-        <div class="field-hint">Sparse Bundles are valid — Code falls back to Fast, Fast falls back to Cheap.</div>
+        <div class="field-hint">Sparse Bundles are valid — Code &amp; Powerful fall back to Fast, Fast falls back to Judges.</div>
     `;
     for (const t of BUNDLE_TIERS) {
         const pick = bundle.tiers[t] || { connection_id: '', slug: '' };
@@ -8475,7 +8483,7 @@ function createBundleCard(bundle, providers) {
         const slugMatched = pick.slug && curated.some((m) => m.slug === pick.slug);
         const customVisible = !slugMatched && (pick.slug || curated.length === 0);
         row.innerHTML = `
-            <span class="provider-tier-label">${BUNDLE_TIER_LABELS[t]}</span>
+            <span class="provider-tier-label" title="${escapeHtml(BUNDLE_TIER_HINTS[t] || '')}">${BUNDLE_TIER_LABELS[t]}</span>
             <select class="bundle-tier-connection">${connectionOptions(pick.connection_id)}</select>
             <select class="bundle-tier-model">${buildModelSelectOptions(curated, pick.slug || '')}</select>
             <input type="text" class="bundle-tier-slug" value="${escapeHtml(pick.slug || '')}" placeholder="custom slug (e.g. deepseek-v4-flash)" style="${customVisible ? '' : 'display: none;'}">

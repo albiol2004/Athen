@@ -14,6 +14,9 @@ interface ProfileRow {
 
 const EFFORTS = ['default', 'off', 'minimal', 'low', 'medium', 'high', 'max'];
 const TIERS = ['auto', 'Cheap', 'Fast', 'Code', 'Powerful'];
+// Display label per tier wire value. "Cheap" shows as "Judges" (the
+// auxiliary triage/judges tier); the stored override value stays "Cheap".
+const tierLabel = (x: string): string => (x === 'Cheap' ? 'Judges' : x);
 const MODES = ['global', 'bunker', 'assistant', 'yolo'];
 
 export function ArcPickers({
@@ -73,7 +76,7 @@ export function ArcPickers({
       >
         {TIERS.map((x) => (
           <option key={x} value={x}>
-            {x === 'auto' ? 'Tier: auto' : `Tier: ${x}`}
+            {x === 'auto' ? 'Tier: auto' : `Tier: ${tierLabel(x)}`}
           </option>
         ))}
       </select>

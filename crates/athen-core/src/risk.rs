@@ -71,10 +71,18 @@ pub enum ComplexityTag {
 /// Map a complexity tag to the model tier the main executor should use.
 /// Hardcoded today; a per-profile mapping is a future option but YAGNI
 /// while there's exactly one main-executor call site honouring this.
+///
+/// Low and Medium both route to `Fast`: `Fast` is the *task-execution*
+/// tier (the model that actually does the user's work — typically local
+/// inference). `Cheap` is deliberately NOT a task-execution tier — it is
+/// reserved for high-parallelism auxiliary calls (triage, judges,
+/// classifiers, extractors), which is why the Bundle UI labels it
+/// "Judges". Sending easy tasks to `Cheap` would push real task work onto
+/// that auxiliary tier (often an external API), defeating the split. Only
+/// `High` escalates above `Fast`, to `Powerful`.
 pub fn complexity_to_tier(tag: ComplexityTag) -> ModelProfile {
     match tag {
-        ComplexityTag::Low => ModelProfile::Cheap,
-        ComplexityTag::Medium => ModelProfile::Fast,
+        ComplexityTag::Low | ComplexityTag::Medium => ModelProfile::Fast,
         ComplexityTag::High => ModelProfile::Powerful,
     }
 }
@@ -179,7 +187,9 @@ mod complexity_tests {
 
     #[test]
     fn complexity_to_tier_maps_expected() {
-        assert_eq!(complexity_to_tier(ComplexityTag::Low), ModelProfile::Cheap);
+        // Low and Medium both route to the Fast (task-execution) tier;
+        // Cheap is reserved for auxiliary "Judges" calls, never tasks.
+        assert_eq!(complexity_to_tier(ComplexityTag::Low), ModelProfile::Fast);
         assert_eq!(
             complexity_to_tier(ComplexityTag::Medium),
             ModelProfile::Fast
@@ -264,10 +274,11 @@ mod complexity_tests {
 
     #[test]
     fn resolve_tier_non_code_paths_match_complexity_to_tier() {
-        // No code flag: behaviour identical to the old complexity-only path.
+        // No code flag: behaviour follows complexity_to_tier — Low and
+        // Medium both land on Fast (task-execution tier).
         assert_eq!(
             resolve_tier_from_signals(Some(ComplexityTag::Low), false, ModelProfile::Fast),
-            ModelProfile::Cheap
+            ModelProfile::Fast
         );
         assert_eq!(
             resolve_tier_from_signals(Some(ComplexityTag::Medium), false, ModelProfile::Fast),

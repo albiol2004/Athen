@@ -146,7 +146,7 @@
                         <span class="profile-picker-label">Tier:</span>
                         <select id="arc-tier-picker" class="profile-picker">
                             <option value="auto">Auto</option>
-                            <option value="Cheap">Cheap</option>
+                            <option value="Cheap">Judges</option>
                             <option value="Fast">Fast</option>
                             <option value="Code">Code</option>
                             <option value="Powerful">Powerful</option>
@@ -291,7 +291,7 @@
             <div class="settings-tab-pane active" data-settings-pane="models">
             <section class="settings-section">
                 <h2>Bundles</h2>
-                <p class="settings-description">A Bundle picks which Connection &amp; model to use for each tier (Cheap / Fast / Code / Powerful). Switch Bundles to swap your whole loadout at once.</p>
+                <p class="settings-description">A Bundle picks which Connection &amp; model to use for each tier. <strong>Judges</strong> runs the high-volume, parallel auxiliary calls (risk triage, completion judges, classifiers, fact extraction) — put a cheap, fast model here, ideally an external API. <strong>Fast</strong> runs the actual task work (the agent doing your request) — point it at your main / local model. <strong>Code</strong> and <strong>Powerful</strong> are optional upgrades for coding and hard tasks (both fall back to Fast). Switch Bundles to swap your whole loadout at once.</p>
                 <div class="setting-row bundle-active-row">
                     <label for="active-bundle-select">Active Bundle</label>
                     <select id="active-bundle-select" class="settings-select"></select>

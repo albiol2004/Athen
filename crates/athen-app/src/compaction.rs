@@ -528,8 +528,10 @@ impl ArcCompactor for LlmArcCompactor {
             &write_entries,
         ));
 
+        // Arc compaction is a background summarization aux call — runs on
+        // the Cheap ("Judges") tier, not the Fast task-execution tier.
         let request = LlmRequest {
-            profile: ModelProfile::Fast,
+            profile: ModelProfile::Cheap,
             messages: vec![ChatMessage {
                 role: Role::User,
                 content: MessageContent::Text(prompt_body),
@@ -768,8 +770,10 @@ repeat boilerplate. Output only the updated summary."
         prompt_body.push_str(&delta);
 
         // 7. Cheap-tier LLM call — mirrors `LlmArcCompactor::compact`.
+        // Compaction is a background summarization aux call, so it rides
+        // the Cheap ("Judges") tier, not the Fast task-execution tier.
         let request = LlmRequest {
-            profile: ModelProfile::Fast,
+            profile: ModelProfile::Cheap,
             messages: vec![ChatMessage {
                 role: Role::User,
                 content: MessageContent::Text(prompt_body),

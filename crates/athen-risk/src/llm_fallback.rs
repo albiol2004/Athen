@@ -192,7 +192,11 @@ impl LlmRiskEvaluator {
         );
 
         LlmRequest {
-            profile: ModelProfile::Fast,
+            // Risk triage is the highest-frequency, most parallelism-heavy
+            // LLM call in the system — it fires on (nearly) every action.
+            // It belongs on the Cheap ("Judges") tier alongside the other
+            // classifiers/judges, not on the Fast task-execution tier.
+            profile: ModelProfile::Cheap,
             messages: vec![ChatMessage {
                 role: Role::User,
                 content: MessageContent::Text(user_message),
@@ -370,7 +374,8 @@ mod tests {
             _ => panic!("Expected text content"),
         }
         assert!(req.system_prompt.is_some());
-        assert_eq!(req.profile, ModelProfile::Fast);
+        // Triage rides the Cheap ("Judges") tier — see build_request.
+        assert_eq!(req.profile, ModelProfile::Cheap);
         assert_eq!(req.temperature, Some(0.0));
     }
 
