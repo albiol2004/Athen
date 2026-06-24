@@ -170,7 +170,9 @@ function ConnectionsSection({
       isNew: true,
       hasKey: false,
       tierDefaults: {
-        Cheap: entry.default_tier_cheap,
+        // "Judges" is the renamed Cheap tier; the catalog field keeps its
+        // historical default_tier_cheap name (a slug source, not a tier key).
+        Judges: entry.default_tier_cheap,
         Fast: entry.default_tier_fast,
         Code: entry.default_tier_code,
         Powerful: entry.default_tier_powerful,

@@ -128,7 +128,7 @@ fn build_router(api_key: String) -> Arc<DefaultLlmRouter> {
     profiles.insert(ModelProfile::Powerful, profile.clone());
     profiles.insert(ModelProfile::Fast, profile.clone());
     profiles.insert(ModelProfile::Code, profile.clone());
-    profiles.insert(ModelProfile::Cheap, profile);
+    profiles.insert(ModelProfile::Judges, profile);
 
     let budget = BudgetTracker::new(None);
 
@@ -204,7 +204,7 @@ fn build_openai_compat_router(
     profiles.insert(ModelProfile::Powerful, profile.clone());
     profiles.insert(ModelProfile::Fast, profile.clone());
     profiles.insert(ModelProfile::Code, profile.clone());
-    profiles.insert(ModelProfile::Cheap, profile);
+    profiles.insert(ModelProfile::Judges, profile);
 
     let budget = BudgetTracker::new(None);
     Arc::new(DefaultLlmRouter::new(providers, profiles, budget))

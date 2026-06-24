@@ -182,7 +182,7 @@ pub struct LlmSeed {
     /// Provider id, e.g. `"deepseek"`. Maps to the key in
     /// `models.providers` and the env var name.
     pub provider_id: String,
-    /// Model slug routed to all four tiers (Cheap/Fast/Code/Powerful).
+    /// Model slug routed to all four tiers (Judges/Fast/Code/Powerful).
     pub slug: String,
     /// API key injected into the container env. Never written to the file.
     pub api_key: String,
@@ -263,7 +263,7 @@ pub fn generate_models_toml(seed: &LlmSeed, now: DateTime<Utc>) -> String {
     //   - `[providers.<id>.tier_models]` → HashMap<ModelProfile, String>; empty table is fine
     //     because #[serde(default)] on ModelsConfig + ProviderConfig
     //   - `[bundles.<uuid>.tiers.Fast]` etc. → HashMap<ModelProfile, BundleTier>;
-    //     ModelProfile variant names: "Fast", "Cheap", "Code", "Powerful"
+    //     ModelProfile variant names: "Fast", "Judges", "Code", "Powerful"
     //   - `connection_id` / `slug` are BundleTier fields (snake_case, no rename)
     //   - `[assignments]` → HashMap<String,String>; keys "active_provider" + "active_bundle"
     //   - `[profiles]` → HashMap<String,ProfileConfig>; empty, #[serde(default)] so omittable
@@ -300,7 +300,7 @@ updated_at = "{ts}"
 connection_id = "{id}"
 slug = "{slug}"
 
-[bundles.{bundle_id_str}.tiers.Cheap]
+[bundles.{bundle_id_str}.tiers.Judges]
 connection_id = "{id}"
 slug = "{slug}"
 
@@ -451,7 +451,7 @@ mod tests {
         let parsed: ModelsConfigSurface = toml::from_str(&toml_str).expect("parse");
         let bundle_id = parsed.assignments["active_bundle"].clone();
         let bundle = &parsed.bundles[&bundle_id];
-        for tier in &["Fast", "Cheap", "Code", "Powerful"] {
+        for tier in &["Fast", "Judges", "Code", "Powerful"] {
             let t = bundle
                 .tiers
                 .get(*tier)

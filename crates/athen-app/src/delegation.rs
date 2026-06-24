@@ -389,7 +389,7 @@ async fn verify_deliverable(
             role: athen_core::llm::Role::User,
             content: athen_core::llm::MessageContent::Text(prompt),
         }],
-        profile: athen_core::llm::ModelProfile::Cheap,
+        profile: athen_core::llm::ModelProfile::Judges,
         max_tokens: Some(64),
         temperature: Some(0.0),
         tools: None,

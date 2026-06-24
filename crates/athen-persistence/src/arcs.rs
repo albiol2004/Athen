@@ -167,8 +167,8 @@ pub struct ArcMeta {
     /// in-flight snapshot.
     pub reasoning_effort_override: Option<String>,
     /// User-set per-arc tier override. Stored as the serialized
-    /// `ModelProfile` wire form (`"Cheap"` / `"Fast"` / `"Code"` /
-    /// `"Powerful"`) so adding tiers later doesn't require a type
+    /// `ModelProfile` wire form (`"Judges"` / `"Fast"` / `"Code"` /
+    /// `"Powerful"`; legacy `"Cheap"`) so adding tiers later doesn't require a type
     /// migration. `None` means "fall through to the task's complexity
     /// tag (if any) and otherwise to the static call-site tier". Same
     /// last-write-wins semantics as `reasoning_effort_override` —
@@ -1177,8 +1177,8 @@ impl ArcStore {
     /// Set (or clear) the per-arc tier override. Last-write-wins: a user
     /// toggling tier mid-task takes effect on the next LLM call. Pass
     /// `None` to clear; pass `Some(wire_str)` where `wire_str` is the
-    /// serialized `ModelProfile` variant name (`"Cheap"`, `"Fast"`,
-    /// `"Code"`, `"Powerful"`). Validation of the wire form happens
+    /// serialized `ModelProfile` variant name (`"Judges"`, `"Fast"`,
+    /// `"Code"`, `"Powerful"`; legacy `"Cheap"`). Validation of the wire form happens
     /// upstream in the Tauri command — this setter trusts its caller.
     pub async fn set_tier_override(&self, id: &str, value: Option<&str>) -> Result<()> {
         let conn = self.conn.clone();

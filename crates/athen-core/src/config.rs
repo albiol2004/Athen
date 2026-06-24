@@ -334,7 +334,7 @@ impl ModelsConfig {
         let default_slug = provider.default_model.clone();
         let mut tiers: HashMap<ModelProfile, BundleTier> = HashMap::new();
         for profile in [
-            ModelProfile::Cheap,
+            ModelProfile::Judges,
             ModelProfile::Fast,
             ModelProfile::Code,
             ModelProfile::Powerful,

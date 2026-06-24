@@ -533,7 +533,7 @@ impl NotificationOrchestrator {
         );
 
         let request = LlmRequest {
-            profile: ModelProfile::Cheap,
+            profile: ModelProfile::Judges,
             messages: vec![ChatMessage {
                 role: Role::User,
                 content: MessageContent::Text(prompt),

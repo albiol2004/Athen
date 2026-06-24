@@ -531,7 +531,7 @@ impl ArcCompactor for LlmArcCompactor {
         // Arc compaction is a background summarization aux call — runs on
         // the Cheap ("Judges") tier, not the Fast task-execution tier.
         let request = LlmRequest {
-            profile: ModelProfile::Cheap,
+            profile: ModelProfile::Judges,
             messages: vec![ChatMessage {
                 role: Role::User,
                 content: MessageContent::Text(prompt_body),
@@ -773,7 +773,7 @@ repeat boilerplate. Output only the updated summary."
         // Compaction is a background summarization aux call, so it rides
         // the Cheap ("Judges") tier, not the Fast task-execution tier.
         let request = LlmRequest {
-            profile: ModelProfile::Cheap,
+            profile: ModelProfile::Judges,
             messages: vec![ChatMessage {
                 role: Role::User,
                 content: MessageContent::Text(prompt_body),

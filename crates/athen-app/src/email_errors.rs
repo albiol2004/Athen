@@ -364,7 +364,7 @@ pub async fn translate_with_llm(
         Role as LlmRole,
     };
     let request = LlmRequest {
-        profile: ModelProfile::Cheap,
+        profile: ModelProfile::Judges,
         messages: vec![LlmChatMessage {
             role: LlmRole::User,
             content: LlmContent::Text(user_msg),

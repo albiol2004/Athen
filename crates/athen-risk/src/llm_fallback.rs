@@ -196,7 +196,7 @@ impl LlmRiskEvaluator {
             // LLM call in the system — it fires on (nearly) every action.
             // It belongs on the Cheap ("Judges") tier alongside the other
             // classifiers/judges, not on the Fast task-execution tier.
-            profile: ModelProfile::Cheap,
+            profile: ModelProfile::Judges,
             messages: vec![ChatMessage {
                 role: Role::User,
                 content: MessageContent::Text(user_message),
@@ -375,7 +375,7 @@ mod tests {
         }
         assert!(req.system_prompt.is_some());
         // Triage rides the Cheap ("Judges") tier — see build_request.
-        assert_eq!(req.profile, ModelProfile::Cheap);
+        assert_eq!(req.profile, ModelProfile::Judges);
         assert_eq!(req.temperature, Some(0.0));
     }
 

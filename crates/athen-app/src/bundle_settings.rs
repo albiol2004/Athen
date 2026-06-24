@@ -70,7 +70,7 @@ fn to_tiers_view(bundle: &Bundle) -> BundleTiersView {
         })
     };
     BundleTiersView {
-        cheap: pick(ModelProfile::Cheap),
+        cheap: pick(ModelProfile::Judges),
         fast: pick(ModelProfile::Fast),
         code: pick(ModelProfile::Code),
         powerful: pick(ModelProfile::Powerful),
@@ -81,7 +81,7 @@ fn from_tiers_view(view: &BundleTiersView) -> HashMap<ModelProfile, BundleTier> 
     let mut out = HashMap::new();
     if let Some(t) = &view.cheap {
         out.insert(
-            ModelProfile::Cheap,
+            ModelProfile::Judges,
             BundleTier {
                 connection_id: t.connection_id.clone(),
                 slug: t.slug.clone(),
@@ -147,7 +147,7 @@ fn active_id_of(models: &ModelsConfig) -> String {
 pub(crate) fn derive_primary_connection(bundle: &Bundle) -> Option<(String, String)> {
     for tier in [
         ModelProfile::Fast,
-        ModelProfile::Cheap,
+        ModelProfile::Judges,
         ModelProfile::Code,
         ModelProfile::Powerful,
         ModelProfile::Local,
@@ -410,7 +410,7 @@ mod tests {
         let b = mk_bundle(
             "x",
             &[
-                (ModelProfile::Cheap, "deepseek", "v4-flash"),
+                (ModelProfile::Judges, "deepseek", "v4-flash"),
                 (ModelProfile::Fast, "anthropic", "claude-sonnet-4-6"),
             ],
         );
@@ -425,7 +425,7 @@ mod tests {
             "x",
             &[
                 (ModelProfile::Powerful, "openai", "gpt-5"),
-                (ModelProfile::Cheap, "deepseek", "v4-flash"),
+                (ModelProfile::Judges, "deepseek", "v4-flash"),
             ],
         );
         let (cid, _) = derive_primary_connection(&b).unwrap();
@@ -443,7 +443,7 @@ mod tests {
         let b = mk_bundle(
             "Default",
             &[
-                (ModelProfile::Cheap, "deepseek", "v4-flash"),
+                (ModelProfile::Judges, "deepseek", "v4-flash"),
                 (ModelProfile::Code, "anthropic", "claude-opus-4-7"),
             ],
         );
@@ -456,7 +456,7 @@ mod tests {
         // Round-trip back.
         let map = from_tiers_view(&view);
         assert_eq!(map.len(), 2);
-        assert_eq!(map.get(&ModelProfile::Cheap).unwrap().slug, "v4-flash");
+        assert_eq!(map.get(&ModelProfile::Judges).unwrap().slug, "v4-flash");
         assert_eq!(
             map.get(&ModelProfile::Code).unwrap().connection_id,
             "anthropic"

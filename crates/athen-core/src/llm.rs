@@ -10,7 +10,13 @@ pub enum ModelProfile {
     Powerful,
     Fast,
     Code,
-    Cheap,
+    /// High-parallelism auxiliary tier — risk triage, completion judges,
+    /// classifiers, fact extraction, compaction. NOT a task-execution tier
+    /// (that's `Fast`). Serialized as `"Judges"`; the `alias` accepts the
+    /// legacy `"Cheap"` key so configs written before the rename still
+    /// load. The display label and wire string are now both "Judges".
+    #[serde(rename = "Judges", alias = "Cheap")]
+    Judges,
     Local,
 }
 

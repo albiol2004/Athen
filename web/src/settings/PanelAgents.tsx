@@ -301,7 +301,7 @@ function ProfilesSection({ client }: { client: AthenClient }) {
                 onChange={(e) => setForm({ ...form, model_profile_hint: e.target.value })}
               >
                 <option value="">(none)</option>
-                <option value="Cheap">Judges</option>
+                <option value="Judges">Judges</option>
                 <option value="Fast">Fast</option>
                 <option value="Code">Code</option>
                 <option value="Powerful">Powerful</option>

@@ -1134,7 +1134,7 @@ async fn classify_tier_for_turn(
     user_text.push_str(user_message);
 
     let request = LlmRequest {
-        profile: ModelProfile::Cheap,
+        profile: ModelProfile::Judges,
         messages: vec![LlmChatMessage {
             role: LlmRole::User,
             content: LlmContent::Text(user_text),
@@ -1243,7 +1243,7 @@ pub(crate) async fn classify_goal_intent(
             role: LlmRole::User,
             content: LlmContent::Text(prompt),
         }],
-        profile: ModelProfile::Cheap,
+        profile: ModelProfile::Judges,
         max_tokens: Some(5),
         temperature: Some(0.0),
         tools: None,
@@ -1330,7 +1330,7 @@ async fn judge_worth_remembering(
     );
 
     let request = LlmRequest {
-        profile: ModelProfile::Cheap,
+        profile: ModelProfile::Judges,
         messages: vec![LlmChatMessage {
             role: LlmRole::User,
             content: LlmContent::Text(prompt),
@@ -7373,10 +7373,11 @@ pub(crate) async fn set_arc_reasoning_effort_core(
 /// Set the per-arc tier override. `None` / `"auto"` / `""` clears it so
 /// the executor falls back to the task's complexity tag (when available)
 /// and otherwise to the static call-site label. Valid wire values are
-/// the `ModelProfile` variant names: `"Cheap"`, `"Fast"`, `"Code"`,
-/// `"Powerful"`. We parse to `ModelProfile` first for validation, then
-/// persist the canonical wire form — so a malformed value can never
-/// land in the DB and trip the resolver's warn-and-fallthrough path.
+/// the `ModelProfile` variant names: `"Judges"`, `"Fast"`, `"Code"`,
+/// `"Powerful"` (plus the legacy `"Cheap"`, normalized to `"Judges"`).
+/// We validate against that set first, then persist the canonical wire
+/// form — so a malformed value can never land in the DB and trip the
+/// resolver's warn-and-fallthrough path.
 #[tauri::command]
 pub async fn set_arc_tier(
     arc_id: String,
@@ -7398,7 +7399,10 @@ pub(crate) async fn set_arc_tier_core(
         None | Some("") | Some("auto") => None,
         Some(s) => {
             let canonical = match s.trim() {
-                "Cheap" => "Cheap",
+                "Judges" => "Judges",
+                // Legacy wire string from before the Cheap→Judges rename —
+                // normalize to the canonical "Judges" on write.
+                "Cheap" => "Judges",
                 "Fast" => "Fast",
                 "Code" => "Code",
                 "Powerful" => "Powerful",

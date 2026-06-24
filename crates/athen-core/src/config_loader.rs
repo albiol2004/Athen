@@ -313,11 +313,11 @@ default_model = "deepseek-chat"
         // Both legacy and unified provider rows present. Collision on
         // Cheap (different slugs) — Anthropic-entry slug should win.
         let mut legacy_tiers: HashMap<ModelProfile, String> = HashMap::new();
-        legacy_tiers.insert(ModelProfile::Cheap, "minimax-m2.5".into());
+        legacy_tiers.insert(ModelProfile::Judges, "minimax-m2.5".into());
         legacy_tiers.insert(ModelProfile::Powerful, "minimax-m2.7".into());
 
         let mut unified_tiers: HashMap<ModelProfile, String> = HashMap::new();
-        unified_tiers.insert(ModelProfile::Cheap, "deepseek-v4-flash".into());
+        unified_tiers.insert(ModelProfile::Judges, "deepseek-v4-flash".into());
         unified_tiers.insert(ModelProfile::Code, "deepseek-v4-pro".into());
 
         config.models.providers.insert(
@@ -380,7 +380,7 @@ default_model = "deepseek-chat"
             .expect("opencode_go must survive merge");
         // Anthropic-entry Cheap slug wins on collision.
         assert_eq!(
-            unified.tier_models.get(&ModelProfile::Cheap),
+            unified.tier_models.get(&ModelProfile::Judges),
             Some(&"minimax-m2.5".to_string())
         );
         // Anthropic-entry Powerful slug copied across.
@@ -411,7 +411,7 @@ default_model = "deepseek-chat"
         let mut config = AthenConfig::default();
 
         let mut tier_models: HashMap<ModelProfile, String> = HashMap::new();
-        tier_models.insert(ModelProfile::Cheap, "deepseek-v4-flash".into());
+        tier_models.insert(ModelProfile::Judges, "deepseek-v4-flash".into());
         tier_models.insert(ModelProfile::Code, "minimax-m2.7".into());
 
         config.models.providers.insert(
@@ -457,7 +457,7 @@ default_model = "deepseek-chat"
         assert_eq!(
             bundle
                 .tiers
-                .get(&ModelProfile::Cheap)
+                .get(&ModelProfile::Judges)
                 .map(|t| t.slug.as_str()),
             Some("deepseek-v4-flash")
         );

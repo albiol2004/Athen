@@ -313,7 +313,7 @@ fn pick_tier(bundle: &Bundle, tier: ModelProfile) -> Option<&athen_core::config:
         ModelProfile::Fast => bundle
             .tiers
             .get(&ModelProfile::Fast)
-            .or_else(|| bundle.tiers.get(&ModelProfile::Cheap)),
+            .or_else(|| bundle.tiers.get(&ModelProfile::Judges)),
         _ => bundle.tiers.get(&tier),
     }
 }

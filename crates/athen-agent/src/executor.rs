@@ -1564,7 +1564,7 @@ impl DefaultExecutor {
                 role: Role::User,
                 content: MessageContent::Text(prompt),
             }],
-            profile: ModelProfile::Cheap,
+            profile: ModelProfile::Judges,
             max_tokens: Some(5),
             temperature: Some(0.0),
             tools: None,

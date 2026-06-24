@@ -13,10 +13,7 @@ interface ProfileRow {
 }
 
 const EFFORTS = ['default', 'off', 'minimal', 'low', 'medium', 'high', 'max'];
-const TIERS = ['auto', 'Cheap', 'Fast', 'Code', 'Powerful'];
-// Display label per tier wire value. "Cheap" shows as "Judges" (the
-// auxiliary triage/judges tier); the stored override value stays "Cheap".
-const tierLabel = (x: string): string => (x === 'Cheap' ? 'Judges' : x);
+const TIERS = ['auto', 'Judges', 'Fast', 'Code', 'Powerful'];
 const MODES = ['global', 'bunker', 'assistant', 'yolo'];
 
 export function ArcPickers({
@@ -41,7 +38,10 @@ export function ArcPickers({
 
   const meta = arc as unknown as Record<string, unknown>;
   const effort = (meta.reasoning_effort_override as string | null) ?? 'default';
-  const tier = (meta.tier_override as string | null) ?? 'auto';
+  // Normalize the legacy "Cheap" override to the renamed "Judges" tier so an
+  // arc pinned before the rename still selects the matching option.
+  const rawTier = (meta.tier_override as string | null) ?? 'auto';
+  const tier = rawTier === 'Cheap' ? 'Judges' : rawTier;
   const mode = (meta.security_mode_override as string | null) ?? 'global';
 
   return (
@@ -76,7 +76,7 @@ export function ArcPickers({
       >
         {TIERS.map((x) => (
           <option key={x} value={x}>
-            {x === 'auto' ? 'Tier: auto' : `Tier: ${tierLabel(x)}`}
+            {x === 'auto' ? 'Tier: auto' : `Tier: ${x}`}
           </option>
         ))}
       </select>

@@ -1458,7 +1458,7 @@ If the body is followed by an "[Attachments on this message ...]" block, those f
             role: LlmRole::User,
             content: LlmContent::Text(prompt),
         }],
-        profile: ModelProfile::Cheap,
+        profile: ModelProfile::Judges,
         max_tokens: Some(200),
         temperature: Some(0.1),
         tools: None,

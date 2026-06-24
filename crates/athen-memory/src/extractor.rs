@@ -28,7 +28,7 @@ Only include clearly stated entities. Be concise."#;
 impl EntityExtractor for LlmEntityExtractor {
     async fn extract(&self, text: &str) -> Result<ExtractionResult> {
         let request = LlmRequest {
-            profile: ModelProfile::Cheap,
+            profile: ModelProfile::Judges,
             messages: vec![ChatMessage {
                 role: Role::User,
                 content: MessageContent::Text(format!("{EXTRACTION_PROMPT}\n\nText:\n{text}")),

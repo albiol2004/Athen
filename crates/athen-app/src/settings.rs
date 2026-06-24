@@ -104,8 +104,9 @@ pub struct ProviderInfo {
     /// Sampling temperature override. `None` lets the provider adapter pick
     /// its baked-in default.
     pub temperature: Option<f32>,
-    /// Per-tier model slugs. Wire-string keys ("Cheap" | "Fast" | "Code" |
-    /// "Powerful"), values are model slugs. Missing keys or empty strings
+    /// Per-tier model slugs. Wire-string keys ("Judges" | "Fast" | "Code" |
+    /// "Powerful"; legacy "Cheap" also accepted), values are model slugs.
+    /// Missing keys or empty strings
     /// mean "use `model` (the default)". The frontend renders one input
     /// per tier so the user can edit them.
     pub tier_models: HashMap<String, String>,
@@ -711,14 +712,17 @@ fn default_family(id: &str) -> &str {
     }
 }
 
-/// Parse a wire-string ModelProfile from the frontend ("Cheap" / "Fast" /
-/// "Code" / "Powerful"). Returns `None` for anything else so a stale or
+/// Parse a wire-string ModelProfile from the frontend ("Judges" / "Fast" /
+/// "Code" / "Powerful"; legacy "Cheap" maps to Judges). Returns `None` for
+/// anything else so a stale or
 /// typo'd payload silently falls through to "use default_model" rather
 /// than poisoning the config.
 fn parse_model_profile(s: &str) -> Option<athen_core::llm::ModelProfile> {
     use athen_core::llm::ModelProfile;
     match s {
-        "Cheap" => Some(ModelProfile::Cheap),
+        "Judges" => Some(ModelProfile::Judges),
+        // Legacy wire string from before the Cheap→Judges rename.
+        "Cheap" => Some(ModelProfile::Judges),
         "Fast" => Some(ModelProfile::Fast),
         "Code" => Some(ModelProfile::Code),
         "Powerful" => Some(ModelProfile::Powerful),
@@ -1224,7 +1228,7 @@ fn provider_config_to_info(id: &str, config: &ProviderConfig, active_id: &str) -
     let mut tier_models_wire: HashMap<String, String> = HashMap::new();
     for (profile, slug) in &config.tier_models {
         let key = match profile {
-            athen_core::llm::ModelProfile::Cheap => "Cheap",
+            athen_core::llm::ModelProfile::Judges => "Judges",
             athen_core::llm::ModelProfile::Fast => "Fast",
             athen_core::llm::ModelProfile::Code => "Code",
             athen_core::llm::ModelProfile::Powerful => "Powerful",
@@ -1454,12 +1458,13 @@ pub(crate) async fn get_settings_core(
             // returned by `bundle_settings::list_bundles`.
             let id = b.id.to_string();
             let tiers = crate::bundle_settings::BundleTiersView {
-                cheap: b.tiers.get(&athen_core::llm::ModelProfile::Cheap).map(|t| {
-                    crate::bundle_settings::BundleTierView {
+                cheap: b
+                    .tiers
+                    .get(&athen_core::llm::ModelProfile::Judges)
+                    .map(|t| crate::bundle_settings::BundleTierView {
                         connection_id: t.connection_id.clone(),
                         slug: t.slug.clone(),
-                    }
-                }),
+                    }),
                 fast: b.tiers.get(&athen_core::llm::ModelProfile::Fast).map(|t| {
                     crate::bundle_settings::BundleTierView {
                         connection_id: t.connection_id.clone(),
@@ -1561,8 +1566,9 @@ pub(crate) async fn save_provider_core(
     compaction_trigger_pct: Option<u8>,
     compaction_target_pct: Option<u8>,
     temperature: Option<f32>,
-    // Wire-string keys: "Cheap" | "Fast" | "Code" | "Powerful". Frontend
-    // posts a flat object; we parse each key into the typed enum. Missing
+    // Wire-string keys: "Judges" | "Fast" | "Code" | "Powerful" (legacy
+    // "Cheap" accepted). Frontend posts a flat object; we parse each key
+    // into the typed enum. Missing
     // keys are treated as "fall back to default_model"; empty strings are
     // also skipped so a cleared input behaves identically.
     tier_models: Option<HashMap<String, String>>,
@@ -1726,7 +1732,7 @@ pub(crate) async fn save_provider_core(
         _ => existing.map(|p| p.family).unwrap_or_default(),
     };
 
-    // Tier models: parse the wire-string map ("Cheap" → slug, …) into the
+    // Tier models: parse the wire-string map ("Judges" → slug, …) into the
     // typed enum. Empty strings are dropped so a cleared input falls back
     // to `default_model`. `None` from the caller preserves the existing
     // map verbatim so editing other fields can't accidentally wipe per-
@@ -2114,7 +2120,7 @@ pub(crate) async fn set_active_provider_core(
         athen_core::config::BundleTier,
     > = std::collections::HashMap::new();
     for tier in [
-        athen_core::llm::ModelProfile::Cheap,
+        athen_core::llm::ModelProfile::Judges,
         athen_core::llm::ModelProfile::Fast,
         athen_core::llm::ModelProfile::Code,
         athen_core::llm::ModelProfile::Powerful,

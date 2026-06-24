@@ -4476,7 +4476,7 @@ No explanation. No markdown."#
             role: LlmRole::User,
             content: LlmContent::Text(prompt),
         }],
-        profile: ModelProfile::Cheap,
+        profile: ModelProfile::Judges,
         max_tokens: Some(40),
         temperature: Some(0.1),
         tools: None,
@@ -5003,14 +5003,14 @@ fn pick_bundle_tier(bundle: &Bundle, tier: ModelProfile) -> Option<(String, Stri
             .map(|bt| (bt.connection_id.clone(), bt.slug.clone()));
     }
     let ladder: &[ModelProfile] = match tier {
-        ModelProfile::Code => &[ModelProfile::Code, ModelProfile::Fast, ModelProfile::Cheap],
+        ModelProfile::Code => &[ModelProfile::Code, ModelProfile::Fast, ModelProfile::Judges],
         ModelProfile::Powerful => &[
             ModelProfile::Powerful,
             ModelProfile::Fast,
-            ModelProfile::Cheap,
+            ModelProfile::Judges,
         ],
-        ModelProfile::Fast => &[ModelProfile::Fast, ModelProfile::Cheap],
-        ModelProfile::Cheap => &[ModelProfile::Cheap],
+        ModelProfile::Fast => &[ModelProfile::Fast, ModelProfile::Judges],
+        ModelProfile::Judges => &[ModelProfile::Judges],
         ModelProfile::Local => unreachable!("Local handled above"),
     };
     for t in ladder {
@@ -5025,7 +5025,7 @@ fn pick_bundle_tier(bundle: &Bundle, tier: ModelProfile) -> Option<(String, Stri
         ModelProfile::Powerful,
         ModelProfile::Fast,
         ModelProfile::Code,
-        ModelProfile::Cheap,
+        ModelProfile::Judges,
     ] {
         if let Some(bt) = bundle.tiers.get(&t) {
             return Some((bt.connection_id.clone(), bt.slug.clone()));
@@ -5106,7 +5106,9 @@ fn parse_model_profile_wire(s: &str) -> Option<ModelProfile> {
         "Powerful" => Some(ModelProfile::Powerful),
         "Fast" => Some(ModelProfile::Fast),
         "Code" => Some(ModelProfile::Code),
-        "Cheap" => Some(ModelProfile::Cheap),
+        "Judges" => Some(ModelProfile::Judges),
+        // Legacy wire string from before the Cheap→Judges rename.
+        "Cheap" => Some(ModelProfile::Judges),
         "Local" => Some(ModelProfile::Local),
         _ => None,
     }
@@ -5699,7 +5701,7 @@ pub(crate) fn build_router_for_provider(
     // provider instance under the default slug, preserving the legacy
     // single-model behaviour for configs that predate the per-tier field.
     for tier in [
-        ModelProfile::Cheap,
+        ModelProfile::Judges,
         ModelProfile::Fast,
         ModelProfile::Code,
         ModelProfile::Powerful,
@@ -5770,7 +5772,7 @@ pub(crate) fn build_router_for_bundle(
     let mut built_keys: HashMap<String, String> = HashMap::new();
 
     for tier in [
-        ModelProfile::Cheap,
+        ModelProfile::Judges,
         ModelProfile::Fast,
         ModelProfile::Code,
         ModelProfile::Powerful,
@@ -5898,7 +5900,7 @@ fn build_startup_router(config: &AthenConfig) -> (Arc<DefaultLlmRouter>, String,
 fn derive_primary_connection_pair(bundle: &Bundle) -> Option<(String, String)> {
     for tier in [
         ModelProfile::Fast,
-        ModelProfile::Cheap,
+        ModelProfile::Judges,
         ModelProfile::Code,
         ModelProfile::Powerful,
         ModelProfile::Local,
@@ -6678,7 +6680,7 @@ mod resolve_effective_tier_tests {
             ModelProfile::Fast,
         )
         .await;
-        assert_eq!(tier, ModelProfile::Cheap);
+        assert_eq!(tier, ModelProfile::Judges);
     }
 
     /// No override but a complexity tag is present — the tag maps to a
@@ -6733,15 +6735,18 @@ mod resolve_effective_tier_tests {
             .await
             .unwrap();
 
+        // High complexity → Powerful, distinct from the Fast default, so a
+        // pass proves the unknown override fell through to the complexity
+        // path rather than silently using the default or a wrong tier.
         let tier = resolve_effective_tier_for_arc(
             Some(&store),
             "arc4",
-            Some(ComplexityTag::Low),
+            Some(ComplexityTag::High),
             false,
             ModelProfile::Fast,
         )
         .await;
-        assert_eq!(tier, ModelProfile::Cheap);
+        assert_eq!(tier, ModelProfile::Powerful);
     }
 
     /// `is_code_task` flips the resolved tier to `Code` for Low/Medium
@@ -7185,7 +7190,7 @@ mod resolve_effective_provider_tests {
                 "main",
                 &[
                     (ModelProfile::Powerful, "opencode_go", "deepseek-v4-pro"),
-                    (ModelProfile::Cheap, "opencode_go", "deepseek-v4-flash"),
+                    (ModelProfile::Judges, "opencode_go", "deepseek-v4-flash"),
                 ],
             ),
         );
@@ -7328,7 +7333,7 @@ mod resolve_effective_provider_tests {
             &mut cfg,
             mk_bundle(
                 "Cheap-only",
-                &[(ModelProfile::Cheap, "deepseek", "deepseek-v4-flash")],
+                &[(ModelProfile::Judges, "deepseek", "deepseek-v4-flash")],
             ),
         );
 
@@ -7425,7 +7430,7 @@ mod build_router_override_slug_tests {
         // Tier map says Cheap=A, Fast=B, Code=C, Powerful=D — would
         // pick a different slug per tier under normal routing.
         let mut tiers: HashMap<ModelProfile, String> = HashMap::new();
-        tiers.insert(ModelProfile::Cheap, "cheap-slug".into());
+        tiers.insert(ModelProfile::Judges, "cheap-slug".into());
         tiers.insert(ModelProfile::Fast, "fast-slug".into());
         tiers.insert(ModelProfile::Code, "code-slug".into());
         tiers.insert(ModelProfile::Powerful, "powerful-slug".into());
@@ -7445,7 +7450,7 @@ mod build_router_override_slug_tests {
         let expected = vec!["openai.kimi-k2.5".to_string()];
         // Every tier collapses to the pinned slug's single provider key.
         for tier in [
-            ModelProfile::Cheap,
+            ModelProfile::Judges,
             ModelProfile::Fast,
             ModelProfile::Code,
             ModelProfile::Powerful,
@@ -7465,7 +7470,7 @@ mod build_router_override_slug_tests {
     #[test]
     fn no_override_preserves_tier_models_routing() {
         let mut tiers: HashMap<ModelProfile, String> = HashMap::new();
-        tiers.insert(ModelProfile::Cheap, "cheap-slug".into());
+        tiers.insert(ModelProfile::Judges, "cheap-slug".into());
         tiers.insert(ModelProfile::Powerful, "powerful-slug".into());
         // Fast + Code are unset → fall back to default_model.
 
@@ -7482,7 +7487,7 @@ mod build_router_override_slug_tests {
         );
 
         assert_eq!(
-            router.profile_provider_keys(ModelProfile::Cheap),
+            router.profile_provider_keys(ModelProfile::Judges),
             &["openai.cheap-slug".to_string()]
         );
         assert_eq!(

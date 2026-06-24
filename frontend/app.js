@@ -1085,7 +1085,10 @@ function renderTierPicker() {
     if (!sel) return;
     sel.disabled = !activeArcId;
     const meta = activeArcId ? arcMetaById.get(activeArcId) : null;
-    sel.value = (meta && meta.tier_override) || 'auto';
+    // Normalize the legacy "Cheap" override string to the renamed "Judges"
+    // tier so an arc pinned before the rename still selects the right option.
+    const stored = (meta && meta.tier_override) || 'auto';
+    sel.value = stored === 'Cheap' ? 'Judges' : stored;
 }
 
 async function onTierChange(ev) {
