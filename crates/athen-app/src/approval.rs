@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::FutureExt;
 use serde::Serialize;
 use tokio::sync::{oneshot, Mutex};
 use tracing::{info, warn};
@@ -258,18 +259,28 @@ impl TelegramApprovalSink {
             let chat_id = p.chat_id;
             let msg_id = p.message_id;
             let confirmation = format!("{label} ✓");
-            tokio::spawn(async move {
-                if let Err(e) = athen_sentidos::telegram::edit_message_text(
-                    &token,
-                    chat_id,
-                    msg_id,
-                    &confirmation,
-                )
-                .await
-                {
-                    warn!("Failed to edit Telegram approval message: {e}");
-                }
-            });
+            // Fire-and-forget: the JoinHandle is dropped, so a panic here
+            // would vanish silently. Contain it and log loudly instead.
+            tokio::spawn(
+                std::panic::AssertUnwindSafe(async move {
+                    if let Err(e) = athen_sentidos::telegram::edit_message_text(
+                        &token,
+                        chat_id,
+                        msg_id,
+                        &confirmation,
+                    )
+                    .await
+                    {
+                        warn!("Failed to edit Telegram approval message: {e}");
+                    }
+                })
+                .catch_unwind()
+                .map(|res| {
+                    if res.is_err() {
+                        warn!("Telegram approval-edit task PANICKED");
+                    }
+                }),
+            );
         }
 
         info!(
@@ -359,18 +370,28 @@ impl ApprovalSink for TelegramApprovalSink {
         };
         if let Some(p) = posted {
             let token = self.bot_token.clone();
-            tokio::spawn(async move {
-                if let Err(e) = athen_sentidos::telegram::edit_message_text(
-                    &token,
-                    p.chat_id,
-                    p.message_id,
-                    "(Approval handled elsewhere.)",
-                )
-                .await
-                {
-                    warn!("Failed to edit cancelled Telegram approval: {e}");
-                }
-            });
+            // Fire-and-forget: contain panics so a crash here logs loudly
+            // rather than vanishing with the dropped JoinHandle.
+            tokio::spawn(
+                std::panic::AssertUnwindSafe(async move {
+                    if let Err(e) = athen_sentidos::telegram::edit_message_text(
+                        &token,
+                        p.chat_id,
+                        p.message_id,
+                        "(Approval handled elsewhere.)",
+                    )
+                    .await
+                    {
+                        warn!("Failed to edit cancelled Telegram approval: {e}");
+                    }
+                })
+                .catch_unwind()
+                .map(|res| {
+                    if res.is_err() {
+                        warn!("Telegram approval-cancel task PANICKED");
+                    }
+                }),
+            );
         }
         Ok(())
     }
@@ -384,21 +405,32 @@ impl ApprovalSink for TelegramApprovalSink {
 /// callback ids.
 fn ack_callback(token: String, callback_id: String, text: &str) {
     let text_owned = text.to_string();
-    tokio::spawn(async move {
-        if let Err(e) =
-            athen_sentidos::telegram::answer_callback_query(&token, &callback_id, &text_owned).await
-        {
-            // Stale callbacks (queued during a previous run, or older than
-            // Telegram's ack window) come back as "query is too old". Not
-            // worth a warn — drop to debug so a relaunch isn't noisy.
-            let msg = e.to_string();
-            if msg.contains("query is too old") || msg.contains("query ID is invalid") {
-                tracing::debug!("Skipping stale Telegram callback ack: {msg}");
-            } else {
-                warn!("Failed to answer Telegram callback: {e}");
+    // Fire-and-forget: capture panics so a crashed ack task logs loudly
+    // instead of disappearing with its dropped JoinHandle.
+    tokio::spawn(
+        std::panic::AssertUnwindSafe(async move {
+            if let Err(e) =
+                athen_sentidos::telegram::answer_callback_query(&token, &callback_id, &text_owned)
+                    .await
+            {
+                // Stale callbacks (queued during a previous run, or older than
+                // Telegram's ack window) come back as "query is too old". Not
+                // worth a warn — drop to debug so a relaunch isn't noisy.
+                let msg = e.to_string();
+                if msg.contains("query is too old") || msg.contains("query ID is invalid") {
+                    tracing::debug!("Skipping stale Telegram callback ack: {msg}");
+                } else {
+                    warn!("Failed to answer Telegram callback: {e}");
+                }
             }
-        }
-    });
+        })
+        .catch_unwind()
+        .map(|res| {
+            if res.is_err() {
+                warn!("Telegram callback-ack task PANICKED");
+            }
+        }),
+    );
 }
 
 pub fn parse_callback_data(data: &str) -> Option<(Uuid, String)> {

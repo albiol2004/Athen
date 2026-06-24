@@ -16,7 +16,16 @@ pub mod user_input;
 use athen_core::error::{AthenError, Result};
 use athen_core::event::SenseEvent;
 use athen_core::traits::sense::SenseMonitor;
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
+
+/// First respawn delay used by [`SenseRunner::run_supervised`].
+const SUPERVISION_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Ceiling for [`SenseRunner::run_supervised`]'s exponential backoff. A
+/// permanently-failing monitor (e.g. its event channel is gone for good)
+/// settles here instead of retrying in a tight loop.
+const SUPERVISION_BACKOFF_CAP: Duration = Duration::from_secs(60);
 
 /// Runs a [`SenseMonitor`] in a polling loop, forwarding events through a channel.
 ///
@@ -97,6 +106,75 @@ impl<M: SenseMonitor> SenseRunner<M> {
     /// Get a reference to the underlying monitor.
     pub fn monitor(&self) -> &M {
         &self.monitor
+    }
+
+    /// Supervise [`Self::run`] so the monitor never silently goes deaf.
+    ///
+    /// ## Supervision contract
+    ///
+    /// `run` exits cleanly (`Ok`) only on a shutdown signal; any `Err`
+    /// (today: the event channel was dropped) is an *unexpected* exit. On an
+    /// unexpected exit this method logs the cause loudly and re-runs after a
+    /// bounded exponential backoff (`1s → 2s → … → 60s` cap) so a permanently
+    /// broken monitor settles at the ceiling instead of hot-looping. A clean
+    /// shutdown stops without respawning, so supervision never fights a
+    /// deliberate teardown.
+    ///
+    /// Each attempt subscribes a **fresh** receiver from `shutdown_tx`, so a
+    /// shutdown fired between attempts is observed on the next subscribe and
+    /// ends supervision immediately. Pass the *sender* (not a receiver) so the
+    /// supervisor can keep re-subscribing across restarts.
+    pub async fn run_supervised(&self, shutdown_tx: broadcast::Sender<()>) {
+        let sense_id = self.monitor.sense_id().to_string();
+        let mut backoff = SUPERVISION_INITIAL_BACKOFF;
+        // A dedicated long-lived receiver used only to race the backoff sleep,
+        // so a shutdown fired *while we're backing off* is observed instead of
+        // missed (a fresh broadcast subscribe won't receive an already-sent
+        // pulse). Kept across iterations.
+        let mut backoff_shutdown = shutdown_tx.subscribe();
+
+        loop {
+            // Each attempt subscribes a fresh receiver for the inner `run`.
+            // If the host drops the sender entirely (app teardown), the next
+            // `recv()` inside `run` returns `Closed`, which `run` also treats
+            // as a clean stop — so we never respawn into a torn-down host.
+            let shutdown_rx = shutdown_tx.subscribe();
+
+            match self.run(shutdown_rx).await {
+                Ok(()) => {
+                    // Clean stop — `run` returns Ok only on a shutdown signal
+                    // (or a closed shutdown channel). Never respawn.
+                    tracing::info!(
+                        sense = %sense_id,
+                        "Supervised sense exited cleanly; not respawning"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        sense = %sense_id,
+                        "Supervised sense exited unexpectedly: {e}; respawning after {:?}",
+                        backoff
+                    );
+                }
+            }
+
+            // Back off before respawning, but bail immediately if a shutdown
+            // arrives (or the channel closes) during the wait — otherwise a
+            // deliberate teardown would be delayed by up to the full backoff,
+            // and a shutdown fired now would be missed by the next subscribe.
+            tokio::select! {
+                _ = tokio::time::sleep(backoff) => {}
+                _ = backoff_shutdown.recv() => {
+                    tracing::info!(
+                        sense = %sense_id,
+                        "Supervised sense shutdown during backoff; not respawning"
+                    );
+                    return;
+                }
+            }
+            backoff = (backoff * 2).min(SUPERVISION_BACKOFF_CAP);
+        }
     }
 }
 
@@ -199,5 +277,58 @@ mod tests {
 
         let _ = shutdown_tx.send(());
         handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_supervised_stops_on_shutdown_signal() {
+        // A clean shutdown must end supervision (no respawn loop).
+        let monitor = UserInputMonitor::new(16);
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let runner = SenseRunner::new(monitor, event_tx);
+
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let shutdown_tx2 = shutdown_tx.clone();
+
+        let handle = tokio::spawn(async move { runner.run_supervised(shutdown_tx2).await });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = shutdown_tx.send(());
+
+        // Supervisor returns (does not respawn) within a reasonable time.
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("supervisor did not stop on shutdown")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_supervised_respawns_after_channel_drop_then_stops() {
+        // Drop the event receiver so `run` fails with a closed-channel error
+        // (unexpected exit). The supervisor must log + back off + respawn,
+        // and then stop cleanly once shutdown fires.
+        let monitor = UserInputMonitor::new(16);
+        let tx = monitor.sender();
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let runner = SenseRunner::new(monitor, event_tx);
+
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let shutdown_tx2 = shutdown_tx.clone();
+
+        // Queue a message and drop the receiver so the first send fails.
+        tx.send("boom".to_string()).await.unwrap();
+        drop(event_rx);
+
+        let handle = tokio::spawn(async move { runner.run_supervised(shutdown_tx2).await });
+
+        // Let it fail at least once and enter backoff (initial backoff is 1s).
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Fire shutdown; the supervisor observes it on the next attempt and
+        // stops without looping forever.
+        let _ = shutdown_tx.send(());
+
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("supervisor did not stop after channel drop + shutdown")
+            .unwrap();
     }
 }

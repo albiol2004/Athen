@@ -57,6 +57,65 @@ use athen_web::{
 
 use crate::file_gate::PendingGrants;
 
+/// Poison-recovery helpers for the long-lived `std::sync` locks below.
+///
+/// These locks guard simple data holders (a hot-swappable provider `Arc`, an
+/// optional sender, a shutdown channel) — there are no multi-step invariants
+/// that a mid-operation panic could leave half-applied. A poisoned guard here
+/// therefore means "some other thread panicked while holding the lock", NOT
+/// "the protected data is corrupt". Athen is a long-running daemon: a single
+/// poisoned lock in a hot path would otherwise turn every later `.expect()`
+/// into a cascading panic and brick the UI for the rest of the session. So we
+/// recover the inner guard (`into_inner`) instead of propagating the poison.
+trait LockRecover {
+    type Guard<'a>
+    where
+        Self: 'a;
+    /// Lock, recovering the guard even if the lock was poisoned by a prior
+    /// panic. See [`LockRecover`] for why this is safe for these holders.
+    fn lock_recover(&self) -> Self::Guard<'_>;
+}
+
+trait RwLockRecover {
+    type Read<'a>
+    where
+        Self: 'a;
+    type Write<'a>
+    where
+        Self: 'a;
+    /// Read-lock, recovering the guard even if poisoned. See [`LockRecover`].
+    fn read_recover(&self) -> Self::Read<'_>;
+    /// Write-lock, recovering the guard even if poisoned. See [`LockRecover`].
+    fn write_recover(&self) -> Self::Write<'_>;
+}
+
+impl<T> LockRecover for std::sync::Mutex<T> {
+    type Guard<'a>
+        = std::sync::MutexGuard<'a, T>
+    where
+        T: 'a;
+    fn lock_recover(&self) -> Self::Guard<'_> {
+        self.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl<T> RwLockRecover for std::sync::RwLock<T> {
+    type Read<'a>
+        = std::sync::RwLockReadGuard<'a, T>
+    where
+        T: 'a;
+    type Write<'a>
+        = std::sync::RwLockWriteGuard<'a, T>
+    where
+        T: 'a;
+    fn read_recover(&self) -> Self::Read<'_> {
+        self.read().unwrap_or_else(|e| e.into_inner())
+    }
+    fn write_recover(&self) -> Self::Write<'_> {
+        self.write().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 /// Per-profile embedding cache: profile id → (the profile's `updated_at`
 /// at the time we cached, the embedding vector). The `updated_at` doubles
 /// as the cache key — when a user edits a profile we re-embed.
@@ -837,9 +896,19 @@ pub(crate) async fn assemble_base_app_tool_registry(
 /// `factory` is `FnMut` so it can be called once per attempt to rebuild a
 /// fresh loop future (each monitor re-subscribes its broadcast shutdown
 /// receiver and re-clones its deps inside the closure).
+///
+/// ## Backoff contract
+///
+/// `initial_backoff` is the delay before the *first* respawn; each
+/// consecutive unexpected exit doubles it up to [`SUPERVISION_BACKOFF_CAP`]
+/// (so a permanently-failing task settles at the ceiling instead of
+/// hot-looping the CPU). The backoff is **reset to `initial_backoff` after a
+/// run that survived at least [`SUPERVISION_HEALTHY_RUN`]** — i.e. a monitor
+/// that ran fine for a while and then dies once doesn't inherit the penalty
+/// of an earlier crash storm. A clean stop never sleeps or respawns.
 async fn spawn_supervised<F, Fut, S>(
     name: &'static str,
-    backoff: std::time::Duration,
+    initial_backoff: std::time::Duration,
     mut should_stop: S,
     mut factory: F,
 ) where
@@ -847,6 +916,7 @@ async fn spawn_supervised<F, Fut, S>(
     Fut: std::future::Future<Output = ()> + Send + 'static,
     S: FnMut() -> bool + Send + 'static,
 {
+    let mut backoff = initial_backoff;
     loop {
         if should_stop() {
             info!(
@@ -856,6 +926,7 @@ async fn spawn_supervised<F, Fut, S>(
             return;
         }
 
+        let attempt_started = std::time::Instant::now();
         let handle = tauri::async_runtime::spawn(factory());
         match handle.await {
             Ok(()) => {
@@ -900,9 +971,33 @@ async fn spawn_supervised<F, Fut, S>(
             );
             return;
         }
+
+        // A run that stayed up past the "healthy" threshold proves the task
+        // can run — treat the next failure as a fresh incident and reset the
+        // ramp. Otherwise keep climbing toward the cap so a tight crash-loop
+        // (panic-on-startup) can't peg a core.
+        if attempt_started.elapsed() >= SUPERVISION_HEALTHY_RUN {
+            backoff = initial_backoff;
+        }
+        warn!(
+            monitor = name,
+            backoff_secs = backoff.as_secs(),
+            "Supervised monitor respawning after backoff"
+        );
         tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(SUPERVISION_BACKOFF_CAP);
     }
 }
+
+/// Ceiling for [`spawn_supervised`]'s exponential backoff. A monitor that
+/// keeps dying settles here rather than retrying forever at sub-second
+/// intervals.
+const SUPERVISION_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A supervised attempt that ran at least this long before exiting is treated
+/// as "was healthy"; the backoff ramp resets so an isolated late failure
+/// doesn't inherit an earlier crash storm's penalty.
+const SUPERVISION_HEALTHY_RUN: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Build a sub-agent's registry + router factories from the live `AppState`
 /// (reached through the [`crate::ui_bridge::UiBridge`] — Tauri managed state
@@ -1452,12 +1547,9 @@ impl AppState {
         // We take() conceptually but only have &self here, so just clone
         // the inner Sender — broadcast senders are cheap to clone and
         // can be dropped freely after the send.
+        pulse!(self.email_shutdown.lock_recover().clone(), "email monitor");
         pulse!(
-            self.email_shutdown.lock().ok().and_then(|g| g.clone()),
-            "email monitor"
-        );
-        pulse!(
-            self.telegram_shutdown.lock().ok().and_then(|g| g.clone()),
+            self.telegram_shutdown.lock_recover().clone(),
             "telegram monitor"
         );
         pulse!(self.calendar_shutdown.as_ref().cloned(), "calendar monitor");
@@ -1477,7 +1569,8 @@ impl AppState {
         // wrapping `std::sync::Mutex` so we can move-send it. Dropping
         // the sender on a take() also fires the rx side, so both paths
         // (explicit send + Drop) wake the scheduler.
-        if let Ok(mut guard) = self.wakeup_scheduler_shutdown.lock() {
+        {
+            let mut guard = self.wakeup_scheduler_shutdown.lock_recover();
             if let Some(tx) = guard.take() {
                 if tx.send(()).is_err() {
                     tracing::debug!("wakeup scheduler shutdown signal had no listener");
@@ -1638,14 +1731,9 @@ impl AppState {
             .await
             .with_spawned_processes(self.spawned_processes.clone())
             .with_spawn_persistence_hook_opt(self.spawn_persistence.clone())
-            .with_web_search(self.web_search.read().expect("web_search lock").clone())
-            .with_email_sender_opt(self.email_sender.read().expect("email_sender lock").clone())
-            .with_telegram_sender_opt(
-                self.telegram_sender
-                    .read()
-                    .expect("telegram_sender lock")
-                    .clone(),
-            )
+            .with_web_search(self.web_search.read_recover().clone())
+            .with_email_sender_opt(self.email_sender.read_recover().clone())
+            .with_telegram_sender_opt(self.telegram_sender.read_recover().clone())
             .with_owner_check_opt(self.owner_destination_check());
         if let Some(router) = self.approval_router.clone() {
             shell_registry = shell_registry.with_toolbox_approval(Arc::new(
@@ -1803,13 +1891,9 @@ impl AppState {
         ToolRegistryDeps {
             spawned_processes: self.spawned_processes.clone(),
             spawn_persistence: self.spawn_persistence.clone(),
-            web_search: self.web_search.read().expect("web_search lock").clone(),
-            email_sender: self.email_sender.read().expect("email_sender lock").clone(),
-            telegram_sender: self
-                .telegram_sender
-                .read()
-                .expect("telegram_sender lock")
-                .clone(),
+            web_search: self.web_search.read_recover().clone(),
+            email_sender: self.email_sender.read_recover().clone(),
+            telegram_sender: self.telegram_sender.read_recover().clone(),
             owner_check: self.owner_destination_check(),
             github_identity_resolver: self.github_identity_resolver.clone(),
             checkpoint_store: self.checkpoint_store.clone(),
@@ -2148,7 +2232,7 @@ impl AppState {
         }
 
         let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
-        *self.email_shutdown.lock().expect("email_shutdown lock") = Some(shutdown_tx.clone());
+        *self.email_shutdown.lock_recover() = Some(shutdown_tx.clone());
 
         // Deps captured by the factory closure. They are all `Arc`/`Clone`, so
         // each supervised respawn re-clones a fresh set and re-subscribes a
@@ -2161,11 +2245,7 @@ impl AppState {
         let attachment_store_ref = self._database.as_ref().map(|db| db.attachment_store());
         let contact_store_ref = self.contact_store.clone();
         let profile_store_ref = self.profile_store.clone();
-        let profile_embedder_ref = self
-            .profile_embedder
-            .read()
-            .expect("profile_embedder lock")
-            .clone();
+        let profile_embedder_ref = self.profile_embedder.read_recover().clone();
         let profile_embedding_cache_ref = Arc::clone(&self.profile_embedding_cache);
         let notifier = self.notifier.load_full();
         let coordinator_ref = Arc::clone(&self.coordinator);
@@ -2286,12 +2366,7 @@ impl AppState {
     /// disables email, the old loop is signalled to stop and `start_email_monitor`
     /// returns early — leaving no monitor running.
     pub fn restart_email_monitor(&self, ui: crate::ui_bridge::UiBridge) {
-        if let Some(tx) = self
-            .email_shutdown
-            .lock()
-            .expect("email_shutdown lock")
-            .take()
-        {
+        if let Some(tx) = self.email_shutdown.lock_recover().take() {
             let _ = tx.send(());
         }
         self.start_email_monitor(ui);
@@ -2334,7 +2409,7 @@ impl AppState {
         let mut cfg = crate::settings::load_main_config_public();
         crate::vault_creds::hydrate_secrets_from_vault(self.vault.as_ref(), &mut cfg).await;
         let rebuilt = build_email_sender(&cfg.email);
-        *self.email_sender.write().expect("email_sender lock") = rebuilt;
+        *self.email_sender.write_recover() = rebuilt;
     }
 
     /// Rebuild the Telegram outbound sender from current (vault-hydrated)
@@ -2345,7 +2420,7 @@ impl AppState {
         let owner_chat_id_override =
             resolve_owner_telegram_chat_id(self.contact_store.as_ref()).await;
         let rebuilt = build_telegram_sender(&cfg.telegram, owner_chat_id_override);
-        *self.telegram_sender.write().expect("telegram_sender lock") = rebuilt;
+        *self.telegram_sender.write_recover() = rebuilt;
     }
 
     /// Rebuild the web-search provider chain from current (vault-hydrated)
@@ -2354,7 +2429,7 @@ impl AppState {
         let mut cfg = crate::settings::load_main_config_public();
         crate::vault_creds::hydrate_secrets_from_vault(self.vault.as_ref(), &mut cfg).await;
         let rebuilt = build_web_search_provider(&cfg.web_search);
-        *self.web_search.write().expect("web_search lock") = rebuilt;
+        *self.web_search.write_recover() = rebuilt;
     }
 
     /// Rebuild the embedding router from current (vault-hydrated) config and
@@ -2367,10 +2442,7 @@ impl AppState {
         crate::vault_creds::hydrate_secrets_from_vault(self.vault.as_ref(), &mut cfg).await;
         let rebuilt: Arc<dyn athen_core::traits::embedding::EmbeddingProvider> =
             Arc::new(build_embedding_router(&cfg.embeddings));
-        *self
-            .profile_embedder
-            .write()
-            .expect("profile_embedder lock") = rebuilt;
+        *self.profile_embedder.write_recover() = rebuilt;
     }
 
     /// Ensure a real (neural) embedder is available out of the box, so
@@ -2501,13 +2573,7 @@ impl AppState {
             tracing::debug!("No wake-up store wired; skipping scheduler");
             return;
         };
-        if self
-            .wakeup_scheduler_shutdown
-            .lock()
-            .ok()
-            .map(|g| g.is_some())
-            .unwrap_or(false)
-        {
+        if self.wakeup_scheduler_shutdown.lock_recover().is_some() {
             tracing::debug!("Wake-up scheduler already running");
             return;
         }
@@ -2532,9 +2598,7 @@ impl AppState {
         // fires whichever per-attempt oneshot is currently parked, so the
         // running attempt unblocks and the supervisor sees a clean stop.
         let (public_tx, public_rx) = tokio::sync::oneshot::channel::<()>();
-        if let Ok(mut guard) = self.wakeup_scheduler_shutdown.lock() {
-            *guard = Some(public_tx);
-        }
+        *self.wakeup_scheduler_shutdown.lock_recover() = Some(public_tx);
 
         let stopped = Arc::new(AtomicBool::new(false));
         // Holds the current attempt's run() shutdown sender so the public
@@ -2667,11 +2731,7 @@ impl AppState {
         let attachment_store_ref = self._database.as_ref().map(|db| db.attachment_store());
         let contact_store_ref = self.contact_store.clone();
         let profile_store_ref = self.profile_store.clone();
-        let profile_embedder_ref = self
-            .profile_embedder
-            .read()
-            .expect("profile_embedder lock")
-            .clone();
+        let profile_embedder_ref = self.profile_embedder.read_recover().clone();
         let profile_embedding_cache_ref = Arc::clone(&self.profile_embedding_cache);
         let notifier = self.notifier.load_full();
         let coordinator_ref = Arc::clone(&self.coordinator);
@@ -2809,10 +2869,7 @@ impl AppState {
         }
 
         let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
-        *self
-            .telegram_shutdown
-            .lock()
-            .expect("telegram_shutdown lock") = Some(shutdown_tx.clone());
+        *self.telegram_shutdown.lock_recover() = Some(shutdown_tx.clone());
 
         let owner_lookup = self.owner_lookup();
         let telegram_settings = config.telegram.clone();
@@ -2825,11 +2882,7 @@ impl AppState {
         // needs at the outer scope. Everything else the owner-Telegram
         // executor wants lives in `tool_registry_deps_ref` below.
         let profile_store_ref = self.profile_store.clone();
-        let profile_embedder_ref = self
-            .profile_embedder
-            .read()
-            .expect("profile_embedder lock")
-            .clone();
+        let profile_embedder_ref = self.profile_embedder.read_recover().clone();
         let profile_embedding_cache_ref = Arc::clone(&self.profile_embedding_cache);
         let contact_store_ref = self.contact_store.clone();
         let notifier = self.notifier.load_full();
@@ -3081,12 +3134,7 @@ impl AppState {
     /// interval/enabled changes apply without an app restart. The outbound
     /// sender is hot-swapped separately by `reload_telegram_sender`.
     pub fn restart_telegram_monitor(&self, ui: crate::ui_bridge::UiBridge) {
-        if let Some(tx) = self
-            .telegram_shutdown
-            .lock()
-            .expect("telegram_shutdown lock")
-            .take()
-        {
+        if let Some(tx) = self.telegram_shutdown.lock_recover().take() {
             let _ = tx.send(());
         }
         self.start_telegram_monitor(ui);
@@ -3141,13 +3189,9 @@ impl AppState {
         let approval_router = self.approval_router.clone();
         let notifier = self.notifier.load_full();
         let compactor = self.compactor.clone();
-        let web_search = self.web_search.read().expect("web_search lock").clone();
-        let email_sender = self.email_sender.read().expect("email_sender lock").clone();
-        let telegram_sender_dispatch = self
-            .telegram_sender
-            .read()
-            .expect("telegram_sender lock")
-            .clone();
+        let web_search = self.web_search.read_recover().clone();
+        let email_sender = self.email_sender.read_recover().clone();
+        let telegram_sender_dispatch = self.telegram_sender.read_recover().clone();
         let telegram_outbound_hint_dispatch = self.telegram_outbound_hint.clone();
         let telegram_chat_log_dispatch = self.telegram_chat_log.clone();
         let owner_check_dispatch = self.owner_destination_check();
@@ -3174,307 +3218,370 @@ impl AppState {
         tauri::async_runtime::spawn(async move {
             use athen_core::traits::coordinator::TaskQueue;
             info!("Autonomous dispatch loop started");
-            loop {
-                // Wait for the next wake-up trigger.
-                tokio::select! {
-                    _ = dispatch_signal.notified() => {}
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
-                    _ = shutdown_rx.recv() => {
-                        info!("Dispatch loop shutdown signal received");
-                        break;
-                    }
-                }
+            // The dispatch loop is the spine of proactivity: if it dies,
+            // sense-enqueued tasks pile up forever and the agent goes deaf
+            // with no surface signal. Its JoinHandle is dropped (fire-and-
+            // forget), so a panic in the orchestration body would otherwise
+            // vanish. Contain it: a panic in one iteration logs loudly and the
+            // loop is re-entered rather than silently terminating. Clean
+            // shutdown breaks out of the inner loop and returns past this.
+            let mut clean_shutdown = false;
+            while !clean_shutdown {
+                let body = AssertUnwindSafe(async {
+                    loop {
+                        // Wait for the next wake-up trigger.
+                        tokio::select! {
+                            _ = dispatch_signal.notified() => {}
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+                            _ = shutdown_rx.recv() => {
+                                info!("Dispatch loop shutdown signal received");
+                                return true;
+                            }
+                        }
 
-                // Drain everything the queue currently has. We keep
-                // looping until dispatch_next returns Ok(None) or the
-                // re-enqueue counter says we've cycled through tasks
-                // we don't own — preventing a tight infinite loop when
-                // the queue holds non-sense tasks.
-                let mut foreign_seen: usize = 0;
-                loop {
-                    let dispatched = match coordinator.dispatch_next_with_task().await {
-                        Ok(Some(pair)) => pair,
-                        Ok(None) => break,
-                        Err(e) => {
-                            warn!(error = %e, "dispatch_next_with_task failed");
-                            break;
-                        }
-                    };
-                    let (task, _agent_id) = dispatched;
+                        // Drain everything the queue currently has. We keep
+                        // looping until dispatch_next returns Ok(None) or the
+                        // re-enqueue counter says we've cycled through tasks
+                        // we don't own — preventing a tight infinite loop when
+                        // the queue holds non-sense tasks.
+                        let mut foreign_seen: usize = 0;
+                        loop {
+                            let dispatched = match coordinator.dispatch_next_with_task().await {
+                                Ok(Some(pair)) => pair,
+                                Ok(None) => break,
+                                Err(e) => {
+                                    warn!(error = %e, "dispatch_next_with_task failed");
+                                    break;
+                                }
+                            };
+                            let (task, _agent_id) = dispatched;
 
-                    // Only act on tasks the sense_router registered.
-                    // user-driven send_message tasks dispatch inline
-                    // and never appear in task_arc_map.
-                    let arc_id = task_arc_map.read().await.get(&task.id).cloned();
-                    let Some(arc_id) = arc_id else {
-                        // Re-enqueue and bail: this task belongs to a
-                        // different code path (e.g. user send_message).
-                        // CRITICAL: `dispatch_next_with_task` already pulled
-                        // an agent out of the pool for this task. Hand it
-                        // back before re-enqueueing — otherwise the (size-1)
-                        // pool drains on the first foreign task and every
-                        // later autonomous dispatch returns `None` forever,
-                        // silently wedging proactivity until a user message
-                        // happens to trigger `force_release_all`.
-                        if let Err(e) = coordinator.dispatcher().release_agent(task.id).await {
-                            tracing::debug!(task_id = %task.id, error = %e, "release_agent on foreign task (already released?)");
-                        }
-                        // Track foreign_seen so we eventually stop if
-                        // the queue is dominated by non-sense tasks —
-                        // otherwise we'd burn CPU recycling them.
-                        foreign_seen = foreign_seen.saturating_add(1);
-                        if let Err(e) = coordinator.queue().enqueue(task).await {
-                            warn!(error = %e, "Failed to re-enqueue foreign task");
-                        }
-                        if foreign_seen >= 8 {
-                            tracing::debug!(
-                                "Dispatch loop yielding after {foreign_seen} foreign tasks"
-                            );
-                            break;
-                        }
-                        continue;
-                    };
+                            // Only act on tasks the sense_router registered.
+                            // user-driven send_message tasks dispatch inline
+                            // and never appear in task_arc_map.
+                            let arc_id = task_arc_map.read().await.get(&task.id).cloned();
+                            let Some(arc_id) = arc_id else {
+                                // Re-enqueue and bail: this task belongs to a
+                                // different code path (e.g. user send_message).
+                                // CRITICAL: `dispatch_next_with_task` already pulled
+                                // an agent out of the pool for this task. Hand it
+                                // back before re-enqueueing — otherwise the (size-1)
+                                // pool drains on the first foreign task and every
+                                // later autonomous dispatch returns `None` forever,
+                                // silently wedging proactivity until a user message
+                                // happens to trigger `force_release_all`.
+                                if let Err(e) =
+                                    coordinator.dispatcher().release_agent(task.id).await
+                                {
+                                    tracing::debug!(task_id = %task.id, error = %e, "release_agent on foreign task (already released?)");
+                                }
+                                // Track foreign_seen so we eventually stop if
+                                // the queue is dominated by non-sense tasks —
+                                // otherwise we'd burn CPU recycling them.
+                                foreign_seen = foreign_seen.saturating_add(1);
+                                if let Err(e) = coordinator.queue().enqueue(task).await {
+                                    warn!(error = %e, "Failed to re-enqueue foreign task");
+                                }
+                                if foreign_seen >= 8 {
+                                    tracing::debug!(
+                                        "Dispatch loop yielding after {foreign_seen} foreign tasks"
+                                    );
+                                    break;
+                                }
+                                continue;
+                            };
 
-                    let task_id = task.id;
-                    // Was this task fired by a wake-up? If so, fetch the
-                    // full row so the executor can apply the declared
-                    // autonomy band + (Phase 3c2) tool/contact allowlists.
-                    // Look-up failures fall through to "no wake-up" — the
-                    // task still runs, just without restrictions.
-                    let wakeup_id_opt = task_wakeup_map.read().await.get(&task.id).cloned();
-                    let wakeup_for_ctx = if let (Some(id), Some(store)) =
-                        (wakeup_id_opt, wakeup_store.as_ref())
-                    {
-                        use athen_core::traits::wakeup::WakeupStore;
-                        match store.get(id).await {
-                            Ok(Some(w)) => Some(w),
-                            Ok(None) => {
-                                tracing::debug!(wakeup_id = %id, "wake-up row missing at dispatch");
+                            let task_id = task.id;
+                            // Was this task fired by a wake-up? If so, fetch the
+                            // full row so the executor can apply the declared
+                            // autonomy band + (Phase 3c2) tool/contact allowlists.
+                            // Look-up failures fall through to "no wake-up" — the
+                            // task still runs, just without restrictions.
+                            let wakeup_id_opt = task_wakeup_map.read().await.get(&task.id).cloned();
+                            let wakeup_for_ctx = if let (Some(id), Some(store)) =
+                                (wakeup_id_opt, wakeup_store.as_ref())
+                            {
+                                use athen_core::traits::wakeup::WakeupStore;
+                                match store.get(id).await {
+                                    Ok(Some(w)) => Some(w),
+                                    Ok(None) => {
+                                        tracing::debug!(wakeup_id = %id, "wake-up row missing at dispatch");
+                                        None
+                                    }
+                                    Err(e) => {
+                                        warn!(wakeup_id = %id, error = %e, "wake-up lookup failed");
+                                        None
+                                    }
+                                }
+                            } else {
                                 None
-                            }
-                            Err(e) => {
-                                warn!(wakeup_id = %id, error = %e, "wake-up lookup failed");
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    };
-                    // A wake-up fire is the START of a fresh task (a
-                    // synthetic sense event with a clock trigger), so it
-                    // must not inherit a provider pin left behind by an
-                    // earlier task on this arc. Without this, a recurring
-                    // wake-up keeps using the model that was active when
-                    // it first fired — even after the user switched
-                    // Bundles or deleted that model — because the pin
-                    // column survived (e.g. a previous run was killed
-                    // before its clear, or the arc is long-lived).
-                    // Clearing here lets the resolve below install a
-                    // fresh pin from the current active Bundle. In-flight
-                    // protection is unaffected: any task already running
-                    // on this arc captured its router into its own ctx at
-                    // dispatch and never re-reads this column.
-                    if wakeup_id_opt.is_some() {
-                        crate::state::clear_provider_pin_for_arc(arc_store.as_ref(), &arc_id).await;
-                    }
-                    // Resolve compaction budget per task. Reads the cached
-                    // parsed config (lock-free `ArcSwap::load`) instead of
-                    // re-reading + re-parsing the TOML off disk each dispatch;
-                    // live Settings saves swap in a fresh config via
-                    // `reload_config_cache`, so the user can still tune
-                    // compaction / switch the active provider without a restart.
-                    let cfg_arc = config_cache.load_full();
-                    let cfg_for_resolvers: &AthenConfig = &cfg_arc;
-                    let active_id_now = crate::state::resolve_active_provider(cfg_for_resolvers);
-                    let effective_target = crate::state::resolve_effective_provider_for_arc(
-                        arc_store.as_ref(),
-                        &arc_id,
-                        &active_id_now,
-                        athen_core::llm::ModelProfile::Powerful,
-                    )
-                    .await;
-                    let effective_provider_id = effective_target.provider_id.clone();
-                    let (compaction_trigger_tokens, compaction_target_tokens) =
-                        crate::compaction::resolve_compaction_budget(
-                            cfg_for_resolvers,
-                            &effective_provider_id,
-                        );
-                    let sampling_temperature = crate::compaction::resolve_provider_temperature(
-                        cfg_for_resolvers,
-                        &effective_provider_id,
-                    );
-                    let reasoning_effort =
-                        crate::state::resolve_reasoning_effort_for_arc(arc_store.as_ref(), &arc_id)
-                            .await;
-                    let security_mode = crate::state::resolve_security_mode_for_arc(
-                        arc_store.as_ref(),
-                        &arc_id,
-                        cfg_for_resolvers.security.mode,
-                    )
-                    .await;
-                    // Per-arc router build: keeps the global router when
-                    // no pin is in force, swaps in a slug-locked router
-                    // when the arc has captured `(provider, slug)`. See
-                    // `arc_router_for` and `docs/PROVIDER_PINNING.md`.
-                    let arc_router = crate::state::arc_router_for(
-                        &router,
-                        &effective_target,
-                        &active_id_now,
-                        cfg_for_resolvers,
-                        vault_snapshot.as_ref(),
-                    )
-                    .await;
-                    let ctx = crate::commands::ApprovedTaskCtx {
-                        coordinator: Arc::clone(&coordinator),
-                        router: arc_router,
-                        arc_store: arc_store.clone(),
-                        calendar_store: calendar_store.clone(),
-                        contact_store: contact_store.clone(),
-                        memory: memory.clone(),
-                        mcp: Arc::clone(&mcp),
-                        tool_doc_dir: tool_doc_dir.clone(),
-                        grant_store: grant_store.clone(),
-                        profile_store: profile_store.clone(),
-                        identity_store: identity_store.clone(),
-                        skill_store: skill_store_dispatch.clone(),
-                        http_endpoint_store: http_endpoint_store_dispatch.clone(),
-                        pending_grants: pending_grants.clone(),
-                        spawned_processes: spawned_processes.clone(),
-                        spawn_persistence: spawn_persistence.clone(),
-                        telegram_approval_sink: telegram_approval_sink.clone(),
-                        cancel_flag: Arc::new(AtomicBool::new(false)),
-                        active_arc_id: arc_id.clone(),
-                        inflight: Arc::clone(&inflight),
-                        ui: ui.clone(),
-                        turn_id: uuid::Uuid::new_v4().to_string(),
-                        message_override: None,
-                        approval_router: approval_router.clone(),
-                        notifier: notifier.clone(),
-                        compactor: compactor.clone(),
-                        web_search: Arc::clone(&web_search),
-                        email_sender: email_sender.clone(),
-                        telegram_sender: telegram_sender_dispatch.clone(),
-                        telegram_outbound_hint: telegram_outbound_hint_dispatch.clone(),
-                        telegram_chat_log: telegram_chat_log_dispatch.clone(),
-                        owner_check: owner_check_dispatch.clone(),
-                        github_identity_resolver: github_identity_resolver_dispatch.clone(),
-                        checkpoint_store: checkpoint_store_dispatch.clone(),
-                        initial_user_images: Vec::new(),
-                        attachment_store: attachment_store_loop.clone(),
-                        compaction_trigger_tokens,
-                        compaction_target_tokens,
-                        sampling_temperature,
-                        reasoning_effort,
-                        security_mode,
-                        wakeup: wakeup_for_ctx,
-                        // Sense-originated tasks don't carry composer
-                        // uploads; the surfacing path uses the original
-                        // event_id stamped on the email/Telegram arc
-                        // entry, not on the user-message entry.
-                        upload_event_id: None,
-                        wakeup_store: wakeup_store
-                            .clone()
-                            .map(|s| s as Arc<dyn athen_core::traits::wakeup::WakeupStore>),
-                        agent_registry: agent_registry_loop.clone(),
-                        vault: vault_snapshot.clone(),
-                        active_provider_id: effective_provider_id.clone(),
-                        project_store: project_store_dispatch.clone(),
-                    };
-
-                    let task_arc_map_clone = Arc::clone(&task_arc_map);
-                    let task_wakeup_map_clone = Arc::clone(&task_wakeup_map);
-                    let pending_email_marks_clone = Arc::clone(&pending_email_marks);
-                    let vault_snapshot = vault_snapshot.clone();
-                    let config_cache = Arc::clone(&config_cache);
-                    tauri::async_runtime::spawn(async move {
-                        let outcome =
-                            crate::commands::execute_dispatched_task(task, arc_id.clone(), ctx)
-                                .await;
-
-                        // Did the agent actually succeed at this task?
-                        // Only on a true success do we flag the source
-                        // email `\Seen` — failures must leave the email
-                        // UNSEEN so the next IMAP poll re-triggers it.
-                        let succeeded = matches!(&outcome, Ok(Some(o)) if o.success);
-
-                        match &outcome {
-                            Ok(Some(o)) => {
-                                info!(
-                                    task_id = %task_id,
-                                    arc = %arc_id,
-                                    success = o.success,
-                                    "Autonomous task finished"
-                                );
-                            }
-                            Ok(None) => {
-                                tracing::debug!(
-                                    task_id = %task_id,
-                                    "Autonomous task skipped (already running on another channel)"
-                                );
-                            }
-                            Err(e) => {
-                                warn!(task_id = %task_id, arc = %arc_id, error = %e, "Autonomous task failed");
-                            }
-                        }
-                        // Always remove the mapping entry so the table
-                        // doesn't leak even on failure.
-                        task_arc_map_clone.write().await.remove(&task_id);
-                        task_wakeup_map_clone.write().await.remove(&task_id);
-
-                        // Drain the pending-email-mark entry too. On
-                        // success: spawn a fire-and-forget IMAP STORE
-                        // call. On failure (or skip): just drop it —
-                        // the source email stays UNSEEN and will
-                        // re-trigger on next poll, which is the user's
-                        // explicit requirement.
-                        let mark_info = pending_email_marks_clone.write().await.remove(&task_id);
-                        if let Some(info) = mark_info {
-                            if succeeded {
-                                // Clone the cached parsed config into an owned
-                                // value for local mutation (vault hydration)
-                                // instead of re-reading + re-parsing the TOML.
-                                let mut config = (*config_cache.load_full()).clone();
-                                crate::vault_creds::hydrate_secrets_from_vault(
-                                    vault_snapshot.as_ref(),
-                                    &mut config,
+                            };
+                            // A wake-up fire is the START of a fresh task (a
+                            // synthetic sense event with a clock trigger), so it
+                            // must not inherit a provider pin left behind by an
+                            // earlier task on this arc. Without this, a recurring
+                            // wake-up keeps using the model that was active when
+                            // it first fired — even after the user switched
+                            // Bundles or deleted that model — because the pin
+                            // column survived (e.g. a previous run was killed
+                            // before its clear, or the arc is long-lived).
+                            // Clearing here lets the resolve below install a
+                            // fresh pin from the current active Bundle. In-flight
+                            // protection is unaffected: any task already running
+                            // on this arc captured its router into its own ctx at
+                            // dispatch and never re-reads this column.
+                            if wakeup_id_opt.is_some() {
+                                crate::state::clear_provider_pin_for_arc(
+                                    arc_store.as_ref(),
+                                    &arc_id,
                                 )
                                 .await;
-                                let email_config = config.email.clone();
-                                tokio::spawn(async move {
-                                    match athen_sentidos::email::mark_uid_seen(
-                                        &email_config,
-                                        &info.folder,
-                                        info.uid,
-                                    )
-                                    .await
-                                    {
-                                        Ok(()) => {
-                                            info!(
-                                                uid = info.uid,
-                                                folder = %info.folder,
-                                                "Marked email \\Seen after successful autonomous run"
-                                            );
-                                        }
-                                        Err(e) => {
-                                            warn!(
-                                                uid = info.uid,
-                                                folder = %info.folder,
-                                                error = %e,
-                                                "Failed to mark email \\Seen; will re-trigger on next poll"
-                                            );
-                                        }
-                                    }
-                                });
-                            } else {
-                                tracing::debug!(
-                                    task_id = %task_id,
-                                    uid = info.uid,
-                                    folder = %info.folder,
-                                    "task failed, leaving email UNSEEN, will re-trigger on next poll"
-                                );
                             }
+                            // Resolve compaction budget per task. Reads the cached
+                            // parsed config (lock-free `ArcSwap::load`) instead of
+                            // re-reading + re-parsing the TOML off disk each dispatch;
+                            // live Settings saves swap in a fresh config via
+                            // `reload_config_cache`, so the user can still tune
+                            // compaction / switch the active provider without a restart.
+                            let cfg_arc = config_cache.load_full();
+                            let cfg_for_resolvers: &AthenConfig = &cfg_arc;
+                            let active_id_now =
+                                crate::state::resolve_active_provider(cfg_for_resolvers);
+                            let effective_target =
+                                crate::state::resolve_effective_provider_for_arc(
+                                    arc_store.as_ref(),
+                                    &arc_id,
+                                    &active_id_now,
+                                    athen_core::llm::ModelProfile::Powerful,
+                                )
+                                .await;
+                            let effective_provider_id = effective_target.provider_id.clone();
+                            let (compaction_trigger_tokens, compaction_target_tokens) =
+                                crate::compaction::resolve_compaction_budget(
+                                    cfg_for_resolvers,
+                                    &effective_provider_id,
+                                );
+                            let sampling_temperature =
+                                crate::compaction::resolve_provider_temperature(
+                                    cfg_for_resolvers,
+                                    &effective_provider_id,
+                                );
+                            let reasoning_effort = crate::state::resolve_reasoning_effort_for_arc(
+                                arc_store.as_ref(),
+                                &arc_id,
+                            )
+                            .await;
+                            let security_mode = crate::state::resolve_security_mode_for_arc(
+                                arc_store.as_ref(),
+                                &arc_id,
+                                cfg_for_resolvers.security.mode,
+                            )
+                            .await;
+                            // Per-arc router build: keeps the global router when
+                            // no pin is in force, swaps in a slug-locked router
+                            // when the arc has captured `(provider, slug)`. See
+                            // `arc_router_for` and `docs/PROVIDER_PINNING.md`.
+                            let arc_router = crate::state::arc_router_for(
+                                &router,
+                                &effective_target,
+                                &active_id_now,
+                                cfg_for_resolvers,
+                                vault_snapshot.as_ref(),
+                            )
+                            .await;
+                            let ctx = crate::commands::ApprovedTaskCtx {
+                                coordinator: Arc::clone(&coordinator),
+                                router: arc_router,
+                                arc_store: arc_store.clone(),
+                                calendar_store: calendar_store.clone(),
+                                contact_store: contact_store.clone(),
+                                memory: memory.clone(),
+                                mcp: Arc::clone(&mcp),
+                                tool_doc_dir: tool_doc_dir.clone(),
+                                grant_store: grant_store.clone(),
+                                profile_store: profile_store.clone(),
+                                identity_store: identity_store.clone(),
+                                skill_store: skill_store_dispatch.clone(),
+                                http_endpoint_store: http_endpoint_store_dispatch.clone(),
+                                pending_grants: pending_grants.clone(),
+                                spawned_processes: spawned_processes.clone(),
+                                spawn_persistence: spawn_persistence.clone(),
+                                telegram_approval_sink: telegram_approval_sink.clone(),
+                                cancel_flag: Arc::new(AtomicBool::new(false)),
+                                active_arc_id: arc_id.clone(),
+                                inflight: Arc::clone(&inflight),
+                                ui: ui.clone(),
+                                turn_id: uuid::Uuid::new_v4().to_string(),
+                                message_override: None,
+                                approval_router: approval_router.clone(),
+                                notifier: notifier.clone(),
+                                compactor: compactor.clone(),
+                                web_search: Arc::clone(&web_search),
+                                email_sender: email_sender.clone(),
+                                telegram_sender: telegram_sender_dispatch.clone(),
+                                telegram_outbound_hint: telegram_outbound_hint_dispatch.clone(),
+                                telegram_chat_log: telegram_chat_log_dispatch.clone(),
+                                owner_check: owner_check_dispatch.clone(),
+                                github_identity_resolver: github_identity_resolver_dispatch.clone(),
+                                checkpoint_store: checkpoint_store_dispatch.clone(),
+                                initial_user_images: Vec::new(),
+                                attachment_store: attachment_store_loop.clone(),
+                                compaction_trigger_tokens,
+                                compaction_target_tokens,
+                                sampling_temperature,
+                                reasoning_effort,
+                                security_mode,
+                                wakeup: wakeup_for_ctx,
+                                // Sense-originated tasks don't carry composer
+                                // uploads; the surfacing path uses the original
+                                // event_id stamped on the email/Telegram arc
+                                // entry, not on the user-message entry.
+                                upload_event_id: None,
+                                wakeup_store: wakeup_store
+                                    .clone()
+                                    .map(|s| s as Arc<dyn athen_core::traits::wakeup::WakeupStore>),
+                                agent_registry: agent_registry_loop.clone(),
+                                vault: vault_snapshot.clone(),
+                                active_provider_id: effective_provider_id.clone(),
+                                project_store: project_store_dispatch.clone(),
+                            };
+
+                            let task_arc_map_clone = Arc::clone(&task_arc_map);
+                            let task_wakeup_map_clone = Arc::clone(&task_wakeup_map);
+                            let pending_email_marks_clone = Arc::clone(&pending_email_marks);
+                            let vault_snapshot = vault_snapshot.clone();
+                            let config_cache = Arc::clone(&config_cache);
+                            tauri::async_runtime::spawn(async move {
+                                // Fire-and-forget finalization task: its JoinHandle is
+                                // dropped, so a panic inside `execute_dispatched_task`
+                                // would otherwise vanish silently and the cleanup
+                                // below (map drains, email-mark handling) would never
+                                // run. Contain the panic, log it loudly, and convert it
+                                // into a failed outcome so the source email is left
+                                // UNSEEN (re-triggers next poll) — same as any error.
+                                let outcome = match AssertUnwindSafe(
+                                    crate::commands::execute_dispatched_task(
+                                        task,
+                                        arc_id.clone(),
+                                        ctx,
+                                    ),
+                                )
+                                .catch_unwind()
+                                .await
+                                {
+                                    Ok(o) => o,
+                                    Err(_) => {
+                                        tracing::error!(
+                                            task_id = %task_id,
+                                            arc = %arc_id,
+                                            "Autonomous task PANICKED; treating as failure, cleaning up"
+                                        );
+                                        Err("dispatched task panicked".to_string())
+                                    }
+                                };
+
+                                // Did the agent actually succeed at this task?
+                                // Only on a true success do we flag the source
+                                // email `\Seen` — failures must leave the email
+                                // UNSEEN so the next IMAP poll re-triggers it.
+                                let succeeded = matches!(&outcome, Ok(Some(o)) if o.success);
+
+                                match &outcome {
+                                    Ok(Some(o)) => {
+                                        info!(
+                                            task_id = %task_id,
+                                            arc = %arc_id,
+                                            success = o.success,
+                                            "Autonomous task finished"
+                                        );
+                                    }
+                                    Ok(None) => {
+                                        tracing::debug!(
+                                            task_id = %task_id,
+                                            "Autonomous task skipped (already running on another channel)"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(task_id = %task_id, arc = %arc_id, error = %e, "Autonomous task failed");
+                                    }
+                                }
+                                // Always remove the mapping entry so the table
+                                // doesn't leak even on failure.
+                                task_arc_map_clone.write().await.remove(&task_id);
+                                task_wakeup_map_clone.write().await.remove(&task_id);
+
+                                // Drain the pending-email-mark entry too. On
+                                // success: spawn a fire-and-forget IMAP STORE
+                                // call. On failure (or skip): just drop it —
+                                // the source email stays UNSEEN and will
+                                // re-trigger on next poll, which is the user's
+                                // explicit requirement.
+                                let mark_info =
+                                    pending_email_marks_clone.write().await.remove(&task_id);
+                                if let Some(info) = mark_info {
+                                    if succeeded {
+                                        // Clone the cached parsed config into an owned
+                                        // value for local mutation (vault hydration)
+                                        // instead of re-reading + re-parsing the TOML.
+                                        let mut config = (*config_cache.load_full()).clone();
+                                        crate::vault_creds::hydrate_secrets_from_vault(
+                                            vault_snapshot.as_ref(),
+                                            &mut config,
+                                        )
+                                        .await;
+                                        let email_config = config.email.clone();
+                                        tokio::spawn(async move {
+                                            match athen_sentidos::email::mark_uid_seen(
+                                                &email_config,
+                                                &info.folder,
+                                                info.uid,
+                                            )
+                                            .await
+                                            {
+                                                Ok(()) => {
+                                                    info!(
+                                                        uid = info.uid,
+                                                        folder = %info.folder,
+                                                        "Marked email \\Seen after successful autonomous run"
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    warn!(
+                                                        uid = info.uid,
+                                                        folder = %info.folder,
+                                                        error = %e,
+                                                        "Failed to mark email \\Seen; will re-trigger on next poll"
+                                                    );
+                                                }
+                                            }
+                                        });
+                                    } else {
+                                        tracing::debug!(
+                                            task_id = %task_id,
+                                            uid = info.uid,
+                                            folder = %info.folder,
+                                            "task failed, leaving email UNSEEN, will re-trigger on next poll"
+                                        );
+                                    }
+                                }
+                            });
                         }
-                    });
+                    }
+                });
+
+                match body.catch_unwind().await {
+                    Ok(stop) => clean_shutdown = stop,
+                    Err(_) => {
+                        // The orchestration body panicked. Log loudly and
+                        // re-enter the loop after a short pause so a tight
+                        // panic-loop can't peg a core. Per-task executor work
+                        // already runs in its own panic-contained spawn, so
+                        // this only fires for panics in the drain scaffolding.
+                        tracing::error!(
+                            "Autonomous dispatch loop PANICKED in orchestration body; re-entering after backoff"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
                 }
             }
             info!("Autonomous dispatch loop stopped");
@@ -3559,18 +3666,18 @@ async fn execute_owner_telegram_message(
             // Tier 2: outbound-notification hint. Read the slot once,
             // then verify the arc still exists and isn't archived (the
             // hint is in-memory and survives DB archive/delete writes).
-            let hint_match = telegram_outbound_hint
-                .lock()
-                .ok()
-                .and_then(|guard| guard.clone())
-                .and_then(|(arc_id, ts)| {
-                    let now = chrono::Utc::now();
-                    if now.signed_duration_since(ts).num_seconds() < 120 {
-                        Some(arc_id)
-                    } else {
-                        None
-                    }
-                });
+            let hint_match =
+                telegram_outbound_hint
+                    .lock_recover()
+                    .clone()
+                    .and_then(|(arc_id, ts)| {
+                        let now = chrono::Utc::now();
+                        if now.signed_duration_since(ts).num_seconds() < 120 {
+                            Some(arc_id)
+                        } else {
+                            None
+                        }
+                    });
             match hint_match {
                 Some(arc_id) => match store.get_arc(&arc_id).await {
                     Ok(Some(meta)) if meta.status == athen_persistence::arcs::ArcStatus::Active => {
@@ -3724,8 +3831,22 @@ async fn execute_owner_telegram_message(
                 }
             }
             Err(e) => {
+                // Surface, don't drop: arc routing failed, so we can't place
+                // this message anywhere. Previously we returned None and let
+                // the handler limp on doing nothing — the owner's Telegram
+                // message just vanished with no reply. Tell them to retry and
+                // stop here rather than spinning the executor against no arc.
                 warn!("Failed to list arcs for owner message: {e}");
-                None
+                if let Err(e2) = athen_sentidos::telegram::send_message(
+                    bot_token,
+                    chat_id,
+                    "⚠️ Sorry, I couldn't process that just now (internal error reading your conversations). Please try again.",
+                )
+                .await
+                {
+                    warn!("Failed to send arc-routing failure notice on Telegram: {e2}");
+                }
+                return;
             }
         }
     } else {
@@ -3735,14 +3856,31 @@ async fn execute_owner_telegram_message(
     // If `/newarc` arrived with no follow-up text, the agent has nothing
     // to do — confirm the reset and return without spinning the executor.
     if force_new_arc && text.is_empty() {
-        if let Err(e) = athen_sentidos::telegram::send_message(
-            bot_token,
-            chat_id,
-            "📍 New arc started. Send your message.",
-        )
-        .await
-        {
-            warn!("Failed to send /newarc ack: {e}");
+        // Ack reliably: this is the ONLY feedback the owner gets for a bare
+        // /newarc, so a single failed send used to leave them staring at an
+        // unacknowledged command. Retry once with a short backoff, and log
+        // loudly (error, not warn) if it still can't be delivered.
+        let ack = "📍 New arc started. Send your message.";
+        let mut acked = false;
+        for attempt in 0..2 {
+            match athen_sentidos::telegram::send_message(bot_token, chat_id, ack).await {
+                Ok(()) => {
+                    acked = true;
+                    break;
+                }
+                Err(e) => {
+                    warn!(attempt = attempt + 1, "Failed to send /newarc ack: {e}");
+                    if attempt == 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                }
+            }
+        }
+        if !acked {
+            tracing::error!(
+                chat_id = %chat_id,
+                "Could not acknowledge /newarc on Telegram after retries — owner has no confirmation their reset landed"
+            );
         }
         return;
     }
@@ -4330,10 +4468,7 @@ pub(crate) fn parse_newarc_command(text: &str) -> (bool, String) {
 /// Tools are de-duplicated in order of first appearance, with a `×N` suffix
 /// for repeated invocations, e.g. `Tools used: shell_execute ×3, read`.
 pub(crate) fn build_telegram_tools_footer(tool_log: &crate::commands::ToolLog) -> String {
-    let names = match tool_log.lock() {
-        Ok(g) => g.clone(),
-        Err(_) => return String::new(),
-    };
+    let names = tool_log.lock_recover().clone();
     if names.is_empty() {
         return String::new();
     }
@@ -5363,7 +5498,7 @@ impl SwappableEmbedder {
     }
 
     fn current(&self) -> Arc<dyn athen_core::traits::embedding::EmbeddingProvider> {
-        self.cell.read().expect("embedder cell lock").clone()
+        self.cell.read_recover().clone()
     }
 }
 
@@ -6335,34 +6470,29 @@ async fn build_memory(
     // `mentions` links + lexical (FTS5) index from each memory's stored
     // metadata. Guarded by a marker row so it runs at most once.
     let needs_backfill = {
-        let guard = marker_conn.lock();
-        match guard {
-            Ok(c) => {
-                let _ = c.execute_batch(
-                    "CREATE TABLE IF NOT EXISTS memory_migrations (key TEXT PRIMARY KEY);",
-                );
-                let done: bool = c
-                    .query_row(
-                        "SELECT 1 FROM memory_migrations WHERE key = 'hybrid_backfill_v1'",
-                        [],
-                        |_| Ok(true),
-                    )
-                    .unwrap_or(false);
-                !done
-            }
-            Err(_) => false,
-        }
+        // Memory's connection is a std::sync::Mutex (see note above); recover
+        // the guard if a prior panic poisoned it rather than skipping the
+        // backfill — the protected Connection itself is still usable.
+        let c = marker_conn.lock_recover();
+        let _ =
+            c.execute_batch("CREATE TABLE IF NOT EXISTS memory_migrations (key TEXT PRIMARY KEY);");
+        let done: bool = c
+            .query_row(
+                "SELECT 1 FROM memory_migrations WHERE key = 'hybrid_backfill_v1'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        !done
     };
     if needs_backfill {
         match memory.backfill_hybrid().await {
             Ok(n) => {
                 info!("Memory hybrid backfill: processed {n} existing memories");
-                if let Ok(c) = marker_conn.lock() {
-                    let _ = c.execute(
-                        "INSERT OR IGNORE INTO memory_migrations (key) VALUES ('hybrid_backfill_v1')",
-                        [],
-                    );
-                }
+                let _ = marker_conn.lock_recover().execute(
+                    "INSERT OR IGNORE INTO memory_migrations (key) VALUES ('hybrid_backfill_v1')",
+                    [],
+                );
             }
             Err(e) => warn!("Memory hybrid backfill failed (will retry next boot): {e}"),
         }

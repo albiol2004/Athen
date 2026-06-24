@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use crate::ui_bridge::UiBridge;
 use chrono::{DateTime, Utc};
+use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -336,9 +337,24 @@ impl Drop for RegistrationGuard {
         if !self.finalized.swap(true, Ordering::Relaxed) {
             let reg = Arc::clone(&self.reg);
             let id = self.task_id;
-            tokio::spawn(async move {
-                reg.finalize(id, FinishStatus::Cancelled, None).await;
-            });
+            // Fire-and-forget cleanup spawned from Drop: its JoinHandle is
+            // dropped, so a panic inside `finalize` (store write, event emit)
+            // would vanish and the run would be stuck "running" forever with
+            // no signal. Contain the panic and log it loudly.
+            tokio::spawn(
+                std::panic::AssertUnwindSafe(async move {
+                    reg.finalize(id, FinishStatus::Cancelled, None).await;
+                })
+                .catch_unwind()
+                .map(move |res| {
+                    if res.is_err() {
+                        tracing::error!(
+                            task_id = %id,
+                            "agent finalize-on-drop task PANICKED; run may be stuck 'running'"
+                        );
+                    }
+                }),
+            );
         }
     }
 }

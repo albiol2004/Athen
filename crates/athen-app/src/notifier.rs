@@ -221,6 +221,53 @@ impl NotificationOrchestrator {
         self.user_present.load(Ordering::Relaxed)
     }
 
+    /// Persist a notification to SQLite with bounded retry/backoff.
+    ///
+    /// Recovery contract: persistence is *separable* from delivery — this
+    /// only touches the DB and never sends to a channel, so callers can
+    /// retry it without risking a duplicate user-facing notification.
+    /// Returns `true` if the row was durably written, `false` if every
+    /// attempt failed (the caller decides how to escalate that loss).
+    ///
+    /// No-op returning `true` when no store is configured (in-memory mode),
+    /// so callers treat "no DB" the same as "successfully persisted".
+    async fn persist_with_retry(&self, notification: &Notification, is_read: bool) -> bool {
+        let store = match &self.store {
+            Some(s) => s,
+            None => return true,
+        };
+
+        // 3 attempts, exponential-ish backoff (50ms, 200ms). Transient
+        // SQLite contention (busy lock) almost always clears within this
+        // window; a persistent failure (disk full, corruption) will burn
+        // all attempts quickly and surface loudly to the caller.
+        let backoffs = [Duration::from_millis(50), Duration::from_millis(200)];
+        let mut last_err = String::new();
+        for attempt in 0..=backoffs.len() {
+            match store.save(notification, is_read).await {
+                Ok(_) => return true,
+                Err(e) => {
+                    last_err = e.to_string();
+                    if let Some(delay) = backoffs.get(attempt) {
+                        tracing::warn!(
+                            id = %notification.id,
+                            attempt = attempt + 1,
+                            error = %last_err,
+                            "Notification persist failed, retrying"
+                        );
+                        tokio::time::sleep(*delay).await;
+                    }
+                }
+            }
+        }
+        tracing::error!(
+            id = %notification.id,
+            error = %last_err,
+            "Notification persist failed after all retries"
+        );
+        false
+    }
+
     /// Main entry point: deliver a notification through the best available channel.
     ///
     /// If an LLM router is configured, the title and body are rephrased into
@@ -234,21 +281,35 @@ impl NotificationOrchestrator {
                 id = %notification.id,
                 "Notification queued during quiet hours"
             );
-            let mut pending = self.pending.write().await;
-            pending.insert(
-                notification.id,
-                PendingNotification {
-                    notification: notification.clone(),
-                    status: DeliveryStatus::Pending,
-                    channel_index: 0,
-                },
-            );
+            {
+                let mut pending = self.pending.write().await;
+                pending.insert(
+                    notification.id,
+                    PendingNotification {
+                        notification: notification.clone(),
+                        status: DeliveryStatus::Pending,
+                        channel_index: 0,
+                    },
+                );
+            }
 
-            // Persist queued notification.
-            if let Some(ref store) = self.store {
-                if let Err(e) = store.save(&notification, false).await {
-                    tracing::warn!(error = %e, "Failed to persist queued notification");
-                }
+            // Persist the queued notification with bounded retry. A queued
+            // notification lives ONLY in the in-memory `pending` map until
+            // quiet hours end or `flush_pending` runs — if persistence
+            // fails and the app restarts before then, it vanishes. To
+            // honor the "must not silently disappear" invariant we fall
+            // back to delivering it immediately when we cannot persist it,
+            // trading the quiet-hours courtesy for guaranteed delivery.
+            // (Delivery is separate from persistence, so this is the only
+            // user-facing send for this notification — no double delivery.)
+            if !self.persist_with_retry(&notification, false).await {
+                tracing::warn!(
+                    id = %notification.id,
+                    "Could not persist quiet-hours notification; delivering now to avoid silent loss"
+                );
+                self.pending.write().await.remove(&notification.id);
+                let channel_index = self.select_first_channel();
+                self.deliver(notification, channel_index).await;
             }
             return;
         }
@@ -274,10 +335,35 @@ impl NotificationOrchestrator {
             pending.status = DeliveryStatus::Seen;
         }
 
-        // Persist read status.
+        // Persist read status with a short bounded retry. mark_read is an
+        // idempotent UPDATE keyed by id, so retrying can never double-apply.
+        // A lost read-status is lower-stakes than a lost notification (worst
+        // case: the item reappears unread after restart), but it's cheap to
+        // recover, so we retry and log loudly if it never lands.
         if let Some(ref store) = self.store {
-            if let Err(e) = store.mark_read(notification_id).await {
-                tracing::warn!(error = %e, "Failed to persist notification read status");
+            let backoffs = [Duration::from_millis(50), Duration::from_millis(200)];
+            let mut last_err = String::new();
+            let mut persisted = false;
+            for attempt in 0..=backoffs.len() {
+                match store.mark_read(notification_id).await {
+                    Ok(_) => {
+                        persisted = true;
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = e.to_string();
+                        if let Some(delay) = backoffs.get(attempt) {
+                            tokio::time::sleep(*delay).await;
+                        }
+                    }
+                }
+            }
+            if !persisted {
+                tracing::error!(
+                    id = %notification_id,
+                    error = %last_err,
+                    "Failed to persist notification read status after retries"
+                );
             }
         }
     }
@@ -650,12 +736,13 @@ impl NotificationOrchestrator {
                     },
                 );
 
-                // Persist to SQLite.
-                if let Some(ref store) = self.store {
-                    if let Err(e) = store.save(&notification, false).await {
-                        tracing::warn!(error = %e, "Failed to persist notification");
-                    }
-                }
+                // Persist to SQLite with bounded retry. Delivery already
+                // succeeded above, so this is pure persistence — retrying
+                // it cannot cause a duplicate user-facing notification. A
+                // persisted row is what survives restart for the InApp
+                // panel and for escalation rehydration; losing it silently
+                // is the bug we're guarding against.
+                self.persist_with_retry(&notification, false).await;
 
                 // Spawn escalation for high/critical notifications that need a response.
                 if requires_response
@@ -742,10 +829,31 @@ impl NotificationOrchestrator {
 
                         match channel.send(&notification).await {
                             Ok(DeliveryResult::Delivered) => {
-                                let mut pending = this.pending.write().await;
-                                if let Some(pn) = pending.get_mut(&notif_id) {
-                                    pn.status = DeliveryStatus::Escalated(kind);
-                                    pn.channel_index = channel_idx;
+                                {
+                                    let mut pending = this.pending.write().await;
+                                    if let Some(pn) = pending.get_mut(&notif_id) {
+                                        pn.status = DeliveryStatus::Escalated(kind);
+                                        pn.channel_index = channel_idx;
+                                    }
+                                }
+
+                                // Persist the escalated notification with
+                                // bounded retry. The send already happened,
+                                // so this is persistence-only (no duplicate
+                                // delivery). Escalations fire for
+                                // high/critical approval-class items — if
+                                // the row is silently dropped here, a
+                                // restart loses an unacknowledged critical
+                                // notification entirely, which is exactly
+                                // the failure mode we're closing. Still
+                                // unread (is_read = false), so on reload it
+                                // surfaces as a pending item.
+                                if !this.persist_with_retry(&notification, false).await {
+                                    tracing::error!(
+                                        id = %notif_id,
+                                        "Failed to persist escalated notification after retries; \
+                                         it may not survive restart"
+                                    );
                                 }
                             }
                             _ => {

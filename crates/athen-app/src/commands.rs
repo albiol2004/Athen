@@ -116,16 +116,22 @@ fn spawn_router_approval(
         approval_router: state.approval_router.clone(),
         notifier: state.notifier.load_full(),
         compactor: state.compactor.clone(),
-        web_search: state.web_search.read().expect("web_search lock").clone(),
+        // Poison-recover: a panic elsewhere while holding this lock must not
+        // brick web search for the rest of the session (see LockRecover in state.rs).
+        web_search: state
+            .web_search
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone(),
         email_sender: state
             .email_sender
             .read()
-            .expect("email_sender lock")
+            .unwrap_or_else(|e| e.into_inner())
             .clone(),
         telegram_sender: state
             .telegram_sender
             .read()
-            .expect("telegram_sender lock")
+            .unwrap_or_else(|e| e.into_inner())
             .clone(),
         telegram_outbound_hint: state.telegram_outbound_hint.clone(),
         telegram_chat_log: state.telegram_chat_log.clone(),
@@ -142,6 +148,11 @@ fn spawn_router_approval(
         vault: state.vault.clone(),
         project_store: state.project_store.clone(),
     };
+
+    // Independent notifier handle for the result-delivery failsafe below:
+    // `bg_ctx.notifier` gets moved into the executor `ctx`, so we keep our own
+    // clone for surfacing "the work is done but Telegram delivery failed".
+    let notifier_failsafe = state.notifier.load_full();
 
     tauri::async_runtime::spawn(async move {
         let prompt = format!("Action requires approval (risk {risk_score:.0}, {risk_level}).");
@@ -359,11 +370,70 @@ fn spawn_router_approval(
         } else {
             format!("{}\n\n{}", outcome.content, footer)
         };
-        if let Err(e) = crate::state::send_telegram_reply(&token, chat_id, &outbound).await {
-            tracing::warn!(
+        // Surface, don't drop: the agent already did the work, so losing this
+        // reply means the user never learns the outcome of something they
+        // explicitly approved. Retry with bounded backoff, then escalate to
+        // the notifier (in-app / other channels) so the result survives even
+        // a sustained Telegram outage. Exactly one user-facing surface per
+        // failure: either the Telegram reply lands, OR the notifier fires —
+        // never both.
+        let mut last_err: Option<String> = None;
+        // Sleep durations BETWEEN attempts; total of N+1 sends.
+        let backoffs = [
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(5),
+        ];
+        let mut delivered = false;
+        for attempt in 0..=backoffs.len() {
+            match crate::state::send_telegram_reply(&token, chat_id, &outbound).await {
+                Ok(()) => {
+                    delivered = true;
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        attempt = attempt + 1,
+                        "Telegram approved-task reply failed; will retry: {e}"
+                    );
+                    last_err = Some(e);
+                    if let Some(delay) = backoffs.get(attempt) {
+                        tokio::time::sleep(*delay).await;
+                    }
+                }
+            }
+        }
+        if !delivered {
+            let err = last_err.unwrap_or_else(|| "unknown error".to_string());
+            tracing::error!(
                 task_id = %task_id,
-                "Failed to send Telegram approved-task reply: {e}"
+                "Could not deliver approved-task result on Telegram after retries: {err}; escalating to notifier"
             );
+            // Escalate through the notifier so the completed work isn't lost.
+            // body_long carries the full result for channels that can render it.
+            if let Some(notifier) = notifier_failsafe.as_ref() {
+                notifier
+                .notify(Notification {
+                    id: Uuid::new_v4(),
+                    urgency: NotificationUrgency::High,
+                    title: "Approved task finished (couldn't reach Telegram)".to_string(),
+                    body: "Athen completed the task you approved, but the Telegram reply couldn't be delivered. Open Athen to see the result.".to_string(),
+                    origin: NotificationOrigin::Agent,
+                    arc_id: arc_id.clone(),
+                    task_id: Some(task_id),
+                    created_at: Utc::now(),
+                    requires_response: false,
+                    skip_humanize: true,
+                    body_long: Some(outbound.clone()),
+                })
+                .await;
+            } else {
+                tracing::error!(
+                    task_id = %task_id,
+                    "Approved-task result lost: Telegram delivery failed and no notifier is configured"
+                );
+            }
         }
     });
 }
@@ -3413,16 +3483,22 @@ pub(crate) async fn approve_task_core(
         approval_router: state.approval_router.clone(),
         notifier: state.notifier.load_full(),
         compactor: state.compactor.clone(),
-        web_search: state.web_search.read().expect("web_search lock").clone(),
+        // Poison-recover: a panic elsewhere while holding this lock must not
+        // brick web search for the rest of the session (see LockRecover in state.rs).
+        web_search: state
+            .web_search
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone(),
         email_sender: state
             .email_sender
             .read()
-            .expect("email_sender lock")
+            .unwrap_or_else(|e| e.into_inner())
             .clone(),
         telegram_sender: state
             .telegram_sender
             .read()
-            .expect("telegram_sender lock")
+            .unwrap_or_else(|e| e.into_inner())
             .clone(),
         telegram_outbound_hint: state.telegram_outbound_hint.clone(),
         telegram_chat_log: state.telegram_chat_log.clone(),

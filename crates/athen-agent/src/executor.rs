@@ -2024,23 +2024,28 @@ impl AgentExecutor for DefaultExecutor {
                     Ok(_) => {
                         // No content AND no tool calls from stream — fall back to
                         // non-streaming to get the full response.
+                        //
+                        // Distinguish two outcomes here:
+                        //  * Fallback Ok  -> use whatever it returned, even if it
+                        //    is genuinely empty (the model legitimately had nothing
+                        //    to say). We keep that legitimate-empty behaviour.
+                        //  * Fallback Err -> the provider actually broke (timeout /
+                        //    500 / garbage). Do NOT synthesize a silent empty
+                        //    success turn — that persists a blank bubble the user
+                        //    cannot distinguish from "the model chose silence".
+                        //    Propagate the error through the executor's normal
+                        //    error path (same as the `Err(e)` arm below) so the
+                        //    turn is recorded as failed.
                         match self.llm_router.route(&request).await {
                             Ok(resp) => resp,
                             Err(e) => {
                                 tracing::warn!(
                                     task_id = %task_id,
                                     error = %e,
-                                    "non-streaming fallback failed after successful stream, using empty response"
+                                    "non-streaming fallback failed after empty stream; \
+                                     propagating error instead of persisting an empty turn"
                                 );
-                                athen_core::llm::LlmResponse {
-                                    content: String::new(),
-                                    reasoning_content: None,
-                                    model_used: String::new(),
-                                    provider: String::new(),
-                                    usage: athen_core::llm::TokenUsage::default(),
-                                    tool_calls: vec![],
-                                    finish_reason: athen_core::llm::FinishReason::Stop,
-                                }
+                                return Err(e);
                             }
                         }
                     }

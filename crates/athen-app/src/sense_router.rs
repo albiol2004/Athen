@@ -228,6 +228,11 @@ pub async fn process_sense_event(
     // it instead.  This prevents rapid-fire messages from the same sender
     // spawning separate arcs.
     let arc_source = event_source_to_arc_source(&event.source);
+    // Tracks whether the arc backing this event actually exists in the store.
+    // If arc creation fails we must NOT write entries against a nonexistent
+    // arc, and we must NOT emit a success-implying notification. See the
+    // "surface, don't drop" handling further down.
+    let mut arc_create_failed = false;
     let arc_id = match &triage.target_arc {
         TriageTarget::NewArc { name } => {
             // Check for a recent arc from the same source within the time window.
@@ -242,7 +247,15 @@ pub async fn process_sense_event(
                 let id = generate_arc_id();
                 if let Some(store) = arc_store {
                     if let Err(e) = store.create_arc(&id, name, arc_source.clone()).await {
-                        warn!("Failed to create arc for sense event: {e}");
+                        // Surface, don't drop: previously this only warned and
+                        // then the flow happily wrote entries against an arc
+                        // that doesn't exist and fired a "handled it" notify.
+                        warn!(
+                            arc = %id,
+                            error = %e,
+                            "Failed to create arc for sense event — skipping entry writes and dispatch"
+                        );
+                        arc_create_failed = true;
                     }
                 }
                 info!(
@@ -252,19 +265,22 @@ pub async fn process_sense_event(
 
                 // Route the new arc to a profile based on its source +
                 // content. Best-effort: any failure here just leaves the arc
-                // on the seeded default profile.
-                route_new_arc_to_profile(
-                    arc_store.as_ref(),
-                    profile_store.as_ref(),
-                    profile_embedder,
-                    profile_embedding_cache,
-                    Some(router),
-                    &id,
-                    arc_source.as_str(),
-                    summary,
-                    &body_text,
-                )
-                .await;
+                // on the seeded default profile. Skip entirely if the arc was
+                // never created — routing a phantom arc is meaningless.
+                if !arc_create_failed {
+                    route_new_arc_to_profile(
+                        arc_store.as_ref(),
+                        profile_store.as_ref(),
+                        profile_embedder,
+                        profile_embedding_cache,
+                        Some(router),
+                        &id,
+                        arc_source.as_str(),
+                        summary,
+                        &body_text,
+                    )
+                    .await;
+                }
 
                 id
             }
@@ -291,7 +307,9 @@ pub async fn process_sense_event(
         "suggested_action": triage.suggested_action,
     });
 
-    if let Some(store) = arc_store {
+    // Don't write entries against an arc we failed to create — they'd be
+    // orphaned and the user would open Athen to find nothing.
+    if let Some(store) = arc_store.as_ref().filter(|_| !arc_create_failed) {
         // Store the raw sense event entry.
         if let Err(e) = store
             .add_entry(
@@ -304,7 +322,7 @@ pub async fn process_sense_event(
             )
             .await
         {
-            warn!("Failed to persist sense event entry: {e}");
+            warn!(arc = %arc_id, error = %e, "Failed to persist sense event entry");
         }
 
         // Also add a system message so the agent has context when the user
@@ -380,7 +398,10 @@ pub async fn process_sense_event(
     // Whether the agent will run autonomously on this event. Computed once
     // here so the frontend event and notification can present accurate UX
     // (no "Draft Reply" button when Athen is already drafting a reply).
-    let will_dispatch = coordinator.is_some() && should_dispatch_autonomously(&triage);
+    // Never dispatch autonomous work tied to an arc that doesn't exist — the
+    // executor would have no entries/context to load.
+    let will_dispatch =
+        coordinator.is_some() && should_dispatch_autonomously(&triage) && !arc_create_failed;
 
     let body_preview: String = if body_text.len() > 500 {
         let cap = body_text.floor_char_boundary(500);
@@ -533,35 +554,56 @@ pub async fn process_sense_event(
     // now reflect the actual risk decision so HumanConfirm doesn't lie
     // about Athen "handling" something it's actually waiting on.
     if let Some(notifier) = notifier {
-        let baseline_urgency = match triage.relevance.as_str() {
-            "high" => NotificationUrgency::High,
-            "medium" => NotificationUrgency::Medium,
-            _ => NotificationUrgency::Low,
-        };
+        let notification = if arc_create_failed {
+            // Surface, don't drop: persistence failed, so the normal copy
+            // ("Athen handled your email…" / "New email from John") would lie —
+            // there's no arc to open. Tell the owner it couldn't be saved.
+            Notification {
+                id: Uuid::new_v4(),
+                urgency: NotificationUrgency::High,
+                title: format!("Couldn't save {source_name} from {sender}"),
+                body: format!(
+                    "Athen received \"{summary}\" but failed to record it, so it won't appear in your arcs. The original is still in your {source_name}; please re-trigger if you need Athen to handle it."
+                ),
+                origin: NotificationOrigin::SenseRouter,
+                arc_id: None,
+                task_id: None,
+                created_at: Utc::now(),
+                requires_response: false,
+                skip_humanize: true,
+                body_long: None,
+            }
+        } else {
+            let baseline_urgency = match triage.relevance.as_str() {
+                "high" => NotificationUrgency::High,
+                "medium" => NotificationUrgency::Medium,
+                _ => NotificationUrgency::Low,
+            };
 
-        let copy = build_sense_notification_copy(
-            will_dispatch,
-            final_decision.as_ref(),
-            source_name,
-            sender,
-            summary,
-            &triage.reason,
-            &body_preview,
-            baseline_urgency,
-        );
+            let copy = build_sense_notification_copy(
+                will_dispatch,
+                final_decision.as_ref(),
+                source_name,
+                sender,
+                summary,
+                &triage.reason,
+                &body_preview,
+                baseline_urgency,
+            );
 
-        let notification = Notification {
-            id: Uuid::new_v4(),
-            urgency: copy.urgency,
-            title: copy.title,
-            body: copy.body,
-            origin: NotificationOrigin::SenseRouter,
-            arc_id: Some(arc_id.clone()),
-            task_id: None,
-            created_at: Utc::now(),
-            requires_response: false,
-            skip_humanize: copy.skip_humanize,
-            body_long: None,
+            Notification {
+                id: Uuid::new_v4(),
+                urgency: copy.urgency,
+                title: copy.title,
+                body: copy.body,
+                origin: NotificationOrigin::SenseRouter,
+                arc_id: Some(arc_id.clone()),
+                task_id: None,
+                created_at: Utc::now(),
+                requires_response: false,
+                skip_humanize: copy.skip_humanize,
+                body_long: None,
+            }
         };
 
         notifier.notify(notification).await;
@@ -577,12 +619,44 @@ pub async fn process_sense_event(
             let coordinator = coordinator.cloned();
             let task_arc_map = task_arc_map.cloned();
             let dispatch_signal = dispatch_signal.cloned();
+            // Clone the notifier into the spawned task so any failure in the
+            // approval flow can SURFACE to the owner instead of dying as a
+            // lone `warn!()` — see the "surface, don't drop" contract below.
+            let notifier_c = notifier.cloned();
             let arc_id_c = arc_id.clone();
             let source_c = source_name.to_string();
             let sender_c = sender.to_string();
             let summary_c = summary.to_string();
             let reason_c = triage.reason.clone();
             tokio::spawn(async move {
+                // Helper: surface an approval-path failure to the owner through
+                // whatever notifier channels are configured (Telegram / in-app).
+                // We never want an approved-or-abandoned task to vanish with only
+                // a server-side log; the owner who acted on Telegram must learn it
+                // failed and that they can retry.
+                let surface_failure = |title: String, body: String| {
+                    let notifier_c = notifier_c.clone();
+                    let arc_id_c = arc_id_c.clone();
+                    async move {
+                        if let Some(notifier) = notifier_c {
+                            notifier
+                                .notify(Notification {
+                                    id: Uuid::new_v4(),
+                                    urgency: NotificationUrgency::High,
+                                    title,
+                                    body,
+                                    origin: NotificationOrigin::SenseRouter,
+                                    arc_id: Some(arc_id_c),
+                                    task_id: None,
+                                    created_at: Utc::now(),
+                                    requires_response: false,
+                                    skip_humanize: true,
+                                    body_long: None,
+                                })
+                                .await;
+                        }
+                    }
+                };
                 let prompt = format!("Act on {source_c} from {sender_c}? Subject: {summary_c}.");
                 let mut question = athen_core::approval::ApprovalQuestion::approve_or_deny(prompt);
                 question.arc_id = Some(arc_id_c.clone());
@@ -600,10 +674,28 @@ pub async fn process_sense_event(
                                     task_id = %task_id,
                                     "HumanConfirm approved but coordinator handle missing"
                                 );
+                                // Surface, don't drop: the owner approved on
+                                // Telegram but we can't dispatch — tell them.
+                                surface_failure(
+                                    "Couldn't act on your approval".to_string(),
+                                    format!(
+                                        "You approved acting on {source_c} from {sender_c}, but Athen couldn't start the task (internal handle missing). Please try again."
+                                    ),
+                                )
+                                .await;
                                 return;
                             };
                             if let Err(e) = coord.approve_task(task_id).await {
                                 warn!(task_id = %task_id, error = %e, "approve_task failed");
+                                // Surface, don't drop: the task otherwise sits in
+                                // `awaiting_approval` forever with no feedback.
+                                surface_failure(
+                                    "Couldn't act on your approval".to_string(),
+                                    format!(
+                                        "You approved acting on {source_c} from {sender_c}, but Athen failed to start the task: {e}. Please try again."
+                                    ),
+                                )
+                                .await;
                                 return;
                             }
                             if let Some(map) = task_arc_map {
@@ -644,6 +736,18 @@ pub async fn process_sense_event(
                             error = %e,
                             "HumanConfirm approval router failed — task left awaiting approval"
                         );
+                        // Surface, don't drop: the router failing (e.g. the
+                        // Telegram send blew up) means the user never saw an
+                        // approval prompt on ANY channel and the task is now
+                        // abandoned. Push a best-effort notification so the
+                        // owner at least knows something needs their attention.
+                        surface_failure(
+                            "Approval request couldn't be delivered".to_string(),
+                            format!(
+                                "Athen wanted to confirm acting on {source_c} from {sender_c} (subject: {summary_c}) but couldn't reach you to ask: {e}. The request is still pending — open Athen to review it."
+                            ),
+                        )
+                        .await;
                     }
                 }
             });
