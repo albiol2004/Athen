@@ -12,6 +12,7 @@ import { Chat, type ChatCallbacks, type OutgoingFile, type OutgoingImage } from 
 import { GoalBanner, type GoalState, type PlanState } from './PlanGoal';
 import { ProjectPage } from './ProjectPage';
 import { Sidebar } from './Sidebar';
+import { errMessage, useToast } from './Toast';
 import { Wakeups } from './Wakeups';
 
 function errMsg(e: unknown): string {
@@ -21,6 +22,7 @@ function errMsg(e: unknown): string {
 type Drawer = 'none' | 'agents' | 'changes' | 'wakeups';
 
 export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () => void }) {
+  const { toast } = useToast();
   const [arcs, setArcs] = useState<ArcMeta[]>([]);
   const [activeArc, setActiveArc] = useState<string | null>(null);
   const [unread, setUnread] = useState<Set<string>>(new Set());
@@ -411,11 +413,32 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
             void createArc();
           },
           onRename: (id, name) =>
-            void client.post(`/arcs/${encodeURIComponent(id)}/rename`, { name }).then(refreshArcs, () => {}),
+            void client
+              .post(`/arcs/${encodeURIComponent(id)}/rename`, { name })
+              .then(refreshArcs, (e) => toast(`Couldn't rename: ${errMessage(e)}`, 'error')),
           onCompact: (id) =>
             void client
-              .post(`/arcs/${encodeURIComponent(id)}/compact`)
-              .then(() => dispatch({ type: 'system', text: 'Conversation compacted.' }))
+              .post<{ compacted?: boolean; tokens_before?: number; tokens_after?: number }>(
+                `/arcs/${encodeURIComponent(id)}/compact`,
+              )
+              .then(async (r) => {
+                if (r && r.compacted) {
+                  const before = r.tokens_before ?? 0;
+                  const after = r.tokens_after ?? 0;
+                  dispatch({
+                    type: 'system',
+                    text: `Conversation compacted (${before} → ${after} tokens).`,
+                  });
+                  // Refresh the timeline so the new summary entry shows up,
+                  // matching the desktop behaviour.
+                  if (id === activeArcRef.current) {
+                    const entries = await client.arcEntries(id).catch(() => null);
+                    if (entries) dispatch({ type: 'reset', entries });
+                  }
+                } else {
+                  dispatch({ type: 'system', text: 'Nothing to compact yet (conversation too short).' });
+                }
+              })
               .catch((e) => dispatch({ type: 'system', text: `Compact failed: ${errMsg(e)}` })),
           onDelete: (id) =>
             void client
@@ -524,7 +547,11 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
             {goal && (
               <GoalBanner
                 goal={goal}
-                onClear={() => void client.del('/goal').then(() => setGoal(null), () => {})}
+                onClear={() =>
+                  void client
+                    .del('/goal')
+                    .then(() => setGoal(null), (e) => toast(`Couldn't clear goal: ${errMessage(e)}`, 'error'))
+                }
               />
             )}
             <Chat

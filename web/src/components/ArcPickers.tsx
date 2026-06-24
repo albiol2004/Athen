@@ -5,6 +5,7 @@
 import { useEffect, useState } from 'react';
 import type { AthenClient } from '../api/client';
 import type { ArcMeta } from '../api/types';
+import { errMessage, useToast } from './Toast';
 
 interface ProfileRow {
   id: string;
@@ -25,6 +26,7 @@ export function ArcPickers({
   arc: ArcMeta;
   onChanged: () => void;
 }) {
+  const { toast } = useToast();
   const [profiles, setProfiles] = useState<ProfileRow[]>([]);
   useEffect(() => {
     client
@@ -34,7 +36,9 @@ export function ArcPickers({
   }, [client]);
 
   const set = (path: string, value: string | null) =>
-    void client.post(`/arcs/${encodeURIComponent(arc.id)}/${path}`, { value }).then(onChanged, () => {});
+    void client
+      .post(`/arcs/${encodeURIComponent(arc.id)}/${path}`, { value })
+      .then(onChanged, (e) => toast(`Couldn't update ${path}: ${errMessage(e)}`, 'error'));
 
   const meta = arc as unknown as Record<string, unknown>;
   const effort = (meta.reasoning_effort_override as string | null) ?? 'default';

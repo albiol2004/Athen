@@ -1279,8 +1279,7 @@ function toggleArcMenu(anchorEl, arc, itemEl) {
 
     menu.appendChild(mkItem('Rename', '&#9998;', () => startRenameArc(itemEl, arc.id, arc.name)));
     menu.appendChild(mkItem('Compact', '&#x21A1;', () => {
-        showToast('Compacting arc…', '');
-        handleCompactArc(arc.id, null);
+        confirmAndCompactArc(arc.id);
     }));
     menu.appendChild(mkItem('Branch', '&#x21B3;', () => branchFromArc(arc.id, arc.name)));
     // Assign to project: clicking swaps the menu body for a project picker
@@ -1620,6 +1619,21 @@ async function handleSwitchArc(arcId) {
     }
 }
 
+// Shows an explanatory confirm dialog, then compacts on confirm. Compaction is
+// destructive — it summarises older messages and reduces the original detailed
+// history — so it always asks first (parity with the web UI).
+async function confirmAndCompactArc(arcId, btnEl) {
+    const ok = await showConfirmDialog({
+        title: 'Compact this conversation?',
+        body: 'Compacting summarises the older messages in this conversation into a short recap to free up context space. The original detailed history is condensed and cannot be restored.',
+        confirmLabel: 'Compact',
+        cancelLabel: 'Cancel',
+    });
+    if (!ok) return;
+    showToast('Compacting conversation…', '');
+    await handleCompactArc(arcId, btnEl);
+}
+
 async function handleCompactArc(arcId, btnEl) {
     if (!invoke) return;
     if (btnEl) {
@@ -1631,7 +1645,7 @@ async function handleCompactArc(arcId, btnEl) {
         if (result && result.compacted) {
             const before = result.tokens_before || 0;
             const after = result.tokens_after || 0;
-            showToast(`Compacted: ${before} → ${after} tokens`, 'success');
+            showToast(`Conversation compacted (${before} → ${after} tokens).`, 'success');
             // If the compacted arc is the active one, refresh the view
             // so the new summary entry shows up in the timeline.
             if (arcId === activeArcId) {
@@ -1646,7 +1660,7 @@ async function handleCompactArc(arcId, btnEl) {
             // Refresh sidebar so the entry_count badge updates.
             await loadArcs();
         } else {
-            showToast('Nothing to compact yet (arc too short).', '');
+            showToast('Nothing to compact yet (conversation too short).', '');
         }
     } catch (err) {
         console.error('Compact arc failed:', err);
@@ -2653,11 +2667,11 @@ function addApprovalDialog(approval) {
     messagesEl.appendChild(row);
 
     // Attach click handlers after adding to DOM
-    bubble.querySelector('.btn-approve').addEventListener('click', () => {
-        handleApproval(approval.task_id, true);
+    bubble.querySelector('.btn-approve').addEventListener('click', (e) => {
+        handleApproval(approval.task_id, true, e.currentTarget);
     });
-    bubble.querySelector('.btn-deny').addEventListener('click', () => {
-        handleApproval(approval.task_id, false);
+    bubble.querySelector('.btn-deny').addEventListener('click', (e) => {
+        handleApproval(approval.task_id, false, e.currentTarget);
     });
 
     scrollChatIfPinned(messagesEl.parentElement);
@@ -2715,8 +2729,8 @@ function addApprovalQuestionDialog(question) {
         btn.className = (c.kind === 'approve' || c.kind === 'allow_once' || c.kind === 'allow_always')
             ? 'btn-approve'
             : 'btn-deny';
-        btn.addEventListener('click', () => {
-            handleApprovalQuestion(question.id, c.key, row);
+        btn.addEventListener('click', (e) => {
+            handleApprovalQuestion(question.id, c.key, row, e.currentTarget);
         });
         actions.appendChild(btn);
     }
@@ -2735,34 +2749,47 @@ function addApprovalQuestionDialog(question) {
     scrollChatIfPinned(messagesEl.parentElement);
 }
 
-async function handleApprovalQuestion(questionId, choiceKey, cardEl) {
+async function handleApprovalQuestion(questionId, choiceKey, cardEl, clickedBtn) {
     if (!invoke) return;
+    // Re-entry guard keyed on the card so a double-click can't fire twice.
+    if (cardEl && cardEl.dataset.qPending === '1') return;
     if (cardEl) {
+        cardEl.dataset.qPending = '1';
         cardEl.querySelectorAll('button').forEach(b => { b.disabled = true; });
     }
+    if (clickedBtn) clickedBtn.classList.add('btn-pending');
     try {
         await invoke('submit_approval', {
             questionId: questionId,
             choiceKey: choiceKey,
         });
+        // Only remove the card on success.
+        if (cardEl) cardEl.remove();
     } catch (e) {
         console.error('submit_approval failed:', e);
-    } finally {
-        if (cardEl) cardEl.remove();
+        showToast('Could not submit your choice: ' + errText(e), 'error');
+        // Re-enable so the user can retry — keep the card on screen.
+        if (clickedBtn) clickedBtn.classList.remove('btn-pending');
+        if (cardEl) {
+            delete cardEl.dataset.qPending;
+            cardEl.querySelectorAll('button').forEach(b => { b.disabled = false; });
+        }
     }
 }
 
-async function handleApproval(taskId, approved) {
+async function handleApproval(taskId, approved, clickedBtn) {
     if (!invoke) return;
     if (approvalsInFlight.has(taskId)) return;
     approvalsInFlight.add(taskId);
 
-    // Disable the approval buttons immediately.
+    // Disable the approval buttons immediately, and show a spinner on the
+    // one the user actually clicked so the action reads as "working".
     const approvalEl = document.getElementById(`approval-${taskId}`);
     if (approvalEl) {
         const buttons = approvalEl.querySelectorAll('button');
         buttons.forEach(btn => { btn.disabled = true; });
     }
+    if (clickedBtn) clickedBtn.classList.add('btn-pending');
 
     setInputEnabled(false);
     setStatus('working', approved ? 'Executing approved action...' : 'Cancelling...');
@@ -2815,7 +2842,17 @@ async function handleApproval(taskId, approved) {
     } catch (err) {
         console.error('Approval error:', err);
         addMessage('assistant', `Error: ${err}`, { isError: true });
+        showToast('Could not complete the action: ' + errText(err), 'error');
         setStatus('error', 'Error');
+        // Re-enable the buttons so the user can retry — the dialog is still
+        // on screen because the invoke failed before it could be removed.
+        if (clickedBtn) clickedBtn.classList.remove('btn-pending');
+        if (approvalEl) {
+            approvalEl.querySelectorAll('button').forEach(btn => { btn.disabled = false; });
+        }
+    } finally {
+        // Drop the in-flight guard regardless of outcome.
+        approvalsInFlight.delete(taskId);
     }
 
     // Reset streaming state.
@@ -3101,7 +3138,7 @@ formEl.addEventListener('submit', async (e) => {
                 inputEl.value = '';
                 inputEl.style.height = 'auto';
                 if (activeArcId) {
-                    handleCompactArc(activeArcId);
+                    confirmAndCompactArc(activeArcId);
                 } else {
                     showToast('No active arc to compact.', 'error');
                 }
@@ -3395,6 +3432,7 @@ formEl.addEventListener('submit', async (e) => {
     } catch (err) {
         console.error('Tauri invoke error:', err);
         addMessage('assistant', `Error: ${err}`, { isError: true });
+        showToast('Message failed: ' + errText(err), 'error');
         currentToolContainer = null;
         flushPendingPlanCard();
         setStatus('error', 'Error');
@@ -5026,12 +5064,17 @@ function renderToolBody_submit_plan(args, result, toolCardEl) {
     const discardBtn = document.createElement('button');
     discardBtn.textContent = 'Discard';
 
-    approveBtn.addEventListener('click', async () => {
+    approveBtn.addEventListener('click', () => {
         if (!invoke) return;
-        approveBtn.disabled = true;
-        try {
+        // Spinner + re-entry guard via the shared helper. On failure the
+        // helper re-enables the button and toasts; on success we mark it
+        // "Executing..." before the auto-send turn runs.
+        withButtonPending(approveBtn, async () => {
             await invoke('approve_plan');
             approveBtn.textContent = 'Executing...';
+            // Plan is now executing — keep it locked even after the helper's
+            // finally re-enables, so a second click can't re-approve.
+            approveBtn.dataset.locked = '1';
             discardBtn.remove();
             // Refresh plan banner
             try {
@@ -5041,10 +5084,7 @@ function renderToolBody_submit_plan(args, result, toolCardEl) {
             showToast('Plan approved — executing', 'success');
             // Auto-send execution message
             await invoke('send_message', { message: 'Execute the plan step by step.' });
-        } catch (err) {
-            approveBtn.disabled = false;
-            showToast(typeof err === 'string' ? err : String(err), 'error');
-        }
+        }, { errorPrefix: 'Could not approve the plan: ' });
     });
     actions.appendChild(approveBtn);
 
@@ -5683,6 +5723,68 @@ function startInlineEdit(row, entryId, originalText) {
             e.preventDefault();
             sendBtn.click();
         }
+    });
+}
+
+// Generic styled confirm dialog (warm-dark glass), reusing the rewind-dialog
+// CSS. Returns a Promise<boolean> that resolves true on confirm, false on
+// cancel/dismiss. Use for destructive-but-not-deletion actions that need a
+// short explanation (e.g. Compact), where a bare window.confirm is too terse.
+function showConfirmDialog({ title, body, confirmLabel = 'Confirm', cancelLabel = 'Cancel', danger = false }) {
+    return new Promise((resolve) => {
+        const overlay = document.createElement('div');
+        overlay.className = 'rewind-dialog-overlay';
+
+        const dialog = document.createElement('div');
+        dialog.className = 'rewind-dialog';
+
+        const titleEl = document.createElement('h3');
+        titleEl.textContent = title;
+        dialog.appendChild(titleEl);
+
+        const desc = document.createElement('p');
+        desc.textContent = body;
+        dialog.appendChild(desc);
+
+        const btnRow = document.createElement('div');
+        btnRow.className = 'rewind-dialog-buttons';
+
+        const cancelBtn = document.createElement('button');
+        cancelBtn.className = 'rewind-dialog-cancel';
+        cancelBtn.textContent = cancelLabel;
+
+        const confirmBtn = document.createElement('button');
+        confirmBtn.className = 'rewind-dialog-confirm' + (danger ? ' danger' : '');
+        confirmBtn.textContent = confirmLabel;
+
+        btnRow.appendChild(cancelBtn);
+        btnRow.appendChild(confirmBtn);
+        dialog.appendChild(btnRow);
+        overlay.appendChild(dialog);
+        document.body.appendChild(overlay);
+
+        let settled = false;
+        const close = (val) => {
+            if (settled) return;
+            settled = true;
+            overlay.remove();
+            resolve(val);
+        };
+
+        cancelBtn.addEventListener('click', () => close(false));
+        confirmBtn.addEventListener('click', () => close(true));
+        overlay.addEventListener('click', (e) => {
+            if (e.target === overlay) close(false);
+        });
+        const onKey = (e) => {
+            if (e.key === 'Escape') {
+                document.removeEventListener('keydown', onKey);
+                close(false);
+            }
+        };
+        document.addEventListener('keydown', onKey);
+
+        confirmBtn.focus();
     });
 }
 
@@ -7024,8 +7126,8 @@ function buildIdentityEntryCard(entry, cat) {
     actions.className = 'identity-entry-actions';
     const saveBtn = document.createElement('button');
     saveBtn.textContent = 'Save';
-    saveBtn.addEventListener('click', async () => {
-        try {
+    saveBtn.addEventListener('click', () => {
+        withButtonPending(saveBtn, async () => {
             await invoke('upsert_identity_entry', {
                 input: {
                     id: entry.id,
@@ -7037,9 +7139,7 @@ function buildIdentityEntryCard(entry, cat) {
             });
             await loadIdentityManager();
             showToast('Saved.', 'success');
-        } catch (err) {
-            showToast('Save failed: ' + err, 'error');
-        }
+        }, { errorPrefix: 'Save failed: ' });
     });
     const delBtn = document.createElement('button');
     delBtn.className = 'btn-danger';
@@ -9469,6 +9569,58 @@ const UPDATE_DISMISS_KEY = 'athen.update.dismissedVersion';
     // Re-check every 6 hours for long-running sessions.
     setInterval(checkForUpdate, 6 * 60 * 60 * 1000);
 })();
+
+// ─── Async action button helper ───
+//
+// Wraps an async action behind a button so the user always sees feedback:
+//   • a visible spinner (.btn-pending) while the request is in flight,
+//   • re-entry guard (a button already working will not fire twice),
+//   • automatic re-enable + an error toast if the action throws.
+//
+// Returns the action's resolved value, or undefined if it was a no-op
+// (re-entry) or threw. Pass { errorPrefix } to customise the toast text,
+// or { rethrow: true } if the caller needs to react to the failure too.
+async function withButtonPending(btn, asyncFn, opts) {
+    opts = opts || {};
+    if (!btn) {
+        // No button to gate on — still run, still surface errors.
+        try {
+            return await asyncFn();
+        } catch (err) {
+            showToast((opts.errorPrefix || 'Action failed: ') + errText(err), 'error');
+            if (opts.rethrow) throw err;
+            return undefined;
+        }
+    }
+    // Re-entry guard: a button mid-flight must not fire again.
+    if (btn.dataset.pending === '1') return undefined;
+    btn.dataset.pending = '1';
+    const wasDisabled = btn.disabled;
+    btn.disabled = true;
+    btn.classList.add('btn-pending');
+    try {
+        return await asyncFn();
+    } catch (err) {
+        showToast((opts.errorPrefix || 'Action failed: ') + errText(err), 'error');
+        if (opts.rethrow) throw err;
+        return undefined;
+    } finally {
+        delete btn.dataset.pending;
+        btn.classList.remove('btn-pending');
+        // Re-enable so the user can retry, unless the action removed the
+        // button from the DOM (e.g. an approval dialog that resolved) or
+        // explicitly locked it (e.g. a plan that is now executing).
+        if (btn.isConnected && btn.dataset.locked !== '1') btn.disabled = wasDisabled;
+    }
+}
+
+// Normalise an unknown thrown value into a readable string for toasts.
+function errText(err) {
+    if (err == null) return 'unknown error';
+    if (typeof err === 'string') return err;
+    if (err.message) return err.message;
+    try { return err.toString(); } catch (_) { return 'unknown error'; }
+}
 
 // ─── Toast Notification ───
 
@@ -18015,7 +18167,7 @@ if (composerMenuBtn && composerMenu) {
         composerMenu.classList.add('hidden');
         const action = item.dataset.action;
         if (action === 'compact') {
-            if (activeArcId) handleCompactArc(activeArcId);
+            if (activeArcId) confirmAndCompactArc(activeArcId);
             else showToast('No active arc to compact.', 'error');
         } else if (action === 'goal') {
             openGoalModal();

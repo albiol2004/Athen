@@ -1598,6 +1598,9 @@ header h1 {
     opacity: 0.6;
     cursor: wait;
 }
+.rewind-dialog-confirm.danger {
+    background: var(--danger, #e0584a);
+}
 
 /* Markdown bits inside messages */
 .message-bubble h1,
@@ -3101,6 +3104,32 @@ footer {
     transition: filter var(--dur) var(--ease), transform var(--dur) var(--ease);
 }
 .btn-approve:hover { filter: brightness(1.08); transform: translateY(-1px); }
+.btn-approve:disabled { opacity: 0.5; cursor: not-allowed; transform: none; filter: none; }
+
+/* ─── Generic in-flight button affordance ───
+   Reusable spinner state for any async action button. Applied by the
+   withButtonPending() helper in app.js. Renders a small spinner inline
+   and dims/locks the label so the user sees the action is working. */
+.btn-pending {
+    position: relative;
+    pointer-events: none;
+    opacity: 0.72;
+}
+.btn-pending > * { visibility: hidden; }
+.btn-pending::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 13px;
+    height: 13px;
+    margin: -7px 0 0 -7px;
+    border: 2px solid currentColor;
+    border-right-color: transparent;
+    border-radius: 50%;
+    opacity: 0.9;
+    animation: spin 0.7s linear infinite;
+}
 
 /* ─── Settings view ─── */
 .settings-view {

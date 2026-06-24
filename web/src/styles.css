@@ -290,6 +290,22 @@ button { font: inherit; }
 .card .resolved { color: var(--text-dim); font-size: 12.5px; }
 .card-error { color: var(--red); font-size: 12px; margin-top: 8px; }
 
+/* Inline spinner for in-flight action buttons (desktop parity).
+   Renders a small rotating ring next to (or in place of) the label. */
+@keyframes btn-spin { to { transform: rotate(360deg); } }
+.btn-spinner {
+  display: inline-block;
+  width: 11px;
+  height: 11px;
+  margin-right: 6px;
+  vertical-align: -1px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  opacity: 0.85;
+  animation: btn-spin 0.7s linear infinite;
+}
+
 /* busy indicator */
 .busy-row { align-self: flex-start; display: flex; gap: 5px; padding: 6px 2px; }
 .busy-dot {
@@ -550,6 +566,41 @@ button { font: inherit; }
   background: rgba(0, 0, 0, 0.3); border: 1px solid var(--coral); border-radius: 7px; padding: 4px 8px; outline: none;
 }
 
+/* ---- confirm dialog (warm-dark glass, matches desktop rewind-dialog) ---- */
+.confirm-overlay {
+  position: fixed; inset: 0; z-index: 1000;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+  animation: confirm-fade 150ms ease;
+}
+@keyframes confirm-fade { from { opacity: 0; } to { opacity: 1; } }
+.confirm-dialog {
+  width: 90%; max-width: 400px;
+  background: rgba(34, 26, 23, 0.97);
+  border: 1px solid var(--glass-border); border-radius: var(--radius);
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.45);
+  padding: 22px;
+  animation: confirm-pop 200ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+@keyframes confirm-pop {
+  from { opacity: 0; transform: scale(0.95) translateY(8px); }
+  to   { opacity: 1; transform: scale(1) translateY(0); }
+}
+.confirm-dialog h3 { margin: 0 0 8px; font-size: 15.5px; font-weight: 600; color: var(--text); }
+.confirm-dialog p { margin: 0 0 18px; font-size: 13px; line-height: 1.5; color: var(--text-dim); }
+.confirm-buttons { display: flex; gap: 8px; justify-content: flex-end; }
+.confirm-cancel, .confirm-ok {
+  font: inherit; font-size: 13px; font-weight: 500; cursor: pointer;
+  padding: 7px 18px; border-radius: 9px; border: 1px solid var(--glass-border);
+  transition: filter 120ms, background 120ms;
+}
+.confirm-cancel { background: none; color: var(--text-dim); }
+.confirm-cancel:hover { background: rgba(255, 255, 255, 0.06); color: var(--text); }
+.confirm-ok { background: var(--coral); color: #20120d; border-color: transparent; }
+.confirm-ok:hover { filter: brightness(1.08); }
+.confirm-ok.danger { background: var(--red); }
+
 /* ---- sidebar projects section ---- */
 .proj-section { display: flex; flex-direction: column; gap: 1px; }
 .proj-head {
@@ -728,3 +779,40 @@ button { font: inherit; }
 }
 .composer .attach-btn:hover { color: var(--text); background: rgba(255, 255, 255, 0.06); }
 .composer.dragover { border-color: var(--coral); }
+
+/* ---- toast stack (warm-dark glass, pinned bottom-right) ---- */
+.toast-stack {
+  position: fixed; right: 16px; bottom: 16px; z-index: 1100;
+  display: flex; flex-direction: column; gap: 8px;
+  max-width: min(380px, calc(100vw - 32px));
+  pointer-events: none;
+}
+.toast {
+  pointer-events: auto;
+  display: flex; align-items: flex-start; gap: 10px;
+  padding: 11px 12px 11px 14px;
+  background: rgba(34, 26, 23, 0.97);
+  border: 1px solid var(--glass-border); border-left: 3px solid var(--text-dim);
+  border-radius: var(--radius);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+  animation: toast-pop 200ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+@keyframes toast-pop {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.toast-error   { border-left-color: var(--red); }
+.toast-success { border-left-color: var(--green); }
+.toast-info    { border-left-color: var(--coral); }
+.toast-msg {
+  flex: 1; min-width: 0;
+  font-size: 12.5px; line-height: 1.45; color: var(--text);
+  word-break: break-word;
+}
+.toast-close {
+  flex: none; background: none; border: none; cursor: pointer;
+  color: var(--text-dim); font-size: 16px; line-height: 1;
+  padding: 0 2px; margin-top: -1px;
+}
+.toast-close:hover { color: var(--text); }

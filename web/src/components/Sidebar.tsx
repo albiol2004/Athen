@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type { ArcMeta, Project } from '../api/types';
+import { ConfirmDialog } from './ConfirmDialog';
 
 function timeAgo(iso: string): string {
   const t = Date.parse(iso);
@@ -33,6 +34,7 @@ function ArcRow({
   const [menu, setMenu] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [confirmCompact, setConfirmCompact] = useState(false);
   const [name, setName] = useState(arc.name);
   const wrapRef = useRef<HTMLDivElement>(null);
 
@@ -106,7 +108,7 @@ function ArcRow({
           <button
             onClick={() => {
               setMenu(false);
-              actions.onCompact(arc.id);
+              setConfirmCompact(true);
             }}
           >
             Compact
@@ -126,6 +128,19 @@ function ArcRow({
             {confirmDelete ? 'Sure? Delete' : 'Delete'}
           </button>
         </div>
+      )}
+      {confirmCompact && (
+        <ConfirmDialog
+          title="Compact this conversation?"
+          body="Compacting summarises the older messages in this conversation into a short recap to free up context space. The original detailed history is condensed and cannot be restored."
+          confirmLabel="Compact"
+          cancelLabel="Cancel"
+          onCancel={() => setConfirmCompact(false)}
+          onConfirm={() => {
+            setConfirmCompact(false);
+            actions.onCompact(arc.id);
+          }}
+        />
       )}
     </div>
   );

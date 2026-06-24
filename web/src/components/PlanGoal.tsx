@@ -2,6 +2,7 @@
 // banner — ports of the desktop's goal/plan surfaces.
 
 import { useState } from 'react';
+import { Spinner } from './Spinner';
 
 export interface GoalState {
   goal?: string | null;
@@ -46,15 +47,22 @@ export function PlanCard({
   onApprove: () => Promise<void>;
   onDiscard: () => Promise<void>;
 }) {
-  const [pending, setPending] = useState(false);
+  const [pendingLabel, setPendingLabel] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const steps = plan.steps ?? [];
   const drafting = (plan.status ?? 'Drafting') === 'Drafting';
-  const run = (f: () => Promise<void>) => async () => {
-    setPending(true);
+  const pending = pendingLabel !== null;
+  const run = (label: string, f: () => Promise<void>) => async () => {
+    if (pending) return; // re-entry guard
+    setPendingLabel(label);
+    setError(null);
     try {
       await f();
+    } catch (e) {
+      // Surface the failure inline and re-enable so the user can retry.
+      setError((e as Error).message);
     } finally {
-      setPending(false);
+      setPendingLabel(null);
     }
   };
   return (
@@ -74,14 +82,19 @@ export function PlanCard({
         ))}
       </ol>
       {drafting ? (
-        <div className="actions">
-          <button className="approve" disabled={pending} onClick={run(onApprove)}>
-            Approve &amp; execute
-          </button>
-          <button disabled={pending} onClick={run(onDiscard)}>
-            Discard
-          </button>
-        </div>
+        <>
+          <div className="actions">
+            <button className="approve" disabled={pending} onClick={run('approve', onApprove)}>
+              {pendingLabel === 'approve' && <Spinner />}
+              Approve &amp; execute
+            </button>
+            <button disabled={pending} onClick={run('discard', onDiscard)}>
+              {pendingLabel === 'discard' && <Spinner />}
+              Discard
+            </button>
+          </div>
+          {error && <div className="card-error">{error}</div>}
+        </>
       ) : (
         <div className="plan-progress">
           Step {Math.min(steps.filter((s) => s.completed).length + 1, steps.length)} of {steps.length} —{' '}

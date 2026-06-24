@@ -3,6 +3,7 @@
 // file-permission grant). Wire shapes mirror chat.html / app.js.
 
 import { useState } from 'react';
+import { Spinner } from './Spinner';
 import type {
   ApprovalChoice,
   ApprovalQuestion,
@@ -56,9 +57,13 @@ function ActionRow({
   resolved?: string;
   actions: { label: string; primary?: boolean; run: () => Promise<void> }[];
 }) {
-  const [pending, setPending] = useState(false);
+  // Track WHICH action is in flight so only the clicked button spins.
+  // A non-null value also doubles as the re-entry guard (all buttons
+  // disabled while any one is running).
+  const [pendingLabel, setPendingLabel] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   if (resolved) return <div className="resolved">{resolved}</div>;
+  const pending = pendingLabel !== null;
   return (
     <>
       <div className="actions">
@@ -68,16 +73,20 @@ function ActionRow({
             className={a.primary ? 'approve' : undefined}
             disabled={pending}
             onClick={async () => {
-              setPending(true);
+              if (pending) return; // re-entry guard
+              setPendingLabel(a.label);
               setError(null);
               try {
                 await a.run();
+                // On success the card resolves and this row unmounts, so we
+                // intentionally leave the button locked.
               } catch (e) {
                 setError((e as Error).message);
-                setPending(false);
+                setPendingLabel(null); // re-enable so the user can retry
               }
             }}
           >
+            {pendingLabel === a.label && <Spinner />}
             {a.label}
           </button>
         ))}
