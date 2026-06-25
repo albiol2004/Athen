@@ -10095,7 +10095,13 @@ pub(crate) async fn deep_research_core(
 
     // ── Run the orchestrator ────────────────────────────────────────────
     let outcome = state
-        .run_deep_research_for_arc(&arc_id, &question, depth.as_deref(), prior_paper, ui.clone())
+        .run_deep_research_for_arc(
+            &arc_id,
+            &question,
+            depth.as_deref(),
+            prior_paper,
+            ui.clone(),
+        )
         .await
         .map_err(|e| e.to_string())?;
 

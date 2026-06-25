@@ -3703,7 +3703,10 @@ mod tests {
         let listed = store.list_arcs().await.unwrap();
         let row = listed.iter().find(|a| a.id == "arc_research").unwrap();
         assert_eq!(row.research_paper_path.as_deref(), Some("/tmp/paper.md"));
-        assert_eq!(row.research_question.as_deref(), Some("What is the answer?"));
+        assert_eq!(
+            row.research_question.as_deref(),
+            Some("What is the answer?")
+        );
 
         // Clearing with None round-trips back to None.
         store

@@ -134,7 +134,10 @@ where
     // ---- Phase 1: plan / decompose ----------------------------------------
     progress(Progress {
         phase: "planning",
-        detail: format!("Decomposing the question into {} angles", depth.num_sub_questions()),
+        detail: format!(
+            "Decomposing the question into {} angles",
+            depth.num_sub_questions()
+        ),
         workers_total: depth.num_sub_questions(),
         workers_done: 0,
         workers_ok: 0,
@@ -243,9 +246,10 @@ async fn plan_sub_questions(
     };
 
     let router = router.read().await.clone();
-    let response = router.route(&request).await.map_err(|e| {
-        AthenError::Other(format!("Deep research planning LLM call failed: {e}"))
-    })?;
+    let response = router
+        .route(&request)
+        .await
+        .map_err(|e| AthenError::Other(format!("Deep research planning LLM call failed: {e}")))?;
 
     let mut parsed = parse_sub_questions(&response.content);
 
@@ -367,7 +371,9 @@ async fn synthesize(
             user.push_str("Findings:\n");
             user.push_str(findings.trim());
         } else {
-            user.push_str("Findings: (this researcher returned no usable findings — note this as a gap)");
+            user.push_str(
+                "Findings: (this researcher returned no usable findings — note this as a gap)",
+            );
         }
         user.push_str("\n\n");
     }
@@ -386,9 +392,10 @@ async fn synthesize(
     };
 
     let router = router.read().await.clone();
-    let response = router.route(&request).await.map_err(|e| {
-        AthenError::Other(format!("Deep research synthesis LLM call failed: {e}"))
-    })?;
+    let response = router
+        .route(&request)
+        .await
+        .map_err(|e| AthenError::Other(format!("Deep research synthesis LLM call failed: {e}")))?;
 
     let paper = response.content.trim().to_string();
     if paper.is_empty() {

@@ -2021,16 +2021,17 @@ impl AppState {
             let base = base.clone();
             let ctx = ctx.clone();
             async move {
-                let (_sub_arc, content, success, _verified, _note) = crate::delegation::run_delegation(
-                    base,
-                    ctx,
-                    crate::delegation::DelegateArgs {
-                        target_profile_id: "deep_research_worker".to_string(),
-                        brief,
-                        reasoning_effort: None,
-                    },
-                )
-                .await?;
+                let (_sub_arc, content, success, _verified, _note) =
+                    crate::delegation::run_delegation(
+                        base,
+                        ctx,
+                        crate::delegation::DelegateArgs {
+                            target_profile_id: "deep_research_worker".to_string(),
+                            brief,
+                            reasoning_effort: None,
+                        },
+                    )
+                    .await?;
                 Ok::<String, AthenError>(if success { content } else { String::new() })
             }
         };
