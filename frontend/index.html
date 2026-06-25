@@ -126,6 +126,12 @@
                         </span>
                         <span class="changes-pill-label">Changes</span>
                     </button>
+                    <button id="code-mode-panel-btn" class="changes-pill hidden" type="button" aria-label="Code Mode repo state" title="Git / worktree state for this Code-Mode arc">
+                        <span class="changes-pill-icon" aria-hidden="true">
+                            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="12" r="2.5"/><path d="M6 8.5v7"/><path d="M6 12a6 6 0 0 0 6 6h3.5"/><path d="M18 9.5V6a3 3 0 0 0-3-3H9"/></svg>
+                        </span>
+                        <span class="changes-pill-label">Repo</span>
+                    </button>
                     <label class="profile-picker-wrap" title="Choose the specialist that handles this arc">
                         <span class="profile-picker-label">Agent:</span>
                         <select id="arc-profile-picker" class="profile-picker"></select>
@@ -160,6 +166,12 @@
                             <option value="assistant">Assistant</option>
                             <option value="yolo">Yolo</option>
                         </select>
+                    </label>
+                    <label class="profile-picker-wrap code-mode-toggle-wrap" title="Code Mode roots this arc in a real git repository: the agent works in-place in that repo, and Athen visualizes its git/worktree state. Power-user feature.">
+                        <span class="profile-picker-label">Code:</span>
+                        <button id="arc-code-mode-toggle" class="code-mode-toggle" type="button" role="switch" aria-checked="false" aria-label="Toggle Code Mode for this arc" disabled>
+                            <span class="code-mode-toggle-track"><span class="code-mode-toggle-thumb"></span></span>
+                        </button>
                     </label>
                     <button id="new-chat-btn" title="Start a new conversation">New Arc</button>
                 </div>
@@ -257,6 +269,22 @@
             <div class="changes-rail-sub">File mutations Athen made in this arc. Click Revert to undo.</div>
             <div id="changes-rail-body" class="changes-rail-body">
                 <div class="changes-rail-empty">No changes yet.</div>
+            </div>
+        </aside>
+
+        <aside id="code-mode-panel" class="changes-rail code-mode-panel hidden" aria-label="Code Mode repository state">
+            <header class="changes-rail-header">
+                <h2 class="changes-rail-title">Repo</h2>
+                <div class="code-mode-panel-head-actions">
+                    <button id="code-mode-refresh" class="code-mode-refresh-btn" type="button" title="Refresh git state" aria-label="Refresh git state">
+                        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7"/><polyline points="3 4 3 10 9 10"/></svg>
+                    </button>
+                    <button id="code-mode-close" class="changes-rail-close" type="button" title="Close" aria-label="Close repo panel">&times;</button>
+                </div>
+            </header>
+            <div class="changes-rail-sub">Live git state of the repository this Code-Mode arc operates in.</div>
+            <div id="code-mode-body" class="changes-rail-body code-mode-body">
+                <div class="changes-rail-empty">Enable Code Mode on this arc to see its repository.</div>
             </div>
         </aside>
 

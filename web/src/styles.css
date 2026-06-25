@@ -929,3 +929,90 @@ button { font: inherit; }
   display: flex; align-items: center; gap: 10px;
   padding: 24px 0; color: var(--text-dim); font-size: 13px;
 }
+
+/* ---- Code Mode (docs/CODE_MODE.md) ---- */
+.icon-btn.active { color: var(--coral); background: var(--coral-soft); }
+
+/* per-arc Code Mode toggle (lives in .arc-pickers) */
+.arc-codemode-toggle {
+  font: inherit; font-size: 11.5px; font-weight: 600; flex: none;
+  color: var(--text-dim); background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--glass-border); border-radius: 8px;
+  padding: 3px 8px; cursor: pointer; white-space: nowrap;
+}
+.arc-codemode-toggle:hover { color: var(--text); }
+.arc-codemode-toggle.active {
+  color: var(--coral); background: var(--coral-soft); border-color: rgba(224, 122, 110, 0.35);
+}
+
+.codemode-path-input {
+  font: 13px ui-monospace, monospace; color: var(--text); width: 100%;
+  background: rgba(0, 0, 0, 0.25); border: 1px solid var(--glass-border);
+  border-radius: 8px; padding: 8px 10px; outline: none; margin: 4px 0 10px;
+  box-sizing: border-box;
+}
+.codemode-path-input:focus { border-color: var(--coral); }
+
+/* Code Mode panel */
+.cm-header {
+  display: flex; flex-direction: column; gap: 4px;
+  padding: 10px; border: 1px solid var(--glass-border); border-radius: 10px;
+  background: rgba(255, 255, 255, 0.03);
+}
+.cm-root {
+  font: 12px ui-monospace, monospace; color: var(--text-dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.cm-branch-row { display: flex; align-items: center; gap: 8px; }
+.cm-branch {
+  font-size: 13px; font-weight: 600; color: var(--coral);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.cm-aheadbehind { display: flex; gap: 6px; font-size: 12px; color: var(--text-dim); }
+.cm-upstream {
+  font: 11.5px ui-monospace, monospace; color: var(--text-dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.cm-not-repo { font-size: 12.5px; color: var(--text-dim); }
+
+.cm-section { display: flex; flex-direction: column; gap: 5px; }
+.cm-section-title {
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px;
+  color: var(--text-dim); font-weight: 600; margin-top: 4px;
+}
+.cm-section-body { display: flex; flex-direction: column; gap: 5px; }
+
+.cm-worktree {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 9px; border: 1px solid var(--glass-border); border-radius: 9px;
+  background: rgba(255, 255, 255, 0.03);
+}
+.cm-worktree-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.cm-worktree-path {
+  font: 12px ui-monospace, monospace; color: var(--text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.cm-worktree-meta { font: 11px ui-monospace, monospace; color: var(--text-dim); }
+.cm-badges { display: flex; gap: 4px; flex: none; }
+.cm-badge {
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px; font-weight: 600;
+  padding: 1px 6px; border-radius: 6px;
+}
+.cm-badge.main { color: var(--coral); background: var(--coral-soft); }
+.cm-badge.locked { color: var(--text-dim); background: rgba(255, 255, 255, 0.06); }
+
+.cm-clean { font-size: 12.5px; color: var(--text-dim); }
+.cm-dirty-row {
+  display: flex; align-items: baseline; gap: 8px;
+  font: 12px ui-monospace, monospace;
+}
+.cm-dirty-status { color: var(--coral); flex: none; min-width: 22px; }
+.cm-dirty-path {
+  color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+.cm-commit { display: flex; align-items: baseline; gap: 8px; font-size: 12.5px; }
+.cm-commit-hash { font: 11px ui-monospace, monospace; color: var(--text-dim); flex: none; }
+.cm-commit-subject {
+  color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}

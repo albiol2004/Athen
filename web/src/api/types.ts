@@ -22,6 +22,10 @@ export interface ArcMeta {
   research_paper_path?: string | null;
   /** The question driving this arc's Deep Research run, if any. */
   research_question?: string | null;
+  /** Code Mode (docs/CODE_MODE.md): is this arc a coding session in a real repo? */
+  code_mode?: boolean;
+  /** Absolute path to the repo root the Code-Mode arc operates in. */
+  code_mode_root?: string | null;
 }
 
 /** One persisted timeline row — `GET /api/arcs/{id}/entries`. */
@@ -194,6 +198,49 @@ export interface DeepResearchDoneEvent {
   workers_total: number;
   sub_questions: string[];
   extended: boolean;
+}
+
+// ---- Code Mode (docs/CODE_MODE.md) ----
+
+/** One working-tree dirty file from `git status --porcelain=v2`. */
+export interface DirtyFile {
+  path: string;
+  status: string;
+}
+
+/** One entry from `git worktree list --porcelain`. */
+export interface WorktreeInfo {
+  path: string;
+  branch: string | null;
+  head: string;
+  is_main: boolean;
+  locked: boolean;
+}
+
+/** One commit from `git log`. */
+export interface CommitInfo {
+  hash: string;
+  subject: string;
+  author: string;
+  timestamp: string;
+}
+
+/**
+ * `GET /api/arcs/{id}/code-mode/git` response (`GitRepoState`, snake_case
+ * verbatim — see athen-app/src/code_mode.rs). Read-only recognition of the
+ * real repo the Code-Mode arc is rooted in.
+ */
+export interface GitRepoState {
+  root: string;
+  is_repo: boolean;
+  head_branch: string | null;
+  detached: boolean;
+  upstream: string | null;
+  ahead: number;
+  behind: number;
+  dirty: DirtyFile[];
+  worktrees: WorktreeInfo[];
+  recent_commits: CommitInfo[];
 }
 
 /** Long-poll `POST /api/messages` response (`AgentResponse` shape). */

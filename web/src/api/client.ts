@@ -9,6 +9,7 @@ import type {
   DeepResearchDepth,
   DeepResearchMode,
   DeepResearchResult,
+  GitRepoState,
   GrantDecision,
   GrantRequest,
   MemoryInfo,
@@ -152,6 +153,24 @@ export class AthenClient {
    */
   getResearchPaper(arcId: string): Promise<string> {
     return this.req(`/arcs/${encodeURIComponent(arcId)}/research-paper`);
+  }
+
+  // ---- code mode (docs/CODE_MODE.md) ----
+  /**
+   * Turn Code Mode on/off for `arcId`. Enabling requires `root` (an absolute
+   * path to an existing directory — the backend validates it's a real dir);
+   * disabling passes `enabled:false, root:null`. Errors (e.g. non-existent
+   * root) come back as the standard `{ error }` shape → `ApiError`.
+   */
+  setArcCodeMode(arcId: string, enabled: boolean, root: string | null): Promise<unknown> {
+    return this.req(`/arcs/${encodeURIComponent(arcId)}/code-mode`, { enabled, root });
+  }
+  /**
+   * Read-only git recognition for a Code-Mode arc. Errors when the arc is not
+   * in Code Mode; a non-repo root degrades to `is_repo: false` (not an error).
+   */
+  codeModeGitState(arcId: string): Promise<GitRepoState> {
+    return this.req(`/arcs/${encodeURIComponent(arcId)}/code-mode/git`);
   }
 
   // ---- approvals & grants ----

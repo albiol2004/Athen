@@ -1016,6 +1016,7 @@ async function loadArcs() {
         renderReasoningPicker();
         renderTierPicker();
         renderSecurityPicker();
+        renderCodeModeToggle();
     } catch (err) {
         console.error('Failed to load arcs:', err);
     }
@@ -1149,6 +1150,393 @@ async function onSecurityChange(ev) {
         console.error('set_arc_security_mode failed:', err);
         renderSecurityPicker();
     }
+}
+
+// ─── Code Mode (per-arc) ───
+//
+// Code Mode is a per-arc, UI-only posture (mirrors security_mode_override /
+// reasoning_effort_override): it roots the arc in a real git repository, the
+// agent works in-place there, and Athen visualizes the repo's git/worktree
+// state via the read-only recognition layer (code_mode_git_state). The toggle
+// lives next to the other per-arc pickers; the #code-mode-panel drawer mirrors
+// the Changes rail. State is reflected from arcMetaById[activeArcId].code_mode
+// (snake_case from the arc-meta cache; root is code_mode_root).
+
+// Reflect the toggle + the panel-open button from the active arc's metadata.
+function renderCodeModeToggle() {
+    const toggle = document.getElementById('arc-code-mode-toggle');
+    const wrap = toggle ? toggle.closest('.code-mode-toggle-wrap') : null;
+    const panelBtn = document.getElementById('code-mode-panel-btn');
+    const meta = activeArcId ? arcMetaById.get(activeArcId) : null;
+    const enabled = !!(meta && meta.code_mode);
+
+    // Only show the toggle/panel button when there is an active arc.
+    if (wrap) wrap.classList.toggle('hidden', !activeArcId);
+    if (toggle) {
+        toggle.disabled = !activeArcId;
+        toggle.classList.toggle('on', enabled);
+        toggle.setAttribute('aria-checked', enabled ? 'true' : 'false');
+        const root = (meta && meta.code_mode_root) || '';
+        toggle.title = enabled
+            ? `Code Mode ON — repo: ${root || '(root unknown)'}. Click to turn off.`
+            : 'Code Mode OFF. Click to root this arc in a git repository.';
+    }
+    // The "Repo" panel button only appears for Code-Mode arcs.
+    if (panelBtn) panelBtn.classList.toggle('hidden', !(activeArcId && enabled));
+    // If Code Mode just got turned off while its panel is open, close it.
+    if (!enabled) {
+        const panel = document.getElementById('code-mode-panel');
+        if (panel && !panel.classList.contains('hidden')) closeCodeModePanel();
+    }
+}
+
+// Toggle handler. On enable, prompt for the absolute repo directory (text
+// input — no native picker, which freezes WebKitGTK). On disable, clear the
+// root. set_arc_code_mode validates the dir exists when enabling and throws a
+// string on error, surfaced via showToast.
+async function onCodeModeToggle() {
+    if (!invoke || !activeArcId) return;
+    const meta = arcMetaById.get(activeArcId);
+    const currentlyOn = !!(meta && meta.code_mode);
+
+    if (currentlyOn) {
+        try {
+            await invoke('set_arc_code_mode', { arcId: activeArcId, enabled: false, root: null });
+            if (meta) { meta.code_mode = false; meta.code_mode_root = null; }
+            renderCodeModeToggle();
+            showToast('Code Mode disabled for this arc.', '');
+        } catch (err) {
+            showToast('Could not disable Code Mode: ' + errText(err), 'error');
+            renderCodeModeToggle();
+        }
+        return;
+    }
+
+    // Enabling: ask for the absolute repo path via a text-input dialog.
+    const defaultRoot = (meta && meta.code_mode_root) || '';
+    const root = await showCodeModeRootDialog(defaultRoot);
+    if (root == null) return; // cancelled
+    const trimmed = root.trim();
+    if (!trimmed) { showToast('A repository path is required.', 'error'); return; }
+
+    try {
+        await invoke('set_arc_code_mode', { arcId: activeArcId, enabled: true, root: trimmed });
+        if (meta) { meta.code_mode = true; meta.code_mode_root = trimmed; }
+        renderCodeModeToggle();
+        showToast('Code Mode enabled.', 'success');
+    } catch (err) {
+        // Backend validates the dir exists; surface its thrown string verbatim.
+        showToast('Could not enable Code Mode: ' + errText(err), 'error');
+        renderCodeModeToggle();
+    }
+}
+
+// Text-input dialog for the absolute repo path. Reuses the rewind-dialog glass
+// CSS (same family as showConfirmDialog / showDeepResearchDialog). Resolves to
+// the entered string, or null if cancelled. No native file picker — those
+// freeze the Tauri+WebKitGTK window.
+function showCodeModeRootDialog(initialPath) {
+    return new Promise((resolve) => {
+        const overlay = document.createElement('div');
+        overlay.className = 'rewind-dialog-overlay';
+
+        const dialog = document.createElement('div');
+        dialog.className = 'rewind-dialog';
+
+        const titleEl = document.createElement('h3');
+        titleEl.textContent = 'Enable Code Mode';
+        dialog.appendChild(titleEl);
+
+        const desc = document.createElement('p');
+        desc.textContent = 'Paste the absolute path to the git repository this arc should work in. The agent will operate in-place there.';
+        dialog.appendChild(desc);
+
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'code-mode-root-input';
+        input.placeholder = '/home/you/code/my-repo';
+        input.value = initialPath || '';
+        input.spellcheck = false;
+        input.autocapitalize = 'off';
+        input.autocomplete = 'off';
+        dialog.appendChild(input);
+
+        const btnRow = document.createElement('div');
+        btnRow.className = 'rewind-dialog-buttons';
+
+        const cancelBtn = document.createElement('button');
+        cancelBtn.className = 'rewind-dialog-cancel';
+        cancelBtn.textContent = 'Cancel';
+
+        const confirmBtn = document.createElement('button');
+        confirmBtn.className = 'rewind-dialog-confirm';
+        confirmBtn.textContent = 'Enable';
+
+        btnRow.appendChild(cancelBtn);
+        btnRow.appendChild(confirmBtn);
+        dialog.appendChild(btnRow);
+        overlay.appendChild(dialog);
+        document.body.appendChild(overlay);
+
+        let settled = false;
+        const close = (val) => {
+            if (settled) return;
+            settled = true;
+            document.removeEventListener('keydown', onKey);
+            overlay.remove();
+            resolve(val);
+        };
+        const submit = () => {
+            const v = input.value.trim();
+            if (!v) { input.focus(); return; }
+            close(v);
+        };
+
+        cancelBtn.addEventListener('click', () => close(null));
+        confirmBtn.addEventListener('click', submit);
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') { e.preventDefault(); submit(); }
+        });
+        overlay.addEventListener('click', (e) => { if (e.target === overlay) close(null); });
+        const onKey = (e) => { if (e.key === 'Escape') close(null); };
+        document.addEventListener('keydown', onKey);
+
+        input.focus();
+        input.setSelectionRange(input.value.length, input.value.length);
+    });
+}
+
+// ─── Code-Mode panel (git / worktree / WIP visualization) ───
+//
+// Arc-scoped drawer mirroring the Changes rail. Open/refresh calls
+// code_mode_git_state(activeArcId) → GitRepoState (snake_case fields) and
+// renders the repo header, worktrees, working-tree (dirty) files, and recent
+// commits. ALL git output (paths, branches, subjects, hashes) is untrusted, so
+// every value goes through textContent / createElement — never innerHTML.
+
+const codeModePanelEl = () => document.getElementById('code-mode-panel');
+const codeModeBodyEl = () => document.getElementById('code-mode-body');
+
+function openCodeModePanel() {
+    const panel = codeModePanelEl();
+    if (!panel) return;
+    // Mutually exclusive with the Changes rail (both are right-side drawers).
+    if (typeof closeChangesRail === 'function') closeChangesRail();
+    panel.classList.remove('hidden');
+    refreshCodeModePanel();
+}
+function closeCodeModePanel() {
+    const panel = codeModePanelEl();
+    if (!panel) return;
+    panel.classList.add('hidden');
+}
+
+async function refreshCodeModePanel() {
+    const body = codeModeBodyEl();
+    if (!invoke || !body) return;
+    if (!activeArcId) {
+        renderCodeModeEmpty(body, 'Pick an arc to see its repository.');
+        return;
+    }
+    renderCodeModeEmpty(body, 'Loading git state…');
+    let state;
+    try {
+        state = await invoke('code_mode_git_state', { arcId: activeArcId });
+    } catch (err) {
+        // Thrown when the arc is not in Code Mode, or git read failed.
+        renderCodeModeEmpty(body, errText(err));
+        return;
+    }
+    renderCodeModeState(body, state || {});
+}
+
+function renderCodeModeEmpty(body, message) {
+    body.innerHTML = '';
+    const empty = document.createElement('div');
+    empty.className = 'changes-rail-empty';
+    empty.textContent = message;
+    body.appendChild(empty);
+}
+
+// Render the full GitRepoState. Defensive about missing fields (a degraded
+// non-repo path returns is_repo:false). Untrusted strings via textContent.
+function renderCodeModeState(body, state) {
+    body.innerHTML = '';
+
+    // ── Repo header ──
+    const header = document.createElement('div');
+    header.className = 'code-mode-section code-mode-repo-header';
+
+    const rootRow = document.createElement('div');
+    rootRow.className = 'code-mode-root-row';
+    rootRow.textContent = state.root || '(unknown root)';
+    rootRow.title = state.root || '';
+    header.appendChild(rootRow);
+
+    if (state.is_repo === false) {
+        body.appendChild(header);
+        const empty = document.createElement('div');
+        empty.className = 'code-mode-notrepo';
+        empty.textContent = 'Not a git repository — run `git init` here.';
+        body.appendChild(empty);
+        return;
+    }
+
+    const branchRow = document.createElement('div');
+    branchRow.className = 'code-mode-branch-row';
+    const branchTag = document.createElement('span');
+    branchTag.className = 'code-mode-branch';
+    if (state.detached) {
+        branchTag.classList.add('detached');
+        branchTag.textContent = 'detached';
+    } else {
+        branchTag.textContent = state.head_branch || '(no branch)';
+    }
+    branchRow.appendChild(branchTag);
+
+    const ahead = Number(state.ahead || 0);
+    const behind = Number(state.behind || 0);
+    if (ahead || behind) {
+        const sync = document.createElement('span');
+        sync.className = 'code-mode-sync';
+        sync.textContent = `↑${ahead} ↓${behind}`;
+        sync.title = `${ahead} ahead, ${behind} behind upstream`;
+        branchRow.appendChild(sync);
+    }
+    header.appendChild(branchRow);
+
+    if (state.upstream) {
+        const up = document.createElement('div');
+        up.className = 'code-mode-upstream';
+        up.textContent = '→ ' + state.upstream;
+        up.title = state.upstream;
+        header.appendChild(up);
+    }
+    body.appendChild(header);
+
+    // ── Worktrees ──
+    body.appendChild(buildCodeModeSection('Worktrees', (sec) => {
+        const worktrees = Array.isArray(state.worktrees) ? state.worktrees : [];
+        if (worktrees.length === 0) {
+            sec.appendChild(buildCodeModeMuted('No worktrees.'));
+            return;
+        }
+        for (const wt of worktrees) {
+            const row = document.createElement('div');
+            row.className = 'code-mode-worktree';
+
+            const top = document.createElement('div');
+            top.className = 'code-mode-worktree-top';
+
+            const branch = document.createElement('span');
+            branch.className = 'code-mode-worktree-branch';
+            branch.textContent = wt.branch || 'detached';
+            if (!wt.branch) branch.classList.add('detached');
+            top.appendChild(branch);
+
+            if (wt.is_main) {
+                const badge = document.createElement('span');
+                badge.className = 'code-mode-badge main';
+                badge.textContent = 'main';
+                top.appendChild(badge);
+            }
+            if (wt.locked) {
+                const badge = document.createElement('span');
+                badge.className = 'code-mode-badge locked';
+                badge.textContent = 'locked';
+                top.appendChild(badge);
+            }
+
+            const head = document.createElement('span');
+            head.className = 'code-mode-worktree-head';
+            head.textContent = (wt.head || '').slice(0, 8);
+            top.appendChild(head);
+
+            row.appendChild(top);
+
+            const pathEl = document.createElement('div');
+            pathEl.className = 'code-mode-worktree-path';
+            pathEl.textContent = wt.path || '';
+            pathEl.title = wt.path || '';
+            row.appendChild(pathEl);
+
+            sec.appendChild(row);
+        }
+    }));
+
+    // ── Working tree (WIP) ──
+    body.appendChild(buildCodeModeSection('Working tree', (sec) => {
+        const dirty = Array.isArray(state.dirty) ? state.dirty : [];
+        if (dirty.length === 0) {
+            sec.appendChild(buildCodeModeMuted('Working tree clean'));
+            return;
+        }
+        for (const f of dirty) {
+            const row = document.createElement('div');
+            row.className = 'code-mode-dirty';
+
+            const status = document.createElement('span');
+            status.className = 'code-mode-dirty-status';
+            status.textContent = f.status || '?';
+            row.appendChild(status);
+
+            const pathEl = document.createElement('span');
+            pathEl.className = 'code-mode-dirty-path';
+            pathEl.textContent = f.path || '';
+            pathEl.title = f.path || '';
+            row.appendChild(pathEl);
+
+            sec.appendChild(row);
+        }
+    }));
+
+    // ── Recent commits (first ~10) ──
+    body.appendChild(buildCodeModeSection('Recent commits', (sec) => {
+        const commits = (Array.isArray(state.recent_commits) ? state.recent_commits : []).slice(0, 10);
+        if (commits.length === 0) {
+            sec.appendChild(buildCodeModeMuted('No commits yet.'));
+            return;
+        }
+        for (const c of commits) {
+            const row = document.createElement('div');
+            row.className = 'code-mode-commit';
+
+            const hash = document.createElement('span');
+            hash.className = 'code-mode-commit-hash';
+            hash.textContent = (c.hash || '').slice(0, 8);
+            row.appendChild(hash);
+
+            const subject = document.createElement('span');
+            subject.className = 'code-mode-commit-subject';
+            subject.textContent = c.subject || '';
+            subject.title = c.subject || '';
+            row.appendChild(subject);
+
+            sec.appendChild(row);
+        }
+    }));
+}
+
+// Build a titled section; `fill(contentEl)` populates its body.
+function buildCodeModeSection(title, fill) {
+    const sec = document.createElement('div');
+    sec.className = 'code-mode-section';
+    const h = document.createElement('div');
+    h.className = 'code-mode-section-title';
+    h.textContent = title;
+    sec.appendChild(h);
+    const content = document.createElement('div');
+    content.className = 'code-mode-section-body';
+    fill(content);
+    sec.appendChild(content);
+    return sec;
+}
+
+function buildCodeModeMuted(text) {
+    const el = document.createElement('div');
+    el.className = 'code-mode-muted';
+    el.textContent = text;
+    return el;
 }
 
 function getSourceIcon(source) {
@@ -1583,6 +1971,14 @@ async function handleSwitchArc(arcId) {
         renderReasoningPicker();
         renderTierPicker();
         renderSecurityPicker();
+        renderCodeModeToggle();
+        // If the Code-Mode panel is open, re-point it at the new arc's repo
+        // (renderCodeModeToggle already closes it when the new arc isn't in
+        // Code Mode).
+        {
+            const cmPanel = document.getElementById('code-mode-panel');
+            if (cmPanel && !cmPanel.classList.contains('hidden')) refreshCodeModePanel();
+        }
 
         // Clear notification dot for this arc.
         arcsWithNotifications.delete(arcId);
@@ -6295,6 +6691,18 @@ function closeChangesRail() {
 }
 if (changesRailBtn) changesRailBtn.addEventListener('click', openChangesRail);
 if (changesRailCloseBtn) changesRailCloseBtn.addEventListener('click', closeChangesRail);
+
+// ─── Code Mode wiring ───
+// invoke is undefined until initTauri() runs, so wire via addEventListener
+// only — never call invoke synchronously at load (see memory lesson).
+const codeModeToggleBtn = document.getElementById('arc-code-mode-toggle');
+const codeModePanelBtn = document.getElementById('code-mode-panel-btn');
+const codeModeCloseBtn = document.getElementById('code-mode-close');
+const codeModeRefreshBtn = document.getElementById('code-mode-refresh');
+if (codeModeToggleBtn) codeModeToggleBtn.addEventListener('click', onCodeModeToggle);
+if (codeModePanelBtn) codeModePanelBtn.addEventListener('click', openCodeModePanel);
+if (codeModeCloseBtn) codeModeCloseBtn.addEventListener('click', closeCodeModePanel);
+if (codeModeRefreshBtn) codeModeRefreshBtn.addEventListener('click', refreshCodeModePanel);
 
 async function refreshChangesRail() {
     if (!invoke || !changesRailBodyEl) return;

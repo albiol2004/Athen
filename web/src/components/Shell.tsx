@@ -16,6 +16,7 @@ import { AgentsPanel } from './AgentsPanel';
 import { ArcPickers } from './ArcPickers';
 import { Bell } from './Bell';
 import { ChangesRail } from './ChangesRail';
+import { CodeModePanel } from './CodeModePanel';
 import { Chat, type ChatCallbacks, type OutgoingFile, type OutgoingImage } from './Chat';
 import { DeepResearchBanner, DeepResearchModal } from './DeepResearch';
 import { GoalBanner, type GoalState, type PlanState } from './PlanGoal';
@@ -28,7 +29,7 @@ function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-type Drawer = 'none' | 'agents' | 'changes' | 'wakeups';
+type Drawer = 'none' | 'agents' | 'changes' | 'wakeups' | 'code-mode';
 
 export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () => void }) {
   const { toast } = useToast();
@@ -612,6 +613,23 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
                 <path d="M12 10v3l2 2M5 4 3 6m16-2 2 2" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
               </svg>
             </button>
+            {activeArc && (
+              <button
+                className={`icon-btn${drawer === 'code-mode' ? ' active' : ''}`}
+                title="Code Mode — git / worktrees / working tree"
+                onClick={() => setDrawer((d) => (d === 'code-mode' ? 'none' : 'code-mode'))}
+              >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                  <path
+                    d="m8 8-4 4 4 4m8-8 4 4-4 4M13.5 5l-3 14"
+                    stroke="currentColor"
+                    strokeWidth="1.8"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                </svg>
+              </button>
+            )}
             <Bell
               notifications={notifications}
               onMarkAllRead={() => void markAllRead()}
@@ -695,6 +713,9 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
         />
       )}
       {drawer === 'wakeups' && <Wakeups client={client} onClose={() => setDrawer('none')} />}
+      {drawer === 'code-mode' && activeArc && (
+        <CodeModePanel client={client} arcId={activeArc} onClose={() => setDrawer('none')} />
+      )}
       {settingsOpen && (
         <SettingsModal
           client={client}
