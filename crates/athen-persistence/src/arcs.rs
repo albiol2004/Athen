@@ -186,6 +186,14 @@ pub struct ArcMeta {
     /// arc is not part of any project. Sub-arcs inherit the parent arc's
     /// `project_id` at creation. See `docs/PROJECTS.md`.
     pub project_id: Option<String>,
+    /// Filesystem path to the research paper produced for this arc, if any.
+    /// `None` means no Deep Research paper has been generated. See
+    /// `docs/DEEP_RESEARCH.md`.
+    pub research_paper_path: Option<String>,
+    /// The research question driving this arc's Deep Research run, if any.
+    /// `None` means the arc is not a Deep Research arc. See
+    /// `docs/DEEP_RESEARCH.md`.
+    pub research_question: Option<String>,
     /// Mini-plan drafted by the triage LLM call (same call that evaluates
     /// risk + complexity — see `RiskScore.plan`). Captured once at task
     /// creation, then survives compaction as arc-level metadata. The
@@ -526,6 +534,17 @@ impl ArcStore {
                     .map_err(|e| AthenError::Other(format!("Add project_id: {e}")))?;
             }
 
+            // Column-level migration: Deep Research arc metadata. NULL means
+            // the arc is not a Deep Research arc. See `docs/DEEP_RESEARCH.md`.
+            if !cols.contains("research_paper_path") {
+                conn.execute("ALTER TABLE arcs ADD COLUMN research_paper_path TEXT", [])
+                    .map_err(|e| AthenError::Other(format!("Add research_paper_path: {e}")))?;
+            }
+            if !cols.contains("research_question") {
+                conn.execute("ALTER TABLE arcs ADD COLUMN research_question TEXT", [])
+                    .map_err(|e| AthenError::Other(format!("Add research_question: {e}")))?;
+            }
+
             Ok(())
         })
         .await
@@ -642,7 +661,8 @@ impl ArcStore {
                             a.user_goal, a.user_goal_criteria, \
                             a.goal_status, a.goal_blocked_reason, \
                             a.plan_json, a.security_mode_override, \
-                            a.project_id \
+                            a.project_id, \
+                            a.research_paper_path, a.research_question \
                      FROM arcs a \
                      LEFT JOIN ( \
                          SELECT arc_id, COUNT(*) AS cnt \
@@ -681,6 +701,8 @@ impl ArcStore {
                             .and_then(|s| serde_json::from_str(&s).ok()),
                         security_mode_override: row.get(23)?,
                         project_id: row.get::<_, Option<String>>(24)?,
+                        research_paper_path: row.get::<_, Option<String>>(25)?,
+                        research_question: row.get::<_, Option<String>>(26)?,
                     })
                 })
                 .map_err(|e| AthenError::Other(format!("Query get arc: {e}")))?;
@@ -734,7 +756,8 @@ impl ArcStore {
                         a.user_goal, a.user_goal_criteria, \
                         a.goal_status, a.goal_blocked_reason, \
                         a.plan_json, a.security_mode_override, \
-                        a.project_id \
+                        a.project_id, \
+                        a.research_paper_path, a.research_question \
                  FROM arcs a \
                  LEFT JOIN ( \
                      SELECT arc_id, COUNT(*) AS cnt \
@@ -776,6 +799,8 @@ impl ArcStore {
                             .and_then(|s| serde_json::from_str(&s).ok()),
                         security_mode_override: row.get(23)?,
                         project_id: row.get::<_, Option<String>>(24)?,
+                        research_paper_path: row.get::<_, Option<String>>(25)?,
+                        research_question: row.get::<_, Option<String>>(26)?,
                     })
                 })
                 .map_err(|e| AthenError::Other(format!("Query list arcs: {e}")))?;
@@ -1233,6 +1258,46 @@ impl ArcStore {
                 params![project_id, arc_id],
             )
             .map_err(|e| AthenError::Other(format!("Set project_id: {e}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
+    /// Set (or clear) the filesystem path to the Deep Research paper produced
+    /// for this arc. Last-write-wins. Pass `None` to clear it. See
+    /// `docs/DEEP_RESEARCH.md`.
+    pub async fn set_research_paper_path(&self, arc_id: &str, path: Option<&str>) -> Result<()> {
+        let conn = self.conn.clone();
+        let arc_id = arc_id.to_string();
+        let path = path.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE arcs SET research_paper_path = ?1 WHERE id = ?2",
+                params![path, arc_id],
+            )
+            .map_err(|e| AthenError::Other(format!("Set research_paper_path: {e}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
+    /// Set (or clear) the research question driving this arc's Deep Research
+    /// run. Last-write-wins. Pass `None` to clear it. See
+    /// `docs/DEEP_RESEARCH.md`.
+    pub async fn set_research_question(&self, arc_id: &str, question: Option<&str>) -> Result<()> {
+        let conn = self.conn.clone();
+        let arc_id = arc_id.to_string();
+        let question = question.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE arcs SET research_question = ?1 WHERE id = ?2",
+                params![question, arc_id],
+            )
+            .map_err(|e| AthenError::Other(format!("Set research_question: {e}")))?;
             Ok(())
         })
         .await
@@ -1878,7 +1943,9 @@ CREATE TABLE IF NOT EXISTS arcs (
     goal_blocked_reason TEXT,
     plan_json TEXT,
     security_mode_override TEXT,
-    project_id TEXT
+    project_id TEXT,
+    research_paper_path TEXT,
+    research_question TEXT
 );
 
 CREATE TABLE IF NOT EXISTS arc_entries (
@@ -3591,5 +3658,68 @@ mod tests {
             .unwrap()
             .expect("arc present");
         assert_eq!(meta.project_id, None);
+    }
+
+    /// Deep Research metadata round-trip: a fresh arc has both fields `None`,
+    /// the setters persist values, and `get_arc` reloads them.
+    #[tokio::test]
+    async fn test_research_fields_round_trip() {
+        let store = setup_arc_store().await;
+
+        // A fresh arc has both Deep Research fields as None.
+        store
+            .create_arc("arc_research", "Research", ArcSource::UserInput)
+            .await
+            .unwrap();
+        let meta = store
+            .get_arc("arc_research")
+            .await
+            .unwrap()
+            .expect("arc present");
+        assert_eq!(meta.research_paper_path, None);
+        assert_eq!(meta.research_question, None);
+
+        // Setters persist both fields; get_arc reloads them.
+        store
+            .set_research_paper_path("arc_research", Some("/tmp/paper.md"))
+            .await
+            .unwrap();
+        store
+            .set_research_question("arc_research", Some("What is the answer?"))
+            .await
+            .unwrap();
+        let meta = store
+            .get_arc("arc_research")
+            .await
+            .unwrap()
+            .expect("arc present");
+        assert_eq!(meta.research_paper_path.as_deref(), Some("/tmp/paper.md"));
+        assert_eq!(
+            meta.research_question.as_deref(),
+            Some("What is the answer?")
+        );
+
+        // list_arcs reflects the same values.
+        let listed = store.list_arcs().await.unwrap();
+        let row = listed.iter().find(|a| a.id == "arc_research").unwrap();
+        assert_eq!(row.research_paper_path.as_deref(), Some("/tmp/paper.md"));
+        assert_eq!(row.research_question.as_deref(), Some("What is the answer?"));
+
+        // Clearing with None round-trips back to None.
+        store
+            .set_research_paper_path("arc_research", None)
+            .await
+            .unwrap();
+        store
+            .set_research_question("arc_research", None)
+            .await
+            .unwrap();
+        let meta = store
+            .get_arc("arc_research")
+            .await
+            .unwrap()
+            .expect("arc present");
+        assert_eq!(meta.research_paper_path, None);
+        assert_eq!(meta.research_question, None);
     }
 }
