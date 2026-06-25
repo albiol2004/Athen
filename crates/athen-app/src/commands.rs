@@ -9998,6 +9998,223 @@ pub(crate) async fn delete_project_core(
     Ok(())
 }
 
+// ── Deep Research ────────────────────────────────────────────────────────
+
+/// Result of a Deep Research run, returned to the UI / HTTP caller. The paper
+/// itself lives on disk (saved via `save_file` into the `Outputs/` bucket); this
+/// just carries the workspace-relative path + the run metadata.
+#[derive(serde::Serialize)]
+pub struct DeepResearchResult {
+    pub arc_id: String,
+    /// Workspace-relative path the paper was saved to (e.g. `Outputs/research-…md`).
+    pub paper_path: String,
+    pub question: String,
+    pub depth: String,
+    pub sub_questions: Vec<String>,
+    pub workers_total: usize,
+    pub workers_ok: usize,
+    /// `true` if this run folded into a prior paper (Extend), `false` for a new paper.
+    pub extended: bool,
+}
+
+/// Slugify a research question into a filesystem-safe filename stem: lowercase,
+/// non-alphanumerics collapsed to single `-`, trimmed, capped to ~40 chars.
+/// Never returns empty — falls back to `"research"`.
+fn slugify_question(question: &str) -> String {
+    let mut slug = String::with_capacity(40);
+    let mut last_dash = true; // suppress a leading dash
+    for ch in question.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash {
+            slug.push('-');
+            last_dash = true;
+        }
+        if slug.len() >= 40 {
+            break;
+        }
+    }
+    let trimmed = slug.trim_matches('-');
+    if trimmed.is_empty() {
+        "research".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Shared core behind the `deep_research` Tauri command + the HTTP route. Runs
+/// the orchestrator for `arc_id`, persists the resulting paper through the
+/// `save_file` tool (so it inherits checkpoint/snapshot), stamps the arc's
+/// research metadata, and emits a final `deep-research-done` event.
+///
+/// `mode == Some("extend")` folds the new findings into the arc's existing paper
+/// (when one exists); any other value (or a missing prior paper) starts fresh.
+pub(crate) async fn deep_research_core(
+    arc_id: String,
+    question: String,
+    depth: Option<String>,
+    mode: Option<String>,
+    state: &AppState,
+    ui: crate::ui_bridge::UiBridge,
+) -> std::result::Result<DeepResearchResult, String> {
+    let Some(ref arc_store) = state.arc_store else {
+        return Err("Arc store not available".to_string());
+    };
+
+    // Load the arc so we can read its existing research metadata.
+    let arc = arc_store
+        .get_arc(&arc_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Arc not found: {arc_id}"))?;
+
+    // ── Decide extend vs new ────────────────────────────────────────────
+    let existing = arc.research_paper_path.clone();
+    let mut extend = mode.as_deref() == Some("extend") && existing.is_some();
+    let prior_paper: Option<String> = if extend {
+        // existing is Some by the guard above.
+        let rel = existing.clone().unwrap();
+        let abs = athen_core::paths::resolve_in_workspace(std::path::Path::new(&rel));
+        match tokio::fs::read_to_string(&abs).await {
+            Ok(text) => Some(text),
+            Err(e) => {
+                // Never hard-fail on a missing/unreadable old paper — degrade to
+                // a fresh run.
+                warn!(
+                    "deep_research: failed to read prior paper {} ({e}); proceeding as a new paper",
+                    abs.display()
+                );
+                extend = false;
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // ── Run the orchestrator ────────────────────────────────────────────
+    let outcome = state
+        .run_deep_research_for_arc(&arc_id, &question, depth.as_deref(), prior_paper, ui.clone())
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // ── Filename: reuse the prior basename on Extend (stable path → overwrite),
+    // otherwise mint a fresh `research-<slug>-<ts>.md`. ────────────────────
+    let filename = if extend {
+        // `existing` is Some when `extend` is still true here.
+        let rel = existing.clone().unwrap();
+        std::path::Path::new(&rel)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                format!(
+                    "research-{}-{}.md",
+                    slugify_question(&question),
+                    Utc::now().format("%Y%m%d-%H%M%S")
+                )
+            })
+    } else {
+        format!(
+            "research-{}-{}.md",
+            slugify_question(&question),
+            Utc::now().format("%Y%m%d-%H%M%S")
+        )
+    };
+
+    // ── Persist via the `save_file` tool so the write is checkpointed/snapshotted.
+    // category "output" maps to the `Outputs/` bucket; the saved workspace-relative
+    // path is therefore `Outputs/<filename>` (mirrors `resolve_save_path`). ──────
+    let reg = crate::state::assemble_base_app_tool_registry(
+        state.tool_registry_deps(),
+        &arc_id,
+        Some(ui.clone()),
+    )
+    .await;
+    let save_res = reg
+        .call_tool(
+            "save_file",
+            serde_json::json!({
+                "category": "output",
+                "filename": filename,
+                "content": outcome.paper_markdown,
+            }),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    if !save_res.success {
+        return Err(format!(
+            "deep_research: failed to save paper: {}",
+            save_res
+                .error
+                .unwrap_or_else(|| "save_file returned failure".to_string())
+        ));
+    }
+    let paper_path = format!("Outputs/{filename}");
+
+    // ── Stamp arc metadata (best-effort; don't fail the run on a write error). ──
+    if let Err(e) = arc_store
+        .set_research_paper_path(&arc_id, Some(&paper_path))
+        .await
+    {
+        warn!("deep_research: failed to stamp research_paper_path on {arc_id}: {e}");
+    }
+    if let Err(e) = arc_store
+        .set_research_question(&arc_id, Some(&question))
+        .await
+    {
+        warn!("deep_research: failed to stamp research_question on {arc_id}: {e}");
+    }
+
+    // ── Final event for the progress surface. ───────────────────────────
+    ui.emit(
+        "deep-research-done",
+        serde_json::json!({
+            "arc_id": arc_id,
+            "paper_path": paper_path,
+            "question": question,
+            "workers_ok": outcome.workers_ok,
+            "workers_total": outcome.workers_total,
+            "sub_questions": outcome.sub_questions,
+            "extended": extend,
+        }),
+    );
+
+    Ok(DeepResearchResult {
+        arc_id,
+        paper_path,
+        question: outcome.question,
+        depth: outcome.depth,
+        sub_questions: outcome.sub_questions,
+        workers_total: outcome.workers_total,
+        workers_ok: outcome.workers_ok,
+        extended: extend,
+    })
+}
+
+/// Trigger a Deep Research run for an arc. The UI reads `arc.research_paper_path`
+/// and prompts the user (extend vs new) BEFORE calling, then passes `mode`.
+#[tauri::command]
+pub async fn deep_research(
+    arc_id: String,
+    question: String,
+    depth: Option<String>,
+    mode: Option<String>,
+    app_handle: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> std::result::Result<DeepResearchResult, String> {
+    deep_research_core(
+        arc_id,
+        question,
+        depth,
+        mode,
+        &state,
+        crate::ui_bridge::UiBridge::Tauri(app_handle),
+    )
+    .await
+}
+
 /// Assign (or clear) an arc's Project membership. When assigning to a project,
 /// that project also becomes the active project.
 #[tauri::command]

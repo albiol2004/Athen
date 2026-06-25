@@ -1081,6 +1081,30 @@ async fn h_set_active_project(
 ) -> Response {
     json_result(commands::set_active_project_core(body.value, api.ui.app_state()).await)
 }
+#[derive(Deserialize)]
+struct DeepResearchBody {
+    question: String,
+    depth: Option<String>,
+    mode: Option<String>,
+}
+async fn h_deep_research(
+    State(api): State<ApiState>,
+    UrlPath(arc_id): UrlPath<String>,
+    Json(body): Json<DeepResearchBody>,
+) -> Response {
+    let state = api.ui.app_state();
+    json_result(
+        commands::deep_research_core(
+            arc_id,
+            body.question,
+            body.depth,
+            body.mode,
+            state,
+            api.ui.clone(),
+        )
+        .await,
+    )
+}
 async fn h_project_summary_mode_get(State(api): State<ApiState>) -> Response {
     json_result(commands::get_project_summary_mode_core(api.ui.app_state()).await)
 }
@@ -1948,6 +1972,7 @@ fn full_surface_router() -> Router<ApiState> {
         .route("/api/projects/{id}/files", get(h_project_files))
         .route("/api/projects/{id}/memories", get(h_project_memories))
         .route("/api/arcs/{id}/project", post(h_arc_assign_project))
+        .route("/api/arcs/{id}/deep-research", post(h_deep_research))
         .route("/api/active-project", post(h_set_active_project))
         // skills
         .route("/api/skills", get(h_skills_list).post(h_skill_upsert))

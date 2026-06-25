@@ -242,6 +242,7 @@ pub fn run() {
             commands::update_project,
             commands::delete_project,
             commands::assign_arc_to_project,
+            commands::deep_research,
             commands::set_active_project,
             commands::update_project_summary,
             commands::get_project_summary_mode,
