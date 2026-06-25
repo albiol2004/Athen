@@ -1123,8 +1123,7 @@ async fn h_arc_code_mode(
     Json(body): Json<ArcCodeModeBody>,
 ) -> Response {
     json_result(
-        commands::set_arc_code_mode_core(arc_id, body.enabled, body.root, api.ui.app_state())
-            .await,
+        commands::set_arc_code_mode_core(arc_id, body.enabled, body.root, api.ui.app_state()).await,
     )
 }
 async fn h_code_mode_git(

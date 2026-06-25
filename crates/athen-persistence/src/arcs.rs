@@ -3802,20 +3802,25 @@ mod tests {
             .create_arc("arc_code", "Code", ArcSource::UserInput)
             .await
             .unwrap();
-        let meta = store.get_arc("arc_code").await.unwrap().expect("arc present");
+        let meta = store
+            .get_arc("arc_code")
+            .await
+            .unwrap()
+            .expect("arc present");
         assert!(matches!(meta.code_mode, None | Some(false)));
         assert_eq!(meta.code_mode_root, None);
 
         // Setters persist both fields; get_arc reloads them.
-        store
-            .set_code_mode("arc_code", Some(true))
-            .await
-            .unwrap();
+        store.set_code_mode("arc_code", Some(true)).await.unwrap();
         store
             .set_code_mode_root("arc_code", Some("/tmp/repo"))
             .await
             .unwrap();
-        let meta = store.get_arc("arc_code").await.unwrap().expect("arc present");
+        let meta = store
+            .get_arc("arc_code")
+            .await
+            .unwrap()
+            .expect("arc present");
         assert_eq!(meta.code_mode, Some(true));
         assert_eq!(meta.code_mode_root.as_deref(), Some("/tmp/repo"));
 
@@ -3826,11 +3831,12 @@ mod tests {
         assert_eq!(row.code_mode_root.as_deref(), Some("/tmp/repo"));
 
         // Setting code_mode back to false round-trips as Some(false).
-        store
-            .set_code_mode("arc_code", Some(false))
+        store.set_code_mode("arc_code", Some(false)).await.unwrap();
+        let meta = store
+            .get_arc("arc_code")
             .await
-            .unwrap();
-        let meta = store.get_arc("arc_code").await.unwrap().expect("arc present");
+            .unwrap()
+            .expect("arc present");
         assert_eq!(meta.code_mode, Some(false));
     }
 }

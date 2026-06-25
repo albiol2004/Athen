@@ -120,12 +120,7 @@ pub async fn read_git_state(root: &Path) -> GitRepoState {
     // None → empty vec, which is exactly what we want.
     if let Some(out) = run_git(
         root,
-        &[
-            "log",
-            "-n",
-            "20",
-            "--pretty=format:%H%x1f%s%x1f%an%x1f%aI",
-        ],
+        &["log", "-n", "20", "--pretty=format:%H%x1f%s%x1f%an%x1f%aI"],
     )
     .await
     {
@@ -161,7 +156,11 @@ async fn run_git(root: &Path, args: &[&str]) -> Option<String> {
         return None;
     }
 
-    Some(String::from_utf8_lossy(&output.stdout).trim_end().to_string())
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .trim_end()
+            .to_string(),
+    )
 }
 
 /// Parse `git status --porcelain=v2 --branch` output into branch metadata and

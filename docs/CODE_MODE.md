@@ -1,7 +1,11 @@
 # Code Mode
 
-> **Status:** DESIGN + BUILD IN FLIGHT (2026-06-25). This doc is the conceptual
-> reference; code is authoritative once shipped. Section §9 tracks per-step status.
+> **Status:** BUILD 1 SHIPPED (2026-06-25, `feat/code-mode`). Code is
+> authoritative. §10 "Build 1" is live (per-arc flag + root, per-arc cwd/fs-base +
+> sandbox widening, checkpoint shadow-override, git recognition layer +
+> command/route, `[CODE MODE]` prompt block, desktop+web toggle + Code-Mode
+> panel). The only deferred items are the §10 "Build 2" list — live ephemeral
+> sub-agent transcript streaming and the Revert-button (a)/(b) behavior in §6.
 
 ## 1. What Code Mode is (and is not)
 
