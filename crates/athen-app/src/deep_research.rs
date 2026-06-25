@@ -491,7 +491,7 @@ mod tests {
     /// that mirrors `run_deep_research`'s phase 2 to assert partial tolerance.
     #[tokio::test]
     async fn fan_out_tolerates_partial_failures() {
-        let sub_questions = vec![
+        let sub_questions = [
             "ok-a".to_string(),
             "empty-b".to_string(),
             "err-c".to_string(),
