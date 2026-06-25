@@ -8,13 +8,17 @@
 //     driven by the `deep-research-progress` / `deep-research-done` SSE events.
 //
 // Backend contract: POST /api/arcs/{id}/deep-research { question, depth?, mode? }
-// (AthenClient.deepResearch). No workspace-file-read endpoint exists, so the
-// completion card surfaces the paper path + a "ask in chat" hint rather than
-// rendering the markdown inline.
+// (AthenClient.deepResearch) to launch; GET /api/arcs/{id}/research-paper
+// (AthenClient.getResearchPaper, body = the Markdown string) to read the
+// finished paper. The completion card's "View paper" fetches that Markdown and
+// renders it inline in a modal via the shared <Markdown> renderer.
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
+import type { AthenClient } from '../api/client';
 import { ConfirmDialog } from './ConfirmDialog';
+import { Markdown } from './Markdown';
 import { Spinner } from './Spinner';
+import { errMessage, useToast } from './Toast';
 import type {
   DeepResearchDepth,
   DeepResearchDoneEvent,
@@ -189,20 +193,110 @@ const PHASE_LABEL: Record<DeepResearchProgressEvent['phase'], string> = {
 };
 
 /**
+ * Modal that fetches the arc's research paper Markdown via
+ * `client.getResearchPaper` and renders it with the shared <Markdown>
+ * component (same renderer the chat uses for assistant messages). Spinner
+ * while pending, toast on failure (then closes). Overlay/dialog chrome mirrors
+ * ConfirmDialog/DeepResearchModal (`confirm-overlay`/`confirm-dialog`).
+ */
+export function ResearchPaperModal({
+  client,
+  arcId,
+  title,
+  onClose,
+}: {
+  client: AthenClient;
+  arcId: string;
+  title: string;
+  onClose: () => void;
+}) {
+  const { toast } = useToast();
+  const [markdown, setMarkdown] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    client.getResearchPaper(arcId).then(
+      (md) => {
+        if (alive) setMarkdown(md);
+      },
+      (e: unknown) => {
+        if (!alive) return;
+        toast(errMessage(e), 'error');
+        onClose();
+      },
+    );
+    return () => {
+      alive = false;
+    };
+  }, [client, arcId, toast, onClose]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  return (
+    <div
+      className="confirm-overlay"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div
+        className="confirm-dialog dr-paper-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Research paper"
+      >
+        <div className="dr-paper-head">
+          <h3 title={title}>{title}</h3>
+          <button
+            type="button"
+            className="dr-banner-close"
+            aria-label="Close"
+            onClick={onClose}
+          >
+            ×
+          </button>
+        </div>
+        <div className="dr-paper-body">
+          {markdown === null ? (
+            <div className="dr-paper-loading">
+              <Spinner />
+              <span>Loading paper…</span>
+            </div>
+          ) : (
+            <Markdown text={markdown} />
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
  * Non-blocking banner. While `progress` is set (and `done` is not) it shows the
  * phase ticker + a bar during the reading phase. Once `done` arrives it shows
  * the completion card. Both are scoped to the active arc by Shell.
  */
 export function DeepResearchBanner({
+  client,
   progress,
   done,
   onDismiss,
 }: {
+  client: AthenClient;
   progress: DeepResearchProgressEvent | null;
   done: DeepResearchDoneEvent | null;
   onDismiss: () => void;
 }) {
+  const [viewing, setViewing] = useState(false);
+
   if (done) {
+    const basename = paperBasename(done.paper_path);
     return (
       <div className="dr-banner dr-done" role="status">
         <span className="dr-done-icon">
@@ -214,15 +308,28 @@ export function DeepResearchBanner({
             {done.extended && <span className="dr-done-tag"> (extended)</span>}
           </div>
           <div className="dr-done-file" title={done.paper_path}>
-            {paperBasename(done.paper_path)}
+            {basename}
           </div>
           <div className="dr-done-meta">
-            {done.workers_ok}/{done.workers_total} sub-topics covered · ask in chat — I can read it.
+            {done.workers_ok}/{done.workers_total} sub-topics covered · or ask in chat — I can read it.
+          </div>
+          <div className="dr-done-actions">
+            <button type="button" className="dr-view-paper" onClick={() => setViewing(true)}>
+              View paper
+            </button>
           </div>
         </div>
         <button type="button" className="dr-banner-close" aria-label="Dismiss" onClick={onDismiss}>
           ×
         </button>
+        {viewing && (
+          <ResearchPaperModal
+            client={client}
+            arcId={done.arc_id}
+            title={basename}
+            onClose={() => setViewing(false)}
+          />
+        )}
       </div>
     );
   }

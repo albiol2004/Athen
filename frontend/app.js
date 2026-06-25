@@ -6078,6 +6078,9 @@ function renderDeepResearchDone(p) {
     const ok = Number(p.workers_ok || 0);
     const total = Number(p.workers_total || 0);
     const extended = !!p.extended;
+    // The done event carries arc_id; the invoke-return fallback path may not,
+    // so fall back to the active arc (which is the one we researched in).
+    const arcId = String(p.arc_id || activeArcId || '');
 
     el.innerHTML = '';
     const card = document.createElement('div');
@@ -6107,13 +6110,33 @@ function renderDeepResearchDone(p) {
     metaEl.textContent = `${ok}/${total} sub-topics covered`;
     body.appendChild(metaEl);
 
-    // No frontend command reads a workspace file's contents, so "View paper"
-    // surfaces the path and tells the user to ask the agent about it in chat.
+    // Primary action: open the paper's Markdown in a reader modal. The
+    // backend `get_research_paper` command reads the workspace file and
+    // returns its contents (or rejects with an error string).
+    const actions = document.createElement('div');
+    actions.className = 'dr-actions';
+
+    const viewBtn = document.createElement('button');
+    viewBtn.type = 'button';
+    viewBtn.className = 'dr-view-btn';
+    viewBtn.textContent = 'View paper';
+    viewBtn.addEventListener('click', () => {
+        if (!invoke) { showToast('Athen is still starting up.', 'error'); return; }
+        if (!arcId) { showToast('No arc to read the paper from.', 'error'); return; }
+        withButtonPending(viewBtn, async () => {
+            const md = await invoke('get_research_paper', { arcId });
+            showResearchPaperModal(md, basename);
+        }, { errorPrefix: 'Could not open the paper: ' });
+    });
+    actions.appendChild(viewBtn);
+    body.appendChild(actions);
+
+    // Secondary hint: the agent can still read it in chat.
     const hint = document.createElement('div');
     hint.className = 'dr-hint';
     hint.textContent = paperPath
-        ? `${paperPath} — ask me about it in chat, I can read it.`
-        : 'Ask me about it in chat — I can read it.';
+        ? `${paperPath} — or ask me about it in chat.`
+        : 'Or ask me about it in chat.';
     body.appendChild(hint);
 
     card.appendChild(body);
@@ -6129,6 +6152,56 @@ function renderDeepResearchDone(p) {
     el.appendChild(card);
 
     showToast('Research paper ready', 'success');
+}
+
+// Reader modal for the research paper. Rides the rewind-dialog overlay shell
+// (same backdrop / fade-in) but uses a wide, scrollable prose column. Renders
+// the Markdown with the same renderer the chat uses, wrapped in
+// sanitizeWebContent as a belt-and-braces pass (the paper is agent-authored,
+// but it may quote arbitrary scraped web content).
+function showResearchPaperModal(md, titleText) {
+    const overlay = document.createElement('div');
+    overlay.className = 'rewind-dialog-overlay';
+
+    const dialog = document.createElement('div');
+    dialog.className = 'paper-modal';
+
+    const head = document.createElement('div');
+    head.className = 'paper-modal-head';
+
+    const title = document.createElement('h3');
+    title.textContent = titleText || 'Research paper';
+    head.appendChild(title);
+
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.className = 'paper-modal-close';
+    closeBtn.setAttribute('aria-label', 'Close');
+    closeBtn.innerHTML = ICON_X;
+    head.appendChild(closeBtn);
+
+    dialog.appendChild(head);
+
+    const bodyEl = document.createElement('div');
+    bodyEl.className = 'paper-modal-body tool-body-prose';
+    bodyEl.innerHTML = renderMarkdown(sanitizeWebContent(String(md || '')));
+    dialog.appendChild(bodyEl);
+
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+
+    // WebKitGTK retains scrollTop across an innerHTML swap; the body starts
+    // fresh here, but reset explicitly so a tall paper opens at the top.
+    bodyEl.scrollTop = 0;
+
+    const close = () => {
+        overlay.remove();
+        document.removeEventListener('keydown', onKey);
+    };
+    const onKey = (e) => { if (e.key === 'Escape') close(); };
+    document.addEventListener('keydown', onKey);
+    closeBtn.addEventListener('click', close);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
 }
 
 function showRewindDialog(entryId, newText, cleanupFn) {

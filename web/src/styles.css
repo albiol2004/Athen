@@ -896,3 +896,36 @@ button { font: inherit; }
   color: var(--text-dim); font-size: 16px; line-height: 1; padding: 0 2px;
 }
 .dr-banner-close:hover { color: var(--text); }
+
+.dr-done-actions { margin-top: 8px; }
+.dr-view-paper {
+  font: inherit; font-size: 12px; font-weight: 500; cursor: pointer;
+  padding: 5px 14px; border-radius: 8px; border: 1px solid var(--glass-border);
+  background: var(--coral); color: #fff;
+  transition: filter 120ms;
+}
+.dr-view-paper:hover { filter: brightness(1.08); }
+
+/* Research-paper viewer: wider + taller than ConfirmDialog, scrollable prose. */
+.dr-paper-modal {
+  max-width: 760px; width: 92%;
+  max-height: 84vh; display: flex; flex-direction: column;
+  padding: 0;
+}
+.dr-paper-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 16px 20px; border-bottom: 1px solid var(--glass-border);
+}
+.dr-paper-head h3 {
+  margin: 0; flex: 1; min-width: 0;
+  font-size: 14.5px; font-weight: 600; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.dr-paper-body {
+  flex: 1; min-height: 0; overflow-y: auto;
+  padding: 18px 22px; font-size: 13.5px; line-height: 1.6; color: var(--text);
+}
+.dr-paper-loading {
+  display: flex; align-items: center; gap: 10px;
+  padding: 24px 0; color: var(--text-dim); font-size: 13px;
+}

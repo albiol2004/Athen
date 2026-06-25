@@ -662,6 +662,7 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
               />
             )}
             <DeepResearchBanner
+              client={client}
               progress={drProgress}
               done={drDone}
               onDismiss={() => setDrDone(null)}

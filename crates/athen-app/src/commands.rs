@@ -10215,6 +10215,54 @@ pub async fn deep_research(
     .await
 }
 
+/// Read the Markdown content of an arc's research paper. The path comes from the
+/// arc's trusted `research_paper_path` metadata (set by `deep_research_core`), not
+/// from caller input, so there is no path-traversal surface — but we still resolve
+/// inside the workspace and refuse anything that escapes it as defense in depth.
+pub(crate) async fn get_research_paper_core(
+    arc_id: String,
+    state: &AppState,
+) -> std::result::Result<String, String> {
+    let Some(ref arc_store) = state.arc_store else {
+        return Err("Arc store not available".to_string());
+    };
+    let arc = arc_store
+        .get_arc(&arc_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Arc not found: {arc_id}"))?;
+    let rel = arc
+        .research_paper_path
+        .ok_or_else(|| "This conversation has no research paper yet.".to_string())?;
+
+    let resolved = athen_core::paths::resolve_in_workspace(std::path::Path::new(&rel));
+    // Defense in depth: the resolved file must stay under the workspace root.
+    if let Some(root) = athen_core::paths::athen_workspace_dir() {
+        let canon = resolved
+            .canonicalize()
+            .map_err(|e| format!("Research paper not found: {e}"))?;
+        let root_canon = root
+            .canonicalize()
+            .map_err(|e| format!("Workspace unavailable: {e}"))?;
+        if !canon.starts_with(&root_canon) {
+            return Err("Refusing to read a paper outside the workspace.".to_string());
+        }
+    }
+    tokio::fs::read_to_string(&resolved)
+        .await
+        .map_err(|e| format!("Could not read research paper: {e}"))
+}
+
+/// Return the Markdown content of an arc's research paper (see
+/// [`get_research_paper_core`]).
+#[tauri::command]
+pub async fn get_research_paper(
+    arc_id: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<String, String> {
+    get_research_paper_core(arc_id, &state).await
+}
+
 /// Assign (or clear) an arc's Project membership. When assigning to a project,
 /// that project also becomes the active project.
 #[tauri::command]

@@ -144,6 +144,15 @@ export class AthenClient {
       mode,
     });
   }
+  /**
+   * Fetch the rendered Markdown of the arc's research paper. The response body
+   * is a JSON string (the Markdown), so the generic GET helper's `resp.json()`
+   * yields a `string` directly. Errors come back as the app's standard
+   * `{ error }` shape and surface as an `ApiError`.
+   */
+  getResearchPaper(arcId: string): Promise<string> {
+    return this.req(`/arcs/${encodeURIComponent(arcId)}/research-paper`);
+  }
 
   // ---- approvals & grants ----
   approveTask(taskId: string, approved: boolean): Promise<unknown> {
