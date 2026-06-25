@@ -10136,6 +10136,9 @@ pub(crate) async fn deep_research_core(
         state.tool_registry_deps(),
         &arc_id,
         Some(ui.clone()),
+        // Save-only registry: no deep_research tool needed (or wanted — this
+        // runs inside deep_research_core itself).
+        None,
     )
     .await;
     let save_res = reg

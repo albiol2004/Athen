@@ -692,6 +692,7 @@ pub(crate) async fn assemble_base_app_tool_registry(
     deps: ToolRegistryDeps,
     arc_id: &str,
     ui: Option<crate::ui_bridge::UiBridge>,
+    deep_research_runner: Option<crate::app_tools::DeepResearchRunner>,
 ) -> Arc<dyn athen_core::traits::tool::ToolRegistry> {
     // Resolve the active profile's GitHub identity once at registry
     // build time so every shell_execute in this arc uses the same
@@ -873,6 +874,11 @@ pub(crate) async fn assemble_base_app_tool_registry(
         registry = registry.with_file_gate(Arc::new(gate));
     }
 
+    // Agent-callable deep_research tool: wired only when the caller passes a
+    // runner (top-level interactive arcs). `None` for sub-agent / worker /
+    // deep-research-base registries keeps the tool unlisted there.
+    registry = registry.with_deep_research_runner(deep_research_runner);
+
     Arc::new(registry)
 }
 
@@ -1024,7 +1030,10 @@ pub(crate) fn build_subagent_factories(
         Box::pin(async move {
             // Snapshot deps and drop the state borrow before awaiting.
             let deps = ui.app_state().tool_registry_deps();
-            let base = assemble_base_app_tool_registry(deps, &sub_arc, Some(ui.clone())).await;
+            // Sub-agents never get the deep_research tool (no runner) — keeps
+            // the bare worker registry bare and prevents recursive runs.
+            let base =
+                assemble_base_app_tool_registry(deps, &sub_arc, Some(ui.clone()), None).await;
             Box::new(crate::delegation::ArcRegistryAdapter(base))
                 as Box<dyn athen_core::traits::tool::ToolRegistry>
         })
@@ -1117,7 +1126,59 @@ pub(crate) async fn assemble_app_tool_registry(
     let wakeup_store = deps.wakeup_store.clone();
     let approval_router = deps.approval_router.clone();
 
-    let base = assemble_base_app_tool_registry(deps, arc_id, ui.clone()).await;
+    // Build the deep_research runner closure for this top-level arc. Requires a
+    // UiBridge (it resolves AppState + emits progress events through it), so
+    // CLI / test builds with no bridge get `None` and simply don't see the tool.
+    // It first applies the extend-vs-new gate: if a paper already exists and the
+    // agent gave no mode, it returns NeedsDecision so the tool can ask the user.
+    let dr_runner: Option<crate::app_tools::DeepResearchRunner> = ui.as_ref().map(|bridge| {
+        let ui = bridge.clone();
+        let arc_id = arc_id.to_string();
+        std::sync::Arc::new(
+            move |question: String, depth: Option<String>, mode: Option<String>| {
+                let ui = ui.clone();
+                let arc_id = arc_id.clone();
+                Box::pin(async move {
+                    let state = ui.app_state();
+                    // extend-vs-new: if a paper already exists and no mode was
+                    // given, ask first.
+                    if mode.is_none() {
+                        if let Some(arc_store) = state.arc_store.as_ref() {
+                            if let Ok(Some(arc)) = arc_store.get_arc(&arc_id).await {
+                                if arc.research_paper_path.is_some() {
+                                    return Ok(crate::app_tools::DeepResearchRun::NeedsDecision {
+                                        existing_question: arc.research_question,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    crate::commands::deep_research_core(
+                        arc_id,
+                        question,
+                        depth,
+                        mode,
+                        state,
+                        ui.clone(),
+                    )
+                    .await
+                    .map(crate::app_tools::DeepResearchRun::Done)
+                })
+                    as std::pin::Pin<
+                        Box<
+                            dyn std::future::Future<
+                                    Output = std::result::Result<
+                                        crate::app_tools::DeepResearchRun,
+                                        String,
+                                    >,
+                                > + Send,
+                        >,
+                    >
+            },
+        ) as crate::app_tools::DeepResearchRunner
+    });
+
+    let base = assemble_base_app_tool_registry(deps, arc_id, ui.clone(), dr_runner).await;
 
     let with_delegation: Box<dyn athen_core::traits::tool::ToolRegistry> =
         if let (Some(profile_store), Some(arc_store)) = (profile_store, arc_store_for_delegation) {
@@ -1996,8 +2057,15 @@ impl AppState {
         // `run_delegation` re-scopes it to each worker's own sub-arc via the
         // context's `sub_registry_factory`.
         let base: Arc<dyn athen_core::traits::tool::ToolRegistry> =
-            assemble_base_app_tool_registry(self.tool_registry_deps(), arc_id, Some(ui.clone()))
-                .await;
+            assemble_base_app_tool_registry(
+                self.tool_registry_deps(),
+                arc_id,
+                Some(ui.clone()),
+                // No deep_research tool for the worker base — prevents a
+                // deep-research worker from recursively triggering another run.
+                None,
+            )
+            .await;
 
         // Build the delegation context once (cloned per worker). Parent arc =
         // this research arc, so worker sub-arcs hang off it. No wake-up

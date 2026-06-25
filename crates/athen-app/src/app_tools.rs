@@ -45,6 +45,32 @@ use crate::vault_creds::endpoint_scope;
 /// `slack__post_message` resolves to mcp_id="slack", tool="post_message".
 const MCP_TOOL_SEPARATOR: &str = "__";
 
+/// Outcome of an agent-triggered deep_research run.
+pub enum DeepResearchRun {
+    Done(crate::commands::DeepResearchResult),
+    /// The arc already has a paper and the agent didn't specify a mode —
+    /// the tool must ask the user extend-vs-new before proceeding.
+    NeedsDecision {
+        existing_question: Option<String>,
+    },
+}
+
+/// Injected by the composition root for top-level arcs only. Captures the arc id
+/// + UiBridge; runs a full deep-research pass (orchestrate + save + metadata).
+pub type DeepResearchRunner = std::sync::Arc<
+    dyn Fn(
+            String,
+            Option<String>,
+            Option<String>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = std::result::Result<DeepResearchRun, String>>
+                    + Send,
+            >,
+        > + Send
+        + Sync,
+>;
+
 /// Wraps [`ShellToolRegistry`] and adds calendar, contact, memory, and MCP tools.
 pub struct AppToolRegistry {
     inner: Arc<ShellToolRegistry>,
@@ -97,6 +123,11 @@ pub struct AppToolRegistry {
     /// `Projects/<slug>/`. Wired in a separate slice from the arc's
     /// `project_id`; `None` means the agent must pass `project` explicitly.
     active_project_slug: Option<String>,
+    /// Runner for the agent-callable `deep_research` tool. Injected by the
+    /// composition root for top-level interactive arcs only; `None` for the
+    /// bare sub-agent/worker registry, which keeps the tool unlisted (so
+    /// deep-research workers can't recursively trigger another run).
+    deep_research_runner: Option<DeepResearchRunner>,
 }
 
 impl AppToolRegistry {
@@ -130,6 +161,7 @@ impl AppToolRegistry {
             telephony: None,
             app_handle: None,
             active_project_slug: None,
+            deep_research_runner: None,
         }
     }
 
@@ -164,6 +196,16 @@ impl AppToolRegistry {
     #[allow(dead_code)]
     pub fn with_active_project(mut self, slug: Option<String>) -> Self {
         self.active_project_slug = slug;
+        self
+    }
+
+    /// Attach the runner closure that powers the agent-callable
+    /// `deep_research` tool. Set only for top-level interactive arcs; when
+    /// `None` the tool is not advertised and refuses if called anyway. Keeps
+    /// the bare sub-agent/worker registry free of the tool so a
+    /// deep-research worker can't recursively trigger another run.
+    pub fn with_deep_research_runner(mut self, r: Option<DeepResearchRunner>) -> Self {
+        self.deep_research_runner = r;
         self
     }
 
@@ -1660,6 +1702,29 @@ impl AppToolRegistry {
         })
     }
 
+    fn deep_research_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "The research question to investigate. Be specific — this drives the whole run.",
+                },
+                "depth": {
+                    "type": "string",
+                    "enum": ["quick", "standard", "deep"],
+                    "description": "How thorough to be. quick = 3 source-areas (faster, cheaper); standard = 5 (default); deep = 8 (slowest, most thorough). Omit for standard.",
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["extend", "new"],
+                    "description": "If this conversation already has a research paper, FIRST ask the user whether to extend it or start a new one, then set mode accordingly. Omit on a first run.",
+                },
+            },
+            "required": ["question"]
+        })
+    }
+
     /// Pure mapping from a semantic category + filename to the relative
     /// workspace path the `write` tool should receive. Kept free of `self`
     /// so the bucket/slug/sanitization logic is unit-testable.
@@ -1761,6 +1826,99 @@ impl AppToolRegistry {
         self.inner
             .call_tool("write", json!({ "path": rel_path, "content": content }))
             .await
+    }
+
+    async fn do_deep_research(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let start = Instant::now();
+
+        // Belt-and-suspenders: the tool isn't listed without a runner, but a
+        // model could still try to call it. Refuse cleanly.
+        let Some(runner) = self.deep_research_runner.clone() else {
+            return Ok(ToolResult {
+                success: false,
+                output: json!({ "error": "Deep research isn't available in this context." }),
+                error: Some("deep_research_unavailable".to_string()),
+                execution_time_ms: start.elapsed().as_millis() as u64,
+            });
+        };
+
+        let question = match args
+            .get("question")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(q) => q.to_string(),
+            None => {
+                let msg = "deep_research: missing required 'question'".to_string();
+                return Ok(ToolResult {
+                    success: false,
+                    output: json!({ "error": msg }),
+                    error: Some(msg),
+                    execution_time_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+        };
+
+        let depth = args
+            .get("depth")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        let mode = args
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
+        match runner(question, depth, mode).await {
+            Ok(DeepResearchRun::NeedsDecision { existing_question }) => {
+                let message = match existing_question {
+                    Some(q) => format!(
+                        "This conversation already has a research paper on \"{q}\". Ask the user whether to extend that paper or start a new one, then re-call deep_research with mode=\"extend\" or mode=\"new\"."
+                    ),
+                    None => "This conversation already has a research paper. Ask the user whether to extend it or start a new one, then re-call deep_research with mode=\"extend\" or mode=\"new\".".to_string(),
+                };
+                Ok(ToolResult {
+                    success: true,
+                    output: json!({ "status": "needs_decision", "message": message }),
+                    error: None,
+                    execution_time_ms: start.elapsed().as_millis() as u64,
+                })
+            }
+            Ok(DeepResearchRun::Done(res)) => {
+                let summary = if res.extended {
+                    format!(
+                        "Research paper saved to {}; covered {}/{} sub-topics, extended the existing paper.",
+                        res.paper_path, res.workers_ok, res.workers_total
+                    )
+                } else {
+                    format!(
+                        "Research paper saved to {}; covered {}/{} sub-topics.",
+                        res.paper_path, res.workers_ok, res.workers_total
+                    )
+                };
+                let mut output = serde_json::to_value(&res)
+                    .unwrap_or_else(|_| json!({ "paper_path": res.paper_path }));
+                if let Some(obj) = output.as_object_mut() {
+                    obj.insert("summary".to_string(), json!(summary));
+                }
+                Ok(ToolResult {
+                    success: true,
+                    output,
+                    error: None,
+                    execution_time_ms: start.elapsed().as_millis() as u64,
+                })
+            }
+            Err(e) => Ok(ToolResult {
+                success: false,
+                output: json!({ "error": e.clone() }),
+                error: Some(e),
+                execution_time_ms: start.elapsed().as_millis() as u64,
+            }),
+        }
     }
 
     fn identity_add_schema() -> serde_json::Value {
@@ -3183,6 +3341,22 @@ impl ToolRegistry for AppToolRegistry {
             base_risk: BaseImpact::WritePersist,
         });
 
+        // deep_research: only advertised when a runner closure is wired (top-
+        // level interactive arcs). Sub-agent / worker registries get `None`,
+        // so the tool stays hidden there — preventing recursive runs.
+        if self.deep_research_runner.is_some() {
+            tools.push(ToolDefinition {
+                name: "deep_research".to_string(),
+                description: "Run a long, parallel, multi-source research workflow that produces a cited Markdown paper saved to the workspace. It decomposes the question, fans out concurrent workers that each search and read several sources, then synthesizes a paper with inline citations and a sources/gaps section. This takes minutes — use it for substantial research questions worth a full report, not quick lookups (use web_search for those). Depth controls breadth (quick/standard/deep). If this conversation already has a research paper, the tool will ask you to confirm extend-vs-new before running.".to_string(),
+                parameters: Self::deep_research_schema(),
+                backend: ToolBackend::Shell {
+                    command: String::new(),
+                    native: false,
+                },
+                base_risk: BaseImpact::WritePersist,
+            });
+        }
+
         if self.identity.is_some() {
             tools.push(ToolDefinition {
                 name: "identity_add".to_string(),
@@ -3364,6 +3538,7 @@ impl ToolRegistry for AppToolRegistry {
             "fetch_attachment" => self.do_fetch_attachment(&args).await,
             "identity_add" => self.do_identity_add(&args).await,
             "save_file" => self.do_save_file(&args).await,
+            "deep_research" => self.do_deep_research(&args).await,
             "load_skill" => self.do_load_skill(&args).await,
             "athen_docs" => self.do_athen_docs(&args),
             "http_request" => self.do_http_request(&args).await,
