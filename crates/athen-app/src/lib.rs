@@ -11,6 +11,7 @@ pub(crate) mod attachment_purger;
 pub(crate) mod bundle_settings;
 pub(crate) mod bundled_embeddings;
 pub(crate) mod calendar_sources;
+pub(crate) mod code_mode;
 mod commands;
 pub(crate) mod compaction;
 mod contacts;

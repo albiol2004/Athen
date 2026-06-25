@@ -194,6 +194,13 @@ pub struct ArcMeta {
     /// `None` means the arc is not a Deep Research arc. See
     /// `docs/DEEP_RESEARCH.md`.
     pub research_question: Option<String>,
+    /// Whether this arc is running in "code mode" (a workspace rooted at a
+    /// concrete repo directory). Stored as INTEGER 0/1. `None` means the
+    /// preference was never set for this arc.
+    pub code_mode: Option<bool>,
+    /// Filesystem path to the repo root this arc's code mode is scoped to.
+    /// `None` means no root has been set.
+    pub code_mode_root: Option<String>,
     /// Mini-plan drafted by the triage LLM call (same call that evaluates
     /// risk + complexity — see `RiskScore.plan`). Captured once at task
     /// creation, then survives compaction as arc-level metadata. The
@@ -545,6 +552,17 @@ impl ArcStore {
                     .map_err(|e| AthenError::Other(format!("Add research_question: {e}")))?;
             }
 
+            // Column-level migration: code-mode arc metadata. `code_mode` is
+            // stored as INTEGER 0/1; NULL means the preference was never set.
+            if !cols.contains("code_mode") {
+                conn.execute("ALTER TABLE arcs ADD COLUMN code_mode INTEGER", [])
+                    .map_err(|e| AthenError::Other(format!("Add code_mode: {e}")))?;
+            }
+            if !cols.contains("code_mode_root") {
+                conn.execute("ALTER TABLE arcs ADD COLUMN code_mode_root TEXT", [])
+                    .map_err(|e| AthenError::Other(format!("Add code_mode_root: {e}")))?;
+            }
+
             Ok(())
         })
         .await
@@ -662,7 +680,8 @@ impl ArcStore {
                             a.goal_status, a.goal_blocked_reason, \
                             a.plan_json, a.security_mode_override, \
                             a.project_id, \
-                            a.research_paper_path, a.research_question \
+                            a.research_paper_path, a.research_question, \
+                            a.code_mode, a.code_mode_root \
                      FROM arcs a \
                      LEFT JOIN ( \
                          SELECT arc_id, COUNT(*) AS cnt \
@@ -703,6 +722,8 @@ impl ArcStore {
                         project_id: row.get::<_, Option<String>>(24)?,
                         research_paper_path: row.get::<_, Option<String>>(25)?,
                         research_question: row.get::<_, Option<String>>(26)?,
+                        code_mode: row.get::<_, Option<i64>>(27)?.map(|n| n != 0),
+                        code_mode_root: row.get::<_, Option<String>>(28)?,
                     })
                 })
                 .map_err(|e| AthenError::Other(format!("Query get arc: {e}")))?;
@@ -757,7 +778,8 @@ impl ArcStore {
                         a.goal_status, a.goal_blocked_reason, \
                         a.plan_json, a.security_mode_override, \
                         a.project_id, \
-                        a.research_paper_path, a.research_question \
+                        a.research_paper_path, a.research_question, \
+                        a.code_mode, a.code_mode_root \
                  FROM arcs a \
                  LEFT JOIN ( \
                      SELECT arc_id, COUNT(*) AS cnt \
@@ -801,6 +823,8 @@ impl ArcStore {
                         project_id: row.get::<_, Option<String>>(24)?,
                         research_paper_path: row.get::<_, Option<String>>(25)?,
                         research_question: row.get::<_, Option<String>>(26)?,
+                        code_mode: row.get::<_, Option<i64>>(27)?.map(|n| n != 0),
+                        code_mode_root: row.get::<_, Option<String>>(28)?,
                     })
                 })
                 .map_err(|e| AthenError::Other(format!("Query list arcs: {e}")))?;
@@ -1298,6 +1322,44 @@ impl ArcStore {
                 params![question, arc_id],
             )
             .map_err(|e| AthenError::Other(format!("Set research_question: {e}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
+    /// Set (or clear) whether this arc is in code mode. Stored as INTEGER
+    /// 0/1. Last-write-wins. Pass `None` to clear it.
+    pub async fn set_code_mode(&self, arc_id: &str, enabled: Option<bool>) -> Result<()> {
+        let conn = self.conn.clone();
+        let arc_id = arc_id.to_string();
+        let enabled = enabled.map(|b| if b { 1 } else { 0 });
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE arcs SET code_mode = ?1 WHERE id = ?2",
+                params![enabled, arc_id],
+            )
+            .map_err(|e| AthenError::Other(format!("Set code_mode: {e}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
+    /// Set (or clear) the repo root this arc's code mode is scoped to.
+    /// Last-write-wins. Pass `None` to clear it.
+    pub async fn set_code_mode_root(&self, arc_id: &str, root: Option<&str>) -> Result<()> {
+        let conn = self.conn.clone();
+        let arc_id = arc_id.to_string();
+        let root = root.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE arcs SET code_mode_root = ?1 WHERE id = ?2",
+                params![root, arc_id],
+            )
+            .map_err(|e| AthenError::Other(format!("Set code_mode_root: {e}")))?;
             Ok(())
         })
         .await
@@ -1945,7 +2007,9 @@ CREATE TABLE IF NOT EXISTS arcs (
     security_mode_override TEXT,
     project_id TEXT,
     research_paper_path TEXT,
-    research_question TEXT
+    research_question TEXT,
+    code_mode INTEGER,
+    code_mode_root TEXT
 );
 
 CREATE TABLE IF NOT EXISTS arc_entries (
@@ -3724,5 +3788,49 @@ mod tests {
             .expect("arc present");
         assert_eq!(meta.research_paper_path, None);
         assert_eq!(meta.research_question, None);
+    }
+
+    /// Code-mode metadata round-trip: a fresh arc has both fields unset,
+    /// the setters persist values (including the INTEGER↔bool mapping), and
+    /// `get_arc` reloads them.
+    #[tokio::test]
+    async fn test_code_mode_fields_round_trip() {
+        let store = setup_arc_store().await;
+
+        // A fresh arc has code_mode unset (None) and no root.
+        store
+            .create_arc("arc_code", "Code", ArcSource::UserInput)
+            .await
+            .unwrap();
+        let meta = store.get_arc("arc_code").await.unwrap().expect("arc present");
+        assert!(matches!(meta.code_mode, None | Some(false)));
+        assert_eq!(meta.code_mode_root, None);
+
+        // Setters persist both fields; get_arc reloads them.
+        store
+            .set_code_mode("arc_code", Some(true))
+            .await
+            .unwrap();
+        store
+            .set_code_mode_root("arc_code", Some("/tmp/repo"))
+            .await
+            .unwrap();
+        let meta = store.get_arc("arc_code").await.unwrap().expect("arc present");
+        assert_eq!(meta.code_mode, Some(true));
+        assert_eq!(meta.code_mode_root.as_deref(), Some("/tmp/repo"));
+
+        // list_arcs reflects the same values.
+        let listed = store.list_arcs().await.unwrap();
+        let row = listed.iter().find(|a| a.id == "arc_code").unwrap();
+        assert_eq!(row.code_mode, Some(true));
+        assert_eq!(row.code_mode_root.as_deref(), Some("/tmp/repo"));
+
+        // Setting code_mode back to false round-trips as Some(false).
+        store
+            .set_code_mode("arc_code", Some(false))
+            .await
+            .unwrap();
+        let meta = store.get_arc("arc_code").await.unwrap().expect("arc present");
+        assert_eq!(meta.code_mode, Some(false));
     }
 }
