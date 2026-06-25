@@ -1,9 +1,41 @@
 # Deep Research (Design Doc)
 
-**Status (2026-06-25):** DESIGN ONLY — not implemented. This doc is grounded in
-a code audit of the existing delegation/fan-out machinery (citations inline);
-where the audit corrected an assumption, the correction is called out. Code is
-authoritative once any of this ships.
+**Status (2026-06-25):** SHIPPED (button/command trigger). Implemented on branch
+`feat/deep-research`. Workspace builds clean (clippy + tests green). Code is
+authoritative; sections below remain the conceptual reference.
+
+Implementation map: `crates/athen-app/src/deep_research.rs` (the pure orchestrator
+`run_deep_research` — plan/fan-out/synthesize, decoupled from `AppState` via a
+worker-spawn closure + progress callback); `AppState::run_deep_research_for_arc`
+(state.rs — builds the bare worker registry + delegation context, wires progress to
+`deep-research-progress` UiBridge events); `deep_research_core` + the `deep_research`
+Tauri command + `POST /api/arcs/{id}/deep-research` (commands.rs/http_api.rs — extend
+-vs-new, save via `save_file`, stamp arc metadata, emit `deep-research-done`);
+`get_research_paper` + `GET /api/arcs/{id}/research-paper` (read-by-arc-id, no
+path-traversal surface); `deep_research_worker` built-in profile (profiles.rs);
+`arcs.research_paper_path`/`research_question` (arcs.rs); desktop UI (frontend/) +
+web UI (web/src, `DeepResearch.tsx`) — trigger dialog, progress banner, result card,
+in-app "View paper" markdown modal.
+
+**Two divergences from the design below, decided during the build:**
+1. **Decentralized discovery (not central discover-then-partition).** §3 describes a
+   discovery phase that collects+dedups URLs and partitions ~5 per worker. The build
+   instead decomposes into N sub-questions (N per depth) and gives **each worker its
+   own sub-question to search + read ~5 sources for** — a cleaner reuse of
+   `run_delegation` (one worker = one delegated sub-agent) that sidesteps the
+   "assign 5 sources before you have the list" trap by letting each worker find its
+   own. Trade-off: possible source overlap across workers, deduped at synthesis. The
+   user's "~5 sources per agent" intent is preserved.
+2. **Agent-callable `deep_research` tool deferred.** §6 lists both a UI affordance and
+   an LLM-callable tool. Only the UI/command/HTTP trigger shipped. The tool needs a
+   runner closure injected into the per-arc tool registry (it can't hold `&AppState`),
+   which is a `state.rs`/`app_tools.rs` refactor; deferred as a fast-follow. Today the
+   agent can still answer questions about a finished paper (it reads the saved file),
+   it just can't self-*initiate* a run — the user triggers it from the UI.
+
+This doc was originally grounded in a code audit of the existing delegation/fan-out
+machinery (citations inline); where the audit corrected an assumption, the correction
+is called out.
 
 Deep Research is a triggered, long-running workflow that turns a question into a
 **cited markdown paper**: the agent decomposes the question, discovers a large
