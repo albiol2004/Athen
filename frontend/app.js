@@ -787,6 +787,27 @@ function registerTauriEventListeners() {
                 node.replaceChildren(updated);
             });
     });
+
+    // ─── Deep Research progress + completion ───
+    // A long-running run reports through these two events. We only react to
+    // frames whose arc_id matches the currently-active arc so a background
+    // run on another arc never hijacks the visible banner. Switching arcs
+    // clears the banner (see switchArc), so a stale frame can't re-show it
+    // for the wrong arc.
+    window.__TAURI__.event.listen('deep-research-progress', (event) => {
+        const p = (event && event.payload) ? event.payload : {};
+        if (String(p.arc_id || '') !== String(activeArcId || '')) return;
+        renderDeepResearchProgress(p);
+    });
+
+    window.__TAURI__.event.listen('deep-research-done', (event) => {
+        const p = (event && event.payload) ? event.payload : {};
+        if (String(p.arc_id || '') !== String(activeArcId || '')) return;
+        renderDeepResearchDone(p);
+        // Refresh arc metadata so the arc now carries research_paper_path /
+        // research_question — the next trigger offers Extend-vs-new.
+        loadArcs();
+    });
 }
 
 // Tiny escape for selector matching; CSS.escape is well-supported in WebKit
@@ -1571,6 +1592,9 @@ async function handleSwitchArc(arcId) {
 
         // Clear the chat UI and render the loaded entries.
         clearChatUI();
+        // Drop any Deep Research banner left over from the previous arc so a
+        // stale progress/result card never lingers on an unrelated arc.
+        clearDeepResearchBanner();
         renderEntries(entries);
 
         // Arc switch is a force-scroll point (see scrollChatIfPinned
@@ -5786,6 +5810,325 @@ function showConfirmDialog({ title, body, confirmLabel = 'Confirm', cancelLabel 
 
         confirmBtn.focus();
     });
+}
+
+// ─── Deep Research ───────────────────────────────────────────────────────
+//
+// Trigger: invoke('deep_research', { arcId, question, depth, mode }) — args are
+// camelCased by Tauri. The returned object is snake_case verbatim
+// (paper_path, sub_questions, workers_total, workers_ok, extended). Progress
+// arrives on 'deep-research-progress', completion on 'deep-research-done'
+// (both registered once in registerTauriEventListeners). No frontend command
+// reads a workspace file's contents, so "View paper" surfaces the path + an
+// "ask me in chat" hint rather than inventing a backend read command.
+
+const DEEP_RESEARCH_DEPTHS = [
+    { value: 'quick', label: 'Quick' },
+    { value: 'standard', label: 'Standard' },
+    { value: 'deep', label: 'Deep' },
+];
+
+// Small dialog: confirm/refine the research question + pick a depth. Reuses
+// the rewind-dialog CSS (same as showConfirmDialog) plus depth chips. Resolves
+// to { question, depth } or null if cancelled.
+function showDeepResearchDialog(initialQuestion) {
+    return new Promise((resolve) => {
+        const overlay = document.createElement('div');
+        overlay.className = 'rewind-dialog-overlay';
+
+        const dialog = document.createElement('div');
+        dialog.className = 'rewind-dialog';
+
+        const titleEl = document.createElement('h3');
+        titleEl.textContent = 'Deep Research';
+        dialog.appendChild(titleEl);
+
+        const desc = document.createElement('p');
+        desc.textContent = 'Athen will research this in depth and write a cited paper.';
+        dialog.appendChild(desc);
+
+        const ta = document.createElement('textarea');
+        ta.className = 'deep-research-question';
+        ta.rows = 3;
+        ta.placeholder = 'What should I research?';
+        ta.value = initialQuestion || '';
+        dialog.appendChild(ta);
+
+        const chipRow = document.createElement('div');
+        chipRow.className = 'deep-research-chips';
+        let selectedDepth = 'standard';
+        for (const d of DEEP_RESEARCH_DEPTHS) {
+            const chip = document.createElement('button');
+            chip.type = 'button';
+            chip.className = 'deep-research-chip' + (d.value === selectedDepth ? ' selected' : '');
+            chip.textContent = d.label;
+            chip.dataset.depth = d.value;
+            chip.addEventListener('click', () => {
+                selectedDepth = d.value;
+                chipRow.querySelectorAll('.deep-research-chip').forEach((c) =>
+                    c.classList.toggle('selected', c.dataset.depth === selectedDepth));
+            });
+            chipRow.appendChild(chip);
+        }
+        dialog.appendChild(chipRow);
+
+        const btnRow = document.createElement('div');
+        btnRow.className = 'rewind-dialog-buttons';
+
+        const cancelBtn = document.createElement('button');
+        cancelBtn.className = 'rewind-dialog-cancel';
+        cancelBtn.textContent = 'Cancel';
+
+        const startBtn = document.createElement('button');
+        startBtn.className = 'rewind-dialog-confirm';
+        startBtn.textContent = 'Start research';
+
+        btnRow.appendChild(cancelBtn);
+        btnRow.appendChild(startBtn);
+        dialog.appendChild(btnRow);
+        overlay.appendChild(dialog);
+        document.body.appendChild(overlay);
+
+        let settled = false;
+        const close = (val) => {
+            if (settled) return;
+            settled = true;
+            document.removeEventListener('keydown', onKey);
+            overlay.remove();
+            resolve(val);
+        };
+        const submit = () => {
+            const question = ta.value.trim();
+            if (!question) { ta.focus(); return; }
+            close({ question, depth: selectedDepth });
+        };
+
+        cancelBtn.addEventListener('click', () => close(null));
+        startBtn.addEventListener('click', submit);
+        overlay.addEventListener('click', (e) => { if (e.target === overlay) close(null); });
+        const onKey = (e) => {
+            if (e.key === 'Escape') close(null);
+        };
+        document.addEventListener('keydown', onKey);
+
+        ta.focus();
+        ta.setSelectionRange(ta.value.length, ta.value.length);
+    });
+}
+
+// Entry point wired to #deep-research-btn. Pulls the question from the
+// composer if present (else asks via the dialog), lets the user pick depth,
+// asks Extend-vs-new when the active arc already has a paper, then fires the
+// (long) invoke gated by withButtonPending so the button shows a pending
+// spinner for the duration.
+async function triggerDeepResearch(btn) {
+    if (!invoke) { showToast('Athen is still starting up.', 'error'); return; }
+    if (!activeArcId) { showToast('No active arc to research in.', 'error'); return; }
+
+    const composerText = inputEl ? inputEl.value.trim() : '';
+    const picked = await showDeepResearchDialog(composerText);
+    if (!picked) return;
+    const { question, depth } = picked;
+
+    // Extend-vs-new only when the active arc already carries a paper.
+    let mode;
+    const meta = arcMetaById.get(activeArcId);
+    const existingPath = meta && meta.research_paper_path;
+    if (existingPath) {
+        const existingQ = (meta && meta.research_question) || 'a previous question';
+        const extend = await showConfirmDialog({
+            title: 'Extend or start new?',
+            body: `This conversation already has a research paper (on "${existingQ}"). Extend it, or start a new one?`,
+            confirmLabel: 'Extend',
+            cancelLabel: 'Start new',
+        });
+        mode = extend ? 'extend' : 'new';
+    }
+
+    // If we took the question from the composer, clear it — it's now the
+    // research subject, not a chat message to send.
+    if (composerText && inputEl && inputEl.value.trim() === composerText) {
+        inputEl.value = '';
+    }
+
+    renderDeepResearchStarting(question);
+
+    await withButtonPending(btn, async () => {
+        const args = { arcId: activeArcId, question, depth };
+        if (mode) args.mode = mode;
+        const res = await invoke('deep_research', args);
+        // The done event also fires and renders the result card; this is the
+        // fallback path (e.g. the event was missed) — render the result here
+        // too. renderDeepResearchDone is idempotent (it just rebuilds the
+        // banner from the result object).
+        if (res) renderDeepResearchDone(res);
+    }, { errorPrefix: 'Deep Research failed: ' });
+}
+
+// ── Banner rendering ──
+// The banner lives in <footer>, OUTSIDE #messages, so the innerHTML swap in
+// clearChatUI() can't wipe it. switchArc clears it explicitly per-arc.
+
+function deepResearchBannerEl() {
+    return document.getElementById('deep-research-banner');
+}
+
+function clearDeepResearchBanner() {
+    const el = deepResearchBannerEl();
+    if (!el) return;
+    el.innerHTML = '';
+    el.classList.add('hidden');
+}
+
+const ICON_DOC_RESEARCH =
+    '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h7"/><path d="M14 2v6h6"/><circle cx="17.5" cy="16.5" r="3"/><line x1="22" y1="21" x2="19.6" y2="18.6"/></svg>';
+
+function renderDeepResearchStarting(question) {
+    const el = deepResearchBannerEl();
+    if (!el) return;
+    el.classList.remove('hidden');
+    el.innerHTML = '';
+    const card = document.createElement('div');
+    card.className = 'deep-research-card running';
+    card.innerHTML =
+        `<span class="dr-icon spin" aria-hidden="true">${ICON_DOC_RESEARCH}</span>` +
+        '<div class="dr-body">' +
+        '<div class="dr-title">Planning research…</div>' +
+        `<div class="dr-detail"></div>` +
+        '</div>';
+    card.querySelector('.dr-detail').textContent = question || '';
+    el.appendChild(card);
+}
+
+function renderDeepResearchProgress(p) {
+    const el = deepResearchBannerEl();
+    if (!el) return;
+    el.classList.remove('hidden');
+
+    const phase = String(p.phase || '');
+    const detail = String(p.detail || '');
+    const total = Number(p.workers_total || 0);
+    const done = Number(p.workers_done || 0);
+    const ok = Number(p.workers_ok || 0);
+
+    let title;
+    let showBar = false;
+    if (phase === 'planning') {
+        title = 'Planning research…';
+    } else if (phase === 'reading') {
+        title = total > 0
+            ? `Researching sources… (${done}/${total} done, ${ok} ok)`
+            : 'Researching sources…';
+        showBar = total > 0;
+    } else if (phase === 'synthesizing') {
+        title = 'Writing the paper…';
+    } else {
+        title = 'Researching…';
+    }
+
+    el.innerHTML = '';
+    const card = document.createElement('div');
+    card.className = 'deep-research-card running';
+
+    const icon = document.createElement('span');
+    icon.className = 'dr-icon spin';
+    icon.setAttribute('aria-hidden', 'true');
+    icon.innerHTML = ICON_DOC_RESEARCH;
+    card.appendChild(icon);
+
+    const body = document.createElement('div');
+    body.className = 'dr-body';
+
+    const titleEl = document.createElement('div');
+    titleEl.className = 'dr-title';
+    titleEl.textContent = title;
+    body.appendChild(titleEl);
+
+    if (showBar) {
+        const bar = document.createElement('div');
+        bar.className = 'dr-progress-bar';
+        const fill = document.createElement('div');
+        fill.className = 'dr-progress-fill';
+        const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
+        fill.style.width = pct + '%';
+        bar.appendChild(fill);
+        body.appendChild(bar);
+    }
+
+    if (detail) {
+        const detailEl = document.createElement('div');
+        detailEl.className = 'dr-detail';
+        detailEl.textContent = detail;
+        body.appendChild(detailEl);
+    }
+
+    card.appendChild(body);
+    el.appendChild(card);
+}
+
+function renderDeepResearchDone(p) {
+    const el = deepResearchBannerEl();
+    if (!el) return;
+    el.classList.remove('hidden');
+
+    // The done event and the invoke return object share field names
+    // (snake_case verbatim): paper_path, workers_ok, workers_total, extended.
+    const paperPath = String(p.paper_path || '');
+    const basename = paperPath.split(/[\\/]/).pop() || paperPath || 'research paper';
+    const ok = Number(p.workers_ok || 0);
+    const total = Number(p.workers_total || 0);
+    const extended = !!p.extended;
+
+    el.innerHTML = '';
+    const card = document.createElement('div');
+    card.className = 'deep-research-card done';
+
+    const icon = document.createElement('span');
+    icon.className = 'dr-icon';
+    icon.setAttribute('aria-hidden', 'true');
+    icon.innerHTML = ICON_DOC_RESEARCH;
+    card.appendChild(icon);
+
+    const body = document.createElement('div');
+    body.className = 'dr-body';
+
+    const titleEl = document.createElement('div');
+    titleEl.className = 'dr-title';
+    titleEl.textContent = 'Research paper ready' + (extended ? ' (extended)' : '');
+    body.appendChild(titleEl);
+
+    const fileEl = document.createElement('div');
+    fileEl.className = 'dr-file';
+    fileEl.textContent = basename;
+    body.appendChild(fileEl);
+
+    const metaEl = document.createElement('div');
+    metaEl.className = 'dr-detail';
+    metaEl.textContent = `${ok}/${total} sub-topics covered`;
+    body.appendChild(metaEl);
+
+    // No frontend command reads a workspace file's contents, so "View paper"
+    // surfaces the path and tells the user to ask the agent about it in chat.
+    const hint = document.createElement('div');
+    hint.className = 'dr-hint';
+    hint.textContent = paperPath
+        ? `${paperPath} — ask me about it in chat, I can read it.`
+        : 'Ask me about it in chat — I can read it.';
+    body.appendChild(hint);
+
+    card.appendChild(body);
+
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.className = 'dr-close';
+    closeBtn.setAttribute('aria-label', 'Dismiss');
+    closeBtn.innerHTML = ICON_X;
+    closeBtn.addEventListener('click', clearDeepResearchBanner);
+    card.appendChild(closeBtn);
+
+    el.appendChild(card);
+
+    showToast('Research paper ready', 'success');
 }
 
 function showRewindDialog(entryId, newText, cleanupFn) {
@@ -18150,6 +18493,12 @@ function openGoalModal() {
 function closeGoalModal() {
     const overlay = document.getElementById('goal-modal-overlay');
     if (overlay) overlay.classList.add('hidden');
+}
+
+// ─── Deep Research trigger ───
+const deepResearchBtn = document.getElementById('deep-research-btn');
+if (deepResearchBtn) {
+    deepResearchBtn.addEventListener('click', () => triggerDeepResearch(deepResearchBtn));
 }
 
 // ─── Composer action menu (three-dot) ───

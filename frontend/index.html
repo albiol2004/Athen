@@ -199,12 +199,16 @@
             </main>
 
             <footer>
+                <div id="deep-research-banner" class="deep-research-banner hidden" aria-live="polite"></div>
                 <form id="input-form">
                     <div id="composer-attachments" class="composer-attachments hidden" aria-label="Attached files"></div>
                     <input type="file" id="composer-image-input" accept="image/*,application/pdf,text/*" multiple class="hidden" aria-hidden="true">
                     <div class="input-wrapper">
                         <button type="button" id="composer-attach-btn" title="Attach image, PDF, or text file" aria-label="Attach file">
                             <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+                        </button>
+                        <button type="button" id="deep-research-btn" title="Deep Research" aria-label="Deep Research">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h7"/><path d="M14 2v6h6"/><circle cx="17.5" cy="16.5" r="3"/><line x1="22" y1="21" x2="19.6" y2="18.6"/></svg>
                         </button>
                         <div class="composer-menu-wrap">
                             <button type="button" id="composer-menu-btn" title="More actions" aria-label="More actions" aria-haspopup="true">
