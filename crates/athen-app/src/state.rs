@@ -1953,6 +1953,116 @@ impl AppState {
         assemble_app_tool_registry(self.tool_registry_deps(), arc_id, ui).await
     }
 
+    /// Drive a full Deep Research run for `arc_id` and return the synthesized
+    /// paper (see `docs/DEEP_RESEARCH.md`). Pure orchestration — this does NOT
+    /// persist the paper or stamp arc metadata; the tool/command layer (a
+    /// later wave) owns that.
+    ///
+    /// Workers are spawned through the existing delegation seam
+    /// (`run_delegation`) under the `deep_research_worker` profile, each in
+    /// its own parent-linked sub-arc, so they surface in the arc tree exactly
+    /// like any other delegated specialist. Fan-out concurrency + partial-
+    /// result tolerance live in [`crate::deep_research::run_deep_research`].
+    ///
+    /// `ui` is required (not read from `self`) because `AppState` never holds
+    /// a `UiBridge` — it is threaded in by every caller. It is used both to
+    /// emit `"deep-research-progress"` events and to wire the workers' sub-arc
+    /// auditor so their tool calls persist under their own sub-arc.
+    pub(crate) async fn run_deep_research_for_arc(
+        &self,
+        arc_id: &str,
+        question: &str,
+        depth: Option<&str>,
+        prior_paper: Option<String>,
+        ui: crate::ui_bridge::UiBridge,
+    ) -> Result<crate::deep_research::ResearchOutcome> {
+        use athen_core::error::AthenError;
+
+        // Required stores. Mirror how other AppState methods guard `Option`
+        // stores — return a clear error rather than panicking.
+        let profile_store = self.profile_store.clone().ok_or_else(|| {
+            AthenError::Other("Deep research unavailable: profile store not configured".to_string())
+        })?;
+        let arc_store = self
+            ._database
+            .as_ref()
+            .map(|db| db.arc_store())
+            .ok_or_else(|| {
+                AthenError::Other("Deep research unavailable: arc store not configured".to_string())
+            })?;
+
+        // Build the BARE base tool registry for this arc — the same bare base
+        // a sub-agent receives (no delegation/wake-up wrappers ⇒ depth=1).
+        // `run_delegation` re-scopes it to each worker's own sub-arc via the
+        // context's `sub_registry_factory`.
+        let base: Arc<dyn athen_core::traits::tool::ToolRegistry> =
+            assemble_base_app_tool_registry(self.tool_registry_deps(), arc_id, Some(ui.clone()))
+                .await;
+
+        // Build the delegation context once (cloned per worker). Parent arc =
+        // this research arc, so worker sub-arcs hang off it. No wake-up
+        // restrictions — this is a user/agent-triggered run.
+        let ctx = build_delegation_context(
+            profile_store,
+            arc_store,
+            self.identity_store.clone(),
+            self.skill_store.clone(),
+            self.http_endpoint_store.clone(),
+            self.tool_doc_dir.clone(),
+            Arc::clone(&self.router),
+            arc_id.to_string(),
+            Some(ui.clone()),
+            None,
+        );
+
+        // Per-worker spawn closure. `Fn` (called N times), so it captures
+        // clonable `Arc`s / clonable context — never moved-once values.
+        let spawn_worker = move |brief: String| {
+            let base = base.clone();
+            let ctx = ctx.clone();
+            async move {
+                let (_sub_arc, content, success, _verified, _note) = crate::delegation::run_delegation(
+                    base,
+                    ctx,
+                    crate::delegation::DelegateArgs {
+                        target_profile_id: "deep_research_worker".to_string(),
+                        brief,
+                        reasoning_effort: None,
+                    },
+                )
+                .await?;
+                Ok::<String, AthenError>(if success { content } else { String::new() })
+            }
+        };
+
+        // Progress closure: cheap, non-blocking emit of a UI event.
+        let arc_id_owned = arc_id.to_string();
+        let ui_for_progress = ui.clone();
+        let progress = move |p: crate::deep_research::Progress| {
+            ui_for_progress.emit(
+                "deep-research-progress",
+                serde_json::json!({
+                    "arc_id": arc_id_owned,
+                    "phase": p.phase,
+                    "detail": p.detail,
+                    "workers_total": p.workers_total,
+                    "workers_done": p.workers_done,
+                    "workers_ok": p.workers_ok,
+                }),
+            );
+        };
+
+        crate::deep_research::run_deep_research(
+            Arc::clone(&self.router),
+            question,
+            crate::deep_research::Depth::parse(depth),
+            prior_paper.as_deref(),
+            spawn_worker,
+            progress,
+        )
+        .await
+    }
+
     /// Initialize the notification orchestrator.
     ///
     /// Must be called after `AppState::new()` but before `app.manage()`.

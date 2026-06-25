@@ -14,6 +14,7 @@ pub(crate) mod calendar_sources;
 mod commands;
 pub(crate) mod compaction;
 mod contacts;
+pub(crate) mod deep_research;
 pub(crate) mod delegation;
 pub(crate) mod email_autodetect;
 pub(crate) mod email_errors;

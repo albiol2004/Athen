@@ -193,15 +193,15 @@ impl DelegationToolRegistry {
 }
 
 #[derive(Debug, Deserialize)]
-struct DelegateArgs {
-    target_profile_id: String,
-    brief: String,
+pub(crate) struct DelegateArgs {
+    pub(crate) target_profile_id: String,
+    pub(crate) brief: String,
     /// Optional per-call reasoning-effort override for the sub-agent.
     /// Stored as the wire string (`"default"`/`"off"`/`"minimal"`/`"low"`/
     /// `"medium"`/`"high"`/`"max"`) and written onto the sub-arc so the
     /// sub-executor picks it up through the standard resolver chain.
     #[serde(default)]
-    reasoning_effort: Option<String>,
+    pub(crate) reasoning_effort: Option<String>,
 }
 
 #[async_trait]
@@ -429,7 +429,7 @@ async fn verify_deliverable(
 /// delegation), and execute a synthetic task built from the brief.
 ///
 /// Returns `(sub_arc_id, content, success, verified, verification_note)`.
-async fn run_delegation(
+pub(crate) async fn run_delegation(
     base: Arc<dyn ToolRegistry>,
     ctx: DelegationContext,
     args: DelegateArgs,

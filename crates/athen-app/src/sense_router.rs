@@ -2300,6 +2300,8 @@ mod tests {
                 plan: None,
                 security_mode_override: None,
                 project_id: None,
+                research_paper_path: None,
+                research_question: None,
             },
             ArcMeta {
                 id: "arc_recent".into(),
@@ -2326,6 +2328,8 @@ mod tests {
                 plan: None,
                 security_mode_override: None,
                 project_id: None,
+                research_paper_path: None,
+                research_question: None,
             },
         ];
 
