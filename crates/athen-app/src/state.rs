@@ -712,6 +712,14 @@ pub(crate) async fn assemble_base_app_tool_registry(
     let security_mode =
         resolve_security_mode_for_arc(deps.arc_store.as_ref(), arc_id, deps.global_security_mode)
             .await;
+    // Resolve whether this arc is an active Code-Mode session and, if so,
+    // its real repo root. When active, the shadow gix snapshot store is
+    // skipped (decision D5 — real git is the undo surface) and the shell
+    // cwd + file-tool fs base are pinned to the repo root. When inactive
+    // this is (false, None) and every downstream call is byte-identical to
+    // pre-Code-Mode behavior.
+    let (code_mode_active, code_mode_root) =
+        resolve_code_mode_for_arc(deps.arc_store.as_ref(), arc_id).await;
     // TODO(plan-cake): wire UserNotifier impl that forwards a
     // Notification to the same plumbing proactive_hints.rs uses
     // (app_handle.emit("notification", ...) + NotificationOrchestrator)
@@ -727,8 +735,14 @@ pub(crate) async fn assemble_base_app_tool_registry(
         .with_owner_check_opt(deps.owner_check.clone())
         .with_github_identity(github_identity)
         .with_github_identity_resolver_opt(deps.github_identity_resolver.clone())
-        .with_checkpoint_store_opt(deps.checkpoint_store.clone())
-        .with_checkpoint_arc_id(arc_id);
+        .with_checkpoint_store_opt(if code_mode_active {
+            None
+        } else {
+            deps.checkpoint_store.clone()
+        })
+        .with_checkpoint_arc_id(arc_id)
+        .with_working_dir(code_mode_root.clone())
+        .with_fs_base(code_mode_root.clone());
     if let Some(store) = deps.grant_store.clone() {
         let provider = Arc::new(crate::file_gate::ArcWritableProvider {
             arc_id: crate::file_gate::arc_uuid(arc_id),
@@ -5408,6 +5422,36 @@ pub(crate) async fn resolve_security_mode_for_arc(
             .and_then(|s| athen_core::config::SecurityMode::from_str(s).ok())
             .unwrap_or(global_default),
         _ => global_default,
+    }
+}
+
+/// Resolve whether `arc_id` is an active Code-Mode session and its repo
+/// root. Active iff code_mode == Some(true) AND code_mode_root points at an
+/// existing directory. Returns (false, None) on any miss / store error /
+/// missing root — never errors.
+pub(crate) async fn resolve_code_mode_for_arc(
+    arc_store: Option<&ArcStore>,
+    arc_id: &str,
+) -> (bool, Option<std::path::PathBuf>) {
+    let Some(store) = arc_store else {
+        return (false, None);
+    };
+    let Some(meta) = store.get_arc(arc_id).await.ok().flatten() else {
+        return (false, None);
+    };
+    if meta.code_mode != Some(true) {
+        return (false, None);
+    }
+    match meta.code_mode_root {
+        Some(root) => {
+            let p = std::path::PathBuf::from(&root);
+            if p.is_dir() {
+                (true, Some(p))
+            } else {
+                (false, None)
+            }
+        }
+        None => (false, None),
     }
 }
 

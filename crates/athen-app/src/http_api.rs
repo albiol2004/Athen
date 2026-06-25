@@ -1112,6 +1112,27 @@ async fn h_research_paper(
 ) -> Response {
     json_result(commands::get_research_paper_core(arc_id, api.ui.app_state()).await)
 }
+#[derive(Deserialize)]
+struct ArcCodeModeBody {
+    enabled: bool,
+    root: Option<String>,
+}
+async fn h_arc_code_mode(
+    State(api): State<ApiState>,
+    UrlPath(arc_id): UrlPath<String>,
+    Json(body): Json<ArcCodeModeBody>,
+) -> Response {
+    json_result(
+        commands::set_arc_code_mode_core(arc_id, body.enabled, body.root, api.ui.app_state())
+            .await,
+    )
+}
+async fn h_code_mode_git(
+    State(api): State<ApiState>,
+    UrlPath(arc_id): UrlPath<String>,
+) -> Response {
+    json_result(commands::code_mode_git_state_core(&arc_id, api.ui.app_state()).await)
+}
 async fn h_project_summary_mode_get(State(api): State<ApiState>) -> Response {
     json_result(commands::get_project_summary_mode_core(api.ui.app_state()).await)
 }
@@ -1981,6 +2002,8 @@ fn full_surface_router() -> Router<ApiState> {
         .route("/api/arcs/{id}/project", post(h_arc_assign_project))
         .route("/api/arcs/{id}/deep-research", post(h_deep_research))
         .route("/api/arcs/{id}/research-paper", get(h_research_paper))
+        .route("/api/arcs/{id}/code-mode", post(h_arc_code_mode))
+        .route("/api/arcs/{id}/code-mode/git", get(h_code_mode_git))
         .route("/api/active-project", post(h_set_active_project))
         // skills
         .route("/api/skills", get(h_skills_list).post(h_skill_upsert))

@@ -701,6 +701,38 @@ fn render_project_volatile_block(project: &athen_persistence::projects::Project)
     block
 }
 
+/// Resolve the per-arc Code-Mode prompt block, if the arc is in Code Mode.
+///
+/// Returns the short `[CODE MODE]` volatile-suffix block (mirroring
+/// [`render_project_volatile_block`]'s shape: trailing `\n`, appended to
+/// `system_suffix`) when `code_mode == Some(true)` and a non-empty
+/// `code_mode_root` is present. Returns `None` otherwise (no project /
+/// not in Code Mode / store absent ⇒ byte-identical to pre-Code-Mode
+/// behavior). Read-only: it never mutates arc state.
+async fn render_code_mode_volatile_block(
+    arc_store: Option<&athen_persistence::arcs::ArcStore>,
+    arc_id: &str,
+) -> Option<String> {
+    let store = arc_store?;
+    let meta = store.get_arc(arc_id).await.ok().flatten()?;
+    if meta.code_mode != Some(true) {
+        return None;
+    }
+    let root = meta.code_mode_root?;
+    if root.trim().is_empty() {
+        return None;
+    }
+    Some(format!(
+        "[CODE MODE]\n\
+You are working inside a real git repository rooted at {root}. The shell working \
+directory and relative file paths are anchored there, and your git commits are the \
+real project history. For PARALLEL work, create one `git worktree` per parallel \
+sub-agent rather than running parallel writers in a shared tree. Athen visualizes \
+worktrees and working-tree changes automatically — you need not report git status \
+in prose.\n"
+    ))
+}
+
 /// Convert a raw technical error string into a user-friendly message.
 ///
 /// Technical details are intentionally stripped — they are already logged
@@ -2999,6 +3031,17 @@ pub(crate) async fn send_message_core(
                 }
                 system_suffix.push_str(&block);
             }
+            // Code Mode block — same VOLATILE system_suffix tail as the
+            // project block above. Present only when the arc is a Code-Mode
+            // session (UI-set; never from sense_router).
+            if let Some(block) =
+                render_code_mode_volatile_block(state.arc_store.as_ref(), &active_arc).await
+            {
+                if !system_suffix.is_empty() && !system_suffix.ends_with("\n\n") {
+                    system_suffix.push_str("\n\n");
+                }
+                system_suffix.push_str(&block);
+            }
             let acceptance_criteria = crate::mission_render::read_acceptance_criteria(
                 state.arc_store.as_ref(),
                 &active_arc,
@@ -4139,6 +4182,17 @@ pub(crate) async fn execute_approved_task(
     // cached static prefix.
     if let Some(ref proj) = active_project {
         let block = render_project_volatile_block(proj);
+        if !system_suffix.is_empty() && !system_suffix.ends_with("\n\n") {
+            system_suffix.push_str("\n\n");
+        }
+        system_suffix.push_str(&block);
+    }
+    // Code Mode block — same VOLATILE system_suffix tail as the project
+    // block above. Present only when the arc is a Code-Mode session
+    // (UI-set; never from sense_router).
+    if let Some(block) =
+        render_code_mode_volatile_block(ctx.arc_store.as_ref(), &ctx.active_arc_id).await
+    {
         if !system_suffix.is_empty() && !system_suffix.ends_with("\n\n") {
             system_suffix.push_str("\n\n");
         }
@@ -7532,6 +7586,58 @@ pub(crate) async fn set_arc_security_mode_core(
         .map_err(|e| e.to_string())
 }
 
+/// Enable or disable per-arc **Code Mode** (the power-user "real git repo"
+/// posture; see `docs/CODE_MODE.md`). UI-only — `sense_router` never calls
+/// this, so sense-created arcs stay `code_mode = false`.
+///
+/// When `enabled`, `root` must be `Some` non-empty and point at an existing
+/// directory (the repo root the arc operates in, stored as an absolute path).
+/// When `enabled` is false the root is cleared to `None`.
+#[tauri::command]
+pub async fn set_arc_code_mode(
+    arc_id: String,
+    enabled: bool,
+    root: Option<String>,
+    state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    set_arc_code_mode_core(arc_id, enabled, root, &state).await
+}
+
+pub(crate) async fn set_arc_code_mode_core(
+    arc_id: String,
+    enabled: bool,
+    root: Option<String>,
+    state: &AppState,
+) -> std::result::Result<(), String> {
+    let Some(arc_store) = state.arc_store.as_ref() else {
+        return Err("Arc store not available".into());
+    };
+    // When enabling, demand an existing directory for the working root. The
+    // sandbox is widened to this path, so it must be a real dir the user
+    // explicitly picked — never empty, never derived from caller-free input.
+    let stored_root: Option<String> = if enabled {
+        let root = root
+            .map(|r| r.trim().to_string())
+            .filter(|r| !r.is_empty())
+            .ok_or_else(|| "Code Mode requires a working directory".to_string())?;
+        if !std::path::Path::new(&root).is_dir() {
+            return Err("Code Mode requires an existing directory".to_string());
+        }
+        Some(root)
+    } else {
+        // Disabling clears the root regardless of what the caller passed.
+        None
+    };
+    arc_store
+        .set_code_mode(&arc_id, Some(enabled))
+        .await
+        .map_err(|e| e.to_string())?;
+    arc_store
+        .set_code_mode_root(&arc_id, stored_root.as_deref())
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Inputs the manager UI sends when creating or updating a user-authored
 /// profile. Mirrors `AgentProfile` minus the server-managed fields
 /// (`builtin`, `created_at`, `updated_at`) and the unused-yet
@@ -10270,6 +10376,41 @@ pub async fn get_research_paper(
     state: State<'_, AppState>,
 ) -> std::result::Result<String, String> {
     get_research_paper_core(arc_id, &state).await
+}
+
+/// Read the live git state of an arc's Code-Mode repo. The repo root comes
+/// from the arc's trusted `code_mode_root` metadata (set by
+/// [`set_arc_code_mode_core`]), never from caller input — so there is no
+/// path argument and no path-traversal surface. The recognition layer is
+/// read-only and degrades to `is_repo: false` for a missing `git` binary or
+/// a non-repo root.
+pub(crate) async fn code_mode_git_state_core(
+    arc_id: &str,
+    state: &AppState,
+) -> std::result::Result<crate::code_mode::GitRepoState, String> {
+    let Some(ref arc_store) = state.arc_store else {
+        return Err("Arc store not available".to_string());
+    };
+    let arc = arc_store
+        .get_arc(arc_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Arc not found: {arc_id}"))?;
+    let root = arc
+        .code_mode_root
+        .filter(|r| !r.trim().is_empty())
+        .ok_or_else(|| "This conversation is not in Code Mode.".to_string())?;
+    Ok(crate::code_mode::read_git_state(std::path::Path::new(&root)).await)
+}
+
+/// Return the live git state of an arc's Code-Mode repo (see
+/// [`code_mode_git_state_core`]).
+#[tauri::command]
+pub async fn code_mode_git_state(
+    arc_id: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<crate::code_mode::GitRepoState, String> {
+    code_mode_git_state_core(&arc_id, &state).await
 }
 
 /// Assign (or clear) an arc's Project membership. When assigning to a project,

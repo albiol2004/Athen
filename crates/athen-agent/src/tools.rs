@@ -407,6 +407,16 @@ pub struct ShellToolRegistry {
     /// (see [`SANDBOX_FALLBACK_NOTIFIED`]). `None` on CLI/tests; the
     /// tracing warn-log still fires either way.
     notifier: Option<Arc<dyn UserNotifier>>,
+    /// Per-arc shell working directory override (Code Mode). When `Some`,
+    /// `build_shell_env` uses this as the shell cwd instead of the global
+    /// `athen_workspace_dir()`. `None` (the default for every non-code-mode
+    /// arc) preserves today's behaviour exactly.
+    working_dir_override: Option<std::path::PathBuf>,
+    /// Per-arc base for resolving relative file-tool paths (Code Mode).
+    /// When `Some`, `do_write`/`do_edit`/`do_read` join relative paths onto
+    /// this base instead of the workspace dir. `None` preserves today's
+    /// `resolve_in_workspace` behaviour exactly.
+    fs_base_override: Option<std::path::PathBuf>,
 }
 
 /// Tripped the first time `shell_execute` falls back from the sandbox to
@@ -692,7 +702,7 @@ impl ShellToolRegistry {
     /// `--prefix` install target lives at `<toolbox>/node/bin` on Unix
     /// and directly at `<toolbox>/node` on Windows, so we adapt the bin
     /// path accordingly.
-    fn build_shell_env() -> (Vec<(String, String)>, Option<PathBuf>) {
+    fn build_shell_env(&self) -> (Vec<(String, String)>, Option<PathBuf>) {
         let mut env: Vec<(String, String)> = Vec::new();
 
         if let Some(pydir) = paths::athen_toolbox_python_dir() {
@@ -727,7 +737,13 @@ impl ShellToolRegistry {
             }
         }
 
-        let cwd = paths::athen_workspace_dir();
+        // Code Mode: a per-arc override anchors the shell in the arc's repo
+        // root. Falls back to the global workspace dir when unset (every
+        // non-code-mode arc), preserving today's behaviour exactly.
+        let cwd = self
+            .working_dir_override
+            .clone()
+            .or_else(paths::athen_workspace_dir);
         (env, cwd)
     }
 
@@ -803,6 +819,8 @@ impl ShellToolRegistry {
             checkpoint_store: None,
             checkpoint_arc_id: None,
             notifier: None,
+            working_dir_override: None,
+            fs_base_override: None,
         }
     }
 
@@ -883,6 +901,39 @@ impl ShellToolRegistry {
     pub fn with_checkpoint_arc_id(mut self, arc_id: impl Into<String>) -> Self {
         self.checkpoint_arc_id = Some(arc_id.into());
         self
+    }
+
+    /// Set the per-arc shell working directory (Code Mode). When `Some`,
+    /// `shell_execute` runs with this as its cwd; when `None` the shell
+    /// falls back to the global `athen_workspace_dir()` exactly as before.
+    pub fn with_working_dir(mut self, dir: Option<std::path::PathBuf>) -> Self {
+        self.working_dir_override = dir;
+        self
+    }
+
+    /// Set the per-arc base for relative file-tool paths (Code Mode). When
+    /// `Some`, `write`/`edit`/`read` resolve relative paths against this
+    /// directory so a shell `ls` and a `write "src/foo.rs"` agree on where
+    /// "here" is. `None` preserves `resolve_in_workspace` behaviour.
+    pub fn with_fs_base(mut self, dir: Option<std::path::PathBuf>) -> Self {
+        self.fs_base_override = dir;
+        self
+    }
+
+    /// Resolve a tool-supplied path. Absolute paths pass through unchanged
+    /// (matching [`paths::resolve_in_workspace`]); a relative path is joined
+    /// onto `fs_base_override` when set, otherwise it falls back to
+    /// `resolve_in_workspace` (i.e. the workspace dir). With no override the
+    /// behaviour is byte-identical to calling `resolve_in_workspace` directly.
+    fn resolve_tool_path(&self, p: &str) -> std::path::PathBuf {
+        let path = Path::new(p);
+        if path.is_absolute() {
+            return path.to_path_buf();
+        }
+        match self.fs_base_override.as_ref() {
+            Some(base) => base.join(path),
+            None => paths::resolve_in_workspace(path),
+        }
     }
 
     /// Snapshot the given paths if the store + arc_id are both wired,
@@ -1440,7 +1491,7 @@ impl ShellToolRegistry {
         // unsandboxed path uses structured env+cwd via the OS process API
         // ([`build_shell_env`]) so it works on every shell on every OS.
         let wrapped_command = Self::build_shell_wrapper(command);
-        let (mut env_overrides, cwd) = Self::build_shell_env();
+        let (mut env_overrides, cwd) = self.build_shell_env();
         // Splice GitHub identity env vars (PAT + author/committer
         // name+email) so git/gh commands authenticate as the configured
         // bot or the user's own account — set on the agent profile,
@@ -1531,6 +1582,14 @@ impl ShellToolRegistry {
                 }
                 if let Ok(cwd) = std::env::current_dir() {
                     allowed.push(cwd);
+                }
+                // Code Mode: widen the sandbox to the per-arc repo root so
+                // the agent can read/write inside a repo that lives outside
+                // the Athen workspace. Strictly additive — the workspace
+                // allow-entries above are kept; only set for UI-enabled,
+                // per-arc Code-Mode arcs (never reachable from a sense).
+                if let Some(root) = self.working_dir_override.as_ref() {
+                    allowed.push(root.clone());
                 }
                 if let Some(provider) = self.extra_writable.as_ref() {
                     for p in provider.extra_writable_paths().await {
@@ -1736,8 +1795,9 @@ impl ShellToolRegistry {
         let limit = limit.max(1) as usize;
 
         // Relative paths resolve against the agent workspace, not the
-        // process cwd — that's where the agent's own files live.
-        let resolved = paths::resolve_in_workspace(Path::new(path_arg));
+        // process cwd — that's where the agent's own files live. In Code
+        // Mode a per-arc `fs_base_override` re-anchors them at the repo root.
+        let resolved = self.resolve_tool_path(path_arg);
         let path = resolved.to_string_lossy().to_string();
         let path = path.as_str();
 
@@ -1877,7 +1937,7 @@ impl ShellToolRegistry {
             ));
         }
 
-        let resolved = paths::resolve_in_workspace(Path::new(path_arg));
+        let resolved = self.resolve_tool_path(path_arg);
         let path = resolved.to_string_lossy().to_string();
         let path = path.as_str();
 
@@ -1969,7 +2029,7 @@ impl ShellToolRegistry {
             .and_then(|v| v.as_str())
             .ok_or_else(|| AthenError::Other("missing 'content' parameter".to_string()))?;
 
-        let resolved = paths::resolve_in_workspace(Path::new(path_arg));
+        let resolved = self.resolve_tool_path(path_arg);
         let path = resolved.to_string_lossy().to_string();
         let path = path.as_str();
 
@@ -2036,7 +2096,7 @@ impl ShellToolRegistry {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let resolved = paths::resolve_in_workspace(Path::new(path_arg));
+        let resolved = self.resolve_tool_path(path_arg);
         let path = resolved.to_string_lossy().to_string();
         let path = path.as_str();
 
@@ -2116,7 +2176,7 @@ impl ShellToolRegistry {
         // `grep { pattern: "foo" }` searches the agent's own files, not
         // whatever the host process happened to be launched from.
         let path_arg = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-        let resolved_path = paths::resolve_in_workspace(Path::new(path_arg));
+        let resolved_path = self.resolve_tool_path(path_arg);
         let path = resolved_path.to_string_lossy().to_string();
         let path = path.as_str();
         let glob = args.get("glob").and_then(|v| v.as_str());
@@ -2694,7 +2754,7 @@ impl ShellToolRegistry {
         // Apply the same toolbox env (PYTHONPATH / PATH) and cwd as
         // `shell_execute`, but via the OS process API so the wrapper
         // works on every shell on every OS.
-        let (mut env_overrides, cwd) = Self::build_shell_env();
+        let (mut env_overrides, cwd) = self.build_shell_env();
         env_overrides.extend(self.github_env_overrides().await);
         for (k, v) in &env_overrides {
             cmd.env(k, v);
@@ -2930,7 +2990,7 @@ impl ShellToolRegistry {
             .and_then(|v| v.as_str())
             .ok_or_else(|| AthenError::Other("missing 'path' parameter".to_string()))?;
 
-        let resolved = paths::resolve_in_workspace(Path::new(path_arg));
+        let resolved = self.resolve_tool_path(path_arg);
         let path = resolved.to_string_lossy().to_string();
         let path = path.as_str();
 

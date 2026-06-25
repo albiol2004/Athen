@@ -193,10 +193,8 @@ pub fn parse_status_v2(output: &str) -> (BranchInfo, Vec<DirtyFile>) {
                         branch.head_branch = Some(val.to_string());
                     }
                 }
-                "branch.upstream" => {
-                    if !val.is_empty() {
-                        branch.upstream = Some(val.to_string());
-                    }
+                "branch.upstream" if !val.is_empty() => {
+                    branch.upstream = Some(val.to_string());
                 }
                 "branch.ab" => {
                     // Format: "+A -B".
