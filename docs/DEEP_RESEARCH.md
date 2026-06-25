@@ -26,12 +26,18 @@ in-app "View paper" markdown modal.
    "assign 5 sources before you have the list" trap by letting each worker find its
    own. Trade-off: possible source overlap across workers, deduped at synthesis. The
    user's "~5 sources per agent" intent is preserved.
-2. **Agent-callable `deep_research` tool deferred.** §6 lists both a UI affordance and
-   an LLM-callable tool. Only the UI/command/HTTP trigger shipped. The tool needs a
-   runner closure injected into the per-arc tool registry (it can't hold `&AppState`),
-   which is a `state.rs`/`app_tools.rs` refactor; deferred as a fast-follow. Today the
-   agent can still answer questions about a finished paper (it reads the saved file),
-   it just can't self-*initiate* a run — the user triggers it from the UI.
+2. **Agent-callable `deep_research` tool — how it's wired.** §6 lists both a UI
+   affordance and an LLM-callable tool; both shipped. Because an `AppToolRegistry`
+   tool can't hold `&AppState`, the tool is backed by an optional `DeepResearchRunner`
+   closure (app_tools.rs) that captures the arc id + `UiBridge` and resolves
+   `&AppState` at call-time via `ui.app_state()`, then calls `deep_research_core`. The
+   runner is injected **only** into the top-level interactive per-arc registry
+   (`assemble_app_tool_registry`); the sub-agent/worker and save-only registries get
+   `None`, so research workers can't recurse and the tool is absent wherever there's
+   no UI bridge (CLI/tests). The whole addition is additive — no existing tool's
+   `list_tools`/`call_tool` behavior changes. Extend-vs-new is handled in-band: if the
+   arc already has a paper and no `mode` is given, the tool returns a `needs_decision`
+   result telling the agent to ask the user and re-call with `mode`.
 
 This doc was originally grounded in a code audit of the existing delegation/fan-out
 machinery (citations inline); where the audit corrected an assumption, the correction
