@@ -721,6 +721,28 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
             vec!["setup"],
             GithubIdentity::None,
         ),
+        mk(
+            "deep_research_worker",
+            "Deep Research Worker",
+            "Researches a single sub-question: searches the web, reads sources, and \
+             returns concise structured findings with citations. Spawned in parallel \
+             by Deep Research.",
+            Some(
+                "You research ONE narrow sub-question. Use web_search to find relevant \
+                 sources, then web_fetch to read about 5 of the most relevant ones. Return \
+                 concise structured findings: for each key claim, state the claim, the \
+                 supporting evidence, and the exact source URL. Do not write files or take \
+                 any action beyond research. If sources conflict, note it. Prefer primary \
+                 and authoritative sources.",
+            ),
+            vec![DomainTag::Research],
+            vec![TaskKindTag::Researching, TaskKindTag::Summarizing],
+            vec!["web research", "source evaluation", "summarization"],
+            vec![],
+            ToolSelection::Groups(vec!["web".into(), "files".into(), "memory".into()]),
+            vec!["web", "files", "memory"],
+            GithubIdentity::None,
+        ),
     ]
 }
 
@@ -1150,6 +1172,7 @@ mod tests {
             "lawyer",
             "doctor",
             "athen_setup",
+            "deep_research_worker",
         ] {
             assert!(ids.contains(canonical), "missing built-in: {canonical}");
         }
