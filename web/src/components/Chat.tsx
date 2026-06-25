@@ -9,6 +9,7 @@ import type {
 } from '../api/types';
 import type { ChatItem } from '../chat/reducer';
 import { GrantCard, QuestionCard, TaskCard, ThinkingBlock } from './cards';
+import { DeepResearchButton } from './DeepResearch';
 import { Markdown } from './Markdown';
 import { PlanCard, type PlanState } from './PlanGoal';
 import { ToolCard, ToolGroup } from './toolcards';
@@ -34,6 +35,8 @@ export interface ChatCallbacks {
   onDiscardPlan: () => Promise<void>;
   /** Open Settings, optionally on a specific tab (used by the no-provider CTA). */
   onOpenSettings: (tab?: string) => void;
+  /** Open the Deep Research launcher, seeded with the current composer text. */
+  onDeepResearch: (question: string) => void;
 }
 
 type ToolItem = Extract<ChatItem, { kind: 'tool' }>;
@@ -116,6 +119,7 @@ async function fileToB64(f: File): Promise<string> {
 export function Chat({
   items,
   busy,
+  researchBusy,
   arcKey,
   plan,
   client,
@@ -123,6 +127,8 @@ export function Chat({
 }: {
   items: ChatItem[];
   busy: boolean;
+  /** A Deep Research POST is in flight — shows a spinner on the trigger. */
+  researchBusy: boolean;
   arcKey: string | null;
   plan: PlanState | null;
   client: AthenClient;
@@ -281,6 +287,7 @@ export function Chat({
               />
             </svg>
           </button>
+          <DeepResearchButton busy={researchBusy} onClick={() => cb.onDeepResearch(text.trim())} />
           <input
             ref={pickerRef}
             type="file"

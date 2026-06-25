@@ -6,6 +6,9 @@
 import type {
   ArcEntry,
   ArcMeta,
+  DeepResearchDepth,
+  DeepResearchMode,
+  DeepResearchResult,
   GrantDecision,
   GrantRequest,
   MemoryInfo,
@@ -120,6 +123,26 @@ export class AthenClient {
   }
   cancelAll(): Promise<{ cancelled: boolean }> {
     return this.req('/cancel', undefined, 'POST');
+  }
+
+  // ---- deep research (docs/DEEP_RESEARCH.md) ----
+  /**
+   * Kick off a Deep Research run on `arcId`. Resolves when the (long-running)
+   * pipeline finishes; live phase updates arrive over SSE as
+   * `deep-research-progress` / `deep-research-done`. `mode` is only meaningful
+   * when the arc already has a paper (extend vs new); omit it for a first run.
+   */
+  deepResearch(
+    arcId: string,
+    question: string,
+    depth?: DeepResearchDepth,
+    mode?: DeepResearchMode,
+  ): Promise<DeepResearchResult> {
+    return this.req(`/arcs/${encodeURIComponent(arcId)}/deep-research`, {
+      question,
+      depth,
+      mode,
+    });
   }
 
   // ---- approvals & grants ----

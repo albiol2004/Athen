@@ -1,7 +1,15 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { ApiError, AthenClient } from '../api/client';
 import { connectEvents, type ConnectionStatus } from '../api/events';
-import type { ArcMeta, NotificationInfo, Project } from '../api/types';
+import type {
+  ArcMeta,
+  DeepResearchDepth,
+  DeepResearchDoneEvent,
+  DeepResearchMode,
+  DeepResearchProgressEvent,
+  NotificationInfo,
+  Project,
+} from '../api/types';
 import { chatReducer, initialChat } from '../chat/reducer';
 import { SettingsModal } from '../settings/SettingsModal';
 import { AgentsPanel } from './AgentsPanel';
@@ -9,6 +17,7 @@ import { ArcPickers } from './ArcPickers';
 import { Bell } from './Bell';
 import { ChangesRail } from './ChangesRail';
 import { Chat, type ChatCallbacks, type OutgoingFile, type OutgoingImage } from './Chat';
+import { DeepResearchBanner, DeepResearchModal } from './DeepResearch';
 import { GoalBanner, type GoalState, type PlanState } from './PlanGoal';
 import { ProjectPage } from './ProjectPage';
 import { Sidebar } from './Sidebar';
@@ -40,6 +49,12 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
   const [projects, setProjects] = useState<Project[]>([]);
   // null = chat surface; a project id = the Project page for that project.
   const [openProject, setOpenProject] = useState<string | null>(null);
+  // Deep Research (docs/DEEP_RESEARCH.md): launcher seed text (null = closed),
+  // live progress/done banners (scoped to the active arc), POST-in-flight flag.
+  const [drQuestion, setDrQuestion] = useState<string | null>(null);
+  const [drProgress, setDrProgress] = useState<DeepResearchProgressEvent | null>(null);
+  const [drDone, setDrDone] = useState<DeepResearchDoneEvent | null>(null);
+  const [drBusy, setDrBusy] = useState(false);
 
   const activeArcRef = useRef<string | null>(null);
   activeArcRef.current = activeArc;
@@ -164,6 +179,17 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
           void refreshGoalPlan();
         },
         onNotification: (n) => setNotifications((l) => [n, ...l]),
+        onDeepResearchProgress: (e) => {
+          if (e.arc_id !== activeArcRef.current) return;
+          setDrProgress(e);
+          setDrDone(null);
+        },
+        onDeepResearchDone: (e) => {
+          if (e.arc_id !== activeArcRef.current) return;
+          setDrProgress(null);
+          setDrDone(e);
+          void refreshArcs();
+        },
         onLagged: () => {
           dispatch({ type: 'system', text: 'Event stream lagged — some output may be missing.' });
           const active = activeArcRef.current;
@@ -185,6 +211,9 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
         const entries = await client.selectArc(id);
         setActiveArc(id);
         dispatch({ type: 'reset', entries });
+        // Deep Research banners are arc-scoped — drop any from the old arc.
+        setDrProgress(null);
+        setDrDone(null);
         setUnread((s) => {
           if (!s.has(id)) return s;
           const n = new Set(s);
@@ -357,6 +386,73 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
     setPlan(null);
   }, [client]);
 
+  // ---- deep research ----
+  // The button only opens the launcher; the POST happens once the user picks
+  // depth (+ extend/new). An arc must exist first so the paper has a home.
+  const onDeepResearch = useCallback<ChatCallbacks['onDeepResearch']>(
+    (question) => {
+      if (!activeArcRef.current) {
+        toast('Start a conversation first, then run Deep Research in it.', 'info');
+        return;
+      }
+      setDrDone(null);
+      setDrQuestion(question);
+    },
+    [toast],
+  );
+
+  const runDeepResearch = useCallback(
+    async (question: string, depth: DeepResearchDepth, mode: DeepResearchMode | undefined) => {
+      const arcId = activeArcRef.current;
+      setDrQuestion(null);
+      if (!arcId) return;
+      setDrBusy(true);
+      setDrDone(null);
+      // Seed an immediate "planning" banner so the surface reacts before the
+      // first SSE tick lands.
+      setDrProgress({
+        arc_id: arcId,
+        phase: 'planning',
+        detail: question,
+        workers_total: 0,
+        workers_done: 0,
+        workers_ok: 0,
+      });
+      try {
+        const res = await client.deepResearch(arcId, question, depth, mode);
+        // The done banner is normally driven by SSE; fall back to the response
+        // if the event was missed (e.g. stream lag).
+        if (arcId === activeArcRef.current) {
+          setDrProgress(null);
+          setDrDone((cur) =>
+            cur ?? {
+              arc_id: res.arc_id,
+              paper_path: res.paper_path,
+              question: res.question,
+              workers_ok: res.workers_ok,
+              workers_total: res.workers_total,
+              sub_questions: res.sub_questions,
+              extended: res.extended,
+            },
+          );
+        }
+        toast(
+          res.extended ? 'Research paper extended.' : 'Research paper ready.',
+          'success',
+        );
+        void refreshArcs();
+      } catch (e) {
+        if (!bail(e)) {
+          if (arcId === activeArcRef.current) setDrProgress(null);
+          toast(errMessage(e), 'error');
+        }
+      } finally {
+        setDrBusy(false);
+      }
+    },
+    [client, toast, bail, refreshArcs],
+  );
+
   const openSettings = useCallback((tab?: string) => {
     setSettingsTab(tab);
     setSettingsOpen(true);
@@ -372,8 +468,19 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
       onApprovePlan,
       onDiscardPlan,
       onOpenSettings: openSettings,
+      onDeepResearch,
     }),
-    [onSend, cancel, onAnswerQuestion, onDecideTask, onDecideGrant, onApprovePlan, onDiscardPlan, openSettings],
+    [
+      onSend,
+      cancel,
+      onAnswerQuestion,
+      onDecideTask,
+      onDecideGrant,
+      onApprovePlan,
+      onDiscardPlan,
+      openSettings,
+      onDeepResearch,
+    ],
   );
 
   const activeMeta = useMemo(() => arcs.find((a) => a.id === activeArc), [arcs, activeArc]);
@@ -554,9 +661,15 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
                 }
               />
             )}
+            <DeepResearchBanner
+              progress={drProgress}
+              done={drDone}
+              onDismiss={() => setDrDone(null)}
+            />
             <Chat
               items={chat.items}
               busy={busy}
+              researchBusy={drBusy}
               arcKey={activeArc}
               plan={plan}
               client={client}
@@ -589,6 +702,15 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
             setSettingsOpen(false);
             setSettingsTab(undefined);
           }}
+        />
+      )}
+      {drQuestion !== null && (
+        <DeepResearchModal
+          initialQuestion={drQuestion}
+          hasPaper={Boolean(activeMeta?.research_paper_path)}
+          priorQuestion={activeMeta?.research_question ?? null}
+          onStart={(q, depth, mode) => void runDeepResearch(q, depth, mode)}
+          onClose={() => setDrQuestion(null)}
         />
       )}
     </div>

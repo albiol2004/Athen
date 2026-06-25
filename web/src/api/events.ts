@@ -8,6 +8,8 @@ import type { AthenClient } from './client';
 import type {
   ApprovalQuestion,
   ApprovalResolved,
+  DeepResearchDoneEvent,
+  DeepResearchProgressEvent,
   GrantRequest,
   NotificationInfo,
   ProgressEvent,
@@ -27,6 +29,10 @@ export interface EventHandlers {
   onGrantResolvedElsewhere?(id: string): void;
   onArcUpdated?(): void;
   onNotification?(n: NotificationInfo): void;
+  /** Deep Research phase tick for some arc (filter by `arc_id` in the handler). */
+  onDeepResearchProgress?(e: DeepResearchProgressEvent): void;
+  /** Deep Research finished for some arc (filter by `arc_id` in the handler). */
+  onDeepResearchDone?(e: DeepResearchDoneEvent): void;
   /** Bus overflow — some events were dropped; refetch state via REST. */
   onLagged?(dropped: number): void;
 }
@@ -56,6 +62,8 @@ export function connectEvents(client: AthenClient, h: EventHandlers): () => void
   on('grant-requested', h.onGrant);
   on('grant-resolved-elsewhere', h.onGrantResolvedElsewhere);
   on('notification', h.onNotification);
+  on('deep-research-progress', h.onDeepResearchProgress);
+  on('deep-research-done', h.onDeepResearchDone);
   on('lagged', h.onLagged);
   // No payload to parse on these — fire directly.
   if (h.onArcUpdated) es.addEventListener('arc-updated', () => h.onArcUpdated?.());

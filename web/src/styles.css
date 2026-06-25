@@ -816,3 +816,83 @@ button { font: inherit; }
   padding: 0 2px; margin-top: -1px;
 }
 .toast-close:hover { color: var(--text); }
+
+/* deep research (docs/DEEP_RESEARCH.md) */
+.composer .dr-trigger {
+  display: grid; place-items: center; width: 34px; height: 34px; flex: none;
+  border: none; border-radius: 11px; cursor: pointer;
+  background: none; color: var(--text-dim);
+}
+.composer .dr-trigger:hover:not(:disabled) {
+  color: var(--coral); background: rgba(255, 255, 255, 0.06);
+}
+.composer .dr-trigger:disabled { opacity: 0.6; cursor: default; }
+
+.dr-modal { max-width: 460px; text-align: left; }
+.dr-modal-sub { color: var(--text-dim); font-size: 12.5px; margin: -4px 0 14px; }
+.dr-field-label {
+  font-size: 11.5px; font-weight: 600; color: var(--text-dim);
+  text-transform: uppercase; letter-spacing: 0.04em; margin: 12px 0 6px;
+}
+.dr-field-label:first-of-type { margin-top: 0; }
+.dr-question {
+  width: 100%; box-sizing: border-box; resize: vertical; min-height: 64px;
+  font: inherit; color: var(--text);
+  background: rgba(0, 0, 0, 0.25); border: 1px solid var(--glass-border);
+  border-radius: 10px; padding: 9px 11px; outline: none;
+}
+.dr-question:focus { border-color: var(--coral); }
+.dr-depths { display: flex; gap: 8px; }
+.dr-depth-chip {
+  flex: 1; display: flex; flex-direction: column; gap: 2px; align-items: flex-start;
+  cursor: pointer; text-align: left;
+  background: rgba(255, 255, 255, 0.04); border: 1px solid var(--glass-border);
+  border-radius: 10px; padding: 8px 10px; color: var(--text);
+}
+.dr-depth-chip:hover { background: rgba(255, 255, 255, 0.07); }
+.dr-depth-chip.active { border-color: var(--coral); background: var(--coral-soft); }
+.dr-depth-label { font-size: 13px; font-weight: 600; }
+.dr-depth-hint { font-size: 10.5px; color: var(--text-dim); }
+
+.dr-banner {
+  max-width: 760px; margin: 8px auto 0; box-sizing: border-box;
+  display: flex; align-items: flex-start; gap: 11px;
+  background: var(--glass); border: 1px solid var(--glass-border);
+  border-radius: var(--radius); padding: 12px 14px;
+  backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+}
+.dr-progress-spin { color: var(--coral); flex: none; margin-top: 1px; }
+.dr-progress-body { flex: 1; min-width: 0; }
+.dr-progress-label { font-size: 13px; font-weight: 600; color: var(--text); }
+.dr-progress-detail {
+  font-size: 11.5px; color: var(--text-dim); margin-top: 2px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.dr-progress-bar {
+  height: 5px; border-radius: 99px; margin-top: 8px;
+  background: rgba(255, 255, 255, 0.08); overflow: hidden;
+}
+.dr-progress-fill {
+  height: 100%; border-radius: 99px; background: var(--coral);
+  transition: width 0.4s ease;
+}
+
+.dr-done { border-color: rgba(127, 200, 164, 0.35); }
+.dr-done-icon {
+  flex: none; display: grid; place-items: center;
+  width: 32px; height: 32px; border-radius: 9px;
+  background: rgba(127, 200, 164, 0.14); color: var(--green);
+}
+.dr-done-body { flex: 1; min-width: 0; }
+.dr-done-title { font-size: 13px; font-weight: 600; color: var(--text); }
+.dr-done-tag { color: var(--text-dim); font-weight: 500; }
+.dr-done-file {
+  font-size: 12px; color: var(--coral); margin-top: 2px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.dr-done-meta { font-size: 11.5px; color: var(--text-dim); margin-top: 3px; }
+.dr-banner-close {
+  flex: none; background: none; border: none; cursor: pointer;
+  color: var(--text-dim); font-size: 16px; line-height: 1; padding: 0 2px;
+}
+.dr-banner-close:hover { color: var(--text); }

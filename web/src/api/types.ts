@@ -18,6 +18,10 @@ export interface ArcMeta {
   pinned_slug?: string | null;
   /** Project membership, or null when the arc belongs to no project. */
   project_id?: string | null;
+  /** Workspace-relative path to this arc's Deep Research paper, if any. */
+  research_paper_path?: string | null;
+  /** The question driving this arc's Deep Research run, if any. */
+  research_question?: string | null;
 }
 
 /** One persisted timeline row — `GET /api/arcs/{id}/entries`. */
@@ -146,6 +150,50 @@ export interface ProgressEvent {
 export interface ApprovalResolved {
   task_id?: string;
   approved?: boolean;
+}
+
+// ---- Deep Research (docs/DEEP_RESEARCH.md) ----
+
+/** Depth knob for a Deep Research run; `standard` is the default. */
+export type DeepResearchDepth = 'quick' | 'standard' | 'deep';
+
+/** Re-trigger mode when an arc already has a paper. Omit for a first run. */
+export type DeepResearchMode = 'extend' | 'new';
+
+/**
+ * `POST /api/arcs/{id}/deep-research` response (`DeepResearchResult`,
+ * snake_case verbatim — see commands::deep_research_core).
+ */
+export interface DeepResearchResult {
+  arc_id: string;
+  paper_path: string;
+  question: string;
+  depth: string;
+  sub_questions: string[];
+  workers_total: number;
+  workers_ok: number;
+  extended: boolean;
+}
+
+/** `deep-research-progress` SSE payload (emitted from state.rs). */
+export interface DeepResearchProgressEvent {
+  arc_id: string;
+  phase: 'planning' | 'reading' | 'synthesizing';
+  detail: string;
+  workers_total: number;
+  workers_done: number;
+  workers_ok: number;
+}
+
+/** `deep-research-done` SSE payload (emitted from commands::deep_research_core). */
+export interface DeepResearchDoneEvent {
+  arc_id: string;
+  paper_path: string;
+  question: string;
+  workers_ok: number;
+  workers_total: number;
+  sub_questions: string[];
+  extended: boolean;
 }
 
 /** Long-poll `POST /api/messages` response (`AgentResponse` shape). */
