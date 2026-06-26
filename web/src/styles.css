@@ -977,6 +977,7 @@ button { font: inherit; }
 
 .cm-section { display: flex; flex-direction: column; gap: 5px; }
 .cm-section-title {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
   font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px;
   color: var(--text-dim); font-weight: 600; margin-top: 4px;
 }
@@ -1008,8 +1009,29 @@ button { font: inherit; }
 }
 .cm-dirty-status { color: var(--coral); flex: none; min-width: 22px; }
 .cm-dirty-path {
+  flex: 1; min-width: 0;
   color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+
+/* GitLens-style discard affordances — subtle danger, small (docs/CODE_MODE.md §6). */
+.cm-discard-btn {
+  flex: none; align-self: center;
+  background: none; border: none; cursor: pointer; padding: 0 4px;
+  font-size: 13px; line-height: 1; color: var(--text-dim);
+  border-radius: 5px; opacity: 0.65; transition: color 0.12s, background 0.12s, opacity 0.12s;
+}
+.cm-discard-btn:hover:not(:disabled) {
+  color: var(--red); background: rgba(224, 122, 110, 0.12); opacity: 1;
+}
+.cm-discard-all-btn {
+  flex: none;
+  background: none; border: 1px solid rgba(224, 122, 110, 0.35); cursor: pointer;
+  padding: 1px 7px; border-radius: 6px;
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px; font-weight: 600;
+  color: var(--red); transition: background 0.12s;
+}
+.cm-discard-all-btn:hover:not(:disabled) { background: rgba(224, 122, 110, 0.12); }
+.cm-discard-btn:disabled, .cm-discard-all-btn:disabled { opacity: 0.4; cursor: default; }
 
 .cm-commit { display: flex; align-items: baseline; gap: 8px; font-size: 12.5px; }
 .cm-commit-hash { font: 11px ui-monospace, monospace; color: var(--text-dim); flex: none; }

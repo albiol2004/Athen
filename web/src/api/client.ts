@@ -172,6 +172,16 @@ export class AthenClient {
   codeModeGitState(arcId: string): Promise<GitRepoState> {
     return this.req(`/arcs/${encodeURIComponent(arcId)}/code-mode/git`);
   }
+  /**
+   * GitLens-style discard of working-tree changes (docs/CODE_MODE.md §6). A
+   * user-initiated, UI-confirmed mutating git op (not agent-callable). `path` =
+   * a repo-relative file to discard ONE file, or `null` to discard ALL
+   * working-tree changes. Returns a fresh `GitRepoState` so the panel updates
+   * in one round-trip.
+   */
+  codeModeDiscard(arcId: string, path: string | null): Promise<GitRepoState> {
+    return this.req(`/arcs/${encodeURIComponent(arcId)}/code-mode/discard`, { path });
+  }
 
   // ---- approvals & grants ----
   approveTask(taskId: string, approved: boolean): Promise<unknown> {

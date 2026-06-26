@@ -8,8 +8,15 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { AthenClient } from '../api/client';
 import type { GitRepoState } from '../api/types';
+import { ConfirmDialog } from './ConfirmDialog';
+import { errMessage, useToast } from './Toast';
 
 const SHORT_HASH = 8;
+
+// What the discard ConfirmDialog is asking about: a single repo-relative file
+// (`path`) or ALL working-tree changes (`null`). Stored as panel state so the
+// glass ConfirmDialog can render outside the row, matching the rest of the app.
+type DiscardTarget = { path: string | null };
 
 function shortHash(hash: string): string {
   return hash.slice(0, SHORT_HASH);
@@ -24,9 +31,14 @@ export function CodeModePanel({
   arcId: string;
   onClose: () => void;
 }) {
+  const { toast } = useToast();
   const [state, setState] = useState<GitRepoState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  // Pending discard confirmation (per-file or all); null = no dialog open.
+  const [discarding, setDiscarding] = useState<DiscardTarget | null>(null);
+  // True while the discard request is in flight — disables the buttons.
+  const [discardBusy, setDiscardBusy] = useState(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -43,6 +55,25 @@ export function CodeModePanel({
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  // GitLens-style discard (docs/CODE_MODE.md §6). `path` null = discard ALL.
+  // Confirmed in the UI because it destroys uncommitted work. Returns a fresh
+  // GitRepoState so we update the panel in one round-trip; errors → Toast.
+  const runDiscard = useCallback(
+    async (path: string | null) => {
+      setDiscardBusy(true);
+      try {
+        setState(await client.codeModeDiscard(arcId, path));
+        setError(null);
+      } catch (e) {
+        toast(errMessage(e), 'error');
+      } finally {
+        setDiscardBusy(false);
+        setDiscarding(null);
+      }
+    },
+    [client, arcId, toast],
+  );
 
   return (
     <div className="drawer">
@@ -117,7 +148,22 @@ export function CodeModePanel({
                   )}
                 </CmSection>
 
-                <CmSection title="Working tree">
+                <CmSection
+                  title="Working tree"
+                  headerActions={
+                    state.dirty.length > 0 ? (
+                      <button
+                        type="button"
+                        className="cm-discard-all-btn"
+                        title="Discard ALL uncommitted changes"
+                        disabled={discardBusy}
+                        onClick={() => setDiscarding({ path: null })}
+                      >
+                        Discard all
+                      </button>
+                    ) : null
+                  }
+                >
                   {state.dirty.length === 0 ? (
                     <div className="cm-clean">clean</div>
                   ) : (
@@ -127,6 +173,16 @@ export function CodeModePanel({
                         <span className="cm-dirty-path" title={f.path}>
                           {f.path}
                         </span>
+                        <button
+                          type="button"
+                          className="cm-discard-btn"
+                          title="Discard changes"
+                          aria-label={`Discard changes to ${f.path}`}
+                          disabled={discardBusy}
+                          onClick={() => setDiscarding({ path: f.path })}
+                        >
+                          ↩
+                        </button>
                       </div>
                     ))
                   )}
@@ -151,14 +207,48 @@ export function CodeModePanel({
           </>
         )}
       </div>
+
+      {discarding &&
+        (discarding.path === null ? (
+          <ConfirmDialog
+            title="Discard all changes?"
+            body="Discard ALL uncommitted changes in this repository? This permanently removes every modification and new file. This cannot be undone."
+            confirmLabel="Discard all"
+            danger
+            onConfirm={() => void runDiscard(null)}
+            onCancel={() => setDiscarding(null)}
+          />
+        ) : (
+          <ConfirmDialog
+            title="Discard changes?"
+            // Path rendered as a plain text child by ConfirmDialog (<p>{body}</p>)
+            // — React escapes it; no dangerouslySetInnerHTML anywhere.
+            body={`Discard changes to ${discarding.path}? This cannot be undone.`}
+            confirmLabel="Discard"
+            danger
+            onConfirm={() => void runDiscard(discarding.path)}
+            onCancel={() => setDiscarding(null)}
+          />
+        ))}
     </div>
   );
 }
 
-function CmSection({ title, children }: { title: string; children: React.ReactNode }) {
+function CmSection({
+  title,
+  headerActions,
+  children,
+}: {
+  title: string;
+  headerActions?: React.ReactNode;
+  children: React.ReactNode;
+}) {
   return (
     <div className="cm-section">
-      <div className="cm-section-title">{title}</div>
+      <div className="cm-section-title">
+        <span>{title}</span>
+        {headerActions}
+      </div>
       <div className="cm-section-body">{children}</div>
     </div>
   );

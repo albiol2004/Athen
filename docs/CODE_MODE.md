@@ -1,11 +1,12 @@
 # Code Mode
 
-> **Status:** BUILD 1 SHIPPED (2026-06-25, `feat/code-mode`). Code is
-> authoritative. §10 "Build 1" is live (per-arc flag + root, per-arc cwd/fs-base +
-> sandbox widening, checkpoint shadow-override, git recognition layer +
-> command/route, `[CODE MODE]` prompt block, desktop+web toggle + Code-Mode
-> panel). The only deferred items are the §10 "Build 2" list — live ephemeral
-> sub-agent transcript streaming and the Revert-button (a)/(b) behavior in §6.
+> **Status:** BUILDS 1 + 2 SHIPPED (2026-06-25/26, `feat/code-mode`). Code is
+> authoritative. Live: per-arc flag + root, per-arc cwd/fs-base + sandbox
+> widening, git recognition layer + command/route, `[CODE MODE]` prompt block,
+> desktop+web toggle + Code-Mode panel. §6 undo resolved to **option (b)** — the
+> shadow checkpoint store stays active for per-action undo, plus a GitLens-style
+> discard. The only deferred items are the §10 "Build 3" list (live sub-agent
+> transcript streaming, generalized progress events, worktree auto-suggest).
 
 ## 1. What Code Mode is (and is not)
 
@@ -143,28 +144,44 @@ that may live outside the workspace. This is a deliberate, scoped widening:
 power-user-only, per-arc, UI-set, explicit directory pick — never reachable from
 a sense-created arc. Document it in the security model alongside `SecurityMode`.
 
-## 6. Checkpoint override + undo granularity (OPEN QUESTION)
+## 6. Checkpoint + discard (RESOLVED: option b)
 
-Today `GixCheckpointStore` snapshots `write`/`edit`/`shell` pre-state into a
-**shadow** bare repo at `<data_dir>/athen-snapshots` (branch-per-arc,
-tag-per-action) and powers the Changes rail's "Revert this action."
+`GixCheckpointStore` snapshots `write`/`edit`/`shell` pre-state into a **shadow**
+bare repo at `<data_dir>/athen-snapshots` (branch-per-arc, tag-per-action) and
+powers the Changes rail's "Revert this action."
 
-In Code Mode **with a real repo detected**, decision **D5** disables that shadow
-snapshotting for the arc and makes **real git** the source of truth for the
-undo/Changes surface. The remaining decision is *what the Revert button does*:
+**Decision (option b), confirmed by the user:** the shadow store **stays active
+in Code Mode**. Agent actions keep their per-action, file-level undo (the Changes
+rail works exactly as in normal arcs). The two undo surfaces are complementary,
+not competing:
 
-- **(a) Lean fully on git** — undo granularity becomes whatever the agent commits;
-  the user reverts with real `git` (or a button that runs `git revert`/`git
-  reset` in the repo). No shadow store in Code Mode. **Recommended** — truest to
-  "the agent can handle git," gives power users real, visible history.
-- **(b) Keep shadow gix running silently** purely for per-edit file-level undo,
-  while the *displayed* state is real git. Finer-grained Revert, but a parallel
-  hidden history and double-snapshotting.
+- **Shadow store → "undo this agent action."** Action-scoped, fires on every
+  `write`/`edit`/`shell` even before anything is committed. This is *Athen's*
+  edit history, not git's. Build 1 originally skipped it in Code Mode (the old
+  D5); Build 2 **reverts that** — `resolve_code_mode_for_arc` now returns only
+  the repo root and the checkpoint store is wired unconditionally.
+- **Real git → visualization + manual discard.** The Code-Mode panel shows
+  branch/worktrees/WIP from the recognition layer, and a **GitLens-style "discard
+  changes"** action lets the user throw away working-tree changes git-natively
+  (per-file or all).
 
-**Leaning (a).** This doc ships with the override implemented as "skip shadow
-snapshot when Code Mode + real repo," and the Changes surface re-pointed at the
-recognition layer. The (a)/(b) Revert-button behavior is the one item left open
-for the user to confirm before the revert action is wired.
+### Discard changes (git-style)
+
+A user-initiated, UI-only mutating git op (like the Changes-rail Revert button —
+**not** agent-callable, **not** risk-gated, but **confirmed** in the UI because it
+destroys uncommitted work). Backed by `code_mode_discard_core(arc_id, path)`:
+
+- `path = Some(rel)` → discard one file. If the path is **tracked**, run
+  `git -C <root> restore --staged --worktree --source=HEAD -- <rel>` (discards
+  staged + unstaged, restores deletes). If **untracked**, `git -C <root> clean
+  -fd -- <rel>` (remove it).
+- `path = None` → discard **all** working-tree changes: `git -C <root> checkout
+  -- .` then `git -C <root> clean -fd` (stronger confirm in the UI).
+
+The path comes from the panel's `dirty[]` list (git-relative) and is **fenced**
+to the repo root in code (resolve + reject any path escaping `root`). Returns a
+fresh `GitRepoState` so the panel updates in one round-trip. Surfaced as the
+`code_mode_discard` Tauri command + `POST /api/arcs/{id}/code-mode/discard`.
 
 ## 7. Git recognition layer (read-only)
 
@@ -245,16 +262,20 @@ When an arc is in Code Mode, the executor injects a small **static-prefix** bloc
 
 ## 10. Build phasing
 
-**Build 1 (this pass):** D1–D7 minus the live-streaming nicety. Concretely:
-per-arc flag + root (persistence) · per-arc cwd/fs-base + sandbox widening ·
-checkpoint shadow-override (skip when real repo) · git recognition layer +
-command/route · executor Code-Mode block · UI toggle + dir picker + Code-Mode
-panel (git/worktree/WIP viz) + arc-scoped agent activity · docs.
+**Build 1 (SHIPPED):** per-arc flag + root (persistence) · per-arc cwd/fs-base +
+sandbox widening · git recognition layer + command/route · `[CODE MODE]` prompt
+block · UI toggle + dir picker + Code-Mode panel (git/worktree/WIP viz). Build 1
+originally skipped the shadow store in Code Mode (the old D5) — superseded below.
 
-**Build 2 (future):** the Revert-button behavior once (a)/(b) is confirmed ·
-live ephemeral sub-agent transcript streaming into the panel · a generalized
-`code-mode-progress` event superset · auto-suggesting a worktree when the agent
-is about to fan out parallel writers.
+**Build 2 (SHIPPED):** undo resolved to **option (b)** — the shadow checkpoint
+store stays active in Code Mode (per-action file-level undo via the Changes rail
+unchanged); the old D5 skip was reverted (`resolve_code_mode_for_arc` now returns
+only the repo root). GitLens-style **discard** (§6): per-file + discard-all,
+`git restore`/`clean`, path-fenced, confirm-gated, desktop + web parity.
+
+**Build 3 (future):** live ephemeral sub-agent transcript streaming into the
+panel · a generalized `code-mode-progress` event superset · auto-suggesting a
+worktree when the agent is about to fan out parallel writers.
 
 ## 11. Ordering (file-disjoint waves)
 

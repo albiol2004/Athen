@@ -13,8 +13,18 @@
 //! The parsing logic is factored into pure free functions
 //! ([`parse_status_v2`], [`parse_worktrees`], [`parse_log`]) so they can be
 //! unit-tested with string fixtures without spawning `git`.
+//!
+//! The one exception to "read-only" is the pair of **mutating, user-initiated**
+//! discard ops at the bottom of this module ([`discard_path`] / [`discard_all`]).
+//! These are the GitLens-style "discard changes" actions: they throw away
+//! working-tree changes git-natively when the user explicitly confirms it in the
+//! UI. They are kept deliberately separate from the read-only observer above —
+//! they run `git restore` / `git clean` / `git checkout` (not just observing
+//! commands), they return `Result<(), String>` so failures surface a message,
+//! and the per-file variant fences its path against the repo root before
+//! touching git.
 
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 /// A snapshot of a git repository's observable state.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -161,6 +171,130 @@ async fn run_git(root: &Path, args: &[&str]) -> Option<String> {
             .trim_end()
             .to_string(),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Mutating, user-initiated discard ops (GitLens-style "discard changes").
+//
+// Unlike the read-only observer above, these throw away working-tree changes.
+// They are never agent-callable and not risk-gated, but the UI confirms them
+// because they destroy uncommitted work (see docs/CODE_MODE.md §6). Returns
+// `Result<(), String>` so a failure surfaces a message (unlike `run_git`).
+// ---------------------------------------------------------------------------
+
+/// Run `git -C <root> <args...>` and return `Ok(())` on a zero exit, or
+/// `Err(stderr-or-generic-message)` on spawn failure / non-zero exit.
+///
+/// Mirrors [`run_git`]'s spawn (incl. the Windows `CREATE_NO_WINDOW` flag) but
+/// surfaces failures instead of collapsing them to `None`.
+async fn run_git_checked(root: &Path, args: &[&str]) -> Result<(), String> {
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.arg("-C").arg(root).args(args);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // Suppress the console flash a GUI parent would otherwise inherit:
+        // CREATE_NO_WINDOW = 0x0800_0000.
+        cmd.creation_flags(0x0800_0000);
+    }
+
+    let output = match cmd.output().await {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::debug!(?args, error = %e, "git discard invocation failed to spawn");
+            return Err(format!("failed to run git: {e}"));
+        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        tracing::debug!(?args, code = ?output.status.code(), %stderr, "git discard returned non-zero");
+        return Err(if stderr.is_empty() {
+            "git command failed".to_string()
+        } else {
+            stderr
+        });
+    }
+
+    Ok(())
+}
+
+/// Lexically resolve `rel` against `root` and return the joined path **only if**
+/// it stays contained within `root`. Returns `None` for absolute paths, paths
+/// containing a `..` component, or anything that escapes the root.
+///
+/// Pure (no filesystem / git access) so it is unit-testable in isolation.
+fn path_within_root(root: &Path, rel: &str) -> Option<PathBuf> {
+    let rel_path = Path::new(rel);
+
+    // Reject absolute inputs outright — a discard path is always repo-relative.
+    if rel_path.is_absolute() {
+        return None;
+    }
+
+    // Lexically normalize the join, rejecting any parent (`..`) or root/prefix
+    // components. We never touch the filesystem (no symlink resolution): the
+    // contract is purely lexical containment.
+    let mut normalized = root.to_path_buf();
+    for component in rel_path.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            // `..`, an embedded root (`/etc`), or a Windows prefix all escape.
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+
+    // Defense in depth: the normalized result must still start with `root`.
+    if normalized.starts_with(root) {
+        Some(normalized)
+    } else {
+        None
+    }
+}
+
+/// Discard working-tree changes to a single repo-relative path. Tracked files
+/// are restored to HEAD (staged + unstaged); untracked files/dirs are removed.
+///
+/// `rel_path` comes from the UI's dirty-file list and is **fenced** to `root`
+/// before any git command runs — absolute paths, `..` components, and anything
+/// escaping the repo root are rejected with `Err("invalid path")`.
+pub async fn discard_path(root: &Path, rel_path: &str) -> Result<(), String> {
+    // 1. Fence the path against the repo root before touching git.
+    if path_within_root(root, rel_path).is_none() {
+        return Err("invalid path".into());
+    }
+
+    // 2. Tracked vs untracked: `ls-files --error-unmatch` exits zero only for a
+    //    tracked path. The Option-returning `run_git` gives Some ⇒ tracked.
+    let tracked = run_git(root, &["ls-files", "--error-unmatch", "--", rel_path])
+        .await
+        .is_some();
+
+    // 3. Restore tracked files to HEAD; remove untracked files/dirs.
+    if tracked {
+        run_git_checked(
+            root,
+            &[
+                "restore",
+                "--staged",
+                "--worktree",
+                "--source=HEAD",
+                "--",
+                rel_path,
+            ],
+        )
+        .await
+    } else {
+        run_git_checked(root, &["clean", "-fd", "--", rel_path]).await
+    }
+}
+
+/// Discard ALL working-tree changes (tracked restored to HEAD + untracked
+/// removed). Propagates the first error if either step fails.
+pub async fn discard_all(root: &Path) -> Result<(), String> {
+    run_git_checked(root, &["checkout", "--", "."]).await?;
+    run_git_checked(root, &["clean", "-fd"]).await
 }
 
 /// Parse `git status --porcelain=v2 --branch` output into branch metadata and
@@ -509,5 +643,21 @@ def456\u{1f}Add feature\u{1f}Jordan\u{1f}2026-06-24T09:30:00+00:00";
     fn log_empty_repo_is_empty_vec() {
         let commits = parse_log("");
         assert!(commits.is_empty());
+    }
+
+    #[test]
+    fn path_within_root_accepts_repo_relative() {
+        let root = Path::new("/repo");
+        let resolved = path_within_root(root, "src/foo.rs");
+        assert_eq!(resolved.as_deref(), Some(Path::new("/repo/src/foo.rs")));
+    }
+
+    #[test]
+    fn path_within_root_rejects_escapes() {
+        let root = Path::new("/repo");
+        // Parent traversal, absolute path, and a buried escape all rejected.
+        assert!(path_within_root(root, "../etc/passwd").is_none());
+        assert!(path_within_root(root, "/etc/passwd").is_none());
+        assert!(path_within_root(root, "a/../../b").is_none());
     }
 }

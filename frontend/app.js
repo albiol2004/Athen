@@ -1465,13 +1465,14 @@ function renderCodeModeState(body, state) {
     }));
 
     // ── Working tree (WIP) ──
+    const dirty = Array.isArray(state.dirty) ? state.dirty : [];
     body.appendChild(buildCodeModeSection('Working tree', (sec) => {
-        const dirty = Array.isArray(state.dirty) ? state.dirty : [];
         if (dirty.length === 0) {
             sec.appendChild(buildCodeModeMuted('Working tree clean'));
             return;
         }
         for (const f of dirty) {
+            const path = f.path || '';
             const row = document.createElement('div');
             row.className = 'code-mode-dirty';
 
@@ -1482,13 +1483,37 @@ function renderCodeModeState(body, state) {
 
             const pathEl = document.createElement('span');
             pathEl.className = 'code-mode-dirty-path';
-            pathEl.textContent = f.path || '';
-            pathEl.title = f.path || '';
+            pathEl.textContent = path;
+            pathEl.title = path;
             row.appendChild(pathEl);
+
+            // GitLens-style per-file discard. Confirmed before firing because
+            // it destroys uncommitted work; not agent-callable / not risk-gated.
+            const discardBtn = document.createElement('button');
+            discardBtn.type = 'button';
+            discardBtn.className = 'code-mode-discard-btn';
+            discardBtn.textContent = '↩'; // ↩ discard
+            discardBtn.title = 'Discard changes';
+            discardBtn.setAttribute('aria-label', 'Discard changes to ' + path);
+            discardBtn.addEventListener('click', () => {
+                discardCodeModeChanges(body, discardBtn, path);
+            });
+            row.appendChild(discardBtn);
 
             sec.appendChild(row);
         }
-    }));
+    }, dirty.length > 0 ? (titleRow) => {
+        // "Discard all" lives in the section header, only when dirty.
+        const allBtn = document.createElement('button');
+        allBtn.type = 'button';
+        allBtn.className = 'code-mode-discard-all-btn';
+        allBtn.textContent = 'Discard all';
+        allBtn.title = 'Discard ALL uncommitted changes';
+        allBtn.addEventListener('click', () => {
+            discardCodeModeChanges(body, allBtn, null);
+        });
+        titleRow.appendChild(allBtn);
+    } : null));
 
     // ── Recent commits (first ~10) ──
     body.appendChild(buildCodeModeSection('Recent commits', (sec) => {
@@ -1517,19 +1542,65 @@ function renderCodeModeState(body, state) {
     }));
 }
 
-// Build a titled section; `fill(contentEl)` populates its body.
-function buildCodeModeSection(title, fill) {
+// Build a titled section; `fill(contentEl)` populates its body. Optional
+// `headerAction(titleRowEl)` lets a caller add a control (e.g. "Discard all")
+// next to the section title.
+function buildCodeModeSection(title, fill, headerAction) {
     const sec = document.createElement('div');
     sec.className = 'code-mode-section';
     const h = document.createElement('div');
     h.className = 'code-mode-section-title';
-    h.textContent = title;
+    if (typeof headerAction === 'function') {
+        // Title + action share a flex row so the action sits on the right.
+        h.classList.add('code-mode-section-title-row');
+        const label = document.createElement('span');
+        label.className = 'code-mode-section-title-label';
+        label.textContent = title;
+        h.appendChild(label);
+        headerAction(h);
+    } else {
+        h.textContent = title;
+    }
     sec.appendChild(h);
     const content = document.createElement('div');
     content.className = 'code-mode-section-body';
     fill(content);
     sec.appendChild(content);
     return sec;
+}
+
+// Shared discard handler for both per-file and "discard all". `path` is a
+// repo-relative string (one file) or null (all working-tree changes). On
+// success, re-renders the panel with the fresh GitRepoState the backend
+// returns; on error, surfaces a toast. Wrapped in withButtonPending.
+async function discardCodeModeChanges(body, btn, path) {
+    if (!invoke || !activeArcId) return;
+    const single = path != null;
+    const confirmed = await showConfirmDialog(single
+        ? {
+            title: 'Discard changes?',
+            body: 'Discard changes to ' + escapeDiscardPath(path) + '? This cannot be undone.',
+            confirmLabel: 'Discard',
+            danger: true,
+        }
+        : {
+            title: 'Discard all changes?',
+            body: 'Discard ALL uncommitted changes in this repository? This permanently removes every modification and new file. This cannot be undone.',
+            confirmLabel: 'Discard all',
+            danger: true,
+        });
+    if (!confirmed) return;
+    await withButtonPending(btn, async () => {
+        const fresh = await invoke('code_mode_discard', { arcId: activeArcId, path });
+        renderCodeModeState(body, fresh || {});
+    }, { errorPrefix: 'Could not discard changes: ' });
+}
+
+// Plain-text echo of a path for the confirm body. showConfirmDialog already
+// renders the message via textContent (no HTML), so this is a readability
+// helper, not an HTML-escape — the path never reaches innerHTML.
+function escapeDiscardPath(path) {
+    return '“' + String(path == null ? '' : path) + '”';
 }
 
 function buildCodeModeMuted(text) {

@@ -10413,6 +10413,49 @@ pub async fn code_mode_git_state(
     code_mode_git_state_core(&arc_id, &state).await
 }
 
+/// Discard working-tree changes in an arc's Code-Mode repo (GitLens-style).
+/// The repo root comes from the arc's trusted `code_mode_root` metadata — the
+/// caller may only pass the repo-relative file path to discard, never a path to
+/// the repo itself. `path = Some(rel)` discards one file (tracked → restore to
+/// HEAD, untracked → remove); `path = None` discards ALL working-tree changes.
+/// Returns the refreshed [`crate::code_mode::GitRepoState`] so the panel updates
+/// in one round-trip.
+pub(crate) async fn code_mode_discard_core(
+    arc_id: &str,
+    path: Option<String>,
+    state: &AppState,
+) -> std::result::Result<crate::code_mode::GitRepoState, String> {
+    let Some(ref arc_store) = state.arc_store else {
+        return Err("Arc store not available".to_string());
+    };
+    let arc = arc_store
+        .get_arc(arc_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Arc not found: {arc_id}"))?;
+    let root = arc
+        .code_mode_root
+        .filter(|r| !r.trim().is_empty())
+        .ok_or_else(|| "This conversation is not in Code Mode.".to_string())?;
+    let root = std::path::Path::new(&root);
+    match path {
+        Some(p) => crate::code_mode::discard_path(root, &p).await?,
+        None => crate::code_mode::discard_all(root).await?,
+    }
+    Ok(crate::code_mode::read_git_state(root).await)
+}
+
+/// Discard working-tree changes in an arc's Code-Mode repo (see
+/// [`code_mode_discard_core`]).
+#[tauri::command]
+pub async fn code_mode_discard(
+    arc_id: String,
+    path: Option<String>,
+    state: State<'_, AppState>,
+) -> std::result::Result<crate::code_mode::GitRepoState, String> {
+    code_mode_discard_core(&arc_id, path, &state).await
+}
+
 /// Assign (or clear) an arc's Project membership. When assigning to a project,
 /// that project also becomes the active project.
 #[tauri::command]

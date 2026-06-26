@@ -1132,6 +1132,17 @@ async fn h_code_mode_git(
 ) -> Response {
     json_result(commands::code_mode_git_state_core(&arc_id, api.ui.app_state()).await)
 }
+#[derive(Deserialize)]
+struct CodeModeDiscardBody {
+    path: Option<String>,
+}
+async fn h_code_mode_discard(
+    State(api): State<ApiState>,
+    UrlPath(arc_id): UrlPath<String>,
+    Json(body): Json<CodeModeDiscardBody>,
+) -> Response {
+    json_result(commands::code_mode_discard_core(&arc_id, body.path, api.ui.app_state()).await)
+}
 async fn h_project_summary_mode_get(State(api): State<ApiState>) -> Response {
     json_result(commands::get_project_summary_mode_core(api.ui.app_state()).await)
 }
@@ -2003,6 +2014,10 @@ fn full_surface_router() -> Router<ApiState> {
         .route("/api/arcs/{id}/research-paper", get(h_research_paper))
         .route("/api/arcs/{id}/code-mode", post(h_arc_code_mode))
         .route("/api/arcs/{id}/code-mode/git", get(h_code_mode_git))
+        .route(
+            "/api/arcs/{id}/code-mode/discard",
+            post(h_code_mode_discard),
+        )
         .route("/api/active-project", post(h_set_active_project))
         // skills
         .route("/api/skills", get(h_skills_list).post(h_skill_upsert))

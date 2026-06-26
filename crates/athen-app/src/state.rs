@@ -718,8 +718,7 @@ pub(crate) async fn assemble_base_app_tool_registry(
     // cwd + file-tool fs base are pinned to the repo root. When inactive
     // this is (false, None) and every downstream call is byte-identical to
     // pre-Code-Mode behavior.
-    let (code_mode_active, code_mode_root) =
-        resolve_code_mode_for_arc(deps.arc_store.as_ref(), arc_id).await;
+    let code_mode_root = resolve_code_mode_for_arc(deps.arc_store.as_ref(), arc_id).await;
     // TODO(plan-cake): wire UserNotifier impl that forwards a
     // Notification to the same plumbing proactive_hints.rs uses
     // (app_handle.emit("notification", ...) + NotificationOrchestrator)
@@ -735,11 +734,11 @@ pub(crate) async fn assemble_base_app_tool_registry(
         .with_owner_check_opt(deps.owner_check.clone())
         .with_github_identity(github_identity)
         .with_github_identity_resolver_opt(deps.github_identity_resolver.clone())
-        .with_checkpoint_store_opt(if code_mode_active {
-            None
-        } else {
-            deps.checkpoint_store.clone()
-        })
+        // The shadow checkpoint store stays active in Code Mode so agent
+        // write/edit/shell actions keep per-action file-level undo (Changes
+        // rail). Real git is the *visualization* + manual-discard surface, not
+        // a replacement for the shadow store — CODE_MODE.md §6 (b).
+        .with_checkpoint_store_opt(deps.checkpoint_store.clone())
         .with_checkpoint_arc_id(arc_id)
         .with_working_dir(code_mode_root.clone())
         .with_fs_base(code_mode_root.clone());
@@ -5425,33 +5424,31 @@ pub(crate) async fn resolve_security_mode_for_arc(
     }
 }
 
-/// Resolve whether `arc_id` is an active Code-Mode session and its repo
-/// root. Active iff code_mode == Some(true) AND code_mode_root points at an
-/// existing directory. Returns (false, None) on any miss / store error /
-/// missing root — never errors.
+/// Resolve the active Code-Mode repo root for `arc_id`, or `None` when the arc
+/// is not an active Code-Mode session. Active iff code_mode == Some(true) AND
+/// code_mode_root points at an existing directory. Returns `None` on any miss /
+/// store error / missing root — never errors. The root anchors the shell cwd,
+/// file-tool resolution, and sandbox allow-list; the shadow checkpoint store
+/// stays active in Code Mode (per-action undo) — see CODE_MODE.md §6 (b).
 pub(crate) async fn resolve_code_mode_for_arc(
     arc_store: Option<&ArcStore>,
     arc_id: &str,
-) -> (bool, Option<std::path::PathBuf>) {
-    let Some(store) = arc_store else {
-        return (false, None);
-    };
-    let Some(meta) = store.get_arc(arc_id).await.ok().flatten() else {
-        return (false, None);
-    };
+) -> Option<std::path::PathBuf> {
+    let store = arc_store?;
+    let meta = store.get_arc(arc_id).await.ok().flatten()?;
     if meta.code_mode != Some(true) {
-        return (false, None);
+        return None;
     }
     match meta.code_mode_root {
         Some(root) => {
             let p = std::path::PathBuf::from(&root);
             if p.is_dir() {
-                (true, Some(p))
+                Some(p)
             } else {
-                (false, None)
+                None
             }
         }
-        None => (false, None),
+        None => None,
     }
 }
 

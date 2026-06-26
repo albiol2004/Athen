@@ -9806,10 +9806,73 @@ option:hover {
     text-align: center;
 }
 .code-mode-dirty-path {
+    flex: 1 1 auto;
     font-family: var(--font-mono, ui-monospace, monospace);
     font-size: 11.5px;
     color: var(--text-2);
     word-break: break-all;
+}
+
+/* Discard affordances — subtle by default, danger-tinted on hover. */
+.code-mode-section-title-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+.code-mode-section-title-label {
+    flex: 1 1 auto;
+}
+.code-mode-discard-btn {
+    flex: 0 0 auto;
+    opacity: 0;
+    width: 20px;
+    height: 20px;
+    padding: 0;
+    line-height: 1;
+    font-size: 12px;
+    color: var(--text-3);
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: var(--r-sm);
+    cursor: pointer;
+    transition: opacity 0.12s ease, color 0.12s ease,
+                background 0.12s ease, border-color 0.12s ease;
+}
+.code-mode-dirty:hover .code-mode-discard-btn,
+.code-mode-discard-btn:focus-visible {
+    opacity: 1;
+}
+.code-mode-discard-btn:hover,
+.code-mode-discard-btn:focus-visible {
+    color: var(--brand-warm);
+    background: rgba(185, 81, 99, 0.12);
+    border-color: rgba(185, 81, 99, 0.28);
+}
+.code-mode-discard-all-btn {
+    flex: 0 0 auto;
+    padding: 2px 8px;
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    text-transform: none;
+    color: var(--text-3);
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    cursor: pointer;
+    transition: color 0.12s ease, background 0.12s ease, border-color 0.12s ease;
+}
+.code-mode-discard-all-btn:hover,
+.code-mode-discard-all-btn:focus-visible {
+    color: var(--brand-warm);
+    background: rgba(185, 81, 99, 0.10);
+    border-color: rgba(185, 81, 99, 0.30);
+}
+.code-mode-discard-btn.btn-pending,
+.code-mode-discard-all-btn.btn-pending {
+    opacity: 0.6;
+    cursor: default;
 }
 
 /* Recent commits */
