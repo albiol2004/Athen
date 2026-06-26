@@ -273,9 +273,63 @@ unchanged); the old D5 skip was reverted (`resolve_code_mode_for_arc` now return
 only the repo root). GitLens-style **discard** (§6): per-file + discard-all,
 `git restore`/`clean`, path-fenced, confirm-gated, desktop + web parity.
 
-**Build 3 (future):** live ephemeral sub-agent transcript streaming into the
-panel · a generalized `code-mode-progress` event superset · auto-suggesting a
-worktree when the agent is about to fan out parallel writers.
+**Build 3 (IN FLIGHT):** sub-agent transcript surfacing — see §14. Part 1
+(delegation tool card: ordered tools-used collapsed + final message) lands in
+**both** modes; Part 2 (arc/project-wide live agents panel with per-agent
+expandable transcript) is Code-Mode-only.
+
+**Build 4 (future):** a generalized `code-mode-progress` delta-streaming event
+superset (true push instead of poll) · auto-suggesting a worktree when the agent
+is about to fan out parallel writers.
+
+## 14. Sub-agent transcripts (Build 3)
+
+Two related surfaces, grounded in the explored seams (delegation returns the
+sub-agent's final text as `content` in the `delegate_to_agent` tool result; the
+sub-auditor persists only `tool_call` entries; the active-agent registry
+deliberately skips sub-agents; the desktop chat renderer is coupled to
+`#messages` while web `<Chat>` is prop-driven).
+
+### Part 1 — delegation tool card (BOTH modes)
+
+When the `delegate_to_agent` card is expanded in the main chat, show:
+- the **list of tools the sub-agent used, in order, collapsed by default** (the
+  existing lazy `get_arc_entries(sub_arc_id)` → tool cards, each `<details>`
+  closed), and
+- the **sub-agent's final message** (rendered markdown) when finished — read
+  directly from the tool result's `content` (no fetch needed); surface
+  `verification_note` when `verified == false`.
+
+UI-only: desktop `renderSubAgentSteps` / web `DelegationSteps`. No backend
+change — `content` is already in the tool result.
+
+### Part 2 — arc/project-wide live agents panel (Code Mode only)
+
+A panel like the agent-control page but scoped to the active Code-Mode arc (and,
+when the arc belongs to a Project, its project siblings), where each agent row
+**expands to its full transcript rendered by the same renderer as the main
+chat** (not a new chat UI). Live via polling while running (no new streaming
+events in Build 3 — `agents-changed` + a short poll of the expanded agent's
+entries gives a growing transcript; true push is Build 4).
+
+Backend gaps to close:
+- **Register sub-agents** in the active-agent registry (`AgentSource::Subagent`
+  already exists) with a new `parent_arc_id` so the panel can group an arc's
+  agent tree. Wire `with_agent_tracking` on the sub-executor in `run_delegation`.
+  (Side effect: sub-agents also become visible in the global agent-control page —
+  intended.)
+- **Persist a faithful sub-arc transcript:** in `run_delegation`, persist the
+  brief as the opening entry and the sub-agent's final `content` as a closing
+  assistant `message` entry, so the sub-arc renders as brief → tool groups →
+  final reply (parity with how a main arc looks). Tool calls already persist.
+- **Enumerate the agent tree:** `ArcStore::list_child_arcs(parent_arc_id)` +
+  a `code_mode_agents(arc_id)` command merging child arcs (running flag from the
+  registry) → Tauri command + `GET /api/arcs/{id}/code-mode/agents`. Transcript
+  reuses the existing `get_arc_entries` / `arcEntries`.
+
+Desktop needs a `renderEntriesInto(entries, container)` refactor (lift the
+`#messages` coupling); web reuses `<Chat>`/a `<Transcript>` with the sub-arc's
+entries.
 
 ## 11. Ordering (file-disjoint waves)
 

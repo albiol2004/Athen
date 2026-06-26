@@ -58,6 +58,11 @@ impl AgentSource {
 pub struct ActiveAgent {
     pub task_id: String,
     pub arc_id: Option<String>,
+    /// The arc this agent's arc descends from. `None` for top-level agents
+    /// (user chat, senses, wake-ups); `Some(parent)` for delegation
+    /// sub-agents, so the Code-Mode agents panel can group an arc's agent
+    /// tree. `Serialize`, so it flows to the FE automatically.
+    pub parent_arc_id: Option<String>,
     pub source: AgentSource,
     pub title: String,
     pub started_at: DateTime<Utc>,

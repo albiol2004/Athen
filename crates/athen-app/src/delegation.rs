@@ -500,6 +500,30 @@ pub(crate) async fn run_delegation(
     {
         tracing::warn!("delegation: set_active_profile_id on sub-arc failed: {e}");
     }
+
+    // Turn id shared by the brief/final transcript entries and the silent
+    // sub-auditor below, so the whole sub-run reads as one conversation turn.
+    let sub_turn_id = uuid::Uuid::new_v4().to_string();
+
+    // Persist the brief as the sub-arc's opening "task" bubble so the
+    // transcript renders as brief → tool groups → final reply, matching how
+    // a main arc looks. Best-effort: a failed write must never abort the
+    // delegation. Only meaningful when persistence is wired (ctx.ui present);
+    // the write itself is harmless without it.
+    if let Err(e) = ctx
+        .arc_store
+        .add_entry(
+            &sub_arc_id,
+            athen_persistence::arcs::EntryType::Message,
+            "user",
+            &args.brief,
+            None,
+            Some(&sub_turn_id),
+        )
+        .await
+    {
+        tracing::warn!("delegation: persist sub-arc brief entry failed: {e}");
+    }
     // Inherit the parent arc's runtime context (provider pin, model slug,
     // tier, reasoning effort) so the specialist runs on the SAME model as
     // the parent rather than silently snapping to the global active
@@ -617,6 +641,13 @@ pub(crate) async fn run_delegation(
     let sub_reasoning_effort =
         crate::state::resolve_reasoning_effort_for_arc(Some(&ctx.arc_store), &sub_arc_id).await;
 
+    // RAII handle for the sub-agent's registry entry. Held across the
+    // sub-run; explicitly dropped after `executor.execute()` so the entry is
+    // removed (and the run finalized as Cancelled by the guard's Drop, which
+    // is correct — the sub-run isn't a tracked top-level task). `None` on
+    // non-UI/test paths.
+    let mut sub_agent_guard: Option<crate::agent_registry::RegistrationGuard> = None;
+
     let mut builder = AgentBuilder::new()
         .llm_router(exec_router)
         .tool_registry(sub_registry)
@@ -642,15 +673,47 @@ pub(crate) async fn run_delegation(
     // (silent) and don't pass a stream sender — both would surface in the
     // parent's UI as if the parent took those steps.
     if let Some(ref ui) = ctx.ui {
-        let sub_turn_id = uuid::Uuid::new_v4().to_string();
         let sub_tool_log = crate::commands::new_tool_log();
-        let sub_auditor = crate::commands::TauriAuditor::new_silent(
+        let mut sub_auditor = crate::commands::TauriAuditor::new_silent(
             ui.clone(),
             Some(ctx.arc_store.clone()),
             sub_arc_id.clone(),
-            sub_turn_id,
+            sub_turn_id.clone(),
             sub_tool_log,
         );
+        // Register the sub-agent in the live agent registry (mirroring the
+        // main executor's `register()` + `with_agent_tracking`) so the
+        // Code-Mode agents panel — and the global agent-control page — can
+        // group an arc's delegation tree and watch each sub-agent's steps.
+        // The registry is resolved at call-time from the UiBridge's AppState
+        // (the same seam the deep_research runner uses), so non-UI/CLI/test
+        // paths (no `ctx.ui`) skip this entirely and behave exactly as before.
+        if let Some(reg) = ui.app_state().agent_registry.clone() {
+            let now = chrono::Utc::now();
+            let title = format!("[{}] {}", profile.id, truncate(&args.brief, 80));
+            let guard = reg
+                .register(crate::agent_registry::ActiveAgent {
+                    task_id: uuid::Uuid::new_v4().to_string(),
+                    arc_id: Some(sub_arc_id.clone()),
+                    parent_arc_id: Some(ctx.parent_arc_id.clone()),
+                    source: crate::agent_registry::AgentSource::Subagent,
+                    title,
+                    started_at: now,
+                    last_step_at: now,
+                    current_tool: None,
+                    current_action: None,
+                    step_count: 0,
+                    profile_id: Some(profile.id.clone()),
+                    model: None,
+                    turn_id: Some(sub_turn_id.clone()),
+                })
+                .await;
+            sub_auditor = sub_auditor.with_agent_tracking(Arc::clone(&reg), guard.task_id());
+            // Hold the guard for the duration of the sub-run; dropping it
+            // after `executor.execute()` removes the registry entry. Stored in
+            // an outer Option so it lives past this block.
+            sub_agent_guard = Some(guard);
+        }
         builder = builder.auditor(Box::new(sub_auditor));
     }
     let executor = builder
@@ -689,6 +752,11 @@ pub(crate) async fn run_delegation(
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "delegate_to_agent: sub-task finished"
             );
+            // Finalize the registry entry as a clean completion (best-effort;
+            // `None` on non-UI paths). Removes the agent from the live panel.
+            if let Some(guard) = sub_agent_guard.take() {
+                guard.complete().await;
+            }
             r
         }
         Err(e) => {
@@ -697,6 +765,10 @@ pub(crate) async fn run_delegation(
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "delegate_to_agent: sub-task errored: {e}"
             );
+            // Finalize the registry entry as a failure before bubbling up.
+            if let Some(guard) = sub_agent_guard.take() {
+                guard.fail(e.to_string()).await;
+            }
             return Err(e);
         }
     };
@@ -731,6 +803,41 @@ pub(crate) async fn run_delegation(
             note = ?verification_note,
             "delegate_to_agent: deliverable failed post-run verification"
         );
+    }
+
+    // Persist the sub-agent's final reply as the closing assistant entry, so
+    // the sub-arc renders as brief → tool groups → final message (parity with
+    // a main arc). Best-effort. Skipped for the placeholder strings (no real
+    // text was produced), since persisting "(specialist returned no text)"
+    // would add a confusing empty bubble. Tool-call rows already persist via
+    // the silent sub-auditor — we never duplicate them here.
+    let is_placeholder = matches!(
+        content.as_str(),
+        "(specialist returned no text)" | "(specialist task failed without a response)"
+    );
+    if !is_placeholder {
+        let meta = if verified {
+            None
+        } else {
+            Some(json!({
+                "verified": verified,
+                "verification_note": verification_note,
+            }))
+        };
+        if let Err(e) = ctx
+            .arc_store
+            .add_entry(
+                &sub_arc_id,
+                athen_persistence::arcs::EntryType::Message,
+                "assistant",
+                &content,
+                meta,
+                Some(&sub_turn_id),
+            )
+            .await
+        {
+            tracing::warn!("delegation: persist sub-arc final message failed: {e}");
+        }
     }
 
     Ok((

@@ -1132,6 +1132,12 @@ async fn h_code_mode_git(
 ) -> Response {
     json_result(commands::code_mode_git_state_core(&arc_id, api.ui.app_state()).await)
 }
+async fn h_code_mode_agents(
+    State(api): State<ApiState>,
+    UrlPath(arc_id): UrlPath<String>,
+) -> Response {
+    json_result(commands::code_mode_agents_core(&arc_id, api.ui.app_state()).await)
+}
 #[derive(Deserialize)]
 struct CodeModeDiscardBody {
     path: Option<String>,
@@ -2014,6 +2020,7 @@ fn full_surface_router() -> Router<ApiState> {
         .route("/api/arcs/{id}/research-paper", get(h_research_paper))
         .route("/api/arcs/{id}/code-mode", post(h_arc_code_mode))
         .route("/api/arcs/{id}/code-mode/git", get(h_code_mode_git))
+        .route("/api/arcs/{id}/code-mode/agents", get(h_code_mode_agents))
         .route(
             "/api/arcs/{id}/code-mode/discard",
             post(h_code_mode_discard),

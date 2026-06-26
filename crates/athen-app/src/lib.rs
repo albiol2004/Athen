@@ -247,6 +247,7 @@ pub fn run() {
             commands::get_research_paper,
             commands::set_arc_code_mode,
             commands::code_mode_git_state,
+            commands::code_mode_agents,
             commands::code_mode_discard,
             commands::set_active_project,
             commands::update_project_summary,

@@ -4304,6 +4304,7 @@ async fn execute_owner_telegram_message(
             reg.register(crate::agent_registry::ActiveAgent {
                 task_id: task_id_for_run.to_string(),
                 arc_id: target_arc_id.clone(),
+                parent_arc_id: None,
                 source: crate::agent_registry::AgentSource::Telegram,
                 title,
                 started_at: now,

@@ -2930,6 +2930,7 @@ pub(crate) async fn send_message_core(
                     reg.register(crate::agent_registry::ActiveAgent {
                         task_id: task_id_for_run.to_string(),
                         arc_id: Some(active_arc.clone()),
+                        parent_arc_id: None,
                         source: crate::agent_registry::AgentSource::UserChat,
                         title,
                         started_at: now,
@@ -4367,6 +4368,7 @@ pub(crate) async fn execute_approved_task(
             reg.register(crate::agent_registry::ActiveAgent {
                 task_id: task_id_for_run.to_string(),
                 arc_id: Some(ctx.active_arc_id.clone()),
+                parent_arc_id: None,
                 source: crate::agent_registry::AgentSource::UserChat,
                 title,
                 started_at: now,
@@ -5558,6 +5560,7 @@ pub(crate) async fn execute_dispatched_task(
             reg.register(crate::agent_registry::ActiveAgent {
                 task_id: task_id_for_run.to_string(),
                 arc_id: Some(arc_id.clone()),
+                parent_arc_id: None,
                 source: derived_source,
                 title,
                 started_at: now,
@@ -10376,6 +10379,132 @@ pub async fn get_research_paper(
     state: State<'_, AppState>,
 ) -> std::result::Result<String, String> {
     get_research_paper_core(arc_id, &state).await
+}
+
+/// One node in the Code-Mode agents tree: a main arc or one of its
+/// delegation sub-agents, merged with whatever live registry state exists.
+/// Serialized verbatim (snake_case) to both the Tauri command and the HTTP
+/// route — the FE renders each node's transcript via the existing
+/// `get_arc_entries` surface.
+#[derive(serde::Serialize)]
+pub struct AgentNode {
+    pub arc_id: String,
+    pub parent_arc_id: Option<String>,
+    pub title: String,
+    pub source: String, // "main" | "subagent" | the arc source
+    pub is_main: bool,
+    pub running: bool,
+    pub started_at: Option<String>,
+    pub step_count: u32,
+    pub current_tool: Option<String>,
+}
+
+/// Build the agent tree for a Code-Mode arc: each root arc (the arc itself,
+/// widened to its Project siblings when it belongs to a Project) plus its
+/// delegation sub-arcs, merged with live registry state so running agents
+/// show `running: true` + their current tool/step count. Ordering is stable:
+/// each main node immediately followed by its children.
+pub(crate) async fn code_mode_agents_core(
+    arc_id: &str,
+    state: &AppState,
+) -> std::result::Result<Vec<AgentNode>, String> {
+    let Some(ref arc_store) = state.arc_store else {
+        return Err("Arc store not available".to_string());
+    };
+
+    // 1. Resolve the root arc set. Default is just {arc_id}; widen to the
+    //    project's member arcs when the arc belongs to a project and a
+    //    project store is available. Degrade silently to {arc_id} otherwise.
+    let arc = arc_store
+        .get_arc(arc_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Arc not found: {arc_id}"))?;
+    let root_ids: Vec<String> = match (&arc.project_id, state.project_store.as_ref()) {
+        (Some(pid), Some(store)) => match store.member_arcs(pid).await {
+            Ok(ids) if !ids.is_empty() => ids,
+            _ => vec![arc_id.to_string()],
+        },
+        _ => vec![arc_id.to_string()],
+    };
+
+    // 2. Snapshot the live registry once, keyed by arc_id, so each node can
+    //    look up its running state without re-locking per arc.
+    let live: std::collections::HashMap<String, crate::agent_registry::ActiveAgent> =
+        match state.agent_registry.as_ref() {
+            Some(reg) => reg
+                .snapshot()
+                .await
+                .into_iter()
+                .filter_map(|a| a.arc_id.clone().map(|id| (id, a)))
+                .collect(),
+            None => std::collections::HashMap::new(),
+        };
+
+    // Closure: turn an ArcMeta + main flag into an AgentNode, merging live
+    // registry state when an agent is running against that arc.
+    let to_node = |meta: &athen_persistence::arcs::ArcMeta, is_main: bool| -> AgentNode {
+        let source = if is_main {
+            "main".to_string()
+        } else {
+            "subagent".to_string()
+        };
+        match live.get(&meta.id) {
+            Some(active) => AgentNode {
+                arc_id: meta.id.clone(),
+                parent_arc_id: meta.parent_arc_id.clone(),
+                title: meta.name.clone(),
+                source,
+                is_main,
+                running: true,
+                started_at: Some(active.started_at.to_rfc3339()),
+                step_count: active.step_count,
+                current_tool: active.current_tool.clone(),
+            },
+            None => AgentNode {
+                arc_id: meta.id.clone(),
+                parent_arc_id: meta.parent_arc_id.clone(),
+                title: meta.name.clone(),
+                source,
+                is_main,
+                running: false,
+                started_at: Some(meta.created_at.clone()),
+                step_count: 0,
+                current_tool: None,
+            },
+        }
+    };
+
+    // 3. For each root arc, emit a main node followed by its child arcs.
+    let mut nodes = Vec::new();
+    for root in &root_ids {
+        let root_meta = match arc_store.get_arc(root).await {
+            Ok(Some(m)) => m,
+            _ => continue,
+        };
+        nodes.push(to_node(&root_meta, true));
+        match arc_store.list_child_arcs(root).await {
+            Ok(children) => {
+                for child in &children {
+                    nodes.push(to_node(child, false));
+                }
+            }
+            Err(e) => {
+                warn!("code_mode_agents: list_child_arcs({root}) failed: {e}");
+            }
+        }
+    }
+
+    Ok(nodes)
+}
+
+/// Return the Code-Mode agent tree for an arc (see [`code_mode_agents_core`]).
+#[tauri::command]
+pub async fn code_mode_agents(
+    arc_id: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<Vec<AgentNode>, String> {
+    code_mode_agents_core(&arc_id, &state).await
 }
 
 /// Read the live git state of an arc's Code-Mode repo. The repo root comes

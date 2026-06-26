@@ -839,6 +839,91 @@ impl ArcStore {
         .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
     }
 
+    /// List the direct child arcs of `parent_arc_id` (those whose
+    /// `parent_arc_id` column matches), oldest first. Used by the Code-Mode
+    /// agents panel to enumerate an arc's delegation sub-agent tree. The
+    /// SELECT column list + row mapping are kept in EXACT lockstep with
+    /// [`Self::list_arcs_inner`] (same indices) so a column-add to one is a
+    /// compile-visible mismatch in the other.
+    pub async fn list_child_arcs(&self, parent_arc_id: &str) -> Result<Vec<ArcMeta>> {
+        let conn = self.conn.clone();
+        let parent_arc_id = parent_arc_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT a.id, a.name, a.source, a.status, a.parent_arc_id, \
+                            a.merged_into_arc_id, a.created_at, a.updated_at, \
+                            COALESCE(e.cnt, 0) AS entry_count, \
+                            a.primary_reply_channel, a.active_profile_id, \
+                            a.summarized_through_entry_id, \
+                            a.pinned_provider_id, a.pinned_slug, \
+                            a.reasoning_effort_override, \
+                            a.tier_override, \
+                            a.triage_plan_acceptance, a.triage_plan_scope, \
+                            a.user_goal, a.user_goal_criteria, \
+                            a.goal_status, a.goal_blocked_reason, \
+                            a.plan_json, a.security_mode_override, \
+                            a.project_id, \
+                            a.research_paper_path, a.research_question, \
+                            a.code_mode, a.code_mode_root \
+                     FROM arcs a \
+                     LEFT JOIN ( \
+                         SELECT arc_id, COUNT(*) AS cnt \
+                         FROM arc_entries GROUP BY arc_id \
+                     ) e ON a.id = e.arc_id \
+                     WHERE a.parent_arc_id = ?1 \
+                     ORDER BY a.created_at ASC",
+                )
+                .map_err(|e| AthenError::Other(format!("Prepare list child arcs: {e}")))?;
+
+            let rows = stmt
+                .query_map(params![parent_arc_id], |row| {
+                    Ok(ArcMeta {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        source: ArcSource::from_str(&row.get::<_, String>(2)?),
+                        status: ArcStatus::from_str(&row.get::<_, String>(3)?),
+                        parent_arc_id: row.get(4)?,
+                        merged_into_arc_id: row.get(5)?,
+                        created_at: row.get(6)?,
+                        updated_at: row.get(7)?,
+                        entry_count: row.get::<_, u32>(8)?,
+                        primary_reply_channel: row.get(9)?,
+                        active_profile_id: row.get(10)?,
+                        summarized_through_entry_id: row.get(11)?,
+                        pinned_provider_id: row.get(12)?,
+                        pinned_slug: row.get(13)?,
+                        reasoning_effort_override: row.get(14)?,
+                        tier_override: row.get(15)?,
+                        triage_plan: assemble_plan(row.get(16)?, row.get(17)?),
+                        user_goal: row.get(18)?,
+                        user_goal_criteria: row.get(19)?,
+                        goal_status: row.get(20)?,
+                        goal_blocked_reason: row.get(21)?,
+                        plan: row
+                            .get::<_, Option<String>>(22)?
+                            .and_then(|s| serde_json::from_str(&s).ok()),
+                        security_mode_override: row.get(23)?,
+                        project_id: row.get::<_, Option<String>>(24)?,
+                        research_paper_path: row.get::<_, Option<String>>(25)?,
+                        research_question: row.get::<_, Option<String>>(26)?,
+                        code_mode: row.get::<_, Option<i64>>(27)?.map(|n| n != 0),
+                        code_mode_root: row.get::<_, Option<String>>(28)?,
+                    })
+                })
+                .map_err(|e| AthenError::Other(format!("Query list child arcs: {e}")))?;
+
+            let mut arcs = Vec::new();
+            for row in rows {
+                arcs.push(row.map_err(|e| AthenError::Other(format!("Child arcs row: {e}")))?);
+            }
+            Ok(arcs)
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
     /// Rename an arc.
     pub async fn rename_arc(&self, id: &str, name: &str) -> Result<()> {
         let conn = self.conn.clone();
@@ -2227,6 +2312,40 @@ mod tests {
         assert!(ids.contains(&"parent"));
         assert!(ids.contains(&"standalone"));
         assert!(!ids.contains(&"sub"));
+    }
+
+    #[tokio::test]
+    async fn test_list_child_arcs() {
+        let store = setup_arc_store().await;
+        store
+            .create_arc("parent", "Parent Arc", ArcSource::UserInput)
+            .await
+            .unwrap();
+        store
+            .create_arc_with_parent("child_a", "Child A", ArcSource::System, "parent")
+            .await
+            .unwrap();
+        store
+            .create_arc_with_parent("child_b", "Child B", ArcSource::System, "parent")
+            .await
+            .unwrap();
+        // Unrelated arc under a different parent — must be excluded.
+        store
+            .create_arc("other_parent", "Other", ArcSource::UserInput)
+            .await
+            .unwrap();
+        store
+            .create_arc_with_parent("other_child", "Other Child", ArcSource::System, "other_parent")
+            .await
+            .unwrap();
+
+        let children = store.list_child_arcs("parent").await.unwrap();
+        let ids: Vec<&str> = children.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(children.len(), 2, "both direct children returned");
+        assert!(ids.contains(&"child_a"));
+        assert!(ids.contains(&"child_b"));
+        assert!(!ids.contains(&"other_child"), "unrelated child excluded");
+        assert!(!ids.contains(&"parent"), "parent itself excluded");
     }
 
     #[tokio::test]
