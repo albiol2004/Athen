@@ -45,6 +45,7 @@ pub(crate) mod skills_render;
 pub(crate) mod spawn_pidfile;
 pub(crate) mod state;
 pub(crate) mod telegram_progress;
+pub(crate) mod tunnel;
 pub(crate) mod telephony_gate;
 pub(crate) mod ui_bridge;
 pub(crate) mod vault_creds;
@@ -249,6 +250,9 @@ pub fn run() {
             commands::code_mode_git_state,
             commands::code_mode_agents,
             commands::code_mode_discard,
+            commands::get_remote_access,
+            commands::set_remote_access,
+            commands::remote_access_status,
             commands::set_active_project,
             commands::update_project_summary,
             commands::get_project_summary_mode,
@@ -450,6 +454,37 @@ pub fn run() {
                         tracing::error!(error = %e, "HTTP API server exited");
                     }
                 });
+            }
+
+            // Auto-start the UI-controlled Remote Access listener (Settings →
+            // Remote Access) if the user left it enabled. Independent of the
+            // env-var `ATHEN_HTTP_ADDR` path above. See docs/REMOTE_ACCESS.md.
+            {
+                let ra = crate::settings::load_main_config_public().remote_access;
+                if ra.enabled {
+                    let handle = app.handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        let ui = crate::ui_bridge::UiBridge::Tauri(handle);
+                        let state = ui.app_state();
+                        let basic = if !ra.username.trim().is_empty() {
+                            let pw = match state.vault.as_ref() {
+                                Some(v) => v.get("remote_access", "password").await.ok().flatten(),
+                                None => None,
+                            };
+                            pw.filter(|p| !p.is_empty()).map(|password| {
+                                crate::http_api::BasicCreds {
+                                    username: ra.username.trim().to_string(),
+                                    password,
+                                }
+                            })
+                        } else {
+                            None
+                        };
+                        state
+                            .start_remote_access(ui.clone(), ra.port, basic, ra.tunnel_enabled)
+                            .await;
+                    });
+                }
             }
 
             // Track window focus state for the notification orchestrator.

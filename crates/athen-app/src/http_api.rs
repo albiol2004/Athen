@@ -54,10 +54,23 @@ use crate::ui_bridge::UiBridge;
 /// JSON, so the Tauri-equivalent payloads can run tens of megabytes.
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 
+/// User+password credentials for HTTP Basic auth, set in the Settings →
+/// Remote Access panel. Carried beside the bearer token; the middleware
+/// accepts either. `None` on the `from_env` path preserves today's
+/// token-only behaviour exactly.
+#[derive(Clone)]
+pub struct BasicCreds {
+    pub username: String,
+    pub password: String,
+}
+
 #[derive(Clone)]
 pub struct HttpApiConfig {
     pub addr: SocketAddr,
     pub token: String,
+    /// User+password Basic credentials when configured via the UI. `None`
+    /// = token-only (the `from_env` / headless path).
+    pub basic: Option<BasicCreds>,
 }
 
 impl HttpApiConfig {
@@ -80,13 +93,23 @@ impl HttpApiConfig {
         let env_reader = |name: &str| std::env::var(name).ok();
         let token = crate::env_creds::lookup_env_secret("ATHEN_HTTP_TOKEN", &env_reader)
             .unwrap_or_else(|| load_or_create_token(data_dir));
-        Some(Self { addr, token })
+        Some(Self {
+            addr,
+            token,
+            basic: None,
+        })
+    }
+
+    /// Build from UI settings (the Remote Access panel). `basic` carries
+    /// the user+password when configured.
+    pub fn from_settings(addr: SocketAddr, token: String, basic: Option<BasicCreds>) -> Self {
+        Self { addr, token, basic }
     }
 }
 
 /// Read the persisted API token, or mint one (two UUIDv4s, 244 bits of
 /// OS randomness) and persist it at `<data_dir>/http_token`, mode 0600.
-fn load_or_create_token(data_dir: &Path) -> String {
+pub(crate) fn load_or_create_token(data_dir: &Path) -> String {
     let path = data_dir.join("http_token");
     if let Ok(s) = std::fs::read_to_string(&path) {
         let s = s.trim();
@@ -119,22 +142,16 @@ fn load_or_create_token(data_dir: &Path) -> String {
 struct ApiState {
     ui: UiBridge,
     token: Arc<String>,
+    /// User+password Basic creds when configured (UI Remote Access panel).
+    /// `None` = token-only, the historical behaviour.
+    basic: Option<Arc<BasicCreds>>,
 }
 
-/// Serve the HTTP API forever. Call once from a composition root after
-/// the `AppState` is reachable through `ui` (Tauri managed state or the
-/// published headless singleton).
-pub async fn serve(cfg: HttpApiConfig, ui: UiBridge) -> std::io::Result<()> {
-    // Bus must be live before the first subscriber AND before loops
-    // emit; composition roots also init it early — this is a no-op then.
-    UiBridge::init_event_bus();
-
-    let api = ApiState {
-        ui,
-        token: Arc::new(cfg.token),
-    };
-
-    let app = Router::new()
+/// Build the fully-wired router from an `ApiState`. Shared by `serve`
+/// (runs forever) and `serve_with_shutdown` (graceful) so both surfaces
+/// expose byte-identical routes + middleware.
+fn build_router(api: ApiState) -> Router {
+    Router::new()
         .route("/api/health", get(health))
         .route("/api/events", get(events))
         .route("/api/arcs", get(arcs_list).post(arcs_create))
@@ -155,21 +172,66 @@ pub async fn serve(cfg: HttpApiConfig, ui: UiBridge) -> std::io::Result<()> {
         .route("/api/notifications/{id}/read", post(notification_read))
         .merge(full_surface_router())
         // The embedded web UI rides every non-/api path (SPA fallback);
-        // require_token skips it — only /api/* carries user data.
+        // require_auth skips it — only /api/* carries user data.
         .fallback(static_asset)
         .layer(axum::middleware::from_fn_with_state(
             api.clone(),
-            require_token,
+            require_auth,
         ))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         // Remote web clients (React dev server, hosted dashboard) need
-        // CORS; auth is the token, not the origin.
+        // CORS; auth is the token/password, not the origin.
         .layer(tower_http::cors::CorsLayer::permissive())
-        .with_state(api);
+        .with_state(api)
+}
 
-    let listener = tokio::net::TcpListener::bind(cfg.addr).await?;
-    tracing::info!(addr = %cfg.addr, "HTTP API listening");
+fn api_state_from_cfg(cfg: HttpApiConfig, ui: UiBridge) -> ApiState {
+    ApiState {
+        ui,
+        token: Arc::new(cfg.token),
+        basic: cfg.basic.map(Arc::new),
+    }
+}
+
+/// Serve the HTTP API forever. Call once from a composition root after
+/// the `AppState` is reachable through `ui` (Tauri managed state or the
+/// published headless singleton).
+pub async fn serve(cfg: HttpApiConfig, ui: UiBridge) -> std::io::Result<()> {
+    // Bus must be live before the first subscriber AND before loops
+    // emit; composition roots also init it early — this is a no-op then.
+    UiBridge::init_event_bus();
+
+    let addr = cfg.addr;
+    let api = api_state_from_cfg(cfg, ui);
+    let app = build_router(api);
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!(addr = %addr, "HTTP API listening");
     axum::serve(listener, app).await
+}
+
+/// Serve the HTTP API until `shutdown` fires, then drain gracefully.
+/// Used by the UI-controlled Remote Access listener so it can be stopped
+/// at runtime (the desktop `stop_remote_access` fires the sender). Apart
+/// from the graceful-shutdown hook this is identical to [`serve`].
+pub async fn serve_with_shutdown(
+    cfg: HttpApiConfig,
+    ui: UiBridge,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
+) -> std::io::Result<()> {
+    UiBridge::init_event_bus();
+
+    let addr = cfg.addr;
+    let api = api_state_from_cfg(cfg, ui);
+    let app = build_router(api);
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!(addr = %addr, "HTTP API listening (graceful)");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let _ = shutdown.await;
+        })
+        .await
 }
 
 // ---------------------------------------------------------------------------
@@ -179,10 +241,15 @@ pub async fn serve(cfg: HttpApiConfig, ui: UiBridge) -> std::io::Result<()> {
 #[derive(Deserialize)]
 struct TokenQuery {
     token: Option<String>,
+    /// `base64(user:pass)` for the Basic-auth path, used by EventSource
+    /// (which can't set an `Authorization` header). Matched against the
+    /// configured `basic` creds, exactly like the `Authorization: Basic`
+    /// header. Ignored when `basic` is `None`.
+    auth: Option<String>,
 }
 
-/// Constant-time string compare — token checks shouldn't leak prefix
-/// length through response timing.
+/// Constant-time string compare — token/password checks shouldn't leak
+/// prefix length through response timing.
 fn ct_eq(a: &str, b: &str) -> bool {
     a.len() == b.len()
         && a.bytes()
@@ -191,7 +258,30 @@ fn ct_eq(a: &str, b: &str) -> bool {
             == 0
 }
 
-async fn require_token(
+/// Decode a `base64(user:pass)` blob into its UTF-8 string. `None` when
+/// the base64 is malformed or the bytes aren't valid UTF-8. Standard
+/// (padded) alphabet — what browsers emit for `Authorization: Basic`.
+fn decode_basic_b64(b64: &str) -> Option<String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64.trim().as_bytes())
+        .ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+/// Pure credential-match decision for a decoded `"user:pass"` string.
+/// Splits on the FIRST colon (passwords may contain colons), then
+/// requires username equality AND constant-time password equality.
+/// Factored out so it's unit-testable without spinning up axum.
+fn check_basic(decoded: &str, creds: &BasicCreds) -> bool {
+    let Some((user, pass)) = decoded.split_once(':') else {
+        return false;
+    };
+    // Username is not secret; password compare stays constant-time.
+    user == creds.username && ct_eq(pass, &creds.password)
+}
+
+async fn require_auth(
     State(api): State<ApiState>,
     Query(q): Query<TokenQuery>,
     req: axum::extract::Request,
@@ -204,9 +294,12 @@ async fn require_token(
         return next.run(req).await;
     }
     let headers = req.headers();
-    let presented = headers
+    let auth_header = headers
         .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.to_str().ok());
+
+    // 1) Bearer token (header / x-athen-token / ?token=) — unchanged path.
+    let presented_token = auth_header
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::to_string)
         .or_else(|| {
@@ -215,15 +308,38 @@ async fn require_token(
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string)
         })
-        .or(q.token);
-    match presented {
-        Some(t) if ct_eq(&t, &api.token) => next.run(req).await,
-        _ => (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "missing or invalid token"})),
-        )
-            .into_response(),
+        .or_else(|| q.token.clone());
+    if let Some(t) = presented_token {
+        if ct_eq(&t, &api.token) {
+            return next.run(req).await;
+        }
     }
+
+    // 2) Basic auth (header / ?auth=) — only when user+password configured.
+    if let Some(creds) = api.basic.as_deref() {
+        // `Authorization: Basic <base64(user:pass)>`
+        if let Some(b64) = auth_header.and_then(|v| v.strip_prefix("Basic ")) {
+            if let Some(decoded) = decode_basic_b64(b64) {
+                if check_basic(&decoded, creds) {
+                    return next.run(req).await;
+                }
+            }
+        }
+        // `?auth=<base64(user:pass)>` for EventSource (no headers).
+        if let Some(ref b64) = q.auth {
+            if let Some(decoded) = decode_basic_b64(b64) {
+                if check_basic(&decoded, creds) {
+                    return next.run(req).await;
+                }
+            }
+        }
+    }
+
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({"error": "missing or invalid credentials"})),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -1149,6 +1265,41 @@ async fn h_code_mode_discard(
 ) -> Response {
     json_result(commands::code_mode_discard_core(&arc_id, body.path, api.ui.app_state()).await)
 }
+async fn h_remote_access_get(State(api): State<ApiState>) -> Response {
+    json_result(Ok::<_, String>(
+        commands::get_remote_access_core(api.ui.app_state()).await,
+    ))
+}
+async fn h_remote_access_status(State(api): State<ApiState>) -> Response {
+    json_result(Ok::<_, String>(commands::remote_access_status_core(
+        api.ui.app_state(),
+    )))
+}
+#[derive(Deserialize)]
+struct RemoteAccessBody {
+    enabled: bool,
+    port: u16,
+    username: String,
+    password: Option<String>,
+    tunnel_enabled: bool,
+}
+async fn h_remote_access_set(
+    State(api): State<ApiState>,
+    Json(body): Json<RemoteAccessBody>,
+) -> Response {
+    json_result(
+        commands::set_remote_access_core(
+            &api.ui,
+            api.ui.app_state(),
+            body.enabled,
+            body.port,
+            body.username,
+            body.password,
+            body.tunnel_enabled,
+        )
+        .await,
+    )
+}
 async fn h_project_summary_mode_get(State(api): State<ApiState>) -> Response {
     json_result(commands::get_project_summary_mode_core(api.ui.app_state()).await)
 }
@@ -2025,6 +2176,11 @@ fn full_surface_router() -> Router<ApiState> {
             "/api/arcs/{id}/code-mode/discard",
             post(h_code_mode_discard),
         )
+        .route(
+            "/api/remote-access",
+            get(h_remote_access_get).post(h_remote_access_set),
+        )
+        .route("/api/remote-access/status", get(h_remote_access_status))
         .route("/api/active-project", post(h_set_active_project))
         // skills
         .route("/api/skills", get(h_skills_list).post(h_skill_upsert))
@@ -2201,5 +2357,73 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             assert!(HttpApiConfig::from_env(dir.path()).is_none());
         }
+    }
+
+    fn creds(user: &str, pass: &str) -> BasicCreds {
+        BasicCreds {
+            username: user.to_string(),
+            password: pass.to_string(),
+        }
+    }
+
+    #[test]
+    fn basic_b64_round_trips() {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode("alex:hunter2");
+        assert_eq!(decode_basic_b64(&encoded).as_deref(), Some("alex:hunter2"));
+    }
+
+    #[test]
+    fn decode_basic_rejects_garbage() {
+        // Not valid base64.
+        assert!(decode_basic_b64("@@@not-base64@@@").is_none());
+    }
+
+    #[test]
+    fn check_basic_accepts_correct_user_and_pass() {
+        let c = creds("alex", "hunter2");
+        assert!(check_basic("alex:hunter2", &c));
+    }
+
+    #[test]
+    fn check_basic_rejects_wrong_password() {
+        let c = creds("alex", "hunter2");
+        assert!(!check_basic("alex:wrong", &c));
+    }
+
+    #[test]
+    fn check_basic_rejects_wrong_username() {
+        let c = creds("alex", "hunter2");
+        assert!(!check_basic("eve:hunter2", &c));
+    }
+
+    #[test]
+    fn check_basic_requires_a_colon() {
+        let c = creds("alex", "hunter2");
+        // No separator at all → not a valid "user:pass" pair.
+        assert!(!check_basic("alexhunter2", &c));
+    }
+
+    #[test]
+    fn check_basic_splits_on_first_colon_so_passwords_may_contain_colons() {
+        let c = creds("alex", "pa:ss:word");
+        assert!(check_basic("alex:pa:ss:word", &c));
+    }
+
+    #[test]
+    fn check_basic_empty_password_only_matches_empty() {
+        let c = creds("alex", "");
+        assert!(check_basic("alex:", &c));
+        assert!(!check_basic("alex:x", &c));
+    }
+
+    #[test]
+    fn full_basic_flow_decode_then_check() {
+        use base64::Engine;
+        let c = creds("alex", "hunter2");
+        let good = base64::engine::general_purpose::STANDARD.encode("alex:hunter2");
+        let bad = base64::engine::general_purpose::STANDARD.encode("alex:nope");
+        assert!(check_basic(&decode_basic_b64(&good).unwrap(), &c));
+        assert!(!check_basic(&decode_basic_b64(&bad).unwrap(), &c));
     }
 }

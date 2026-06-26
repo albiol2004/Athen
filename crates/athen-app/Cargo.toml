@@ -73,5 +73,10 @@ tauri-build = { version = "2", features = [] }
 glib = "0.20"
 is-wsl = "0.4"
 
+# macOS cloudflared ships as a .tgz; tunnel.rs extracts it on that target only.
+[target.'cfg(target_os = "macos")'.dependencies]
+flate2 = "1"
+tar = "0.4"
+
 [dev-dependencies]
 tempfile = "3"

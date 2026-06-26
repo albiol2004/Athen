@@ -200,6 +200,24 @@ pub struct PendingApproval {
 /// First caller to insert wins, the other no-ops.
 pub type InflightApprovals = Arc<Mutex<HashSet<Uuid>>>;
 
+/// Live snapshot of the UI-controlled Remote Access runtime (Settings →
+/// Remote Access). Read by the `remote_access_status` command; written by
+/// [`AppState::start_remote_access`] / [`AppState::stop_remote_access`].
+/// See [`docs/REMOTE_ACCESS.md`].
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct RemoteAccessStatus {
+    /// Whether the HTTP listener is currently bound.
+    pub listening: bool,
+    /// `http://127.0.0.1:<port>` when listening.
+    pub local_url: Option<String>,
+    /// The `*.trycloudflare.com` URL once the quick-tunnel is up.
+    pub tunnel_url: Option<String>,
+    /// Whether a usable `cloudflared` binary was found/installed.
+    pub cloudflared_installed: bool,
+    /// Last tunnel/listener error surfaced to the panel (never a secret).
+    pub last_error: Option<String>,
+}
+
 /// Top-level application state managed by Tauri.
 pub struct AppState {
     pub coordinator: Arc<Coordinator>,
@@ -287,6 +305,16 @@ pub struct AppState {
     /// Shutdown sender for the Telegram monitor background task. Behind a Mutex
     /// for the same live-restart reason as `email_shutdown`.
     pub telegram_shutdown: std::sync::Mutex<Option<tokio::sync::broadcast::Sender<()>>>,
+    /// Shutdown sender for the UI-controlled Remote Access HTTP listener
+    /// (Settings → Remote Access). Oneshot so it can be started/stopped from a
+    /// `&self` Settings-save handler without an app restart. See
+    /// [`docs/REMOTE_ACCESS.md`].
+    pub remote_access_shutdown: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// Live cloudflared quick-tunnel handle; killing it (Drop or `stop`) tears
+    /// down the public link. `None` when no tunnel is up.
+    pub tunnel: std::sync::Mutex<Option<crate::tunnel::TunnelHandle>>,
+    /// Snapshot of the Remote Access runtime for the status command/UI poll.
+    pub remote_access_status: std::sync::Mutex<RemoteAccessStatus>,
     /// Shutdown sender for the calendar monitor background task. Set by
     /// [`Self::start_calendar_monitor`]; consumed by [`Self::shutdown_all`].
     pub calendar_shutdown: Option<tokio::sync::broadcast::Sender<()>>,
@@ -1482,6 +1510,9 @@ impl AppState {
             pending_user_inputs: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             email_shutdown: std::sync::Mutex::new(None),
             telegram_shutdown: std::sync::Mutex::new(None),
+            remote_access_shutdown: std::sync::Mutex::new(None),
+            tunnel: std::sync::Mutex::new(None),
+            remote_access_status: std::sync::Mutex::new(RemoteAccessStatus::default()),
             calendar_shutdown: None,
             calendar_sync_shutdown: None,
             attachment_purger_shutdown: None,
@@ -1651,6 +1682,12 @@ impl AppState {
                 }
             }
         }
+        // Remote Access listener (oneshot) + cloudflared tunnel (Drop kills the
+        // child). Best-effort; ignore absence.
+        if let Some(tx) = self.remote_access_shutdown.lock_recover().take() {
+            let _ = tx.send(());
+        }
+        drop(self.tunnel.lock_recover().take());
 
         // 2. Mark live agent runs as Cancelled with reason "app_shutdown".
         if let Some(reg) = self.agent_registry.as_ref() {
@@ -2613,6 +2650,105 @@ impl AppState {
             resolve_owner_telegram_chat_id(self.contact_store.as_ref()).await;
         let rebuilt = build_telegram_sender(&cfg.telegram, owner_chat_id_override);
         *self.telegram_sender.write_recover() = rebuilt;
+    }
+
+    /// Clone the current Remote Access status snapshot (the `lock_recover`
+    /// trait is private to this module, so the command layer reads through
+    /// here).
+    pub fn remote_access_status_snapshot(&self) -> RemoteAccessStatus {
+        let mut st = self.remote_access_status.lock_recover();
+        // Refresh the install flag opportunistically — cheap PATH probe.
+        st.cloudflared_installed = crate::tunnel::cloudflared_path().is_some();
+        st.clone()
+    }
+
+    /// Start (or restart) the UI-controlled Remote Access HTTP listener on
+    /// `127.0.0.1:port`. Idempotent — stops any existing listener first. When
+    /// `tunnel_enabled`, brings up a cloudflared quick-tunnel in the background
+    /// and stamps its URL into `remote_access_status` once it resolves, so the
+    /// caller returns immediately. See [`docs/REMOTE_ACCESS.md`].
+    pub async fn start_remote_access(
+        &self,
+        ui: crate::ui_bridge::UiBridge,
+        port: u16,
+        basic: Option<crate::http_api::BasicCreds>,
+        tunnel_enabled: bool,
+    ) {
+        self.stop_remote_access().await;
+
+        let data_dir =
+            athen_core::paths::athen_data_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let token = crate::http_api::load_or_create_token(&data_dir);
+        let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+        let cfg = crate::http_api::HttpApiConfig::from_settings(addr, token, basic);
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        *self.remote_access_shutdown.lock_recover() = Some(tx);
+
+        {
+            let mut st = self.remote_access_status.lock_recover();
+            st.listening = true;
+            st.local_url = Some(format!("http://127.0.0.1:{port}"));
+            st.tunnel_url = None;
+            st.last_error = None;
+            st.cloudflared_installed = crate::tunnel::cloudflared_path().is_some();
+        }
+
+        let ui_for_serve = ui.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::http_api::serve_with_shutdown(cfg, ui_for_serve, rx).await {
+                tracing::error!(error = %e, "Remote Access HTTP listener exited with error");
+            }
+        });
+        tracing::info!(%addr, tunnel = tunnel_enabled, "Remote Access listener started");
+
+        if tunnel_enabled {
+            // cloudflared bring-up (download + handshake) can take ~20s. Do it
+            // off the caller's path; resolve `&AppState` through the moved-in
+            // `ui` since `&self` can't cross into a 'static task.
+            tokio::spawn(async move {
+                let state = ui.app_state();
+                let path = match crate::tunnel::ensure_cloudflared(None).await {
+                    Ok(p) => {
+                        state.remote_access_status.lock_recover().cloudflared_installed = true;
+                        p
+                    }
+                    Err(e) => {
+                        state.remote_access_status.lock_recover().last_error =
+                            Some(format!("cloudflared install failed: {e}"));
+                        return;
+                    }
+                };
+                match crate::tunnel::start_quick_tunnel(&path, port).await {
+                    Ok(handle) => {
+                        let url = handle.url().to_string();
+                        *state.tunnel.lock_recover() = Some(handle);
+                        let mut st = state.remote_access_status.lock_recover();
+                        st.tunnel_url = Some(url.clone());
+                        st.last_error = None;
+                        drop(st);
+                        tracing::info!(%url, "Cloudflare quick-tunnel up");
+                    }
+                    Err(e) => {
+                        state.remote_access_status.lock_recover().last_error =
+                            Some(format!("tunnel start failed: {e}"));
+                    }
+                }
+            });
+        }
+    }
+
+    /// Stop the Remote Access listener and tear down any live tunnel. Safe to
+    /// call when nothing is running.
+    pub async fn stop_remote_access(&self) {
+        if let Some(tx) = self.remote_access_shutdown.lock_recover().take() {
+            let _ = tx.send(());
+        }
+        let handle = self.tunnel.lock_recover().take();
+        if let Some(h) = handle {
+            h.stop().await;
+        }
+        *self.remote_access_status.lock_recover() = RemoteAccessStatus::default();
     }
 
     /// Rebuild the web-search provider chain from current (vault-hydrated)

@@ -7606,6 +7606,160 @@ pub async fn set_arc_code_mode(
     set_arc_code_mode_core(arc_id, enabled, root, &state).await
 }
 
+// ---------------------------------------------------------------------------
+// Remote Access (Settings → Remote Access; see docs/REMOTE_ACCESS.md)
+// ---------------------------------------------------------------------------
+
+/// Vault scope/key holding the Basic-auth password (never in config.toml).
+const REMOTE_ACCESS_VAULT_SCOPE: &str = "remote_access";
+const REMOTE_ACCESS_VAULT_KEY: &str = "password";
+
+/// Non-secret view of the Remote Access config for the Settings panel.
+#[derive(serde::Serialize, Debug)]
+pub struct RemoteAccessInfo {
+    pub enabled: bool,
+    pub port: u16,
+    pub username: String,
+    pub tunnel_enabled: bool,
+    /// Whether a password is stored in the vault (the password itself is
+    /// never returned).
+    pub has_password: bool,
+}
+
+/// Read the persisted Remote Access config (password presence only).
+pub(crate) async fn get_remote_access_core(state: &AppState) -> RemoteAccessInfo {
+    let cfg = crate::settings::load_main_config_public();
+    let ra = cfg.remote_access;
+    let has_password = match state.vault.as_ref() {
+        Some(v) => matches!(
+            v.get(REMOTE_ACCESS_VAULT_SCOPE, REMOTE_ACCESS_VAULT_KEY).await,
+            Ok(Some(p)) if !p.is_empty()
+        ),
+        None => false,
+    };
+    RemoteAccessInfo {
+        enabled: ra.enabled,
+        port: ra.port,
+        username: ra.username,
+        tunnel_enabled: ra.tunnel_enabled,
+        has_password,
+    }
+}
+
+/// Current Remote Access runtime status (listening addr, tunnel URL, …).
+pub(crate) fn remote_access_status_core(state: &AppState) -> crate::state::RemoteAccessStatus {
+    state.remote_access_status_snapshot()
+}
+
+/// Resolve the effective Basic credentials for the listener: `Some` only when
+/// a username AND a password are both present. A freshly-supplied password
+/// wins over the stored one; otherwise the stored vault password is read.
+async fn resolve_basic_creds(
+    state: &AppState,
+    username: &str,
+    new_password: Option<&str>,
+) -> Option<crate::http_api::BasicCreds> {
+    let username = username.trim();
+    if username.is_empty() {
+        return None;
+    }
+    let password = match new_password {
+        Some(p) if !p.is_empty() => Some(p.to_string()),
+        _ => match state.vault.as_ref() {
+            Some(v) => v
+                .get(REMOTE_ACCESS_VAULT_SCOPE, REMOTE_ACCESS_VAULT_KEY)
+                .await
+                .ok()
+                .flatten(),
+            None => None,
+        },
+    };
+    password.filter(|p| !p.is_empty()).map(|password| {
+        crate::http_api::BasicCreds {
+            username: username.to_string(),
+            password,
+        }
+    })
+}
+
+/// Persist Remote Access settings and apply them live (stop + restart the
+/// listener, no app restart). Returns the fresh runtime status.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn set_remote_access_core(
+    ui: &UiBridge,
+    state: &AppState,
+    enabled: bool,
+    port: u16,
+    username: String,
+    password: Option<String>,
+    tunnel_enabled: bool,
+) -> std::result::Result<crate::state::RemoteAccessStatus, String> {
+    // 1. Persist the non-secret config.
+    let mut cfg = crate::settings::load_main_config_public();
+    cfg.remote_access.enabled = enabled;
+    cfg.remote_access.port = port;
+    cfg.remote_access.username = username.trim().to_string();
+    cfg.remote_access.tunnel_enabled = tunnel_enabled;
+    crate::settings::save_main_config_public(&cfg)?;
+
+    // 2. Store the password in the vault if a non-empty one was provided.
+    if let (Some(pw), Some(vault)) = (password.as_ref(), state.vault.as_ref()) {
+        if !pw.is_empty() {
+            vault
+                .set(REMOTE_ACCESS_VAULT_SCOPE, REMOTE_ACCESS_VAULT_KEY, pw)
+                .await
+                .map_err(|e| format!("could not store password: {e}"))?;
+        }
+    }
+
+    // 3. Apply live.
+    if enabled {
+        let basic = resolve_basic_creds(state, &cfg.remote_access.username, password.as_deref()).await;
+        state
+            .start_remote_access(ui.clone(), port, basic, tunnel_enabled)
+            .await;
+    } else {
+        state.stop_remote_access().await;
+    }
+    Ok(state.remote_access_status_snapshot())
+}
+
+#[tauri::command]
+pub async fn get_remote_access(
+    state: State<'_, AppState>,
+) -> std::result::Result<RemoteAccessInfo, String> {
+    Ok(get_remote_access_core(&state).await)
+}
+
+#[tauri::command]
+pub async fn remote_access_status(
+    state: State<'_, AppState>,
+) -> std::result::Result<crate::state::RemoteAccessStatus, String> {
+    Ok(remote_access_status_core(&state))
+}
+
+#[tauri::command]
+pub async fn set_remote_access(
+    enabled: bool,
+    port: u16,
+    username: String,
+    password: Option<String>,
+    tunnel_enabled: bool,
+    state: State<'_, AppState>,
+    app_handle: AppHandle,
+) -> std::result::Result<crate::state::RemoteAccessStatus, String> {
+    set_remote_access_core(
+        &UiBridge::Tauri(app_handle),
+        &state,
+        enabled,
+        port,
+        username,
+        password,
+        tunnel_enabled,
+    )
+    .await
+}
+
 pub(crate) async fn set_arc_code_mode_core(
     arc_id: String,
     enabled: bool,

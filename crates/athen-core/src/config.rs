@@ -40,6 +40,8 @@ pub struct AthenConfig {
     pub attachment_policy: AttachmentPolicy,
     #[serde(default)]
     pub calendar: CalendarConfig,
+    #[serde(default)]
+    pub remote_access: RemoteAccessConfig,
     /// Opaque JSON blob carrying the voice subsystem configuration.
     /// Typed shape (`VoiceConfig`) lives in the `athen-voice` crate, which
     /// `athen-core` cannot depend on (hexagonal rules). `athen-app`
@@ -54,6 +56,41 @@ pub struct AthenConfig {
     /// bug presented.
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub voice: serde_json::Value,
+}
+
+/// UI-controlled remote-access settings for the desktop HTTP listener.
+/// Distinct from the `ATHEN_HTTP_ADDR` env path (headless / power users):
+/// this drives the Settings → Remote Access panel that starts/stops the
+/// listener at runtime with user+password Basic auth and an optional
+/// Cloudflare quick-tunnel. Off by default; binds `127.0.0.1`.
+///
+/// The password is deliberately NOT stored here — secrets live in the
+/// vault (scope `"remote_access"`, key `"password"`). `config.toml` stays
+/// non-secret. See `docs/REMOTE_ACCESS.md`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RemoteAccessConfig {
+    /// Whether the UI-controlled HTTP listener auto-starts at boot.
+    pub enabled: bool,
+    /// Port bound on 127.0.0.1. Default 8787.
+    pub port: u16,
+    /// Basic-auth username the user sets in Settings. Empty = unset.
+    pub username: String,
+    /// Whether to start a cloudflared quick-tunnel when the listener starts.
+    pub tunnel_enabled: bool,
+    // NOTE: the password is NOT stored here — secrets live in the vault
+    // (scope "remote_access", key "password"). config.toml stays non-secret.
+}
+
+impl Default for RemoteAccessConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: 8787,
+            username: String::new(),
+            tunnel_enabled: false,
+        }
+    }
 }
 
 /// User-facing calendar settings. Currently just one free-form prompt
@@ -94,6 +131,7 @@ impl Default for AthenConfig {
             web_search: WebSearchConfig::default(),
             attachment_policy: AttachmentPolicy::default(),
             calendar: CalendarConfig::default(),
+            remote_access: RemoteAccessConfig::default(),
             voice: serde_json::Value::Null,
         }
     }
