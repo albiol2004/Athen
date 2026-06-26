@@ -1329,6 +1329,8 @@ function closeCodeModePanel() {
     const panel = codeModePanelEl();
     if (!panel) return;
     panel.classList.add('hidden');
+    // Stop the Agents live poll while the panel is hidden.
+    stopCodeModeAgentsPolling();
 }
 
 async function refreshCodeModePanel() {
@@ -1540,6 +1542,228 @@ function renderCodeModeState(body, state) {
             sec.appendChild(row);
         }
     }));
+
+    // ── Agents (this arc's agent tree + per-agent live transcript) ──
+    body.appendChild(buildCodeModeAgentsSection());
+}
+
+// ─── Code-Mode Agents section (Build 3) ───
+//
+// Lists the active arc's agent tree (main agent + sub-agents) and lets each
+// row expand to its full transcript, rendered with the same building blocks
+// as the main chat via renderTranscriptInto. While any agent is running and
+// the section is open, polls code_mode_agents (~2.5s) and re-renders expanded
+// running transcripts so the sub-arc grows live. ALL agent strings are
+// untrusted → textContent / createElement only.
+
+const CODE_MODE_AGENTS_POLL_MS = 2500;
+// Polling lifecycle state. `interval` is the live timer; `expanded` maps an
+// arc_id → its open transcript container (so the poll can re-render it).
+const codeModeAgentsState = {
+    interval: null,
+    sectionEl: null,
+    expanded: new Map(),
+};
+
+// Tear down any running Agents poll + expansion state. Called when the panel
+// closes, the section is rebuilt, or the active arc changes.
+function stopCodeModeAgentsPolling() {
+    if (codeModeAgentsState.interval) {
+        clearInterval(codeModeAgentsState.interval);
+        codeModeAgentsState.interval = null;
+    }
+    codeModeAgentsState.expanded.clear();
+    codeModeAgentsState.sectionEl = null;
+}
+
+function buildCodeModeAgentsSection() {
+    // A fresh section replaces any prior one — drop stale poll/expansion state.
+    stopCodeModeAgentsPolling();
+    const section = buildCodeModeSection('Agents', (sec) => {
+        sec.appendChild(buildCodeModeMuted('Loading agents…'));
+    });
+    codeModeAgentsState.sectionEl = section;
+    // Populate asynchronously; the section is already in the DOM.
+    refreshCodeModeAgents();
+    return section;
+}
+
+// Fetch the agent tree for the active arc and render it into the Agents
+// section body. Re-renders existing expanded transcripts that are still
+// running. Starts/stops polling based on whether anything is running.
+async function refreshCodeModeAgents() {
+    const section = codeModeAgentsState.sectionEl;
+    if (!invoke || !section || !activeArcId) return;
+    const sectionBody = section.querySelector('.code-mode-section-body');
+    if (!sectionBody) return;
+
+    let nodes;
+    try {
+        nodes = await invoke('code_mode_agents', { arcId: activeArcId });
+    } catch (err) {
+        // Section may have been torn down mid-flight.
+        if (codeModeAgentsState.sectionEl !== section) return;
+        sectionBody.innerHTML = '';
+        sectionBody.appendChild(buildCodeModeMuted(errText(err)));
+        stopCodeModeAgentsPolling();
+        return;
+    }
+    // Bail if the section was replaced while we awaited.
+    if (codeModeAgentsState.sectionEl !== section) return;
+
+    renderCodeModeAgentTree(sectionBody, Array.isArray(nodes) ? nodes : []);
+
+    const anyRunning = (Array.isArray(nodes) ? nodes : []).some(n => n && n.running);
+
+    // Re-render expanded + running transcripts so they grow live.
+    for (const [arcId, container] of codeModeAgentsState.expanded.entries()) {
+        const node = (Array.isArray(nodes) ? nodes : []).find(n => n && n.arc_id === arcId);
+        if (node && node.running) {
+            try {
+                const entries = await invoke('get_arc_entries', { arcId });
+                if (codeModeAgentsState.expanded.has(arcId)) {
+                    renderTranscriptInto(entries || [], container);
+                }
+            } catch (_) { /* transient; next poll retries */ }
+        }
+    }
+
+    // Manage the poll timer.
+    if (anyRunning && !codeModeAgentsState.interval) {
+        codeModeAgentsState.interval = setInterval(refreshCodeModeAgents, CODE_MODE_AGENTS_POLL_MS);
+    } else if (!anyRunning && codeModeAgentsState.interval) {
+        clearInterval(codeModeAgentsState.interval);
+        codeModeAgentsState.interval = null;
+    }
+}
+
+// Render the agent tree: main nodes (is_main) as top rows, children
+// (matching parent_arc_id) indented beneath. Preserves which arcs are
+// currently expanded so a live poll doesn't collapse open transcripts.
+function renderCodeModeAgentTree(sectionBody, nodes) {
+    const previouslyExpanded = new Set(codeModeAgentsState.expanded.keys());
+    codeModeAgentsState.expanded.clear();
+    sectionBody.innerHTML = '';
+
+    const mains = nodes.filter(n => n && n.is_main);
+    const others = nodes.filter(n => n && !n.is_main);
+
+    if (mains.length === 0 && others.length === 0) {
+        sectionBody.appendChild(buildCodeModeMuted('No agents have run on this arc yet.'));
+        return;
+    }
+
+    const renderNode = (node, depth) => {
+        sectionBody.appendChild(buildCodeModeAgentRow(node, depth, previouslyExpanded));
+        const children = others.filter(c => c.parent_arc_id === node.arc_id);
+        for (const child of children) renderNode(child, depth + 1);
+    };
+
+    for (const main of mains) renderNode(main, 0);
+    // Orphan children whose parent isn't in the list (defensive) — show flat.
+    const placed = new Set();
+    const collectPlaced = (node) => {
+        placed.add(node.arc_id);
+        for (const c of others.filter(c => c.parent_arc_id === node.arc_id)) collectPlaced(c);
+    };
+    for (const main of mains) collectPlaced(main);
+    for (const orphan of others) {
+        if (!placed.has(orphan.arc_id)) renderNode(orphan, 0);
+    }
+}
+
+// Build one agent row + its (lazily/expandably) populated transcript
+// container. Clicking the row header toggles the transcript and registers
+// the container for live re-rendering while running.
+function buildCodeModeAgentRow(node, depth, previouslyExpanded) {
+    const wrap = document.createElement('div');
+    wrap.className = 'code-mode-agent';
+    if (depth > 0) {
+        wrap.classList.add('code-mode-agent-child');
+        wrap.style.marginLeft = `${Math.min(depth, 4) * 14}px`;
+    }
+
+    const head = document.createElement('button');
+    head.type = 'button';
+    head.className = 'code-mode-agent-head';
+    head.setAttribute('aria-expanded', 'false');
+
+    const caret = document.createElement('span');
+    caret.className = 'code-mode-agent-caret';
+    caret.textContent = '▸';
+    head.appendChild(caret);
+
+    const title = document.createElement('span');
+    title.className = 'code-mode-agent-title';
+    title.textContent = node.title || (node.is_main ? 'Main agent' : 'Sub-agent');
+    title.title = title.textContent;
+    head.appendChild(title);
+
+    const badge = document.createElement('span');
+    badge.className = 'code-mode-agent-badge ' + (node.running ? 'running' : 'finished');
+    badge.textContent = node.running ? 'running' : 'finished';
+    head.appendChild(badge);
+
+    wrap.appendChild(head);
+
+    // Running detail line: step count + current tool.
+    if (node.running) {
+        const detail = document.createElement('div');
+        detail.className = 'code-mode-agent-detail';
+        const steps = Number(node.step_count || 0);
+        let txt = `${steps} step${steps === 1 ? '' : 's'}`;
+        if (node.current_tool) txt += ` · ${node.current_tool}`;
+        detail.textContent = txt;
+        wrap.appendChild(detail);
+    }
+
+    const transcript = document.createElement('div');
+    transcript.className = 'code-mode-agent-transcript hidden';
+    wrap.appendChild(transcript);
+
+    let loaded = false;
+    const expand = async () => {
+        transcript.classList.remove('hidden');
+        head.setAttribute('aria-expanded', 'true');
+        caret.textContent = '▾';
+        codeModeAgentsState.expanded.set(node.arc_id, transcript);
+        if (!loaded) {
+            loaded = true;
+            transcript.innerHTML = '';
+            const loading = document.createElement('div');
+            loading.className = 'code-mode-muted';
+            loading.textContent = 'Loading transcript…';
+            transcript.appendChild(loading);
+            try {
+                const entries = await invoke('get_arc_entries', { arcId: node.arc_id });
+                if (codeModeAgentsState.expanded.has(node.arc_id)) {
+                    renderTranscriptInto(entries || [], transcript);
+                }
+            } catch (e) {
+                transcript.innerHTML = '';
+                transcript.appendChild(buildCodeModeMuted('Could not load transcript: ' + e));
+            }
+        }
+    };
+    const collapse = () => {
+        transcript.classList.add('hidden');
+        head.setAttribute('aria-expanded', 'false');
+        caret.textContent = '▸';
+        codeModeAgentsState.expanded.delete(node.arc_id);
+    };
+
+    head.addEventListener('click', () => {
+        if (transcript.classList.contains('hidden')) expand();
+        else collapse();
+    });
+
+    // Restore prior expansion across a live re-render so the poll doesn't
+    // collapse an open transcript out from under the user.
+    if (previouslyExpanded && previouslyExpanded.has(node.arc_id)) {
+        expand();
+    }
+
+    return wrap;
 }
 
 // Build a titled section; `fill(contentEl)` populates its body. Optional
@@ -2034,6 +2258,10 @@ async function handleSwitchArc(arcId) {
     // whether the arc is actually changing.
     returnToChatIfOnSubView();
     if (arcId === activeArcId) return;
+
+    // The Code-Mode Agents poll is bound to the previous arc — stop it before
+    // the active arc changes; the panel refresh below restarts it if needed.
+    stopCodeModeAgentsPolling();
 
     try {
         const entries = await invoke('switch_arc', { arcId });
@@ -4143,13 +4371,23 @@ function buildToolCardBlock(meta) {
 
         const wrapper = document.createElement('div');
         wrapper.className = 'tool-card-block delegate-block';
+        wrapper.appendChild(card);
 
+        // ── Final message of the sub-agent (when finished). The text is
+        // already in the tool result's `content` — no fetch needed. Skip
+        // placeholders the executor emits when the specialist returned no
+        // usable text.
+        const finalBlock = buildDelegateFinalMessage(result);
+        if (finalBlock) wrapper.appendChild(finalBlock);
+
+        // ── Tools the sub-agent used, in order, collapsed by default.
+        // Lazily fetched on first expand, each card rendered collapsed.
         const details = document.createElement('details');
         details.className = 'sub-agent-steps';
 
         const summary = document.createElement('summary');
         summary.className = 'sub-agent-steps-summary';
-        summary.textContent = '⤷ specialist steps';
+        summary.textContent = 'Tools used';
         details.appendChild(summary);
 
         const body = document.createElement('div');
@@ -4163,13 +4401,15 @@ function buildToolCardBlock(meta) {
             loaded = true;
             try {
                 const entries = await invoke('get_arc_entries', { arcId: subArcId });
-                renderSubAgentSteps(body, entries || []);
+                const subEntries = entries || [];
+                renderSubAgentSteps(body, subEntries);
+                const n = subEntries.filter(e => e.entry_type === 'tool_call').length;
+                summary.textContent = `Tools used (${n})`;
             } catch (e) {
                 body.textContent = `Could not load specialist steps: ${e}`;
             }
         });
 
-        wrapper.appendChild(card);
         wrapper.appendChild(details);
         return wrapper;
     }
@@ -4202,6 +4442,47 @@ function buildToolCardBlock(meta) {
     if (revertRow) bodyWrap.appendChild(revertRow);
     details.appendChild(bodyWrap);
     return details;
+}
+
+// Placeholder strings the executor emits when a specialist returned no
+// usable text — never worth surfacing as a "final message".
+const DELEGATE_PLACEHOLDER_CONTENT = new Set([
+    '(specialist returned no text)',
+    '(specialist task failed without a response)',
+]);
+
+// Build the "Final message" block for an expanded delegate_to_agent card.
+// `result` is the tool result object (meta.result). Reads `content`
+// (already present — no fetch) and renders it as sanitized markdown. When
+// the delegation was not verified, surfaces the verification note as a
+// muted warning. Returns null when there is no usable final message.
+function buildDelegateFinalMessage(result) {
+    if (!result || typeof result !== 'object') return null;
+    const content = typeof result.content === 'string' ? result.content.trim() : '';
+    if (!content || DELEGATE_PLACEHOLDER_CONTENT.has(content)) return null;
+
+    const block = document.createElement('div');
+    block.className = 'delegate-final-message';
+
+    const label = document.createElement('div');
+    label.className = 'delegate-final-label';
+    label.textContent = 'Final message';
+    block.appendChild(label);
+
+    if (result.verified === false && typeof result.verification_note === 'string'
+        && result.verification_note.trim()) {
+        const warn = document.createElement('div');
+        warn.className = 'delegate-final-warning';
+        warn.textContent = '⚠ ' + result.verification_note.trim();
+        block.appendChild(warn);
+    }
+
+    const bubble = document.createElement('div');
+    bubble.className = 'delegate-final-body message-bubble';
+    bubble.innerHTML = renderMarkdown(sanitizeWebContent(content));
+    block.appendChild(bubble);
+
+    return block;
 }
 
 // Build a Revert action row when this tool-call has an associated snapshot.
@@ -5767,6 +6048,115 @@ function renderSubAgentSteps(container, entries) {
 
         container.appendChild(row);
     }
+}
+
+// Render a list of arc entries as a transcript INTO an arbitrary container
+// (NOT the global #messages). Mirrors the main chat's buildRenderUnits +
+// per-unit rendering — message bubbles via renderMarkdown(sanitizeWebContent)
+// and grouped tool_call cards (collapsed) via buildToolCardBlock — but stays
+// container-scoped so it can never regress the main chat's renderEntries path.
+// Used by the Code-Mode Agents panel to render a sub-agent's full transcript.
+function renderTranscriptInto(entries, container) {
+    container.innerHTML = '';
+    const units = buildRenderUnits(entries || []);
+    if (units.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'agent-transcript-empty code-mode-muted';
+        empty.textContent = '(no activity yet)';
+        container.appendChild(empty);
+        return;
+    }
+    for (const unit of units) {
+        if (unit.kind === 'tool_group') {
+            container.appendChild(buildTranscriptToolGroup(unit.entries));
+        } else {
+            const node = buildTranscriptEntry(unit.entry);
+            if (node) container.appendChild(node);
+        }
+    }
+}
+
+// Container-scoped tool group for renderTranscriptInto: a collapsed <details>
+// strip with one buildToolCardBlock per invocation. Mirrors renderToolGroup
+// but returns a node instead of appending to messagesEl.
+function buildTranscriptToolGroup(toolCalls) {
+    const details = document.createElement('details');
+    details.className = 'tool-group-history agent-transcript-tools';
+
+    const summary = document.createElement('summary');
+    summary.className = 'tool-group-summary';
+
+    const icons = document.createElement('span');
+    icons.className = 'tool-group-icons';
+    for (const tc of toolCalls) {
+        const meta = parseEntryMetadata(tc.metadata) || {};
+        const toolName = meta.tool || tc.content || '';
+        const icon = builtinToolIcon(toolName);
+        const slot = document.createElement('span');
+        slot.className = 'tool-group-icon-slot';
+        slot.title = toolName;
+        if (icon) {
+            slot.innerHTML = icon;
+        } else {
+            slot.textContent = toolName.slice(0, 2);
+            slot.classList.add('fallback');
+        }
+        if ((meta.status || 'Completed') === 'Failed') slot.classList.add('failed');
+        icons.appendChild(slot);
+    }
+    summary.appendChild(icons);
+
+    const count = document.createElement('span');
+    count.className = 'tool-group-count';
+    count.textContent = `${toolCalls.length} tool${toolCalls.length === 1 ? '' : 's'}`;
+    summary.appendChild(count);
+
+    details.appendChild(summary);
+
+    const body = document.createElement('div');
+    body.className = 'tool-group-body tool-steps-container';
+    for (const tc of toolCalls) {
+        const meta = parseEntryMetadata(tc.metadata) || {};
+        body.appendChild(buildToolCardBlock(meta));
+    }
+    details.appendChild(body);
+    return details;
+}
+
+// Container-scoped single non-tool entry for renderTranscriptInto. Renders
+// user/assistant message entries as bubbles (markdown for assistant, plain
+// text for user); other entry types fall through to a compact note. Returns
+// null for entries with nothing to show.
+function buildTranscriptEntry(entry) {
+    if (!entry) return null;
+    if (entry.entry_type === 'message') {
+        const role = entry.source === 'user' ? 'user' : 'assistant';
+        const row = document.createElement('div');
+        row.className = `agent-transcript-msg message-row ${role}`;
+
+        const bubble = document.createElement('div');
+        bubble.className = 'message-bubble';
+        const content = typeof entry.content === 'string' ? entry.content : '';
+        if (role === 'user') {
+            bubble.textContent = content;
+        } else {
+            bubble.innerHTML = renderMarkdown(sanitizeWebContent(content));
+        }
+        row.appendChild(bubble);
+        return row;
+    }
+    if (entry.entry_type === 'summary') {
+        const note = document.createElement('div');
+        note.className = 'agent-transcript-note code-mode-muted';
+        note.textContent = '↻ ' + (typeof entry.content === 'string' ? entry.content : '(summary)');
+        return note;
+    }
+    // Other entry types (email_event, etc.) are not expected in a sub-arc
+    // transcript; show a minimal text note rather than nothing.
+    const note = document.createElement('div');
+    note.className = 'agent-transcript-note code-mode-muted';
+    note.textContent = typeof entry.content === 'string' ? entry.content : '';
+    return note.textContent ? note : null;
 }
 
 // Render a single non-tool-call history entry. tool_call entries should be

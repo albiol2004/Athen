@@ -4,6 +4,7 @@
 // lives in events.ts because EventSource is platform-specific.
 
 import type {
+  AgentNode,
   ArcEntry,
   ArcMeta,
   DeepResearchDepth,
@@ -181,6 +182,15 @@ export class AthenClient {
    */
   codeModeDiscard(arcId: string, path: string | null): Promise<GitRepoState> {
     return this.req(`/arcs/${encodeURIComponent(arcId)}/code-mode/discard`, { path });
+  }
+  /**
+   * Code-Mode agent tree (docs/CODE_MODE.md §14, Part 2). The arc itself
+   * (widened to its Project siblings) plus delegation sub-arcs, merged live
+   * with the active-agent registry (`running` / `current_tool` / `step_count`).
+   * Children are matched to parents via `parent_arc_id`.
+   */
+  codeModeAgents(arcId: string): Promise<AgentNode[]> {
+    return this.req(`/arcs/${encodeURIComponent(arcId)}/code-mode/agents`);
   }
 
   // ---- approvals & grants ----

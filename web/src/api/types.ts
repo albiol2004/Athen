@@ -226,6 +226,24 @@ export interface CommitInfo {
 }
 
 /**
+ * One node in a Code-Mode arc's agent tree — `GET /api/arcs/{id}/code-mode/agents`
+ * (`AgentNode`, snake_case verbatim — see athen-app/src/commands.rs). The main
+ * arc(s) plus their delegation sub-arcs; `running` + `current_tool` + `step_count`
+ * are merged live from the active-agent registry.
+ */
+export interface AgentNode {
+  arc_id: string;
+  parent_arc_id: string | null;
+  title: string;
+  source: string;
+  is_main: boolean;
+  running: boolean;
+  started_at: string | null;
+  step_count: number;
+  current_tool: string | null;
+}
+
+/**
  * `GET /api/arcs/{id}/code-mode/git` response (`GitRepoState`, snake_case
  * verbatim — see athen-app/src/code_mode.rs). Read-only recognition of the
  * real repo the Code-Mode arc is rooted in.

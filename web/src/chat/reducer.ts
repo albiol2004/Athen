@@ -70,7 +70,7 @@ function sealOpen(items: ChatItem[]): ChatItem[] {
   return out;
 }
 
-function fromEntries(entries: ArcEntry[], startId: number): { items: ChatItem[]; nextId: number } {
+export function fromEntries(entries: ArcEntry[], startId: number): { items: ChatItem[]; nextId: number } {
   const items: ChatItem[] = [];
   let id = startId;
   for (const e of entries) {

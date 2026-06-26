@@ -1038,3 +1038,45 @@ button { font: inherit; }
 .cm-commit-subject {
   color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+
+/* Agents section (docs/CODE_MODE.md §14, Part 2) — agent tree + per-row
+   transcript. Children are indented under their parent. */
+.cm-agent { display: flex; flex-direction: column; }
+.cm-agent.child { margin-left: 14px; border-left: 2px solid var(--coral-soft); padding-left: 8px; }
+.cm-agent-head {
+  display: flex; align-items: center; gap: 7px; width: 100%;
+  background: rgba(255, 255, 255, 0.03); border: 1px solid var(--glass-border);
+  border-radius: 9px; padding: 6px 9px; cursor: pointer; text-align: left;
+  color: var(--text); font: inherit;
+}
+.cm-agent-head:hover { background: rgba(255, 255, 255, 0.05); }
+.cm-chev { flex: none; font-size: 13px; color: var(--text-dim); transition: transform 0.12s; }
+.cm-chev.open { transform: rotate(90deg); }
+.cm-agent-title { flex: 1; min-width: 0; font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cm-agent-badge {
+  flex: none; font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px;
+  font-weight: 600; padding: 1px 6px; border-radius: 6px;
+}
+.cm-agent-badge.running { color: var(--coral); background: var(--coral-soft); text-transform: none; letter-spacing: 0; }
+.cm-agent-badge.done { color: var(--text-dim); background: rgba(255, 255, 255, 0.06); }
+.cm-agent-transcript {
+  margin: 5px 0 3px; padding: 8px 10px;
+  background: rgba(0, 0, 0, 0.18); border: 1px solid var(--glass-border); border-radius: 9px;
+  max-height: 360px; overflow: auto;
+}
+
+/* Read-only transcript (sub-arc playback) reuses the chat message rendering. */
+.transcript { display: flex; flex-direction: column; gap: 10px; }
+.transcript-empty { color: var(--text-dim); font-size: 12px; padding: 8px 0; text-align: center; }
+
+/* Delegation card expansion (docs/CODE_MODE.md §14, Part 1). */
+.tc-delegation { display: flex; flex-direction: column; gap: 8px; }
+.tc-final { display: flex; flex-direction: column; gap: 3px; }
+.tc-final-body { font-size: 13px; }
+.tc-verify-warning {
+  font-size: 12px; color: var(--amber);
+  background: rgba(214, 165, 90, 0.1); border: 1px solid rgba(214, 165, 90, 0.25);
+  border-radius: 8px; padding: 6px 9px;
+}
+.tc-tools-used { display: flex; flex-direction: column; gap: 5px; }
+.tc-tools-used .tc-sub-btn { display: inline-flex; align-items: center; gap: 5px; }

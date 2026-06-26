@@ -2335,7 +2335,12 @@ mod tests {
             .await
             .unwrap();
         store
-            .create_arc_with_parent("other_child", "Other Child", ArcSource::System, "other_parent")
+            .create_arc_with_parent(
+                "other_child",
+                "Other Child",
+                ArcSource::System,
+                "other_parent",
+            )
             .await
             .unwrap();
 

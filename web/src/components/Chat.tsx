@@ -1,4 +1,4 @@
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { AthenClient } from '../api/client';
 import type {
   ApprovalChoice,
@@ -8,11 +8,9 @@ import type {
   PendingApproval,
 } from '../api/types';
 import type { ChatItem } from '../chat/reducer';
-import { GrantCard, QuestionCard, TaskCard, ThinkingBlock } from './cards';
 import { DeepResearchButton } from './DeepResearch';
-import { Markdown } from './Markdown';
+import { MessageList } from './MessageList';
 import { PlanCard, type PlanState } from './PlanGoal';
-import { ToolCard, ToolGroup } from './toolcards';
 
 export interface OutgoingImage {
   mime_type: string;
@@ -38,72 +36,6 @@ export interface ChatCallbacks {
   /** Open the Deep Research launcher, seeded with the current composer text. */
   onDeepResearch: (question: string) => void;
 }
-
-type ToolItem = Extract<ChatItem, { kind: 'tool' }>;
-type RenderUnit = { kind: 'group'; key: string; tools: ToolItem[] } | { kind: 'item'; item: ChatItem };
-
-/** Consecutive tool items collapse into one group (desktop rule). */
-function toRenderUnits(items: ChatItem[]): RenderUnit[] {
-  const units: RenderUnit[] = [];
-  let buf: ToolItem[] = [];
-  const flush = () => {
-    if (buf.length === 1) units.push({ kind: 'item', item: buf[0] });
-    else if (buf.length > 1) units.push({ kind: 'group', key: buf[0].key, tools: buf });
-    buf = [];
-  };
-  for (const it of items) {
-    if (it.kind === 'tool') buf.push(it);
-    else {
-      flush();
-      units.push({ kind: 'item', item: it });
-    }
-  }
-  flush();
-  return units;
-}
-
-// memo'd: finished items keep their object identity across renders (the
-// reducer's immutable index-replace only swaps the one live item), and
-// `cb` + `client` are stabilized by Shell, so only the streaming item
-// re-renders per delta. Sealed bubbles / completed tools skip entirely.
-const Item = memo(function Item({ it, cb, client }: { it: ChatItem; cb: ChatCallbacks; client: AthenClient }) {
-  switch (it.kind) {
-    case 'msg': {
-      // No-provider recovery: the backend formats the "all providers
-      // exhausted" failure into a friendly message containing this phrase.
-      // Detect it (in agent or system bubbles) and offer a CTA to setup so
-      // the user isn't stranded on a cryptic error with no recourse.
-      const noProvider = /no ai provider is set up/i.test(it.content);
-      if (noProvider) {
-        return (
-          <div className={`msg ${it.role === 'system' ? 'system' : 'agent'} no-provider`}>
-            <div>{it.content}</div>
-            <button className="no-provider-cta" onClick={() => cb.onOpenSettings('models')}>
-              Open Settings → Connections
-            </button>
-          </div>
-        );
-      }
-      if (it.role === 'system') return <div className="msg system">{it.content}</div>;
-      if (it.role === 'user') return <div className="msg user">{it.content}</div>;
-      return (
-        <div className={`msg agent${it.streaming ? ' streaming' : ''}`}>
-          {it.streaming ? it.content : <Markdown text={it.content} />}
-        </div>
-      );
-    }
-    case 'thinking':
-      return <ThinkingBlock content={it.content} done={it.done} />;
-    case 'tool':
-      return <ToolCard it={it} client={client} />;
-    case 'question':
-      return <QuestionCard q={it.q} resolved={it.resolved} onAnswer={(c) => cb.onAnswerQuestion(it.q, c)} />;
-    case 'task':
-      return <TaskCard t={it.t} resolved={it.resolved} onDecide={(a) => cb.onDecideTask(it.t, a)} />;
-    case 'grant':
-      return <GrantCard g={it.g} resolved={it.resolved} onDecide={(d, l) => cb.onDecideGrant(it.g, d, l)} />;
-  }
-});
 
 const IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
 
@@ -193,11 +125,6 @@ export function Chat({
     inputRef.current?.focus();
   };
 
-  // Recompute render units only when the timeline actually changes. The
-  // unit arrays (and their grouped tool slices) then keep their reference
-  // identity across streaming renders, so memo'd children below stay put.
-  const units = useMemo(() => toRenderUnits(items), [items]);
-
   return (
     <div className="chat">
       <div className="chat-scroll" ref={scrollRef} onScroll={onScroll}>
@@ -210,13 +137,8 @@ export function Chat({
               <p>Athen is watching its senses and ready for direct tasks.</p>
             </div>
           )}
-          {units.map((u) =>
-            u.kind === 'group' ? (
-              <ToolGroup key={`g-${u.key}`} items={u.tools} client={client} />
-            ) : (
-              <Item key={u.item.id} it={u.item} cb={cb} client={client} />
-            ),
-          )}
+          {/* cb (ChatCallbacks) is a structural superset of MessageListCallbacks. */}
+          <MessageList items={items} cb={cb} client={client} />
           {plan && (plan.status ?? 'Drafting') === 'Drafting' && (
             <PlanCard plan={plan} onApprove={cb.onApprovePlan} onDiscard={cb.onDiscardPlan} />
           )}

@@ -5,11 +5,12 @@
 // rendered as plain text children — React escapes them; we never use
 // dangerouslySetInnerHTML on any git output.
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { AthenClient } from '../api/client';
-import type { GitRepoState } from '../api/types';
+import type { AgentNode, ArcEntry, GitRepoState } from '../api/types';
 import { ConfirmDialog } from './ConfirmDialog';
 import { errMessage, useToast } from './Toast';
+import { Transcript } from './Transcript';
 
 const SHORT_HASH = 8;
 
@@ -206,6 +207,8 @@ export function CodeModePanel({
             )}
           </>
         )}
+
+        <CmAgents client={client} arcId={arcId} />
       </div>
 
       {discarding &&
@@ -251,5 +254,152 @@ function CmSection({
       </div>
       <div className="cm-section-body">{children}</div>
     </div>
+  );
+}
+
+const AGENTS_POLL_MS = 2500;
+
+// Order nodes so each main node is immediately followed by its children
+// (matched on `parent_arc_id`). The backend already returns this order, but we
+// re-derive it client-side so the indentation is robust to ordering changes.
+function groupAgents(nodes: AgentNode[]): { node: AgentNode; isChild: boolean }[] {
+  const byParent = new Map<string, AgentNode[]>();
+  for (const n of nodes) {
+    if (n.parent_arc_id) {
+      const arr = byParent.get(n.parent_arc_id) ?? [];
+      arr.push(n);
+      byParent.set(n.parent_arc_id, arr);
+    }
+  }
+  const out: { node: AgentNode; isChild: boolean }[] = [];
+  for (const n of nodes) {
+    if (n.parent_arc_id) continue; // children are emitted under their parent
+    out.push({ node: n, isChild: false });
+    for (const child of byParent.get(n.arc_id) ?? []) {
+      out.push({ node: child, isChild: true });
+    }
+  }
+  // Any child whose parent isn't in the list (defensive) — append at root.
+  for (const n of nodes) {
+    if (n.parent_arc_id && !out.some((o) => o.node.arc_id === n.arc_id)) {
+      out.push({ node: n, isChild: false });
+    }
+  }
+  return out;
+}
+
+/**
+ * Agents section (docs/CODE_MODE.md §14, Part 2). Lists the Code-Mode arc's
+ * agent tree (main nodes + delegation sub-arcs, indented). Each row expands to
+ * the agent's full transcript, rendered by the SAME renderer as the main chat
+ * (`<Transcript>` → `<MessageList>`). While any node is running, polls the
+ * tree + the expanded-running agent's entries every ~2.5s; the interval is
+ * cleared on unmount / arc change (`arcId` dep).
+ */
+function CmAgents({ client, arcId }: { client: AthenClient; arcId: string }) {
+  const [nodes, setNodes] = useState<AgentNode[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const [entries, setEntries] = useState<ArcEntry[] | null>(null);
+  // Latest expanded id, so the polling closure reads it without re-subscribing.
+  const expandedRef = useRef<string | null>(null);
+  expandedRef.current = expanded;
+
+  const loadAgents = useCallback(async () => {
+    try {
+      const list = await client.codeModeAgents(arcId);
+      setNodes(list);
+      setError(null);
+      return list;
+    } catch (e) {
+      setError((e as Error).message);
+      return null;
+    }
+  }, [client, arcId]);
+
+  const loadEntries = useCallback(
+    async (id: string) => {
+      try {
+        setEntries(await client.arcEntries(id));
+      } catch {
+        setEntries([]);
+      }
+    },
+    [client],
+  );
+
+  // Initial load + reset when the panel's arc changes.
+  useEffect(() => {
+    setNodes(null);
+    setExpanded(null);
+    setEntries(null);
+    void loadAgents();
+  }, [loadAgents]);
+
+  // Poll while anything is running. Re-fetches the tree and, if the expanded
+  // agent is itself running, its growing transcript. Cleared on unmount /
+  // arc change (loadAgents / loadEntries are keyed to arcId).
+  const anyRunning = (nodes ?? []).some((n) => n.running);
+  useEffect(() => {
+    if (!anyRunning) return;
+    const t = setInterval(() => {
+      void (async () => {
+        const list = await loadAgents();
+        const id = expandedRef.current;
+        if (id && list?.some((n) => n.arc_id === id && n.running)) {
+          await loadEntries(id);
+        }
+      })();
+    }, AGENTS_POLL_MS);
+    return () => clearInterval(t);
+  }, [anyRunning, loadAgents, loadEntries]);
+
+  const toggle = (id: string) => {
+    if (expanded === id) {
+      setExpanded(null);
+      setEntries(null);
+    } else {
+      setExpanded(id);
+      setEntries(null);
+      void loadEntries(id);
+    }
+  };
+
+  const rows = nodes ? groupAgents(nodes) : [];
+
+  return (
+    <CmSection title="Agents">
+      {error && <div className="drawer-error">{error}</div>}
+      {nodes === null && !error && <div className="drawer-empty">Loading…</div>}
+      {nodes !== null && rows.length === 0 && <div className="drawer-empty">No agents.</div>}
+      {rows.map(({ node, isChild }) => (
+        <div className={`cm-agent${isChild ? ' child' : ''}`} key={node.arc_id}>
+          <button className="cm-agent-head" onClick={() => toggle(node.arc_id)}>
+            <span className={`cm-chev${expanded === node.arc_id ? ' open' : ''}`}>›</span>
+            <span className="cm-agent-title" title={node.title}>
+              {node.title}
+            </span>
+            {node.running ? (
+              <span className="cm-agent-badge running">
+                running
+                {node.current_tool ? ` · ${node.current_tool}` : ''}
+                {node.step_count > 0 ? ` · ${node.step_count} step${node.step_count === 1 ? '' : 's'}` : ''}
+              </span>
+            ) : (
+              <span className="cm-agent-badge done">finished</span>
+            )}
+          </button>
+          {expanded === node.arc_id && (
+            <div className="cm-agent-transcript">
+              {entries === null ? (
+                <div className="transcript-empty">Loading…</div>
+              ) : (
+                <Transcript client={client} entries={entries} />
+              )}
+            </div>
+          )}
+        </div>
+      ))}
+    </CmSection>
   );
 }

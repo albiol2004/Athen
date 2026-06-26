@@ -1,12 +1,14 @@
 # Code Mode
 
-> **Status:** BUILDS 1 + 2 SHIPPED (2026-06-25/26, `feat/code-mode`). Code is
+> **Status:** BUILDS 1 + 2 + 3 SHIPPED (2026-06-25/26, `feat/code-mode`). Code is
 > authoritative. Live: per-arc flag + root, per-arc cwd/fs-base + sandbox
 > widening, git recognition layer + command/route, `[CODE MODE]` prompt block,
 > desktop+web toggle + Code-Mode panel. §6 undo resolved to **option (b)** — the
 > shadow checkpoint store stays active for per-action undo, plus a GitLens-style
-> discard. The only deferred items are the §10 "Build 3" list (live sub-agent
-> transcript streaming, generalized progress events, worktree auto-suggest).
+> discard. §14 sub-agent transcripts: delegation card final message + ordered
+> tools (both modes) + an arc/project agents panel with per-agent expandable
+> transcript, polled live. Deferred (§10 "Build 4"): true delta-push progress
+> events + worktree auto-suggest.
 
 ## 1. What Code Mode is (and is not)
 
@@ -273,10 +275,10 @@ unchanged); the old D5 skip was reverted (`resolve_code_mode_for_arc` now return
 only the repo root). GitLens-style **discard** (§6): per-file + discard-all,
 `git restore`/`clean`, path-fenced, confirm-gated, desktop + web parity.
 
-**Build 3 (IN FLIGHT):** sub-agent transcript surfacing — see §14. Part 1
+**Build 3 (SHIPPED):** sub-agent transcript surfacing — see §14. Part 1
 (delegation tool card: ordered tools-used collapsed + final message) lands in
 **both** modes; Part 2 (arc/project-wide live agents panel with per-agent
-expandable transcript) is Code-Mode-only.
+expandable transcript, polled while running) is Code-Mode-only.
 
 **Build 4 (future):** a generalized `code-mode-progress` delta-streaming event
 superset (true push instead of poll) · auto-suggesting a worktree when the agent

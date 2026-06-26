@@ -9922,6 +9922,136 @@ option:hover {
     box-shadow: var(--ring-focus);
 }
 
+/* ─── Delegation card: final message (Build 3, Part 1) ─── */
+.delegate-final-message {
+    margin-left: 22px;
+    border-left: 2px solid var(--border);
+    padding: 6px 0 4px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+}
+.delegate-final-label {
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--text-3);
+}
+.delegate-final-warning {
+    font-size: 11.5px;
+    color: var(--brand-warm);
+    line-height: 1.4;
+}
+.delegate-final-body {
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--text-1);
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
+    padding: 8px 10px;
+    max-width: 100%;
+}
+
+/* ─── Code-Mode Agents section + live transcript (Build 3, Part 2) ─── */
+.code-mode-agent {
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
+    overflow: hidden;
+}
+.code-mode-agent-child {
+    background: transparent;
+    border-left: 2px solid var(--border);
+    border-top: none;
+    border-right: none;
+    border-bottom: none;
+    border-radius: 0;
+}
+.code-mode-agent-head {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    width: 100%;
+    padding: 7px 9px;
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    text-align: left;
+    color: var(--text-1);
+}
+.code-mode-agent-head:hover { background: var(--surface-2); }
+.code-mode-agent-caret {
+    flex: 0 0 auto;
+    font-size: 9px;
+    color: var(--text-3);
+    width: 10px;
+}
+.code-mode-agent-title {
+    flex: 1 1 auto;
+    font-size: 12.5px;
+    font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.code-mode-agent-badge {
+    flex: 0 0 auto;
+    font-size: 9.5px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    padding: 1px 7px;
+    border-radius: 999px;
+}
+.code-mode-agent-badge.running {
+    color: var(--brand-warm);
+    background: rgba(185, 81, 99, 0.12);
+}
+.code-mode-agent-badge.finished {
+    color: var(--text-3);
+    background: var(--surface-2);
+}
+.code-mode-agent-detail {
+    padding: 0 9px 6px 26px;
+    font-size: 11px;
+    color: var(--text-3);
+    font-family: var(--font-mono, ui-monospace, monospace);
+}
+.code-mode-agent-transcript {
+    padding: 6px 9px 9px 9px;
+    border-top: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.code-mode-agent-transcript.hidden { display: none; }
+.agent-transcript-msg {
+    display: block;
+    margin: 0;
+}
+.agent-transcript-msg .message-bubble {
+    font-size: 12.5px;
+    line-height: 1.5;
+    padding: 7px 10px;
+    border-radius: var(--r-md);
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    max-width: 100%;
+}
+.agent-transcript-msg.user .message-bubble {
+    background: rgba(185, 81, 99, 0.10);
+}
+.agent-transcript-note {
+    font-size: 11.5px;
+    padding: 2px 0;
+}
+.agent-transcript-empty {
+    font-size: 12px;
+    padding: 2px 0;
+}
+
 /* ─── Light theme element overrides ───
    Things that can't be fixed by variable swaps alone. */
 

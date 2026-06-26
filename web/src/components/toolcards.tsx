@@ -5,8 +5,16 @@
 import { memo, useState } from 'react';
 import type { AthenClient } from '../api/client';
 import type { ChatItem } from '../chat/reducer';
+import { Markdown } from './Markdown';
 
 type ToolItem = Extract<ChatItem, { kind: 'tool' }>;
+
+// Placeholder strings the backend persists when a sub-agent produced no
+// usable text — never worth rendering as a "final message".
+const FINAL_PLACEHOLDERS = new Set([
+  '(specialist returned no text)',
+  '(specialist task failed without a response)',
+]);
 
 function asRecord(v: unknown): Record<string, unknown> | null {
   return v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
@@ -97,15 +105,31 @@ function ToolBody({ it, client }: { it: ToolItem; client: AthenClient }) {
   );
 }
 
-/** "Show sub-agent steps" — loads the sub-arc's tool_call entries. */
+/**
+ * Delegation expansion (docs/CODE_MODE.md §14, Part 1 — both normal + Code
+ * mode). Shows the sub-agent's FINAL message (read straight from the tool
+ * result `content` — no fetch) plus, collapsed by default, the ordered list of
+ * tools the sub-agent used (lazy-loaded from the sub-arc's `tool_call` entries).
+ */
 function DelegationSteps({ it, client }: { it: ToolItem; client: AthenClient }) {
   const [steps, setSteps] = useState<ToolItem[] | null>(null);
   const [loading, setLoading] = useState(false);
+  const [toolsOpen, setToolsOpen] = useState(false);
   const result = asRecord(it.result);
   const subArcId = str(result?.sub_arc_id) ?? str(result?.arc_id);
-  if (!subArcId) return null;
+
+  // Final message comes from the tool result `content` — already present, no
+  // fetch. Skip empty / placeholder text (the backend's "no text" sentinels).
+  const content = (str(result?.content) ?? '').trim();
+  const hasFinal = content.length > 0 && !FINAL_PLACEHOLDERS.has(content);
+  const verified = result?.verified;
+  const verifyNote = str(result?.verification_note);
+  const showVerifyWarning = verified === false && Boolean(verifyNote);
+
+  if (!subArcId && !hasFinal && !showVerifyWarning) return null;
 
   const load = async () => {
+    if (!subArcId) return;
     setLoading(true);
     try {
       const entries = await client.arcEntries(subArcId);
@@ -145,20 +169,50 @@ function DelegationSteps({ it, client }: { it: ToolItem; client: AthenClient }) 
     }
   };
 
-  if (steps) {
-    return (
-      <div className="tc-substeps">
-        {steps.length === 0 && <div className="tc-section-label">No recorded sub-agent steps.</div>}
-        {steps.map((s) => (
-          <ToolCard key={s.key} it={s} client={client} />
-        ))}
-      </div>
-    );
-  }
+  const toggleTools = () => {
+    const next = !toolsOpen;
+    setToolsOpen(next);
+    if (next && steps === null && !loading) void load();
+  };
+
   return (
-    <button className="tc-sub-btn" disabled={loading} onClick={() => void load()}>
-      {loading ? 'Loading…' : 'Show sub-agent steps'}
-    </button>
+    <div className="tc-delegation">
+      {hasFinal && (
+        <div className="tc-final">
+          <div className="tc-section-label">Final message</div>
+          <div className="tc-final-body">
+            <Markdown text={content} />
+          </div>
+        </div>
+      )}
+      {showVerifyWarning && (
+        <div className="tc-verify-warning" title="Sub-agent output failed verification">
+          {verifyNote}
+        </div>
+      )}
+      {subArcId && (
+        <div className="tc-tools-used">
+          <button className="tc-sub-btn" onClick={toggleTools}>
+            {loading
+              ? 'Loading…'
+              : steps
+                ? `Tools used (${steps.length})`
+                : 'Tools used'}
+            <span className={`tc-chev${toolsOpen ? ' open' : ''}`}>›</span>
+          </button>
+          {toolsOpen && steps && (
+            <div className="tc-substeps">
+              {steps.length === 0 && (
+                <div className="tc-section-label">No recorded sub-agent steps.</div>
+              )}
+              {steps.map((s) => (
+                <ToolCard key={s.key} it={s} client={client} />
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
   );
 }
 
