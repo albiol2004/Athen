@@ -17,6 +17,8 @@ import type {
   NotificationInfo,
   Project,
   ProjectFileInfo,
+  RemoteAccessInfo,
+  RemoteAccessStatus,
   SendResult,
   SummaryMode,
 } from './types';
@@ -26,6 +28,14 @@ export interface ClientConfig {
   baseUrl: string;
   /** Contents of `<data_dir>/http_token` / `ATHEN_HTTP_TOKEN`. */
   token: string;
+  /**
+   * HTTP Basic username (docs/REMOTE_ACCESS.md §4). When BOTH `username`
+   * and `password` are set the client authenticates with
+   * `Authorization: Basic …` instead of the bearer token.
+   */
+  username?: string;
+  /** HTTP Basic password — paired with `username`. */
+  password?: string;
 }
 
 export class ApiError extends Error {
@@ -44,8 +54,29 @@ export class AthenClient {
     return this.cfg.baseUrl;
   }
 
-  /** SSE endpoint with the token as a query param (EventSource can't set headers). */
+  /** True when user+password (HTTP Basic) credentials are configured. */
+  private get useBasic(): boolean {
+    return Boolean(this.cfg.username && this.cfg.password);
+  }
+
+  /**
+   * The `Authorization` header value for every request. Basic when
+   * user+password are set (docs/REMOTE_ACCESS.md §3/§4), else the existing
+   * bearer token.
+   */
+  private authHeader(): string {
+    if (this.useBasic) {
+      return `Basic ${btoa(`${this.cfg.username}:${this.cfg.password}`)}`;
+    }
+    return `Bearer ${this.cfg.token}`;
+  }
+
+  /** SSE endpoint credential as a query param (EventSource can't set headers). */
   eventsUrl(): string {
+    if (this.useBasic) {
+      const auth = encodeURIComponent(btoa(`${this.cfg.username}:${this.cfg.password}`));
+      return `${this.cfg.baseUrl}/api/events?auth=${auth}`;
+    }
     return `${this.cfg.baseUrl}/api/events?token=${encodeURIComponent(this.cfg.token)}`;
   }
 
@@ -55,7 +86,7 @@ export class AthenClient {
       resp = await fetch(`${this.cfg.baseUrl}/api${path}`, {
         method: method ?? (body === undefined ? 'GET' : 'POST'),
         headers: {
-          Authorization: `Bearer ${this.cfg.token}`,
+          Authorization: this.authHeader(),
           ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
         },
         body: body !== undefined ? JSON.stringify(body) : undefined,
@@ -266,5 +297,28 @@ export class AthenClient {
   }
   markNotificationRead(id: string): Promise<{ ok: boolean }> {
     return this.req(`/notifications/${encodeURIComponent(id)}/read`, undefined, 'POST');
+  }
+
+  // ---- remote access (docs/REMOTE_ACCESS.md §7) ----
+  /** Current Remote Access config (never returns the stored password). */
+  getRemoteAccess(): Promise<RemoteAccessInfo> {
+    return this.req('/remote-access');
+  }
+  /**
+   * Persist Remote Access config and stop+restart the listener to apply
+   * live. Omit `password` to keep the stored one. Returns fresh status.
+   */
+  setRemoteAccess(body: {
+    enabled: boolean;
+    port: number;
+    username: string;
+    password?: string;
+    tunnel_enabled: boolean;
+  }): Promise<RemoteAccessStatus> {
+    return this.req('/remote-access', body);
+  }
+  /** Live listener / tunnel status. */
+  remoteAccessStatus(): Promise<RemoteAccessStatus> {
+    return this.req('/remote-access/status');
   }
 }

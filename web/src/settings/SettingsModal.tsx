@@ -13,8 +13,17 @@ import { PanelSecurity } from './PanelSecurity';
 import { PanelContacts } from './PanelContacts';
 import { PanelMemory } from './PanelMemory';
 import { PanelProjects } from './PanelProjects';
+import { PanelRemoteAccess } from './PanelRemoteAccess';
 
-export type TabId = 'models' | 'agents' | 'connections' | 'security' | 'contacts' | 'memory' | 'projects';
+export type TabId =
+  | 'models'
+  | 'agents'
+  | 'connections'
+  | 'security'
+  | 'contacts'
+  | 'memory'
+  | 'projects'
+  | 'remote';
 
 const stroke = { stroke: 'currentColor', strokeWidth: 1.7, strokeLinecap: 'round', strokeLinejoin: 'round', fill: 'none' } as const;
 
@@ -60,6 +69,12 @@ const ICONS: Record<TabId, JSX.Element> = {
       <path {...stroke} d="M3.5 7.5a2 2 0 0 1 2-2h3l2 2h6a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2h-11a2 2 0 0 1-2-2V7.5Z" />
     </svg>
   ),
+  remote: (
+    <svg width="15" height="15" viewBox="0 0 24 24" aria-hidden="true">
+      <circle {...stroke} cx="12" cy="12" r="2.4" />
+      <path {...stroke} d="M7.8 16.2a6 6 0 0 1 0-8.4M16.2 7.8a6 6 0 0 1 0 8.4M5 19a9.5 9.5 0 0 1 0-14M19 5a9.5 9.5 0 0 1 0 14" />
+    </svg>
+  ),
 };
 
 const TABS: { id: TabId; label: string }[] = [
@@ -70,6 +85,7 @@ const TABS: { id: TabId; label: string }[] = [
   { id: 'contacts', label: 'Contacts' },
   { id: 'memory', label: 'Memory' },
   { id: 'projects', label: 'Projects' },
+  { id: 'remote', label: 'Remote Access' },
 ];
 
 export function SettingsModal({
@@ -83,7 +99,7 @@ export function SettingsModal({
 }): JSX.Element {
   const isTabId = (t: string | undefined): t is TabId =>
     t === 'models' || t === 'agents' || t === 'connections' || t === 'security'
-    || t === 'contacts' || t === 'memory' || t === 'projects';
+    || t === 'contacts' || t === 'memory' || t === 'projects' || t === 'remote';
   const [tab, setTab] = useState<TabId>(isTabId(initialTab) ? initialTab : 'models');
 
   useEffect(() => {
@@ -149,6 +165,7 @@ export function SettingsModal({
             {tab === 'contacts' && <PanelContacts client={client} />}
             {tab === 'memory' && <PanelMemory client={client} />}
             {tab === 'projects' && <PanelProjects client={client} />}
+            {tab === 'remote' && <PanelRemoteAccess client={client} />}
           </div>
         </div>
       </div>

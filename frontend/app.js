@@ -7569,6 +7569,7 @@ function showChat() {
     document.getElementById('project-view')?.classList.add('hidden');
     document.getElementById('sidebar').style.display = '';
     if (timelineRefreshInterval) { clearInterval(timelineRefreshInterval); timelineRefreshInterval = null; }
+    if (typeof stopRemoteAccessPolling === 'function') stopRemoteAccessPolling();
     appView.style.display = 'flex';
     inputEl.focus();
 }
@@ -9296,6 +9297,235 @@ function buildProjectEditCard(project) {
     }
 })();
 
+// ─── Remote Access (Settings → Remote Access tab) ────────────────────
+// Runs Athen's web UI as a password-protected server, optionally fronted
+// by a Cloudflare quick-tunnel for a public `*.trycloudflare.com` link.
+// Backend Tauri commands: get_remote_access / set_remote_access /
+// remote_access_status. While a tunnel is coming up the status block
+// polls every 2.5s until a URL or error appears, then stops. The poll is
+// also torn down when the user leaves the Remote Access tab.
+
+const REMOTE_ACCESS_POLL_MS = 2500;
+let remoteAccessPollTimer = null;
+
+function stopRemoteAccessPolling() {
+    if (remoteAccessPollTimer) {
+        clearInterval(remoteAccessPollTimer);
+        remoteAccessPollTimer = null;
+    }
+}
+
+// Load stored config into the form, then fetch live status.
+async function loadRemoteAccess() {
+    if (!invoke) return;
+    try {
+        const cfg = (await invoke('get_remote_access')) || {};
+        const enabled = document.getElementById('ra-enabled');
+        const port = document.getElementById('ra-port');
+        const username = document.getElementById('ra-username');
+        const password = document.getElementById('ra-password');
+        const tunnel = document.getElementById('ra-tunnel');
+        if (enabled) enabled.checked = !!cfg.enabled;
+        if (port) port.value = cfg.port != null ? cfg.port : 8787;
+        if (username) username.value = cfg.username || '';
+        if (password) {
+            password.value = '';
+            password.placeholder = cfg.has_password
+                ? 'leave blank to keep current password'
+                : 'Set a password';
+        }
+        if (tunnel) tunnel.checked = !!cfg.tunnel_enabled;
+    } catch (err) {
+        console.error('Failed to load remote access config:', err);
+        showToast('Failed to load remote access: ' + errText(err), 'error');
+    }
+    await refreshRemoteAccessStatus();
+}
+
+// Fetch live status and (re)render #ra-status entirely via DOM nodes —
+// never innerHTML, since tunnel URLs / errors are untrusted strings.
+// Manages the tunnel-startup poll: arm it while we're waiting for a URL,
+// tear it down once a URL or error lands (or the pane is no longer active).
+async function refreshRemoteAccessStatus() {
+    const box = document.getElementById('ra-status');
+    if (!box || !invoke) return;
+
+    let status;
+    try {
+        status = (await invoke('remote_access_status')) || {};
+    } catch (err) {
+        box.innerHTML = '';
+        const row = document.createElement('div');
+        row.className = 'ra-status-row ra-status-error';
+        row.textContent = 'Status unavailable: ' + errText(err);
+        box.appendChild(row);
+        stopRemoteAccessPolling();
+        return;
+    }
+
+    box.innerHTML = '';
+
+    const addRow = (label, value, cls) => {
+        const row = document.createElement('div');
+        row.className = 'ra-status-row' + (cls ? ' ' + cls : '');
+        const lab = document.createElement('span');
+        lab.className = 'ra-status-label';
+        lab.textContent = label;
+        row.appendChild(lab);
+        const val = document.createElement('span');
+        val.className = 'ra-status-value';
+        val.textContent = value;
+        row.appendChild(val);
+        box.appendChild(row);
+        return row;
+    };
+
+    // Listening state + local URL.
+    addRow('Server', status.listening ? 'Listening' : 'Stopped',
+        status.listening ? 'ra-status-ok' : '');
+    if (status.local_url) {
+        addRow('Local URL', status.local_url);
+    }
+
+    // Whether a tunnel is in flight: enabled + tunnel toggle on + no URL yet
+    // + no error reported. Read the live checkboxes so this reflects the
+    // current form even before a status round-trip settles.
+    const tunnelToggle = document.getElementById('ra-tunnel');
+    const enabledToggle = document.getElementById('ra-enabled');
+    const wantTunnel = tunnelToggle ? tunnelToggle.checked : false;
+    const isEnabled = enabledToggle ? enabledToggle.checked : false;
+    const tunnelComingUp = isEnabled && wantTunnel && !status.tunnel_url && !status.last_error;
+
+    if (status.tunnel_url) {
+        const row = document.createElement('div');
+        row.className = 'ra-status-row ra-url-row';
+        const lab = document.createElement('span');
+        lab.className = 'ra-status-label';
+        lab.textContent = 'Public link';
+        row.appendChild(lab);
+
+        const link = document.createElement('a');
+        link.className = 'ra-status-value ra-url-link';
+        link.href = status.tunnel_url;           // opened via tauri-plugin-opener
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        link.textContent = status.tunnel_url;
+        row.appendChild(link);
+
+        const copyBtn = document.createElement('button');
+        copyBtn.className = 'btn-secondary ra-copy-btn';
+        copyBtn.type = 'button';
+        copyBtn.textContent = 'Copy';
+        copyBtn.addEventListener('click', async () => {
+            try {
+                await navigator.clipboard.writeText(status.tunnel_url);
+                showToast('Public link copied', 'success');
+            } catch (err) {
+                showToast('Copy failed: ' + errText(err), 'error');
+            }
+        });
+        row.appendChild(copyBtn);
+
+        const openLink = document.createElement('a');
+        openLink.className = 'btn-secondary ra-open-link';
+        openLink.href = status.tunnel_url;
+        openLink.target = '_blank';
+        openLink.rel = 'noopener noreferrer';
+        openLink.textContent = 'Open';
+        row.appendChild(openLink);
+
+        box.appendChild(row);
+    } else if (tunnelComingUp) {
+        const row = document.createElement('div');
+        row.className = 'ra-status-row ra-status-pending';
+        const spinner = document.createElement('span');
+        spinner.className = 'ra-spinner';
+        row.appendChild(spinner);
+        const txt = document.createElement('span');
+        txt.className = 'ra-status-value';
+        txt.textContent = 'Creating public link…';
+        row.appendChild(txt);
+        box.appendChild(row);
+    }
+
+    // cloudflared install state (only meaningful when a tunnel is wanted).
+    if (wantTunnel || status.tunnel_url) {
+        addRow('cloudflared',
+            status.cloudflared_installed ? 'Installed' : 'Not installed',
+            status.cloudflared_installed ? 'ra-status-ok' : '');
+    }
+
+    if (status.last_error) {
+        addRow('Last error', status.last_error, 'ra-status-error');
+    }
+
+    // Poll lifecycle: keep polling only while the tunnel is still coming up
+    // AND this pane is the active one. Otherwise tear the timer down.
+    const paneActive = !!document.querySelector(
+        '.settings-tab-pane[data-settings-pane="remote-access"].active');
+    if (tunnelComingUp && paneActive) {
+        if (!remoteAccessPollTimer) {
+            remoteAccessPollTimer = setInterval(
+                refreshRemoteAccessStatus, REMOTE_ACCESS_POLL_MS);
+        }
+    } else {
+        stopRemoteAccessPolling();
+    }
+}
+
+// One-time wiring for the Save button. The element lives in the Settings
+// DOM at boot, so a single pass is enough.
+(function wireRemoteAccessControls() {
+    const saveBtn = document.getElementById('ra-save');
+    if (!saveBtn) return;
+    saveBtn.addEventListener('click', async () => {
+        if (!invoke) return;
+        const enabledEl = document.getElementById('ra-enabled');
+        const portEl = document.getElementById('ra-port');
+        const usernameEl = document.getElementById('ra-username');
+        const passwordEl = document.getElementById('ra-password');
+        const tunnelEl = document.getElementById('ra-tunnel');
+
+        const enabled = enabledEl ? enabledEl.checked : false;
+        const port = portEl ? Number(portEl.value) : 8787;
+        const username = usernameEl ? usernameEl.value.trim() : '';
+        const password = passwordEl ? passwordEl.value : '';
+        const tunnelEnabled = tunnelEl ? tunnelEl.checked : false;
+
+        if (enabled && !username) {
+            showToast('Enter a username before enabling remote access', 'error');
+            return;
+        }
+        if (!Number.isFinite(port) || port < 1 || port > 65535) {
+            showToast('Port must be between 1 and 65535', 'error');
+            return;
+        }
+
+        // Tauri camelCases ARG keys → tunnelEnabled maps to tunnel_enabled.
+        // `password` is only sent when the user typed one (empty = keep stored).
+        const args = { enabled, port, username, tunnelEnabled };
+        if (password) args.password = password;
+
+        saveBtn.disabled = true;
+        const original = saveBtn.textContent;
+        saveBtn.textContent = 'Saving…';
+        try {
+            await invoke('set_remote_access', args);
+            showToast('Remote access settings saved', 'success');
+            if (passwordEl) {
+                passwordEl.value = '';
+                passwordEl.placeholder = 'leave blank to keep current password';
+            }
+            await refreshRemoteAccessStatus();
+        } catch (err) {
+            showToast('Save failed: ' + errText(err), 'error');
+        } finally {
+            saveBtn.disabled = false;
+            saveBtn.textContent = original;
+        }
+    });
+})();
+
 // ─── Shell toolbox ────────────────────────────────────────────────────
 
 async function loadToolboxPackages() {
@@ -10719,6 +10949,15 @@ function setSettingsTab(tabId) {
             const remembered = readSettingsSectionMap()[tabId];
             setSettingsSection(newPane, remembered);
         }
+    }
+
+    // Per-tab loader dispatch + lifecycle. The Remote Access tab refreshes
+    // live status (and may start a tunnel-startup poll) on entry; leaving it
+    // tears that poll down so it never runs in the background.
+    if (tabId === 'remote-access') {
+        if (typeof loadRemoteAccess === 'function') loadRemoteAccess();
+    } else if (typeof stopRemoteAccessPolling === 'function') {
+        stopRemoteAccessPolling();
     }
 }
 

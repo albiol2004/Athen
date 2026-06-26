@@ -890,6 +890,102 @@ header h1 {
     margin-top: 12px;
 }
 
+/* ─── Remote Access settings tab ─────────────────────────────── */
+.ra-warning {
+    margin: 4px 0 14px;
+    padding: 10px 12px;
+    border: 1px solid var(--warning);
+    background: var(--warning-soft);
+    border-radius: var(--r-sm, 10px);
+    color: var(--text);
+    font-size: 12.5px;
+    line-height: 1.5;
+}
+
+.ra-status {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 16px;
+}
+
+.ra-status:empty {
+    display: none;
+}
+
+.ra-status-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 8px 12px;
+    background: var(--surface-2, var(--surface-3));
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm, 10px);
+    font-size: 12.5px;
+}
+
+.ra-status-label {
+    min-width: 96px;
+    color: var(--text-dim, var(--text));
+    opacity: 0.8;
+    font-weight: 600;
+}
+
+.ra-status-value {
+    color: var(--text);
+    word-break: break-all;
+}
+
+.ra-status-ok .ra-status-value {
+    color: var(--success);
+}
+
+.ra-status-error {
+    border-color: var(--danger);
+    background: var(--danger-soft);
+}
+
+.ra-status-error .ra-status-value {
+    color: var(--danger);
+}
+
+.ra-url-row .ra-url-link {
+    color: var(--brand-warm);
+    flex: 1 1 auto;
+}
+
+.ra-url-row .ra-url-link:hover {
+    color: var(--brand-amber);
+}
+
+.ra-copy-btn,
+.ra-open-link {
+    flex: 0 0 auto;
+    padding: 4px 10px;
+    font-size: 12px;
+    text-decoration: none;
+}
+
+.ra-status-pending {
+    color: var(--text-dim, var(--text));
+}
+
+.ra-spinner {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    border: 2px solid var(--border-strong);
+    border-top-color: var(--brand-warm);
+    border-radius: 50%;
+    animation: ra-spin 0.8s linear infinite;
+    flex: 0 0 auto;
+}
+
+@keyframes ra-spin {
+    to { transform: rotate(360deg); }
+}
+
 .session-rename-input {
     width: 100%;
     background: var(--surface-3);

@@ -179,6 +179,18 @@
 .st-badge.red { background: rgba(224, 122, 110, 0.14); color: var(--red); }
 .st-badge.amber { background: rgba(217, 176, 108, 0.14); color: var(--amber); }
 
+/* ---- warning callout (Remote Access exposes a shell-capable agent) ---- */
+.st-warn {
+  border: 1px solid rgba(217, 176, 108, 0.4);
+  background: rgba(217, 176, 108, 0.1);
+  color: var(--amber);
+  border-radius: 8px;
+  padding: 8px 11px;
+  font-size: 12.5px;
+  line-height: 1.45;
+  margin-bottom: 10px;
+}
+
 /* ---- feedback ---- */
 .st-error { color: var(--red); font-size: 12.5px; white-space: pre-wrap; }
 .st-dim { color: var(--text-dim); font-size: 12.5px; }

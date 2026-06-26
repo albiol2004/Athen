@@ -261,6 +261,26 @@ export interface GitRepoState {
   recent_commits: CommitInfo[];
 }
 
+// ---- Remote Access (docs/REMOTE_ACCESS.md §7) ----
+
+/** `GET /api/remote-access` — config (password never returned). */
+export interface RemoteAccessInfo {
+  enabled: boolean;
+  port: number;
+  username: string;
+  tunnel_enabled: boolean;
+  has_password: boolean;
+}
+
+/** `GET /api/remote-access/status` — live listener + tunnel state. */
+export interface RemoteAccessStatus {
+  listening: boolean;
+  local_url: string | null;
+  tunnel_url: string | null;
+  cloudflared_installed: boolean;
+  last_error: string | null;
+}
+
 /** Long-poll `POST /api/messages` response (`AgentResponse` shape). */
 export interface SendResult {
   /** Final assistant text — the no-stream fallback. */

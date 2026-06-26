@@ -2,18 +2,23 @@ import { useState } from 'react';
 import { AthenClient, type ClientConfig } from '../api/client';
 
 export function Login({ onLogin }: { onLogin: (cfg: ClientConfig) => void }) {
+  const [username, setUsername] = useState('');
   const [token, setToken] = useState('');
   const [server, setServer] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
 
   const connect = async () => {
-    const cfg: ClientConfig = {
-      baseUrl: server.trim().replace(/\/+$/, ''),
-      token: token.trim(),
-    };
-    if (!cfg.token) {
-      setError('Enter the access token.');
+    const baseUrl = server.trim().replace(/\/+$/, '');
+    const user = username.trim();
+    const secret = token.trim();
+    // Non-empty username ⇒ HTTP Basic (username + password). Empty
+    // username ⇒ the existing token mode (the field holds the token).
+    const cfg: ClientConfig = user
+      ? { baseUrl, token: '', username: user, password: secret }
+      : { baseUrl, token: secret };
+    if (!secret) {
+      setError(user ? 'Enter the password.' : 'Enter the access token.');
       return;
     }
     setPending(true);
@@ -44,13 +49,23 @@ export function Login({ onLogin }: { onLogin: (cfg: ClientConfig) => void }) {
           Athen
         </div>
         <label>
-          Access token
+          Username (leave blank for token mode)
+          <input
+            type="text"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            placeholder="username"
+            autoFocus
+            autoComplete="username"
+          />
+        </label>
+        <label>
+          Password or token
           <input
             type="password"
             value={token}
             onChange={(e) => setToken(e.target.value)}
-            placeholder="paste your token"
-            autoFocus
+            placeholder="password or token"
             autoComplete="current-password"
           />
         </label>
@@ -71,8 +86,9 @@ export function Login({ onLogin }: { onLogin: (cfg: ClientConfig) => void }) {
           {pending ? 'Connecting…' : 'Connect'}
         </button>
         <p className="hint">
-          The token lives in <code>http_token</code> inside the instance's data directory (or{' '}
-          <code>ATHEN_HTTP_TOKEN</code>).
+          Sign in with the username + password set in Settings → Remote Access, or leave the
+          username blank and paste the access token from <code>http_token</code> in the instance's
+          data directory (or <code>ATHEN_HTTP_TOKEN</code>).
         </p>
       </form>
     </div>

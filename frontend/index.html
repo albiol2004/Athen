@@ -317,6 +317,7 @@
                 <button class="settings-tab" data-settings-tab="agents" role="tab" aria-selected="false">Agents &amp; Tools</button>
                 <button class="settings-tab" data-settings-tab="projects" role="tab" aria-selected="false">Projects</button>
                 <button class="settings-tab" data-settings-tab="connections" role="tab" aria-selected="false">Connections</button>
+                <button class="settings-tab" data-settings-tab="remote-access" role="tab" aria-selected="false">Remote Access</button>
                 <button class="settings-tab" data-settings-tab="security" role="tab" aria-selected="false">Security &amp; Access</button>
             </nav>
 
@@ -528,6 +529,55 @@
                 <div class="setting-actions">
                     <button id="project-new-btn" class="btn-primary" type="button">+ New Project</button>
                 </div>
+            </section>
+            </div>
+
+            <div class="settings-tab-pane" data-settings-pane="remote-access">
+            <section class="settings-section">
+                <h2>Remote Access</h2>
+                <p class="settings-description">Run Athen's web UI as a small password-protected server so you can reach it from your phone or another machine. The same agent — with its shell, file, and tool access — answers on that link. Keep this <strong>off</strong> unless you need it: anyone with the link <em>and</em> the credentials controls a shell-capable agent on this computer.</p>
+
+                <div class="ra-warning">
+                    Enabling remote access exposes a shell-capable agent to anyone who has the link and your username + password. Only turn it on when you need it, and use a strong password.
+                </div>
+
+                <div class="setting-row">
+                    <label class="toggle-label">
+                        <input type="checkbox" id="ra-enabled">
+                        <span>Enable remote access</span>
+                    </label>
+                </div>
+
+                <div class="setting-row">
+                    <label for="ra-port">Port</label>
+                    <input type="number" id="ra-port" class="settings-input" min="1" max="65535" placeholder="8787" value="8787">
+                    <p class="setting-hint">The local port the server listens on (default 8787).</p>
+                </div>
+
+                <div class="setting-row">
+                    <label for="ra-username">Username</label>
+                    <input type="text" id="ra-username" class="settings-input" placeholder="Choose a username" autocomplete="off">
+                </div>
+
+                <div class="setting-row">
+                    <label for="ra-password">Password</label>
+                    <input type="password" id="ra-password" class="settings-input" placeholder="leave blank to keep current" autocomplete="new-password">
+                    <p class="setting-hint">Used together with the username for HTTP Basic auth. Leave blank to keep the stored password.</p>
+                </div>
+
+                <div class="setting-row">
+                    <label class="toggle-label">
+                        <input type="checkbox" id="ra-tunnel">
+                        <span>Create public link (Cloudflare tunnel)</span>
+                    </label>
+                    <p class="setting-hint">Installs <code>cloudflared</code> on demand and exposes a temporary <code>*.trycloudflare.com</code> URL you can open from anywhere. Without this, the server is only reachable on your local network.</p>
+                </div>
+
+                <div class="setting-actions">
+                    <button id="ra-save" class="btn-primary" type="button">Save</button>
+                </div>
+
+                <div id="ra-status" class="ra-status"></div>
             </section>
             </div>
 

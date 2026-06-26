@@ -18,11 +18,24 @@ function loadSaved(): ClientConfig | null {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return null;
-    const v = JSON.parse(raw) as ClientConfig;
-    return typeof v.token === 'string' && typeof v.baseUrl === 'string' ? v : null;
+    const v = JSON.parse(raw) as Partial<ClientConfig>;
+    if (typeof v.token !== 'string' || typeof v.baseUrl !== 'string') return null;
+    const cfg: ClientConfig = { baseUrl: v.baseUrl, token: v.token };
+    // HTTP Basic credentials (docs/REMOTE_ACCESS.md §4), when present.
+    if (typeof v.username === 'string') cfg.username = v.username;
+    if (typeof v.password === 'string') cfg.password = v.password;
+    return cfg;
   } catch {
     return null;
   }
+}
+
+/** Serialize only the fields we persist (baseUrl/token + optional Basic creds). */
+function saveCfg(c: ClientConfig): void {
+  const out: ClientConfig = { baseUrl: c.baseUrl, token: c.token };
+  if (c.username) out.username = c.username;
+  if (c.password) out.password = c.password;
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(out));
 }
 
 export function App() {
@@ -48,7 +61,7 @@ export function App() {
     return (
       <Login
         onLogin={(c) => {
-          localStorage.setItem(STORAGE_KEY, JSON.stringify(c));
+          saveCfg(c);
           setCfg(c);
         }}
       />
