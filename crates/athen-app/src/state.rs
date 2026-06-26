@@ -2678,7 +2678,7 @@ impl AppState {
 
         let data_dir =
             athen_core::paths::athen_data_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-        let token = crate::http_api::load_or_create_token(&data_dir);
+        let token = crate::http_api::resolve_token(&data_dir);
         let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
         let cfg = crate::http_api::HttpApiConfig::from_settings(addr, token, basic);
 

@@ -90,12 +90,9 @@ impl HttpApiConfig {
                 return None;
             }
         };
-        let env_reader = |name: &str| std::env::var(name).ok();
-        let token = crate::env_creds::lookup_env_secret("ATHEN_HTTP_TOKEN", &env_reader)
-            .unwrap_or_else(|| load_or_create_token(data_dir));
         Some(Self {
             addr,
-            token,
+            token: resolve_token(data_dir),
             basic: None,
         })
     }
@@ -105,6 +102,16 @@ impl HttpApiConfig {
     pub fn from_settings(addr: SocketAddr, token: String, basic: Option<BasicCreds>) -> Self {
         Self { addr, token, basic }
     }
+}
+
+/// Resolve the API bearer token with the canonical precedence:
+/// `ATHEN_HTTP_TOKEN` (+`_FILE` variant) → persisted `<data_dir>/http_token`
+/// → freshly minted. Used by both the env-driven listener and the
+/// UI-controlled Remote Access listener so a single token works on either.
+pub(crate) fn resolve_token(data_dir: &Path) -> String {
+    let env_reader = |name: &str| std::env::var(name).ok();
+    crate::env_creds::lookup_env_secret("ATHEN_HTTP_TOKEN", &env_reader)
+        .unwrap_or_else(|| load_or_create_token(data_dir))
 }
 
 /// Read the persisted API token, or mint one (two UUIDv4s, 244 bits of
