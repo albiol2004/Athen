@@ -4,6 +4,26 @@
 `feat/deep-research`. Workspace builds clean (clippy + tests green). Code is
 authoritative; sections below remain the conceptual reference.
 
+**Update (2026-06-27, `feat/deep-research-improvements`):** four follow-ups
+shipped from user feedback. (1) **Deeper runs** — bigger depth budgets, the
+synthesis token budget scaled with depth (4096 was silently truncating long
+papers), richer worker briefs, and a new **gap-fill second round** on `deep`
+that reviews the first wave and investigates up to 4 unresolved gaps (see the
+updated §4 table). (2) **Paper awareness** — once an arc has a paper, a volatile
+context block tells the agent it exists, where it lives, and to read it before
+answering follow-ups (`render_research_paper_volatile_block` in commands.rs,
+injected on both the in-app message core AND the owner-Telegram executor). (3)
+**In-thread progress** — the detached banner became an agentic, per-arc progress
+card rendered inside the chat thread (stepper Planning→Researching→Refining→
+Synthesizing, live worker bar), desktop + web at parity. (4) **Telegram
+trigger** — `/deepresearch <topic>` (owner DM) creates a research arc, offers
+Quick/Standard/Deep depth buttons, runs in the background on the tap, and
+delivers the `.md` paper as a Telegram document (`parse_deepresearch_command` +
+`handle_telegram_deepresearch_command`/`_callback` +
+`deliver_deepresearch_paper_telegram` in state.rs; pending requests parked on
+`AppState.pending_deep_research`, token-keyed, carried in the button
+`callback_data`).
+
 Implementation map: `crates/athen-app/src/deep_research.rs` (the pure orchestrator
 `run_deep_research` — plan/fan-out/synthesize, decoupled from `AppState` via a
 worker-spawn closure + progress callback); `AppState::run_deep_research_for_arc`
@@ -191,11 +211,18 @@ pending delegation-expansion UI surface them for audit.
 Deep Research is expensive (dozens of fetches + many LLM calls). It ships with a
 **depth knob** mirroring Gemini's, bounding the blast radius:
 
-| Depth | Sub-questions | Workers | Sources/worker | Synthesis tier |
-|-------|---------------|---------|----------------|----------------|
-| `quick` | 3 | 3 | 4 | Fast |
-| `standard` (default) | 5 | 5 | 5 | Standard |
-| `deep` | 8 | 8 | 6 | Heavy |
+| Depth | Sub-questions | Concurrency cap | Sources/worker | Synthesis tier | Synth tokens | Gap-fill round |
+|-------|---------------|-----------------|----------------|----------------|--------------|----------------|
+| `quick` | 3 | 3 | 4 | Fast | 4096 | no |
+| `standard` (default) | 6 | 4 | 6 | Powerful | 6144 | no |
+| `deep` | 10 | 5 | 8 | Powerful | 8192 | yes (≤4 gaps) |
+
+*(2026-06-27 budgets. The synthesis **token** budget is the single biggest lever
+on paper depth — a flat 4096 cap was truncating long-form papers. The `deep`
+gap-fill round runs a cheap Fast-tier editor pass over the first wave's
+findings, surfaces up to 4 unresolved gaps, and fans out a second targeted wave
+merged into synthesis — this is what makes `deep` meaningfully deeper than
+`standard`, not just wider.)*
 
 - **Semaphore.** The orchestrator caps concurrent workers (e.g. `min(depth.workers,
   4)` permits) so a `deep` run doesn't open 8×6 simultaneous fetches. This is the
