@@ -854,53 +854,122 @@ button { font: inherit; }
 .dr-depth-label { font-size: 13px; font-weight: 600; }
 .dr-depth-hint { font-size: 10.5px; color: var(--text-dim); }
 
-.dr-banner {
-  max-width: 760px; margin: 8px auto 0; box-sizing: border-box;
-  display: flex; align-items: flex-start; gap: 11px;
+/* In-thread Deep Research card — lives inside the chat thread (rendered by
+   <Chat>) so a run reads like an agent working in the conversation. */
+.dr-thread-card {
+  box-sizing: border-box;
   background: var(--glass); border: 1px solid var(--glass-border);
-  border-radius: var(--radius); padding: 12px 14px;
+  border-radius: var(--radius); padding: 14px 16px; margin: 6px 0;
   backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
 }
-.dr-progress-spin { color: var(--coral); flex: none; margin-top: 1px; }
-.dr-progress-body { flex: 1; min-width: 0; }
-.dr-progress-label { font-size: 13px; font-weight: 600; color: var(--text); }
-.dr-progress-detail {
-  font-size: 11.5px; color: var(--text-dim); margin-top: 2px;
+.dr-thread-card.running { border-color: rgba(232, 116, 90, 0.35); }
+.dr-thread-card.done { border-color: rgba(127, 200, 164, 0.35); }
+
+.dr-thread-head { display: flex; align-items: center; gap: 8px; }
+.dr-thread-icon { flex: none; display: flex; align-items: center; color: var(--coral); }
+.dr-thread-icon.done {
+  width: 18px; height: 18px; border-radius: 99px; justify-content: center;
+  background: var(--green); color: #20120d;
+}
+.dr-thread-label {
+  flex: 1; min-width: 0; font-size: 11.5px; font-weight: 600;
+  letter-spacing: 0.04em; text-transform: uppercase; color: var(--text-dim);
+}
+.dr-thread-card.done .dr-thread-label {
+  text-transform: none; letter-spacing: 0; font-size: 13px; color: var(--text);
+}
+/* Pulsing "live" working dot. */
+.dr-live-dot {
+  flex: none; width: 7px; height: 7px; border-radius: 99px;
+  background: var(--coral); animation: dr-pulse 1.6s ease-in-out infinite;
+}
+@keyframes dr-pulse {
+  0%   { box-shadow: 0 0 0 0 rgba(232, 116, 90, 0.55); opacity: 1; }
+  70%  { box-shadow: 0 0 0 6px rgba(232, 116, 90, 0); opacity: 0.6; }
+  100% { box-shadow: 0 0 0 0 rgba(232, 116, 90, 0); opacity: 1; }
+}
+.dr-thread-tag {
+  flex: none; font-size: 11px; font-weight: 600; color: var(--text-dim);
+  background: var(--glass); border: 1px solid var(--glass-border);
+  border-radius: 99px; padding: 2px 9px;
+}
+.dr-thread-close {
+  flex: none; background: none; border: none; cursor: pointer;
+  color: var(--text-dim); font-size: 16px; line-height: 1; padding: 0 2px;
+}
+.dr-thread-close:hover { color: var(--text); }
+
+.dr-thread-question {
+  font-size: 13px; font-weight: 600; color: var(--text);
+  margin-top: 8px; line-height: 1.4; word-break: break-word;
+}
+
+/* Phase stepper: Planning → Researching → Refining → Synthesizing */
+.dr-stepper {
+  display: flex; align-items: center; gap: 4px; flex-wrap: wrap;
+  margin: 12px 0 4px;
+}
+.dr-step { display: flex; align-items: center; gap: 6px; }
+.dr-step-marker {
+  flex: none; width: 18px; height: 18px; border-radius: 99px;
+  display: grid; place-items: center; font-size: 10px;
+  border: 1.5px solid var(--glass-border);
+  color: var(--text-dim); background: rgba(255, 255, 255, 0.04);
+  transition: background 200ms, border-color 200ms, color 200ms;
+}
+.dr-step-name { font-size: 12px; color: var(--text-dim); transition: color 200ms; }
+.dr-step-conn {
+  width: 16px; height: 1.5px; border-radius: 1px;
+  background: var(--glass-border); transition: background 200ms;
+}
+.dr-step-conn.filled { background: var(--coral); }
+.dr-step-done .dr-step-marker { background: var(--coral); border-color: transparent; color: #20120d; }
+.dr-step-done .dr-step-name { color: var(--text); }
+.dr-step-active .dr-step-marker {
+  border-color: var(--coral); color: var(--coral); background: var(--coral-soft);
+  animation: dr-pulse 1.6s ease-in-out infinite;
+}
+.dr-step-active .dr-step-name { color: var(--text); font-weight: 600; }
+.dr-step-skipped { opacity: 0.4; }
+.dr-step-skipped .dr-step-name { text-decoration: line-through; }
+
+.dr-thread-status { font-size: 13px; color: var(--text); margin-top: 8px; }
+.dr-thread-detail {
+  font-size: 11.5px; color: var(--text-dim); margin-top: 4px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.dr-progress-bar {
-  height: 5px; border-radius: 99px; margin-top: 8px;
+.dr-thread-file {
+  font-size: 12px; color: var(--coral); margin-top: 6px; word-break: break-word;
+}
+.dr-thread-stat { font-size: 12px; color: var(--text-dim); margin-top: 6px; }
+.dr-thread-bar {
+  height: 5px; border-radius: 99px; margin: 10px 0 2px;
   background: rgba(255, 255, 255, 0.08); overflow: hidden;
 }
-.dr-progress-fill {
+.dr-thread-fill {
   height: 100%; border-radius: 99px; background: var(--coral);
   transition: width 0.4s ease;
 }
 
-.dr-done { border-color: rgba(127, 200, 164, 0.35); }
-.dr-done-icon {
-  flex: none; display: grid; place-items: center;
-  width: 32px; height: 32px; border-radius: 9px;
-  background: rgba(127, 200, 164, 0.14); color: var(--green);
+/* Collapsible list of investigated sub-questions */
+.dr-thread-subq { margin-top: 10px; }
+.dr-thread-subq > summary {
+  font-size: 12px; color: var(--text-dim); cursor: pointer;
+  list-style: none; user-select: none;
 }
-.dr-done-body { flex: 1; min-width: 0; }
-.dr-done-title { font-size: 13px; font-weight: 600; color: var(--text); }
-.dr-done-tag { color: var(--text-dim); font-weight: 500; }
-.dr-done-file {
-  font-size: 12px; color: var(--coral); margin-top: 2px;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+.dr-thread-subq > summary::-webkit-details-marker { display: none; }
+.dr-thread-subq > summary::before {
+  content: "▸"; display: inline-block; margin-right: 6px;
+  color: var(--text-dim); transition: transform 120ms;
 }
-.dr-done-meta { font-size: 11.5px; color: var(--text-dim); margin-top: 3px; }
-.dr-banner-close {
-  flex: none; background: none; border: none; cursor: pointer;
-  color: var(--text-dim); font-size: 16px; line-height: 1; padding: 0 2px;
-}
-.dr-banner-close:hover { color: var(--text); }
+.dr-thread-subq[open] > summary::before { transform: rotate(90deg); }
+.dr-thread-subq ul { margin: 8px 0 0; padding-left: 20px; }
+.dr-thread-subq li { font-size: 12px; color: var(--text-dim); margin: 4px 0; line-height: 1.4; }
 
-.dr-done-actions { margin-top: 8px; }
+.dr-thread-actions { margin-top: 12px; }
 .dr-view-paper {
   font: inherit; font-size: 12px; font-weight: 500; cursor: pointer;
-  padding: 5px 14px; border-radius: 8px; border: 1px solid var(--glass-border);
+  padding: 6px 16px; border-radius: 8px; border: 1px solid var(--glass-border);
   background: var(--coral); color: #fff;
   transition: filter 120ms;
 }

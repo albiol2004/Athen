@@ -182,7 +182,9 @@ export interface DeepResearchResult {
 /** `deep-research-progress` SSE payload (emitted from state.rs). */
 export interface DeepResearchProgressEvent {
   arc_id: string;
-  phase: 'planning' | 'reading' | 'synthesizing';
+  // `refining` is a gap-review step that runs on `deep` depth between reading
+  // rounds; quick/standard runs never emit it.
+  phase: 'planning' | 'reading' | 'refining' | 'synthesizing';
   detail: string;
   workers_total: number;
   workers_done: number;

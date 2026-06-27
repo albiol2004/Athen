@@ -18,7 +18,7 @@ import { Bell } from './Bell';
 import { ChangesRail } from './ChangesRail';
 import { CodeModePanel } from './CodeModePanel';
 import { Chat, type ChatCallbacks, type OutgoingFile, type OutgoingImage } from './Chat';
-import { DeepResearchBanner, DeepResearchModal } from './DeepResearch';
+import { DeepResearchModal } from './DeepResearch';
 import { GoalBanner, type GoalState, type PlanState } from './PlanGoal';
 import { ProjectPage } from './ProjectPage';
 import { Sidebar } from './Sidebar';
@@ -28,6 +28,16 @@ import { Wakeups } from './Wakeups';
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
+
+/** Per-arc Deep Research run state backing the in-thread card. */
+type DrRun = {
+  /** Launch question (shown during progress; the done event carries its own). */
+  question: string | null;
+  progress: DeepResearchProgressEvent | null;
+  done: DeepResearchDoneEvent | null;
+  /** True once a `refining` event has arrived (deep runs) — drives the stepper. */
+  refiningSeen: boolean;
+};
 
 type Drawer = 'none' | 'agents' | 'changes' | 'wakeups' | 'code-mode';
 
@@ -51,10 +61,11 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
   // null = chat surface; a project id = the Project page for that project.
   const [openProject, setOpenProject] = useState<string | null>(null);
   // Deep Research (docs/DEEP_RESEARCH.md): launcher seed text (null = closed),
-  // live progress/done banners (scoped to the active arc), POST-in-flight flag.
+  // per-arc run state (in-thread card; keyed by arc_id so switching arcs shows
+  // the right run and a background run never shows on an unrelated arc),
+  // POST-in-flight flag.
   const [drQuestion, setDrQuestion] = useState<string | null>(null);
-  const [drProgress, setDrProgress] = useState<DeepResearchProgressEvent | null>(null);
-  const [drDone, setDrDone] = useState<DeepResearchDoneEvent | null>(null);
+  const [drRuns, setDrRuns] = useState<Map<string, DrRun>>(new Map());
   const [drBusy, setDrBusy] = useState(false);
 
   const activeArcRef = useRef<string | null>(null);
@@ -181,14 +192,31 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
         },
         onNotification: (n) => setNotifications((l) => [n, ...l]),
         onDeepResearchProgress: (e) => {
-          if (e.arc_id !== activeArcRef.current) return;
-          setDrProgress(e);
-          setDrDone(null);
+          // Track every arc's run; the card only renders for the active arc.
+          setDrRuns((m) => {
+            const next = new Map(m);
+            const prev = next.get(e.arc_id);
+            next.set(e.arc_id, {
+              question: prev?.question ?? null,
+              progress: e,
+              done: null,
+              refiningSeen: (prev?.refiningSeen ?? false) || e.phase === 'refining',
+            });
+            return next;
+          });
         },
         onDeepResearchDone: (e) => {
-          if (e.arc_id !== activeArcRef.current) return;
-          setDrProgress(null);
-          setDrDone(e);
+          setDrRuns((m) => {
+            const next = new Map(m);
+            const prev = next.get(e.arc_id);
+            next.set(e.arc_id, {
+              question: prev?.question ?? null,
+              progress: null,
+              done: e,
+              refiningSeen: prev?.refiningSeen ?? false,
+            });
+            return next;
+          });
           void refreshArcs();
         },
         onLagged: () => {
@@ -212,9 +240,8 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
         const entries = await client.selectArc(id);
         setActiveArc(id);
         dispatch({ type: 'reset', entries });
-        // Deep Research banners are arc-scoped — drop any from the old arc.
-        setDrProgress(null);
-        setDrDone(null);
+        // Deep Research run state is kept per arc (drRuns) so the in-thread
+        // card reappears when switching back — nothing to clear here.
         setUnread((s) => {
           if (!s.has(id)) return s;
           const n = new Set(s);
@@ -396,11 +423,21 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
         toast('Start a conversation first, then run Deep Research in it.', 'info');
         return;
       }
-      setDrDone(null);
       setDrQuestion(question);
     },
     [toast],
   );
+
+  const dismissResearch = useCallback(() => {
+    const arcId = activeArcRef.current;
+    if (!arcId) return;
+    setDrRuns((m) => {
+      if (!m.has(arcId)) return m;
+      const next = new Map(m);
+      next.delete(arcId);
+      return next;
+    });
+  }, []);
 
   const runDeepResearch = useCallback(
     async (question: string, depth: DeepResearchDepth, mode: DeepResearchMode | undefined) => {
@@ -408,25 +445,37 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
       setDrQuestion(null);
       if (!arcId) return;
       setDrBusy(true);
-      setDrDone(null);
-      // Seed an immediate "planning" banner so the surface reacts before the
+      // Seed an immediate "planning" card so the surface reacts before the
       // first SSE tick lands.
-      setDrProgress({
-        arc_id: arcId,
-        phase: 'planning',
-        detail: question,
-        workers_total: 0,
-        workers_done: 0,
-        workers_ok: 0,
+      setDrRuns((m) => {
+        const next = new Map(m);
+        next.set(arcId, {
+          question,
+          progress: {
+            arc_id: arcId,
+            phase: 'planning',
+            detail: '',
+            workers_total: 0,
+            workers_done: 0,
+            workers_ok: 0,
+          },
+          done: null,
+          refiningSeen: false,
+        });
+        return next;
       });
       try {
         const res = await client.deepResearch(arcId, question, depth, mode);
-        // The done banner is normally driven by SSE; fall back to the response
+        // The done card is normally driven by SSE; fall back to the response
         // if the event was missed (e.g. stream lag).
-        if (arcId === activeArcRef.current) {
-          setDrProgress(null);
-          setDrDone((cur) =>
-            cur ?? {
+        setDrRuns((m) => {
+          const prev = m.get(arcId);
+          if (prev?.done) return m; // SSE already delivered it.
+          const next = new Map(m);
+          next.set(arcId, {
+            question,
+            progress: null,
+            done: {
               arc_id: res.arc_id,
               paper_path: res.paper_path,
               question: res.question,
@@ -435,8 +484,10 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
               sub_questions: res.sub_questions,
               extended: res.extended,
             },
-          );
-        }
+            refiningSeen: prev?.refiningSeen ?? false,
+          });
+          return next;
+        });
         toast(
           res.extended ? 'Research paper extended.' : 'Research paper ready.',
           'success',
@@ -444,7 +495,14 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
         void refreshArcs();
       } catch (e) {
         if (!bail(e)) {
-          if (arcId === activeArcRef.current) setDrProgress(null);
+          // Clear the in-flight card for this arc on failure.
+          setDrRuns((m) => {
+            const prev = m.get(arcId);
+            if (!prev || prev.done) return m;
+            const next = new Map(m);
+            next.delete(arcId);
+            return next;
+          });
           toast(errMessage(e), 'error');
         }
       } finally {
@@ -485,6 +543,8 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
   );
 
   const activeMeta = useMemo(() => arcs.find((a) => a.id === activeArc), [arcs, activeArc]);
+  // The Deep Research run for the arc currently in view (null if none).
+  const activeRun = activeArc ? drRuns.get(activeArc) ?? null : null;
   const openProjectMeta = useMemo(
     () => projects.find((p) => p.id === openProject) ?? null,
     [projects, openProject],
@@ -679,12 +739,6 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
                 }
               />
             )}
-            <DeepResearchBanner
-              client={client}
-              progress={drProgress}
-              done={drDone}
-              onDismiss={() => setDrDone(null)}
-            />
             <Chat
               items={chat.items}
               busy={busy}
@@ -693,6 +747,8 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
               plan={plan}
               client={client}
               cb={cb}
+              research={activeRun}
+              onDismissResearch={dismissResearch}
             />
           </>
         )}

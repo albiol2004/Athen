@@ -4,8 +4,10 @@
 //   - DeepResearchModal:  question (if the composer was empty) + depth picker,
 //     then (when the active arc already has a paper) a ConfirmDialog for
 //     extend-vs-new before the POST.
-//   - DeepResearchBanner: non-blocking progress ticker + completion card,
-//     driven by the `deep-research-progress` / `deep-research-done` SSE events.
+//   - DeepResearchThreadCard: in-thread progress stepper + completion card
+//     (rendered inside the chat thread by <Chat>, so a run reads like an agent
+//     working in the conversation), driven by the `deep-research-progress` /
+//     `deep-research-done` SSE events. Arc-scoped by Shell's per-arc run map.
 //
 // Backend contract: POST /api/arcs/{id}/deep-research { question, depth?, mode? }
 // (AthenClient.deepResearch) to launch; GET /api/arcs/{id}/research-paper
@@ -13,7 +15,7 @@
 // finished paper. The completion card's "View paper" fetches that Markdown and
 // renders it inline in a modal via the shared <Markdown> renderer.
 
-import { useEffect, useState } from 'react';
+import { Fragment, useEffect, useState } from 'react';
 import type { AthenClient } from '../api/client';
 import { ConfirmDialog } from './ConfirmDialog';
 import { Markdown } from './Markdown';
@@ -46,15 +48,15 @@ const ResearchIcon = ({ size = 15 }: { size?: number }) => (
   </svg>
 );
 
-const DocIcon = () => (
-  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-    <path
-      d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-5-5Zm0 0v5h5"
+const CheckIcon = () => (
+  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+    <polyline
+      points="20 6 9 17 4 12"
       stroke="currentColor"
-      strokeWidth="1.8"
+      strokeWidth="3"
+      strokeLinecap="round"
       strokeLinejoin="round"
     />
-    <path d="M9 13h6M9 16h4" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
   </svg>
 );
 
@@ -186,11 +188,69 @@ export function DeepResearchModal({
   );
 }
 
-const PHASE_LABEL: Record<DeepResearchProgressEvent['phase'], string> = {
-  planning: 'Planning research…',
-  reading: 'Researching sources…',
+type Phase = DeepResearchProgressEvent['phase'];
+
+const PHASE_LABEL: Record<Phase, string> = {
+  planning: 'Decomposing the question…',
+  reading: 'Researching sources',
+  refining: 'Reviewing findings for gaps…',
   synthesizing: 'Writing the paper…',
 };
+
+// Pipeline shown in the stepper. "Refining" only lights up on deep runs (a
+// `refining` event arrives between reading rounds); otherwise it's skipped.
+const DR_STEPS: { key: Phase; label: string }[] = [
+  { key: 'planning', label: 'Planning' },
+  { key: 'reading', label: 'Researching' },
+  { key: 'refining', label: 'Refining' },
+  { key: 'synthesizing', label: 'Synthesizing' },
+];
+const DR_STEP_INDEX: Record<Phase, number> = {
+  planning: 0,
+  reading: 1,
+  refining: 2,
+  synthesizing: 3,
+};
+
+/** Four-step phase ticker. Completed steps show a check, the current one is
+ *  active (pulsing), and "Refining" greys out (skipped) once a non-deep run
+ *  moves past it. */
+function DeepResearchStepper({
+  current,
+  refiningSeen,
+  finished,
+}: {
+  current: Phase;
+  refiningSeen: boolean;
+  finished: boolean;
+}) {
+  const curIdx = finished ? DR_STEPS.length : DR_STEP_INDEX[current];
+  return (
+    <div className="dr-stepper">
+      {DR_STEPS.map((step, i) => {
+        let state: 'done' | 'active' | 'pending' | 'skipped';
+        if (step.key === 'refining' && !refiningSeen && !finished) {
+          state = curIdx > 2 ? 'skipped' : 'pending';
+        } else if (i < curIdx) {
+          state = 'done';
+        } else if (i === curIdx) {
+          state = 'active';
+        } else {
+          state = 'pending';
+        }
+        return (
+          <Fragment key={step.key}>
+            {i > 0 && <span className={`dr-step-conn${i <= curIdx ? ' filled' : ''}`} />}
+            <div className={`dr-step dr-step-${state}`}>
+              <span className="dr-step-marker">{state === 'done' ? <CheckIcon /> : null}</span>
+              <span className="dr-step-name">{step.label}</span>
+            </div>
+          </Fragment>
+        );
+      })}
+    </div>
+  );
+}
 
 /**
  * Modal that fetches the arc's research paper Markdown via
@@ -255,7 +315,7 @@ export function ResearchPaperModal({
           <h3 title={title}>{title}</h3>
           <button
             type="button"
-            className="dr-banner-close"
+            className="dr-thread-close"
             aria-label="Close"
             onClick={onClose}
           >
@@ -278,19 +338,26 @@ export function ResearchPaperModal({
 }
 
 /**
- * Non-blocking banner. While `progress` is set (and `done` is not) it shows the
- * phase ticker + a bar during the reading phase. Once `done` arrives it shows
- * the completion card. Both are scoped to the active arc by Shell.
+ * In-thread Deep Research card. Rendered inside the chat message thread (by
+ * <Chat>) so the run reads like an agent working in the conversation. While
+ * `progress` is set (and `done` is not) it shows the phase stepper + a bar
+ * during the reading phase; once `done` arrives it becomes the result card.
+ * `question` is the launch question (shown during progress; the done event
+ * carries its own). All inputs are scoped to the active arc by Shell.
  */
-export function DeepResearchBanner({
+export function DeepResearchThreadCard({
   client,
+  question,
   progress,
   done,
+  refiningSeen,
   onDismiss,
 }: {
   client: AthenClient;
+  question: string | null;
   progress: DeepResearchProgressEvent | null;
   done: DeepResearchDoneEvent | null;
+  refiningSeen: boolean;
   onDismiss: () => void;
 }) {
   const [viewing, setViewing] = useState(false);
@@ -298,30 +365,49 @@ export function DeepResearchBanner({
   if (done) {
     const basename = paperBasename(done.paper_path);
     return (
-      <div className="dr-banner dr-done" role="status">
-        <span className="dr-done-icon">
-          <DocIcon />
-        </span>
-        <div className="dr-done-body">
-          <div className="dr-done-title">
-            Research paper ready
-            {done.extended && <span className="dr-done-tag"> (extended)</span>}
-          </div>
-          <div className="dr-done-file" title={done.paper_path}>
-            {basename}
-          </div>
-          <div className="dr-done-meta">
-            {done.workers_ok}/{done.workers_total} sub-topics covered · or ask in chat — I can read it.
-          </div>
-          <div className="dr-done-actions">
-            <button type="button" className="dr-view-paper" onClick={() => setViewing(true)}>
-              View paper
-            </button>
-          </div>
+      <div className="dr-thread-card done" role="status">
+        <div className="dr-thread-head">
+          <span className="dr-thread-icon done">
+            <CheckIcon />
+          </span>
+          <span className="dr-thread-label">Research paper ready</span>
+          <span className="dr-thread-tag">
+            {done.extended ? 'Extended existing paper' : 'New paper'}
+          </span>
+          <button
+            type="button"
+            className="dr-thread-close"
+            aria-label="Dismiss"
+            onClick={onDismiss}
+          >
+            ×
+          </button>
         </div>
-        <button type="button" className="dr-banner-close" aria-label="Dismiss" onClick={onDismiss}>
-          ×
-        </button>
+        {done.question && <div className="dr-thread-question">{done.question}</div>}
+        <div className="dr-thread-file" title={done.paper_path}>
+          {basename}
+        </div>
+        <div className="dr-thread-stat">
+          {done.workers_ok}/{done.workers_total} sub-topics covered
+        </div>
+        {done.sub_questions.length > 0 && (
+          <details className="dr-thread-subq">
+            <summary>
+              {done.sub_questions.length} sub-question
+              {done.sub_questions.length === 1 ? '' : 's'} investigated
+            </summary>
+            <ul>
+              {done.sub_questions.map((q, i) => (
+                <li key={i}>{q}</li>
+              ))}
+            </ul>
+          </details>
+        )}
+        <div className="dr-thread-actions">
+          <button type="button" className="dr-view-paper" onClick={() => setViewing(true)}>
+            View paper
+          </button>
+        </div>
         {viewing && (
           <ResearchPaperModal
             client={client}
@@ -337,29 +423,33 @@ export function DeepResearchBanner({
   if (!progress) return null;
 
   const reading = progress.phase === 'reading';
-  const pct =
-    reading && progress.workers_total > 0
-      ? Math.round((progress.workers_done / progress.workers_total) * 100)
-      : 0;
-  const label =
-    reading && progress.workers_total > 0
-      ? `${PHASE_LABEL.reading} (${progress.workers_done}/${progress.workers_total}, ${progress.workers_ok} ok)`
-      : PHASE_LABEL[progress.phase];
+  const hasBar = reading && progress.workers_total > 0;
+  const pct = hasBar ? Math.round((progress.workers_done / progress.workers_total) * 100) : 0;
 
   return (
-    <div className="dr-banner dr-progress" role="status" aria-live="polite">
-      <span className="dr-progress-spin">
-        <Spinner />
-      </span>
-      <div className="dr-progress-body">
-        <div className="dr-progress-label">{label}</div>
-        {progress.detail && <div className="dr-progress-detail">{progress.detail}</div>}
-        {reading && progress.workers_total > 0 && (
-          <div className="dr-progress-bar" aria-hidden="true">
-            <div className="dr-progress-fill" style={{ width: `${pct}%` }} />
-          </div>
-        )}
+    <div className="dr-thread-card running" role="status" aria-live="polite">
+      <div className="dr-thread-head">
+        <span className="dr-thread-icon">
+          <ResearchIcon />
+        </span>
+        <span className="dr-thread-label">Deep Research</span>
+        <span className="dr-live-dot" aria-hidden="true" />
       </div>
+      {question && <div className="dr-thread-question">{question}</div>}
+      <DeepResearchStepper current={progress.phase} refiningSeen={refiningSeen} finished={false} />
+      <div className="dr-thread-status">{PHASE_LABEL[progress.phase]}</div>
+      {hasBar && (
+        <>
+          <div className="dr-thread-bar" aria-hidden="true">
+            <div className="dr-thread-fill" style={{ width: `${pct}%` }} />
+          </div>
+          <div className="dr-thread-stat">
+            {progress.workers_done}/{progress.workers_total} researchers reporting ·{' '}
+            {progress.workers_ok} succeeded
+          </div>
+        </>
+      )}
+      {progress.detail && <div className="dr-thread-detail">{progress.detail}</div>}
     </div>
   );
 }

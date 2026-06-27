@@ -3,12 +3,22 @@ import type { AthenClient } from '../api/client';
 import type {
   ApprovalChoice,
   ApprovalQuestion,
+  DeepResearchDoneEvent,
+  DeepResearchProgressEvent,
   GrantDecision,
   GrantRequest,
   PendingApproval,
 } from '../api/types';
 import type { ChatItem } from '../chat/reducer';
-import { DeepResearchButton } from './DeepResearch';
+import { DeepResearchButton, DeepResearchThreadCard } from './DeepResearch';
+
+/** Deep Research run state for the active arc (rendered in-thread). */
+export interface ChatResearch {
+  question: string | null;
+  progress: DeepResearchProgressEvent | null;
+  done: DeepResearchDoneEvent | null;
+  refiningSeen: boolean;
+}
 import { MessageList } from './MessageList';
 import { PlanCard, type PlanState } from './PlanGoal';
 
@@ -56,6 +66,8 @@ export function Chat({
   plan,
   client,
   cb,
+  research,
+  onDismissResearch,
 }: {
   items: ChatItem[];
   busy: boolean;
@@ -65,6 +77,9 @@ export function Chat({
   plan: PlanState | null;
   client: AthenClient;
   cb: ChatCallbacks;
+  /** Deep Research run for the active arc, rendered in-thread (null = none). */
+  research: ChatResearch | null;
+  onDismissResearch: () => void;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const pinnedRef = useRef(true);
@@ -82,7 +97,7 @@ export function Chat({
   useLayoutEffect(() => {
     const el = scrollRef.current;
     if (el && pinnedRef.current) el.scrollTop = el.scrollHeight;
-  }, [items, plan]);
+  }, [items, plan, research]);
   useEffect(() => {
     const el = scrollRef.current;
     if (el) {
@@ -141,6 +156,16 @@ export function Chat({
           <MessageList items={items} cb={cb} client={client} />
           {plan && (plan.status ?? 'Drafting') === 'Drafting' && (
             <PlanCard plan={plan} onApprove={cb.onApprovePlan} onDiscard={cb.onDiscardPlan} />
+          )}
+          {research && (research.progress || research.done) && (
+            <DeepResearchThreadCard
+              client={client}
+              question={research.question}
+              progress={research.progress}
+              done={research.done}
+              refiningSeen={research.refiningSeen}
+              onDismiss={onDismissResearch}
+            />
           )}
           {busy && (
             <div className="busy-row">

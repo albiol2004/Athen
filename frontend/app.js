@@ -789,20 +789,17 @@ function registerTauriEventListeners() {
     });
 
     // ─── Deep Research progress + completion ───
-    // A long-running run reports through these two events. We only react to
-    // frames whose arc_id matches the currently-active arc so a background
-    // run on another arc never hijacks the visible banner. Switching arcs
-    // clears the banner (see switchArc), so a stale frame can't re-show it
-    // for the wrong arc.
+    // A long-running run reports through these two events. Run state is kept
+    // per arc_id (renderDeepResearchProgress/Done store it), but the in-thread
+    // card only renders for the arc currently in view — a background run on
+    // another arc updates its state silently and shows when that arc is opened.
     window.__TAURI__.event.listen('deep-research-progress', (event) => {
         const p = (event && event.payload) ? event.payload : {};
-        if (String(p.arc_id || '') !== String(activeArcId || '')) return;
         renderDeepResearchProgress(p);
     });
 
     window.__TAURI__.event.listen('deep-research-done', (event) => {
         const p = (event && event.payload) ? event.payload : {};
-        if (String(p.arc_id || '') !== String(activeArcId || '')) return;
         renderDeepResearchDone(p);
         // Refresh arc metadata so the arc now carries research_paper_path /
         // research_question — the next trigger offers Extend-vs-new.
@@ -2287,10 +2284,11 @@ async function handleSwitchArc(arcId) {
 
         // Clear the chat UI and render the loaded entries.
         clearChatUI();
-        // Drop any Deep Research banner left over from the previous arc so a
-        // stale progress/result card never lingers on an unrelated arc.
-        clearDeepResearchBanner();
         renderEntries(entries);
+        // Re-attach the Deep Research in-thread card if a run for THIS arc is
+        // active or just finished. clearChatUI wiped any card from the prior
+        // arc; this rebuilds the card only for the arc now in view.
+        renderDeepResearchInline(arcId);
 
         // Arc switch is a force-scroll point (see scrollChatIfPinned
         // notes): a loaded chat lands at its most-recent message. An empty
@@ -6822,193 +6820,333 @@ async function triggerDeepResearch(btn) {
     }, { errorPrefix: 'Deep Research failed: ' });
 }
 
-// ── Banner rendering ──
-// The banner lives in <footer>, OUTSIDE #messages, so the innerHTML swap in
-// clearChatUI() can't wipe it. switchArc clears it explicitly per-arc.
+// ── In-thread progress + result rendering ──
+// Deep Research progress renders INLINE in the chat thread — like an agent
+// working in the conversation — rather than as a detached banner above the
+// composer. Run state is keyed by arc_id so switching arcs shows the right
+// card; the card DOM lives inside #messages and is rebuilt by
+// renderDeepResearchInline after every arc switch (clearChatUI wipes it).
 
-function deepResearchBannerEl() {
-    return document.getElementById('deep-research-banner');
-}
+// arc_id -> run state.
+//   running : { question, phase, detail, total, done, ok, refiningSeen, finished:false }
+//   done    : { ...running, finished:true, result }  (result mirrors the done payload)
+const deepResearchRuns = new Map();
 
-function clearDeepResearchBanner() {
-    const el = deepResearchBannerEl();
-    if (!el) return;
-    el.innerHTML = '';
-    el.classList.add('hidden');
-}
+// Pipeline steps shown in the stepper. "Refining" only lights up on deep
+// runs (a `refining` gap-review event arrives between reading rounds);
+// otherwise it stays skipped/greyed.
+const DR_STEPS = [
+    { key: 'planning', label: 'Planning' },
+    { key: 'reading', label: 'Researching' },
+    { key: 'refining', label: 'Refining' },
+    { key: 'synthesizing', label: 'Synthesizing' },
+];
+const DR_STEP_INDEX = { planning: 0, reading: 1, refining: 2, synthesizing: 3 };
 
 const ICON_DOC_RESEARCH =
-    '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h7"/><path d="M14 2v6h6"/><circle cx="17.5" cy="16.5" r="3"/><line x1="22" y1="21" x2="19.6" y2="18.6"/></svg>';
+    '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h7"/><path d="M14 2v6h6"/><circle cx="17.5" cy="16.5" r="3"/><line x1="22" y1="21" x2="19.6" y2="18.6"/></svg>';
+const ICON_DR_STEP_CHECK =
+    '<svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
 
-function renderDeepResearchStarting(question) {
-    const el = deepResearchBannerEl();
-    if (!el) return;
-    el.classList.remove('hidden');
-    el.innerHTML = '';
-    const card = document.createElement('div');
-    card.className = 'deep-research-card running';
-    card.innerHTML =
-        `<span class="dr-icon spin" aria-hidden="true">${ICON_DOC_RESEARCH}</span>` +
-        '<div class="dr-body">' +
-        '<div class="dr-title">Planning research…</div>' +
-        `<div class="dr-detail"></div>` +
-        '</div>';
-    card.querySelector('.dr-detail').textContent = question || '';
-    el.appendChild(card);
+function deepResearchInlineEl() {
+    return messagesEl ? messagesEl.querySelector('#deep-research-inline') : null;
 }
 
-function renderDeepResearchProgress(p) {
-    const el = deepResearchBannerEl();
-    if (!el) return;
-    el.classList.remove('hidden');
+function removeDeepResearchInline() {
+    const el = deepResearchInlineEl();
+    if (el) el.remove();
+}
 
-    const phase = String(p.phase || '');
-    const detail = String(p.detail || '');
-    const total = Number(p.workers_total || 0);
-    const done = Number(p.workers_done || 0);
-    const ok = Number(p.workers_ok || 0);
+// Back-compat shim retained for switchArc: the inline card is rebuilt from
+// run state, so removing the DOM node is all that's needed here.
+function clearDeepResearchBanner() {
+    removeDeepResearchInline();
+}
+
+// Builds the four-step phase ticker. `current` is the active phase key;
+// `refiningSeen` decides whether the Refining step is pending (may still
+// run) or skipped (we've passed it on a non-deep run). `finished` marks
+// every step done.
+function buildDeepResearchStepper(current, refiningSeen, finished) {
+    const stepper = document.createElement('div');
+    stepper.className = 'dr-stepper';
+    const curIdx = finished ? DR_STEPS.length : (DR_STEP_INDEX[current] ?? 0);
+    DR_STEPS.forEach((step, i) => {
+        if (i > 0) {
+            const conn = document.createElement('span');
+            conn.className = 'dr-step-conn' + (i <= curIdx ? ' filled' : '');
+            stepper.appendChild(conn);
+        }
+        let state;
+        if (step.key === 'refining' && !refiningSeen && !finished) {
+            // Not a deep run (or refining not reached yet): pending while we
+            // could still get there, skipped once we've moved past it.
+            state = curIdx > 2 ? 'skipped' : 'pending';
+        } else if (i < curIdx) {
+            state = 'done';
+        } else if (i === curIdx) {
+            state = 'active';
+        } else {
+            state = 'pending';
+        }
+        const el = document.createElement('div');
+        el.className = 'dr-step dr-step-' + state;
+        const marker = document.createElement('span');
+        marker.className = 'dr-step-marker';
+        marker.innerHTML = state === 'done' ? ICON_DR_STEP_CHECK : '';
+        const name = document.createElement('span');
+        name.className = 'dr-step-name';
+        name.textContent = step.label;
+        el.appendChild(marker);
+        el.appendChild(name);
+        stepper.appendChild(el);
+    });
+    return stepper;
+}
+
+function buildDeepResearchProgressCard(run) {
+    const card = document.createElement('div');
+    card.className = 'dr-thread-card running';
+
+    const head = document.createElement('div');
+    head.className = 'dr-thread-head';
+    const icon = document.createElement('span');
+    icon.className = 'dr-thread-icon';
+    icon.setAttribute('aria-hidden', 'true');
+    icon.innerHTML = ICON_DOC_RESEARCH;
+    head.appendChild(icon);
+    const label = document.createElement('span');
+    label.className = 'dr-thread-label';
+    label.textContent = 'Deep Research';
+    head.appendChild(label);
+    const dot = document.createElement('span');
+    dot.className = 'dr-live-dot';
+    dot.setAttribute('aria-hidden', 'true');
+    head.appendChild(dot);
+    card.appendChild(head);
+
+    if (run.question) {
+        const q = document.createElement('div');
+        q.className = 'dr-thread-question';
+        q.textContent = run.question;
+        card.appendChild(q);
+    }
+
+    card.appendChild(buildDeepResearchStepper(run.phase, run.refiningSeen, false));
+
+    const phase = String(run.phase || '');
+    const total = Number(run.total || 0);
+    const done = Number(run.done || 0);
+    const ok = Number(run.ok || 0);
 
     let title;
-    let showBar = false;
-    if (phase === 'planning') {
-        title = 'Planning research…';
-    } else if (phase === 'reading') {
-        title = total > 0
-            ? `Researching sources… (${done}/${total} done, ${ok} ok)`
-            : 'Researching sources…';
-        showBar = total > 0;
-    } else if (phase === 'synthesizing') {
-        title = 'Writing the paper…';
-    } else {
-        title = 'Researching…';
-    }
-
-    el.innerHTML = '';
-    const card = document.createElement('div');
-    card.className = 'deep-research-card running';
-
-    const icon = document.createElement('span');
-    icon.className = 'dr-icon spin';
-    icon.setAttribute('aria-hidden', 'true');
-    icon.innerHTML = ICON_DOC_RESEARCH;
-    card.appendChild(icon);
-
-    const body = document.createElement('div');
-    body.className = 'dr-body';
+    if (phase === 'planning') title = 'Decomposing the question…';
+    else if (phase === 'reading') title = 'Researching sources';
+    else if (phase === 'refining') title = 'Reviewing findings for gaps…';
+    else if (phase === 'synthesizing') title = 'Writing the paper…';
+    else title = 'Researching…';
 
     const titleEl = document.createElement('div');
-    titleEl.className = 'dr-title';
+    titleEl.className = 'dr-thread-status';
     titleEl.textContent = title;
-    body.appendChild(titleEl);
+    card.appendChild(titleEl);
 
-    if (showBar) {
+    if (phase === 'reading' && total > 0) {
         const bar = document.createElement('div');
-        bar.className = 'dr-progress-bar';
+        bar.className = 'dr-thread-bar';
         const fill = document.createElement('div');
-        fill.className = 'dr-progress-fill';
-        const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
+        fill.className = 'dr-thread-fill';
+        const pct = Math.min(100, Math.round((done / total) * 100));
         fill.style.width = pct + '%';
         bar.appendChild(fill);
-        body.appendChild(bar);
+        card.appendChild(bar);
+
+        const stat = document.createElement('div');
+        stat.className = 'dr-thread-stat';
+        stat.textContent =
+            `${done}/${total} researcher${total === 1 ? '' : 's'} reporting · ${ok} succeeded`;
+        card.appendChild(stat);
     }
 
-    if (detail) {
+    if (run.detail) {
         const detailEl = document.createElement('div');
-        detailEl.className = 'dr-detail';
-        detailEl.textContent = detail;
-        body.appendChild(detailEl);
+        detailEl.className = 'dr-thread-detail';
+        detailEl.textContent = run.detail;
+        card.appendChild(detailEl);
     }
 
-    card.appendChild(body);
-    el.appendChild(card);
+    return card;
 }
 
-function renderDeepResearchDone(p) {
-    const el = deepResearchBannerEl();
-    if (!el) return;
-    el.classList.remove('hidden');
-
+function buildDeepResearchResultCard(arcId, result) {
     // The done event and the invoke return object share field names
-    // (snake_case verbatim): paper_path, workers_ok, workers_total, extended.
-    const paperPath = String(p.paper_path || '');
+    // (snake_case verbatim): paper_path, question, sub_questions, workers_ok,
+    // workers_total, extended.
+    const r = result || {};
+    const paperPath = String(r.paper_path || '');
     const basename = paperPath.split(/[\\/]/).pop() || paperPath || 'research paper';
-    const ok = Number(p.workers_ok || 0);
-    const total = Number(p.workers_total || 0);
-    const extended = !!p.extended;
+    const ok = Number(r.workers_ok || 0);
+    const total = Number(r.workers_total || 0);
+    const extended = !!r.extended;
+    const question = String(r.question || '');
+    const subQuestions = Array.isArray(r.sub_questions) ? r.sub_questions : [];
     // The done event carries arc_id; the invoke-return fallback path may not,
-    // so fall back to the active arc (which is the one we researched in).
-    const arcId = String(p.arc_id || activeArcId || '');
+    // so fall back to the arc this card belongs to.
+    const id = String(r.arc_id || arcId || activeArcId || '');
 
-    el.innerHTML = '';
     const card = document.createElement('div');
-    card.className = 'deep-research-card done';
+    card.className = 'dr-thread-card done';
 
+    const head = document.createElement('div');
+    head.className = 'dr-thread-head';
     const icon = document.createElement('span');
-    icon.className = 'dr-icon';
+    icon.className = 'dr-thread-icon done';
     icon.setAttribute('aria-hidden', 'true');
-    icon.innerHTML = ICON_DOC_RESEARCH;
-    card.appendChild(icon);
+    icon.innerHTML = ICON_DR_STEP_CHECK;
+    head.appendChild(icon);
+    const label = document.createElement('span');
+    label.className = 'dr-thread-label';
+    label.textContent = 'Research paper ready';
+    head.appendChild(label);
+    const tag = document.createElement('span');
+    tag.className = 'dr-thread-tag';
+    tag.textContent = extended ? 'Extended existing paper' : 'New paper';
+    head.appendChild(tag);
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.className = 'dr-thread-close';
+    closeBtn.setAttribute('aria-label', 'Dismiss');
+    closeBtn.innerHTML = ICON_X;
+    closeBtn.addEventListener('click', () => {
+        deepResearchRuns.delete(id);
+        removeDeepResearchInline();
+    });
+    head.appendChild(closeBtn);
+    card.appendChild(head);
 
-    const body = document.createElement('div');
-    body.className = 'dr-body';
-
-    const titleEl = document.createElement('div');
-    titleEl.className = 'dr-title';
-    titleEl.textContent = 'Research paper ready' + (extended ? ' (extended)' : '');
-    body.appendChild(titleEl);
+    if (question) {
+        const q = document.createElement('div');
+        q.className = 'dr-thread-question';
+        q.textContent = question;
+        card.appendChild(q);
+    }
 
     const fileEl = document.createElement('div');
-    fileEl.className = 'dr-file';
+    fileEl.className = 'dr-thread-file';
     fileEl.textContent = basename;
-    body.appendChild(fileEl);
+    card.appendChild(fileEl);
 
-    const metaEl = document.createElement('div');
-    metaEl.className = 'dr-detail';
-    metaEl.textContent = `${ok}/${total} sub-topics covered`;
-    body.appendChild(metaEl);
+    const stat = document.createElement('div');
+    stat.className = 'dr-thread-stat';
+    stat.textContent = `${ok}/${total} sub-topics covered`;
+    card.appendChild(stat);
+
+    if (subQuestions.length) {
+        const details = document.createElement('details');
+        details.className = 'dr-thread-subq';
+        const summary = document.createElement('summary');
+        summary.textContent =
+            `${subQuestions.length} sub-question${subQuestions.length === 1 ? '' : 's'} investigated`;
+        details.appendChild(summary);
+        const ul = document.createElement('ul');
+        for (const sq of subQuestions) {
+            const li = document.createElement('li');
+            li.textContent = String(sq);
+            ul.appendChild(li);
+        }
+        details.appendChild(ul);
+        card.appendChild(details);
+    }
 
     // Primary action: open the paper's Markdown in a reader modal. The
     // backend `get_research_paper` command reads the workspace file and
     // returns its contents (or rejects with an error string).
     const actions = document.createElement('div');
-    actions.className = 'dr-actions';
-
+    actions.className = 'dr-thread-actions';
     const viewBtn = document.createElement('button');
     viewBtn.type = 'button';
     viewBtn.className = 'dr-view-btn';
     viewBtn.textContent = 'View paper';
     viewBtn.addEventListener('click', () => {
         if (!invoke) { showToast('Athen is still starting up.', 'error'); return; }
-        if (!arcId) { showToast('No arc to read the paper from.', 'error'); return; }
+        if (!id) { showToast('No arc to read the paper from.', 'error'); return; }
         withButtonPending(viewBtn, async () => {
-            const md = await invoke('get_research_paper', { arcId });
+            const md = await invoke('get_research_paper', { arcId: id });
             showResearchPaperModal(md, basename);
         }, { errorPrefix: 'Could not open the paper: ' });
     });
     actions.appendChild(viewBtn);
-    body.appendChild(actions);
+    card.appendChild(actions);
 
-    // Secondary hint: the agent can still read it in chat.
-    const hint = document.createElement('div');
-    hint.className = 'dr-hint';
-    hint.textContent = paperPath
-        ? `${paperPath} — or ask me about it in chat.`
-        : 'Or ask me about it in chat.';
-    body.appendChild(hint);
+    return card;
+}
 
-    card.appendChild(body);
+// Rebuilds the in-thread Deep Research card for `arcId`. Only renders when
+// `arcId` is the arc currently in view, so a background run never shows on an
+// unrelated arc; switching back to that arc re-renders from stored run state.
+function renderDeepResearchInline(arcId) {
+    if (!messagesEl) return;
+    removeDeepResearchInline();
+    const id = String(arcId || '');
+    if (!id || id !== String(activeArcId || '')) return;
+    const run = deepResearchRuns.get(id);
+    if (!run) return;
 
-    const closeBtn = document.createElement('button');
-    closeBtn.type = 'button';
-    closeBtn.className = 'dr-close';
-    closeBtn.setAttribute('aria-label', 'Dismiss');
-    closeBtn.innerHTML = ICON_X;
-    closeBtn.addEventListener('click', clearDeepResearchBanner);
-    card.appendChild(closeBtn);
+    // Drop the welcome empty-state if it's still showing.
+    const welcome = messagesEl.querySelector('.welcome-message');
+    if (welcome) welcome.remove();
 
-    el.appendChild(card);
+    const wasPinned = isScrollPinned(messagesEl.parentElement);
+    const card = run.finished
+        ? buildDeepResearchResultCard(id, run.result)
+        : buildDeepResearchProgressCard(run);
+    card.id = 'deep-research-inline';
+    card.dataset.arc = id;
+    messagesEl.appendChild(card);
+    scrollChatIfPinned(messagesEl.parentElement, 'auto', wasPinned);
+}
 
-    showToast('Research paper ready', 'success');
+function renderDeepResearchStarting(question) {
+    const id = String(activeArcId || '');
+    if (!id) return;
+    deepResearchRuns.set(id, {
+        question: question || '',
+        phase: 'planning',
+        detail: '',
+        total: 0,
+        done: 0,
+        ok: 0,
+        refiningSeen: false,
+        finished: false,
+    });
+    renderDeepResearchInline(id);
+}
+
+function renderDeepResearchProgress(p) {
+    const id = String((p && p.arc_id) || activeArcId || '');
+    if (!id) return;
+    const prev = deepResearchRuns.get(id) || { question: '', refiningSeen: false };
+    const phase = String(p.phase || '');
+    deepResearchRuns.set(id, {
+        question: prev.question || '',
+        phase,
+        detail: String(p.detail || ''),
+        total: Number(p.workers_total || 0),
+        done: Number(p.workers_done || 0),
+        ok: Number(p.workers_ok || 0),
+        refiningSeen: !!prev.refiningSeen || phase === 'refining',
+        finished: false,
+    });
+    renderDeepResearchInline(id);
+}
+
+function renderDeepResearchDone(p) {
+    const id = String((p && p.arc_id) || activeArcId || '');
+    if (!id) return;
+    const prev = deepResearchRuns.get(id) || {};
+    deepResearchRuns.set(id, { ...prev, finished: true, result: p || {} });
+    renderDeepResearchInline(id);
+    if (id === String(activeArcId || '')) showToast('Research paper ready', 'success');
 }
 
 // Reader modal for the research paper. Rides the rewind-dialog overlay shell
