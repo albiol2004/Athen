@@ -303,16 +303,16 @@ body.window-blurred .traffic-btn {
 }
 
 .update-banner-btn {
-    background: var(--brand-grad);
+    background: var(--brand-solid);
     color: #fff;
-    border-radius: 8px;
+    border-radius: var(--r-xs);
     padding: 5px 12px;
     font-size: 12px;
     font-weight: 600;
-    box-shadow: var(--shadow-card);
+    transition: background var(--dur-fast) var(--ease);
 }
 
-.update-banner-btn:hover { filter: brightness(1.05); }
+.update-banner-btn:hover { background: var(--brand-warm); }
 .update-banner-btn:disabled { opacity: 0.6; cursor: progress; }
 
 .update-banner-dismiss {
@@ -3395,20 +3395,16 @@ footer {
     border-radius: 50%;
     display: grid;
     place-items: center;
-    transition: transform var(--dur) var(--ease), filter var(--dur) var(--ease), background var(--dur) var(--ease);
+    transition: background var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease);
 }
 
 #send-btn {
-    background: var(--brand-grad);
+    background: var(--brand-solid);
     color: var(--text);
-    box-shadow: 0 4px 14px var(--brand-glow);
 }
-#send-btn:hover {
-    transform: translateY(-1px);
-    filter: brightness(1.08);
-    box-shadow: 0 6px 18px var(--brand-glow-strong);
-}
-#send-btn:active { transform: translateY(0); }
+#send-btn:hover { background: var(--brand-warm); }
+#send-btn:active { filter: brightness(0.94); }
+#send-btn:focus-visible { outline: none; box-shadow: var(--ring-focus); }
 #send-btn:disabled {
     background: var(--surface-3);
     color: var(--text-3);
@@ -3480,45 +3476,42 @@ footer {
 /* ─── Buttons ─── */
 .btn-primary {
     height: 36px;
-    padding: 0 14px;
-    background: var(--brand-grad);
+    padding: 0 16px;
+    background: var(--brand-solid);
     color: var(--text);
     border: none;
-    border-radius: var(--r-md);
+    border-radius: var(--r-sm);
     font-size: 13px;
-    font-weight: 500;
-    transition: transform var(--dur) var(--ease), filter var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
-    box-shadow: 0 1px 2px rgba(0,0,0,0.3);
+    font-weight: 600;
+    letter-spacing: 0.01em;
+    transition: background var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease);
 }
-.btn-primary:hover {
-    transform: translateY(-1px);
-    filter: brightness(1.06);
-    box-shadow: 0 6px 18px var(--brand-glow);
-}
-.btn-primary:active { transform: translateY(0); }
+.btn-primary:hover { background: var(--brand-warm); }
+.btn-primary:active { background: var(--brand-solid); filter: brightness(0.94); }
+.btn-primary:focus-visible { outline: none; box-shadow: var(--ring-focus); }
 .btn-primary:disabled {
     background: var(--surface-3);
     color: var(--text-3);
     cursor: not-allowed;
-    transform: none;
     box-shadow: none;
 }
 
 .btn-secondary {
     height: 36px;
-    padding: 0 14px;
+    padding: 0 16px;
     background: var(--surface-2);
     color: var(--text);
-    border: 1px solid var(--border);
-    border-radius: var(--r-md);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--r-sm);
     font-size: 13px;
-    font-weight: 500;
-    transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease);
+    font-weight: 600;
+    transition: background var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease);
 }
 .btn-secondary:hover {
     background: var(--surface-3);
-    border-color: var(--border-strong);
+    border-color: var(--border-bright);
 }
+.btn-secondary:focus-visible { outline: none; box-shadow: var(--ring-focus); }
 .btn-secondary:disabled {
     color: var(--text-3);
     cursor: not-allowed;
@@ -3535,27 +3528,28 @@ footer {
 
 .btn-danger {
     height: 36px;
-    padding: 0 14px;
+    padding: 0 16px;
     background: var(--danger);
-    color: var(--text);
+    color: #fff;
     border: none;
-    border-radius: var(--r-md);
+    border-radius: var(--r-sm);
     font-size: 13px;
-    font-weight: 500;
-    transition: filter var(--dur) var(--ease);
+    font-weight: 600;
+    transition: filter var(--dur-fast) var(--ease);
 }
-.btn-danger:hover { filter: brightness(1.1); }
+.btn-danger:hover { filter: brightness(1.08); }
+.btn-danger:focus-visible { outline: none; box-shadow: 0 0 0 1.5px var(--danger), 0 0 0 4px var(--danger-soft); }
 
 .btn-deny {
     height: 36px;
-    padding: 0 14px;
+    padding: 0 16px;
     background: transparent;
     color: var(--danger);
     border: 1px solid rgba(229, 72, 77, 0.35);
-    border-radius: var(--r-md);
+    border-radius: var(--r-sm);
     font-size: 13px;
-    font-weight: 500;
-    transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease);
+    font-weight: 600;
+    transition: background var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease);
 }
 .btn-deny:hover {
     background: var(--danger-soft);
@@ -3566,17 +3560,20 @@ footer {
 
 .btn-approve {
     height: 36px;
-    padding: 0 14px;
-    background: var(--brand-grad);
+    padding: 0 16px;
+    background: var(--brand-solid);
     color: var(--text);
     border: none;
-    border-radius: var(--r-md);
+    border-radius: var(--r-sm);
     font-size: 13px;
-    font-weight: 500;
-    transition: filter var(--dur) var(--ease), transform var(--dur) var(--ease);
+    font-weight: 600;
+    letter-spacing: 0.01em;
+    transition: background var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease);
 }
-.btn-approve:hover { filter: brightness(1.08); transform: translateY(-1px); }
-.btn-approve:disabled { opacity: 0.5; cursor: not-allowed; transform: none; filter: none; }
+.btn-approve:hover { background: var(--brand-warm); }
+.btn-approve:active { filter: brightness(0.94); }
+.btn-approve:focus-visible { outline: none; box-shadow: var(--ring-focus); }
+.btn-approve:disabled { opacity: 0.5; cursor: not-allowed; filter: none; }
 
 /* ─── Generic in-flight button affordance ───
    Reusable spinner state for any async action button. Applied by the
@@ -8381,13 +8378,11 @@ option:hover {
     font-size: 12px;
     font-weight: 500;
     cursor: pointer;
-    transition: transform var(--dur) var(--ease),
-                border-color var(--dur) var(--ease),
-                background var(--dur) var(--ease);
+    transition: border-color var(--dur-fast) var(--ease),
+                background var(--dur-fast) var(--ease);
 }
 .agents-pill.hidden { display: none; }
 .agents-pill:hover {
-    transform: translateY(-1px);
     border-color: var(--brand-warm);
     background: var(--brand-glow);
 }
@@ -9592,13 +9587,11 @@ option:hover {
     font-size: 12px;
     font-weight: 500;
     cursor: pointer;
-    transition: transform var(--dur) var(--ease),
-                border-color var(--dur) var(--ease),
-                color var(--dur) var(--ease),
-                background var(--dur) var(--ease);
+    transition: border-color var(--dur-fast) var(--ease),
+                color var(--dur-fast) var(--ease),
+                background var(--dur-fast) var(--ease);
 }
 .changes-pill:hover {
-    transform: translateY(-1px);
     color: var(--text-1);
     border-color: var(--border-strong);
     background: var(--surface-2);

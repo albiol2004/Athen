@@ -7,13 +7,19 @@
   --text: #efe7e0;
   --text-dim: #a89d94;
   --coral: #e8745a;
+  --coral-hover: #ef8268;
   --coral-soft: rgba(232, 116, 90, 0.16);
+  --coral-ink: #20120d;
   --glass: rgba(255, 255, 255, 0.045);
   --glass-border: rgba(255, 255, 255, 0.09);
   --green: #7fc8a4;
   --red: #e07a6e;
   --amber: #d9b06c;
   --radius: 14px;
+  --radius-sm: 10px;
+  --ease: cubic-bezier(0.16, 1, 0.3, 1);
+  /* Two-stop focus ring mirroring the desktop frontend. */
+  --ring-focus: 0 0 0 1.5px var(--coral), 0 0 0 4px var(--coral-soft);
 }
 
 * { box-sizing: border-box; }
@@ -57,9 +63,13 @@ button { font: inherit; }
 }
 .login-card input:focus { border-color: var(--coral); }
 .login-card button[type="submit"] {
-  border: none; border-radius: 11px; cursor: pointer;
-  background: var(--coral); color: #20120d; font-weight: 600; padding: 9px;
+  border: none; border-radius: var(--radius-sm); cursor: pointer;
+  background: var(--coral); color: var(--coral-ink); font-weight: 600; padding: 10px;
+  letter-spacing: 0.01em;
+  transition: background 120ms var(--ease), box-shadow 120ms var(--ease);
 }
+.login-card button[type="submit"]:hover { background: var(--coral-hover); }
+.login-card button[type="submit"]:focus-visible { outline: none; box-shadow: var(--ring-focus); }
 .login-card button[type="submit"]:disabled { opacity: 0.5; cursor: default; }
 .login-card .advanced summary { cursor: pointer; color: var(--text-dim); font-size: 12.5px; }
 .login-card .advanced label { margin-top: 8px; }
@@ -83,10 +93,12 @@ button { font: inherit; }
 .new-chat {
   display: flex; align-items: center; gap: 8px;
   background: var(--coral-soft); color: var(--coral);
-  border: none; border-radius: 10px; padding: 8px 12px;
+  border: none; border-radius: var(--radius-sm); padding: 8px 12px;
   font-weight: 600; cursor: pointer;
+  transition: background 120ms var(--ease), color 120ms var(--ease);
 }
-.new-chat:hover { filter: brightness(1.1); }
+.new-chat:hover { background: rgba(232, 116, 90, 0.24); color: var(--coral-hover); }
+.new-chat:focus-visible { outline: none; box-shadow: var(--ring-focus); }
 .arc-list { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
 .arc-row {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
@@ -211,13 +223,15 @@ button { font: inherit; }
 .msg.no-provider { display: flex; flex-direction: column; gap: 10px; align-self: flex-start; }
 .no-provider-cta {
   align-self: flex-start;
-  padding: 8px 16px;
+  padding: 9px 16px;
   background: var(--coral);
-  color: #20120d;
-  border: none; border-radius: 8px;
-  font-weight: 600; cursor: pointer;
+  color: var(--coral-ink);
+  border: none; border-radius: var(--radius-sm);
+  font-weight: 600; cursor: pointer; letter-spacing: 0.01em;
+  transition: background 120ms var(--ease), box-shadow 120ms var(--ease);
 }
-.no-provider-cta:hover { filter: brightness(1.06); }
+.no-provider-cta:hover { background: var(--coral-hover); }
+.no-provider-cta:focus-visible { outline: none; box-shadow: var(--ring-focus); }
 
 /* markdown body */
 .md > :first-child { margin-top: 0; }
@@ -281,11 +295,15 @@ button { font: inherit; }
 .card .paths { font-family: ui-monospace, monospace; font-size: 12px; word-break: break-all; }
 .card .actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .card button {
-  font-size: 13px; padding: 6px 14px; border-radius: 9px; cursor: pointer;
+  font: inherit; font-size: 13px; padding: 7px 14px; border-radius: var(--radius-sm); cursor: pointer;
   border: 1px solid var(--glass-border); background: rgba(255, 255, 255, 0.06);
-  color: var(--text);
+  color: var(--text); font-weight: 600;
+  transition: background 120ms var(--ease), border-color 120ms var(--ease);
 }
-.card button.approve { background: var(--coral); border-color: transparent; color: #20120d; font-weight: 600; }
+.card button:hover { background: rgba(255, 255, 255, 0.1); border-color: rgba(255, 255, 255, 0.14); }
+.card button.approve { background: var(--coral); border-color: transparent; color: var(--coral-ink); }
+.card button.approve:hover { background: var(--coral-hover); }
+.card button:focus-visible { outline: none; box-shadow: var(--ring-focus); }
 .card button:disabled { opacity: 0.5; cursor: default; }
 .card .resolved { color: var(--text-dim); font-size: 12.5px; }
 .card-error { color: var(--red); font-size: 12px; margin-top: 8px; }
@@ -330,9 +348,12 @@ button { font: inherit; }
 }
 .composer .send, .composer .stop {
   display: grid; place-items: center; width: 34px; height: 34px; flex: none;
-  border: none; border-radius: 11px; cursor: pointer;
+  border: none; border-radius: var(--radius-sm); cursor: pointer;
+  transition: background 120ms var(--ease), box-shadow 120ms var(--ease);
 }
-.composer .send { background: var(--coral); color: #20120d; }
+.composer .send { background: var(--coral); color: var(--coral-ink); }
+.composer .send:hover { background: var(--coral-hover); }
+.composer .send:focus-visible, .composer .stop:focus-visible { outline: none; box-shadow: var(--ring-focus); }
 .composer .send:disabled { opacity: 0.4; cursor: default; }
 .composer .stop { background: rgba(224, 122, 110, 0.15); color: var(--red); }
 .composer .stop:hover { background: rgba(224, 122, 110, 0.25); }
@@ -444,10 +465,14 @@ button { font: inherit; }
 .plan-steps li.done { color: var(--text-dim); text-decoration: line-through; }
 .plan-card .actions { display: flex; gap: 8px; }
 .plan-card button {
-  font: inherit; font-size: 13px; padding: 6px 14px; border-radius: 9px; cursor: pointer;
-  border: 1px solid var(--glass-border); background: rgba(255, 255, 255, 0.06); color: var(--text);
+  font: inherit; font-size: 13px; padding: 7px 14px; border-radius: var(--radius-sm); cursor: pointer;
+  border: 1px solid var(--glass-border); background: rgba(255, 255, 255, 0.06); color: var(--text); font-weight: 600;
+  transition: background 120ms var(--ease), border-color 120ms var(--ease);
 }
-.plan-card button.approve { background: var(--green); border-color: transparent; color: #11241b; font-weight: 600; }
+.plan-card button:hover { background: rgba(255, 255, 255, 0.1); border-color: rgba(255, 255, 255, 0.14); }
+.plan-card button.approve { background: var(--green); border-color: transparent; color: #11241b; }
+.plan-card button.approve:hover { filter: brightness(1.06); }
+.plan-card button:focus-visible { outline: none; box-shadow: var(--ring-focus); }
 .plan-card button:disabled { opacity: 0.5; }
 .plan-progress { font-size: 12.5px; color: var(--text-dim); }
 
@@ -469,13 +494,20 @@ button { font: inherit; }
 .drawer-empty { color: var(--text-dim); font-size: 12.5px; text-align: center; padding: 26px 0; }
 .drawer-error { color: var(--red); font-size: 12.5px; }
 .btn-small {
-  font: inherit; font-size: 12px; padding: 4px 11px; border-radius: 8px; cursor: pointer;
+  font: inherit; font-size: 12px; padding: 5px 12px; border-radius: 8px; cursor: pointer;
   background: var(--coral-soft); color: var(--coral); border: none; font-weight: 600;
+  transition: background 120ms var(--ease), color 120ms var(--ease);
 }
+.btn-small:hover { background: rgba(232, 116, 90, 0.24); }
+.btn-small:focus-visible { outline: none; box-shadow: var(--ring-focus); }
 .btn-primary {
-  font: inherit; font-size: 13px; padding: 7px 14px; border-radius: 9px; cursor: pointer;
-  background: var(--coral); color: #20120d; border: none; font-weight: 600;
+  font: inherit; font-size: 13px; padding: 8px 16px; border-radius: var(--radius-sm); cursor: pointer;
+  background: var(--coral); color: var(--coral-ink); border: none; font-weight: 600; letter-spacing: 0.01em;
+  transition: background 120ms var(--ease), box-shadow 120ms var(--ease);
 }
+.btn-primary:hover { background: var(--coral-hover); }
+.btn-primary:active { filter: brightness(0.94); }
+.btn-primary:focus-visible { outline: none; box-shadow: var(--ring-focus); }
 .btn-primary:disabled { opacity: 0.5; }
 
 .agent-row, .change-row, .wakeup-row {
@@ -591,15 +623,17 @@ button { font: inherit; }
 .confirm-dialog p { margin: 0 0 18px; font-size: 13px; line-height: 1.5; color: var(--text-dim); }
 .confirm-buttons { display: flex; gap: 8px; justify-content: flex-end; }
 .confirm-cancel, .confirm-ok {
-  font: inherit; font-size: 13px; font-weight: 500; cursor: pointer;
-  padding: 7px 18px; border-radius: 9px; border: 1px solid var(--glass-border);
-  transition: filter 120ms, background 120ms;
+  font: inherit; font-size: 13px; font-weight: 600; cursor: pointer;
+  padding: 8px 18px; border-radius: var(--radius-sm); border: 1px solid var(--glass-border);
+  transition: background 120ms var(--ease), color 120ms var(--ease), box-shadow 120ms var(--ease);
 }
 .confirm-cancel { background: none; color: var(--text-dim); }
 .confirm-cancel:hover { background: rgba(255, 255, 255, 0.06); color: var(--text); }
-.confirm-ok { background: var(--coral); color: #20120d; border-color: transparent; }
-.confirm-ok:hover { filter: brightness(1.08); }
+.confirm-cancel:focus-visible, .confirm-ok:focus-visible { outline: none; box-shadow: var(--ring-focus); }
+.confirm-ok { background: var(--coral); color: var(--coral-ink); border-color: transparent; }
+.confirm-ok:hover { background: var(--coral-hover); }
 .confirm-ok.danger { background: var(--red); }
+.confirm-ok.danger:hover { background: var(--red); filter: brightness(1.06); }
 
 /* ---- sidebar projects section ---- */
 .proj-section { display: flex; flex-direction: column; gap: 1px; }
@@ -658,12 +692,15 @@ button { font: inherit; }
 .pp-slug { font: 11.5px ui-monospace, monospace; color: var(--text-dim); }
 .pp-head-actions { margin-left: auto; display: flex; gap: 8px; flex: none; }
 .pp-btn {
-  font: inherit; font-size: 13px; padding: 6px 13px; border-radius: 9px; cursor: pointer;
-  background: rgba(255, 255, 255, 0.06); border: 1px solid var(--glass-border); color: var(--text);
+  font: inherit; font-size: 13px; padding: 7px 14px; border-radius: var(--radius-sm); cursor: pointer;
+  background: rgba(255, 255, 255, 0.06); border: 1px solid var(--glass-border); color: var(--text); font-weight: 600;
+  transition: background 120ms var(--ease), border-color 120ms var(--ease), box-shadow 120ms var(--ease);
 }
-.pp-btn:hover { background: rgba(255, 255, 255, 0.1); }
+.pp-btn:hover { background: rgba(255, 255, 255, 0.1); border-color: rgba(255, 255, 255, 0.14); }
+.pp-btn:focus-visible { outline: none; box-shadow: var(--ring-focus); }
 .pp-btn:disabled { opacity: 0.5; cursor: default; }
-.pp-btn.primary { background: var(--coral); border-color: transparent; color: #20120d; font-weight: 600; }
+.pp-btn.primary { background: var(--coral); border-color: transparent; color: var(--coral-ink); }
+.pp-btn.primary:hover { background: var(--coral-hover); }
 .pp-btn.danger { color: var(--red); border-color: rgba(224, 122, 110, 0.35); background: none; }
 .pp-btn.danger:hover { background: rgba(224, 122, 110, 0.1); }
 .pp-btn.danger.armed { background: var(--red); color: #20120d; font-weight: 600; }
