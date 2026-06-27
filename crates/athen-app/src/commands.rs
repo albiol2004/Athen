@@ -7674,12 +7674,12 @@ async fn resolve_basic_creds(
             None => None,
         },
     };
-    password.filter(|p| !p.is_empty()).map(|password| {
-        crate::http_api::BasicCreds {
+    password
+        .filter(|p| !p.is_empty())
+        .map(|password| crate::http_api::BasicCreds {
             username: username.to_string(),
             password,
-        }
-    })
+        })
 }
 
 /// Persist Remote Access settings and apply them live (stop + restart the
@@ -7714,7 +7714,8 @@ pub(crate) async fn set_remote_access_core(
 
     // 3. Apply live.
     if enabled {
-        let basic = resolve_basic_creds(state, &cfg.remote_access.username, password.as_deref()).await;
+        let basic =
+            resolve_basic_creds(state, &cfg.remote_access.username, password.as_deref()).await;
         state
             .start_remote_access(ui.clone(), port, basic, tunnel_enabled)
             .await;

@@ -266,8 +266,7 @@ async fn extract_cloudflared_from_tgz(bytes: Vec<u8>) -> Result<Vec<u8>> {
             .entries()
             .map_err(|e| AthenError::Other(format!("tar open failed: {e}")))?
         {
-            let mut entry =
-                entry.map_err(|e| AthenError::Other(format!("tar entry: {e}")))?;
+            let mut entry = entry.map_err(|e| AthenError::Other(format!("tar entry: {e}")))?;
             let path = entry
                 .path()
                 .map_err(|e| AthenError::Other(format!("tar entry path: {e}")))?

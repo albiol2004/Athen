@@ -2710,7 +2710,10 @@ impl AppState {
                 let state = ui.app_state();
                 let path = match crate::tunnel::ensure_cloudflared(None).await {
                     Ok(p) => {
-                        state.remote_access_status.lock_recover().cloudflared_installed = true;
+                        state
+                            .remote_access_status
+                            .lock_recover()
+                            .cloudflared_installed = true;
                         p
                     }
                     Err(e) => {
