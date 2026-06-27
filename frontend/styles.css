@@ -8430,6 +8430,7 @@ option:hover {
 /* Shared service-icon chip (Cloud APIs + MCP) — a quiet rounded tile that
    reads as part of the icon system, not a logo wall. */
 .svc-icon {
+    position: relative;
     flex: none;
     display: inline-flex;
     align-items: center;
@@ -8442,13 +8443,17 @@ option:hover {
     border: 1px solid rgba(255, 255, 255, 0.06);
 }
 .svc-icon svg { width: 18px; height: 18px; }
-.svc-icon-img {
+.svc-glyph { display: inline-flex; align-items: center; justify-content: center; }
+.svc-icon-img,
+.svc-favicon {
     width: 22px;
     height: 22px;
     object-fit: contain;
     border-radius: 5px;
     display: block;
 }
+/* Logo layers over the glyph; whichever survives load stays centered. */
+.svc-favicon { position: absolute; inset: 0; margin: auto; }
 .cloud-api-icon { grid-area: icon; align-self: center; }
 .cloud-api-row-actions {
     grid-area: actions;

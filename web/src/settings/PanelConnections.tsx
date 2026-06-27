@@ -1145,7 +1145,7 @@ function EndpointsSection({ client }: { client: AthenClient }) {
       <div className="st-list">
         {(endpoints.data ?? []).map((e) => (
           <div key={e.id} className="st-item">
-            <CloudApiIcon provider={e.provider} />
+            <CloudApiIcon provider={e.provider} baseUrl={e.base_url} />
             <div className="st-item-main">
               <div className="st-item-title">
                 {e.name}

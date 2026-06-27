@@ -7989,9 +7989,31 @@ function normalizeProviderKey(provider) {
     return (provider || '').toLowerCase().replace(/[^a-z0-9]/g, '');
 }
 
-// Icon for a curated HTTP provider; neutral cloud for anything else.
-function cloudApiIcon(provider) {
-    return svcSvg(CLOUD_API_ICONS[normalizeProviderKey(provider)] || SVC_GLYPHS.cloud);
+// Real brand favicon for a host, via DuckDuckGo's icon service (follows
+// each site's declared icon, normalizes size, privacy-respecting). Keyed
+// on the registrable domain (last two labels) so api.* subdomains still
+// resolve the marketing-site logo. Returns null for unparseable URLs.
+function svcFaviconUrl(url) {
+    try {
+        const host = new URL(url).hostname;
+        const parts = host.split('.');
+        const domain = parts.length > 2 ? parts.slice(-2).join('.') : host;
+        if (!domain) return null;
+        return `https://icons.duckduckgo.com/ip3/${domain}.ico`;
+    } catch (e) {
+        return null;
+    }
+}
+
+// Tile contents for a curated HTTP provider: the provider's real logo
+// (favicon) layered over a category glyph. On a successful logo load the
+// glyph is hidden; if the logo fails the broken <img> is removed and the
+// glyph stays. So every row shows *something* recognizable, online or off.
+function cloudApiIcon(provider, url) {
+    const glyph = `<span class="svc-glyph">${svcSvg(CLOUD_API_ICONS[normalizeProviderKey(provider)] || SVC_GLYPHS.cloud)}</span>`;
+    const fav = svcFaviconUrl(url);
+    if (!fav) return glyph;
+    return `${glyph}<img class="svc-favicon" src="${escapeHtml(fav)}" alt="" loading="lazy" onload="this.previousElementSibling.style.display='none'" onerror="this.remove()">`;
 }
 
 // MCP server icon. A custom `icon` may be a data:/http(s) image (user
@@ -17881,7 +17903,7 @@ function renderCloudApisList() {
         const authLabel = describeAuthMethod(e.auth_method);
         return `
             <div class="cloud-api-row" data-endpoint-id="${escapeHtml(e.id)}">
-                <span class="cloud-api-icon svc-icon">${cloudApiIcon(e.provider)}</span>
+                <span class="cloud-api-icon svc-icon">${cloudApiIcon(e.provider, e.base_url)}</span>
                 <div class="cloud-api-row-main">
                     <div class="cloud-api-row-name">
                         <strong>${escapeHtml(e.name)}</strong>

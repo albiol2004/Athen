@@ -10,6 +10,8 @@
 // Kept in lockstep with the desktop equivalents in frontend/app.js
 // (SVC_GLYPHS / CLOUD_API_ICONS / mcpEntryIconHtml / fileToIconDataUrl).
 
+import { useState } from 'react';
+
 function svg(inner: string): string {
   return `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${inner}</svg>`;
 }
@@ -103,8 +105,43 @@ function isImageUrl(v: string): boolean {
   return /^(data:|https?:\/\/)/i.test(v);
 }
 
-/** Icon chip for a curated HTTP provider; neutral cloud for anything else. */
-export function CloudApiIcon({ provider }: { provider: string }) {
+// Real brand favicon for a host, via DuckDuckGo's icon service (follows
+// each site's declared icon, normalizes size). Keyed on the registrable
+// domain (last two labels) so api.* subdomains resolve the marketing-site
+// logo. Returns null for unparseable URLs.
+function faviconUrl(url: string): string | null {
+  try {
+    const host = new URL(url).hostname;
+    const parts = host.split('.');
+    const domain = parts.length > 2 ? parts.slice(-2).join('.') : host;
+    return domain ? `https://icons.duckduckgo.com/ip3/${domain}.ico` : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Icon chip for a curated HTTP provider: the provider's real logo
+ * (favicon), falling back to a category glyph (neutral cloud for unknown)
+ * when the logo can't load — so every row stays recognizable, online or
+ * off.
+ */
+export function CloudApiIcon({ provider, baseUrl }: { provider: string; baseUrl?: string }) {
+  const [failed, setFailed] = useState(false);
+  const fav = baseUrl ? faviconUrl(baseUrl) : null;
+  if (fav && !failed) {
+    return (
+      <span className="st-item-icon">
+        <img
+          className="st-item-icon-img"
+          src={fav}
+          alt=""
+          loading="lazy"
+          onError={() => setFailed(true)}
+        />
+      </span>
+    );
+  }
   const inner = CLOUD_API_ICONS[normalizeProviderKey(provider)] ?? GLYPHS.cloud;
   return <span className="st-item-icon" dangerouslySetInnerHTML={{ __html: svg(inner) }} />;
 }
