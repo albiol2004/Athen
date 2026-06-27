@@ -733,6 +733,37 @@ in prose.\n"
     ))
 }
 
+/// Render the VOLATILE awareness block for an arc that already has a Deep
+/// Research paper. Without this the agent has no idea a paper exists — after a
+/// run, `research_paper_path`/`research_question` are stamped on the arc but
+/// never surfaced, so follow-up questions are answered blind. This tells the
+/// agent the paper exists, where it lives, and to read it before answering.
+/// Rides the volatile `system_suffix` tail (cache-safe), like the project block.
+async fn render_research_paper_volatile_block(
+    arc_store: Option<&athen_persistence::arcs::ArcStore>,
+    arc_id: &str,
+) -> Option<String> {
+    let store = arc_store?;
+    let meta = store.get_arc(arc_id).await.ok().flatten()?;
+    let path = meta.research_paper_path?;
+    if path.trim().is_empty() {
+        return None;
+    }
+    let question = meta
+        .research_question
+        .filter(|q| !q.trim().is_empty())
+        .unwrap_or_else(|| "the original research question".to_string());
+    Some(format!(
+        "[RESEARCH PAPER AVAILABLE]\n\
+A Deep Research paper for this conversation has already been written and saved at \
+`{path}` (a workspace-relative path), covering: {question}\n\
+To answer any follow-up about this research, FIRST read the paper with the `read` \
+tool at that path, then answer from its contents and cite its sources — do not \
+re-research from scratch. To expand it, run deep_research again in this \
+conversation with mode \"extend\".\n"
+    ))
+}
+
 /// Convert a raw technical error string into a user-friendly message.
 ///
 /// Technical details are intentionally stripped — they are already logged
@@ -3037,6 +3068,17 @@ pub(crate) async fn send_message_core(
             // session (UI-set; never from sense_router).
             if let Some(block) =
                 render_code_mode_volatile_block(state.arc_store.as_ref(), &active_arc).await
+            {
+                if !system_suffix.is_empty() && !system_suffix.ends_with("\n\n") {
+                    system_suffix.push_str("\n\n");
+                }
+                system_suffix.push_str(&block);
+            }
+            // Research-paper awareness — same VOLATILE tail. Present only once a
+            // Deep Research run has stamped a paper path on this arc, so the
+            // agent knows the paper exists and reads it for follow-ups.
+            if let Some(block) =
+                render_research_paper_volatile_block(state.arc_store.as_ref(), &active_arc).await
             {
                 if !system_suffix.is_empty() && !system_suffix.ends_with("\n\n") {
                     system_suffix.push_str("\n\n");
