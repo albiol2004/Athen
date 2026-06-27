@@ -169,9 +169,8 @@ export function Chat({
           )}
           {busy && (
             <div className="busy-row">
-              <span className="busy-dot" />
-              <span className="busy-dot" />
-              <span className="busy-dot" />
+              <span className="tool-pulse-dot" />
+              <span className="busy-label">Working…</span>
             </div>
           )}
         </div>

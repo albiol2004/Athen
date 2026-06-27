@@ -42,8 +42,11 @@ export function ThinkingBlock({ content, done }: { content: string; done: boolea
   // While live: forced open. Once done the attribute is dropped, the
   // block collapses, and the user can re-expand it freely.
   return (
-    <details className="thinking" open={done ? undefined : true}>
-      <summary>{done ? 'Thought process' : 'Thinking…'}</summary>
+    <details className={`thinking${done ? '' : ' thinking-live'}`} open={done ? undefined : true}>
+      <summary>
+        {!done && <span className="tool-pulse-dot" />}
+        {done ? 'Thought process' : 'Thinking…'}
+      </summary>
       <pre>{content}</pre>
     </details>
   );

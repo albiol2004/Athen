@@ -2330,14 +2330,38 @@ header h1 {
 }
 .tool-execution-card .tool-status-icon {
     flex-shrink: 0;
-    font-size: 13px;
+    width: 14px;
+    height: 14px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     margin-top: 1px;
 }
-.tool-execution-card.in-progress .tool-status-icon { color: var(--info); animation: spin 1.4s linear infinite; }
+.tool-execution-card .tool-status-icon svg { display: block; width: 13px; height: 13px; }
+.tool-execution-card.in-progress .tool-status-icon { color: var(--brand-warm); }
 .tool-execution-card.completed   .tool-status-icon { color: var(--success); }
 .tool-execution-card.failed      .tool-status-icon { color: var(--danger);  }
 
 @keyframes spin { to { transform: rotate(360deg); } }
+
+/* Canonical "working" pulse — one motion vocabulary shared by tool cards,
+   the agents pill and the Deep Research stepper (soft expanding ring, no spin). */
+.tool-pulse-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--brand-warm);
+    box-shadow: 0 0 0 0 var(--brand-glow-strong);
+    animation: trace-pulse 1.6s ease-out infinite;
+}
+@keyframes trace-pulse {
+    0%   { box-shadow: 0 0 0 0   var(--brand-glow-strong); }
+    70%  { box-shadow: 0 0 0 5px rgba(185, 81, 99, 0); }
+    100% { box-shadow: 0 0 0 0   rgba(185, 81, 99, 0); }
+}
+@media (prefers-reduced-motion: reduce) {
+    .tool-pulse-dot { animation: none; }
+}
 
 .tool-execution-card .tool-name {
     font-family: var(--mono);
@@ -2433,6 +2457,14 @@ header h1 {
     padding: 4px 12px 12px;
     border-top: 1px solid var(--border);
     margin: 0;
+}
+.tool-group-history[open] > .tool-group-body { animation: trace-reveal 220ms var(--ease); }
+@keyframes trace-reveal {
+    from { opacity: 0; transform: translateY(-4px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+@media (prefers-reduced-motion: reduce) {
+    .tool-group-history[open] > .tool-group-body { animation: none; }
 }
 
 /* ─── Per-tool expanded body (Read content, Edit diff, Fetch page, …) ─── */
@@ -2980,15 +3012,58 @@ mark.grep-match {
 /* ─── Thinking blocks ─── */
 .thinking-block {
     margin: 8px 0;
-    padding: 10px 12px;
-    background: var(--overlay-hover);
-    border: 1px dashed var(--border);
+    padding: 0;
+    background: var(--glass-bg);
+    backdrop-filter: var(--glass-blur);
+    -webkit-backdrop-filter: var(--glass-blur);
+    border: 1px solid var(--glass-border);
     border-radius: var(--r-md);
-    color: var(--text-3);
+    color: var(--text-2);
     font-size: 12.5px;
+    overflow: hidden;
+}
+.thinking-block > summary {
+    list-style: none;
+    cursor: pointer;
+    user-select: none;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 9px 12px;
+    color: var(--text-2);
+    font-weight: 500;
+}
+.thinking-block > summary::-webkit-details-marker { display: none; }
+.thinking-block > summary::after {
+    content: '\025BE';
+    margin-left: auto;
+    color: var(--text-3);
+    font-size: 11px;
+    transition: transform 120ms var(--ease);
+}
+.thinking-block[open] > summary::after { transform: rotate(180deg); }
+/* Live reasoning gets a leading pulse dot; the settled block is quiet. */
+.thinking-block.thinking-live > summary::before {
+    content: '';
+    flex: none;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--brand-warm);
+    box-shadow: 0 0 0 0 var(--brand-glow-strong);
+    animation: trace-pulse 1.6s ease-out infinite;
+}
+.thinking-content {
+    line-height: 1.6;
+    padding: 0 12px 11px;
+    color: var(--text-3);
     font-style: italic;
 }
-.thinking-content { line-height: 1.5; }
+.thinking-block[open] > .thinking-content { animation: trace-reveal 220ms var(--ease); }
+@media (prefers-reduced-motion: reduce) {
+    .thinking-block.thinking-live > summary::before,
+    .thinking-block[open] > .thinking-content { animation: none; }
+}
 
 /* ─── Error / approval bubbles ─── */
 .message-bubble.error-message {

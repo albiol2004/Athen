@@ -233,7 +233,19 @@ export const ToolCard = memo(function ToolCard({ it, client }: { it: ToolItem; c
         onClick={() => expandable && setOpen((o) => !o)}
         title={it.detail || undefined}
       >
-        <span className={`dot${done ? ' done' : ''}${it.failed ? ' fail' : ''}`} />
+        <span className={`tc-mark${done ? ' done' : ''}${it.failed ? ' fail' : ''}`}>
+          {it.failed ? (
+            <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path d="M4.5 4.5l7 7M11.5 4.5l-7 7" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+            </svg>
+          ) : done ? (
+            <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path d="M3.5 8.5l3 3 6-7" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          ) : (
+            <span className="tool-pulse-dot" />
+          )}
+        </span>
         <span className="tc-name">{it.name}</span>
         <span className="tc-detail">{!done && !it.failed ? it.status : it.detail || ''}</span>
         {expandable && <span className={`tc-chev${open ? ' open' : ''}`}>›</span>}

@@ -293,6 +293,9 @@ function sealCurrentStreamingRow() {
             thinkingContent.textContent = thinkingText;
         }
         thinkingBlock.open = false;
+        thinkingBlock.classList.remove('thinking-live');
+        const s = thinkingBlock.querySelector('summary');
+        if (s) s.textContent = 'Thought process';
     }
     streamingBubble = null;
     streamingText = '';
@@ -408,6 +411,9 @@ function registerTauriEventListeners() {
             if (isActiveArc && thinkingBlock && thinkingText) {
                 thinkingContent.textContent = thinkingText;
                 thinkingBlock.open = false;
+                thinkingBlock.classList.remove('thinking-live');
+                const ts = thinkingBlock.querySelector('summary');
+                if (ts) ts.textContent = 'Thought process';
             }
             // If it was a background arc, show a notification dot
             // and refresh the sidebar.
@@ -515,11 +521,11 @@ function registerTauriEventListeners() {
                 const wrap = row.querySelector('.message-content-wrap');
 
                 thinkingBlock = document.createElement('details');
-                thinkingBlock.className = 'thinking-block';
+                thinkingBlock.className = 'thinking-block thinking-live';
                 thinkingBlock.open = true;
 
                 const summary = document.createElement('summary');
-                summary.textContent = 'Thinking...';
+                summary.textContent = 'Thinking…';
                 thinkingBlock.appendChild(summary);
 
                 thinkingContent = document.createElement('div');
@@ -5987,8 +5993,13 @@ function buildToolCard(meta) {
     card.className = `tool-execution-card ${statusClass}${builtinClass}`;
     card.title = toolName;
 
-    const statusIcon = status === 'Completed' ? '&#10003;'
-                     : status === 'Failed' ? '&#10007;' : '&#9679;';
+    // Geometric status markers (no emoji): a crisp stroked check / x when
+    // settled, a soft pulsing dot while the tool is still running.
+    const statusIcon = status === 'Completed'
+        ? '<svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3.5 8.5l3 3 6-7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+        : status === 'Failed'
+        ? '<svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4.5 4.5l7 7M11.5 4.5l-7 7" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>'
+        : '<span class="tool-pulse-dot"></span>';
     let labelText = icon ? builtinToolLabel(toolName) : toolName;
     // http_request reads as "Cloud API" by default; promote to
     // "Cloud API: <endpoint>" so the user can tell which API the
