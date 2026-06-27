@@ -364,9 +364,16 @@ async fn identify_gaps(
         user.push_str(&format!("=== Angle {} : {sub_q} ===\n", i + 1));
         if *ok && !findings.trim().is_empty() {
             // Keep the digest bounded — the editor needs the gist, not every byte.
+            // Truncate by CHARS, not bytes: a byte slice (`&f[..1500]`) panics
+            // when the cut lands mid-UTF-8-codepoint, and findings are often
+            // non-ASCII.
             let f = findings.trim();
-            let clipped = if f.len() > 1500 { &f[..1500] } else { f };
-            user.push_str(clipped);
+            if f.len() > 1500 {
+                let clipped: String = f.chars().take(1500).collect();
+                user.push_str(&clipped);
+            } else {
+                user.push_str(f);
+            }
         } else {
             user.push_str("(no usable findings)");
         }
