@@ -128,6 +128,17 @@ pub type ProfileEmbeddingCache =
 /// the running agent mid-task without cancelling and restarting.
 pub type PendingInputSlot = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
 
+/// A Telegram-triggered Deep Research request parked between the `/deepresearch`
+/// command (which sends the depth-choice keyboard) and the owner tapping a depth
+/// button (which carries this entry's token in its `callback_data`). See
+/// [`AppState::stash_pending_deep_research`].
+pub(crate) struct PendingDeepResearch {
+    pub arc_id: String,
+    pub chat_id: i64,
+    pub question: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Maps coordinator task ids to the arc the originating sense event
 /// landed in. The sense_router populates this when it hands an event to
 /// the coordinator; the dispatch loop consumes it to know which arc to
@@ -298,6 +309,11 @@ pub struct AppState {
     /// without cancelling.
     pub pending_user_inputs:
         std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<String, PendingInputSlot>>>,
+    /// Telegram-triggered Deep Research requests awaiting the owner's depth
+    /// choice (the inline-keyboard buttons). Keyed by a short token carried in
+    /// the button `callback_data`; consumed when a depth button is tapped.
+    pub(crate) pending_deep_research:
+        std::sync::Mutex<std::collections::HashMap<String, PendingDeepResearch>>,
     /// Shutdown sender for the email monitor background task. Behind a Mutex
     /// so the monitor can be stopped + respawned from a `&self` Settings-save
     /// handler (`restart_email_monitor`) without an app restart.
@@ -1508,6 +1524,7 @@ impl AppState {
             _database: database,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             pending_user_inputs: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            pending_deep_research: std::sync::Mutex::new(HashMap::new()),
             email_shutdown: std::sync::Mutex::new(None),
             telegram_shutdown: std::sync::Mutex::new(None),
             remote_access_shutdown: std::sync::Mutex::new(None),
@@ -2062,6 +2079,25 @@ impl AppState {
         ui: Option<crate::ui_bridge::UiBridge>,
     ) -> Box<dyn athen_core::traits::tool::ToolRegistry> {
         assemble_app_tool_registry(self.tool_registry_deps(), arc_id, ui).await
+    }
+
+    /// Park a Telegram-triggered Deep Research request until the owner taps a
+    /// depth button, returning a short token to embed in the button
+    /// `callback_data`. Opportunistically prunes entries older than an hour so
+    /// an abandoned request never lingers.
+    pub(crate) fn stash_pending_deep_research(&self, pending: PendingDeepResearch) -> String {
+        let full = uuid::Uuid::new_v4().simple().to_string();
+        let token = full[..10].to_string();
+        let mut map = self.pending_deep_research.lock_recover();
+        let now = chrono::Utc::now();
+        map.retain(|_, p| now.signed_duration_since(p.created_at).num_seconds() < 3600);
+        map.insert(token.clone(), pending);
+        token
+    }
+
+    /// Consume the parked request for `token` (the depth button was tapped).
+    pub(crate) fn take_pending_deep_research(&self, token: &str) -> Option<PendingDeepResearch> {
+        self.pending_deep_research.lock_recover().remove(token)
     }
 
     /// Drive a full Deep Research run for `arc_id` and return the synthesized
@@ -3422,8 +3458,16 @@ impl AppState {
                         let callbacks = monitor.take_callbacks();
                         if !callbacks.is_empty() {
                             info!(count = callbacks.len(), "Draining Telegram callback events");
-                            if let Some(ref sink) = telegram_approval_sink {
-                                for cb in callbacks {
+                            for cb in callbacks {
+                                // Deep Research depth-button taps (`dr|<token>|<depth>`)
+                                // are ours, not approval-router questions — handle them
+                                // before falling through to the approval sink.
+                                if cb.data.starts_with("dr|") {
+                                    handle_telegram_deepresearch_callback(&cb, &bot_token, &ui)
+                                        .await;
+                                    continue;
+                                }
+                                if let Some(ref sink) = telegram_approval_sink {
                                     let resolved =
                                         sink.resolve_callback(&cb.callback_id, &cb.data).await;
                                     info!(
@@ -3432,12 +3476,12 @@ impl AppState {
                                         resolved,
                                         "Telegram callback dispatched"
                                     );
+                                } else {
+                                    warn!(
+                                        callback_id = %cb.callback_id,
+                                        "Telegram callback dropped — no approval sink configured"
+                                    );
                                 }
-                            } else {
-                                warn!(
-                                    count = callbacks.len(),
-                                    "Telegram callbacks dropped — no approval sink configured"
-                                );
                             }
                         }
 
@@ -3924,6 +3968,288 @@ impl AppState {
 // Owner Telegram auto-execution
 // ---------------------------------------------------------------------------
 
+/// Parse a leading `/deepresearch` (or `/deep_research`) command, tolerating a
+/// `@botname` suffix on the command token. Returns the trimmed topic that
+/// follows (which may be empty, e.g. a bare `/deepresearch`). `None` when the
+/// message isn't this command.
+fn parse_deepresearch_command(text: &str) -> Option<String> {
+    let t = text.trim_start();
+    if !t.starts_with('/') {
+        return None;
+    }
+    let (head, rest) = match t.split_once(char::is_whitespace) {
+        Some((h, r)) => (h, r),
+        None => (t, ""),
+    };
+    // Strip an optional `@botname` so "/deepresearch@AthenBot topic" matches.
+    let cmd = head.split('@').next().unwrap_or(head).to_ascii_lowercase();
+    if cmd == "/deepresearch" || cmd == "/deep_research" {
+        Some(rest.trim().to_string())
+    } else {
+        None
+    }
+}
+
+/// Handle `/deepresearch <topic>` from the owner: create a dedicated research
+/// arc, then send an inline keyboard offering the three depth levels. The
+/// actual run is kicked off when a depth button is tapped (see
+/// [`handle_telegram_deepresearch_callback`]).
+#[allow(clippy::too_many_arguments)]
+async fn handle_telegram_deepresearch_command(
+    topic: &str,
+    chat_id: i64,
+    bot_token: &str,
+    ui: &crate::ui_bridge::UiBridge,
+    deps: &ToolRegistryDeps,
+    profile_embedder: &Arc<dyn athen_core::traits::embedding::EmbeddingProvider>,
+    profile_embedding_cache: &ProfileEmbeddingCache,
+) {
+    let topic = topic.trim();
+    if topic.is_empty() {
+        let _ = athen_sentidos::telegram::send_message(
+            bot_token,
+            chat_id,
+            "Usage: /deepresearch <topic>\n\nExample:\n/deepresearch state of EU right-to-repair law vs California",
+        )
+        .await;
+        return;
+    }
+
+    let Some(arc_store) = deps.arc_store.as_ref() else {
+        let _ = athen_sentidos::telegram::send_message(
+            bot_token,
+            chat_id,
+            "⚠️ Research is unavailable right now (no conversation store).",
+        )
+        .await;
+        return;
+    };
+
+    // Dedicated arc per research, so its paper + follow-ups stay self-contained.
+    let arc_id = crate::sense_router::generate_arc_id();
+    let name = if topic.chars().count() > 40 {
+        let cap = topic.floor_char_boundary(37);
+        format!("{}...", &topic[..cap])
+    } else {
+        topic.to_string()
+    };
+    if let Err(e) = arc_store
+        .create_arc(&arc_id, &name, athen_persistence::arcs::ArcSource::Messaging)
+        .await
+    {
+        warn!("deepresearch: failed to create arc: {e}");
+        let _ = athen_sentidos::telegram::send_message(
+            bot_token,
+            chat_id,
+            "⚠️ Couldn't start research (failed to create a conversation).",
+        )
+        .await;
+        return;
+    }
+    crate::sense_router::route_new_arc_to_profile(
+        Some(arc_store),
+        deps.profile_store.as_ref(),
+        profile_embedder,
+        profile_embedding_cache,
+        Some(&deps.router),
+        &arc_id,
+        "user_input",
+        &name,
+        topic,
+    )
+    .await;
+
+    // Park the request; the token rides in each button's callback_data.
+    let token = ui.app_state().stash_pending_deep_research(PendingDeepResearch {
+        arc_id,
+        chat_id,
+        question: topic.to_string(),
+        created_at: chrono::Utc::now(),
+    });
+
+    let quick = format!("dr|{token}|quick");
+    let standard = format!("dr|{token}|standard");
+    let deep = format!("dr|{token}|deep");
+    let buttons: Vec<(&str, &str)> = vec![
+        ("⚡ Quick", quick.as_str()),
+        ("📚 Standard", standard.as_str()),
+        ("🔬 Deep", deep.as_str()),
+    ];
+    let prompt = format!(
+        "🔎 Deep Research: \"{topic}\"\n\nChoose a depth:\n\
+         • ⚡ Quick — fastest, 3 angles\n\
+         • 📚 Standard — balanced, 6 angles\n\
+         • 🔬 Deep — most thorough, 10 angles + a gap-fill pass (slowest)"
+    );
+    if let Err(e) =
+        athen_sentidos::telegram::send_message_with_keyboard(bot_token, chat_id, &prompt, &buttons)
+            .await
+    {
+        warn!("deepresearch: failed to send depth keyboard: {e}");
+        let _ = ui.app_state().take_pending_deep_research(&token);
+        let _ = athen_sentidos::telegram::send_message(
+            bot_token,
+            chat_id,
+            "⚠️ Couldn't send the depth options. Please try again.",
+        )
+        .await;
+    }
+}
+
+/// Resolve a `dr|<token>|<depth>` depth-button tap: ack it, confirm in-thread,
+/// then run Deep Research in the background and deliver the paper. Returns fast
+/// (spawns the run) so the Telegram poll loop keeps ticking during the
+/// minutes-long research.
+async fn handle_telegram_deepresearch_callback(
+    cb: &athen_sentidos::telegram::TelegramCallbackEvent,
+    bot_token: &str,
+    ui: &crate::ui_bridge::UiBridge,
+) {
+    let parts: Vec<&str> = cb.data.splitn(3, '|').collect();
+    if parts.len() != 3 {
+        let _ = athen_sentidos::telegram::answer_callback_query(bot_token, &cb.callback_id, "").await;
+        return;
+    }
+    let token = parts[1];
+    let depth = parts[2].to_string();
+
+    let pending = match ui.app_state().take_pending_deep_research(token) {
+        Some(p) => p,
+        None => {
+            let _ = athen_sentidos::telegram::answer_callback_query(
+                bot_token,
+                &cb.callback_id,
+                "That research request expired — send /deepresearch again.",
+            )
+            .await;
+            return;
+        }
+    };
+
+    // Clear the button spinner immediately.
+    let _ = athen_sentidos::telegram::answer_callback_query(bot_token, &cb.callback_id, "Starting…")
+        .await;
+
+    // Replace the keyboard message with a running note (best-effort).
+    let running = format!(
+        "🔬 Researching ({depth}): \"{}\"\n\nThis can take a few minutes — I'll send the paper when it's ready.",
+        pending.question
+    );
+    match cb.message_id {
+        Some(mid) => {
+            let _ = athen_sentidos::telegram::edit_message_text(
+                bot_token,
+                pending.chat_id,
+                mid,
+                &running,
+            )
+            .await;
+        }
+        None => {
+            let _ = athen_sentidos::telegram::send_message(bot_token, pending.chat_id, &running)
+                .await;
+        }
+    }
+
+    // Run in the background so the poll loop is never blocked.
+    let bot_token = bot_token.to_string();
+    let ui = ui.clone();
+    tauri::async_runtime::spawn(async move {
+        let res = AssertUnwindSafe(crate::commands::deep_research_core(
+            pending.arc_id.clone(),
+            pending.question.clone(),
+            Some(depth.clone()),
+            None,
+            ui.app_state(),
+            ui.clone(),
+        ))
+        .catch_unwind()
+        .await;
+        match res {
+            Ok(Ok(result)) => {
+                deliver_deepresearch_paper_telegram(&bot_token, pending.chat_id, &result).await;
+                // Freshen the outbound hint so the owner's immediate follow-up
+                // routes back to the research arc (the 2-min routing window).
+                ui.app_state()
+                    .telegram_outbound_hint
+                    .lock_recover()
+                    .replace((result.arc_id.clone(), chrono::Utc::now()));
+            }
+            Ok(Err(e)) => {
+                warn!("deepresearch: run failed: {e}");
+                let _ = athen_sentidos::telegram::send_message(
+                    &bot_token,
+                    pending.chat_id,
+                    &format!("⚠️ Research failed: {e}"),
+                )
+                .await;
+            }
+            Err(_) => {
+                tracing::error!("deepresearch: run PANICKED");
+                let _ = athen_sentidos::telegram::send_message(
+                    &bot_token,
+                    pending.chat_id,
+                    "⚠️ Research crashed unexpectedly. Please try again.",
+                )
+                .await;
+            }
+        }
+    });
+}
+
+/// Deliver a finished research paper to Telegram: the `.md` file as a document
+/// with a short stats caption. Falls back to a text note if the upload fails.
+async fn deliver_deepresearch_paper_telegram(
+    bot_token: &str,
+    chat_id: i64,
+    result: &crate::commands::DeepResearchResult,
+) {
+    use athen_core::traits::telegram_sender::{
+        OutboundTelegramMessage, TelegramAttachment, TelegramAttachmentKind, TelegramSender,
+    };
+
+    let abs = athen_core::paths::resolve_in_workspace(std::path::Path::new(&result.paper_path));
+    let kind = if result.extended {
+        "extended"
+    } else {
+        "complete"
+    };
+    let caption = format!(
+        "✅ Research {kind}: \"{}\"\n{} of {} researchers reported · depth: {}\n\nFull paper attached. Reply here to ask follow-up questions about it.",
+        result.question, result.workers_ok, result.workers_total, result.depth
+    );
+
+    match athen_sentidos::telegram_send::BotApiTelegramSender::new(bot_token, Some(chat_id)) {
+        Ok(sender) => {
+            let msg = OutboundTelegramMessage {
+                chat_id: Some(chat_id),
+                text: Some(caption.clone()),
+                attachments: vec![TelegramAttachment {
+                    path: abs,
+                    kind: TelegramAttachmentKind::Document,
+                    caption: None,
+                }],
+                reply_to_message_id: None,
+            };
+            if let Err(e) = sender.send(&msg).await {
+                warn!("deepresearch: failed to send paper document: {e}");
+                let _ = athen_sentidos::telegram::send_message(
+                    bot_token,
+                    chat_id,
+                    &format!(
+                        "✅ Research {kind}: \"{}\". The paper is saved at {} — ask me about it here.",
+                        result.question, result.paper_path
+                    ),
+                )
+                .await;
+            }
+        }
+        Err(e) => {
+            warn!("deepresearch: telegram sender init failed: {e}");
+        }
+    }
+}
+
 /// Execute a Telegram message from the owner through the agent, just like
 /// `send_message` does for direct UI input.
 ///
@@ -3965,6 +4291,24 @@ async fn execute_owner_telegram_message(
     let telegram_outbound_hint = &deps.telegram_outbound_hint;
 
     info!("Executing owner Telegram message through agent: {}", text);
+
+    // `/deepresearch <topic>` is a dedicated command: rather than running a
+    // normal agent turn, create a research arc and offer depth buttons. The
+    // tap (a callback) kicks off the run. Intercept before any /newarc/arc
+    // routing so the command never reaches the executor.
+    if let Some(topic) = parse_deepresearch_command(text) {
+        handle_telegram_deepresearch_command(
+            &topic,
+            chat_id,
+            bot_token,
+            ui,
+            &deps,
+            profile_embedder,
+            profile_embedding_cache,
+        )
+        .await;
+        return;
+    }
 
     // Stable id for every entry produced by this Telegram turn — user msg,
     // tool calls, assistant reply — so the UI groups them on rehydration.
@@ -4512,6 +4856,14 @@ async fn execute_owner_telegram_message(
     } else {
         None
     };
+    // If this arc already has a Deep Research paper (e.g. one triggered earlier
+    // via `/deepresearch`), make the agent aware of it so Telegram follow-ups
+    // read the paper instead of answering blind — parity with the in-app path.
+    let research_suffix = if let Some(id) = target_arc_id.as_ref() {
+        crate::commands::render_research_paper_volatile_block(arc_store.as_ref(), id).await
+    } else {
+        None
+    };
 
     let mut builder = AgentBuilder::new()
         .llm_router(exec_router)
@@ -4524,6 +4876,7 @@ async fn execute_owner_telegram_message(
         .endpoints_block(endpoints_block)
         .mission_block(mission_block)
         .acceptance_criteria(acceptance_criteria)
+        .external_system_suffix(research_suffix)
         .enable_default_reminders(true)
         .default_temperature(sampling_temperature);
     // Per-call shell classifier needs a GrantLookup + arc UUID. Wire
@@ -7128,6 +7481,31 @@ mod newarc_command_tests {
         let (force, rest) = parse_newarc_command("/newarc\tafter tab");
         assert!(force);
         assert_eq!(rest, "after tab");
+    }
+
+    #[test]
+    fn deepresearch_command_parsing() {
+        use super::parse_deepresearch_command;
+        // Topic captured, command + bot suffix tolerated, case-insensitive.
+        assert_eq!(
+            parse_deepresearch_command("/deepresearch EU right to repair"),
+            Some("EU right to repair".to_string())
+        );
+        assert_eq!(
+            parse_deepresearch_command("  /DeepResearch@AthenBot   spaced topic  "),
+            Some("spaced topic".to_string())
+        );
+        assert_eq!(
+            parse_deepresearch_command("/deep_research underscore variant"),
+            Some("underscore variant".to_string())
+        );
+        // Bare command → empty topic (the handler then prompts for usage).
+        assert_eq!(parse_deepresearch_command("/deepresearch"), Some(String::new()));
+        // Not the command.
+        assert_eq!(parse_deepresearch_command("just a message"), None);
+        assert_eq!(parse_deepresearch_command("/newarc something"), None);
+        // No false-positive on a longer command token.
+        assert_eq!(parse_deepresearch_command("/deepresearchx topic"), None);
     }
 }
 

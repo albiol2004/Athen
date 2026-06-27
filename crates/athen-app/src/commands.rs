@@ -739,7 +739,7 @@ in prose.\n"
 /// never surfaced, so follow-up questions are answered blind. This tells the
 /// agent the paper exists, where it lives, and to read it before answering.
 /// Rides the volatile `system_suffix` tail (cache-safe), like the project block.
-async fn render_research_paper_volatile_block(
+pub(crate) async fn render_research_paper_volatile_block(
     arc_store: Option<&athen_persistence::arcs::ArcStore>,
     arc_id: &str,
 ) -> Option<String> {
