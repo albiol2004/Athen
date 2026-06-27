@@ -162,6 +162,9 @@ const ICON_PENCIL      = toolSvg('<path d="M12 20h9"/><path d="M16.5 3.5a2.121 2
 const ICON_BLOCK       = toolSvg('<circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/>');
 // Person silhouette in a dashed/soft frame: "select a contact" empty placeholder.
 const ICON_CONTACT_PLACEHOLDER = toolSvg('<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>', 56);
+// Fallback marker for tools without a dedicated icon (user MCPs, unknown names)
+// so every tool card still shows an SVG rather than a bare dot.
+const ICON_TOOL_GENERIC = toolSvg('<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>');
 
 // Maps a notification/toast urgency string to its semantic SVG icon. Low =
 // info, Medium = mail (the canonical "new event" glyph), High = warning
@@ -5984,23 +5987,19 @@ function buildToolCard(meta) {
     const toolName = meta.tool || '';
     const status = meta.status || 'Completed';
     const summaryText = meta.summary || '';
-    const icon = builtinToolIcon(toolName);
+    // The tool's own SVG is the marker — animated while running, tinted by
+    // state. Unknown/MCP tools fall back to a generic glyph (never a bare dot).
+    const realIcon = builtinToolIcon(toolName);
+    const icon = realIcon || ICON_TOOL_GENERIC;
 
     const card = document.createElement('div');
     const statusClass = status === 'Completed' ? 'completed'
                       : status === 'Failed' ? 'failed' : 'in-progress';
-    const builtinClass = icon ? ' builtin' : '';
+    const builtinClass = realIcon ? ' builtin' : '';
     card.className = `tool-execution-card ${statusClass}${builtinClass}`;
     card.title = toolName;
 
-    // Geometric status markers (no emoji): a crisp stroked check / x when
-    // settled, a soft pulsing dot while the tool is still running.
-    const statusIcon = status === 'Completed'
-        ? '<svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3.5 8.5l3 3 6-7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>'
-        : status === 'Failed'
-        ? '<svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4.5 4.5l7 7M11.5 4.5l-7 7" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>'
-        : '<span class="tool-pulse-dot"></span>';
-    let labelText = icon ? builtinToolLabel(toolName) : toolName;
+    let labelText = realIcon ? builtinToolLabel(toolName) : toolName;
     // http_request reads as "Cloud API" by default; promote to
     // "Cloud API: <endpoint>" so the user can tell which API the
     // agent hit at a glance, without expanding the card.
@@ -6008,14 +6007,13 @@ function buildToolCard(meta) {
         const ep = (meta.args && meta.args.endpoint) || '';
         if (ep) labelText = `Cloud API: ${ep}`;
     }
-    const iconMarkup = icon ? `<span class="tool-builtin-icon">${icon}</span>` : '';
+    const iconMarkup = `<span class="tool-mark">${icon}</span>`;
     let detailHtml = '';
     if (summaryText) {
         const truncated = summaryText.length > 80 ? summaryText.substring(0, 80) + '...' : summaryText;
         detailHtml = `<span class="tool-detail">${escapeHtml(truncated)}</span>`;
     }
     card.innerHTML =
-        `<span class="tool-status-icon">${statusIcon}</span>` +
         iconMarkup +
         `<span class="tool-name">${escapeHtml(labelText)}</span>` +
         detailHtml;

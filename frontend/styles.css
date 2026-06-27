@@ -2370,19 +2370,33 @@ header h1 {
     .tool-execution-card.in-progress { animation: none; }
     .tool-execution-card.in-progress::after { display: none; }
 }
-.tool-execution-card .tool-status-icon {
+/* The tool's own SVG is the marker. Neutral at rest, brand-tinted and
+   gently breathing while running, softly state-tinted once settled. */
+.tool-execution-card .tool-mark {
     flex-shrink: 0;
-    width: 14px;
-    height: 14px;
+    width: 17px;
+    height: 17px;
     display: inline-flex;
     align-items: center;
     justify-content: center;
     margin-top: 1px;
+    color: var(--text-2);
+    transition: color var(--dur) var(--ease);
 }
-.tool-execution-card .tool-status-icon svg { display: block; width: 13px; height: 13px; }
-.tool-execution-card.in-progress .tool-status-icon { color: var(--brand-warm); }
-.tool-execution-card.completed   .tool-status-icon { color: var(--success); }
-.tool-execution-card.failed      .tool-status-icon { color: var(--danger);  }
+.tool-execution-card .tool-mark svg { display: block; width: 16px; height: 16px; }
+.tool-execution-card.in-progress .tool-mark {
+    color: var(--brand-warm);
+    animation: icon-breath 1.8s ease-in-out infinite;
+}
+.tool-execution-card.completed .tool-mark { color: color-mix(in srgb, var(--text-2) 60%, var(--success)); }
+.tool-execution-card.failed    .tool-mark { color: var(--danger); }
+@keyframes icon-breath {
+    0%, 100% { opacity: 0.7; transform: scale(0.94); }
+    50%      { opacity: 1;   transform: scale(1.08); }
+}
+@media (prefers-reduced-motion: reduce) {
+    .tool-execution-card.in-progress .tool-mark { animation: none; }
+}
 
 @keyframes spin { to { transform: rotate(360deg); } }
 
@@ -2416,18 +2430,9 @@ header h1 {
     font-size: 13px;
     letter-spacing: -0.005em;
 }
-.tool-execution-card .tool-builtin-icon {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 16px;
-    height: 16px;
-    flex-shrink: 0;
-    margin-top: 1px;
-    color: var(--brand-warm, var(--brand-solid));
-    opacity: 0.95;
-}
-.tool-execution-card .tool-builtin-icon svg { display: block; }
+/* Success/error colour codes — kept subtle, carried on the title only. */
+.tool-execution-card.completed .tool-name { color: color-mix(in srgb, var(--text) 80%, var(--success)); }
+.tool-execution-card.failed    .tool-name { color: color-mix(in srgb, var(--text) 72%, var(--danger)); }
 .tool-execution-card .tool-detail {
     color: var(--text-3);
     font-size: 11.5px;

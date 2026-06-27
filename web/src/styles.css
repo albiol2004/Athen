@@ -447,15 +447,28 @@ button { font: inherit; }
   .tc-head.running { animation: none; }
   .tc-head.running::after { display: none; }
 }
+/* The tool's own SVG is the marker — neutral at rest, coral + breathing
+   while running, softly state-tinted once settled. */
 .tc-mark {
-  flex: none; width: 14px; height: 14px;
+  flex: none; width: 17px; height: 17px;
   display: inline-flex; align-items: center; justify-content: center;
-  color: var(--coral);
+  color: var(--text-dim);
+  transition: color 160ms var(--ease);
 }
-.tc-mark svg { display: block; width: 13px; height: 13px; }
-.tc-mark.done { color: var(--green); }
+.tc-mark svg { display: block; width: 16px; height: 16px; }
+.tc-mark.running { color: var(--coral); animation: icon-breath 1.8s ease-in-out infinite; }
+.tc-mark.done { color: color-mix(in srgb, var(--text-dim) 55%, var(--green)); }
 .tc-mark.fail { color: var(--red); }
+@keyframes icon-breath {
+  0%, 100% { opacity: 0.7; transform: scale(0.94); }
+  50%      { opacity: 1;   transform: scale(1.08); }
+}
+@media (prefers-reduced-motion: reduce) { .tc-mark.running { animation: none; } }
 .tc-name { font-weight: 600; color: var(--text); flex: none; }
+/* Success/error colour codes — subtle, on the title only. */
+.tc.running .tc-name { color: var(--text); }
+.tc:not(.running):not(.failed) .tc-name { color: color-mix(in srgb, var(--text) 80%, var(--green)); }
+.tc.failed .tc-name { color: color-mix(in srgb, var(--text) 72%, var(--red)); }
 .tc-detail {
   flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
