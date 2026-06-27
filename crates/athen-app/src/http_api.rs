@@ -33,7 +33,8 @@
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use axum::extract::{DefaultBodyLimit, Path as UrlPath, Query, State};
 use axum::http::StatusCode;
@@ -152,6 +153,8 @@ struct ApiState {
     /// User+password Basic creds when configured (UI Remote Access panel).
     /// `None` = token-only, the historical behaviour.
     basic: Option<Arc<BasicCreds>>,
+    /// Brute-force throttle for failed auth (global, per-listener).
+    throttle: Arc<AuthThrottle>,
 }
 
 /// Build the fully-wired router from an `ApiState`. Shared by `serve`
@@ -197,6 +200,7 @@ fn api_state_from_cfg(cfg: HttpApiConfig, ui: UiBridge) -> ApiState {
         ui,
         token: Arc::new(cfg.token),
         basic: cfg.basic.map(Arc::new),
+        throttle: Arc::new(AuthThrottle::default()),
     }
 }
 
@@ -288,19 +292,80 @@ fn check_basic(decoded: &str, creds: &BasicCreds) -> bool {
     user == creds.username && ct_eq(pass, &creds.password)
 }
 
-async fn require_auth(
-    State(api): State<ApiState>,
-    Query(q): Query<TokenQuery>,
-    req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Response {
-    let path = req.uri().path();
-    // Health is the readiness probe; non-/api paths are the embedded
-    // web UI shell (static assets, no user data).
-    if path == "/api/health" || !path.starts_with("/api/") {
-        return next.run(req).await;
+/// Failed-auth attempts tolerated before the listener starts locking out.
+const AUTH_FAIL_THRESHOLD: u32 = 8;
+/// First lockout length; doubles per further failure, capped at MAX.
+const AUTH_LOCKOUT_BASE: Duration = Duration::from_secs(15);
+const AUTH_LOCKOUT_MAX: Duration = Duration::from_secs(900);
+
+/// Process-local brute-force throttle for the HTTP listener. Behind a
+/// Cloudflare quick-tunnel every request originates from localhost, so a
+/// per-IP limiter is useless — this is a GLOBAL failed-attempt counter with
+/// exponential backoff. The 244-bit token is unbruteforceable, but a
+/// user-chosen Basic password is not; this caps the guess rate. Resets to
+/// zero on the first success, so a fumbled password never compounds once
+/// the legitimate client gets in.
+#[derive(Default)]
+struct AuthThrottle {
+    inner: Mutex<AuthThrottleState>,
+}
+
+#[derive(Default)]
+struct AuthThrottleState {
+    consecutive: u32,
+    locked_until: Option<Instant>,
+}
+
+impl AuthThrottle {
+    /// `Err(retry_after)` when currently locked out — reject before even
+    /// looking at the presented credentials.
+    fn check(&self, now: Instant) -> Result<(), Duration> {
+        let st = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        match st.locked_until {
+            Some(until) if until > now => Err(until - now),
+            _ => Ok(()),
+        }
     }
-    let headers = req.headers();
+
+    /// Record a failed attempt. From the threshold on, each failure locks
+    /// the listener for `BASE * 2^extra`, capped at `MAX`.
+    fn record_failure(&self, now: Instant) {
+        let mut st = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        st.consecutive = st.consecutive.saturating_add(1);
+        if st.consecutive >= AUTH_FAIL_THRESHOLD {
+            let exp = (st.consecutive - AUTH_FAIL_THRESHOLD).min(6);
+            let lockout = AUTH_LOCKOUT_BASE
+                .saturating_mul(1u32 << exp)
+                .min(AUTH_LOCKOUT_MAX);
+            st.locked_until = Some(now + lockout);
+        }
+    }
+
+    /// A success clears all failure state.
+    fn record_success(&self) {
+        let mut st = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        st.consecutive = 0;
+        st.locked_until = None;
+    }
+}
+
+/// Build the 429 response with a `Retry-After` header (whole seconds).
+fn too_many_requests(retry: Duration) -> Response {
+    let secs = retry.as_secs().max(1);
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(axum::http::header::RETRY_AFTER, secs.to_string())],
+        Json(json!({
+            "error": "too many failed attempts, retry later",
+            "retry_after_secs": secs,
+        })),
+    )
+        .into_response()
+}
+
+/// Decide whether the presented credentials are valid. Pure over the
+/// request inputs + `ApiState` creds; no throttle side effects.
+fn credentials_ok(api: &ApiState, headers: &axum::http::HeaderMap, q: &TokenQuery) -> bool {
     let auth_header = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
@@ -318,35 +383,60 @@ async fn require_auth(
         .or_else(|| q.token.clone());
     if let Some(t) = presented_token {
         if ct_eq(&t, &api.token) {
-            return next.run(req).await;
+            return true;
         }
     }
 
     // 2) Basic auth (header / ?auth=) — only when user+password configured.
     if let Some(creds) = api.basic.as_deref() {
-        // `Authorization: Basic <base64(user:pass)>`
         if let Some(b64) = auth_header.and_then(|v| v.strip_prefix("Basic ")) {
             if let Some(decoded) = decode_basic_b64(b64) {
                 if check_basic(&decoded, creds) {
-                    return next.run(req).await;
+                    return true;
                 }
             }
         }
-        // `?auth=<base64(user:pass)>` for EventSource (no headers).
         if let Some(ref b64) = q.auth {
             if let Some(decoded) = decode_basic_b64(b64) {
                 if check_basic(&decoded, creds) {
-                    return next.run(req).await;
+                    return true;
                 }
             }
         }
     }
+    false
+}
 
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(json!({"error": "missing or invalid credentials"})),
-    )
-        .into_response()
+async fn require_auth(
+    State(api): State<ApiState>,
+    Query(q): Query<TokenQuery>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let path = req.uri().path();
+    // Health is the readiness probe; non-/api paths are the embedded
+    // web UI shell (static assets, no user data).
+    if path == "/api/health" || !path.starts_with("/api/") {
+        return next.run(req).await;
+    }
+
+    let now = Instant::now();
+    // Locked out from prior failures? Reject before touching credentials.
+    if let Err(retry) = api.throttle.check(now) {
+        return too_many_requests(retry);
+    }
+
+    if credentials_ok(&api, req.headers(), &q) {
+        api.throttle.record_success();
+        next.run(req).await
+    } else {
+        api.throttle.record_failure(now);
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "missing or invalid credentials"})),
+        )
+            .into_response()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2328,6 +2418,70 @@ fn full_surface_router() -> Router<ApiState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn throttle_allows_until_threshold_then_locks() {
+        let t = AuthThrottle::default();
+        let now = Instant::now();
+        // One below the threshold: still no lockout.
+        for _ in 0..(AUTH_FAIL_THRESHOLD - 1) {
+            t.record_failure(now);
+            assert!(t.check(now).is_ok());
+        }
+        // The threshold-th failure arms the lockout.
+        t.record_failure(now);
+        let retry = t.check(now).expect_err("should be locked out");
+        assert!(retry <= AUTH_LOCKOUT_BASE && retry > Duration::ZERO);
+    }
+
+    #[test]
+    fn throttle_lockout_grows_and_caps() {
+        let t = AuthThrottle::default();
+        let now = Instant::now();
+        for _ in 0..AUTH_FAIL_THRESHOLD {
+            t.record_failure(now);
+        }
+        let first = t.check(now).expect_err("locked");
+        // A few more failures push the lockout strictly longer…
+        for _ in 0..3 {
+            t.record_failure(now);
+        }
+        let later = t.check(now).expect_err("still locked");
+        assert!(later > first);
+        // …but never past the cap.
+        for _ in 0..50 {
+            t.record_failure(now);
+        }
+        assert!(t.check(now).expect_err("locked") <= AUTH_LOCKOUT_MAX);
+    }
+
+    #[test]
+    fn throttle_success_resets_failures() {
+        let t = AuthThrottle::default();
+        let now = Instant::now();
+        for _ in 0..AUTH_FAIL_THRESHOLD {
+            t.record_failure(now);
+        }
+        assert!(t.check(now).is_err());
+        t.record_success();
+        assert!(t.check(now).is_ok());
+        // And the counter is back to zero — one more failure shouldn't relock.
+        t.record_failure(now);
+        assert!(t.check(now).is_ok());
+    }
+
+    #[test]
+    fn throttle_lockout_expires_with_time() {
+        let t = AuthThrottle::default();
+        let past = Instant::now() - Duration::from_secs(10_000);
+        // Arm a lockout relative to a far-past "now" so it's already expired
+        // by real now.
+        for _ in 0..AUTH_FAIL_THRESHOLD {
+            t.record_failure(past);
+        }
+        // Checking at the real present (well after past+lockout) is allowed.
+        assert!(t.check(Instant::now()).is_ok());
+    }
 
     #[test]
     fn ct_eq_basic() {

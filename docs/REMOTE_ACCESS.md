@@ -203,10 +203,16 @@ warnings` && `cargo test --workspace` && `cd web && npx tsc --noEmit`.
 
 ## 10. Security notes
 
-- The desktop `http_api` has **no rate-limiting** (the admin gateway
-  does; this listener doesn't). 244-bit token is unbruteforceable, but a
-  user-chosen password is not — a login throttle is a sensible follow-up
-  (deferred; documented here so it isn't forgotten).
+- **Login throttle (SHIPPED).** `AuthThrottle` in `http_api.rs` is a
+  process-local GLOBAL failed-auth counter with exponential backoff
+  (threshold 8, lockout 15s doubling to a 15-min cap, reset on first
+  success). It's *global* by design: behind a quick-tunnel every request
+  comes from localhost, so a per-IP limiter is useless. The lockout is
+  checked BEFORE the credential compare, so during a cooldown even a
+  correct token/password gets `429 Too Many Requests` (with `Retry-After`).
+  The 244-bit token is unbruteforceable on its own; this caps the guess
+  rate against a weaker user-chosen Basic password. `/api/health` and the
+  static web shell are never throttled.
 - Bind `127.0.0.1` only; the tunnel is the sole public path.
 - Password at rest in the vault, never `config.toml`; never logged
   (log lengths only).
