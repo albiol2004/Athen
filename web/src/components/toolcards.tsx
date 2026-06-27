@@ -7,6 +7,7 @@ import type { AthenClient } from '../api/client';
 import type { ChatItem } from '../chat/reducer';
 import { Markdown } from './Markdown';
 import { toolIconSvg } from './toolIcons';
+import { endpointIcon } from '../api/endpointIcons';
 
 type ToolItem = Extract<ChatItem, { kind: 'tool' }>;
 
@@ -228,6 +229,13 @@ export const ToolCard = memo(function ToolCard({ it, client }: { it: ToolItem; c
   const running = !done && !it.failed;
   const expandable =
     it.args !== undefined || it.result !== undefined || Boolean(it.error) || it.name === 'delegate_to_agent';
+  // For a registered Cloud API call, prefer the provider's cached logo as
+  // the marker so the card is recognizable at a glance.
+  const epIcon =
+    it.name === 'http_request'
+      ? endpointIcon((asRecord(it.args)?.endpoint as string | undefined) ?? null)
+      : null;
+  const markClass = `tc-mark${running ? ' running' : ''}${done ? ' done' : ''}${it.failed ? ' fail' : ''}`;
   return (
     <div className={`tc${it.failed ? ' failed' : ''}${running ? ' running' : ''}`}>
       <button
@@ -235,10 +243,13 @@ export const ToolCard = memo(function ToolCard({ it, client }: { it: ToolItem; c
         onClick={() => expandable && setOpen((o) => !o)}
         title={it.detail || undefined}
       >
-        <span
-          className={`tc-mark${running ? ' running' : ''}${done ? ' done' : ''}${it.failed ? ' fail' : ''}`}
-          dangerouslySetInnerHTML={{ __html: toolIconSvg(it.name) }}
-        />
+        {epIcon ? (
+          <span className={markClass}>
+            <img className="tc-mark-img" src={epIcon} alt="" />
+          </span>
+        ) : (
+          <span className={markClass} dangerouslySetInnerHTML={{ __html: toolIconSvg(it.name) }} />
+        )}
         <span className="tc-name">{it.name}</span>
         <span className="tc-detail">{!done && !it.failed ? it.status : it.detail || ''}</span>
         {expandable && <span className={`tc-chev${open ? ' open' : ''}`}>›</span>}

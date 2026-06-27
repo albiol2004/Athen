@@ -6160,6 +6160,8 @@ pub struct EndpointWire {
     pub call_count_30d: u32,
     pub created_at: String,
     pub has_credential: bool,
+    /// Cached provider logo (data: URL), or `None` → UI shows a glyph.
+    pub icon: Option<String>,
 }
 
 fn endpoint_to_wire(
@@ -6186,7 +6188,55 @@ fn endpoint_to_wire(
         call_count_30d: e.call_count_30d,
         created_at: e.created_at.to_rfc3339(),
         has_credential,
+        icon: e.icon,
     }
+}
+
+/// Fetch a provider's brand logo (favicon) and return it as a small
+/// `data:` URL for local caching, so the UI never re-fetches over the
+/// network. Uses DuckDuckGo's icon service keyed on the registrable domain
+/// (last two labels) of `base_url`, so `api.*` subdomains resolve the
+/// marketing-site mark. Best-effort: any failure (no network, no icon,
+/// oversize, unparseable URL) returns `None` and the UI falls back to a
+/// category glyph.
+pub(crate) async fn fetch_provider_icon(base_url: &str) -> Option<String> {
+    // Largest favicon we'll inline into a DB row / wire payload.
+    const MAX_BYTES: usize = 96 * 1024;
+
+    let host = url::Url::parse(base_url).ok()?.host_str()?.to_string();
+    let parts: Vec<&str> = host.split('.').collect();
+    let domain = if parts.len() > 2 {
+        parts[parts.len() - 2..].join(".")
+    } else {
+        host
+    };
+    if domain.is_empty() {
+        return None;
+    }
+    let icon_url = format!("https://icons.duckduckgo.com/ip3/{domain}.ico");
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(6))
+        .build()
+        .ok()?;
+    let resp = client.get(&icon_url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(';').next().unwrap_or(s).trim().to_string())
+        .filter(|s| s.starts_with("image/"))
+        .unwrap_or_else(|| "image/x-icon".to_string());
+    let bytes = resp.bytes().await.ok()?;
+    if bytes.is_empty() || bytes.len() > MAX_BYTES {
+        return None;
+    }
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Some(format!("data:{content_type};base64,{b64}"))
 }
 
 async fn endpoint_has_credential(
@@ -6305,6 +6355,19 @@ pub(crate) async fn upsert_http_endpoint_core(
         None => None,
     };
 
+    // Reuse the cached logo when the domain is unchanged; only hit the
+    // network when this is a new endpoint or its base_url changed. This
+    // keeps the "fetch once, then serve locally" contract — a plain
+    // enable/notes edit never re-fetches.
+    let prior = store.get(id).await.ok().flatten();
+    let mut icon = prior
+        .as_ref()
+        .filter(|p| p.base_url == input.base_url)
+        .and_then(|p| p.icon.clone());
+    if icon.is_none() {
+        icon = fetch_provider_icon(&input.base_url).await;
+    }
+
     let endpoint = RegisteredEndpoint {
         id,
         name: input.name.trim().to_string(),
@@ -6326,6 +6389,7 @@ pub(crate) async fn upsert_http_endpoint_core(
         last_used: None,
         call_count_30d: 0,
         created_at: chrono::Utc::now(),
+        icon,
     };
 
     store.upsert(&endpoint).await.map_err(|e| e.to_string())?;

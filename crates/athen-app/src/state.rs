@@ -1584,6 +1584,27 @@ impl AppState {
         if let Err(e) = state.refresh_cloud_apis_doc().await {
             warn!("Failed to write initial cloud_apis catalogue: {e}");
         }
+        // Backfill provider logos for endpoints registered before icon
+        // caching existed. One-time per endpoint (skips rows that already
+        // have an icon), best-effort, detached so it never delays boot.
+        if let Some(store) = state.http_endpoint_store.clone() {
+            tokio::spawn(async move {
+                use athen_core::traits::http_endpoint::HttpEndpointStore;
+                let endpoints = match store.list().await {
+                    Ok(e) => e,
+                    Err(_) => return,
+                };
+                for mut ep in endpoints {
+                    if ep.icon.is_some() {
+                        continue;
+                    }
+                    if let Some(icon) = crate::commands::fetch_provider_icon(&ep.base_url).await {
+                        ep.icon = Some(icon);
+                        let _ = store.upsert(&ep).await;
+                    }
+                }
+            });
+        }
         // Reconcile the skills index against the filesystem so hand-edited
         // or freshly git-cloned skill folders show up without restart. The
         // sync is idempotent and cheap when nothing changed.

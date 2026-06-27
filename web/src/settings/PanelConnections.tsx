@@ -132,6 +132,7 @@ interface EndpointWire {
   rate_limit_per_minute: number;
   notes: string | null;
   has_credential: boolean;
+  icon: string | null;
 }
 
 interface EndpointPreset {
@@ -1145,7 +1146,7 @@ function EndpointsSection({ client }: { client: AthenClient }) {
       <div className="st-list">
         {(endpoints.data ?? []).map((e) => (
           <div key={e.id} className="st-item">
-            <CloudApiIcon provider={e.provider} baseUrl={e.base_url} />
+            <CloudApiIcon provider={e.provider} icon={e.icon} />
             <div className="st-item-main">
               <div className="st-item-title">
                 {e.name}

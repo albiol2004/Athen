@@ -2384,6 +2384,13 @@ header h1 {
     transition: color var(--dur) var(--ease);
 }
 .tool-execution-card .tool-mark svg { display: block; width: 16px; height: 16px; }
+.tool-execution-card .tool-mark .tool-mark-img {
+    display: block;
+    width: 15px;
+    height: 15px;
+    object-fit: contain;
+    border-radius: 3px;
+}
 .tool-execution-card.in-progress .tool-mark {
     color: var(--brand-warm);
     animation: icon-breath 1.8s ease-in-out infinite;

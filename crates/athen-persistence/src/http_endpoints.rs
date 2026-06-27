@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS http_endpoints (
     notes TEXT,
     last_used TEXT,
     call_count_30d INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    icon TEXT
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_http_endpoints_name_ci
@@ -44,7 +45,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_http_endpoints_name_ci
 
 const COLS: &str = "id, name, provider, base_url, enabled, auth_method_json, \
 default_headers_json, default_query_json, rate_limit_json, risk_override, notes, \
-last_used, call_count_30d, created_at";
+last_used, call_count_30d, created_at, icon";
 
 pub struct SqliteHttpEndpointStore {
     conn: Arc<Mutex<Connection>>,
@@ -61,6 +62,16 @@ impl SqliteHttpEndpointStore {
             let conn = conn.blocking_lock();
             conn.execute_batch(SCHEMA_SQL)
                 .map_err(|e| AthenError::Other(format!("Init http_endpoints schema: {e}")))?;
+            // Column-level migration: `icon` was added after the table
+            // shipped. Add it if a pre-existing DB lacks it (idempotent —
+            // a duplicate-column error means it's already there).
+            let has_icon = conn
+                .prepare("SELECT 1 FROM pragma_table_info('http_endpoints') WHERE name = 'icon'")
+                .and_then(|mut s| s.exists([]))
+                .unwrap_or(false);
+            if !has_icon {
+                let _ = conn.execute("ALTER TABLE http_endpoints ADD COLUMN icon TEXT", []);
+            }
             Ok(())
         })
         .await
@@ -100,6 +111,7 @@ fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RegisteredEndpoint> {
     let last_used_str: Option<String> = row.get(11)?;
     let call_count_30d: i64 = row.get(12)?;
     let created_at_str: String = row.get(13)?;
+    let icon: Option<String> = row.get(14)?;
 
     let id = Uuid::parse_str(&id_str).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
@@ -157,6 +169,7 @@ fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RegisteredEndpoint> {
         last_used,
         call_count_30d: call_count_30d.max(0) as u32,
         created_at,
+        icon,
     })
 }
 
@@ -272,8 +285,8 @@ impl HttpEndpointStore for SqliteHttpEndpointStore {
                 "INSERT OR REPLACE INTO http_endpoints \
                  (id, name, provider, base_url, enabled, auth_method_json, \
                   default_headers_json, default_query_json, rate_limit_json, risk_override, \
-                  notes, last_used, call_count_30d, created_at) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                  notes, last_used, call_count_30d, created_at, icon) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
                 params![
                     e.id.to_string(),
                     e.name,
@@ -289,6 +302,7 @@ impl HttpEndpointStore for SqliteHttpEndpointStore {
                     e.last_used.map(|t| t.to_rfc3339()),
                     e.call_count_30d as i64,
                     e.created_at.to_rfc3339(),
+                    e.icon,
                 ],
             )
             .map_err(|err| AthenError::Other(format!("Upsert endpoint: {err}")))?;
@@ -384,6 +398,7 @@ mod tests {
             last_used: None,
             call_count_30d: 0,
             created_at: now,
+            icon: None,
         }
     }
 
@@ -396,6 +411,24 @@ mod tests {
         assert_eq!(by_id.name, "Jina");
         assert_eq!(by_id.auth_method, AuthMethod::BearerToken);
         assert_eq!(by_id.default_headers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn icon_round_trips_and_survives_record_call() {
+        let store = setup().await;
+        let mut e = mk_endpoint("Jina");
+        e.icon = Some("data:image/png;base64,AAAA".to_string());
+        store.upsert(&e).await.unwrap();
+        assert_eq!(
+            store.get(e.id).await.unwrap().unwrap().icon.as_deref(),
+            Some("data:image/png;base64,AAAA")
+        );
+        // A targeted UPDATE (record_call) must not clobber the cached icon.
+        store.record_call(e.id).await.unwrap();
+        assert_eq!(
+            store.get(e.id).await.unwrap().unwrap().icon.as_deref(),
+            Some("data:image/png;base64,AAAA")
+        );
     }
 
     #[tokio::test]

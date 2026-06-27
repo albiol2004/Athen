@@ -889,6 +889,9 @@ function startInitialDataLoads() {
         // Warm the project cache so the per-arc "Assign to project" menu can
         // render its picker without an IPC round-trip on first open.
         scheduleIdle(() => loadProjectsManager());
+        // Warm the endpoint→logo map so `http_request` tool cards can show
+        // the provider's brand mark without a network call.
+        scheduleIdle(() => preloadCloudApiIcons());
         performance.mark('athen-init-done');
         try {
             const t0 = performance.getEntriesByName('athen-init-start')[0];
@@ -5990,7 +5993,7 @@ function buildToolCard(meta) {
     // The tool's own SVG is the marker — animated while running, tinted by
     // state. Unknown/MCP tools fall back to a generic glyph (never a bare dot).
     const realIcon = builtinToolIcon(toolName);
-    const icon = realIcon || ICON_TOOL_GENERIC;
+    let icon = realIcon || ICON_TOOL_GENERIC;
 
     const card = document.createElement('div');
     const statusClass = status === 'Completed' ? 'completed'
@@ -6002,10 +6005,14 @@ function buildToolCard(meta) {
     let labelText = realIcon ? builtinToolLabel(toolName) : toolName;
     // http_request reads as "Cloud API" by default; promote to
     // "Cloud API: <endpoint>" so the user can tell which API the
-    // agent hit at a glance, without expanding the card.
+    // agent hit at a glance, without expanding the card. When the
+    // endpoint's provider logo is cached locally, use it as the marker so
+    // the card is recognizable at a glance (e.g. the Brave or Groq mark).
     if (toolName === 'http_request') {
         const ep = (meta.args && meta.args.endpoint) || '';
         if (ep) labelText = `Cloud API: ${ep}`;
+        const epIcon = endpointIcon(ep);
+        if (epIcon) icon = `<img class="tool-mark-img" src="${escapeHtml(epIcon)}" alt="">`;
     }
     const iconMarkup = `<span class="tool-mark">${icon}</span>`;
     let detailHtml = '';
@@ -7989,31 +7996,37 @@ function normalizeProviderKey(provider) {
     return (provider || '').toLowerCase().replace(/[^a-z0-9]/g, '');
 }
 
-// Real brand favicon for a host, via DuckDuckGo's icon service (follows
-// each site's declared icon, normalizes size, privacy-respecting). Keyed
-// on the registrable domain (last two labels) so api.* subdomains still
-// resolve the marketing-site logo. Returns null for unparseable URLs.
-function svcFaviconUrl(url) {
-    try {
-        const host = new URL(url).hostname;
-        const parts = host.split('.');
-        const domain = parts.length > 2 ? parts.slice(-2).join('.') : host;
-        if (!domain) return null;
-        return `https://icons.duckduckgo.com/ip3/${domain}.ico`;
-    } catch (e) {
-        return null;
-    }
+// Tile contents for a curated HTTP provider: the provider's real logo
+// (a `data:` URL the backend fetched once and cached locally — no network
+// here) layered over a category glyph. The glyph hides once the logo loads
+// and stays if the logo is absent (not yet cached, or the domain has none).
+function cloudApiIcon(provider, icon) {
+    const glyph = `<span class="svc-glyph">${svcSvg(CLOUD_API_ICONS[normalizeProviderKey(provider)] || SVC_GLYPHS.cloud)}</span>`;
+    if (!icon) return glyph;
+    return `${glyph}<img class="svc-favicon" src="${escapeHtml(icon)}" alt="" loading="lazy" onload="this.previousElementSibling.style.display='none'" onerror="this.remove()">`;
 }
 
-// Tile contents for a curated HTTP provider: the provider's real logo
-// (favicon) layered over a category glyph. On a successful logo load the
-// glyph is hidden; if the logo fails the broken <img> is removed and the
-// glyph stays. So every row shows *something* recognizable, online or off.
-function cloudApiIcon(provider, url) {
-    const glyph = `<span class="svc-glyph">${svcSvg(CLOUD_API_ICONS[normalizeProviderKey(provider)] || SVC_GLYPHS.cloud)}</span>`;
-    const fav = svcFaviconUrl(url);
-    if (!fav) return glyph;
-    return `${glyph}<img class="svc-favicon" src="${escapeHtml(fav)}" alt="" loading="lazy" onload="this.previousElementSibling.style.display='none'" onerror="this.remove()">`;
+// name(lowercased) → cached logo data URL, used to brand `http_request`
+// tool cards. Populated from the registered endpoint list so the chat view
+// never fetches over the network.
+let cloudApiIconByName = {};
+function refreshCloudApiIconMap(endpoints) {
+    const m = {};
+    for (const e of endpoints || []) {
+        if (e && e.name && e.icon) m[String(e.name).toLowerCase()] = e.icon;
+    }
+    cloudApiIconByName = m;
+}
+function endpointIcon(name) {
+    if (!name) return null;
+    return cloudApiIconByName[String(name).toLowerCase()] || null;
+}
+async function preloadCloudApiIcons() {
+    try {
+        refreshCloudApiIconMap(await invoke('list_http_endpoints'));
+    } catch (e) {
+        /* best-effort — tool cards fall back to the globe glyph */
+    }
 }
 
 // MCP server icon. A custom `icon` may be a data:/http(s) image (user
@@ -17873,6 +17886,7 @@ async function loadCloudApis() {
         ]);
         cloudApiEndpoints = endpoints || [];
         cloudApiPresets = presets || [];
+        refreshCloudApiIconMap(cloudApiEndpoints);
         renderCloudApisList();
         // Endpoint changes show up in every profile's `http_request`
         // section — drop the cached estimates so chips refetch.
@@ -17903,7 +17917,7 @@ function renderCloudApisList() {
         const authLabel = describeAuthMethod(e.auth_method);
         return `
             <div class="cloud-api-row" data-endpoint-id="${escapeHtml(e.id)}">
-                <span class="cloud-api-icon svc-icon">${cloudApiIcon(e.provider, e.base_url)}</span>
+                <span class="cloud-api-icon svc-icon">${cloudApiIcon(e.provider, e.icon)}</span>
                 <div class="cloud-api-row-main">
                     <div class="cloud-api-row-name">
                         <strong>${escapeHtml(e.name)}</strong>

@@ -213,6 +213,7 @@ mod tests {
             last_used: None,
             call_count_30d: 0,
             created_at: Utc::now(),
+            icon: None,
         }
     }
 

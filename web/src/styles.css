@@ -456,6 +456,7 @@ button { font: inherit; }
   transition: color 160ms var(--ease);
 }
 .tc-mark svg { display: block; width: 16px; height: 16px; }
+.tc-mark .tc-mark-img { display: block; width: 15px; height: 15px; object-fit: contain; border-radius: 3px; }
 .tc-mark.running { color: var(--coral); animation: icon-breath 1.8s ease-in-out infinite; }
 .tc-mark.done { color: color-mix(in srgb, var(--text-dim) 55%, var(--green)); }
 .tc-mark.fail { color: var(--red); }

@@ -118,4 +118,12 @@ pub struct RegisteredEndpoint {
     /// journal if abuse pricing matters.
     pub call_count_30d: u32,
     pub created_at: DateTime<Utc>,
+    /// Cached provider logo as a `data:` URL. The provider's favicon is
+    /// fetched once (on save / lazy backfill) and stored locally so the UI
+    /// never re-fetches over the network. `None` until fetched, or when the
+    /// domain has no usable icon — the UI then falls back to a category
+    /// glyph. Carried here (not a separate table) since it's small and read
+    /// holistically with the rest of the endpoint.
+    #[serde(default)]
+    pub icon: Option<String>,
 }

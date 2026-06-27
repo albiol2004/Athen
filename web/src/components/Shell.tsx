@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { ApiError, AthenClient } from '../api/client';
+import { loadEndpointIcons } from '../api/endpointIcons';
 import { connectEvents, type ConnectionStatus } from '../api/events';
 import type {
   ArcMeta,
@@ -137,6 +138,9 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
         setNotifications(notifs);
         setProjects(projs);
         void refreshGoalPlan();
+        // Warm the endpoint→logo map so http_request tool cards show the
+        // provider's brand mark (no per-card network call).
+        void loadEndpointIcons(client);
       } catch (e) {
         if (!bail(e)) dispatch({ type: 'system', text: `Couldn't load: ${errMsg(e)}` });
       }

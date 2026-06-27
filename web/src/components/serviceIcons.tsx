@@ -105,36 +105,21 @@ function isImageUrl(v: string): boolean {
   return /^(data:|https?:\/\/)/i.test(v);
 }
 
-// Real brand favicon for a host, via DuckDuckGo's icon service (follows
-// each site's declared icon, normalizes size). Keyed on the registrable
-// domain (last two labels) so api.* subdomains resolve the marketing-site
-// logo. Returns null for unparseable URLs.
-function faviconUrl(url: string): string | null {
-  try {
-    const host = new URL(url).hostname;
-    const parts = host.split('.');
-    const domain = parts.length > 2 ? parts.slice(-2).join('.') : host;
-    return domain ? `https://icons.duckduckgo.com/ip3/${domain}.ico` : null;
-  } catch {
-    return null;
-  }
-}
-
 /**
- * Icon chip for a curated HTTP provider: the provider's real logo
- * (favicon), falling back to a category glyph (neutral cloud for unknown)
- * when the logo can't load — so every row stays recognizable, online or
- * off.
+ * Icon chip for a curated HTTP provider: the provider's real logo (a
+ * `data:` URL the backend fetched once and cached locally — no network
+ * here), falling back to a category glyph (neutral cloud for unknown) when
+ * no logo is cached or it fails to render. So every row stays recognizable,
+ * online or off.
  */
-export function CloudApiIcon({ provider, baseUrl }: { provider: string; baseUrl?: string }) {
+export function CloudApiIcon({ provider, icon }: { provider: string; icon?: string | null }) {
   const [failed, setFailed] = useState(false);
-  const fav = baseUrl ? faviconUrl(baseUrl) : null;
-  if (fav && !failed) {
+  if (icon && !failed) {
     return (
       <span className="st-item-icon">
         <img
           className="st-item-icon-img"
-          src={fav}
+          src={icon}
           alt=""
           loading="lazy"
           onError={() => setFailed(true)}
