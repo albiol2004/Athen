@@ -60,23 +60,28 @@ impl Depth {
     fn num_sub_questions(&self) -> usize {
         match self {
             Depth::Quick => 3,
-            Depth::Standard => 5,
-            Depth::Deep => 8,
+            Depth::Standard => 6,
+            Depth::Deep => 10,
         }
     }
 
-    /// Concurrency cap — never more than 4 workers in flight at once so a
-    /// `deep` run doesn't stampede the provider + network.
+    /// Concurrency cap — bounds the simultaneous worker burst so a deep run
+    /// doesn't stampede the provider + network. Scales modestly with depth.
     fn max_concurrent(&self) -> usize {
-        self.num_sub_questions().min(4)
+        let cap = match self {
+            Depth::Quick => 3,
+            Depth::Standard => 4,
+            Depth::Deep => 5,
+        };
+        self.num_sub_questions().min(cap)
     }
 
     /// How many sources each worker is hinted to read.
     fn sources_hint(&self) -> usize {
         match self {
             Depth::Quick => 4,
-            Depth::Standard => 5,
-            Depth::Deep => 6,
+            Depth::Standard => 6,
+            Depth::Deep => 8,
         }
     }
 
@@ -86,6 +91,33 @@ impl Depth {
         match self {
             Depth::Quick => ModelProfile::Fast,
             Depth::Standard | Depth::Deep => ModelProfile::Powerful,
+        }
+    }
+
+    /// Output-token budget for the synthesis pass. This is the single biggest
+    /// lever on paper *depth*: a 4k cap silently truncates a thorough paper to
+    /// ~3k words. Scale it with depth so a `deep` run can actually produce a
+    /// long-form, multi-section paper.
+    fn synth_max_tokens(&self) -> u32 {
+        match self {
+            Depth::Quick => 4096,
+            Depth::Standard => 6144,
+            Depth::Deep => 8192,
+        }
+    }
+
+    /// Whether this depth runs a second, gap-targeted fan-out round after the
+    /// first wave. Only `deep` pays for the extra pass — it's what makes the
+    /// deepest tier meaningfully deeper than `standard`.
+    fn gap_fill(&self) -> bool {
+        matches!(self, Depth::Deep)
+    }
+
+    /// Upper bound on follow-up gap questions spawned in the second round.
+    fn max_gap_questions(&self) -> usize {
+        match self {
+            Depth::Deep => 4,
+            _ => 0,
         }
     }
 }
@@ -144,7 +176,9 @@ where
     });
 
     let sub_questions = plan_sub_questions(&router, question, depth).await?;
-    let workers_total = sub_questions.len();
+    // `workers_total` grows if the gap-fill round (deep) adds a second wave —
+    // the progress bar legitimately expands as new angles are discovered.
+    let mut workers_total = sub_questions.len();
 
     // ---- Phase 2: fan out -------------------------------------------------
     progress(Progress {
@@ -155,47 +189,67 @@ where
         workers_ok: 0,
     });
 
-    let sem = Arc::new(Semaphore::new(depth.max_concurrent()));
+    // Counters shared across both fan-out rounds so the reported count stays
+    // continuous (e.g. "8/12 reported" once gap workers are added).
     let done = Arc::new(AtomicUsize::new(0));
     let ok = Arc::new(AtomicUsize::new(0));
-    let progress_ref = &progress;
-    let spawn_ref = &spawn_worker;
     let sources_hint = depth.sources_hint();
 
-    let futures = sub_questions.iter().cloned().map(|sub_q| {
-        let sem = Arc::clone(&sem);
-        let done = Arc::clone(&done);
-        let ok = Arc::clone(&ok);
-        async move {
-            // Hold the permit for the worker's whole lifetime so no more than
-            // `max_concurrent` workers run at once.
-            let _permit = sem.acquire().await;
-            let brief = worker_brief(question, &sub_q, sources_hint);
-            let findings = match spawn_ref(brief).await {
-                Ok(f) if !f.trim().is_empty() => {
-                    ok.fetch_add(1, Ordering::SeqCst);
-                    (sub_q.clone(), true, f)
-                }
-                Ok(_) => (sub_q.clone(), false, String::new()),
-                Err(e) => {
-                    tracing::warn!("deep_research: worker for {sub_q:?} failed: {e}");
-                    (sub_q.clone(), false, String::new())
-                }
-            };
-            let workers_done = done.fetch_add(1, Ordering::SeqCst) + 1;
-            let workers_ok = ok.load(Ordering::SeqCst);
-            progress_ref(Progress {
-                phase: "reading",
-                detail: format!("Researcher {workers_done}/{workers_total} reported"),
-                workers_total,
-                workers_done,
-                workers_ok,
-            });
-            findings
-        }
-    });
+    let mut results = fan_out_round(
+        &sub_questions,
+        question,
+        sources_hint,
+        depth.max_concurrent(),
+        &spawn_worker,
+        &progress,
+        &done,
+        &ok,
+        workers_total,
+    )
+    .await;
 
-    let results: Vec<(String, bool, String)> = futures::future::join_all(futures).await;
+    // ---- Phase 2b: gap-fill (deep only) -----------------------------------
+    // Review the first wave's findings, surface the most important unresolved
+    // gaps/contradictions, and run a second targeted fan-out on them. This is
+    // what makes `deep` meaningfully deeper than `standard`.
+    let mut gap_questions: Vec<String> = Vec::new();
+    if depth.gap_fill() {
+        progress(Progress {
+            phase: "refining",
+            detail: "Reviewing findings for unresolved gaps".to_string(),
+            workers_total,
+            workers_done: workers_total,
+            workers_ok: ok.load(Ordering::SeqCst),
+        });
+        gap_questions = identify_gaps(&router, question, &results, depth).await;
+        if !gap_questions.is_empty() {
+            workers_total += gap_questions.len();
+            progress(Progress {
+                phase: "reading",
+                detail: format!(
+                    "Investigating {} follow-up gap(s)",
+                    gap_questions.len()
+                ),
+                workers_total,
+                workers_done: done.load(Ordering::SeqCst),
+                workers_ok: ok.load(Ordering::SeqCst),
+            });
+            let round2 = fan_out_round(
+                &gap_questions,
+                question,
+                sources_hint,
+                depth.max_concurrent(),
+                &spawn_worker,
+                &progress,
+                &done,
+                &ok,
+                workers_total,
+            )
+            .await;
+            results.extend(round2);
+        }
+    }
+
     let workers_ok = ok.load(Ordering::SeqCst);
 
     // ---- Phase 3: synthesize ----------------------------------------------
@@ -209,14 +263,143 @@ where
 
     let paper_markdown = synthesize(&router, question, depth, &results, prior_paper).await?;
 
+    // Report every sub-question actually investigated (plan + gaps) so the
+    // caller's result card reflects the true breadth of the run.
+    let mut all_sub_questions = sub_questions;
+    all_sub_questions.extend(gap_questions);
+
     Ok(ResearchOutcome {
         paper_markdown,
         question: question.to_string(),
         depth: depth.as_str().to_string(),
-        sub_questions,
+        sub_questions: all_sub_questions,
         workers_total,
         workers_ok,
     })
+}
+
+/// Run one concurrent fan-out wave: one worker per sub-question, gated by a
+/// semaphore. `done`/`ok`/`workers_total` are shared across waves so progress
+/// counts stay continuous. Tolerant of empty/failed workers (they contribute
+/// an empty findings string and are counted as not-ok).
+#[allow(clippy::too_many_arguments)]
+async fn fan_out_round<F, Fut>(
+    sub_questions: &[String],
+    question: &str,
+    sources_hint: usize,
+    max_concurrent: usize,
+    spawn_worker: &F,
+    progress: &(impl Fn(Progress) + Send + Sync),
+    done: &Arc<AtomicUsize>,
+    ok: &Arc<AtomicUsize>,
+    workers_total: usize,
+) -> Vec<(String, bool, String)>
+where
+    F: Fn(String) -> Fut + Send + Sync,
+    Fut: std::future::Future<Output = Result<String>> + Send,
+{
+    let sem = Arc::new(Semaphore::new(max_concurrent.max(1)));
+    let futures = sub_questions.iter().cloned().map(|sub_q| {
+        let sem = Arc::clone(&sem);
+        async move {
+            // Hold the permit for the worker's whole lifetime so no more than
+            // `max_concurrent` workers run at once.
+            let _permit = sem.acquire().await;
+            let brief = worker_brief(question, &sub_q, sources_hint);
+            let findings = match spawn_worker(brief).await {
+                Ok(f) if !f.trim().is_empty() => {
+                    ok.fetch_add(1, Ordering::SeqCst);
+                    (sub_q.clone(), true, f)
+                }
+                Ok(_) => (sub_q.clone(), false, String::new()),
+                Err(e) => {
+                    tracing::warn!("deep_research: worker for {sub_q:?} failed: {e}");
+                    (sub_q.clone(), false, String::new())
+                }
+            };
+            let workers_done = done.fetch_add(1, Ordering::SeqCst) + 1;
+            let workers_ok = ok.load(Ordering::SeqCst);
+            progress(Progress {
+                phase: "reading",
+                detail: format!("Researcher {workers_done}/{workers_total} reported"),
+                workers_total,
+                workers_done,
+                workers_ok,
+            });
+            findings
+        }
+    });
+    futures::future::join_all(futures).await
+}
+
+/// Best-effort second-round planner: read the first wave's findings and return
+/// up to `depth.max_gap_questions()` focused follow-up questions targeting the
+/// most important unresolved gaps/contradictions. Never hard-fails — any error
+/// (or an empty/garbage response) yields no gaps and the run proceeds to
+/// synthesis with the first wave's findings only.
+async fn identify_gaps(
+    router: &Arc<RwLock<Arc<DefaultLlmRouter>>>,
+    question: &str,
+    results: &[(String, bool, String)],
+    depth: Depth,
+) -> Vec<String> {
+    let max_gaps = depth.max_gap_questions();
+    if max_gaps == 0 {
+        return Vec::new();
+    }
+    let system = format!(
+        "You are a meticulous research editor reviewing findings gathered by parallel \
+         researchers. Identify the most important UNRESOLVED gaps, unanswered angles, or \
+         contradictions that still block a thorough, authoritative answer to the question. \
+         Return ONLY a JSON array of at most {max_gaps} focused follow-up research questions, \
+         each investigable on its own. If the findings are already comprehensive, return an \
+         empty array []."
+    );
+
+    let mut user = String::new();
+    user.push_str("Research question: ");
+    user.push_str(question);
+    user.push_str("\n\nFindings so far:\n\n");
+    for (i, (sub_q, ok, findings)) in results.iter().enumerate() {
+        user.push_str(&format!("=== Angle {} : {sub_q} ===\n", i + 1));
+        if *ok && !findings.trim().is_empty() {
+            // Keep the digest bounded — the editor needs the gist, not every byte.
+            let f = findings.trim();
+            let clipped = if f.len() > 1500 { &f[..1500] } else { f };
+            user.push_str(clipped);
+        } else {
+            user.push_str("(no usable findings)");
+        }
+        user.push_str("\n\n");
+    }
+
+    let request = LlmRequest {
+        profile: ModelProfile::Fast,
+        messages: vec![ChatMessage {
+            role: Role::User,
+            content: MessageContent::Text(user),
+        }],
+        max_tokens: Some(1024),
+        temperature: Some(0.3),
+        tools: None,
+        system_prompt: Some(system),
+        reasoning_effort: Default::default(),
+    };
+
+    let router = router.read().await.clone();
+    match router.route(&request).await {
+        Ok(response) => {
+            let mut gaps = parse_sub_questions(&response.content);
+            if gaps.len() > max_gaps {
+                gaps.truncate(max_gaps);
+            }
+            gaps
+        }
+        Err(e) => {
+            tracing::warn!("deep_research: gap-identification pass failed: {e}");
+            Vec::new()
+        }
+    }
 }
 
 /// One-shot Fast-tier LLM call to decompose the question. Never hard-fails on
@@ -330,10 +513,15 @@ fn worker_brief(question: &str, sub_q: &str, sources_hint: usize) -> String {
     format!(
         "You are one of several parallel researchers investigating: \"{question}\".\n\n\
          Your sub-question: {sub_q}\n\n\
-         Use web_search to find sources, then web_fetch to read about {sources_hint} of the \
-         most relevant ones. Return concise structured findings: for each key claim, give the \
-         claim, the evidence, and the exact source URL. Note any conflicts between sources. \
-         Do not write files."
+         Method: run several web_search queries (vary the wording to widen coverage), then \
+         web_fetch and READ at least {sources_hint} of the most relevant, credible, and \
+         independent sources — prefer primary sources, official docs, and recent reporting \
+         over aggregators. Do not stop at the first page; cross-check claims across sources.\n\n\
+         Return THOROUGH structured findings, not a summary. For each key claim provide: the \
+         claim, the supporting evidence (with concrete specifics — figures, dates, names, \
+         direct quotes where useful), and the exact source URL. Call out disagreements or \
+         contradictions between sources explicitly, and note anything you could not verify. \
+         Aim for depth and completeness on your sub-question. Do not write files."
     )
 }
 
@@ -347,11 +535,16 @@ async fn synthesize(
     results: &[(String, bool, String)],
     prior_paper: Option<&str>,
 ) -> Result<String> {
-    let system = "You write a rigorous research paper in Markdown from findings gathered by \
-         parallel researchers. Structure: a title (#), a short abstract, thematic sections (##) \
-         with inline [n] citations, a '## Sources' numbered list mapping each [n] to its URL, \
-         and a '## Gaps & Caveats' section noting sub-questions that returned little or failed. \
-         Cite ONLY URLs that appear in the findings — never invent sources or URLs.";
+    let system = "You write a rigorous, in-depth research paper in Markdown from findings \
+         gathered by parallel researchers. Be comprehensive and analytical, not a bullet \
+         summary: synthesize across the findings, compare and reconcile conflicting evidence, \
+         and develop each theme with specifics (figures, dates, named sources, direct \
+         evidence). Structure: a title (#), an abstract, a short table of contents, multiple \
+         thematic sections (##) — each substantive and several paragraphs deep — with inline \
+         [n] citations, a concluding analysis, a '## Sources' numbered list mapping each [n] to \
+         its URL, and a '## Gaps & Caveats' section noting sub-questions that returned little, \
+         failed, or remain contested. Use the full length available; do not truncate the \
+         analysis. Cite ONLY URLs that appear in the findings — never invent sources or URLs.";
 
     let mut user = String::new();
     if let Some(prior) = prior_paper {
@@ -384,7 +577,7 @@ async fn synthesize(
             role: Role::User,
             content: MessageContent::Text(user),
         }],
-        max_tokens: Some(4096),
+        max_tokens: Some(depth.synth_max_tokens()),
         temperature: Some(0.2),
         tools: None,
         system_prompt: Some(system.to_string()),
@@ -435,20 +628,32 @@ mod tests {
     #[test]
     fn depth_budget_accessors() {
         assert_eq!(Depth::Quick.num_sub_questions(), 3);
-        assert_eq!(Depth::Standard.num_sub_questions(), 5);
-        assert_eq!(Depth::Deep.num_sub_questions(), 8);
+        assert_eq!(Depth::Standard.num_sub_questions(), 6);
+        assert_eq!(Depth::Deep.num_sub_questions(), 10);
 
         assert_eq!(Depth::Quick.max_concurrent(), 3);
         assert_eq!(Depth::Standard.max_concurrent(), 4);
-        assert_eq!(Depth::Deep.max_concurrent(), 4);
+        assert_eq!(Depth::Deep.max_concurrent(), 5);
 
         assert_eq!(Depth::Quick.sources_hint(), 4);
-        assert_eq!(Depth::Standard.sources_hint(), 5);
-        assert_eq!(Depth::Deep.sources_hint(), 6);
+        assert_eq!(Depth::Standard.sources_hint(), 6);
+        assert_eq!(Depth::Deep.sources_hint(), 8);
 
         assert_eq!(Depth::Quick.synth_profile(), ModelProfile::Fast);
         assert_eq!(Depth::Standard.synth_profile(), ModelProfile::Powerful);
         assert_eq!(Depth::Deep.synth_profile(), ModelProfile::Powerful);
+
+        assert_eq!(Depth::Quick.synth_max_tokens(), 4096);
+        assert_eq!(Depth::Standard.synth_max_tokens(), 6144);
+        assert_eq!(Depth::Deep.synth_max_tokens(), 8192);
+
+        // Only `deep` runs the gap-fill second round.
+        assert!(!Depth::Quick.gap_fill());
+        assert!(!Depth::Standard.gap_fill());
+        assert!(Depth::Deep.gap_fill());
+        assert_eq!(Depth::Quick.max_gap_questions(), 0);
+        assert_eq!(Depth::Standard.max_gap_questions(), 0);
+        assert_eq!(Depth::Deep.max_gap_questions(), 4);
 
         assert_eq!(Depth::Quick.as_str(), "quick");
         assert_eq!(Depth::Standard.as_str(), "standard");
