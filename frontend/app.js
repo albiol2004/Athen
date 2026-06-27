@@ -7927,6 +7927,163 @@ function mcpIconSvg(name) {
     }
 }
 
+// ─── Service icons (Cloud APIs + MCP) ─────────────────────────────────
+// Monochrome 24×24 stroke glyphs (currentColor) matching the chat tool
+// icons, so provider rows read as part of the same system rather than a
+// pasted-in logo wall. Each curated HTTP provider gets a category-true
+// glyph; anything unrecognized falls back to a neutral cloud.
+
+function svcSvg(inner) {
+    return `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${inner}</svg>`;
+}
+
+// Inner-path glyphs reused across providers.
+const SVC_GLYPHS = {
+    search: '<circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>',
+    shield: '<path d="M12 2 4 5v6c0 5 3.4 8.4 8 11 4.6-2.6 8-6 8-11V5z"/>',
+    flame: '<path d="M12 2C9 5 7 7 7 11a5 5 0 0 0 10 0c0-2-1-3.6-2-5-.5 1.5-1.5 2-2.5 2C13 8 13 5 12 2z"/>',
+    reader: '<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="13" y2="17"/>',
+    atSign: '<circle cx="12" cy="12" r="4"/><path d="M16 12v1.5a2.5 2.5 0 0 0 5 0V12a9 9 0 1 0-3.6 7.2"/>',
+    users: '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>',
+    database: '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/>',
+    languages: '<path d="M4 5h7"/><path d="M9 3v2c0 4.5-2.2 7.5-5 9"/><path d="M5 9c0 3 3.5 5 6 6"/><path d="m13 20 4-9 4 9"/><path d="M14.5 17h5"/>',
+    newspaper: '<path d="M4 22a2 2 0 0 1-2-2V6a1 1 0 0 1 1-1h13a1 1 0 0 1 1 1v14a2 2 0 0 0 2 2H4z"/><path d="M18 9h2a1 1 0 0 1 1 1v9a2 2 0 0 1-2 2"/><line x1="6" y1="9" x2="14" y2="9"/><line x1="6" y1="13" x2="14" y2="13"/><line x1="6" y1="17" x2="11" y2="17"/>',
+    cloudSun: '<path d="M12 2v2"/><path d="m4.9 4.9 1.4 1.4"/><path d="M20 12h2"/><path d="m17.7 6.3 1.4-1.4"/><path d="M15.9 12.6a4 4 0 1 0-5.9-4.1"/><path d="M13 22H7a5 5 0 1 1 4.9-6H13a3 3 0 0 1 0 6z"/>',
+    banknote: '<rect x="2" y="6" width="20" height="12" rx="2"/><circle cx="12" cy="12" r="2.5"/><path d="M6 12h.01M18 12h.01"/>',
+    mapPin: '<path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0z"/><circle cx="12" cy="10" r="3"/>',
+    audioBars: '<line x1="4" y1="9" x2="4" y2="15"/><line x1="8" y1="6" x2="8" y2="18"/><line x1="12" y1="4" x2="12" y2="20"/><line x1="16" y1="7" x2="16" y2="17"/><line x1="20" y1="10" x2="20" y2="14"/>',
+    speaker: '<path d="M11 5 6 9H2v6h4l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M19 5a9 9 0 0 1 0 14"/>',
+    mic: '<rect x="9" y="2" width="6" height="11" rx="3"/><path d="M5 10a7 7 0 0 0 14 0"/><line x1="12" y1="19" x2="12" y2="22"/>',
+    route: '<circle cx="6" cy="19" r="3"/><path d="M9 19h8.5a3.5 3.5 0 0 0 0-7h-11a3.5 3.5 0 0 1 0-7H15"/><circle cx="18" cy="5" r="3"/>',
+    zap: '<path d="M13 2 3 14h7l-1 8 10-12h-7l1-8z"/>',
+    phone: '<path d="M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1 1 .4 1.9.7 2.8a2 2 0 0 1-.5 2.1L8.1 9.9a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.1-.4c.9.3 1.8.6 2.8.7a2 2 0 0 1 1.7 2z"/>',
+    cloud: '<path d="M17.5 19a4.5 4.5 0 0 0 0-9 6 6 0 0 0-11.6 1.5A4 4 0 0 0 6 19z"/>',
+    server: '<rect x="2" y="3" width="20" height="8" rx="2"/><rect x="2" y="13" width="20" height="8" rx="2"/><line x1="6" y1="7" x2="6.01" y2="7"/><line x1="6" y1="17" x2="6.01" y2="17"/>',
+};
+
+// Curated provider → glyph. Keyed by the normalized `provider` string so
+// both the preset list AND any registered endpoint (which copies the
+// preset's provider verbatim) resolve the same icon.
+const CLOUD_API_ICONS = {
+    jinaai: SVC_GLYPHS.reader,
+    firecrawl: SVC_GLYPHS.flame,
+    bravesearch: SVC_GLYPHS.shield,
+    serpapi: SVC_GLYPHS.search,
+    hunter: SVC_GLYPHS.atSign,
+    apollo: SVC_GLYPHS.users,
+    peopledatalabs: SVC_GLYPHS.database,
+    deepl: SVC_GLYPHS.languages,
+    newsapiorg: SVC_GLYPHS.newspaper,
+    openmeteo: SVC_GLYPHS.cloudSun,
+    frankfurter: SVC_GLYPHS.banknote,
+    opencage: SVC_GLYPHS.mapPin,
+    elevenlabs: SVC_GLYPHS.audioBars,
+    cartesia: SVC_GLYPHS.speaker,
+    deepgram: SVC_GLYPHS.mic,
+    openrouter: SVC_GLYPHS.route,
+    groq: SVC_GLYPHS.zap,
+    twilio: SVC_GLYPHS.phone,
+};
+
+function normalizeProviderKey(provider) {
+    return (provider || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+// Icon for a curated HTTP provider; neutral cloud for anything else.
+function cloudApiIcon(provider) {
+    return svcSvg(CLOUD_API_ICONS[normalizeProviderKey(provider)] || SVC_GLYPHS.cloud);
+}
+
+// MCP server icon. A custom `icon` may be a data:/http(s) image (user
+// upload), a built-in icon name (mcpIconSvg), or absent → default server
+// glyph. Returns ready-to-inject HTML.
+function mcpEntryIconHtml(entry) {
+    const icon = entry && entry.icon;
+    if (typeof icon === 'string' && icon.trim()) {
+        const v = icon.trim();
+        if (/^(data:|https?:\/\/)/i.test(v)) {
+            return `<img class="svc-icon-img" src="${escapeHtml(v)}" alt="" draggable="false">`;
+        }
+        const named = mcpIconSvg(v);
+        if (named) return named;
+    }
+    return svcSvg(SVC_GLYPHS.server);
+}
+
+// Read a user-picked image file into a small icon data URL. SVGs ride
+// through as-is (vector, tiny); rasters are downscaled to ≤64px so the
+// stored definition stays a few KB regardless of the source resolution.
+function fileToIconDataUrl(file) {
+    return new Promise((resolve, reject) => {
+        if (!file) {
+            reject('No file');
+            return;
+        }
+        if (file.size > 2 * 1024 * 1024) {
+            reject('Image too large (max 2 MB)');
+            return;
+        }
+        const reader = new FileReader();
+        reader.onerror = () => reject('Could not read file');
+        if (file.type === 'image/svg+xml') {
+            reader.onload = () => resolve(reader.result);
+            reader.readAsDataURL(file);
+            return;
+        }
+        reader.onload = () => {
+            const img = new Image();
+            img.onload = () => {
+                const max = 64;
+                const scale = Math.min(1, max / Math.max(img.width, img.height));
+                const w = Math.max(1, Math.round(img.width * scale));
+                const h = Math.max(1, Math.round(img.height * scale));
+                const canvas = document.createElement('canvas');
+                canvas.width = w;
+                canvas.height = h;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(img, 0, 0, w, h);
+                try {
+                    resolve(canvas.toDataURL('image/png'));
+                } catch (e) {
+                    reject('Could not encode image');
+                }
+            };
+            img.onerror = () => reject('Could not decode image');
+            img.src = reader.result;
+        };
+        reader.readAsDataURL(file);
+    });
+}
+
+// Open a file picker and set the chosen image as an MCP server's icon.
+function pickMcpIcon(id) {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'image/png,image/jpeg,image/webp,image/gif,image/svg+xml';
+    input.addEventListener('change', async () => {
+        const file = input.files && input.files[0];
+        if (!file) return;
+        try {
+            const dataUrl = await fileToIconDataUrl(file);
+            await invoke('mcp_set_icon', { id, icon: dataUrl });
+            await loadMcpServers();
+            showToast('Icon updated', 'success');
+        } catch (err) {
+            showToast(`Icon update failed: ${err}`, 'error');
+        }
+    });
+    input.click();
+}
+
+async function resetMcpIcon(id) {
+    try {
+        await invoke('mcp_set_icon', { id, icon: null });
+        await loadMcpServers();
+    } catch (err) {
+        showToast(`Could not reset icon: ${err}`, 'error');
+    }
+}
+
 // ─── Profile manager ──────────────────────────────────────────────────
 
 const PROFILE_DOMAINS = [
@@ -17724,6 +17881,7 @@ function renderCloudApisList() {
         const authLabel = describeAuthMethod(e.auth_method);
         return `
             <div class="cloud-api-row" data-endpoint-id="${escapeHtml(e.id)}">
+                <span class="cloud-api-icon svc-icon">${cloudApiIcon(e.provider)}</span>
                 <div class="cloud-api-row-main">
                     <div class="cloud-api-row-name">
                         <strong>${escapeHtml(e.name)}</strong>
@@ -18909,9 +19067,14 @@ function renderMcpServersList() {
         const errorBlock = isEnabled && isError
             ? `<div class="mcp-server-row-error">${escapeHtml(status.replace(/^error:\s*/, ''))}</div>`
             : '';
+        const hasCustomIcon = typeof entry.icon === 'string' && /^(data:|https?:\/\/)/i.test(entry.icon.trim());
+        const resetBtn = hasCustomIcon
+            ? `<button class="btn-secondary mcp-server-icon-reset-btn" data-mcp-id="${escapeHtml(entry.id)}" type="button">Reset icon</button>`
+            : '';
         return `
             <div class="mcp-server-row" data-mcp-id="${escapeHtml(entry.id)}">
                 <div class="mcp-server-row-main">
+                    <button class="mcp-server-icon svc-icon mcp-server-icon-btn" data-mcp-id="${escapeHtml(entry.id)}" type="button" title="Set a custom icon">${mcpEntryIconHtml(entry)}</button>
                     <div class="mcp-server-row-info">
                         <div class="mcp-server-row-name">
                             <strong>${escapeHtml(entry.display_name || entry.id)}</strong>
@@ -18925,6 +19088,7 @@ function renderMcpServersList() {
                             <input type="checkbox" class="mcp-server-enabled" ${isEnabled ? 'checked' : ''} data-mcp-id="${escapeHtml(entry.id)}">
                             <span>Enabled</span>
                         </label>
+                        ${resetBtn}
                         <button class="btn-secondary mcp-server-expand-btn" data-mcp-id="${escapeHtml(entry.id)}" type="button">${expanded ? 'Hide' : 'Tools'}</button>
                         <button class="btn-secondary mcp-server-delete-btn" data-mcp-id="${escapeHtml(entry.id)}" type="button">Delete</button>
                     </div>
@@ -18953,6 +19117,12 @@ function renderMcpServersList() {
     });
     list.querySelectorAll('.mcp-server-delete-btn').forEach((b) => {
         b.addEventListener('click', () => deleteMcpServer(b.dataset.mcpId));
+    });
+    list.querySelectorAll('.mcp-server-icon-btn').forEach((b) => {
+        b.addEventListener('click', () => pickMcpIcon(b.dataset.mcpId));
+    });
+    list.querySelectorAll('.mcp-server-icon-reset-btn').forEach((b) => {
+        b.addEventListener('click', () => resetMcpIcon(b.dataset.mcpId));
     });
 
     // Lazy-fetch the tool list for any pane that's already expanded.

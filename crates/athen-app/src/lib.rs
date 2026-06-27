@@ -221,6 +221,7 @@ pub fn run() {
             commands::mcp_test_spawn,
             commands::mcp_list_tools_for,
             commands::mcp_set_risks,
+            commands::mcp_set_icon,
             commands::list_pending_grants,
             commands::resolve_pending_grant,
             commands::list_arc_grants,

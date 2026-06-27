@@ -1129,6 +1129,18 @@ async fn h_mcp_set_risks(
             .await,
     )
 }
+#[derive(Deserialize)]
+struct McpIconBody {
+    #[serde(default)]
+    icon: Option<String>,
+}
+async fn h_mcp_set_icon(
+    State(api): State<ApiState>,
+    UrlPath(id): UrlPath<String>,
+    Json(b): Json<McpIconBody>,
+) -> Response {
+    json_result(commands::mcp_set_icon_core(id, b.icon, api.ui.app_state()).await)
+}
 
 // directory grants
 async fn h_grants_arc(State(api): State<ApiState>, UrlPath(arc_id): UrlPath<String>) -> Response {
@@ -2212,6 +2224,7 @@ fn full_surface_router() -> Router<ApiState> {
         .route("/api/mcp/{id}/set-enabled", post(h_mcp_set_enabled))
         .route("/api/mcp/{id}/tools", get(h_mcp_tools_for))
         .route("/api/mcp/{id}/risks", post(h_mcp_set_risks))
+        .route("/api/mcp/{id}/icon", post(h_mcp_set_icon))
         // directory grants
         .route("/api/grants/arc/{arc_id}", get(h_grants_arc))
         .route("/api/grants/arc/{id}/revoke", post(h_grant_arc_revoke))

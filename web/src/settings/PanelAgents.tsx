@@ -4,6 +4,7 @@
 
 import { useState } from 'react';
 import type { AthenClient } from '../api/client';
+import { McpIcon, fileToIconDataUrl, isCustomImageIcon } from '../components/serviceIcons';
 import {
   ConfirmButton,
   ErrorText,
@@ -826,6 +827,30 @@ function McpSection({ client }: { client: AthenClient }) {
     if (ok) await refresh();
   };
 
+  const pickIcon = (id: string) => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'image/png,image/jpeg,image/webp,image/gif,image/svg+xml';
+    input.onchange = () => {
+      const file = input.files?.[0];
+      if (!file) return;
+      void act
+        .run(async () => {
+          const icon = await fileToIconDataUrl(file);
+          await client.post(`/mcp/${encodeURIComponent(id)}/icon`, { icon });
+        })
+        .then((ok) => {
+          if (ok) void custom.reload();
+        });
+    };
+    input.click();
+  };
+
+  const resetIcon = async (id: string) => {
+    const ok = await act.run(() => client.post(`/mcp/${encodeURIComponent(id)}/icon`, { icon: null }));
+    if (ok) await custom.reload();
+  };
+
   const showTools = async (id: string) => {
     if (tools?.id === id) {
       setTools(null);
@@ -885,6 +910,7 @@ function McpSection({ client }: { client: AthenClient }) {
         <div className="st-list">
           {(custom.data ?? []).map((e) => (
             <div key={e.id} className="st-item">
+              <McpIcon icon={e.icon} onPick={() => pickIcon(e.id)} />
               <div className="st-item-main">
                 <div className="st-item-title">{e.display_name}</div>
                 <div className="st-item-sub st-mono">
@@ -907,6 +933,11 @@ function McpSection({ client }: { client: AthenClient }) {
                 )}
               </div>
               <div className="st-item-actions">
+                {isCustomImageIcon(e.icon) && (
+                  <button type="button" className="st-btn small" disabled={act.pending} onClick={() => void resetIcon(e.id)}>
+                    Reset icon
+                  </button>
+                )}
                 <button type="button" className="st-btn small" disabled={act.pending} onClick={() => void showTools(e.id)}>
                   {tools?.id === e.id ? 'Hide tools' : 'Tools'}
                 </button>

@@ -10,6 +10,7 @@
 
 import { useEffect, useState } from 'react';
 import type { AthenClient } from '../api/client';
+import { CloudApiIcon } from '../components/serviceIcons';
 import {
   ConfirmButton,
   ErrorText,
@@ -1144,6 +1145,7 @@ function EndpointsSection({ client }: { client: AthenClient }) {
       <div className="st-list">
         {(endpoints.data ?? []).map((e) => (
           <div key={e.id} className="st-item">
+            <CloudApiIcon provider={e.provider} />
             <div className="st-item-main">
               <div className="st-item-title">
                 {e.name}

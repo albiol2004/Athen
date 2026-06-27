@@ -8416,9 +8416,9 @@ option:hover {
 
 .cloud-api-row {
     display: grid;
-    grid-template-columns: 1fr auto;
-    grid-template-areas: "main actions" "result result";
-    gap: 8px 16px;
+    grid-template-columns: auto 1fr auto;
+    grid-template-areas: "icon main actions" "icon result result";
+    gap: 8px 14px;
     padding: 12px 16px;
     border: 1px solid var(--border-color, #2a2a2a);
     border-radius: 8px;
@@ -8426,6 +8426,30 @@ option:hover {
 }
 
 .cloud-api-row-main { grid-area: main; min-width: 0; }
+
+/* Shared service-icon chip (Cloud APIs + MCP) — a quiet rounded tile that
+   reads as part of the icon system, not a logo wall. */
+.svc-icon {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 34px;
+    height: 34px;
+    border-radius: 9px;
+    color: var(--text-2);
+    background: rgba(255, 255, 255, 0.035);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+}
+.svc-icon svg { width: 18px; height: 18px; }
+.svc-icon-img {
+    width: 22px;
+    height: 22px;
+    object-fit: contain;
+    border-radius: 5px;
+    display: block;
+}
+.cloud-api-icon { grid-area: icon; align-self: center; }
 .cloud-api-row-actions {
     grid-area: actions;
     display: flex;
@@ -9371,12 +9395,28 @@ option:hover {
 
 .mcp-server-row-main {
     display: grid;
-    grid-template-columns: 1fr auto;
-    gap: 8px 16px;
+    grid-template-columns: auto 1fr auto;
+    align-items: center;
+    gap: 8px 14px;
     padding: 12px 16px;
 }
 
 .mcp-server-row-info { min-width: 0; }
+
+/* Icon tile doubles as the "set custom icon" button. */
+.mcp-server-icon {
+    align-self: center;
+    padding: 0;
+    cursor: pointer;
+    transition: border-color var(--dur-fast) var(--ease),
+        background var(--dur-fast) var(--ease);
+}
+.mcp-server-icon:hover {
+    color: var(--text);
+    border-color: rgba(255, 255, 255, 0.14);
+    background: rgba(255, 255, 255, 0.06);
+}
+.mcp-server-icon:focus-visible { box-shadow: var(--ring-focus); outline: none; }
 
 .mcp-server-row-name {
     display: flex;

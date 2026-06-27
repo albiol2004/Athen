@@ -159,6 +159,40 @@
 }
 .st-item.selected { border-color: rgba(232, 116, 90, 0.4); }
 .st-item-main { flex: 1; min-width: 160px; }
+
+/* Service-icon chip (Cloud APIs + MCP) — a quiet rounded tile that reads
+   as part of the icon system rather than a logo wall. */
+.st-item-icon {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  color: var(--text-dim);
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+.st-item-icon svg { width: 18px; height: 18px; }
+.st-item-icon-img {
+  width: 22px;
+  height: 22px;
+  object-fit: contain;
+  border-radius: 5px;
+  display: block;
+}
+.st-item-icon-btn {
+  padding: 0;
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease, color 120ms ease;
+}
+.st-item-icon-btn:hover {
+  color: var(--text);
+  border-color: rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.06);
+}
+.st-item-icon-btn:focus-visible { box-shadow: var(--ring-focus); outline: none; }
 .st-item-title {
   font-size: 13px; font-weight: 600; color: var(--text);
   display: flex; align-items: center; gap: 8px; flex-wrap: wrap;

@@ -9537,6 +9537,69 @@ pub(crate) async fn mcp_set_risks_core(
     Ok(())
 }
 
+/// Set (or clear) a custom MCP server's display icon. `icon` is a small
+/// image as a `data:` URL (PNG / SVG / JPEG / WebP), an `http(s)` URL, or a
+/// built-in icon name; an empty string or `None` resets to the default
+/// glyph. Only custom (BYO) entries are addressable — bundled ids have no
+/// editable row.
+///
+/// Data URLs are length-capped so the icon stays a thumbnail riding inside
+/// the `mcp_custom_entries.definition` JSON blob, not a full-resolution
+/// image bloating the row. The desktop / web UIs downscale rasters to a
+/// ~64px thumbnail before calling, so this cap is a backstop, not the
+/// expected size.
+#[tauri::command]
+pub async fn mcp_set_icon(
+    id: String,
+    icon: Option<String>,
+    state: State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    mcp_set_icon_core(id, icon, &state).await
+}
+
+pub(crate) async fn mcp_set_icon_core(
+    id: String,
+    icon: Option<String>,
+    state: &AppState,
+) -> std::result::Result<(), String> {
+    // ~256 KB of data-URL text. A 64px PNG thumbnail is a few KB; this
+    // only trips on someone hand-posting a full image.
+    const MAX_ICON_LEN: usize = 256 * 1024;
+
+    let Some(store) = &state.mcp_store else {
+        return Err("MCP persistence not available".into());
+    };
+
+    // Trim; treat empty as "clear back to the default glyph".
+    let icon = match icon {
+        Some(s) if s.trim().is_empty() => None,
+        Some(s) => Some(s.trim().to_string()),
+        None => None,
+    };
+    if let Some(s) = &icon {
+        if s.len() > MAX_ICON_LEN {
+            return Err(format!(
+                "Icon is too large ({} KB). Use a small image under {} KB.",
+                s.len() / 1024,
+                MAX_ICON_LEN / 1024
+            ));
+        }
+    }
+
+    let mut entry = store
+        .get_custom(&id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Unknown custom MCP id: {id}"))?;
+
+    entry.icon = icon;
+    // `add_custom` upserts by id — the companion `mcp_enabled` row and the
+    // live registry are untouched (icon is display-only metadata; the
+    // custom list the UI renders is read straight from this store).
+    store.add_custom(&entry).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Path-grant approval flow + grant management
 // ---------------------------------------------------------------------------
