@@ -226,10 +226,7 @@ where
             workers_total += gap_questions.len();
             progress(Progress {
                 phase: "reading",
-                detail: format!(
-                    "Investigating {} follow-up gap(s)",
-                    gap_questions.len()
-                ),
+                detail: format!("Investigating {} follow-up gap(s)", gap_questions.len()),
                 workers_total,
                 workers_done: done.load(Ordering::SeqCst),
                 workers_ok: ok.load(Ordering::SeqCst),

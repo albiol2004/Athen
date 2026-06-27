@@ -4034,7 +4034,11 @@ async fn handle_telegram_deepresearch_command(
         topic.to_string()
     };
     if let Err(e) = arc_store
-        .create_arc(&arc_id, &name, athen_persistence::arcs::ArcSource::Messaging)
+        .create_arc(
+            &arc_id,
+            &name,
+            athen_persistence::arcs::ArcSource::Messaging,
+        )
         .await
     {
         warn!("deepresearch: failed to create arc: {e}");
@@ -4060,12 +4064,14 @@ async fn handle_telegram_deepresearch_command(
     .await;
 
     // Park the request; the token rides in each button's callback_data.
-    let token = ui.app_state().stash_pending_deep_research(PendingDeepResearch {
-        arc_id,
-        chat_id,
-        question: topic.to_string(),
-        created_at: chrono::Utc::now(),
-    });
+    let token = ui
+        .app_state()
+        .stash_pending_deep_research(PendingDeepResearch {
+            arc_id,
+            chat_id,
+            question: topic.to_string(),
+            created_at: chrono::Utc::now(),
+        });
 
     let quick = format!("dr|{token}|quick");
     let standard = format!("dr|{token}|standard");
@@ -4107,7 +4113,8 @@ async fn handle_telegram_deepresearch_callback(
 ) {
     let parts: Vec<&str> = cb.data.splitn(3, '|').collect();
     if parts.len() != 3 {
-        let _ = athen_sentidos::telegram::answer_callback_query(bot_token, &cb.callback_id, "").await;
+        let _ =
+            athen_sentidos::telegram::answer_callback_query(bot_token, &cb.callback_id, "").await;
         return;
     }
     let token = parts[1];
@@ -4127,8 +4134,9 @@ async fn handle_telegram_deepresearch_callback(
     };
 
     // Clear the button spinner immediately.
-    let _ = athen_sentidos::telegram::answer_callback_query(bot_token, &cb.callback_id, "Starting…")
-        .await;
+    let _ =
+        athen_sentidos::telegram::answer_callback_query(bot_token, &cb.callback_id, "Starting…")
+            .await;
 
     // Replace the keyboard message with a running note (best-effort).
     let running = format!(
@@ -4146,8 +4154,8 @@ async fn handle_telegram_deepresearch_callback(
             .await;
         }
         None => {
-            let _ = athen_sentidos::telegram::send_message(bot_token, pending.chat_id, &running)
-                .await;
+            let _ =
+                athen_sentidos::telegram::send_message(bot_token, pending.chat_id, &running).await;
         }
     }
 
@@ -7500,7 +7508,10 @@ mod newarc_command_tests {
             Some("underscore variant".to_string())
         );
         // Bare command → empty topic (the handler then prompts for usage).
-        assert_eq!(parse_deepresearch_command("/deepresearch"), Some(String::new()));
+        assert_eq!(
+            parse_deepresearch_command("/deepresearch"),
+            Some(String::new())
+        );
         // Not the command.
         assert_eq!(parse_deepresearch_command("just a message"), None);
         assert_eq!(parse_deepresearch_command("/newarc something"), None);
