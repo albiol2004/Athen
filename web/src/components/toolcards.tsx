@@ -224,12 +224,13 @@ export const ToolCard = memo(function ToolCard({ it, client }: { it: ToolItem; c
   const [open, setOpen] = useState(false);
   const done =
     it.status === 'Completed' || it.status === 'completed' || it.status === 'done';
+  const running = !done && !it.failed;
   const expandable =
     it.args !== undefined || it.result !== undefined || Boolean(it.error) || it.name === 'delegate_to_agent';
   return (
-    <div className={`tc${it.failed ? ' failed' : ''}`}>
+    <div className={`tc${it.failed ? ' failed' : ''}${running ? ' running' : ''}`}>
       <button
-        className="tc-head"
+        className={`tc-head${running ? ' running' : ''}`}
         onClick={() => expandable && setOpen((o) => !o)}
         title={it.detail || undefined}
       >

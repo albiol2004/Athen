@@ -411,12 +411,42 @@ button { font: inherit; }
 /* ---- tool cards v2 + groups ---- */
 .tc { align-self: stretch; max-width: 100%; }
 .tc-head {
+  position: relative; overflow: hidden;
   display: flex; align-items: center; gap: 8px; width: 100%;
   background: rgba(255, 255, 255, 0.03); border: 1px solid var(--glass-border);
-  border-radius: 11px; padding: 6px 12px; cursor: pointer;
+  border-radius: 11px; padding: 7px 12px; cursor: pointer;
   color: var(--text-dim); font-size: 12.5px; text-align: left;
+  transition: border-color 160ms var(--ease), box-shadow 160ms var(--ease), background 160ms var(--ease);
 }
+.tc-head > * { position: relative; z-index: 1; }
 .tc-head:hover { background: rgba(255, 255, 255, 0.05); }
+
+/* Running: alive — coral-tinted, breathing glow + a sheen sweep. */
+.tc-head.running {
+  border-color: rgba(232, 116, 90, 0.42);
+  background: rgba(232, 116, 90, 0.07);
+  animation: card-breathe 2.4s ease-in-out infinite;
+}
+.tc-head.running::after {
+  content: ''; position: absolute; inset: 0; z-index: 0; pointer-events: none;
+  background: linear-gradient(100deg, transparent 28%, rgba(232, 116, 90, 0.20) 50%, transparent 72%);
+  transform: translateX(-65%);
+  animation: card-sheen 2.2s var(--ease) infinite;
+}
+@keyframes card-breathe {
+  0%, 100% { box-shadow: inset 0 0 0 1px rgba(232, 116, 90, 0.14), 0 0 14px -4px rgba(232, 116, 90, 0.28); }
+  50%      { box-shadow: inset 0 0 0 1px rgba(232, 116, 90, 0.32), 0 0 24px -2px rgba(232, 116, 90, 0.52); }
+}
+@keyframes card-sheen {
+  0%   { transform: translateX(-65%); opacity: 0; }
+  18%  { opacity: 1; }
+  82%  { opacity: 1; }
+  100% { transform: translateX(165%); opacity: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tc-head.running { animation: none; }
+  .tc-head.running::after { display: none; }
+}
 .tc-mark {
   flex: none; width: 14px; height: 14px;
   display: inline-flex; align-items: center; justify-content: center;

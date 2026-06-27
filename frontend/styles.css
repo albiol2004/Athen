@@ -2318,15 +2318,57 @@ header h1 {
 }
 
 .tool-execution-card {
+    position: relative;
     display: flex;
     align-items: flex-start;
     gap: 10px;
-    padding: 10px 12px;
-    background: var(--surface-1);
+    padding: 9px 13px;
+    background: rgba(255, 255, 255, 0.022);
     border: 1px solid var(--border);
-    border-radius: var(--r-md);
+    border-radius: var(--r-sm);
     font-size: 12.5px;
+    overflow: hidden;
     animation: msg-in 200ms var(--ease);
+    transition: border-color var(--dur) var(--ease),
+                box-shadow var(--dur) var(--ease),
+                background var(--dur) var(--ease);
+}
+/* Keep label/marker above the running sheen overlay. */
+.tool-execution-card > * { position: relative; z-index: 1; }
+
+/* ─ Running state: alive — coral-tinted, a breathing glow and a sheen
+   that sweeps across to signal work in flight. Settles calm when done. ─ */
+.tool-execution-card.in-progress {
+    border-color: rgba(185, 81, 99, 0.40);
+    background: rgba(185, 81, 99, 0.06);
+    animation: msg-in 200ms var(--ease), card-breathe 2.4s ease-in-out infinite;
+}
+.tool-execution-card.in-progress::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+    background: linear-gradient(100deg,
+        transparent 28%,
+        rgba(215, 132, 113, 0.20) 50%,
+        transparent 72%);
+    transform: translateX(-65%);
+    animation: card-sheen 2.2s var(--ease) infinite;
+}
+@keyframes card-breathe {
+    0%, 100% { box-shadow: inset 0 0 0 1px rgba(185, 81, 99, 0.14), 0 0 14px -4px rgba(185, 81, 99, 0.25); }
+    50%      { box-shadow: inset 0 0 0 1px rgba(185, 81, 99, 0.32), 0 0 24px -2px rgba(185, 81, 99, 0.50); }
+}
+@keyframes card-sheen {
+    0%   { transform: translateX(-65%); opacity: 0; }
+    18%  { opacity: 1; }
+    82%  { opacity: 1; }
+    100% { transform: translateX(165%); opacity: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+    .tool-execution-card.in-progress { animation: none; }
+    .tool-execution-card.in-progress::after { display: none; }
 }
 .tool-execution-card .tool-status-icon {
     flex-shrink: 0;
@@ -2393,8 +2435,11 @@ header h1 {
     white-space: pre-wrap;
     word-break: break-word;
 }
-.tool-execution-card.completed { border-color: rgba(123, 201, 122, 0.18); }
-.tool-execution-card.failed    { border-color: rgba(229, 72, 77, 0.22); }
+.tool-execution-card.completed { border-color: rgba(123, 201, 122, 0.16); }
+.tool-execution-card.failed    {
+    border-color: rgba(229, 72, 77, 0.22);
+    background: rgba(229, 72, 77, 0.04);
+}
 
 /* ─── Persisted tool group (collapsible dropdown on rehydration) ─── */
 .tool-group-history {
