@@ -4364,6 +4364,38 @@ function appendLiveToolCard(groupEl, card, toolName, status, stepIndex) {
     slot.classList.toggle('failed', status === 'Failed');
 }
 
+// Tools whose detail (full file content / diff) opens in the right-side
+// Inspector panel on click, instead of the cramped inline expander.
+const INSPECTOR_DETAIL_TOOLS = new Set(['read', 'write', 'edit', 'delete_file']);
+
+function toolPathBasename(p) {
+    if (typeof p !== 'string' || !p) return '';
+    const parts = p.split(/[\\/]/);
+    return parts[parts.length - 1] || p;
+}
+
+// Make a tool card open its detail in the Inspector panel. Used for
+// read/write/edit/delete_file cards (both standalone and inside tool groups).
+function makeCardOpenInInspector(card, meta) {
+    const toolName = meta.tool || '';
+    card.classList.add('tool-card-clickable');
+    card.setAttribute('role', 'button');
+    card.setAttribute('tabindex', '0');
+    const open = () => {
+        if (typeof openInspectorPanel !== 'function') return;
+        const detail = renderToolBody(meta);
+        if (!detail) return;
+        const path = (meta.args && typeof meta.args.path === 'string') ? meta.args.path : '';
+        const label = (typeof builtinToolLabel === 'function' ? builtinToolLabel(toolName) : toolName) || toolName;
+        const title = path ? `${label} · ${toolPathBasename(path)}` : label;
+        openInspectorPanel(title, detail);
+    };
+    card.addEventListener('click', open);
+    card.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); }
+    });
+}
+
 // Build a single tool-call card. For `delegate_to_agent`, wraps the card
 // with a nested expandable view that lazily fetches the sub-arc's tool
 // calls and renders them inline (Claude-Code-style sub-agent activity).
@@ -4437,6 +4469,19 @@ function buildToolCardBlock(meta) {
         wrap.className = 'tool-card-block';
         wrap.appendChild(card);
         wrap.appendChild(revertOnly);
+        return wrap;
+    }
+
+    // read/write/edit/delete_file → open full content/diff in the Inspector
+    // panel on click, rather than the cramped inline expander.
+    if (INSPECTOR_DETAIL_TOOLS.has(toolName)) {
+        makeCardOpenInInspector(card, meta);
+        const revertRow = maybeBuildRevertRow(meta);
+        if (!revertRow) return card;
+        const wrap = document.createElement('div');
+        wrap.className = 'tool-card-block';
+        wrap.appendChild(card);
+        wrap.appendChild(revertRow);
         return wrap;
     }
 
