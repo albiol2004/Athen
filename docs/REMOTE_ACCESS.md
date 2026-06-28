@@ -107,12 +107,25 @@ Standalone module, no `AppState` coupling:
   (extract the single `cloudflared`). Reuses the reqwest download shape
   from `runtimes.rs`.
 - `start_quick_tunnel(port) -> Result<TunnelHandle>` — spawn
-  `cloudflared tunnel --url http://127.0.0.1:<port> --no-autoupdate`,
-  read stderr lines, regex-extract `https://<sub>.trycloudflare.com`,
-  resolve with a timeout (~20s) or kill+error. `TunnelHandle { child,
-  url }`; drop/`stop()` kills the child. Windows: `CREATE_NO_WINDOW`.
-- `parse_tunnel_url(line) -> Option<String>` — pure, unit-tested against
-  real cloudflared stderr fixtures.
+  `cloudflared tunnel --url http://127.0.0.1:<port> --no-autoupdate
+  --protocol http2`, merge stdout+stderr into a bounded channel (one
+  reader task per pipe), and wait until cloudflared has BOTH printed
+  `https://<sub>.trycloudflare.com` AND logged a `Registered tunnel
+  connection` line before returning ready (timeout `TUNNEL_READY_TIMEOUT`
+  ~30s; on timeout-with-URL it returns the URL anyway, else kill+error).
+  Three deliberate 1033-avoidance choices: (a) wait for an edge
+  connection, not just the URL — returning on the URL alone handed the
+  user a hostname whose connections weren't up yet → immediate 1033;
+  (b) a background **drain task** keeps reading both pipes for the
+  child's whole lifetime, so cloudflared's logging never blocks on a full
+  ~64 KiB pipe buffer (a full buffer stalls its connection manager →
+  sustained 1033); (c) `--protocol http2` forces the outbound-TCP-443
+  edge protocol because the default QUIC (outbound UDP 7844) is silently
+  dropped on many home/ISP networks. `TunnelHandle { child, url, drain }`;
+  drop/`stop()` aborts the drain and kills the child. Windows:
+  `CREATE_NO_WINDOW`.
+- `parse_tunnel_url(line) -> Option<String>` / `is_connection_registered(line)`
+  — pure, unit-tested against real cloudflared stderr fixtures.
 
 ## 6. Runtime + persistence (`athen-core` + `state.rs`)
 

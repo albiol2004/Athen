@@ -40,9 +40,12 @@ use athen_core::paths;
 /// protocol is stable across these so an old pin keeps working.
 const CLOUDFLARED_VERSION: &str = "2024.10.1";
 
-/// How long to wait for cloudflared to print its `*.trycloudflare.com`
-/// URL on stderr before we give up and kill the child.
-const TUNNEL_URL_TIMEOUT: Duration = Duration::from_secs(25);
+/// How long to wait for cloudflared to both print its
+/// `*.trycloudflare.com` URL AND register at least one edge connection
+/// before we give up and kill the child. We wait for the connection (not
+/// just the URL) because the edge serves HTTP 1033 until a tunnel
+/// connection is actually live.
+const TUNNEL_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ─── Progress reporting ──────────────────────────────────────────────
 
@@ -303,12 +306,19 @@ async fn extract_cloudflared_from_tgz(_bytes: Vec<u8>) -> Result<Vec<u8>> {
 
 // ─── Running the tunnel ──────────────────────────────────────────────
 
-/// A live cloudflared quick-tunnel. Holds the child process and the
-/// resolved public URL. Dropping it best-effort kills the child so a
-/// dropped handle never leaks the process.
+/// A live cloudflared quick-tunnel. Holds the child process, the resolved
+/// public URL, and a background task that keeps draining the child's
+/// stdout/stderr. Dropping it best-effort kills the child and stops the
+/// drain so a dropped handle never leaks either.
 pub struct TunnelHandle {
     child: tokio::process::Child,
     pub url: String,
+    /// Keeps reading cloudflared's stdout/stderr for the child's whole
+    /// lifetime. Without it the OS pipe buffer (~64 KiB) fills, cloudflared's
+    /// next log write blocks, its connection manager stalls, and the edge
+    /// starts serving HTTP 1033 ("no healthy tunnel connection"). Aborted on
+    /// stop/drop.
+    drain: tokio::task::JoinHandle<()>,
 }
 
 impl TunnelHandle {
@@ -319,6 +329,7 @@ impl TunnelHandle {
 
     /// Stop the tunnel, killing the cloudflared child and reaping it.
     pub async fn stop(mut self) {
+        self.drain.abort();
         let _ = self.child.start_kill();
         let _ = self.child.wait().await;
     }
@@ -326,17 +337,35 @@ impl TunnelHandle {
 
 impl Drop for TunnelHandle {
     fn drop(&mut self) {
-        // Best-effort: don't block in Drop; just signal the kill. The OS
-        // reaps the zombie when the tokio reactor's child watcher runs, or
-        // at process exit.
+        // Best-effort: don't block in Drop; just signal the kill and stop the
+        // drain. The OS reaps the zombie when the tokio reactor's child
+        // watcher runs, or at process exit.
+        self.drain.abort();
         let _ = self.child.start_kill();
     }
 }
 
-/// Spawn `cloudflared tunnel --url http://127.0.0.1:<port> --no-autoupdate`,
-/// read its stderr/stdout for the `*.trycloudflare.com` URL, and return a
-/// handle to the still-running child. Times out after ~25s (killing the
-/// child) if no URL appears.
+/// True if a cloudflared log line announces that an edge connection is now
+/// registered. The canonical line for the pinned version is
+/// `Registered tunnel connection connIndex=0 …`; we also accept the looser
+/// "connection … registered" shape so a minor wording change across
+/// cloudflared releases doesn't silently break readiness detection.
+fn is_connection_registered(line: &str) -> bool {
+    let l = line.to_ascii_lowercase();
+    l.contains("registered tunnel connection")
+        || (l.contains("connection") && l.contains("registered"))
+}
+
+/// Spawn `cloudflared tunnel --url http://127.0.0.1:<port> …`, wait until it
+/// has BOTH printed its `*.trycloudflare.com` URL AND registered an edge
+/// connection, then return a handle to the still-running child. Times out
+/// after [`TUNNEL_READY_TIMEOUT`] (killing the child) if no URL ever appears.
+///
+/// Returning on the URL alone — as an earlier version did — hands the user a
+/// hostname whose edge connections aren't up yet, so opening it immediately
+/// yields a Cloudflare 1033 error. We force the HTTP/2 edge protocol because
+/// the default QUIC (UDP 7844) is silently dropped on many home/ISP networks,
+/// which is itself a common cause of 1033.
 pub async fn start_quick_tunnel(cloudflared: &Path, port: u16) -> Result<TunnelHandle> {
     let mut cmd = Command::new(cloudflared);
     cmd.args([
@@ -344,6 +373,13 @@ pub async fn start_quick_tunnel(cloudflared: &Path, port: u16) -> Result<TunnelH
         "--url",
         &format!("http://127.0.0.1:{port}"),
         "--no-autoupdate",
+        // Force HTTP/2 (outbound TCP 443) instead of the default QUIC
+        // (outbound UDP 7844). Many networks drop outbound UDP, which leaves
+        // the hostname registered but every tunnel connection failing — the
+        // exact shape of a 1033. TCP 443 is universally open; the latency
+        // cost is immaterial for a remote-control UI.
+        "--protocol",
+        "http2",
     ])
     .stdin(Stdio::null())
     .stdout(Stdio::piped())
@@ -365,56 +401,91 @@ pub async fn start_quick_tunnel(cloudflared: &Path, port: u16) -> Result<TunnelH
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
-    // cloudflared prints the URL to stderr; read stdout too for safety.
-    let find_url = async {
-        let mut out_lines = stdout.map(|s| BufReader::new(s).lines());
-        let mut err_lines = stderr.map(|s| BufReader::new(s).lines());
-        loop {
-            let line: Option<String> = match (&mut err_lines, &mut out_lines) {
-                (Some(e), Some(o)) => {
-                    tokio::select! {
-                        l = e.next_line() => l.ok().flatten(),
-                        l = o.next_line() => l.ok().flatten(),
-                    }
+    // Merge both pipes into one bounded channel via a reader task per stream.
+    // Dedicated readers + a bounded channel mean the consumer never blocks
+    // cloudflared's own writes, and each stream's EOF is handled
+    // independently — when both readers finish, the channel closes on its own.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(128);
+    if let Some(out) = stdout {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(out).lines();
+            while let Ok(Some(l)) = lines.next_line().await {
+                if tx.send(l).await.is_err() {
+                    break;
                 }
-                (Some(e), None) => e.next_line().await.ok().flatten(),
-                (None, Some(o)) => o.next_line().await.ok().flatten(),
-                (None, None) => None,
-            };
-            match line {
-                Some(l) => {
-                    if let Some(url) = parse_tunnel_url(&l) {
-                        return Some(url);
-                    }
-                }
-                None => return None, // both streams closed (process exited)
             }
+        });
+    }
+    if let Some(err) = stderr {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(err).lines();
+            while let Ok(Some(l)) = lines.next_line().await {
+                if tx.send(l).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    drop(tx); // our copy; the channel closes once both readers hit EOF
+
+    // Wait until cloudflared has printed the URL AND registered an edge
+    // connection (or the process exits / we time out).
+    let mut url_seen: Option<String> = None;
+    let ready = tokio::time::timeout(TUNNEL_READY_TIMEOUT, async {
+        let mut connected = false;
+        while let Some(line) = rx.recv().await {
+            tracing::debug!(target: "cloudflared", "{line}");
+            if url_seen.is_none() {
+                url_seen = parse_tunnel_url(&line);
+            }
+            if is_connection_registered(&line) {
+                connected = true;
+            }
+            if url_seen.is_some() && connected {
+                return true;
+            }
+        }
+        false // channel closed: the process exited
+    })
+    .await;
+
+    let url = match (ready, url_seen) {
+        // Fully ready: URL printed and an edge connection registered.
+        (Ok(true), Some(url)) => url,
+        // Timed out but we did see the URL. cloudflared itself warns the
+        // hostname "may take some time to be reachable", so hand it back
+        // rather than failing — the drain keeps the child healthy and a
+        // connection usually lands shortly after.
+        (Err(_), Some(url)) => {
+            tracing::warn!(
+                %url,
+                "tunnel URL seen but no edge connection registered before timeout; returning anyway"
+            );
+            url
+        }
+        // Process exited before any URL, or timed out without one.
+        _ => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(AthenError::Other(
+                "cloudflared did not establish a tunnel in time".into(),
+            ));
         }
     };
 
-    match tokio::time::timeout(TUNNEL_URL_TIMEOUT, find_url).await {
-        Ok(Some(url)) => {
-            tracing::info!(%url, "cloudflared quick-tunnel up");
-            // Keep the child running; we no longer actively read its pipes.
-            // cloudflared writes little after the URL line, so a full pipe
-            // buffer is not a practical concern for a quick-tunnel.
-            Ok(TunnelHandle { child, url })
+    tracing::info!(%url, "cloudflared quick-tunnel up");
+
+    // Keep draining both pipes for the child's lifetime so cloudflared's
+    // logging never blocks on a full pipe buffer (the 1033-on-stall cause).
+    let drain = tokio::spawn(async move {
+        while let Some(line) = rx.recv().await {
+            tracing::debug!(target: "cloudflared", "{line}");
         }
-        Ok(None) => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            Err(AthenError::Other(
-                "cloudflared exited before producing a tunnel URL".into(),
-            ))
-        }
-        Err(_) => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            Err(AthenError::Other(
-                "cloudflared did not produce a tunnel URL in time".into(),
-            ))
-        }
-    }
+    });
+
+    Ok(TunnelHandle { child, url, drain })
 }
 
 // ─── URL parsing (pure) ──────────────────────────────────────────────
@@ -531,6 +602,27 @@ mod tests {
         // `https://.trycloudflare.com` (empty subdomain) must not match.
         let line = "weird https://.trycloudflare.com";
         assert_eq!(parse_tunnel_url(line), None);
+    }
+
+    #[test]
+    fn detects_registered_connection_line() {
+        let line = "2024-10-01T00:00:00Z INF Registered tunnel connection connIndex=0 connection=abc event=0 ip=198.51.100.1 location=mad";
+        assert!(is_connection_registered(line));
+    }
+
+    #[test]
+    fn detects_looser_connection_registered_wording() {
+        assert!(is_connection_registered("INF connection 1 registered"));
+    }
+
+    #[test]
+    fn url_and_request_lines_are_not_a_registered_connection() {
+        assert!(!is_connection_registered(
+            "INF |  https://abc.trycloudflare.com  |"
+        ));
+        assert!(!is_connection_registered(
+            "INF Requesting new quick Tunnel on trycloudflare.com..."
+        ));
     }
 
     #[test]
