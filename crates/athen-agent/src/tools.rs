@@ -683,7 +683,11 @@ impl ShellToolRegistry {
     /// inner command is always invoked through `sh -c`, so bash syntax is
     /// safe here.
     ///
-    /// 1. `cd <workspace>` so relative paths land in the agent workspace.
+    /// 1. `cd <cwd>` so relative paths land in the correct directory.
+    ///    `cwd` is the per-arc Code Mode repo root when Code Mode is active,
+    ///    otherwise the global agent workspace — matching [`build_shell_env`]'s
+    ///    resolution so the sandboxed and unsandboxed paths share one cwd
+    ///    source of truth.
     /// 2. Export `PYTHONPATH=<toolbox/python>:<existing>` so `pip
     ///    install --target` modules import without env juggling.
     /// 3. Prepend `<toolbox/node>/bin` onto `PATH` so npm-installed
@@ -695,9 +699,9 @@ impl ShellToolRegistry {
     /// the same intent through the OS process API (`Command::env`/`cwd`)
     /// and works on any shell (sh, bash, zsh, nushell, cmd, pwsh) on any
     /// OS without embedding shell-specific syntax in the command string.
-    fn build_shell_wrapper(command: &str) -> String {
+    fn build_shell_wrapper(command: &str, cwd: Option<&std::path::Path>) -> String {
         let mut out = String::new();
-        if let Some(ws) = paths::athen_workspace_dir() {
+        if let Some(ws) = cwd {
             out.push_str(&format!("cd {} && ", sh_quote(&ws.to_string_lossy())));
         }
         if let Some(pydir) = paths::athen_toolbox_python_dir() {
@@ -1532,8 +1536,11 @@ impl ShellToolRegistry {
         // only what the bwrap-sandboxed (Linux) branch actually runs. The
         // unsandboxed path uses structured env+cwd via the OS process API
         // ([`build_shell_env`]) so it works on every shell on every OS.
-        let wrapped_command = Self::build_shell_wrapper(command);
+        // `build_shell_env` is called first so its resolved cwd (honouring
+        // any per-arc Code Mode working_dir_override) can be forwarded to
+        // `build_shell_wrapper`, keeping both paths in sync.
         let (mut env_overrides, cwd) = self.build_shell_env();
+        let wrapped_command = Self::build_shell_wrapper(command, cwd.as_deref());
         // Splice GitHub identity env vars (PAT + author/committer
         // name+email) so git/gh commands authenticate as the configured
         // bot or the user's own account — set on the agent profile,
@@ -5262,7 +5269,9 @@ mod tests {
 
     #[test]
     fn build_shell_wrapper_includes_pythonpath_when_dir_available() {
-        let wrapped = ShellToolRegistry::build_shell_wrapper("echo hi");
+        // Pass None for cwd — this exercises the existing "no cwd prefix"
+        // path and keeps the toolbox-PYTHONPATH assertion valid.
+        let wrapped = ShellToolRegistry::build_shell_wrapper("echo hi", None);
         // Either the toolbox dir is available (PYTHONPATH export
         // appears) or no home is set and the bare command is
         // returned. Both are valid; we just want to make sure the
@@ -5271,6 +5280,34 @@ mod tests {
         if wrapped != "echo hi" {
             assert!(wrapped.ends_with("( echo hi )"), "got: {wrapped}");
         }
+    }
+
+    #[test]
+    fn build_shell_wrapper_uses_supplied_cwd() {
+        let cwd = std::path::Path::new("/repo/root");
+        let wrapped = ShellToolRegistry::build_shell_wrapper("echo hi", Some(cwd));
+        // The wrapper must start with a `cd` to the supplied path.
+        // sh_quote wraps the path in single quotes even when it contains no
+        // special characters, so the expected form is `cd '/repo/root' &&`.
+        assert!(
+            wrapped.contains("cd '/repo/root' &&"),
+            "expected \"cd '/repo/root' &&\" in wrapper, got: {wrapped}"
+        );
+        // The user's command must appear (possibly inside a subshell).
+        assert!(wrapped.contains("echo hi"), "got: {wrapped}");
+    }
+
+    #[test]
+    fn build_shell_wrapper_no_cwd_omits_cd() {
+        let wrapped = ShellToolRegistry::build_shell_wrapper("echo hi", None);
+        // With no cwd supplied and no toolbox dirs present (clean test
+        // environment), the result must not contain any `cd ` prefix.
+        // When toolbox dirs ARE present the wrapper still must not start
+        // with `cd ` — only cwd injection produces that prefix.
+        assert!(
+            !wrapped.starts_with("cd "),
+            "unexpected 'cd' prefix with None cwd, got: {wrapped}"
+        );
     }
 
     /// Mock SMTP sender. Records every `send` call so the tests can
