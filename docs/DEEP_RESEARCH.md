@@ -24,6 +24,17 @@ delivers the `.md` paper as a Telegram document (`parse_deepresearch_command` +
 `AppState.pending_deep_research`, token-keyed, carried in the button
 `callback_data`).
 
+**Update (2026-06-28):** the "View paper" surface moved out of a cramped centered
+modal into a **wide right-side "Inspector" drawer** shared with the Changes/Repo
+rails (mutually exclusive, one right-edge slot). The same drawer also hosts
+**Read/Write/Edit/Delete tool detail** (full file content + the edit diff) —
+clicking one of those tool cards opens it there instead of the cramped inline
+expander. Desktop (`frontend/`: `openInspectorPanel`/`#inspector-panel`,
+`makeCardOpenInInspector`) + web (`web/src/components/Inspector.tsx`:
+`InspectorContext`/`InspectorPanel`, opened contextually so no callbacks thread
+through the chat tree; `ToolBodyInner` factored so inline + drawer never diverge)
+at parity. Reuses the existing `<Markdown>`/`renderToolBody` renderers verbatim.
+
 Implementation map: `crates/athen-app/src/deep_research.rs` (the pure orchestrator
 `run_deep_research` — plan/fan-out/synthesize, decoupled from `AppState` via a
 worker-spawn closure + progress callback); `AppState::run_deep_research_for_arc`
@@ -35,7 +46,8 @@ Tauri command + `POST /api/arcs/{id}/deep-research` (commands.rs/http_api.rs —
 path-traversal surface); `deep_research_worker` built-in profile (profiles.rs);
 `arcs.research_paper_path`/`research_question` (arcs.rs); desktop UI (frontend/) +
 web UI (web/src, `DeepResearch.tsx`) — trigger dialog, progress banner, result card,
-in-app "View paper" markdown modal.
+in-app "View paper" opening into the right-side Inspector drawer (see the
+2026-06-28 update above).
 
 **Two divergences from the design below, decided during the build:**
 1. **Decentralized discovery (not central discover-then-partition).** §3 describes a
