@@ -22,7 +22,7 @@ use athen_core::traits::compaction::{
     ArcCompactor, ArcContextView, CompactionOutcome, ContextEntry,
 };
 use athen_core::traits::llm::LlmRouter;
-use athen_persistence::arcs::{ArcEntry, ArcStore, EntryType};
+use athen_persistence::arcs::{ArcEntry, ArcMeta, ArcStore, EntryType};
 
 /// Tool names whose successful invocation produces side effects the
 /// compactor MUST preserve verbatim in the summary's TOOL OUTCOMES
@@ -450,6 +450,22 @@ OPEN ACTION: <what the agent was about to do next, verbatim from the latest entr
     }
 }
 
+/// Select the entry-id cutoff from which the next compaction pass should
+/// load entries. Returns `ArcMeta.summarized_through_entry_id` when set —
+/// the authoritative record of what the last summary covers — or `0` when
+/// the arc has never been compacted (meaning: load all entries from scratch).
+///
+/// Using this value (not `prior_summary.id`) is critical: the summary row
+/// is inserted *after* the entries it covers, so its `id` is strictly
+/// greater than any covered entry. A cutoff of `prior_summary.id` would
+/// silently exclude the verbatim tail the previous compaction deliberately
+/// kept (the ~25% of entries between `summarized_through_entry_id` and
+/// `prior_summary.id`), causing permanent mid-history data loss on the
+/// second compaction cycle. Mirrors `load_context_view`'s semantics.
+fn select_compaction_cutoff(meta: Option<&ArcMeta>) -> i64 {
+    meta.and_then(|m| m.summarized_through_entry_id).unwrap_or(0)
+}
+
 #[async_trait]
 impl ArcCompactor for LlmArcCompactor {
     async fn should_compact(&self, arc_id: &str, trigger_tokens: u32) -> Result<bool> {
@@ -459,9 +475,26 @@ impl ArcCompactor for LlmArcCompactor {
     }
 
     async fn compact(&self, arc_id: &str, target_tokens: u32) -> Result<CompactionOutcome> {
-        let prior_summary = self.arc_store.load_latest_summary(arc_id).await?;
-        let cutoff = prior_summary.as_ref().map(|s| s.id).unwrap_or(0);
-        let entries = self.arc_store.load_entries_after(arc_id, cutoff).await?;
+        // `summarized_through_entry_id` is authoritative for what the last
+        // compaction covered; see `select_compaction_cutoff` for why using
+        // `prior_summary.id` as the cutoff would cause data loss on the
+        // second cycle. Fetch meta once here and reuse it for both the
+        // cutoff and the triage_plan (avoids a second `get_arc` call below).
+        let meta = self.arc_store.get_arc(arc_id).await?;
+        let cutoff_id = select_compaction_cutoff(meta.as_ref());
+        // Consume meta to extract triage_plan. cutoff_id (i64) is already a
+        // copy so meta is free to move.
+        let triage_plan = meta.and_then(|m| m.triage_plan);
+        // Only fetch the prior summary when a previous compaction actually
+        // ran (cutoff_id > 0). When cutoff_id == 0 we load ALL entries, so
+        // prepending a summary block would double-count them — same guard as
+        // in `load_context_view`.
+        let prior_summary = if cutoff_id > 0 {
+            self.arc_store.load_latest_summary(arc_id).await?
+        } else {
+            None
+        };
+        let entries = self.arc_store.load_entries_after(arc_id, cutoff_id).await?;
         if entries.is_empty() {
             return Ok(CompactionOutcome {
                 compacted: false,
@@ -500,20 +533,11 @@ impl ArcCompactor for LlmArcCompactor {
             .map(|e| e.id)
             .ok_or_else(|| AthenError::Other("empty summarize range".into()))?;
 
-        // Load the arc's persisted TriagePlan (Slice 1-3) so the
-        // summarizer keeps the acceptance criterion + scope verbatim, and
-        // identify write-bearing entries (Slice 6 protect-list) so the
+        // Identify write-bearing entries (Slice 6 protect-list) so the
         // summarizer can't silently drop "we sent the email" / "we wrote
-        // the file" rows. Both are best-effort: a missing plan or empty
-        // provenance just means the prompt skips that block — never a
-        // hard failure on the compaction path.
-        let triage_plan = self
-            .arc_store
-            .get_arc(arc_id)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|m| m.triage_plan);
+        // the file" rows. Best-effort: empty provenance just means the
+        // prompt skips that block — never a hard failure on the compaction
+        // path. triage_plan was already extracted from meta at the top.
         let write_entries = Self::collect_write_provenance(to_summarize);
 
         let mut prompt_body = String::new();
@@ -1425,6 +1449,90 @@ mod tests {
         // content — so the agent sees the "Re-read foo.rs" instruction.
         assert!(body.contains("Re-read foo.rs"), "got: {body}");
         assert!(body.contains("Out-of-band"), "got: {body}");
+    }
+
+    // ── select_compaction_cutoff regression tests ────────────────────────────
+    //
+    // These tests verify the fix for the data-loss bug where `compact()` used
+    // `prior_summary.id` (the summary row's own id, strictly GREATER than the
+    // entries it covers) as the cutoff instead of the authoritative
+    // `summarized_through_entry_id`. On the second compaction cycle that caused
+    // the verbatim tail kept by the first compaction to be silently excluded —
+    // neither re-summarized nor retained.
+
+    /// No prior compaction → cutoff must be 0 (load all entries from scratch).
+    #[test]
+    fn select_compaction_cutoff_returns_zero_for_none_meta() {
+        assert_eq!(select_compaction_cutoff(None), 0);
+    }
+
+    /// After `compact_arc`, the cutoff returned by `select_compaction_cutoff`
+    /// must equal `summarized_through_entry_id`, NOT the summary row's own id.
+    /// Proves the fix: the summary row's id is strictly greater than
+    /// `summarized_through`, so the old code (`prior_summary.id`) would have
+    /// produced a different (larger) cutoff that skips the kept tail.
+    #[tokio::test]
+    async fn select_compaction_cutoff_returns_summarized_through_not_summary_id() {
+        let store = empty_store().await;
+        store
+            .create_arc("a", "A", athen_persistence::arcs::ArcSource::UserInput)
+            .await
+            .unwrap();
+
+        // Freshly-created arc: no prior compaction → cutoff must be 0.
+        let meta = store.get_arc("a").await.unwrap();
+        assert_eq!(
+            select_compaction_cutoff(meta.as_ref()),
+            0,
+            "no prior compaction → cutoff must be 0"
+        );
+
+        // Insert entries and compact through the second one.
+        for i in 0..4 {
+            store
+                .add_entry(
+                    "a",
+                    EntryType::Message,
+                    "user",
+                    &format!("e{i}"),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let entries = store.load_entries("a").await.unwrap();
+        let summarized_through = entries[1].id; // compact through entry index 1
+        store
+            .compact_arc("a", "summary text", None, summarized_through)
+            .await
+            .unwrap();
+
+        // The summary row itself gets a higher id than the entries it covers.
+        let summary = store.load_latest_summary("a").await.unwrap().unwrap();
+        assert!(
+            summary.id > summarized_through,
+            "summary row id ({}) must be strictly > summarized_through ({})",
+            summary.id,
+            summarized_through,
+        );
+
+        // `select_compaction_cutoff` must return `summarized_through`, NOT
+        // `summary.id`. Under the old bug the cutoff would equal `summary.id`,
+        // skipping the tail entries [entries[2], entries[3]] on cycle 2.
+        let meta_after = store.get_arc("a").await.unwrap();
+        assert_eq!(
+            select_compaction_cutoff(meta_after.as_ref()),
+            summarized_through,
+            "cutoff must equal summarized_through_entry_id={}, not summary.id={}",
+            summarized_through,
+            summary.id,
+        );
+        assert_ne!(
+            select_compaction_cutoff(meta_after.as_ref()),
+            summary.id,
+            "cutoff must NOT equal the summary row's own id (that was the bug)"
+        );
     }
 
     #[tokio::test]
