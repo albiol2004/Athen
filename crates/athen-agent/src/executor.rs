@@ -1717,7 +1717,15 @@ impl AgentExecutor for DefaultExecutor {
     async fn execute(&self, task: athen_core::task::Task) -> Result<TaskResult> {
         let task_id = task.id;
         let mut steps_completed: u32 = 0;
-        let mut has_been_judged = false;
+        // Bounded self-repair budget for the completion/honesty judge. On a
+        // CONTINUE verdict the agent is nudged and this increments; once it
+        // hits the cap, a subsequent text-only "done" is accepted without
+        // re-judging. The cap is mode-dependent: goal mode keeps its historical
+        // single-nudge behavior (cap 1, unchanged), while the non-goal honesty
+        // check gets a few attempts to self-correct a false completion claim.
+        const MAX_COMPLETION_NUDGES: u32 = 2;
+        let mut completion_nudges: u32 = 0;
+        let max_completion_nudges: u32 = if self.goal_mode { 1 } else { MAX_COMPLETION_NUDGES };
 
         let mut tools_called: Vec<String> = Vec::new();
         let mut conversation: Vec<ChatMessage> = Vec::new();
@@ -1846,13 +1854,13 @@ impl AgentExecutor for DefaultExecutor {
             // user sent these via `queue_user_input` while we were busy;
             // surface them as regular `User` turns BEFORE the next LLM
             // call so the agent treats them as steering input on its
-            // next iteration. Resetting `has_been_judged` lets the
-            // honesty check re-fire if the new input provokes another
+            // next iteration. Resetting the nudge budget (`completion_nudges`)
+            // lets the honesty check re-fire if the new input provokes another
             // narration-only "done" reply.
             if let Some(ref slot) = self.pending_input {
                 if let Ok(mut queue) = slot.lock() {
                     if !queue.is_empty() {
-                        has_been_judged = false;
+                        completion_nudges = 0;
                     }
                     for text in queue.drain(..) {
                         conversation.push(ChatMessage {
@@ -2208,7 +2216,7 @@ impl AgentExecutor for DefaultExecutor {
                 // incomplete tool use — in any language. In goal mode the
                 // judge can also signal BLOCKED, which exits the loop
                 // cleanly with a `goal_blocked` marker for the frontend.
-                if !available_tools.is_empty() && !has_been_judged {
+                if !available_tools.is_empty() && completion_nudges < max_completion_nudges {
                     let verdict = self
                         .judge_completion(&task.description, &response_content, &tools_called)
                         .await;
@@ -2219,7 +2227,7 @@ impl AgentExecutor for DefaultExecutor {
                                 task_id = %task_id,
                                 "Completion judge: task NOT done, nudging agent"
                             );
-                            has_been_judged = true;
+                            completion_nudges += 1;
                             let nudge = if self.goal_mode {
                                 "The goal is not yet fully accomplished. Review the goal and \
                                  continue working toward it. If you are genuinely blocked by \
@@ -2301,7 +2309,7 @@ impl AgentExecutor for DefaultExecutor {
                                 content: MessageContent::Text(text),
                             });
                         }
-                        has_been_judged = false;
+                        completion_nudges = 0;
                         steps_completed += 1;
                         continue;
                     }
