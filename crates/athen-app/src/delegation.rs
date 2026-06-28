@@ -793,10 +793,11 @@ pub(crate) async fn run_delegation(
     //    is reusable (`execute(&self, ...)`), so when a *successful* run yields
     //    a deliverable that fails post-run verification we re-run it with the
     //    verifier's critique folded into the brief, up to MAX_DELEGATION_ATTEMPTS
-    //    total. This catches the common "claimed done but didn't" failure with
-    //    no human in the loop. A run that errors, or that the executor itself
-    //    reports unsuccessful, is terminal (no repair) — same as before.
-    const MAX_DELEGATION_ATTEMPTS: u32 = 2;
+    //    total (1 initial + 2 repairs). This catches the common "claimed done
+    //    but didn't" failure with no human in the loop. A run that errors, or
+    //    that the executor itself reports unsuccessful, is terminal (no repair)
+    //    — same as before.
+    const MAX_DELEGATION_ATTEMPTS: u32 = 3;
 
     let verify_router = crate::state::SharedRouter(Arc::clone(&sub_router_cell));
     let mut attempt: u32 = 1;
