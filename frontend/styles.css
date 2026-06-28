@@ -9847,6 +9847,37 @@ option:hover {
     font-size: 12px;
 }
 
+/* Inspector panel — wider variant of the changes rail, hosts the research
+   paper reader and Read/Write/Edit tool detail (full-height content + diffs). */
+.inspector-panel {
+    width: min(760px, 58vw);
+    max-width: 94vw;
+}
+.inspector-body {
+    padding: 0;
+}
+/* Research paper rendered as readable prose inside the panel. */
+.inspector-paper {
+    padding: 22px 30px 40px;
+    max-width: 72ch;
+    margin: 0 auto;
+    box-sizing: border-box;
+}
+/* Tool detail rendered inside the panel: let content fill the panel height
+   and scroll within the body, instead of the cramped inline caps. */
+.inspector-body .tool-body-code,
+.inspector-body .tool-body-diff-block {
+    max-height: none;
+}
+.inspector-body .tool-body-path {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+}
+/* Tool cards that open in the inspector get a pointer affordance. */
+.tool-card-clickable { cursor: pointer; }
+.tool-card-clickable:hover { background: var(--overlay-hover); }
+
 /* Timeline layout: a vertical spine on the left, a node per action, and
    the card body to the right of each node. "Revert up to this point"
    semantics — clicking a node rolls back that action and everything

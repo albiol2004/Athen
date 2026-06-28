@@ -1331,6 +1331,7 @@ function openCodeModePanel() {
     if (!panel) return;
     // Mutually exclusive with the Changes rail (both are right-side drawers).
     if (typeof closeChangesRail === 'function') closeChangesRail();
+    if (typeof closeInspectorPanel === 'function') closeInspectorPanel();
     panel.classList.remove('hidden');
     refreshCodeModePanel();
 }
@@ -7171,48 +7172,10 @@ function renderDeepResearchDone(p) {
 // sanitizeWebContent as a belt-and-braces pass (the paper is agent-authored,
 // but it may quote arbitrary scraped web content).
 function showResearchPaperModal(md, titleText) {
-    const overlay = document.createElement('div');
-    overlay.className = 'rewind-dialog-overlay';
-
-    const dialog = document.createElement('div');
-    dialog.className = 'paper-modal';
-
-    const head = document.createElement('div');
-    head.className = 'paper-modal-head';
-
-    const title = document.createElement('h3');
-    title.textContent = titleText || 'Research paper';
-    head.appendChild(title);
-
-    const closeBtn = document.createElement('button');
-    closeBtn.type = 'button';
-    closeBtn.className = 'paper-modal-close';
-    closeBtn.setAttribute('aria-label', 'Close');
-    closeBtn.innerHTML = ICON_X;
-    head.appendChild(closeBtn);
-
-    dialog.appendChild(head);
-
     const bodyEl = document.createElement('div');
-    bodyEl.className = 'paper-modal-body tool-body-prose';
+    bodyEl.className = 'inspector-paper tool-body-prose';
     bodyEl.innerHTML = renderMarkdown(sanitizeWebContent(String(md || '')));
-    dialog.appendChild(bodyEl);
-
-    overlay.appendChild(dialog);
-    document.body.appendChild(overlay);
-
-    // WebKitGTK retains scrollTop across an innerHTML swap; the body starts
-    // fresh here, but reset explicitly so a tall paper opens at the top.
-    bodyEl.scrollTop = 0;
-
-    const close = () => {
-        overlay.remove();
-        document.removeEventListener('keydown', onKey);
-    };
-    const onKey = (e) => { if (e.key === 'Escape') close(); };
-    document.addEventListener('keydown', onKey);
-    closeBtn.addEventListener('click', close);
-    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+    openInspectorPanel(titleText || 'Research paper', bodyEl);
 }
 
 function showRewindDialog(entryId, newText, cleanupFn) {
@@ -7297,6 +7260,7 @@ const changesRailBodyEl = document.getElementById('changes-rail-body');
 
 function openChangesRail() {
     if (!changesRailEl) return;
+    if (typeof closeInspectorPanel === 'function') closeInspectorPanel();
     changesRailEl.classList.remove('hidden');
     refreshChangesRail();
 }
@@ -7306,6 +7270,50 @@ function closeChangesRail() {
 }
 if (changesRailBtn) changesRailBtn.addEventListener('click', openChangesRail);
 if (changesRailCloseBtn) changesRailCloseBtn.addEventListener('click', closeChangesRail);
+
+// ─── Inspector Panel (research paper + tool detail) ───
+const inspectorEl = () => document.getElementById('inspector-panel');
+const inspectorBodyEl = () => document.getElementById('inspector-body');
+const inspectorTitleEl = () => document.getElementById('inspector-title');
+let inspectorKeyHandler = null;
+
+function closeInspectorPanel() {
+    const p = inspectorEl();
+    if (!p) return;
+    p.classList.add('hidden');
+    const body = inspectorBodyEl();
+    if (body) body.innerHTML = '';
+    if (inspectorKeyHandler) {
+        document.removeEventListener('keydown', inspectorKeyHandler);
+        inspectorKeyHandler = null;
+    }
+}
+
+function openInspectorPanel(title, contentNode) {
+    const p = inspectorEl();
+    if (!p) return;
+    // Right-edge drawers share one slot — keep them mutually exclusive.
+    if (typeof closeChangesRail === 'function') closeChangesRail();
+    if (typeof closeCodeModePanel === 'function') closeCodeModePanel();
+    const titleEl = inspectorTitleEl();
+    if (titleEl) titleEl.textContent = title || 'Detail';
+    const body = inspectorBodyEl();
+    if (body) {
+        body.innerHTML = '';
+        if (contentNode) body.appendChild(contentNode);
+        // WebKitGTK retains scrollTop across an innerHTML swap; reset so new
+        // content opens at the top.
+        body.scrollTop = 0;
+    }
+    p.classList.remove('hidden');
+    if (!inspectorKeyHandler) {
+        inspectorKeyHandler = (e) => { if (e.key === 'Escape') closeInspectorPanel(); };
+        document.addEventListener('keydown', inspectorKeyHandler);
+    }
+}
+
+const inspectorCloseBtn = document.getElementById('inspector-close');
+if (inspectorCloseBtn) inspectorCloseBtn.addEventListener('click', closeInspectorPanel);
 
 // ─── Code Mode wiring ───
 // invoke is undefined until initTauri() runs, so wire via addEventListener
