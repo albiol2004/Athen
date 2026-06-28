@@ -352,6 +352,44 @@ async fn propagate_parent_pins(
     }
 }
 
+/// Render the sub-agent's *executed* tool calls into a compact, verifier-
+/// readable list, one per line (e.g. `- write (ok)` / `- send_email (failed)`).
+/// Reads the persisted `tool_call` rows from the sub-arc. Returns an empty
+/// string when no tool calls were recorded (CLI/test paths, or a sub-agent
+/// that genuinely ran no tools) — the verifier then behaves exactly like the
+/// old text-only check.
+fn render_tool_trace(entries: &[athen_persistence::arcs::ArcEntry]) -> String {
+    use athen_persistence::arcs::EntryType;
+    let mut lines = Vec::new();
+    for e in entries {
+        if e.entry_type != EntryType::ToolCall {
+            continue;
+        }
+        let name = e
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("tool"))
+            .and_then(|t| t.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(e.content.as_str());
+        let status = e
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("status"))
+            .and_then(|s| s.as_str())
+            .unwrap_or("");
+        let has_error = e
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("error"))
+            .map(|v| !v.is_null() && v.as_str().map(|s| !s.trim().is_empty()).unwrap_or(true))
+            .unwrap_or(false);
+        let ok = !has_error && !status.eq_ignore_ascii_case("failed");
+        lines.push(format!("- {} ({})", name, if ok { "ok" } else { "failed" }));
+    }
+    lines.join("\n")
+}
+
 /// Lightweight post-run check that the specialist's deliverable actually
 /// satisfies the brief, mirroring the executor's completion-judge envelope
 /// (one cheap-tier LLM call, low max_tokens, temperature 0, reasoning off,
@@ -365,6 +403,7 @@ async fn verify_deliverable(
     router: &dyn LlmRouter,
     brief: &str,
     content: &str,
+    tool_trace: &str,
 ) -> (bool, Option<String>) {
     if content.trim().is_empty() {
         return (
@@ -372,17 +411,26 @@ async fn verify_deliverable(
             Some("specialist returned an empty deliverable".to_string()),
         );
     }
+    let trace_for_prompt = if tool_trace.trim().is_empty() {
+        "(tool activity not available — do not infer anything from its absence)"
+    } else {
+        tool_trace
+    };
     let prompt = format!(
         "A specialist sub-agent was given this brief:\n\n\
          ---BRIEF---\n{}\n---END BRIEF---\n\n\
          It returned this deliverable:\n\n\
          ---DELIVERABLE---\n{}\n---END DELIVERABLE---\n\n\
+         During the task it actually executed these tools (name + outcome):\n\n\
+         ---TOOLS RUN---\n{}\n---END TOOLS RUN---\n\n\
          Does the deliverable satisfy the brief? Reply with exactly one line:\n\
-         - `DONE` if it addresses the brief.\n\
-         - `CONTINUE: <one short reason>` if it is empty, off-topic, a refusal, \
-         or claims work it did not actually produce.",
+         - `DONE` if it addresses the brief AND its claims are consistent with the tools actually run.\n\
+         - `CONTINUE: <one short reason>` if it is empty, off-topic, a refusal, claims work it did not \
+         actually produce, OR claims to have performed an action (wrote / created / sent / edited / \
+         installed something) that no corresponding tool in TOOLS RUN could have produced.",
         truncate(brief, 2000),
         truncate(content, 4000),
+        trace_for_prompt,
     );
     let request = athen_core::llm::LlmRequest {
         messages: vec![athen_core::llm::ChatMessage {
@@ -793,7 +841,14 @@ pub(crate) async fn run_delegation(
     // router (same provider/model), so it's one cheap-tier call.
     let (verified, verification_note) = if result.success {
         let verify_router = crate::state::SharedRouter(Arc::clone(&sub_router_cell));
-        verify_deliverable(&verify_router, &args.brief, &content).await
+        let tool_trace = match ctx.arc_store.load_entries(&sub_arc_id).await {
+            Ok(entries) => render_tool_trace(&entries),
+            Err(e) => {
+                tracing::warn!("delegation: load sub-arc entries for verify trace failed: {e}");
+                String::new()
+            }
+        };
+        verify_deliverable(&verify_router, &args.brief, &content, &tool_trace).await
     } else {
         (true, None)
     };
@@ -1194,7 +1249,7 @@ mod tests {
         let router = FakeRouter {
             reply: Some("DONE".into()),
         };
-        let (verified, note) = verify_deliverable(&router, "brief", "   \n\t ").await;
+        let (verified, note) = verify_deliverable(&router, "brief", "   \n\t ", "").await;
         assert!(!verified);
         assert!(note.is_some());
     }
@@ -1206,7 +1261,7 @@ mod tests {
         let router = FakeRouter {
             reply: Some("CONTINUE: off-topic".into()),
         };
-        let (verified, note) = verify_deliverable(&router, "brief", "some content").await;
+        let (verified, note) = verify_deliverable(&router, "brief", "some content", "").await;
         assert!(!verified);
         assert_eq!(note.as_deref(), Some("off-topic"));
     }
@@ -1217,7 +1272,7 @@ mod tests {
         let router = FakeRouter {
             reply: Some("DONE".into()),
         };
-        let (verified, note) = verify_deliverable(&router, "brief", "real content").await;
+        let (verified, note) = verify_deliverable(&router, "brief", "real content", "").await;
         assert!(verified);
         assert!(note.is_none());
     }
@@ -1227,8 +1282,56 @@ mod tests {
     #[tokio::test]
     async fn verify_deliverable_router_error_trusts_result() {
         let router = FakeRouter { reply: None };
-        let (verified, _note) = verify_deliverable(&router, "brief", "content").await;
+        let (verified, _note) = verify_deliverable(&router, "brief", "content", "").await;
         assert!(verified);
+    }
+
+    #[test]
+    fn render_tool_trace_lists_executed_tools_with_outcome() {
+        use athen_persistence::arcs::{ArcEntry, EntryType};
+        let mk = |et: EntryType, name: &str, meta: Option<serde_json::Value>| ArcEntry {
+            id: 1,
+            arc_id: "a".into(),
+            entry_type: et,
+            source: "assistant".into(),
+            content: name.into(),
+            metadata: meta,
+            created_at: "now".into(),
+            turn_id: None,
+        };
+        let entries = vec![
+            mk(EntryType::Message, "hello", None),
+            mk(
+                EntryType::ToolCall,
+                "write",
+                Some(serde_json::json!({"tool": "write", "status": "Completed", "error": null})),
+            ),
+            mk(
+                EntryType::ToolCall,
+                "send_email",
+                Some(serde_json::json!({"tool": "send_email", "status": "Failed", "error": "smtp refused"})),
+            ),
+        ];
+        let trace = render_tool_trace(&entries);
+        assert!(trace.contains("write (ok)"), "got: {trace}");
+        assert!(trace.contains("send_email (failed)"), "got: {trace}");
+        assert!(!trace.contains("hello"), "non-tool rows must be excluded: {trace}");
+    }
+
+    #[test]
+    fn render_tool_trace_empty_when_no_tool_calls() {
+        use athen_persistence::arcs::{ArcEntry, EntryType};
+        let entries = vec![ArcEntry {
+            id: 1,
+            arc_id: "a".into(),
+            entry_type: EntryType::Message,
+            source: "user".into(),
+            content: "just a message".into(),
+            metadata: None,
+            created_at: "now".into(),
+            turn_id: None,
+        }];
+        assert!(render_tool_trace(&entries).is_empty());
     }
 
     /// `propagate_parent_pins` copies the parent arc's provider pin, slug,
