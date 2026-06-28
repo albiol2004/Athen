@@ -20,6 +20,7 @@ import { ChangesRail } from './ChangesRail';
 import { CodeModePanel } from './CodeModePanel';
 import { Chat, type ChatCallbacks, type OutgoingFile, type OutgoingImage } from './Chat';
 import { DeepResearchModal } from './DeepResearch';
+import { InspectorContext, InspectorPanel, type InspectorContent } from './Inspector';
 import { GoalBanner, type GoalState, type PlanState } from './PlanGoal';
 import { ProjectPage } from './ProjectPage';
 import { Sidebar } from './Sidebar';
@@ -40,7 +41,7 @@ type DrRun = {
   refiningSeen: boolean;
 };
 
-type Drawer = 'none' | 'agents' | 'changes' | 'wakeups' | 'code-mode';
+type Drawer = 'none' | 'agents' | 'changes' | 'wakeups' | 'code-mode' | 'inspector';
 
 export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () => void }) {
   const { toast } = useToast();
@@ -55,6 +56,10 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
   const [goal, setGoal] = useState<GoalState | null>(null);
   const [plan, setPlan] = useState<PlanState | null>(null);
   const [drawer, setDrawer] = useState<Drawer>('none');
+  // Inspector drawer content (Deep Research paper OR a Read/Write/Edit/Delete
+  // tool's full detail). Opening any other drawer flips `drawer` away from
+  // 'inspector', so it auto-closes — mutual exclusivity is free.
+  const [inspectorContent, setInspectorContent] = useState<InspectorContent | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState<string | undefined>(undefined);
   const [changesKey, setChangesKey] = useState(0);
@@ -521,6 +526,11 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
     setSettingsOpen(true);
   }, []);
 
+  const openInspector = useCallback((c: InspectorContent) => {
+    setInspectorContent(c);
+    setDrawer('inspector');
+  }, []);
+
   const cb = useMemo<ChatCallbacks>(
     () => ({
       onSend,
@@ -559,6 +569,7 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
   }, [openProject, openProjectMeta]);
 
   return (
+    <InspectorContext.Provider value={{ open: openInspector }}>
     <div className="shell">
       <Sidebar
         arcs={arcs}
@@ -776,6 +787,9 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
       {drawer === 'code-mode' && activeArc && (
         <CodeModePanel client={client} arcId={activeArc} onClose={() => setDrawer('none')} />
       )}
+      {drawer === 'inspector' && (
+        <InspectorPanel content={inspectorContent} onClose={() => setDrawer('none')} />
+      )}
       {settingsOpen && (
         <SettingsModal
           client={client}
@@ -796,5 +810,6 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
         />
       )}
     </div>
+    </InspectorContext.Provider>
   );
 }

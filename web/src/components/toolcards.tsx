@@ -5,11 +5,16 @@
 import { memo, useState } from 'react';
 import type { AthenClient } from '../api/client';
 import type { ChatItem } from '../chat/reducer';
+import { useInspector } from './Inspector';
 import { Markdown } from './Markdown';
 import { toolIconSvg } from './toolIcons';
 import { endpointIcon } from '../api/endpointIcons';
 
-type ToolItem = Extract<ChatItem, { kind: 'tool' }>;
+export type ToolItem = Extract<ChatItem, { kind: 'tool' }>;
+
+// File-detail tools whose body (full content / diff) reads better in the wide
+// Inspector drawer than the inline expander. Clicking these cards opens it.
+const INSPECTOR_DETAIL_TOOLS = new Set(['read', 'write', 'edit', 'delete_file']);
 
 // Placeholder strings the backend persists when a sub-agent produced no
 // usable text — never worth rendering as a "final message".
@@ -66,7 +71,9 @@ function EditBody({ args }: { args: Record<string, unknown> }) {
   );
 }
 
-function ToolBody({ it, client }: { it: ToolItem; client: AthenClient }) {
+// Inner body content (no `tc-body` wrapper, no delegation). Shared verbatim by
+// the inline expander and the Inspector drawer so they never diverge.
+function ToolBodyInner({ it }: { it: ToolItem }) {
   const args = asRecord(it.args);
   const result = asRecord(it.result);
 
@@ -94,7 +101,7 @@ function ToolBody({ it, client }: { it: ToolItem; client: AthenClient }) {
   }
 
   return (
-    <div className="tc-body">
+    <>
       {it.error && <div className="tc-error">{it.error}</div>}
       {special ?? (
         <>
@@ -102,7 +109,28 @@ function ToolBody({ it, client }: { it: ToolItem; client: AthenClient }) {
           <JsonBlock label="result" value={it.result} />
         </>
       )}
+    </>
+  );
+}
+
+function ToolBody({ it, client }: { it: ToolItem; client: AthenClient }) {
+  return (
+    <div className="tc-body">
+      <ToolBodyInner it={it} />
       {it.name === 'delegate_to_agent' && <DelegationSteps it={it} client={client} />}
+    </div>
+  );
+}
+
+/**
+ * Standalone tool body for the Inspector drawer. Renders the SAME inner content
+ * as the inline expander (full file content for read/write, the diff for edit,
+ * args/result for delete_file). No delegation — the detail tools never delegate.
+ */
+export function ToolDetailBody({ tool }: { tool: ToolItem }) {
+  return (
+    <div className="tc-body">
+      <ToolBodyInner it={tool} />
     </div>
   );
 }
@@ -224,6 +252,7 @@ function DelegationSteps({ it, client }: { it: ToolItem; client: AthenClient }) 
 // stable singleton passed straight down from Shell.
 export const ToolCard = memo(function ToolCard({ it, client }: { it: ToolItem; client: AthenClient }) {
   const [open, setOpen] = useState(false);
+  const inspector = useInspector();
   const done =
     it.status === 'Completed' || it.status === 'completed' || it.status === 'done';
   const running = !done && !it.failed;
@@ -236,11 +265,17 @@ export const ToolCard = memo(function ToolCard({ it, client }: { it: ToolItem; c
       ? endpointIcon((asRecord(it.args)?.endpoint as string | undefined) ?? null)
       : null;
   const markClass = `tc-mark${running ? ' running' : ''}${done ? ' done' : ''}${it.failed ? ' fail' : ''}`;
+  // Read/Write/Edit/Delete open their full detail in the wide Inspector drawer
+  // (when the context is available) instead of toggling the inline expander.
+  const toDrawer = Boolean(inspector) && INSPECTOR_DETAIL_TOOLS.has(it.name);
   return (
     <div className={`tc${it.failed ? ' failed' : ''}${running ? ' running' : ''}`}>
       <button
         className={`tc-head${running ? ' running' : ''}`}
-        onClick={() => expandable && setOpen((o) => !o)}
+        onClick={() => {
+          if (toDrawer) inspector?.open({ kind: 'tool', tool: it });
+          else if (expandable) setOpen((o) => !o);
+        }}
         title={it.detail || undefined}
       >
         {epIcon ? (

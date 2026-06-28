@@ -13,12 +13,13 @@
 // (AthenClient.deepResearch) to launch; GET /api/arcs/{id}/research-paper
 // (AthenClient.getResearchPaper, body = the Markdown string) to read the
 // finished paper. The completion card's "View paper" fetches that Markdown and
-// renders it inline in a modal via the shared <Markdown> renderer.
+// hands it to the wide Inspector drawer, which renders it via the shared
+// <Markdown> component (see Inspector.tsx).
 
-import { Fragment, useEffect, useState } from 'react';
+import { Fragment, useState } from 'react';
 import type { AthenClient } from '../api/client';
 import { ConfirmDialog } from './ConfirmDialog';
-import { Markdown } from './Markdown';
+import { useInspector } from './Inspector';
 import { Spinner } from './Spinner';
 import { errMessage, useToast } from './Toast';
 import type {
@@ -253,91 +254,6 @@ function DeepResearchStepper({
 }
 
 /**
- * Modal that fetches the arc's research paper Markdown via
- * `client.getResearchPaper` and renders it with the shared <Markdown>
- * component (same renderer the chat uses for assistant messages). Spinner
- * while pending, toast on failure (then closes). Overlay/dialog chrome mirrors
- * ConfirmDialog/DeepResearchModal (`confirm-overlay`/`confirm-dialog`).
- */
-export function ResearchPaperModal({
-  client,
-  arcId,
-  title,
-  onClose,
-}: {
-  client: AthenClient;
-  arcId: string;
-  title: string;
-  onClose: () => void;
-}) {
-  const { toast } = useToast();
-  const [markdown, setMarkdown] = useState<string | null>(null);
-
-  useEffect(() => {
-    let alive = true;
-    client.getResearchPaper(arcId).then(
-      (md) => {
-        if (alive) setMarkdown(md);
-      },
-      (e: unknown) => {
-        if (!alive) return;
-        toast(errMessage(e), 'error');
-        onClose();
-      },
-    );
-    return () => {
-      alive = false;
-    };
-  }, [client, arcId, toast, onClose]);
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, [onClose]);
-
-  return (
-    <div
-      className="confirm-overlay"
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
-    >
-      <div
-        className="confirm-dialog dr-paper-modal"
-        role="dialog"
-        aria-modal="true"
-        aria-label="Research paper"
-      >
-        <div className="dr-paper-head">
-          <h3 title={title}>{title}</h3>
-          <button
-            type="button"
-            className="dr-thread-close"
-            aria-label="Close"
-            onClick={onClose}
-          >
-            ×
-          </button>
-        </div>
-        <div className="dr-paper-body">
-          {markdown === null ? (
-            <div className="dr-paper-loading">
-              <Spinner />
-              <span>Loading paper…</span>
-            </div>
-          ) : (
-            <Markdown text={markdown} />
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-/**
  * In-thread Deep Research card. Rendered inside the chat message thread (by
  * <Chat>) so the run reads like an agent working in the conversation. While
  * `progress` is set (and `done` is not) it shows the phase stepper + a bar
@@ -360,10 +276,27 @@ export function DeepResearchThreadCard({
   refiningSeen: boolean;
   onDismiss: () => void;
 }) {
-  const [viewing, setViewing] = useState(false);
+  const { toast } = useToast();
+  const inspector = useInspector();
+  const [loadingPaper, setLoadingPaper] = useState(false);
 
   if (done) {
     const basename = paperBasename(done.paper_path);
+
+    // Fetch the paper Markdown, then hand it to the wide Inspector drawer (same
+    // <Markdown> renderer as before, just hosted in the drawer not a modal).
+    const viewPaper = async () => {
+      if (!inspector) return; // Always rendered under Shell — guard is belt-and-braces.
+      setLoadingPaper(true);
+      try {
+        const md = await client.getResearchPaper(done.arc_id);
+        inspector.open({ kind: 'paper', title: basename, markdown: md });
+      } catch (e) {
+        toast(errMessage(e), 'error');
+      } finally {
+        setLoadingPaper(false);
+      }
+    };
     return (
       <div className="dr-thread-card done" role="status">
         <div className="dr-thread-head">
@@ -404,18 +337,15 @@ export function DeepResearchThreadCard({
           </details>
         )}
         <div className="dr-thread-actions">
-          <button type="button" className="dr-view-paper" onClick={() => setViewing(true)}>
-            View paper
+          <button
+            type="button"
+            className="dr-view-paper"
+            onClick={() => void viewPaper()}
+            disabled={loadingPaper}
+          >
+            {loadingPaper ? 'Loading…' : 'View paper'}
           </button>
         </div>
-        {viewing && (
-          <ResearchPaperModal
-            client={client}
-            arcId={done.arc_id}
-            title={basename}
-            onClose={() => setViewing(false)}
-          />
-        )}
       </div>
     );
   }
