@@ -463,7 +463,8 @@ OPEN ACTION: <what the agent was about to do next, verbatim from the latest entr
 /// `prior_summary.id`), causing permanent mid-history data loss on the
 /// second compaction cycle. Mirrors `load_context_view`'s semantics.
 fn select_compaction_cutoff(meta: Option<&ArcMeta>) -> i64 {
-    meta.and_then(|m| m.summarized_through_entry_id).unwrap_or(0)
+    meta.and_then(|m| m.summarized_through_entry_id)
+        .unwrap_or(0)
 }
 
 #[async_trait]

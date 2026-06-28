@@ -1725,7 +1725,11 @@ impl AgentExecutor for DefaultExecutor {
         // check gets a few attempts to self-correct a false completion claim.
         const MAX_COMPLETION_NUDGES: u32 = 2;
         let mut completion_nudges: u32 = 0;
-        let max_completion_nudges: u32 = if self.goal_mode { 1 } else { MAX_COMPLETION_NUDGES };
+        let max_completion_nudges: u32 = if self.goal_mode {
+            1
+        } else {
+            MAX_COMPLETION_NUDGES
+        };
 
         let mut tools_called: Vec<String> = Vec::new();
         let mut conversation: Vec<ChatMessage> = Vec::new();

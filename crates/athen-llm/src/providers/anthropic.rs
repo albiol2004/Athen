@@ -747,15 +747,18 @@ impl ToolUseAccumulator {
     /// Finalize and remove the block at `index`, if present and named.
     /// Attaches the thinking signature to the **first** call produced this turn.
     fn finalize(&mut self, index: u64) -> Option<ToolCall> {
-        self.parts.remove(&index).and_then(finalize_part).map(|mut tc| {
-            if !self.signature_attached {
-                if let Some(sig) = self.thinking_signature.clone() {
-                    tc.thought_signature = Some(sig);
-                    self.signature_attached = true;
+        self.parts
+            .remove(&index)
+            .and_then(finalize_part)
+            .map(|mut tc| {
+                if !self.signature_attached {
+                    if let Some(sig) = self.thinking_signature.clone() {
+                        tc.thought_signature = Some(sig);
+                        self.signature_attached = true;
+                    }
                 }
-            }
-            tc
-        })
+                tc
+            })
     }
 
     /// Finalize every remaining block (defensive: a `message_stop` without
@@ -1662,7 +1665,10 @@ mod tests {
         let arr = result.as_array().expect("must be array");
 
         // First block must be the thinking block.
-        assert_eq!(arr[0]["type"], "thinking", "first block must be thinking: {arr:?}");
+        assert_eq!(
+            arr[0]["type"], "thinking",
+            "first block must be thinking: {arr:?}"
+        );
         assert_eq!(arr[0]["thinking"], "let me think");
         assert_eq!(arr[0]["signature"], "sig123");
 
@@ -1673,8 +1679,7 @@ mod tests {
         // The tool_use block must NOT carry thought_signature or signature.
         let tool_use = arr.iter().find(|b| b["type"] == "tool_use").unwrap();
         assert!(
-            tool_use.get("thought_signature").is_none()
-                && tool_use.get("signature").is_none(),
+            tool_use.get("thought_signature").is_none() && tool_use.get("signature").is_none(),
             "tool_use must not carry signature fields: {tool_use}"
         );
     }
@@ -1752,7 +1757,10 @@ mod tests {
                 .map(|r| r.expect("chunk ok"))
                 .collect();
         assert_eq!(chunks.len(), 1);
-        assert!(chunks[0].is_thinking, "thinking_delta must set is_thinking=true");
+        assert!(
+            chunks[0].is_thinking,
+            "thinking_delta must set is_thinking=true"
+        );
         assert_eq!(chunks[0].delta, "I need to think about this.");
 
         // signature_delta → stored on accumulator, attached to subsequent tool call

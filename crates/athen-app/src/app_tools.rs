@@ -4955,9 +4955,11 @@ mod tests {
 
     #[test]
     fn join_base_same_host_absolute_url_ok() {
-        let url =
-            join_base_and_path("https://api.example.com/base", "https://api.example.com/other")
-                .unwrap();
+        let url = join_base_and_path(
+            "https://api.example.com/base",
+            "https://api.example.com/other",
+        )
+        .unwrap();
         assert_eq!(url.host_str(), Some("api.example.com"));
         assert_eq!(url.scheme(), "https");
         assert_eq!(url.path(), "/other");
@@ -4965,11 +4967,11 @@ mod tests {
 
     #[test]
     fn join_base_cross_host_absolute_url_rejected() {
-        let err =
-            join_base_and_path("https://api.example.com/base", "https://evil.com/collect")
-                .unwrap_err();
+        let err = join_base_and_path("https://api.example.com/base", "https://evil.com/collect")
+            .unwrap_err();
         assert!(
-            err.to_string().contains("may not leave the registered endpoint host"),
+            err.to_string()
+                .contains("may not leave the registered endpoint host"),
             "unexpected error: {err}"
         );
     }
@@ -4978,7 +4980,8 @@ mod tests {
     fn join_base_protocol_relative_path_rejected() {
         let err = join_base_and_path("https://api.example.com/base", "//evil.com/x").unwrap_err();
         assert!(
-            err.to_string().contains("may not leave the registered endpoint host"),
+            err.to_string()
+                .contains("may not leave the registered endpoint host"),
             "unexpected error: {err}"
         );
     }
@@ -4986,11 +4989,11 @@ mod tests {
     #[test]
     fn join_base_scheme_downgrade_rejected() {
         // Base is https; path attempts http on the same host — scheme differs → rejected.
-        let err =
-            join_base_and_path("https://api.example.com/base", "http://api.example.com/x")
-                .unwrap_err();
+        let err = join_base_and_path("https://api.example.com/base", "http://api.example.com/x")
+            .unwrap_err();
         assert!(
-            err.to_string().contains("may not leave the registered endpoint host"),
+            err.to_string()
+                .contains("may not leave the registered endpoint host"),
             "unexpected error: {err}"
         );
     }
@@ -5003,7 +5006,8 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            err.to_string().contains("may not leave the registered endpoint host"),
+            err.to_string()
+                .contains("may not leave the registered endpoint host"),
             "unexpected error: {err}"
         );
     }

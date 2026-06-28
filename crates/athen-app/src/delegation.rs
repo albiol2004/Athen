@@ -1391,13 +1391,18 @@ mod tests {
             mk(
                 EntryType::ToolCall,
                 "send_email",
-                Some(serde_json::json!({"tool": "send_email", "status": "Failed", "error": "smtp refused"})),
+                Some(
+                    serde_json::json!({"tool": "send_email", "status": "Failed", "error": "smtp refused"}),
+                ),
             ),
         ];
         let trace = render_tool_trace(&entries);
         assert!(trace.contains("write (ok)"), "got: {trace}");
         assert!(trace.contains("send_email (failed)"), "got: {trace}");
-        assert!(!trace.contains("hello"), "non-tool rows must be excluded: {trace}");
+        assert!(
+            !trace.contains("hello"),
+            "non-tool rows must be excluded: {trace}"
+        );
     }
 
     #[test]

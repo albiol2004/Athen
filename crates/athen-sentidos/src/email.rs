@@ -548,7 +548,10 @@ fn poll_all_folders<S: std::io::Read + std::io::Write>(
         match fetch_folder(session, folder, prev, save_root, owner_emails) {
             Ok((events, uid_validity, max_uid)) => {
                 all_events.extend(events);
-                seen.insert(folder.clone(), merge_folder_watermark(prev, uid_validity, max_uid));
+                seen.insert(
+                    folder.clone(),
+                    merge_folder_watermark(prev, uid_validity, max_uid),
+                );
             }
             Err(e) => tracing::warn!("Error polling folder '{folder}': {e}"),
         }

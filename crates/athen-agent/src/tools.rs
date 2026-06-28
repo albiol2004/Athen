@@ -666,7 +666,12 @@ fn forbidden_data_path_in(path: &Path, data: &Path) -> Option<&'static str> {
     if path == data.join("vault.key") {
         return Some("vault.key holds the master encryption key and is not readable from tools");
     }
-    for vault_name in ["vault.db", "vault.db-wal", "vault.db-shm", "vault.db-journal"] {
+    for vault_name in [
+        "vault.db",
+        "vault.db-wal",
+        "vault.db-shm",
+        "vault.db-journal",
+    ] {
         if path == data.join(vault_name) {
             return Some("vault.db holds encrypted credentials and is not readable from tools");
         }
@@ -5773,7 +5778,12 @@ mod tests {
         );
 
         // Ciphertext DB and all SQLite sidecar files must be blocked.
-        for name in ["vault.db", "vault.db-wal", "vault.db-shm", "vault.db-journal"] {
+        for name in [
+            "vault.db",
+            "vault.db-wal",
+            "vault.db-shm",
+            "vault.db-journal",
+        ] {
             assert_eq!(
                 forbidden_data_path_in(&data.join(name), data),
                 Some("vault.db holds encrypted credentials and is not readable from tools"),
@@ -5782,10 +5792,7 @@ mod tests {
         }
 
         // Unrelated files in the same data dir must NOT be blocked.
-        assert_eq!(
-            forbidden_data_path_in(&data.join("notes.txt"), data),
-            None
-        );
+        assert_eq!(forbidden_data_path_in(&data.join("notes.txt"), data), None);
     }
 
     // ---- lexical_normalize tests ----
@@ -5800,10 +5807,7 @@ mod tests {
 
     #[test]
     fn lexical_normalize_removes_cur_dir() {
-        assert_eq!(
-            lexical_normalize(Path::new("./a/b")),
-            PathBuf::from("a/b")
-        );
+        assert_eq!(lexical_normalize(Path::new("./a/b")), PathBuf::from("a/b"));
     }
 
     #[test]
@@ -5817,10 +5821,7 @@ mod tests {
     #[test]
     fn lexical_normalize_preserves_leading_dotdot() {
         // A leading `..` on a relative path has nothing to pop — preserve it.
-        assert_eq!(
-            lexical_normalize(Path::new("../a")),
-            PathBuf::from("../a")
-        );
+        assert_eq!(lexical_normalize(Path::new("../a")), PathBuf::from("../a"));
     }
 
     #[test]
