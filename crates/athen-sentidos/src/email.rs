@@ -48,7 +48,7 @@ const ACCOUNT_ID_PRIMARY: &str = "primary";
 /// them as [`SenseEvent`]s.
 pub struct EmailMonitor {
     config: Arc<Mutex<Option<EmailConfig>>>,
-    last_seen_uid: Arc<Mutex<Option<u32>>>,
+    last_seen: Arc<Mutex<std::collections::HashMap<String, (u32, u32)>>>,
     poll_interval: Duration,
     /// Cross-channel owner resolver. When set and the From address
     /// matches one of the owner contact's email identifiers, the event
@@ -61,7 +61,7 @@ impl EmailMonitor {
     pub fn new() -> Self {
         Self {
             config: Arc::new(Mutex::new(None)),
-            last_seen_uid: Arc::new(Mutex::new(None)),
+            last_seen: Arc::new(Mutex::new(std::collections::HashMap::new())),
             poll_interval: Duration::from_secs(60),
             owner_lookup: None,
         }
@@ -71,7 +71,7 @@ impl EmailMonitor {
     pub fn with_interval(poll_interval: Duration) -> Self {
         Self {
             config: Arc::new(Mutex::new(None)),
-            last_seen_uid: Arc::new(Mutex::new(None)),
+            last_seen: Arc::new(Mutex::new(std::collections::HashMap::new())),
             poll_interval,
             owner_lookup: None,
         }
@@ -509,44 +509,66 @@ fn message_to_event(
     })
 }
 
-/// Poll all configured folders and return collected events with the global max UID.
+/// The min-UID filter for a folder: only meaningful when the stored
+/// UIDVALIDITY still matches the server's. On a UIDVALIDITY change the UID
+/// space reset, so we must re-evaluate all UNSEEN from scratch (return None).
+fn folder_min_uid(prev: Option<(u32, u32)>, uid_validity: u32) -> Option<u32> {
+    match prev {
+        Some((v, last)) if v == uid_validity => Some(last),
+        _ => None,
+    }
+}
+
+/// New per-folder watermark after a fetch. Same validity → keep the higher of
+/// stored/observed max. Changed validity (or first sight) → adopt the new
+/// validity with the observed max (0 if no messages this round), discarding
+/// the stale high-water mark so future mail isn't filtered against it.
+fn merge_folder_watermark(
+    prev: Option<(u32, u32)>,
+    uid_validity: u32,
+    max_uid: Option<u32>,
+) -> (u32, u32) {
+    match prev {
+        Some((v, old)) if v == uid_validity => (uid_validity, max_uid.map_or(old, |m| old.max(m))),
+        _ => (uid_validity, max_uid.unwrap_or(0)),
+    }
+}
+
+/// Poll all configured folders, updating per-folder watermarks in `seen`.
 fn poll_all_folders<S: std::io::Read + std::io::Write>(
     session: &mut imap::Session<S>,
     folders: &[String],
-    current_last: Option<u32>,
+    seen: &mut std::collections::HashMap<String, (u32, u32)>,
     save_root: Option<&Path>,
     owner_emails: &[String],
-) -> Result<(Vec<SenseEvent>, Option<u32>)> {
+) -> Result<Vec<SenseEvent>> {
     let mut all_events = Vec::new();
-    let mut global_max_uid = current_last;
-
     for folder in folders {
-        match fetch_folder(session, folder, current_last, save_root, owner_emails) {
-            Ok((events, max_uid)) => {
+        let prev = seen.get(folder).copied();
+        match fetch_folder(session, folder, prev, save_root, owner_emails) {
+            Ok((events, uid_validity, max_uid)) => {
                 all_events.extend(events);
-                if let Some(mu) = max_uid {
-                    global_max_uid = Some(global_max_uid.map_or(mu, |cur: u32| cur.max(mu)));
-                }
+                seen.insert(folder.clone(), merge_folder_watermark(prev, uid_validity, max_uid));
             }
-            Err(e) => {
-                tracing::warn!("Error polling folder '{folder}': {e}");
-            }
+            Err(e) => tracing::warn!("Error polling folder '{folder}': {e}"),
         }
     }
-
-    Ok((all_events, global_max_uid))
+    Ok(all_events)
 }
 
 /// Perform the blocking IMAP fetch for a single folder.
 ///
-/// Returns the events and the maximum UID seen.
+/// Returns the events, the folder's UIDVALIDITY, and the maximum UID seen this
+/// round (None when there are no new messages). The caller uses these to update
+/// the per-folder `(uid_validity, max_uid)` watermark via
+/// [`merge_folder_watermark`].
 fn fetch_folder<S: std::io::Read + std::io::Write>(
     session: &mut imap::Session<S>,
     folder: &str,
-    min_uid: Option<u32>,
+    prev: Option<(u32, u32)>,
     save_root: Option<&Path>,
     owner_emails: &[String],
-) -> Result<(Vec<SenseEvent>, Option<u32>)> {
+) -> Result<(Vec<SenseEvent>, u32, Option<u32>)> {
     let mailbox = session
         .select(folder)
         .map_err(|e| AthenError::Other(format!("IMAP select '{folder}': {e}")))?;
@@ -555,6 +577,10 @@ fn fetch_folder<S: std::io::Read + std::io::Write>(
     let uids = session
         .uid_search("UNSEEN")
         .map_err(|e| AthenError::Other(format!("IMAP uid_search UNSEEN in '{folder}': {e}")))?;
+
+    // Derive the per-folder min-UID filter. On a UIDVALIDITY change the UID
+    // space has been reset, so we must fetch all UNSEEN from scratch.
+    let min_uid = folder_min_uid(prev, uid_validity);
 
     // Filter to only UIDs we haven't seen yet.
     let new_uids: Vec<u32> = uids
@@ -566,7 +592,7 @@ fn fetch_folder<S: std::io::Read + std::io::Write>(
         .collect();
 
     if new_uids.is_empty() {
-        return Ok((Vec::new(), None));
+        return Ok((Vec::new(), uid_validity, None));
     }
 
     // Build a comma-separated UID set for the fetch command.
@@ -608,7 +634,7 @@ fn fetch_folder<S: std::io::Read + std::io::Write>(
         }
     }
 
-    Ok((events, max_uid))
+    Ok((events, uid_validity, max_uid))
 }
 
 #[async_trait]
@@ -637,7 +663,7 @@ impl SenseMonitor for EmailMonitor {
             }
         };
 
-        let last_seen = Arc::clone(&self.last_seen_uid);
+        let last_seen = Arc::clone(&self.last_seen);
         // Resolve the on-disk root once per poll. None means "host
         // hasn't been initialised with a writable data dir" — fine for
         // tests, just degrades to metadata-only attachments.
@@ -658,13 +684,15 @@ impl SenseMonitor for EmailMonitor {
         };
 
         let result = tokio::task::spawn_blocking(move || -> Result<Vec<SenseEvent>> {
-            let current_last = *last_seen.lock().unwrap();
+            // Clone the per-folder watermark map out under lock; hold no lock
+            // across the blocking IMAP network calls.
+            let mut seen = last_seen.lock().unwrap().clone();
             let save_root = save_root.as_deref();
 
             let server = config.imap_server.as_str();
             let port = config.imap_port;
 
-            let (all_events, global_max_uid) = if config.use_tls {
+            let all_events = if config.use_tls {
                 let tcp = std::net::TcpStream::connect((server, port)).map_err(|e| {
                     AthenError::Other(format!("TCP connect to {server}:{port}: {e}"))
                 })?;
@@ -684,7 +712,7 @@ impl SenseMonitor for EmailMonitor {
                 let result = poll_all_folders(
                     &mut session,
                     &config.folders,
-                    current_last,
+                    &mut seen,
                     save_root,
                     &owner_emails,
                 );
@@ -705,7 +733,7 @@ impl SenseMonitor for EmailMonitor {
                 let result = poll_all_folders(
                     &mut session,
                     &config.folders,
-                    current_last,
+                    &mut seen,
                     save_root,
                     &owner_emails,
                 );
@@ -715,14 +743,8 @@ impl SenseMonitor for EmailMonitor {
                 result?
             };
 
-            // Update last seen UID.
-            if let Some(new_max) = global_max_uid {
-                let mut guard = last_seen.lock().unwrap();
-                *guard = Some(match *guard {
-                    Some(old) => old.max(new_max),
-                    None => new_max,
-                });
-            }
+            // Write per-folder watermarks back under lock.
+            *last_seen.lock().unwrap() = seen;
 
             Ok(all_events)
         })
@@ -1466,6 +1488,66 @@ PDF-BYTES\r\n\
         assert_eq!(sanitize_filename("invoice<>.pdf"), "invoice__.pdf");
         assert_eq!(sanitize_filename(""), "file");
         assert_eq!(sanitize_filename("..."), "file");
+    }
+
+    // ---------------------------------------------------------------
+    // Per-folder watermark helpers — these encode the multi-folder UID
+    // bug fix: two folders with disjoint UID ranges no longer share a
+    // single global watermark, so a high-UID INBOX can never silence a
+    // low-UID secondary folder.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn folder_min_uid_same_validity_returns_last() {
+        // Same validity → filter above the stored high-water mark.
+        assert_eq!(folder_min_uid(Some((7, 123)), 7), Some(123));
+    }
+
+    #[test]
+    fn folder_min_uid_changed_validity_returns_none() {
+        // UIDVALIDITY changed → UID space reset; fetch everything fresh.
+        assert_eq!(folder_min_uid(Some((7, 5000)), 8), None);
+    }
+
+    #[test]
+    fn folder_min_uid_no_prev_returns_none() {
+        // First sight of this folder → no filter, fetch all UNSEEN.
+        assert_eq!(folder_min_uid(None, 1), None);
+    }
+
+    #[test]
+    fn merge_folder_watermark_same_validity_takes_max() {
+        // Same validity: keep the higher of stored and observed.
+        assert_eq!(merge_folder_watermark(Some((3, 50)), 3, Some(80)), (3, 80));
+        assert_eq!(merge_folder_watermark(Some((3, 90)), 3, Some(80)), (3, 90));
+    }
+
+    #[test]
+    fn merge_folder_watermark_same_validity_none_observed_keeps_stored() {
+        // No new messages this round → stored high-water mark is unchanged.
+        assert_eq!(merge_folder_watermark(Some((3, 50)), 3, None), (3, 50));
+    }
+
+    #[test]
+    fn merge_folder_watermark_changed_validity_resets() {
+        // UIDVALIDITY changed → stale mark discarded; adopt new validity.
+        assert_eq!(
+            merge_folder_watermark(Some((3, 5000)), 4, Some(10)),
+            (4, 10)
+        );
+    }
+
+    #[test]
+    fn merge_folder_watermark_changed_validity_no_messages() {
+        // UIDVALIDITY changed and no messages yet → (new_validity, 0).
+        assert_eq!(merge_folder_watermark(Some((3, 5000)), 4, None), (4, 0));
+    }
+
+    #[test]
+    fn merge_folder_watermark_first_sight_adopts_observed() {
+        // No prior entry → first-sight path, same as changed validity.
+        assert_eq!(merge_folder_watermark(None, 5, Some(42)), (5, 42));
+        assert_eq!(merge_folder_watermark(None, 5, None), (5, 0));
     }
 
     // ---------------------------------------------------------------
