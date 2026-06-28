@@ -352,6 +352,22 @@ async fn propagate_parent_pins(
     }
 }
 
+/// Build the brief for a repair attempt: the original brief plus the rejected
+/// deliverable and the verifier's reason, so the re-run sub-agent sees exactly
+/// what to fix. Pure (truncates the prior deliverable) for unit-testing.
+fn build_repair_brief(original_brief: &str, prev_content: &str, reason: &str) -> String {
+    format!(
+        "{original_brief}\n\n\
+         --- YOUR PREVIOUS ATTEMPT WAS REJECTED ---\n\
+         Previous deliverable:\n{}\n\n\
+         Why it was rejected: {reason}\n\n\
+         Produce a corrected deliverable that fully satisfies the ORIGINAL brief above. \
+         If the rejection was because you claimed an action you did not actually perform, \
+         actually perform it this time using the appropriate tool.",
+        truncate(prev_content, 2000),
+    )
+}
+
 /// Render the sub-agent's *executed* tool calls into a compact, verifier-
 /// readable list, one per line (e.g. `- write (ok)` / `- send_email (failed)`).
 /// Reads the persisted `tool_call` rows from the sub-arc. Returns an empty
@@ -773,90 +789,155 @@ pub(crate) async fn run_delegation(
         "delegate_to_agent: sub-executor built; starting sub-task"
     );
 
-    // 4. Synthesize a Task from the brief and run it.
-    let task = Task {
-        id: uuid::Uuid::new_v4(),
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
-        source_event: None,
-        domain: DomainType::Base,
-        description: args.brief.clone(),
-        priority: TaskPriority::Normal,
-        status: TaskStatus::InProgress,
-        risk_score: None,
-        risk_budget: None,
-        risk_used: 0,
-        assigned_agent: None,
-        steps: vec![],
-        deadline: None,
-    };
+    // 4. Run the sub-task with a bounded verify→repair loop. The sub-executor
+    //    is reusable (`execute(&self, ...)`), so when a *successful* run yields
+    //    a deliverable that fails post-run verification we re-run it with the
+    //    verifier's critique folded into the brief, up to MAX_DELEGATION_ATTEMPTS
+    //    total. This catches the common "claimed done but didn't" failure with
+    //    no human in the loop. A run that errors, or that the executor itself
+    //    reports unsuccessful, is terminal (no repair) — same as before.
+    const MAX_DELEGATION_ATTEMPTS: u32 = 2;
 
-    let result = match executor.execute(task).await {
-        Ok(r) => {
-            tracing::info!(
-                sub_arc_id = %sub_arc_id,
-                success = r.success,
-                steps_completed = r.steps_completed,
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "delegate_to_agent: sub-task finished"
-            );
-            // Finalize the registry entry as a clean completion (best-effort;
-            // `None` on non-UI paths). Removes the agent from the live panel.
-            if let Some(guard) = sub_agent_guard.take() {
-                guard.complete().await;
-            }
-            r
-        }
-        Err(e) => {
-            tracing::warn!(
-                sub_arc_id = %sub_arc_id,
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "delegate_to_agent: sub-task errored: {e}"
-            );
-            // Finalize the registry entry as a failure before bubbling up.
-            if let Some(guard) = sub_agent_guard.take() {
-                guard.fail(e.to_string()).await;
-            }
-            return Err(e);
-        }
-    };
+    let verify_router = crate::state::SharedRouter(Arc::clone(&sub_router_cell));
+    let mut attempt: u32 = 1;
+    let mut current_brief = args.brief.clone();
+    let mut content;
+    let mut result_success;
+    let mut verified;
+    let mut verification_note;
 
-    // Pull the human-readable response back out of the TaskResult.
-    let content = result
-        .output
-        .as_ref()
-        .and_then(|v| v.get("response").and_then(|s| s.as_str()))
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            if result.success {
-                "(specialist returned no text)".to_string()
-            } else {
-                "(specialist task failed without a response)".to_string()
-            }
-        });
+    loop {
+        let task = Task {
+            id: uuid::Uuid::new_v4(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            source_event: None,
+            domain: DomainType::Base,
+            description: current_brief.clone(),
+            priority: TaskPriority::Normal,
+            status: TaskStatus::InProgress,
+            risk_score: None,
+            risk_budget: None,
+            risk_used: 0,
+            assigned_agent: None,
+            steps: vec![],
+            deadline: None,
+        };
 
-    // Post-run verification: confirm the deliverable actually satisfies the
-    // brief before we report success upward. Skipped when the run already
-    // failed (the failure carries its own signal). Reuses the sub-agent's
-    // router (same provider/model), so it's one cheap-tier call.
-    let (verified, verification_note) = if result.success {
-        let verify_router = crate::state::SharedRouter(Arc::clone(&sub_router_cell));
-        let tool_trace = match ctx.arc_store.load_entries(&sub_arc_id).await {
-            Ok(entries) => render_tool_trace(&entries),
+        let result = match executor.execute(task).await {
+            Ok(r) => {
+                tracing::info!(
+                    sub_arc_id = %sub_arc_id,
+                    attempt,
+                    success = r.success,
+                    steps_completed = r.steps_completed,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "delegate_to_agent: sub-task attempt finished"
+                );
+                r
+            }
             Err(e) => {
-                tracing::warn!("delegation: load sub-arc entries for verify trace failed: {e}");
-                String::new()
+                tracing::warn!(
+                    sub_arc_id = %sub_arc_id,
+                    attempt,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "delegate_to_agent: sub-task errored: {e}"
+                );
+                // Finalize the registry entry as a failure before bubbling up.
+                if let Some(guard) = sub_agent_guard.take() {
+                    guard.fail(e.to_string()).await;
+                }
+                return Err(e);
             }
         };
-        verify_deliverable(&verify_router, &args.brief, &content, &tool_trace).await
-    } else {
-        (true, None)
-    };
+
+        result_success = result.success;
+
+        // Pull the human-readable response back out of the TaskResult.
+        content = result
+            .output
+            .as_ref()
+            .and_then(|v| v.get("response").and_then(|s| s.as_str()))
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                if result.success {
+                    "(specialist returned no text)".to_string()
+                } else {
+                    "(specialist task failed without a response)".to_string()
+                }
+            });
+
+        // Post-run verification: confirm the deliverable actually satisfies the
+        // brief. Skipped when the run already failed (its failure carries its
+        // own signal). Reuses the sub-agent's router (one cheap-tier call) and
+        // the sub-arc's persisted tool trace so claim-vs-action gaps surface.
+        let (v, note) = if result_success {
+            let tool_trace = match ctx.arc_store.load_entries(&sub_arc_id).await {
+                Ok(entries) => render_tool_trace(&entries),
+                Err(e) => {
+                    tracing::warn!("delegation: load sub-arc entries for verify trace failed: {e}");
+                    String::new()
+                }
+            };
+            verify_deliverable(&verify_router, &args.brief, &content, &tool_trace).await
+        } else {
+            (true, None)
+        };
+        verified = v;
+        verification_note = note;
+
+        // Stop unless we have a verifiable failure worth repairing and attempts
+        // remain. Only a successful-but-rejected run is repaired.
+        if verified || !result_success || attempt >= MAX_DELEGATION_ATTEMPTS {
+            break;
+        }
+
+        // Repair: fold the verifier's critique into the next attempt's brief and
+        // surface it in the sub-arc transcript as a follow-up instruction
+        // (best-effort persistence).
+        let note_text = verification_note
+            .clone()
+            .unwrap_or_else(|| "the deliverable did not satisfy the brief".to_string());
+        tracing::info!(
+            sub_arc_id = %sub_arc_id,
+            attempt,
+            reason = %note_text,
+            "delegate_to_agent: deliverable rejected; starting repair attempt"
+        );
+        if let Err(e) = ctx
+            .arc_store
+            .add_entry(
+                &sub_arc_id,
+                athen_persistence::arcs::EntryType::Message,
+                "user",
+                &format!(
+                    "Your previous attempt was rejected by verification: {note_text}\n\n\
+                     Please correct it and produce a deliverable that fully satisfies the \
+                     original brief."
+                ),
+                None,
+                Some(&sub_turn_id),
+            )
+            .await
+        {
+            tracing::warn!("delegation: persist repair-feedback entry failed: {e}");
+        }
+        current_brief = build_repair_brief(&args.brief, &content, &note_text);
+        attempt += 1;
+    }
+
+    // Finalize the live-registry entry once, after the loop. (Mid-loop execute
+    // errors already returned via the `guard.fail` path above.)
+    if let Some(guard) = sub_agent_guard.take() {
+        guard.complete().await;
+    }
+
     if !verified {
         tracing::warn!(
             sub_arc_id = %sub_arc_id,
+            attempts = attempt,
             note = ?verification_note,
-            "delegate_to_agent: deliverable failed post-run verification"
+            "delegate_to_agent: deliverable failed verification after repair attempts"
         );
     }
 
@@ -898,7 +979,7 @@ pub(crate) async fn run_delegation(
     Ok((
         sub_arc_id,
         content,
-        result.success,
+        result_success,
         verified,
         verification_note,
     ))
@@ -1316,6 +1397,18 @@ mod tests {
         assert!(trace.contains("write (ok)"), "got: {trace}");
         assert!(trace.contains("send_email (failed)"), "got: {trace}");
         assert!(!trace.contains("hello"), "non-tool rows must be excluded: {trace}");
+    }
+
+    #[test]
+    fn build_repair_brief_includes_brief_prev_and_reason() {
+        let b = build_repair_brief(
+            "Do the thing",
+            "I did the thing (but lied)",
+            "no write tool ran",
+        );
+        assert!(b.contains("Do the thing"), "got: {b}");
+        assert!(b.contains("I did the thing"), "got: {b}");
+        assert!(b.contains("no write tool ran"), "got: {b}");
     }
 
     #[test]
