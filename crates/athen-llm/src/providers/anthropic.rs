@@ -260,8 +260,15 @@ impl LlmProvider for AnthropicProvider {
             .collect::<Vec<_>>()
             .join("");
 
+        // Extract thinking text + signature so they can be echoed back on the
+        // next turn. Anthropic requires the thinking block (with its opaque
+        // signature) to precede tool_use blocks in the assistant history, else
+        // it returns HTTP 400. We carry the signature on the first tool call's
+        // `thought_signature` field so the round-trip is fully provider-local.
+        let (thinking_text, thinking_sig) = extract_thinking(&api_response.content);
+
         // Extract tool calls if present.
-        let tool_calls: Vec<ToolCall> = api_response
+        let mut tool_calls: Vec<ToolCall> = api_response
             .content
             .iter()
             .filter(|block| block.content_type == "tool_use")
@@ -272,6 +279,13 @@ impl LlmProvider for AnthropicProvider {
                 thought_signature: None,
             })
             .collect();
+
+        // Stash the thinking block's signature on the first tool call so
+        // `structured_to_anthropic_content` can reconstruct the thinking block
+        // when this turn is replayed in the conversation history.
+        if let (Some(sig), Some(first)) = (thinking_sig.as_ref(), tool_calls.first_mut()) {
+            first.thought_signature = Some(sig.clone());
+        }
 
         let finish_reason = match api_response.stop_reason.as_deref() {
             Some("end_turn") | Some("stop") => FinishReason::Stop,
@@ -304,7 +318,7 @@ impl LlmProvider for AnthropicProvider {
 
         let mut response = LlmResponse {
             content,
-            reasoning_content: None,
+            reasoning_content: thinking_text,
             model_used: api_response.model,
             provider: "anthropic".into(),
             usage,
@@ -464,10 +478,16 @@ impl LlmProvider for AnthropicProvider {
 /// M2.7, Qwen) produce garbled conversation history that the model can't
 /// connect tool results to → infinite loops.
 ///
-/// Two envelope shapes exist in the conversation:
+/// Three envelope shapes exist in the conversation:
 ///
-/// **Assistant turn** — `{"text":"...", "tool_calls":[...], "reasoning_content":"..."}`
+/// **Assistant turn (no thinking)** — `{"text":"...", "tool_calls":[...]}`
 /// → `[{"type":"text","text":"..."},{"type":"tool_use","id":"...","name":"...","input":{...}},...]`
+///
+/// **Assistant turn (thinking + tools)** — when `reasoning_content` is
+/// non-empty and `tool_calls[0].thought_signature` is present, Anthropic
+/// requires the thinking block to appear **before** the tool_use blocks (else
+/// HTTP 400). We reconstruct it here from the carried text + signature:
+/// → `[{"type":"thinking","thinking":"...","signature":"..."},{"type":"text",...},{"type":"tool_use",...},...]`
 ///
 /// **Tool result** — `{"tool_call_id":"...", "content":"..."}`
 /// → `[{"type":"tool_result","tool_use_id":"...","content":"..."}]`
@@ -479,10 +499,34 @@ fn structured_to_anthropic_content(
     if is_assistant {
         if let Some(text) = v.get("text").and_then(|t| t.as_str()) {
             let mut blocks: Vec<serde_json::Value> = Vec::new();
+            let calls = v.get("tool_calls").and_then(|c| c.as_array());
+            // Anthropic requires the thinking block (with signature) to precede
+            // tool_use blocks on a thinking+tools turn, else HTTP 400.  The
+            // signature was carried on the first tool call's `thought_signature`
+            // field through the executor's Structured round-trip.
+            if let Some(calls) = calls {
+                let reasoning = v
+                    .get("reasoning_content")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("");
+                let sig = calls
+                    .first()
+                    .and_then(|c| c.get("thought_signature"))
+                    .and_then(|s| s.as_str());
+                if !reasoning.is_empty() {
+                    if let Some(sig) = sig {
+                        blocks.push(serde_json::json!({
+                            "type": "thinking",
+                            "thinking": reasoning,
+                            "signature": sig,
+                        }));
+                    }
+                }
+            }
             if !text.is_empty() {
                 blocks.push(serde_json::json!({"type": "text", "text": text}));
             }
-            if let Some(calls) = v.get("tool_calls").and_then(|c| c.as_array()) {
+            if let Some(calls) = calls {
                 for call in calls {
                     let id = call.get("id").and_then(|i| i.as_str()).unwrap_or("");
                     let name = call.get("name").and_then(|n| n.as_str()).unwrap_or("");
@@ -490,6 +534,9 @@ fn structured_to_anthropic_content(
                         .get("arguments")
                         .cloned()
                         .unwrap_or(serde_json::json!({}));
+                    // Do NOT include thought_signature in the tool_use block —
+                    // Anthropic's tool_use has no signature field; the signature
+                    // only belongs on the preceding thinking block.
                     blocks.push(serde_json::json!({
                         "type": "tool_use",
                         "id": id,
@@ -648,9 +695,21 @@ impl StreamUsageAcc {
 /// arguments JSON, terminated by `content_block_stop`. The events are keyed
 /// by the top-level `index`, so we collect fragments per index and finalize
 /// on stop. Mirrors the OpenAI `ToolCallAccumulator` shape.
+///
+/// Also tracks the thinking-block `signature_delta` that arrives (at index 0,
+/// before any tool_use index) when reasoning is active. The signature is
+/// attached to the **first** finalised `ToolCall` so it round-trips through
+/// the executor's Structured envelope and can be replayed by
+/// `structured_to_anthropic_content`.
 #[derive(Debug, Default)]
 struct ToolUseAccumulator {
     parts: BTreeMap<u64, PartialToolUse>,
+    /// Opaque Anthropic signature from a `signature_delta` event. Stashed here
+    /// until the first tool call is finalised.
+    thinking_signature: Option<String>,
+    /// `true` once the signature has been placed on a `ToolCall`; prevents it
+    /// being duplicated onto subsequent calls in the same turn.
+    signature_attached: bool,
 }
 
 #[derive(Debug, Default)]
@@ -678,18 +737,44 @@ impl ToolUseAccumulator {
         }
     }
 
+    /// Store the thinking-block signature received from a `signature_delta`
+    /// event. Called before any tool_use `content_block_stop` fires, so the
+    /// signature is ready when the first `ToolCall` is finalised.
+    fn set_thinking_signature(&mut self, sig: String) {
+        self.thinking_signature = Some(sig);
+    }
+
     /// Finalize and remove the block at `index`, if present and named.
+    /// Attaches the thinking signature to the **first** call produced this turn.
     fn finalize(&mut self, index: u64) -> Option<ToolCall> {
-        self.parts.remove(&index).and_then(finalize_part)
+        self.parts.remove(&index).and_then(finalize_part).map(|mut tc| {
+            if !self.signature_attached {
+                if let Some(sig) = self.thinking_signature.clone() {
+                    tc.thought_signature = Some(sig);
+                    self.signature_attached = true;
+                }
+            }
+            tc
+        })
     }
 
     /// Finalize every remaining block (defensive: a `message_stop` without
-    /// a preceding `content_block_stop`).
+    /// a preceding `content_block_stop`). Attaches the thinking signature to
+    /// the first call if it hasn't been attached yet.
     fn drain(&mut self) -> Vec<ToolCall> {
-        std::mem::take(&mut self.parts)
+        let mut calls: Vec<ToolCall> = std::mem::take(&mut self.parts)
             .into_values()
             .filter_map(finalize_part)
-            .collect()
+            .collect();
+        if !self.signature_attached {
+            if let Some(sig) = self.thinking_signature.clone() {
+                if let Some(first) = calls.first_mut() {
+                    first.thought_signature = Some(sig);
+                    self.signature_attached = true;
+                }
+            }
+        }
+        calls
     }
 }
 
@@ -789,6 +874,35 @@ fn parse_sse_chunks(
                                         acc.push_partial(index, frag);
                                     }
                                 }
+                                // Streaming thinking text — forward as an
+                                // is_thinking chunk so the executor accumulates
+                                // it into `reasoning_content`.
+                                "thinking_delta" => {
+                                    if let Some(t) = delta
+                                        .and_then(|d| d.get("thinking"))
+                                        .and_then(|t| t.as_str())
+                                    {
+                                        chunks.push(Ok(LlmChunk {
+                                            delta: t.to_string(),
+                                            is_final: false,
+                                            is_thinking: true,
+                                            tool_calls: vec![],
+                                            usage: None,
+                                        }));
+                                    }
+                                }
+                                // Opaque signature for the thinking block.
+                                // Stash it on the accumulator; it will be
+                                // attached to the first tool call once
+                                // content_block_stop fires.
+                                "signature_delta" => {
+                                    if let Some(s) = delta
+                                        .and_then(|d| d.get("signature"))
+                                        .and_then(|s| s.as_str())
+                                    {
+                                        acc.set_thinking_signature(s.to_string());
+                                    }
+                                }
                                 // Plain assistant text.
                                 _ => {
                                     if let Some(text_delta) =
@@ -861,6 +975,26 @@ fn parse_sse_chunks(
     }
 
     chunks
+}
+
+/// Extract the concatenated thinking text and the (last) thinking-block
+/// signature from a response's content blocks. Anthropic emits at most one
+/// thinking block per turn under normal settings; if multiple appear we
+/// concatenate text and keep the last signature.
+fn extract_thinking(blocks: &[ContentBlock]) -> (Option<String>, Option<String>) {
+    let mut text = String::new();
+    let mut sig: Option<String> = None;
+    for b in blocks {
+        if b.content_type == "thinking" {
+            if let Some(t) = b.thinking.as_deref() {
+                text.push_str(t);
+            }
+            if let Some(s) = b.signature.as_deref() {
+                sig = Some(s.to_string());
+            }
+        }
+    }
+    (if text.is_empty() { None } else { Some(text) }, sig)
 }
 
 /// Rough cost estimation for Anthropic models (per 1M tokens pricing as
@@ -1034,6 +1168,11 @@ struct ContentBlock {
     id: Option<String>,
     name: Option<String>,
     input: Option<serde_json::Value>,
+    /// Present on `{"type":"thinking",...}` blocks; holds the thinking text.
+    thinking: Option<String>,
+    /// Opaque signature on a thinking block — must be echoed back verbatim on
+    /// the next request when tool_use blocks follow, else Anthropic returns 400.
+    signature: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1455,5 +1594,194 @@ mod tests {
         // 1M cache-write tokens bills at 1.25x = $3.75.
         let cost = estimate_anthropic_cost("claude-sonnet-4-6", 0, 0, 0, 1_000_000);
         assert!((cost - 3.75).abs() < 1e-9, "cache write cost: {cost}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Thinking + tools round-trip tests
+    // -----------------------------------------------------------------------
+
+    fn make_thinking_block(text: &str, sig: &str) -> ContentBlock {
+        ContentBlock {
+            content_type: "thinking".into(),
+            text: None,
+            id: None,
+            name: None,
+            input: None,
+            thinking: Some(text.into()),
+            signature: Some(sig.into()),
+        }
+    }
+
+    fn make_tool_use_block(id: &str, name: &str) -> ContentBlock {
+        ContentBlock {
+            content_type: "tool_use".into(),
+            text: None,
+            id: Some(id.into()),
+            name: Some(name.into()),
+            input: Some(serde_json::json!({})),
+            thinking: None,
+            signature: None,
+        }
+    }
+
+    #[test]
+    fn extract_thinking_returns_text_and_sig() {
+        let blocks = vec![
+            make_thinking_block("let me think", "opaque-sig-abc"),
+            make_tool_use_block("t1", "do_thing"),
+        ];
+        let (text, sig) = extract_thinking(&blocks);
+        assert_eq!(text.as_deref(), Some("let me think"));
+        assert_eq!(sig.as_deref(), Some("opaque-sig-abc"));
+    }
+
+    #[test]
+    fn extract_thinking_no_block_returns_nones() {
+        let blocks = vec![make_tool_use_block("t1", "do_thing")];
+        let (text, sig) = extract_thinking(&blocks);
+        assert!(text.is_none(), "no thinking block → text should be None");
+        assert!(sig.is_none(), "no thinking block → sig should be None");
+    }
+
+    /// Build an assistant-turn envelope with reasoning_content + thought_signature
+    /// on the first tool call and verify that structured_to_anthropic_content
+    /// emits: [thinking-block, text-block?, tool_use-block].
+    #[test]
+    fn structured_assistant_emits_thinking_block_before_tool_use() {
+        let envelope = serde_json::json!({
+            "text": "",
+            "tool_calls": [{
+                "id": "t1",
+                "name": "x",
+                "arguments": {},
+                "thought_signature": "sig123"
+            }],
+            "reasoning_content": "let me think"
+        });
+        let result = structured_to_anthropic_content(&envelope, true, false);
+        let arr = result.as_array().expect("must be array");
+
+        // First block must be the thinking block.
+        assert_eq!(arr[0]["type"], "thinking", "first block must be thinking: {arr:?}");
+        assert_eq!(arr[0]["thinking"], "let me think");
+        assert_eq!(arr[0]["signature"], "sig123");
+
+        // There must be a tool_use block somewhere after.
+        let has_tool_use = arr.iter().any(|b| b["type"] == "tool_use");
+        assert!(has_tool_use, "must contain a tool_use block: {arr:?}");
+
+        // The tool_use block must NOT carry thought_signature or signature.
+        let tool_use = arr.iter().find(|b| b["type"] == "tool_use").unwrap();
+        assert!(
+            tool_use.get("thought_signature").is_none()
+                && tool_use.get("signature").is_none(),
+            "tool_use must not carry signature fields: {tool_use}"
+        );
+    }
+
+    /// Without a thought_signature no thinking block should be emitted
+    /// (back-compat: regular tool turns without reasoning must be unaffected).
+    #[test]
+    fn structured_assistant_without_signature_omits_thinking_block() {
+        let envelope = serde_json::json!({
+            "text": "here you go",
+            "tool_calls": [{
+                "id": "t1",
+                "name": "x",
+                "arguments": {}
+                // no thought_signature
+            }],
+            "reasoning_content": "some thoughts"
+        });
+        let result = structured_to_anthropic_content(&envelope, true, false);
+        let arr = result.as_array().expect("must be array");
+
+        let has_thinking = arr.iter().any(|b| b["type"] == "thinking");
+        assert!(!has_thinking, "no signature → no thinking block: {arr:?}");
+
+        let has_tool_use = arr.iter().any(|b| b["type"] == "tool_use");
+        assert!(has_tool_use, "must still have tool_use block: {arr:?}");
+    }
+
+    /// Drive the accumulator through two tool calls after setting a signature;
+    /// only the first should carry thought_signature.
+    #[test]
+    fn accumulator_attaches_signature_to_first_tool_call_only() {
+        let mut acc = ToolUseAccumulator::default();
+
+        // Signature arrives before any tool_use block.
+        acc.set_thinking_signature("sig-xyz".into());
+
+        // First tool call.
+        acc.start(1, "tc1".into(), "tool_a".into());
+        let first = acc.finalize(1).expect("finalized tc1");
+        assert_eq!(
+            first.thought_signature.as_deref(),
+            Some("sig-xyz"),
+            "first call must carry signature"
+        );
+
+        // Second tool call — must NOT get the signature.
+        acc.start(2, "tc2".into(), "tool_b".into());
+        let second = acc.finalize(2).expect("finalized tc2");
+        assert!(
+            second.thought_signature.is_none(),
+            "second call must not carry signature: {:?}",
+            second.thought_signature
+        );
+    }
+
+    /// Feed a `thinking_delta` SSE event through the parser and assert an
+    /// `is_thinking: true` chunk is emitted; feed a `signature_delta` and
+    /// assert the accumulator stores the signature (visible when a tool call
+    /// is later finalised).
+    #[test]
+    fn streaming_thinking_and_signature_delta_events() {
+        // thinking_delta → is_thinking chunk
+        let sse_thinking = concat!(
+            "data: {\"type\":\"content_block_delta\",\"index\":0,",
+            "\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"I need to think about this.\"}}\n",
+            "\n",
+        );
+        let mut buffer = sse_thinking.as_bytes().to_vec();
+        let mut acc = ToolUseAccumulator::default();
+        let mut usage_acc = StreamUsageAcc::default();
+        let chunks: Vec<LlmChunk> =
+            drain_complete_sse_events(&mut buffer, &mut acc, &mut usage_acc)
+                .into_iter()
+                .map(|r| r.expect("chunk ok"))
+                .collect();
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].is_thinking, "thinking_delta must set is_thinking=true");
+        assert_eq!(chunks[0].delta, "I need to think about this.");
+
+        // signature_delta → stored on accumulator, attached to subsequent tool call
+        let sse_sig = concat!(
+            "data: {\"type\":\"content_block_delta\",\"index\":0,",
+            "\"delta\":{\"type\":\"signature_delta\",\"signature\":\"opaque-sig-99\"}}\n",
+            "\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,",
+            "\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"fn\",\"input\":{}}}\n",
+            "\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n",
+            "\n",
+            "data: {\"type\":\"message_stop\"}\n",
+            "\n",
+        );
+        let mut buffer2 = sse_sig.as_bytes().to_vec();
+        let mut acc2 = ToolUseAccumulator::default();
+        let mut usage_acc2 = StreamUsageAcc::default();
+        let chunks2: Vec<LlmChunk> =
+            drain_complete_sse_events(&mut buffer2, &mut acc2, &mut usage_acc2)
+                .into_iter()
+                .map(|r| r.expect("chunk ok"))
+                .collect();
+        let calls: Vec<&ToolCall> = chunks2.iter().flat_map(|c| c.tool_calls.iter()).collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].thought_signature.as_deref(),
+            Some("opaque-sig-99"),
+            "signature_delta must end up on the first tool call"
+        );
     }
 }
