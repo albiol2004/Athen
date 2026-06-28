@@ -614,6 +614,31 @@ fn repair_unescaped_control_chars(input: &str) -> String {
 /// surfaces (`config.toml`, `athen.db` + WAL/SHM siblings, `vault.key`,
 /// `vault.db` + WAL/SHM siblings) and the large binary `runtimes/` tree are
 /// off-limits.
+/// Lexically normalize a path: collapse `.` and resolve `..` against the
+/// preceding component WITHOUT touching the filesystem (so it works for
+/// not-yet-existing files, unlike `canonicalize`). This makes the
+/// `forbidden_data_path` equality checks robust against traversal evasion
+/// like `<workspace>/../vault.key`. A leading `..` on a relative path is
+/// preserved (nothing to pop).
+fn lexical_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else {
+                    out.push(comp.as_os_str());
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 fn forbidden_data_path(path: &Path) -> Option<&'static str> {
     let data = paths::athen_data_dir()?;
     forbidden_data_path_in(path, &data)
@@ -937,15 +962,20 @@ impl ShellToolRegistry {
     /// onto `fs_base_override` when set, otherwise it falls back to
     /// `resolve_in_workspace` (i.e. the workspace dir). With no override the
     /// behaviour is byte-identical to calling `resolve_in_workspace` directly.
+    /// The result is always lexically normalized (`.` removed, `..` resolved)
+    /// so that `forbidden_data_path` equality checks cannot be evaded via
+    /// traversal sequences like `workspace/../vault.key`.
     fn resolve_tool_path(&self, p: &str) -> std::path::PathBuf {
         let path = Path::new(p);
-        if path.is_absolute() {
-            return path.to_path_buf();
-        }
-        match self.fs_base_override.as_ref() {
-            Some(base) => base.join(path),
-            None => paths::resolve_in_workspace(path),
-        }
+        let joined = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            match self.fs_base_override.as_ref() {
+                Some(base) => base.join(path),
+                None => paths::resolve_in_workspace(path),
+            }
+        };
+        lexical_normalize(&joined)
     }
 
     /// Snapshot the given paths if the store + arc_id are both wired,
@@ -1950,6 +1980,16 @@ impl ShellToolRegistry {
         }
 
         let resolved = self.resolve_tool_path(path_arg);
+
+        if let Some(reason) = forbidden_data_path(&resolved) {
+            return Ok(ToolResult {
+                success: false,
+                output: json!({ "error": reason, "path": resolved.display().to_string() }),
+                error: Some(reason.to_string()),
+                execution_time_ms: 0,
+            });
+        }
+
         let path = resolved.to_string_lossy().to_string();
         let path = path.as_str();
 
@@ -2042,6 +2082,16 @@ impl ShellToolRegistry {
             .ok_or_else(|| AthenError::Other("missing 'content' parameter".to_string()))?;
 
         let resolved = self.resolve_tool_path(path_arg);
+
+        if let Some(reason) = forbidden_data_path(&resolved) {
+            return Ok(ToolResult {
+                success: false,
+                output: json!({ "error": reason, "path": resolved.display().to_string() }),
+                error: Some(reason.to_string()),
+                execution_time_ms: 0,
+            });
+        }
+
         let path = resolved.to_string_lossy().to_string();
         let path = path.as_str();
 
@@ -2109,6 +2159,16 @@ impl ShellToolRegistry {
             .unwrap_or(false);
 
         let resolved = self.resolve_tool_path(path_arg);
+
+        if let Some(reason) = forbidden_data_path(&resolved) {
+            return Ok(ToolResult {
+                success: false,
+                output: json!({ "error": reason, "path": resolved.display().to_string() }),
+                error: Some(reason.to_string()),
+                execution_time_ms: 0,
+            });
+        }
+
         let path = resolved.to_string_lossy().to_string();
         let path = path.as_str();
 
@@ -5688,6 +5748,70 @@ mod tests {
         assert_eq!(
             forbidden_data_path_in(&data.join("notes.txt"), data),
             None
+        );
+    }
+
+    // ---- lexical_normalize tests ----
+
+    #[test]
+    fn lexical_normalize_collapses_dotdot() {
+        assert_eq!(
+            lexical_normalize(Path::new("a/b/../c")),
+            PathBuf::from("a/c")
+        );
+    }
+
+    #[test]
+    fn lexical_normalize_removes_cur_dir() {
+        assert_eq!(
+            lexical_normalize(Path::new("./a/b")),
+            PathBuf::from("a/b")
+        );
+    }
+
+    #[test]
+    fn lexical_normalize_absolute_path() {
+        assert_eq!(
+            lexical_normalize(Path::new("/x/y/../z")),
+            PathBuf::from("/x/z")
+        );
+    }
+
+    #[test]
+    fn lexical_normalize_preserves_leading_dotdot() {
+        // A leading `..` on a relative path has nothing to pop — preserve it.
+        assert_eq!(
+            lexical_normalize(Path::new("../a")),
+            PathBuf::from("../a")
+        );
+    }
+
+    #[test]
+    fn lexical_normalize_multiple_dotdot() {
+        assert_eq!(
+            lexical_normalize(Path::new("a/b/../../c")),
+            PathBuf::from("c")
+        );
+    }
+
+    #[test]
+    fn lexical_normalize_defeats_traversal_evasion() {
+        // The workspace sits at `<data_dir>/workspace`; a `..` traversal
+        // lands in `<data_dir>` where the vault key lives.  Without
+        // normalization the un-normalized path does NOT match the `==`
+        // checks inside `forbidden_data_path_in`.  After normalization it
+        // must be blocked.
+        let data = Path::new("/home/u/.athen");
+        let traversal = data.join("workspace").join("../vault.key");
+        let normalized = lexical_normalize(&traversal);
+        assert_eq!(
+            normalized,
+            data.join("vault.key"),
+            "normalization must collapse the traversal to the real path"
+        );
+        assert!(
+            forbidden_data_path_in(&normalized, data).is_some(),
+            "normalized traversal path must be blocked by forbidden_data_path"
         );
     }
 }
