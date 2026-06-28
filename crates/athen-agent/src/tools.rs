@@ -611,8 +611,9 @@ fn repair_unescaped_control_chars(input: &str) -> String {
 /// Blocklist over allowlist: `tools/`, `toolbox/`, `workspace/`, `files/`
 /// stay readable so the agent can still discover its toolset, list installed
 /// packages, and inspect its own workspace. Only the credential-bearing
-/// surfaces (`config.toml`, `athen.db` + WAL/SHM siblings) and the large
-/// binary `runtimes/` tree are off-limits.
+/// surfaces (`config.toml`, `athen.db` + WAL/SHM siblings, `vault.key`,
+/// `vault.db` + WAL/SHM siblings) and the large binary `runtimes/` tree are
+/// off-limits.
 fn forbidden_data_path(path: &Path) -> Option<&'static str> {
     let data = paths::athen_data_dir()?;
     forbidden_data_path_in(path, &data)
@@ -632,6 +633,17 @@ fn forbidden_data_path_in(path: &Path, data: &Path) -> Option<&'static str> {
     ] {
         if path == data.join(db_name) {
             return Some("athen.db is not readable from tools");
+        }
+    }
+    // EncryptedFileVault: master key and ciphertext DB.  These hold every
+    // at-rest secret (API keys, IMAP/SMTP passwords, GitHub PAT, OAuth
+    // tokens) on headless/Docker and any host without a working OS keychain.
+    if path == data.join("vault.key") {
+        return Some("vault.key holds the master encryption key and is not readable from tools");
+    }
+    for vault_name in ["vault.db", "vault.db-wal", "vault.db-shm", "vault.db-journal"] {
+        if path == data.join(vault_name) {
+            return Some("vault.db holds encrypted credentials and is not readable from tools");
         }
     }
     if path.starts_with(data.join("runtimes")) {
@@ -5649,6 +5661,32 @@ mod tests {
         // Paths entirely outside the data dir are unaffected.
         assert_eq!(
             forbidden_data_path_in(Path::new("/tmp/something.toml"), data),
+            None
+        );
+    }
+
+    #[test]
+    fn forbidden_data_path_blocks_vault_files() {
+        let data = Path::new("/home/u/.athen");
+
+        // Master key must be blocked.
+        assert_eq!(
+            forbidden_data_path_in(&data.join("vault.key"), data),
+            Some("vault.key holds the master encryption key and is not readable from tools"),
+        );
+
+        // Ciphertext DB and all SQLite sidecar files must be blocked.
+        for name in ["vault.db", "vault.db-wal", "vault.db-shm", "vault.db-journal"] {
+            assert_eq!(
+                forbidden_data_path_in(&data.join(name), data),
+                Some("vault.db holds encrypted credentials and is not readable from tools"),
+                "expected block for {name}"
+            );
+        }
+
+        // Unrelated files in the same data dir must NOT be blocked.
+        assert_eq!(
+            forbidden_data_path_in(&data.join("notes.txt"), data),
             None
         );
     }

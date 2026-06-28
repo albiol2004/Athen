@@ -73,6 +73,14 @@ impl BwrapSandbox {
                         "athen.db-wal",
                         "athen.db-shm",
                         "athen.db-journal",
+                        // EncryptedFileVault master key and ciphertext DB —
+                        // these hold ALL at-rest secrets on headless/Docker
+                        // and any host without a working OS keychain.
+                        "vault.key",
+                        "vault.db",
+                        "vault.db-wal",
+                        "vault.db-shm",
+                        "vault.db-journal",
                     ] {
                         let masked = data.join(name);
                         if masked.exists() {
