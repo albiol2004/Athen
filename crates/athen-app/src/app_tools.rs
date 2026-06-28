@@ -3079,9 +3079,26 @@ impl AppToolRegistry {
 fn join_base_and_path(base: &str, path: &str) -> Result<reqwest::Url> {
     let parsed = reqwest::Url::parse(base)
         .map_err(|e| AthenError::Other(format!("http_request: invalid base_url '{base}': {e}")))?;
-    parsed
+    let joined = parsed
         .join(path)
-        .map_err(|e| AthenError::Other(format!("http_request: invalid path '{path}': {e}")))
+        .map_err(|e| AthenError::Other(format!("http_request: invalid path '{path}': {e}")))?;
+    // Security: `path` is agent-controlled. Url::join lets an absolute
+    // ("https://evil.com/x") or protocol-relative ("//evil.com/x") path
+    // replace the host, which would send the endpoint's vault credential to
+    // an attacker-chosen host (SSRF + credential exfiltration). Pin the
+    // request to the registered endpoint's scheme/host/port.
+    if joined.scheme() != parsed.scheme()
+        || joined.host_str() != parsed.host_str()
+        || joined.port_or_known_default() != parsed.port_or_known_default()
+    {
+        return Err(AthenError::Other(format!(
+            "http_request: path '{path}' may not leave the registered endpoint host \
+             ({}://{}). Absolute or cross-host paths are rejected.",
+            parsed.scheme(),
+            parsed.host_str().unwrap_or("<none>")
+        )));
+    }
+    Ok(joined)
 }
 
 /// Best-effort MIME guess from file extension. Used to set the Content-Type
@@ -4917,5 +4934,77 @@ mod tests {
                 .unwrap();
             assert_eq!(r.output["already_loaded"].as_bool(), Some(true));
         }
+    }
+
+    // ── join_base_and_path security tests ────────────────────────────────────
+
+    #[test]
+    fn join_base_relative_path_slash_prefix_ok() {
+        let url = join_base_and_path("https://api.example.com/base", "/v1/chat").unwrap();
+        assert_eq!(url.host_str(), Some("api.example.com"));
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.path(), "/v1/chat");
+    }
+
+    #[test]
+    fn join_base_bare_relative_path_ok() {
+        let url = join_base_and_path("https://api.example.com/base/", "chat").unwrap();
+        assert_eq!(url.host_str(), Some("api.example.com"));
+        assert_eq!(url.scheme(), "https");
+    }
+
+    #[test]
+    fn join_base_same_host_absolute_url_ok() {
+        let url =
+            join_base_and_path("https://api.example.com/base", "https://api.example.com/other")
+                .unwrap();
+        assert_eq!(url.host_str(), Some("api.example.com"));
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.path(), "/other");
+    }
+
+    #[test]
+    fn join_base_cross_host_absolute_url_rejected() {
+        let err =
+            join_base_and_path("https://api.example.com/base", "https://evil.com/collect")
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("may not leave the registered endpoint host"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn join_base_protocol_relative_path_rejected() {
+        let err = join_base_and_path("https://api.example.com/base", "//evil.com/x").unwrap_err();
+        assert!(
+            err.to_string().contains("may not leave the registered endpoint host"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn join_base_scheme_downgrade_rejected() {
+        // Base is https; path attempts http on the same host — scheme differs → rejected.
+        let err =
+            join_base_and_path("https://api.example.com/base", "http://api.example.com/x")
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("may not leave the registered endpoint host"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn join_base_cloud_metadata_ssrf_rejected() {
+        let err = join_base_and_path(
+            "https://api.example.com/base",
+            "http://169.254.169.254/latest/meta-data/",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("may not leave the registered endpoint host"),
+            "unexpected error: {err}"
+        );
     }
 }
