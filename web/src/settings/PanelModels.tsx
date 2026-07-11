@@ -5,7 +5,7 @@
 // BundleUpdateBody, EmbeddingsSaveBody…), response shapes from
 // settings.rs (SettingsResponse) and bundle_settings.rs (BundleView).
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { AthenClient } from '../api/client';
 import {
   ConfirmButton,
@@ -132,11 +132,37 @@ export function PanelModels({ client }: { client: AthenClient }) {
     [client],
   );
 
+  // Jump chips: the panel is a long single-column stack, and on phones the
+  // lower sections (Bundles, Embeddings) are off-screen — give them a
+  // visible handle that scrolls the section into view.
+  const connectionsRef = useRef<HTMLDivElement>(null);
+  const bundlesRef = useRef<HTMLDivElement>(null);
+  const embeddingsRef = useRef<HTMLDivElement>(null);
+  const jump = (ref: React.RefObject<HTMLDivElement>) =>
+    ref.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+
   return (
     <>
-      <ConnectionsSection client={client} settings={settings} catalog={catalog.data ?? []} />
-      <BundlesSection client={client} providers={settings.data?.providers ?? []} />
-      <EmbeddingsSection client={client} settings={settings} />
+      <div className="st-subtabs">
+        <button type="button" className="st-subtab" onClick={() => jump(connectionsRef)}>
+          Connections
+        </button>
+        <button type="button" className="st-subtab" onClick={() => jump(bundlesRef)}>
+          Bundles
+        </button>
+        <button type="button" className="st-subtab" onClick={() => jump(embeddingsRef)}>
+          Embeddings
+        </button>
+      </div>
+      <div ref={connectionsRef}>
+        <ConnectionsSection client={client} settings={settings} catalog={catalog.data ?? []} />
+      </div>
+      <div ref={bundlesRef}>
+        <BundlesSection client={client} providers={settings.data?.providers ?? []} />
+      </div>
+      <div ref={embeddingsRef}>
+        <EmbeddingsSection client={client} settings={settings} />
+      </div>
     </>
   );
 }

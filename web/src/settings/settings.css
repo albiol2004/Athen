@@ -42,7 +42,10 @@
 .st-tab.active svg { color: var(--coral); }
 
 /* ---- body ---- */
-.st-body { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+/* min-height: 0 is load-bearing: without it, in the mobile column layout the
+   body's min-height:auto floor equals its content height, so .st-content
+   never gets a bounded height and its overflow-y:auto can never engage. */
+.st-body { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
 .st-head {
   display: flex; align-items: center; justify-content: space-between;
   padding: 13px 20px; flex: none;
@@ -256,7 +259,7 @@
   .st-overlay { padding: 0; }
   .st-modal { width: 100%; height: 100%; border-radius: 0; flex-direction: column; }
   .st-nav {
-    width: 100%; flex-direction: row; overflow-x: auto;
+    width: 100%; flex: none; flex-direction: row; overflow-x: auto;
     border-right: none; border-bottom: 1px solid var(--glass-border);
     padding: 10px;
   }
