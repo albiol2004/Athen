@@ -248,6 +248,7 @@ pub fn run() {
             commands::assign_arc_to_project,
             commands::deep_research,
             commands::get_research_paper,
+            commands::get_loop_file,
             commands::loop_start,
             commands::loop_stop,
             commands::loop_status,

@@ -1371,6 +1371,17 @@ async fn h_loop_stop(State(api): State<ApiState>, UrlPath(arc_id): UrlPath<Strin
 async fn h_loop_status(State(api): State<ApiState>, UrlPath(arc_id): UrlPath<String>) -> Response {
     json_result(commands::loop_status_core(arc_id, api.ui.app_state()).await)
 }
+/// GET `/api/arcs/{id}/loop/file/{name}` — read one of an arc's Loop Mode
+/// mailbox files (`GOAL.md`/`PLAN.md`/`REPORT.md`/`VERDICT.md`/`STATE.md`/
+/// `LOG.md`). Read-by-arc-id; the `name` is matched against a fixed allow-list
+/// server-side, so there is no path-traversal surface. Under `require_auth` like
+/// every other `/api/*` route.
+async fn h_loop_file(
+    State(api): State<ApiState>,
+    UrlPath((arc_id, name)): UrlPath<(String, String)>,
+) -> Response {
+    json_result(commands::get_loop_file_core(arc_id, name, api.ui.app_state()).await)
+}
 #[derive(Deserialize)]
 struct ArcCodeModeBody {
     enabled: bool,
@@ -2315,6 +2326,7 @@ fn full_surface_router() -> Router<ApiState> {
         .route("/api/arcs/{id}/research-paper", get(h_research_paper))
         .route("/api/arcs/{id}/loop", get(h_loop_status).post(h_loop_start))
         .route("/api/arcs/{id}/loop/stop", post(h_loop_stop))
+        .route("/api/arcs/{id}/loop/file/{name}", get(h_loop_file))
         .route("/api/arcs/{id}/code-mode", post(h_arc_code_mode))
         .route("/api/arcs/{id}/code-mode/git", get(h_code_mode_git))
         .route("/api/arcs/{id}/code-mode/agents", get(h_code_mode_agents))

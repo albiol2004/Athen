@@ -11,6 +11,7 @@ import type {
 } from '../api/types';
 import type { ChatItem } from '../chat/reducer';
 import { DeepResearchButton, DeepResearchThreadCard } from './DeepResearch';
+import { LoopModeButton, LoopThreadCard, type LoopRun } from './LoopMode';
 
 /** Deep Research run state for the active arc (rendered in-thread). */
 export interface ChatResearch {
@@ -45,6 +46,8 @@ export interface ChatCallbacks {
   onOpenSettings: (tab?: string) => void;
   /** Open the Deep Research launcher, seeded with the current composer text. */
   onDeepResearch: (question: string) => void;
+  /** Open the Loop Mode launcher modal. */
+  onLoop: () => void;
 }
 
 const IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
@@ -68,6 +71,10 @@ export function Chat({
   cb,
   research,
   onDismissResearch,
+  loopBusy,
+  loop,
+  onStopLoop,
+  onDismissLoop,
 }: {
   items: ChatItem[];
   busy: boolean;
@@ -80,6 +87,12 @@ export function Chat({
   /** Deep Research run for the active arc, rendered in-thread (null = none). */
   research: ChatResearch | null;
   onDismissResearch: () => void;
+  /** A Loop Mode POST is in flight — shows a spinner on the trigger. */
+  loopBusy: boolean;
+  /** Loop Mode run for the active arc, rendered in-thread (null = none). */
+  loop: LoopRun | null;
+  onStopLoop: () => void;
+  onDismissLoop: () => void;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const pinnedRef = useRef(true);
@@ -167,6 +180,14 @@ export function Chat({
               onDismiss={onDismissResearch}
             />
           )}
+          {loop && (loop.progress || loop.done) && (
+            <LoopThreadCard
+              client={client}
+              run={loop}
+              onStop={onStopLoop}
+              onDismiss={onDismissLoop}
+            />
+          )}
           {busy && (
             <div className="busy-row">
               <span className="tool-pulse-dot" />
@@ -234,6 +255,7 @@ export function Chat({
             </svg>
           </button>
           <DeepResearchButton busy={researchBusy} onClick={() => cb.onDeepResearch(text.trim())} />
+          <LoopModeButton busy={loopBusy} onClick={cb.onLoop} />
           <input
             ref={pickerRef}
             type="file"

@@ -814,6 +814,22 @@ function registerTauriEventListeners() {
         // research_question — the next trigger offers Extend-vs-new.
         loadArcs();
     });
+
+    // ─── Loop Mode progress + completion ───
+    // Same per-arc discipline as Deep Research: run state is keyed by arc_id and
+    // the in-thread card only renders for the arc in view. The loop-done ERROR
+    // payload carries only { arc_id, stop }, so renderLoopDone reads defensively.
+    window.__TAURI__.event.listen('loop-progress', (event) => {
+        const p = (event && event.payload) ? event.payload : {};
+        renderLoopProgress(p);
+    });
+
+    window.__TAURI__.event.listen('loop-done', (event) => {
+        const p = (event && event.payload) ? event.payload : {};
+        renderLoopDone(p);
+        // Refresh arc metadata so the arc's loop_* columns are current.
+        loadArcs();
+    });
 }
 
 // Tiny escape for selector matching; CSS.escape is well-supported in WebKit
@@ -2302,6 +2318,11 @@ async function handleSwitchArc(arcId) {
         // active or just finished. clearChatUI wiped any card from the prior
         // arc; this rebuilds the card only for the arc now in view.
         renderDeepResearchInline(arcId);
+        // Loop Mode: repaint any in-memory card for this arc, then re-hydrate
+        // from persisted status so a loop running/finished before this switch
+        // (or before an app restart) re-shows its card.
+        renderLoopInline(arcId);
+        hydrateLoop(arcId);
 
         // Arc switch is a force-scroll point (see scrollChatIfPinned
         // notes): a loaded chat lands at its most-recent message. An empty
@@ -6361,6 +6382,11 @@ async function loadHistory() {
         updatePlanBanner(null);
     }
 
+    // Re-hydrate a Loop Mode card if a loop is running / finished on the initial
+    // arc — Deep Research keeps run state in memory only, but a loop must survive
+    // an app restart (it runs in the background on the daemon side).
+    if (activeArcId) hydrateLoop(activeArcId);
+
     drainPendingApprovalQuestionsForActiveArc();
 }
 
@@ -7221,6 +7247,503 @@ function showResearchPaperModal(md, titleText) {
     bodyEl.className = 'inspector-paper tool-body-prose';
     bodyEl.innerHTML = renderMarkdown(sanitizeWebContent(String(md || '')));
     openInspectorPanel(titleText || 'Research paper', bodyEl);
+}
+
+// ─── Loop Mode ───────────────────────────────────────────────────────────
+//
+// Desktop half of Loop Mode (docs/LOOP_MODE.md), mirroring the Deep Research
+// surface: a composer trigger + start dialog, an in-thread per-arc progress
+// card driven by `loop-progress`/`loop-done` Tauri events, a cooperative Stop
+// button, and mailbox viewing in the Inspector. Unlike Deep Research, Loop Mode
+// re-hydrates from `invoke('loop_status')` on boot AND arc-switch, so a loop
+// started before an app restart / arc change stays visible.
+//
+// Backend contract (Tauri; args are camelCased by Tauri, results are snake_case
+// verbatim):
+//   invoke('loop_start',    { arcId, goal, maxIterations })
+//        -> { arc_id, started, loop_root, max_iterations }
+//   invoke('loop_stop',     { arcId })    -> { arc_id, stopped }
+//   invoke('loop_status',   { arcId })    -> { arc_id, state, iteration,
+//                                              max_iterations, loop_root, running }
+//   invoke('get_loop_file', { arcId, file }) -> raw markdown string (rejects
+//        with an error string when the file has not been written yet).
+// Events: 'loop-progress' { arc_id, iteration, max_iterations, phase, detail,
+//   last_verdict } and 'loop-done' { arc_id, stop, iterations_run,
+//   max_iterations, last_verdict, verdict_source_disagreement }. The ERROR/PANIC
+//   loop-done payload carries ONLY { arc_id, stop:"error" }, so every field
+//   except arc_id+stop is read defensively.
+
+// Mailbox files surfaced on the card (matches the web surface + GOAL.md).
+const LOOP_MAILBOX_FILES = ['GOAL.md', 'PLAN.md', 'REPORT.md', 'VERDICT.md'];
+
+// Human copy for each terminal `stop` reason (mirrors the web card's TERMINAL map).
+const LOOP_TERMINAL = {
+    ship:                   { label: 'Ready to ship',                    tone: 'ship' },
+    blocked:                { label: 'Blocked — needs a human decision', tone: 'blocked' },
+    blocked_double_iterate: { label: 'Blocked — the loop is stuck',      tone: 'blocked' },
+    cap_reached:            { label: 'Iteration cap reached',            tone: 'cap' },
+    stopped:                { label: 'Stopped',                          tone: 'stopped' },
+    error:                  { label: 'Errored',                          tone: 'error' },
+};
+
+const ICON_LOOP =
+    '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9a8 8 0 0 1 13.7-4M20 15A8 8 0 0 1 6.3 19"/><path d="M17 3v4h-4M7 21v-4h4"/></svg>';
+
+// arc_id -> run state.
+//   running : { goal, progress:{iteration,max_iterations,phase,detail,last_verdict},
+//               done:null, loopRoot }
+//   done    : { goal, progress:null, done:{stop,iterations_run,max_iterations,
+//               last_verdict,verdict_source_disagreement}, loopRoot }
+const loopModeRuns = new Map();
+
+const loopInlineEl = () => (messagesEl ? messagesEl.querySelector('#loop-mode-inline') : null);
+function removeLoopInline() {
+    const el = loopInlineEl();
+    if (el) el.remove();
+}
+
+// Start dialog: collect the goal, optional acceptance criteria (folded into the
+// goal under a heading — the backend takes a single `goal` string), and a
+// max-iterations cap (default 10). Rides the rewind-dialog overlay shell, the
+// same as showDeepResearchDialog. Resolves to { goal, maxIterations } or null.
+function showLoopModeDialog(initialGoal) {
+    return new Promise((resolve) => {
+        const overlay = document.createElement('div');
+        overlay.className = 'rewind-dialog-overlay';
+
+        const dialog = document.createElement('div');
+        dialog.className = 'rewind-dialog';
+
+        const titleEl = document.createElement('h3');
+        titleEl.textContent = 'Loop Mode';
+        dialog.appendChild(titleEl);
+
+        const desc = document.createElement('p');
+        desc.textContent =
+            'Athen runs a Lead→Evaluator loop toward your goal, iterating until the '
+            + 'Evaluator rules SHIP or BLOCKED (or the iteration cap is hit).';
+        dialog.appendChild(desc);
+
+        const goalLabel = document.createElement('label');
+        goalLabel.className = 'loop-field-label';
+        goalLabel.textContent = 'Goal';
+        dialog.appendChild(goalLabel);
+
+        const goalTa = document.createElement('textarea');
+        goalTa.className = 'deep-research-question';
+        goalTa.rows = 3;
+        goalTa.placeholder = 'e.g. Add a --dry-run flag to the export command, with tests.';
+        goalTa.value = initialGoal || '';
+        dialog.appendChild(goalTa);
+
+        const critLabel = document.createElement('label');
+        critLabel.className = 'loop-field-label';
+        critLabel.innerHTML = 'Acceptance criteria <span class="loop-optional">(optional)</span>';
+        dialog.appendChild(critLabel);
+
+        const critTa = document.createElement('textarea');
+        critTa.className = 'deep-research-question';
+        critTa.rows = 2;
+        critTa.placeholder = 'How the Evaluator should judge done — commands, behaviors, checks.';
+        dialog.appendChild(critTa);
+
+        const maxLabel = document.createElement('label');
+        maxLabel.className = 'loop-field-label';
+        maxLabel.textContent = 'Max iterations';
+        dialog.appendChild(maxLabel);
+
+        const maxInput = document.createElement('input');
+        maxInput.type = 'number';
+        maxInput.className = 'loop-max-input';
+        maxInput.min = '1';
+        maxInput.max = '50';
+        maxInput.value = '10';
+        dialog.appendChild(maxInput);
+
+        const btnRow = document.createElement('div');
+        btnRow.className = 'rewind-dialog-buttons';
+
+        const cancelBtn = document.createElement('button');
+        cancelBtn.className = 'rewind-dialog-cancel';
+        cancelBtn.textContent = 'Cancel';
+
+        const startBtn = document.createElement('button');
+        startBtn.className = 'rewind-dialog-confirm';
+        startBtn.textContent = 'Start loop';
+
+        btnRow.appendChild(cancelBtn);
+        btnRow.appendChild(startBtn);
+        dialog.appendChild(btnRow);
+        overlay.appendChild(dialog);
+        document.body.appendChild(overlay);
+
+        let settled = false;
+        const close = (val) => {
+            if (settled) return;
+            settled = true;
+            document.removeEventListener('keydown', onKey);
+            overlay.remove();
+            resolve(val);
+        };
+        const submit = () => {
+            const goal = goalTa.value.trim();
+            if (!goal) { goalTa.focus(); return; }
+            const crit = critTa.value.trim();
+            const fullGoal = crit ? `${goal}\n\n## Acceptance criteria\n${crit}` : goal;
+            let cap = Math.round(Number(maxInput.value));
+            if (!Number.isFinite(cap)) cap = 10;
+            cap = Math.min(50, Math.max(1, cap));
+            close({ goal: fullGoal, maxIterations: cap });
+        };
+
+        cancelBtn.addEventListener('click', () => close(null));
+        startBtn.addEventListener('click', submit);
+        overlay.addEventListener('click', (e) => { if (e.target === overlay) close(null); });
+        // Cmd/Ctrl+Enter submits from either textarea (Enter alone inserts a newline).
+        const onGoalKey = (e) => {
+            if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); submit(); }
+        };
+        goalTa.addEventListener('keydown', onGoalKey);
+        critTa.addEventListener('keydown', onGoalKey);
+        const onKey = (e) => { if (e.key === 'Escape') close(null); };
+        document.addEventListener('keydown', onKey);
+
+        goalTa.focus();
+        goalTa.setSelectionRange(goalTa.value.length, goalTa.value.length);
+    });
+}
+
+// Entry point wired to #loop-mode-btn. Opens the dialog, then invokes
+// loop_start and — ONLY after the ack resolves — seeds the optimistic running
+// card (matching the web ordering, so a refused start, e.g. a loop already
+// running on this arc, throws before any seed and cannot leave a ghost card).
+async function triggerLoopMode(btn) {
+    if (!invoke) { showToast('Athen is still starting up.', 'error'); return; }
+    if (!activeArcId) { showToast('Start a conversation first, then run a loop in it.', 'error'); return; }
+
+    const composerText = inputEl ? inputEl.value.trim() : '';
+    const picked = await showLoopModeDialog(composerText);
+    if (!picked) return;
+    const { goal, maxIterations } = picked;
+
+    // If we took the goal seed from the composer, clear it — it's now the loop's
+    // goal, not a chat message to send.
+    if (composerText && inputEl && inputEl.value.trim() === composerText) {
+        inputEl.value = '';
+    }
+
+    const arcId = activeArcId;
+    await withButtonPending(btn, async () => {
+        const res = await invoke('loop_start', { arcId, goal, maxIterations });
+        const ack = res || {};
+        const prev = loopModeRuns.get(arcId);
+        // A live SSE/event tick may have beaten the ack — just fold in the loop
+        // root rather than clobbering richer progress data.
+        if (prev && (prev.progress || prev.done)) {
+            loopModeRuns.set(arcId, { ...prev, goal, loopRoot: ack.loop_root || prev.loopRoot || null });
+        } else {
+            loopModeRuns.set(arcId, {
+                goal,
+                progress: {
+                    iteration: 0,
+                    max_iterations: Number(ack.max_iterations || maxIterations),
+                    phase: 'lead',
+                    detail: 'Starting…',
+                    last_verdict: null,
+                },
+                done: null,
+                loopRoot: ack.loop_root || null,
+            });
+        }
+        renderLoopInline(arcId);
+    }, { errorPrefix: 'Loop Mode failed: ' });
+}
+
+// ── In-thread progress + result rendering ──
+// Mirrors renderDeepResearchInline: the card renders only for the arc currently
+// in view; a background loop on another arc updates its state silently and shows
+// when that arc is opened.
+
+function renderLoopInline(arcId) {
+    if (!messagesEl) return;
+    removeLoopInline();
+    const id = String(arcId || '');
+    if (!id || id !== String(activeArcId || '')) return;
+    const run = loopModeRuns.get(id);
+    if (!run) return;
+
+    const welcome = messagesEl.querySelector('.welcome-message');
+    if (welcome) welcome.remove();
+
+    const wasPinned = isScrollPinned(messagesEl.parentElement);
+    const card = run.done
+        ? buildLoopResultCard(id, run)
+        : buildLoopProgressCard(id, run);
+    card.id = 'loop-mode-inline';
+    card.dataset.arc = id;
+    messagesEl.appendChild(card);
+    scrollChatIfPinned(messagesEl.parentElement, 'auto', wasPinned);
+}
+
+function renderLoopProgress(p) {
+    const id = String((p && p.arc_id) || activeArcId || '');
+    if (!id) return;
+    const prev = loopModeRuns.get(id) || {};
+    loopModeRuns.set(id, {
+        goal: prev.goal || null,
+        progress: {
+            iteration: Number(p.iteration || 0),
+            max_iterations: Number(p.max_iterations || 0),
+            phase: String(p.phase || ''),
+            detail: String(p.detail || ''),
+            last_verdict: p.last_verdict || null,
+        },
+        done: null,
+        loopRoot: prev.loopRoot || null,
+    });
+    renderLoopInline(id);
+}
+
+function renderLoopDone(p) {
+    const id = String((p && p.arc_id) || activeArcId || '');
+    if (!id) return;
+    const prev = loopModeRuns.get(id) || {};
+    // Every field except arc_id+stop is optional (the ERROR/PANIC payload is
+    // { arc_id, stop:"error" } only) — read defensively.
+    loopModeRuns.set(id, {
+        goal: prev.goal || null,
+        progress: null,
+        done: {
+            stop: String((p && p.stop) || 'stopped'),
+            iterations_run: (p && p.iterations_run != null) ? Number(p.iterations_run) : null,
+            max_iterations: (p && p.max_iterations != null) ? Number(p.max_iterations) : null,
+            last_verdict: (p && p.last_verdict) || null,
+            verdict_source_disagreement: !!(p && p.verdict_source_disagreement),
+        },
+        loopRoot: prev.loopRoot || null,
+    });
+    renderLoopInline(id);
+}
+
+// Shared mailbox row: GOAL/PLAN/REPORT/VERDICT buttons that open the loop file
+// in the Inspector. A not-yet-written file surfaces as a friendly info toast,
+// not a raw error (matches the web card).
+function buildLoopMailboxRow(arcId) {
+    const row = document.createElement('div');
+    row.className = 'loop-mailbox';
+    row.setAttribute('role', 'group');
+    row.setAttribute('aria-label', 'Loop mailbox');
+    for (const file of LOOP_MAILBOX_FILES) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'loop-mailbox-btn';
+        btn.textContent = file.replace(/\.md$/, '');
+        btn.addEventListener('click', () => {
+            if (!invoke) { showToast('Athen is still starting up.', 'error'); return; }
+            if (!arcId) { showToast('No arc to read the loop file from.', 'error'); return; }
+            withButtonPending(btn, async () => {
+                let md;
+                try {
+                    md = await invoke('get_loop_file', { arcId, file });
+                } catch (err) {
+                    const msg = errText(err);
+                    if (/not found|not written|no such file|does not exist/i.test(msg)) {
+                        showToast(`${file} hasn't been written yet.`, '');
+                        return;
+                    }
+                    throw err;
+                }
+                const bodyEl = document.createElement('div');
+                bodyEl.className = 'inspector-paper tool-body-prose';
+                bodyEl.innerHTML = renderMarkdown(sanitizeWebContent(String(md || '')));
+                openInspectorPanel(file, bodyEl);
+            }, { errorPrefix: 'Could not open the file: ' });
+        });
+        row.appendChild(btn);
+    }
+    return row;
+}
+
+function buildLoopProgressCard(arcId, run) {
+    const pr = run.progress || {};
+    const card = document.createElement('div');
+    card.className = 'loop-thread-card running';
+
+    const head = document.createElement('div');
+    head.className = 'loop-thread-head';
+    const dot = document.createElement('span');
+    dot.className = 'loop-live-dot';
+    dot.setAttribute('aria-hidden', 'true');
+    head.appendChild(dot);
+    const label = document.createElement('span');
+    label.className = 'loop-thread-label';
+    label.textContent = 'Loop Mode';
+    head.appendChild(label);
+    const tag = document.createElement('span');
+    tag.className = 'loop-thread-tag';
+    tag.textContent = `${Number(pr.iteration || 0)} / ${Number(pr.max_iterations || 0)}`;
+    head.appendChild(tag);
+    card.appendChild(head);
+
+    const phase = String(pr.phase || '');
+    let role;
+    if (phase === 'lead') role = 'Lead working…';
+    else if (phase === 'evaluator') role = 'Evaluator verifying…';
+    else role = 'Wrapping up…';
+    const roleEl = document.createElement('div');
+    roleEl.className = 'loop-thread-role';
+    roleEl.textContent = role;
+    card.appendChild(roleEl);
+
+    if (pr.detail) {
+        const detailEl = document.createElement('div');
+        detailEl.className = 'loop-thread-detail';
+        detailEl.textContent = pr.detail;
+        card.appendChild(detailEl);
+    }
+    if (pr.last_verdict) {
+        const vEl = document.createElement('div');
+        vEl.className = 'loop-thread-stat';
+        vEl.textContent = `Last verdict: ${pr.last_verdict}`;
+        card.appendChild(vEl);
+    }
+
+    if (run.loopRoot) card.appendChild(buildLoopMailboxRow(arcId));
+
+    const actions = document.createElement('div');
+    actions.className = 'loop-thread-actions';
+    const stopBtn = document.createElement('button');
+    stopBtn.type = 'button';
+    stopBtn.className = 'loop-stop';
+    stopBtn.textContent = 'Stop loop';
+    stopBtn.addEventListener('click', () => {
+        if (!invoke) { showToast('Athen is still starting up.', 'error'); return; }
+        withButtonPending(stopBtn, async () => {
+            const res = await invoke('loop_stop', { arcId });
+            showToast(
+                (res && res.stopped)
+                    ? 'Stop requested — the loop will halt at the next role boundary.'
+                    : 'No running loop to stop.',
+                '',
+            );
+        }, { errorPrefix: 'Could not stop the loop: ' });
+    });
+    actions.appendChild(stopBtn);
+    const hint = document.createElement('span');
+    hint.className = 'loop-stop-hint';
+    hint.textContent = 'Stops at the next role boundary, not instantly.';
+    actions.appendChild(hint);
+    card.appendChild(actions);
+
+    return card;
+}
+
+function buildLoopResultCard(arcId, run) {
+    const done = run.done || {};
+    const stop = String(done.stop || 'stopped');
+    const term = LOOP_TERMINAL[stop] || { label: stop, tone: 'stopped' };
+
+    const card = document.createElement('div');
+    card.className = `loop-thread-card done ${term.tone}`;
+
+    const head = document.createElement('div');
+    head.className = 'loop-thread-head';
+    const icon = document.createElement('span');
+    icon.className = 'loop-thread-icon done';
+    icon.setAttribute('aria-hidden', 'true');
+    icon.innerHTML = (term.tone === 'blocked' || term.tone === 'error') ? ICON_ALERT : ICON_DR_STEP_CHECK;
+    head.appendChild(icon);
+    const label = document.createElement('span');
+    label.className = 'loop-thread-label';
+    label.textContent = `Loop Mode — ${term.label}`;
+    head.appendChild(label);
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.className = 'loop-thread-close';
+    closeBtn.setAttribute('aria-label', 'Dismiss');
+    closeBtn.innerHTML = ICON_X;
+    closeBtn.addEventListener('click', () => {
+        loopModeRuns.delete(String(arcId || ''));
+        removeLoopInline();
+    });
+    head.appendChild(closeBtn);
+    card.appendChild(head);
+
+    if (done.iterations_run != null) {
+        const iters = document.createElement('div');
+        iters.className = 'loop-thread-stat';
+        iters.textContent = (done.max_iterations != null)
+            ? `${done.iterations_run} / ${done.max_iterations} iterations`
+            : `${done.iterations_run} iterations`;
+        card.appendChild(iters);
+    }
+    if (done.last_verdict) {
+        const vEl = document.createElement('div');
+        vEl.className = 'loop-thread-stat';
+        vEl.textContent = `Final verdict: ${done.last_verdict}`;
+        card.appendChild(vEl);
+    }
+    if (done.verdict_source_disagreement) {
+        const note = document.createElement('div');
+        note.className = 'loop-thread-detail';
+        note.textContent =
+            "Note: the Evaluator's structured verdict disagreed with loop/VERDICT.md; "
+            + 'the file was used as truth.';
+        card.appendChild(note);
+    }
+
+    if (run.loopRoot) card.appendChild(buildLoopMailboxRow(arcId));
+
+    return card;
+}
+
+// Re-hydrate the in-thread card from persisted status on boot and arc-switch,
+// so a loop started before an app restart / arc change stays visible. Never
+// clobbers a fresher in-memory run (an optimistic seed or a live event tick).
+async function hydrateLoop(arcId) {
+    if (!invoke) return;
+    const id = String(arcId || '');
+    if (!id) return;
+    let st;
+    try {
+        st = await invoke('loop_status', { arcId: id });
+    } catch (_) {
+        return; // status is best-effort; a failure leaves the card as-is.
+    }
+    const state = st && st.state;
+    if (!state) return; // no loop has ever run on this arc.
+    const prev = loopModeRuns.get(id);
+    if (prev && (prev.progress || prev.done)) { renderLoopInline(id); return; }
+    if (st.running || state === 'running') {
+        loopModeRuns.set(id, {
+            goal: (prev && prev.goal) || null,
+            progress: {
+                iteration: Number(st.iteration || 0),
+                max_iterations: Number(st.max_iterations || 0),
+                // loop_status carries no phase; default to 'lead' until the next
+                // loop-progress tick corrects it (self-heals, cosmetic).
+                phase: 'lead',
+                detail: '',
+                last_verdict: null,
+            },
+            done: null,
+            loopRoot: st.loop_root || (prev && prev.loopRoot) || null,
+        });
+    } else {
+        loopModeRuns.set(id, {
+            goal: (prev && prev.goal) || null,
+            progress: null,
+            done: {
+                stop: String(state),
+                iterations_run: (st.iteration != null) ? Number(st.iteration) : null,
+                max_iterations: (st.max_iterations != null) ? Number(st.max_iterations) : null,
+                last_verdict: null,
+                verdict_source_disagreement: false,
+            },
+            loopRoot: st.loop_root || (prev && prev.loopRoot) || null,
+        });
+    }
+    renderLoopInline(id);
 }
 
 function showRewindDialog(entryId, newText, cleanupFn) {
@@ -20086,6 +20609,12 @@ function closeGoalModal() {
 const deepResearchBtn = document.getElementById('deep-research-btn');
 if (deepResearchBtn) {
     deepResearchBtn.addEventListener('click', () => triggerDeepResearch(deepResearchBtn));
+}
+
+// ─── Loop Mode trigger ───
+const loopModeBtn = document.getElementById('loop-mode-btn');
+if (loopModeBtn) {
+    loopModeBtn.addEventListener('click', () => triggerLoopMode(loopModeBtn));
 }
 
 // ─── Composer action menu (three-dot) ───

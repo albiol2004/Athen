@@ -10989,6 +10989,136 @@ pub async fn get_research_paper(
     get_research_paper_core(arc_id, &state).await
 }
 
+/// The fixed set of Loop Mode mailbox files a client may read. The requested
+/// name is matched against this allow-list before it ever reaches the
+/// filesystem, so a caller can never smuggle a path (`..`, an absolute path, an
+/// arbitrary sibling file) through the `file` argument — there is no
+/// caller-supplied path surface at all, only a choice among these constants.
+const LOOP_MAILBOX_FILES: [&str; 6] = [
+    "GOAL.md",
+    "PLAN.md",
+    "REPORT.md",
+    "VERDICT.md",
+    "STATE.md",
+    "LOG.md",
+];
+
+/// Resolve a client-requested mailbox `file` name to its canonical allow-listed
+/// filename, or `None` if it is not one of [`LOOP_MAILBOX_FILES`]. Case-sensitive
+/// exact match — the mailbox files are fixed-case constants. Kept as a small pure
+/// helper so the allow-list can be unit-tested without an `AppState`/DB.
+fn resolve_loop_mailbox_file(file: &str) -> Option<&'static str> {
+    LOOP_MAILBOX_FILES
+        .into_iter()
+        .find(|allowed| *allowed == file)
+}
+
+/// Read the Markdown content of one of an arc's Loop Mode mailbox files
+/// (`GOAL.md`/`PLAN.md`/`REPORT.md`/`VERDICT.md`/`STATE.md`/`LOG.md`). Mirrors
+/// [`get_research_paper_core`]: read-by-arc-id, no caller-supplied path.
+///
+/// The loop root comes from the arc's trusted `loop_root` column (set server-side
+/// by `run_loop_for_arc`, never client input); the file name is matched against a
+/// fixed allow-list ([`resolve_loop_mailbox_file`]) so there is no path-traversal
+/// surface — but we still canonicalize and refuse anything that escapes the loop
+/// root as defense in depth.
+pub(crate) async fn get_loop_file_core(
+    arc_id: String,
+    file: String,
+    state: &AppState,
+) -> std::result::Result<String, String> {
+    let Some(ref arc_store) = state.arc_store else {
+        return Err("Arc store not available".to_string());
+    };
+    let arc = arc_store
+        .get_arc(&arc_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Arc not found: {arc_id}"))?;
+
+    // The requested name must be one of the fixed mailbox files. Reject anything
+    // else before touching the filesystem — no arbitrary path ever gets built.
+    let name = resolve_loop_mailbox_file(&file)
+        .ok_or_else(|| format!("Not a Loop Mode mailbox file: {file}"))?;
+
+    let loop_root = arc
+        .loop_root
+        .ok_or_else(|| "No Loop Mode run has been started on this conversation.".to_string())?;
+    let loop_root = std::path::PathBuf::from(loop_root);
+    let resolved = crate::loop_mode::loop_dir(&loop_root).join(name);
+
+    // Defense in depth: the resolved file must stay under the loop root. Even
+    // though `name` is allow-listed and `loop_root` is trusted, a symlink inside
+    // the mailbox dir could otherwise point outside it.
+    let root_canon = loop_root
+        .canonicalize()
+        .map_err(|e| format!("Loop root unavailable: {e}"))?;
+    let file_canon = resolved
+        .canonicalize()
+        .map_err(|e| format!("Loop Mode file not found: {e}"))?;
+    if !file_canon.starts_with(&root_canon) {
+        return Err("Refusing to read a file outside the loop root.".to_string());
+    }
+
+    tokio::fs::read_to_string(&resolved)
+        .await
+        .map_err(|e| format!("Could not read {name}: {e}"))
+}
+
+/// Return the Markdown content of one of an arc's Loop Mode mailbox files (see
+/// [`get_loop_file_core`]).
+#[tauri::command]
+pub async fn get_loop_file(
+    arc_id: String,
+    file: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<String, String> {
+    get_loop_file_core(arc_id, file, &state).await
+}
+
+#[cfg(test)]
+mod loop_mailbox_tests {
+    use super::{resolve_loop_mailbox_file, LOOP_MAILBOX_FILES};
+
+    #[test]
+    fn allow_list_accepts_every_mailbox_file() {
+        // Each of the six shipped mailbox files must resolve to itself.
+        for name in LOOP_MAILBOX_FILES {
+            assert_eq!(
+                resolve_loop_mailbox_file(name),
+                Some(name),
+                "expected {name} to be allow-listed"
+            );
+        }
+        // Exactly the documented six — no more, no fewer.
+        assert_eq!(LOOP_MAILBOX_FILES.len(), 6);
+    }
+
+    #[test]
+    fn allow_list_rejects_traversal_and_arbitrary_names() {
+        // Path-traversal attempts and any name outside the fixed set must be
+        // rejected before a filesystem path is ever built.
+        for bad in [
+            "../../etc/passwd",
+            "..",
+            ".",
+            "/etc/passwd",
+            "loop/GOAL.md",
+            "GOAL.md/../../secret",
+            "secret.txt",
+            "goal.md",   // case-sensitive: lowercase is not allow-listed
+            "GOAL",      // missing extension
+            "",          // empty
+        ] {
+            assert_eq!(
+                resolve_loop_mailbox_file(bad),
+                None,
+                "expected {bad:?} to be rejected by the mailbox allow-list"
+            );
+        }
+    }
+}
+
 /// One node in the Code-Mode agents tree: a main arc or one of its
 /// delegation sub-agents, merged with whatever live registry state exists.
 /// Serialized verbatim (snake_case) to both the Tauri command and the HTTP

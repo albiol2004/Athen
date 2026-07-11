@@ -11,6 +11,8 @@ import type {
   DeepResearchDoneEvent,
   DeepResearchProgressEvent,
   GrantRequest,
+  LoopDoneEvent,
+  LoopProgressEvent,
   NotificationInfo,
   ProgressEvent,
   StreamEvent,
@@ -33,6 +35,10 @@ export interface EventHandlers {
   onDeepResearchProgress?(e: DeepResearchProgressEvent): void;
   /** Deep Research finished for some arc (filter by `arc_id` in the handler). */
   onDeepResearchDone?(e: DeepResearchDoneEvent): void;
+  /** Loop Mode phase tick for some arc (filter by `arc_id` in the handler). */
+  onLoopProgress?(e: LoopProgressEvent): void;
+  /** Loop Mode finished for some arc (filter by `arc_id` in the handler). */
+  onLoopDone?(e: LoopDoneEvent): void;
   /** Bus overflow — some events were dropped; refetch state via REST. */
   onLagged?(dropped: number): void;
 }
@@ -64,6 +70,8 @@ export function connectEvents(client: AthenClient, h: EventHandlers): () => void
   on('notification', h.onNotification);
   on('deep-research-progress', h.onDeepResearchProgress);
   on('deep-research-done', h.onDeepResearchDone);
+  on('loop-progress', h.onLoopProgress);
+  on('loop-done', h.onLoopDone);
   on('lagged', h.onLagged);
   // No payload to parse on these — fire directly.
   if (h.onArcUpdated) es.addEventListener('arc-updated', () => h.onArcUpdated?.());

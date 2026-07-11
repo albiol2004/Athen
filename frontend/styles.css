@@ -2014,6 +2014,229 @@ header h1 {
     cursor: wait;
 }
 
+/* ─── Loop Mode ─── */
+.loop-thread-card {
+    margin: 6px 0;
+    padding: 14px 16px;
+    border-radius: var(--r-md);
+    background: var(--glass-bg, rgba(19, 18, 18, 0.50));
+    -webkit-backdrop-filter: var(--glass-blur);
+    backdrop-filter: var(--glass-blur);
+    border: 1px solid var(--glass-border, var(--border));
+    box-shadow: var(--shadow-card);
+    animation: dialog-pop 200ms var(--ease);
+}
+.loop-thread-card.running {
+    border-color: color-mix(in srgb, var(--brand, #C25868) 40%, var(--border));
+}
+.loop-thread-card.done.ship {
+    border-color: color-mix(in srgb, #6fc89a 45%, var(--border));
+}
+.loop-thread-card.done.blocked,
+.loop-thread-card.done.error {
+    border-color: color-mix(in srgb, var(--danger, #e0584a) 45%, var(--border));
+}
+.loop-thread-card.done.cap {
+    border-color: color-mix(in srgb, #d6b45a 45%, var(--border));
+}
+.loop-thread-card.done.stopped {
+    border-color: var(--border-strong);
+}
+
+.loop-thread-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.loop-thread-icon.done {
+    color: #fff;
+    background: var(--brand-grad);
+    border-radius: 999px;
+    width: 18px;
+    height: 18px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.loop-thread-card.done.blocked .loop-thread-icon.done,
+.loop-thread-card.done.error .loop-thread-icon.done {
+    background: var(--danger, #e0584a);
+}
+.loop-thread-card.done.cap .loop-thread-icon.done {
+    background: #d6b45a;
+    color: #241d07;
+}
+.loop-thread-card.done.stopped .loop-thread-icon.done {
+    background: var(--text-3);
+    color: var(--surface-1);
+}
+.loop-thread-card.done.ship .loop-thread-icon.done {
+    background: var(--brand-grad);
+}
+.loop-thread-label {
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    color: var(--text-2);
+    flex: 1 1 auto;
+    min-width: 0;
+}
+.loop-thread-card.done .loop-thread-label {
+    text-transform: none;
+    letter-spacing: 0;
+    font-size: 13px;
+    color: var(--text);
+}
+/* Pulsing "live" dot — the working affordance. */
+.loop-live-dot {
+    flex: 0 0 auto;
+    width: 7px;
+    height: 7px;
+    border-radius: 999px;
+    background: var(--brand, #C25868);
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--brand, #C25868) 60%, transparent);
+    animation: loop-pulse 1.6s ease-in-out infinite;
+}
+@keyframes loop-pulse {
+    0%   { box-shadow: 0 0 0 0 color-mix(in srgb, var(--brand, #C25868) 55%, transparent); opacity: 1; }
+    70%  { box-shadow: 0 0 0 6px color-mix(in srgb, var(--brand, #C25868) 0%, transparent); opacity: 0.65; }
+    100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--brand, #C25868) 0%, transparent); opacity: 1; }
+}
+.loop-thread-tag {
+    flex: 0 0 auto;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-2);
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 2px 9px;
+}
+.loop-thread-close {
+    flex: 0 0 auto;
+    background: transparent;
+    border: none;
+    color: var(--text-3);
+    cursor: pointer;
+    padding: 2px;
+    display: flex;
+    align-items: center;
+    border-radius: 6px;
+    transition: background 120ms, color 120ms;
+}
+.loop-thread-close:hover {
+    background: var(--surface-3);
+    color: var(--text);
+}
+
+.loop-thread-role {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+    margin-top: 8px;
+}
+.loop-thread-detail {
+    font-size: 12px;
+    color: var(--text-2);
+    margin-top: 4px;
+    line-height: 1.4;
+    word-break: break-word;
+}
+.loop-thread-stat {
+    font-size: 12px;
+    color: var(--text-2);
+    margin-top: 6px;
+}
+
+.loop-mailbox {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 12px;
+}
+.loop-mailbox-btn {
+    font-size: 12px;
+    padding: 4px 10px;
+    border-radius: var(--r-sm);
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    color: var(--text-2);
+    cursor: pointer;
+    transition: color 120ms, border-color 120ms;
+}
+.loop-mailbox-btn:hover:not(:disabled) {
+    color: var(--brand);
+    border-color: color-mix(in srgb, var(--brand) 35%, var(--border));
+}
+.loop-mailbox-btn:disabled {
+    opacity: 0.6;
+    cursor: wait;
+}
+
+.loop-thread-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-top: 12px;
+}
+.loop-stop {
+    font-size: 12px;
+    font-weight: 600;
+    padding: 6px 16px;
+    border-radius: var(--r-sm);
+    background: transparent;
+    border: 1px solid color-mix(in srgb, var(--danger, #e0584a) 45%, var(--border));
+    color: var(--danger, #e0584a);
+    cursor: pointer;
+    transition: background 120ms;
+}
+.loop-stop:hover {
+    background: color-mix(in srgb, var(--danger, #e0584a) 12%, transparent);
+}
+.loop-stop:disabled {
+    opacity: 0.6;
+    cursor: wait;
+}
+.loop-stop-hint {
+    font-size: 11px;
+    color: var(--text-3);
+}
+
+/* Start dialog fields (rides .rewind-dialog + .deep-research-question) */
+.loop-field-label {
+    display: block;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-2);
+    margin: 0 0 6px;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+}
+.loop-optional {
+    font-weight: 400;
+    text-transform: none;
+    letter-spacing: 0;
+    color: var(--text-3);
+}
+.loop-max-input {
+    width: 90px;
+    box-sizing: border-box;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    color: var(--text);
+    font: inherit;
+    font-size: 13px;
+    padding: 8px 10px;
+    margin-bottom: 18px;
+}
+.loop-max-input:focus {
+    outline: none;
+    border-color: var(--border-bright, var(--brand));
+}
+
 /* Research paper reader modal (rides .rewind-dialog-overlay) */
 .paper-modal {
     background: var(--surface-1);
@@ -3409,7 +3632,8 @@ footer {
 }
 
 #composer-attach-btn,
-#deep-research-btn {
+#deep-research-btn,
+#loop-mode-btn {
     background: transparent;
     border: none;
     color: var(--text-soft, #888);
@@ -3424,7 +3648,8 @@ footer {
     transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
 }
 #composer-attach-btn:hover,
-#deep-research-btn:hover {
+#deep-research-btn:hover,
+#loop-mode-btn:hover {
     background: var(--surface-3, rgba(255,255,255,0.04));
     color: var(--text);
 }

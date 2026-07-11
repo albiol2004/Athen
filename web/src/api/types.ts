@@ -202,6 +202,79 @@ export interface DeepResearchDoneEvent {
   extended: boolean;
 }
 
+// ---- Loop Mode (docs/LOOP_MODE.md) ----
+
+/**
+ * Wire state string for a Loop Mode run (arc `loop_state` column /
+ * `loop-done.stop`). `running` = in flight; the rest are terminal reasons.
+ * `error` is emitted only on the ERROR/PANIC path. `null` (never-run) is
+ * modelled as the absence of a run, so it is not part of this union.
+ */
+export type LoopState =
+  | 'running'
+  | 'ship'
+  | 'blocked'
+  | 'blocked_double_iterate'
+  | 'cap_reached'
+  | 'stopped'
+  | 'error';
+
+/** Verdict on an iteration (Evaluator ruling), carried by `loop-progress`. */
+export type LoopVerdict = 'SHIP' | 'ITERATE' | 'BLOCKED';
+
+/**
+ * `POST /api/arcs/{id}/loop` response (`LoopStartResult`, snake_case verbatim —
+ * see commands::LoopStartResult). `started` is always `true` on the Ok path.
+ */
+export interface LoopStartResult {
+  arc_id: string;
+  started: boolean;
+  /** Resolved loop root (parent of the `loop/` mailbox dir). */
+  loop_root: string;
+  max_iterations: number;
+}
+
+/**
+ * `GET /api/arcs/{id}/loop` response (`LoopStatusResult`). `state` is `null`
+ * when no loop has ever run on the arc; `running` distinguishes a live run from
+ * a persisted terminal state after a restart. Drives boot re-hydration of the
+ * in-thread card.
+ */
+export interface LoopStatusResult {
+  arc_id: string;
+  state: LoopState | null;
+  iteration: number | null;
+  max_iterations: number | null;
+  loop_root: string | null;
+  running: boolean;
+}
+
+/** `loop-progress` SSE payload (emitted from state.rs). */
+export interface LoopProgressEvent {
+  arc_id: string;
+  iteration: number;
+  max_iterations: number;
+  /** Coarse phase within the iteration. */
+  phase: 'lead' | 'evaluator' | 'done';
+  detail: string;
+  last_verdict: LoopVerdict | null;
+}
+
+/**
+ * `loop-done` SSE payload. Emitted in two shapes: the NORMAL path carries every
+ * field; the ERROR/PANIC path (commands::loop_start_core) carries ONLY `arc_id`
+ * and `stop:"error"`. Every field except `arc_id` and `stop` is therefore
+ * optional and must be treated as such by the UI (the most likely crash trap).
+ */
+export interface LoopDoneEvent {
+  arc_id: string;
+  stop: LoopState;
+  iterations_run?: number;
+  max_iterations?: number;
+  last_verdict?: LoopVerdict | null;
+  verdict_source_disagreement?: boolean;
+}
+
 // ---- Code Mode (docs/CODE_MODE.md) ----
 
 /** One working-tree dirty file from `git status --porcelain=v2`. */

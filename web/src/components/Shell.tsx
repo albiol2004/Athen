@@ -8,6 +8,7 @@ import type {
   DeepResearchDoneEvent,
   DeepResearchMode,
   DeepResearchProgressEvent,
+  LoopStatusResult,
   NotificationInfo,
   Project,
 } from '../api/types';
@@ -21,6 +22,7 @@ import { CodeModePanel } from './CodeModePanel';
 import { Chat, type ChatCallbacks, type OutgoingFile, type OutgoingImage } from './Chat';
 import { DeepResearchModal } from './DeepResearch';
 import { InspectorContext, InspectorPanel, type InspectorContent } from './Inspector';
+import { LoopModeModal, type LoopRun } from './LoopMode';
 import { GoalBanner, type GoalState, type PlanState } from './PlanGoal';
 import { ProjectPage } from './ProjectPage';
 import { Sidebar } from './Sidebar';
@@ -73,6 +75,13 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
   const [drQuestion, setDrQuestion] = useState<string | null>(null);
   const [drRuns, setDrRuns] = useState<Map<string, DrRun>>(new Map());
   const [drBusy, setDrBusy] = useState(false);
+  // Loop Mode (docs/LOOP_MODE.md): modal open flag, per-arc run state (keyed by
+  // arc_id, same rationale as drRuns), and a POST-in-flight flag. Unlike Deep
+  // Research, Loop Mode re-hydrates from `loopStatus` on load/arc-switch so a
+  // running loop survives a refresh.
+  const [loopOpen, setLoopOpen] = useState(false);
+  const [loopRuns, setLoopRuns] = useState<Map<string, LoopRun>>(new Map());
+  const [loopBusy, setLoopBusy] = useState(false);
 
   const activeArcRef = useRef<string | null>(null);
   activeArcRef.current = activeArc;
@@ -119,6 +128,60 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
     }
   }, [client]);
 
+  // ---- loop mode: re-hydrate the in-thread card from persisted status ----
+  // Deep Research keeps run state in memory only; Loop Mode instead rebuilds a
+  // running or terminal card from `loopStatus` on load and on arc-switch, so a
+  // loop started before a page refresh / re-login stays visible. Never clobbers
+  // a fresher in-memory run (an optimistic seed or a live SSE tick).
+  const hydrateLoop = useCallback(
+    async (arcId: string) => {
+      let st: LoopStatusResult;
+      try {
+        st = await client.loopStatus(arcId);
+      } catch {
+        return; // status is best-effort; a failure just leaves the card as-is.
+      }
+      const state = st.state;
+      if (!state) return; // no loop has ever run on this arc.
+      setLoopRuns((m) => {
+        const prev = m.get(arcId);
+        // Don't overwrite a live run we already track for this arc — SSE and the
+        // optimistic seed carry richer, fresher data (detail, phase).
+        if (prev && (prev.progress || prev.done)) return m;
+        const next = new Map(m);
+        if (st.running || state === 'running') {
+          next.set(arcId, {
+            goal: prev?.goal ?? null,
+            progress: {
+              arc_id: arcId,
+              iteration: st.iteration ?? 0,
+              max_iterations: st.max_iterations ?? 0,
+              phase: 'lead',
+              detail: '',
+              last_verdict: null,
+            },
+            done: null,
+            loopRoot: st.loop_root ?? prev?.loopRoot ?? null,
+          });
+        } else {
+          next.set(arcId, {
+            goal: prev?.goal ?? null,
+            progress: null,
+            done: {
+              arc_id: arcId,
+              stop: state,
+              iterations_run: st.iteration ?? undefined,
+              max_iterations: st.max_iterations ?? undefined,
+            },
+            loopRoot: st.loop_root ?? prev?.loopRoot ?? null,
+          });
+        }
+        return next;
+      });
+    },
+    [client],
+  );
+
   // ---- boot ----
   useEffect(() => {
     let gone = false;
@@ -132,6 +195,9 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
           const entries = await client.arcEntries(cur.arc_id);
           if (gone) return;
           dispatch({ type: 'reset', entries });
+          // Re-hydrate a Loop Mode card if one is running / finished on this arc
+          // (survives a page refresh or re-login).
+          void hydrateLoop(cur.arc_id);
         }
         const [grants, notifs, projs] = await Promise.all([
           client.pendingGrants(),
@@ -153,7 +219,7 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
     return () => {
       gone = true;
     };
-  }, [client, bail, refreshGoalPlan]);
+  }, [client, bail, refreshGoalPlan, hydrateLoop]);
 
   // ---- live events ----
   useEffect(
@@ -228,6 +294,34 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
           });
           void refreshArcs();
         },
+        onLoopProgress: (e) => {
+          // Track every arc's loop; the card only renders for the active arc.
+          setLoopRuns((m) => {
+            const next = new Map(m);
+            const prev = next.get(e.arc_id);
+            next.set(e.arc_id, {
+              goal: prev?.goal ?? null,
+              progress: e,
+              done: null,
+              loopRoot: prev?.loopRoot ?? null,
+            });
+            return next;
+          });
+        },
+        onLoopDone: (e) => {
+          setLoopRuns((m) => {
+            const next = new Map(m);
+            const prev = next.get(e.arc_id);
+            next.set(e.arc_id, {
+              goal: prev?.goal ?? null,
+              progress: null,
+              done: e,
+              loopRoot: prev?.loopRoot ?? null,
+            });
+            return next;
+          });
+          void refreshArcs();
+        },
         onLagged: () => {
           dispatch({ type: 'system', text: 'Event stream lagged — some output may be missing.' });
           const active = activeArcRef.current;
@@ -250,7 +344,9 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
         setActiveArc(id);
         dispatch({ type: 'reset', entries });
         // Deep Research run state is kept per arc (drRuns) so the in-thread
-        // card reappears when switching back — nothing to clear here.
+        // card reappears when switching back — nothing to clear here. Loop Mode
+        // re-hydrates the switched-to arc's card from persisted status.
+        void hydrateLoop(id);
         setUnread((s) => {
           if (!s.has(id)) return s;
           const n = new Set(s);
@@ -264,7 +360,7 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
         if (!bail(e)) dispatch({ type: 'system', text: `Couldn't switch: ${errMsg(e)}` });
       }
     },
-    [client, bail, refreshGoalPlan, refreshArcs],
+    [client, bail, refreshGoalPlan, refreshArcs, hydrateLoop],
   );
 
   const createArc = useCallback(async () => {
@@ -521,6 +617,90 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
     [client, toast, bail, refreshArcs],
   );
 
+  // ---- loop mode ----
+  // The button only opens the modal; the POST happens on submit. An arc must
+  // exist first so the loop's mailbox has a home.
+  const onLoop = useCallback(() => {
+    if (!activeArcRef.current) {
+      toast('Start a conversation first, then run a loop in it.', 'info');
+      return;
+    }
+    setLoopOpen(true);
+  }, [toast]);
+
+  const dismissLoop = useCallback(() => {
+    const arcId = activeArcRef.current;
+    if (!arcId) return;
+    setLoopRuns((m) => {
+      if (!m.has(arcId)) return m;
+      const next = new Map(m);
+      next.delete(arcId);
+      return next;
+    });
+  }, []);
+
+  const stopLoop = useCallback(async () => {
+    const arcId = activeArcRef.current;
+    if (!arcId) return;
+    try {
+      const res = await client.loopStop(arcId);
+      toast(
+        res.stopped
+          ? 'Stop requested — the loop will halt at the next role boundary.'
+          : 'No running loop to stop.',
+        'info',
+      );
+    } catch (e) {
+      if (!bail(e)) toast(errMessage(e), 'error');
+    }
+  }, [client, toast, bail]);
+
+  const runLoop = useCallback(
+    async (goal: string, maxIterations: number) => {
+      const arcId = activeArcRef.current;
+      setLoopOpen(false);
+      if (!arcId) return;
+      setLoopBusy(true);
+      try {
+        // `loopStart` returns an immediate ack (the run is a background task);
+        // progress arrives over SSE. Seed the optimistic running card only after
+        // the ack succeeds, so a refusal (e.g. a loop already running) doesn't
+        // leave a phantom card.
+        const res = await client.loopStart(arcId, goal, maxIterations);
+        setLoopRuns((m) => {
+          const prev = m.get(arcId);
+          if (prev?.progress || prev?.done) {
+            // A live SSE tick already beat the ack — just fold in the loop root.
+            const next = new Map(m);
+            next.set(arcId, { ...prev, goal, loopRoot: res.loop_root });
+            return next;
+          }
+          const next = new Map(m);
+          next.set(arcId, {
+            goal,
+            progress: {
+              arc_id: arcId,
+              iteration: 0,
+              max_iterations: res.max_iterations,
+              phase: 'lead',
+              detail: 'Starting…',
+              last_verdict: null,
+            },
+            done: null,
+            loopRoot: res.loop_root,
+          });
+          return next;
+        });
+        void refreshArcs();
+      } catch (e) {
+        if (!bail(e)) toast(errMessage(e), 'error');
+      } finally {
+        setLoopBusy(false);
+      }
+    },
+    [client, toast, bail, refreshArcs],
+  );
+
   const openSettings = useCallback((tab?: string) => {
     setSettingsTab(tab);
     setSettingsOpen(true);
@@ -542,6 +722,7 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
       onDiscardPlan,
       onOpenSettings: openSettings,
       onDeepResearch,
+      onLoop,
     }),
     [
       onSend,
@@ -553,12 +734,15 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
       onDiscardPlan,
       openSettings,
       onDeepResearch,
+      onLoop,
     ],
   );
 
   const activeMeta = useMemo(() => arcs.find((a) => a.id === activeArc), [arcs, activeArc]);
   // The Deep Research run for the arc currently in view (null if none).
   const activeRun = activeArc ? drRuns.get(activeArc) ?? null : null;
+  // The Loop Mode run for the arc currently in view (null if none).
+  const activeLoop = activeArc ? loopRuns.get(activeArc) ?? null : null;
   const openProjectMeta = useMemo(
     () => projects.find((p) => p.id === openProject) ?? null,
     [projects, openProject],
@@ -764,6 +948,10 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
               cb={cb}
               research={activeRun}
               onDismissResearch={dismissResearch}
+              loopBusy={loopBusy}
+              loop={activeLoop}
+              onStopLoop={() => void stopLoop()}
+              onDismissLoop={dismissLoop}
             />
           </>
         )}
@@ -807,6 +995,12 @@ export function Shell({ client, onLogout }: { client: AthenClient; onLogout: () 
           priorQuestion={activeMeta?.research_question ?? null}
           onStart={(q, depth, mode) => void runDeepResearch(q, depth, mode)}
           onClose={() => setDrQuestion(null)}
+        />
+      )}
+      {loopOpen && (
+        <LoopModeModal
+          onStart={(goal, maxIterations) => void runLoop(goal, maxIterations)}
+          onClose={() => setLoopOpen(false)}
         />
       )}
     </div>

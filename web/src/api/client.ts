@@ -13,6 +13,8 @@ import type {
   GitRepoState,
   GrantDecision,
   GrantRequest,
+  LoopStartResult,
+  LoopStatusResult,
   MemoryInfo,
   NotificationInfo,
   Project,
@@ -185,6 +187,52 @@ export class AthenClient {
    */
   getResearchPaper(arcId: string): Promise<string> {
     return this.req(`/arcs/${encodeURIComponent(arcId)}/research-paper`);
+  }
+
+  // ---- loop mode (docs/LOOP_MODE.md) ----
+  /**
+   * Start a Loop Mode run (Lead→Evaluator) on `arcId`. Resolves with the ack
+   * immediately — the run is a background task; live phase updates arrive over
+   * SSE as `loop-progress` / `loop-done`. `goal` is the mission text (acceptance
+   * criteria are folded into it client-side); `maxIterations` caps the loop.
+   * A refusal (e.g. a loop already running on this arc) comes back as the
+   * standard `{ error }` shape → `ApiError`.
+   */
+  loopStart(arcId: string, goal: string, maxIterations: number): Promise<LoopStartResult> {
+    return this.req(`/arcs/${encodeURIComponent(arcId)}/loop`, {
+      goal,
+      max_iterations: maxIterations,
+    });
+  }
+  /**
+   * Cooperatively request a running loop to stop. Idempotent — a no-op if no
+   * loop is in flight (`stopped:false`). The loop unwinds at the next role
+   * boundary, not instantly.
+   */
+  loopStop(arcId: string): Promise<{ arc_id: string; stopped: boolean }> {
+    return this.req(`/arcs/${encodeURIComponent(arcId)}/loop/stop`, {}, 'POST');
+  }
+  /**
+   * Read an arc's Loop Mode status snapshot (from the persisted `loop_*`
+   * columns + the in-memory run registry). Drives the in-thread card on
+   * page/app load so a running loop survives a refresh. `state` is `null` if no
+   * loop has ever run on the arc.
+   */
+  loopStatus(arcId: string): Promise<LoopStatusResult> {
+    return this.req(`/arcs/${encodeURIComponent(arcId)}/loop`);
+  }
+  /**
+   * Fetch the raw Markdown of one of the arc's Loop Mode mailbox files
+   * (`GOAL.md`/`PLAN.md`/`REPORT.md`/`VERDICT.md`/`STATE.md`/`LOG.md`). The
+   * `name` is matched against a fixed server-side allow-list (no path traversal
+   * surface). A file that has not been written yet returns a "file not found"
+   * `{ error }` → `ApiError` (status 400); callers render that as "not written
+   * yet", not a hard failure.
+   */
+  getLoopFile(arcId: string, name: string): Promise<string> {
+    return this.req(
+      `/arcs/${encodeURIComponent(arcId)}/loop/file/${encodeURIComponent(name)}`,
+    );
   }
 
   // ---- code mode (docs/CODE_MODE.md) ----
