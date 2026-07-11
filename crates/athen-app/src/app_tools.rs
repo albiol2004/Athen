@@ -71,6 +71,43 @@ pub type DeepResearchRunner = std::sync::Arc<
         + Sync,
 >;
 
+/// Outcome of an agent-triggered `start_loop` run. Mirrors [`DeepResearchRun`]:
+/// the runner closure returns this, and the tool handler maps it to a
+/// [`ToolResult`] in-band (no exceptions escape to the model).
+pub enum LoopStartOutcome {
+    /// The loop was accepted and is now running in the background. Carries the
+    /// resolved loop root + the (clamped) iteration budget for the ack.
+    Started {
+        loop_root: String,
+        max_iterations: u32,
+    },
+    /// The start was refused BEFORE any loop began — the sense fence blocked a
+    /// non-direct-chat arc, the Bunker posture denied it, the user declined the
+    /// approval prompt, or a precondition failed. Carries a human-readable
+    /// reason the tool relays to the agent (which must relay it to the user).
+    Refused(String),
+}
+
+/// Injected by the composition root for top-level arcs only. Captures the arc
+/// id + UiBridge; applies the sense fence + per-mode risk gate, then starts a
+/// Loop Mode run via `loop_start_core`. `None` for sub-agent / worker / loop-
+/// role / save-only registries — an agent inside a loop or delegation
+/// structurally CANNOT start a loop (docs/LOOP_MODE.md "No recursion").
+/// Parameters: goal text, optional (already-clamped-by-caller-or-here) max
+/// iterations.
+pub type LoopStartRunner = std::sync::Arc<
+    dyn Fn(
+            String,
+            Option<u32>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = std::result::Result<LoopStartOutcome, String>>
+                    + Send,
+            >,
+        > + Send
+        + Sync,
+>;
+
 /// Wraps [`ShellToolRegistry`] and adds calendar, contact, memory, and MCP tools.
 pub struct AppToolRegistry {
     inner: Arc<ShellToolRegistry>,
@@ -128,6 +165,13 @@ pub struct AppToolRegistry {
     /// bare sub-agent/worker registry, which keeps the tool unlisted (so
     /// deep-research workers can't recursively trigger another run).
     deep_research_runner: Option<DeepResearchRunner>,
+    /// Runner for the agent-callable `start_loop` tool. Injected by the
+    /// composition root for top-level interactive arcs only; `None` for the
+    /// bare sub-agent / worker / loop-role / save-only registry, which keeps
+    /// the tool unlisted (so a loop role or delegated worker can't recursively
+    /// start another loop — docs/LOOP_MODE.md "No recursion"). Same injection
+    /// discipline as `deep_research_runner`.
+    loop_start_runner: Option<LoopStartRunner>,
 }
 
 impl AppToolRegistry {
@@ -162,6 +206,7 @@ impl AppToolRegistry {
             app_handle: None,
             active_project_slug: None,
             deep_research_runner: None,
+            loop_start_runner: None,
         }
     }
 
@@ -206,6 +251,17 @@ impl AppToolRegistry {
     /// deep-research worker can't recursively trigger another run.
     pub fn with_deep_research_runner(mut self, r: Option<DeepResearchRunner>) -> Self {
         self.deep_research_runner = r;
+        self
+    }
+
+    /// Attach the runner closure that powers the agent-callable `start_loop`
+    /// tool. Set only for top-level interactive arcs; when `None` the tool is
+    /// not advertised and refuses if called anyway. Keeps the bare sub-agent /
+    /// worker / loop-role registry free of the tool so a loop role or delegated
+    /// worker can't recursively start another loop (no recursion). Same
+    /// discipline as [`Self::with_deep_research_runner`].
+    pub fn with_loop_start_runner(mut self, r: Option<LoopStartRunner>) -> Self {
+        self.loop_start_runner = r;
         self
     }
 
@@ -1725,6 +1781,28 @@ impl AppToolRegistry {
         })
     }
 
+    fn start_loop_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "goal": {
+                    "type": "string",
+                    "description": "The goal to loop on, stated as a mission with a clear definition of done. A Lead agent plans and implements the smallest verifiable increment each iteration; an adversarial Evaluator independently verifies it; the cycle repeats until the Evaluator rules SHIP or BLOCKED, or the iteration budget runs out. Be concrete and outcome-focused.",
+                },
+                "max_iterations": {
+                    "type": "integer",
+                    "description": "Maximum Lead→Evaluator iterations before the loop stops on its own. Optional; defaults to 10. Clamped to a sane ceiling.",
+                    "minimum": 1,
+                },
+                "acceptance_criteria": {
+                    "type": "string",
+                    "description": "Optional objectively-checkable criteria the Evaluator will verify (commands, behaviors — not vibes). Folded into the goal text.",
+                },
+            },
+            "required": ["goal"]
+        })
+    }
+
     /// Pure mapping from a semantic category + filename to the relative
     /// workspace path the `write` tool should receive. Kept free of `self`
     /// so the bucket/slug/sanitization logic is unit-testable.
@@ -1912,6 +1990,102 @@ impl AppToolRegistry {
                     execution_time_ms: start.elapsed().as_millis() as u64,
                 })
             }
+            Err(e) => Ok(ToolResult {
+                success: false,
+                output: json!({ "error": e.clone() }),
+                error: Some(e),
+                execution_time_ms: start.elapsed().as_millis() as u64,
+            }),
+        }
+    }
+
+    /// Agent-callable Loop Mode start. Thin in-band shell over the injected
+    /// [`LoopStartRunner`] closure, which owns the whole policy (sense fence →
+    /// Bunker deny → Yolo proceed / Assistant approval → `loop_start_core`).
+    /// The handler only parses args and maps the outcome to a [`ToolResult`],
+    /// mirroring [`Self::do_deep_research`]. No policy lives here.
+    async fn do_start_loop(&self, args: &serde_json::Value) -> Result<ToolResult> {
+        let start = Instant::now();
+
+        // Belt-and-suspenders: the tool isn't listed without a runner, but a
+        // model could still try to call it. Refuse cleanly (mirrors
+        // `do_deep_research`). A `None` runner here is also the structural
+        // no-recursion guarantee: loop-role / worker registries get `None`.
+        let Some(runner) = self.loop_start_runner.clone() else {
+            return Ok(ToolResult {
+                success: false,
+                output: json!({ "error": "Starting a loop isn't available in this context." }),
+                error: Some("start_loop_unavailable".to_string()),
+                execution_time_ms: start.elapsed().as_millis() as u64,
+            });
+        };
+
+        let goal = match args
+            .get("goal")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(g) => g.to_string(),
+            None => {
+                let msg = "start_loop: missing required 'goal'".to_string();
+                return Ok(ToolResult {
+                    success: false,
+                    output: json!({ "error": msg }),
+                    error: Some(msg),
+                    execution_time_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+        };
+
+        // Fold optional acceptance criteria into the goal text (the loop's
+        // GOAL.md is a single blob; the roles read acceptance criteria from it).
+        let goal = match args
+            .get("acceptance_criteria")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(ac) => format!("{goal}\n\n## Acceptance criteria\n{ac}"),
+            None => goal,
+        };
+
+        // Optional iteration budget. `u64::as_u64` is used because JSON
+        // integers deserialize as u64/i64; clamp to u32 range happens in the
+        // runner closure alongside the sane ceiling.
+        let max_iterations = args
+            .get("max_iterations")
+            .and_then(|v| v.as_u64())
+            .map(|n| n.min(u32::MAX as u64) as u32);
+
+        match runner(goal, max_iterations).await {
+            Ok(LoopStartOutcome::Started {
+                loop_root,
+                max_iterations,
+            }) => Ok(ToolResult {
+                success: true,
+                output: json!({
+                    "status": "started",
+                    "loop_root": loop_root,
+                    "max_iterations": max_iterations,
+                    "summary": format!(
+                        "Loop started (max {max_iterations} iterations). It runs in the background; \
+                         the user can watch progress in the thread and stop it anytime."
+                    ),
+                }),
+                error: None,
+                execution_time_ms: start.elapsed().as_millis() as u64,
+            }),
+            // A refusal is a legitimate, expected outcome (sense fence, Bunker,
+            // declined approval). Surface it as an unsuccessful result carrying
+            // the reason so the agent relays it to the user rather than
+            // retrying blindly.
+            Ok(LoopStartOutcome::Refused(reason)) => Ok(ToolResult {
+                success: false,
+                output: json!({ "status": "refused", "message": reason.clone() }),
+                error: Some(reason),
+                execution_time_ms: start.elapsed().as_millis() as u64,
+            }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: json!({ "error": e.clone() }),
@@ -3374,6 +3548,24 @@ impl ToolRegistry for AppToolRegistry {
             });
         }
 
+        // start_loop: only advertised when a runner closure is wired (top-level
+        // interactive arcs). Sub-agent / worker / loop-role / save-only
+        // registries get `None`, so the tool stays hidden there — preventing a
+        // loop role or delegated worker from recursively starting another loop
+        // (docs/LOOP_MODE.md "No recursion"). Same discipline as deep_research.
+        if self.loop_start_runner.is_some() {
+            tools.push(ToolDefinition {
+                name: "start_loop".to_string(),
+                description: "Start a Loop Mode run: an autonomous Lead→Evaluator iteration loop that pursues a goal until it ships. A Lead agent plans and implements the smallest verifiable increment each iteration; an independent, adversarial Evaluator verifies it; the cycle repeats until the Evaluator rules SHIP or BLOCKED, or the iteration budget runs out. This is a STANDING GRANT OF AUTONOMY that runs in the background for many iterations — use it only when the user explicitly asks to loop on a goal until it's done. Starting a loop requires user approval (an approval card is shown) unless the user has opted into unattended autonomy. It runs in the background; watch the in-thread loop card for progress.".to_string(),
+                parameters: Self::start_loop_schema(),
+                backend: ToolBackend::Shell {
+                    command: String::new(),
+                    native: false,
+                },
+                base_risk: BaseImpact::WritePersist,
+            });
+        }
+
         if self.identity.is_some() {
             tools.push(ToolDefinition {
                 name: "identity_add".to_string(),
@@ -3556,6 +3748,7 @@ impl ToolRegistry for AppToolRegistry {
             "identity_add" => self.do_identity_add(&args).await,
             "save_file" => self.do_save_file(&args).await,
             "deep_research" => self.do_deep_research(&args).await,
+            "start_loop" => self.do_start_loop(&args).await,
             "load_skill" => self.do_load_skill(&args).await,
             "athen_docs" => self.do_athen_docs(&args),
             "http_request" => self.do_http_request(&args).await,

@@ -10573,6 +10573,8 @@ pub(crate) async fn deep_research_core(
         // Save-only registry: no deep_research tool needed (or wanted — this
         // runs inside deep_research_core itself).
         None,
+        // No start_loop tool either — this save-only path must never expose it.
+        None,
     )
     .await;
     let save_res = reg

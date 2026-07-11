@@ -748,6 +748,7 @@ pub(crate) async fn assemble_base_app_tool_registry(
     arc_id: &str,
     ui: Option<crate::ui_bridge::UiBridge>,
     deep_research_runner: Option<crate::app_tools::DeepResearchRunner>,
+    loop_start_runner: Option<crate::app_tools::LoopStartRunner>,
 ) -> Arc<dyn athen_core::traits::tool::ToolRegistry> {
     // Resolve the active profile's GitHub identity once at registry
     // build time so every shell_execute in this arc uses the same
@@ -947,6 +948,13 @@ pub(crate) async fn assemble_base_app_tool_registry(
     // deep-research-base registries keeps the tool unlisted there.
     registry = registry.with_deep_research_runner(deep_research_runner);
 
+    // Agent-callable start_loop tool: wired only when the caller passes a runner
+    // (top-level interactive arcs). `None` for sub-agent / worker / loop-role /
+    // save-only registries keeps the tool unlisted there — the structural
+    // no-recursion guarantee (a loop role or delegated worker can never start
+    // another loop). Same discipline as the deep_research runner above.
+    registry = registry.with_loop_start_runner(loop_start_runner);
+
     Arc::new(registry)
 }
 
@@ -1101,7 +1109,8 @@ pub(crate) fn build_subagent_factories(
             // Sub-agents never get the deep_research tool (no runner) — keeps
             // the bare worker registry bare and prevents recursive runs.
             let base =
-                assemble_base_app_tool_registry(deps, &sub_arc, Some(ui.clone()), None).await;
+                assemble_base_app_tool_registry(deps, &sub_arc, Some(ui.clone()), None, None)
+                    .await;
             Box::new(crate::delegation::ArcRegistryAdapter(base))
                 as Box<dyn athen_core::traits::tool::ToolRegistry>
         })
@@ -1169,6 +1178,88 @@ pub(crate) fn build_delegation_context(
         wakeup_restrictions,
         sub_registry_factory,
         sub_router_factory,
+    }
+}
+
+/// Default iteration budget for an agent-started loop when `max_iterations` is
+/// absent or zero — matches the shipped client-side default.
+pub(crate) const LOOP_START_DEFAULT_MAX_ITERATIONS: u32 = 10;
+/// Sane ceiling for an agent-started loop's iteration budget. A loop is a
+/// standing grant of autonomy, so an out-of-band request is clamped rather than
+/// honored — DECISION-1 in `loop/PLAN.md`.
+pub(crate) const LOOP_START_MAX_ITERATIONS_CEILING: u32 = 25;
+
+/// Clamp an optional agent-supplied iteration budget into `[1, ceiling]`,
+/// substituting the default when absent or zero. Pure so it is unit-testable.
+pub(crate) fn clamp_loop_max_iterations(requested: Option<u32>) -> u32 {
+    match requested {
+        None | Some(0) => LOOP_START_DEFAULT_MAX_ITERATIONS,
+        Some(n) => n.clamp(1, LOOP_START_MAX_ITERATIONS_CEILING),
+    }
+}
+
+/// Sense fence for `start_loop`: a loop may be started ONLY from a direct-chat
+/// arc (`ArcSource::UserInput`). Any sense/automated origin (email, calendar,
+/// telegram/messaging, system) is refused, as is any ambiguity — a missing arc,
+/// a store/lookup failure, or an arc whose source can't be confirmed. Fails
+/// CLOSED per GOAL. `source` is the loaded arc's origin, or `None` when the arc
+/// could not be confirmed at all. Returns `Ok(())` to proceed or `Err(reason)`
+/// to refuse. Takes just the origin (not the whole `ArcMeta`) so it is trivially
+/// unit-testable and decoupled from the arc struct shape.
+pub(crate) fn loop_start_sense_fence(
+    source: Option<athen_persistence::arcs::ArcSource>,
+) -> std::result::Result<(), String> {
+    use athen_persistence::arcs::ArcSource;
+    match source {
+        Some(ArcSource::UserInput) => Ok(()),
+        Some(
+            other @ (ArcSource::Email
+            | ArcSource::Calendar
+            | ArcSource::Messaging
+            | ArcSource::System),
+        ) => Err(format!(
+            "start_loop refused: this conversation originated from a {other:?} event, not \
+             direct user chat. Loops can only be started from a direct-chat conversation \
+             (a standing grant of autonomy must not be initiated by an inbound message)."
+        )),
+        // Fail closed on any ambiguity — the arc could not be confirmed as a
+        // direct-chat origin.
+        None => Err(
+            "start_loop refused: could not confirm this conversation is a direct-chat \
+             conversation (arc origin unavailable); refusing to start a loop."
+                .to_string(),
+        ),
+    }
+}
+
+/// Per-mode risk decision for `start_loop` (DECISION-2 in `loop/PLAN.md`).
+/// Starting a loop is a standing grant of autonomy, so the posture gate is
+/// stricter than every other tool's gate in the codebase:
+/// * `Yolo` → proceed with no approval prompt (that is what Yolo means);
+/// * `Assistant` → require an approval round-trip (an approval card fires);
+/// * `Bunker` → deny outright, in-band, without prompting.
+///
+/// This is intentionally NOT the shared `coerce_for_security_mode` mapping (no
+/// existing gate denies in Bunker) — it is a tool-local policy. Pure so it is
+/// unit-testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoopStartGate {
+    /// Proceed without prompting (Yolo).
+    Proceed,
+    /// Ask the user via the approval router before proceeding (Assistant).
+    RequireApproval,
+    /// Deny outright, no prompt (Bunker).
+    Deny,
+}
+
+pub(crate) fn loop_start_gate_for_mode(
+    mode: athen_core::config::SecurityMode,
+) -> LoopStartGate {
+    use athen_core::config::SecurityMode;
+    match mode {
+        SecurityMode::Yolo => LoopStartGate::Proceed,
+        SecurityMode::Assistant => LoopStartGate::RequireApproval,
+        SecurityMode::Bunker => LoopStartGate::Deny,
     }
 }
 
@@ -1246,7 +1337,141 @@ pub(crate) async fn assemble_app_tool_registry(
         ) as crate::app_tools::DeepResearchRunner
     });
 
-    let base = assemble_base_app_tool_registry(deps, arc_id, ui.clone(), dr_runner).await;
+    // Build the start_loop runner closure for this top-level arc. Same
+    // injection discipline as `dr_runner`: requires a UiBridge (it resolves
+    // AppState at call time), so CLI / test builds with no bridge get `None`
+    // and don't see the tool. The closure owns the ENTIRE start_loop policy —
+    // sense fence, per-mode risk gate (Yolo proceed / Assistant approval /
+    // Bunker deny), iteration clamp — then reuses `loop_start_core` (which owns
+    // the double-start refusal + background spawn). Withheld (`None`) from every
+    // sub-agent / worker / loop-role / save-only registry, so a loop role or
+    // delegated worker structurally cannot start another loop (no recursion).
+    let loop_runner: Option<crate::app_tools::LoopStartRunner> = ui.as_ref().map(|bridge| {
+        let ui = bridge.clone();
+        let arc_id = arc_id.to_string();
+        std::sync::Arc::new(move |goal: String, max_iterations: Option<u32>| {
+            let ui = ui.clone();
+            let arc_id = arc_id.clone();
+            Box::pin(async move {
+                use crate::app_tools::LoopStartOutcome;
+                let state = ui.app_state();
+
+                let Some(arc_store) = state.arc_store.as_ref() else {
+                    // Fail closed: without the arc store we can't confirm origin.
+                    return Ok(LoopStartOutcome::Refused(
+                        loop_start_sense_fence(None).unwrap_err(),
+                    ));
+                };
+
+                // ── Sense fence (fail closed on any ambiguity). ──────────────
+                let arc_source = arc_store
+                    .get_arc(&arc_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|m| m.source);
+                if let Err(reason) = loop_start_sense_fence(arc_source) {
+                    return Ok(LoopStartOutcome::Refused(reason));
+                }
+
+                // ── Per-mode risk gate. ─────────────────────────────────────
+                let mode = resolve_security_mode_for_arc(
+                    Some(arc_store),
+                    &arc_id,
+                    state.security.load().mode,
+                )
+                .await;
+                match loop_start_gate_for_mode(mode) {
+                    LoopStartGate::Deny => {
+                        return Ok(LoopStartOutcome::Refused(
+                            "start_loop refused: the current security posture is Bunker, which \
+                             does not permit starting an autonomous loop. Switch to Assistant or \
+                             Yolo in Settings → Security, or start the loop from the loop button."
+                                .to_string(),
+                        ));
+                    }
+                    LoopStartGate::Proceed => { /* Yolo: no prompt */ }
+                    LoopStartGate::RequireApproval => {
+                        // Assistant: fire an approval card and wait. Mirrors
+                        // `RouterToolboxApprovalGate::confirm_install`. Any
+                        // non-approve outcome (deny / timeout / router error /
+                        // no router) refuses — fail closed.
+                        let Some(router) = state.approval_router.as_ref() else {
+                            return Ok(LoopStartOutcome::Refused(
+                                "start_loop refused: no approval channel is available to confirm \
+                                 this high-risk action."
+                                    .to_string(),
+                            ));
+                        };
+                        use athen_core::approval::{ApprovalChoice, ApprovalQuestion};
+                        use athen_core::notification::{NotificationOrigin, NotificationUrgency};
+                        let clamped = clamp_loop_max_iterations(max_iterations);
+                        let question = ApprovalQuestion {
+                            id: uuid::Uuid::new_v4(),
+                            prompt: "Start an autonomous Loop Mode run on this conversation?"
+                                .to_string(),
+                            description: Some(format!(
+                                "The agent wants to start a Lead→Evaluator loop (up to {clamped} \
+                                 iterations) toward this goal:\n\n{goal}"
+                            )),
+                            choices: vec![ApprovalChoice::approve(), ApprovalChoice::deny()],
+                            arc_id: Some(arc_id.clone()),
+                            task_id: None,
+                            origin: NotificationOrigin::RiskSystem,
+                            urgency: NotificationUrgency::High,
+                            created_at: chrono::Utc::now(),
+                        };
+                        let primary = router.pick_primary(Some(&arc_id)).await;
+                        let approved = match router.ask_with_escalation(question, primary).await {
+                            Ok(answer) => answer.choice_key == "approve",
+                            Err(e) => {
+                                warn!("start_loop: approval router failed; treating as deny: {e}");
+                                false
+                            }
+                        };
+                        if !approved {
+                            return Ok(LoopStartOutcome::Refused(
+                                "start_loop was not approved by the user.".to_string(),
+                            ));
+                        }
+                    }
+                }
+
+                // ── Approved / permitted: start via the shared core (owns the
+                // double-start refusal + background spawn). Clamp the budget. ─
+                let clamped = clamp_loop_max_iterations(max_iterations);
+                match crate::commands::loop_start_core(
+                    arc_id.clone(),
+                    goal,
+                    clamped,
+                    state,
+                    ui.clone(),
+                )
+                .await
+                {
+                    Ok(ack) => Ok(LoopStartOutcome::Started {
+                        loop_root: ack.loop_root,
+                        max_iterations: ack.max_iterations,
+                    }),
+                    // A refusal from the core (e.g. a loop already running) is a
+                    // clean in-band refusal, not a tool error.
+                    Err(reason) => Ok(LoopStartOutcome::Refused(reason)),
+                }
+            }) as std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = std::result::Result<
+                                crate::app_tools::LoopStartOutcome,
+                                String,
+                            >,
+                        > + Send,
+                >,
+            >
+        }) as crate::app_tools::LoopStartRunner
+    });
+
+    let base =
+        assemble_base_app_tool_registry(deps, arc_id, ui.clone(), dr_runner, loop_runner).await;
 
     let with_delegation: Box<dyn athen_core::traits::tool::ToolRegistry> =
         if let (Some(profile_store), Some(arc_store)) = (profile_store, arc_store_for_delegation) {
@@ -2183,6 +2408,8 @@ impl AppState {
                 // No deep_research tool for the worker base — prevents a
                 // deep-research worker from recursively triggering another run.
                 None,
+                // No start_loop tool either — same no-recursion discipline.
+                None,
             )
             .await;
 
@@ -2342,15 +2569,18 @@ impl AppState {
         }
 
         // ── Build the BARE base tool registry for the roles — same bare base a
-        // sub-agent receives. The trailing `None` is the deep-research runner
-        // slot: omitting it keeps recursion-triggering surfaces off the role
-        // registries (and is the same position a future `start_loop` tool would
-        // be withheld from — no such tool exists this phase). ─────────────────
+        // sub-agent receives. The two trailing `None`s are the deep-research
+        // runner slot and the start_loop runner slot: withholding BOTH keeps
+        // recursion-triggering surfaces off the role registries. This is the
+        // load-bearing no-recursion guarantee — a loop role (loop_lead /
+        // loop_evaluator) gets no `start_loop` tool, so it can never start
+        // another loop (docs/LOOP_MODE.md "No recursion"). ─────────────────────
         let base: Arc<dyn athen_core::traits::tool::ToolRegistry> =
             assemble_base_app_tool_registry(
                 self.tool_registry_deps(),
                 arc_id,
                 Some(ui.clone()),
+                None,
                 None,
             )
             .await;

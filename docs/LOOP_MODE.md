@@ -11,6 +11,26 @@ Phases 3–4 below (per-role Bundle picker, restart reconciliation, FollowUp
 wake-up generalization) remain open. Code is authoritative; sections below
 remain the conceptual reference.
 
+**Phase 4a (2026-07-11) — agent-callable `start_loop` shipped.** The loop can
+now be started by the agent from chat ("loop on this until it ships"), not only
+by the client button/command, via a fenced, risk-gated `start_loop` agent tool.
+Wiring mirrors the `deep_research` tool exactly: an optional `LoopStartRunner`
+closure on `AppToolRegistry` (`app_tools.rs`), injected ONLY in the top-level
+`assemble_app_tool_registry` (`state.rs`); every sub-agent / worker /
+loop-role (`loop_lead`/`loop_evaluator`) / save-only registry gets `None`, so an
+agent inside a loop or delegation **structurally cannot start another loop** (the
+no-recursion guarantee, now enforced by structural tests, not a blanket
+"absent"). The tool reuses `loop_start_core` end-to-end (double-start refusal,
+`loop_*` columns, `loop-progress`/`loop-done` events), so the existing web +
+desktop cards render agent-started loops with zero UI change. Three fences:
+(1) **sense fence** — refuses on any arc whose origin is not `ArcSource::UserInput`
+(email/calendar/telegram/system) and fails closed on ambiguity, regardless of
+security mode; (2) **risk gate** — Bunker denies outright, Assistant requires an
+approval round-trip (approval card via the `ApprovalRouter`), Yolo proceeds
+unattended (tool-local Bunker-deny — no other gate denies in Bunker); (3) the
+injection-only-at-top no-recursion wiring above. `max_iterations` defaults to 10,
+clamped to `[1, 25]`.
+
 Loop Mode is a per-arc, UI-triggered **Lead → Evaluator iteration loop** for
 goal-shaped work: the user states a goal with acceptance criteria, a Lead
 agent plans and implements the smallest verifiable increment, an adversarial
@@ -105,9 +125,10 @@ failure memory, plateau check, `DECISION:` flags for human veto.
   steering mechanism, and the next Lead run picks it up for free because
   every role invocation is fresh-context.
 - **No recursion.** `loop_lead` may spawn sub-agents; neither role may start
-  loops. If a later phase adds an agent-callable `start_loop` tool, it gets
-  the Deep-Research treatment: an optional runner closure injected only into
-  the top-level registry.
+  loops. The agent-callable `start_loop` tool (Phase 4a, shipped) got the
+  Deep-Research treatment: an optional `LoopStartRunner` closure injected only
+  into the top-level registry, `None` for sub-agent/worker/loop-role/save-only
+  registries — so a loop role structurally cannot start another loop.
 - **Evaluator tier ≥ Lead tier.** The trigger dialog should warn if the user
   configures it the other way around.
 
