@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use futures::FutureExt;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
@@ -10655,6 +10656,289 @@ pub async fn deep_research(
         crate::ui_bridge::UiBridge::Tauri(app_handle),
     )
     .await
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Loop Mode: start / stop / status surface (CLIENT-ONLY).
+//
+// Each command shims a shared `*_core` fn (the deep_research precedent), so the
+// Tauri command and the HTTP route share one implementation. Unlike deep
+// research (awaited synchronously), a loop runs for many iterations, so
+// `loop_start_core` SPAWNS the run on a detached background task and returns an
+// immediate ack; progress is surfaced out-of-band via `"loop-progress"` /
+// `"loop-done"` UiBridge events, and terminal state lands in the `loop_*` arc
+// columns. `loop_status` reads those columns; `loop_stop` flips the arc's
+// cooperative cancel flag.
+//
+// GUARDRAIL: this surface is Tauri + HTTP ONLY. It is NEVER a sense trigger and
+// NEVER an agent-callable tool — the role registries built inside
+// `run_loop_for_arc` get the bare base with the recursion-runner slot left
+// `None`, so a loop role can never start another loop (docs/LOOP_MODE.md "No
+// recursion").
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Ack returned by `loop_start`: the loop was accepted and is now running in the
+/// background. The client watches `"loop-progress"`/`"loop-done"` events (and/or
+/// polls `loop_status`) for the rest of the run.
+#[derive(serde::Serialize)]
+pub struct LoopStartResult {
+    pub arc_id: String,
+    /// Always `true` on the Ok path — a refusal (e.g. a loop already running)
+    /// is returned as `Err`.
+    pub started: bool,
+    /// The resolved loop root (parent of the `loop/` mailbox dir).
+    pub loop_root: String,
+    pub max_iterations: u32,
+}
+
+/// Result of `loop_stop`.
+#[derive(serde::Serialize)]
+pub struct LoopStopResult {
+    pub arc_id: String,
+    /// `true` if a running loop's cancel flag was flipped; `false` if no loop
+    /// was in flight for this arc (idempotent no-op).
+    pub stopped: bool,
+}
+
+/// Snapshot of an arc's Loop Mode run metadata, read from the `loop_*` columns.
+#[derive(serde::Serialize)]
+pub struct LoopStatusResult {
+    pub arc_id: String,
+    /// Wire state string (`"running"`/`"ship"`/`"blocked"`/`"stopped"`/… ) or
+    /// `None` if no loop has ever run on this arc.
+    pub state: Option<String>,
+    pub iteration: Option<u32>,
+    pub max_iterations: Option<u32>,
+    pub loop_root: Option<String>,
+    /// `true` iff a background run is currently registered for this arc (its
+    /// cancel flag is in the in-memory registry). Distinguishes a live run from
+    /// a persisted terminal state after an app restart.
+    pub running: bool,
+}
+
+/// Shared core behind the `loop_start` Tauri command + the HTTP route.
+///
+/// Validates the arc, refuses to start a second concurrent loop on it, registers
+/// a fresh cooperative cancel flag, stamps `loop_state = "running"`, and spawns
+/// `run_loop_for_arc` on a detached background task (the flag is removed when the
+/// run finishes). Returns immediately with a start ack.
+pub(crate) async fn loop_start_core(
+    arc_id: String,
+    goal: String,
+    max_iterations: u32,
+    state: &AppState,
+    ui: crate::ui_bridge::UiBridge,
+) -> std::result::Result<LoopStartResult, String> {
+    let Some(ref arc_store) = state.arc_store else {
+        return Err("Arc store not available".to_string());
+    };
+
+    // The arc must exist before we start a standing grant of autonomy on it.
+    let _arc = arc_store
+        .get_arc(&arc_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Arc not found: {arc_id}"))?;
+
+    // Refuse a second concurrent loop on the same arc — one arc's `loop/`
+    // mailbox can only host one run at a time. Register the cancel flag under
+    // the lock so two racing `loop_start` calls can't both slip through.
+    let cancel_flag = {
+        let mut flags = state
+            .loop_cancel_flags
+            .lock()
+            .map_err(|_| "Loop registry lock poisoned".to_string())?;
+        if flags.contains_key(&arc_id) {
+            return Err(format!("A loop is already running on arc {arc_id}"));
+        }
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        flags.insert(arc_id.clone(), flag.clone());
+        flag
+    };
+
+    // Stamp "running" up front so `loop_status` reflects the start even before
+    // the first iteration boundary emits its progress stamp (best-effort).
+    if let Err(e) = arc_store
+        .set_loop_state(&arc_id, Some("running"), Some(0), Some(max_iterations))
+        .await
+    {
+        warn!("loop_mode: failed to stamp initial running state on {arc_id}: {e}");
+    }
+
+    // Spawn the run detached. We can't borrow `&AppState` across the spawn, so
+    // resolve the shared `AppState` from the `UiBridge` inside the task (the
+    // same handle the command was invoked with). A panic is logged, not lost,
+    // and the cancel flag is always removed from the registry on completion.
+    let arc_for_task = arc_id.clone();
+    let ui_for_task = ui.clone();
+    tauri::async_runtime::spawn(async move {
+        let task_state = ui_for_task.app_state();
+        let run = std::panic::AssertUnwindSafe(task_state.run_loop_for_arc(
+            &arc_for_task,
+            &goal,
+            max_iterations,
+            ui_for_task.clone(),
+            cancel_flag,
+        ))
+        .catch_unwind()
+        .await;
+        // Always deregister the flag so a finished/failed/panicked run frees the
+        // arc for a future loop.
+        if let Ok(mut flags) = task_state.loop_cancel_flags.lock() {
+            flags.remove(&arc_for_task);
+        }
+        match run {
+            Ok(Ok(outcome)) => {
+                tracing::info!(
+                    "loop_mode: arc {arc_for_task} finished — stop={}, iterations={}",
+                    outcome.stop.as_str(),
+                    outcome.iterations_run
+                );
+            }
+            Ok(Err(e)) => {
+                warn!("loop_mode: arc {arc_for_task} run errored: {e}");
+                if let Some(store) = task_state.arc_store.as_ref() {
+                    let _ = store
+                        .set_loop_state(&arc_for_task, Some("error"), None, None)
+                        .await;
+                }
+                ui_for_task.emit(
+                    "loop-done",
+                    serde_json::json!({ "arc_id": arc_for_task, "stop": "error" }),
+                );
+            }
+            Err(_) => {
+                warn!("loop_mode: arc {arc_for_task} run panicked");
+                if let Some(store) = task_state.arc_store.as_ref() {
+                    let _ = store
+                        .set_loop_state(&arc_for_task, Some("error"), None, None)
+                        .await;
+                }
+                ui_for_task.emit(
+                    "loop-done",
+                    serde_json::json!({ "arc_id": arc_for_task, "stop": "error" }),
+                );
+            }
+        }
+    });
+
+    // Resolve the loop root for the ack (mirrors run_loop_for_arc's resolution;
+    // best-effort — the run has already been accepted regardless).
+    let loop_root = match crate::state::resolve_code_mode_for_arc(Some(arc_store), &arc_id).await {
+        Some(repo_root) => repo_root.to_string_lossy().to_string(),
+        None => athen_core::paths::athen_workspace_dir()
+            .map(|w| {
+                w.join("loop-runs")
+                    .join(crate::state::sanitize_arc_id_for_path(&arc_id))
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .unwrap_or_default(),
+    };
+
+    Ok(LoopStartResult {
+        arc_id,
+        started: true,
+        loop_root,
+        max_iterations,
+    })
+}
+
+/// Shared core behind the `loop_stop` Tauri command + the HTTP route. Flips the
+/// arc's cooperative cancel flag if a run is in flight; the running orchestrator
+/// observes it at the next role boundary and unwinds with `LoopStop::Stopped`.
+/// Idempotent: stopping an arc with no running loop returns `stopped: false`.
+pub(crate) async fn loop_stop_core(
+    arc_id: String,
+    state: &AppState,
+) -> std::result::Result<LoopStopResult, String> {
+    let flag = {
+        let flags = state
+            .loop_cancel_flags
+            .lock()
+            .map_err(|_| "Loop registry lock poisoned".to_string())?;
+        flags.get(&arc_id).cloned()
+    };
+    let stopped = match flag {
+        Some(flag) => {
+            flag.store(true, Ordering::Relaxed);
+            true
+        }
+        None => false,
+    };
+    Ok(LoopStopResult { arc_id, stopped })
+}
+
+/// Shared core behind the `loop_status` Tauri command + the HTTP route. Reads
+/// the arc's persisted `loop_*` columns and overlays whether a background run is
+/// currently registered (live vs. a persisted terminal state after a restart).
+pub(crate) async fn loop_status_core(
+    arc_id: String,
+    state: &AppState,
+) -> std::result::Result<LoopStatusResult, String> {
+    let Some(ref arc_store) = state.arc_store else {
+        return Err("Arc store not available".to_string());
+    };
+    let arc = arc_store
+        .get_arc(&arc_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Arc not found: {arc_id}"))?;
+    let running = state
+        .loop_cancel_flags
+        .lock()
+        .map(|flags| flags.contains_key(&arc_id))
+        .unwrap_or(false);
+    Ok(LoopStatusResult {
+        arc_id,
+        state: arc.loop_state,
+        iteration: arc.loop_iteration,
+        max_iterations: arc.loop_max_iterations,
+        loop_root: arc.loop_root,
+        running,
+    })
+}
+
+/// Start a per-arc Loop Mode run (Lead → Evaluator iteration loop). Returns
+/// immediately once the background run is accepted; watch `"loop-progress"` /
+/// `"loop-done"` events (or poll `loop_status`) for the rest of the run.
+///
+/// CLIENT-ONLY: this is a desktop/web trigger, never sense-driven and never an
+/// agent tool (no recursion). See `docs/LOOP_MODE.md`.
+#[tauri::command]
+pub async fn loop_start(
+    arc_id: String,
+    goal: String,
+    max_iterations: u32,
+    app_handle: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> std::result::Result<LoopStartResult, String> {
+    loop_start_core(
+        arc_id,
+        goal,
+        max_iterations,
+        &state,
+        crate::ui_bridge::UiBridge::Tauri(app_handle),
+    )
+    .await
+}
+
+/// Request a running Loop Mode run to stop at its next role boundary.
+#[tauri::command]
+pub async fn loop_stop(
+    arc_id: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<LoopStopResult, String> {
+    loop_stop_core(arc_id, &state).await
+}
+
+/// Read the current Loop Mode status for an arc.
+#[tauri::command]
+pub async fn loop_status(
+    arc_id: String,
+    state: State<'_, AppState>,
+) -> std::result::Result<LoopStatusResult, String> {
+    loop_status_core(arc_id, &state).await
 }
 
 /// Read the Markdown content of an arc's research paper. The path comes from the

@@ -1337,6 +1337,40 @@ async fn h_research_paper(
 ) -> Response {
     json_result(commands::get_research_paper_core(arc_id, api.ui.app_state()).await)
 }
+
+#[derive(Deserialize)]
+struct LoopStartBody {
+    goal: String,
+    max_iterations: u32,
+}
+/// POST `/api/arcs/{id}/loop` — start a Loop Mode run (background). Client-only
+/// surface, mirroring the Tauri `loop_start` command; both shim
+/// `loop_start_core`.
+async fn h_loop_start(
+    State(api): State<ApiState>,
+    UrlPath(arc_id): UrlPath<String>,
+    Json(body): Json<LoopStartBody>,
+) -> Response {
+    let state = api.ui.app_state();
+    json_result(
+        commands::loop_start_core(
+            arc_id,
+            body.goal,
+            body.max_iterations,
+            state,
+            api.ui.clone(),
+        )
+        .await,
+    )
+}
+/// POST `/api/arcs/{id}/loop/stop` — request a running loop to stop.
+async fn h_loop_stop(State(api): State<ApiState>, UrlPath(arc_id): UrlPath<String>) -> Response {
+    json_result(commands::loop_stop_core(arc_id, api.ui.app_state()).await)
+}
+/// GET `/api/arcs/{id}/loop` — read Loop Mode status for an arc.
+async fn h_loop_status(State(api): State<ApiState>, UrlPath(arc_id): UrlPath<String>) -> Response {
+    json_result(commands::loop_status_core(arc_id, api.ui.app_state()).await)
+}
 #[derive(Deserialize)]
 struct ArcCodeModeBody {
     enabled: bool,
@@ -2279,6 +2313,8 @@ fn full_surface_router() -> Router<ApiState> {
         .route("/api/arcs/{id}/project", post(h_arc_assign_project))
         .route("/api/arcs/{id}/deep-research", post(h_deep_research))
         .route("/api/arcs/{id}/research-paper", get(h_research_paper))
+        .route("/api/arcs/{id}/loop", get(h_loop_status).post(h_loop_start))
+        .route("/api/arcs/{id}/loop/stop", post(h_loop_stop))
         .route("/api/arcs/{id}/code-mode", post(h_arc_code_mode))
         .route("/api/arcs/{id}/code-mode/git", get(h_code_mode_git))
         .route("/api/arcs/{id}/code-mode/agents", get(h_code_mode_agents))

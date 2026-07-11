@@ -314,6 +314,17 @@ pub struct AppState {
     /// the button `callback_data`; consumed when a depth button is tapped.
     pub(crate) pending_deep_research:
         std::sync::Mutex<std::collections::HashMap<String, PendingDeepResearch>>,
+    /// Per-arc cooperative stop flags for in-flight Loop Mode runs. Keyed by
+    /// arc id; a flag is inserted by `loop_start_core` before the background
+    /// run is spawned and removed when the run finishes. `loop_stop` flips the
+    /// flag; the running orchestrator polls it between role delegations
+    /// ([`crate::loop_mode::run_trio_loop`]'s `should_stop`) and unwinds with
+    /// `LoopStop::Stopped`. Registry membership also gates a second concurrent
+    /// loop on the same arc. Mirrors `pending_deep_research`'s `Mutex<HashMap>`
+    /// shape and the per-run `Arc<AtomicBool>` cancel flag used by
+    /// `agent_registry`.
+    pub(crate) loop_cancel_flags:
+        std::sync::Mutex<std::collections::HashMap<String, Arc<AtomicBool>>>,
     /// Shutdown sender for the email monitor background task. Behind a Mutex
     /// so the monitor can be stopped + respawned from a `&self` Settings-save
     /// handler (`restart_email_monitor`) without an app restart.
@@ -1525,6 +1536,7 @@ impl AppState {
             cancel_flag: Arc::new(AtomicBool::new(false)),
             pending_user_inputs: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             pending_deep_research: std::sync::Mutex::new(HashMap::new()),
+            loop_cancel_flags: std::sync::Mutex::new(HashMap::new()),
             email_shutdown: std::sync::Mutex::new(None),
             telegram_shutdown: std::sync::Mutex::new(None),
             remote_access_shutdown: std::sync::Mutex::new(None),
@@ -2237,6 +2249,293 @@ impl AppState {
             progress,
         )
         .await
+    }
+
+    /// Run a full Loop Mode (Lead → Evaluator) iteration loop on `arc_id`, from
+    /// the state layer. This is the AppState glue that bridges the **pure**
+    /// [`crate::loop_mode::run_trio_loop`] orchestrator to real machinery,
+    /// mirroring [`Self::run_deep_research_for_arc`] exactly:
+    ///
+    /// * resolves the **loop root** (the arc's Code-Mode repo root when it is a
+    ///   Code-Mode session, else the default agent workspace) and seeds the
+    ///   `loop/` file protocol (`GOAL.md` written once — human-owned, never
+    ///   clobbered — and `STATE.md` seeded if absent);
+    /// * builds the two role-spawn closures over the `run_delegation` seam,
+    ///   delegating to the built-in `loop_lead` / `loop_evaluator` profiles with
+    ///   the embedded [`crate::loop_mode::LEAD_PROMPT`] /
+    ///   [`crate::loop_mode::EVALUATOR_PROMPT`] briefs. Each role registry is the
+    ///   BARE base (`assemble_base_app_tool_registry(.., None)`) — the trailing
+    ///   `None` (the deep-research runner slot) keeps any recursion-triggering
+    ///   surface off the role registries, exactly as deep-research workers get
+    ///   (per `docs/LOOP_MODE.md`'s "no recursion" rule);
+    /// * wires progress to `"loop-progress"` UiBridge events and stamps the
+    ///   `loop_*` arc columns (`set_loop_root` once at start, `set_loop_state`
+    ///   each iteration and at the terminal stop).
+    ///
+    /// Like `run_deep_research_for_arc`, this is an **awaitable `&self` method**,
+    /// NOT self-spawning — the background `tokio::spawn` wrapper belongs to the
+    /// command layer (`loop_start_core` in `commands.rs`, mirroring how
+    /// `deep_research_core` is spawned by its command/Telegram callers). `ui` is
+    /// threaded in by the caller because `AppState` never holds a `UiBridge`.
+    ///
+    /// `should_stop` is the arc's cooperative cancel flag (from the
+    /// [`AppState::loop_cancel_flags`] registry): `loop_stop` flips it, and the
+    /// pure orchestrator polls it between role delegations, returning
+    /// [`crate::loop_mode::LoopStop::Stopped`].
+    pub(crate) async fn run_loop_for_arc(
+        &self,
+        arc_id: &str,
+        goal: &str,
+        max_iterations: u32,
+        ui: crate::ui_bridge::UiBridge,
+        should_stop: Arc<AtomicBool>,
+    ) -> Result<crate::loop_mode::LoopOutcome> {
+        use athen_core::error::AthenError;
+
+        // Required stores — guard like the deep-research glue.
+        let profile_store = self.profile_store.clone().ok_or_else(|| {
+            AthenError::Other("Loop Mode unavailable: profile store not configured".to_string())
+        })?;
+        let arc_store = self
+            ._database
+            .as_ref()
+            .map(|db| db.arc_store())
+            .ok_or_else(|| {
+                AthenError::Other("Loop Mode unavailable: arc store not configured".to_string())
+            })?;
+
+        // ── Resolve the loop root. Composes with Code Mode: an active
+        // Code-Mode session's repo root IS the loop root (the role registries'
+        // cwd/fs-base are already pinned to it by the base assembler, and each
+        // Code-Mode session already has its own repo, so it is per-arc-unique).
+        //
+        // Otherwise fall back to a PER-ARC subdir under the workspace —
+        // `<workspace>/loop-runs/<arc_id>/` — NOT the bare workspace dir. This
+        // is the mailbox-collision fix (iter-4 verdict obs 2): two concurrent
+        // non-Code-Mode loops on different arcs would otherwise both write the
+        // single `<workspace>/loop/GOAL.md|VERDICT.md` and clobber each other.
+        // Giving every arc its own `loop/` mailbox removes that data-corruption
+        // path without forbidding concurrent loops. The arc_id is the unique
+        // key; it is sanitized so any non-portable char can't escape the dir.
+        let loop_root = match resolve_code_mode_for_arc(Some(&arc_store), arc_id).await {
+            Some(repo_root) => repo_root,
+            None => {
+                let workspace = athen_core::paths::athen_workspace_dir().ok_or_else(|| {
+                    AthenError::Other("Loop Mode unavailable: no workspace directory".to_string())
+                })?;
+                workspace
+                    .join("loop-runs")
+                    .join(sanitize_arc_id_for_path(arc_id))
+            }
+        };
+
+        // Seed the human-owned + bookkeeping loop files (GOAL.md once, STATE.md
+        // if absent). PLAN/REPORT/VERDICT/LOG are role-owned.
+        crate::loop_mode::ensure_loop_files(&loop_root, goal, max_iterations)
+            .map_err(|e| AthenError::Other(format!("Loop Mode: could not seed loop/ files: {e}")))?;
+
+        // Persist the loop root once at run start (best-effort — a stamp failure
+        // must not abort the run).
+        let loop_root_str = loop_root.to_string_lossy().to_string();
+        if let Err(e) = arc_store.set_loop_root(arc_id, Some(&loop_root_str)).await {
+            warn!("loop_mode: failed to stamp loop_root on {arc_id}: {e}");
+        }
+
+        // ── Build the BARE base tool registry for the roles — same bare base a
+        // sub-agent receives. The trailing `None` is the deep-research runner
+        // slot: omitting it keeps recursion-triggering surfaces off the role
+        // registries (and is the same position a future `start_loop` tool would
+        // be withheld from — no such tool exists this phase). ─────────────────
+        let base: Arc<dyn athen_core::traits::tool::ToolRegistry> =
+            assemble_base_app_tool_registry(
+                self.tool_registry_deps(),
+                arc_id,
+                Some(ui.clone()),
+                None,
+            )
+            .await;
+
+        // Build the delegation context once (cloned per role invocation). Parent
+        // arc = this loop arc, so each role's sub-arc hangs off it — fresh
+        // context per role per iteration, the loop's load-bearing property.
+        let ctx = build_delegation_context(
+            profile_store,
+            arc_store.clone(),
+            self.identity_store.clone(),
+            self.skill_store.clone(),
+            self.http_endpoint_store.clone(),
+            self.tool_doc_dir.clone(),
+            Arc::clone(&self.router),
+            arc_id.to_string(),
+            Some(ui.clone()),
+            None,
+        );
+
+        // Per-role brief: a short header naming the loop root + iteration,
+        // followed by the embedded role prompt. The role does its own `loop/`
+        // file I/O through its tool registry.
+        let loop_root_for_brief = loop_root_str.clone();
+        let build_lead_brief = move |iter: u32| {
+            format!(
+                "Loop root: {loop_root_for_brief}\nCurrent iteration: {iter} of {max_iterations}\n\
+                 All `loop/` paths are relative to the loop root above.\n\n{}",
+                crate::loop_mode::LEAD_PROMPT
+            )
+        };
+        let loop_root_for_eval_brief = loop_root_str.clone();
+        let build_eval_brief = move |iter: u32| {
+            format!(
+                "Loop root: {loop_root_for_eval_brief}\nCurrent iteration: {iter} of {max_iterations}\n\
+                 All `loop/` paths are relative to the loop root above.\n\n{}",
+                crate::loop_mode::EVALUATOR_PROMPT
+            )
+        };
+
+        // Lead role-spawn closure. `Fn` (called once per iteration), so it
+        // captures clonable `Arc`s / clonable context only.
+        let base_lead = base.clone();
+        let ctx_lead = ctx.clone();
+        let spawn_lead = move |iter: u32| {
+            let base = base_lead.clone();
+            let ctx = ctx_lead.clone();
+            let brief = build_lead_brief(iter);
+            async move {
+                let (_sub_arc, content, _success, _verified, _note) =
+                    crate::delegation::run_delegation(
+                        base,
+                        ctx,
+                        crate::delegation::DelegateArgs {
+                            target_profile_id: "loop_lead".to_string(),
+                            brief,
+                            reasoning_effort: None,
+                        },
+                    )
+                    .await?;
+                Ok::<String, AthenError>(content)
+            }
+        };
+
+        // Evaluator role-spawn closure. Its returned deliverable's first line is
+        // the structured verdict the orchestrator cross-checks against
+        // `loop/VERDICT.md`.
+        let base_eval = base.clone();
+        let ctx_eval = ctx.clone();
+        let spawn_evaluator = move |iter: u32| {
+            let base = base_eval.clone();
+            let ctx = ctx_eval.clone();
+            let brief = build_eval_brief(iter);
+            async move {
+                let (_sub_arc, content, _success, _verified, _note) =
+                    crate::delegation::run_delegation(
+                        base,
+                        ctx,
+                        crate::delegation::DelegateArgs {
+                            target_profile_id: "loop_evaluator".to_string(),
+                            brief,
+                            reasoning_effort: None,
+                        },
+                    )
+                    .await?;
+                Ok::<String, AthenError>(content)
+            }
+        };
+
+        // Source of truth: the first line of `<root>/loop/VERDICT.md`.
+        let loop_root_for_verdict = loop_root.clone();
+        let read_verdict =
+            move || crate::loop_mode::read_loop_verdict(&loop_root_for_verdict);
+
+        // Progress closure: emit a UI event AND stamp the run-progress columns
+        // each iteration (best-effort). `set_loop_state` is async and the
+        // orchestrator's `progress` callback is sync, so the stamp is fired on a
+        // detached task — a stamp lagging behind the loop is harmless (last
+        // write wins) and must never block or fail the loop.
+        let arc_id_owned = arc_id.to_string();
+        let ui_for_progress = ui.clone();
+        let arc_store_for_progress = arc_store.clone();
+        let progress = move |p: crate::loop_mode::LoopProgress| {
+            ui_for_progress.emit(
+                "loop-progress",
+                serde_json::json!({
+                    "arc_id": arc_id_owned,
+                    "iteration": p.iteration,
+                    "max_iterations": p.max_iterations,
+                    "phase": p.phase,
+                    "detail": p.detail,
+                    "last_verdict": p.last_verdict,
+                }),
+            );
+            let store = arc_store_for_progress.clone();
+            let id = arc_id_owned.clone();
+            let iteration = p.iteration;
+            let max = p.max_iterations;
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = store
+                    .set_loop_state(&id, Some("running"), Some(iteration), Some(max))
+                    .await
+                {
+                    warn!("loop_mode: failed to stamp loop_state on {id}: {e}");
+                }
+            });
+        };
+
+        // Cooperative stop predicate: the arc's cancel flag, flipped by
+        // `loop_stop`. Polled by the orchestrator between role delegations.
+        let should_stop_flag = should_stop.clone();
+        let should_stop_pred = move || should_stop_flag.load(std::sync::atomic::Ordering::Relaxed);
+
+        // ── Run the pure orchestrator. ──────────────────────────────────────
+        let outcome = crate::loop_mode::run_trio_loop(
+            max_iterations,
+            spawn_lead,
+            spawn_evaluator,
+            read_verdict,
+            progress,
+            should_stop_pred,
+        )
+        .await?;
+
+        // Surface a verdict-source disagreement (the evaluator's returned
+        // deliverable diverged from `loop/VERDICT.md` on some iteration; the
+        // file won, but the human should know the grader's structured output and
+        // its human-readable file disagreed).
+        if outcome.verdict_source_disagreement {
+            warn!(
+                "loop_mode: arc {arc_id} had a verdict-source disagreement during the run \
+                 (evaluator deliverable vs loop/VERDICT.md); the file was used as truth"
+            );
+        }
+
+        // Stamp the terminal state from the outcome (best-effort). The stop
+        // reason string comes from `LoopStop::as_str()` so the wire vocabulary
+        // stays in one place.
+        if let Err(e) = arc_store
+            .set_loop_state(
+                arc_id,
+                Some(outcome.stop.as_str()),
+                Some(outcome.iterations_run),
+                Some(max_iterations),
+            )
+            .await
+        {
+            warn!("loop_mode: failed to stamp terminal loop_state on {arc_id}: {e}");
+        }
+
+        // Final progress event so the surface can render the terminal state and
+        // the deciding verdict (`last_verdict`) without re-reading the DB.
+        ui.emit(
+            "loop-done",
+            serde_json::json!({
+                "arc_id": arc_id,
+                "stop": outcome.stop.as_str(),
+                "iterations_run": outcome.iterations_run,
+                "max_iterations": max_iterations,
+                "last_verdict": outcome.last_verdict.map(|v| v.as_str()),
+                "verdict_source_disagreement": outcome.verdict_source_disagreement,
+            }),
+        );
+
+        Ok(outcome)
     }
 
     /// Initialize the notification orchestrator.
@@ -5971,6 +6270,57 @@ pub(crate) async fn resolve_code_mode_for_arc(
             }
         }
         None => None,
+    }
+}
+
+/// Sanitize an arc id for use as a single path segment (the per-arc Loop Mode
+/// fallback root `<workspace>/loop-runs/<arc_id>/`). Arc ids are normally
+/// `arc_YYYYMMDD_HHMMSS` or a UUID — both already portable — but this defends
+/// against any exotic id by replacing every char outside `[A-Za-z0-9._-]` with
+/// `_`, and refuses `.`/`..`, so the segment can never escape `loop-runs/` or
+/// collide with a parent-dir traversal. Never returns an empty string.
+pub(crate) fn sanitize_arc_id_for_path(arc_id: &str) -> String {
+    let cleaned: String = arc_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    // Guard against traversal-y or empty segments.
+    match cleaned.as_str() {
+        "" | "." | ".." => "_arc".to_string(),
+        _ => cleaned,
+    }
+}
+
+#[cfg(test)]
+mod loop_root_tests {
+    use super::sanitize_arc_id_for_path;
+
+    #[test]
+    fn sanitize_keeps_normal_arc_ids_intact() {
+        assert_eq!(sanitize_arc_id_for_path("arc_20260711_120000"), "arc_20260711_120000");
+        assert_eq!(
+            sanitize_arc_id_for_path("3f2504e0-4f89-11d3-9a0c-0305e82c3301"),
+            "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
+        );
+    }
+
+    #[test]
+    fn sanitize_neutralizes_path_traversal_and_separators() {
+        // Path separators become `_`, so the result is a single flat segment
+        // that cannot traverse (the `..` dots survive but with no separator
+        // they are inert as one segment name).
+        assert_eq!(sanitize_arc_id_for_path("../etc/passwd"), ".._etc_passwd");
+        assert!(!sanitize_arc_id_for_path("../etc/passwd").contains('/'));
+        assert_eq!(sanitize_arc_id_for_path("a/b\\c"), "a_b_c");
+        assert_eq!(sanitize_arc_id_for_path(".."), "_arc");
+        assert_eq!(sanitize_arc_id_for_path("."), "_arc");
+        assert_eq!(sanitize_arc_id_for_path(""), "_arc");
     }
 }
 

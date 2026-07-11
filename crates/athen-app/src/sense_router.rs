@@ -2304,6 +2304,10 @@ mod tests {
                 research_question: None,
                 code_mode: None,
                 code_mode_root: None,
+                loop_state: None,
+                loop_iteration: None,
+                loop_max_iterations: None,
+                loop_root: None,
             },
             ArcMeta {
                 id: "arc_recent".into(),
@@ -2334,6 +2338,10 @@ mod tests {
                 research_question: None,
                 code_mode: None,
                 code_mode_root: None,
+                loop_state: None,
+                loop_iteration: None,
+                loop_max_iterations: None,
+                loop_root: None,
             },
         ];
 

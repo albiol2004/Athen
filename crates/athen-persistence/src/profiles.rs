@@ -743,6 +743,98 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
             vec!["web", "files", "memory"],
             GithubIdentity::None,
         ),
+        // ── Loop Mode roles ──────────────────────────────────────────────
+        // Built-in profiles for the per-arc Lead→Evaluator iteration loop
+        // (see `docs/LOOP_MODE.md` and `athen-app/src/loop_mode.rs`). The
+        // full per-iteration contract (read order, verdict grammar,
+        // test-integrity audit) is injected by the orchestrator's embedded
+        // `LEAD_PROMPT` / `EVALUATOR_PROMPT` at delegation time; these
+        // personas only carry the role's standing identity. Both run on the
+        // `Powerful` tier because the work is judgment-heavy planning and
+        // adversarial grading, not mechanical execution.
+        //
+        // `loop_lead` keeps `ToolSelection::All`: the Lead plans AND
+        // implements, may `spawn_subagent`, and is the only role allowed to
+        // mutate product code.
+        {
+            let mut p = mk(
+                "loop_lead",
+                "Loop Mode Lead",
+                "Loop Mode Lead: plans and implements one iteration of a per-arc \
+                 Lead→Evaluator loop, then hands off to the Evaluator for an \
+                 adversarial grade. Only role allowed to modify product code.",
+                Some(
+                    "You are the Lead in a two-agent iteration loop (Lead → Evaluator). \
+                     You own both planning and implementation for one iteration: fold in \
+                     the last verdict's blocking issues, pick the smallest independently \
+                     verifiable increment, implement it, run the project's build/tests/\
+                     linters, and write your report. Delegate mechanical work to \
+                     sub-agents via spawn_subagent and review everything they produce — \
+                     you own the diff. Never weaken verification to pass it. The \
+                     orchestrator supplies the full per-iteration contract (read order, \
+                     acceptance-criteria format, failure memory) at run time.",
+                ),
+                vec![DomainTag::Coding],
+                vec![
+                    TaskKindTag::Coding,
+                    TaskKindTag::Debugging,
+                    TaskKindTag::CodeReview,
+                ],
+                vec!["iterative planning", "incremental implementation", "self-verification"],
+                vec![],
+                ToolSelection::All,
+                vec![],
+                GithubIdentity::None,
+            );
+            p.model_profile_hint = Some("Powerful".into());
+            p
+        },
+        // `loop_evaluator` carries `ToolSelection::Deny` on the file-mutating
+        // tools so the grader mechanically CANNOT fix code — "the grader never
+        // fixes" is enforced in the callable surface, not just the prompt.
+        // `apply_tool_selection` (athen-agent executor) subtracts these by
+        // exact tool name. All four are live, always-advertised file mutators:
+        // `edit`/`write`/`delete_file` (athen-agent tools.rs) plus `save_file`
+        // (an app-level tool at athen-app app_tools.rs, `base_risk:
+        // WritePersist`, delegating to `write`). So each deny entry is
+        // load-bearing — dropping any one restores a callable path by which the
+        // grader could mutate code, defeating "the grader never fixes."
+        {
+            let mut p = mk(
+                "loop_evaluator",
+                "Loop Mode Evaluator",
+                "Loop Mode Evaluator: adversarially grades one iteration against the \
+                 plan's acceptance criteria by actually exercising the code, then writes \
+                 a SHIP / ITERATE / BLOCKED verdict. NEVER fixes anything itself — a \
+                 broken build gets an ITERATE verdict, not a patch.",
+                Some(
+                    "You are the Evaluator in a two-agent iteration loop (Lead → \
+                     Evaluator), with no memory of previous iterations. You are \
+                     adversarial by design: find the ways the iteration is wrong, not \
+                     confirm it is right. Form your own verdict by running the builds/\
+                     tests/checks yourself BEFORE reading the Lead's claims. You NEVER \
+                     fix code — you have no file-writing tools, by design; a broken build \
+                     is an ITERATE verdict, not a patch. Emit a verdict whose first line \
+                     is exactly `VERDICT: SHIP`, `VERDICT: ITERATE`, or `VERDICT: \
+                     BLOCKED`. The orchestrator supplies the full grading contract at run \
+                     time.",
+                ),
+                vec![DomainTag::Coding],
+                vec![TaskKindTag::CodeReview, TaskKindTag::Debugging],
+                vec!["adversarial verification", "acceptance-criteria grading", "test-integrity audit"],
+                vec![],
+                ToolSelection::Deny(vec![
+                    "edit".into(),
+                    "write".into(),
+                    "delete_file".into(),
+                    "save_file".into(),
+                ]),
+                vec![],
+                GithubIdentity::None,
+            );
+            p.model_profile_hint = Some("Powerful".into());
+            p
+        },
     ]
 }
 
@@ -1173,9 +1265,60 @@ mod tests {
             "doctor",
             "athen_setup",
             "deep_research_worker",
+            "loop_lead",
+            "loop_evaluator",
         ] {
             assert!(ids.contains(canonical), "missing built-in: {canonical}");
         }
+    }
+
+    /// The `loop_evaluator` built-in must mechanically be unable to fix code:
+    /// its `ToolSelection::Deny` lists the file-mutating tools so
+    /// `apply_tool_selection` strips them from the callable surface. This is a
+    /// first-class guardrail ("the grader never fixes"), not a prompt claim —
+    /// if this regresses, the Evaluator could patch a broken build instead of
+    /// returning an honest ITERATE verdict.
+    #[tokio::test]
+    async fn loop_evaluator_denies_write_tools() {
+        let store = setup_store().await;
+        let evaluator = store
+            .get_profile("loop_evaluator")
+            .await
+            .unwrap()
+            .expect("loop_evaluator profile seeded");
+        assert!(evaluator.builtin);
+        match &evaluator.tool_selection {
+            ToolSelection::Deny(denied) => {
+                for tool in ["edit", "write", "delete_file", "save_file"] {
+                    assert!(
+                        denied.iter().any(|d| d == tool),
+                        "loop_evaluator must deny the file-mutating tool `{tool}` \
+                         so the grader cannot fix code; denied = {denied:?}"
+                    );
+                }
+            }
+            other => panic!(
+                "loop_evaluator must use ToolSelection::Deny on the write tools, \
+                 got {other:?}"
+            ),
+        }
+    }
+
+    /// The `loop_lead` built-in is unrestricted (`ToolSelection::All`): the
+    /// Lead plans AND implements, may `spawn_subagent`, and is the only role
+    /// allowed to mutate product code. If this narrows, the Lead loses tools
+    /// it needs to actually land an increment.
+    #[tokio::test]
+    async fn loop_lead_allows_all_tools() {
+        let store = setup_store().await;
+        let lead = store
+            .get_profile("loop_lead")
+            .await
+            .unwrap()
+            .expect("loop_lead profile seeded");
+        assert!(lead.builtin);
+        assert_eq!(lead.tool_selection, ToolSelection::All);
+        assert_eq!(lead.model_profile_hint.as_deref(), Some("Powerful"));
     }
 
     /// The coder profile ships a narrow `ToolSelection::Groups` rather than

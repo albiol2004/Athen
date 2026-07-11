@@ -201,6 +201,22 @@ pub struct ArcMeta {
     /// Filesystem path to the repo root this arc's code mode is scoped to.
     /// `None` means no root has been set.
     pub code_mode_root: Option<String>,
+    /// Loop Mode run state as a wire string (`"idle"` / `"running"` /
+    /// `"shipped"` / `"blocked"`, etc.). Stored as TEXT so adding states later
+    /// is a no-op for the schema — same rationale as the other status/override
+    /// columns. `None` means a Loop Mode run has never been started on this arc.
+    /// See `docs/LOOP_MODE.md`.
+    pub loop_state: Option<String>,
+    /// Current Loop Mode iteration counter for this arc's active run. `None`
+    /// means no run has been started. See `docs/LOOP_MODE.md`.
+    pub loop_iteration: Option<u32>,
+    /// The iteration cap configured for this arc's Loop Mode run. `None` means
+    /// no run has been started / no cap configured. See `docs/LOOP_MODE.md`.
+    pub loop_max_iterations: Option<u32>,
+    /// Filesystem path to the Loop Mode root (the directory that contains the
+    /// `loop/` mailbox). `None` means no loop root has been set. See
+    /// `docs/LOOP_MODE.md`.
+    pub loop_root: Option<String>,
     /// Mini-plan drafted by the triage LLM call (same call that evaluates
     /// risk + complexity — see `RiskScore.plan`). Captured once at task
     /// creation, then survives compaction as arc-level metadata. The
@@ -563,6 +579,30 @@ impl ArcStore {
                     .map_err(|e| AthenError::Other(format!("Add code_mode_root: {e}")))?;
             }
 
+            // Column-level migration: Loop Mode run metadata. `loop_state` and
+            // `loop_root` are TEXT; `loop_iteration` and `loop_max_iterations`
+            // are INTEGER counts. NULL means no Loop Mode run has been started
+            // on the arc. See `docs/LOOP_MODE.md`.
+            if !cols.contains("loop_state") {
+                conn.execute("ALTER TABLE arcs ADD COLUMN loop_state TEXT", [])
+                    .map_err(|e| AthenError::Other(format!("Add loop_state: {e}")))?;
+            }
+            if !cols.contains("loop_iteration") {
+                conn.execute("ALTER TABLE arcs ADD COLUMN loop_iteration INTEGER", [])
+                    .map_err(|e| AthenError::Other(format!("Add loop_iteration: {e}")))?;
+            }
+            if !cols.contains("loop_max_iterations") {
+                conn.execute(
+                    "ALTER TABLE arcs ADD COLUMN loop_max_iterations INTEGER",
+                    [],
+                )
+                .map_err(|e| AthenError::Other(format!("Add loop_max_iterations: {e}")))?;
+            }
+            if !cols.contains("loop_root") {
+                conn.execute("ALTER TABLE arcs ADD COLUMN loop_root TEXT", [])
+                    .map_err(|e| AthenError::Other(format!("Add loop_root: {e}")))?;
+            }
+
             Ok(())
         })
         .await
@@ -681,7 +721,9 @@ impl ArcStore {
                             a.plan_json, a.security_mode_override, \
                             a.project_id, \
                             a.research_paper_path, a.research_question, \
-                            a.code_mode, a.code_mode_root \
+                            a.code_mode, a.code_mode_root, \
+                            a.loop_state, a.loop_iteration, \
+                            a.loop_max_iterations, a.loop_root \
                      FROM arcs a \
                      LEFT JOIN ( \
                          SELECT arc_id, COUNT(*) AS cnt \
@@ -724,6 +766,10 @@ impl ArcStore {
                         research_question: row.get::<_, Option<String>>(26)?,
                         code_mode: row.get::<_, Option<i64>>(27)?.map(|n| n != 0),
                         code_mode_root: row.get::<_, Option<String>>(28)?,
+                        loop_state: row.get::<_, Option<String>>(29)?,
+                        loop_iteration: row.get::<_, Option<i64>>(30)?.map(|n| n as u32),
+                        loop_max_iterations: row.get::<_, Option<i64>>(31)?.map(|n| n as u32),
+                        loop_root: row.get::<_, Option<String>>(32)?,
                     })
                 })
                 .map_err(|e| AthenError::Other(format!("Query get arc: {e}")))?;
@@ -779,7 +825,9 @@ impl ArcStore {
                         a.plan_json, a.security_mode_override, \
                         a.project_id, \
                         a.research_paper_path, a.research_question, \
-                        a.code_mode, a.code_mode_root \
+                        a.code_mode, a.code_mode_root, \
+                        a.loop_state, a.loop_iteration, \
+                        a.loop_max_iterations, a.loop_root \
                  FROM arcs a \
                  LEFT JOIN ( \
                      SELECT arc_id, COUNT(*) AS cnt \
@@ -825,6 +873,10 @@ impl ArcStore {
                         research_question: row.get::<_, Option<String>>(26)?,
                         code_mode: row.get::<_, Option<i64>>(27)?.map(|n| n != 0),
                         code_mode_root: row.get::<_, Option<String>>(28)?,
+                        loop_state: row.get::<_, Option<String>>(29)?,
+                        loop_iteration: row.get::<_, Option<i64>>(30)?.map(|n| n as u32),
+                        loop_max_iterations: row.get::<_, Option<i64>>(31)?.map(|n| n as u32),
+                        loop_root: row.get::<_, Option<String>>(32)?,
                     })
                 })
                 .map_err(|e| AthenError::Other(format!("Query list arcs: {e}")))?;
@@ -866,7 +918,9 @@ impl ArcStore {
                             a.plan_json, a.security_mode_override, \
                             a.project_id, \
                             a.research_paper_path, a.research_question, \
-                            a.code_mode, a.code_mode_root \
+                            a.code_mode, a.code_mode_root, \
+                            a.loop_state, a.loop_iteration, \
+                            a.loop_max_iterations, a.loop_root \
                      FROM arcs a \
                      LEFT JOIN ( \
                          SELECT arc_id, COUNT(*) AS cnt \
@@ -910,6 +964,10 @@ impl ArcStore {
                         research_question: row.get::<_, Option<String>>(26)?,
                         code_mode: row.get::<_, Option<i64>>(27)?.map(|n| n != 0),
                         code_mode_root: row.get::<_, Option<String>>(28)?,
+                        loop_state: row.get::<_, Option<String>>(29)?,
+                        loop_iteration: row.get::<_, Option<i64>>(30)?.map(|n| n as u32),
+                        loop_max_iterations: row.get::<_, Option<i64>>(31)?.map(|n| n as u32),
+                        loop_root: row.get::<_, Option<String>>(32)?,
                     })
                 })
                 .map_err(|e| AthenError::Other(format!("Query list child arcs: {e}")))?;
@@ -1445,6 +1503,60 @@ impl ArcStore {
                 params![root, arc_id],
             )
             .map_err(|e| AthenError::Other(format!("Set code_mode_root: {e}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
+    /// Set (or clear) the Loop Mode run-progress columns for this arc:
+    /// `loop_state` (wire string), `loop_iteration`, and `loop_max_iterations`.
+    /// These three always advance together during a run, so they are written
+    /// atomically in one statement (same precedent as `set_triage_plan`'s
+    /// two-column atomic write). Pass `None` for any field to clear it — e.g.
+    /// `set_loop_state(id, None, None, None)` resets the run progress. The
+    /// separate `loop_root` (set once at run start) is written via
+    /// [`Self::set_loop_root`]. Last-write-wins. See `docs/LOOP_MODE.md`.
+    pub async fn set_loop_state(
+        &self,
+        id: &str,
+        state: Option<&str>,
+        iteration: Option<u32>,
+        max_iterations: Option<u32>,
+    ) -> Result<()> {
+        let conn = self.conn.clone();
+        let id = id.to_string();
+        let state = state.map(|s| s.to_string());
+        let iteration = iteration.map(|n| n as i64);
+        let max_iterations = max_iterations.map(|n| n as i64);
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE arcs SET loop_state = ?1, loop_iteration = ?2, \
+                 loop_max_iterations = ?3 WHERE id = ?4",
+                params![state, iteration, max_iterations, id],
+            )
+            .map_err(|e| AthenError::Other(format!("Set loop_state: {e}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| AthenError::Other(format!("Spawn blocking error: {e}")))?
+    }
+
+    /// Set (or clear) the Loop Mode root path (the directory containing the
+    /// `loop/` mailbox) for this arc. Set once at run start. Last-write-wins.
+    /// Pass `None` to clear it. See `docs/LOOP_MODE.md`.
+    pub async fn set_loop_root(&self, id: &str, root: Option<&str>) -> Result<()> {
+        let conn = self.conn.clone();
+        let id = id.to_string();
+        let root = root.map(|s| s.to_string());
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.blocking_lock();
+            conn.execute(
+                "UPDATE arcs SET loop_root = ?1 WHERE id = ?2",
+                params![root, id],
+            )
+            .map_err(|e| AthenError::Other(format!("Set loop_root: {e}")))?;
             Ok(())
         })
         .await
@@ -2094,7 +2206,11 @@ CREATE TABLE IF NOT EXISTS arcs (
     research_paper_path TEXT,
     research_question TEXT,
     code_mode INTEGER,
-    code_mode_root TEXT
+    code_mode_root TEXT,
+    loop_state TEXT,
+    loop_iteration INTEGER,
+    loop_max_iterations INTEGER,
+    loop_root TEXT
 );
 
 CREATE TABLE IF NOT EXISTS arc_entries (
@@ -3962,5 +4078,127 @@ mod tests {
             .unwrap()
             .expect("arc present");
         assert_eq!(meta.code_mode, Some(false));
+    }
+
+    /// Loop Mode metadata round-trip: a fresh arc has all four loop_* fields
+    /// unset, the setters persist values (including the INTEGER↔u32 mapping for
+    /// the counters), `get_arc` AND `list_arcs` reload them, and clearing with
+    /// None round-trips back to None.
+    #[tokio::test]
+    async fn test_loop_mode_fields_round_trip() {
+        let store = setup_arc_store().await;
+
+        // A fresh arc has all four loop_* fields unset.
+        store
+            .create_arc("arc_loop", "Loop", ArcSource::UserInput)
+            .await
+            .unwrap();
+        let meta = store
+            .get_arc("arc_loop")
+            .await
+            .unwrap()
+            .expect("arc present");
+        assert_eq!(meta.loop_state, None);
+        assert_eq!(meta.loop_iteration, None);
+        assert_eq!(meta.loop_max_iterations, None);
+        assert_eq!(meta.loop_root, None);
+
+        // Setters persist all four fields; get_arc reloads them.
+        store
+            .set_loop_state("arc_loop", Some("running"), Some(3), Some(10))
+            .await
+            .unwrap();
+        store
+            .set_loop_root("arc_loop", Some("/tmp/loop-work"))
+            .await
+            .unwrap();
+        let meta = store
+            .get_arc("arc_loop")
+            .await
+            .unwrap()
+            .expect("arc present");
+        assert_eq!(meta.loop_state.as_deref(), Some("running"));
+        assert_eq!(meta.loop_iteration, Some(3));
+        assert_eq!(meta.loop_max_iterations, Some(10));
+        assert_eq!(meta.loop_root.as_deref(), Some("/tmp/loop-work"));
+
+        // list_arcs reflects the same values (all three read sites in lockstep).
+        let listed = store.list_arcs().await.unwrap();
+        let row = listed.iter().find(|a| a.id == "arc_loop").unwrap();
+        assert_eq!(row.loop_state.as_deref(), Some("running"));
+        assert_eq!(row.loop_iteration, Some(3));
+        assert_eq!(row.loop_max_iterations, Some(10));
+        assert_eq!(row.loop_root.as_deref(), Some("/tmp/loop-work"));
+
+        // Clearing with None round-trips back to None for all four.
+        store
+            .set_loop_state("arc_loop", None, None, None)
+            .await
+            .unwrap();
+        store.set_loop_root("arc_loop", None).await.unwrap();
+        let meta = store
+            .get_arc("arc_loop")
+            .await
+            .unwrap()
+            .expect("arc present");
+        assert_eq!(meta.loop_state, None);
+        assert_eq!(meta.loop_iteration, None);
+        assert_eq!(meta.loop_max_iterations, None);
+        assert_eq!(meta.loop_root, None);
+    }
+
+    /// Proves the ALTER-TABLE migration path (not just the fresh-DB
+    /// ARC_SCHEMA_SQL create): build a legacy `arcs` table missing the four
+    /// loop_* columns, insert a pre-existing row, run `init_schema`, and assert
+    /// the columns are added and the legacy row reads back with all four None.
+    #[tokio::test]
+    async fn test_loop_columns_migrate_onto_legacy_arcs() {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+
+        // A legacy arcs table WITHOUT any loop_* columns, plus a pre-existing
+        // row. Only the columns the mapping reads by name are declared; SQLite
+        // ALTER ADD COLUMN fills the rest with NULL for existing rows.
+        conn.execute_batch(
+            "CREATE TABLE arcs (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'user_input',
+                status TEXT NOT NULL DEFAULT 'active',
+                parent_arc_id TEXT,
+                merged_into_arc_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            INSERT INTO arcs (id, name, source, status, created_at, updated_at)
+            VALUES ('legacy_arc', 'Legacy', 'user_input', 'active', '2020-01-01', '2020-01-01');",
+        )
+        .expect("create legacy arcs table");
+
+        let store = ArcStore::new(Arc::new(Mutex::new(conn)));
+        // init_schema must ALTER the existing table to add the loop_* columns.
+        store.init_schema().await.expect("init/migrate arc schema");
+
+        // The pre-existing legacy row now reads back with all four loop_*
+        // columns present and NULL — proving the migration added them without
+        // dropping the row.
+        let meta = store
+            .get_arc("legacy_arc")
+            .await
+            .unwrap()
+            .expect("legacy arc present after migration");
+        assert_eq!(meta.loop_state, None);
+        assert_eq!(meta.loop_iteration, None);
+        assert_eq!(meta.loop_max_iterations, None);
+        assert_eq!(meta.loop_root, None);
+
+        // And the setters work against the migrated table.
+        store
+            .set_loop_state("legacy_arc", Some("blocked"), Some(1), Some(5))
+            .await
+            .unwrap();
+        let meta = store.get_arc("legacy_arc").await.unwrap().unwrap();
+        assert_eq!(meta.loop_state.as_deref(), Some("blocked"));
+        assert_eq!(meta.loop_iteration, Some(1));
+        assert_eq!(meta.loop_max_iterations, Some(5));
     }
 }

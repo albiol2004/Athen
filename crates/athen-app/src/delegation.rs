@@ -1521,4 +1521,71 @@ mod tests {
         let filtered = athen_agent::executor::apply_tool_selection(&tools, &coder.tool_selection);
         assert!(filtered.iter().any(|t| t.name == "spawn_subagent"));
     }
+
+    /// End-to-end enforcement of Loop Mode's "the grader never fixes code"
+    /// guardrail: the seeded `loop_evaluator` profile's `ToolSelection::Deny`
+    /// must strip every file-mutating tool (`edit`, `write`, `delete_file`,
+    /// `save_file`) from the CALLABLE surface once it passes through the same
+    /// `apply_tool_selection` seam the executor uses before each LLM call — not
+    /// merely list them in a stored config vec. This is the executor-level test
+    /// GOAL.md mandates, deferred from I2 (where only athen-persistence, which
+    /// cannot depend on the executor, was in scope) to I4, where both the seeded
+    /// profile and `athen_agent::executor::apply_tool_selection` are reachable
+    /// from athen-app.
+    #[test]
+    fn loop_evaluator_deny_strips_file_mutators_from_callable_surface() {
+        use athen_core::agent_profile::ToolSelection;
+
+        let evaluator = athen_persistence::profiles::canonical_builtin_profile("loop_evaluator")
+            .expect("loop_evaluator builtin profile exists (seeded in I2)");
+
+        // Precondition: it really is a Deny list naming all four mutators.
+        match &evaluator.tool_selection {
+            ToolSelection::Deny(denied) => {
+                for name in ["edit", "write", "delete_file", "save_file"] {
+                    assert!(
+                        denied.iter().any(|d| d == name),
+                        "loop_evaluator must deny {name}"
+                    );
+                }
+            }
+            other => panic!("loop_evaluator expected ToolSelection::Deny, got {other:?}"),
+        }
+
+        // A registry surface that advertises all four mutators plus a benign,
+        // non-denied read tool (which must survive).
+        let mk = |name: &str, risk: BaseImpact| ToolDefinition {
+            name: name.to_string(),
+            description: "x".to_string(),
+            parameters: json!({}),
+            backend: ToolBackend::Shell {
+                command: String::new(),
+                native: false,
+            },
+            base_risk: risk,
+        };
+        let tools = vec![
+            mk("edit", BaseImpact::WritePersist),
+            mk("write", BaseImpact::WritePersist),
+            mk("delete_file", BaseImpact::WritePersist),
+            mk("save_file", BaseImpact::WritePersist),
+            mk("read_file", BaseImpact::Read),
+        ];
+
+        let filtered =
+            athen_agent::executor::apply_tool_selection(&tools, &evaluator.tool_selection);
+        let surviving: Vec<&str> = filtered.iter().map(|t| t.name.as_str()).collect();
+
+        // Every file mutator is stripped end-to-end — the grader mechanically
+        // cannot call any of them.
+        for name in ["edit", "write", "delete_file", "save_file"] {
+            assert!(
+                !surviving.contains(&name),
+                "{name} must NOT survive on the evaluator's callable surface, got {surviving:?}"
+            );
+        }
+        // The non-denied read tool is untouched.
+        assert!(surviving.contains(&"read_file"));
+        assert_eq!(filtered.len(), 1);
+    }
 }

@@ -31,6 +31,7 @@ pub(crate) mod http_api;
 pub(crate) mod http_presets;
 pub(crate) mod http_rate_limiter;
 pub(crate) mod identity_render;
+pub(crate) mod loop_mode;
 pub(crate) mod mission_render;
 pub(crate) mod notifier;
 pub(crate) mod owner_migration;
@@ -247,6 +248,9 @@ pub fn run() {
             commands::assign_arc_to_project,
             commands::deep_research,
             commands::get_research_paper,
+            commands::loop_start,
+            commands::loop_stop,
+            commands::loop_status,
             commands::set_arc_code_mode,
             commands::code_mode_git_state,
             commands::code_mode_agents,
