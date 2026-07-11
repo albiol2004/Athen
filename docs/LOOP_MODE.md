@@ -1,6 +1,15 @@
 # Loop Mode (Design Doc)
 
-**Status (2026-07-11):** DESIGN — not yet implemented.
+**Status (2026-07-11):** SHIPPED Phases 1 + 2 on `feat/loop-mode` (commits
+4936497 backend, 23183d7 dual-surface UI), pending merge + a manual smoke
+test on each surface. Phase 1 = orchestrator/profiles/arc columns/state
+glue/client-only command surface/guardrail tests; Phase 2 = desktop
+(`frontend/`) + web (`web/`) trigger dialog, live in-thread progress card,
+cooperative Stop, reload/arc-switch re-hydration, Inspector mailbox views,
+and the auth-gated traversal-safe `get_loop_file` mailbox read endpoint.
+Phases 3–4 below (per-role Bundle picker, restart reconciliation, FollowUp
+wake-up generalization) remain open. Code is authoritative; sections below
+remain the conceptual reference.
 
 Loop Mode is a per-arc, UI-triggered **Lead → Evaluator iteration loop** for
 goal-shaped work: the user states a goal with acceptance criteria, a Lead
