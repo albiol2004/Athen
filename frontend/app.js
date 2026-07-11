@@ -1202,7 +1202,7 @@ function renderCodeModeToggle() {
         toggle.classList.toggle('on', enabled);
         toggle.setAttribute('aria-checked', enabled ? 'true' : 'false');
         const root = (meta && meta.code_mode_root) || '';
-        toggle.title = enabled
+        toggle.dataset.tip = enabled
             ? `Code Mode ON — repo: ${root || '(root unknown)'}. Click to turn off.`
             : 'Code Mode OFF. Click to root this arc in a git repository.';
     }
@@ -1398,7 +1398,7 @@ function renderCodeModeState(body, state) {
     const rootRow = document.createElement('div');
     rootRow.className = 'code-mode-root-row';
     rootRow.textContent = state.root || '(unknown root)';
-    rootRow.title = state.root || '';
+    rootRow.dataset.tip = state.root || '';
     header.appendChild(rootRow);
 
     if (state.is_repo === false) {
@@ -1428,7 +1428,7 @@ function renderCodeModeState(body, state) {
         const sync = document.createElement('span');
         sync.className = 'code-mode-sync';
         sync.textContent = `↑${ahead} ↓${behind}`;
-        sync.title = `${ahead} ahead, ${behind} behind upstream`;
+        sync.dataset.tip = `${ahead} ahead, ${behind} behind upstream`;
         branchRow.appendChild(sync);
     }
     header.appendChild(branchRow);
@@ -1437,7 +1437,7 @@ function renderCodeModeState(body, state) {
         const up = document.createElement('div');
         up.className = 'code-mode-upstream';
         up.textContent = '→ ' + state.upstream;
-        up.title = state.upstream;
+        up.dataset.tip = state.upstream;
         header.appendChild(up);
     }
     body.appendChild(header);
@@ -1485,7 +1485,7 @@ function renderCodeModeState(body, state) {
             const pathEl = document.createElement('div');
             pathEl.className = 'code-mode-worktree-path';
             pathEl.textContent = wt.path || '';
-            pathEl.title = wt.path || '';
+            pathEl.dataset.tip = wt.path || '';
             row.appendChild(pathEl);
 
             sec.appendChild(row);
@@ -1512,7 +1512,7 @@ function renderCodeModeState(body, state) {
             const pathEl = document.createElement('span');
             pathEl.className = 'code-mode-dirty-path';
             pathEl.textContent = path;
-            pathEl.title = path;
+            pathEl.dataset.tip = path;
             row.appendChild(pathEl);
 
             // GitLens-style per-file discard. Confirmed before firing because
@@ -1521,7 +1521,7 @@ function renderCodeModeState(body, state) {
             discardBtn.type = 'button';
             discardBtn.className = 'code-mode-discard-btn';
             discardBtn.textContent = '↩'; // ↩ discard
-            discardBtn.title = 'Discard changes';
+            discardBtn.dataset.tip = 'Discard changes';
             discardBtn.setAttribute('aria-label', 'Discard changes to ' + path);
             discardBtn.addEventListener('click', () => {
                 discardCodeModeChanges(body, discardBtn, path);
@@ -1536,7 +1536,7 @@ function renderCodeModeState(body, state) {
         allBtn.type = 'button';
         allBtn.className = 'code-mode-discard-all-btn';
         allBtn.textContent = 'Discard all';
-        allBtn.title = 'Discard ALL uncommitted changes';
+        allBtn.dataset.tip = 'Discard ALL uncommitted changes';
         allBtn.addEventListener('click', () => {
             discardCodeModeChanges(body, allBtn, null);
         });
@@ -1562,7 +1562,7 @@ function renderCodeModeState(body, state) {
             const subject = document.createElement('span');
             subject.className = 'code-mode-commit-subject';
             subject.textContent = c.subject || '';
-            subject.title = c.subject || '';
+            subject.dataset.tip = c.subject || '';
             row.appendChild(subject);
 
             sec.appendChild(row);
@@ -1722,7 +1722,7 @@ function buildCodeModeAgentRow(node, depth, previouslyExpanded) {
     const title = document.createElement('span');
     title.className = 'code-mode-agent-title';
     title.textContent = node.title || (node.is_main ? 'Main agent' : 'Sub-agent');
-    title.title = title.textContent;
+    title.dataset.tip = title.textContent;
     head.appendChild(title);
 
     const badge = document.createElement('span');
@@ -1862,11 +1862,11 @@ function buildCodeModeMuted(text) {
 
 function getSourceIcon(source) {
     switch (source) {
-        case 'Email': return '<span class="arc-source-icon" title="Email">&#x1f4e7;</span>';
-        case 'Calendar': return '<span class="arc-source-icon" title="Calendar">&#x1f4c5;</span>';
-        case 'Messaging': return '<span class="arc-source-icon" title="Message">&#x1f4ac;</span>';
-        case 'System': return '<span class="arc-source-icon" title="System">&#9881;</span>';
-        default: return '<span class="arc-source-icon" title="Chat">&#x1f4ac;</span>';
+        case 'Email': return '<span class="arc-source-icon" data-tip="Email">&#x1f4e7;</span>';
+        case 'Calendar': return '<span class="arc-source-icon" data-tip="Calendar">&#x1f4c5;</span>';
+        case 'Messaging': return '<span class="arc-source-icon" data-tip="Message">&#x1f4ac;</span>';
+        case 'System': return '<span class="arc-source-icon" data-tip="System">&#9881;</span>';
+        default: return '<span class="arc-source-icon" data-tip="Chat">&#x1f4ac;</span>';
     }
 }
 
@@ -1932,7 +1932,7 @@ function buildArcItem(arc) {
 
         const menuBtn = document.createElement('button');
         menuBtn.className = 'session-action-btn arc-menu-trigger';
-        menuBtn.title = 'More actions';
+        menuBtn.dataset.tip = 'More actions';
         menuBtn.innerHTML = '&#x22EF;'; // horizontal ellipsis
         menuBtn.addEventListener('click', (e) => {
             e.stopPropagation();
@@ -2426,7 +2426,12 @@ async function handleCompactArc(arcId, btnEl) {
 
 async function handleDeleteArc(arcId) {
     if (!invoke) return;
-    if (!confirm('Delete this Arc and all its entries?')) return;
+    if (!(await showConfirmDialog({
+        title: 'Delete this Arc?',
+        body: 'The Arc and all its entries will be deleted.',
+        confirmLabel: 'Delete',
+        danger: true,
+    }))) return;
 
     try {
         const newActiveId = await invoke('delete_arc', { arcId });
@@ -2865,7 +2870,7 @@ function renderAttachmentChips(attachments) {
             img.className = 'message-attachment-thumb';
             img.src = att.data_url;
             img.alt = att.name || 'image';
-            img.title = att.name || '';
+            img.dataset.tip = att.name || '';
             img.addEventListener('click', () => {
                 window.open(att.data_url, '_blank');
             });
@@ -3659,7 +3664,7 @@ function refreshComposerImagesUI() {
     for (const img of composerImages) {
         const chip = document.createElement('div');
         chip.className = 'composer-image-chip';
-        chip.title = img.name || img.mime_type;
+        chip.dataset.tip = img.name || img.mime_type;
         chip.innerHTML = `
             <img src="${img.dataUrl}" alt="">
             <button type="button" class="composer-image-remove" aria-label="Remove image" data-id="${img.id}">×</button>
@@ -3669,7 +3674,7 @@ function refreshComposerImagesUI() {
     for (const att of composerAttachments) {
         const chip = document.createElement('div');
         chip.className = 'composer-file-chip';
-        chip.title = `${att.name} (${att.mime_type}, ${fmtBytes(att.size)})`;
+        chip.dataset.tip = `${att.name} (${att.mime_type}, ${fmtBytes(att.size)})`;
         chip.innerHTML = `
             <span class="composer-file-icon" aria-hidden="true">📄</span>
             <span class="composer-file-name">${att.name}</span>
@@ -3866,7 +3871,7 @@ function updateComposerVisionGate(providers) {
             hint = 'Attach image';
         }
     }
-    composerAttachBtn.title = hint;
+    composerAttachBtn.dataset.tip = hint;
     composerAttachBtn.classList.toggle('disabled', !visionOk);
     composerAttachBtn.dataset.visionOk = visionOk ? '1' : '0';
 }
@@ -4127,7 +4132,7 @@ formEl.addEventListener('submit', async (e) => {
                     }
                     const label = escapeHtml(labelRaw);
                     const titleAttr = escapeHtml(rawName);
-                    toolsHtml += `<div class="tool-call builtin" title="${titleAttr}">
+                    toolsHtml += `<div class="tool-call builtin" data-tip="${titleAttr}">
                         <span class="tool-call-icon">${builtinIcon}</span>
                         <span class="tool-call-name">${label}</span>
                         <span class="tool-call-summary">${summary}</span>
@@ -4288,7 +4293,7 @@ function renderToolGroup(toolCalls) {
         const icon = builtinToolIcon(toolName);
         const slot = document.createElement('span');
         slot.className = 'tool-group-icon-slot';
-        slot.title = toolName;
+        slot.dataset.tip = toolName;
         if (icon) {
             slot.innerHTML = icon;
         } else {
@@ -4368,7 +4373,7 @@ function appendLiveToolCard(groupEl, card, toolName, status, stepIndex) {
     if (!slot) {
         slot = document.createElement('span');
         slot.className = 'tool-group-icon-slot';
-        slot.title = toolName || '';
+        slot.dataset.tip = toolName || '';
         const icon = builtinToolIcon(toolName);
         if (icon) {
             slot.innerHTML = icon;
@@ -4602,11 +4607,18 @@ function maybeBuildRevertRow(meta) {
         } catch (lookupErr) {
             console.warn('Snapshot lookup failed, proceeding with single-action confirm:', lookupErr);
         }
-        const confirmMsg = cascadeCount > 1
-            ? `Revert this change and ${cascadeCount - 1} newer change${cascadeCount - 1 === 1 ? '' : 's'}?\n\n` +
-              `Files will be restored to their state just before this point. The reverted changes will be removed from the timeline and cannot be brought back.`
-            : `Revert this change?\n\nThe file will be restored to its previous state. This change will be removed from the timeline and cannot be brought back.`;
-        if (!window.confirm(confirmMsg)) return;
+        const confirmTitle = cascadeCount > 1
+            ? `Revert this change and ${cascadeCount - 1} newer change${cascadeCount - 1 === 1 ? '' : 's'}?`
+            : 'Revert this change?';
+        const confirmBody = cascadeCount > 1
+            ? 'Files will be restored to their state just before this point. The reverted changes will be removed from the timeline and cannot be brought back.'
+            : 'The file will be restored to its previous state. This change will be removed from the timeline and cannot be brought back.';
+        if (!(await showConfirmDialog({
+            title: confirmTitle,
+            body: confirmBody,
+            confirmLabel: 'Revert',
+            danger: true,
+        }))) return;
 
         btn.disabled = true;
         status.textContent = 'Reverting…';
@@ -6067,7 +6079,7 @@ function buildToolCard(meta) {
                       : status === 'Failed' ? 'failed' : 'in-progress';
     const builtinClass = realIcon ? ' builtin' : '';
     card.className = `tool-execution-card ${statusClass}${builtinClass}`;
-    card.title = toolName;
+    card.dataset.tip = toolName;
 
     let labelText = realIcon ? builtinToolLabel(toolName) : toolName;
     // http_request reads as "Cloud API" by default; promote to
@@ -6175,7 +6187,7 @@ function buildTranscriptToolGroup(toolCalls) {
         const icon = builtinToolIcon(toolName);
         const slot = document.createElement('span');
         slot.className = 'tool-group-icon-slot';
-        slot.title = toolName;
+        slot.dataset.tip = toolName;
         if (icon) {
             slot.innerHTML = icon;
         } else {
@@ -6469,7 +6481,12 @@ async function newArc() {
 
 async function branchFromArc(parentArcId, parentName, upToEntryId) {
     if (!invoke) return;
-    const branchName = prompt('Name for the new branch:', parentName + ' (branch)');
+    const branchName = await showPromptDialog({
+        title: 'Branch this Arc',
+        body: 'Name for the new branch:',
+        defaultValue: parentName + ' (branch)',
+        confirmLabel: 'Create branch',
+    });
     if (!branchName) return;
     try {
         const newId = await invoke('branch_arc', {
@@ -6568,7 +6585,7 @@ function buildMsgHoverActions(entryId, content, isUser) {
 
     const trigger = document.createElement('button');
     trigger.className = 'msg-action-btn msg-dots-btn';
-    trigger.title = 'Actions';
+    trigger.dataset.tip = 'Actions';
     trigger.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="5" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="12" cy="19" r="2"/></svg>';
     wrap.appendChild(trigger);
 
@@ -6693,66 +6710,142 @@ function startInlineEdit(row, entryId, originalText) {
     });
 }
 
-// Generic styled confirm dialog (warm-dark glass), reusing the rewind-dialog
-// CSS. Returns a Promise<boolean> that resolves true on confirm, false on
-// cancel/dismiss. Use for destructive-but-not-deletion actions that need a
-// short explanation (e.g. Compact), where a bare window.confirm is too terse.
-function showConfirmDialog({ title, body, confirmLabel = 'Confirm', cancelLabel = 'Cancel', danger = false }) {
+// ─── App dialog layer (styled alert / confirm / prompt) ─────────────────
+//
+// One glass dialog (rewind-dialog shell) replaces every native
+// window.alert/confirm/prompt. Shared core: focus is trapped inside the
+// dialog (Tab cycles), Enter fires the primary action, Escape cancels,
+// `danger: true` turns the primary button red. Variants:
+//   showConfirmDialog -> Promise<boolean>  (true on confirm)
+//   showAlertDialog   -> Promise<void>     (resolves on dismiss)
+//   showPromptDialog  -> Promise<string|null> (null on cancel — exact
+//                        native-prompt semantics; '' is a valid answer)
+function openAppDialog({ title, body, mode = 'confirm', confirmLabel = 'Confirm', cancelLabel = 'Cancel', danger = false, defaultValue = '', placeholder = '' }) {
     return new Promise((resolve) => {
         const overlay = document.createElement('div');
         overlay.className = 'rewind-dialog-overlay';
 
         const dialog = document.createElement('div');
         dialog.className = 'rewind-dialog';
+        dialog.setAttribute('role', mode === 'alert' ? 'alertdialog' : 'dialog');
+        dialog.setAttribute('aria-modal', 'true');
 
         const titleEl = document.createElement('h3');
         titleEl.textContent = title;
         dialog.appendChild(titleEl);
 
-        const desc = document.createElement('p');
-        desc.textContent = body;
-        dialog.appendChild(desc);
+        if (body) {
+            const desc = document.createElement('p');
+            desc.textContent = body;
+            dialog.appendChild(desc);
+        }
+
+        let inputEl = null;
+        if (mode === 'prompt') {
+            inputEl = document.createElement('input');
+            inputEl.type = 'text';
+            inputEl.className = 'app-dialog-input';
+            inputEl.value = defaultValue;
+            if (placeholder) inputEl.placeholder = placeholder;
+            dialog.appendChild(inputEl);
+        }
 
         const btnRow = document.createElement('div');
         btnRow.className = 'rewind-dialog-buttons';
 
-        const cancelBtn = document.createElement('button');
-        cancelBtn.className = 'rewind-dialog-cancel';
-        cancelBtn.textContent = cancelLabel;
+        let cancelBtn = null;
+        if (mode !== 'alert') {
+            cancelBtn = document.createElement('button');
+            cancelBtn.className = 'rewind-dialog-cancel';
+            cancelBtn.textContent = cancelLabel;
+            btnRow.appendChild(cancelBtn);
+        }
 
         const confirmBtn = document.createElement('button');
         confirmBtn.className = 'rewind-dialog-confirm' + (danger ? ' danger' : '');
         confirmBtn.textContent = confirmLabel;
-
-        btnRow.appendChild(cancelBtn);
         btnRow.appendChild(confirmBtn);
+
         dialog.appendChild(btnRow);
         overlay.appendChild(dialog);
         document.body.appendChild(overlay);
+
+        // Cancel value per variant: confirm -> false, prompt -> null,
+        // alert -> undefined (dismiss and OK are the same outcome).
+        const cancelValue = mode === 'prompt' ? null : (mode === 'alert' ? undefined : false);
+        const confirmValue = () => (mode === 'prompt' ? inputEl.value
+            : (mode === 'alert' ? undefined : true));
 
         let settled = false;
         const close = (val) => {
             if (settled) return;
             settled = true;
+            document.removeEventListener('keydown', onKey, true);
             overlay.remove();
             resolve(val);
         };
 
-        cancelBtn.addEventListener('click', () => close(false));
-        confirmBtn.addEventListener('click', () => close(true));
+        if (cancelBtn) cancelBtn.addEventListener('click', () => close(cancelValue));
+        confirmBtn.addEventListener('click', () => close(confirmValue()));
         overlay.addEventListener('click', (e) => {
-            if (e.target === overlay) close(false);
+            if (e.target === overlay) close(cancelValue);
         });
+
+        // Keyboard: Escape cancels, Enter fires the primary action, Tab is
+        // trapped inside the dialog. Capture phase so underlying views
+        // (chat input, global shortcuts) never see these keys.
+        const focusables = () => Array.prototype.filter.call(
+            dialog.querySelectorAll('input, button'),
+            (el) => !el.disabled
+        );
         const onKey = (e) => {
             if (e.key === 'Escape') {
-                document.removeEventListener('keydown', onKey);
-                close(false);
+                e.preventDefault();
+                e.stopPropagation();
+                close(cancelValue);
+            } else if (e.key === 'Enter') {
+                e.preventDefault();
+                e.stopPropagation();
+                // Enter on the cancel button should still cancel.
+                if (cancelBtn && document.activeElement === cancelBtn) close(cancelValue);
+                else close(confirmValue());
+            } else if (e.key === 'Tab') {
+                const els = focusables();
+                if (els.length === 0) return;
+                e.preventDefault();
+                e.stopPropagation();
+                const idx = els.indexOf(document.activeElement);
+                const next = e.shiftKey
+                    ? (idx <= 0 ? els.length - 1 : idx - 1)
+                    : (idx === -1 || idx === els.length - 1 ? 0 : idx + 1);
+                els[next].focus();
             }
         };
-        document.addEventListener('keydown', onKey);
+        document.addEventListener('keydown', onKey, true);
 
-        confirmBtn.focus();
+        if (inputEl) {
+            inputEl.focus();
+            inputEl.select();
+        } else {
+            confirmBtn.focus();
+        }
     });
+}
+
+// Returns Promise<boolean>: true on confirm, false on cancel/dismiss.
+function showConfirmDialog({ title, body, confirmLabel = 'Confirm', cancelLabel = 'Cancel', danger = false }) {
+    return openAppDialog({ title, body, mode: 'confirm', confirmLabel, cancelLabel, danger });
+}
+
+// Returns Promise<void>: resolves when the user dismisses the message.
+function showAlertDialog({ title, body, confirmLabel = 'OK', danger = false }) {
+    return openAppDialog({ title, body, mode: 'alert', confirmLabel, danger });
+}
+
+// Returns Promise<string|null>: the input value on confirm, null on
+// cancel/Escape/overlay-click (native prompt semantics — '' is an answer).
+function showPromptDialog({ title, body, defaultValue = '', placeholder = '', confirmLabel = 'OK', cancelLabel = 'Cancel' }) {
+    return openAppDialog({ title, body, mode: 'prompt', confirmLabel, cancelLabel, defaultValue, placeholder });
 }
 
 // ─── Deep Research ───────────────────────────────────────────────────────
@@ -7980,7 +8073,7 @@ function buildRewindDivider(target, isTop, undoneChain) {
             ? `Revert all ${count} change${count === 1 ? '' : 's'}`
             : `Rewind here · undo ${count} change${count === 1 ? '' : 's'}`) +
         '</span>';
-    btn.title = isTop
+    btn.dataset.tip = isTop
         ? 'Rewind to the state before any of these changes happened.'
         : 'Rewind to this point in time — everything below this line gets undone.';
 
@@ -8011,10 +8104,14 @@ function highlightCascade(divider, on) {
 async function rewindToBefore(target, undoneChain, btn) {
     if (!invoke || btn.disabled || !activeArcId) return;
     const count = undoneChain.length;
-    const confirmMsg = count > 1
-        ? `Rewind ${count} changes?\n\nFiles will be restored to their state at this point in time. The ${count} changes will be removed from the timeline and cannot be brought back.`
-        : `Rewind 1 change?\n\nThe file will be restored to its previous state. This change will be removed from the timeline and cannot be brought back.`;
-    if (!window.confirm(confirmMsg)) return;
+    if (!(await showConfirmDialog({
+        title: count > 1 ? `Rewind ${count} changes?` : 'Rewind 1 change?',
+        body: count > 1
+            ? `Files will be restored to their state at this point in time. The ${count} changes will be removed from the timeline and cannot be brought back.`
+            : 'The file will be restored to its previous state. This change will be removed from the timeline and cannot be brought back.',
+        confirmLabel: 'Rewind',
+        danger: true,
+    }))) return;
 
     btn.disabled = true;
     const prevHtml = btn.innerHTML;
@@ -8062,7 +8159,7 @@ function buildChangesNode(action) {
     const timeEl = document.createElement('span');
     timeEl.className = 'changes-node-time';
     timeEl.textContent = formatRelativeTime(action.created_at);
-    timeEl.title = action.created_at || '';
+    timeEl.dataset.tip = action.created_at || '';
     head.appendChild(toolEl);
     head.appendChild(timeEl);
     card.appendChild(head);
@@ -8780,16 +8877,16 @@ async function paintProfileChip(chipEl, profileId) {
     if (!chipEl) return;
     chipEl.classList.add('loading');
     chipEl.textContent = '…';
-    chipEl.title = 'Calculating fresh-start token cost…';
+    chipEl.dataset.tip = 'Calculating fresh-start token cost…';
     const est = await fetchProfileTokenEstimate(profileId);
     chipEl.classList.remove('loading');
     if (!est || !est.approx_tokens) {
         chipEl.textContent = '— tok';
-        chipEl.title = 'Token estimate unavailable.';
+        chipEl.dataset.tip = 'Token estimate unavailable.';
         return;
     }
     chipEl.textContent = `≈ ${formatTokenCount(est.approx_tokens)} tok`;
-    chipEl.title = buildEstimateTooltip(est);
+    chipEl.dataset.tip = buildEstimateTooltip(est);
 }
 
 async function paintAllProfileChips() {
@@ -8832,13 +8929,13 @@ function buildProfileCard(p) {
     // Built-ins get a "Restore default" affordance. User-authored profiles
     // get a "Delete" instead — there's no canonical version to revert to.
     const tailButton = isBuiltin
-        ? '<button data-action="restore" title="Revert this built-in to its shipped values">Restore default</button>'
+        ? '<button data-action="restore" data-tip="Revert this built-in to its shipped values">Restore default</button>'
         : '<button data-action="delete" class="btn-danger">Delete</button>';
     card.innerHTML = `
         <div class="profile-card-main">
             <div class="profile-card-name">
                 ${escapeHtml(p.display_name)} ${badge}
-                <span class="profile-token-chip loading" data-profile-id="${escapeHtml(p.id)}" title="Calculating fresh-start token cost…">…</span>
+                <span class="profile-token-chip loading" data-profile-id="${escapeHtml(p.id)}" data-tip="Calculating fresh-start token cost…">…</span>
             </div>
             ${desc}
         </div>
@@ -8857,7 +8954,12 @@ function buildProfileCard(p) {
 
 async function restoreProfile(p) {
     if (!invoke) return;
-    if (!confirm(`Restore "${p.display_name}" to its built-in defaults?\n\nYour edits to this profile will be lost.`)) {
+    if (!(await showConfirmDialog({
+        title: `Restore "${p.display_name}" to its built-in defaults?`,
+        body: 'Your edits to this profile will be lost.',
+        confirmLabel: 'Restore',
+        danger: true,
+    }))) {
         return;
     }
     try {
@@ -8871,7 +8973,12 @@ async function restoreProfile(p) {
 async function deleteProfile(p) {
     if (!invoke) return;
     if (p.builtin) return; // Should be disabled in UI; defense in depth.
-    if (!confirm(`Delete profile "${p.display_name}"?\n\nArcs using this profile will fall back to the default.`)) {
+    if (!(await showConfirmDialog({
+        title: `Delete profile "${p.display_name}"?`,
+        body: 'Arcs using this profile will fall back to the default.',
+        confirmLabel: 'Delete',
+        danger: true,
+    }))) {
         return;
     }
     try {
@@ -9281,7 +9388,7 @@ function buildIdentityEntryCard(entry, cat) {
         const dismiss = document.createElement('button');
         dismiss.type = 'button';
         dismiss.className = 'identity-proposed-chip-dismiss';
-        dismiss.title = 'Dismiss this suggestion';
+        dismiss.dataset.tip = 'Dismiss this suggestion';
         dismiss.setAttribute('aria-label', 'Dismiss this suggestion');
         dismiss.textContent = '×';
         dismiss.addEventListener('click', async () => {
@@ -9346,7 +9453,11 @@ function buildIdentityEntryCard(entry, cat) {
     delBtn.className = 'btn-danger';
     delBtn.textContent = 'Delete';
     delBtn.addEventListener('click', async () => {
-        if (!confirm('Delete this entry?')) return;
+        if (!(await showConfirmDialog({
+            title: 'Delete this entry?',
+            confirmLabel: 'Delete',
+            danger: true,
+        }))) return;
         try {
             await invoke('delete_identity_entry', { id: entry.id });
             await loadIdentityManager();
@@ -9441,7 +9552,11 @@ async function deleteIdentityCategory(cat) {
         count > 0
             ? `Delete category "${cat.name}" and its ${count} entrie${count === 1 ? 'y' : 's'}?`
             : `Delete category "${cat.name}"?`;
-    if (!confirm(msg)) return;
+    if (!(await showConfirmDialog({
+        title: msg,
+        confirmLabel: 'Delete',
+        danger: true,
+    }))) return;
     try {
         await invoke('delete_identity_category', { name: cat.name });
         if (identitySelectedCategory === cat.name) identitySelectedCategory = null;
@@ -9831,7 +9946,7 @@ async function renderSkillsDetail() {
     const bodyInput = document.createElement('textarea');
     bodyInput.className = 'identity-entry-body';
     bodyInput.style.minHeight = '320px';
-    bodyInput.style.fontFamily = 'var(--font-mono, monospace)';
+    bodyInput.style.fontFamily = 'var(--mono)';
     bodyInput.value = editing.body;
     bodyInput.placeholder = '# Procedure\n\nStep 1 …';
     bodyInput.addEventListener('input', () => {
@@ -9891,7 +10006,12 @@ async function renderSkillsDetail() {
         delBtn.className = 'btn-danger';
         delBtn.textContent = 'Delete';
         delBtn.addEventListener('click', async () => {
-            if (!confirm(`Delete skill "${editing.slug}"? This removes the folder on disk.`)) return;
+            if (!(await showConfirmDialog({
+                title: `Delete skill "${editing.slug}"?`,
+                body: 'This removes the folder on disk.',
+                confirmLabel: 'Delete',
+                danger: true,
+            }))) return;
             try {
                 await invoke('delete_skill', { slug: editing.slug });
                 skillsDrafts.delete(editing.slug);
@@ -10091,10 +10211,12 @@ function buildProjectRow(project) {
     deleteBtn.type = 'button';
     deleteBtn.textContent = 'Delete';
     deleteBtn.addEventListener('click', async () => {
-        const ok = window.confirm(
-            `Delete project "${project.name}"?\n\n` +
-            'Arcs in this project will be un-assigned but kept, and the workspace folder on disk is preserved. This only removes the project grouping.'
-        );
+        const ok = await showConfirmDialog({
+            title: `Delete project "${project.name}"?`,
+            body: 'Arcs in this project will be un-assigned but kept, and the workspace folder on disk is preserved. This only removes the project grouping.',
+            confirmLabel: 'Delete',
+            danger: true,
+        });
         if (!ok) return;
         try {
             await invoke('delete_project', { id: project.id });
@@ -10546,9 +10668,12 @@ function formatRelativeTime(iso) {
 }
 
 async function handleClearToolbox() {
-    const ok = window.confirm(
-        'Remove every package the agent has installed in ~/.athen/toolbox? \nThis cannot be undone.'
-    );
+    const ok = await showConfirmDialog({
+        title: 'Clear the toolbox?',
+        body: 'Remove every package the agent has installed in ~/.athen/toolbox? This cannot be undone.',
+        confirmLabel: 'Remove all',
+        danger: true,
+    });
     if (!ok) return;
     try {
         await invoke('clear_toolbox');
@@ -11016,7 +11141,7 @@ function createBundleCard(bundle, providers) {
         const slugMatched = pick.slug && curated.some((m) => m.slug === pick.slug);
         const customVisible = !slugMatched && (pick.slug || curated.length === 0);
         row.innerHTML = `
-            <span class="provider-tier-label" title="${escapeHtml(BUNDLE_TIER_HINTS[t] || '')}">${BUNDLE_TIER_LABELS[t]}</span>
+            <span class="provider-tier-label" data-tip="${escapeHtml(BUNDLE_TIER_HINTS[t] || '')}">${BUNDLE_TIER_LABELS[t]}</span>
             <select class="bundle-tier-connection">${connectionOptions(pick.connection_id)}</select>
             <select class="bundle-tier-model">${buildModelSelectOptions(curated, pick.slug || '')}</select>
             <input type="text" class="bundle-tier-slug" value="${escapeHtml(pick.slug || '')}" placeholder="custom slug (e.g. deepseek-v4-flash)" style="${customVisible ? '' : 'display: none;'}">
@@ -11167,7 +11292,12 @@ async function handleSaveBundle(card, id) {
 
 async function handleDeleteBundle(id, name) {
     if (!invoke) return;
-    if (!confirm(`Delete Bundle "${name}"? You can re-create it later.`)) return;
+    if (!(await showConfirmDialog({
+        title: `Delete Bundle "${name}"?`,
+        body: 'You can re-create it later.',
+        confirmLabel: 'Delete',
+        danger: true,
+    }))) return;
     try {
         await invoke('delete_bundle', { id });
         showToast('Bundle deleted', 'success');
@@ -11179,7 +11309,11 @@ async function handleDeleteBundle(id, name) {
 
 async function handleDuplicateBundle(id, name) {
     if (!invoke) return;
-    const newName = prompt(`Duplicate "${name}" as:`, `${name} (copy)`);
+    const newName = await showPromptDialog({
+        title: `Duplicate "${name}" as:`,
+        defaultValue: `${name} (copy)`,
+        confirmLabel: 'Duplicate',
+    });
     if (!newName) return;
     try {
         await invoke('duplicate_bundle', { id, newName: newName.trim() });
@@ -11193,7 +11327,11 @@ async function handleDuplicateBundle(id, name) {
 if (addBundleBtn) {
     addBundleBtn.addEventListener('click', async () => {
         if (!invoke) return;
-        const name = prompt('Name for the new Bundle:');
+        const name = await showPromptDialog({
+            title: 'New Bundle',
+            body: 'Name for the new Bundle:',
+            confirmLabel: 'Create',
+        });
         if (!name) return;
         try {
             await invoke('create_bundle', { name: name.trim() });
@@ -11219,14 +11357,14 @@ function showProviderHelpModal(entry) {
     title.textContent = (entry.name || entry.label || entry.provider || 'Provider') + ' Setup';
     let html = '';
     if (entry.cost_note || entry.free_tier_blurb) {
-        html += '<p style="color:var(--fg-muted);margin:0 0 12px">' + (entry.cost_note || entry.free_tier_blurb) + '</p>';
+        html += '<p style="color:var(--text-2);margin:0 0 12px">' + (entry.cost_note || entry.free_tier_blurb) + '</p>';
     }
     const url = entry.dashboard_url || entry.signup_url || '';
     if (url) {
-        html += '<div style="margin-bottom:14px"><strong>Get your API key:</strong> <a href="' + url + '" style="color:var(--accent)">' + url.replace(/^https?:\/\//, '') + '</a></div>';
+        html += '<div style="margin-bottom:14px"><strong>Get your API key:</strong> <a href="' + url + '" style="color:var(--brand-solid)">' + url.replace(/^https?:\/\//, '') + '</a></div>';
     }
     if (entry.key_format_hint) {
-        html += '<div style="margin-bottom:14px;color:var(--fg-muted);font-size:0.85rem">Key format: ' + entry.key_format_hint + '</div>';
+        html += '<div style="margin-bottom:14px;color:var(--text-2);font-size:0.85rem">Key format: ' + entry.key_format_hint + '</div>';
     }
     const steps = entry.setup_steps || [];
     if (steps.length) {
@@ -11238,7 +11376,7 @@ function showProviderHelpModal(entry) {
     if (snippets.length) {
         html += '<div style="margin-bottom:6px"><strong>Install:</strong></div>';
         for (const sn of snippets) {
-            html += '<div style="margin-bottom:8px"><span style="font-size:0.8rem;color:var(--fg-muted)">' + sn.os + ':</span><pre style="margin:2px 0;padding:6px 10px;background:var(--bg-deeper);border-radius:4px;font-size:0.82rem;overflow-x:auto">' + sn.cmd + '</pre></div>';
+            html += '<div style="margin-bottom:8px"><span style="font-size:0.8rem;color:var(--text-2)">' + sn.os + ':</span><pre style="margin:2px 0;padding:6px 10px;background:var(--bg-deep);border-radius:4px;font-size:0.82rem;overflow-x:auto">' + sn.cmd + '</pre></div>';
         }
     }
     body.innerHTML = html;
@@ -11292,7 +11430,7 @@ function createProviderCard(provider) {
         const helpBtn = document.createElement('button');
         helpBtn.className = 'btn-provider-help';
         helpBtn.textContent = '?';
-        helpBtn.title = 'Setup help for ' + provider.name;
+        helpBtn.dataset.tip = 'Setup help for ' + provider.name;
         helpBtn.addEventListener('click', (e) => {
             e.stopPropagation();
             showProviderHelpModal(catalogEntry);
@@ -11355,7 +11493,7 @@ function createProviderCard(provider) {
             <label>API Key</label>
             <div class="api-key-wrapper">
                 <input type="password" class="provider-api-key" placeholder="${provider.has_api_key ? 'Key is set (leave blank to keep)' : 'Enter API key'}" autocomplete="off">
-                <button class="api-key-toggle" title="Show/hide key">&#128065;</button>
+                <button class="api-key-toggle" data-tip="Show/hide key" aria-label="Show/hide key">&#128065;</button>
             </div>
             ${provider.api_key_hint ? `<div class="api-key-hint">Current: ${escapeHtml(provider.api_key_hint)}</div>` : ''}
         </div>
@@ -11577,7 +11715,12 @@ async function handleSaveProvider(card, id) {
 
 async function handleDeleteProvider(id) {
     if (!invoke) return;
-    if (!confirm('Delete provider "' + id + '"? You can re-add it later.')) return;
+    if (!(await showConfirmDialog({
+        title: 'Delete provider "' + id + '"?',
+        body: 'You can re-add it later.',
+        confirmLabel: 'Delete',
+        danger: true,
+    }))) return;
 
     // Optimistic removal: drop the card immediately so the user gets
     // instant feedback. If the backend call fails, loadSettings() in
@@ -13072,7 +13215,7 @@ function renderOwnerIdentifierRow(kind, value) {
     if (value) input.value = value;
     const remove = document.createElement('button');
     remove.className = 'btn-secondary owner-identifier-remove';
-    remove.title = 'Remove';
+    remove.dataset.tip = 'Remove';
     remove.type = 'button';
     remove.textContent = '×';
     remove.addEventListener('click', () => row.remove());
@@ -13161,9 +13304,12 @@ document.getElementById('save-owner-contact-btn')?.addEventListener('click', asy
 
 document.getElementById('clear-owner-contact-btn')?.addEventListener('click', async function () {
     clearOwnerContactError();
-    const ok = window.confirm(
-        'Remove your contact info? Athen will no longer recognize messages as coming from you.'
-    );
+    const ok = await showConfirmDialog({
+        title: 'Remove your contact info?',
+        body: 'Athen will no longer recognize messages as coming from you.',
+        confirmLabel: 'Remove',
+        danger: true,
+    });
     if (!ok) return;
     const btn = this;
     btn.disabled = true;
@@ -13962,7 +14108,7 @@ async function renderTimeline() {
             const color = getTlColor(i);
             const icon = getTlSourceIcon(arc.source);
             const statusCls = arc.status === 'Merged' ? ' tl-merged' : arc.status === 'Archived' ? ' tl-archived' : '';
-            html += '<div class="tl-col-header' + statusCls + '" style="border-bottom-color: ' + color + '" data-arc-id="' + arc.id + '" title="Click to open">';
+            html += '<div class="tl-col-header' + statusCls + '" style="border-bottom-color: ' + color + '" data-arc-id="' + arc.id + '" data-tip="Click to open">';
             html += '<span class="tl-col-icon">' + icon + '</span>';
             html += '<span class="tl-col-name">' + escapeHtml(arc.name) + '</span>';
             html += '<span class="tl-col-count">' + arc.entry_count + '</span>';
@@ -14813,7 +14959,11 @@ async function deleteCalendarEvent() {
     const id = document.getElementById('cal-event-id').value;
     if (!id) return;
 
-    if (!confirm('Delete this event?')) return;
+    if (!(await showConfirmDialog({
+        title: 'Delete this event?',
+        confirmLabel: 'Delete',
+        danger: true,
+    }))) return;
 
     if (!invoke) {
         calEvents = calEvents.filter(ev => ev.id !== id);
@@ -15498,7 +15648,7 @@ function buildContactRow(contact) {
     const trustClass = 'trust-' + (contact.trust_level || 'unknown').toLowerCase();
     const pip = document.createElement('span');
     pip.className = 'contact-trust-pip ' + trustClass;
-    pip.title = contact.trust_level === 'AuthUser' ? 'Owner' : (contact.trust_level || 'Unknown');
+    pip.dataset.tip = contact.trust_level === 'AuthUser' ? 'Owner' : (contact.trust_level || 'Unknown');
     trail.appendChild(pip);
     row.appendChild(trail);
 
@@ -15837,7 +15987,12 @@ async function toggleBlockContact(id, block) {
 }
 
 async function deleteContact(id) {
-    if (!confirm('Are you sure you want to delete this contact? This cannot be undone.')) {
+    if (!(await showConfirmDialog({
+        title: 'Delete this contact?',
+        body: 'Are you sure you want to delete this contact? This cannot be undone.',
+        confirmLabel: 'Delete',
+        danger: true,
+    }))) {
         return;
     }
     if (!invoke) return;
@@ -15898,7 +16053,7 @@ function addIdentifierRow(kind, value) {
     const removeBtn = document.createElement('button');
     removeBtn.className = 'remove-identifier-btn';
     removeBtn.textContent = '\u00d7';
-    removeBtn.title = 'Remove';
+    removeBtn.dataset.tip = 'Remove';
     removeBtn.addEventListener('click', () => row.remove());
 
     row.appendChild(select);
@@ -16104,7 +16259,11 @@ async function editMemory(id, btn) {
 }
 
 async function deleteMemory(id) {
-    if (!confirm('Delete this memory?')) return;
+    if (!(await showConfirmDialog({
+        title: 'Delete this memory?',
+        confirmLabel: 'Delete',
+        danger: true,
+    }))) return;
     try {
         await invoke('delete_memory', { id: id });
         loadMemories();
@@ -16195,7 +16354,11 @@ function renderEntities(entities) {
 }
 
 async function deleteEntity(id) {
-    if (!confirm('Delete this entity and its relations?')) return;
+    if (!(await showConfirmDialog({
+        title: 'Delete this entity and its relations?',
+        confirmLabel: 'Delete',
+        danger: true,
+    }))) return;
     try {
         await invoke('delete_entity', { id });
         loadEntities();
@@ -16287,7 +16450,7 @@ function renderProjectsStrip() {
     }
 
     listEl.innerHTML = projectsList.map((p) => {
-        return '<div class="project-strip-row" data-id="' + escapeHtml(p.id) + '" title="' + escapeHtml(p.name) + '">' +
+        return '<div class="project-strip-row" data-id="' + escapeHtml(p.id) + '" data-tip="' + escapeHtml(p.name) + '">' +
             '<span class="project-strip-icon" aria-hidden="true">' +
                 '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>' +
             '</span>' +
@@ -16296,8 +16459,8 @@ function renderProjectsStrip() {
     }).join('');
 }
 
-// Inline create row in the sidebar strip header (no prompt()/alert() — those
-// may be no-ops under the WebView).
+// Inline create row in the sidebar strip header (no popup dialog — an
+// inline field is lighter for a quick name entry).
 function toggleProjectInlineCreate(show) {
     const wrap = document.getElementById('project-new-inline');
     const input = document.getElementById('project-new-inline-input');
@@ -16676,7 +16839,12 @@ async function loadProjectMemories(projectId) {
         if (!invoke || !openProjectId) return;
         const project = projectsList.find((p) => p.id === openProjectId);
         const label = project ? project.name : 'this project';
-        if (!confirm('Delete “' + label + '”? Member arcs are detached, not deleted.')) return;
+        if (!(await showConfirmDialog({
+            title: 'Delete “' + label + '”?',
+            body: 'Member arcs are detached, not deleted.',
+            confirmLabel: 'Delete',
+            danger: true,
+        }))) return;
         try {
             await invoke('delete_project', { id: openProjectId });
             showToast('Project deleted', 'success');
@@ -16804,7 +16972,7 @@ function renderGrantModal(req) {
         const row = document.createElement('div');
         row.className = 'grant-modal-path';
         const prefix = isMove ? (idx === 0 ? 'From: ' : 'To: ') : '';
-        row.innerHTML = `<span class="grant-modal-path-prefix">${escapeHtml(prefix)}</span><code title="${escapeHtml(p)}">${escapeHtml(ellipsizePath(p))}</code>`;
+        row.innerHTML = `<span class="grant-modal-path-prefix">${escapeHtml(prefix)}</span><code data-tip="${escapeHtml(p)}">${escapeHtml(ellipsizePath(p))}</code>`;
         pathsEl.appendChild(row);
     });
 
@@ -16814,6 +16982,8 @@ function renderGrantModal(req) {
     const anySystem = paths.some(isSystemPath);
     if (anySystem) {
         allowAlwaysBtn.disabled = true;
+        // Native title on purpose: disabled buttons get no mouse events, so
+        // the data-tip tooltip is unreachable here (same as bundle-delete).
         allowAlwaysBtn.title = 'System paths cannot be granted permanently';
     } else {
         allowAlwaysBtn.disabled = false;
@@ -16827,7 +16997,7 @@ function renderGrantModal(req) {
     if (root && root.path) {
         allowRootBtn.classList.remove('hidden');
         allowRootBtn.textContent = `Allow ${root.pathDisplay || root.path} (${root.marker || 'project root'})`;
-        allowRootBtn.title = root.path;
+        allowRootBtn.dataset.tip = root.path;
         allowRootBtn.disabled = anySystem;
         // Demote Allow Always to secondary so there is exactly one primary.
         allowAlwaysBtn.classList.remove('btn-primary');
@@ -16943,7 +17113,7 @@ function renderGrantsList(containerId, grants, scope) {
         card.innerHTML = `
             <div class="grant-card-main">
                 <span class="grant-access-badge ${badgeClass}">${accessLabel}</span>
-                <code class="grant-card-path" title="${escapeHtml(g.path)}">${escapeHtml(ellipsizePath(g.path, 70))}</code>
+                <code class="grant-card-path" data-tip="${escapeHtml(g.path)}">${escapeHtml(ellipsizePath(g.path, 70))}</code>
             </div>
             <button class="btn-secondary grant-revoke-btn" data-grant-id="${g.id}" data-scope="${scope}">Revoke</button>
         `;
@@ -18019,7 +18189,7 @@ async function populateWakeupToolAllowlist(selectedNames) {
             for (const t of items) {
                 const row = document.createElement('label');
                 row.className = 'wakeup-allowlist-row';
-                row.title = t.name; // raw id available on hover
+                row.dataset.tip = t.name; // raw id available on hover
                 const cb = document.createElement('input');
                 cb.type = 'checkbox';
                 cb.value = t.name;
@@ -18038,7 +18208,7 @@ async function populateWakeupToolAllowlist(selectedNames) {
                     const badge = document.createElement('span');
                     badge.className = 'wakeup-allowlist-badge wakeup-allowlist-badge-warn';
                     badge.textContent = 'bypasses limits';
-                    badge.title = 'Spawns a sub-agent that does NOT inherit this wake-up\'s tool/contact restrictions yet (tracked under task #175). Only enable if you intend that.';
+                    badge.dataset.tip = 'Spawns a sub-agent that does NOT inherit this wake-up\'s tool/contact restrictions yet (tracked under task #175). Only enable if you intend that.';
                     head.appendChild(badge);
                 }
                 const desc = document.createElement('span');
@@ -18345,7 +18515,7 @@ function renderWakeupRow(w) {
             await invoke('set_wakeup_enabled', { id: w.id, enabled: !w.enabled });
             await loadWakeups();
         } catch (e) {
-            alert(`Toggle failed: ${e}`);
+            await showAlertDialog({ title: 'Toggle failed', body: `${e}`, danger: true });
         }
     });
 
@@ -18354,12 +18524,17 @@ function renderWakeupRow(w) {
     deleteBtn.type = 'button';
     deleteBtn.textContent = 'Delete';
     deleteBtn.addEventListener('click', async () => {
-        if (!confirm(`Delete this wake-up?\n\n"${w.instruction}"`)) return;
+        if (!(await showConfirmDialog({
+            title: 'Delete this wake-up?',
+            body: `"${w.instruction}"`,
+            confirmLabel: 'Delete',
+            danger: true,
+        }))) return;
         try {
             await invoke('delete_wakeup', { id: w.id });
             await loadWakeups();
         } catch (e) {
-            alert(`Delete failed: ${e}`);
+            await showAlertDialog({ title: 'Delete failed', body: `${e}`, danger: true });
         }
     });
 
@@ -18502,14 +18677,14 @@ function renderCloudApisList() {
                         ${enabledBadge}
                     </div>
                     <div class="cloud-api-row-meta">
-                        <span title="Auth method">${escapeHtml(authLabel)}</span>
-                        <span title="30-day call count">${e.call_count_30d} calls / 30d</span>
-                        <span title="Last call">last: ${escapeHtml(lastUsed)}</span>
+                        <span data-tip="Auth method">${escapeHtml(authLabel)}</span>
+                        <span data-tip="30-day call count">${e.call_count_30d} calls / 30d</span>
+                        <span data-tip="Last call">last: ${escapeHtml(lastUsed)}</span>
                     </div>
                     <div class="cloud-api-row-url">${escapeHtml(e.base_url)}</div>
                 </div>
                 <div class="cloud-api-row-actions">
-                    <button class="btn-provider-help cloud-api-help-btn" data-endpoint-name="${escapeHtml(e.name)}" type="button" title="Setup help">?</button>
+                    <button class="btn-provider-help cloud-api-help-btn" data-endpoint-name="${escapeHtml(e.name)}" type="button" data-tip="Setup help">?</button>
                     <label class="toggle-label">
                         <input type="checkbox" class="cloud-api-enabled" ${e.enabled ? 'checked' : ''} data-endpoint-id="${escapeHtml(e.id)}">
                         <span>Enabled</span>
@@ -18576,10 +18751,12 @@ async function testCloudApi(id) {
         (p) => p.base_url === ep.base_url || p.label === ep.name || p.provider === ep.provider,
     );
     const defaultPath = matchingPreset?.test_path || '';
-    const path = window.prompt(
-        `Test path for "${ep.name}" (joined to ${ep.base_url}). Leave blank to hit the base URL.`,
-        defaultPath,
-    );
+    const path = await showPromptDialog({
+        title: `Test "${ep.name}"`,
+        body: `Test path (joined to ${ep.base_url}). Leave blank to hit the base URL.`,
+        defaultValue: defaultPath,
+        confirmLabel: 'Test',
+    });
     // null = user cancelled.
     if (path === null) return;
 
@@ -18607,7 +18784,12 @@ async function testCloudApi(id) {
 async function deleteCloudApi(id) {
     const ep = cloudApiEndpoints.find((e) => e.id === id);
     if (!ep) return;
-    if (!confirm(`Delete endpoint "${ep.name}"? Its credential will also be removed from the vault.`)) return;
+    if (!(await showConfirmDialog({
+        title: `Delete endpoint "${ep.name}"?`,
+        body: 'Its credential will also be removed from the vault.',
+        confirmLabel: 'Delete',
+        danger: true,
+    }))) return;
     try {
         await invoke('delete_http_endpoint', { id });
         await loadCloudApis();
@@ -19166,7 +19348,7 @@ function buildActiveAgentCard(agent) {
     const jumpBtn = arcId
         ? `<button class="agent-card-jump" type="button" data-jump-arc="${arcId}">Jump to arc</button>`
         : '';
-    const stopBtn = `<button class="agent-card-stop" type="button" title="Stop agent" aria-label="Stop agent" data-stop-task="${taskId}">${ICON_STOP}</button>`;
+    const stopBtn = `<button class="agent-card-stop" type="button" data-tip="Stop agent" aria-label="Stop agent" data-stop-task="${taskId}">${ICON_STOP}</button>`;
     const card = document.createElement('article');
     card.className = 'agent-card';
     card.setAttribute('data-source', sourceKey);
@@ -19176,7 +19358,7 @@ function buildActiveAgentCard(agent) {
     card.innerHTML = `
     <header class="agent-card-head">
         <span class="agent-card-icon" aria-hidden="true">${icon}</span>
-        <span class="agent-card-title" title="${title}">${title}</span>
+        <span class="agent-card-title" data-tip="${title}">${title}</span>
         <span class="agent-card-elapsed" data-elapsed-for="${taskId}">${elapsed}</span>
         <span class="agent-card-chevron" aria-hidden="true">${agentChevronSvg()}</span>
     </header>
@@ -19449,7 +19631,7 @@ function renderAgentControlHistory() {
         const taskId = escapeHtml(run.task_id || '');
         const turnId = run.turn_id ? escapeHtml(run.turn_id) : '';
         const jumpBtn = arcId
-            ? `<button class="agent-history-jump" type="button" title="Open arc" aria-label="Open arc">
+            ? `<button class="agent-history-jump" type="button" data-tip="Open arc" aria-label="Open arc">
                    <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17 17 7"/><path d="M8 7h9v9"/></svg>
                </button>`
             : '';
@@ -19457,7 +19639,7 @@ function renderAgentControlHistory() {
 <div class="agent-history-item" data-source="${sourceKey}" data-task-id="${taskId}" data-arc-id="${arcId}" data-turn-id="${turnId}">
     <div class="agent-history-row" data-source="${sourceKey}" data-arc-id="${arcId}">
         <span class="agent-history-icon" aria-hidden="true">${icon}</span>
-        <span class="agent-history-title" title="${title}">${title}</span>
+        <span class="agent-history-title" data-tip="${title}">${title}</span>
         <span class="agent-history-meta">${started}</span>
         <span class="agent-history-duration">${duration}</span>
         <span class="agent-history-status" data-status="${escapeHtml(status)}">${escapeHtml(status)}</span>
@@ -19686,7 +19868,7 @@ function renderMcpServersList() {
         return `
             <div class="mcp-server-row" data-mcp-id="${escapeHtml(entry.id)}">
                 <div class="mcp-server-row-main">
-                    <button class="mcp-server-icon svc-icon mcp-server-icon-btn" data-mcp-id="${escapeHtml(entry.id)}" type="button" title="Set a custom icon">${mcpEntryIconHtml(entry)}</button>
+                    <button class="mcp-server-icon svc-icon mcp-server-icon-btn" data-mcp-id="${escapeHtml(entry.id)}" type="button" data-tip="Set a custom icon" aria-label="Set a custom icon">${mcpEntryIconHtml(entry)}</button>
                     <div class="mcp-server-row-info">
                         <div class="mcp-server-row-name">
                             <strong>${escapeHtml(entry.display_name || entry.id)}</strong>
@@ -19977,7 +20159,12 @@ function cssEscape(s) {
 async function deleteMcpServer(id) {
     const entry = mcpServersCustom.find((e) => e.id === id);
     if (!entry) return;
-    if (!confirm(`Delete MCP server "${entry.display_name || id}"? Any secrets it uses will be removed from the vault.`)) return;
+    if (!(await showConfirmDialog({
+        title: `Delete MCP server "${entry.display_name || id}"?`,
+        body: 'Any secrets it uses will be removed from the vault.',
+        confirmLabel: 'Delete',
+        danger: true,
+    }))) return;
     try {
         await invoke('mcp_remove_custom', { id });
         mcpServersExpanded.delete(id);
@@ -20355,7 +20542,7 @@ function applyCalendarSourcePreset() {
 
 async function addCalendarSource() {
     if (typeof invoke !== 'function') {
-        alert('Tauri bridge not ready yet — try again in a moment.');
+        await showAlertDialog({ title: 'Not ready', body: 'Tauri bridge not ready yet — try again in a moment.' });
         return;
     }
     const presetKey = document.getElementById('calendar-source-preset').value;
@@ -20499,14 +20686,19 @@ async function onCalendarSourceAction(ev) {
             await invoke('set_calendar_source_enabled', { id, enabled: !currentlyEnabled });
             refreshCalendarSourcesList();
         } else if (action === 'delete') {
-            if (!confirm('Remove this calendar source? Synced events stay in the local calendar; future updates from this source will stop.')) {
+            if (!(await showConfirmDialog({
+                title: 'Remove this calendar source?',
+                body: 'Synced events stay in the local calendar; future updates from this source will stop.',
+                confirmLabel: 'Remove',
+                danger: true,
+            }))) {
                 return;
             }
             await invoke('delete_calendar_source', { id });
             refreshCalendarSourcesList();
         }
     } catch (e) {
-        alert(`Action failed: ${e}`);
+        await showAlertDialog({ title: 'Action failed', body: `${e}`, danger: true });
     }
 }
 
@@ -20569,7 +20761,7 @@ async function saveCalendarSourcePicker() {
         hideCalendarSourcePicker();
         refreshCalendarSourcesList();
     } catch (e) {
-        alert(`Save failed: ${e}`);
+        await showAlertDialog({ title: 'Save failed', body: `${e}`, danger: true });
     }
 }
 
@@ -21298,6 +21490,125 @@ function wireVoicePanel() {
         });
     }
 }
+
+// ─── Tooltip layer (data-tip) ───
+// One reusable fixed-position element replaces every native title= tooltip.
+// Driven by event delegation on document so dynamically inserted nodes work
+// without rebinding. ~400ms show delay, skipped when hopping between
+// adjacent tipped elements; flips at viewport edges; hides on
+// scroll / mousedown / Escape.
+
+let tooltipEl = null;
+let tooltipTarget = null;      // element the visible tooltip belongs to
+let tooltipPending = null;     // element waiting on the show delay
+let tooltipShowTimer = null;
+let tooltipHiddenAt = 0;
+
+const TOOLTIP_SHOW_DELAY = 400;
+const TOOLTIP_HOP_GRACE = 250; // ms after hide during which show is instant
+const TOOLTIP_MARGIN = 8;      // px gap to target and viewport edges
+
+function ensureTooltipEl() {
+    if (tooltipEl) return tooltipEl;
+    tooltipEl = document.createElement('div');
+    tooltipEl.id = 'app-tooltip';
+    tooltipEl.setAttribute('role', 'tooltip');
+    tooltipEl.setAttribute('aria-hidden', 'true');
+    document.body.appendChild(tooltipEl);
+    return tooltipEl;
+}
+
+function showTooltipFor(target) {
+    const text = target.getAttribute('data-tip');
+    if (!text || !target.isConnected) return;
+    const tip = ensureTooltipEl();
+    tip.textContent = text;
+    tip.classList.remove('visible');
+    const rect = target.getBoundingClientRect();
+    const tw = tip.offsetWidth;
+    const th = tip.offsetHeight;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    let left = rect.left + rect.width / 2 - tw / 2;
+    left = Math.max(TOOLTIP_MARGIN, Math.min(left, vw - tw - TOOLTIP_MARGIN));
+    let top = rect.bottom + TOOLTIP_MARGIN;
+    if (top + th > vh - TOOLTIP_MARGIN) {
+        top = rect.top - th - TOOLTIP_MARGIN;       // flip above
+        if (top < TOOLTIP_MARGIN) top = TOOLTIP_MARGIN;
+    }
+    tip.style.left = Math.round(left) + 'px';
+    tip.style.top = Math.round(top) + 'px';
+    tip.classList.add('visible');
+    tip.setAttribute('aria-hidden', 'false');
+    tooltipTarget = target;
+}
+
+function hideTooltip() {
+    if (tooltipShowTimer) {
+        clearTimeout(tooltipShowTimer);
+        tooltipShowTimer = null;
+    }
+    tooltipPending = null;
+    if (tooltipTarget) {
+        tooltipHiddenAt = Date.now();
+        tooltipTarget = null;
+    }
+    if (tooltipEl) {
+        tooltipEl.classList.remove('visible');
+        tooltipEl.setAttribute('aria-hidden', 'true');
+    }
+}
+
+function scheduleTooltip(target) {
+    if (tooltipShowTimer) clearTimeout(tooltipShowTimer);
+    tooltipPending = target;
+    const instant = tooltipTarget !== null
+        || (Date.now() - tooltipHiddenAt) < TOOLTIP_HOP_GRACE;
+    if (instant) {
+        tooltipPending = null;
+        showTooltipFor(target);
+        return;
+    }
+    tooltipShowTimer = setTimeout(() => {
+        tooltipShowTimer = null;
+        const el = tooltipPending;
+        tooltipPending = null;
+        if (el && el.isConnected) showTooltipFor(el);
+    }, TOOLTIP_SHOW_DELAY);
+}
+
+document.addEventListener('mouseover', (e) => {
+    const t = e.target && e.target.closest ? e.target.closest('[data-tip]') : null;
+    if (!t) return;
+    if (t === tooltipTarget || t === tooltipPending) return;
+    scheduleTooltip(t);
+});
+
+document.addEventListener('mouseout', (e) => {
+    const current = tooltipTarget || tooltipPending;
+    if (!current) return;
+    const to = e.relatedTarget;
+    if (to && current.contains(to)) return;
+    const from = e.target;
+    if (!from || !current.contains(from)) return;
+    hideTooltip();
+});
+
+document.addEventListener('focusin', (e) => {
+    const t = e.target && e.target.closest ? e.target.closest('[data-tip]') : null;
+    // Keyboard focus only — mouse clicks must not flash the tooltip.
+    if (t && t.matches(':focus-visible')) showTooltipFor(t);
+});
+
+document.addEventListener('focusout', () => {
+    hideTooltip();
+});
+
+document.addEventListener('scroll', () => { hideTooltip(); }, true);
+document.addEventListener('mousedown', () => { hideTooltip(); });
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') hideTooltip();
+});
 
 // ─── Initialize ───
 

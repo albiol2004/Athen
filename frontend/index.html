@@ -9,13 +9,13 @@
 <body>
     <div id="titlebar" data-tauri-drag-region>
         <div class="titlebar-traffic" aria-label="Window controls">
-            <button class="traffic-btn traffic-close" id="win-close" aria-label="Close" title="Close">
+            <button class="traffic-btn traffic-close" id="win-close" aria-label="Close" data-tip="Close">
                 <svg viewBox="0 0 10 10" width="6" height="6" aria-hidden="true"><path d="M2 2 L8 8 M8 2 L2 8" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
             </button>
-            <button class="traffic-btn traffic-min" id="win-minimize" aria-label="Minimize" title="Minimize">
+            <button class="traffic-btn traffic-min" id="win-minimize" aria-label="Minimize" data-tip="Minimize">
                 <svg viewBox="0 0 10 10" width="6" height="6" aria-hidden="true"><line x1="2" y1="5" x2="8" y2="5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
             </button>
-            <button class="traffic-btn traffic-max" id="win-maximize" aria-label="Maximize" title="Maximize">
+            <button class="traffic-btn traffic-max" id="win-maximize" aria-label="Maximize" data-tip="Maximize">
                 <svg viewBox="0 0 10 10" width="6" height="6" aria-hidden="true"><path d="M2.5 5.5 L2.5 7.5 L4.5 7.5 M7.5 4.5 L7.5 2.5 L5.5 2.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" fill="none"/></svg>
             </button>
         </div>
@@ -32,7 +32,7 @@
             <div class="projects-strip">
                 <div class="projects-strip-header">
                     <h2>Projects</h2>
-                    <button id="project-new-sidebar-btn" title="New Project" aria-label="New Project">
+                    <button id="project-new-sidebar-btn" data-tip="New Project" aria-label="New Project">
                         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
                     </button>
                 </div>
@@ -44,54 +44,54 @@
             <div class="sidebar-header">
                 <h2>Arcs</h2>
                 <div class="sidebar-header-buttons">
-                    <button id="timeline-toggle-btn" title="Timeline View" aria-label="Timeline View">
+                    <button id="timeline-toggle-btn" data-tip="Timeline View" aria-label="Timeline View">
                         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>
                     </button>
-                    <button id="sidebar-new-chat-btn" title="New Arc" aria-label="New Arc">
+                    <button id="sidebar-new-chat-btn" data-tip="New Arc" aria-label="New Arc">
                         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
                     </button>
                 </div>
             </div>
             <div id="session-list" class="session-list"></div>
             <div class="sidebar-footer">
-                <button id="notifications-btn" class="sidebar-footer-btn" title="Notifications">
+                <button id="notifications-btn" class="sidebar-footer-btn" data-tip="Notifications">
                     <span class="sidebar-icon" aria-hidden="true">
                         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>
                     </span>
                     <span>Notifications</span>
                     <span id="notif-badge" class="notif-badge" style="display: none;">0</span>
                 </button>
-                <button id="contacts-btn" class="sidebar-footer-btn" title="Contacts">
+                <button id="contacts-btn" class="sidebar-footer-btn" data-tip="Contacts">
                     <span class="contacts-icon" aria-hidden="true">
                         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
                     </span>
                     <span>Contacts</span>
                 </button>
-                <button id="calendar-btn" class="sidebar-footer-btn" title="Calendar">
+                <button id="calendar-btn" class="sidebar-footer-btn" data-tip="Calendar">
                     <span class="calendar-icon" aria-hidden="true">
                         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
                     </span>
                     <span>Calendar</span>
                 </button>
-                <button id="wakeups-btn" class="sidebar-footer-btn" title="Scheduled wake-ups">
+                <button id="wakeups-btn" class="sidebar-footer-btn" data-tip="Scheduled wake-ups">
                     <span class="wakeups-icon" aria-hidden="true">
                         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="13" r="8"/><polyline points="12 9 12 13 15 15"/><line x1="5" y1="3" x2="2" y2="6"/><line x1="22" y1="6" x2="19" y2="3"/></svg>
                     </span>
                     <span>Scheduled</span>
                 </button>
-                <button id="agent-control-btn" class="sidebar-footer-btn" title="Agent Control">
+                <button id="agent-control-btn" class="sidebar-footer-btn" data-tip="Agent Control">
                     <span class="agent-control-icon" aria-hidden="true">
                         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="5" width="14" height="14" rx="2"/><rect x="9" y="9" width="6" height="6" rx="1"/><line x1="9" y1="2" x2="9" y2="5"/><line x1="15" y1="2" x2="15" y2="5"/><line x1="9" y1="19" x2="9" y2="22"/><line x1="15" y1="19" x2="15" y2="22"/><line x1="2" y1="9" x2="5" y2="9"/><line x1="2" y1="15" x2="5" y2="15"/><line x1="19" y1="9" x2="22" y2="9"/><line x1="19" y1="15" x2="22" y2="15"/></svg>
                     </span>
                     <span>Agent Control</span>
                 </button>
-                <button id="memory-btn" class="sidebar-footer-btn" title="Memory">
+                <button id="memory-btn" class="sidebar-footer-btn" data-tip="Memory">
                     <span class="memory-icon" aria-hidden="true">
                         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.5 4.5L18 9l-4.5 1.5L12 15l-1.5-4.5L6 9l4.5-1.5z"/><path d="M5.2 17l.6 1.8L7.6 19.4 5.8 20l-.6 1.8L4.6 20 2.8 19.4 4.6 18.8z"/></svg>
                     </span>
                     <span>Memory</span>
                 </button>
-                <button id="settings-btn" class="sidebar-footer-btn" title="Settings">
+                <button id="settings-btn" class="sidebar-footer-btn" data-tip="Settings">
                     <span class="settings-icon" aria-hidden="true">
                         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
                     </span>
@@ -103,7 +103,7 @@
         <div id="app">
             <header>
                 <div class="header-left">
-                    <button id="sidebar-toggle" class="sidebar-toggle" title="Toggle sidebar">
+                    <button id="sidebar-toggle" class="sidebar-toggle" data-tip="Toggle sidebar" aria-label="Toggle sidebar">
                         <span class="hamburger-icon" aria-hidden="true">
                             <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
                         </span>
@@ -115,28 +115,28 @@
                     </div>
                 </div>
                 <div class="header-right">
-                    <button id="active-agents-pill" class="agents-pill hidden" type="button" aria-label="Active agents" title="Open Agent Control">
+                    <button id="active-agents-pill" class="agents-pill hidden" type="button" aria-label="Active agents" data-tip="Open Agent Control">
                         <span class="agents-pulse" aria-hidden="true"></span>
                         <span class="agents-count">0</span>
                         <span class="agents-label">working</span>
                     </button>
-                    <button id="changes-rail-btn" class="changes-pill" type="button" aria-label="Changes" title="Recent agent file changes (undo)">
+                    <button id="changes-rail-btn" class="changes-pill" type="button" aria-label="Changes" data-tip="Recent agent file changes (undo)">
                         <span class="changes-pill-icon" aria-hidden="true">
                             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7"/><polyline points="3 4 3 10 9 10"/></svg>
                         </span>
                         <span class="changes-pill-label">Changes</span>
                     </button>
-                    <button id="code-mode-panel-btn" class="changes-pill hidden" type="button" aria-label="Code Mode repo state" title="Git / worktree state for this Code-Mode arc">
+                    <button id="code-mode-panel-btn" class="changes-pill hidden" type="button" aria-label="Code Mode repo state" data-tip="Git / worktree state for this Code-Mode arc">
                         <span class="changes-pill-icon" aria-hidden="true">
                             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="12" r="2.5"/><path d="M6 8.5v7"/><path d="M6 12a6 6 0 0 0 6 6h3.5"/><path d="M18 9.5V6a3 3 0 0 0-3-3H9"/></svg>
                         </span>
                         <span class="changes-pill-label">Repo</span>
                     </button>
-                    <label class="profile-picker-wrap" title="Choose the specialist that handles this arc">
+                    <label class="profile-picker-wrap" data-tip="Choose the specialist that handles this arc">
                         <span class="profile-picker-label">Agent:</span>
                         <select id="arc-profile-picker" class="profile-picker"></select>
                     </label>
-                    <label class="profile-picker-wrap" title="How hard the model should think on this arc. Default = provider's own default.">
+                    <label class="profile-picker-wrap" data-tip="How hard the model should think on this arc. Default = provider's own default.">
                         <span class="profile-picker-label">Think:</span>
                         <select id="arc-reasoning-picker" class="profile-picker">
                             <option value="default">Default</option>
@@ -148,7 +148,7 @@
                             <option value="max">Max</option>
                         </select>
                     </label>
-                    <label class="profile-picker-wrap" title="Force a model tier for this arc. Auto = pick from task complexity, falling back to Fast.">
+                    <label class="profile-picker-wrap" data-tip="Force a model tier for this arc. Auto = pick from task complexity, falling back to Fast.">
                         <span class="profile-picker-label">Tier:</span>
                         <select id="arc-tier-picker" class="profile-picker">
                             <option value="auto">Auto</option>
@@ -158,7 +158,7 @@
                             <option value="Powerful">Powerful</option>
                         </select>
                     </label>
-                    <label class="profile-picker-wrap" title="Security posture for this arc. Global = follow the app-wide Security Mode. Bunker asks before anything beyond read-only; Yolo only asks on critical actions.">
+                    <label class="profile-picker-wrap" data-tip="Security posture for this arc. Global = follow the app-wide Security Mode. Bunker asks before anything beyond read-only; Yolo only asks on critical actions.">
                         <span class="profile-picker-label">Security:</span>
                         <select id="arc-security-picker" class="profile-picker">
                             <option value="global">Global</option>
@@ -167,13 +167,13 @@
                             <option value="yolo">Yolo</option>
                         </select>
                     </label>
-                    <label class="profile-picker-wrap code-mode-toggle-wrap" title="Code Mode roots this arc in a real git repository: the agent works in-place in that repo, and Athen visualizes its git/worktree state. Power-user feature.">
+                    <label class="profile-picker-wrap code-mode-toggle-wrap" data-tip="Code Mode roots this arc in a real git repository: the agent works in-place in that repo, and Athen visualizes its git/worktree state. Power-user feature.">
                         <span class="profile-picker-label">Code:</span>
                         <button id="arc-code-mode-toggle" class="code-mode-toggle" type="button" role="switch" aria-checked="false" aria-label="Toggle Code Mode for this arc" disabled>
                             <span class="code-mode-toggle-track"><span class="code-mode-toggle-thumb"></span></span>
                         </button>
                     </label>
-                    <button id="new-chat-btn" title="Start a new conversation">New Arc</button>
+                    <button id="new-chat-btn" data-tip="Start a new conversation">New Arc</button>
                 </div>
             </header>
 
@@ -215,17 +215,17 @@
                     <div id="composer-attachments" class="composer-attachments hidden" aria-label="Attached files"></div>
                     <input type="file" id="composer-image-input" accept="image/*,application/pdf,text/*" multiple class="hidden" aria-hidden="true">
                     <div class="input-wrapper">
-                        <button type="button" id="composer-attach-btn" title="Attach image, PDF, or text file" aria-label="Attach file">
+                        <button type="button" id="composer-attach-btn" data-tip="Attach image, PDF, or text file" aria-label="Attach file">
                             <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
                         </button>
-                        <button type="button" id="deep-research-btn" title="Deep Research" aria-label="Deep Research">
+                        <button type="button" id="deep-research-btn" data-tip="Deep Research" aria-label="Deep Research">
                             <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h7"/><path d="M14 2v6h6"/><circle cx="17.5" cy="16.5" r="3"/><line x1="22" y1="21" x2="19.6" y2="18.6"/></svg>
                         </button>
-                        <button type="button" id="loop-mode-btn" title="Loop Mode — run a Lead→Evaluator loop toward a goal" aria-label="Loop Mode">
+                        <button type="button" id="loop-mode-btn" data-tip="Loop Mode — run a Lead→Evaluator loop toward a goal" aria-label="Loop Mode">
                             <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9a8 8 0 0 1 13.7-4M20 15A8 8 0 0 1 6.3 19"/><path d="M17 3v4h-4M7 21v-4h4"/></svg>
                         </button>
                         <div class="composer-menu-wrap">
-                            <button type="button" id="composer-menu-btn" title="More actions" aria-label="More actions" aria-haspopup="true">
+                            <button type="button" id="composer-menu-btn" data-tip="More actions" aria-label="More actions" aria-haspopup="true">
                                 <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><circle cx="12" cy="6" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="12" cy="18" r="1.5"/></svg>
                             </button>
                             <div id="composer-menu" class="composer-menu hidden" role="menu">
@@ -244,12 +244,12 @@
                             </div>
                         </div>
                         <textarea id="message-input" placeholder="Send a message..." rows="1" autofocus></textarea>
-                        <button type="submit" id="send-btn" title="Send message" aria-label="Send message">
+                        <button type="submit" id="send-btn" data-tip="Send message" aria-label="Send message">
                             <span class="send-icon" aria-hidden="true">
                                 <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>
                             </span>
                         </button>
-                        <button type="button" id="stop-btn" class="hidden" title="Cancel task (Esc)" aria-label="Cancel task">
+                        <button type="button" id="stop-btn" class="hidden" data-tip="Cancel task (Esc)" aria-label="Cancel task">
                             <span class="stop-icon" aria-hidden="true">
                                 <svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="1.5"/></svg>
                             </span>
@@ -266,7 +266,7 @@
         <aside id="changes-rail" class="changes-rail hidden" aria-label="Recent file changes">
             <header class="changes-rail-header">
                 <h2 class="changes-rail-title">Changes</h2>
-                <button id="changes-rail-close" class="changes-rail-close" type="button" title="Close" aria-label="Close changes panel">&times;</button>
+                <button id="changes-rail-close" class="changes-rail-close" type="button" data-tip="Close" aria-label="Close changes panel">&times;</button>
             </header>
             <div class="changes-rail-sub">File mutations Athen made in this arc. Click Revert to undo.</div>
             <div id="changes-rail-body" class="changes-rail-body">
@@ -278,10 +278,10 @@
             <header class="changes-rail-header">
                 <h2 class="changes-rail-title">Repo</h2>
                 <div class="code-mode-panel-head-actions">
-                    <button id="code-mode-refresh" class="code-mode-refresh-btn" type="button" title="Refresh git state" aria-label="Refresh git state">
+                    <button id="code-mode-refresh" class="code-mode-refresh-btn" type="button" data-tip="Refresh git state" aria-label="Refresh git state">
                         <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7"/><polyline points="3 4 3 10 9 10"/></svg>
                     </button>
-                    <button id="code-mode-close" class="changes-rail-close" type="button" title="Close" aria-label="Close repo panel">&times;</button>
+                    <button id="code-mode-close" class="changes-rail-close" type="button" data-tip="Close" aria-label="Close repo panel">&times;</button>
                 </div>
             </header>
             <div class="changes-rail-sub">Live git state of the repository this Code-Mode arc operates in.</div>
@@ -293,7 +293,7 @@
         <aside id="inspector-panel" class="changes-rail inspector-panel hidden" aria-label="Detail view">
             <header class="changes-rail-header">
                 <h2 class="changes-rail-title" id="inspector-title">Detail</h2>
-                <button id="inspector-close" class="changes-rail-close" type="button" title="Close" aria-label="Close detail panel">&times;</button>
+                <button id="inspector-close" class="changes-rail-close" type="button" data-tip="Close" aria-label="Close detail panel">&times;</button>
             </header>
             <div id="inspector-body" class="changes-rail-body inspector-body"></div>
         </aside>
@@ -301,12 +301,12 @@
         <div id="timeline-view" class="timeline-view hidden">
             <header class="timeline-header">
                 <div class="header-left">
-                    <button id="timeline-back" class="settings-back-btn" title="Back">
+                    <button id="timeline-back" class="settings-back-btn" data-tip="Back">
                         <span>&#8592;</span> Back
                     </button>
                 </div>
                 <h1>Arc Timeline</h1>
-                <button id="timeline-new-arc" class="timeline-new-btn" title="New Arc">+ New Arc</button>
+                <button id="timeline-new-arc" class="timeline-new-btn" data-tip="New Arc">+ New Arc</button>
             </header>
             <div id="timeline-canvas" class="timeline-canvas"></div>
         </div>
@@ -314,7 +314,7 @@
         <div id="settings-view" class="settings-view hidden">
         <header class="settings-header">
             <div class="header-left">
-                <button id="settings-back" class="settings-back-btn" title="Back to Chat">
+                <button id="settings-back" class="settings-back-btn" data-tip="Back to Chat">
                     <span>&#8592;</span> Back
                 </button>
             </div>
@@ -428,7 +428,7 @@
                         <label for="embedding-api-key">API Key</label>
                         <div class="api-key-wrapper">
                             <input type="password" id="embedding-api-key" class="settings-input" placeholder="Only needed for cloud providers" autocomplete="off">
-                            <button class="api-key-toggle" id="embedding-key-toggle" title="Show/hide key">&#128065;</button>
+                            <button class="api-key-toggle" id="embedding-key-toggle" data-tip="Show/hide key" aria-label="Show/hide key">&#128065;</button>
                         </div>
                     </div>
 
@@ -479,7 +479,7 @@
                     <div class="identity-sidebar">
                         <div id="skills-list" class="identity-category-list"></div>
                         <button id="skills-new-btn" class="btn-secondary identity-new-category-btn" type="button">+ New skill</button>
-                        <button id="skills-rescan-btn" class="btn-secondary identity-new-category-btn" type="button" title="Re-read SKILL.md files from disk">↻ Rescan disk</button>
+                        <button id="skills-rescan-btn" class="btn-secondary identity-new-category-btn" type="button" data-tip="Re-read SKILL.md files from disk">↻ Rescan disk</button>
                         <div class="identity-token-footer" id="skills-token-footer">
                             <div class="identity-token-line"><span id="skills-listing-count">0</span> skills · <span id="skills-listing-tokens">0</span> listing tok</div>
                         </div>
@@ -609,7 +609,7 @@
                     <button class="btn-primary" id="save-owner-contact-btn">Save</button>
                     <button class="btn-secondary" id="clear-owner-contact-btn">Remove</button>
                 </div>
-                <div id="owner-contact-error" class="setting-hint" style="display:none; color: var(--color-error, #c33);"></div>
+                <div id="owner-contact-error" class="setting-hint" style="display:none; color: var(--danger);"></div>
             </section>
 
             <section class="settings-section">
@@ -644,7 +644,7 @@
                         <label for="email-smtp-password">SMTP Password</label>
                         <div class="api-key-wrapper">
                             <input type="password" id="email-smtp-password" class="settings-input" placeholder="App password (same as above on most providers)" autocomplete="off">
-                            <button class="api-key-toggle" id="email-smtp-password-toggle" title="Show/hide password" type="button">&#128065;</button>
+                            <button class="api-key-toggle" id="email-smtp-password-toggle" data-tip="Show/hide password" type="button" aria-label="Show/hide password">&#128065;</button>
                         </div>
                         <p class="setting-hint">Same app password works for both IMAP and SMTP on most providers.</p>
                     </div>
@@ -743,7 +743,7 @@
                         <label for="telegram-bot-token">Bot Token</label>
                         <div class="api-key-wrapper">
                             <input type="password" id="telegram-bot-token" class="settings-input" placeholder="123456:ABC-DEF..." autocomplete="off">
-                            <button class="api-key-toggle" id="telegram-token-toggle" title="Show/hide token">&#128065;</button>
+                            <button class="api-key-toggle" id="telegram-token-toggle" data-tip="Show/hide token" aria-label="Show/hide token">&#128065;</button>
                         </div>
                         <p class="setting-hint" id="telegram-token-hint"></p>
                     </div>
@@ -786,7 +786,7 @@
                     <label for="gh-bot-token">Personal Access Token</label>
                     <div class="api-key-wrapper">
                         <input type="password" id="gh-bot-token" class="settings-input" placeholder="github_pat_..." autocomplete="off">
-                        <button class="api-key-toggle" id="gh-bot-token-toggle" title="Show/hide token">&#128065;</button>
+                        <button class="api-key-toggle" id="gh-bot-token-toggle" data-tip="Show/hide token" aria-label="Show/hide token">&#128065;</button>
                     </div>
                     <p class="setting-hint" id="gh-bot-token-hint"></p>
                 </div>
@@ -811,7 +811,7 @@
                     <label for="gh-user-token">Personal Access Token</label>
                     <div class="api-key-wrapper">
                         <input type="password" id="gh-user-token" class="settings-input" placeholder="github_pat_..." autocomplete="off">
-                        <button class="api-key-toggle" id="gh-user-token-toggle" title="Show/hide token">&#128065;</button>
+                        <button class="api-key-toggle" id="gh-user-token-toggle" data-tip="Show/hide token" aria-label="Show/hide token">&#128065;</button>
                     </div>
                     <p class="setting-hint" id="gh-user-token-hint"></p>
                 </div>
@@ -882,7 +882,7 @@
                         <label for="calendar-source-password">App-specific password</label>
                         <div class="api-key-wrapper">
                             <input type="password" id="calendar-source-password" class="settings-input" placeholder="xxxx-xxxx-xxxx-xxxx" autocomplete="off">
-                            <button class="api-key-toggle" id="calendar-source-password-toggle" title="Show/hide password" type="button">&#128065;</button>
+                            <button class="api-key-toggle" id="calendar-source-password-toggle" data-tip="Show/hide password" type="button" aria-label="Show/hide password">&#128065;</button>
                         </div>
                     </div>
 
@@ -915,7 +915,7 @@
                     <label for="web-search-brave">Brave Search API key</label>
                     <div class="api-key-wrapper">
                         <input type="password" id="web-search-brave" class="settings-input" placeholder="BSA…" autocomplete="off">
-                        <button class="api-key-toggle" id="web-search-brave-toggle" title="Show/hide key">&#128065;</button>
+                        <button class="api-key-toggle" id="web-search-brave-toggle" data-tip="Show/hide key" aria-label="Show/hide key">&#128065;</button>
                     </div>
                     <p class="setting-hint" id="web-search-brave-hint">2,000 free queries/month. Sign up at <a href="https://api.search.brave.com" target="_blank">api.search.brave.com</a>.</p>
                 </div>
@@ -924,7 +924,7 @@
                     <label for="web-search-tavily">Tavily API key</label>
                     <div class="api-key-wrapper">
                         <input type="password" id="web-search-tavily" class="settings-input" placeholder="tvly-…" autocomplete="off">
-                        <button class="api-key-toggle" id="web-search-tavily-toggle" title="Show/hide key">&#128065;</button>
+                        <button class="api-key-toggle" id="web-search-tavily-toggle" data-tip="Show/hide key" aria-label="Show/hide key">&#128065;</button>
                     </div>
                     <p class="setting-hint" id="web-search-tavily-hint">~1,000 free queries/month, answer-ready snippets. Sign up at <a href="https://tavily.com" target="_blank">tavily.com</a>.</p>
                 </div>
@@ -1027,7 +1027,7 @@
 
                     <div class="voice-actions">
                         <button id="voice-save-btn" class="btn-primary" type="button">Save voice config</button>
-                        <button id="voice-test-btn" class="btn-secondary" type="button" title="Validates your voice settings without placing a real call">Test setup</button>
+                        <button id="voice-test-btn" class="btn-secondary" type="button" data-tip="Validates your voice settings without placing a real call">Test setup</button>
                         <span class="voice-pending-note">Ready to use — ask Athen in chat, e.g. <em>"Call +1-555-1234 and book a table for 4 at 8pm tomorrow under Alex."</em></span>
                     </div>
 
@@ -1253,7 +1253,7 @@
         <div id="contacts-view" class="contacts-view hidden">
             <header class="contacts-header">
                 <div class="header-left">
-                    <button id="contacts-back" class="settings-back-btn" title="Back">
+                    <button id="contacts-back" class="settings-back-btn" data-tip="Back">
                         <span>&#8592;</span> Back
                     </button>
                 </div>
@@ -1266,7 +1266,7 @@
                     <div class="contacts-searchbar">
                         <span class="contacts-search-icon" id="contacts-search-icon" aria-hidden="true"></span>
                         <input type="text" id="contacts-search" class="contacts-search-input" placeholder="Search contacts" autocomplete="off" spellcheck="false">
-                        <button type="button" id="contacts-search-clear" class="contacts-search-clear hidden" title="Clear search" aria-label="Clear search"></button>
+                        <button type="button" id="contacts-search-clear" class="contacts-search-clear hidden" data-tip="Clear search" aria-label="Clear search"></button>
                     </div>
                     <div id="contacts-scroll" class="contacts-scroll">
                         <div id="contacts-list"></div>
@@ -1291,7 +1291,7 @@
         <div id="notifications-view" class="notifications-view hidden">
             <header class="notifications-header">
                 <div class="header-left">
-                    <button id="notifications-back" class="settings-back-btn" title="Back">
+                    <button id="notifications-back" class="settings-back-btn" data-tip="Back">
                         <span>&#8592;</span> Back
                     </button>
                 </div>
@@ -1307,18 +1307,18 @@
         <div id="calendar-view" class="calendar-view hidden">
             <header class="calendar-header">
                 <div class="header-left">
-                    <button id="calendar-back" class="settings-back-btn" title="Back">
+                    <button id="calendar-back" class="settings-back-btn" data-tip="Back">
                         <span>&#8592;</span> Back
                     </button>
                 </div>
                 <div class="calendar-nav">
-                    <button id="cal-prev" class="cal-nav-btn" title="Previous">&lt;</button>
+                    <button id="cal-prev" class="cal-nav-btn" data-tip="Previous" aria-label="Previous">&lt;</button>
                     <h1 id="cal-title">April 2026</h1>
-                    <button id="cal-next" class="cal-nav-btn" title="Next">&gt;</button>
+                    <button id="cal-next" class="cal-nav-btn" data-tip="Next" aria-label="Next">&gt;</button>
                 </div>
                 <div class="calendar-header-actions">
-                    <button id="cal-prompt-btn" class="cal-today-btn" title="Standing instruction the agent gets on every calendar reminder">Prompt</button>
-                    <button id="cal-sync-btn" class="cal-today-btn" title="Pull events from your connected calendars">Sync</button>
+                    <button id="cal-prompt-btn" class="cal-today-btn" data-tip="Standing instruction the agent gets on every calendar reminder">Prompt</button>
+                    <button id="cal-sync-btn" class="cal-today-btn" data-tip="Pull events from your connected calendars">Sync</button>
                     <button id="cal-today-btn" class="cal-today-btn">Today</button>
                     <select id="cal-view-select" class="cal-view-select">
                         <option value="month">Month</option>
@@ -1399,13 +1399,13 @@
                         <div class="cal-field">
                             <label>Color</label>
                             <div class="cal-color-options" id="cal-color-options">
-                                <span class="cal-color-dot selected" data-color="#7aa2f7" style="background:#7aa2f7" title="Blue"></span>
-                                <span class="cal-color-dot" data-color="#bb9af7" style="background:#bb9af7" title="Purple"></span>
-                                <span class="cal-color-dot" data-color="#9ece6a" style="background:#9ece6a" title="Green"></span>
-                                <span class="cal-color-dot" data-color="#e0af68" style="background:#e0af68" title="Amber"></span>
-                                <span class="cal-color-dot" data-color="#f7768e" style="background:#f7768e" title="Red"></span>
-                                <span class="cal-color-dot" data-color="#73daca" style="background:#73daca" title="Teal"></span>
-                                <span class="cal-color-dot" data-color="#ff9e64" style="background:#ff9e64" title="Orange"></span>
+                                <span class="cal-color-dot selected" data-color="#7aa2f7" style="background:#7aa2f7" data-tip="Blue" aria-label="Blue"></span>
+                                <span class="cal-color-dot" data-color="#bb9af7" style="background:#bb9af7" data-tip="Purple" aria-label="Purple"></span>
+                                <span class="cal-color-dot" data-color="#9ece6a" style="background:#9ece6a" data-tip="Green" aria-label="Green"></span>
+                                <span class="cal-color-dot" data-color="#e0af68" style="background:#e0af68" data-tip="Amber" aria-label="Amber"></span>
+                                <span class="cal-color-dot" data-color="#f7768e" style="background:#f7768e" data-tip="Red" aria-label="Red"></span>
+                                <span class="cal-color-dot" data-color="#73daca" style="background:#73daca" data-tip="Teal" aria-label="Teal"></span>
+                                <span class="cal-color-dot" data-color="#ff9e64" style="background:#ff9e64" data-tip="Orange" aria-label="Orange"></span>
                             </div>
                         </div>
                         <div class="cal-field">
@@ -1450,7 +1450,7 @@
         <div id="wakeups-view" class="wakeups-view hidden">
             <header class="wakeups-header">
                 <div class="header-left">
-                    <button id="wakeups-back" class="settings-back-btn" title="Back">
+                    <button id="wakeups-back" class="settings-back-btn" data-tip="Back">
                         <span>&#8592;</span> Back
                     </button>
                 </div>
@@ -1560,7 +1560,7 @@
         <div id="agent-control-view" class="agent-control-view hidden">
             <header class="agent-control-header">
                 <div class="header-left">
-                    <button id="agent-control-back" class="settings-back-btn" type="button" title="Back">
+                    <button id="agent-control-back" class="settings-back-btn" type="button" data-tip="Back">
                         <span>&#8592;</span> Back
                     </button>
                 </div>
@@ -1601,7 +1601,7 @@
         <div id="memory-view" class="memory-view hidden">
             <header class="memory-header">
                 <div class="header-left">
-                    <button id="memory-back" class="settings-back-btn" title="Back">
+                    <button id="memory-back" class="settings-back-btn" data-tip="Back">
                         <span>&#8592;</span> Back
                     </button>
                 </div>
@@ -1630,7 +1630,7 @@
         <div id="project-view" class="project-view hidden">
             <header class="memory-header">
                 <div class="header-left">
-                    <button id="project-back" class="settings-back-btn" title="Back">
+                    <button id="project-back" class="settings-back-btn" data-tip="Back">
                         <span>&#8592;</span> Back
                     </button>
                 </div>
@@ -2173,7 +2173,7 @@
                 <p class="onboarding-hint" style="margin-top: 1.5em; opacity: 0.7;">
                     Athen runs entirely on your machine. No telemetry, no analytics, nothing leaves your computer — this info is stored locally in your encrypted Athen database and used only to recognize you.
                 </p>
-                <div id="onb-owner-error" class="setting-hint" style="display:none; color: var(--color-error, #c33);"></div>
+                <div id="onb-owner-error" class="setting-hint" style="display:none; color: var(--danger);"></div>
                 <div class="onboarding-buttons">
                     <button id="onb-back-identity" class="btn-secondary">Back</button>
                     <button id="onb-skip-identity" class="btn-secondary">Skip for now</button>
