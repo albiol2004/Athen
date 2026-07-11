@@ -53,6 +53,7 @@
     --dur-fast:  120ms;
     --dur:       180ms;
     --dur-slow:  280ms;
+    --dur-slower: 600ms;
 
     /* shadows — single layer, low spread */
     --shadow-card:   0 1px 2px rgba(0, 0, 0, 0.4), 0 0 0 1px var(--border);
@@ -678,7 +679,7 @@ header h1 {
     color: var(--text-2);
     transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
     user-select: none;
-    animation: session-item-in 280ms var(--ease) both;
+    animation: session-item-in var(--dur-slow) var(--ease) both;
 }
 @keyframes session-item-in {
     from { opacity: 0; transform: translateY(-4px); }
@@ -825,7 +826,7 @@ header h1 {
     display: flex;
     flex-direction: column;
     gap: 1px;
-    animation: arc-menu-in 110ms var(--ease) both;
+    animation: arc-menu-in var(--dur-fast) var(--ease) both;
 }
 @keyframes arc-menu-in {
     from { opacity: 0; transform: translateY(-2px); }
@@ -1276,7 +1277,7 @@ header h1 {
     transition: background var(--dur) var(--ease),
                 border-color var(--dur) var(--ease),
                 transform var(--dur) var(--ease);
-    animation: welcome-chip-in 380ms var(--ease) both;
+    animation: welcome-chip-in var(--dur-slow) var(--ease) both;
 }
 .welcome-chip:hover {
     background: var(--surface-2);
@@ -1334,7 +1335,7 @@ header h1 {
 .message-row {
     display: flex;
     flex-direction: column;
-    animation: msg-in 280ms var(--ease);
+    animation: msg-in var(--dur-slow) var(--ease);
 }
 
 @keyframes msg-in {
@@ -1524,7 +1525,7 @@ header h1 {
 }
 .msg-dots-btn {
     opacity: 0;
-    transition: opacity 150ms ease;
+    transition: opacity var(--dur) var(--ease);
 }
 .message-row:hover .msg-dots-btn,
 .message-row.editing .msg-dots-btn,
@@ -1547,7 +1548,7 @@ header h1 {
     align-items: center;
     justify-content: center;
     padding: 0;
-    transition: color 120ms, border-color 120ms, background 120ms;
+    transition: color var(--dur-fast), border-color var(--dur-fast), background var(--dur-fast);
 }
 .msg-action-btn:hover {
     color: var(--text);
@@ -1587,7 +1588,7 @@ header h1 {
     display: flex;
     align-items: center;
     gap: 8px;
-    transition: background 100ms, color 100ms;
+    transition: background var(--dur-fast), color var(--dur-fast);
 }
 .msg-action-menu-item:hover {
     background: var(--surface-1);
@@ -1625,7 +1626,7 @@ header h1 {
     font-weight: 500;
     cursor: pointer;
     border: 1px solid var(--border);
-    transition: background 120ms, border-color 120ms;
+    transition: background var(--dur-fast), border-color var(--dur-fast);
 }
 .msg-edit-cancel {
     background: transparent;
@@ -1652,7 +1653,7 @@ header h1 {
     align-items: center;
     justify-content: center;
     z-index: 9999;
-    animation: fade-in 150ms ease;
+    animation: fade-in var(--dur) var(--ease);
 }
 @keyframes fade-in {
     from { opacity: 0; }
@@ -1666,7 +1667,7 @@ header h1 {
     max-width: 400px;
     width: 90%;
     box-shadow: 0 16px 48px rgba(0,0,0,0.35);
-    animation: dialog-pop 200ms var(--ease);
+    animation: dialog-pop var(--dur) var(--ease);
 }
 @keyframes dialog-pop {
     from { opacity: 0; transform: scale(0.95) translateY(8px); }
@@ -1709,7 +1710,7 @@ header h1 {
     font-weight: 500;
     cursor: pointer;
     border: 1px solid var(--border);
-    transition: background 120ms;
+    transition: background var(--dur-fast);
 }
 .rewind-dialog-cancel {
     background: transparent;
@@ -1791,7 +1792,7 @@ header h1 {
     font-size: var(--fs-md);
     font-weight: 500;
     cursor: pointer;
-    transition: background 120ms, color 120ms, border-color 120ms;
+    transition: background var(--dur-fast), color var(--dur-fast), border-color var(--dur-fast);
 }
 .deep-research-chip:hover {
     background: var(--surface-2);
@@ -1814,7 +1815,7 @@ header h1 {
     backdrop-filter: var(--glass-blur);
     border: 1px solid var(--glass-border, var(--border));
     box-shadow: var(--shadow-card);
-    animation: dialog-pop 200ms var(--ease);
+    animation: dialog-pop var(--dur) var(--ease);
 }
 .dr-thread-card.running {
     border-color: color-mix(in srgb, var(--brand-warm) 40%, var(--border));
@@ -1892,7 +1893,7 @@ header h1 {
     display: flex;
     align-items: center;
     border-radius: 6px;
-    transition: background 120ms, color 120ms;
+    transition: background var(--dur-fast), color var(--dur-fast);
 }
 .dr-thread-close:hover {
     background: var(--surface-3);
@@ -1933,19 +1934,19 @@ header h1 {
     border: 1.5px solid var(--border-strong);
     color: var(--text-3);
     background: var(--surface-2);
-    transition: background 200ms, border-color 200ms, color 200ms;
+    transition: background var(--dur), border-color var(--dur), color var(--dur);
 }
 .dr-step-name {
     font-size: var(--fs-sm);
     color: var(--text-3);
-    transition: color 200ms;
+    transition: color var(--dur);
 }
 .dr-step-conn {
     width: 16px;
     height: 1.5px;
     background: var(--border-strong);
     border-radius: 1px;
-    transition: background 200ms;
+    transition: background var(--dur);
 }
 .dr-step-conn.filled {
     background: var(--brand-warm);
@@ -2010,7 +2011,7 @@ header h1 {
     height: 100%;
     background: var(--brand-grad);
     border-radius: 3px;
-    transition: width 300ms var(--ease);
+    transition: width var(--dur-slow) var(--ease);
 }
 
 /* Collapsible list of investigated sub-questions */
@@ -2031,7 +2032,7 @@ header h1 {
     content: "▸";
     display: inline-block;
     margin-right: 6px;
-    transition: transform 120ms;
+    transition: transform var(--dur-fast);
     color: var(--text-3);
 }
 .dr-thread-subq[open] > summary::before {
@@ -2060,7 +2061,7 @@ header h1 {
     font-size: var(--fs-sm);
     font-weight: 600;
     cursor: pointer;
-    transition: filter 120ms;
+    transition: filter var(--dur-fast);
 }
 .dr-thread-card .dr-view-btn:hover {
     filter: brightness(1.1);
@@ -2080,7 +2081,7 @@ header h1 {
     backdrop-filter: var(--glass-blur);
     border: 1px solid var(--glass-border, var(--border));
     box-shadow: var(--shadow-card);
-    animation: dialog-pop 200ms var(--ease);
+    animation: dialog-pop var(--dur) var(--ease);
 }
 .loop-thread-card.running {
     border-color: color-mix(in srgb, var(--brand-warm) 40%, var(--border));
@@ -2179,7 +2180,7 @@ header h1 {
     display: flex;
     align-items: center;
     border-radius: 6px;
-    transition: background 120ms, color 120ms;
+    transition: background var(--dur-fast), color var(--dur-fast);
 }
 .loop-thread-close:hover {
     background: var(--surface-3);
@@ -2219,7 +2220,7 @@ header h1 {
     border: 1px solid var(--border);
     color: var(--text-2);
     cursor: pointer;
-    transition: color 120ms, border-color 120ms;
+    transition: color var(--dur-fast), border-color var(--dur-fast);
 }
 .loop-mailbox-btn:hover:not(:disabled) {
     color: var(--brand-warm);
@@ -2246,7 +2247,7 @@ header h1 {
     border: 1px solid color-mix(in srgb, var(--danger, #e0584a) 45%, var(--border));
     color: var(--danger, #e0584a);
     cursor: pointer;
-    transition: background 120ms;
+    transition: background var(--dur-fast);
 }
 .loop-stop:hover {
     background: color-mix(in srgb, var(--danger, #e0584a) 12%, transparent);
@@ -2305,7 +2306,7 @@ header h1 {
     display: flex;
     flex-direction: column;
     overflow: hidden;
-    animation: dialog-pop 200ms var(--ease);
+    animation: dialog-pop var(--dur) var(--ease);
 }
 .paper-modal-head {
     display: flex;
@@ -2334,7 +2335,7 @@ header h1 {
     display: flex;
     align-items: center;
     border-radius: 6px;
-    transition: background 120ms, color 120ms;
+    transition: background var(--dur-fast), color var(--dur-fast);
 }
 .paper-modal-close:hover {
     background: var(--surface-3);
@@ -2607,7 +2608,7 @@ header h1 {
     border-radius: var(--r-sm);
     font-size: var(--fs-sm);
     overflow: hidden;
-    animation: msg-in 200ms var(--ease);
+    animation: msg-in var(--dur) var(--ease);
     transition: border-color var(--dur) var(--ease),
                 box-shadow var(--dur) var(--ease),
                 background var(--dur) var(--ease);
@@ -2620,7 +2621,7 @@ header h1 {
 .tool-execution-card.in-progress {
     border-color: rgba(185, 81, 99, 0.40);
     background: rgba(185, 81, 99, 0.06);
-    animation: msg-in 200ms var(--ease), card-breathe 2.4s ease-in-out infinite;
+    animation: msg-in var(--dur) var(--ease), card-breathe 2.4s ease-in-out infinite;
 }
 .tool-execution-card.in-progress::after {
     content: '';
@@ -2755,7 +2756,7 @@ header h1 {
     margin-left: auto;
     color: var(--text-3);
     font-size: var(--fs-xs);
-    transition: transform 120ms var(--ease);
+    transition: transform var(--dur-fast) var(--ease);
 }
 .tool-group-history[open] > summary::after { transform: rotate(180deg); }
 .tool-group-history:hover > summary { background: var(--overlay-hover); }
@@ -2794,7 +2795,7 @@ header h1 {
     border-top: 1px solid var(--border);
     margin: 0;
 }
-.tool-group-history[open] > .tool-group-body { animation: trace-reveal 220ms var(--ease); }
+.tool-group-history[open] > .tool-group-body { animation: trace-reveal var(--dur) var(--ease); }
 @keyframes trace-reveal {
     from { opacity: 0; transform: translateY(-4px); }
     to   { opacity: 1; transform: translateY(0); }
@@ -2820,7 +2821,7 @@ header h1 {
 .tool-card-expand > summary.tool-card-expand-summary > .tool-execution-card {
     /* Subtle hover indicates clickability without competing with the
        card's own status colours. */
-    transition: background 100ms var(--ease);
+    transition: background var(--dur-fast) var(--ease);
 }
 .tool-card-expand > summary.tool-card-expand-summary:hover > .tool-execution-card {
     background: var(--overlay-hover);
@@ -2859,7 +2860,7 @@ header h1 {
     border-radius: var(--r-sm);
     padding: 3px 8px;
     cursor: pointer;
-    transition: background 100ms var(--ease), color 100ms var(--ease), border-color 100ms var(--ease);
+    transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease);
 }
 .tool-revert-btn:hover:not(:disabled) {
     color: var(--text);
@@ -3301,7 +3302,7 @@ mark.grep-match {
 .sub-agent-steps-summary::after {
     content: '\25be';
     margin-left: 6px;
-    transition: transform 120ms ease;
+    transition: transform var(--dur-fast) var(--ease);
     display: inline-block;
 }
 .sub-agent-steps[open] > .sub-agent-steps-summary::after { transform: rotate(180deg); }
@@ -3375,7 +3376,7 @@ mark.grep-match {
     margin-left: auto;
     color: var(--text-3);
     font-size: var(--fs-xs);
-    transition: transform 120ms var(--ease);
+    transition: transform var(--dur-fast) var(--ease);
 }
 .thinking-block[open] > summary::after { transform: rotate(180deg); }
 /* Live reasoning gets a leading pulse dot; the settled block is quiet. */
@@ -3395,7 +3396,7 @@ mark.grep-match {
     color: var(--text-3);
     font-style: italic;
 }
-.thinking-block[open] > .thinking-content { animation: trace-reveal 220ms var(--ease); }
+.thinking-block[open] > .thinking-content { animation: trace-reveal var(--dur) var(--ease); }
 @media (prefers-reduced-motion: reduce) {
     .thinking-block.thinking-live > summary::before,
     .thinking-block[open] > .thinking-content { animation: none; }
@@ -4295,7 +4296,7 @@ footer {
     border-radius: 8px;
     background: var(--surface-2);
     cursor: pointer;
-    transition: background 120ms ease, border-color 120ms ease;
+    transition: background var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease);
 }
 .att-mime-bundle:hover {
     background: var(--surface-3);
@@ -7517,7 +7518,7 @@ option:hover {
     border-radius: 999px;
     background: var(--surface-2);
     color: var(--text-3, var(--text-2));
-    transition: background 120ms ease, color 120ms ease;
+    transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
 }
 .onb-progress-step.active {
     background: var(--info-soft);
@@ -8355,7 +8356,7 @@ option:hover {
     display: inline-block;
     margin-right: 6px;
     font-size: var(--fs-2xs);
-    transition: transform 0.1s ease;
+    transition: transform var(--dur-fast) var(--ease);
 }
 
 .wakeup-allowlist-group[open] > .wakeup-allowlist-group-summary::before {
@@ -8535,7 +8536,7 @@ option:hover {
     background: var(--bg);
     color: var(--text);
     cursor: pointer;
-    transition: background 0.1s ease, border-color 0.1s ease;
+    transition: background var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease);
 }
 
 .wakeup-preset:hover {
@@ -8637,7 +8638,7 @@ option:hover {
     font-size: var(--fs-sm);
     cursor: pointer;
     padding: 0;
-    transition: background 0.08s ease;
+    transition: background var(--dur-fast) var(--ease);
 }
 
 .wakeup-cal-cell:hover {
@@ -9352,7 +9353,7 @@ option:hover {
     padding: 1px 6px;
     border-radius: var(--r-sm);
     transform-origin: center;
-    animation: agentStepBump 420ms var(--ease) both;
+    animation: agentStepBump var(--dur-slower) var(--ease) both;
 }
 
 /* ── History rows ── */
@@ -9593,11 +9594,11 @@ option:hover {
 }
 .agent-card-steps > .fresh,
 .agent-history-steps > .fresh {
-    animation: agentStepFresh 600ms var(--ease) both;
+    animation: agentStepFresh var(--dur-slower) var(--ease) both;
 }
 .agent-card-steps > details.tool-card-expand.fresh,
 .agent-history-steps > details.tool-card-expand.fresh {
-    animation: agentStepFresh 600ms var(--ease) both;
+    animation: agentStepFresh var(--dur-slower) var(--ease) both;
     border-radius: var(--r-md);
 }
 
@@ -10077,7 +10078,7 @@ option:hover {
     display: flex;
     flex-direction: column;
     transform: translateX(0);
-    transition: transform 180ms var(--ease);
+    transition: transform var(--dur) var(--ease);
 }
 .changes-rail.hidden {
     transform: translateX(100%);
@@ -10264,7 +10265,7 @@ option:hover {
     border-radius: var(--r-sm);
     padding: 3px 8px;
     cursor: pointer;
-    transition: background 100ms var(--ease), color 100ms var(--ease), border-color 100ms var(--ease);
+    transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease);
 }
 .changes-revert-btn:hover:not(:disabled) {
     color: var(--text);
@@ -10291,7 +10292,7 @@ option:hover {
     flex: 1;
     height: 1px;
     background: var(--border);
-    transition: background 120ms var(--ease);
+    transition: background var(--dur-fast) var(--ease);
 }
 .changes-divider-btn {
     display: inline-flex;
@@ -10306,10 +10307,10 @@ option:hover {
     padding: 2px 9px;
     cursor: pointer;
     opacity: 0.65;
-    transition: opacity 120ms var(--ease),
-                color 120ms var(--ease),
-                border-color 120ms var(--ease),
-                background 120ms var(--ease);
+    transition: opacity var(--dur-fast) var(--ease),
+                color var(--dur-fast) var(--ease),
+                border-color var(--dur-fast) var(--ease),
+                background var(--dur-fast) var(--ease);
 }
 .changes-divider:hover .changes-divider-line,
 .changes-divider:focus-within .changes-divider-line {
@@ -10565,8 +10566,8 @@ option:hover {
     border: 1px solid transparent;
     border-radius: var(--r-sm);
     cursor: pointer;
-    transition: opacity 0.12s ease, color 0.12s ease,
-                background 0.12s ease, border-color 0.12s ease;
+    transition: opacity var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease),
+                background var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease);
 }
 .code-mode-dirty:hover .code-mode-discard-btn,
 .code-mode-discard-btn:focus-visible {
@@ -10590,7 +10591,7 @@ option:hover {
     border: 1px solid var(--border);
     border-radius: var(--r-sm);
     cursor: pointer;
-    transition: color 0.12s ease, background 0.12s ease, border-color 0.12s ease;
+    transition: color var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease);
 }
 .code-mode-discard-all-btn:hover,
 .code-mode-discard-all-btn:focus-visible {
@@ -10886,7 +10887,7 @@ option:hover {
     border-radius: var(--r-md); padding: 4px;
     min-width: 160px; box-shadow: var(--shadow-raised);
     z-index: 50;
-    animation: fade-in 0.1s var(--ease);
+    animation: fade-in var(--dur-fast) var(--ease);
 }
 .composer-menu.hidden { display: none; }
 .composer-menu-item {
@@ -11038,7 +11039,7 @@ option:hover {
     padding: 6px 14px; border-radius: var(--r-md);
     font-size: var(--fs-sm); cursor: pointer; border: 1px solid var(--border);
     background: var(--surface-2); color: var(--text);
-    transition: background 0.15s;
+    transition: background var(--dur);
 }
 .plan-card-actions button:hover { background: var(--surface-3); }
 .plan-card-actions button.btn-primary {
@@ -11149,7 +11150,7 @@ option:hover {
     border: 1px solid var(--border);
     border-radius: var(--r-sm, 6px);
     cursor: pointer;
-    transition: border-color var(--dur, 0.15s) var(--ease, ease);
+    transition: border-color var(--dur, var(--dur)) var(--ease, ease);
 }
 .bundled-emb-tier-row:hover {
     border-color: var(--border-strong);
@@ -11228,7 +11229,7 @@ option:hover {
     background: var(--surface-2);
     color: var(--text);
     cursor: pointer;
-    transition: background var(--dur, 0.15s) var(--ease, ease),
+    transition: background var(--dur, var(--dur)) var(--ease, ease),
                 border-color var(--dur, 0.15s) var(--ease, ease);
 }
 .bundled-emb-download-btn:hover,
@@ -11343,7 +11344,7 @@ option:hover {
     content: '\25B6';
     display: inline-block;
     margin-right: 6px;
-    transition: transform 0.15s ease;
+    transition: transform var(--dur) var(--ease);
     color: var(--text-3, var(--text-2));
     font-size: var(--fs-2xs);
 }
@@ -11411,7 +11412,7 @@ option:hover {
     content: '\25B6';
     display: inline-block;
     margin-right: 6px;
-    transition: transform 0.15s ease;
+    transition: transform var(--dur) var(--ease);
     color: var(--text-3, var(--text-2));
     font-size: var(--fs-2xs);
 }
@@ -11498,7 +11499,7 @@ option:hover {
     height: 100%;
     width: 0%;
     background: var(--brand-solid);
-    transition: width 0.25s ease;
+    transition: width var(--dur-slow) var(--ease);
 }
 .voice-setup-progress-fill.is-failed {
     background: var(--danger, #E0584C);
