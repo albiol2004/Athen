@@ -11728,3 +11728,96 @@ option:hover {
 #app-tooltip.visible {
     opacity: 1;
 }
+
+/* ─── Skeleton loaders ───
+   One primitive: .skeleton is a neutral block with a shimmer sweep
+   (skeleton-shimmer — named ambient keyframe, exempt from the motion-token
+   duration rule). Rendered by beginSkeleton() in app.js only when a fetch
+   is still pending after 150ms, so cached/instant renders never flash. */
+
+.skeleton {
+    position: relative;
+    border-radius: var(--r-xs);
+    background: var(--surface-2);
+    overflow: hidden;
+}
+.skeleton::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(90deg,
+        transparent,
+        rgba(255, 255, 255, 0.07),
+        transparent);
+    animation: skeleton-shimmer 1.4s linear infinite;
+}
+@keyframes skeleton-shimmer {
+    from { transform: translateX(-100%); }
+    to   { transform: translateX(100%); }
+}
+:root[data-theme="light"] .skeleton::after {
+    background: linear-gradient(90deg,
+        transparent,
+        rgba(80, 40, 20, 0.06),
+        transparent);
+}
+/* Reduced motion: shimmer becomes a static tint (the global 0.01ms
+   override would leave the sweep frozen mid-gradient; pin it instead). */
+@media (prefers-reduced-motion: reduce) {
+    .skeleton::after {
+        animation: none;
+        transform: none;
+        background: rgba(255, 255, 255, 0.04);
+    }
+    :root[data-theme="light"] .skeleton::after {
+        background: rgba(80, 40, 20, 0.04);
+    }
+}
+
+/* Size variants */
+.skeleton-line  { height: 12px; }
+.skeleton-bar   { height: 18px; }
+.skeleton-block { height: 64px; }
+
+.skeleton-list {
+    display: flex;
+    flex-direction: column;
+    pointer-events: none;
+}
+
+/* Session sidebar rows — mirror .session-item geometry (8px 10px padding,
+   name line + meta line) so the swap to real rows doesn't jump. */
+.skel-session-row {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    padding: 10px 10px;
+    border-radius: var(--r-md);
+}
+.skel-session-row .skel-sub { height: 10px; }
+
+/* Chat bubbles — alternating alignment, roomy bubble blocks. */
+.skel-msg-row {
+    display: flex;
+    justify-content: flex-start;
+    margin-bottom: 18px;
+}
+.skel-msg-row.mine { justify-content: flex-end; }
+.skel-bubble {
+    height: 48px;
+    max-width: 70%;
+    border-radius: var(--r-lg);
+}
+
+/* Settings list rows — bordered surface cards matching .profile-card /
+   .cal-src-row / .mcp-server-row paddings. */
+.skel-card-row {
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+    padding: 13px 15px;
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
+    margin-bottom: 10px;
+}

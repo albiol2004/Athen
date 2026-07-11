@@ -1030,8 +1030,10 @@ const arcMetaById = new Map();
 
 async function loadArcs() {
     if (!invoke) return;
+    const skel = beginSkeleton(sessionListEl, 'session', 6);
     try {
         const arcs = await invoke('list_arcs');
+        skel.end();
         arcMetaById.clear();
         for (const a of arcs || []) {
             arcMetaById.set(a.id, a);
@@ -1043,6 +1045,11 @@ async function loadArcs() {
         renderSecurityPicker();
         renderCodeModeToggle();
     } catch (err) {
+        skel.end();
+        // If the skeleton already replaced the list, don't leave it
+        // shimmering forever — clear it (matches the pre-skeleton
+        // "nothing rendered on failure" behavior).
+        if (skel.shown) sessionListEl.innerHTML = '';
         console.error('Failed to load arcs:', err);
     }
 }
@@ -2289,8 +2296,13 @@ async function handleSwitchArc(arcId) {
     // the active arc changes; the panel refresh below restarts it if needed.
     stopCodeModeAgentsPolling();
 
+    // Chat skeleton while the target arc's history loads. Only appears if
+    // the IPC round-trip is still pending after 150ms — instant switches
+    // keep the old content until the real render below.
+    const chatSkel = beginSkeleton(messagesEl, 'chat', 4);
     try {
         const entries = await invoke('switch_arc', { arcId });
+        chatSkel.end();
         activeArcId = arcId;
         renderProfilePicker();
         renderReasoningPicker();
@@ -2366,6 +2378,12 @@ async function handleSwitchArc(arcId) {
 
         inputEl.focus();
     } catch (err) {
+        chatSkel.end();
+        // If the skeleton already replaced the previous arc's messages,
+        // that DOM is gone — fall back to the welcome state rather than
+        // leaving skeleton bars shimmering forever. Errors that arrive
+        // before the 150ms delay keep the old content, as before.
+        if (chatSkel.shown) clearChatUI();
         console.error('Switch arc failed:', err);
     }
 }
@@ -2502,6 +2520,69 @@ function welcomeHTML() {
         + `<div class="welcome-chips">${chips}</div>`
         + `</div>`
     );
+}
+
+// ─── Skeleton loaders ───
+// Perceived-speed trick: the skeleton only appears if the fetch is still
+// pending after SKELETON_DELAY_MS, so cached/instant renders never flash.
+// Call .end() before painting real content (or an error) — it cancels the
+// pending timer so a late skeleton can never clobber real rows.
+const SKELETON_DELAY_MS = 150;
+
+function skeletonRowsHtml(kind, rows) {
+    const out = [];
+    for (let i = 0; i < rows; i++) {
+        // Deterministic width variation so rows read as content, not stripes.
+        const w1 = 55 + ((i * 17) % 35);
+        const w2 = 30 + ((i * 23) % 30);
+        if (kind === 'chat') {
+            const mine = i % 2 === 1;
+            out.push(
+                `<div class="skel-msg-row${mine ? ' mine' : ''}">`
+                + `<div class="skeleton skel-bubble" style="width: ${w1}%"></div>`
+                + '</div>'
+            );
+        } else if (kind === 'card') {
+            out.push(
+                '<div class="skel-card-row">'
+                + `<div class="skeleton skeleton-bar" style="width: ${w2}%"></div>`
+                + `<div class="skeleton skeleton-line" style="width: ${w1}%"></div>`
+                + '</div>'
+            );
+        } else {
+            out.push(
+                '<div class="skel-session-row">'
+                + `<div class="skeleton skeleton-line" style="width: ${w1}%"></div>`
+                + `<div class="skeleton skeleton-line skel-sub" style="width: ${w2}%"></div>`
+                + '</div>'
+            );
+        }
+    }
+    return `<div class="skeleton-list" aria-hidden="true">${out.join('')}</div>`;
+}
+
+// kind: 'session' | 'chat' | 'card'. Returns { shown, end() }. The chat
+// kind also clamps the parent scroller — WebKitGTK retains a stale
+// scrollTop across innerHTML swaps and won't re-clamp until the next
+// user interaction, so a tall→short swap must reset it explicitly.
+function beginSkeleton(el, kind, rows) {
+    if (!el) {
+        return { shown: false, end() {} };
+    }
+    const handle = {
+        shown: false,
+        end() { clearTimeout(timer); },
+    };
+    const timer = setTimeout(() => {
+        handle.shown = true;
+        el.innerHTML = skeletonRowsHtml(kind, rows);
+        if (el.scrollTop) el.scrollTop = 0;
+        if (kind === 'chat') {
+            const scroller = el.parentElement;
+            if (scroller && scroller.scrollTop) scroller.scrollTop = 0;
+        }
+    }, SKELETON_DELAY_MS);
+    return handle;
 }
 
 function clearChatUI() {
@@ -8809,10 +8890,12 @@ const PROFILE_TASK_KINDS = [
 async function loadProfileManager() {
     const listEl = document.getElementById('profile-list');
     if (!listEl) return;
+    const skel = beginSkeleton(listEl, 'card', 4);
     try {
         // Reuse the cached list when possible — the per-arc picker keeps it
         // fresh, and the manager re-fetches after each save anyway.
         agentProfiles = await invoke('list_agent_profiles');
+        skel.end();
         renderProfileList();
         // Push the freshly loaded list back to the per-arc dropdown so the
         // two views never disagree.
@@ -8821,6 +8904,7 @@ async function loadProfileManager() {
         renderTierPicker();
         renderSecurityPicker();
     } catch (err) {
+        skel.end();
         console.error('Failed to load profiles:', err);
         listEl.innerHTML = '<p class="setting-hint">Failed to load profiles.</p>';
     }
@@ -19818,15 +19902,18 @@ let mcpServersExpanded = new Set();  // ids the user clicked open
 async function loadMcpServers() {
     const list = document.getElementById('mcp-servers-list');
     if (!list) return;
+    const skel = beginSkeleton(list, 'card', 3);
     try {
         const [custom, enabled] = await Promise.all([
             invoke('mcp_list_custom'),
             invoke('mcp_list_enabled'),
         ]);
+        skel.end();
         mcpServersCustom = custom || [];
         mcpServersEnabled = enabled || [];
         renderMcpServersList();
     } catch (err) {
+        skel.end();
         console.error('Failed to load MCP servers:', err);
         list.innerHTML = `<p class="setting-hint">Failed to load: ${escapeHtml(String(err))}</p>`;
     }
@@ -20605,8 +20692,10 @@ async function addCalendarSource() {
 async function refreshCalendarSourcesList() {
     const listEl = document.getElementById('calendar-sources-list');
     if (!listEl || typeof invoke !== 'function') return;
+    const skel = beginSkeleton(listEl, 'card', 2);
     try {
         const sources = await invoke('list_calendar_sources');
+        skel.end();
         if (!sources || sources.length === 0) {
             listEl.innerHTML = '<p class="calendar-sources-empty">No calendar sources configured.</p>';
             return;
@@ -20617,6 +20706,7 @@ async function refreshCalendarSourcesList() {
             btn.addEventListener('click', onCalendarSourceAction);
         });
     } catch (e) {
+        skel.end();
         listEl.innerHTML = `<p class="test-result error">Failed to load: ${escapeHtml(String(e))}</p>`;
     }
 }
