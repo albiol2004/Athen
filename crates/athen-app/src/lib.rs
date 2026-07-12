@@ -60,6 +60,69 @@ use state::AppState;
 
 pub use headless::run_headless;
 
+/// Attach the per-window wiring every main window needs. Called once for
+/// the window Tauri creates at startup and again by
+/// [`show_or_recreate_main_window`] for every recreated window, so the
+/// handlers never stack: each window instance carries exactly one set and
+/// they die with the window. State is resolved at event time (not captured
+/// at setup) so a recreated window sees the live notifier.
+///
+/// There is deliberately NO `CloseRequested` arm: close is allowed to
+/// proceed, which destroys the window and its webview (renderer processes
+/// exit, RAM returns to the OS). The backend survives via the
+/// zero-windows `ExitRequested` gate in [`run`].
+fn attach_main_window_handlers(app: &tauri::AppHandle, window: &tauri::WebviewWindow) {
+    use tauri::Manager;
+    let handle = app.clone();
+    let set_present = move |present: bool| {
+        if let Some(state) = handle.try_state::<AppState>() {
+            if let Some(notifier) = state.notifier.load_full() {
+                notifier.set_user_present(present);
+            }
+        }
+    };
+    window.on_window_event(move |event| match event {
+        tauri::WindowEvent::Focused(focused) => set_present(*focused),
+        // Window gone → notifications route to external channels, same as
+        // unfocused today.
+        tauri::WindowEvent::Destroyed => set_present(false),
+        _ => {}
+    });
+}
+
+/// Focus the main window if it exists, otherwise recreate it from the
+/// `tauri.conf.json` window config (single source for title/size/
+/// decorations) and re-attach the per-window wiring. Every reopen path —
+/// tray left-click, tray menu "Show", the single-instance callback — goes
+/// through here.
+fn show_or_recreate_main_window(app: &tauri::AppHandle) {
+    use tauri::Manager;
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+        return;
+    }
+    let Some(cfg) = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|w| w.label == "main")
+        .cloned()
+    else {
+        tracing::error!("no 'main' window config in tauri.conf.json; cannot recreate window");
+        return;
+    };
+    match tauri::WebviewWindowBuilder::from_config(app, &cfg).and_then(|b| b.build()) {
+        Ok(window) => {
+            attach_main_window_handlers(app, &window);
+            let _ = window.set_focus();
+        }
+        Err(e) => tracing::error!(error = %e, "failed to recreate main window"),
+    }
+}
+
 /// Build and run the Tauri application.
 pub fn run() {
     // Initialize tracing with RUST_LOG env filter (defaults to info).
@@ -87,12 +150,7 @@ pub fn run() {
         // bounces it and runs this callback in the original process so
         // we can raise the existing window instead of starting a new one.
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            use tauri::Manager;
-            if let Some(w) = app.get_webview_window("main") {
-                let _ = w.show();
-                let _ = w.unminimize();
-                let _ = w.set_focus();
-            }
+            show_or_recreate_main_window(app);
         }))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
@@ -496,9 +554,9 @@ pub fn run() {
             // Track window focus state for the notification orchestrator.
             // When the window loses focus, the orchestrator routes notifications
             // to external channels (Telegram) instead of in-app.
-            // Also intercept window close: hide to tray instead of exiting,
-            // so the Telegram poll loop and other background work keep
-            // running. The tray menu provides a real Quit.
+            // Window close DESTROYS the window (webview RAM returns to the
+            // OS); the backend keeps running via the zero-windows
+            // ExitRequested gate below. The tray recreates the window.
             let state_ref = app.state::<AppState>();
 
             // Ensure memory has a real embedder out of the box: if nothing
@@ -510,26 +568,13 @@ pub fn run() {
             state_ref
                 .start_embedder_warmup(crate::ui_bridge::UiBridge::Tauri(app.handle().clone()));
 
-            let notifier_for_focus = state_ref.notifier.load_full();
             if let Some(window) = app.get_webview_window("main") {
-                let win_for_event = window.clone();
-                window.on_window_event(move |event| match event {
-                    tauri::WindowEvent::Focused(focused) => {
-                        if let Some(ref notifier) = notifier_for_focus {
-                            notifier.set_user_present(*focused);
-                        }
-                    }
-                    tauri::WindowEvent::CloseRequested { api, .. } => {
-                        api.prevent_close();
-                        let _ = win_for_event.hide();
-                    }
-                    _ => {}
-                });
+                attach_main_window_handlers(app.handle(), &window);
             }
 
-            // Tray icon: left-click toggles the window, right-click menu
-            // exposes Show / Quit. `Quit` is the only path that actually
-            // exits the process now that close-to-tray is wired.
+            // Tray icon: left-click toggles the window (close-to-destroy /
+            // recreate), right-click menu exposes Show / Quit. `Quit` is
+            // the only path that actually exits the process.
             use tauri::menu::{MenuBuilder, MenuItemBuilder};
             use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
@@ -551,13 +596,7 @@ pub fn run() {
                 .menu(&tray_menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id().as_ref() {
-                    "show" => {
-                        if let Some(w) = app.get_webview_window("main") {
-                            let _ = w.show();
-                            let _ = w.unminimize();
-                            let _ = w.set_focus();
-                        }
-                    }
+                    "show" => show_or_recreate_main_window(app),
                     "quit" => app.exit(0),
                     _ => {}
                 })
@@ -569,16 +608,14 @@ pub fn run() {
                     } = event
                     {
                         let app = tray.app_handle();
-                        if let Some(w) = app.get_webview_window("main") {
-                            // Toggle: hide if visible+focused, show otherwise.
-                            let visible = w.is_visible().unwrap_or(false);
-                            if visible {
-                                let _ = w.hide();
-                            } else {
-                                let _ = w.show();
-                                let _ = w.unminimize();
-                                let _ = w.set_focus();
+                        // Toggle: a visible window is closed (destroyed, so
+                        // its RAM is freed — not hidden); otherwise the
+                        // window is recreated or focused.
+                        match app.get_webview_window("main") {
+                            Some(w) if w.is_visible().unwrap_or(false) => {
+                                let _ = w.close();
                             }
+                            _ => show_or_recreate_main_window(app),
                         }
                     }
                 })
@@ -589,18 +626,31 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building Athen");
 
-    // Intercept ExitRequested so we can run the async shutdown coordinator
-    // before the process dies. The window-close path is already wired to
-    // hide-to-tray (above) — Quit via tray menu / auto-updater restart /
-    // OS signal (SIGTERM) is what funnels through here.
+    // Intercept ExitRequested for two distinct purposes:
     //
-    // The flow is: ExitRequested fires once → we `api.prevent_exit()`,
-    // spawn the async `shutdown_all()`, then call `handle.exit(code)`
-    // from inside the spawned future. That re-enters this callback;
-    // a static `AtomicBool` guard lets the second pass through.
+    // 1. Zero-windows idle: closing the main window DESTROYS it (freeing
+    //    the webview RAM), and Tauri then requests exit because the last
+    //    window is gone. That request carries `code: None`; we prevent it
+    //    so the backend (senses, coordinator, wake-ups, Telegram, HTTP
+    //    API, tray) keeps running windowless until the tray recreates the
+    //    window or Quit is chosen.
+    // 2. Real exit (tray Quit / auto-updater restart — always via
+    //    `app.exit(code)`, which carries `Some(code)`): run the async
+    //    shutdown coordinator before the process dies. The flow is:
+    //    ExitRequested fires once → we `api.prevent_exit()`, spawn the
+    //    async `shutdown_all()`, then call `handle.exit(code)` from inside
+    //    the spawned future. That re-enters this callback; a static
+    //    `AtomicBool` guard lets the second pass through.
     app.run(|app_handle, event| {
         if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
             use std::sync::atomic::{AtomicBool, Ordering};
+            if code.is_none() {
+                // Last window closed — stay alive in the tray. A real exit
+                // in flight is unaffected: its `handle.exit(code)` arrives
+                // as a separate Some(code) event.
+                api.prevent_exit();
+                return;
+            }
             static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
             if SHUTTING_DOWN.swap(true, Ordering::SeqCst) {
                 // Re-entry from our own handle.exit() at the end of the
