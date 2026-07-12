@@ -222,9 +222,7 @@ where
                 iteration: stopped_after,
                 max_iterations: cap,
                 phase: "done",
-                detail: format!(
-                    "Loop stopped by request after iteration {stopped_after}/{cap}"
-                ),
+                detail: format!("Loop stopped by request after iteration {stopped_after}/{cap}"),
                 last_verdict: last_verdict.map(|v| v.as_str()),
             });
             return Ok(LoopOutcome {
@@ -365,7 +363,10 @@ fn emit_done(
         iteration: iter,
         max_iterations: cap,
         phase: "done",
-        detail: format!("Loop stopped on iteration {iter}/{cap}: {}", verdict.as_str()),
+        detail: format!(
+            "Loop stopped on iteration {iter}/{cap}: {}",
+            verdict.as_str()
+        ),
         last_verdict: Some(verdict.as_str()),
     });
 }
@@ -683,7 +684,9 @@ pub(crate) fn acquire_loop_lock(
                     tracing::warn!(
                         "loop_mode: taking over stale mailbox lock {} (pid {} is gone)",
                         dir.display(),
-                        other.map(|p| p.to_string()).unwrap_or_else(|| "unknown".into())
+                        other
+                            .map(|p| p.to_string())
+                            .unwrap_or_else(|| "unknown".into())
                     );
                     std::fs::remove_dir_all(&dir).map_err(LoopLockError::Io)?;
                     std::fs::create_dir(&dir).map_err(LoopLockError::Io)?;
@@ -751,7 +754,10 @@ mod tests {
     #[test]
     fn verdict_tolerates_surrounding_whitespace() {
         assert_eq!(Verdict::parse("   VERDICT:   SHIP   "), Some(Verdict::Ship));
-        assert_eq!(Verdict::parse("\tVERDICT:\tBLOCKED"), Some(Verdict::Blocked));
+        assert_eq!(
+            Verdict::parse("\tVERDICT:\tBLOCKED"),
+            Some(Verdict::Blocked)
+        );
     }
 
     #[test]
@@ -863,7 +869,9 @@ mod tests {
         let outcome = run_trio_loop(
             10,
             |_iter| async { Ok::<String, athen_core::error::AthenError>(String::new()) },
-            |_iter| async { Ok::<String, athen_core::error::AthenError>("VERDICT: SHIP\n".to_string()) },
+            |_iter| async {
+                Ok::<String, athen_core::error::AthenError>("VERDICT: SHIP\n".to_string())
+            },
             || Some("VERDICT: SHIP\n".to_string()),
             |_p| {},
             || false, // never stop: exercises the prior (no-cancel) behavior
@@ -882,7 +890,9 @@ mod tests {
         let outcome = run_trio_loop(
             10,
             |_iter| async { Ok::<String, athen_core::error::AthenError>(String::new()) },
-            |_iter| async { Ok::<String, athen_core::error::AthenError>("VERDICT: BLOCKED\n".to_string()) },
+            |_iter| async {
+                Ok::<String, athen_core::error::AthenError>("VERDICT: BLOCKED\n".to_string())
+            },
             || Some("VERDICT: BLOCKED\n".to_string()),
             |_p| {},
             || false, // never stop: exercises the prior (no-cancel) behavior
@@ -915,7 +925,11 @@ mod tests {
                 let seq_eval = Arc::clone(&seq_eval);
                 let current_eval = Arc::clone(&current_eval);
                 async move {
-                    let v = seq_eval.lock().unwrap().next().unwrap_or("VERDICT: ITERATE\n");
+                    let v = seq_eval
+                        .lock()
+                        .unwrap()
+                        .next()
+                        .unwrap_or("VERDICT: ITERATE\n");
                     *current_eval.lock().unwrap() = Some(v);
                     Ok::<String, athen_core::error::AthenError>(v.to_string())
                 }
@@ -957,13 +971,21 @@ mod tests {
                 async move {
                     let n = counter_eval.fetch_add(1, Ordering::SeqCst);
                     // Even iterations: ITERATE; odd: garbage (no parseable verdict).
-                    let v = if n.is_multiple_of(2) { "VERDICT: ITERATE\n" } else { "no verdict here\n" };
+                    let v = if n.is_multiple_of(2) {
+                        "VERDICT: ITERATE\n"
+                    } else {
+                        "no verdict here\n"
+                    };
                     Ok::<String, athen_core::error::AthenError>(v.to_string())
                 }
             },
             move || {
                 let n = counter_file.fetch_add(1, Ordering::SeqCst);
-                let v = if n.is_multiple_of(2) { "VERDICT: ITERATE\n" } else { "no verdict here\n" };
+                let v = if n.is_multiple_of(2) {
+                    "VERDICT: ITERATE\n"
+                } else {
+                    "no verdict here\n"
+                };
                 Some(v.to_string())
             },
             |_p| {},
@@ -1000,7 +1022,11 @@ mod tests {
                     log_eval.lock().unwrap().push("evaluator");
                     // SHIP on iteration 2 so the run has >1 iteration to check
                     // ordering across, then stops cleanly.
-                    let v = if iter >= 2 { "VERDICT: SHIP\n" } else { "VERDICT: ITERATE\n" };
+                    let v = if iter >= 2 {
+                        "VERDICT: SHIP\n"
+                    } else {
+                        "VERDICT: ITERATE\n"
+                    };
                     Ok::<String, athen_core::error::AthenError>(v.to_string())
                 }
             },
@@ -1025,7 +1051,9 @@ mod tests {
         let outcome = run_trio_loop(
             1, // cap of 1 so an ITERATE ruling ends at CapReached
             |_iter| async { Ok::<String, athen_core::error::AthenError>(String::new()) },
-            |_iter| async { Ok::<String, athen_core::error::AthenError>("VERDICT: SHIP\n".to_string()) },
+            |_iter| async {
+                Ok::<String, athen_core::error::AthenError>("VERDICT: SHIP\n".to_string())
+            },
             || Some("VERDICT: ITERATE\n".to_string()),
             |_p| {},
             || false, // never stop: exercises the prior (no-cancel) behavior
@@ -1044,7 +1072,9 @@ mod tests {
         let outcome = run_trio_loop(
             0,
             |_iter| async { Ok::<String, athen_core::error::AthenError>(String::new()) },
-            |_iter| async { Ok::<String, athen_core::error::AthenError>("VERDICT: SHIP\n".to_string()) },
+            |_iter| async {
+                Ok::<String, athen_core::error::AthenError>("VERDICT: SHIP\n".to_string())
+            },
             || Some("VERDICT: SHIP\n".to_string()),
             |_p| {},
             || false, // never stop: exercises the prior (no-cancel) behavior
@@ -1064,7 +1094,9 @@ mod tests {
                     "lead boom".to_string(),
                 ))
             },
-            |_iter| async { Ok::<String, athen_core::error::AthenError>("VERDICT: SHIP\n".to_string()) },
+            |_iter| async {
+                Ok::<String, athen_core::error::AthenError>("VERDICT: SHIP\n".to_string())
+            },
             || Some("VERDICT: SHIP\n".to_string()),
             |_p| {},
             || false, // never stop: exercises the prior (no-cancel) behavior
@@ -1124,7 +1156,9 @@ mod tests {
                     Ok::<String, athen_core::error::AthenError>(String::new())
                 }
             },
-            |_iter| async { Ok::<String, athen_core::error::AthenError>("VERDICT: SHIP\n".to_string()) },
+            |_iter| async {
+                Ok::<String, athen_core::error::AthenError>("VERDICT: SHIP\n".to_string())
+            },
             || Some("VERDICT: SHIP\n".to_string()),
             |_p| {},
             || true, // stop immediately
@@ -1222,10 +1256,8 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "athen-loop-lock-{}-{tag}-{n}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("athen-loop-lock-{}-{tag}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         root
     }
@@ -1293,7 +1325,10 @@ mod tests {
             std::fs::read_to_string(ld.join("pid")).unwrap().trim(),
             std::process::id().to_string()
         );
-        assert_eq!(std::fs::read_to_string(ld.join("arc_id")).unwrap(), "arc_new");
+        assert_eq!(
+            std::fs::read_to_string(ld.join("arc_id")).unwrap(),
+            "arc_new"
+        );
         drop(guard);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1363,7 +1398,10 @@ mod tests {
             .join("loop-runs")
             .join(sanitize_arc_id_for_path("arc_b"));
         assert_eq!(a, std::path::Path::new("/repos/myproj/loop-runs/arc_a"));
-        assert_ne!(a, b, "distinct arcs at the same repo get distinct mailboxes");
+        assert_ne!(
+            a, b,
+            "distinct arcs at the same repo get distinct mailboxes"
+        );
     }
 
     // ---- Guardrails audit (design-doc invariants, code-enforced) ----------
@@ -1489,7 +1527,6 @@ mod tests {
             app_tools.contains("name: \"start_loop\""),
             "the agent-callable `start_loop` tool must be registered by name"
         );
-
     }
 
     /// The loop machinery must contain no git-commit / process-spawn code path
@@ -1634,8 +1671,8 @@ mod tests {
     /// `loop_start_sense_fence` decides correctly for every origin + ambiguity).
     #[test]
     fn guardrail_start_loop_has_sense_fence() {
-        use athen_persistence::arcs::ArcSource;
         use crate::state::loop_start_sense_fence;
+        use athen_persistence::arcs::ArcSource;
 
         let state = include_str!("state.rs");
         assert!(
@@ -1667,8 +1704,8 @@ mod tests {
     /// `loop_start_gate_for_mode` maps each mode correctly).
     #[test]
     fn guardrail_start_loop_risk_gated_per_mode() {
-        use athen_core::config::SecurityMode;
         use crate::state::{loop_start_gate_for_mode, LoopStartGate};
+        use athen_core::config::SecurityMode;
 
         assert_eq!(
             loop_start_gate_for_mode(SecurityMode::Yolo),
@@ -1691,8 +1728,7 @@ mod tests {
         let state = include_str!("state.rs");
         let runner_region = loop_source_region(state, "let loop_runner:", 130);
         assert!(
-            runner_region.contains("ask_with_escalation")
-                && runner_region.contains("pick_primary"),
+            runner_region.contains("ask_with_escalation") && runner_region.contains("pick_primary"),
             "the start_loop runner must route Assistant approvals through the \
              approval router (ask_with_escalation / pick_primary)"
         );

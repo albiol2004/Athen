@@ -780,7 +780,11 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
                     TaskKindTag::Debugging,
                     TaskKindTag::CodeReview,
                 ],
-                vec!["iterative planning", "incremental implementation", "self-verification"],
+                vec![
+                    "iterative planning",
+                    "incremental implementation",
+                    "self-verification",
+                ],
                 vec![],
                 ToolSelection::All,
                 vec![],
@@ -821,7 +825,11 @@ fn builtin_profiles(now: chrono::DateTime<chrono::Utc>) -> Vec<AgentProfile> {
                 ),
                 vec![DomainTag::Coding],
                 vec![TaskKindTag::CodeReview, TaskKindTag::Debugging],
-                vec!["adversarial verification", "acceptance-criteria grading", "test-integrity audit"],
+                vec![
+                    "adversarial verification",
+                    "acceptance-criteria grading",
+                    "test-integrity audit",
+                ],
                 vec![],
                 ToolSelection::Deny(vec![
                     "edit".into(),

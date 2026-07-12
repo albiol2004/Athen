@@ -11151,9 +11151,9 @@ mod loop_mailbox_tests {
             "loop/GOAL.md",
             "GOAL.md/../../secret",
             "secret.txt",
-            "goal.md",   // case-sensitive: lowercase is not allow-listed
-            "GOAL",      // missing extension
-            "",          // empty
+            "goal.md", // case-sensitive: lowercase is not allow-listed
+            "GOAL",    // missing extension
+            "",        // empty
         ] {
             assert_eq!(
                 resolve_loop_mailbox_file(bad),

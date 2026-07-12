@@ -1109,8 +1109,7 @@ pub(crate) fn build_subagent_factories(
             // Sub-agents never get the deep_research tool (no runner) — keeps
             // the bare worker registry bare and prevents recursive runs.
             let base =
-                assemble_base_app_tool_registry(deps, &sub_arc, Some(ui.clone()), None, None)
-                    .await;
+                assemble_base_app_tool_registry(deps, &sub_arc, Some(ui.clone()), None, None).await;
             Box::new(crate::delegation::ArcRegistryAdapter(base))
                 as Box<dyn athen_core::traits::tool::ToolRegistry>
         })
@@ -1252,9 +1251,7 @@ pub(crate) enum LoopStartGate {
     Deny,
 }
 
-pub(crate) fn loop_start_gate_for_mode(
-    mode: athen_core::config::SecurityMode,
-) -> LoopStartGate {
+pub(crate) fn loop_start_gate_for_mode(mode: athen_core::config::SecurityMode) -> LoopStartGate {
     use athen_core::config::SecurityMode;
     match mode {
         SecurityMode::Yolo => LoopStartGate::Proceed,
@@ -1457,16 +1454,17 @@ pub(crate) async fn assemble_app_tool_registry(
                     // clean in-band refusal, not a tool error.
                     Err(reason) => Ok(LoopStartOutcome::Refused(reason)),
                 }
-            }) as std::pin::Pin<
-                Box<
-                    dyn std::future::Future<
-                            Output = std::result::Result<
-                                crate::app_tools::LoopStartOutcome,
-                                String,
-                            >,
-                        > + Send,
-                >,
-            >
+            })
+                as std::pin::Pin<
+                    Box<
+                        dyn std::future::Future<
+                                Output = std::result::Result<
+                                    crate::app_tools::LoopStartOutcome,
+                                    String,
+                                >,
+                            > + Send,
+                    >,
+                >
         }) as crate::app_tools::LoopStartRunner
     });
 
@@ -2560,8 +2558,9 @@ impl AppState {
 
         // Seed the human-owned + bookkeeping loop files (GOAL.md once, STATE.md
         // if absent). PLAN/REPORT/VERDICT/LOG are role-owned.
-        crate::loop_mode::ensure_loop_files(&loop_root, goal, max_iterations)
-            .map_err(|e| AthenError::Other(format!("Loop Mode: could not seed loop/ files: {e}")))?;
+        crate::loop_mode::ensure_loop_files(&loop_root, goal, max_iterations).map_err(|e| {
+            AthenError::Other(format!("Loop Mode: could not seed loop/ files: {e}"))
+        })?;
 
         // Persist the loop root once at run start (best-effort — a stamp failure
         // must not abort the run).
@@ -2674,8 +2673,7 @@ impl AppState {
 
         // Source of truth: the first line of `<root>/loop/VERDICT.md`.
         let loop_root_for_verdict = loop_root.clone();
-        let read_verdict =
-            move || crate::loop_mode::read_loop_verdict(&loop_root_for_verdict);
+        let read_verdict = move || crate::loop_mode::read_loop_verdict(&loop_root_for_verdict);
 
         // Progress closure: emit a UI event AND stamp the run-progress columns
         // each iteration (best-effort). `set_loop_state` is async and the
@@ -6535,7 +6533,10 @@ mod loop_root_tests {
 
     #[test]
     fn sanitize_keeps_normal_arc_ids_intact() {
-        assert_eq!(sanitize_arc_id_for_path("arc_20260711_120000"), "arc_20260711_120000");
+        assert_eq!(
+            sanitize_arc_id_for_path("arc_20260711_120000"),
+            "arc_20260711_120000"
+        );
         assert_eq!(
             sanitize_arc_id_for_path("3f2504e0-4f89-11d3-9a0c-0305e82c3301"),
             "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
