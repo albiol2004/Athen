@@ -1548,9 +1548,11 @@
                     <div id="wakeup-form-error" class="wakeups-form-error hidden"></div>
                 </form>
 
-                <div id="wakeups-empty" class="wakeups-empty hidden">
-                    <p>No scheduled wake-ups yet.</p>
-                    <p class="wakeups-empty-sub">Create one to have Athen run something on a timer — daily news, weekly digests, deferred reminders.</p>
+                <div id="wakeups-empty" class="empty-state wakeups-empty hidden">
+                    <span class="empty-state-icon" id="wakeups-empty-icon" aria-hidden="true"></span>
+                    <span class="empty-state-title">No scheduled wake-ups yet</span>
+                    <span class="empty-state-hint">Create one to have Athen run something on a timer — daily news, weekly digests, deferred reminders.</span>
+                    <button type="button" class="btn-secondary empty-state-cta" data-empty-cta="new-wakeup">New wake-up</button>
                 </div>
 
                 <div id="wakeups-list" class="wakeups-list"></div>

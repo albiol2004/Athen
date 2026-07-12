@@ -1030,6 +1030,10 @@ const arcMetaById = new Map();
 
 async function loadArcs() {
     if (!invoke) return;
+    // Capture BEFORE the skeleton: the session-kind skeleton resets
+    // sessionListEl.scrollTop, so capturing inside renderArcList would
+    // read 0 whenever the skeleton actually showed.
+    const restoreScroll = captureScroll(sessionListEl);
     const skel = beginSkeleton(sessionListEl, 'session', 6);
     try {
         const arcs = await invoke('list_arcs');
@@ -1038,7 +1042,7 @@ async function loadArcs() {
         for (const a of arcs || []) {
             arcMetaById.set(a.id, a);
         }
-        renderArcList(arcs || []);
+        renderArcList(arcs || [], restoreScroll);
         renderProfilePicker();
         renderReasoningPicker();
         renderTierPicker();
@@ -1049,7 +1053,10 @@ async function loadArcs() {
         // If the skeleton already replaced the list, don't leave it
         // shimmering forever — clear it (matches the pre-skeleton
         // "nothing rendered on failure" behavior).
-        if (skel.shown) sessionListEl.innerHTML = '';
+        if (skel.shown) {
+            sessionListEl.innerHTML = '';
+            restoreScroll();
+        }
         console.error('Failed to load arcs:', err);
     }
 }
@@ -1314,7 +1321,7 @@ function showCodeModeRootDialog(initialPath) {
         const close = (val) => {
             if (settled) return;
             settled = true;
-            document.removeEventListener('keydown', onKey);
+            removeOverlay(overlayHandle);
             overlay.remove();
             resolve(val);
         };
@@ -1330,8 +1337,7 @@ function showCodeModeRootDialog(initialPath) {
             if (e.key === 'Enter') { e.preventDefault(); submit(); }
         });
         overlay.addEventListener('click', (e) => { if (e.target === overlay) close(null); });
-        const onKey = (e) => { if (e.key === 'Escape') close(null); };
-        document.addEventListener('keydown', onKey);
+        const overlayHandle = pushOverlay(() => close(null));
 
         input.focus();
         input.setSelectionRange(input.value.length, input.value.length);
@@ -1960,6 +1966,15 @@ function buildArcItem(arc) {
             startRenameArc(item, arc.id, arc.name);
         });
 
+        // Right-click: custom context menu (second entry point to the
+        // arc actions). stopPropagation keeps the document-level chrome
+        // suppression listener from double-handling.
+        item.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            openArcContextMenu(e.clientX, e.clientY, arc);
+        });
+
     return item;
 }
 
@@ -1967,6 +1982,7 @@ function buildArcItem(arc) {
 let openArcMenuEl = null;
 let openArcMenuCleanup = null;
 let openArcMenuTrigger = null;
+let openArcMenuPlace = null;
 
 function closeArcMenu() {
     if (openArcMenuCleanup) {
@@ -1981,6 +1997,116 @@ function closeArcMenu() {
         openArcMenuTrigger.classList.remove('active');
         openArcMenuTrigger = null;
     }
+    openArcMenuPlace = null;
+}
+
+function mkArcMenuItem(label, icon, onclick, danger) {
+    const btn = document.createElement('button');
+    btn.className = 'arc-menu-item' + (danger ? ' danger' : '');
+    btn.setAttribute('role', 'menuitem');
+    const iconSpan = document.createElement('span');
+    iconSpan.className = 'arc-menu-icon';
+    iconSpan.innerHTML = icon;
+    const labelSpan = document.createElement('span');
+    labelSpan.className = 'arc-menu-label';
+    labelSpan.textContent = label;
+    btn.appendChild(iconSpan);
+    btn.appendChild(labelSpan);
+    btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        closeArcMenu();
+        onclick();
+    });
+    return btn;
+}
+
+// Assign to project: clicking swaps the menu body for a project picker
+// (None + each project). Kept in-place so the menu stays the single
+// arc-action surface rather than spawning a nested popup. Built without
+// mkArcMenuItem because that closes the menu on click, which would tear
+// down the picker before it renders.
+function mkArcAssignItem(menu, arc) {
+    const assignBtn = document.createElement('button');
+    assignBtn.className = 'arc-menu-item';
+    assignBtn.setAttribute('role', 'menuitem');
+    const ic = document.createElement('span');
+    ic.className = 'arc-menu-icon';
+    ic.innerHTML = '&#x1F4C1;';
+    const lb = document.createElement('span');
+    lb.className = 'arc-menu-label';
+    lb.textContent = 'Assign to project';
+    assignBtn.appendChild(ic);
+    assignBtn.appendChild(lb);
+    assignBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        renderArcProjectPicker(menu, arc);
+    });
+    return assignBtn;
+}
+
+// place = { x, y, flipY, alignRight }: the menu's top-left lands at (x, y)
+// (right edge at x when alignRight); when it would overflow the bottom,
+// its bottom edge lands at flipY instead.
+function positionArcMenu(menu, place) {
+    const menuW = menu.offsetWidth;
+    const menuH = menu.offsetHeight;
+    let left = place.alignRight ? place.x - menuW : place.x;
+    if (left < 8) left = 8;
+    if (left + menuW > window.innerWidth - 8) left = window.innerWidth - menuW - 8;
+    let top = place.y;
+    if (top + menuH > window.innerHeight - 8) top = place.flipY - menuH;
+    if (top < 8) top = 8;
+    menu.style.left = `${Math.round(left)}px`;
+    menu.style.top = `${Math.round(top)}px`;
+}
+
+// Shared presenter for the kebab overflow menu and the right-click context
+// menu: body-append + position, click-away / overlay-stack Escape /
+// sidebar-scroll / resize dismissal, and ArrowUp/ArrowDown focus-walk.
+function presentArcMenu(menu, place, triggerEl) {
+    document.body.appendChild(menu);
+    positionArcMenu(menu, place);
+
+    openArcMenuEl = menu;
+    openArcMenuPlace = place;
+    openArcMenuTrigger = triggerEl || null;
+    if (triggerEl) triggerEl.classList.add('active');
+
+    const onDocClick = (e) => {
+        if (!menu.contains(e.target) && e.target !== triggerEl) closeArcMenu();
+    };
+    const onScrollOrResize = () => closeArcMenu();
+    const onMenuKeydown = (e) => {
+        if (e.isComposing) return;
+        if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+        // Leave arrows alone while a text field outside the menu is focused
+        // (e.g. the chat input under an open context menu).
+        const ae = document.activeElement;
+        if (ae && !menu.contains(ae) &&
+            (ae.isContentEditable || ae.closest('input, textarea'))) return;
+        const items = Array.from(menu.querySelectorAll('.arc-menu-item'));
+        if (items.length === 0) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const cur = items.indexOf(ae);
+        const next = e.key === 'ArrowDown'
+            ? (cur < items.length - 1 ? cur + 1 : 0)
+            : (cur > 0 ? cur - 1 : items.length - 1);
+        items[next].focus();
+    };
+    // Defer so the originating click doesn't immediately close the menu.
+    setTimeout(() => document.addEventListener('click', onDocClick, true), 0);
+    const overlayHandle = pushOverlay(closeArcMenu);
+    document.addEventListener('keydown', onMenuKeydown, true);
+    sessionListEl.addEventListener('scroll', onScrollOrResize, true);
+    window.addEventListener('resize', onScrollOrResize);
+    openArcMenuCleanup = () => {
+        document.removeEventListener('click', onDocClick, true);
+        document.removeEventListener('keydown', onMenuKeydown, true);
+        removeOverlay(overlayHandle);
+        sessionListEl.removeEventListener('scroll', onScrollOrResize, true);
+        window.removeEventListener('resize', onScrollOrResize);
+    };
 }
 
 function toggleArcMenu(anchorEl, arc, itemEl) {
@@ -1994,95 +2120,73 @@ function toggleArcMenu(anchorEl, arc, itemEl) {
     menu.className = 'arc-menu';
     menu.setAttribute('role', 'menu');
 
-    const mkItem = (label, icon, onclick, danger) => {
-        const btn = document.createElement('button');
-        btn.className = 'arc-menu-item' + (danger ? ' danger' : '');
-        btn.setAttribute('role', 'menuitem');
-        const iconSpan = document.createElement('span');
-        iconSpan.className = 'arc-menu-icon';
-        iconSpan.innerHTML = icon;
-        const labelSpan = document.createElement('span');
-        labelSpan.className = 'arc-menu-label';
-        labelSpan.textContent = label;
-        btn.appendChild(iconSpan);
-        btn.appendChild(labelSpan);
-        btn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            closeArcMenu();
-            onclick();
-        });
-        return btn;
-    };
-
-    menu.appendChild(mkItem('Rename', '&#9998;', () => startRenameArc(itemEl, arc.id, arc.name)));
-    menu.appendChild(mkItem('Compact', '&#x21A1;', () => {
+    menu.appendChild(mkArcMenuItem('Rename', '&#9998;', () => startRenameArc(itemEl, arc.id, arc.name)));
+    menu.appendChild(mkArcMenuItem('Compact', '&#x21A1;', () => {
         confirmAndCompactArc(arc.id);
     }));
-    menu.appendChild(mkItem('Branch', '&#x21B3;', () => branchFromArc(arc.id, arc.name)));
-    // Assign to project: clicking swaps the menu body for a project picker
-    // (None + each project). Kept in-place so the overflow menu stays the
-    // single arc-action surface rather than spawning a nested popup. Built
-    // without mkItem because mkItem closes the menu on click, which would
-    // tear down the picker before it renders.
-    {
-        const assignBtn = document.createElement('button');
-        assignBtn.className = 'arc-menu-item';
-        assignBtn.setAttribute('role', 'menuitem');
-        const ic = document.createElement('span');
-        ic.className = 'arc-menu-icon';
-        ic.innerHTML = '&#x1F4C1;';
-        const lb = document.createElement('span');
-        lb.className = 'arc-menu-label';
-        lb.textContent = 'Assign to project';
-        assignBtn.appendChild(ic);
-        assignBtn.appendChild(lb);
-        assignBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            renderArcProjectPicker(menu, arc);
-        });
-        menu.appendChild(assignBtn);
-    }
+    menu.appendChild(mkArcMenuItem('Branch', '&#x21B3;', () => branchFromArc(arc.id, arc.name)));
+    menu.appendChild(mkArcAssignItem(menu, arc));
 
     const sep = document.createElement('div');
     sep.className = 'arc-menu-sep';
     menu.appendChild(sep);
 
-    menu.appendChild(mkItem('Delete', '&#10005;', () => handleDeleteArc(arc.id), true));
-
-    document.body.appendChild(menu);
+    menu.appendChild(mkArcMenuItem('Delete', '&#10005;', () => handleDeleteArc(arc.id), true));
 
     // Position relative to the trigger; flip up if it would overflow.
     const r = anchorEl.getBoundingClientRect();
-    const menuW = menu.offsetWidth;
-    const menuH = menu.offsetHeight;
-    let left = r.right - menuW;
-    if (left < 8) left = 8;
-    if (left + menuW > window.innerWidth - 8) left = window.innerWidth - menuW - 8;
-    let top = r.bottom + 4;
-    if (top + menuH > window.innerHeight - 8) top = r.top - menuH - 4;
-    menu.style.left = `${Math.round(left)}px`;
-    menu.style.top = `${Math.round(top)}px`;
+    presentArcMenu(menu, {
+        x: r.right,
+        y: r.bottom + 4,
+        flipY: r.top - 4,
+        alignRight: true,
+    }, anchorEl);
+}
 
-    openArcMenuEl = menu;
-    openArcMenuTrigger = anchorEl;
-    anchorEl.classList.add('active');
+// Right-click context menu on arc rows: a second entry point to the same
+// arc actions (GOAL's four: Open / Rename / Assign to project / Delete).
+// Anchored at the cursor; flip-up puts the menu's bottom at the cursor.
+function openArcContextMenu(x, y, arc) {
+    closeArcMenu();
 
-    const onDocClick = (e) => {
-        if (!menu.contains(e.target) && e.target !== anchorEl) closeArcMenu();
-    };
-    const onKey = (e) => { if (e.key === 'Escape') closeArcMenu(); };
-    const onScrollOrResize = () => closeArcMenu();
-    // Defer so the originating click doesn't immediately close the menu.
-    setTimeout(() => document.addEventListener('click', onDocClick, true), 0);
-    document.addEventListener('keydown', onKey);
-    sessionListEl.addEventListener('scroll', onScrollOrResize, true);
-    window.addEventListener('resize', onScrollOrResize);
-    openArcMenuCleanup = () => {
-        document.removeEventListener('click', onDocClick, true);
-        document.removeEventListener('keydown', onKey);
-        sessionListEl.removeEventListener('scroll', onScrollOrResize, true);
-        window.removeEventListener('resize', onScrollOrResize);
-    };
+    const menu = document.createElement('div');
+    menu.className = 'arc-menu';
+    menu.setAttribute('role', 'menu');
+
+    menu.appendChild(mkArcMenuItem('Open', '&#8599;', () => handleSwitchArc(arc.id)));
+    menu.appendChild(mkArcMenuItem('Rename', '&#9998;', () => promptRenameArc(arc)));
+    menu.appendChild(mkArcAssignItem(menu, arc));
+
+    const sep = document.createElement('div');
+    sep.className = 'arc-menu-sep';
+    menu.appendChild(sep);
+
+    menu.appendChild(mkArcMenuItem('Delete', '&#10005;', () => handleDeleteArc(arc.id), true));
+
+    presentArcMenu(menu, { x, y, flipY: y, alignRight: false }, null);
+}
+
+// Dialog-based rename for the context menu (the kebab menu's inline rename
+// edits the row's name element in place; this one persists the same way
+// via rename_arc, then refreshes the sidebar).
+async function promptRenameArc(arc) {
+    if (!invoke) return;
+    const newName = await showPromptDialog({
+        title: 'Rename Arc',
+        defaultValue: arc.name || '',
+        placeholder: 'Arc name',
+        confirmLabel: 'Rename',
+    });
+    if (newName === null) return;
+    const trimmed = newName.trim();
+    if (!trimmed || trimmed === arc.name) return;
+    try {
+        await invoke('rename_arc', { arcId: arc.id, name: trimmed });
+        await loadArcs();
+    } catch (err) {
+        console.error('Rename failed:', err);
+        showToast('Rename failed: ' + err, 'error');
+    }
 }
 
 // Swap the open arc menu's body for a project picker: a "← Back" header,
@@ -2154,18 +2258,8 @@ function renderArcProjectPicker(menu, arc) {
     }
 
     // Reposition: the picker may be taller/shorter than the action menu.
-    if (openArcMenuTrigger) {
-        const r = openArcMenuTrigger.getBoundingClientRect();
-        const menuW = menu.offsetWidth;
-        const menuH = menu.offsetHeight;
-        let left = r.right - menuW;
-        if (left < 8) left = 8;
-        if (left + menuW > window.innerWidth - 8) left = window.innerWidth - menuW - 8;
-        let top = r.bottom + 4;
-        if (top + menuH > window.innerHeight - 8) top = r.top - menuH - 4;
-        if (top < 8) top = 8;
-        menu.style.left = `${Math.round(left)}px`;
-        menu.style.top = `${Math.round(top)}px`;
+    if (openArcMenuPlace) {
+        positionArcMenu(menu, openArcMenuPlace);
     }
 }
 
@@ -2174,7 +2268,10 @@ function renderArcProjectPicker(menu, arc) {
 // are appended on idle slices so initial paint isn't blocked when the
 // user has hundreds of conversations.
 const ARC_EAGER_COUNT = 10;
-function renderArcList(arcs) {
+function renderArcList(arcs, restoreScroll) {
+    // The caller (loadArcs) captures before its skeleton can wipe the
+    // list; fall back to a local capture for safety.
+    const restore = restoreScroll || captureScroll(sessionListEl);
     sessionListEl.innerHTML = '';
 
     if (!arcs || arcs.length === 0) {
@@ -2185,7 +2282,9 @@ function renderArcList(arcs) {
                 </svg>
                 <div class="session-list-empty-title">No conversations yet</div>
                 <div class="session-list-empty-hint">Type below to start a new one</div>
+                <button type="button" class="btn-secondary empty-state-cta" data-empty-cta="new-arc">New arc</button>
             </div>`;
+        restore();
         return;
     }
 
@@ -2198,6 +2297,11 @@ function renderArcList(arcs) {
     for (const arc of eager) {
         sessionListEl.appendChild(buildArcItem(arc));
     }
+    // Restore now (clamped — the list may still be short), then keep
+    // re-clamping after each idle slice until the captured offset is
+    // reachable. Once restored, stop: later appends must not fight a
+    // user who has started scrolling.
+    let restored = restore();
 
     if (rest.length === 0) return;
 
@@ -2208,6 +2312,7 @@ function renderArcList(arcs) {
         for (; idx < end; idx++) {
             sessionListEl.appendChild(buildArcItem(rest[idx]));
         }
+        if (!restored) restored = restore();
         if (idx < rest.length) scheduleIdle(appendChunk);
     }
     scheduleIdle(appendChunk);
@@ -2520,6 +2625,27 @@ function welcomeHTML() {
         + `<div class="welcome-chips">${chips}</div>`
         + `</div>`
     );
+}
+
+// ─── Scroll preservation ───
+// Full innerHTML rebuilds destroy scroll position — or worse: WebKitGTK
+// retains a stale scrollTop across the swap and won't re-clamp it until
+// the next user interaction, so a tall→short rebuild leaves the list
+// scrolled past its own content. captureScroll() reads the container's
+// offset BEFORE the rebuild; the returned restore() re-applies it
+// clamped to the new scrollHeight (the clamp is always explicit — never
+// trust the engine to do it). restore() returns true once the captured
+// offset is fully reachable again, so callers that grow content in idle
+// slices can stop re-clamping (and stop fighting the user's own
+// scrolling) as soon as the position is restored.
+function captureScroll(scrollEl) {
+    const prev = scrollEl ? scrollEl.scrollTop : 0;
+    return function restoreScroll() {
+        if (!scrollEl) return true;
+        const max = Math.max(0, scrollEl.scrollHeight - scrollEl.clientHeight);
+        scrollEl.scrollTop = Math.min(prev, max);
+        return prev <= max;
+    };
 }
 
 // ─── Skeleton loaders ───
@@ -6861,10 +6987,13 @@ function openAppDialog({ title, body, mode = 'confirm', confirmLabel = 'Confirm'
         const close = (val) => {
             if (settled) return;
             settled = true;
+            removeOverlay(overlayHandle);
             document.removeEventListener('keydown', onKey, true);
             overlay.remove();
             resolve(val);
         };
+        // Escape is handled by the overlay stack (topmost-only policy).
+        const overlayHandle = pushOverlay(() => close(cancelValue));
 
         if (cancelBtn) cancelBtn.addEventListener('click', () => close(cancelValue));
         confirmBtn.addEventListener('click', () => close(confirmValue()));
@@ -6872,19 +7001,15 @@ function openAppDialog({ title, body, mode = 'confirm', confirmLabel = 'Confirm'
             if (e.target === overlay) close(cancelValue);
         });
 
-        // Keyboard: Escape cancels, Enter fires the primary action, Tab is
-        // trapped inside the dialog. Capture phase so underlying views
-        // (chat input, global shortcuts) never see these keys.
+        // Keyboard: Enter fires the primary action, Tab is trapped inside
+        // the dialog. Capture phase so underlying views (chat input, global
+        // shortcuts) never see these keys.
         const focusables = () => Array.prototype.filter.call(
             dialog.querySelectorAll('input, button'),
             (el) => !el.disabled
         );
         const onKey = (e) => {
-            if (e.key === 'Escape') {
-                e.preventDefault();
-                e.stopPropagation();
-                close(cancelValue);
-            } else if (e.key === 'Enter') {
+            if (e.key === 'Enter') {
                 e.preventDefault();
                 e.stopPropagation();
                 // Enter on the cancel button should still cancel.
@@ -7010,7 +7135,7 @@ function showDeepResearchDialog(initialQuestion) {
         const close = (val) => {
             if (settled) return;
             settled = true;
-            document.removeEventListener('keydown', onKey);
+            removeOverlay(overlayHandle);
             overlay.remove();
             resolve(val);
         };
@@ -7023,10 +7148,7 @@ function showDeepResearchDialog(initialQuestion) {
         cancelBtn.addEventListener('click', () => close(null));
         startBtn.addEventListener('click', submit);
         overlay.addEventListener('click', (e) => { if (e.target === overlay) close(null); });
-        const onKey = (e) => {
-            if (e.key === 'Escape') close(null);
-        };
-        document.addEventListener('keydown', onKey);
+        const overlayHandle = pushOverlay(() => close(null));
 
         ta.focus();
         ta.setSelectionRange(ta.value.length, ta.value.length);
@@ -7555,7 +7677,7 @@ function showLoopModeDialog(initialGoal) {
         const close = (val) => {
             if (settled) return;
             settled = true;
-            document.removeEventListener('keydown', onKey);
+            removeOverlay(overlayHandle);
             overlay.remove();
             resolve(val);
         };
@@ -7579,8 +7701,7 @@ function showLoopModeDialog(initialGoal) {
         };
         goalTa.addEventListener('keydown', onGoalKey);
         critTa.addEventListener('keydown', onGoalKey);
-        const onKey = (e) => { if (e.key === 'Escape') close(null); };
-        document.addEventListener('keydown', onKey);
+        const overlayHandle = pushOverlay(() => close(null));
 
         goalTa.focus();
         goalTa.setSelectionRange(goalTa.value.length, goalTa.value.length);
@@ -8017,7 +8138,7 @@ if (changesRailCloseBtn) changesRailCloseBtn.addEventListener('click', closeChan
 const inspectorEl = () => document.getElementById('inspector-panel');
 const inspectorBodyEl = () => document.getElementById('inspector-body');
 const inspectorTitleEl = () => document.getElementById('inspector-title');
-let inspectorKeyHandler = null;
+let inspectorOverlayHandle = null;
 
 function closeInspectorPanel() {
     const p = inspectorEl();
@@ -8025,9 +8146,9 @@ function closeInspectorPanel() {
     p.classList.add('hidden');
     const body = inspectorBodyEl();
     if (body) body.innerHTML = '';
-    if (inspectorKeyHandler) {
-        document.removeEventListener('keydown', inspectorKeyHandler);
-        inspectorKeyHandler = null;
+    if (inspectorOverlayHandle) {
+        removeOverlay(inspectorOverlayHandle);
+        inspectorOverlayHandle = null;
     }
 }
 
@@ -8048,9 +8169,8 @@ function openInspectorPanel(title, contentNode) {
         body.scrollTop = 0;
     }
     p.classList.remove('hidden');
-    if (!inspectorKeyHandler) {
-        inspectorKeyHandler = (e) => { if (e.key === 'Escape') closeInspectorPanel(); };
-        document.addEventListener('keydown', inspectorKeyHandler);
+    if (!inspectorOverlayHandle) {
+        inspectorOverlayHandle = pushOverlay(closeInspectorPanel);
     }
 }
 
@@ -8071,11 +8191,20 @@ if (codeModeRefreshBtn) codeModeRefreshBtn.addEventListener('click', refreshCode
 
 async function refreshChangesRail() {
     if (!invoke || !changesRailBodyEl) return;
+    // Capture BEFORE any innerHTML swap. The old near-bottom check read
+    // the rail AFTER the wipe (heights ~0), so it considered every
+    // refresh "near bottom" and yanked the scroll on each auto-refresh.
+    const restoreScroll = captureScroll(changesRailBodyEl);
+    const prevScrollTop = changesRailBodyEl.scrollTop;
+    const wasNearBottom = changesRailBodyEl.scrollHeight
+        - (prevScrollTop + changesRailBodyEl.clientHeight) < 40;
     if (!activeArcId) {
         changesRailBodyEl.innerHTML = '<div class="changes-rail-empty">Pick an arc to see its changes.</div>';
+        restoreScroll();
         return;
     }
     changesRailBodyEl.innerHTML = '<div class="changes-rail-empty">Loading…</div>';
+    restoreScroll();
     let actions;
     try {
         actions = await invoke('list_arc_snapshots', { arcId: activeArcId });
@@ -8085,6 +8214,7 @@ async function refreshChangesRail() {
         e.className = 'changes-rail-empty';
         e.textContent = 'Could not load changes: ' + (err && err.toString ? err.toString() : 'unknown error');
         changesRailBodyEl.appendChild(e);
+        restoreScroll();
         return;
     }
     changesRailBodyEl.innerHTML = '';
@@ -8093,6 +8223,7 @@ async function refreshChangesRail() {
         empty.className = 'changes-rail-empty';
         empty.textContent = 'No file changes recorded for this arc yet.';
         changesRailBodyEl.appendChild(empty);
+        restoreScroll();
         return;
     }
     // Oldest first — top of the timeline is the earliest change, bottom
@@ -8119,16 +8250,13 @@ async function refreshChangesRail() {
     // Preserve scroll behaviour across re-renders: if the user was
     // already pinned near the bottom (or this is the first paint),
     // follow the newest change. If they had scrolled up to inspect
-    // older entries, leave their position alone — auto-refresh
+    // older entries, restore their position (clamped) — auto-refresh
     // shouldn't yank focus.
-    const prevScrollTop = changesRailBodyEl.scrollTop;
-    const prevHeight = changesRailBodyEl.scrollHeight;
-    const wasNearBottom = prevHeight - (prevScrollTop + changesRailBodyEl.clientHeight) < 40;
     changesRailBodyEl.appendChild(timeline);
     if (wasNearBottom) {
         changesRailBodyEl.scrollTop = changesRailBodyEl.scrollHeight;
     } else {
-        changesRailBodyEl.scrollTop = prevScrollTop;
+        restoreScroll();
     }
 }
 
@@ -8984,14 +9112,18 @@ async function paintAllProfileChips() {
 function renderProfileList() {
     const listEl = document.getElementById('profile-list');
     if (!listEl) return;
+    // The list itself doesn't scroll — the settings panel body does.
+    const restoreScroll = captureScroll(document.querySelector('.settings-content'));
     listEl.innerHTML = '';
     if (!agentProfiles || agentProfiles.length === 0) {
         listEl.innerHTML = '<p class="setting-hint">No profiles yet.</p>';
+        restoreScroll();
         return;
     }
     for (const p of agentProfiles) {
         listEl.appendChild(buildProfileCard(p));
     }
+    restoreScroll();
     // Fire all estimate calls in parallel so the chips fill in within ~1s
     // of paint instead of one-at-a-time. Errors degrade per-chip; never
     // throw out of here or the whole list disappears.
@@ -9840,10 +9972,14 @@ function renderSkillsSidebar() {
     if (!listEl) return;
     listEl.innerHTML = '';
     if (skillsList.length === 0 && skillsSelectedSlug !== '__new__') {
-        const empty = document.createElement('div');
-        empty.className = 'identity-detail-empty';
-        empty.textContent = 'No skills yet.';
-        listEl.appendChild(empty);
+        listEl.innerHTML = emptyStateHtml({
+            icon: EMPTY_ICON_BOOK,
+            title: 'No skills yet',
+            hint: 'Skills are reusable playbooks the agent loads on demand.',
+            cta: 'New skill',
+            ctaAction: 'new-skill',
+            compact: true,
+        });
         return;
     }
     // Group by source so users can see which skills they wrote vs imported
@@ -15320,9 +15456,15 @@ async function loadNotifications() {
 
 function renderNotificationList(notifications) {
     const container = document.getElementById('notifications-list');
+    const restoreScroll = captureScroll(container);
 
     if (!notifications || notifications.length === 0) {
-        container.innerHTML = '<p class="empty-state">No notifications yet</p>';
+        container.innerHTML = emptyStateHtml({
+            icon: EMPTY_ICON_BELL,
+            title: 'No notifications yet',
+            hint: 'Approvals and agent updates appear here.',
+        });
+        restoreScroll();
         return;
     }
 
@@ -15409,6 +15551,7 @@ function renderNotificationList(notifications) {
         item.appendChild(actions);
         container.appendChild(item);
     }
+    restoreScroll();
 }
 
 async function updateNotifBadge() {
@@ -16296,7 +16439,11 @@ function renderMemories(items) {
         });
     }
     if (!items || items.length === 0) {
-        container.innerHTML = '<div class="empty-state">No memories stored yet. The agent will remember important information from your conversations.</div>';
+        container.innerHTML = emptyStateHtml({
+            icon: EMPTY_ICON_DB,
+            title: 'No memories stored yet',
+            hint: 'The agent will remember important information from your conversations.',
+        });
         return;
     }
 
@@ -16385,7 +16532,11 @@ function renderEntities(entities) {
         });
     }
     if (!entities || entities.length === 0) {
-        container.innerHTML = '<div class="empty-state">No entities discovered yet. The agent extracts people, organizations, and concepts from your conversations.</div>';
+        container.innerHTML = emptyStateHtml({
+            icon: EMPTY_ICON_NODES,
+            title: 'No entities discovered yet',
+            hint: 'The agent extracts people, organizations, and concepts from your conversations.',
+        });
         return;
     }
 
@@ -16694,7 +16845,14 @@ async function loadProjectArcs(projectId) {
         const arcs = (await invoke('list_arcs')) || [];
         const mine = arcs.filter((a) => a.project_id === projectId && a.status !== 'Merged');
         if (mine.length === 0) {
-            listEl.innerHTML = '<div class="empty-state">No arcs in this project yet. Use “New arc” above to start one.</div>';
+            listEl.innerHTML = emptyStateHtml({
+                icon: EMPTY_ICON_CHAT,
+                title: 'No arcs in this project yet',
+                hint: 'Conversations assigned to this project appear here.',
+                cta: 'New arc',
+                ctaAction: 'project-new-arc',
+                compact: true,
+            });
             return;
         }
         listEl.innerHTML = mine.map((a) => {
@@ -16708,7 +16866,12 @@ async function loadProjectArcs(projectId) {
         }).join('');
     } catch (err) {
         console.error('list_arcs (project arcs) failed:', err);
-        listEl.innerHTML = '<div class="empty-state">Failed to load arcs.</div>';
+        listEl.innerHTML = emptyStateHtml({
+            icon: EMPTY_ICON_ALERT,
+            title: 'Failed to load arcs.',
+            error: true,
+            compact: true,
+        });
     }
 }
 
@@ -16718,7 +16881,12 @@ async function loadProjectFiles(projectId) {
     try {
         const files = (await invoke('list_project_files', { projectId })) || [];
         if (files.length === 0) {
-            listEl.innerHTML = '<div class="empty-state">No files yet. Files saved into this project\'s workspace folder appear here.</div>';
+            listEl.innerHTML = emptyStateHtml({
+                icon: EMPTY_ICON_FOLDER,
+                title: 'No files yet',
+                hint: 'Files saved into this project\'s workspace folder appear here.',
+                compact: true,
+            });
             return;
         }
         const folderIcon = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>';
@@ -16737,7 +16905,12 @@ async function loadProjectFiles(projectId) {
         listEl.scrollTop = 0;
     } catch (err) {
         console.error('list_project_files failed:', err);
-        listEl.innerHTML = '<div class="empty-state">Failed to load files.</div>';
+        listEl.innerHTML = emptyStateHtml({
+            icon: EMPTY_ICON_ALERT,
+            title: 'Failed to load files.',
+            error: true,
+            compact: true,
+        });
     }
 }
 
@@ -16747,7 +16920,12 @@ async function loadProjectMemories(projectId) {
     try {
         const items = (await invoke('list_project_memories', { projectId })) || [];
         if (items.length === 0) {
-            listEl.innerHTML = '<div class="empty-state">No project-scoped memories yet.</div>';
+            listEl.innerHTML = emptyStateHtml({
+                icon: EMPTY_ICON_DB,
+                title: 'No project-scoped memories yet',
+                hint: 'Memories the agent stores while working in this project appear here.',
+                compact: true,
+            });
             return;
         }
         listEl.innerHTML = items.map((item) => {
@@ -16764,7 +16942,12 @@ async function loadProjectMemories(projectId) {
         listEl.scrollTop = 0;
     } catch (err) {
         console.error('list_project_memories failed:', err);
-        listEl.innerHTML = '<div class="empty-state">Failed to load memories.</div>';
+        listEl.innerHTML = emptyStateHtml({
+            icon: EMPTY_ICON_ALERT,
+            title: 'Failed to load memories.',
+            error: true,
+            compact: true,
+        });
     }
 }
 
@@ -16973,6 +17156,7 @@ const SYSTEM_PATH_PREFIXES = ['/etc', '/usr', '/bin', '/sbin', '/boot', '/sys', 
 
 const grantQueue = [];
 let grantInFlight = null;
+let grantOverlayHandle = null;
 
 function isSystemPath(p) {
     if (!p) return false;
@@ -17018,11 +17202,21 @@ function showNextGrantRequest() {
     if (grantQueue.length === 0) {
         grantInFlight = null;
         overlay.classList.add('hidden');
+        if (grantOverlayHandle) {
+            removeOverlay(grantOverlayHandle);
+            grantOverlayHandle = null;
+        }
         return;
     }
     grantInFlight = grantQueue.shift();
     renderGrantModal(grantInFlight);
     overlay.classList.remove('hidden');
+    // ESC = Deny, routed through the overlay stack (topmost-only policy).
+    if (!grantOverlayHandle) {
+        grantOverlayHandle = pushOverlay(() => {
+            if (grantInFlight) resolveCurrentGrant('Deny');
+        });
+    }
 }
 
 function renderGrantModal(req) {
@@ -17137,16 +17331,8 @@ document.getElementById('grant-allow-root-btn')?.addEventListener('click', () =>
     resolveCurrentGrant({ AllowProjectRoot: root.path });
 });
 
-// ESC closes the modal as Deny (only when modal is visible).
-document.addEventListener('keydown', (e) => {
-    if (e.key !== 'Escape') return;
-    const overlay = document.getElementById('grant-modal-overlay');
-    if (!overlay || overlay.classList.contains('hidden')) return;
-    if (!grantInFlight) return;
-    e.stopPropagation();
-    resolveCurrentGrant('Deny');
-});
-
+// ESC closes the modal as Deny — routed through the overlay stack (see
+// showNextGrantRequest), so a dialog opened above it closes first.
 // Click backdrop = no-op (don't accidentally Deny). Modal is dismissed only by buttons or ESC.
 
 // ─── Permissions settings: grant lists ──────────────────────────────
@@ -18634,6 +18820,12 @@ function renderWakeupRow(w) {
 
 async function loadWakeups() {
     if (!invoke || !wakeupsListEl) return;
+    // One-time icon injection into the static empty-state markup (same
+    // pattern as injectContactsIcons — the ICON constants live in JS).
+    const wakeupsEmptyIcon = document.getElementById('wakeups-empty-icon');
+    if (wakeupsEmptyIcon && !wakeupsEmptyIcon.firstChild) {
+        wakeupsEmptyIcon.innerHTML = toolSvg(EMPTY_ICON_CLOCK_PLUS, 44);
+    }
     try {
         const rows = await invoke('list_wakeups');
         wakeupsListEl.innerHTML = '';
@@ -19562,10 +19754,12 @@ function renderAgentControlActive() {
     const container = document.getElementById('agent-control-active');
     if (!container) return;
     if (activeAgentsCache.length === 0) {
-        container.innerHTML = '<div class="agent-cards-empty">'
-            + 'No agents are running right now.'
-            + '<span class="empty-sub">Tasks you start show up here in real time.</span>'
-            + '</div>';
+        container.innerHTML = emptyStateHtml({
+            icon: EMPTY_ICON_ACTIVITY,
+            title: 'No agents are running right now.',
+            hint: 'Tasks you start show up here in real time.',
+            extraClass: 'agent-cards-empty',
+        });
         lastActiveStepCount.clear();
         return;
     }
@@ -19692,14 +19886,13 @@ function renderAgentControlHistory() {
         ? finalized
         : finalized.filter((r) => agentSourceKey(r.source) === agentHistoryFilter);
     if (filtered.length === 0) {
-        const msg = finalized.length === 0
-            ? 'No agent runs yet.'
-            : 'No runs match this filter.';
-        const sub = finalized.length === 0
-            ? 'Past runs will live here for 30 days.'
-            : 'Try a different source.';
-        container.innerHTML = `<div class="agent-history-empty">${msg}`
-            + `<span class="empty-sub">${sub}</span></div>`;
+        const noRuns = finalized.length === 0;
+        container.innerHTML = emptyStateHtml({
+            icon: noRuns ? EMPTY_ICON_HISTORY : EMPTY_ICON_FILTER,
+            title: noRuns ? 'No agent runs yet.' : 'No runs match this filter.',
+            hint: noRuns ? 'Past runs will live here for 30 days.' : 'Try a different source.',
+            extraClass: 'agent-history-empty',
+        });
         container.classList.remove('agent-history-list-wrap');
         return;
     }
@@ -19922,8 +20115,11 @@ async function loadMcpServers() {
 function renderMcpServersList() {
     const list = document.getElementById('mcp-servers-list');
     if (!list) return;
+    // The list itself doesn't scroll — the settings panel body does.
+    const restoreScroll = captureScroll(document.querySelector('.settings-content'));
     if (!mcpServersCustom.length) {
         list.innerHTML = '<p class="setting-hint">No MCP servers yet. Connect tools from Slack, Notion, GitHub, and more by adding an MCP server below. Each one runs as a sandboxed subprocess on your machine.</p>';
+        restoreScroll();
         return;
     }
     const enabledById = new Map(mcpServersEnabled.map((e) => [e.id, e]));
@@ -20010,6 +20206,7 @@ function renderMcpServersList() {
     for (const id of mcpServersExpanded) {
         loadMcpServerTools(id);
     }
+    restoreScroll();
 }
 
 function mcpServerCommandLine(entry) {
@@ -20692,12 +20889,15 @@ async function addCalendarSource() {
 async function refreshCalendarSourcesList() {
     const listEl = document.getElementById('calendar-sources-list');
     if (!listEl || typeof invoke !== 'function') return;
+    // The list itself doesn't scroll — the settings panel body does.
+    const restoreScroll = captureScroll(document.querySelector('.settings-content'));
     const skel = beginSkeleton(listEl, 'card', 2);
     try {
         const sources = await invoke('list_calendar_sources');
         skel.end();
         if (!sources || sources.length === 0) {
             listEl.innerHTML = '<p class="calendar-sources-empty">No calendar sources configured.</p>';
+            restoreScroll();
             return;
         }
         listEl.innerHTML = sources.map(renderCalendarSourceRow).join('');
@@ -20705,9 +20905,11 @@ async function refreshCalendarSourcesList() {
         listEl.querySelectorAll('[data-cal-action]').forEach((btn) => {
             btn.addEventListener('click', onCalendarSourceAction);
         });
+        restoreScroll();
     } catch (e) {
         skel.end();
         listEl.innerHTML = `<p class="test-result error">Failed to load: ${escapeHtml(String(e))}</p>`;
+        restoreScroll();
     }
 }
 
@@ -21696,9 +21898,431 @@ document.addEventListener('focusout', () => {
 
 document.addEventListener('scroll', () => { hideTooltip(); }, true);
 document.addEventListener('mousedown', () => { hideTooltip(); });
-document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') hideTooltip();
+// Escape is handled by the keyboard command layer below: a visible tooltip
+// counts as the topmost transient overlay.
+
+// ─── Empty states ───
+//
+// One shared empty-state pattern: SVG icon (toolSvg, stroke currentColor)
+// + title + optional hint + optional CTA button. Failure-to-load states
+// use the `error` variant (danger-tinted icon) so they never read as a
+// benign empty list. All inputs are code-side literals — no user data
+// flows through this helper, so string concatenation is safe here.
+function emptyStateHtml(opts) {
+    const cls = 'empty-state'
+        + (opts.error ? ' error' : '')
+        + (opts.compact ? ' compact' : '')
+        + (opts.extraClass ? ' ' + opts.extraClass : '');
+    let html = '<div class="' + cls + '">';
+    if (opts.icon) {
+        html += '<span class="empty-state-icon" aria-hidden="true">'
+            + toolSvg(opts.icon, opts.compact ? 32 : 44) + '</span>';
+    }
+    html += '<span class="empty-state-title">' + opts.title + '</span>';
+    if (opts.hint) html += '<span class="empty-state-hint">' + opts.hint + '</span>';
+    if (opts.cta && opts.ctaAction) {
+        html += '<button type="button" class="btn-secondary empty-state-cta" data-empty-cta="'
+            + opts.ctaAction + '">' + opts.cta + '</button>';
+    }
+    return html + '</div>';
+}
+
+// Icon paths for the empty-state surfaces (24x24 viewBox, toolSvg wraps).
+const EMPTY_ICON_BELL = '<path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/>';
+const EMPTY_ICON_DB = '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>';
+const EMPTY_ICON_NODES = '<circle cx="12" cy="5" r="2.5"/><circle cx="5" cy="18" r="2.5"/><circle cx="19" cy="18" r="2.5"/><path d="M10.8 7.2 6.2 15.8"/><path d="M13.2 7.2l4.6 8.6"/><path d="M7.5 18h9"/>';
+const EMPTY_ICON_CHAT = '<path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/>';
+const EMPTY_ICON_FOLDER = '<path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>';
+const EMPTY_ICON_BOOK = '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>';
+const EMPTY_ICON_HISTORY = '<circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15.5 14"/>';
+const EMPTY_ICON_FILTER = '<polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/>';
+const EMPTY_ICON_ALERT = '<path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>';
+const EMPTY_ICON_CLOCK_PLUS = '<circle cx="12" cy="12" r="9"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/>';
+const EMPTY_ICON_ACTIVITY = '<polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>';
+
+// CTA dispatch: one delegated listener; each action maps to an EXISTING
+// entry point (function or the visible button whose handler owns the flow).
+const EMPTY_STATE_ACTIONS = {
+    'new-arc': () => newArc(),
+    'project-new-arc': () => document.getElementById('project-new-arc-btn')?.click(),
+    'new-wakeup': () => document.getElementById('wakeups-new-btn')?.click(),
+    'new-skill': async () => {
+        skillsSelectedSlug = '__new__';
+        renderSkillsSidebar();
+        await renderSkillsDetail();
+    },
+};
+document.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-empty-cta]');
+    if (!btn) return;
+    const action = EMPTY_STATE_ACTIONS[btn.dataset.emptyCta];
+    if (action) action();
 });
+
+// ─── Keyboard command layer ───
+//
+// One overlay-stack policy: every document-level overlay (dialogs, menus,
+// the grant modal, the inspector drawer, the palette, the shortcut sheet)
+// registers a close function via pushOverlay() on open and removes it on
+// close. A single CAPTURE-phase keydown listener closes the TOPMOST overlay
+// on Escape — and only that one. Element-level Escape handlers on focused
+// inputs (slash autocomplete, inline rename, rewind textarea) are
+// intentionally untouched: when the stack is empty and no tooltip is
+// visible, Escape falls through to them and to the bubble-phase
+// cancel-task handler, exactly as before.
+
+const overlayStack = [];
+
+function pushOverlay(closeFn) {
+    const handle = { close: closeFn };
+    overlayStack.push(handle);
+    return handle;
+}
+
+function removeOverlay(handle) {
+    if (!handle) return;
+    const idx = overlayStack.indexOf(handle);
+    if (idx !== -1) overlayStack.splice(idx, 1);
+}
+
+// ── App-chrome context menu suppression ──
+// The WebView default menu (Reload, inspect, …) is suppressed on app
+// chrome; text-editing surfaces (inputs, textareas, contenteditable) keep
+// the native menu for copy/paste/spellcheck. The arc-row context menu
+// listener stopPropagates before this runs.
+document.addEventListener('contextmenu', (e) => {
+    const t = e.target;
+    if (!(t instanceof Element)) return;
+    if (t.isContentEditable || t.closest('input, textarea')) return;
+    e.preventDefault();
+});
+
+// ── Command palette (Ctrl/Cmd+K) ──
+// Lazily-built glass modal. Commands only dispatch to existing functions;
+// arc/project names are untrusted and rendered via textContent.
+
+let cmdkOverlayEl = null;
+let cmdkInputEl = null;
+let cmdkListWrapEl = null;
+let cmdkHandle = null;
+let cmdkCommands = [];
+let cmdkFiltered = [];
+let cmdkIndex = 0;
+
+// Linear-time match (NO regex over user input — JSC backtracking rule):
+// substring via indexOf ranks best, then an in-order subsequence walk.
+// Returns a rank (lower = better) or -1 for no match. Inputs pre-lowered.
+function cmdkMatchRank(query, text) {
+    if (!query) return 0;
+    const idx = text.indexOf(query);
+    if (idx === 0) return 0;
+    if (idx > 0) return 1;
+    let qi = 0;
+    for (let ti = 0; ti < text.length && qi < query.length; ti++) {
+        if (text[ti] === query[qi]) qi++;
+    }
+    return qi === query.length ? 2 : -1;
+}
+
+function buildCmdkCommands() {
+    const cmds = [];
+    cmds.push({ label: 'New arc', kind: 'Action', run: () => newArc() });
+    for (const [id, a] of arcMetaById) {
+        if (a && a.status === 'Merged') continue;
+        cmds.push({
+            label: a && a.name ? a.name : 'Untitled',
+            kind: 'Arc',
+            run: () => handleSwitchArc(id),
+        });
+    }
+    const surfaces = [
+        ['Chat', showChat],
+        ['Settings', showSettings],
+        ['Notifications', showNotifications],
+        ['Contacts', showContacts],
+        ['Calendar', showCalendar],
+        ['Scheduled', showWakeups],
+        ['Timeline', showTimeline],
+        ['Agent Control', showAgentControl],
+        ['Memory', showMemory],
+    ];
+    for (const [label, fn] of surfaces) {
+        cmds.push({ label, kind: 'Go to', run: fn });
+    }
+    for (const p of projectsList || []) {
+        if (!p || !p.id) continue;
+        cmds.push({
+            label: p.name || 'Untitled project',
+            kind: 'Project',
+            run: () => showProjectPage(p.id),
+        });
+    }
+    cmds.push({ label: 'Keyboard shortcuts', kind: 'Help', run: openShortcutSheet });
+    return cmds;
+}
+
+function renderCmdkList() {
+    if (!cmdkListWrapEl) return;
+    cmdkListWrapEl.innerHTML = '';
+    if (cmdkFiltered.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'cmdk-empty';
+        empty.textContent = 'No matching commands';
+        cmdkListWrapEl.appendChild(empty);
+        return;
+    }
+    cmdkFiltered.forEach((cmd, i) => {
+        const item = document.createElement('button');
+        item.type = 'button';
+        item.className = 'cmdk-item' + (i === cmdkIndex ? ' active' : '');
+        item.setAttribute('role', 'option');
+        const label = document.createElement('span');
+        label.className = 'cmdk-label';
+        label.textContent = cmd.label;
+        const kind = document.createElement('span');
+        kind.className = 'cmdk-kind';
+        kind.textContent = cmd.kind;
+        item.appendChild(label);
+        item.appendChild(kind);
+        // mousedown would steal focus from the input; run on click.
+        item.addEventListener('mousedown', (e) => e.preventDefault());
+        item.addEventListener('click', () => runCmdkCommand(cmd));
+        item.addEventListener('mousemove', () => {
+            if (cmdkIndex !== i) {
+                cmdkIndex = i;
+                updateCmdkHighlight();
+            }
+        });
+        cmdkListWrapEl.appendChild(item);
+    });
+}
+
+function updateCmdkHighlight() {
+    if (!cmdkListWrapEl) return;
+    const items = cmdkListWrapEl.querySelectorAll('.cmdk-item');
+    items.forEach((el, i) => el.classList.toggle('active', i === cmdkIndex));
+    const active = items[cmdkIndex];
+    if (active) active.scrollIntoView({ block: 'nearest' });
+}
+
+function filterCmdk() {
+    const q = (cmdkInputEl ? cmdkInputEl.value : '').trim().toLowerCase();
+    const ranked = [];
+    for (let i = 0; i < cmdkCommands.length; i++) {
+        const cmd = cmdkCommands[i];
+        const rank = cmdkMatchRank(q, cmd.label.toLowerCase() + ' ' + cmd.kind.toLowerCase());
+        if (rank !== -1) ranked.push({ cmd, rank, i });
+    }
+    ranked.sort((x, y) => (x.rank - y.rank) || (x.i - y.i));
+    cmdkFiltered = ranked.map((r) => r.cmd);
+    cmdkIndex = 0;
+    renderCmdkList();
+}
+
+function runCmdkCommand(cmd) {
+    closeCommandPalette();
+    try {
+        cmd.run();
+    } catch (err) {
+        console.error('[athen] palette command failed:', err);
+    }
+}
+
+function ensureCmdkDom() {
+    if (cmdkOverlayEl) return;
+    cmdkOverlayEl = document.createElement('div');
+    cmdkOverlayEl.className = 'cmdk-overlay';
+    const panel = document.createElement('div');
+    panel.className = 'cmdk-panel';
+    panel.setAttribute('role', 'dialog');
+    panel.setAttribute('aria-modal', 'true');
+    panel.setAttribute('aria-label', 'Command palette');
+
+    cmdkInputEl = document.createElement('input');
+    cmdkInputEl.type = 'text';
+    cmdkInputEl.className = 'cmdk-input';
+    cmdkInputEl.placeholder = 'Search arcs, views, projects…';
+    cmdkInputEl.spellcheck = false;
+    cmdkInputEl.autocapitalize = 'off';
+    cmdkInputEl.autocomplete = 'off';
+
+    cmdkListWrapEl = document.createElement('div');
+    cmdkListWrapEl.className = 'cmdk-list';
+    cmdkListWrapEl.setAttribute('role', 'listbox');
+
+    panel.appendChild(cmdkInputEl);
+    panel.appendChild(cmdkListWrapEl);
+    cmdkOverlayEl.appendChild(panel);
+    document.body.appendChild(cmdkOverlayEl);
+
+    cmdkOverlayEl.addEventListener('mousedown', (e) => {
+        if (e.target === cmdkOverlayEl) closeCommandPalette();
+    });
+    cmdkInputEl.addEventListener('input', filterCmdk);
+    cmdkInputEl.addEventListener('keydown', (e) => {
+        if (e.isComposing) return;
+        if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            if (cmdkFiltered.length) {
+                cmdkIndex = (cmdkIndex + 1) % cmdkFiltered.length;
+                updateCmdkHighlight();
+            }
+        } else if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            if (cmdkFiltered.length) {
+                cmdkIndex = (cmdkIndex - 1 + cmdkFiltered.length) % cmdkFiltered.length;
+                updateCmdkHighlight();
+            }
+        } else if (e.key === 'Enter') {
+            e.preventDefault();
+            const cmd = cmdkFiltered[cmdkIndex];
+            if (cmd) runCmdkCommand(cmd);
+        }
+    });
+}
+
+function openCommandPalette() {
+    ensureCmdkDom();
+    if (cmdkHandle) {
+        cmdkInputEl.focus();
+        return;
+    }
+    cmdkCommands = buildCmdkCommands();
+    cmdkInputEl.value = '';
+    filterCmdk();
+    cmdkOverlayEl.classList.add('open');
+    cmdkHandle = pushOverlay(closeCommandPalette);
+    cmdkInputEl.focus();
+}
+
+function closeCommandPalette() {
+    if (!cmdkHandle) return;
+    removeOverlay(cmdkHandle);
+    cmdkHandle = null;
+    if (cmdkOverlayEl) cmdkOverlayEl.classList.remove('open');
+}
+
+// ── Shortcut reference sheet (Ctrl/Cmd+/) ──
+
+let shortcutSheetEl = null;
+let shortcutSheetHandle = null;
+
+const SHORTCUT_ROWS = [
+    ['Ctrl/Cmd + K', 'Command palette'],
+    ['Ctrl/Cmd + N', 'New arc'],
+    ['Ctrl/Cmd + /', 'This shortcut sheet'],
+    ['Enter', 'Send message'],
+    ['Shift + Enter', 'New line in the composer'],
+    ['Ctrl/Cmd + Enter', 'Submit from multi-line dialogs'],
+    ['Escape', 'Close the topmost overlay; stop the running task when none is open'],
+];
+
+function ensureShortcutSheetDom() {
+    if (shortcutSheetEl) return;
+    shortcutSheetEl = document.createElement('div');
+    shortcutSheetEl.className = 'cmdk-overlay';
+    const panel = document.createElement('div');
+    panel.className = 'cmdk-panel shortcut-sheet';
+    panel.setAttribute('role', 'dialog');
+    panel.setAttribute('aria-modal', 'true');
+    panel.setAttribute('aria-label', 'Keyboard shortcuts');
+
+    const title = document.createElement('h3');
+    title.className = 'shortcut-sheet-title';
+    title.textContent = 'Keyboard shortcuts';
+    panel.appendChild(title);
+
+    for (const [keys, desc] of SHORTCUT_ROWS) {
+        const row = document.createElement('div');
+        row.className = 'sc-row';
+        const keysEl = document.createElement('span');
+        keysEl.className = 'sc-keys';
+        for (const part of keys.split(' + ')) {
+            const kbd = document.createElement('kbd');
+            kbd.textContent = part;
+            keysEl.appendChild(kbd);
+        }
+        const descEl = document.createElement('span');
+        descEl.className = 'sc-desc';
+        descEl.textContent = desc;
+        row.appendChild(keysEl);
+        row.appendChild(descEl);
+        panel.appendChild(row);
+    }
+
+    shortcutSheetEl.appendChild(panel);
+    document.body.appendChild(shortcutSheetEl);
+    shortcutSheetEl.addEventListener('mousedown', (e) => {
+        if (e.target === shortcutSheetEl) closeShortcutSheet();
+    });
+}
+
+function openShortcutSheet() {
+    ensureShortcutSheetDom();
+    if (shortcutSheetHandle) return;
+    shortcutSheetEl.classList.add('open');
+    shortcutSheetHandle = pushOverlay(closeShortcutSheet);
+}
+
+function closeShortcutSheet() {
+    if (!shortcutSheetHandle) return;
+    removeOverlay(shortcutSheetHandle);
+    shortcutSheetHandle = null;
+    if (shortcutSheetEl) shortcutSheetEl.classList.remove('open');
+}
+
+// ── Global shortcuts + the one Escape policy ──
+// Capture phase: registered at load, so this always runs before per-dialog
+// capture listeners (which are added later, at open time).
+
+document.addEventListener('keydown', (e) => {
+    if (e.isComposing) return;
+
+    if (e.key === 'Escape') {
+        // A visible tooltip is the topmost transient layer.
+        if (tooltipTarget !== null) {
+            e.preventDefault();
+            e.stopPropagation();
+            hideTooltip();
+            return;
+        }
+        // A pending (not yet visible) tooltip is cancelled silently without
+        // consuming the key.
+        if (tooltipShowTimer) hideTooltip();
+        if (overlayStack.length > 0) {
+            e.preventDefault();
+            e.stopPropagation();
+            overlayStack[overlayStack.length - 1].close();
+        }
+        // Stack empty: fall through to element-level handlers and the
+        // bubble-phase cancel-task listener.
+        return;
+    }
+
+    const mod = (e.ctrlKey || e.metaKey) && !e.altKey;
+    if (!mod) return;
+
+    if (e.key === 'k' || e.key === 'K') {
+        // Toggle only when the palette itself is topmost; ignore when a
+        // dialog or another overlay sits above everything.
+        const top = overlayStack.length ? overlayStack[overlayStack.length - 1] : null;
+        if (top && top !== cmdkHandle) return;
+        e.preventDefault();
+        e.stopPropagation();
+        if (cmdkHandle) closeCommandPalette();
+        else openCommandPalette();
+    } else if ((e.key === 'n' || e.key === 'N') && !e.shiftKey) {
+        if (overlayStack.length > 0) return;
+        e.preventDefault();
+        e.stopPropagation();
+        newArc();
+    } else if (e.key === '/' || e.key === '?') {
+        if (overlayStack.length > 0) return;
+        e.preventDefault();
+        e.stopPropagation();
+        openShortcutSheet();
+    }
+}, true);
 
 // ─── Initialize ───
 
