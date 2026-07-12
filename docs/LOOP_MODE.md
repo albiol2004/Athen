@@ -31,6 +31,27 @@ unattended (tool-local Bunker-deny — no other gate denies in Bunker); (3) the
 injection-only-at-top no-recursion wiring above. `max_iterations` defaults to 10,
 clamped to `[1, 25]`.
 
+**Phase 4b (2026-07-12) — mailbox-collision guards.** Two loops can no longer
+corrupt each other's mailbox, and Athen is now wire-compatible with the trio
+driver's on-disk lock. (1) **Per-arc mailbox everywhere.** The loop root always
+nests a `loop-runs/<sanitized-arc-id>/` subdir — under Code Mode the anchor is
+the arc's repo root, otherwise the shared workspace dir. Two Code-Mode arcs
+rooted at the SAME repo previously shared one mailbox; now each gets its own.
+The resolution lives once in `run_loop_for_arc` (`state.rs`) and is mirrored in
+`loop_start_core`'s ack (`commands.rs`); the persisted `loop_root` column stays
+the source of truth for `loop_status` / `get_loop_file`, so an arc with an
+already-stamped root keeps it. (2) **Mailbox ownership lock**, wire-compatible
+with `agent-trio-template/portable/driver.sh`: before seeding, `loop_start_core`
+atomically creates `<loop_root>/.lock/` (via `std::fs::create_dir`) holding a
+`pid` (this process) + `arc_id` file. A live foreign pid (liveness checked via
+`sysinfo`, the `kill -0` equivalent) is refused **synchronously** with the same
+in-band `Err(String)` UX as the double-start refusal; a stale (dead-pid) lock is
+taken over with a `tracing::warn!`. The lock is a `LoopLock` RAII guard moved
+into the run's background task and dropped at task end — releasing on
+completion, error, cooperative stop, AND panic (Drop runs during unwind), the
+same all-paths discipline as the cancel-flag deregistration. The six-file
+`get_loop_file` allow-list never exposes `.lock` / `pid` / `arc_id`.
+
 Loop Mode is a per-arc, UI-triggered **Lead → Evaluator iteration loop** for
 goal-shaped work: the user states a goal with acceptance criteria, a Lead
 agent plans and implements the smallest verifiable increment, an adversarial

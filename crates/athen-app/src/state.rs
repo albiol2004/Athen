@@ -2531,21 +2531,23 @@ impl AppState {
                 AthenError::Other("Loop Mode unavailable: arc store not configured".to_string())
             })?;
 
-        // ── Resolve the loop root. Composes with Code Mode: an active
-        // Code-Mode session's repo root IS the loop root (the role registries'
-        // cwd/fs-base are already pinned to it by the base assembler, and each
-        // Code-Mode session already has its own repo, so it is per-arc-unique).
-        //
-        // Otherwise fall back to a PER-ARC subdir under the workspace —
-        // `<workspace>/loop-runs/<arc_id>/` — NOT the bare workspace dir. This
-        // is the mailbox-collision fix (iter-4 verdict obs 2): two concurrent
-        // non-Code-Mode loops on different arcs would otherwise both write the
-        // single `<workspace>/loop/GOAL.md|VERDICT.md` and clobber each other.
-        // Giving every arc its own `loop/` mailbox removes that data-corruption
-        // path without forbidding concurrent loops. The arc_id is the unique
-        // key; it is sanitized so any non-portable char can't escape the dir.
+        // ── Resolve the loop root. Composes with Code Mode, but ALWAYS nests a
+        // per-arc `loop-runs/<arc_id>/` subdir so two arcs can never share a
+        // mailbox (Phase-4b mailbox-collision fix). Under Code Mode the anchor
+        // is the arc's repo root; otherwise it is the shared workspace dir. In
+        // both cases the raw anchor is shared across arcs (two Code-Mode arcs
+        // can be rooted at the SAME repo), so the bare anchor would let two
+        // concurrent loops both write the single `loop/GOAL.md|VERDICT.md` and
+        // clobber each other. Nesting under `loop-runs/<sanitized-arc-id>/`
+        // removes that data-corruption path without forbidding concurrent loops.
+        // The arc_id is the unique key; it is sanitized so any non-portable char
+        // can't escape the dir. (Arcs whose `loop_root` column was stamped by an
+        // earlier run keep that persisted value — the column is the source of
+        // truth for readers; only a NEW run resolves a fresh root here.)
         let loop_root = match resolve_code_mode_for_arc(Some(&arc_store), arc_id).await {
-            Some(repo_root) => repo_root,
+            Some(repo_root) => repo_root
+                .join("loop-runs")
+                .join(sanitize_arc_id_for_path(arc_id)),
             None => {
                 let workspace = athen_core::paths::athen_workspace_dir().ok_or_else(|| {
                     AthenError::Other("Loop Mode unavailable: no workspace directory".to_string())

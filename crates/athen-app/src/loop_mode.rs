@@ -574,6 +574,148 @@ pub(crate) fn ensure_loop_files(
     Ok(())
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Mailbox ownership lock (Phase 4b) — wire-compatible with the trio-template
+// bash driver (`portable/driver.sh`): an atomic `.lock/` directory created via
+// `mkdir` (here `std::fs::create_dir`, which fails if the dir exists) inside the
+// loop root, holding a `pid` file. A live pid (checked the `kill -0` way, via
+// `sysinfo`) means the mailbox is owned; a dead pid is a stale lock we take over.
+// The lock is removed on drop so it is released on EVERY exit path — the same
+// discipline as the cancel-flag deregistration in `loop_start_core`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Why `acquire_loop_lock` refused (or failed) to take the mailbox lock.
+#[derive(Debug)]
+pub(crate) enum LoopLockError {
+    /// The mailbox is owned by a LIVE process (`pid`). Refuse — same UX class as
+    /// the double-start refusal (the human sees why).
+    Busy { pid: u32 },
+    /// A filesystem error while acquiring the lock (create/read/write).
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for LoopLockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoopLockError::Busy { pid } => {
+                write!(f, "mailbox is locked by a live process (pid {pid})")
+            }
+            LoopLockError::Io(e) => write!(f, "lock I/O error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for LoopLockError {}
+
+/// The `.lock/` directory guarding a loop root's mailbox.
+pub(crate) fn lock_dir(loop_root: &std::path::Path) -> std::path::PathBuf {
+    loop_root.join(".lock")
+}
+
+/// RAII guard for a held mailbox lock. Dropping it removes the `.lock/`
+/// directory, so the lock is released on normal return, on any error early
+/// return, AND during a panic unwind (Drop runs while unwinding) — matching the
+/// cancel-flag registry's "always deregister" discipline. Best-effort: a
+/// removal failure is logged, never panics (Drop must not panic).
+#[derive(Debug)]
+#[must_use = "the mailbox lock is released when this guard is dropped; hold it for the run's lifetime"]
+pub(crate) struct LoopLock {
+    dir: std::path::PathBuf,
+}
+
+impl Drop for LoopLock {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.dir) {
+            // Missing dir is fine (already released / never fully created).
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    "loop_mode: failed to release mailbox lock {}: {e}",
+                    self.dir.display()
+                );
+            }
+        }
+    }
+}
+
+/// Is `pid` a live process right now? The `kill -0` equivalent, via `sysinfo`
+/// (already a dependency). Like `kill -0` it cannot distinguish PID reuse, which
+/// matches the bash driver's semantics exactly.
+fn pid_is_live(pid: u32) -> bool {
+    use sysinfo::{Pid, ProcessesToUpdate, System};
+    let mut sys = System::new();
+    let target = Pid::from_u32(pid);
+    sys.refresh_processes(ProcessesToUpdate::Some(&[target]), true);
+    sys.process(target).is_some()
+}
+
+/// Atomically acquire the mailbox ownership lock at `<loop_root>/.lock/`,
+/// wire-compatible with the trio driver. On success writes `pid` (this process)
+/// and `arc_id` into the lock dir and returns a [`LoopLock`] guard.
+///
+/// Semantics (mirroring `portable/driver.sh:33-42`):
+/// - `create_dir` succeeds (atomic) → fresh lock; write `pid` + `arc_id`.
+/// - `create_dir` fails `AlreadyExists` → read `.lock/pid`:
+///   - live pid → [`LoopLockError::Busy`] (refuse; caller surfaces the in-band
+///     error, same UX as the double-start refusal);
+///   - dead / unreadable / empty pid → stale lock: log, remove and recreate
+///     (take over), then write `pid` + `arc_id`.
+///
+/// The parent (`loop_root`) is `create_dir_all`'d first so the atomic
+/// single-dir `create_dir` of `.lock/` is the only race-relevant step (mailbox
+/// seeding later `create_dir_all`s `<loop_root>/loop/` independently — harmless).
+pub(crate) fn acquire_loop_lock(
+    loop_root: &std::path::Path,
+    arc_id: &str,
+) -> std::result::Result<LoopLock, LoopLockError> {
+    std::fs::create_dir_all(loop_root).map_err(LoopLockError::Io)?;
+    let dir = lock_dir(loop_root);
+
+    match std::fs::create_dir(&dir) {
+        Ok(()) => finalize_lock(dir, arc_id),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing_pid = std::fs::read_to_string(dir.join("pid"))
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok());
+            match existing_pid {
+                Some(pid) if pid_is_live(pid) => Err(LoopLockError::Busy { pid }),
+                other => {
+                    // Stale (dead pid) or unreadable/empty pid file → take over.
+                    tracing::warn!(
+                        "loop_mode: taking over stale mailbox lock {} (pid {} is gone)",
+                        dir.display(),
+                        other.map(|p| p.to_string()).unwrap_or_else(|| "unknown".into())
+                    );
+                    std::fs::remove_dir_all(&dir).map_err(LoopLockError::Io)?;
+                    std::fs::create_dir(&dir).map_err(LoopLockError::Io)?;
+                    finalize_lock(dir, arc_id)
+                }
+            }
+        }
+        Err(e) => Err(LoopLockError::Io(e)),
+    }
+}
+
+/// Write the `pid` + `arc_id` marker files into a freshly-created lock dir and
+/// wrap it in a guard. On any write error the half-built lock is removed so we
+/// never leave a lock we don't hold.
+fn finalize_lock(
+    dir: std::path::PathBuf,
+    arc_id: &str,
+) -> std::result::Result<LoopLock, LoopLockError> {
+    let write = (|| -> std::io::Result<()> {
+        std::fs::write(dir.join("pid"), std::process::id().to_string())?;
+        std::fs::write(dir.join("arc_id"), arc_id)?;
+        Ok(())
+    })();
+    match write {
+        Ok(()) => Ok(LoopLock { dir }),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            Err(LoopLockError::Io(e))
+        }
+    }
+}
+
 /// Read `<loop_root>/loop/VERDICT.md` for the orchestrator's `read_verdict`
 /// closure. Returns the full file contents (the pure orchestrator parses the
 /// first line via [`parse_verdict_file`]); `None` when the file is missing or
@@ -1070,6 +1212,158 @@ mod tests {
         assert_eq!(parse_verdict_file(&read), Some(Verdict::Iterate));
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ---- Mailbox ownership lock (Phase 4b) --------------------------------
+    //
+    // A unique temp loop-root per test invocation. Uses pid + a monotonic
+    // counter so parallel test threads never collide on the same dir.
+    fn unique_lock_root(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "athen-loop-lock-{}-{tag}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        root
+    }
+
+    #[test]
+    fn acquire_loop_lock_writes_pid_and_arc_id() {
+        let root = unique_lock_root("acquire");
+        let guard = acquire_loop_lock(&root, "arc_test").unwrap();
+        let ld = lock_dir(&root);
+        assert!(ld.is_dir(), ".lock/ must exist after acquire");
+        let pid = std::fs::read_to_string(ld.join("pid")).unwrap();
+        assert_eq!(pid.trim(), std::process::id().to_string());
+        let aid = std::fs::read_to_string(ld.join("arc_id")).unwrap();
+        assert_eq!(aid, "arc_test");
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn acquire_loop_lock_refuses_live_foreign_pid() {
+        // Driver wire-compat: a `.lock/` created by ANOTHER (non-Athen) actor
+        // with a LIVE pid must be honored. We simulate the foreign actor with the
+        // test process's own pid (guaranteed live) written into the lock dir by
+        // hand — exactly the shape the bash driver leaves on disk.
+        let root = unique_lock_root("foreign-live");
+        let ld = lock_dir(&root);
+        std::fs::create_dir_all(&ld).unwrap();
+        std::fs::write(ld.join("pid"), std::process::id().to_string()).unwrap();
+
+        let err = acquire_loop_lock(&root, "arc_test").unwrap_err();
+        match err {
+            LoopLockError::Busy { pid } => assert_eq!(pid, std::process::id()),
+            other => panic!("expected Busy, got {other:?}"),
+        }
+        // The refusal must NOT disturb the existing lock.
+        assert!(ld.join("pid").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn acquire_loop_lock_holds_off_second_acquire_while_live() {
+        // A held guard (our own live pid) refuses a second acquire in-process.
+        let root = unique_lock_root("held-live");
+        let guard = acquire_loop_lock(&root, "arc_a").unwrap();
+        let err = acquire_loop_lock(&root, "arc_b").unwrap_err();
+        assert!(matches!(err, LoopLockError::Busy { .. }));
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn acquire_loop_lock_takes_over_stale_lock() {
+        // A `.lock/` holding a DEAD pid is stale → taken over. Use pid 0, which
+        // `sysinfo` never reports as a live user process (the kernel "swapper"
+        // slot is not enumerated as a refreshable process).
+        let root = unique_lock_root("stale");
+        let ld = lock_dir(&root);
+        std::fs::create_dir_all(&ld).unwrap();
+        std::fs::write(ld.join("pid"), "0").unwrap();
+        std::fs::write(ld.join("arc_id"), "arc_dead").unwrap();
+
+        let guard = acquire_loop_lock(&root, "arc_new").unwrap();
+        // Took over: pid + arc_id are now OURS.
+        assert_eq!(
+            std::fs::read_to_string(ld.join("pid")).unwrap().trim(),
+            std::process::id().to_string()
+        );
+        assert_eq!(std::fs::read_to_string(ld.join("arc_id")).unwrap(), "arc_new");
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn acquire_loop_lock_takes_over_unreadable_pid() {
+        // A `.lock/` with no/garbage pid file is also treated as stale.
+        let root = unique_lock_root("garbage");
+        let ld = lock_dir(&root);
+        std::fs::create_dir_all(&ld).unwrap();
+        std::fs::write(ld.join("pid"), "not-a-number").unwrap();
+
+        let guard = acquire_loop_lock(&root, "arc_new").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(ld.join("pid")).unwrap().trim(),
+            std::process::id().to_string()
+        );
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn loop_lock_released_on_drop() {
+        let root = unique_lock_root("drop");
+        let ld = lock_dir(&root);
+        {
+            let _guard = acquire_loop_lock(&root, "arc_test").unwrap();
+            assert!(ld.is_dir());
+        } // guard dropped here
+        assert!(!ld.exists(), ".lock/ must be gone after the guard drops");
+        // And the freed mailbox can be re-acquired.
+        let g2 = acquire_loop_lock(&root, "arc_test").unwrap();
+        assert!(ld.is_dir());
+        drop(g2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn loop_lock_released_on_panic() {
+        // Drop runs during unwind, so a panic while the guard is held still
+        // releases the lock — the same all-paths coverage the cancel-flag
+        // deregistration has (verified against the panic path).
+        let root = unique_lock_root("panic");
+        let ld = lock_dir(&root);
+        let root_for_closure = root.clone();
+        let res = std::panic::catch_unwind(move || {
+            let _guard = acquire_loop_lock(&root_for_closure, "arc_test").unwrap();
+            panic!("boom inside the locked region");
+        });
+        assert!(res.is_err(), "the closure must have panicked");
+        assert!(!ld.exists(), ".lock/ must be released even on panic");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn code_mode_loop_root_is_per_arc_nested() {
+        // Path-shape guard for the Code-Mode branch mirror in
+        // `run_loop_for_arc` / `loop_start_core`: a Code-Mode repo root anchors a
+        // per-arc `loop-runs/<sanitized-arc-id>/` mailbox, so two arcs rooted at
+        // the SAME repo can never share a mailbox.
+        use crate::state::sanitize_arc_id_for_path;
+        let repo = std::path::Path::new("/repos/myproj");
+        let a = repo
+            .join("loop-runs")
+            .join(sanitize_arc_id_for_path("arc_a"));
+        let b = repo
+            .join("loop-runs")
+            .join(sanitize_arc_id_for_path("arc_b"));
+        assert_eq!(a, std::path::Path::new("/repos/myproj/loop-runs/arc_a"));
+        assert_ne!(a, b, "distinct arcs at the same repo get distinct mailboxes");
     }
 
     // ---- Guardrails audit (design-doc invariants, code-enforced) ----------

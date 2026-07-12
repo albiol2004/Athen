@@ -10742,6 +10742,23 @@ pub(crate) async fn loop_start_core(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("Arc not found: {arc_id}"))?;
 
+    // Resolve the per-arc loop root up-front — the SAME resolution
+    // `run_loop_for_arc` performs (Phase-4b: Code Mode and the workspace
+    // fallback both nest under `loop-runs/<sanitized-arc-id>/`). We need it here
+    // to (a) take the mailbox ownership lock before spawning and (b) report the
+    // true root in the ack. `run_loop_for_arc` re-resolves the identical path,
+    // so seeding + the persisted `loop_root` column stay consistent.
+    let loop_root: std::path::PathBuf =
+        match crate::state::resolve_code_mode_for_arc(Some(arc_store), &arc_id).await {
+            Some(repo_root) => repo_root
+                .join("loop-runs")
+                .join(crate::state::sanitize_arc_id_for_path(&arc_id)),
+            None => athen_core::paths::athen_workspace_dir()
+                .ok_or_else(|| "Loop Mode unavailable: no workspace directory".to_string())?
+                .join("loop-runs")
+                .join(crate::state::sanitize_arc_id_for_path(&arc_id)),
+        };
+
     // Refuse a second concurrent loop on the same arc — one arc's `loop/`
     // mailbox can only host one run at a time. Register the cancel flag under
     // the lock so two racing `loop_start` calls can't both slip through.
@@ -10756,6 +10773,36 @@ pub(crate) async fn loop_start_core(
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         flags.insert(arc_id.clone(), flag.clone());
         flag
+    };
+
+    // Take the mailbox ownership lock (Phase-4b), wire-compatible with the trio
+    // driver's `.lock/` protocol. This guards against an EXTERNAL orchestrator
+    // (the bash driver / another Claude Code session) sharing this mailbox — the
+    // in-process double-start is already refused above via the cancel registry,
+    // but the on-disk lock is what makes two *processes* safe. A live-foreign
+    // lock is refused synchronously here (same in-band `Err(String)` UX as the
+    // double-start refusal); on refusal we roll back the just-registered cancel
+    // flag so the arc is not wedged. The guard is moved into the spawned task and
+    // dropped when it ends, releasing the lock on completion / error / panic —
+    // the same discipline as the cancel-flag deregistration.
+    let loop_lock = match crate::loop_mode::acquire_loop_lock(&loop_root, &arc_id) {
+        Ok(guard) => guard,
+        Err(e) => {
+            if let Ok(mut flags) = state.loop_cancel_flags.lock() {
+                flags.remove(&arc_id);
+            }
+            return Err(match e {
+                crate::loop_mode::LoopLockError::Busy { pid } => format!(
+                    "A loop is already running on arc {arc_id}: its mailbox {} is \
+                     locked by a live process (pid {pid})",
+                    loop_root.display()
+                ),
+                crate::loop_mode::LoopLockError::Io(io) => format!(
+                    "Loop Mode: could not lock mailbox {}: {io}",
+                    loop_root.display()
+                ),
+            });
+        }
     };
 
     // Stamp "running" up front so `loop_status` reflects the start even before
@@ -10773,7 +10820,13 @@ pub(crate) async fn loop_start_core(
     // and the cancel flag is always removed from the registry on completion.
     let arc_for_task = arc_id.clone();
     let ui_for_task = ui.clone();
+    // Move the mailbox lock guard into the task so it lives exactly as long as
+    // the run. `AssertUnwindSafe`/`catch_unwind` on the run means a panic inside
+    // `run_loop_for_arc` is caught here; the guard is dropped when this closure
+    // returns (on the Ok path, the error path, AND after a caught panic), which
+    // is precisely when the cancel flag is deregistered below.
     tauri::async_runtime::spawn(async move {
+        let _loop_lock = loop_lock;
         let task_state = ui_for_task.app_state();
         let run = std::panic::AssertUnwindSafe(task_state.run_loop_for_arc(
             &arc_for_task,
@@ -10785,7 +10838,9 @@ pub(crate) async fn loop_start_core(
         .catch_unwind()
         .await;
         // Always deregister the flag so a finished/failed/panicked run frees the
-        // arc for a future loop.
+        // arc for a future loop. The `_loop_lock` guard is dropped at the end of
+        // this closure with the same all-paths coverage, releasing the on-disk
+        // `.lock/` mailbox lock.
         if let Ok(mut flags) = task_state.loop_cancel_flags.lock() {
             flags.remove(&arc_for_task);
         }
@@ -10824,24 +10879,12 @@ pub(crate) async fn loop_start_core(
         }
     });
 
-    // Resolve the loop root for the ack (mirrors run_loop_for_arc's resolution;
-    // best-effort — the run has already been accepted regardless).
-    let loop_root = match crate::state::resolve_code_mode_for_arc(Some(arc_store), &arc_id).await {
-        Some(repo_root) => repo_root.to_string_lossy().to_string(),
-        None => athen_core::paths::athen_workspace_dir()
-            .map(|w| {
-                w.join("loop-runs")
-                    .join(crate::state::sanitize_arc_id_for_path(&arc_id))
-                    .to_string_lossy()
-                    .to_string()
-            })
-            .unwrap_or_default(),
-    };
-
+    // Report the loop root already resolved above — identical to the path
+    // `run_loop_for_arc` seeds and stamps, so the ack never lies about it.
     Ok(LoopStartResult {
         arc_id,
         started: true,
-        loop_root,
+        loop_root: loop_root.to_string_lossy().to_string(),
         max_iterations,
     })
 }
@@ -11118,6 +11161,22 @@ mod loop_mailbox_tests {
                 "expected {bad:?} to be rejected by the mailbox allow-list"
             );
         }
+    }
+
+    #[test]
+    fn allow_list_never_exposes_the_ownership_lock() {
+        // Phase 4b: the mailbox ownership lock lives at `<loop_root>/.lock/`
+        // (with `pid` / `arc_id` inside). None of it may be readable through
+        // `get_loop_file` — the lock is process bookkeeping, not a mailbox file.
+        for hidden in [".lock", ".lock/pid", ".lock/arc_id", "pid", "arc_id"] {
+            assert_eq!(
+                resolve_loop_mailbox_file(hidden),
+                None,
+                "the ownership lock artifact {hidden:?} must never be allow-listed"
+            );
+        }
+        assert!(!LOOP_MAILBOX_FILES.contains(&".lock"));
+        assert!(!LOOP_MAILBOX_FILES.contains(&"pid"));
     }
 }
 
