@@ -26,3 +26,9 @@ __pycache__/
 
 # Web UI (web/dist IS committed — the binary embeds it via rust-embed)
 web/node_modules/
+
+# Loops directories
+loop-*
+
+# Personal Script
+scripts/build-guard.sh
